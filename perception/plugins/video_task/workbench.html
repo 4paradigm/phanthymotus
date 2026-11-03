@@ -1,0 +1,876 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:light;--bg:#faf8f5;--paper:#fffdfa;--ink:#302e2b;--muted:#827d76;--line:#e8e2da;--accent:#b95d37;--soft:#f9ece3;--warning:#946121}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.6 system-ui,-apple-system,"PingFang SC",sans-serif;height:100dvh;display:flex;flex-direction:column}button,input,select,textarea{font:inherit;color:inherit}button{border:1px solid var(--line);background:var(--paper);border-radius:7px;padding:8px 12px;cursor:pointer}button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.primary{background:var(--accent);color:white;border-color:var(--accent);font-weight:600}button.primary:hover:not(:disabled){color:white;background:#a54e2b}.quiet{background:transparent;border-color:transparent}.small{font-size:12px;padding:4px 8px}input,select,textarea{border:1px solid var(--line);background:var(--paper);padding:7px 9px;border-radius:5px;min-width:0;max-width:100%}input[type=number]{width:94px}input[type=checkbox]{width:auto;accent-color:var(--accent)}textarea{width:100%;resize:vertical}label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}h2,h3,p{margin:0}h2{font-size:21px;line-height:1.4;letter-spacing:-.4px;overflow-wrap:anywhere}h3{font-size:14px}p{margin:6px 0}.muted,.note{color:var(--muted)}.note{font-size:11px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:0}.hidden{display:none!important}.badge{font-size:11px;padding:3px 7px;background:#eee9e2;border-radius:5px;color:var(--muted)}.warning{background:#fff1df;color:var(--warning);padding:10px 12px;border-radius:7px;font-size:12px}.empty{color:var(--muted);padding:30px 20px;text-align:center;background:#f3f0eb;border-radius:9px}.stack{display:flex;flex-direction:column;gap:12px}.panel{border:1px solid var(--line);border-radius:9px;padding:14px;background:var(--paper)}.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}.two>*{min-width:0}.inline-label{flex-direction:row;align-items:center}.line{height:1px;background:var(--line);margin:12px 0}.topbar{display:flex;align-items:center;gap:16px;padding:0 24px;min-height:58px;border-bottom:1px solid var(--line);flex-shrink:0}#headerDraft{max-width:225px;flex:1;border:0;background:transparent;padding-left:0;font-weight:500}nav{display:flex;align-self:stretch;gap:14px;margin:auto}nav button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;padding:14px 8px;white-space:nowrap}nav button.active{border-color:var(--accent);color:var(--accent);font-weight:600}main{flex:1;min-height:0;overflow:auto;padding:22px 24px}.page-heading{margin-bottom:18px;align-items:flex-start}.eyebrow{font-size:12px;color:var(--muted);margin-bottom:5px}.subtitle{color:var(--muted);font-size:12px;margin-top:7px}.pane{min-height:100%}.menu{position:relative}.menu>summary{list-style:none;padding:6px 8px;color:var(--muted)}.menu[open] .menu-items{position:absolute;right:0;top:32px;z-index:5;width:175px;padding:8px;background:var(--paper);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 30px #30251b1a}.menu-items button{display:block;text-align:left;border:0;width:100%;margin:3px 0}.menu-items .note{padding:8px}.welcome{padding:65px 20px;background:transparent}.welcome h2{font-size:27px}.welcome p{margin:12px 0 25px}.welcome-symbol{font-size:35px;color:var(--accent);margin-bottom:15px}.library-layout{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:24px}.library-side{border-left:1px solid var(--line);padding-left:20px}.library-side h3{margin-bottom:12px}.recent{display:flex;gap:10px;width:100%;padding:9px 0;text-align:left;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent}.recent.active{color:var(--accent)}.recent video{width:64px;height:48px;object-fit:cover;background:#e9e4dd;border-radius:5px;flex-shrink:0}.recent strong{font-size:12px;line-height:1.5;display:block;overflow-wrap:anywhere}.recent small{color:var(--muted)}.drop-zone{border:1px dashed #d5cbbf;border-radius:8px;padding:18px 12px;text-align:center;margin-top:18px}.drop-zone.over{border-color:var(--accent);background:var(--soft)}.drop-zone button{display:block;margin:0 auto}.video-box{position:relative;background:#e8e3dc;border-radius:9px;overflow:hidden;display:flex;align-items:center;justify-content:center}.video-box video,.result-player{width:100%;height:clamp(200px,32vh,290px);object-fit:contain;display:block;background:#e8e3dc;border-radius:9px}.video-box canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.video-box canvas.editing{pointer-events:auto;cursor:crosshair}.video-label{position:absolute;top:10px;left:10px;background:#302c26b0;color:white;padding:3px 8px;border-radius:4px;font-size:11px;pointer-events:none}.video-controls{margin-top:9px}.seek{width:100%;accent-color:var(--accent);padding:0}.thumbs{display:flex;gap:8px;margin-top:8px}.thumb{flex:1;min-width:0;background:#e8e3dc;border-radius:6px;overflow:hidden}.thumb video{width:100%;height:100px;object-fit:contain;display:block}.thumb span{font-size:11px;display:block;padding:3px 7px}.thumb img{width:100%}.action-bar{border-top:1px solid var(--line);padding-top:14px;margin-top:18px}.action-bar .primary{min-width:170px}.stream-list{display:flex;gap:8px;flex-wrap:wrap}.stream{flex:1;text-align:left;min-width:100px}.stream .muted{display:block;font-size:11px}.stream.active{border-color:var(--accent);background:var(--soft)}details>summary{cursor:pointer;color:var(--muted);padding:5px 0}details[open]>summary{margin-bottom:10px}.local-tabs{display:flex;gap:8px;border-bottom:1px solid var(--line);margin-bottom:14px}.local-tabs button{border:0;background:transparent;border-bottom:2px solid transparent;border-radius:0}.local-tabs button.active{color:var(--accent);border-color:var(--accent)}.observation-view{margin-top:16px}.sync-lane{height:48px;background:#e9e1d5;position:relative;overflow:hidden;touch-action:none;border-radius:6px}.sync-lane canvas{width:100%;height:100%;opacity:.6}.sync-lane span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--ink);background:#faf8f54d;font-size:12px}.sync-lane.movable{cursor:ew-resize;border:1px solid var(--accent)}.trace{width:100%;height:230px;background:#f3f0ea;border-radius:8px;touch-action:none}.curve{width:100%;height:90px;background:#f3f0ea;border-radius:8px}
+.analysis-layout{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(280px,1fr);gap:26px}.result-caption{font-size:12px;color:var(--muted);margin:10px 0}.candidate{border:0}.step-list{list-style:none;padding:0;margin:8px 0 16px}.step-item{border-bottom:1px solid var(--line);position:relative;border-radius:3px}.step-item.active{background:var(--soft)}.step-item.active:before{content:'';position:absolute;left:-5px;top:8px;bottom:8px;border-left:3px solid var(--accent);border-radius:3px}.watch-step,.step{display:flex;gap:12px;align-items:flex-start;width:100%;text-align:left;background:transparent;border:0;border-radius:0;padding:12px 6px}.step-number{background:#eee9e3;color:#6f685e;width:29px;height:29px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:12px}.active .step-number{background:#f1cdb5;color:#884324}.step-text{flex:1;min-width:0}.step-text strong{font-size:14px;font-weight:550;display:block}.step-text small{font-size:12px;color:var(--muted)}.step-note{padding:0 10px 10px 47px;font-size:11px;color:var(--muted)}.candidate .primary{width:100%;margin-top:16px}.candidate details{margin-top:10px;font-size:11px}.result-actions{display:flex;gap:10px;align-items:center;margin-top:18px}.result-actions>.primary{flex:1}.task-tools{margin-top:22px;padding-top:12px;border-top:1px solid var(--line)}#stepEditor{padding:0 12px 12px 47px;gap:8px}#stepTitle{border:0;border-bottom:1px solid var(--accent);border-radius:0;background:transparent;width:100%;font-size:14px;padding:3px 0}#stepEditor textarea{font-size:12px}#steps{margin:8px 0}#stepEmpty{padding:20px}.chips{display:flex;gap:5px;flex-wrap:wrap}.chip{font-size:11px;background:var(--soft);border:0;border-radius:4px;padding:3px 7px}.filmstrip{height:52px;width:100%;display:block;border-radius:6px;background:#e8e3dc}.range-timeline{position:relative;height:30px;background:#ede6dc;border-radius:5px;margin:8px 6px 6px;touch-action:none}.range-fill{position:absolute;top:0;bottom:0;background:#c9764e70;border-radius:4px;pointer-events:none}.range-handle{position:absolute;top:2px;bottom:2px;width:17px;min-width:0;padding:0;background:var(--paper);border:1px solid #bcb0a2;border-radius:5px;transform:translateX(-50%);cursor:ew-resize;box-shadow:0 1px 4px #4d312522;touch-action:none}.range-handle:after{content:'Ⅱ';font-size:10px}.range-label{justify-content:space-between;font-size:11px;color:var(--muted)}.params{display:grid;grid-template-columns:1fr 1fr;gap:9px}.feedback{display:block;border:0;border-bottom:1px solid var(--line);border-left:3px solid var(--line);padding:10px;text-align:left;width:100%;background:transparent}.feedback.failed{border-left-color:#bb633e}.feedback.success{border-left-color:#718268}.feedback.selected{background:var(--soft)}.run-videos video{width:100%;height:210px;object-fit:contain;background:#e8e3dc;border-radius:8px}.run-videos h3{margin-bottom:8px}.outcome-choices{display:flex;gap:8px;margin:12px 0}.outcome-choices button{flex:1}.outcome-choices button[aria-pressed=true]{background:var(--soft);border-color:var(--accent);color:var(--accent)}.review-steps{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.review-steps button.active{border-color:var(--accent);background:var(--soft)}.readiness-row{display:flex;align-items:center;gap:10px;padding:13px 0;border-bottom:1px solid var(--line)}.readiness-row p{margin:3px 0;font-size:12px;color:var(--muted)}.tool-list{padding:12px;background:#f3f0ea;border-radius:7px;font-size:12px}.tool-list p{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:220px;overflow:auto}footer{padding:8px 24px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);display:flex;gap:10px;align-items:center;flex-shrink:0;min-height:35px}#status{flex:1;overflow-wrap:anywhere}.error{color:#a24122}dialog{border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);width:min(730px,94vw);max-height:92dvh;padding:22px}dialog::backdrop{background:#30281f40}dialog .dialog-heading{position:sticky;top:-22px;padding:10px 0 15px;background:var(--bg);z-index:2}dialog.drawer{margin:0 0 0 auto;height:100dvh;max-height:100dvh;width:min(390px,94vw);border-radius:0;border:0;border-left:1px solid var(--line);padding:22px}.history-item{padding:15px 0;border-bottom:1px solid var(--line)}.history-item.active{background:var(--soft);margin:0 -8px;padding:15px 8px;border-radius:6px}.history-item h3{font-size:13px}.history-item .row{margin-top:6px}.history-item time{font-size:11px;color:var(--muted)}#historyList{margin:12px 0}.drawer .primary{width:100%}.tool-heading{margin-bottom:18px}.regression{align-items:flex-start}.regression input{flex:1;min-width:100px}
+@media(max-width:760px){.topbar{padding:0 16px;gap:6px;flex-wrap:wrap}.topbar nav{order:3;width:100%;justify-content:center;gap:20px}.topbar nav button{padding:10px 8px}#headerDraft{max-width:none}.topbar .menu{margin-left:auto}main{padding:18px 16px}.library-layout{grid-template-columns:minmax(0,1fr) 160px;gap:16px}.library-side{padding-left:12px}.recent video{width:46px;height:38px}.analysis-layout{grid-template-columns:minmax(0,1fr) minmax(260px,1fr);gap:18px}.result-player{height:220px}.run-videos video{height:170px}.params{grid-template-columns:1fr}.page-heading h2{font-size:19px}}
+@media(max-width:580px){.library-layout,.analysis-layout,.two{grid-template-columns:1fr}.library-side{border-left:0;border-top:1px solid var(--line);padding:15px 0 0}.library-side #recentVideos{display:flex;gap:12px;overflow:auto}.recent{min-width:160px;max-width:210px}.library-side .drop-zone{padding:10px;margin-top:12px}.video-box video,.result-player{height:210px}.page-heading{margin-bottom:14px}.page-heading>.grow{min-width:65%}.run-videos video{height:160px}.action-bar .primary{width:100%}.outcome-choices button{padding:8px}.task-tools{gap:2px}.task-tools button{font-size:12px;padding:7px}.regression{flex-direction:column}.regression input{width:100%}dialog{padding:16px}}
+.step-item:not(.active) .step-note{display:none}nav button:hover:not(.active){border-bottom-color:transparent}.primary-dock{padding:12px 24px;border-top:1px solid var(--line);background:var(--bg);flex-shrink:0;min-height:62px}.primary-dock .primary{min-width:190px}#candidateAction{margin-left:auto}#returnCurrent{position:sticky;bottom:0;box-shadow:0 -12px 15px var(--bg)}.result-player{height:clamp(210px,38vh,310px)}.review-placeholder{height:210px;display:flex;align-items:center;justify-content:center;background:#efebe5;border-radius:8px;color:var(--muted);padding:20px;text-align:center}.status-alert{position:sticky;bottom:0;margin:12px 0 0;padding:10px 12px;background:#fff1df;color:#a24122;border:1px solid #ebd8bf;border-radius:6px;font-size:12px}
+@media(max-width:580px){.primary-dock{padding:10px 16px}.primary-dock .primary{min-width:150px}.result-player{height:210px}}
+.primary-dock .task-tools{margin:0;padding:0;border:0;gap:0}.primary-dock .task-tools button{font-size:12px;padding:6px 9px}.primary-dock #revision{font-size:11px;min-width:50px}#reviewDock .primary{margin-left:auto}@media(max-width:580px){.primary-dock{gap:5px}.primary-dock .task-tools{flex-basis:100%;justify-content:space-between}.primary-dock #revision{display:none}}
+.library-layout.observing{grid-template-columns:minmax(0,1.25fr) minmax(270px,1fr);gap:20px}.library-layout.observing .observation-view{margin-top:0}.library-layout.observing .video-box video{height:280px}.library-layout.observing .stream-list .stream{font-size:12px;padding:7px}.library-layout.observing .stream-list .stream .muted{font-size:10px}@media(max-width:650px){.library-layout.observing{grid-template-columns:1fr}.library-layout.observing .video-box video{height:210px}}
+.run-videos video,.review-placeholder{height:clamp(130px,23vh,160px)}#recordStream{padding:3px 0;border-color:transparent;background:transparent;font-size:12px}#reviewEmpty{background:transparent;padding:0;color:var(--muted);font-size:12px}.review-steps{margin:10px 0}.outcome-choices{margin:8px 0}.observation-view .trace{height:180px}
+
+.skill-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:28px}.skill-grid>*{min-width:0}.skill-grid aside{border-left:1px solid var(--line);padding-left:24px}.skill-description{display:flex;flex-direction:column;gap:12px}.skill-description p{font-size:12px}.skill-step{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.skill-notes{color:var(--muted)}.skill-list-item{display:grid;grid-template-columns:38px 1fr;gap:4px 14px;text-align:left;width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;padding:18px 4px}.skill-list-item strong{font-size:16px}.skill-list-item span.muted,.skill-list-item small{grid-column:2}.skill-symbol{grid-row:span 3;font-size:28px;color:var(--accent)}.skill-installed{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;padding:12px 0}.skill-match{display:block;text-align:left;width:100%;background:transparent;padding:18px;margin:8px 0;border:1px solid var(--line)}.skill-match.selected{background:var(--soft);border-color:var(--accent)}.skill-match strong{font-size:15px}.skill-param{padding:18px;border:1px solid var(--line);border-radius:8px;gap:10px;color:var(--ink)}.skill-param strong{font-size:14px}.skill-param input,.skill-param select{width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;font-size:17px;padding:8px 0}.skill-gap{padding:9px 0;color:var(--warning);border-bottom:1px solid var(--line);overflow-wrap:anywhere}.skill-evidence-step{display:block;text-align:left;font-size:11px;border:0;background:transparent;padding:6px 0;color:var(--muted)}#skillVideo{width:100%;height:220px;background:#eee8df;border-radius:8px;object-fit:contain}#skillTools{margin-bottom:16px}#skillTools .menu-items{width:190px}#skillSource{width:100%;margin-bottom:10px}.skill-toolbar{justify-content:space-between;margin-bottom:18px}#skillDock .primary,#skillRunDock .primary{margin-left:auto}#skill-library details{margin-top:22px}#skillComparison{display:flex;flex-direction:column;gap:14px}#skillTaskHistory{max-width:100%;width:100%;margin:10px 0 18px}
+@media(max-width:650px){.skill-grid{grid-template-columns:1fr;gap:20px}.skill-grid aside{border-left:0;border-top:1px solid var(--line);padding:18px 0 0}.skill-param{padding:14px}.topbar nav{gap:8px}#skillDock .note{max-width:46%}}
+</style></head><body>
+<header class="topbar"><select id="headerDraft" aria-label="选择示范"><option value="">选择已有视频</option></select><nav aria-label="工作区"><button class="active" data-tab="data">视频</button><button data-tab="task">步骤</button><button data-tab="skill">技能</button><button data-tab="review">复盘</button></nav><button id="openModelSettings" class="quiet small" title="设置视频分析模型">模型设置</button><details class="menu"><summary aria-label="更多操作">•••</summary><div class="menu-items"><button id="quickImport">导入新视频</button><button id="newDraft">新建空白示范</button><button id="renameDraft">重命名</button><button id="refresh">刷新</button><div id="modelState" class="note"></div></div></details></header>
+<main>
+<section id="pane-data" class="pane">
+<div id="dataWelcome" class="welcome drop-zone"><div class="welcome-symbol" aria-hidden="true">▷</div><h2>从一段示范开始</h2><p class="muted">放入视频，看清动作，再把做法整理成自己的任务。</p><button id="welcomeNew" class="primary">选择视频文件</button><p class="note">也可以把视频拖到这里 · MP4 / MOV / WebM · 最多64 MiB</p><button id="welcomeLink" class="quiet">粘贴视频链接</button></div>
+<div id="dataWorkspace" class="hidden">
+<div class="row page-heading"><div class="grow"><div class="eyebrow" id="dataEyebrow">示范视频</div><h2 id="streamTitle">先添加一段视频</h2><p id="nextHint" class="subtitle"></p></div><button id="observationToggle" class="quiet">观察工具 ↗</button></div>
+<div id="observeTabs" class="local-tabs hidden" aria-label="观察工具"><button data-observe="sync" class="active">多视角</button><button data-observe="points">标记点</button><button data-observe="motion">动作数据 · Ego / UMI</button></div><div class="library-layout" id="libraryLayout"><div>
+<div id="videoEmpty" class="empty">还没有素材。<button id="emptyImport" class="quiet">选择视频</button></div>
+<div id="videoWorkspace" class="stack hidden"><div class="video-box"><video id="mainVideo" muted playsinline preload="metadata"></video><canvas id="overlay"></canvas><span id="videoLabel" class="video-label"></span></div><div id="thumbs" class="thumbs hidden"></div><div class="row video-controls"><button id="play" class="quiet small">▶ 播放</button><span id="clock" class="note">0 / 0 秒</span><span class="grow"></span><span id="streamInfo" class="note"></span></div><input id="seek" class="seek" type="range" min="0" max="1" step="0.001" value="0" aria-label="共享任务时间"></div>
+<details id="goalOptions"><summary>希望重点看什么？</summary><input id="quickGoal" style="width:100%" placeholder="可选，例如：重点看如何握住杯子" aria-label="分析关注点"></details>
+<div id="dataActionBar" class="row action-bar"><button id="dataToTask" class="quiet">手工编写步骤</button><span id="dataTaskState" class="note grow"></span><button id="quickAnalyze" class="primary">分析这个视频</button></div>
+</div><aside class="library-side" id="librarySide"><h3>最近的示范</h3><div id="recentVideos"></div><div class="drop-zone" id="libraryDrop"><button id="libraryImport" class="quiet">＋ 导入新视频</button><span class="note">或拖入文件</span><button id="libraryLink" class="quiet small">粘贴视频链接</button></div></aside></div>
+<div id="dataAdvanced" class="observation-view hidden">
+<div class="row"><div id="streams" class="stream-list grow"></div><button id="addVideo" class="quiet">＋ 同次视角</button></div>
+<div id="observe-sync" class="stack" style="margin-top:14px"><p class="note">选取辅助视角，拖动时间条，让同一个动作出现在同一时刻；保存前需人工核对。</p><div class="sync-lane"><canvas id="syncBaseFilm"></canvas><span>主视角 · 时间基准</span></div><div id="syncDrag" class="sync-lane movable" role="slider" tabindex="0" aria-label="辅助视角时间偏移"><canvas id="syncOtherFilm"></canvas><span id="syncDragLabel">选择辅助视角后拖动对齐</span></div><div class="row"><label class="inline-label"><input id="syncConfirmed" type="checkbox">已核对同步</label><span class="grow note" id="syncNote"></span></div><details><summary>精确偏移与漂移校准</summary><div class="row"><label>源视频偏移（秒）<input id="offset" type="number" step="0.01" value="0"></label><button id="driftSync">两点校准漂移</button></div></details></div>
+<div id="observe-points" class="stack hidden" style="margin-top:14px"><div class="row"><label class="inline-label"><input id="editPoints" type="checkbox">在画面上点选位置</label><input id="pointName" aria-label="点名称" placeholder="点名称，可选" class="grow"><span id="pointsNote" class="note"></span></div><div class="row"><select id="trackChoice" class="grow" aria-label="选择标注或轨迹"><option value="">不显示图层</option></select><span id="trackSource" class="note grow"></span></div><div class="row action-bar"><button id="clearPoints" class="quiet">清除标记</button><button id="savePoints" class="quiet">仅保存标注</button><span class="grow"></span></div><p class="note">人工点与算法跟踪会分别记录；遮挡后可能失跟，需要回看核对。</p><details><summary>跟踪范围与自动手部起点</summary><div class="row"><label>起点（任务秒）<input id="rangeStart" type="number" min="0" step=".01" value="0"></label><label>终点（任务秒）<input id="rangeEnd" type="number" min="0" step=".01" value="1"></label><button id="useCurrentTime">以当前帧为起点</button><button id="detectHands">检测手部并跟踪</button></div><p class="note">单次最多30秒。手部检测复用已有pose引擎；没有接触力或左右手保证。</p></details></div>
+<div id="observe-motion" class="stack hidden" style="margin-top:14px"><div class="row"><div class="grow"><h3>把动作数据和画面对照</h3><p class="note">EgoDex HDF5、UMI 数值NPZ/Zarr或轨迹JSON</p></div><button id="exportTrack" class="quiet">导出轨迹</button></div><select id="motionTrackChoice" aria-label="选择动作轨迹"></select><div id="trajectoryEmpty" class="empty">选择视频对应的数据，导入后可旋转查看轨迹。</div><div id="trajectoryView" class="hidden"><canvas id="trajectory" class="trace"></canvas><canvas id="widthCurve" class="curve"></canvas><p id="trajectoryInfo" class="note"></p></div><details><summary>数据来源、坐标与缺失情况</summary><pre id="trackMeta">尚未选择轨迹</pre></details><section id="motionEvidence" class="stack" style="margin-top:16px"><h3>用于理解的动作证据</h3><div id="motionSummary" class="note"></div><div id="motionSignals" class="stack"></div><details><summary>采集质量与来源</summary><div id="captureQuality" class="note"></div><pre id="motionProvenance"></pre></details></section></div>
+</div></div></section>
+<section id="pane-task" class="pane hidden">
+<div id="taskEmpty" class="empty welcome"><div class="welcome-symbol" aria-hidden="true">≡</div><h2>把示范整理成步骤</h2><p>分析视频后，在这里回看和修改做法。</p><button id="backData" class="primary">返回视频</button><details id="manualTask"><summary>手工编写步骤</summary><label>任务目标<input id="newGoal" placeholder="例如：将杯子放入托盘"></label><button id="createTask">创建任务</button></details></div>
+<div id="taskWorkspace" class="hidden"><div class="row page-heading"><div class="grow"><div id="resultIdentity" class="eyebrow"></div><h2 id="resultTitle"></h2><p id="resultMeta" class="subtitle"></p></div><button id="openHistory" class="quiet">◷ 历史分析</button></div>
+<div class="analysis-layout"><div id="resultPlayer"><video id="resultVideo" class="result-player" controls muted playsinline></video><p id="resultCaption" class="result-caption">点击步骤，回看对应片段</p><div id="editTimeline" class="hidden"><canvas id="editFilm" class="filmstrip"></canvas><div id="rangeTimeline" class="range-timeline"><div id="rangeFill" class="range-fill"></div><button id="rangeIn" class="range-handle" role="slider" aria-label="片段开始时间"></button><button id="rangeOut" class="range-handle" role="slider" aria-label="片段结束时间"></button></div><div class="row range-label"><span id="rangeInLabel"></span><span id="rangeOutLabel"></span></div><p class="note">拖动边界调整片段；也可聚焦手柄使用方向键。</p></div></div>
+<div><div id="resultEmpty" class="empty hidden">没有可用步骤</div><div id="candidates"></div>
+<div id="taskEditor" class="hidden"><div class="row"><h3 class="grow">任务步骤</h3><button id="finishEdit" class="quiet small">退出编辑</button></div><div id="steps"></div><div id="editorFields" class="hidden"><div id="stepEditor" class="stack"><input id="stepTitle" aria-label="步骤名称"><details id="stepDetails"><summary>说明、完成条件与更多细节</summary><div class="stack"><label>说明与疑点<textarea id="notes" rows="2"></textarea></label><div class="row"><label>开始秒<input id="stepStart" type="number" step=".01"></label><label>结束秒<input id="stepEnd" type="number" step=".01"></label></div><label>依据<select id="basis"><option value="unknown">未知 / 待核对</option><option value="observed">画面观察</option><option value="inferred">推断</option></select></label><label>前置条件（每行一项）<textarea id="pre" rows="2"></textarea></label><label>完成条件（每行一项）<textarea id="post" rows="2"></textarea></label><div id="stepEvidence" class="chips"></div><div class="row"><button id="observeStep">抽帧补看</button><select id="evidenceChoice" class="grow" aria-label="观察记录"></select><button id="attachEvidence">关联证据</button></div><div id="frames" class="thumbs"></div><label>依赖步骤ID（逗号分隔）<input id="dependencies"></label><div class="row"><button id="moveStepUp" class="small">上移</button><button id="moveStepDown" class="small">下移</button><button id="removeStep" class="small">删除这一步</button></div></div></details></div></div><div id="stepEmpty" class="empty">添加第一步，从视频里看见的动作开始。</div><button id="addStep" class="quiet">＋ 添加一步</button><div id="uncertainties" class="warning hidden"></div></div></div></div>
+</div></section>
+<section id="pane-skill" class="pane hidden">
+<div class="row page-heading"><div class="grow"><div class="eyebrow">可复用的任务技能</div><h2 id="skillHeading">把做法留下来，下次接着用</h2><p id="skillSubtitle" class="subtitle"></p></div><button id="skillRefresh" class="quiet">刷新</button></div>
+<div id="skillTools" class="row skill-toolbar hidden"><button id="skillCompare" class="quiet">比较已有技能</button><details class="menu"><summary>更多 ⋯</summary><div class="menu-items"><button id="skillEdit">编辑候选</button><button id="skillVersions">查看版本与改动</button><button id="skillReviewVersion">核验与推荐版本</button></div></details></div>
+<div id="skill-library"><div id="skillLibrary"></div><div class="row" style="margin-top:16px"><button id="skillExtractMore" class="quiet">选择多个示范提炼</button></div><details><summary id="installedSummary">原技能库</summary><div id="installedRows"></div><button id="skillInstalledMore" class="quiet">读取更多摘要</button></details></div>
+<div id="skill-candidate" class="skill-grid hidden"><div id="skillDescription" class="skill-description"></div><aside><h3 style="margin-bottom:12px">示范依据</h3><select id="skillSource" aria-label="选择技能来源示范"></select><video id="skillVideo" controls muted playsinline></video><div id="skillVideoEmpty" class="empty hidden"></div><p id="skillEvidenceNote" class="note"></p><div id="skillEvidenceSteps"></div><p class="note">通用做法来自归纳；原步骤的疑点仍需回看核对。</p></aside></div>
+<div id="skill-compare" class="skill-grid hidden"><div><div id="skillMatches"></div><button id="skillSearchInstalled" class="quiet">查找其他技能</button></div><aside id="skillComparison"></aside></div>
+<div id="skill-task" class="skill-grid hidden"><div id="skillParameterFields" class="stack"></div><aside id="skillTaskPreview"></aside></div>
+</section>
+<section id="pane-review" class="pane hidden"><div class="local-tabs"><button data-review-mode="video" class="active">视频任务</button><button data-review-mode="skill">技能任务</button></div><div id="legacyReview"><div class="row page-heading"><div class="grow"><div class="eyebrow">执行复盘</div><h2>这一次，做得怎么样？</h2><p class="subtitle">按步骤对照两次录像，记录你实际观察到的结果。</p></div><button id="openReviewHistory" class="quiet">◷ 复盘记录</button></div><div id="reviewEmpty" class="warning">尚无反馈记录。先选择步骤和执行视频，再标记结果。</div><div id="reviewContent"><div class="two run-videos" style="margin-top:16px"><div><h3>参考示范 <span class="note">· 示范时间</span></h3><video id="demoVideo" controls muted playsinline></video></div><div><div class="row"><h3 class="grow">执行录像 <span class="note">· 独立时间</span></h3><button id="addExecution" class="quiet small">＋ 导入</button></div><video id="executionVideo" controls muted playsinline></video><div id="executionEmpty" class="review-placeholder hidden">导入这次执行的录像<br>也可以只记录人工观察</div><select id="recordStream" style="width:100%" aria-label="选择执行录像"></select></div></div><div id="reviewSteps" class="review-steps"></div><div id="reviewReady" class="warning hidden"></div><div id="reviewQuestion"><h3>这一步的结果是？ <span class="note">人工判断</span></h3><div class="outcome-choices"><button data-outcome="success" aria-pressed="false">✓ 完成</button><button data-outcome="failed" aria-pressed="false">↻ 需重试</button><button data-outcome="unknown" aria-pressed="false">? 不确定</button></div><details><summary>补充说明（可选）</summary><textarea id="recordEvidence" rows="2" placeholder="补充你看到的现象" aria-label="复盘说明"></textarea></details><details id="reviewContext"><summary>执行片段与设备配置</summary><div class="row"><label>设备配置<select id="recordProfile"></select></label><label>复盘步骤<select id="recordStep"></select></label><label>起点秒<input id="recordStart" type="number" step=".01" min="0" value="0"></label><label>终点秒<input id="recordEnd" type="number" step=".01" min="0" value="1"></label></div></details><select id="outcome" class="hidden" aria-label="结果"><option value="unknown">不确定</option><option value="failed">需重试</option><option value="success">完成</option></select></div><p class="note">两次录像独立播放；改进建议需经过回归检查后才能采用。</p></div></div><div id="skillReview" class="hidden"><select id="skillTaskHistory" aria-label="选择技能任务"></select><div id="skillReviewEmpty" class="empty">选择一次技能任务，记录实际结果与依据。</div><div id="skillReviewBody" class="hidden"><div class="row page-heading"><div class="grow"><h2 id="skillRunTitle"></h2><p id="skillRunMeta" class="subtitle"></p></div><button id="skillRunPreview" class="quiet">查看任务预览</button></div><label>复盘步骤<select id="skillRecordStep"></select></label><h3 style="margin-top:16px">这一步的结果是？ <span class="note">人工判断</span></h3><div class="outcome-choices"><button data-task-outcome="success" aria-pressed="false">完成</button><button data-task-outcome="failed" aria-pressed="false">失败</button><button data-task-outcome="unknown" aria-pressed="false">不确定</button></div><details><summary>补充观察依据（可选）</summary><textarea id="skillRecordEvidence" rows="2" aria-label="技能任务反馈依据"></textarea></details><div id="skillRunRecords" style="margin-top:18px"></div></div></div></section>
+</main><div id="skillDock" class="primary-dock row hidden"><button id="skillBack" class="quiet hidden">返回技能</button><span id="skillHint" class="note grow"></span><button id="skillPrimary" class="primary">从当前步骤提炼</button></div><div id="skillRunDock" class="primary-dock row hidden"><span class="note grow">反馈属于当前任务与技能版本；改进先形成候选。</span><button id="skillReviewPrimary" class="primary">生成改进候选</button></div><div id="observeDock" class="primary-dock row hidden"><span id="observeHint" class="note grow"></span><button id="saveSync" class="primary">保存同步</button><button id="trackPoints" class="primary">跟踪这些点</button><button id="importData" class="primary">导入动作数据</button><button id="motionAnalyze" class="primary hidden">结合动作分析</button></div><div id="reviewDock" class="primary-dock row hidden"><button id="saveRecord" class="quiet">仅保存反馈</button><button id="openRegression" class="quiet">检查改进建议</button><span class="grow"></span><button id="improve" class="primary">生成改进建议</button></div><div id="taskDock" class="primary-dock row hidden"><div class="row task-tools"><button id="openAnalysis" class="quiet">重新分析</button><button id="openDevice" class="quiet">设备能力</button><button id="openTaskMore" class="quiet">更多工具</button><span class="grow"></span><button id="backToVideo" class="quiet small">返回视频</button></div><span id="revision" class="note grow"></span><div id="candidateAction"></div><button id="saveRecipe" class="primary hidden">保存修改</button></div><footer><span id="status" role="status" aria-live="polite">正在连接工作台…</span><button id="cancelJob" class="small hidden">取消处理</button></footer>
+<dialog id="historyDrawer" class="drawer" aria-labelledby="historyTitle"><div class="row dialog-heading"><h2 id="historyTitle" class="grow">历史分析</h2><button id="closeHistory" class="quiet" aria-label="关闭历史">✕</button></div><p class="note">查看记录不会替换当前任务。这里只列出最近保留的分析。</p><div id="historyList"></div><button id="returnCurrent" class="primary">返回当前结果</button></dialog>
+<dialog id="toolsDialog" aria-labelledby="toolsTitle"><div class="row dialog-heading"><h2 id="toolsTitle" class="grow"></h2><button id="closeTools" class="quiet" aria-label="关闭工具">✕</button></div>
+<section id="analysisAdvanced" class="tool-pane hidden stack"><p class="muted">生成一份新的建议，现有步骤会保留。</p><div class="row"><select id="analysisStream" class="grow" aria-label="分析视角"></select><select id="mode" aria-label="视频输入方式"><option value="frames">分段抽帧</option><option value="native">原生视频</option></select><button id="analyze" class="primary">开始分析</button></div><details><summary>片段范围与采样参数</summary><div class="row"><label>开始秒<input id="analysisStart" type="number" step=".01" value="0"></label><label>结束秒<input id="analysisEnd" type="number" step=".01" value="1"></label><label>帧预算<input id="frameCount" type="number" min="4" max="32" value="12"></label><label>原生FPS<input id="nativeFps" type="number" min=".1" max="10" step=".1" value="2"></label><select id="sampling"><option value="uniform">均匀抽帧</option><option value="focused">区间中部加密</option></select></div></details><button id="compareModes">原生 / 抽帧对照</button><p id="analysisState" class="note"></p></section>
+<section id="devicePanel" class="tool-pane hidden stack"><p class="muted">先看每一步还缺什么，再配置对应工具。</p><div class="row"><select id="profiles" class="grow" aria-label="已有绑定"></select><button id="checkBinding" class="primary">检查能力缺口</button></div><div id="readinessSummary"></div><div id="readinessSteps"></div><div id="availableTools" class="tool-list">读取原画布中已连接的工具；检查本身不会运行设备。</div><details id="bindingEditor"><summary>配置所选步骤的工具与反馈</summary><div class="stack"><div class="row"><input id="profileName" class="grow" aria-label="绑定配置名称" placeholder="绑定配置名称"><button id="loadTools">刷新已连接工具</button></div><select id="bindingStep" aria-label="选择绑定步骤"></select><div class="two"><div class="stack"><h3>动作工具</h3><select id="actionTool" aria-label="动作工具"></select><div id="actionParams" class="params"></div></div><div class="stack"><h3>停止工具</h3><select id="stopTool" aria-label="停止工具"></select><div id="stopParams" class="params"></div></div></div><label>怎样确认实际完成<textarea id="completion" rows="2"></textarea></label><button id="saveBinding">保存此步骤绑定</button></div></details><details><summary>检查依据与运行入口</summary><pre id="bindingResult"></pre><p class="note">声明匹配不代表运动已验证；现场确认和停止仍使用原设备与Agent流程。</p><button id="execute">请求 Agent 运行</button></details></section>
+<section id="taskMore" class="tool-pane hidden stack"><label>任务目标<input id="taskGoal"></label><button id="saveSkill">保存任务快照</button><details><summary>配方历史与恢复</summary><div class="row"><select id="versionChoice" class="grow" aria-label="历史版本"></select><button id="viewVersion">对比 / 恢复旧配方</button></div><p class="note">恢复会新增版本，并清空需重新核验的设备绑定。</p></details><details><summary>让 Agent 补看与寻找示范</summary><div class="row"><button id="agentPlan">补看规划</button><button id="agentSearch">寻找示范</button></div><div id="sources" class="stack"></div></details></section>
+<section id="reviewHistory" class="tool-pane hidden stack"><div id="records"></div></section>
+<section id="regressionPanel" class="tool-pane hidden stack"><p class="note">候选保留当前版本；实际验证证据通过后才可采用。</p><select id="reviewCandidate" aria-label="选择改进候选"></select><div id="improvementPreview"></div><div id="reviewCases" class="stack"></div><div class="row"><button id="manualImprovement">把任务编辑存为候选</button><button id="saveCases">保存回归检查</button><button id="adoptImprovement" class="primary">采用已验证候选</button></div></section>
+</dialog>
+<dialog id="modelDialog" aria-labelledby="modelTitle" style="width:460px">
+<div class="row dialog-heading"><h2 id="modelTitle" class="grow">模型设置</h2><button id="closeModelSettings" class="quiet" aria-label="关闭模型设置">✕</button></div>
+<p class="muted">供视频理解和技能提炼使用。</p><div class="stack">
+<label>模型服务<select id="modelService"><option value="router">PhanthyRouter · Gemini</option><option value="gemini">Gemini 官方 API</option><option value="compatible">其他兼容服务</option></select></label>
+<label id="modelChoiceField">分析模型<select id="modelChoice" aria-label="选择分析模型"><option value="">正在读取服务目录…</option></select></label><p id="modelCatalogNote" class="note"></p>
+<label>API Key<input id="modelKey" type="password" placeholder="输入服务的 API Key" autocomplete="new-password" spellcheck="false"></label><p id="modelKeyHint" class="note"></p>
+<details id="modelAdvanced"><summary>高级设置 · 自定义模型与接口</summary><div class="stack" style="margin-top:12px"><label>模型 ID（可手动填写）<input id="modelName" placeholder="服务中提供的模型 ID" autocomplete="off"></label>
+<label>API 地址<input id="modelEndpoint" type="url" placeholder="https://…" autocomplete="off" spellcheck="false"></label>
+<label>接口协议<select id="modelProvider"><option value="gemini">Gemini · 原生视频与抽帧</option><option value="compatible">OpenAI 兼容 · 抽帧</option></select></label>
+<label id="nativeProtocolField">兼容接口的原生视频支持<select id="modelNative"><option value="disabled">未声明（使用抽帧）</option><option value="qwen_video_url">Qwen video_url（需服务支持）</option></select></label>
+<p id="modelProtocolHint" class="note"></p><p class="note">目录不保证账号权限或视频能力。保存设置不会发起模型请求。</p></div></details>
+<button id="saveModelSettings" class="primary">保存设置</button></div></dialog>
+<dialog id="dialog" aria-labelledby="dialogTitle"><h2 id="dialogTitle"></h2><div id="dialogBody" class="stack"></div><div class="row" style="margin-top:16px;justify-content:flex-end"><button id="dialogCancel">取消</button><button id="dialogOk" class="primary">确定</button></div></dialog>
+<input id="quickVideoFile" type="file" accept="video/mp4,video/webm,video/quicktime" hidden><input id="videoFile" type="file" accept="video/mp4,video/webm,video/quicktime" hidden><input id="dataFile" type="file" accept=".json,.npz,.zip,.hdf5,.h5" hidden>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id), clone = x => JSON.parse(JSON.stringify(x));
+let seedTime=null, editRecipeRevision=null;
+let port, sequence=0, draft=null, info={}, recipe=null, dirty=false, selectedStep=-1, activeStream='', activeTrack=null, trackToken=0, tab='data', points=[], tools=[], polling=false, operation=false, loading=false;
+const DEFAULT_GOAL='根据视频识别实际发生的操作及先后顺序，给出可复核的步骤；只描述画面证据，不确定的地方明确说明。';
+// Display identity is separate from saved recipe identity. History never adopts.
+let resultSelection=0, selectedAnalysis=null, editing=false, activeResultStep=0, observing=false, observationTab='sync';
+let reviewTouched=false, reviewOutcomeChosen=false, reviewToken=0, recentToken=0, readiness=null;
+const films=new Map();
+const pending=new Map(), urls=new Map(); let previewVideos=[], dialogResolve=null, uploadRole='external', uploadName='', importOptions={}, selectedRecord=null;
+function status(text,error=false){$('status').textContent=text;$('status').classList.toggle('error',error);for(const d of document.querySelectorAll('dialog')){d.querySelector('.status-alert')?.remove();if(error&&d.open){const alert=document.createElement('p');alert.className='status-alert';alert.setAttribute('role','alert');alert.textContent=text;d.append(alert);}}}
+function option(text,value){const e=document.createElement('option');e.textContent=text;e.value=value;return e;}
+function button(id,fn){$(id).addEventListener('click',async()=>{if($(id).disabled)return;$(id).disabled=true;try{await fn();}catch(e){status(e.message,true);}finally{$(id).disabled=false;}});}
+function rpc(method,args={},extra={}){return new Promise((resolve,reject)=>{if(!port){reject(Error('工作台尚未连接'));return;}const id=String(++sequence),timeout=setTimeout(()=>{pending.delete(id);reject(Error('请求超时；请检查状态后重试'));},120000);pending.set(id,{resolve,reject,timeout});port.postMessage({id,method,args,...extra});});}
+function call(action,args={}){return rpc('call',{action,...(draft?{draft_id:draft.id}:{}),...args});}
+function editGuard(){if(dirty&&editRecipeRevision!==draft.recipe_revision)throw Error('配方已被其他操作修改，请复制你的编辑后刷新再合并；未覆盖新版本');}
+function revision(){if(!draft)throw Error('请先创建或选择示范');return {expected_revision:draft.revision};}
+function stream(id=activeStream){return draft?.streams.find(s=>s.id===id);}
+function taskSeconds(video=$('mainVideo'),s=stream()){return s?s.rate*video.currentTime+s.offset_s:0;}
+function lines(id){return $(id).value.split('\n').map(s=>s.trim()).filter(Boolean);}
+function duration(){return draft?.media?.duration_s||1;}
+function dialog(title,body,ok='确定'){if(dialogResolve)throw Error('请先完成当前输入');$('dialogTitle').textContent=title;$('dialogBody').replaceChildren(...body);$('dialogOk').textContent=ok;$('dialogCancel').textContent='取消';$('dialog').showModal();return new Promise(resolve=>dialogResolve=resolve);}
+function closeDialog(value){$('dialog').close();const fn=dialogResolve;dialogResolve=null;fn?.(value);}
+$('dialogCancel').onclick=()=>closeDialog(false);$('dialogOk').onclick=()=>closeDialog(true);$('dialog').addEventListener('cancel',e=>{e.preventDefault();closeDialog(false);});
+function field(text,type='text',value=''){const label=document.createElement('label'),input=document.createElement('input');label.textContent=text;input.type=type;input.value=value;label.append(input);return {label,input};}
+async function confirmText(text){const p=document.createElement('p');p.textContent=text;return dialog('请确认',[p],'继续');}
+async function checkDirty(){return (!dirty&&!points.length&&!reviewTouched)||await confirmText('离开将放弃尚未保存的任务编辑、标注点或复盘反馈。继续？');}
+function closeMenu(){document.querySelectorAll('.menu').forEach(d=>d.open=false);}
+function pauseAll(){for(const v of document.querySelectorAll('video'))v.pause();$('play').textContent='▶ 播放';}
+function setTab(next){pauseAll();if(next!==tab)document.querySelector('main').scrollTop=0;tab=next;syncDock();syncSkillHeader();document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===next));for(const name of ['data','task','skill','review'])$('pane-'+name).classList.toggle('hidden',name!==next);if(next==='task'){renderTask();renderCandidates();}if(next==='review'){renderReview();loadReviewVideos().catch(e=>status(e.message,true));}if(next==='data'){drawOverlay();drawTrajectory();}if(next==='skill'){renderSkills();if(skillMode==='library')refreshSkills().catch(e=>status(e.message,true));}if(next==='review')setReviewMode(reviewMode);}
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
+async function blobUrl(s){if(!urls.has(s.asset_id)){const r=await rpc('media',{asset_id:s.asset_id});urls.set(s.asset_id,URL.createObjectURL(r.blob));}return urls.get(s.asset_id);}
+function release(){pauseAll();films.clear();recentToken++;for(const url of urls.values())URL.revokeObjectURL(url);urls.clear();previewVideos=[];trackToken++;activeTrack=null;}
+function changed(){dirty=true;$('revision').textContent='● 有未保存修改';}
+function selectOptions(id,rows,selected,empty){$(id).replaceChildren();if(empty!==undefined)$(id).append(option(empty,''));for(const row of rows)$(id).append(option(row.text,row.value));if([...$(id).options].some(o=>o.value===selected))$(id).value=selected;}
+async function render(next,force=false){
+ const different=draft?.id!==next.id, previousRecipe=draft?.recipe_revision, oldSelection=recipe?.steps[selectedStep]?.id;
+ if(different){release();selectedRecord=null;seedTime=null;resultSelection++;$('resultPlayer').classList.add('hidden');$('resultVideo').removeAttribute('src');editing=false;selectedAnalysis=null;activeResultStep=0;reviewTouched=false;reviewOutcomeChosen=false;readiness=null;setObservation(false);$('quickGoal').value='';$('recordEvidence').value='';$('recordStream').value='';$('profileName').value='';document.querySelectorAll('[data-outcome]').forEach(b=>b.setAttribute('aria-pressed','false'));}
+ if(previousRecipe!==next.recipe_revision)readiness=null;
+ draft=next;
+ if(different||force||!dirty){recipe=clone(draft.recipe);dirty=false;editRecipeRevision=draft.recipe_revision;selectedStep=recipe?.steps.findIndex(s=>s.id===oldSelection)??-1;}
+ else if(previousRecipe!==draft.recipe_revision)status('配方已被其他操作修改；你的编辑仍保留，保存已锁定，请复制编辑后刷新合并。',true);
+ $('dataWelcome').classList.toggle('hidden',!!draft);$('dataWorkspace').classList.remove('hidden');
+ $('dataTaskState').textContent=draft.recipe?'已关联任务':'尚未关联任务';
+ if(!draft.streams.some(s=>s.id===activeStream)){activeStream=draft.streams[0]?.id||'';points=[];}
+ renderStreams();renderTask();renderReview();renderSources();renderCandidates();
+ if(different||force||!$('mainVideo').src)await selectStream(activeStream,false);
+ refreshTrackList();renderNextAction();renderRecent();renderReadiness();
+ await refreshMotionEvidence();
+}
+let motionRequest=0;
+async function refreshMotionEvidence(){
+ const token=++motionRequest,id=draft?.id;
+ $('motionSignals').replaceChildren();$('motionProvenance').textContent='';$('captureQuality').textContent='';
+ if(!draft?.capture&&!draft?.tracks.length){$('motionSummary').textContent='导入EgoDex / UMI、跟踪关键点或录制状态后，分析会结合这些测量。没有动作数据时仍可分析视频。';return;}
+ try{
+  const result=await call('motion');if(token!==motionRequest||draft?.id!==id)return;
+  const evidence=result.motion;$('motionSummary').textContent='可用于分析：'+evidence.tracks.length+'组轨迹、'+evidence.signals.length+'路数值状态。分析时按所选区间提取，辅助视角只使用已确认同步的画面。';
+  for(const mark of evidence.human_marks||[]){const b=document.createElement('button');b.className='quiet';b.textContent=mark.time_s.toFixed(2)+'秒 · '+mark.label+'（人工标记）';b.onclick=()=>{const s=stream();if(s)$('mainVideo').currentTime=Math.max(0,(mark.time_s-s.offset_s)/s.rate);};$('motionSignals').append(b);}
+  const quality=result.capture?.quality||[];
+  $('captureQuality').textContent=result.capture?(result.capture.sync_note+' '+quality.map(q=>q.topic+'：'+q.count+'条，'+q.gaps+'处接收间隙，'+q.rejected+'条拒收'+(q.tail_gap_s>.5?'，末尾缺失'+q.tail_gap_s.toFixed(1)+'秒':'')).join('；')):'文件导入或跟踪产生的数据，保留源坐标与缺失，不等同机器人坐标。';
+  $('motionProvenance').textContent=JSON.stringify({references:evidence.references,limits:evidence.limits,omitted_layers:evidence.omitted_layers},null,2);
+  for(const source of evidence.signals){
+   const box=document.createElement('div'),title=document.createElement('strong'),note=document.createElement('p');box.className='panel';title.textContent=source.topic;note.className='note';note.textContent='单位：'+(typeof source.units==='string'?source.units:JSON.stringify(source.units))+'；以下为最多8个时刻的稀疏采样，不补齐缺失。';box.append(title,note);
+   for(const channel of source.stats.slice(0,4)){const row=document.createElement('p');row.className='note';row.textContent=channel.channel+'：'+Number(channel.first.toPrecision(5))+' → '+Number(channel.last.toPrecision(5))+'，范围 '+Number(channel.min.toPrecision(5))+'–'+Number(channel.max.toPrecision(5));box.append(row);}
+   if(source.samples?.length){const canvas=document.createElement('canvas');canvas.className='curve';canvas.width=600;canvas.height=100;box.append(canvas);const ctx=canvas.getContext('2d'),key=source.stats[0]?.channel,values=source.samples.map(r=>r.values[key]).filter(v=>typeof v==='number');if(values.length){const low=Math.min(...values),span=Math.max(...values)-low||1,first=source.samples[0].task_time_s,last=source.samples.at(-1).task_time_s;ctx.fillStyle='#a64e29';for(const r of source.samples){const v=r.values[key];if(typeof v!=='number')continue;ctx.beginPath();ctx.arc(10+580*(r.task_time_s-first)/(last-first||1),85-70*(v-low)/span,4,0,Math.PI*2);ctx.fill();}}}
+   $('motionSignals').append(box);
+  }
+ }catch(e){if(token===motionRequest)$('motionSummary').textContent='动作证据暂不可读：'+e.message;}
+}
+function renderStreams(){
+ $('streams').replaceChildren();for(const s of draft.streams){const b=document.createElement('button');b.className='stream'+(s.id===activeStream?' active':'');b.append(document.createTextNode(s.name));const small=document.createElement('span');small.className='muted';small.textContent=({external:'外部视角',ego:'第一人称',wrist:'腕部视角',other:'其他视角',execution:'另一次执行'}[s.role]||s.role)+' · '+s.media.duration_s.toFixed(2)+'s';b.append(small);b.onclick=()=>selectStream(s.id).catch(e=>status(e.message,true));$('streams').append(b);}
+ const demos=draft.streams.filter(s=>s.role!=='execution').map(s=>({text:s.name,value:s.id}));
+ selectOptions('analysisStream',demos,$('analysisStream').value||activeStream);
+}
+async function selectStream(id,reset=true){
+ if(reset&&points.length&&!await confirmText('切换视角会清除未保存的点。继续？'))return;
+ pauseAll();activeStream=id;activeTrack=null;points=[];seedTime=null;trackToken++;renderStreams();
+ const s=stream();$('videoEmpty').classList.toggle('hidden',!!s);$('videoWorkspace').classList.toggle('hidden',!s);
+ renderNextAction();if(!s)return;
+ $('streamTitle').textContent=s.name;$('videoLabel').textContent=s.role==='execution'?'执行视频 · 独立时间':'示范视角';
+ $('streamInfo').textContent=s.media.duration_s.toFixed(1)+' 秒';$('streamInfo').title=s.media.width+'×'+s.media.height+' · '+(s.media.timestamp_source||'旧时间索引');
+ $('offset').value=s.offset_s;$('syncConfirmed').checked=s.alignment_confirmed;
+ const fixed=s.id===draft.streams[0].id||s.role==='execution';$('offset').disabled=fixed;$('syncConfirmed').disabled=fixed;$('saveSync').disabled=fixed;$('driftSync').disabled=fixed;
+ $('syncDrag').setAttribute('aria-disabled',String(fixed));$('syncNote').textContent=fixed?'主视角为时间基准；另一次执行不做同步。':(s.alignment_confirmed?'人工已确认；比例 '+s.rate:'尚未核对同步。')+' 空间标定未提供。';
+ const requested=id,url=await blobUrl(s);if(activeStream!==requested)return;
+ $('mainVideo').src=url;$('seek').max=s.role==='execution'?s.media.duration_s:duration();
+ $('rangeStart').value=Math.max(0,s.offset_s).toFixed(3);$('rangeEnd').value=Math.min(duration(),s.offset_s+s.rate*s.media.duration_s,Number($('rangeStart').value)+30).toFixed(3);
+ $('analysisStart').value=Math.max(0,s.offset_s);$('analysisEnd').value=Math.min(duration(),s.offset_s+s.rate*s.media.duration_s);
+ $('thumbs').replaceChildren();previewVideos=[];
+ if(s.role!=='execution')for(const other of draft.streams.filter(v=>v.id!==id&&v.role!=='execution').slice(0,2)){
+  const box=document.createElement('div');box.className='thumb';const video=document.createElement('video');video.muted=true;video.playsInline=true;const label=document.createElement('span');label.textContent=other.name;box.append(video,label);$('thumbs').append(box);
+  const otherUrl=await blobUrl(other);if(activeStream!==requested)return;video.src=otherUrl;previewVideos.push({video,stream:other,label});
+ }
+ refreshTrackList();drawOverlay();renderSyncLanes().catch(e=>status(e.message,true));
+}
+function syncPlayback(){
+ const s=stream();if(!s)return;const t=(observing&&observationTab==='sync'&&!$('offset').disabled)?s.rate*$('mainVideo').currentTime+(Number($('offset').value)||0):taskSeconds();$('clock').textContent=$('mainVideo').currentTime.toFixed(1)+' / '+s.media.duration_s.toFixed(1)+' 秒';$('clock').title='任务时间 '+t.toFixed(3)+' 秒';$('seek').value=t;
+ for(const item of previewVideos){const v=item.video,target=(t-item.stream.offset_s)/item.stream.rate;
+  const available=target>=0&&target<item.stream.media.duration_s;item.label.textContent=item.stream.name+(available?'':' · 此刻无画面');
+  v.style.opacity=available?'1':'.25';if(!available){v.pause();continue;}if(Math.abs(v.currentTime-target)>.08)v.currentTime=target;v.playbackRate=s.rate/item.stream.rate;
+  if(!$('mainVideo').paused&&v.paused)v.play().catch(()=>{});else if($('mainVideo').paused)v.pause();
+ }
+ drawOverlay();drawTrajectory();
+}
+$('mainVideo').addEventListener('timeupdate',syncPlayback);$('mainVideo').addEventListener('loadedmetadata',syncPlayback);$('mainVideo').addEventListener('ended',()=>{$('play').textContent='▶ 播放';previewVideos.forEach(x=>x.video.pause());});
+button('play',async()=>{if($('mainVideo').paused){await $('mainVideo').play();$('play').textContent='Ⅱ 暂停';}else pauseAll();syncPlayback();});
+$('seek').oninput=()=>{const s=stream();if(s){const t=(Number($('seek').value)-s.offset_s)/s.rate;$('mainVideo').currentTime=Math.max(0,Math.min(s.media.duration_s,t));syncPlayback();}};
+button('useCurrentTime',()=>{$('rangeStart').value=taskSeconds().toFixed(3);});
+function canvasSize(canvas){const r=canvas.getBoundingClientRect();const ratio=devicePixelRatio||1;canvas.width=Math.max(1,Math.round(r.width*ratio));canvas.height=Math.max(1,Math.round(r.height*ratio));const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);return {ctx,w:r.width,h:r.height};}
+function frameAt(track,sourceTime){if(!track?.frames.length)return null;let lo=0,hi=track.frames.length;while(lo<hi){const m=(lo+hi)>>1;if(track.frames[m].time_s<=sourceTime)lo=m+1;else hi=m;}const i=Math.max(0,lo-1),f=track.frames[i];if(sourceTime<f.time_s-.05||sourceTime>track.frames.at(-1).time_s+.05)return null;return f;}
+function pictureRect(w,h){const v=$('mainVideo'),scale=Math.min(w/(v.videoWidth||w),h/(v.videoHeight||h)),pw=(v.videoWidth||w)*scale,ph=(v.videoHeight||h)*scale;return {x:(w-pw)/2,y:(h-ph)/2,w:pw,h:ph};}
+function drawOverlay(){
+ const {ctx,w,h}=canvasSize($('overlay'));const rect=pictureRect(w,h);let names=[],values=[];const f=activeTrack?.kind==='points2d'?frameAt(activeTrack,$('mainVideo').currentTime):null;
+ if(f){names=activeTrack.names;values=f.points;}if(points.length){names=points.map(p=>p.name);values=points.map(p=>[p.x,p.y,1]);}
+ for(let i=0;i<values.length;i++){const p=values[i];if(!p)continue;ctx.beginPath();ctx.arc(rect.x+p[0]*rect.w,rect.y+p[1]*rect.h,4,0,Math.PI*2);ctx.fillStyle='#c96834';ctx.fill();ctx.strokeStyle='#fff';ctx.stroke();ctx.fillStyle='#8b3f21';ctx.font='11px sans-serif';ctx.fillText(names[i],rect.x+p[0]*rect.w+6,rect.y+p[1]*rect.h-4);}
+ $('pointsNote').textContent=points.length?'待保存 '+points.length+' 个点':'尚未指定点';
+}
+$('editPoints').onchange=()=>$('overlay').classList.toggle('editing',$('editPoints').checked);
+$('overlay').onclick=e=>{if(!$('editPoints').checked||!stream())return;pauseAll();const r=e.currentTarget.getBoundingClientRect();const picture=pictureRect(r.width,r.height),px=(e.clientX-r.left-picture.x)/picture.w,py=(e.clientY-r.top-picture.y)/picture.h;if(px<0||px>1||py<0||py>1)return;const now=taskSeconds();if(points.length&&Math.abs(now-seedTime)>.04){status('这些点属于另一帧，请先保存或清除再标注',true);return;}if(!points.length){seedTime=now;$('rangeStart').value=now.toFixed(3);$('rangeEnd').value=Math.min(duration(),now+30).toFixed(3);}const name=$('pointName').value.trim()||'点'+(points.length+1);if(points.some(p=>p.name===name)){status('点名称重复，请修改名称',true);return;}if(points.length>=80)return;points.push({name,x:px,y:py});$('pointName').value='';drawOverlay();};
+button('clearPoints',()=>{points=[];drawOverlay();});
+button('savePoints',async()=>{if(!points.length)throw Error('请先点击画面指定点');await mutate('annotate',{stream_id:activeStream,start_s:seedTime,points});points=[];await chooseLatestTrack();});
+button('driftSync',async()=>{const s=stream(),a=field('锚点1：源视频秒','number','0'),b=field('锚点1：主视角秒','number',String(s.offset_s)),c=field('锚点2：源视频秒','number',String(s.media.duration_s-1)),d=field('锚点2：主视角秒','number',String(s.rate*(s.media.duration_s-1)+s.offset_s));for(const f of [a,b,c,d])f.input.step='0.001';if(!await dialog('同次示范的时间漂移校准',[a.label,b.label,c.label,d.label],'保存并确认'))return;const t1=Number(a.input.value),t2=Number(c.input.value),v1=Number(b.input.value),v2=Number(d.input.value);if(t2-t1<1)throw Error('两个源时间至少间隔1秒');const rate=(v2-v1)/(t2-t1),offset=v1-rate*t1;await mutate('sync',{stream_id:s.id,rate,offset_s:offset,confirmed:true,anchors:[{source_s:t1,task_s:v1},{source_s:t2,task_s:v2}]});await selectStream(s.id,false);status('两点时间校准已保存；未进行空间标定。');});
+button('saveSync',async()=>{await mutate('sync',{stream_id:activeStream,offset_s:Number($('offset').value),rate:stream().rate,confirmed:$('syncConfirmed').checked});await selectStream(activeStream,false);status('同步已保存；历史证据保留原版本，修改步骤前需重新补看。');});
+function refreshTrackList(){if(!draft)return;const old=$('trackChoice').value,rows=draft.tracks.filter(t=>t.stream_id===activeStream).map(t=>({text:({manual:'人工',imported:'导入',tracked_from_manual:'跟踪',detected_and_tracked:'检测+跟踪'}[t.source]||t.source)+' · '+t.names.length+'点 · '+t.frame_count+'帧',value:t.id}));for(const id of ['trackChoice','motionTrackChoice'])selectOptions(id,rows,old,'选择标注或轨迹');}
+async function loadTrack(id){
+ const token=++trackToken;activeTrack=null;if(!id){drawOverlay();drawTrajectory();return;}
+ let cursor=0,value=null;do{const r=await call('tracks',{track_id:id,cursor,limit:20});if(token!==trackToken)return;if(!value)value={...r.track,frames:[]};value.frames.push(...r.track.frames);cursor=r.next_cursor;}while(cursor!==null);
+ activeTrack=value;$('trackSource').textContent=value.source+' · '+value.coordinate_frame+' · '+value.units;
+ $('trackMeta').textContent=JSON.stringify({...draft.tracks.find(t=>t.id===id),metadata:value.metadata},null,2);drawOverlay();drawTrajectory();
+}
+for(const id of ['trackChoice','motionTrackChoice'])$(id).onchange=()=>{const value=$(id).value;$('trackChoice').value=value;$('motionTrackChoice').value=value;loadTrack(value).catch(e=>status(e.message,true));};
+async function chooseLatestTrack(){refreshTrackList();const t=draft.tracks.filter(t=>t.stream_id===activeStream).at(-1);if(t){$('trackChoice').value=t.id;$('motionTrackChoice').value=t.id;await loadTrack(t.id);}}
+button('trackPoints',async()=>{if(!points.length)throw Error('请先指定跟踪起点');if(Math.abs(Number($('rangeStart').value)-seedTime)>.002)throw Error('跟踪起点须与点选帧一致，请重新点选');await job('track',{...revision(),stream_id:activeStream,start_s:Number($('rangeStart').value),end_s:Number($('rangeEnd').value),points});points=[];await chooseLatestTrack();});
+button('detectHands',async()=>{await job('track',{...revision(),stream_id:activeStream,start_s:Number($('rangeStart').value),end_s:Number($('rangeEnd').value),detect:true});await chooseLatestTrack();});
+let yaw=.65,pitch=.55,drag=null;
+$('trajectory').onpointerdown=e=>{drag=[e.clientX,e.clientY];e.currentTarget.setPointerCapture(e.pointerId);};$('trajectory').onpointerup=()=>drag=null;
+$('trajectory').onpointermove=e=>{if(!drag)return;yaw+=(e.clientX-drag[0])*.01;pitch=Math.max(-1.2,Math.min(1.2,pitch+(e.clientY-drag[1])*.01));drag=[e.clientX,e.clientY];drawTrajectory();};
+function drawTrajectory(){
+ const track=activeTrack,show=track?.kind==='trajectory3d';$('trajectoryView').classList.toggle('hidden',!show);$('trajectoryEmpty').classList.toggle('hidden',show||!!draft?.capture?.quality.some(q=>q.kind!=='video'&&q.count>0));if(!show)return;
+ const {ctx,w,h}=canvasSize($('trajectory')),all=track.frames.flatMap(f=>f.points.filter(Boolean)),current=frameAt(track,$('mainVideo').currentTime);
+ if(!all.length){ctx.fillText('该片段无有效轨迹',20,30);return;}
+ const min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];for(const p of all)for(let i=0;i<3;i++){min[i]=Math.min(min[i],p[i]);max[i]=Math.max(max[i],p[i]);}const center=min.map((v,i)=>(v+max[i])/2),scale=Math.min(w,h)*.55/Math.max(.01,...max.map((v,i)=>v-min[i]));
+ const project=p=>{const x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],xx=x*Math.cos(yaw)-z*Math.sin(yaw),zz=x*Math.sin(yaw)+z*Math.cos(yaw);return [w/2+xx*scale,h/2-(y*Math.cos(pitch)-zz*Math.sin(pitch))*scale];};
+ const colors=['#bd6139','#607d86','#71845c','#8e6c99'];for(let n=0;n<track.names.length;n++){ctx.strokeStyle=colors[n%colors.length];ctx.lineWidth=1.3;ctx.beginPath();let previous=false;for(const f of track.frames){const p=f.points[n];if(!p){previous=false;continue;}const q=project(p);if(previous)ctx.lineTo(...q);else ctx.moveTo(...q);previous=true;}ctx.stroke();if(current?.points[n]){const q=project(current.points[n]);ctx.beginPath();ctx.arc(...q,4,0,Math.PI*2);ctx.fillStyle=colors[n%colors.length];ctx.fill();}}
+ ctx.fillStyle='#837c73';ctx.font='12px sans-serif';ctx.fillText('拖动旋转 · '+track.coordinate_frame+' · 米',12,20);
+ const curve=canvasSize($('widthCurve'));curve.ctx.fillStyle='#837c73';curve.ctx.font='11px sans-serif';curve.ctx.fillText('夹爪开度（米）；缺失区间留空',10,16);
+ const widths=track.frames.flatMap(f=>(f.widths||[]).filter(x=>x!==null));if(widths.length){const top=widths.reduce((a,b)=>Math.max(a,b),.01),lo=track.frames[0].time_s,span=Math.max(.01,track.frames.at(-1).time_s-lo);for(let n=0;n<track.names.length;n++){curve.ctx.beginPath();curve.ctx.strokeStyle=colors[n%colors.length];let prev=false;for(const f of track.frames){const v=f.widths?.[n];if(v==null){prev=false;continue;}const x=10+(curve.w-20)*(f.time_s-lo)/span,y=curve.h-10-(curve.h-35)*v/top;if(prev)curve.ctx.lineTo(x,y);else curve.ctx.moveTo(x,y);prev=true;}curve.ctx.stroke();}}
+ $('trajectoryInfo').textContent='来源：'+track.metadata.format+'；'+track.frames.length+'帧。未绑定机器人坐标；显示源数据，不插补缺失点。';
+}
+button('exportTrack',async()=>{if(!activeTrack)throw Error('请选择轨迹');const area=document.createElement('textarea');area.rows=15;area.readOnly=true;area.value=JSON.stringify(activeTrack,null,2);const p=document.createElement('p');p.textContent='导出为轨迹JSON：全选复制后保存为 .json。包含原始坐标、单位、时间和缺失值。';await dialog('导出当前轨迹',[p,area],'关闭');});
+async function mutate(action,args={}){const r=await call(action,{...revision(),...args});await render(r.draft);status('已保存');return r;}
+async function job(action,args={}){
+ if(operation)throw Error('已有操作，请等待或取消');if(dirty)throw Error('请先保存任务编辑，避免覆盖');operation=true;polling=true;renderNextAction();$('cancelJob').classList.remove('hidden');status(({analyze:'正在分析视频…',add_stream:'正在准备视频…',track:'正在跟踪标记点…',import_data:'正在读取动作数据…',improve:'正在生成改进建议…'}[action])||'正在处理…');
+ try{await call(action,args);let current;do{await new Promise(r=>setTimeout(r,400));current=await call('info');status(({analyze:'正在看视频并整理步骤…',add_stream:'正在准备视频…',track:'正在跟踪标记点…',import_data:'正在读取动作数据…'}[current.job?.kind||action])||'正在处理…');}while(current.busy);
+  if(current.job?.state==='failed')throw Error(current.job.error);if(current.job?.state==='cancelled'){status('处理已取消');return;}
+  const next=(await call('inspect')).draft;
+  if(action==='analyze'){selectedAnalysis=next.analyses.at(-1)?.id||null;editing=false;activeResultStep=0;}
+  await render(next);status('处理完成'+(['analyze','improve'].includes(action)?'；分析建议需要核对。':'。'));return true;
+ }finally{operation=false;polling=false;$('cancelJob').classList.add('hidden');await refreshInfo();}
+}
+async function refreshInfo(){
+ info=await call('info');const id=draft?.id||'';selectOptions('headerDraft',info.drafts.map(d=>({text:d.name||d.goal||'未命名示范',value:d.id})),id,'选择已有视频');
+ $('modelState').textContent=info.configured?'已设置 · '+info.model:'未配置分析模型';$('openModelSettings').title=info.configured?'当前模型：'+info.model:'尚未配置，点击设置分析模型';$('openModelSettings').textContent=info.configured?'模型设置':'模型设置 · 未配置';
+ $('analysisState').textContent=info.configured?'每次候选保留输入方式、来源、用量与耗时':'点击右上角“模型设置”连接服务；原生与抽帧都保留';
+ $('cancelJob').classList.toggle('hidden',!info.busy);renderNextAction();return info;
+}
+const MODEL_SERVICES={router:{endpoint:'https://cloud.phanthy.com/phanrouterapi/v1beta',provider:'gemini'},gemini:{endpoint:'https://generativelanguage.googleapis.com/v1beta',provider:'gemini'},compatible:{endpoint:'',provider:'compatible'}};
+let modelSaving=false,modelCatalog=null,modelCatalogRequest=0;
+function renderModelProtocol(){const native=$('modelProvider').value==='gemini';$('nativeProtocolField').classList.toggle('hidden',native);$('modelProtocolHint').textContent=native?'此协议支持原生视频与分段抽帧，分析时可选择。':$('modelNative').value==='qwen_video_url'?'已选择原生 video_url，请确认该服务与模型支持。':'当前使用分段抽帧；只在服务明确支持时开启原生视频。';}
+function syncModelPicker(){
+ const router=$('modelService').value==='router';$('modelChoiceField').classList.toggle('hidden',!router);
+ if(!router){$('modelCatalogNote').textContent='此服务请在高级设置中填写模型 ID。';$('modelAdvanced').open=true;return;}
+ const current=$('modelName').value.trim();$('modelChoice').replaceChildren();
+ if(!modelCatalog){$('modelChoice').append(option(current||'正在读取服务目录…',current));return;}
+ const rows=[...modelCatalog.models];if(current&&!rows.includes(current))rows.unshift(current);
+ for(const id of rows)$('modelChoice').append(option(id+(id==='PR-G-Flash-3.8'?' · 此项目曾验证':id===current&&!modelCatalog.models.includes(id)?' · 当前配置':''),id));
+ const selected=current||(rows.includes('PR-G-Flash-3.8')?'PR-G-Flash-3.8':'');
+ if(!selected)$('modelChoice').prepend(option('请选择模型',''));
+ $('modelChoice').value=selected;$('modelName').value=selected;
+ $('modelCatalogNote').textContent='来自服务目录 · 尚未测试模型调用。';
+}
+async function loadModelChoices(){
+ const token=++modelCatalogRequest;syncModelPicker();if($('modelService').value!=='router'||modelCatalog)return;
+ try{const result=await call('model_catalog');if(token!==modelCatalogRequest||!$('modelDialog').open)return;modelCatalog=result;syncModelPicker();}
+ catch(e){if(token!==modelCatalogRequest||!$('modelDialog').open)return;$('modelCatalogNote').textContent='目录暂不可读，可在高级设置填写模型 ID，或重新打开设置重试。';$('modelChoice').replaceChildren(option('使用手动填写的模型',$('modelName').value));$('modelAdvanced').open=true;}
+}
+$('modelChoice').onchange=()=>{$('modelName').value=$('modelChoice').value;};
+$('modelName').oninput=()=>{if($('modelService').value==='router'&&modelCatalog)syncModelPicker();};
+async function openModelSettings(){
+ if(operation||info.busy)throw Error('请等待当前处理完成，再设置模型');
+ const settings=await rpc('config'),v=settings.values;
+ $('modelEndpoint').value=v.endpoint||'';$('modelName').value=v.model||'';$('modelProvider').value=v.provider||'compatible';$('modelNative').value=v.native_protocol||'disabled';$('modelKey').value='';
+ const preset=Object.entries(MODEL_SERVICES).find(([k,x])=>x.endpoint===v.endpoint&&x.provider===v.provider);
+ $('modelService').value=preset?.[0]||'compatible';$('modelAdvanced').open=!!v.endpoint&&!preset;
+ if(!v.endpoint&&!v.model){$('modelService').value='router';$('modelEndpoint').value=MODEL_SERVICES.router.endpoint;$('modelProvider').value='gemini';}
+ $('modelName').placeholder=$('modelService').value==='router'?'填写 PhanthyRouter 中的模型 ID':'服务中提供的模型 ID';
+ $('modelKey').placeholder=settings.secret_set.api_key?'已保存；留空保留原密钥':'输入服务的 API Key';
+ $('modelKeyHint').textContent=settings.secret_set.api_key?'密钥已保存，修改其他设置时无需重填。':settings.runtime_secret_set.api_key?'服务当前有密钥；如需在此应用重启后保留，请输入一次。':'只需设置一次；无鉴权服务可留空。';
+ renderModelProtocol();$('modelDialog').querySelector('.status-alert')?.remove();$('modelDialog').showModal();loadModelChoices();
+}
+button('openModelSettings',openModelSettings);
+$('modelService').onchange=()=>{const v=MODEL_SERVICES[$('modelService').value];$('modelEndpoint').value=v.endpoint;$('modelProvider').value=v.provider;$('modelNative').value='disabled';$('modelAdvanced').open=!v.endpoint;$('modelName').placeholder=$('modelService').value==='router'?'填写 PhanthyRouter 中的模型 ID':'服务中提供的模型 ID';renderModelProtocol();loadModelChoices();};
+$('modelProvider').onchange=renderModelProtocol;$('modelNative').onchange=renderModelProtocol;
+function closeModelSettings(){if(!modelSaving){modelCatalogRequest++;$('modelKey').value='';$('modelDialog').close();}}
+$('closeModelSettings').onclick=closeModelSettings;$('modelDialog').addEventListener('cancel',e=>{e.preventDefault();closeModelSettings();});
+button('saveModelSettings',async()=>{
+ const values={endpoint:$('modelEndpoint').value.trim().replace(/\/+$/,''),model:$('modelName').value.trim(),provider:$('modelProvider').value,native_protocol:$('modelProvider').value==='gemini'?'disabled':$('modelNative').value};
+ let endpoint;try{endpoint=new URL(values.endpoint);}catch{}if(!endpoint||!['https:','http:'].includes(endpoint.protocol)||endpoint.username||endpoint.password||endpoint.search||endpoint.hash)throw Error('请在高级设置中填写有效的 API 地址；密钥请放在 API Key 栏。');
+ if(!values.model)throw Error('请填写服务中提供的模型名称。');
+ if($('modelKey').value.trim())values.api_key=$('modelKey').value.trim();
+ modelSaving=true;$('closeModelSettings').disabled=true;
+ try{await rpc('config',{values});$('modelKey').value='';$('modelDialog').close();await refreshInfo();status('模型设置已保存；尚未测试连接。');}
+ finally{modelSaving=false;$('closeModelSettings').disabled=false;delete values.api_key;}
+});
+function renderNextAction(){
+ const s=stream(),hasResults=!!draft?.analyses.length||!!draft?.recipe?.steps.length;$('goalOptions').classList.toggle('hidden',hasResults||observing);
+ $('quickAnalyze').textContent=hasResults?'查看分析结果':'分析这个视频';$('quickAnalyze').disabled=!s||s.role==='execution'||operation||loading||!!info.busy;
+ $('nextHint').textContent=!s?'先添加视频，再看动作步骤。':s.role==='execution'?'这是另一次执行录像，可在执行复盘里查看。':hasResults?'已有分析，点击查看并回放每一步。':'点击分析，自动理解视频并整理动作步骤。';
+}
+async function quickImport(){
+ if(operation||info.busy||loading)throw Error('请等待当前处理完成');if(!await checkDirty())return;$('quickVideoFile').click();
+}
+async function uploadNewFile(file){
+ try{if(!file)return;if(operation||info.busy||loading)throw Error('请等待当前处理完成');if(file.size>64*1024*1024)throw Error('文件超过64 MiB');if(!await checkDirty())return;
+  loading=true;renderNextAction();const name=file.name.replace(/\.[^.]+$/,'').slice(0,120)||'新视频';await render((await call('new',{name})).draft,true);await refreshInfo();setTab('data');const owner=draft.id;
+  status('正在上传视频…');const type=file.type||({mp4:'video/mp4',mov:'video/quicktime',webm:'video/webm'}[file.name.split('.').at(-1).toLowerCase()]||'video/mp4');const r=await rpc('upload',{}, {file:new Blob([await file.arrayBuffer()],{type})});
+  if(draft?.id!==owner)throw Error('示范已切换，请重新导入');await job('add_stream',{...revision(),video_path:r.path,role:'external',name});await selectStream(draft.streams[0].id,false);renderRecent();status('视频已就绪，点击“分析这个视频”即可。');
+ }catch(e){status(e.message,true);}finally{loading=false;$('quickVideoFile').value='';renderNextAction();}
+}
+$('quickVideoFile').onchange=()=>uploadNewFile($('quickVideoFile').files[0]);
+button('quickAnalyze',async()=>{
+ if(draft?.analyses.length||draft?.recipe?.steps.length){setTab('task');return;}
+ if(operation||info.busy||loading)throw Error('请等待当前处理完成');if(dirty)throw Error('请先保存任务编辑');await refreshInfo();
+ if(!info.configured){await openModelSettings();status('请先设置模型，再点击分析。');return;}
+ const source=stream();if(!source||source.role==='execution')throw Error('请选择示范视频');
+ const goal=$('quickGoal').value.trim()||draft.recipe?.goal||DEFAULT_GOAL;
+ if(!draft.recipe||goal!==draft.recipe.goal)await render((await call('update',{...revision(),recipe:{...(draft.recipe||{objects:[],uncertainties:[],steps:[]}),goal}})).draft,true);
+ const mode=info.native_available?'native':'frames';$('mode').value=mode;$('analysisStream').value=source.id;$('analysisStream').onchange();$('frameCount').value=12;$('nativeFps').value=2;$('sampling').value='uniform';
+ setTab('task');status(mode==='native'?'正在分析整个视频…':'当前模型使用关键帧分析…');await job('analyze',analysisArgs(mode));
+});
+async function newDraft(){
+ if(operation||info.busy||loading)throw Error('处理进行中，请完成或取消后再切换示范');
+ closeMenu();if(!await checkDirty())return;const f=field('示范名称','text','未命名示范');if(!await dialog('新建示范',[f.label],'创建'))return;
+ await render((await call('new',{name:f.input.value})).draft,true);await refreshInfo();setTab('data');status('已创建，可直接导入视频。');
+}
+button('newDraft',newDraft);button('welcomeNew',quickImport);button('quickImport',quickImport);
+button('renameDraft',async()=>{closeMenu();if(!draft)throw Error('请先选择示范');const f=field('名称','text',draft.name);if(await dialog('重命名',[f.label],'保存')){await mutate('rename',{name:f.input.value});await refreshInfo();}});
+$('headerDraft').onchange=async()=>{try{if(operation||info.busy||loading){$('headerDraft').value=draft?.id||'';throw Error('处理进行中，请完成或取消后再切换示范');}if(!$('headerDraft').value)return;if(!await checkDirty()){$('headerDraft').value=draft.id;return;}await render((await call('inspect',{draft_id:$('headerDraft').value})).draft,true);status('示范已载入');}catch(e){status(e.message,true);}};
+button('refresh',async()=>{closeMenu();if(!await checkDirty())return;await refreshInfo();if(draft)await render((await call('inspect')).draft,true);status('已刷新');});
+button('cancelJob',async()=>{status((await call('cancel')).message);});
+async function importVideo(role='external'){
+ if(!draft)throw Error('请先创建示范');if(operation)throw Error('请等待当前处理完成');if(dirty)throw Error('请先保存任务编辑');
+ const name=field('素材名称','text',role==='execution'?'执行视频':'新视角'),label=document.createElement('label'),sel=document.createElement('select');label.textContent='素材角色';
+ for(const [v,t]of[['external','外部视角'],['ego','第一人称'],['wrist','腕部视角'],['other','其他视角'],['execution','另一次执行']])sel.append(option(t,v));sel.value=role;label.append(sel);
+ const url=field('视频直链或支持的公开视频页面（留空则上传）','text',''),p=document.createElement('p');p.className='note';p.textContent='添加视角表示同次示范。不同示范请新建；执行视频不参加示范时间同步。每文件≤64 MiB。';
+ if(!await dialog('导入视频',[name.label,label,url.label,p],'继续'))return;uploadRole=sel.value;uploadName=name.input.value;
+ if(url.input.value.trim())await job('add_stream',{...revision(),url:url.input.value.trim(),role:uploadRole,name:uploadName});else $('videoFile').click();
+}
+button('addVideo',()=>importVideo());button('addExecution',async()=>{if(!draft)throw Error('请先选择示范');if(dirty)throw Error('请先保存任务编辑');uploadRole='execution';uploadName='';$('videoFile').click();});
+$('videoFile').onchange=async()=>{try{if(operation||loading||info.busy)throw Error('请等待当前处理完成');loading=true;const owner=draft?.id;const file=$('videoFile').files[0];if(!file)return;if(file.size>64*1024*1024)throw Error('文件超过64 MiB');status('正在上传视频…');const type=file.type||({mp4:'video/mp4',mov:'video/quicktime',webm:'video/webm'}[file.name.split('.').at(-1).toLowerCase()]||'video/mp4');const r=await rpc('upload',{}, {file:new Blob([await file.arrayBuffer()],{type})});if(draft?.id!==owner)throw Error('已切换示范，上传文件尚未导入，请在目标示范重试');await job('add_stream',{...revision(),video_path:r.path,role:uploadRole,name:uploadName||file.name.replace(/\.[^.]+$/,'')});if(uploadRole==='execution'){$('recordStream').value=draft.streams.at(-1).id;$('recordStream').onchange();}else{activeStream=draft.streams.at(-1).id;await selectStream(activeStream,false);}}catch(e){status(e.message,true);}finally{loading=false;$('videoFile').value='';renderNextAction();}};
+button('motionAnalyze',()=>{$('quickAnalyze').click();});
+button('importData',()=>{if(!stream())throw Error('请先选择对应的视频');if(operation||loading||info.busy)throw Error('请等待当前处理完成');$('dataFile').click();});
+$('dataFile').onchange=async()=>{
+ try{
+  if(operation||loading||info.busy)throw Error('请等待当前处理完成');const owner=draft?.id,source=activeStream,file=$('dataFile').files[0];if(!file)return;if(file.size>64*1024*1024)throw Error('文件超过64 MiB');
+  const ext=file.name.split('.').at(-1).toLowerCase(),format={json:'tracks_json',npz:'umi_npz',zip:'umi_zarr',h5:'egodex_hdf5',hdf5:'egodex_hdf5'}[ext];if(!format)throw Error('请选择轨迹JSON、UMI数值NPZ/Zarr ZIP或EgoDex HDF5文件');
+  importOptions={data_format:format};
+  if(format!=='tracks_json'){
+   const fps=field('核对源数据帧率','number',String(stream().media.original?.fps||stream().media.fps)),coordinate=field('数据使用的坐标系','text',''),episode=field('episode索引','number','0'),first=field('起始帧索引','number','0'),last=field('结束帧索引（不含，可留空）','number','');
+   const note=document.createElement('p');note.className='note';note.textContent=file.name+' · 已识别为 '+(format==='egodex_hdf5'?'EgoDex HDF5':'UMI数值数据')+'。默认帧率取自所选视频，请按采集信息核对；最多3000帧。';
+   const options=document.createElement('details'),title=document.createElement('summary');title.textContent='只导入某个片段';options.append(title);if(format!=='egodex_hdf5')options.append(episode.label);options.append(first.label,last.label);
+   const body=[note,fps.label];if(format!=='egodex_hdf5')body.push(coordinate.label);body.push(options);
+   if(!await dialog('确认动作数据的时间与坐标',[...body],'导入'))return;
+   importOptions={data_format:format,fps:Number(fps.input.value),coordinate_frame:coordinate.input.value,episode:Number(episode.input.value),first_frame:Number(first.input.value),...(last.input.value?{last_frame:Number(last.input.value)}:{})};
+  }
+  if(draft?.id!==owner||activeStream!==source)throw Error('所选视频已变化，请重新导入');loading=true;status('正在上传动作数据…');
+  const r=await rpc('upload',{}, {file:new Blob([await file.arrayBuffer()],{type:'application/octet-stream'})});await job('import_data',{...revision(),stream_id:source,data_path:r.path,...importOptions});await chooseLatestTrack();
+ }catch(e){status(e.message,true);}finally{loading=false;$('dataFile').value='';}
+};
+function syncDock(){$('skillDock').classList.toggle('hidden',tab!=='skill');$('skillRunDock').classList.toggle('hidden',tab!=='review'||reviewMode!=='skill'||!skillInstance);$('observeDock').classList.toggle('hidden',tab!=='data'||!observing);$('reviewDock').classList.toggle('hidden',tab!=='review'||reviewMode!=='video'||!recipe?.steps.length);$('taskDock').classList.toggle('hidden',tab!=='task'||!recipe);$('saveRecipe').classList.toggle('hidden',!editing);$('candidateAction').classList.toggle('hidden',editing);}
+function renderTask(){
+ syncDock(); const has=!!recipe;$('taskEmpty').classList.toggle('hidden',has);$('taskWorkspace').classList.toggle('hidden',!has);if(!has)return;
+ selectOptions('versionChoice',draft.versions.map(v=>({text:'r'+v.revision+' · '+v.change+' · '+v.step_count+'步',value:String(v.revision)})),$('versionChoice').value);
+ $('taskGoal').value=recipe.goal;$('revision').textContent=dirty?'● 有未保存修改':'修改后记得保存';
+ // Detach the live editor before replacing rows, keeping its inputs and handlers.
+ $('editorFields').append($('stepEditor'));$('steps').replaceChildren();
+ recipe.steps.forEach((s,i)=>{const row=document.createElement('div');row.className='step-item'+(i===selectedStep?' active':'');const b=stepButton(s,i,'step');b.onclick=()=>{selectedStep=i;renderTask();};row.append(b);if(i===selectedStep)row.append($('stepEditor'));$('steps').append(row);});
+ const step=recipe.steps[selectedStep];$('stepEmpty').classList.toggle('hidden',!!recipe.steps.length);
+ if(step){$('stepTitle').value=step.title;$('stepStart').value=step.start_s;$('stepEnd').value=step.end_s;$('basis').value=step.basis;$('pre').value=step.preconditions.join('\n');$('post').value=step.postconditions.join('\n');$('notes').value=step.notes;$('dependencies').value=step.depends_on.join(', ');renderEvidence();if(editing)loadTaskVideo(step).catch(e=>status(e.message,true));}
+ $('uncertainties').textContent=recipe.uncertainties.join('；');$('uncertainties').classList.toggle('hidden',!recipe.uncertainties.length);
+ const names=recipe.steps.map(s=>({text:s.title,value:s.id}));selectOptions('bindingStep',names,$('bindingStep').value);selectOptions('recordStep',names,$('recordStep').value);
+ const profiles=Object.keys(draft.profiles).map(p=>({text:p,value:p}));selectOptions('profiles',profiles,$('profiles').value,'选择绑定');selectOptions('recordProfile',profiles,$('recordProfile').value);
+ $('taskEditor').classList.toggle('hidden',!editing);$('candidates').classList.toggle('hidden',editing);$('editTimeline').classList.toggle('hidden',!editing||!step);renderRange();
+}
+function stepButton(step,index,className='watch-step'){
+ const b=document.createElement('button');b.className=className;const number=document.createElement('span');number.className='step-number';number.textContent=index+1;
+ const text=document.createElement('span');text.className='step-text';const title=document.createElement('strong');title.textContent=step.title;const time=document.createElement('small');time.textContent=step.start_s.toFixed(2)+'–'+step.end_s.toFixed(2)+' 秒';text.append(title,time);b.append(number,text);return b;
+}
+async function loadTaskVideo(step){
+ const evidence=draft.observations.find(e=>step.evidence_ids?.includes(e.id));await showCandidateStep({evidence:evidence||{}},step);
+ if(editing)drawFilm($('editFilm'),$('resultVideo').getAttribute('src'),duration());
+}
+
+function renderEvidence(){
+ const s=recipe?.steps[selectedStep];if(!s)return;$('stepEvidence').replaceChildren();
+ for(const id of s.evidence_ids||[]){const e=draft.observations.find(o=>o.id===id),chip=document.createElement('button');chip.className='chip';chip.textContent=e?(stream(e.stream_id)?.name||'视角')+' '+e.start_s.toFixed(2)+'–'+e.end_s.toFixed(2)+'s':'未知引用';
+ chip.onclick=async()=>{const pre=document.createElement('pre');pre.textContent=JSON.stringify(e,null,2);if(await dialog('观察来源',[pre],'移除此引用')){s.evidence_ids=s.evidence_ids.filter(v=>v!==id);changed();renderEvidence();}};$('stepEvidence').append(chip);}
+ selectOptions('evidenceChoice',draft.observations.map(e=>({text:(stream(e.stream_id)?.name||'视角')+' '+e.start_s.toFixed(2)+'–'+e.end_s.toFixed(2)+'s',value:e.id})),$('evidenceChoice').value,'选择观察');
+}
+for(const id of ['stepTitle','stepStart','stepEnd','basis','pre','post','notes','dependencies'])$(id).oninput=()=>{const s=recipe?.steps[selectedStep];if(!s)return;Object.assign(s,{title:$('stepTitle').value,start_s:Number($('stepStart').value),end_s:Number($('stepEnd').value),basis:$('basis').value,preconditions:lines('pre'),postconditions:lines('post'),notes:$('notes').value,depends_on:$('dependencies').value.split(',').map(v=>v.trim()).filter(Boolean)});changed();renderRange();const row=$('steps').children[selectedStep];if(row){row.querySelector('strong').textContent=s.title;row.querySelector('small').textContent=s.start_s.toFixed(2)+'–'+s.end_s.toFixed(2)+' 秒';}};
+$('taskGoal').oninput=()=>{if(recipe){recipe.goal=$('taskGoal').value;editing=true;selectedAnalysis=null;changed();syncDock();}};
+button('dataToTask',()=>{if(recipe){editing=true;selectedAnalysis=null;selectedStep=recipe.steps.length?0:-1;}setTab('task');if(!recipe)$('manualTask').open=true;});button('backToVideo',()=>setTab('data'));button('backData',()=>setTab('data'));
+button('createTask',async()=>{if(!draft?.media)throw Error('请先导入示范视频');const value={goal:$('newGoal').value,objects:[],uncertainties:[],steps:[]};await render((await call('update',{...revision(),recipe:value})).draft,true);await refreshInfo();editing=true;selectedAnalysis=null;renderTask();renderCandidates();status('任务已创建，可手工添加步骤。');});
+button('addStep',()=>{if(!recipe)return;let n=1;while(recipe.steps.some(s=>s.id==='s'+n))n++;const time=Math.min(duration(),Math.max(0,taskSeconds()));recipe.steps.push({id:'s'+n,title:'新步骤',start_s:Math.round(time*100)/100,end_s:Math.min(duration(),Math.round((time+1)*100)/100),basis:'unknown',preconditions:[],postconditions:[],depends_on:[],notes:'',evidence_ids:[]});selectedStep=recipe.steps.length-1;changed();renderTask();renderCandidates();});
+button('removeStep',()=>{const id=recipe.steps[selectedStep]?.id;if(!id)return;recipe.steps.splice(selectedStep,1);recipe.steps.forEach(s=>s.depends_on=s.depends_on.filter(d=>d!==id));selectedStep=Math.min(selectedStep,recipe.steps.length-1);changed();renderTask();renderCandidates();});
+button('saveRecipe',async()=>{editGuard();editing=false;await render((await call('update',{...revision(),recipe})).draft,true);await refreshInfo();status('任务已保存；已有绑定需按新配方重新核对。');});
+button('viewVersion',async()=>{const r=await call('inspect',{view_revision:Number($('versionChoice').value)}),old=r.version.recipe;if(!old)throw Error('该版本尚未创建任务');const current=document.createElement('pre'),prior=document.createElement('pre');current.textContent='当前配方\n'+JSON.stringify(recipe,null,2);prior.textContent='旧配方\n'+JSON.stringify(old,null,2);if(await dialog('比较配方',[current,prior],'恢复为新版本')){if(!await checkDirty())return;await render((await call('update',{...revision(),recipe:old})).draft,true);status('旧配方已恢复为新版本；请重新核验设备绑定。');}});
+button('saveSkill',async()=>{if(dirty)throw Error('请先保存编辑');await rpc('save',{draft_id:draft.id});status('任务配方已存入现有技能库。');});
+button('observeStep',async()=>{const s=recipe.steps[selectedStep];if(!s)throw Error('请选择步骤');const id=$('analysisStream').value;const r=await call('observe',{stream_id:id,start_s:s.start_s,end_s:s.end_s,frame_count:6});draft.observations=[r.observation,...draft.observations.filter(e=>e.id!==r.observation.id)];renderEvidence();$('evidenceChoice').value=r.observation.id;$('frames').replaceChildren();for(let i=0;i<(r.images||[]).length;i++){const box=document.createElement('div');box.className='thumb';const img=document.createElement('img');img.style.width='100%';img.src='data:'+r.images[i].mimeType+';base64,'+r.images[i].data;img.alt=r.timestamps_s[i]+'秒';box.append(img);$('frames').append(box);}status('已保存真实抽帧与时间证据；尚未调用模型。');});
+button('attachEvidence',()=>{const s=recipe.steps[selectedStep],id=$('evidenceChoice').value;if(!s||!id)throw Error('请选择步骤与观察');s.evidence_ids=[...new Set([...(s.evidence_ids||[]),id])];changed();renderEvidence();});
+function analysisArgs(mode=$('mode').value){return {mode,stream_id:$('analysisStream').value,start_s:Number($('analysisStart').value),end_s:Number($('analysisEnd').value),frame_count:Number($('frameCount').value),fps:Number($('nativeFps').value),sampling:$('sampling').value};}
+$('analysisStream').onchange=()=>{const s=stream($('analysisStream').value);if(s){$('analysisStart').value=Math.max(0,s.offset_s);$('analysisEnd').value=Math.min(duration(),s.offset_s+s.rate*s.media.duration_s);}};
+button('analyze',async()=>{if(dirty)throw Error('请先保存任务编辑');$('toolsDialog').close();setTab('task');await job('analyze',analysisArgs());});button('compareModes',async()=>{if(!info.native_available)throw Error('模型端点未声明原生视频协议');if(dirty)throw Error('请先保存任务编辑');$('toolsDialog').close();setTab('task');if(await job('analyze',analysisArgs('frames')))await job('analyze',analysisArgs('native'));});
+async function agent(intent){
+ if(dirty)throw Error('请先保存编辑');const context=await rpc('context');if(!context.conversation_ready)throw Error('请先将本卡执行连接到决策核心，并连接本卡输出与核心输入');
+ if(intent==='execute'){const result=await checkBinding();if(!result.ready_for_review)throw Error('绑定存在缺口');if(!await confirmText('将请求当前Agent操作已绑定设备。请核对现场、完成反馈与原驱动停止方式。继续？'))return;}
+ status((await call('agent',{intent,profile:$('profileName').value.trim()})).message);
+}
+button('agentPlan',()=>agent('plan'));button('agentSearch',()=>agent('search'));button('execute',()=>agent('execute'));
+function renderSources(){
+ $('sources').replaceChildren();for(const item of draft.candidates){const div=document.createElement('div');div.className='candidate';const title=document.createElement('strong');title.textContent=item.title;const p=document.createElement('p');p.textContent=item.reason;const url=document.createElement('input');url.value=item.url;url.readOnly=true;url.style.width='100%';const importButton=document.createElement('button');importButton.textContent='作为新示范获取';
+ importButton.onclick=async()=>{try{if(!await checkDirty())return;const goal=recipe?.goal;await render((await call('new',{name:item.title.slice(0,120)||'搜索示范',...(goal?{goal}:{})})).draft,true);await refreshInfo();setTab('data');await job('add_stream',{...revision(),url:item.url,role:'external',name:'搜索来源'});}catch(e){status(e.message,true);}};div.append(title,p,url,importButton);$('sources').append(div);}
+}
+async function showCandidateStep(candidate,step){
+ const owner=draft.id,token=++resultSelection,e=candidate.evidence||{},source=stream(e.stream_id)||draft.streams[0];if(!source)return;
+ const url=await blobUrl(source);if(draft?.id!==owner||token!==resultSelection)return;
+ const rate=(e.source_end_s>e.source_start_s)?(e.end_s-e.start_s)/(e.source_end_s-e.source_start_s):source.rate;
+ const offset=Number.isFinite(e.source_start_s)?e.start_s-rate*e.source_start_s:source.offset_s;
+ $('resultPlayer').classList.remove('hidden');if($('resultVideo').getAttribute('src')!==url)$('resultVideo').src=url;
+ const target=Math.max(0,(step.start_s-offset)/(rate||1));if(Math.abs($('resultVideo').currentTime-target)>.001)$('resultVideo').currentTime=target;
+ $('resultCaption').textContent=step.title+' · '+step.start_s.toFixed(2)+'–'+step.end_s.toFixed(2)+' 秒';
+}
+function currentCandidate(){
+ if(selectedAnalysis)return draft.analyses.find(c=>c.id===selectedAnalysis)||null;
+ if(recipe?.steps.length||editing)return null;
+ return draft.analyses.filter(c=>c.purpose!=='improvement').at(-1)||draft.analyses.at(-1)||null;
+}
+function analysisTime(c){const seconds=c.evidence?.created_at;return seconds?new Date(seconds*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'时间未记录';}
+function analysisMode(c){return ({native:'原生视频',frames:'关键帧分析',human:'人工建议',agent:'Agent建议',manual:'人工建议'}[c.evidence?.mode]||'补充分析');}
+function renderCandidates(){
+ if(!draft||!recipe)return;const c=currentCandidate(),value=c?.recipe||recipe,isLatest=c?.id===draft.analyses.at(-1)?.id;
+ $('resultIdentity').textContent=editing?'当前任务 · 编辑中':c?((selectedAnalysis&&!isLatest?'历史分析':'最新分析')+' · '+(c.adoption==='adopted'?'曾采用':c.purpose==='improvement'?'待回归核验':'待采用')):'当前任务 · 已保存';
+ $('resultTitle').textContent=value.goal||'整理任务步骤';$('resultMeta').textContent=editing?'点步骤改文字，拖动片段边界调整时间':c?analysisMode(c)+' · '+analysisTime(c):'你保存的做法 · '+value.steps.length+' 步';
+ $('openHistory').textContent='◷ 历史分析 '+draft.analyses.length;
+ $('candidates').replaceChildren();$('candidates').classList.toggle('hidden',editing);$('resultEmpty').classList.add('hidden');if(editing){renderHistory();return;}
+ const div=document.createElement('article');div.className='candidate';const heading=document.createElement('h3');heading.textContent='动作步骤 · '+value.steps.length+' 步';const list=document.createElement('ol');list.className='step-list';
+ activeResultStep=Math.min(activeResultStep,Math.max(0,value.steps.length-1));
+ value.steps.forEach((step,index)=>{const item=document.createElement('li');item.className='step-item'+(index===activeResultStep?' active':'');const watch=stepButton(step,index);watch.onclick=()=>{activeResultStep=index;for(const [i,row] of [...list.children].entries())row.classList.toggle('active',i===index);showCandidateStep(c||{evidence:draft.observations.find(e=>step.evidence_ids?.includes(e.id))},step).catch(e=>status(e.message,true));};item.append(watch);if(step.notes||step.basis!=='observed'){const note=document.createElement('p');note.className='step-note';note.textContent=(step.basis==='inferred'?'推测 · ':step.basis==='unknown'?'待核对 · ':'')+(step.notes||'请回看画面确认');item.append(note);}list.append(item);});
+ div.append(heading,list);if(!value.steps.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='还没有步骤，可以手工添加或重新分析。';div.append(empty);}
+ if(value.uncertainties.length){const warning=document.createElement('div');warning.className='warning';const title=document.createElement('strong');title.textContent='需要确认';const note=document.createElement('p');note.textContent=value.uncertainties.join('；');warning.append(title,note);div.append(warning);}
+ const action=document.createElement('button');action.className='primary';action.textContent=c?(c.purpose==='improvement'?'检查改进建议':'采用并编辑'):'编辑步骤';action.id=c?'adoptAnalysis':'editCurrent';
+ action.onclick=async()=>{try{
+  if(c?.purpose==='improvement'){setTab('review');$('reviewCandidate').value=c.id;renderCases();openTools('regressionPanel');return;}
+  if(c){if(!await checkDirty())return;const result=await call('adopt',{...revision(),candidate_id:c.id});selectedAnalysis=null;editing=true;await render(result.draft,true);}
+  else{editing=true;selectedAnalysis=null;}selectedStep=recipe.steps.length?0:-1;renderTask();renderCandidates();status(c?'已采用，可修改并保存。':'正在编辑当前任务；原版本会保留。');
+ }catch(e){status(e.message,true);}};if(!c&&value.steps.length){action.className='quiet';const extract=skillAction('提炼为技能',()=>extractSkill(),'primary');extract.id='extractSkill';$('candidateAction').replaceChildren(action,extract);}else $('candidateAction').replaceChildren(action);$('revision').textContent=c?'建议需要回看核对；采用后才能编辑':'当前保存的任务';
+ if(c){const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');summary.textContent='来源与模型详情';pre.textContent=JSON.stringify({mode:c.evidence.mode,model:c.evidence.reported_model||c.evidence.model,elapsed_s:c.evidence.elapsed_s,usage:c.evidence.usage,recipe:c.recipe},null,2);details.append(summary,pre);div.append(details);}
+ $('candidates').append(div);if(value.steps.length&&tab==='task'){const step=value.steps[activeResultStep];showCandidateStep(c||{evidence:draft.observations.find(e=>step.evidence_ids?.includes(e.id))},step).catch(e=>status(e.message,true));}
+ if(!value.steps.length&&draft.streams[0]){const owner=draft.id;blobUrl(draft.streams[0]).then(url=>{if(draft?.id===owner&&!recipe?.steps.length)$('resultVideo').src=url;}).catch(e=>status(e.message,true));}
+ renderHistory();
+}
+function renderHistory(){
+ $('historyList').replaceChildren();if(!draft)return;for(const c of draft.analyses.slice().reverse()){
+  const item=document.createElement('div');item.className='history-item'+(currentCandidate()?.id===c.id?' active':'');const heading=document.createElement('h3');heading.textContent=c.recipe.goal;const time=document.createElement('time');time.textContent=analysisTime(c);const row=document.createElement('div');row.className='row';const meta=document.createElement('span');meta.className='note grow';meta.textContent=analysisMode(c)+' · '+(c.adoption==='adopted'?'曾采用':c.purpose==='improvement'?'待回归':'未采用');const view=document.createElement('button');view.className='small quiet';view.textContent='查看';view.dataset.candidateId=c.id;view.onclick=async()=>{if(!await leaveEditor())return;selectedAnalysis=c.id;activeResultStep=0;renderTask();renderCandidates();$('historyDrawer').close();};row.append(meta,view);item.append(heading,time,row);$('historyList').append(item);
+ }if(!draft.analyses.length)$('historyList').textContent='尚无分析记录。';$('returnCurrent').textContent=recipe?.steps.length?'返回当前任务':'返回最新分析';
+}
+async function leaveEditor(){if(dirty){if(!await checkDirty())return false;recipe=clone(draft.recipe);dirty=false;editRecipeRevision=draft.recipe_revision;}editing=false;return true;}
+
+async function loadTools(){const r=await rpc('tools');tools=r.tools;for(const id of ['actionTool','stopTool'])selectOptions(id,tools.map((t,i)=>({text:t.name+' · '+(t.instance_id||''),value:String(i)})), '', '选择工具');renderParams('action');renderParams('stop');renderToolList();showBinding();status('已读取 '+tools.length+' 项已连接能力；未新增授权。');}
+function renderParams(prefix,initial={}){
+ const index=$(prefix+'Tool').value,tool=index===''?null:tools[Number(index)],box=$(prefix+'Params');box.replaceChildren();if(!tool)return;
+ const schema=tool.inputSchema||{},properties=schema.properties||{},actionSpec=properties.action,actionValue=initial.action||actionSpec?.enum?.[0];
+ let keys=Object.keys(properties);const actionKeys=schema['x-action-params']?.[actionValue]?.params;if(actionKeys)keys=['action',...actionKeys];
+ for(const key of [...new Set(keys)].filter(k=>k!=='instance_id').slice(0,24)){
+  const spec=properties[key]||{};const label=document.createElement('label');label.textContent=spec.title||spec.description?.slice(0,45)||key;
+  let input;if(spec.enum){input=document.createElement('select');spec.enum.forEach(v=>input.append(option(String(v),String(v))));}else if(spec.type==='object'||spec.type==='array'){input=document.createElement('textarea');input.rows=2;}else{input=document.createElement('input');input.type=spec.type==='boolean'?'checkbox':(['integer','number'].includes(spec.type)?'number':'text');if(input.type==='number')input.step=spec.type==='integer'?'1':'any';}
+  input.dataset.key=key;input.dataset.type=spec.type||'string';const value=initial[key]??spec.default??(key==='action'?actionValue:'');
+  if(input.type==='checkbox')input.checked=!!value;else input.value=typeof value==='object'?JSON.stringify(value):String(value);
+  if(key==='action')input.onchange=()=>renderParams(prefix,{...readParams(prefix),action:input.value});
+  label.append(input);box.append(label);
+ }
+}
+function readParams(prefix){
+ const tool=tools[Number($(prefix+'Tool').value)],args=tool?.instance_id?{instance_id:tool.instance_id}:{};
+ for(const input of $(prefix+'Params').querySelectorAll('[data-key]')){const type=input.dataset.type,key=input.dataset.key;if(input.type==='checkbox')args[key]=input.checked;else if(input.value!=='')args[key]=['integer','number'].includes(type)?Number(input.value):['object','array'].includes(type)?JSON.parse(input.value):input.value;}
+ return args;
+}
+for(const p of ['action','stop'])$(p+'Tool').onchange=()=>renderParams(p);
+function showBinding(){
+ const binding=draft?.profiles[$('profileName').value.trim()]?.[$('bindingStep').value];if(!binding){$('completion').value='';for(const p of ['action','stop']){$(p+'Tool').value='';renderParams(p);}return;}$('completion').value=binding.completion;
+ for(const [p,name,args]of[['action',binding.tool,binding.arguments],['stop',binding.stop_tool,binding.stop_arguments]]){const index=tools.findIndex(t=>t.name===name&&(!args.instance_id||t.instance_id===args.instance_id));if(index>=0){$(p+'Tool').value=String(index);renderParams(p,args);}}
+}
+$('profileName').oninput=()=>{readiness=null;showBinding();renderReadiness();};
+$('profiles').onchange=()=>{$('profileName').value=$('profiles').value;readiness=null;showBinding();renderReadiness();};$('bindingStep').onchange=showBinding;
+button('loadTools',loadTools);
+button('saveBinding',async()=>{if(dirty)throw Error('请先保存任务');if($('actionTool').value===''||$('stopTool').value==='')throw Error('请选择动作和停止工具');const profile=$('profileName').value.trim(),bindings=clone(draft.profiles[profile]||{}),id=$('bindingStep').value;if(!id)throw Error('请选择步骤');bindings[id]={tool:tools[Number($('actionTool').value)].name,arguments:readParams('action'),stop_tool:tools[Number($('stopTool').value)].name,stop_arguments:readParams('stop'),completion:$('completion').value};await mutate('bind',{profile,bindings});readiness=null;renderReadiness();});
+async function checkBinding(){
+ if(dirty)throw Error('请先保存任务修改，再核验对应的设备绑定');
+ const r=await rpc('tools');tools=r.tools;const profile=$('profileName').value.trim(),names=new Set(Object.values(draft.profiles[profile]||{}).flatMap(b=>[b.tool,b.stop_tool]));
+ const relevant=tools.filter(t=>names.has(t.name)).map(t=>({name:t.name,instance_id:t.instance_id,inputSchema:{required:t.inputSchema?.required,'x-action-params':Object.fromEntries(Object.entries(t.inputSchema?.['x-action-params']||{}).map(([k,v])=>[k,{required:v.required}])),properties:Object.fromEntries(Object.entries(t.inputSchema?.properties||{}).map(([k,v])=>[k,Object.fromEntries(['type','enum','minimum','maximum'].filter(key=>key in v).map(key=>[key,v[key]]))]))}}));const result=await call('check',{profile,tools:relevant});$('bindingResult').textContent=JSON.stringify(result,null,2);readiness=result;renderReadiness();renderToolList();return result;
+}
+button('checkBinding',checkBinding);
+function renderReview(){
+ if(!draft)return;syncDock();const hasSteps=!!recipe?.steps.length;$('reviewContent').classList.toggle('hidden',!hasSteps);$('reviewEmpty').classList.toggle('hidden',draft.records.length>0&&hasSteps);$('reviewEmpty').textContent=hasSteps?'尚无反馈记录。选择步骤和执行录像，再标记结果。':'先在分析与步骤中采用或保存做法，再来逐步复盘。';$('records').replaceChildren();
+ const oldRun=$('recordStream').value;selectOptions('recordStream',draft.streams.filter(s=>s.role==='execution').map(s=>({text:s.name,value:s.id})),oldRun,'暂不关联执行录像');
+ if(!oldRun&&draft.streams.some(s=>s.role==='execution')&&!reviewTouched){$('recordStream').value=draft.streams.find(s=>s.role==='execution').id;$('recordEnd').value=stream($('recordStream').value).media.duration_s;}
+ $('executionEmpty').classList.toggle('hidden',!!$('recordStream').value);$('executionVideo').classList.toggle('hidden',!$('recordStream').value);
+ for(const r of draft.records.slice().reverse()){const div=document.createElement('button');div.className='feedback '+r.outcome+(r.id===selectedRecord?' selected':'');div.textContent=(recipe?.steps.find(s=>s.id===r.step_id)?.title||r.step_id)+' · '+({success:'完成',failed:'需重试',unknown:'不确定'}[r.outcome])+' · '+r.evidence+'（'+(r.source==='human'?'人工':r.source)+'，配方 r'+r.recipe_revision+'）';div.onclick=()=>showRecord(r).catch(e=>status(e.message,true));$('records').append(div);}
+ if(!draft.records.length)$('records').textContent='还没有保存的复盘记录。';
+ selectOptions('reviewCandidate',draft.analyses.filter(c=>c.purpose==='improvement').map(c=>({text:c.recipe.goal+' · 基于 r'+c.base_recipe_revision,value:c.id})),$('reviewCandidate').value,'选择改进候选');renderCases();renderReviewSteps();
+ const ready=!!recipe?.steps.length&&!!Object.keys(draft.profiles).length;
+ $('reviewReady').classList.toggle('hidden',ready);$('reviewReady').replaceChildren();if(!ready){const text=document.createElement('span');text.textContent=!recipe?.steps.length?'先采用或编写任务步骤，再逐步复盘。':'这份任务尚未关联设备配置；记录执行前，需要明确动作、停止方式和完成反馈。';const link=document.createElement('button');link.className='quiet small';link.textContent=!recipe?.steps.length?'查看步骤':'检查设备能力';link.onclick=()=>{setTab('task');if(recipe?.steps.length)openDevice().catch(e=>status(e.message,true));};$('reviewReady').append(text,link);}
+ $('saveRecord').disabled=!ready;$('improve').disabled=!ready;
+ $('improve').textContent=reviewTouched?'保存反馈并生成建议':'生成改进建议';
+}
+function renderReviewSteps(){
+ $('reviewSteps').replaceChildren();for(const [i,step] of (recipe?.steps||[]).entries()){const b=document.createElement('button');b.className='small'+(step.id===$('recordStep').value?' active':'');b.textContent=(i+1)+' '+step.title;b.onclick=()=>selectReviewStep(step.id);$('reviewSteps').append(b);}
+}
+async function selectReviewStep(id){
+ if(reviewTouched&&!await confirmText('当前反馈尚未保存，切换步骤会放弃这次填写。继续？'))return;
+ $('recordStep').value=id;reviewTouched=false;reviewOutcomeChosen=false;$('recordEvidence').value='';document.querySelectorAll('[data-outcome]').forEach(b=>b.setAttribute('aria-pressed','false'));renderReviewSteps();$('improve').textContent='生成改进建议';loadReviewVideos().catch(e=>status(e.message,true));
+}
+async function loadReviewVideos(){
+ if(!draft)return;const token=++reviewToken,owner=draft.id,step=recipe?.steps.find(s=>s.id===$('recordStep').value),e=draft.observations.find(e=>step?.evidence_ids?.includes(e.id)),primary=stream(e?.stream_id)||draft.streams[0],run=stream($('recordStream').value);
+ for(const [element,source,time] of [[$('demoVideo'),primary,step?Math.max(0,(step.start_s-(primary?.offset_s||0))/(primary?.rate||1)):0],[$('executionVideo'),run,Number($('recordStart').value)]]){
+  if(!source){element.removeAttribute('src');element.load();continue;}const url=await blobUrl(source);if(draft?.id!==owner||token!==reviewToken)return;if(element.getAttribute('src')!==url)element.src=url;if(Math.abs(element.currentTime-time)>.001)element.currentTime=time;
+ }
+}
+async function showRecord(r){
+ const owner=draft.id,token=++reviewToken;selectedRecord=r.id;const revision=r.recipe_revision;let saved=recipe;if(revision!==draft.recipe_revision){try{saved=(await call('inspect',{view_revision:revision})).version.recipe;}catch{saved=null;}}
+ if(draft.id!==owner||token!==reviewToken)return;const step=saved?.steps.find(s=>s.id===r.step_id),primary=draft.streams[0];$('toolsDialog').close();
+ if(primary){const url=await blobUrl(primary);if(draft.id!==owner||token!==reviewToken)return;$('demoVideo').src=url;$('demoVideo').currentTime=step?.start_s||0;}
+ const run=stream(r.stream_id);$('executionEmpty').classList.toggle('hidden',!!run);$('executionVideo').classList.toggle('hidden',!run);if(run){const url=await blobUrl(run);if(draft.id!==owner||token!==reviewToken)return;$('executionVideo').src=url;$('executionVideo').currentTime=Number(r.start_s)||0;}else{$('executionVideo').removeAttribute('src');$('executionVideo').load();}
+ status('正在回看人工/Agent记录：'+r.evidence+' · 配方 r'+revision+'；当前反馈表单未被替换。');
+}
+function markReview(){reviewTouched=true;$('improve').textContent='保存反馈并生成建议';}
+ $('recordStream').onchange=()=>{const run=stream($('recordStream').value);$('recordStart').value=0;$('recordEnd').value=run?.media.duration_s||1;markReview();$('executionEmpty').classList.toggle('hidden',!!run);$('executionVideo').classList.toggle('hidden',!run);loadReviewVideos().catch(e=>status(e.message,true));};
+ $('recordStep').onfocus=()=>$('recordStep').dataset.previous=$('recordStep').value;
+ $('recordStep').onchange=async()=>{const next=$('recordStep').value;$('recordStep').value=$('recordStep').dataset.previous||next;await selectReviewStep(next);$('recordStep').dataset.previous=$('recordStep').value;};
+ for(const id of ['recordEvidence','recordProfile','recordStart','recordEnd'])$(id).addEventListener('input',markReview);
+ document.querySelectorAll('[data-outcome]').forEach(b=>b.onclick=()=>{$('outcome').value=b.dataset.outcome;reviewOutcomeChosen=true;markReview();document.querySelectorAll('[data-outcome]').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));});
+ async function saveRecord(){
+ if(dirty)throw Error('请先保存编辑');if(!reviewOutcomeChosen)throw Error('请先选择这一步的结果：完成、需重试或不确定');
+ const id=$('recordStream').value,step=recipe?.steps.find(s=>s.id===$('recordStep').value),label={success:'完成',failed:'需重试',unknown:'不确定'}[$('outcome').value];
+ const evidence=$('recordEvidence').value.trim()||('人工标记“'+label+'”'+(id?'；关联执行录像 '+stream(id).name+' '+$('recordStart').value+'–'+$('recordEnd').value+'秒':'；未关联录像')+'；未提供补充说明。');
+ const record={profile:$('recordProfile').value,step_id:step?.id,outcome:$('outcome').value,evidence,source:'human',...(id?{stream_id:id,start_s:Number($('recordStart').value),end_s:Number($('recordEnd').value)}:{})};
+ const r=await call('record',{record});reviewTouched=false;reviewOutcomeChosen=false;$('recordEvidence').value='';document.querySelectorAll('[data-outcome]').forEach(b=>b.setAttribute('aria-pressed','false'));await render(r.draft);status('人工反馈已保存，保留配方与绑定版本。');
+ }
+ button('saveRecord',saveRecord);
+ button('improve',async()=>{if(reviewTouched){await saveRecord();}else if(!draft.records.length)throw Error('请先标记结果并保存一条反馈');const complete=await job('improve',analysisArgs());if(complete){$('reviewCandidate').value=draft.analyses.filter(c=>c.purpose==='improvement').at(-1)?.id||'';renderCases();openTools('regressionPanel');}});
+ button('manualImprovement',async()=>{editGuard();if(!recipe)throw Error('请先创建任务');await mutate('propose',{recipe,purpose:'improvement',source:'human'});$('reviewCandidate').value=draft.analyses.at(-1).id;renderCases();status('编辑已保存为候选；当前配方保持不变。');});
+
+function renderCases(){
+ $('reviewCases').replaceChildren();$('improvementPreview').replaceChildren();const c=draft?.analyses.find(c=>c.id===$('reviewCandidate').value);if(!c)return;for(const [i,step] of c.recipe.steps.entries()){const p=document.createElement('p');p.textContent=(i+1)+'. '+step.title;$('improvementPreview').append(p);}
+ const cases=c.cases?.length?c.cases:[{name:'原任务回归',status:'pending',evidence:''},{name:'新示范验证',status:'pending',evidence:''}];
+ for(const item of cases){const row=document.createElement('div');row.className='row regression';const name=document.createElement('input');name.className='case-name';name.value=item.name;const sel=document.createElement('select');sel.className='case-status';for(const [v,t]of[['pending','未验证'],['passed','通过'],['failed','失败']])sel.append(option(t,v));sel.value=item.status;const evidence=document.createElement('input');evidence.className='case-evidence grow';evidence.value=item.evidence;evidence.placeholder='实际验证证据';row.append(name,sel,evidence);$('reviewCases').append(row);}
+}
+$('reviewCandidate').onchange=renderCases;
+button('saveCases',async()=>{const cases=[...$('reviewCases').querySelectorAll('.regression')].map(row=>({name:row.querySelector('.case-name').value,status:row.querySelector('.case-status').value,evidence:row.querySelector('.case-evidence').value}));await mutate('review_candidate',{candidate_id:$('reviewCandidate').value,cases});status('回归证据已记录；这是人工核验记录。');});
+button('adoptImprovement',async()=>{if(!await checkDirty())return;const r=await call('adopt',{...revision(),candidate_id:$('reviewCandidate').value});selectedAnalysis=null;editing=false;await render(r.draft,true);status('候选已采用；旧版本保留，设备绑定需要重新核对。');});
+function openTools(id){
+ const titles={analysisAdvanced:'重新分析',devicePanel:'设备能力检查',taskMore:'任务工具',reviewHistory:'复盘记录',regressionPanel:'改进建议与回归检查'};
+ $('toolsDialog').querySelector('.status-alert')?.remove();document.querySelectorAll('.tool-pane').forEach(p=>p.classList.toggle('hidden',p.id!==id));$('toolsTitle').textContent=titles[id];if(!$('toolsDialog').open)$('toolsDialog').showModal();
+}
+button('closeTools',()=>{$('toolsDialog').close();if(tab==='task'){renderTask();renderCandidates();}});
+$('toolsDialog').addEventListener('close',()=>{if(tab==='task'){renderTask();renderCandidates();}});
+button('openAnalysis',()=>openTools('analysisAdvanced'));
+button('openTaskMore',()=>openTools('taskMore'));
+button('openReviewHistory',()=>openTools('reviewHistory'));
+button('openRegression',()=>openTools('regressionPanel'));
+button('openHistory',()=>{renderHistory();$('historyDrawer').showModal();});
+button('closeHistory',()=>$('historyDrawer').close());
+button('returnCurrent',async()=>{if(!await leaveEditor())return;selectedAnalysis=null;activeResultStep=0;renderTask();renderCandidates();$('historyDrawer').close();});
+button('finishEdit',async()=>{if(!await leaveEditor())return;renderTask();renderCandidates();});
+for(const [id,delta] of [['moveStepUp',-1],['moveStepDown',1]])button(id,()=>{const next=selectedStep+delta;if(next<0||next>=recipe.steps.length)return;[recipe.steps[selectedStep],recipe.steps[next]]=[recipe.steps[next],recipe.steps[selectedStep]];selectedStep=next;changed();renderTask();});
+button('libraryImport',quickImport);button('emptyImport',quickImport);
+async function importLink(){
+ if(operation||info.busy||loading)throw Error('请等待当前处理完成');if(!await checkDirty())return;
+ const f=field('视频直链或支持的公开视频页面','url'),note=document.createElement('p');note.className='note';note.textContent='链接会作为一份新的示范导入；同次多视角请使用观察工具。';
+ if(!await dialog('粘贴视频链接',[f.label,note],'导入'))return;
+ let url;try{url=new URL(f.input.value.trim());}catch{throw Error('请输入完整的视频链接');}if(!['https:','http:'].includes(url.protocol))throw Error('仅支持 HTTP / HTTPS 视频链接');
+ await render((await call('new',{name:'来自 '+url.hostname+' 的示范'})).draft,true);await refreshInfo();setTab('data');await job('add_stream',{...revision(),url:url.href,role:'external',name:'链接视频'});
+}
+button('welcomeLink',importLink);button('libraryLink',importLink);
+for(const id of ['dataWelcome','libraryDrop']){
+ const box=$(id);box.ondragover=e=>{e.preventDefault();box.classList.add('over');};box.ondragleave=()=>box.classList.remove('over');box.ondrop=e=>{e.preventDefault();box.classList.remove('over');if(e.dataTransfer.files.length!==1){status('每次请拖入一个视频文件',true);return;}uploadNewFile(e.dataTransfer.files[0]);};
+}
+async function selectDraft(id){
+ if(operation||info.busy||loading)throw Error('处理进行中，请完成或取消后再切换示范');if(!await checkDirty())return;
+ await render((await call('inspect',{draft_id:id})).draft,true);$('headerDraft').value=id;status('示范已载入');
+}
+async function renderRecent(){
+ const token=++recentToken;$('recentVideos').replaceChildren();
+ for(const d of info.drafts.slice(0,4)){
+  const b=document.createElement('button');b.className='recent'+(d.id===draft?.id?' active':'');const video=document.createElement('video');video.muted=true;video.playsInline=true;video.preload='metadata';video.setAttribute('aria-hidden','true');const title=document.createElement('span');const strong=document.createElement('strong');strong.textContent=d.name||d.goal||'未命名示范';const small=document.createElement('small');small.textContent=d.id===draft?.id?'正在查看':'打开示范';title.append(strong,small);b.append(video,title);b.onclick=()=>selectDraft(d.id).catch(e=>status(e.message,true));$('recentVideos').append(b);
+  try{const value=d.id===draft?.id?draft:(await call('inspect',{draft_id:d.id})).draft;if(token!==recentToken)return;const source=value.streams[0];if(source){const url=await blobUrl(source);if(token!==recentToken)return;video.src=url;}}catch{small.textContent+=' · 缩略图暂不可用';}
+ }
+ if(!info.drafts.length)$('recentVideos').textContent='导入后会出现在这里。';
+}
+function setObservation(open){
+ observing=open;$('nextHint').classList.toggle('hidden',open);$('dataAdvanced').classList.toggle('hidden',!open);$('librarySide').classList.toggle('hidden',open);$('libraryLayout').classList.toggle('observing',open);$('observeTabs').classList.toggle('hidden',!open);$('libraryLayout').append($('dataAdvanced'));$('dataActionBar').classList.toggle('hidden',open);$('goalOptions').classList.toggle('hidden',open||!!draft?.analyses.length);$('thumbs').classList.toggle('hidden',!open);
+ $('observationToggle').textContent=open?'← 返回视频':'观察工具 ↗';$('dataEyebrow').textContent=open?'视频 / 观察工具':'示范视频';
+ if(!open){$('editPoints').checked=false;$('overlay').classList.remove('editing');}
+ if(open){setObservationTab(observationTab);renderSyncLanes().catch(e=>status(e.message,true));}syncDock();drawOverlay();drawTrajectory();
+}
+button('observationToggle',()=>setObservation(!observing));
+function setObservationTab(value){
+ observationTab=value;const hasMotion=!!draft?.tracks.length||!!draft?.capture?.quality.some(q=>q.kind!=='video'&&q.count>0);$('motionAnalyze').classList.toggle('hidden',value!=='motion'||!hasMotion);$('importData').classList.toggle('primary',!hasMotion);$('importData').classList.toggle('quiet',hasMotion);$('importData').textContent=hasMotion?'补充动作文件':'导入动作数据';const ids={sync:'saveSync',points:'trackPoints',motion:'importData'};for(const id of Object.values(ids))$(id).classList.toggle('hidden',id!==ids[value]);$('observeHint').textContent={sync:'时间对齐需要人工核对；不改变空间坐标。',points:'点选画面中的位置；遮挡后可能失跟。',motion:'保留数据原始坐标；没有自动转换到机器人。'}[value];document.querySelectorAll('[data-observe]').forEach(b=>b.classList.toggle('active',b.dataset.observe===value));for(const id of ['sync','points','motion'])$('observe-'+id).classList.toggle('hidden',value!==id);
+ $('editPoints').checked=value==='points';$('overlay').classList.toggle('editing',observing&&value==='points');drawTrajectory();
+}
+document.querySelectorAll('[data-observe]').forEach(b=>b.onclick=()=>setObservationTab(b.dataset.observe));
+// Thumbnails are decoded from the local preview. No model call or new endpoint.
+async function drawFilm(canvas,url){
+ if(!url)return;canvas.dataset.source=url;
+ if(!films.has(url))films.set(url,(async()=>{
+  const v=document.createElement('video');v.muted=true;v.preload='auto';const atlas=document.createElement('canvas');atlas.width=600;atlas.height=64;
+  const wait=(event,act)=>new Promise((resolve,reject)=>{const timer=setTimeout(()=>{clear();reject(Error('预览帧暂不可用'));},8000);function clear(){clearTimeout(timer);v.removeEventListener(event,done);v.removeEventListener('error',fail);}function done(){clear();resolve();}function fail(){clear();reject(Error('预览帧暂不可用'));}v.addEventListener(event,done,{once:true});v.addEventListener('error',fail,{once:true});act();});
+  try{await wait('loadeddata',()=>v.src=url);const ctx=atlas.getContext('2d');for(let i=0;i<8;i++){const t=Math.min(v.duration-.001,(i+.5)/8*v.duration);await wait('seeked',()=>v.currentTime=t);const scale=Math.max(75/v.videoWidth,64/v.videoHeight),w=v.videoWidth*scale,h=v.videoHeight*scale;ctx.save();ctx.beginPath();ctx.rect(i*75,0,74,64);ctx.clip();ctx.drawImage(v,i*75+(75-w)/2,(64-h)/2,w,h);ctx.restore();}return atlas;}finally{v.removeAttribute('src');v.load();}
+ })());
+ try{const atlas=await films.get(url);if(canvas.dataset.source!==url)return;canvas.width=600;canvas.height=64;canvas.getContext('2d').drawImage(atlas,0,0);}catch{canvas.title='预览帧暂不可用；时间编辑仍可使用';}
+}
+async function renderSyncLanes(){
+ if(!observing||!draft?.streams.length)return;const owner=draft.id,source=stream(),base=draft.streams[0];
+ drawFilm($('syncBaseFilm'),await blobUrl(base));if(draft?.id!==owner||stream()?.id!==source?.id)return;if(source)drawFilm($('syncOtherFilm'),await blobUrl(source));updateSyncPreview();
+}
+function updateSyncPreview(){
+ const source=stream(),offset=Number($('offset').value)||0;$('syncDragLabel').textContent=!source||source.id===draft.streams[0]?.id||source.role==='execution'?'主视角固定；选择同次示范的辅助视角':source.name+' · 偏移 '+offset.toFixed(2)+' 秒 · 拖动对齐';
+ $('syncOtherFilm').style.transform='translateX('+(offset/duration()*100)+'%)';$('syncDrag').setAttribute('aria-valuenow',offset);$('syncDrag').setAttribute('aria-valuemin',-duration());$('syncDrag').setAttribute('aria-valuemax',duration());syncPlayback();
+}
+let syncDrag=null;
+$('syncDrag').onpointerdown=e=>{if($('offset').disabled)return;pauseAll();syncDrag={x:e.clientX,offset:Number($('offset').value)};e.currentTarget.setPointerCapture(e.pointerId);};
+$('syncDrag').onpointermove=e=>{if(!syncDrag)return;const delta=(e.clientX-syncDrag.x)/Math.max(1,e.currentTarget.clientWidth)*duration();$('offset').value=Math.max(-duration(),Math.min(duration(),syncDrag.offset+delta)).toFixed(3);$('syncConfirmed').checked=false;updateSyncPreview();};
+$('syncDrag').onpointerup=$('syncDrag').onpointercancel=()=>syncDrag=null;
+$('syncDrag').onkeydown=e=>{if($('offset').disabled||!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();$('offset').value=(Number($('offset').value)+(e.key==='ArrowLeft'?-.01:.01)).toFixed(3);$('syncConfirmed').checked=false;updateSyncPreview();};
+$('offset').oninput=()=>{$('syncConfirmed').checked=false;updateSyncPreview();};
+function renderRange(){
+ const step=recipe?.steps[selectedStep];if(!step)return;const total=duration();$('rangeFill').style.left=step.start_s/total*100+'%';$('rangeFill').style.width=(step.end_s-step.start_s)/total*100+'%';
+ for(const [id,value,label] of [['rangeIn',step.start_s,'rangeInLabel'],['rangeOut',step.end_s,'rangeOutLabel']]){const el=$(id);el.style.left=value/total*100+'%';el.setAttribute('aria-valuemin','0');el.setAttribute('aria-valuemax',total);el.setAttribute('aria-valuenow',value);el.setAttribute('aria-valuetext',value.toFixed(2)+' 秒');$(label).textContent=value.toFixed(2)+' 秒';}
+}
+function moveBoundary(id,value){
+ const step=recipe?.steps[selectedStep];if(!step)return;value=Math.round(value*1000)/1000;
+ if(id==='rangeIn')step.start_s=Math.max(0,Math.min(step.end_s-.001,value));else step.end_s=Math.min(duration(),Math.max(step.start_s+.001,value));
+ $('stepStart').value=step.start_s;$('stepEnd').value=step.end_s;changed();renderRange();const row=$('steps').children[selectedStep];if(row)row.querySelector('small').textContent=step.start_s.toFixed(2)+'–'+step.end_s.toFixed(2)+' 秒';loadTaskVideo(step).catch(e=>status(e.message,true));
+}
+for(const id of ['rangeIn','rangeOut']){
+ let moving=false;const el=$(id);el.onpointerdown=e=>{moving=true;e.currentTarget.setPointerCapture(e.pointerId);e.preventDefault();};el.onpointermove=e=>{if(!moving)return;const r=$('rangeTimeline').getBoundingClientRect();moveBoundary(id,(e.clientX-r.left)/r.width*duration());};el.onpointerup=el.onpointercancel=()=>moving=false;
+ el.onkeydown=e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const step=recipe?.steps[selectedStep];if(!step)return;const current=id==='rangeIn'?step.start_s:step.end_s;moveBoundary(id,e.key==='Home'?0:e.key==='End'?duration():current+(e.key==='ArrowLeft'?-1:1)*(e.shiftKey?.01:.1));};
+}
+async function openDevice(){
+ readiness=null;openTools('devicePanel');const profile=$('profileName').value||$('profiles').value||Object.keys(draft?.profiles||{})[0]||'';$('profileName').value=profile;$('profiles').value=profile;renderReadiness();await loadTools();
+}
+button('openDevice',openDevice);
+function renderToolList(){
+ $('availableTools').replaceChildren();const title=document.createElement('strong');title.textContent='已连接工具 · '+tools.length+' 项';$('availableTools').append(title);
+ if(!tools.length){const p=document.createElement('p');p.textContent='请先在原画布连接可用工具。';$('availableTools').append(p);}
+ for(const t of tools){const p=document.createElement('p');p.textContent=t.name+(t.description?' — '+t.description.slice(0,90):'');$('availableTools').append(p);}
+ const note=document.createElement('p');note.className='note';note.textContent='工具声明可用不等于已验证抓取、接触或运动能力。';$('availableTools').append(note);
+}
+function renderReadiness(){
+ $('readinessSteps').replaceChildren();$('checkBinding').disabled=!recipe?.steps.length;const bindings=draft?.profiles[$('profileName').value.trim()]||{};
+ $('readinessSummary').className=readiness?.ready_for_review?'note':'warning';$('readinessSummary').textContent=readiness?(readiness.ready_for_review?'声明检查通过；运行前仍需现场核验。':'还有能力缺口，按步骤补充后重新检查。'):'尚未检查。这里会逐步列出动作、停止与完成反馈。';
+ if(!recipe?.steps.length){$('readinessSummary').textContent='请先采用分析或保存任务步骤，再检查设备能力。';}
+ for(const [index,step] of (recipe?.steps||[]).entries()){
+  const b=bindings[step.id],check=readiness?.steps.find(r=>r.step_id===step.id),row=document.createElement('div');row.className='readiness-row';const num=document.createElement('span');num.className='step-number';num.textContent=index+1;const content=document.createElement('div');content.className='grow';const title=document.createElement('strong');title.textContent=step.title;const p=document.createElement('p');p.textContent=check?(check.errors.length?check.errors.join('；'):'动作、停止和反馈已配置'):b?'已有绑定，等待核验连接与参数':'缺少动作、停止方式与完成反馈';content.append(title,p);const edit=document.createElement('button');edit.className='quiet small';edit.textContent=b?'查看配置':'补充';edit.onclick=()=>{$('bindingStep').value=step.id;showBinding();$('bindingEditor').open=true;$('bindingEditor').scrollIntoView({block:'nearest'});};row.append(num,content,edit);$('readinessSteps').append(row);
+ }
+}
+
+// Skills remain inside this workbench. Core owns installed state.
+let skillView=null, skillMode='library', skillLibrary=[], installedSkills=[], installedCursor=null;
+let installedState='unknown', installedError='', skillInstance=null, skillCheck=null, skillToken=0;
+let skillValuesDirty=false, compareSlug='', reviewMode='video', taskOutcome='', taskFeedbackDirty=false;
+const skillCall=(action,args={})=>rpc('call',{action,...args});
+const el=(tag,text='',className='')=>{const n=document.createElement(tag);n.textContent=text;if(className)n.className=className;return n;};
+function skillAction(text,fn,className='quiet small'){const b=el('button',text,className);b.onclick=async()=>{if(b.disabled)return;b.disabled=true;try{await fn();}catch(e){status(e.message,true);}finally{b.disabled=false;}};return b;}
+function skillArgs(){if(!skillView)throw Error('请先选择技能');return {skill_id:skillView.asset.id,skill_version:skillView.version.version,expected_revision:skillView.asset.revision};}
+function taskArgs(){if(!skillInstance)throw Error('请先生成任务预览');return {task_id:skillInstance.id,expected_revision:skillInstance.revision};}
+async function skillJob(action,args){
+ if(operation||info.busy)throw Error('已有处理任务，请等待或取消');operation=true;polling=true;$('cancelJob').classList.remove('hidden');status('正在整理技能候选…');
+ try{await skillCall(action,args);let state;do{await new Promise(r=>setTimeout(r,400));state=await call('info');}while(state.busy);
+  if(state.job?.state==='failed')throw Error(state.job.error);if(state.job?.state==='cancelled'){status('处理已取消，原技能保持原样');return null;}
+  if(!state.job?.result?.skill_id)throw Error('处理结果缺少技能标识，请刷新');return state.job.result;
+ }finally{operation=false;polling=false;$('cancelJob').classList.add('hidden');await refreshInfo();}
+}
+async function installedPage(reset=true,query=''){
+ try{const r=await rpc('skills',{cursor:reset?0:installedCursor,limit:30,query});installedSkills=reset?r.skills:[...installedSkills,...r.skills];installedCursor=r.next_cursor;installedError='';}
+ catch(e){installedError=e.message;throw e;}
+}
+async function installedStatus(){
+ installedState='unknown';
+ try{const r=await rpc('skills',{slug:skillView.slug});const expected=skillView.export;
+  installedState=expected&&['slug','name','oneLiner','instruction','category','version'].some(k=>r.skill[k]!==expected[k])?'conflict':'installed';
+ }catch(e){if(e.message.includes('未安装'))installedState='missing';else{installedState='unknown';installedError=e.message;}}
+}
+async function refreshSkills(){
+ const r=await skillCall('skill_list');skillLibrary=r.skills;
+ await installedPage().catch(e=>status('技能库暂不可读：'+e.message,true));
+ if(skillView){skillView=await skillCall('skill_inspect',{skill_id:skillView.asset.id,skill_version:skillView.version.version});await installedStatus();}
+ if(skillInstance&&skillMode==='task')skillInstance=(await skillCall('task_inspect',{task_id:skillInstance.id})).task;
+ renderSkills();
+}
+async function openSkill(id,version){
+ if((skillValuesDirty||taskFeedbackDirty)&&!await confirmText('打开另一技能将放弃未保存的参数或反馈。继续？'))return;
+ taskFeedbackDirty=false;taskOutcome='';$('skillRecordEvidence').value='';document.querySelectorAll('[data-task-outcome]').forEach(b=>b.setAttribute('aria-pressed','false'));
+ skillView=await skillCall('skill_inspect',{skill_id:id,...(version?{skill_version:version}:{})});skillMode='candidate';skillInstance=null;skillCheck=null;skillValuesDirty=false;
+ await installedStatus();setTab('skill');renderSkills();status('技能已载入；示范来源和旧版本保留。');
+}
+async function extractSkill(selectMore=false){
+ if(dirty)throw Error('请先保存步骤修改');
+ const options=info.drafts.filter(d=>d.has_task);let ids=draft?.recipe?.steps.length?[draft.id]:[];
+ if(selectMore||!ids.length){
+  const rows=options.map(d=>{const label=el('label','', 'inline-label');const input=el('input');input.type='checkbox';input.value=d.id;input.checked=ids.includes(d.id);label.append(input,el('span',d.name||d.goal));return {label,input};});
+  if(!rows.length){setTab('data');status('先导入示范并采用步骤，再提炼技能');return;}
+  if(!await dialog('选择示范',[el('p','最多4段已确认示范。同一视频的多视角和不同分析方式只计一次。','note'),...rows.map(r=>r.label)],'提炼技能'))return;
+  ids=rows.filter(r=>r.input.checked).map(r=>r.input.value);if(!ids.length||ids.length>4)throw Error('请选择1–4段示范');
+ }
+ setTab('skill');const result=await skillJob('skill_extract',{draft_ids:ids});if(result){await openSkill(result.skill_id,result.skill_version);status('已形成技能候选，请核对适用范围与完成条件。');}
+}
+function roleText(c,text){const labels=Object.fromEntries(c.parameters.map(p=>[p.id,p.label]));return text.replace(/\{\{(\w+)\}\}/g,(_,id)=>'〈'+(labels[id]||id)+'〉');}
+function appendTextList(box,title,items,className=''){if(!items.length)return;const block=el('div','',className);block.append(el('h3',title));for(const text of items)block.append(el('p',text));box.append(block);}
+function renderSkills(){
+ const active=tab==='skill';$('skillDock').classList.toggle('hidden',!active);$('skillBack').classList.toggle('hidden',skillMode==='library');
+ for(const mode of ['library','candidate','compare','task'])$('skill-'+mode).classList.toggle('hidden',skillMode!==mode);
+ $('skillTools').classList.toggle('hidden',!skillView||skillMode!=='candidate');$('skillPrimary').disabled=operation||info.busy;
+ $('skillPrimary').textContent='从当前步骤提炼';$('skillHint').textContent='技能是可复用的做法，执行还需核验当前现场与设备。';
+ if(skillMode==='library'){
+  $('skillHeading').textContent='把做法留下来，下次接着用';$('skillSubtitle').textContent='从示范提炼技能，也可以直接打开已有技能，无需新视频。';
+  const box=$('skillLibrary');box.replaceChildren();
+  if(!skillLibrary.length)box.append(el('div','还没有提炼出的技能。先确认一份示范步骤，就可以开始。','empty'));
+  for(const s of skillLibrary){const row=skillAction('',()=>openSkill(s.id,s.recommended||s.version),'skill-list-item');row.append(el('span','◇','skill-symbol'),el('strong',s.title),el('span',s.summary,'muted'),el('small','v'+s.version+(s.recommended?' · 推荐 v'+s.recommended:' · 待核验'),'note'));box.append(row);}
+  $('installedSummary').textContent=installedError?'已安装技能暂不可读；可刷新重试':'原技能库 · 已读取 '+installedSkills.length+' 项';
+  $('installedRows').replaceChildren();for(const s of installedSkills)$('installedRows').append(skillAction(s.name+' · '+s.oneLiner,()=>showInstalled(s.slug),'skill-installed'));
+  $('skillPrimary').textContent=draft?.recipe?.steps.length?'从当前步骤提炼':'选择示范提炼';return;
+ }
+ if(!skillView)return;const v=skillView.version,c=v.content;
+ $('skillHeading').textContent=c.title;$('skillSubtitle').textContent='v'+v.version+' · '+v.sources.length+' 段独立示范 · '+(installedState==='installed'?'已入库':installedState==='missing'?'候选待核对':installedState==='conflict'?'安装内容冲突':'安装状态待刷新');
+ if(skillMode==='candidate'){
+  const box=$('skillDescription');box.replaceChildren();
+  if(v.parent){const changes=v.changes.map(r=>{const labels={title:'名称',goal:'目标',summary:'用途',parameters:'可替换参数',steps:'步骤、条件或能力',applicability:'适用范围',exclusions:'不适用范围',uncertainties:'待核对事项',conflicts:'示范冲突'};if(typeof r.after==='string')return (labels[r.field]||r.field)+'：'+r.after;const added=Array.isArray(r.after)?r.after.filter(x=>typeof x==='string'&&!r.before.includes(x)):[];return (labels[r.field]||r.field)+(added.length?'：新增 '+added.join('；'):'已调整');});appendTextList(box,'本次候选改了什么',changes.length?changes:['步骤未变，新增来源或反馈记录'],'skill-notes');box.append(skillAction('查看与 v'+v.parent+' 的完整差异',showSkillVersions));}
+  appendTextList(box,'能做什么',[roleText(c,c.summary)]);
+  const roles=el('div','','chips');for(const p of c.parameters)roles.append(el('span',p.label,'badge'));box.append(el('h3','每次可以替换'),roles);
+  const list=el('ol','','step-list');for(const [i,s] of c.steps.entries()){const row=el('li','','skill-step');row.append(el('span',i+1,'step-number'),el('span',roleText(c,s.title)));list.append(row);}box.append(list);
+  appendTextList(box,'适用范围',c.applicability);appendTextList(box,'不适用于',c.exclusions);appendTextList(box,'待核对',c.uncertainties,'skill-notes');appendTextList(box,'示范冲突',c.conflicts,'warning');
+  const details=el('details'),summary=el('summary','条件、所需能力与失败处理');details.append(summary);for(const s of c.steps)appendTextList(details,roleText(c,s.title),['前置：'+s.preconditions.map(x=>roleText(c,x)).join('；'),'完成：'+s.postconditions.map(x=>roleText(c,x)).join('；'),'所需能力（待核验）：'+s.capabilities.join('；'),'失败时：'+s.failure]);box.append(details);
+  selectOptions('skillSource',v.sources.map(s=>({value:s.source_id,text:'示范 · '+s.recipe.goal})),$('skillSource').value);$('skillSource').classList.toggle('hidden',v.sources.length<2);showSkillEvidence().catch(e=>status(e.message,true));
+  $('skillHint').textContent=v.sources.length===1?'单个示范，泛化效果尚未验证。':'多示范归纳仍需核验适用条件；不代表设备已学会。';
+  $('skillPrimary').textContent=installedState==='installed'?'用于新任务':installedState==='unknown'?'刷新安装状态':installedState==='conflict'?'查看安装冲突':'确认并入库';
+ }
+ if(skillMode==='compare')renderSkillCompare();if(skillMode==='task')renderSkillTask();
+}
+async function showSkillEvidence(){
+ const token=++skillToken,v=skillView?.version,s=v?.sources.find(s=>s.source_id===$('skillSource').value)||v?.sources[0];if(!s)return;
+ $('skillEvidenceNote').textContent=s.recipe.goal+' · 原步骤证据仍区分观察、推断与未知';$('skillVideo').classList.add('hidden');$('skillVideoEmpty').classList.remove('hidden');$('skillVideoEmpty').textContent='正在读取原示范…';
+ const box=$('skillEvidenceSteps');box.replaceChildren();for(const step of s.recipe.steps){const b=skillAction(step.title+' · '+({observed:'原步骤标记为观察',inferred:'推断',unknown:'待核对'}[step.basis]||'待核对'),()=>{$('skillVideo').currentTime=(step.start_s-(s.streams[0]?.offset_s||0))/(s.streams[0]?.rate||1);},'skill-evidence-step');box.append(b);}
+ try{const url=await blobUrl(s.streams[0]);if(token!==skillToken)return;$('skillVideo').src=url;$('skillVideo').classList.remove('hidden');$('skillVideoEmpty').classList.add('hidden');}
+ catch{if(token===skillToken)$('skillVideoEmpty').textContent='原素材暂不可读。来源和步骤快照仍保留，可稍后重试。';}
+}
+async function editSkill(){
+ const c=clone(skillView.version.content),fields=[];
+ for(const [key,title] of [['title','技能名称'],['goal','通用目标'],['summary','能做什么']]){const f=field(title,'text',c[key]);f.input.dataset.skillField=key;fields.push(f);}
+ const rows=fields.map(f=>f.label);const areas={};for(const [key,title]of[['applicability','适用条件'],['exclusions','不适用情况'],['uncertainties','待核对'],['conflicts','示范冲突']]){const l=el('label',title),a=el('textarea');a.rows=2;a.value=c[key].join('\n');l.append(a);rows.push(l);areas[key]=a;}
+ const steps=[];for(const s of c.steps){const d=el('details'),title=el('summary',roleText(c,s.title));const f=field('步骤','text',s.title),post=el('textarea'),pre=el('textarea'),caps=el('textarea'),fail=field('失败处理','text',s.failure);post.value=s.postconditions.join('\n');post.setAttribute('aria-label','完成条件');pre.value=s.preconditions.join('\n');pre.setAttribute('aria-label','前置条件');caps.value=s.capabilities.join('\n');caps.setAttribute('aria-label','所需能力');d.append(title,f.label,el('label','前置条件（每行一项）'),pre,el('label','完成条件（每行一项）'),post,el('label','所需能力（每行一项）'),caps,fail.label);steps.push({f,post,pre,caps,fail});rows.push(d);}
+ rows.unshift(el('p','用 {{参数ID}} 引用对象；保存会生成新版本，旧版本保留。参数：'+c.parameters.map(p=>p.id+'='+p.label).join('，'),'note'));
+ if(!await dialog('编辑技能候选',rows,'保存为新版本'))return;for(const f of fields)c[f.input.dataset.skillField]=f.input.value;for(const [k,a]of Object.entries(areas))c[k]=a.value.split('\n').map(x=>x.trim()).filter(Boolean);steps.forEach((r,i)=>Object.assign(c.steps[i],{title:r.f.input.value,preconditions:r.pre.value.split('\n').map(x=>x.trim()).filter(Boolean),postconditions:r.post.value.split('\n').map(x=>x.trim()).filter(Boolean),capabilities:r.caps.value.split('\n').map(x=>x.trim()).filter(Boolean),failure:r.fail.input.value}));
+ try{skillView=await skillCall('skill_edit',{...skillArgs(),skill:c});}catch(e){const backup=el('textarea');backup.rows=12;backup.readOnly=true;backup.value=JSON.stringify(c,null,2);await dialog('未覆盖现有版本',[el('p',e.message+'。以下保留你的修改，可以复制后刷新核对。','warning'),backup],'关闭');throw e;}await installedStatus();renderSkills();status('已保存新候选；原版本和安装保持原样。');
+}
+async function showSkillVersions(){
+ const rows=skillView.history.slice().reverse().map(v=>skillAction('v'+v.version+' · '+new Date(v.created_at*1000).toLocaleString(),async()=>{closeDialog(false);await openSkill(skillView.asset.id,v.version);},'skill-installed'));
+ const diff=el('details');diff.append(el('summary','当前版本改动'));for(const row of skillView.version.changes){const names={title:'名称',goal:'目标',summary:'用途',parameters:'可替换参数',steps:'步骤与条件',applicability:'适用范围',exclusions:'不适用范围',uncertainties:'疑点',conflicts:'冲突'};diff.append(el('h3',names[row.field]||row.field));const p=el('pre');p.textContent='此前：'+JSON.stringify(row.before,null,2)+'\n候选：'+JSON.stringify(row.after,null,2);diff.append(p);}rows.push(diff);await dialog('技能版本',rows,'关闭');
+}
+async function showInstalled(slug,inspectOnly=false){const r=await rpc('skills',{slug});const matching=/^vskill-([a-f0-9]{32})-v(\d+)$/.exec(slug);if(!inspectOnly&&matching&&skillLibrary.some(s=>s.id===matching[1])){await openSkill(matching[1],Number(matching[2]));return;}const p=el('p',inspectOnly?'这是 Core 当前安装的内容；与本地固定版本不一致。':'此技能由原技能库管理，可在原 Agent 中使用；这里没有它的参数化结构。','note'),pre=el('pre',r.skill.instruction);await dialog(r.skill.name,[p,pre],'关闭');}
+function relatedSkills(){
+ const c=skillView.version.content,context=[c.title,c.goal,...c.parameters.map(p=>p.label),...c.applicability].join(' ');
+ const tokens=new Set(context.match(/[A-Za-z]{2,}|[\u4e00-\u9fff]{2}/g)||[]);
+ return installedSkills.filter(s=>s.slug!==skillView.slug).map(s=>({s,score:[...tokens].filter(t=>(s.name+' '+s.oneLiner+' '+s.description).includes(t)).length})).sort((a,b)=>b.score-a.score).slice(0,3).map(r=>r.s);
+}
+function renderSkillCompare(){
+ $('skillHeading').textContent='有可以复用的技能吗？';$('skillSubtitle').textContent='先按摘要筛选，再比较操作方式、对象、条件与能力。';const rows=relatedSkills();if(!rows.some(s=>s.slug===compareSlug))compareSlug=rows[0]?.slug||'';
+ $('skillMatches').replaceChildren();if(!rows.length)$('skillMatches').append(el('div',installedError?'技能库读取失败，请刷新重试。':'没有找到其他已安装技能。可以保留为独立技能。','empty'));
+ for(const s of rows){const b=skillAction('',()=>{compareSlug=s.slug;renderSkillCompare();},'skill-match'+(s.slug===compareSlug?' selected':''));b.append(el('strong',s.name),el('p',s.oneLiner),el('small',/^vskill-/.test(s.slug)?'任务技能 · 参数结构还需核对':'其他技能 · 按原技能机制使用','note'));$('skillMatches').append(b);}
+ const box=$('skillComparison');box.replaceChildren();const comparison=skillView.comparison?.slug===compareSlug?skillView.comparison:null;
+ if(comparison){appendTextList(box,{reuse:'建议复用已有技能',supplement:'建议补充现有技能',separate:'建议保留为独立技能'}[comparison.decision],[comparison.reason]);appendTextList(box,'共有做法',comparison.shared);appendTextList(box,'差异',comparison.differences);appendTextList(box,'不兼容条件',comparison.conflicts,'warning');box.append(el('p','这是模型建议；保存补充候选不会替换原技能。','note'));}
+ else box.append(el('p','选择一项后比较。只读取所选技能的完整指令。','muted'));
+ $('skillPrimary').textContent=!rows.length?'返回技能候选':!comparison?'比较所选技能':comparison.decision==='supplement'?'保存补充候选':comparison.decision==='reuse'?'打开已有技能':'保留为独立技能';
+ const local=/^vskill-([a-f0-9]{32})-v(\d+)$/.exec(compareSlug);if(comparison&&comparison.decision!=='separate'&&(!local||!skillLibrary.some(s=>s.id===local[1]))){$('skillPrimary').textContent='查看原技能';box.append(el('p','此项没有本工作台的参数结构，可通过原 Agent 使用；这里仅作参考。','note'));}
+}
+async function comparePrimary(){
+ if(!compareSlug){skillMode='candidate';renderSkills();return;}
+ const c=skillView.comparison?.slug===compareSlug?skillView.comparison:null;
+ if(!c){const detail=(await rpc('skills',{slug:compareSlug})).skill;const r=await skillJob('skill_compare',{...skillArgs(),installed:[detail]});if(r){skillView=await skillCall('skill_inspect',r);renderSkills();}return;}
+ if(c.decision==='separate'){skillMode='candidate';renderSkills();return;}
+ const target=/^vskill-([a-f0-9]{32})-v(\d+)$/.exec(compareSlug);
+ if(!target||!skillLibrary.some(s=>s.id===target[1])){await showInstalled(compareSlug);return;}
+ if(c.decision==='reuse'){await openSkill(target[1],Number(target[2]));return;}
+ const asset=await skillCall('skill_inspect',{skill_id:target[1],skill_version:Number(target[2])});
+ const r=await skillJob('skill_supplement',{...skillArgs(),target_skill_id:asset.asset.id,target_version:asset.version.version,expected_revision:asset.asset.revision});if(r){await openSkill(r.skill_id,r.skill_version);status('补充版本已形成候选，仍需核对和入库。');}
+}
+async function startSkillTask(){if((skillValuesDirty||taskFeedbackDirty)&&!await confirmText('新建任务将放弃未保存的参数或反馈。继续？'))return;skillInstance=null;skillCheck=null;skillValuesDirty=false;taskFeedbackDirty=false;taskOutcome='';skillMode='task';$('skillParameterFields').replaceChildren();renderSkillParameters({});renderSkills();}
+function renderSkillParameters(values){
+ $('skillParameterFields').replaceChildren();const optional=el('details');optional.append(el('summary','更多任务设置（可选）'));for(const p of skillView.version.content.parameters){const label=el('label','','skill-param');label.append(el('strong',p.label+(p.required?'':'（可选）')));let input;
+  if(p.type==='enum'){input=el('select');input.append(option('请选择',''));for(const v of p.options)input.append(option(v,v));}else{input=el('input');input.type=p.type==='number'?'number':'text';input.placeholder=p.type==='region'?'例如：右侧托盘':p.type==='object'?'例如：蓝色杯子':'填写本次数值';if(p.type==='number'){input.min=p.min;input.max=p.max;input.step='any';}}
+  input.value=values[p.id]??'';input.dataset.parameter=p.id;input.dataset.kind=p.type;input.setAttribute('aria-label',p.label);input.oninput=()=>{skillValuesDirty=true;skillCheck=null;renderSkillTask();};label.append(input);if(p.description)label.append(el('small',p.description,'note'));(p.required?$('skillParameterFields'):optional).append(label);
+ }
+ if(optional.children.length>1)$('skillParameterFields').append(optional);
+}
+function renderSkillTask(){
+ $('skillHeading').textContent='这次要对什么操作？';$('skillSubtitle').textContent=skillView.version.content.title+' · v'+skillView.version.version+' · 无需新示范';const box=$('skillTaskPreview');box.replaceChildren();
+ if(!skillInstance||skillValuesDirty){box.append(el('div','补充本次对象和目标，生成任务预览。'+(skillInstance?'原任务已保留，修改将生成新任务。':''),'empty'));$('skillPrimary').textContent='生成任务预览';}
+ else{box.append(el('h3','本次任务预览'));for(const [i,s]of skillInstance.recipe.steps.entries()){const row=el('div','','skill-step');row.append(el('span',i+1,'step-number'),el('span',s.title));box.append(row);}box.append(el('div','','line'),el('h3','执行前还缺什么'));
+  const gaps=skillCheck?[...skillCheck.gaps,...skillCheck.steps.flatMap(s=>s.errors.map(e=>(skillInstance.recipe.steps.find(v=>v.id===s.step_id)?.title||s.step_id)+'：'+e))]:[...skillInstance.missing.map(x=>'缺少参数：'+x),'现场位置、动作/停止工具与完成反馈尚未检查'];
+  if(gaps.length)for(const g of gaps)box.append(el('p',g,'skill-gap'));else box.append(el('p','声明检查通过；执行前 Agent 仍需核验现场与运动可行性。','note'));
+  $('skillPrimary').textContent=skillCheck?.ready_for_review?'交给 Agent':skillCheck?'补充现场与工具':'检查能力缺口';box.append(skillAction('复盘这次任务',()=>{reviewMode='skill';setTab('review');refreshSkillReview();}));
+ }
+ $('skillHint').textContent='当前任务固定技能版本；不会复制示范位姿和设备绑定。';
+}
+async function taskTools(){const r=await rpc('tools');tools=r.tools;const names=new Set(Object.values(skillInstance?.bindings||{}).flatMap(b=>[b.tool,b.stop_tool]));return tools.filter(t=>names.has(t.name)).map(t=>({name:t.name,instance_id:t.instance_id,inputSchema:{required:t.inputSchema?.required,'x-action-params':Object.fromEntries(Object.entries(t.inputSchema?.['x-action-params']||{}).map(([k,v])=>[k,{required:v.required}])),properties:Object.fromEntries(Object.entries(t.inputSchema?.properties||{}).map(([k,v])=>[k,Object.fromEntries(['type','enum','minimum','maximum'].filter(key=>key in v).map(key=>[key,v[key]]))]))}}));}
+async function checkSkillTask(){skillCheck=await skillCall('task_check',{task_id:skillInstance.id,tools:await taskTools()});renderSkills();return skillCheck;}
+async function taskPrimary(){
+ if(!skillInstance||skillValuesDirty){const values={};for(const n of $('skillParameterFields').querySelectorAll('[data-parameter]'))if(n.value!=='')values[n.dataset.parameter]=n.dataset.kind==='number'?Number(n.value):n.value;
+  skillInstance=(await skillCall('task_create',{skill_id:skillView.asset.id,skill_version:skillView.version.version,values})).task;skillValuesDirty=false;skillCheck=null;renderSkills();status('任务预览已保存；尚未请求设备执行。');return;}
+ if(!skillCheck){await checkSkillTask();return;}
+ if(!skillCheck.ready_for_review){await openTaskReadiness();return;}
+ if(!(await rpc('context')).conversation_ready)throw Error('请先将本卡连接到决策核心');
+ if(!await confirmText('将请求当前 Agent 使用本次现场与绑定执行任务。请核对设备状态和原驱动停止方式。'))return;
+ const currentTools=await taskTools();const check=await skillCall('task_check',{task_id:skillInstance.id,tools:currentTools});if(!check.ready_for_review){skillCheck=check;renderSkills();throw Error('现场或工具状态已改变，请补齐缺口');}
+ status((await skillCall('task_agent',{...taskArgs(),tools:currentTools})).message);
+}
+async function openTaskReadiness(){
+ const rows=[el('p','按需补齐当前场景和步骤绑定。现场变化会清空旧绑定，需重新核对。','note')];
+ rows.push(skillAction('补充当前现场位置',async()=>{closeDialog(false);await editTaskScene();}));
+ for(const s of skillInstance.recipe.steps)rows.push(skillAction(s.title+' · '+(skillInstance.bindings[s.id]?'查看绑定':'补充动作、停止和反馈'),async()=>{closeDialog(false);await editTaskBinding(s);}));
+ rows.push(skillAction('重新检查能力缺口',async()=>{closeDialog(false);await checkSkillTask();}));await dialog('本次任务的能力缺口',rows,'关闭');
+}
+async function editTaskScene(){
+ const fields=[],rows=[el('p','仅填写刚获取的现场数据，单位为米。需要明确坐标系和依据；不能从示范猜测。','note')];
+ for(const p of skillView.version.content.parameters.filter(p=>['object','region'].includes(p.type)&&skillInstance.values[p.id])){
+  const box=el('div','','stack');box.append(el('h3',p.label+' · '+skillInstance.values[p.id]));const position=['X','Y','Z'].map(k=>field(k+'（米）','number',''));const coords=el('div','','row');position.forEach(f=>{f.input.step='any';coords.append(f.label);});const frame=field('当前坐标系'),evidence=field('位置依据');box.append(coords,frame.label,evidence.label);rows.push(box);fields.push({p,position,frame,evidence});
+ }
+ if(!fields.length)throw Error('请先填写对象与目标参数，重新生成任务');const confirmed=field('已核对这些位置来自刚获取的当前现场','checkbox');rows.push(confirmed.label);
+ if(!await dialog('当前现场信息',rows,'保存现场信息'))return;if(!confirmed.input.checked)throw Error('请核对现场来源后再保存');const scene={};for(const r of fields){if(r.position.some(f=>f.input.value===''))throw Error('现场位置未填写完整');scene[r.p.id]={position:r.position.map(f=>Number(f.input.value)),unit:'m',coordinate_frame:r.frame.input.value,source:'human',observed_at:Date.now()/1000,evidence:r.evidence.input.value};}
+ skillInstance=(await skillCall('task_update',{...taskArgs(),scene})).task;skillCheck=null;await checkSkillTask();status('现场信息已保存；设备动作需按新现场重新绑定。');
+}
+async function editTaskBinding(step){
+ await taskTools();const rows=[el('p',step.title),el('p','只填写当前已连接工具所需参数。保存不会调用设备。','note')],binding=skillInstance.bindings[step.id];
+ for(const prefix of ['skillAction','skillStop']){const label=el('label',prefix==='skillAction'?'动作工具':'停止工具'),select=el('select'),box=el('div','','params');select.id=prefix+'Tool';box.id=prefix+'Params';select.setAttribute('aria-label',label.textContent);select.append(option('选择已连接工具',''));tools.forEach((t,i)=>select.append(option(t.name+' · '+(t.instance_id||''),String(i))));select.onchange=()=>renderParams(prefix);label.append(select);rows.push(label,box);}
+ const completion=field('如何获得并核对实际完成反馈','text',binding?.completion||'');rows.push(completion.label);const response=dialog('绑定这一步',rows,'保存绑定');
+ for(const [prefix,name,args]of[['skillAction',binding?.tool,binding?.arguments],['skillStop',binding?.stop_tool,binding?.stop_arguments]]){const i=tools.findIndex(t=>t.name===name&&(!args?.instance_id||args.instance_id===t.instance_id));$(prefix+'Tool').value=i<0?'':String(i);renderParams(prefix,args||{});}
+ if(!await response)return;if($('skillActionTool').value===''||$('skillStopTool').value==='')throw Error('请选择动作和停止工具');const bindings=clone(skillInstance.bindings);bindings[step.id]={tool:tools[Number($('skillActionTool').value)].name,arguments:readParams('skillAction'),stop_tool:tools[Number($('skillStopTool').value)].name,stop_arguments:readParams('skillStop'),completion:completion.input.value};
+ skillInstance=(await skillCall('task_update',{...taskArgs(),bindings})).task;skillCheck=null;await checkSkillTask();
+}
+async function skillPrimary(){
+ if(skillMode==='library'){await extractSkill(!draft?.recipe?.steps.length);return;}if(skillMode==='compare'){await comparePrimary();return;}if(skillMode==='task'){await taskPrimary();return;}
+ if(installedState==='unknown'){await installedStatus();renderSkills();if(installedState==='unknown')throw Error(installedError||'技能库暂不可读');return;}
+ if(installedState==='conflict'){await showInstalled(skillView.slug,true);throw Error('同标识的安装内容已改变；请保存为新版本，不能覆盖');}
+ if(installedState==='installed'){await startSkillTask();return;}
+ await rpc('save',{skill_id:skillView.asset.id,skill_version:skillView.version.version,confirmed:true});await installedStatus();await refreshSkills();status(installedState==='installed'?'技能已入库，可以用于新任务。':'导入已返回，请刷新核对实际安装状态。');
+}
+async function reviewSkillVersion(){
+ const v=skillView.version,previous=skillView.review?.cases||[],cases=[...v.sources.map(s=>({id:s.source_id,label:'示范：'+s.recipe.goal})),...v.feedback.map(r=>({id:r.id,label:'反馈：'+r.outcome+' · '+r.evidence}))];
+ const rows=cases.map(c=>{const box=el('div','','stack');const verdict=el('select');verdict.append(option('待核验','unknown'),option('人工核验通过','pass'),option('未通过','fail'));const note=field('核验依据');const old=previous.find(r=>r.case_id===c.id);verdict.value=old?.verdict||'unknown';note.input.value=old?.note||'';box.append(el('strong',c.label),verdict,note.label);return {box,verdict,note,c};});
+ const recommend=field('核验通过后，设为本工作台推荐版本','checkbox');if(!await dialog('核验当前技能版本',[el('p','逐项核对示范和反馈；人工核验不代表实机已学会。推荐只影响本工作台，不切换 Core 的已安装版本。','note'),...rows.map(r=>r.box),recommend.label],'保存核验'))return;
+ skillView=await skillCall('skill_review',{...skillArgs(),cases:rows.map(r=>({case_id:r.c.id,verdict:r.verdict.value,note:r.note.input.value})),recommend:recommend.input.checked});renderSkills();status('核验已保存，原安装和其他版本保持原样。');
+}
+function syncSkillHeader(){const hide=tab==='skill'||tab==='review'&&reviewMode==='skill';$('headerDraft').classList.toggle('hidden',hide);document.querySelector('.topbar>.menu').classList.toggle('hidden',hide);}
+function setReviewMode(mode){reviewMode=mode;syncSkillHeader();for(const b of document.querySelectorAll('[data-review-mode]'))b.classList.toggle('active',b.dataset.reviewMode===mode);$('legacyReview').classList.toggle('hidden',mode!=='video');$('skillReview').classList.toggle('hidden',mode!=='skill');syncDock();if(mode==='skill')refreshSkillReview().catch(e=>status(e.message,true));}
+async function refreshSkillReview(){
+ const rows=(await skillCall('task_list')).tasks;selectOptions('skillTaskHistory',rows.map(t=>({value:t.id,text:t.goal+' · v'+t.skill_version+' · '+t.records+' 条反馈'})),skillInstance?.id||'','选择一次技能任务');
+ if(skillInstance){skillInstance=(await skillCall('task_inspect',{task_id:skillInstance.id})).task;renderSkillReview();}else{$('skillReviewBody').classList.add('hidden');$('skillReviewEmpty').classList.remove('hidden');}
+}
+function renderSkillReview(){
+ if(!skillInstance)return;$('skillReviewBody').classList.remove('hidden');$('skillReviewEmpty').classList.add('hidden');$('skillRunTitle').textContent=skillInstance.recipe.goal;$('skillRunMeta').textContent='技能 v'+skillInstance.skill_version+' · 固定任务参数 · 人工与 Agent 反馈分别记录';selectOptions('skillRecordStep',skillInstance.recipe.steps.map(s=>({text:s.title,value:s.id})),$('skillRecordStep').value);
+ $('skillRunRecords').replaceChildren();for(const r of skillInstance.records.slice().reverse())$('skillRunRecords').append(el('p',({success:'完成',failed:'失败',unknown:'不确定'}[r.outcome])+' · '+(r.source==='human'?'人工标记':'Agent记录')+' · '+r.evidence,'feedback '+r.outcome));
+ $('skillReviewPrimary').textContent=taskFeedbackDirty?'保存反馈':'生成改进候选';$('skillReviewPrimary').disabled=!taskFeedbackDirty&&!skillInstance.records.length;
+}
+async function saveTaskFeedback(){if(!taskOutcome)throw Error('请选择实际结果');const evidence=$('skillRecordEvidence').value.trim()||'人工标记：'+({success:'完成',failed:'失败',unknown:'不确定'}[taskOutcome])+'；未提供补充依据';skillInstance=(await skillCall('task_record',{...taskArgs(),record:{step_id:$('skillRecordStep').value,outcome:taskOutcome,source:'human',evidence}})).task;taskFeedbackDirty=false;taskOutcome='';$('skillRecordEvidence').value='';document.querySelectorAll('[data-task-outcome]').forEach(b=>b.setAttribute('aria-pressed','false'));renderSkillReview();status('反馈已关联这次任务、技能版本与绑定快照。');}
+button('skillPrimary',skillPrimary);button('skillBack',async()=>{if(skillMode==='task'){if(skillValuesDirty&&!await confirmText('返回将放弃未生成任务的参数修改。继续？'))return;skillMode='candidate';skillValuesDirty=false;}else skillMode='library';renderSkills();});button('skillRefresh',refreshSkills);
+button('skillExtractMore',()=>extractSkill(true));button('skillEdit',editSkill);button('skillVersions',showSkillVersions);button('skillReviewVersion',reviewSkillVersion);
+button('skillCompare',async()=>{await installedPage();skillMode='compare';renderSkills();});button('skillSearchInstalled',async()=>{const q=field('搜索技能名称或用途');if(await dialog('查找已有技能',[q.label],'查找')){await installedPage(true,q.input.value);skillMode='compare';renderSkills();}});
+button('skillInstalledMore',async()=>{if(installedCursor!==null)await installedPage(false);renderSkills();});$('skillSource').onchange=()=>showSkillEvidence().catch(e=>status(e.message,true));
+button('skillReviewPrimary',async()=>{if(taskFeedbackDirty){await saveTaskFeedback();return;}if(!skillInstance?.records.length)throw Error('请先记录本次结果');const current=await skillCall('skill_inspect',{skill_id:skillInstance.skill_id,skill_version:skillInstance.skill_version});const r=await skillJob('skill_improve',{skill_id:current.asset.id,skill_version:current.version.version,expected_revision:current.asset.revision,task_ids:[skillInstance.id]});if(r){await openSkill(r.skill_id,r.skill_version);status('改进候选已生成；请核对变更和案例，尚未设为推荐或入库。');}});
+button('skillRunPreview',async()=>{const instance=skillInstance;skillView=await skillCall('skill_inspect',{skill_id:instance.skill_id,skill_version:instance.skill_version});skillMode='task';skillValuesDirty=false;skillCheck=null;renderSkillParameters(instance.values);setTab('skill');renderSkills();});
+document.querySelectorAll('[data-review-mode]').forEach(b=>b.onclick=()=>setReviewMode(b.dataset.reviewMode));
+document.querySelectorAll('[data-task-outcome]').forEach(b=>b.onclick=()=>{taskOutcome=b.dataset.taskOutcome;taskFeedbackDirty=true;document.querySelectorAll('[data-task-outcome]').forEach(v=>v.setAttribute('aria-pressed',v===b?'true':'false'));renderSkillReview();});$('skillRecordEvidence').oninput=()=>{taskFeedbackDirty=true;renderSkillReview();};
+$('skillTaskHistory').onchange=async()=>{try{if(taskFeedbackDirty&&!await confirmText('切换将放弃未保存的反馈。继续？'))return;const id=$('skillTaskHistory').value;if(!id)return;skillInstance=(await skillCall('task_inspect',{task_id:id})).task;taskFeedbackDirty=false;taskOutcome='';$('skillRecordEvidence').value='';document.querySelectorAll('[data-task-outcome]').forEach(b=>b.setAttribute('aria-pressed','false'));renderSkillReview();}catch(e){status(e.message,true);}};
+
+window.addEventListener('message',async event=>{if(event.source!==parent||event.data?.protocol!=='motus.workbench/1'||!event.ports[0]||port)return;port=event.ports[0];port.onmessage=({data})=>{const p=pending.get(data.id);if(!p)return;pending.delete(data.id);clearTimeout(p.timeout);data.error?p.reject(Error(data.error)):p.resolve(data.result);};try{await refreshInfo();status('就绪。可以先看数据，再按需创建任务。');}catch(e){status(e.message,true);}});
+setInterval(async()=>{if(!port||polling||operation||loading)return;polling=true;try{await refreshInfo();if(draft){const r=await call('inspect');if(r.draft.revision!==draft.revision)await render(r.draft);}}catch(e){status(e.message,true);}finally{polling=false;}},5000);
+
+window.addEventListener('resize',()=>{drawOverlay();drawTrajectory();});window.addEventListener('unload',()=>{release();port?.close();});
+})();
+</script></body></html>

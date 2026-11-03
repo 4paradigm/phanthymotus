@@ -710,3 +710,17 @@ plugins:
     # 没有 camera_info 时的兜底；留空 = 不猜，只输出距离。
     half_fov_rad: null
     half_fov_v_rad: null
+
+  # 只读订阅画布连接的JPEG/数值状态；录制需显式操作，共用video_task数据目录。
+  demo_capture:
+    enabled: true
+
+  # 现有卡片内的视频任务编写；模型按需调用，不加载本地权重。
+  video_task:
+    enabled: true
+    data_dir: /models/video_task
+    upload_roots: [/models/uploads]
+    endpoint: ""  # Chat Completions 兼容地址，如 .../compatible-mode/v1
+    model: ""
+    api_key: ""   # 也可在示范学习内的“模型设置”填写；已保存的值不会回传到页面
+    native_protocol: disabled  # 确认服务支持后选择 qwen_video_url

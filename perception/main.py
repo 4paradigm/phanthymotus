@@ -233,6 +233,14 @@ class PerceptionBundle:
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
 
+        if plugins_cfg.get("video_task", {}).get("enabled", False):
+            from plugins.video_task import VideoTaskPlugin
+            video_task = VideoTaskPlugin(plugins_cfg["video_task"], executor)
+            self._plugins.append(video_task)
+            if plugins_cfg.get("demo_capture", {}).get("enabled", False):
+                from plugins.video_task.capture import DemoCapturePlugin
+                self._plugins.append(DemoCapturePlugin(plugins_cfg["demo_capture"], executor, video_task))
+
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["pose"].get("namespace", "").strip()
@@ -376,6 +384,31 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if self.path.split('?')[0] == '/workbench/media':
+                import hmac
+                from urllib.parse import urlsplit, parse_qs
+                from utils.file_intake import access_token
+                token = access_token()
+                if token and not hmac.compare_digest(token, self.headers.get('X-Access-Token', '')):
+                    self._send(401, '{"error":"unauthorized"}')
+                    return
+                try:
+                    query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                    plugin, _ = _bundle._plugin_for(query.get('tool', ''))
+                    if plugin is None or not callable(getattr(plugin, 'media_file', None)):
+                        raise ValueError('tool has no media capability')
+                    path, mime = plugin.media_file(query.get('asset_id'), query.get('kind'))
+                    with path.open('rb') as source:
+                        self.send_response(200)
+                        self.send_header('Content-Type', mime)
+                        self.send_header('Content-Length', str(path.stat().st_size))
+                        self.send_header('Cache-Control', 'no-store')
+                        self.end_headers()
+                        import shutil
+                        shutil.copyfileobj(source, self.wfile, 256 * 1024)
+                except (ValueError, OSError) as error:
+                    self._send(400, json.dumps({'error': str(error)}))
+                return
             if self.path in ("/vad/test", "/tts/test"):
                 self._send(405, '{"error":"Use POST"}')
                 return
@@ -536,9 +569,10 @@ def make_handler():
                     is_info = (args.get('action') == 'info')
                     music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
                   or name == 'audio_mixer' or name.startswith('audio_mixer_'))
+                    private_payload = music_call or name == 'video_task' or name.startswith('video_task_') or name == 'demo_capture' or name.startswith('demo_capture_')
                     if not is_info:
-                        if music_call:
-                            log.info("[mcp] tools/call: phanthy_music (payload omitted)")
+                        if private_payload:
+                            log.info("[mcp] tools/call: %s (payload omitted)", name)
                         else:
                             log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
@@ -559,11 +593,13 @@ def make_handler():
                             err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            if music_call:
-                                log.info("[mcp] phanthy_music result received (payload omitted)")
+                            if private_payload:
+                                log.info("[mcp] %s result received (payload omitted)", name)
                             else:
                                 log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        content = result.get('_mcp_content') if isinstance(result, dict) else None
+                        ok({"content": content if isinstance(content, list) else
+                            [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
             except BrokenPipeError:
