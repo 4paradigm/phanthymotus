@@ -348,6 +348,12 @@ function _buildSubgroupLabel(type, count) {
 function sidebarOwnsConfig(mcpId, tool) {
   const schema = typeof tool === 'object' ? tool.configSchema : null;
   if (!schema) return false;
+  const page = tool.inputSchema?.['x-workbench'];
+  const shared = Object.entries(schema.properties || {}).filter(([, d]) => d.scope !== 'instance').map(([k]) => k);
+  // An optional configuration owned by the embedded page has one entry point.
+  // Required pre-start settings still need the original sidebar dialog.
+  if (page?.protocol === 'motus.workbench/1' && Array.isArray(page.config) &&
+      shared.every(k => page.config.includes(k)) && !(schema.required || []).some(k => shared.includes(k))) return false;
   const props = Object.values(schema.properties || {});
   if (!props.some(def => def.scope !== 'instance')) return false;   // nothing to set here
 
@@ -415,7 +421,7 @@ function _buildChip(mcp, tool) {
   const configBtnHtml = hasSharedFields
     ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
     : '';
-  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
+  chip.innerHTML = `<span class="chip-name">${_esc(tool.inputSchema?.['x-workbench']?.title || tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
 
   // Mobile add-to-canvas button
   chip.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
@@ -549,7 +555,7 @@ function _buildToolCard(mcp, tool) {
     <div class="tool-card-header">
       <div class="tool-card-title-row">
         ${badgeHtml}
-        <span class="tool-card-name" title="${_esc(tool.name)}">${_esc(tool.name)}</span>
+        <span class="tool-card-name" title="${_esc(tool.name)}">${_esc(tool.inputSchema?.['x-workbench']?.title || tool.name)}</span>
       </div>
       <div class="tool-card-actions">
         <button class="mobile-add-btn" title="添加到画布">+</button>

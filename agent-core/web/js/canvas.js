@@ -258,14 +258,27 @@ async function _rearmBrowserSources() {
   }
 }
 
+function _isWorkbenchEntry(el) {
+  const entry = el.dataset.workbenchEntry;
+  return !!entry && el.querySelector('.canvas-field-input[data-key="action"]')?.value === entry;
+}
+
+function _syncCardExecution(el) {
+  const btn = el.querySelector('.canvas-exec-btn');
+  if (!btn) return;
+  const opensWorkbench = _isWorkbenchEntry(el);
+  // Authoring a skill must be possible before starting the robot project.
+  // Only the declared UI entry is exempt; ordinary actions remain locked.
+  btn.classList.toggle('locked', !_projectRunning && !opensWorkbench);
+  if (!btn.disabled) btn.textContent = opensWorkbench ? '打开工作台' : '▶ 执行';
+}
+
 /** Record what the backend says about the run state, and unblock editing. */
 function _applyProjectState(running) {
   _projectRunning = !!running;
   _projectStateKnown = true;
   _syncProjectBtn();
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning);
-  });
+  document.querySelectorAll('.canvas-card').forEach(_syncCardExecution);
   // Idempotent: both helpers no-op when their stream is already active, so the
   // start-project path and the cross-tab project_state event cannot double-start.
   if (_projectRunning) _rearmBrowserSources();
@@ -948,6 +961,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const tools   = mcp?.tools || [];
   const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const schema  = typeof toolObj === 'object' ? toolObj.inputSchema : null;
+  const workbench = schema?.['x-workbench'];
+  const displayName = workbench?.protocol === 'motus.workbench/1' ? workbench.title || toolName : toolName;
+  if (workbench?.protocol === 'motus.workbench/1' && typeof workbench.entry === 'string') {
+    el.dataset.workbenchEntry = workbench.entry;
+  }
   const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
   const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
   const hasInstanceFields = configSchema && Object.values(configSchema.properties || {}).some(d => d.scope === 'instance');
@@ -990,7 +1008,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
           <div class="canvas-card-info">
-            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(displayName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
@@ -1071,7 +1089,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
           <div class="canvas-card-info">
-            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(displayName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
           ${sensorInstanceCfgBtn}
@@ -1204,7 +1222,13 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     const _SYSTEM_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const _TOPIC_KEY_RE = /input.*topic|topic.*in|output.*topic|topic.*out/i;
+    // Opt-in presentation only; keep the complete tool/RPC schema for Agents.
+    const cardActions = workbench?.protocol === 'motus.workbench/1' && Array.isArray(workbench.card_actions)
+      ? new Set([workbench.entry, ...workbench.card_actions]) : null;
+    const cardParams = cardActions && new Set([...cardActions].flatMap(a => schema['x-action-params']?.[a]?.params || []));
+    const entryOnly = cardActions?.size === 1 && cardActions.has(workbench.entry);
     const fieldsHtml = Object.entries(props).map(([key, def]) => {
+      if (cardParams && key !== 'action' && !cardParams.has(key)) return '';
       // Hide auto-populated topic fields for processor cards
       if ((effectiveType === 'processor' || effectiveType === 'actuator') && _TOPIC_KEY_RE.test(key)) return '';
       const isReq = required.includes(key);
@@ -1216,7 +1240,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         if (key === 'action') {
           enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
           // The page owns internal actions; the card exposes its entry and public actions.
-          if (schema['x-workbench'] && schema['x-action-params']) {
+          if (cardActions) {
+            enumVals = enumVals.filter(v => cardActions.has(v));
+          } else if (schema['x-workbench'] && schema['x-action-params']) {
             enumVals = enumVals.filter(v => v === schema['x-workbench'].entry || v in schema['x-action-params']);
           }
         }
@@ -1235,7 +1261,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
       }
       return `
-        <div class="canvas-field">
+        <div class="canvas-field"${key === 'action' && entryOnly ? ' style="display:none"' : ''}>
           <label class="canvas-field-label" title="${_esc(def.description || '')}">${_esc(label)}</label>
           ${inputHtml}
         </div>`;
@@ -1265,15 +1291,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
           <div class="canvas-card-info">
-            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(displayName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
           ${instanceCfgBtn}
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
-        ${fieldsHtml ? `<div class="canvas-card-body">${fieldsHtml}</div>` : ''}
-        <div class="canvas-card-footer"${!fieldsHtml ? ' style="padding:8px 10px"' : ''}>
+        ${entryOnly ? fieldsHtml : fieldsHtml ? `<div class="canvas-card-body">${fieldsHtml}</div>` : ''}
+        <div class="canvas-card-footer"${!fieldsHtml || entryOnly ? ' style="padding:8px 10px"' : ''}>
           ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
           ${hasUsableFields && showViewBtn ? '<hr class="canvas-footer-divider">' : ''}
           ${showViewBtn ? '<button class="canvas-view-btn">📡 查看数据流</button>' : ''}
@@ -1409,6 +1435,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  el.querySelector('.canvas-field-input[data-key="action"]')?.addEventListener('change', () => _syncCardExecution(el));
+  _syncCardExecution(el);
   return el;
 }
 
@@ -2731,6 +2759,10 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 // ── Execute ───────────────────────────────────────────────────────────────────
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
+  if (!_projectRunning && !_isWorkbenchEntry(el)) {
+    _showToast('请先开启智能控制再执行此动作');
+    return;
+  }
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
@@ -2782,7 +2814,8 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
       const spec = _toolObj?.inputSchema?.['x-workbench'];
       if (spec?.protocol === 'motus.workbench/1' && args.action === spec.entry) {
         const { openWorkbench } = await import('./workbench.js');
-        await openWorkbench({mcp: mcpId, tool: toolName, instanceId: instanceId || el.dataset.cardId},
+        await openWorkbench({mcp: mcpId, tool: toolName, instanceId: instanceId || el.dataset.cardId,
+          getInputs: () => _collectInTopics(el.dataset.cardId, el)},
           spec, JSON.parse(_formatCallResult(json.data)));
         return;
       }
@@ -2800,7 +2833,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     _logActivity('mcp_error', `${toolName} error: ${err}`);
   } finally {
     btn.disabled = false;
-    btn.textContent = '▶ 执行';
+    _syncCardExecution(el);
   }
 }
 

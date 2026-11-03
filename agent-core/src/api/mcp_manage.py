@@ -1,5 +1,7 @@
 import asyncio
 import json
+import re
+import tempfile
 import time
 from typing import Optional
 
@@ -8,6 +10,7 @@ import typing
 import aiohttp
 import fastapi
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 import config
 import mcp_client
@@ -407,8 +410,11 @@ async def mcp_file_upload(
     import auth
     token = auth.get_token()
 
+    # Python 3.10's SpooledTemporaryFile is not an IOBase; aiohttp cannot
+    # auto-select its payload. Explicit wrapping preserves bounded streaming.
     form = aiohttp.FormData()
-    form.add_field('file', file.file,
+    form.add_field('file', aiohttp.payload.BufferedReaderPayload(
+                       file.file, content_type=file.content_type or 'application/octet-stream'),
                    filename=file.filename or 'upload.bin',
                    content_type=file.content_type or 'application/octet-stream')
     if subdir:
@@ -447,6 +453,61 @@ async def mcp_file_upload(
         return {'code': 504,
                 'message': f'{mcp_id} did not finish receiving the file in time',
                 'data': None}
+
+
+class WorkbenchMediaRequest(BaseModel):
+    tool: str
+    asset_id: str
+    instance_id: str = ''
+    kind: str = 'video'
+
+
+@router.post('/{mcp_id}/workbench/media')
+async def workbench_media(mcp_id: str, req: WorkbenchMediaRequest):
+    """Read a declared card asset; never accept a URL or filesystem path."""
+    endpoint = _file_intake_url(mcp_id).removesuffix('/file/upload') + '/workbench/media'
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', req.asset_id) or req.kind != 'video':
+        raise fastapi.HTTPException(400, 'invalid media identifier')
+    target = next(m for m in _get_mcp_list() if m.get('id') == mcp_id)
+    tool = next((t for t in target.get('tools', []) if t.get('name') == req.tool), {})
+    if (tool.get('inputSchema', {}).get('x-workbench') or {}).get('media') is not True:
+        raise fastapi.HTTPException(403, 'tool does not declare workbench media')
+    import auth
+    token = auth.get_token()
+    headers = {'X-Access-Token': token} if token else {}
+    # Spool before sending headers so an oversized or failed upstream response
+    # can still return a normal error. At most 1 MiB remains in RAM.
+    spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+    limit, total = 64 * 1024 * 1024, 0
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
+            async with session.get(endpoint, params=req.model_dump(), headers=headers, allow_redirects=False) as response:
+                if response.status != 200 or response.content_type != 'video/mp4':
+                    raise fastapi.HTTPException(502, 'card did not return a video asset')
+                async for chunk in response.content.iter_chunked(256 * 1024):
+                    total += len(chunk)
+                    if total > limit:
+                        raise fastapi.HTTPException(413, 'video asset exceeds 64 MiB')
+                    spool.write(chunk)
+        spool.seek(0)
+    except BaseException as error:
+        spool.close()
+        if isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError)):
+            raise fastapi.HTTPException(502, 'card video service unavailable') from None
+        raise
+
+    def chunks():
+        try:
+            while True:
+                chunk = spool.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            spool.close()
+    return fastapi.responses.StreamingResponse(chunks(), media_type='video/mp4',
+        headers={'Content-Length': str(total), 'Cache-Control': 'no-store'},
+        background=BackgroundTask(spool.close))
 
 
 @router.post('')
