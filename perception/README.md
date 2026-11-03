@@ -8,6 +8,11 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+The **示范采集** (`demo_capture`) and **示范学习** (`video_task`) cards open
+embedded pages in the existing Canvas for demonstration recording, video
+analysis, task-skill authoring and feedback. See the [illustrated usage guide](../docs/DEMONSTRATION_WORKBENCH_ZH.md)
+for model setup, multi-view/EgoDex/UMI inputs, dependencies and validation limits.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
