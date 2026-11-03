@@ -168,6 +168,12 @@ class EvidenceService:
                     repo, pr_number, head_sha, item):
                 # Internal object_key is needed only by the trusted download path.
                 row['object_key'] = item['object_key']
+                from . import evidence_auth
+                row['capability'] = evidence_auth.issue_capability(
+                    self.config, repo, pr_number, head_sha, round_id,
+                    purpose=DOWNLOAD_PURPOSE,
+                    resource='log:' + round_id + ':' + alias,
+                )
                 output[alias] = row
             elif item['status'] == 'ready':
                 continue
@@ -214,7 +220,7 @@ class EvidenceService:
         live_head = pr.get('head')
         if not isinstance(live_head, dict) or live_head.get('sha') != expected_head:
             raise EvidenceError('round_changed', 409)
-        await self._authorize(repo, principal, state, pr=pr)
+        authorized_writer = await self._authorize(repo, principal, state, pr=pr)
         validate_context(pr, state, expected_head, active_round, write=False)
 
         invite = principal.get('upload_invite')
@@ -232,7 +238,7 @@ class EvidenceService:
             and invite.get('status') == 'testing'
             and type(invite.get('expires_at')) is int
             and invite['expires_at'] > int(time.time())
-            and pr.get('state') == 'open' and not pr.get('merged') and not pr.get('draft')
+            and not pr.get('merged') and not pr.get('draft')
             and pr.get('base', {}).get('repo', {}).get('full_name', '').casefold() == repo.casefold()
             and pr.get('head', {}).get('sha') == expected_head
             and state.get('head_sha') == expected_head
@@ -275,11 +281,15 @@ class EvidenceService:
             'github_user_authenticated': bool(
                 principal.get('actor_verified') is True
                 and principal.get('github_user_authenticated') is True),
-            'can_write': False, 'evidence_degraded': True,
+            'can_write': bool((authorized_writer or invite_allowed)
+                              and state.get('status') == 'testing'
+                              and pr.get('head', {}).get('sha') == expected_head
+                              and not pr.get('merged') and not pr.get('draft')),
+            'evidence_degraded': True,
             'display_deployments': self._display_deployments(state),
             'deployment_logs': self._trusted_deployment_logs(
                 state, repo, pr_number, expected_head, active_round),
-            'upload_invite': False,
+            'upload_invite': invite_allowed,
             'auth_method': principal.get('auth_method', 'github_comment_proof'),
             'actor_verified': principal.get('actor_verified') is True,
             'upload_method': principal.get('upload_method', 'github_comment_proof'),
@@ -977,7 +987,14 @@ class EvidenceService:
                     return await self._degraded_current_context(
                         repo, pr_number, principal, pr, state, payload, active_round,
                     )
-                records = history_read.result()
+                try:
+                    records = history_read.result()
+                    if not isinstance(records, (list, tuple)):
+                        raise EvidenceError('evidence_records_unavailable', 503)
+                except Exception:
+                    return await self._degraded_current_context(
+                        repo, pr_number, principal, pr, state, payload, active_round,
+                    )
             else:
                 records = await self.proxy.read_evidence_records(repo, pr_number)
             round_numbers = trusted_round_numbers(records, state, repo, pr_number)
@@ -1050,7 +1067,7 @@ class EvidenceService:
                     and invite.get('status') == 'testing'
                     and type(invite.get('expires_at')) is int
                     and invite['expires_at'] > int(time.time())
-                    and isinstance(target_pr, dict) and target_pr.get('state') == 'open'
+                    and isinstance(target_pr, dict) and target_pr.get('state') in {'open', 'closed'}
                     and not target_pr.get('merged') and not target_pr.get('draft')
                     and target_pr.get('base', {}).get('repo', {}).get('full_name', '').lower() == repo.lower()
                     and target_pr.get('head', {}).get('sha') == expected_head
@@ -1066,7 +1083,7 @@ class EvidenceService:
                 and round_id == active_round
                 and selected.get('status') == 'testing'
                 and selected.get('head_sha') == pr.get('head', {}).get('sha')
-                and pr.get('state') == 'open' and not pr.get('merged')
+                and pr.get('state') in {'open', 'closed'} and not pr.get('merged')
                 and not pr.get('draft')
             )
             invite_read_context = bool(
@@ -1437,8 +1454,6 @@ class EvidenceService:
                         'deployment_logs': self._trusted_deployment_logs(
                             selected, repo, pr_number, selected['head_sha'], round_id),
                         'upload_invite': bool(invite_allowed),
-                        'upload_identity_label': ('分享链接上传，GitHub 身份未验证'
-                                                  if invite_allowed else ''),
                         'auth_method': principal.get('auth_method', 'github_comment_proof'),
                         'actor_verified': principal.get('actor_verified') is True,
                         'upload_method': principal.get('upload_method', 'github_comment_proof'),

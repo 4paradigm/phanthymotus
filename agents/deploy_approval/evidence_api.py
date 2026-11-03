@@ -385,7 +385,13 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     if not isinstance(result, dict):
         raise HTTPException(503, detail='invalid_evidence_service_response')
     if action == 'context' and result.get('evidence_degraded') is True:
-        if result.get('can_write') is not False:
+        verified_can_write = result.get('can_write') is True
+        verified_upload_invite = result.get('upload_invite') is True
+        verified_authenticated = result.get('authenticated') is True
+        verified_enabled = result.get('enabled') is True
+        if (type(result.get('can_write')) is not bool
+                or type(result.get('upload_invite')) is not bool
+                or not verified_authenticated or not verified_enabled):
             raise HTTPException(503, detail='invalid_degraded_evidence_context')
         head, round_id = result.get('head_sha'), result.get('round_id')
         if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
@@ -410,10 +416,12 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                    'acceptance_pending', 'display_deployments'}
         result = {k: result[k] for k in allowed if k in result}
         result.update({
-            'can_write': False, 'evidence_degraded': True,
+            'can_write': verified_can_write,
+            'evidence_degraded': True,
             'attachments': [], 'rounds': [], 'history': [], 'archive_links': [],
             'deployment_logs': current_logs,
-            'authenticated': True, 'enabled': True,
+            'authenticated': verified_authenticated, 'enabled': verified_enabled,
+            'upload_invite': verified_upload_invite,
             'github_user_authenticated': bool(principal.get('github_user_authenticated')),
             'actor_verified': principal.get('actor_verified') is True,
             'auth_method': principal.get('auth_method', 'github_comment_proof'),
@@ -777,7 +785,14 @@ async def page(request: Request, owner: str, repo: str, pr: int):
             409: 'PR 或测试轮次已变化，请刷新当前 PR Summary 后重新打开。',
             503: '附件服务暂时不可用，请稍后从当前 PR Summary 重新打开。',
         }
-        message = messages.get(exc.status_code, '附件链接暂不可用，请从当前 PR Summary 重新打开。')
+        details = {
+            'evidence_pr_unavailable': '暂时无法读取 GitHub PR 信息；这不代表 PR 已关闭。请稍后重试，或检查 GitHub API 连通性。',
+            'evidence_pr_status_unavailable': '暂时无法确认 GitHub PR 状态或 HEAD；请稍后重试。',
+            'evidence_history_unavailable': '历史附件记录暂时无法读取；请返回当前 PR Summary 查看最新状态，稍后再试历史附件。',
+            'evidence_state_unavailable': '暂时无法验证当前 Lifecycle 状态；请稍后重试。',
+        }
+        message = details.get(exc.detail, messages.get(
+            exc.status_code, '附件链接暂不可用，请从当前 PR Summary 重新打开。'))
         summary_link = ('<p><a href="https://github.com/' + canonical + '/pull/' + str(pr)
                         + '">打开当前 PR Summary</a></p>') if canonical else ''
         html = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'

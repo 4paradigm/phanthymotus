@@ -223,10 +223,8 @@ class EvidenceBuilder:
                 raise ValueError("round_id must be HEAD followed by a positive integer")
             if result != "deployed":
                 raise ValueError("machine deployment evidence requires result=deployed")
-            if not isinstance(runtime_logs, dict) or not any(
-                isinstance(value, str) and value.strip() for value in runtime_logs.values()
-            ):
-                raise ValueError("machine deployment evidence requires collected runtime logs")
+            if not isinstance(runtime_logs, dict):
+                runtime_logs = {}
             if not collected_at:
                 raise ValueError("machine deployment evidence requires fixed collected_at")
             try:
@@ -241,6 +239,7 @@ class EvidenceBuilder:
         fixed_header = self._build_fixed_header(
             repo, pr_number, head_sha, state, result, summary, deploy_error,
             machine_alias=machine_alias, round_id=round_id, collected_at=collected_at,
+            runtime_logs=runtime_logs,
         )
         variable_body = self._build_variable_body(runtime_logs)
         gzip_bytes = self._fit_evidence_archive(fixed_header, variable_body)
@@ -260,6 +259,7 @@ class EvidenceBuilder:
         machine_alias: str = "",
         round_id: str = "",
         collected_at: str = "",
+        runtime_logs: dict[str, str] | None = None,
     ) -> str:
         safe_summary = _bound_text(_sanitize_for_evidence(summary), 4096)
         lines: list[str] = [
@@ -307,12 +307,35 @@ class EvidenceBuilder:
                 lines.append(f"component={cid} result={case_result} advisory=true")
         if state.get("command", {}).get("kind") == "record_test":
             lines.extend(("", "[test]", f"result={result or state.get('test_result', '')}", f"summary={safe_summary}"))
+        if machine_alias:
+            has_runtime_logs = isinstance(runtime_logs, dict) and any(
+                isinstance(value, str) and value.strip()
+                and "SNAPSHOT_UNAVAILABLE" not in value
+                for value in runtime_logs.values()
+            )
+            lines.extend(("", "[controller-deployment-and-verification]",
+                          "source=trusted Lifecycle deployment and runtime verification facts"))
+            machine_components = set()
+            for deployment in state.get("deployments", []):
+                if (isinstance(deployment, dict) and deployment.get("machine") == machine_alias
+                        and deployment.get("phase") == "deployed"):
+                    ids = [cid for cid in deployment.get("component_ids", []) if isinstance(cid, str)]
+                    machine_components.update(ids)
+                    lines.append(f"machine={machine_alias} phase=deployed components={','.join(ids)}")
+            for component in components:
+                if isinstance(component, dict) and component.get("component_id") in machine_components:
+                    lines.append(f"component={component.get('component_id', '')} target={component.get('target', '')} image={component.get('image_ref', '')} runtime={component.get('runtime_id', '')}")
+            lines.extend(("", "[agent-core-runtime-logs]",
+                          "status=collected" if has_runtime_logs else
+                          "status=unavailable; Agent Core original runtime logs could not be read"))
         return _sanitize_for_evidence("\n".join(lines))
 
     def _build_variable_body(self, runtime_logs: dict[str, str] | None) -> str:
         lines: list[str] = []
         if runtime_logs:
             for source, log_text in runtime_logs.items():
+                if not isinstance(log_text, str) or "SNAPSHOT_UNAVAILABLE" in log_text:
+                    continue
                 lines.extend(("", "[runtime-log]", f"source={source}"))
                 lines.append(_sanitize_for_evidence(log_text))
         return "\n".join(lines)

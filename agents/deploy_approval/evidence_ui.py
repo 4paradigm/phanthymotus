@@ -371,8 +371,8 @@ _JAVASCRIPT = r'''"use strict";
           if (!(path === "/context" && authMode === "invite")) halt(expired);
           throw new ApiError(401, expired, detail);
         }
-        if (response.status === 403) throw new ApiError(403, "权限不足：当前上传者无权执行此操作。", detail);
-        if (response.status === 503) throw new ApiError(503, "GitHub 或附件服务暂时不可用；当前操作未确认完成，请稍后重试。", detail);
+        if (response.status === 403) throw new ApiError(403, "当前链接没有此操作权限。请从 PR Summary 获取有效上传邀请；历史轮次仅支持查看。", detail);
+        if (response.status === 503) throw new ApiError(503, "附件或 GitHub 服务暂时无法读取；当前操作未确认完成。请稍后重试，或重新打开 PR Summary 中的附件页面。", detail);
         if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed",
           "pr_closed_or_mismatched", "pr_draft", "state_unavailable"].includes(detail))
           halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新 PR Summary 并打开最新上传链接。");
@@ -725,9 +725,8 @@ _JAVASCRIPT = r'''"use strict";
     // remain readable throughout every supported phase.
     const stageAvailable = pageAvailable;
     if (degraded) {
-      contextAuthorized = false;
       message("");
-      const label = document.createTextNode("历史附件暂未加载，写入已禁用。请重试以恢复完整可信数据。 ");
+      const label = document.createTextNode("历史附件暂未加载；当前轮信息仍来自已验证的 Lifecycle。 ");
       const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
       retry.addEventListener("click", () => refresh().catch(refreshFailure));
       $("message").append(label, retry);
@@ -871,7 +870,7 @@ _JAVASCRIPT = r'''"use strict";
     }
     if (useProofFallback) next = await request("/context", {job, authMode: "proof", timeoutMs});
     context = next;
-    contextAuthorized = next.evidence_degraded !== true;
+    contextAuthorized = next.authenticated === true && next.enabled === true;
     if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
     else if (next.auth_method === "signed_invite") clearProof();
     render(); return next;

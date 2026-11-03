@@ -62,6 +62,16 @@ class DeployCommandError(Exception):
     """Raised when a command cannot be processed."""
 
 
+def _github_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, GitHubRateLimitError):
+        return "github_rate_limited"
+    if isinstance(exc, GitHubTransientError):
+        return "github_transient_or_timeout"
+    if isinstance(exc, GitHubError) and exc.status_code is not None:
+        return f"github_http_{exc.status_code}"
+    return type(exc).__name__
+
+
 def _needs_initial_comment_baseline(state: dict | None) -> bool:
     """Determine if a PR needs an initial comment baseline cycle.
 
@@ -167,7 +177,7 @@ class GitHubCommandWatcher:
         self._priority_generation = 0
         self._priority_baseline_failures: dict[tuple[str, int], int] = {}
         self._priority_pr_retry_after: dict[tuple[str, int], float] = {}
-        self._priority_baseline_webhook_bypassed: set[tuple[str, int]] = set()
+        self._priority_baseline_external_bypassed: set[tuple[str, int]] = set()
         # Initialized in start() under the running event loop (Python 3.9 safe).
         self._wakeup = None
         self._last_successful_cycle = None
@@ -305,19 +315,25 @@ class GitHubCommandWatcher:
         elif action == "converted_to_draft":
             self._ready_for_review_at.pop(item, None)
             self._baseline_progress.get(repo, set()).discard(pr_number)
-        self._priority_generation += 1
-        self._prioritize_new_webhook_baseline_retry(item)
+        self._prioritize_new_external_baseline_retry(item)
         if item in self._priority_pr_set:
+            priority_changed = False
             if item in self._priority_pr_queue:
-                self._priority_pr_queue.remove(item)
-                self._priority_pr_queue.appendleft(item)
-                self._priority_pr_sources[item] = "webhook"
-                self._priority_pr_enqueued_at[item] = self._monotonic()
+                if self._priority_pr_sources.get(item) != "webhook":
+                    self._priority_pr_queue.remove(item)
+                    self._priority_pr_queue.appendleft(item)
+                    self._priority_pr_sources[item] = "webhook"
+                    self._priority_pr_enqueued_at[item] = self._monotonic()
+                    self._priority_generation += 1
+                    priority_changed = True
             else:
                 # A webhook can arrive while the same PR is being read. Keep a
                 # fresh queued pass so the new comment is not hidden by dedupe.
-                self._queue_priority_pr(item, "webhook")
-            self._signal_wakeup()
+                if self._queue_priority_pr(item, "webhook"):
+                    self._priority_generation += 1
+                    priority_changed = True
+            if priority_changed:
+                self._signal_wakeup()
             return True
         if len(self._priority_pr_queue) >= 128:
             evicted = self._priority_pr_queue.pop()
@@ -329,6 +345,7 @@ class GitHubCommandWatcher:
         self._priority_pr_set.add(item)
         self._priority_pr_sources[item] = "webhook"
         self._priority_pr_enqueued_at[item] = self._monotonic()
+        self._priority_generation += 1
         self._signal_wakeup()
         return True
 
@@ -385,19 +402,18 @@ class GitHubCommandWatcher:
     def _clear_priority_baseline_retry(self, item: tuple[str, int]) -> None:
         self._priority_baseline_failures.pop(item, None)
         self._priority_pr_retry_after.pop(item, None)
-        self._priority_baseline_webhook_bypassed.discard(item)
+        self._priority_baseline_external_bypassed.discard(item)
 
-    def _prioritize_new_webhook_baseline_retry(self, item: tuple[str, int]) -> None:
-        """Let one new webhook bypass a retry delay in an incomplete baseline episode.
+    def _prioritize_new_external_baseline_retry(self, item: tuple[str, int]) -> None:
+        """Let one fresh webhook/comment hint bypass an incomplete baseline delay.
 
         Internal retry hints use _queue_priority_pr and keep their deadline.
-        The webhook route deduplicates repeated delivery IDs before enqueue_pr;
-        this per-episode latch also prevents repeated enqueue calls from
-        continually clearing a backoff while the same baseline keeps failing.
+        This per-episode latch prevents repeated external hints from continually
+        clearing a backoff while the same baseline keeps failing.
         """
         if (self._monotonic() < self._priority_pr_retry_after.get(item, 0.0)
-                and item not in self._priority_baseline_webhook_bypassed):
-            self._priority_baseline_webhook_bypassed.add(item)
+                and item not in self._priority_baseline_external_bypassed):
+            self._priority_baseline_external_bypassed.add(item)
             self._priority_baseline_failures.pop(item, None)
             self._priority_pr_retry_after.pop(item, None)
 
@@ -585,14 +601,14 @@ class GitHubCommandWatcher:
         discovery_delay = item.get("discovery_delay_seconds")
         discovery_to_processing = item.get("discovery_to_processing_seconds")
         if isinstance(discovery_delay, (int, float)):
-            if isinstance(discovery_to_processing, (int, float)):
+            completed_delay = item.get("discovery_to_completion_seconds")
+            if item.get("status") in {"discovered", "retry", "processing"}:
+                created_to_processing = self._recent_command_latency(item)
+            elif (item.get("status") in {"handled", "already_processed"}
+                    and isinstance(completed_delay, (int, float))):
+                created_to_processing = discovery_delay + completed_delay
+            elif isinstance(discovery_to_processing, (int, float)):
                 created_to_processing = discovery_delay + discovery_to_processing
-            elif item.get("status") in {"discovered", "retry", "processing"}:
-                discovered_mono = item.get("_discovered_monotonic")
-                if isinstance(discovered_mono, (int, float)):
-                    created_to_processing = discovery_delay + max(
-                        0.0, self._monotonic() - discovered_mono,
-                    )
         metric["created_to_processing_seconds"] = (
             round(created_to_processing, 3)
             if isinstance(created_to_processing, (int, float)) else None
@@ -601,15 +617,41 @@ class GitHubCommandWatcher:
             isinstance(created_to_processing, (int, float))
             and created_to_processing > 60.0
         )
+        metric["latency_seconds"] = (
+            self._recent_command_latency(item)
+            if item.get("status") in {"discovered", "retry", "processing"}
+            else item.get("latency_seconds")
+        )
         if metric["over_60_seconds"] and not item.get("_over_60_diagnostic_logged"):
             item["_over_60_diagnostic_logged"] = True
             logger.warning(
-                "watcher recent command processing exceeded 60 seconds repo=%s pr=%s comment_id=%s status=%s created_to_processing_seconds=%.3f last_failure_reason=%s",
+                "watcher recent command processing exceeded 60 seconds repo=%s pr=%s comment_id=%s status=%s comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s latency_seconds=%.3f failure_reason=%s",
                 item.get("repo"), item.get("pr_number"), item.get("comment_id"),
-                item.get("status"), created_to_processing,
-                item.get("last_failure_reason"),
+                item.get("status"), item.get("comment_created_at"),
+                item.get("discovered_at"), item.get("queued_at"),
+                item.get("dispatch_started_at"), item.get("dispatch_completed_at"),
+                created_to_processing, item.get("failure_reason"),
             )
         return metric
+
+    def _recent_command_latency(self, record: dict, *, now: float | None = None) -> float | None:
+        discovery_delay = record.get("discovery_delay_seconds")
+        discovered_mono = record.get("_discovered_monotonic")
+        if not isinstance(discovery_delay, (int, float)) or not isinstance(
+                discovered_mono, (int, float)):
+            return None
+        current = self._monotonic() if now is None else now
+        return round(max(0.0, discovery_delay + current - discovered_mono), 3)
+
+    def _log_recent_command_diagnostic(self, event: str, record: dict) -> None:
+        logger.info(
+            "watcher recent command event=%s repo=%s pr=%s comment_id=%s comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s latency_seconds=%s failure_reason=%s",
+            event, record.get("repo"), record.get("pr_number"),
+            record.get("comment_id"), record.get("comment_created_at"),
+            record.get("discovered_at"), record.get("queued_at"),
+            record.get("dispatch_started_at"), record.get("dispatch_completed_at"),
+            self._recent_command_latency(record), record.get("failure_reason"),
+        )
 
     @staticmethod
     def _parse_comment_time(value) -> datetime | None:
@@ -705,15 +747,19 @@ class GitHubCommandWatcher:
         key = (repo, pr_number, comment_id)
         if key not in self._recent_command_records:
             is_review_completion = self._is_trusted_review_completion(comment)
+            now_utc = datetime.now(timezone.utc)
             record = {
                 "repo": repo, "pr_number": pr_number, "comment_id": comment_id,
                 "event_type": "review_completion" if is_review_completion else "slash_command",
                 "created_at": comment.get("created_at"),
                 "comment_created_at": comment.get("created_at"),
-                "discovered_at": datetime.now(timezone.utc).isoformat(),
+                "discovered_at": now_utc.isoformat(),
                 "discovery_delay_seconds": round(max(
-                    0.0, (datetime.now(timezone.utc) - created_at).total_seconds(),
+                    0.0, (now_utc - created_at).total_seconds(),
                 ), 3),
+                "queued_at": None,
+                "dispatch_started_at": None, "dispatch_completed_at": None,
+                "latency_seconds": None,
                 "processing_started_at": None, "processing_completed_at": None,
                 "discovery_to_processing_seconds": None,
                 "discovery_to_completion_seconds": None,
@@ -728,11 +774,7 @@ class GitHubCommandWatcher:
             latest = self._recent_command_records.get(latest_key) if latest_key else None
             if latest is None or record["_created_sort"] >= latest.get("_created_sort", (0.0, 0)):
                 self._latest_recent_command_key = key
-            logger.info(
-                "watcher recent command discovered repo=%s pr=%s comment_id=%s created_at=%s discovered_at=%s delay_seconds=%.3f",
-                repo, pr_number, comment_id, record["comment_created_at"], record["discovered_at"],
-                record["discovery_delay_seconds"],
-            )
+            self._log_recent_command_diagnostic("discovered", record)
             if len(self._recent_command_records) > 512:
                 oldest = min(self._recent_command_records,
                              key=lambda item: self._recent_command_records[item].get(
@@ -746,6 +788,14 @@ class GitHubCommandWatcher:
                     )
         return key
 
+    def _mark_recent_command_queued(self, repo, pr_number, comment_id, *, queued_at=None):
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return
+        if not isinstance(record.get("queued_at"), str):
+            record["queued_at"] = queued_at or datetime.now(timezone.utc).isoformat()
+            self._log_recent_command_diagnostic("queued", record)
+
     def _mark_recent_command_processing(self, repo, pr_number, comment_id):
         key = (repo, pr_number, comment_id)
         record = self._recent_command_records.get(key)
@@ -756,6 +806,8 @@ class GitHubCommandWatcher:
         record.update(
             processing_started_at=started_at,
             processing_completed_at=None,
+            dispatch_started_at=None, dispatch_completed_at=None,
+            failure_reason=None, latency_seconds=None,
             discovery_to_processing_seconds=round(elapsed, 3),
             discovery_to_completion_seconds=None,
             processing_duration_seconds=None,
@@ -763,10 +815,20 @@ class GitHubCommandWatcher:
             _processing_attempt_count=record.get("_processing_attempt_count", 0) + 1,
             status="processing",
         )
-        logger.info(
-            "watcher recent command processing started repo=%s pr=%s comment_id=%s started_at=%s delay_seconds=%.3f",
-            repo, pr_number, comment_id, started_at, elapsed,
-        )
+        self._log_recent_command_diagnostic("processing", record)
+
+    def _mark_recent_command_dispatch_started(self, repo, pr_number, comment_id):
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return
+        record["dispatch_started_at"] = datetime.now(timezone.utc).isoformat()
+        self._log_recent_command_diagnostic("dispatch_started", record)
+
+    def _mark_recent_command_dispatch_completed(self, repo, pr_number, comment_id):
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return
+        record["dispatch_completed_at"] = datetime.now(timezone.utc).isoformat()
 
     def _finish_recent_command(
         self, repo, pr_number, comment_id, *, failure_reason=None, retryable=True,
@@ -780,6 +842,9 @@ class GitHubCommandWatcher:
         record["failure_reason"] = failure_reason
         completed_mono = self._monotonic()
         record["processing_completed_at"] = datetime.now(timezone.utc).isoformat()
+        if (record.get("dispatch_started_at") is not None
+                and record.get("dispatch_completed_at") is None):
+            record["dispatch_completed_at"] = record["processing_completed_at"]
         discovered_mono = record.get("_discovered_monotonic")
         if isinstance(discovered_mono, (int, float)):
             record["discovery_to_completion_seconds"] = round(
@@ -790,11 +855,13 @@ class GitHubCommandWatcher:
             record["processing_duration_seconds"] = round(
                 max(0.0, completed_mono - started_mono), 3,
             )
+        record["latency_seconds"] = self._recent_command_latency(
+            record, now=completed_mono,
+        )
         record["status"] = "retry" if failure_reason and retryable else "handled"
-        logger.info(
-            "watcher recent command finished repo=%s pr=%s comment_id=%s status=%s delay_seconds=%s last_failure_reason=%s",
-            repo, pr_number, comment_id, record["status"],
-            record.get("discovery_to_processing_seconds"), failure_reason,
+        self._log_recent_command_diagnostic(
+            "dispatch_completed" if record.get("dispatch_started_at") else "finished",
+            record,
         )
 
     def _mark_recent_command_already_processed(self, repo, pr_number, comment_id):
@@ -828,6 +895,7 @@ class GitHubCommandWatcher:
         discovery_interval = max(5.0, min(10.0, poll_interval))
         discovery_timeout = min(8.0, max(5.0, poll_interval))
         candidates = {}
+        newly_discovered_prs = set()
         for repo in repos:
             if (not self.config.auth_valid or repo not in self.config.active_repos
                     or repo not in self.config.github_repos):
@@ -842,10 +910,11 @@ class GitHubCommandWatcher:
                     list_recent(repo, limit=100), timeout=discovery_timeout,
                 )
             except (GitHubRateLimitError, GitHubTransientError) as exc:
-                self._recent_discovery_last_failure[repo] = type(exc).__name__
+                reason = _github_failure_reason(exc)
+                self._recent_discovery_last_failure[repo] = reason
                 logger.warning(
                     "watcher recent command discovery deferred repo=%s reason=%s",
-                    repo, type(exc).__name__,
+                    repo, reason,
                 )
                 if isinstance(exc, GitHubRateLimitError):
                     break
@@ -902,12 +971,19 @@ class GitHubCommandWatcher:
                 )
                 if not is_command and not self._is_trusted_review_completion(comment):
                     continue
+                comment_id = comment.get("id")
+                was_known = (
+                    type(comment_id) is int and comment_id > 0
+                    and (repo, number, comment_id) in self._recent_command_records
+                )
                 key = self._observe_recent_command(repo, number, comment, created_at)
                 if key is None:
                     continue
                 observed = self._recent_command_records[key]
                 if observed.get("status") in {"handled", "already_processed", "processing"}:
                     continue
+                if not was_known:
+                    newly_discovered_prs.add((repo, number))
                 previous = per_pr.get(number)
                 if (previous is None or created_at > previous[0]
                         or created_at == previous[0] and key[2] > previous[1]):
@@ -918,13 +994,32 @@ class GitHubCommandWatcher:
         # Refresh the order of observed recent hints while leaving webhooks in
         # their higher-priority prefix. A newly-created comment on an already
         # queued PR must move that PR ahead of older recent hints.
+        if newly_discovered_prs:
+            for item in newly_discovered_prs:
+                self._prioritize_new_external_baseline_retry(item)
         existing_recent_enqueued_at = {}
         for item in list(candidates):
             repo, number = item
             if (item in self._priority_pr_set
                     and self._priority_pr_sources.get(item, "webhook") == "webhook"):
-                candidates.pop((repo, number), None)
-                continue
+                if item in self._priority_pr_queue:
+                    comment_key = candidates[item][2]
+                    enqueued = self._priority_pr_enqueued_at.get(item)
+                    queued_at = None
+                    if isinstance(enqueued, (int, float)):
+                        elapsed = max(0.0, self._monotonic() - enqueued)
+                        queued_at = datetime.fromtimestamp(
+                            datetime.now(timezone.utc).timestamp() - elapsed,
+                            timezone.utc,
+                        ).isoformat()
+                    self._mark_recent_command_queued(
+                        repo, number, comment_key[2], queued_at=queued_at,
+                    )
+                    candidates.pop((repo, number), None)
+                    continue
+                if item not in newly_discovered_prs:
+                    candidates.pop((repo, number), None)
+                    continue
             if item in self._priority_pr_queue:
                 if self._priority_pr_sources.get(item) == "recent":
                     existing_recent_enqueued_at[item] = self._priority_pr_enqueued_at.get(item)
@@ -937,9 +1032,22 @@ class GitHubCommandWatcher:
         # item is then placed ahead of older discovery hints in the final queue.
         ordered = sorted(candidates.items(), key=lambda item: (item[1][0], item[1][1]))
         queued_recent = False
-        for (repo, number), (_created_at, _comment_id, _key) in ordered:
+        for (repo, number), (_created_at, _comment_id, key) in ordered:
             item = (repo, number)
             if item in self._priority_pr_set:
+                if item not in newly_discovered_prs:
+                    continue
+                if (len(self._priority_pr_queue) >= 128
+                        and not any(self._priority_pr_sources.get(queued) == "recent"
+                                    for queued in self._priority_pr_queue)):
+                    # Preserve the in-flight dedupe marker if every queue slot
+                    # belongs to a webhook hint; the fair ordinary scan remains
+                    # the fallback until a queue slot is available.
+                    continue
+                if not self._queue_priority_pr(item, "recent"):
+                    continue
+                queued_recent = True
+                self._mark_recent_command_queued(repo, number, key[2])
                 continue
             if len(self._priority_pr_queue) >= 128:
                 oldest_recent = next((queued for queued in reversed(self._priority_pr_queue)
@@ -963,9 +1071,13 @@ class GitHubCommandWatcher:
                 prior_enqueued_at if isinstance(prior_enqueued_at, (int, float))
                 else self._monotonic()
             )
+            self._mark_recent_command_queued(repo, number, key[2])
             if prior_enqueued_at is None:
                 queued_recent = True
-        if queued_recent:
+        if newly_discovered_prs or queued_recent:
+            self._priority_generation += 1
+            # Wake the serial writer and interrupt its ordinary scan after the
+            # currently active PR operation yields. Discovery itself stays read-only.
             self._signal_wakeup()
         return queued_recent
 
@@ -1255,10 +1367,10 @@ class GitHubCommandWatcher:
             self._pr_reconcile_cache.pop(next(iter(self._pr_reconcile_cache)))
 
     def _defer_evidence_projection_for_priority(
-        self, repo: str, pr_number: int, *, priority_path: bool = False,
+        self, repo: str, pr_number: int,
     ) -> bool:
-        """Let ordinary work project; priority work yields to queued hints."""
-        if not priority_path or not self._priority_pr_queue:
+        """Yield optional historical evidence work when a priority hint waits."""
+        if not self._priority_pr_queue:
             return False
         self._last_evidence_projection.pop((repo, pr_number), None)
         self._current_scan_stage = "priority_wait_before_evidence_projection"
@@ -1267,6 +1379,15 @@ class GitHubCommandWatcher:
             repo, pr_number, len(self._priority_pr_queue),
         )
         return True
+
+    def _priority_work_waiting_for_other_pr(self, repo: str, pr_number: int) -> bool:
+        """Yield normal comment-history reads to an already queued PR hint."""
+        now = self._monotonic()
+        return any(
+            queued_repo != repo or queued_pr != pr_number
+            for queued_repo, queued_pr in self._priority_pr_queue
+            if now >= self._priority_pr_retry_after.get((queued_repo, queued_pr), 0.0)
+        )
 
     async def _process_scheduled_pr(
         self, repo: str, pr_number: int, *, priority_path: bool = False,
@@ -1285,17 +1406,15 @@ class GitHubCommandWatcher:
                 baseline_succeeded = False
         else:
             self._current_scan_stage = "command_reconcile_and_dispatch"
-            await self._process_pr(repo, pr_number)
+            await self._process_pr(repo, pr_number, yield_for_priority=not priority_path)
         if (self.config.auth_valid is not True or repo not in self.config.active_repos
                 or repo not in self.config.github_repos):
             return False
-        if self._defer_evidence_projection_for_priority(
-                repo, pr_number, priority_path=priority_path):
+        if self._defer_evidence_projection_for_priority(repo, pr_number):
             return baseline_succeeded
         self._current_scan_stage = "post_command_pr_validation"
         current_pr = await self.proxy.get_pr(repo, pr_number)
-        if self._defer_evidence_projection_for_priority(
-                repo, pr_number, priority_path=priority_path):
+        if self._defer_evidence_projection_for_priority(repo, pr_number):
             return baseline_succeeded
         if (isinstance(current_pr, dict) and current_pr.get("state") == "open"
                 and not current_pr.get("merged") and not current_pr.get("draft")):
@@ -1313,12 +1432,18 @@ class GitHubCommandWatcher:
             if changed or refresh_due:
                 self._current_scan_stage = "evidence_projection"
                 await self.controller.project_evidence(repo, pr_number)
+                if self._defer_evidence_projection_for_priority(repo, pr_number):
+                    return baseline_succeeded
                 self._current_scan_stage = "visible_archive_migration"
                 await self.proxy.ensure_visible_evidence_archive_comments(
                     repo, pr_number, limit=2,
                 )
+                if self._defer_evidence_projection_for_priority(repo, pr_number):
+                    return baseline_succeeded
                 self._current_scan_stage = "legacy_reply_retirement"
                 valid_cos_links = await self._validated_current_summary_cos_links(repo, pr_number)
+                if self._defer_evidence_projection_for_priority(repo, pr_number):
+                    return baseline_succeeded
                 await self.proxy.retire_legacy_evidence_link_replies(
                     repo, pr_number, valid_cos_links, limit=2,
                 )
@@ -1342,8 +1467,16 @@ class GitHubCommandWatcher:
         """Process a bounded priority tier through the existing serial PR path."""
         cycle_ok = True
         processed_items = 0
-        queued_items = [item for item in self._priority_pr_queue
-                        if self._priority_pr_sources.get(item, "webhook") in allowed_sources]
+        queued_items = []
+        for source in ("webhook", "recent"):
+            if source not in allowed_sources:
+                continue
+            item = next((queued for queued in self._priority_pr_queue
+                         if self._priority_pr_sources.get(queued, "webhook") == source
+                         and self._monotonic() >= self._priority_pr_retry_after.get(queued, 0.0)),
+                        None)
+            if item is not None:
+                queued_items.append(item)
         for item in queued_items:
             if processed_items >= max_items:
                 break
@@ -1372,7 +1505,7 @@ class GitHubCommandWatcher:
             source_attempted = (priority_attempted.setdefault(queued_repo, [])
                                 if source == "webhook"
                                 else recent_attempted.setdefault(queued_repo, []))
-            if len(source_attempted) >= (2 if source == "webhook" else 1):
+            if len(source_attempted) >= 1:
                 self._queue_priority_pr(item, source)
                 continue
             source_attempted.append(pr_number)
@@ -1588,7 +1721,7 @@ class GitHubCommandWatcher:
         self._current_scan_stage = "priority_queue"
         cycle_ok = await self._drain_priority_prs(
             priority_done, priority_attempted, recent_attempted,
-            allowed_sources={"webhook", "recent"}, max_items=1,
+            allowed_sources={"webhook", "recent"}, max_items=2,
         ) and cycle_ok
         priority_generation_after_drain = self._priority_generation
         interrupted_for_new_priority = False
@@ -2473,7 +2606,9 @@ class GitHubCommandWatcher:
             self._ready_for_review_at.pop(key, None)
         return True
 
-    async def _process_pr(self, repo: str, pr_number: int) -> None:
+    async def _process_pr(
+        self, repo: str, pr_number: int, *, yield_for_priority: bool = False,
+    ) -> None:
         """Process commands for one PR.
 
         Reads hidden state, fetches comments, processes in ascending id order.
@@ -2629,9 +2764,47 @@ class GitHubCommandWatcher:
             recent_command = self._recent_command_records.get(
                 (repo, pr_number, comment_id),
             )
+            if (yield_for_priority
+                    and self._priority_work_waiting_for_other_pr(repo, pr_number)):
+                logger.info(
+                    "watcher yielded normal comment scan to queued priority repo=%s pr=%s cursor=%s",
+                    repo, pr_number, comment_id,
+                )
+                return
+            if (isinstance(recent_command, dict)
+                    and str(recent_command.get("failure_reason", "")).startswith(
+                        "dispatch_outcome_unknown")):
+                # Do not replay a command after its handler began but returned
+                # an unknown result. Reconciliation on the next pass can expose
+                # a persisted executing/uncertain lifecycle for manual recovery.
+                return
+            if (isinstance(recent_command, dict)
+                    and recent_command.get("failure_reason") == "cursor_persist_not_confirmed"
+                    and recent_command.get("dispatch_completed_at")):
+                if await self._consume_comment_cursor(repo, pr_number, comment_id):
+                    self._finish_recent_command(repo, pr_number, comment_id)
+                    continue
+                return
+            if (isinstance(recent_command, dict)
+                    and recent_command.get("failure_reason") in {
+                        "comment_edited", "comment_edited_cursor_persist_not_confirmed",
+                        "dispatch_comment_edited",
+                        "dispatch_comment_edited_cursor_persist_not_confirmed",
+                    }):
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=("comment_edited" if consumed
+                                    else "comment_edited_cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
+                if not consumed:
+                    return
+                continue
             if (isinstance(recent_command, dict)
                     and recent_command.get("failure_reason") == "pr_is_draft"):
-                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                if not await self._consume_comment_cursor(repo, pr_number, comment_id):
+                    return
                 continue
 
             # Skip bot's own lifecycle comments — fresh-read body to avoid stale-body TOCTOU
@@ -2639,11 +2812,12 @@ class GitHubCommandWatcher:
                 fresh_comment_obj = await self.proxy.get_comment(repo, comment_id)
             except Exception as e:
                 logger.warning(
-                    "watcher fresh-read comment %s#%s #%s: %s — skip this cycle",
-                    repo, pr_number, comment_id, e,
+                    "watcher fresh-read comment %s#%s #%s failed reason=%s — skip this cycle",
+                    repo, pr_number, comment_id, _github_failure_reason(e),
                 )
                 self._finish_recent_command(
-                    repo, pr_number, comment_id, failure_reason=type(e).__name__,
+                    repo, pr_number, comment_id,
+                    failure_reason=_github_failure_reason(e),
                 )
                 return
 
@@ -2682,13 +2856,15 @@ class GitHubCommandWatcher:
 
             if _top_level_command(fresh_body, "authorize_evidence"):
                 # This comment proves browser identity; it is not test evidence.
-                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                if not await self._consume_comment_cursor(repo, pr_number, comment_id):
+                    return
                 continue
 
             if _top_level_command(fresh_body, "submit_cos_evidence"):
                 # Retire the former COS receipt command without treating its
                 # payload as evidence or sending it to a second writer.
-                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                if not await self._consume_comment_cursor(repo, pr_number, comment_id):
+                    return
                 continue
 
             if not commands_mod.command_starts_line_any(fresh_body):
@@ -2784,18 +2960,18 @@ class GitHubCommandWatcher:
 
             cmd = commands_mod.parse_command(fresh_body)
             if not cmd.is_command:
+                if not await self._consume_comment_cursor(repo, pr_number, comment_id):
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="cursor_persist_not_confirmed",
+                    )
+                    return
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
                     failure_reason="recognized_command_rejected_by_parser",
                     retryable=False,
                 )
-                if state.get("head_sha"):
-                    state = await self.proxy.persist_cursor(
-                        repo, pr_number, comment_id,
-                    ) or state
                 continue
-
-            self._mark_recent_command_processing(repo, pr_number, comment_id)
 
             # Keep the existing one-business-action-per-PR-cycle behavior:
             # comments after this cycle's recovered evidence wait for the next
@@ -2834,6 +3010,9 @@ class GitHubCommandWatcher:
                 # but must never be dispatched as a fresh approval.
                 await self._consume_comment_cursor(repo, pr_number, comment_id)
                 return
+            self._observe_recent_command(
+                repo, pr_number, fresh_comment_obj, created_utc.astimezone(timezone.utc),
+            )
             updated_at = fresh_comment_obj.get("updated_at")
             if not isinstance(updated_at, str) or not updated_at.strip():
                 self._finish_recent_command(
@@ -2857,7 +3036,127 @@ class GitHubCommandWatcher:
             if updated_utc.astimezone(timezone.utc) != created_utc.astimezone(timezone.utc):
                 # GitHub edits retain created_at; an edited command is not a
                 # newly authored approval and is terminally skipped.
-                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=("comment_edited" if consumed
+                                    else "comment_edited_cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
+                return
+
+            queued_mono = self._priority_pr_enqueued_at.get((repo, pr_number))
+            if isinstance(queued_mono, (int, float)):
+                queued_elapsed = max(0.0, self._monotonic() - queued_mono)
+                queued_at = datetime.fromtimestamp(
+                    datetime.now(timezone.utc).timestamp() - queued_elapsed,
+                    timezone.utc,
+                ).isoformat()
+                self._mark_recent_command_queued(
+                    repo, pr_number, comment_id, queued_at=queued_at,
+                )
+            self._mark_recent_command_processing(repo, pr_number, comment_id)
+
+            # Re-read both records at the dispatch boundary. The earlier list
+            # and comment reads may be separated from execution by reconciliation
+            # or evidence work, so they cannot serve as the final identity proof.
+            try:
+                dispatch_pr = await self.proxy.get_pr(repo, pr_number)
+                dispatch_comment = await self.proxy.get_comment(repo, comment_id)
+            except Exception as exc:
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=f"dispatch_identity_read_{_github_failure_reason(exc)}",
+                )
+                return
+            if (not isinstance(dispatch_comment, dict)
+                    or type(dispatch_comment.get("id")) is not int
+                    or dispatch_comment.get("id") != comment_id):
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason="dispatch_comment_id_mismatch",
+                )
+                return
+            if self._recent_comment_pr_number(repo, dispatch_comment) != pr_number:
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason="dispatch_comment_pr_mismatch",
+                )
+                return
+            initial_user = fresh_comment_obj.get("user")
+            dispatch_user = dispatch_comment.get("user")
+            if (not isinstance(initial_user, dict) or not isinstance(dispatch_user, dict)
+                    or type(initial_user.get("id")) is not int
+                    or initial_user.get("id") <= 0
+                    or not isinstance(initial_user.get("login"), str)
+                    or not initial_user.get("login", "").strip()
+                    or type(dispatch_user.get("id")) is not int
+                    or dispatch_user.get("id") <= 0
+                    or not isinstance(dispatch_user.get("login"), str)
+                    or not dispatch_user.get("login", "").strip()
+                    or dispatch_user.get("id") != initial_user.get("id")
+                    or dispatch_user.get("login") != initial_user.get("login")):
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason="dispatch_comment_author_mismatch",
+                )
+                return
+            dispatch_created = self._parse_comment_time(
+                dispatch_comment.get("created_at"),
+            )
+            dispatch_updated = self._parse_comment_time(
+                dispatch_comment.get("updated_at"),
+            )
+            if dispatch_created is None or dispatch_updated is None:
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason="dispatch_comment_timestamp_invalid",
+                )
+                return
+            if (dispatch_created != created_utc.astimezone(timezone.utc)
+                    or dispatch_updated != dispatch_created
+                    or dispatch_comment.get("updated_at") != fresh_comment_obj.get("updated_at")):
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=("dispatch_comment_edited" if consumed
+                                    else "dispatch_comment_edited_cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
+                return
+            if (dispatch_comment.get("body") != fresh_body
+                    or dispatch_comment.get("created_at") != fresh_comment_obj.get("created_at")):
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=("dispatch_comment_edited" if consumed
+                                    else "dispatch_comment_edited_cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
+                return
+            dispatch_head = (
+                dispatch_pr.get("head", {}).get("sha")
+                if isinstance(dispatch_pr, dict)
+                and isinstance(dispatch_pr.get("head"), dict) else None
+            )
+            base = dispatch_pr.get("base") if isinstance(dispatch_pr, dict) else None
+            base_repo = base.get("repo") if isinstance(base, dict) else None
+            base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+            if (not isinstance(dispatch_pr, dict)
+                    or type(dispatch_pr.get("number")) is not int
+                    or dispatch_pr.get("number") != pr_number
+                    or dispatch_pr.get("state") != "open"
+                    or dispatch_pr.get("merged")
+                    or dispatch_pr.get("draft")
+                    or not isinstance(dispatch_head, str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", dispatch_head)
+                    or dispatch_head != state.get("head_sha")
+                    or not isinstance(base_name, str)
+                    or base_name.casefold() != repo.casefold()):
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason="dispatch_pr_identity_or_head_mismatch",
+                )
                 return
 
             # TOCTOU recheck: the auth snapshot was validated at cycle start,
@@ -2876,12 +3175,23 @@ class GitHubCommandWatcher:
 
             # Dispatch to controller — transient failure must NOT advance cursor
             try:
+                self._mark_recent_command_dispatch_started(
+                    repo, pr_number, comment_id,
+                )
                 handled = await self.controller.on_command(
                     cmd, repo, pr_number, comment_id,
                 )
+                self._mark_recent_command_dispatch_completed(
+                    repo, pr_number, comment_id,
+                )
                 if handled:
-                    self._finish_recent_command(repo, pr_number, comment_id)
-                    await self._consume_comment_cursor(repo, pr_number, comment_id)
+                    if await self._consume_comment_cursor(repo, pr_number, comment_id):
+                        self._finish_recent_command(repo, pr_number, comment_id)
+                    else:
+                        self._finish_recent_command(
+                            repo, pr_number, comment_id,
+                            failure_reason="cursor_persist_not_confirmed",
+                        )
                 else:
                     self._finish_recent_command(
                         repo, pr_number, comment_id,
@@ -2891,36 +3201,61 @@ class GitHubCommandWatcher:
                 # consume a later comment past it; retry from fresh state next poll.
                 return
             except DeployCommandError as e:
-                self._finish_recent_command(
-                    repo, pr_number, comment_id,
-                    failure_reason=type(e).__name__, retryable=False,
-                )
                 logger.warning(
-                    "command %s comment %s in %s#%s: %s",
-                    cmd.kind, comment_id, repo, pr_number, e,
+                    "command %s comment %s in %s#%s rejected error=%s",
+                    cmd.kind, comment_id, repo, pr_number, type(e).__name__,
                 )
                 # Invalid/unauthorized commands are terminally handled — advance cursor
                 # only when an authoritative lifecycle already exists.
-                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=(type(e).__name__ if consumed
+                                    else "cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
                 return
             except Exception as e:
                 self._finish_recent_command(
-                    repo, pr_number, comment_id, failure_reason=type(e).__name__,
+                    repo, pr_number, comment_id,
+                    failure_reason=f"dispatch_outcome_unknown_{_github_failure_reason(e)}",
                 )
                 logger.error(
-                    "unexpected error processing command %s comment %s: %s",
-                    cmd.kind, comment_id, e,
+                    "command handler outcome unknown command=%s comment_id=%s repo=%s pr=%s error=%s; automatic replay suppressed",
+                    cmd.kind, comment_id, repo, pr_number, _github_failure_reason(e),
                 )
                 # Transient error — do NOT advance cursor, stop processing this PR
                 return
 
-    async def _consume_comment_cursor(self, repo: str, pr_number: int, comment_id: int) -> None:
-        """Advance the command cursor without mutating lifecycle state."""
+    async def _consume_comment_cursor(self, repo: str, pr_number: int, comment_id: int) -> bool:
+        """Advance and confirm the cursor without changing business lifecycle state."""
+        if type(comment_id) is not int or comment_id <= 0:
+            return False
+
         try:
             state = await self.proxy.read_hidden_state(repo, pr_number)
         except Exception as e:
-            logger.warning("watcher consume cursor read %s#%s: %s", repo, pr_number, e)
-            return
-        if state is not None:
-            await self.proxy.persist_cursor(repo, pr_number, comment_id)
-            return
+            logger.warning(
+                "watcher consume cursor read %s#%s failure_reason=%s",
+                repo, pr_number, _github_failure_reason(e),
+            )
+            return False
+        if not isinstance(state, dict):
+            return False
+        cursor = state.get("last_processed_comment_id")
+        if type(cursor) is not int or cursor < 0:
+            return False
+        if cursor >= comment_id:
+            return True
+        try:
+            persisted = await self.proxy.persist_cursor(repo, pr_number, comment_id)
+        except Exception as e:
+            logger.warning(
+                "watcher consume cursor write %s#%s failure_reason=%s",
+                repo, pr_number, _github_failure_reason(e),
+            )
+            return False
+        if not isinstance(persisted, dict):
+            return False
+        persisted_cursor = persisted.get("last_processed_comment_id")
+        return type(persisted_cursor) is int and persisted_cursor >= comment_id

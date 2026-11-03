@@ -1848,9 +1848,9 @@ class GitHubStateProxy:
         async def assert_writable_pr() -> None:
             self._evidence_repo_guard(repo)
             pr = await self.get_pr(repo, pr_number)
-            if (not isinstance(pr, dict) or pr.get("state") != "open"
+            if (not isinstance(pr, dict) or pr.get("state") not in {"open", "closed"}
                     or pr.get("merged") is not False or pr.get("draft") is not False):
-                raise GitHubStateProxyError("Evidence records require an Open, unmerged, non-draft PR")
+                raise GitHubStateProxyError("Evidence records require a known, unmerged, non-draft PR")
             if kind != "round" and (pr.get("head") or {}).get("sha") != head_sha:
                 raise GitHubStateProxyError("Evidence record HEAD no longer matches the PR")
 

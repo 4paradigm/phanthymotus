@@ -327,55 +327,116 @@ class DeployController:
             return None
         return extract_review_evidence(comments, author_id, author_login, head_sha=head_sha)
 
-    async def _review_evidence_from_comments(self, repo: str, pr_number: int, head_sha: str, comments: list[dict]):
+    async def _review_evidence_from_comments(
+        self, repo: str, pr_number: int, head_sha: str, comments: list[dict],
+        *, recheck_latest_comments: bool = True,
+        require_exact_pr_context: bool = False,
+        resolved_head: str | None = None,
+        expected_review_comment_fingerprints: dict[int, dict] | None = None,
+        failure_reason: list[str] | None = None,
+    ):
         """Authenticate the real triggering comment and recheck HEAD after awaits.
 
         Parsed unbound evidence remains available for inspection, but its
         blocking flag forbids readiness, requests and pre-POST revalidation.
         """
+        if failure_reason is not None:
+            failure_reason.clear()
+
+        def reject(reason: str):
+            if failure_reason is not None:
+                failure_reason[:] = [reason]
+            if evidence is not None:
+                evidence.run_binding_valid = False
+            return evidence
+
         evidence = self._extract_trusted_review_evidence(comments, head_sha=head_sha)
         if evidence is not None and evidence.test_results_block_deployment:
             logger.warning("REVIEW_EVIDENCE_BLOCKED TEST_RESULTS_STATE=%s TEST_FAILED=%s REQUEST_RUN_BOUND=%s",
                            evidence.test_status, evidence.test_failed, evidence.run_binding_valid)
-        if evidence is None or evidence.request_comment is None or not evidence.run_binding_valid:
+        if evidence is None:
+            if failure_reason is not None:
+                failure_reason[:] = ["review_incomplete_or_ambiguous"]
+            return None
+        if evidence.request_comment is None or not evidence.run_binding_valid:
+            if failure_reason is not None:
+                failure_reason[:] = ["review_source_or_run_untrusted"]
             return evidence
         request = evidence.request_comment
         original_evidence = copy.deepcopy(evidence)
         evidence.run_binding_valid = False
         try:
             fresh = await self.proxy.get_comment(repo, int(request["id"]))
+            if not isinstance(fresh, dict):
+                return reject("review_request_unavailable")
             for key in ("id", "body", "created_at", "updated_at", "user"):
                 if fresh.get(key) != request.get(key):
-                    return evidence
+                    return reject("review_request_changed")
             user = fresh["user"]
             pr = await self.proxy.get_pr(repo, pr_number)
-            if (pr.get("head", {}).get("sha") != head_sha or pr.get("state") != "open"
+            if not isinstance(pr, dict):
+                return reject("pr_unavailable")
+            if (require_exact_pr_context
+                    and not self._review_recovery_pr_matches(
+                        pr, repo, pr_number, head_sha,
+                    )):
+                return reject("pr_identity_or_status_mismatch")
+            if (not isinstance(pr.get("head"), dict)
+                    or pr["head"].get("sha") != head_sha or pr.get("state") != "open"
                     or pr.get("merged") or pr.get("draft") is True):
-                return evidence
+                return reject("pr_head_or_status_mismatch")
             author = pr.get("user", {})
             if (str(author.get("id", "")) != str(user["id"])
                     or author.get("login", "").casefold() != user["login"].casefold()):
                 permission = await self.proxy.collaborator_permission(repo, user["login"])
                 if not Policy.collaborator_can_approve(permission):
-                    return evidence
-            if await self._resolve_commit_prefix_for_head(repo, head_sha, evidence.commit_prefix) != head_sha:
-                return evidence
+                    return reject("review_request_unauthorized")
+            if (resolved_head is not None and resolved_head != head_sha):
+                return reject("review_commit_resolution_failed")
+            if (resolved_head is None
+                    and await self._resolve_commit_prefix_for_head(
+                        repo, head_sha, evidence.commit_prefix,
+                    ) != head_sha):
+                return reject("review_commit_resolution_failed")
             # Permission/commit lookups await GitHub too. A newer run, deleted
             # evidence or an edited result during those awaits must revoke this
             # snapshot even when the PR HEAD itself has not changed.
-            latest_comments = await self.proxy.get_issue_comments(repo, pr_number)
-            if not isinstance(latest_comments, list):
-                return evidence
-            latest_evidence = self._extract_trusted_review_evidence(latest_comments, head_sha=head_sha)
-            if latest_evidence != original_evidence:
-                return evidence
+            if recheck_latest_comments:
+                latest_comments = await self.proxy.get_issue_comments(repo, pr_number)
+                if not isinstance(latest_comments, list):
+                    return reject("review_comments_unavailable")
+                if expected_review_comment_fingerprints is not None:
+                    latest_by_id = {
+                        comment.get("id"): comment for comment in latest_comments
+                        if isinstance(comment, dict)
+                    }
+                    for comment_id, expected_fingerprint in expected_review_comment_fingerprints.items():
+                        if self._review_recovery_comment_fingerprint(
+                            latest_by_id.get(comment_id),
+                        ) != expected_fingerprint:
+                            return reject("review_comment_changed_during_check")
+                if (require_exact_pr_context
+                        and self._has_untrusted_newer_review_comment(
+                            latest_comments, original_evidence.build_comment_id,
+                        )):
+                    return reject("untrusted_newer_review_run")
+                latest_evidence = self._extract_trusted_review_evidence(latest_comments, head_sha=head_sha)
+                if latest_evidence != original_evidence:
+                    return reject("review_updated_during_check")
             final_pr = await self.proxy.get_pr(repo, pr_number)
-            if (final_pr.get("head", {}).get("sha") != head_sha
+            if (require_exact_pr_context
+                    and not self._review_recovery_pr_matches(
+                        final_pr, repo, pr_number, head_sha,
+                    )):
+                return reject("pr_identity_or_status_mismatch")
+            if (not isinstance(final_pr, dict)
+                    or not isinstance(final_pr.get("head"), dict)
+                    or final_pr["head"].get("sha") != head_sha
                     or final_pr.get("state") != "open" or final_pr.get("merged")
                     or final_pr.get("draft") is True):
-                return evidence
+                return reject("pr_changed_during_check")
         except Exception:
-            return evidence
+            return reject("temporary_read_failure")
         evidence.head_sha = head_sha
         evidence.run_binding_valid = True
         if evidence.code_review_binding == "LEGACY_CONTIGUOUS_CHAIN_NO_DIRECT_SHA":
@@ -419,6 +480,634 @@ class DeployController:
             for key in _REVIEW_EVIDENCE_IDENTITY_FIELDS
             if key in snapshot
         }
+
+    def _review_recovery_state_is_eligible(
+        self, state: dict, current_head: str,
+    ) -> bool:
+        """Allow review recovery only before any approval/deployment activity."""
+        if not isinstance(state, dict) or state.get("status") != "deploy-requested":
+            return False
+        if state.get("head_sha") != current_head:
+            return False
+        review = state.get("review_evidence")
+        if (not isinstance(review, dict)
+                or type(review.get("build_comment_id")) is not int
+                or review.get("build_comment_id", 0) <= 0
+                or review.get("resolved_head_sha") != current_head
+                or type(review.get("code_review_comment_id")) is not int
+                or review.get("code_review_comment_id", 0) <= 0
+                or not isinstance(state.get("components"), list)
+                or not state.get("components")):
+            return False
+        command = state.get("command")
+        if (not isinstance(command, dict)
+                or command.get("kind") != "request_deploy"
+                or command.get("phase") != "completed"
+                or not isinstance(command.get("args"), dict)
+                or command.get("args") != {}):
+            return False
+        request_comment_id = command.get("comment_id")
+        cursor = state.get("last_processed_comment_id")
+        if (type(request_comment_id) is not int or request_comment_id <= 0
+                or type(cursor) is not int or cursor < request_comment_id):
+            return False
+        try:
+            if round_id_for_state(state) != make_round_id(current_head, request_comment_id):
+                return False
+        except (TypeError, ValueError):
+            return False
+        if (state.get("deployments") != []
+                or state.get("approve_attempts") != []
+                or type(state.get("approve_attempts_total")) is not int
+                or state.get("approve_attempts_total") != 0
+                or state.get("approve_attempts_truncated") is not False
+                or state.get("deployment_logs") not in (None, {})
+                or state.get("case_results") != {}
+                or state.get("test_result") != ""
+                or state.get("acceptance_request") is not None
+                or state.get("cos") != self._empty_cos()):
+            return False
+        return True
+
+    @staticmethod
+    def _review_recovery_position(comment: dict) -> tuple[datetime, int] | None:
+        if (not isinstance(comment, dict) or type(comment.get("id")) is not int
+                or comment["id"] <= 0):
+            return None
+        try:
+            created = datetime.fromisoformat(
+                str(comment.get("created_at", "")).replace("Z", "+00:00"),
+            )
+            updated = datetime.fromisoformat(
+                str(comment.get("updated_at", "")).replace("Z", "+00:00"),
+            )
+        except (TypeError, ValueError):
+            return None
+        if (created.tzinfo is None or created.utcoffset() is None
+                or updated.tzinfo is None or updated.utcoffset() is None
+                or updated < created):
+            return None
+        return created, comment["id"]
+
+    def _review_recovery_comment_is_scoped(
+        self,
+        repo: str,
+        pr_number: int,
+        comment_id: int,
+        comment: dict,
+        expected_author_id: str,
+        expected_author_login: str,
+        *,
+        allow_edited: bool = False,
+    ) -> bool:
+        """Verify comment scope and identity, with edits allowed only by caller."""
+        if (type(comment_id) is not int or comment_id <= 0
+                or not isinstance(comment, dict)):
+            return False
+        api_base = self.config.github_api_url.rstrip("/")
+        expected_url = f"{api_base}/repos/{repo}/issues/comments/{comment_id}"
+        expected_issue_url = f"{api_base}/repos/{repo}/issues/{pr_number}"
+        user = comment.get("user")
+        return (
+            type(comment.get("id")) is int and comment.get("id") == comment_id
+            and isinstance(comment.get("body"), str)
+            and isinstance(comment.get("created_at"), str)
+            and isinstance(comment.get("updated_at"), str)
+            and (allow_edited
+                 or comment.get("created_at") == comment.get("updated_at"))
+            and comment.get("url") == expected_url
+            and comment.get("issue_url") == expected_issue_url
+            and self._review_recovery_position(comment) is not None
+            and isinstance(user, dict)
+            and str(user.get("id", "")) == str(expected_author_id)
+            and user.get("login") == expected_author_login
+        )
+
+    @staticmethod
+    def _review_recovery_comment_fingerprint(comment: dict | None) -> dict | None:
+        """Capture fields that must remain byte-for-byte stable across a reread."""
+        if (not isinstance(comment, dict)
+                or DeployController._review_recovery_position(comment) is None
+                or not isinstance(comment.get("body"), str)
+                or not isinstance(comment.get("user"), dict)):
+            return None
+        return {
+            "id": comment.get("id"),
+            "body": comment.get("body"),
+            "created_at": comment.get("created_at"),
+            "updated_at": comment.get("updated_at"),
+            "url": comment.get("url"),
+            "issue_url": comment.get("issue_url"),
+            "user": copy.deepcopy(comment.get("user")),
+        }
+
+    def _has_untrusted_newer_review_comment(
+        self, comments: list[dict], frozen_build_comment_id: int,
+    ) -> bool:
+        """Do not let newer untrusted Review protocol comments expose an older run."""
+        from .review_comment_parser import (
+            CODE_REVIEW_HEADING,
+            ERROR_HEADING,
+            PR_REVIEW_MARKER,
+            TEST_HEADING,
+            _is_review_job_anchor_body,
+        )
+
+        trusted_id = self.config.review_comment_author_id
+        trusted_login = self.config.review_comment_author_login
+        frozen_comment = next((comment for comment in comments
+                               if isinstance(comment, dict)
+                               and type(comment.get("id")) is int
+                               and comment.get("id") == frozen_build_comment_id), None)
+        frozen_position = self._review_recovery_position(frozen_comment)
+        if frozen_position is None:
+            return True
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            body = str(comment.get("body", "") or "")
+            is_review_protocol_comment = (
+                _is_review_job_anchor_body(body)
+                or (PR_REVIEW_MARKER in body and any(
+                    heading in body for heading in (
+                        TEST_HEADING, CODE_REVIEW_HEADING, ERROR_HEADING,
+                    )
+                ))
+            )
+            if not is_review_protocol_comment:
+                continue
+            user = comment.get("user", {})
+            is_trusted = (
+                isinstance(user, dict)
+                and str(user.get("id", "")) == str(trusted_id)
+                and user.get("login") == trusted_login
+            )
+            if is_trusted:
+                continue
+            position = self._review_recovery_position(comment)
+            try:
+                updated = datetime.fromisoformat(
+                    str(comment.get("updated_at", "")).replace("Z", "+00:00"),
+                )
+            except (TypeError, ValueError):
+                updated = None
+            if (position is None
+                    or comment.get("id", 0) > frozen_build_comment_id
+                    or position > frozen_position
+                    or (updated is not None and updated.tzinfo is not None
+                        and updated.utcoffset() is not None
+                        and updated > frozen_position[0])):
+                return True
+        return False
+
+    @staticmethod
+    def _review_recovery_pr_matches(
+        pr: dict, repo: str, pr_number: int, expected_head: str,
+    ) -> bool:
+        if (not isinstance(pr, dict) or type(pr.get("number")) is not int
+                or pr.get("number") != pr_number or pr.get("state") != "open"
+                or pr.get("merged") is not False or pr.get("draft") is not False):
+            return False
+        base = pr.get("base")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        if (not isinstance(base_repo, dict)
+                or not isinstance(base_repo.get("full_name"), str)
+                or base_repo["full_name"].casefold() != repo.casefold()):
+            return False
+        head = pr.get("head")
+        sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return False
+        user = pr.get("user")
+        if (not isinstance(user, dict) or not str(user.get("id", "")).isdigit()
+                or not isinstance(user.get("login"), str) or not user["login"]):
+            return False
+        return sha == expected_head
+
+    async def _review_recovery_candidate(
+        self,
+        repo: str,
+        pr_number: int,
+        state: dict,
+        expected_head: str,
+        *,
+        final_recheck: bool = True,
+    ) -> tuple[str, dict | None]:
+        """Return a fully revalidated newer Review Run, or a fail-closed reason."""
+        if not self._review_recovery_state_is_eligible(state, expected_head):
+            return "lifecycle_not_safely_recoverable", None
+        try:
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return "temporary_read_failure", None
+        if not isinstance(comments, list):
+            return "temporary_read_failure", None
+
+        from .commands import _iter_top_level_command_lines, parse_command
+        from .review_comment_parser import (
+            _parse_review_request,
+            extract_latest_review_job_anchor,
+        )
+        cursor = state["last_processed_comment_id"]
+        for comment in comments:
+            if (not isinstance(comment, dict) or type(comment.get("id")) is not int
+                    or comment["id"] <= cursor
+                    or not isinstance(comment.get("body"), str)):
+                continue
+            if parse_command(comment["body"]).kind == "approve_deploy":
+                return "approval_command_pending", None
+        author_id = self.config.review_comment_author_id
+        author_login = self.config.review_comment_author_login
+        if (not isinstance(author_id, str) or not author_id
+                or not isinstance(author_login, str) or not author_login):
+            return "review_agent_identity_unconfigured", None
+        saved_review = state["review_evidence"]
+        old_build_id = saved_review["build_comment_id"]
+        if self._has_untrusted_newer_review_comment(comments, old_build_id):
+            return "untrusted_newer_review_run", None
+
+        latest_anchor = extract_latest_review_job_anchor(
+            comments, author_id, author_login,
+        )
+        if latest_anchor is None:
+            return "no_trusted_review_run", None
+        review_comments = {
+            comment["id"]: comment for comment in comments
+            if isinstance(comment, dict) and type(comment.get("id")) is int
+        }
+        old_comment = review_comments.get(old_build_id)
+        if latest_anchor.comment_id == old_build_id:
+            if (old_comment is not None
+                    and old_comment.get("updated_at")
+                    == saved_review.get("build_comment_updated_at")):
+                return "no_new_review_run", None
+            return "frozen_review_comment_changed", None
+        if latest_anchor.state == "reviewing":
+            return "latest_review_still_running", None
+        if latest_anchor.state == "terminal":
+            return "latest_review_failed", None
+        if latest_anchor.state != "build-succeeded":
+            return "latest_review_state_ambiguous", None
+        if old_comment is None:
+            return "frozen_review_origin_unverifiable", None
+
+        old_anchor = extract_latest_review_job_anchor(
+            [old_comment], author_id, author_login,
+        )
+        old_position = self._review_recovery_position(old_comment)
+        new_anchor_comment = review_comments.get(latest_anchor.comment_id)
+        new_position = self._review_recovery_position(new_anchor_comment)
+        if (old_anchor is None or old_position is None or new_position is None
+                or old_anchor.comment_id != old_build_id
+                or old_anchor.state != "build-succeeded"
+                or old_anchor.commit_prefix != saved_review.get("commit_prefix")
+                or old_comment.get("updated_at") != saved_review.get("build_comment_updated_at")
+                or new_anchor_comment.get("updated_at") != latest_anchor.updated_at
+                or latest_anchor.comment_id <= max(
+                    state["command"]["comment_id"], old_build_id,
+                )
+                or not old_position < new_position):
+            return "review_run_identity_mismatch", None
+
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+        except Exception:
+            return "temporary_read_failure", None
+        pr_head = pr.get("head", {}).get("sha") if isinstance(pr, dict) else None
+        if pr_head != expected_head:
+            return "head_changed", None
+        if not self._review_recovery_pr_matches(pr, repo, pr_number, expected_head):
+            return "pr_identity_or_status_mismatch", None
+
+        request_id = state["command"]["comment_id"]
+        try:
+            original_request = await self.proxy.get_comment(repo, request_id)
+        except Exception:
+            return "temporary_read_failure", None
+        original_body = original_request.get("body", "") if isinstance(original_request, dict) else ""
+        request_lines = [
+            line for line in _iter_top_level_command_lines(original_body)
+            if re.match(r"^/request_deploy(?:\s|$)", line, re.I)
+        ] if isinstance(original_body, str) else []
+        parsed_original = parse_command(original_body) if isinstance(original_body, str) else None
+        pr_author = pr.get("user", {})
+        if (not isinstance(original_request, dict)
+                or type(original_request.get("id")) is not int
+                or original_request.get("id") != request_id
+                or not request_lines or len(request_lines) != 1
+                or parsed_original is None or parsed_original.kind != "request_deploy"
+                or self.proxy.is_bot_comment(original_request)
+                or original_request.get("url")
+                != f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/comments/{request_id}"
+                or original_request.get("issue_url")
+                != f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
+                or original_request.get("created_at") != original_request.get("updated_at")
+                or self._review_recovery_position(original_request) is None
+                or not isinstance(original_request.get("user"), dict)
+                or str(original_request["user"].get("id", "")) != str(pr_author.get("id", ""))
+                or not isinstance(original_request["user"].get("login"), str)
+                or not isinstance(pr_author.get("login"), str)
+                or original_request["user"]["login"].casefold()
+                != pr_author["login"].casefold()):
+            return "original_request_identity_unverifiable", None
+        original_request_position = self._review_recovery_position(original_request)
+        if (original_request_position is None
+                or not original_request_position < new_position):
+            return "review_run_order_mismatch", None
+
+        try:
+            resolved_head = await self.github.resolve_commit_sha(
+                repo, latest_anchor.commit_prefix,
+            )
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code in {400, 404, 422}:
+                return "review_commit_identity_mismatch", None
+            return "temporary_read_failure", None
+        if not isinstance(resolved_head, str) or not re.fullmatch(r"[0-9a-f]{40}", resolved_head):
+            return "review_commit_identity_mismatch", None
+        if resolved_head != expected_head:
+            return "review_head_mismatch", None
+
+        evidence = self._extract_trusted_review_evidence(comments, head_sha=expected_head)
+        if evidence is None:
+            return "latest_review_incomplete_or_ambiguous", None
+        if (not evidence.run_binding_valid
+                or evidence.build_comment_id != latest_anchor.comment_id
+                or evidence.review_author_id != author_id
+                or evidence.review_author_login != author_login
+                or evidence.commit_prefix != latest_anchor.commit_prefix
+                or evidence.test_results_block_deployment):
+            return "review_source_or_matrix_untrusted", None
+        request_comment = evidence.request_comment
+        parsed_request = _parse_review_request(
+            str((request_comment or {}).get("body", "")),
+        )
+        request_position = self._review_recovery_position(request_comment)
+        if (parsed_request is None or not parsed_request.get("valid")
+                or not isinstance(request_comment, dict)
+                or type(request_comment.get("id")) is not int
+                or request_comment.get("id") <= request_id
+                or request_position is None
+                or not original_request_position < request_position
+                or not request_position < new_position):
+            return "review_request_identity_mismatch", None
+
+        if (not evidence.test_comment_id
+                and not (evidence.skip_tests_requested and evidence.test_skipped)):
+            return "review_test_evidence_incomplete", None
+        if (request_comment.get("created_at") != request_comment.get("updated_at")
+                or request_comment.get("id") not in review_comments
+                or not isinstance(request_comment.get("user"), dict)):
+            return "review_request_was_edited_or_mismatched", None
+
+        build_comment = review_comments.get(evidence.build_comment_id)
+        if (not isinstance(build_comment, dict)
+                or build_comment.get("id") != latest_anchor.comment_id
+                or build_comment.get("created_at") != evidence.build_comment_created_at
+                or build_comment.get("updated_at") != evidence.build_comment_updated_at
+                or build_comment.get("updated_at") != latest_anchor.updated_at
+                or self._review_recovery_position(build_comment) is None):
+            return "review_build_identity_or_time_mismatch", None
+
+        immutable_result_sources = [
+            (evidence.code_review_comment_id, evidence.code_review_created_at,
+             evidence.code_review_comment_updated_at),
+        ]
+        if evidence.test_comment_id:
+            immutable_result_sources.append((
+                evidence.test_comment_id, evidence.test_comment_created_at,
+                evidence.test_comment_updated_at,
+            ))
+        elif not (evidence.skip_tests_requested and evidence.test_skipped):
+            return "review_test_evidence_incomplete", None
+        for comment_id, created_at, updated_at in immutable_result_sources:
+            listed = review_comments.get(comment_id)
+            if (not isinstance(listed, dict)
+                    or listed.get("created_at") != created_at
+                    or listed.get("updated_at") != updated_at
+                    or created_at != updated_at):
+                return "review_result_was_edited_or_mismatched", None
+
+        scoped_ids = [
+            (request_comment["id"], request_comment["user"].get("id"),
+             request_comment["user"].get("login"), False),
+            (old_build_id, author_id, author_login, True),
+            (evidence.build_comment_id, author_id, author_login, True),
+        ]
+        scoped_ids.extend(
+            (comment_id, author_id, author_login, False)
+            for comment_id, _, _ in immutable_result_sources
+        )
+        for comment_id, expected_id, expected_login, allow_edited in scoped_ids:
+            listed = review_comments.get(comment_id)
+            if (not isinstance(listed, dict)
+                    or not self._review_recovery_comment_is_scoped(
+                        repo, pr_number, comment_id, listed,
+                        str(expected_id), expected_login,
+                        allow_edited=allow_edited,
+                    )):
+                return "review_comment_identity_mismatch", None
+
+        prior_result_sources = [
+            (saved_review.get("code_review_comment_id"),
+             saved_review.get("code_review_comment_updated_at")),
+        ]
+        if saved_review.get("test_comment_id"):
+            prior_result_sources.append((
+                saved_review.get("test_comment_id"),
+                saved_review.get("test_comment_updated_at"),
+            ))
+        for comment_id, persisted_updated_at in prior_result_sources:
+            prior = review_comments.get(comment_id)
+            if (type(comment_id) is not int or not isinstance(prior, dict)
+                    or prior.get("updated_at") != persisted_updated_at
+                    or prior.get("created_at") != persisted_updated_at
+                    or not self._review_recovery_comment_is_scoped(
+                        repo, pr_number, comment_id, prior, author_id, author_login,
+                    )):
+                return "frozen_review_result_was_edited_or_mismatched", None
+
+        expected_comment_fingerprints = {}
+        for comment_id in {
+            request_comment["id"], old_build_id, evidence.build_comment_id,
+            evidence.code_review_comment_id,
+            *([evidence.test_comment_id] if evidence.test_comment_id else []),
+        }:
+            fingerprint = self._review_recovery_comment_fingerprint(
+                review_comments.get(comment_id),
+            )
+            if fingerprint is None:
+                return "review_comment_identity_mismatch", None
+            expected_comment_fingerprints[comment_id] = fingerprint
+
+        validation_reason: list[str] = []
+        validated = await self._review_evidence_from_comments(
+            repo, pr_number, expected_head, comments,
+            recheck_latest_comments=final_recheck,
+            require_exact_pr_context=True,
+            resolved_head=resolved_head,
+            expected_review_comment_fingerprints=expected_comment_fingerprints,
+            failure_reason=validation_reason,
+        )
+        if validated is None:
+            return (validation_reason[0] if validation_reason
+                    else "latest_review_incomplete_or_ambiguous"), None
+        if not validated.run_binding_valid or validated.head_sha != expected_head:
+            reason = validation_reason[0] if validation_reason else "review_source_or_run_untrusted"
+            if reason in {
+                "temporary_read_failure", "review_request_unavailable",
+                "pr_unavailable", "review_comments_unavailable",
+                "review_commit_resolution_failed",
+            }:
+                return "temporary_read_failure", None
+            if reason == "review_updated_during_check":
+                return reason, None
+            return reason, None
+        evidence = validated
+
+        builds = self._review_build_infos(repo, evidence)
+        try:
+            components = await self._build_component_snapshot(
+                repo, pr_number, expected_head, builds,
+            )
+        except Exception:
+            return "review_component_identity_unavailable", None
+        if (not components or any(
+                item.get("image_ref") != item.get("review_image_tag")
+                or item.get("resolved_platform") != get_deploy_platform()
+                for item in components)):
+            return "review_component_matrix_or_image_mismatch", None
+        snapshot = self._review_evidence_snapshot(evidence, resolved_head)
+        fingerprint = self._review_recovery_fingerprint(
+            evidence, snapshot, components, expected_comment_fingerprints,
+        )
+        return "ready", {
+            "evidence": evidence,
+            "snapshot": snapshot,
+            "components": components,
+            "builds": builds,
+            "fingerprint": fingerprint,
+            "head_sha": expected_head,
+        }
+
+    @staticmethod
+    def _review_recovery_fingerprint(
+        evidence: "ReviewCommentEvidence", snapshot: dict,
+        components: list[dict],
+        comment_fingerprints: dict[int, dict],
+    ) -> dict:
+        request = evidence.request_comment or {}
+        user = request.get("user", {}) if isinstance(request, dict) else {}
+        return {
+            "snapshot": copy.deepcopy(snapshot),
+            "request": {
+                "id": request.get("id"),
+                "body": request.get("body"),
+                "created_at": request.get("created_at"),
+                "updated_at": request.get("updated_at"),
+                "url": request.get("url"),
+                "issue_url": request.get("issue_url"),
+                "user_id": user.get("id") if isinstance(user, dict) else None,
+                "user_login": user.get("login") if isinstance(user, dict) else None,
+            },
+            "build_created_at": evidence.build_comment_created_at,
+            "test_created_at": evidence.test_comment_created_at,
+            "code_review_created_at": evidence.code_review_created_at,
+            "code_review_text": evidence.code_review_text,
+            "code_review_binding": evidence.code_review_binding,
+            "skip_tests_requested": evidence.skip_tests_requested,
+            "builds": [
+                (build.target, build.driver_path, build.variant,
+                 build.success, build.image_tag)
+                for build in evidence.builds
+            ],
+            "components": DeployController._canonical_component_snapshot(components),
+            "comments": {
+                comment_id: copy.deepcopy(comment_fingerprints[comment_id])
+                for comment_id in sorted(comment_fingerprints)
+            },
+        }
+
+    async def _recover_deploy_requested_review(
+        self, repo: str, pr_number: int, state: dict, current_head: str,
+    ) -> dict:
+        """Supersede an untouched frozen request after a verified newer Review Run."""
+        status, candidate = await self._review_recovery_candidate(
+            repo, pr_number, state, current_head, final_recheck=False,
+        )
+        if status != "ready" or candidate is None:
+            if status not in {"no_new_review_run", "lifecycle_not_safely_recoverable"}:
+                logger.debug(
+                    "review recovery deferred %s#%s reason=%s",
+                    repo, pr_number, status,
+                )
+            return state
+
+        evidence = candidate["evidence"]
+        next_state = copy.deepcopy(state)
+        review_comment_ids = [
+            evidence.build_comment_id,
+            evidence.code_review_comment_id,
+            evidence.request_comment["id"],
+        ]
+        if evidence.test_comment_id:
+            review_comment_ids.append(evidence.test_comment_id)
+        cursor = max(
+            int(state.get("last_processed_comment_id", 0) or 0),
+            *review_comment_ids,
+        )
+        next_state["status"] = "deploy-ready"
+        next_state["review_evidence"] = candidate["snapshot"]
+        next_state["components"] = candidate["components"]
+        next_state["last_processed_comment_id"] = cursor
+        next_state["round_id"] = make_round_id(
+            current_head, evidence.build_comment_id,
+        )
+        next_state["round_started_at"] = utc_now()
+        next_state["command"] = {
+            "comment_id": cursor,
+            "kind": "",
+            "phase": "completed",
+            "args": {},
+        }
+        # Consume commands posted before the complete Review result, while
+        # preserving monotonicity. The next deploy request must follow the
+        # newest reviewed comment. The history-aware writer archives the
+        # frozen request once and links it to the existing chain.
+        event = {
+            "event": "New trusted Review Run invalidated the frozen deployment request",
+            "lifecycle": "`deploy-requested` → `deploy-ready`",
+            "review_build_comment_id": evidence.build_comment_id,
+            "review_code_comment_id": evidence.code_review_comment_id,
+            "timestamp": comments_mod.beijing_now_str(),
+        }
+
+        async def guard_latest_review() -> bool:
+            guard_status, latest = await self._review_recovery_candidate(
+                repo, pr_number, state, current_head,
+            )
+            return (
+                guard_status == "ready" and latest is not None
+                and latest["fingerprint"] == candidate["fingerprint"]
+            )
+
+        markdown = comments_mod.deploy_ready(
+            repo, pr_number, current_head, candidate["builds"],
+            review_evidence=candidate["snapshot"],
+        )
+        try:
+            written = await self._write_lifecycle_with_history(
+                repo, pr_number, next_state, markdown, event=event,
+                expected_lifecycle_state=state, write_guard=guard_latest_review,
+                archive_reason=(
+                    "New trusted Review Run invalidated frozen deployment request"
+                ),
+            )
+        except Exception:
+            logger.warning("review recovery write failed %s#%s", repo, pr_number)
+            return state
+        return next_state if written else state
 
     async def _resolve_commit_prefix_for_head(
         self,
@@ -957,6 +1646,17 @@ class DeployController:
                 comments = await self.github.get_issue_comments(repo, pr_number)
                 if not isinstance(comments, list):
                     comments = []
+                persisted_build_id = state.get("review_evidence", {}).get("build_comment_id")
+                if (comments and type(persisted_build_id) is int
+                        and self._has_untrusted_newer_review_comment(
+                            comments, persisted_build_id,
+                        )):
+                    await self._post_error(
+                        repo, pr_number,
+                        "A newer Review Agent protocol comment is not from the configured trusted "
+                        "Review Agent. No deployment request was created.",
+                    )
+                    return True
                 evidence = await self._review_evidence_from_comments(repo, pr_number, pr_head, comments)
             except Exception as e:
                 logger.warning(
@@ -1015,6 +1715,27 @@ class DeployController:
                 evidence, resolved_head,
             )
 
+            # A ready lifecycle is the developer-visible review snapshot. If
+            # the latest trusted run changed before this command was handled,
+            # consume this request without silently treating the new findings
+            # as already reviewed. Reconciliation will publish the new result
+            # and require a fresh /request_deploy comment.
+            if _current_status == "deploy-ready":
+                persisted_evidence = state.get("review_evidence", {})
+                persisted_components = state.get("components", [])
+                if (self._review_evidence_identity(review_evidence_data)
+                        != self._review_evidence_identity(persisted_evidence)
+                        or (persisted_components and
+                            self._canonical_component_snapshot(components)
+                            != self._canonical_component_snapshot(persisted_components))):
+                    await self._post_error(
+                        repo, pr_number,
+                        "Review evidence changed after this `deploy-ready` snapshot. "
+                        "Read the latest Review Agent result, wait for lifecycle reconciliation, "
+                        "then post a NEW `/request_deploy`.",
+                    )
+                    return True
+
             # Determine compatible machine groups
             machine_groups = self._get_machine_groups_for_components(components)
 
@@ -1028,9 +1749,6 @@ class DeployController:
             )
             state["round_id"] = make_round_id(pr_head, comment_id)
             state["round_started_at"] = utc_now()
-            state["round_archive"] = await self._archive_round(
-                repo, pr_number, previous_state, "New deployment request",
-            )
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "request_deploy",
@@ -1050,9 +1768,13 @@ class DeployController:
                 "lifecycle": "`deploy-ready` \u2192 `deploy-requested`",
                 "timestamp": comments_mod.beijing_now_str(),
             }
-            await self._write_lifecycle_with_history(
+            written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, markdown, event=event,
+                expected_lifecycle_state=previous_state,
+                archive_reason="New deployment request",
             )
+            if not written:
+                return False
             await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
             return True
 
@@ -1725,6 +2447,19 @@ class DeployController:
             state["last_processed_comment_id"] = comment_id
             approve_attempt["outcome"] = "deployed"
             self._record_approve_attempt(state, approve_attempt)
+            # Persist this machine's log task atomically with its verified
+            # deployed fact, before testing projection or other evidence reads.
+            deployment_logs = state.setdefault("deployment_logs", {})
+            prior_log = deployment_logs.get(machine_alias)
+            if not (isinstance(prior_log, dict)
+                    and prior_log.get("head_sha") == pr_head
+                    and prior_log.get("round_id") == round_id_for_state(state)
+                    and prior_log.get("status") == "ready"):
+                deployment_logs[machine_alias] = {
+                    "head_sha": pr_head, "round_id": round_id_for_state(state),
+                    "status": "pending", "collected_at": "",
+                    "object_key": "", "sha256": "", "size": 0,
+                }
 
             # Check completion: all required components durably deployed -> testing; else -> stay deploy-requested
             all_component_ids = {c.get("component_id", "") for c in components}
@@ -2895,15 +3630,8 @@ class DeployController:
                     continue
                 runtime_id = str(comp.get("runtime_id") or "")
                 comp_target = comp.get("target", "")
-                # Core has no driver_status; use sentinel log
+                # Core has no driver_status endpoint; never fabricate runtime text.
                 if comp_target == "core":
-                    runtime_id = "core"
-                    seen_key = (machine_alias, runtime_id)
-                    if seen_key in seen:
-                        continue
-                    seen.add(seen_key)
-                    source_key = f"{machine_alias}/{runtime_id}"
-                    result[source_key] = "[CORE_RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
                     continue
                 if not runtime_id:
                     continue
@@ -3027,11 +3755,9 @@ class DeployController:
                 timeout=20,
             )
             machine_logs = {k: v for k, v in all_logs.items() if k.startswith(machine_alias + "/")}
-            if not machine_logs or any("SNAPSHOT_UNAVAILABLE" in v for v in machine_logs.values()):
-                unavailable = copy.deepcopy(task)
-                unavailable["status"] = "unavailable"
-                await self._write_machine_log_state(repo, pr_number, state, machine_alias, unavailable)
-                return
+            machine_logs = {k: v for k, v in machine_logs.items()
+                            if isinstance(v, str) and v.strip()
+                            and "SNAPSHOT_UNAVAILABLE" not in v}
             if not task.get("collected_at"):
                 task = copy.deepcopy(task)
                 task["collected_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -3065,6 +3791,9 @@ class DeployController:
                     or not isinstance(meta.get("sha256"), str)
                     or not re.fullmatch(r"[0-9a-f]{64}", meta["sha256"])
                     or type(meta.get("size")) is not int or meta["size"] <= 0):
+                unavailable = copy.deepcopy(task)
+                unavailable["status"] = "unavailable"
+                await self._write_machine_log_state(repo, pr_number, state, machine_alias, unavailable)
                 return
             ready = copy.deepcopy(task)
             ready.update(status="ready", object_key=meta["object_key"],
@@ -4753,6 +5482,9 @@ class DeployController:
             current_rows = await bind_download_capabilities(current_rows, state["head_sha"], current_round)
             render_state["attachments"] = current_rows
             await bind_log_url(render_state, state["head_sha"], current_round)
+            render_state["deployment_logs"] = self.evidence_service._trusted_deployment_logs(
+                render_state, repo, pr_number, state["head_sha"], current_round,
+            )
         trusted_archives = []
         testing_statuses = {"testing", "succeeded", "failed"}
         for archive in archives:
@@ -4792,6 +5524,9 @@ class DeployController:
                 snapshot["log_capability"] = issue_capability(
                     self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
                     purpose=DOWNLOAD_PURPOSE, resource="log:" + archive["round_id"],
+                )
+                snapshot["deployment_logs"] = self.evidence_service._trusted_deployment_logs(
+                    snapshot, repo, pr_number, archive["head_sha"], archive["round_id"],
                 )
             snapshot["deployments"] = self._enrich_deployments_for_render(
                 snapshot.get("deployments", []), historical=True,
@@ -4985,7 +5720,34 @@ class DeployController:
                 compact_current_rows.append(item)
             compact_state = copy.deepcopy(render_state)
             compact_state["attachments"] = compact_current_rows
-            compact_state["deployments"] = []
+            compact_machines = sorted({
+                deployment.get("machine") for deployment in render_state.get("deployments", [])
+                if isinstance(deployment, dict)
+                and deployment.get("phase") == "deployed"
+                and isinstance(deployment.get("machine"), str)
+            })
+            compact_state["deployments"] = [
+                {"machine": machine, "phase": "deployed"}
+                for machine in compact_machines
+            ]
+            source_machine_logs = render_state.get("deployment_logs", {})
+            compact_log_machines = {
+                machine for machine, record in source_machine_logs.items()
+                if isinstance(source_machine_logs, dict)
+                and isinstance(machine, str) and isinstance(record, dict)
+                and record.get("head_sha") == state["head_sha"]
+                and record.get("round_id") == current_round
+                and record.get("status") in {"pending", "ready", "unavailable"}
+            } if isinstance(source_machine_logs, dict) else set()
+            compact_state["deployment_logs"] = {
+                machine: {
+                    field: source_machine_logs[machine][field]
+                    for field in ("head_sha", "round_id", "status", "capability")
+                    if field in source_machine_logs[machine]
+                }
+                for machine in compact_log_machines
+            }
+            compact_state["_compact_projection"] = True
             compact_state["components"] = []
             compact_state["machine_groups"] = []
             compact_state["case_results"] = {}
@@ -5101,11 +5863,13 @@ class DeployController:
                 (f"第 {round_numbers[current_round]} 轮"
                  if current_round in round_numbers else "当前轮"),
             )
+            bundle_snapshots_by_round = {}
             for bundle in bundles:
                 bundle_round = bundle.get("round_id")
                 bundle_snapshot = bundle.get("snapshot")
                 if not isinstance(bundle_snapshot, dict):
                     continue
+                bundle_snapshots_by_round[bundle_round] = bundle_snapshot
                 compatibility_downloads_by_round[bundle_round] = compatibility_download_lines(
                     bundle_snapshot.get("attachments", []),
                     f"第 {round_numbers[bundle_round]} 轮",
@@ -5185,6 +5949,13 @@ class DeployController:
                 compact_history.extend(
                     compatibility_downloads_by_round.get(archive_round, []),
                 )
+                historical_machine_logs = comments_mod._machine_log_lines(
+                    bundle_snapshots_by_round.get(archive_round, {}),
+                    (archive_head, archive_round), comments_mod._evidence_path(repo, pr_number),
+                    read_origin,
+                )
+                if historical_machine_logs:
+                    compact_history.extend(["", "**每机器部署日志：**", *historical_machine_logs])
                 compact_history.extend(["", "</details>", ""])
             end_pos = compact_section.rfind(evidence_end)
             if end_pos < 0:
@@ -5264,6 +6035,21 @@ class DeployController:
                         "", "<details>", "<summary>历史附件兼容下载链接</summary>", "",
                         *all_compatibility_downloads, "", "</details>",
                     ])
+                all_machine_log_lines = []
+                for archive in compact_archives:
+                    archive_round = archive["round_id"]
+                    archive_head = archive["head_sha"]
+                    label = f"第 {round_numbers[archive_round]} 轮"
+                    for line in comments_mod._machine_log_lines(
+                            bundle_snapshots_by_round.get(archive_round, {}),
+                            (archive_head, archive_round),
+                            comments_mod._evidence_path(repo, pr_number), read_origin):
+                        all_machine_log_lines.append(line.replace("- `", f"- {label} · `", 1))
+                if all_machine_log_lines:
+                    minimal_lines.extend([
+                        "", "<details>", "<summary>历史机器部署日志</summary>", "",
+                        *all_machine_log_lines, "", "</details>",
+                    ])
                 minimal_section = (
                     minimal_section[:minimal_end].rstrip()
                     + "\n" + "\n".join(minimal_lines)
@@ -5316,6 +6102,9 @@ class DeployController:
         expected_acceptance_state: dict | None = None,
         expected_acceptance_comment: dict | None = None,
         evidence_projection_only: bool = False,
+        expected_lifecycle_state: dict | None = None,
+        write_guard: Any | None = None,
+        archive_reason: str = "Lifecycle snapshot replaced",
     ) -> bool:
         """Write lifecycle comment with automatic history management.
 
@@ -5327,12 +6116,20 @@ class DeployController:
         projection_state_expected = copy.deepcopy(state) if evidence_projection_only else None
         async def write_if_current(visible: str) -> bool:
             async with self._evidence_lock:
+                if expected_lifecycle_state is not None:
+                    fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if fresh_state != expected_lifecycle_state:
+                        return False
                 if archive_source is not None:
-                    # Final recapture includes any attachment committed while
-                    # the initial archive/projection was being assembled.
+                    # Capture the prior round once under the evidence lock,
+                    # after the expected lifecycle state has been checked.
                     state["round_archive"] = await self._archive_round_unlocked(
-                        repo, pr_number, archive_source, "Lifecycle snapshot replaced",
+                        repo, pr_number, archive_source, archive_reason,
                     )
+                if expected_lifecycle_state is not None:
+                    fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if fresh_state != expected_lifecycle_state:
+                        return False
                 # History/archive discovery also awaits GitHub. Recheck after all
                 # of those awaits, immediately before a terminal record_test write.
                 if expected_record_test_state is not None:
@@ -5420,6 +6217,47 @@ class DeployController:
                             current_comment.get("id") != comment.get("id")
                             or current_comment.get("body") != comment.get("body")))):
                     raise GitHubStateProxyError("Lifecycle History changed before write")
+                if expected_lifecycle_state is not None or write_guard is not None:
+                    # Archiving awaited GitHub. Re-read the lifecycle CAS
+                    # inputs and PR identity before replacing the comment.
+                    if expected_lifecycle_state is not None:
+                        fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                        if fresh_state != expected_lifecycle_state:
+                            return False
+                    final_pr = await self.proxy.get_pr(repo, pr_number)
+                    final_base = final_pr.get("base", {}) if isinstance(final_pr, dict) else {}
+                    final_base_repo = final_base.get("repo", {}) if isinstance(final_base, dict) else {}
+                    final_pr_valid = (
+                        isinstance(final_pr, dict)
+                        and type(final_pr.get("number")) is int
+                        and final_pr.get("number") == pr_number
+                        and final_pr.get("state") == "open"
+                        and not final_pr.get("merged")
+                        and not final_pr.get("draft")
+                        and final_pr.get("head", {}).get("sha") == state.get("head_sha")
+                        and isinstance(final_base_repo, dict)
+                        and isinstance(final_base_repo.get("full_name"), str)
+                        and final_base_repo["full_name"].casefold() == repo.casefold()
+                    )
+                    if not final_pr_valid:
+                        return False
+                    final_comment = await self.proxy.find_trusted_lifecycle_comment(
+                        repo, pr_number,
+                    )
+                    if ((comment is None) != (final_comment is None)
+                            or (comment is not None and (
+                                final_comment.get("id") != comment.get("id")
+                                or final_comment.get("body") != comment.get("body")))):
+                        return False
+                if write_guard is not None:
+                    # Archive creation can take several GitHub calls. Recheck
+                    # the complete Review provenance after that wait and just
+                    # before the lifecycle CAS so a superseded run cannot win.
+                    guard_result = write_guard()
+                    if inspect.isawaitable(guard_result):
+                        guard_result = await guard_result
+                    if guard_result is not True:
+                        return False
                 if evidence_projection_only:
                     current_state = await self.proxy.read_hidden_state(repo, pr_number)
                     if current_state != projection_state_expected:
@@ -5451,6 +6289,9 @@ class DeployController:
             if old is None:
                 raise GitHubStateProxyError("Cannot replace unreadable prior round")
             old = _validate_hidden_state(old)
+            if (expected_lifecycle_state is not None
+                    and old != expected_lifecycle_state):
+                return False
             if evidence_projection_only:
                 if old != state:
                     raise GitHubStateProxyError("Lifecycle state changed before evidence projection")
@@ -5474,7 +6315,15 @@ class DeployController:
                                for k in ("object_key", "sha256", "size"))))
             if destructive:
                 archive_source = copy.deepcopy(old)
-                state["round_archive"] = await self._archive_round(repo, pr_number, old, "Lifecycle snapshot replaced")
+                guarded_write = (
+                    expected_lifecycle_state is not None or write_guard is not None
+                )
+                if not guarded_write:
+                    # Preserve the original behavior for legacy lifecycle
+                    # callers. Only guarded transitions defer archive capture.
+                    state["round_archive"] = await self._archive_round(
+                        repo, pr_number, old, archive_reason,
+                    )
                 if head_changed or (lost_fields and not round_changed):
                     state["round_id"] = make_round_id(state["head_sha"], state.get("command", {}).get("comment_id", 0))
                     state["round_started_at"] = utc_now()
@@ -5483,7 +6332,7 @@ class DeployController:
             if "round_started_at" not in state and old.get("round_started_at") and not head_changed and not round_changed:
                 state["round_started_at"] = old["round_started_at"]
         if comment is None:
-            if evidence_projection_only:
+            if evidence_projection_only or expected_lifecycle_state is not None:
                 return False
             if events is not None:
                 # Multiple events: newest-first; then insert existing fresh markdown
@@ -6022,6 +6871,18 @@ class DeployController:
                 return
 
             if state.get("status") == "deploy-requested":
+                try:
+                    state = await self._recover_deploy_requested_review(
+                        repo, pr_number, state, current_head,
+                    )
+                except Exception as e:
+                    # A read or identity failure leaves the frozen request
+                    # untouched. The approval path independently keeps its
+                    # fresh-evidence gate closed.
+                    logger.warning(
+                        "reconcile review recovery %s#%s: %s",
+                        repo, pr_number, type(e).__name__,
+                    )
                 try:
                     await self.proxy.project_status_label(
                         repo, pr_number, state.get("status", "review-required"),
@@ -7110,6 +7971,14 @@ class DeployController:
         try:
             comments = await self.proxy.get_issue_comments(repo, pr_number)
         except Exception:
+            return False
+        if not isinstance(comments, list):
+            return False
+        persisted_build_id = persisted_review_evidence.get("build_comment_id")
+        if (type(persisted_build_id) is int
+                and self._has_untrusted_newer_review_comment(
+                    comments, persisted_build_id,
+                )):
             return False
         evidence = await self._review_evidence_from_comments(repo, pr_number, fresh_head, comments)
         if evidence is None:

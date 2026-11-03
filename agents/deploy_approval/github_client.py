@@ -743,6 +743,9 @@ class GitHubClient:
         dispatch. A 403/404 on this optional endpoint does not invalidate App
         authorization for the rest of the client.
         """
+        # GitHub permits Pull requests:read as an alternative to Issues:read
+        # for this endpoint; the installation's Pull requests:write permission
+        # already includes the required read access.
         if (not isinstance(repo, str) or not re.fullmatch(
                 r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
                 or type(limit) is not int or not 1 <= limit <= 100):

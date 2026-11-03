@@ -918,6 +918,51 @@ def _trusted_github_attachment_url(item: dict) -> str:
     return value
 
 
+def _machine_log_lines(group, key, api, origin):
+    machine_logs = group.get("deployment_logs", {})
+    deployed_machines = {
+        deployment.get("machine") for deployment in group.get("deployments", [])
+        if isinstance(deployment, dict) and deployment.get("phase") == "deployed"
+        and isinstance(deployment.get("machine"), str)
+    }
+    valid_log_statuses = {"pending", "ready", "unavailable"}
+    if isinstance(machine_logs, dict):
+        deployed_machines.update(
+            machine for machine, record in machine_logs.items()
+            if isinstance(machine, str) and isinstance(record, dict)
+            and record.get("head_sha") == key[0]
+            and record.get("round_id") == key[1]
+            and record.get("status") in valid_log_statuses
+        )
+    deployed_machines = sorted(deployed_machines)
+    if not deployed_machines:
+        return []
+    lines = []
+    for machine in deployed_machines:
+        record = machine_logs.get(machine) if isinstance(machine_logs, dict) else None
+        if (not isinstance(record, dict)
+                or record.get("head_sha") != key[0]
+                or record.get("round_id") != key[1]
+                or record.get("status") not in valid_log_statuses):
+            record = None
+        status = record.get("status") if record is not None else "missing"
+        capability = record.get("capability") if record is not None else None
+        if status == "ready" and origin and isinstance(capability, str) and capability:
+            path = api + "/rounds/" + urllib.parse.quote(key[1], safe="")
+            path += "/machines/" + urllib.parse.quote(machine, safe="") + "/log/download"
+            url = origin + path + "?" + urllib.parse.urlencode({"cap": capability})
+            lines.append(f"- `{_escape(machine)}`：[下载机器部署日志](<{url}>)")
+        elif status == "ready":
+            lines.append(f"- `{_escape(machine)}`：已归档，下载链接暂不可用")
+        elif status == "pending":
+            lines.append(f"- `{_escape(machine)}`：正在保存部署日志")
+        elif status == "unavailable":
+            lines.append(f"- `{_escape(machine)}`：记录包不可用")
+        else:
+            lines.append(f"- `{_escape(machine)}`：未归档")
+    return lines
+
+
 def render_evidence_section(
     repo, pr_number, state, records, archive_links, *, public_base_url="",
     upload_public_base_url="", cos_download_url_expiry=None,
@@ -1463,10 +1508,15 @@ def render_evidence_section(
                     lines.append("该轮未保存附件")
             elif state.get("status") in {"succeeded", "failed"}:
                 lines.append("本轮未保存附件")
-        if group.get("deployments"):
+        compact_projection = group.get("_compact_projection") is True
+        if group.get("deployments") and not compact_projection:
             lines.extend(["", "### 部署记录", "",
                           _deployment_table(group["deployments"], group.get("components"),
                                             group.get("machine_groups"))])
+        machine_log_lines = _machine_log_lines(group, key, api, base or upload_base)
+        if machine_log_lines:
+            lines.extend(["", "### 每机器部署日志", ""])
+            lines.extend(machine_log_lines)
         attachment_page = round_attachment_page_url(key, group)
         if attachment_page:
             lines.extend(["", f"[打开附件页](<{attachment_page}>)"])
