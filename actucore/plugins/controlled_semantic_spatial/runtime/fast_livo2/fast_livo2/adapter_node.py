@@ -152,6 +152,8 @@ class FastLivo2Adapter(Node):
         self._mapper_contract_ready = False
         self._mapper_contract_issues: tuple[str, ...] = ()
         self._point_time_span_ms: float | None = None
+        self._mapper_state_stamp_sec: float | None = None
+        self._mapper_publish_latency_ms: float | None = None
         self._base_to_sensor_tf_ready = False
         self._sensor_tf_error: str | None = None
         self._odom_health = OdomHealthMonitor()
@@ -565,6 +567,12 @@ class FastLivo2Adapter(Node):
             lidar_frame = lidar_frame.strip()
             imu_frame = imu_frame.strip()
             point_time_span_ms = float(payload.get("point_time_span_ms", -1.0))
+            mapper_state_stamp_sec = float(
+                payload.get("state_stamp_sec", -1.0)
+            )
+            mapper_publish_latency_ms = float(
+                payload.get("publish_latency_ms", -1.0)
+            )
             lidar_stamp_sec = float(
                 payload.get("last_lidar_source_stamp_sec", -1.0)
             )
@@ -578,6 +586,8 @@ class FastLivo2Adapter(Node):
                     point_time_span_ms,
                     lidar_stamp_sec,
                     imu_stamp_sec,
+                    mapper_state_stamp_sec,
+                    mapper_publish_latency_ms,
                 )
             ) or not isinstance(mapper_ready, bool):
                 raise InvalidFastLivo2Frame("mapper runtime contract is invalid")
@@ -617,6 +627,16 @@ class FastLivo2Adapter(Node):
             self._mapper_contract_ready = mapper_ready
             self._mapper_contract_issues = tuple(issues)
             self._point_time_span_ms = point_time_span_ms
+            # State time is what the published pose was integrated to; the
+            # latency shows how far behind the published state is.
+            self._mapper_state_stamp_sec = (
+                mapper_state_stamp_sec if mapper_state_stamp_sec > 0.0 else None
+            )
+            self._mapper_publish_latency_ms = (
+                mapper_publish_latency_ms
+                if mapper_publish_latency_ms >= 0.0
+                else None
+            )
         self._refresh_sensor_contract()
 
     def _refresh_sensor_contract(self) -> None:
@@ -1796,6 +1816,8 @@ class FastLivo2Adapter(Node):
                 "base_to_sensor_tf_ready": self._base_to_sensor_tf_ready,
                 "sensor_tf_error": self._sensor_tf_error,
                 "point_time_span_ms": self._point_time_span_ms,
+                "mapper_state_stamp_sec": self._mapper_state_stamp_sec,
+                "mapper_publish_latency_ms": self._mapper_publish_latency_ms,
                 "odom_health": self._odom_health.diagnostics(),
                 "readiness_blockers": self._readiness_blockers_locked(),
                 "map_view_enabled": self._map_view_enabled,
@@ -1937,6 +1959,8 @@ class FastLivo2Adapter(Node):
             "base_to_sensor_tf_ready": state["base_to_sensor_tf_ready"],
             "sensor_tf_error": state["sensor_tf_error"],
             "point_time_span_ms": state["point_time_span_ms"],
+            "mapper_state_stamp_sec": state["mapper_state_stamp_sec"],
+            "mapper_publish_latency_ms": state["mapper_publish_latency_ms"],
             "odom_health": state["odom_health"],
             "readiness_blockers": state["readiness_blockers"],
         }

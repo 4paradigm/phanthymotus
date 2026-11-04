@@ -117,7 +117,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=1dce6118522a36c3242f27c1c7873714dfc272787ad518bc55a507c5284536c5",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=6feed844676374762501cf5b621f2ea1689439994e8f2fbcaa31cbba03eb2acb",
             source_lock,
         )
         self.assertIn(
@@ -165,7 +165,23 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("@@ -13,", runtime_cpp_patch)
         self.assertIn("publishRuntimeDiagnostics", runtime_patch_text)
         self.assertIn("input_contract_ready", runtime_patch_text)
+        # Published state time must describe the integrated state, not the
+        # publish instant; speed/freshness checks read these stamps.
+        self.assertIn("stateStampSec", runtime_patch_text)
+        self.assertIn(
+            "odomAftMapped.header.stamp = sec2Stamp(state_sec);", runtime_patch_text
+        )
+        self.assertNotIn(
+            "+  odomAftMapped.header.stamp = this->node->get_clock()->now();",
+            runtime_patch_text,
+        )
+        self.assertIn("state_stamp_sec", runtime_patch_text)
+        self.assertIn("publish_latency_ms", runtime_patch_text)
+        # A dropped IMU sample must not become one giant integration step.
+        self.assertIn("if (dt > 0.05) dt = 0.05;", runtime_patch_text)
         self.assertIn("self._on_mapper_runtime", adapter)
+        self.assertIn("mapper_publish_latency_ms", adapter)
+        self.assertIn("mapper_state_stamp_sec", adapter)
         self.assertNotIn("self._on_lidar_contract", adapter)
         self.assertNotIn("self._on_imu_contract", adapter)
         self.assertIn("+#include <stdexcept>", pcd_patch.read_text(encoding="utf-8"))
@@ -214,7 +230,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "1dce6118522a36c3242f27c1c7873714dfc272787ad518bc55a507c5284536c5",
+            "6feed844676374762501cf5b621f2ea1689439994e8f2fbcaa31cbba03eb2acb",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

@@ -77,6 +77,13 @@ FAST-LIVO2 内部订阅队列默认保留 `100` 帧 LiDAR 和 `2000` 条 IMU，�
 `imu_qos_depth`（1..8000）调整，下次启动卡片生效。该参数在启动算法子进程前
 传入 ROS，因此首次升级需要重建 navigation base，之后调值只需重启卡片，不再
 重建镜像。发布端（Driver 桥）同样必须保留等量历史，否则丢弃发生在更早一段。
+published odom、registered cloud 和同源 TF 的 header 时间是**本次成功积分到的
+状态时间**（ONLY_LIO 下为 `meas.lio_time`，即扫描结束时刻），不是消息发布时刻。
+判速用相邻状态自身的时间差、新鲜度用 `now - 状态时间`，二者才如实反映算法是否
+落后；发布时刻会让积压看起来健康、也会让挤在一起的两次发布看起来像速度尖峰。
+回执里 `mapper_state_stamp_sec` / `mapper_publish_latency_ms` 直接暴露该状态时间
+与发布延迟。状态时间为空、非有限或不递增时算法拒绝发布，不回退墙钟；数据因此
+变旧时仍由既有新鲜度门禁拦截，不会因判速正常而被当作可用数据。
 FAST-LIVO2 使用与 LiDAR 同 frame 的 IMU 做重力对齐，因此整套传感器
 相对机身的小角度倾斜不会直接把地图永久建斜；adapter 再用实测
 `base_link -> sensor_frame` 静态 TF 恢复机器人机身位姿。若实际安装角度发生变化、
