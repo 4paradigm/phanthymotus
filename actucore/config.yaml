@@ -402,8 +402,9 @@ plugins:
     stuck_speed_ratio: 0.2
 
     # 任何一路观测比这个旧，就什么都不发，交给下游 watchdog 把底盘停住。
-    # 拿上一条指令顶着才是危险的。
-    max_obs_age_ms: 600
+    # 这是下游未声明时的回退值；启动时会采纳 descriptor.rate.max_obs_age_ms，
+    # 但绝不超过 600 ms。拿上一条指令顶着才是危险的。
+    max_obs_age_ms: 500
 
     # ── 目标跟踪（plugins/navi/track.py）─────────────────────────────────
     # 开始追一个目标的置信度门槛。

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -563,10 +564,11 @@ def _first_command(card):
     card._state = navi_plugin.policy_mod.State(target="chair")
     card._objects = {"objects": [{"name": "chair", "confidence": 0.9,
                                   "position": [0.5, 0.0]}]}
-    card._objects_ms = 10 ** 13
+    now_ms = int(navi_plugin.time.time() * 1000)
+    card._objects_ms = now_ms
     card._depth_bands = {"left": 5.0, "center": 5.0, "right": 5.0}
-    card._depth_ms = 10 ** 13
-    card._config.max_obs_age_ms = 10 ** 13
+    card._depth_ms = now_ms
+    card._config.max_obs_age_ms = 60_000
     # The policy will not command anything from a track it has not confirmed,
     # so the card has to tick a few times before there is a first command at
     # all. Dropping the unconfirmed ticks keeps this about the descriptor echo.
@@ -575,6 +577,125 @@ def _first_command(card):
         if message is not None:
             return message
     return card.next_command()
+
+
+def test_command_observation_stamp_is_the_oldest_required_fresh_input(monkeypatch):
+    card = _card()
+    assert _first_command(card) is not None  # confirm the tracker first
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 1000.0)
+    card._last_tick = 999.9
+    card._config.max_obs_age_ms = 600
+
+    card._objects_ms = 999_900
+    card._depth_ms = 999_600
+    message = card.next_command()
+    assert message["obs_stamp_ms"] == 999_600
+
+    card._objects_ms = 999_500
+    card._depth_ms = 999_950
+    message = card.next_command()
+    assert message["obs_stamp_ms"] == 999_500
+
+
+@pytest.mark.parametrize("max_age_ms", [500, 600])
+def test_observation_freshness_includes_the_boundary_and_rejects_one_ms_more(
+        monkeypatch, max_age_ms):
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 1000.0)
+    card._config.max_obs_age_ms = max_age_ms
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+
+    card._objects_ms = card._depth_ms = 1_000_000 - max_age_ms
+    objects, depth, _ = card.observation()
+    assert objects is not None and depth is not None
+
+    card._objects_ms = card._depth_ms = 1_000_000 - max_age_ms - 1
+    objects, depth, _ = card.observation()
+    assert objects is None and depth is None
+
+
+def test_observation_with_a_future_local_timestamp_is_not_fresh(monkeypatch):
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 1000.0)
+    card._config.max_obs_age_ms = 600
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+    card._objects_ms = card._depth_ms = 1_000_001
+
+    objects, depth, _ = card.observation()
+    assert objects is None and depth is None
+
+    card._state = navi_plugin.policy_mod.State(target="chair")
+    assert card.next_command() is None
+    assert "clock invalid" in card._last_decision.reason
+
+
+@pytest.mark.parametrize("stale_stream, expected_name", [
+    ("objects", "vop(objects)"),
+    ("depth", "depth"),
+])
+def test_blind_reason_names_the_required_stream_that_is_stale(
+        monkeypatch, stale_stream, expected_name):
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 1000.0)
+    card._state = navi_plugin.policy_mod.State(target="chair")
+    card._config.max_obs_age_ms = 500
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+    card._objects_ms = card._depth_ms = 999_900
+    if stale_stream == "objects":
+        card._objects_ms = 999_499
+    else:
+        card._depth_ms = 999_499
+
+    assert card.next_command() is None
+    assert card._last_decision.status == navi_plugin.policy_mod.BLIND
+    assert expected_name in card._last_decision.reason
+    assert "501ms > 500ms" in card._last_decision.reason
+
+
+def test_blind_reason_names_both_required_streams_when_they_never_arrived():
+    card = _card()
+    card._state = navi_plugin.policy_mod.State(target="chair")
+    assert card.next_command() is None
+    assert card._last_decision.status == navi_plugin.policy_mod.BLIND
+    assert "vop(objects) missing" in card._last_decision.reason
+    assert "depth missing" in card._last_decision.reason
+
+
+def test_info_exposes_effective_freshness_and_depth_pipeline_timing(monkeypatch):
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 1000.0)
+    card._config.max_obs_age_ms = 600
+    card._objects = {"objects": []}
+    card._objects_ms = 999_900
+    card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    card._odom_ms = 999_700
+    depth = np.ones((4, 4), dtype=np.float32)
+    card._set_depth_map(depth, received_ms=999_500, decode_ms=40.0,
+                        source_stamp_ms=999_450)
+    card._set_depth_map(depth, received_ms=999_800, decode_ms=20.0,
+                        source_stamp_ms=999_750)
+
+    info = card._info()
+    assert info["max_obs_age_ms"] == 600
+    observation = info["observation"]
+    assert observation["max_obs_age_ms"] == 600
+    assert observation["ages_ms"] == {
+        "objects": 100, "depth": 200, "odom": 300,
+    }
+    assert observation["fresh"] == {
+        "objects": True, "depth": True, "odom": True,
+    }
+    assert observation["depth_timing"] == {
+        "receive_age_ms": 200,
+        "receive_gap_ms": 300.0,
+        "max_receive_gap_ms": 300.0,
+        "decode_ms": 20.0,
+        "max_decode_ms": 40.0,
+        "source_age_ms": 250,
+    }
 
 
 def test_the_first_command_names_its_axes_even_with_no_downstream():
@@ -838,12 +959,15 @@ def test_odom_timing_selects_the_bound_topic_and_computes_freshness():
 def test_missing_or_invalid_odom_timing_falls_back_without_blocking(interface):
     card = _card()
     card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
-    assert card._odom_max_age_ms == 600
+    assert card._odom_max_age_ms == 500
     assert card._limit_notes
 
 
 def test_visual_observation_accepts_600ms_and_rejects_601ms(monkeypatch):
     card = _card()
+    # Tianyi advertises this value in its downstream descriptor; the generic
+    # and R1 fallback remains 500 ms.
+    card._config.max_obs_age_ms = 600
     now_ms = 123_456
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
     card._objects = {"objects": []}
@@ -857,6 +981,22 @@ def test_visual_observation_accepts_600ms_and_rejects_601ms(monkeypatch):
     card._objects_ms = card._depth_ms = now_ms - 601
     objects, depth, _ = card.observation()
     assert objects is None and depth is None
+
+
+def test_visual_and_odom_freshness_keep_independent_contracts(monkeypatch):
+    card = _card()
+    card._config.max_obs_age_ms = 600
+    card._odom_max_age_ms = 420
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+    card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    card._objects_ms = card._depth_ms = card._odom_ms = now_ms - 500
+
+    objects, depth, odom = card.observation()
+    assert objects is card._objects and depth is not None
+    assert odom is None
 
 
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
@@ -1219,9 +1359,21 @@ def test_start_stop_start_destroys_old_node_and_does_not_duplicate_depth_subscri
     card._open_publisher = lambda: setattr(card, '_node', next(nodes))
     args = {'action': 'start', 'input_topics': ['/cam/objects', '/camera/depth']}
     assert card.dispatch('navi', args)['state'] == 'running'
+    card._depth_receive_ms = 100
+    card._depth_receive_gap_ms = 200.0
+    card._depth_receive_gap_max_ms = 300.0
+    card._depth_decode_ms = 40.0
+    card._depth_decode_max_ms = 50.0
+    card._depth_source_ms = 60
     assert card.dispatch('navi', {'action': 'stop'})['state'] == 'stopped'
     assert first.destroyed and executor.removed == [first]
     assert card.dispatch('navi', args)['state'] == 'running'
+    assert card._depth_receive_ms == 0
+    assert card._depth_receive_gap_ms is None
+    assert card._depth_receive_gap_max_ms is None
+    assert card._depth_decode_ms is None
+    assert card._depth_decode_max_ms is None
+    assert card._depth_source_ms is None
     assert [item[0].__name__ for item in second.subscription_details
             if item[1] == '/camera/depth'] == ['CompressedImage']
 

@@ -1241,6 +1241,41 @@ _R1_DESC = {
 }
 
 
+@pytest.mark.parametrize("declared, expected", [
+    (500, 500),                 # R1
+    (600, 600),                 # Tianyi
+    (601, 600),
+    (5000, 600),
+])
+def test_observation_age_is_adopted_from_the_chassis_but_capped(declared, expected):
+    config = _cfg(max_obs_age_ms=123)
+    notes = P.adopt_limits(config, {
+        **_R1_DESC, "rate": {"max_obs_age_ms": declared},
+    })
+    assert config.max_obs_age_ms == expected
+    if declared > P.MAX_NEGOTIATED_OBS_AGE_MS:
+        assert any(str(declared) in note and "600" in note and "硬上限" in note
+                   for note in notes)
+    else:
+        assert not any("观测有效期" in note for note in notes)
+
+
+def test_missing_observation_age_falls_back_to_500_even_after_a_custom_value():
+    config = _cfg(max_obs_age_ms=123)
+    P.adopt_limits(config, _R1_DESC)
+    assert config.max_obs_age_ms == P.DEFAULT_MAX_OBS_AGE_MS == 500
+
+
+@pytest.mark.parametrize("declared", [True, 0, -1, float("nan"), "600"])
+def test_invalid_observation_age_falls_back_to_500(declared):
+    config = _cfg(max_obs_age_ms=123)
+    notes = P.adopt_limits(config, {
+        **_R1_DESC, "rate": {"max_obs_age_ms": declared},
+    })
+    assert config.max_obs_age_ms == 500
+    assert any("max_obs_age_ms" in note and "500" in note for note in notes)
+
+
 def test_a_ceiling_below_the_floor_is_raised_off_it():
     """The cause of the stutter, and the reason `adopt_limits` exists.
 
