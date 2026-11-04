@@ -253,6 +253,12 @@ class PerceptionBundle:
                 log.error("PointCloudPerceptionPlugin failed to load; continuing without pointcloud",
                           exc_info=True)
 
+        slam_cfg = plugins_cfg.get("pointcloud_slam") or {}
+        if slam_cfg.get("enabled", False):
+            from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
+            self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor))
+            log.info("PointCloudSlamPlugin loaded (experimental input only)")
+
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["pose"].get("namespace", "").strip()

@@ -16,6 +16,33 @@ rather than evicting historical points. It does not subscribe to inputs,
 establish clock synchronization, validate loops, or merge submaps; the runtime
 must handle a full store and signal tracking loss. It is not a SLAM card.
 
+## Experimental live input and graph wiring
+
+An opt-in `pointcloud_slam` card now subscribes to `state/odom` and
+`sensor/pointcloud2`. Agent-core passes the formats from live producer `info()`
+keyed by resolved topic; unknown or ambiguous bindings are rejected. Canvas
+connection order is not an input role. The ROS adapter checks PointCloud2 XYZ
+layout and capture header; a bounded buffer waits for a compatible odometry
+bracket and transforms points using `T_child_cloud`. The monotonic receipt
+clock detects stale input only and is not substituted for capture time.
+
+The card is disabled by default. To start it, `plugins.pointcloud_slam` needs
+`enabled`, `cloud_frame`, `child_frame`, `clock_id`, `child_from_cloud`,
+`max_gap_ms`, `max_age_s`, `max_pending`, `max_cloud_points`, `max_frames`, and
+`max_points`. It also requires the operator assertions
+`clock_relation_verified: true` and `extrinsic_calibrated: true`; these flags
+do not constitute evidence, so set them only after independent verification.
+There is deliberately no default extrinsic or claimed safe timing limit.
+
+Keyframes create one odometry-only graph per segment. The GTSAM adapter accepts
+only a consecutive odometry chain and explicit positive noise sigmas; a manual
+Python call can optimize a graph captured from the input node. It accepts no
+loop edges and does not publish poses, maps, or map-to-odom corrections. The
+current Perception image does not include GTSAM, and its Jetson compatibility
+has not been built or tested. The card therefore exposes no map output, and
+its running state means only that the experimental input subscriptions started.
+The ROS tests use stubs; the input adapter has not been validated on a robot.
+
 ## Inputs and reproducibility
 
 The experimental reader currently supports the recorded

@@ -131,7 +131,7 @@ def rig(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
 
     return types.SimpleNamespace(starts=starts, events=events, infos=infos,
-                                 declarations=declarations)
+                                 declarations=declarations, topic_outs=topic_outs)
 
 
 def _run(layout) -> bool:
@@ -143,6 +143,18 @@ def _errors(events):
     return [e['payload'] for e in events
             if e.get('type') == 'project_start_item'
             and e['payload'].get('status') == 'error']
+
+
+def test_slam_gets_live_input_formats_by_topic_not_connection_order(rig):
+    rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'sensor/pointcloud2'}]
+    rig.topic_outs[DEPTH] = [{'topic': DEPTH_TOPIC, 'format': 'state/odom'}]
+    layout = {'cards': [_card(CAM, 'cloud'), _card(DEPTH, 'odom'),
+                        _card(NAVI, 'pointcloud_slam')],
+              'connections': [_conn(CAM, NAVI, '/stale/cloud'),
+                              _conn(DEPTH, NAVI, '/stale/odom')]}
+    _run(layout)
+    assert rig.starts[NAVI]['input_bindings'] == {
+        CAM_TOPIC: 'sensor/pointcloud2', DEPTH_TOPIC: 'state/odom'}
 
 
 # ── it arrives, keyed by the topic the consumer bound ────────────────────────

@@ -661,7 +661,7 @@ async def _do_start_project_impl():
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
                                  control_interface: dict = None,
-                                 camera_info: dict = None):
+                                 camera_info: dict = None, input_bindings: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -713,6 +713,9 @@ async def _do_start_project_impl():
             # frame, and reports in `info().degraded` what it had to assume when
             # a source declared nothing.
             args['camera_info'] = camera_info
+
+        if input_bindings:
+            args['input_bindings'] = input_bindings
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -920,6 +923,27 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
+    def _slam_input_bindings(card_id: str) -> dict:
+        """Bind only formats reported by the currently running producer."""
+        bindings, ambiguous = {}, set()
+        for conn in (c for c in connections if c.get('toCardId') == card_id):
+            topic = _topic_of_connection(conn)
+            outputs = resolved_topics.get(conn.get('fromCardId')) or []
+            formats = {entry.get('format') for entry in outputs
+                       if isinstance(entry, dict) and entry.get('topic') == topic
+                       and isinstance(entry.get('format'), str) and entry.get('format')}
+            if len(formats) != 1 or topic in ambiguous:
+                ambiguous.add(topic)
+                bindings.pop(topic, None)
+                continue
+            fmt = next(iter(formats))
+            if topic in bindings and bindings[topic] != fmt:
+                ambiguous.add(topic)
+                bindings.pop(topic, None)
+            else:
+                bindings[topic] = fmt
+        return bindings
+
     def _upstream_camera_info(card_id: str) -> dict:
         """What this card's sources say about the optics behind each input.
 
@@ -1087,7 +1111,9 @@ async def _do_start_project_impl():
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
-                                 camera_info=_upstream_camera_info(card.get('id', '')))
+                                 camera_info=_upstream_camera_info(card.get('id', '')),
+                                 input_bindings=_slam_input_bindings(card.get('id', ''))
+                                 if card.get('toolName') == 'pointcloud_slam' else None)
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
