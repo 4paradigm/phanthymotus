@@ -220,7 +220,7 @@ cost_scaling_factor 或高度过滤。`info.inflation_radius_m` 是已配置值�
 `planning_request_timeout_sec`、`planning_discovery_timeout_sec`、
 `lidar_qos_depth`、`imu_qos_depth`、`map_voxel_size_m`。
 通信超时固定为 mapping `130/5 s`、planning `30/5 s`，QoS 深度固定为
-LiDAR `2`、IMU `400`，地图体素固定为 `0.10 m`；不是隐藏后继续采用旧自定义值。
+LiDAR `100`、IMU `2000`，地图体素固定为 `0.10 m`；不是隐藏后继续采用旧自定义值。
 旧 MCP `config` 请求仅兼容上述精确字段名，忽略其值（包括畸形值）；其他 action
 携带旧字段仍拒绝，拼写错误等未知字段也拒绝。响应和 info 通过
 `ignored_legacy_fields` 只报告字段名、`legacy_config_policy=fixed_internal_defaults`
