@@ -33,9 +33,9 @@ Driver navigation_sensors
 - 原始 `/tf`、debug cloud 和 marker 全部隔离在
   `/ubuntu/navigation/fast_livo2/raw/*`，只有 adapter 发布权威
   `map -> base_link`。
-- 建图时 `map` 是本次 FAST-LIVO2 进程的会话原点。加载旧图后，
-  adapter 只在有限搜索范围内匹配成功后建立旧图到当前会话的刚体变换；
-  匹配前不发布伪造的 canonical odom/cloud 或 TF。
+- 建图时 `map` 的高度基准见下方新图约定；加载已保存的新图后，
+  adapter 只在有限搜索范围内匹配成功后建立地图到当前会话的刚体变换；
+  匹配前不发布伪造的 canonical odom/cloud 或 TF。旧基准地图不支持本约定，须重新建图。
 
 ## 输入
 
@@ -194,7 +194,7 @@ freshness 门禁。
 | `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
 | `stop_mapping`  | 无                                                                                     | 停止当前建图 session；静态证据足够时同步落盘 raw/static PCD 和 manifest，否则返回 `status=stopped, map_saved=false` 及 warning |
 | `load_map`      | `map_name`                                                                            | 先校验新旧 manifest/PCD，再串行替换定位前端，失败时尝试回滚旧图 |
-| `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
+| `relocalize`    | `initial_x`, `initial_y`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 在建图起点附近做有界二维 scan-to-map 匹配 |
 
 重定位只有在匹配率至少为 0.35、且最优候选未贴住 XY/yaw 搜索边界时才提交新的
 `map -> base_link` 对齐；否则明确拒绝并要求扩大搜索范围或修正初始位姿。失败
@@ -219,13 +219,21 @@ PCD 后才发送停止信号。落盘失败或超时会返回可重试错误并�
 不会先停算法再留下无法恢复的 `map_artifact_missing`。参数写入使用不经 daemon 的
 直连 ROS 图发现并等待 5 秒，避免首次 stop 时 daemon 尚未发现 `/laserMapping`。
 
+### 地图高度基准与重定位输入
+
+以下约定只适用于重新创建并保存的新地图；旧版本地图不受支持，必须重新建图。
+建图的 `map` 原点是 FAST-LIVO2 会话原点，障碍高度带是地图绝对 Z，不是机器人
+离地高度。重定位必须在建图起点、同一高度进行：当前雷达会话原点在地图中的 Z
+取 0，由现有外参与姿态换算机器人 `base_link` 高度，而不是把机身高度强制设为 0。
+无需输入 Z；二维匹配不能验证两次的高度或姿态是否相同。
+
 重定位的操作顺序为：
 
 1. 执行 `load_map(map_name)`；只接受该卡片 `stop_mapping` 生成的
-   `phanthy.navigation.fast_livo2_map_session.v1` manifest，不猜测孤立 PCD 的归属。
-2. 机器人保持静止，等待新前端产生新鲜 odom 和 registered cloud。
-3. 在 Canvas 中给出机器人在旧图上的近似 `x/y/z/yaw`，执行
-   `relocalize`。默认只搜索位置±1.0 m、航向±0.35 rad；允许范围分别是
+   `phanthy.navigation.fast_livo2_map_session.v2` manifest，不猜测孤立 PCD 的归属。
+2. 机器人保持静止，人工确认 `base_link` 在地图中接近水平；当前输入不包含
+   roll/pitch，匹配假设它们为零，不能自动验证姿态。等待新前端产生新鲜 odom 和 registered cloud。
+3. 在建图起点给出近似 `x/y/yaw`，执行 `relocalize`。默认只搜索位置±1.0 m、航向±0.35 rad；允许范围分别是
    `0.1–3.0 m` 和 `0.05–π/2 rad`。
 4. 返回 `status=relocalized` 后，卡片才发布旧图 frame 下的
    `map -> base_link`、registered cloud 和障碍图；此时再启动 Nav2 任务。
@@ -234,7 +242,10 @@ PCD 后才发送停止信号。落盘失败或超时会返回可重试错误并�
    adapter 加载或新算法启动失败，会尝试恢复旧图。回执中的
    `rollback_status` 为 `restored/failed`，`loaded_map/runtime_mode`
    是切换后真实状态；回滚也失败时必须 fail closed。卡片停止时会自动释放
-   当前定位前端，不再对外提供 `unload_map`。
+   当前定位前端，不再对外提供 `unload_map`。切图先向静态图话题发送上一已发布
+   窗口的全空栅格；重定位后再按机器人位置发布新图。此操作只覆盖最后发布窗口，
+   adapter 重启后可能仅发送 1×1 的空图；也不清除实时障碍层。ROS/DDS 与 Nav2
+   消费侧尚需集成验证，不能将发布成功当成下游已完整清除。
 
 当前锁定的 FAST-LIVO2 本身仍然没有 PCD 加载、`/initialpose` 或全局回环。
 这里的加载和重定位由同容器 ActuCore adapter 实现：它是依赖人工
@@ -245,9 +256,8 @@ fail closed。
 当前有界匹配以 confirmed static PCD 为参考，缓存最近 `2 s`、最多 20 帧，
 每帧最多保留 2,000 点后合并；最终使用 `0.20 m` 二维体素去重并最多评分
 1,200 点。评分按点到参考体素的距离连续衰减，并对偏离人工初值的候选施加
-轻微先验代价。旧图和当前数据都至少需要 40 个有效障碍体素，最低匹配比为
-`0.35`。`initial_z` 只决定成功后垂直对齐，二维 XY/yaw 评分不再用它平移
-当前点云的 Z 高度带。成功回执会返回 `match_ratio`、`matched_points`、
+轻微先验代价。已加载地图和当前数据都至少需要 40 个有效障碍体素，最低匹配比为
+`0.35`。匹配保留原有二维近似，不估计高度或 roll/pitch。成功回执会返回 `match_ratio`、`matched_points`、
 `evaluated_points`、输入帧数和输入点数；
 `status=relocalized` 只证明本次有界匹配过关，不等同于长时间全局定位
 可靠性已验收。
@@ -284,13 +294,12 @@ fail closed。
   完全一致，多 token、多行或少行均拒绝，解析过程持续检查 map-control
   deadline。每张图最多接受 64 个 raw PCD，manifest 最大 64 KiB，raw 会话快照与 confirmed static PCD
   合计最多 512 MiB；单个 PCD 另有 1 GiB 上限，但仍受更小的会话总量约束。
-  raw 重定位参考点最多抽样 200,000 个，而 confirmed static map 超过
-  200,000 点会直接拒绝，不做抽样。manifest
-  的 `pcd_files` 继续保存 raw PCD 并仅用于有界重定位；
-  `static_map_pcd` 保存导航高度带内的确认静态点并用于 Canvas/StaticLayer。
-  新保存的 manifest 带 `static_map_format_version=2`，缺少 confirmed static
-  PCD 会 fail closed；旧版 manifest 没有该版本字段时兼容回退到 raw PCD，并在加载回执标记
-  `static_map_source=legacy_raw`；该回退不具备动态物体过滤保证。所有路径仍须
+  raw 地图预览上下文最多抽样 200,000 个点，而 confirmed static map 超过
+  200,000 点会直接拒绝，不做抽样。manifest 的 `pcd_files` 保存 raw PCD，
+  用于地图预览上下文；`static_map_pcd` 保存导航高度带内的确认静态点，
+  用于有界重定位参考和 StaticLayer。
+  新保存的 manifest 带 `static_map_format_version=2`；旧版本地图以及缺少
+  confirmed static PCD 的地图均会拒绝，必须重新建图。所有路径仍须
   位于当前 map root 的固定目录。confirmed static PCD 会同时记录建图时的
   `obstacle_height_range_m`；加载时必须与当前卡片上下界一致，否则 fail closed，
   操作者应恢复原上下界或重新建图，不能用另一套高度语义解释既有静态证据。

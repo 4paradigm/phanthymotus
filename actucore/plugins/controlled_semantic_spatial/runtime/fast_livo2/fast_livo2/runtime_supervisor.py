@@ -1318,12 +1318,14 @@ class FastLivo2Supervisor(Node):
         if len(manifest_bytes) > _MAX_MAP_MANIFEST_BYTES:
             raise ValueError("map manifest exceeds byte safety limit")
         manifest = json.loads(manifest_bytes.decode("utf-8"))
-        if manifest.get("schema") != "phanthy.navigation.fast_livo2_map_session.v1":
-            raise ValueError("map manifest schema is unsupported")
+        if manifest.get("schema") != "phanthy.navigation.fast_livo2_map_session.v2":
+            raise ValueError("map height contract is unsupported; create a new map")
+        if manifest.get("height_frame") != "absolute_session_map_z":
+            raise ValueError("map height contract is missing or invalid; create a new map")
         if manifest.get("map_name") != map_name:
             raise ValueError("map manifest name does not match request")
         static_format_version = manifest.get("static_map_format_version")
-        if static_format_version is not None and static_format_version != 2:
+        if static_format_version != 2:
             raise ValueError("map manifest static-map format is unsupported")
         names = manifest.get("pcd_files")
         if not isinstance(names, list) or not names:
@@ -1693,7 +1695,8 @@ class FastLivo2Supervisor(Node):
         temporary.write_text(
             json.dumps(
                 {
-                    "schema": "phanthy.navigation.fast_livo2_map_session.v1",
+                    "schema": "phanthy.navigation.fast_livo2_map_session.v2",
+                    "height_frame": "absolute_session_map_z",
                     "static_map_format_version": 2,
                     "map_name": map_name,
                     "started_unix_ms": started,

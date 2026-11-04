@@ -138,6 +138,7 @@ class _CapturePublisher:
 
 def _prepare_adapter_concurrency(adapter) -> None:
     adapter._static_lock = threading.Lock()
+    adapter._static_save_lock = threading.Lock()
     adapter._mapping_work_condition = threading.Condition()
     adapter._mapping_work = None
     adapter._mapping_generation = 0
@@ -430,6 +431,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
     def test_cached_map_view_refreshes_pose_without_reencoding_points(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
+        adapter._mapping_generation = 0
+        adapter._odom_epoch = 0
         adapter._latency_ms = {}
         adapter._latency_max_ms = {}
         identity = Pose3(
@@ -595,6 +598,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._mapper_contract_ready = True
         adapter._mapper_contract_issues = ()
         adapter._last_mapper_runtime_monotonic = time.monotonic() - 3.1
+        adapter._mapping_generation = 0
         adapter._base_to_sensor_tf_ready = True
         adapter._base_to_sensor = Pose3(
             0.0,
@@ -836,7 +840,12 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._map_view_cache = b"old-cache"
         adapter._map_view_cache_monotonic = time.monotonic()
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_health.observe(1, adapter._latest_session_pose)
+        adapter._sensor_geometry_ready_locked = lambda: True
         adapter._odom_epoch = 0
+        adapter._latest_session_pose_epoch = 0
+        adapter._mapping_generation = 0
+        adapter._pose_history = [(1, adapter._latest_session_pose)]
         adapter._last_published_odom = None
         map_from_session = Pose3(
             1.0,
@@ -866,6 +875,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 {
                     "initial_x": 3.0,
                     "initial_y": 4.0,
+                    "initial_z": 0.0,
                     "initial_yaw": 0.0,
                     "search_xy_m": 1.0,
                     "search_yaw_rad": 0.35,
@@ -904,6 +914,10 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             0.0,
             Quaternion(0.0, 0.0, 0.0, 1.0),
         )
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_health.observe(1, adapter._latest_session_pose)
+        adapter._sensor_geometry_ready_locked = lambda: True
+        adapter._latest_session_pose_epoch = 0
         points = tuple((index * 0.1, 0.0, 0.0) for index in range(40))
         adapter._latest_session_points = points
         adapter._relocalization_cloud_history = [(time.monotonic(), points)]
@@ -912,6 +926,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._last_odom_monotonic = time.monotonic()
         adapter._last_cloud_monotonic = time.monotonic()
         adapter._source_max_age = 0.5
+        adapter._odom_epoch = 0
+        adapter._mapping_generation = 0
         adapter._reference_points = points
         adapter._obstacle_min_height = -0.3
         adapter._obstacle_max_height = 0.3
@@ -944,6 +960,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                     "args": {
                         "initial_x": 1.0,
                         "initial_y": 2.0,
+                        "initial_z": 0.0,
                         "initial_yaw": 0.0,
                     },
                     "operation_deadline_monotonic": time.monotonic() + 1.0,
@@ -1088,6 +1105,41 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertTrue(result["retryable"])
         supervisor._map_control_pub.publish.assert_not_called()
 
+    def test_relocalization_history_keeps_multiple_sampled_clouds(self) -> None:
+        import numpy as np
+        from collections import deque
+
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._odom_epoch = adapter._mapping_generation = 0
+        adapter._odom_health = SimpleNamespace(ready=True)
+        adapter._sensor_geometry_ready_locked = lambda: True
+        adapter._source_age = lambda _stamp: 0.0
+        adapter._source_max_age, adapter._source_age_tolerance = 0.5, 0.05
+        adapter._map_load_max_points = 200_000
+        adapter._live_cloud_max_bytes = 64 * 1024 * 1024
+        adapter._mode, adapter._map_from_session = "awaiting_relocalization", None
+        adapter._last_cloud_monotonic = None
+        adapter._relocalization_cloud_history = deque(maxlen=20)
+        adapter._observe_pipeline_event = lambda _name: None
+        adapter._record_latency_locked = lambda *_args: None
+        adapter._mark_valid = lambda _name: None
+        points = np.zeros((200_000, 3), dtype=np.float32)
+        points[:, 2] = 2.0
+        points[-50:, 2] = 0.0
+        message = SimpleNamespace(header=SimpleNamespace(frame_id="camera_init", stamp=SimpleNamespace(sec=1, nanosec=0)),
+            width=len(points), height=1, point_step=12, is_bigendian=False, fields=[], data=b"")
+        with mock.patch.object(ADAPTER_MODULE, "decode_xyz_array", return_value=points):
+            adapter._on_cloud(message)
+        self.assertEqual(len(adapter._relocalization_cloud_history), 1)
+        cached = adapter._relocalization_cloud_history[0][1]
+        self.assertEqual(len(cached), 2_000)
+        message.header.stamp = SimpleNamespace(sec=2, nanosec=0)
+        with mock.patch.object(ADAPTER_MODULE, "decode_xyz_array", return_value=points):
+            adapter._on_cloud(message)
+        self.assertEqual(len(adapter._relocalization_cloud_history), 2)
+        self.assertEqual(len(adapter._relocalization_cloud_history[1][1]), 2_000)
+
     def test_extreme_float64_live_cloud_is_rejected_without_callback_escape(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._source_age = lambda _stamp: 0.0
@@ -1126,6 +1178,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         )
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
         adapter._odom_epoch = 0
+        adapter._mapping_generation = 0
         adapter._last_published_odom = None
         adapter._odom_health.observe(
             1_000_000_000,
@@ -1172,6 +1225,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             10.0,
             0.01,
         )
+        adapter._odom_epoch = 0
         adapter._map_from_session = identity
         adapter._mode = "relocalized"
         adapter._pose_history = [(1_000_000_000, identity)]
@@ -1296,6 +1350,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             old_points = tuple((index * 0.2, 2.0, 0.0) for index in range(40))
             pcd = root / "office.pcd"
             write_pcd_xyz_atomic(pcd, points)
+            static_pcd = root / "static" / "office.static.pcd"
+            static_pcd.parent.mkdir()
+            write_pcd_xyz_atomic(static_pcd, points)
             adapter = object.__new__(FastLivo2Adapter)
             adapter._lock = threading.RLock()
             _prepare_adapter_concurrency(adapter)
@@ -1313,6 +1370,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             args = {
                 "map_name": "office",
                 "pcd_files": [str(pcd)],
+                "static_map_pcd": str(static_pcd),
+                "obstacle_height_range_m": [-0.30, 0.30],
                 "_operation_deadline_monotonic": time.monotonic() + 30.0,
             }
             original_require = FastLivo2Adapter._require_map_control_deadline
@@ -1333,6 +1392,22 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             self.assertEqual(adapter._mode, "idle")
             self.assertEqual(adapter._static_map.confirmed_points, old_points)
 
+    def test_adapter_rejects_raw_only_map(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pcd = root / "office.pcd"
+            write_pcd_xyz_atomic(pcd, tuple((index * 0.25, 0.0, 0.0) for index in range(40)))
+            adapter = object.__new__(FastLivo2Adapter)
+            adapter._lock = threading.RLock()
+            adapter._map_root = root
+            adapter._map_load_max_points = 200_000
+            adapter.get_parameter = lambda _name: SimpleNamespace(value=0.1)
+            with self.assertRaisesRegex(ADAPTER_MODULE.InvalidFastLivo2Frame, "confirmed static PCD"):
+                adapter._load_saved_map({
+                    "map_name": "office", "pcd_files": [str(pcd)],
+                    "_operation_deadline_monotonic": time.monotonic() + 30.0,
+                }, validate_only=True)
+
     def test_map_validation_recovers_ground_for_canvas_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1342,6 +1417,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             )
             pcd = root / "office.pcd"
             write_pcd_xyz_atomic(pcd, points)
+            static_pcd = root / "static" / "office.static.pcd"
+            static_pcd.parent.mkdir()
+            write_pcd_xyz_atomic(static_pcd, tuple((index * 0.25, 1.0, 0.0) for index in range(40)))
             adapter = object.__new__(FastLivo2Adapter)
             adapter._lock = threading.RLock()
             _prepare_adapter_concurrency(adapter)
@@ -1359,6 +1437,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 {
                     "map_name": "office",
                     "pcd_files": [str(pcd)],
+                    "static_map_pcd": str(static_pcd),
+                    "obstacle_height_range_m": [-0.30, 0.30],
                     "_operation_deadline_monotonic": time.monotonic() + 30.0,
                 },
                 validate_only=True,
@@ -1367,6 +1447,59 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             self.assertEqual(result["status"], "map_validated")
             self.assertEqual(result["map_view_context_point_count"], 20)
             self.assertEqual(adapter._static_map.point_count, 0)
+
+    def test_loading_new_map_publishes_clear_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pcd = root / "office.pcd"
+            points = tuple((i * 0.25, 0.0, 0.0) for i in range(40))
+            write_pcd_xyz_atomic(pcd, points)
+            static_pcd = root / "static" / "office.static.pcd"
+            static_pcd.parent.mkdir()
+            write_pcd_xyz_atomic(static_pcd, points)
+            adapter = object.__new__(FastLivo2Adapter)
+            adapter._lock = threading.RLock()
+            _prepare_adapter_concurrency(adapter)
+            adapter._map_root = root
+            adapter._map_load_max_points = adapter._static_map_load_max_points = 200_000
+            adapter._obstacle_min_height, adapter._obstacle_max_height = -0.3, 0.3
+            adapter._map_view_voxel_size = 0.2
+            adapter._map_view_context = VoxelMap(0.2)
+            adapter._static_map = TemporalOccupancyMap(0.1)
+            adapter._reference_points, adapter._pose_history = (), []
+            adapter._latest_session_points = adapter._latest_mapped_points = ()
+            adapter._relocalization_cloud_history = []
+            adapter._relocalization_preview_points = ()
+            adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+            adapter._odom_epoch = 0
+            adapter.get_parameter = lambda _name: SimpleNamespace(value=0.1)
+            adapter.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: "now"))
+            adapter._clear_published_static_grid_locked = mock.Mock()
+            result = adapter._load_saved_map({"map_name": "office", "pcd_files": [str(pcd)],
+                "static_map_pcd": str(static_pcd), "obstacle_height_range_m": [-0.3, 0.3],
+                "_operation_deadline_monotonic": time.monotonic() + 30})
+            self.assertEqual(result["status"], "map_loaded")
+            adapter._clear_published_static_grid_locked.assert_called_once()
+            self.assertNotIn("_post_response", result)
+            self.assertIsNone(adapter._map_from_session)
+
+    def test_static_clear_uses_last_published_grid_not_unpublished_bounds(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._static_map_pub = _CapturePublisher()
+        adapter._static_map_load_time = "load-time"
+        adapter.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: "now"))
+        adapter._last_static_grid = SimpleNamespace(
+            header=SimpleNamespace(frame_id="map"),
+            info=SimpleNamespace(width=4, height=3, origin=SimpleNamespace(x=7.0)),
+            data=[100] * 12,
+        )
+        fake_grid = SimpleNamespace()
+        with mock.patch.object(ADAPTER_MODULE, "OccupancyGrid", return_value=fake_grid):
+            adapter._clear_published_static_grid_locked(None)
+        self.assertEqual(fake_grid.data, [0] * 12)
+        self.assertEqual(fake_grid.info.origin.x, 7.0)
+        self.assertIs(adapter._static_map_pub.messages[-1], fake_grid)
+        self.assertIs(adapter._last_static_grid, fake_grid)
 
     def test_mapping_work_queue_keeps_only_the_latest_scan(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
@@ -1606,7 +1739,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             (root / "sessions" / "office.json").write_text(
                 json.dumps(
                     {
-                        "schema": "phanthy.navigation.fast_livo2_map_session.v1",
+                        "schema": "phanthy.navigation.fast_livo2_map_session.v2",
+                        "height_frame": "absolute_session_map_z",
                         "static_map_format_version": 2,
                         "map_name": "office",
                         "pcd_files": ["raw.pcd"],
@@ -1625,6 +1759,23 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 6,
             ):
                 with self.assertRaisesRegex(ValueError, "aggregate byte"):
+                    supervisor._map_artifacts_from_manifest("office")
+
+    def test_legacy_and_incomplete_map_manifest_require_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sessions").mkdir()
+            manifest_path = root / "sessions" / "office.json"
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._map_root = root
+            for manifest in (
+                {"schema": "phanthy.navigation.fast_livo2_map_session.v1"},
+                {"schema": "phanthy.navigation.fast_livo2_map_session.v2"},
+                {"schema": "phanthy.navigation.fast_livo2_map_session.v2",
+                 "height_frame": "absolute_session_map_z", "map_name": "office"},
+            ):
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.subTest(manifest=manifest), self.assertRaises(ValueError):
                     supervisor._map_artifacts_from_manifest("office")
 
     def test_oversized_manifest_is_rejected_before_json_decode(self) -> None:

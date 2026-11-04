@@ -135,6 +135,10 @@ class FastLivo2Core:
                 return self._result(action, result)
 
             if action == "relocalize":
+                if "initial_z" in args:
+                    raise FastLivo2BackendError(
+                        "invalid_argument", "initial_z is not supported; relocalize at the mapping origin"
+                    )
                 with self._lock:
                     loaded_map = self._loaded_map
                 if not loaded_map:
@@ -145,7 +149,6 @@ class FastLivo2Core:
                     "map_name": loaded_map,
                     "initial_x": _finite_number(args, "initial_x", -1000.0, 1000.0),
                     "initial_y": _finite_number(args, "initial_y", -1000.0, 1000.0),
-                    "initial_z": _finite_number(args, "initial_z", -10.0, 10.0, default=0.0),
                     "initial_yaw": _finite_number(args, "initial_yaw", -math.pi, math.pi),
                     "search_xy_m": _finite_number(args, "search_xy_m", 0.1, 3.0, default=1.0),
                     "search_yaw_rad": _finite_number(

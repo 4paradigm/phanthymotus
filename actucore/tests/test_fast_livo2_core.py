@@ -145,7 +145,11 @@ class FastLivo2CoreTest(unittest.TestCase):
         )
         self.assertEqual(localized["status"], "relocalized")
         self.assertEqual(backend.calls[-1][1]["map_name"], "office")
+        self.assertNotIn("initial_z", backend.calls[-1][1])
         self.assertEqual(backend.calls[-1][1]["search_xy_m"], 1.0)
+        rejected = core.dispatch({"action": "relocalize", "initial_x": 1.0,
+                                  "initial_y": -2.0, "initial_yaw": 0.5, "initial_z": 2.0})
+        self.assertEqual(rejected["error_code"], "invalid_argument")
 
         replaced = core.dispatch({"action": "load_map", "map_name": "warehouse"})
         self.assertEqual(replaced["status"], "map_loaded")

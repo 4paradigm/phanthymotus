@@ -855,7 +855,25 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
 
         self.assertAlmostEqual(result.map_base_pose.x, expected.x, delta=0.15)
         self.assertAlmostEqual(result.map_base_pose.y, expected.y, delta=0.15)
-        self.assertEqual(result.map_base_pose.z, 5.0)
+        self.assertAlmostEqual(result.map_from_session.z, 0.0, places=12)
+        self.assertAlmostEqual(result.map_base_pose.z, -3.0, places=12)
+
+    def test_relocalization_uses_session_origin_z_with_tilt(self) -> None:
+        points = [(i * 0.3, j * 0.4, 0.0) for i in range(10) for j in range(5)]
+        session_base = Pose3(1.0, 0.0, 0.5, quaternion_from_rpy(0.0, math.pi / 2, 0.0))
+        initial = Pose3(1.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.0))
+        result = estimate_planar_relocalization(
+            reference_points=points, session_points=points,
+            session_base_pose=session_base, initial_map_base_pose=initial,
+            search_xy_m=0.1, search_yaw_rad=0.1, min_z=-0.3, max_z=0.3,
+        )
+        self.assertAlmostEqual(result.map_from_session.z, 0.0, places=12)
+        self.assertAlmostEqual(result.map_base_pose.z, 1.0, places=12)
+        self.assertNotAlmostEqual(result.map_base_pose.z, session_base.z)
+        actual = compose_pose(result.map_from_session, session_base)
+        for value, expected_value in zip((actual.x, actual.y, actual.z),
+                                         (result.map_base_pose.x, result.map_base_pose.y, result.map_base_pose.z)):
+            self.assertAlmostEqual(value, expected_value, places=12)
 
     def test_relocalization_rejection_exposes_best_candidate(self) -> None:
         points = [

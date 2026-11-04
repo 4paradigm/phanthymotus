@@ -888,14 +888,15 @@ def estimate_planar_relocalization(
                     best,
                 )
 
-    map_base = Pose3(
-        best[2],
-        best[3],
-        initial_map_base_pose.z,
-        quaternion_from_rpy(0.0, 0.0, best[4]),
-    )
+    session_inverse = inverse_pose(session_base_pose)
+    map_base_rotation = quaternion_from_rpy(0.0, 0.0, best[4])
+    inverse_z = rotate_vector(
+        map_base_rotation, (session_inverse.x, session_inverse.y, session_inverse.z)
+    )[2]
+    # The operator relocalizes at the mapping origin: session-origin map Z is 0.
+    map_base = Pose3(best[2], best[3], -inverse_z, map_base_rotation)
     result = RelocalizationResult(
-        map_from_session=compose_pose(map_base, inverse_pose(session_base_pose)),
+        map_from_session=compose_pose(map_base, session_inverse),
         map_base_pose=map_base,
         match_ratio=best[0],
         matched_points=best[1],

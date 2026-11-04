@@ -293,9 +293,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("global_localization", actions)
         self.assertNotIn("navigate_to_tag", actions)
         self.assertEqual(
-            tool["inputSchema"]["x-action-params"]["relocalize"]["params"][:4],
-            ["initial_x", "initial_y", "initial_z", "initial_yaw"],
+            tool["inputSchema"]["x-action-params"]["relocalize"]["params"][:3],
+            ["initial_x", "initial_y", "initial_yaw"],
         )
+        self.assertNotIn("initial_z", tool["inputSchema"]["properties"])
 
         runtime_package = (
             ACTUCORE_ROOT

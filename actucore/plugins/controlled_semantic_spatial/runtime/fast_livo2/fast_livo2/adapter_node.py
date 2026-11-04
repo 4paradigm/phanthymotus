@@ -7,6 +7,7 @@ import logsafe
 logsafe.install()
 
 from collections import deque
+from copy import deepcopy
 from itertools import chain
 import json
 import math
@@ -242,6 +243,7 @@ class FastLivo2Adapter(Node):
         self._latency_ms: dict[str, float] = {}
         self._latency_max_ms: dict[str, float] = {}
         self._static_map_load_time = self.get_clock().now().to_msg()
+        self._last_static_grid = None
         self._callbacks = ReentrantCallbackGroup()
         self._display_callbacks = MutuallyExclusiveCallbackGroup()
 
@@ -1080,7 +1082,7 @@ class FastLivo2Adapter(Node):
             self._static_map_error = None
             self._static_save_result = None
             self._invalidate_map_view_cache_locked()
-        self._static_map_pub.publish(self._occupancy_grid(cleared))
+            self._clear_published_static_grid_locked(cleared)
         _ = retired_map_view
 
     def _on_map_control(self, message: String) -> None:
@@ -1329,7 +1331,9 @@ class FastLivo2Adapter(Node):
         if loaded.point_count < 40:
             raise InvalidFastLivo2Frame("saved map has too few finite points")
         static_file = args.get("static_map_pcd")
-        static_source = "legacy_raw"
+        if static_file is None:
+            raise InvalidFastLivo2Frame("confirmed static PCD is required; create a new map")
+        static_source = "confirmed_static_pcd"
         static_loaded = loaded
         with self._lock:
             active_height_range = (
@@ -1388,13 +1392,6 @@ class FastLivo2Adapter(Node):
         )
         with self._static_lock:
             prepared = self._static_map.prepare_confirmed(static_loaded.points)
-            snapshot = self._static_map.prepared_occupancy_snapshot(
-                prepared,
-                center_x=static_loaded.points[0][0],
-                center_y=static_loaded.points[0][1],
-                min_z=active_height_range[0],
-                max_z=active_height_range[1],
-            )
         self._require_map_control_deadline(args, stage="map activation")
         if validate_only:
             return {
@@ -1406,8 +1403,6 @@ class FastLivo2Adapter(Node):
                 "map_view_context_point_count": map_view_context.point_count,
                 "obstacle_height_range_m": list(active_height_range),
             }
-        with self._static_lock:
-            cleared = self._static_map.cleared_snapshot()
         self._require_map_control_deadline(args, stage="map activation commit")
         with self._lock:
             if (
@@ -1423,6 +1418,7 @@ class FastLivo2Adapter(Node):
             )
             self._invalidate_mapping_work_locked()
             with self._static_lock:
+                cleared = self._static_map.cleared_snapshot()
                 retired_static = self._static_map.apply_prepared_confirmed(prepared)
                 retired_adapter = (
                     self._reference_points,
@@ -1460,12 +1456,8 @@ class FastLivo2Adapter(Node):
             self._static_map_error = None
             self._static_save_result = None
             self._invalidate_map_view_cache_locked()
-        def publish_loaded_map() -> None:
-            self._static_map_pub.publish(self._occupancy_grid(cleared))
-            self._static_map_pub.publish(self._occupancy_grid(snapshot))
-            # Keep detached large containers alive until after the response and
-            # latched-map publication, outside the deadline-protected commit.
-            _ = retired_static, retired_adapter
+            self._clear_published_static_grid_locked(cleared)
+        _ = retired_static, retired_adapter
 
         return {
             "status": "map_loaded",
@@ -1476,7 +1468,6 @@ class FastLivo2Adapter(Node):
             "map_view_context_point_count": map_view_context.point_count,
             "obstacle_height_range_m": list(active_height_range),
             "localization_state": "awaiting_relocalization",
-            "_post_response": publish_loaded_map,
         }
 
     def _relocalize(self, args: dict) -> dict:
@@ -1515,7 +1506,7 @@ class FastLivo2Adapter(Node):
         initial = Pose3(
             float(args["initial_x"]),
             float(args["initial_y"]),
-            float(args.get("initial_z", 0.0)),
+            0.0,
             quaternion_from_rpy(0.0, 0.0, float(args["initial_yaw"])),
         )
         try:
@@ -1598,17 +1589,21 @@ class FastLivo2Adapter(Node):
         self._require_map_control_deadline(args, stage="map unload")
         with self._lock:
             map_name = self._session_name
-        with self._static_lock:
-            cleared = self._static_map.cleared_snapshot()
+            unload_generation = self._mapping_generation
+            unload_mode = self._mode
         self._require_map_control_deadline(args, stage="map unload commit")
         with self._lock:
-            if self._session_name != map_name:
+            if (self._session_name != map_name
+                    or self._mapping_generation != unload_generation
+                    or self._mode != unload_mode):
                 raise InvalidFastLivo2Frame(
                     "loaded map changed while unloading"
                 )
             self._require_map_control_deadline(args, stage="map unload commit")
-            self._invalidate_mapping_work_locked()
             with self._static_lock:
+                self._require_map_control_deadline(args, stage="map unload commit")
+                self._invalidate_mapping_work_locked()
+                cleared = self._static_map.cleared_snapshot()
                 retired_static = self._static_map.retire_and_clear()
                 retired_adapter = (
                     self._reference_points,
@@ -1646,8 +1641,11 @@ class FastLivo2Adapter(Node):
             self._static_map_error = None
             self._static_save_result = None
             self._invalidate_map_view_cache_locked()
+            publication_generation = self._mapping_generation
         def publish_cleared_map() -> None:
-            self._static_map_pub.publish(self._occupancy_grid(cleared))
+            with self._lock:
+                if self._mapping_generation == publication_generation:
+                    self._clear_published_static_grid_locked(cleared)
             _ = retired_static, retired_adapter
 
         return {
@@ -1718,12 +1716,29 @@ class FastLivo2Adapter(Node):
         output.data = list(snapshot.data)
         return output
 
+    def _clear_published_static_grid_locked(self, fallback) -> None:
+        previous = self._last_static_grid
+        if previous is None:
+            cleared = self._occupancy_grid(fallback)
+        else:
+            cleared = OccupancyGrid()
+            cleared.header = deepcopy(previous.header)
+            cleared.info = deepcopy(previous.info)
+            cleared.header.stamp = self.get_clock().now().to_msg()
+            cleared.info.map_load_time = self._static_map_load_time
+            cleared.data = [0] * (previous.info.width * previous.info.height)
+        self._static_map_pub.publish(cleared)
+        self._last_static_grid = cleared
+
     def _publish_periodic(self) -> None:
         now = time.monotonic()
         static_grid = None
         encoded_map_view = None
         map_view_encode_sec = None
         with self._lock:
+            publication_generation = self._mapping_generation
+            publication_epoch = self._odom_epoch
+            publication_preview = self._relocalization_preview_pose
             confirmed_pose = self._latest_pose
             pose = confirmed_pose or self._relocalization_preview_pose
             odom_age = None if self._last_odom_monotonic is None else now - self._last_odom_monotonic
@@ -1826,6 +1841,10 @@ class FastLivo2Adapter(Node):
             self._observe_pipeline_event("map_view_encoded")
         if encoded_map_view is not None:
             with self._lock:
+                if (self._mapping_generation != publication_generation
+                        or self._odom_epoch != publication_epoch
+                        or self._relocalization_preview_pose is not publication_preview):
+                    return
                 self._map_view_cache = encoded_map_view
                 self._map_view_cache_monotonic = time.monotonic()
                 self._record_latency_locked(
@@ -1915,11 +1934,17 @@ class FastLivo2Adapter(Node):
             "odom_health": state["odom_health"],
             "readiness_blockers": state["readiness_blockers"],
         }
-        if static_grid is not None:
-            self._static_map_pub.publish(static_grid)
-        self._obstacle_map_pub.publish(self._obstacle_cloud(obstacle_points))
         message = String()
         message.data = json.dumps(payload, separators=(",", ":"))
+        with self._lock:
+            if (self._mapping_generation != publication_generation
+                    or self._odom_epoch != publication_epoch
+                    or self._relocalization_preview_pose is not publication_preview):
+                return
+            if static_grid is not None:
+                self._static_map_pub.publish(static_grid)
+                self._last_static_grid = static_grid
+        self._obstacle_map_pub.publish(self._obstacle_cloud(obstacle_points))
         self._diagnostics_pub.publish(message)
 
 

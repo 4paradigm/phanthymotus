@@ -149,7 +149,6 @@ FAST_LIVO2_ACTION_PARAMS = {
         "params": [
             "initial_x",
             "initial_y",
-            "initial_z",
             "initial_yaw",
             "search_xy_m",
             "search_yaw_rad",
@@ -330,13 +329,6 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                     "minimum": -1000.0,
                     "maximum": 1000.0,
                     "description": "Approximate robot Y in the loaded map, metres",
-                },
-                "initial_z": {
-                    "type": "number",
-                    "minimum": -10.0,
-                    "maximum": 10.0,
-                    "default": 0.0,
-                    "description": "Approximate robot Z in the loaded map, metres",
                 },
                 "initial_yaw": {
                     "type": "number",
