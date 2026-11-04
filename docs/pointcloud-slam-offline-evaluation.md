@@ -107,6 +107,11 @@ verified ground truth. The original archive SHA-256 is
   moves historical poses and changes the map rebuilt from local point clouds.
   It does not prove actual loop detection, robustness, cross-segment merging or
   the quality of a real map. An unverified edge is rejected by the experiment.
+- On the development Mac, the 317-frame single-frame run took 80.47 s and
+  peaked at 184.9 MB process RSS; the two submap runs took 11.56 s / 224.2 MB
+  and 65.50 s / 222.1 MB respectively. Runs overlapped with each other, and
+  these totals include descriptor generation for both methods. They are not
+  per-frame latency guarantees or Jetson performance measurements.
 
 The two sets of descriptor scores and rankings are saved with the local Bumi
 recording as `retrieval-exploratory.json`,
