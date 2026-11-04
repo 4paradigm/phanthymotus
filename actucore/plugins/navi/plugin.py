@@ -521,13 +521,13 @@ class NaviPlugin:
         that declare neither keep the existing observation-age fallback.
         """
         self._odom_interface = dict(interface) if isinstance(interface, dict) else {}
-        fallback = 500
+        fallback = int(self._config.max_obs_age_ms)
         max_age = fallback
         try:
             if not self._odom_interface:
                 if bound_topic:
                     self._limit_notes.append(
-                        "state/odom 未声明 timing，已使用通用 500ms 观测有效期")
+                        f"state/odom 未声明 timing，已使用通用 {fallback}ms 观测有效期")
                 self._odom_max_age_ms = fallback
                 return
             if self._odom_interface.get("schema") != "motus.odom/1":
@@ -551,9 +551,9 @@ class NaviPlugin:
             if bound_topic:
                 self._limit_notes.append(
                     "odom_interface 的 schema/topic/timing 声明无效，"
-                    "已使用通用 500ms 观测有效期")
+                    f"已使用通用 {fallback}ms 观测有效期")
             # A malformed declaration is the same as no timing contract. Keep
-            # the legacy receipt-time semantics as well as its 500ms budget;
+            # the legacy receipt-time semantics as well as the configured budget;
             # otherwise `_on_string` would trust an unvalidated producer stamp.
             self._odom_interface = {}
             max_age = fallback

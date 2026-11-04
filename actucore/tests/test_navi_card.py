@@ -838,8 +838,25 @@ def test_odom_timing_selects_the_bound_topic_and_computes_freshness():
 def test_missing_or_invalid_odom_timing_falls_back_without_blocking(interface):
     card = _card()
     card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
-    assert card._odom_max_age_ms == 500
+    assert card._odom_max_age_ms == 600
     assert card._limit_notes
+
+
+def test_visual_observation_accepts_600ms_and_rejects_601ms(monkeypatch):
+    card = _card()
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+
+    card._objects_ms = card._depth_ms = now_ms - 600
+    objects, depth, _ = card.observation()
+    assert objects is card._objects
+    assert depth == {"map": None, "bands": {"center": 2.0}}
+
+    card._objects_ms = card._depth_ms = now_ms - 601
+    objects, depth, _ = card.observation()
+    assert objects is None and depth is None
 
 
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
