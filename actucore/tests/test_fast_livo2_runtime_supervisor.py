@@ -280,6 +280,36 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         )
         self.assertEqual(adapter._rejection_counts, {})
 
+    def test_mapper_runtime_epoch_timestamps_preserve_rejection_skew(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._rejection_counts = {}
+        adapter._lidar_frame = None
+        adapter._imu_frame = None
+        adapter._odom_epoch = 0
+        adapter._mapper_runtime_max_age = 3.0
+        adapter._sensor_rejection_pub = _CapturePublisher()
+        adapter._refresh_sensor_contract = mock.Mock()
+        adapter.get_logger = lambda: SimpleNamespace(warning=mock.Mock(), info=mock.Mock())
+        lidar = 1_793_790_123.987654
+        for delta, expected in ((0.001, "matched"), (0.250, "skew_exceeded")):
+            with self.subTest(delta=delta):
+                payload = {
+                    "lidar_frame": "lidar", "imu_frame": "lidar",
+                    "last_lidar_source_stamp_sec": lidar,
+                    "last_imu_source_stamp_sec": lidar + delta,
+                    "state_stamp_sec": lidar,
+                    "publish_latency_ms": 123.0,
+                    "point_time_span_ms": 80.0,
+                    "input_contract_ready": True,
+                }
+                adapter._on_mapper_runtime(SimpleNamespace(data=json.dumps(payload)))
+                adapter._warn_rejected("FAST-LIVO2 cloud", "test")
+                evidence = json.loads(adapter._sensor_rejection_pub.messages[-1].data)
+                self.assertAlmostEqual(evidence["lidar_imu_skew_ms"], delta * 1000, delta=0.001)
+                self.assertEqual(evidence["lidar_imu_pair_result"], expected)
+                self.assertEqual(adapter._mapper_state_stamp_sec, lidar)
+
     def test_launch_uses_python_38_compatible_syntax_and_no_dict_union(self) -> None:
         path = PACKAGE_ROOT / "launch" / "fast_livo2.launch.py"
         tree = ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, 8))

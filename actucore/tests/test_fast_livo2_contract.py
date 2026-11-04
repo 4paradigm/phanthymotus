@@ -117,8 +117,14 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=1e776ea08d0082fdef911b93aa88b88aee2a2b91a9bb08b608bb34daa4dd8b7f",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e",
             source_lock,
+        )
+        self.assertEqual(
+            base_dockerfile.count(
+                "ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e"
+            ),
+            2,
         )
         self.assertIn(
             "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe",
@@ -164,6 +170,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )[1]
         self.assertNotIn("@@ -13,", runtime_cpp_patch)
         self.assertIn("publishRuntimeDiagnostics", runtime_patch_text)
+        self.assertIn("payload << std::setprecision(17)", runtime_patch_text)
         self.assertIn("input_contract_ready", runtime_patch_text)
         # Published state time must describe the integrated state, not the
         # publish instant; speed/freshness checks read these stamps.
@@ -228,7 +235,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "1e776ea08d0082fdef911b93aa88b88aee2a2b91a9bb08b608bb34daa4dd8b7f",
+            "cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

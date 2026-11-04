@@ -143,7 +143,7 @@ index 4b92dfe..8bc6974 100755
    if (enable_image_processing) {
      sub_img_compressed = this->node->create_subscription<sensor_msgs::msg::CompressedImage>(
        img_topic, 200000, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
-@@ -340,6 +366,84 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
+@@ -340,6 +366,85 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
    voxelmap_manager->voxel_map_pub_= this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/planes", 10000);
  }
  
@@ -186,7 +186,8 @@ index 4b92dfe..8bc6974 100755
 +    last_point_time_span_ms > 0.0 && last_point_time_span_ms <= 200.0;
 +
 +  std::ostringstream payload;
-+  payload << "{\"schema\":\"phanthy.navigation.fast_livo2_mapper_runtime.v1\""
++  payload << std::setprecision(17)
++          << "{\"schema\":\"phanthy.navigation.fast_livo2_mapper_runtime.v1\""
 +          << ",\"lidar_callbacks\":" << lidar_callback_count
 +          << ",\"imu_callbacks\":" << imu_callback_count
 +          << ",\"processed_lidar\":" << processed_lidar_count
