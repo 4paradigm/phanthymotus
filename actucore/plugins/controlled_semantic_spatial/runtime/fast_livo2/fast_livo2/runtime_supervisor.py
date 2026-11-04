@@ -770,6 +770,25 @@ class FastLivo2Supervisor(Node):
                 diagnostics_current
                 and diagnostics.get("localization_state") == "mapping"
             )
+            odom_health = diagnostics.get("odom_health")
+            if (
+                diagnostics_ready
+                and isinstance(odom_health, dict)
+                and odom_health.get("latched") is True
+            ):
+                stop_error = self._terminate_process(process)
+                result = {
+                    "status": "stopped",
+                    "map_name": map_name,
+                    "map_saved": False,
+                    "warning_code": "static_map_odom_fault",
+                    "warning": "map was not saved after a latched odometry fault",
+                    "odom_health": odom_health,
+                    "retryable": False,
+                    "algorithm_stop_error": stop_error,
+                }
+                self._finish_mapping_runtime(process, terminal_result=result)
+                return result
             if not diagnostics_ready or point_count < 40:
                 warning_code = (
                     "static_map_not_ready"

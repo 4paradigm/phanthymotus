@@ -775,6 +775,44 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertTrue(math.isnan(published(4)[0][0]))
         self.assertEqual(adapter._invalid_odom, 3)
 
+    def test_latched_odom_rejections_do_not_repeatedly_invalidate_epoch(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._odom_epoch = 0
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._source_age = lambda _stamp: 0.0
+        adapter._source_max_age = 0.5
+        adapter._source_age_tolerance = 0.05
+        adapter._sensor_geometry_ready_locked = lambda: True
+        adapter._observe_pipeline_event = lambda _name: None
+        adapter._warn_rejected = lambda *_args, **_kwargs: None
+        adapter._invalid_odom = 0
+
+        def raw(nanosec, x):
+            return SimpleNamespace(
+                header=SimpleNamespace(
+                    frame_id="camera_init",
+                    stamp=SimpleNamespace(sec=1, nanosec=nanosec),
+                ),
+                child_frame_id="aft_mapped",
+                pose=SimpleNamespace(pose=SimpleNamespace(
+                    position=SimpleNamespace(x=x, y=0.0, z=0.0),
+                    orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                )),
+            )
+
+        adapter._odom_health.observe(1_000_000_000, Pose3(
+            0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0),
+        ))
+        adapter._on_odom(raw(100_000_000, 2.0))
+        self.assertTrue(adapter._odom_health.diagnostics()["latched"])
+        self.assertEqual(adapter._odom_epoch, 1)
+        for index in range(2, 10):
+            adapter._on_odom(raw(index * 100_000_000, 2.0))
+        self.assertEqual(adapter._odom_epoch, 1)
+        self.assertEqual(adapter._invalid_odom, 9)
+        self.assertFalse(adapter._odom_health.ready)
+
     def test_sensor_contract_reports_frame_mismatch_and_missing_tf(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
@@ -1261,6 +1299,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             adapter._session_name = "office"
             adapter._static_map_error = None
             adapter._static_save_result = None
+            adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
             adapter._mode = "mapping"
             adapter._static_map = SimpleNamespace(
                 confirmed_points=tuple(
@@ -1295,6 +1334,29 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             self.assertEqual(payload["error_code"], "map_control_io_failed")
             self.assertTrue(payload["retryable"])
             self.assertEqual(adapter._mode, "finalizing")
+
+    def test_static_map_save_rejects_latched_odom_fault(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._session_name = "office"
+        adapter._static_map_error = None
+        adapter._static_save_result = None
+        adapter._mode = "mapping"
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_health.observe(1_000_000_000, Pose3(
+            0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0),
+        ))
+        adapter._odom_health.observe(1_100_000_000, Pose3(
+            2.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0),
+        ))
+        with self.assertRaisesRegex(
+            ADAPTER_MODULE.InvalidFastLivo2Frame, "latched odometry fault"
+        ):
+            adapter._save_static_map({
+                "map_name": "office",
+                "_operation_deadline_monotonic": time.monotonic() + 10.0,
+            })
+        self.assertEqual(adapter._mode, "mapping")
 
     def test_expired_map_control_cannot_mutate_adapter_state(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
@@ -1595,6 +1657,35 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIs(supervisor._process, process)
         killpg.assert_not_called()
 
+    def test_stop_mapping_rejects_latched_odom_before_flush(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        process = mock.Mock()
+        process.poll.return_value = None
+        supervisor._lock = threading.RLock()
+        supervisor._process = process
+        supervisor._active_map = "map-a"
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "mapping"
+        supervisor._started_unix_ms = 123
+        supervisor._pending_mapping_finalize = None
+        supervisor._last_mapping_result = None
+        supervisor._diagnostics = {
+            "session_name": "map-a", "localization_state": "mapping",
+            "map_point_count": 9048,
+            "odom_health": {"state": "fault", "latched": True},
+        }
+        supervisor._diagnostics_monotonic = time.monotonic()
+        supervisor._terminate_process = mock.Mock(return_value=None)
+        supervisor._flush_raw_pcd = mock.Mock()
+
+        result = supervisor._stop_mapping("map-a")
+
+        self.assertEqual(result["warning_code"], "static_map_odom_fault")
+        self.assertFalse(result["map_saved"])
+        self.assertTrue(result["terminal_confirmed"])
+        supervisor._flush_raw_pcd.assert_not_called()
+        supervisor._terminate_process.assert_called_once_with(process)
+
     def test_stop_mapping_without_persistable_map_releases_session(self) -> None:
         for diagnostics, diagnostics_monotonic, warning_code in (
             ({}, None, "static_map_status_unavailable"),
@@ -1818,6 +1909,42 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
 
             self.assertFalse(raw.exists())
             self.assertFalse(static.exists())
+
+    def test_odom_fault_during_flush_rejects_finalization(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        process = mock.Mock()
+        supervisor._lock = threading.RLock()
+        supervisor._process = process
+        supervisor._active_map = "office"
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "finalizing"
+        supervisor._started_unix_ms = 123
+        supervisor._last_mapping_result = None
+        supervisor._diagnostics = {}
+        supervisor._diagnostics_monotonic = None
+        supervisor._pending_mapping_finalize = {
+            "process": process, "map_name": "office", "started_unix_ms": 123,
+            "return_code": 0, "pcd_files": ["office-session.raw.pcd"],
+            "static_result": None,
+        }
+        supervisor._adapter_execute = mock.Mock(return_value={
+            "status": "error", "error_code": "map_control_failed",
+            "error": "cannot save a map after a latched odometry fault",
+            "retryable": False,
+        })
+        supervisor._cleanup_session_artifacts = mock.Mock()
+        supervisor._write_manifest = mock.Mock()
+
+        result = supervisor._stop_mapping("office")
+
+        self.assertEqual(result["error_code"], "static_map_save_failed")
+        self.assertFalse(result["retryable"])
+        self.assertIsNone(result["manifest"])
+        self.assertIsNone(supervisor._pending_mapping_finalize)
+        supervisor._cleanup_session_artifacts.assert_called_once_with(
+            ["office-session.raw.pcd"], None
+        )
+        supervisor._write_manifest.assert_not_called()
 
     def test_algorithm_start_cleanup_timeout_keeps_adapter_map_owned(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)

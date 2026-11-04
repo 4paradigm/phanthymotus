@@ -759,11 +759,13 @@ class FastLivo2Adapter(Node):
                     raise InvalidFastLivo2Frame(
                         "navigation sensor geometry is not ready"
                     )
+                was_latched = self._odom_health.diagnostics()["latched"]
                 if not self._odom_health.observe(source_stamp_ns, raw_sensor_pose):
                     error_code = self._odom_health.reason
                     # Invalidate in the same critical section as the health
                     # fault, before any concurrent older callback can publish.
-                    self._odom_epoch += 1
+                    if not was_latched:
+                        self._odom_epoch += 1
                     rejection_recorded = True
                     raise InvalidFastLivo2Frame(
                         self._odom_health.detail or "raw odom is unhealthy"
@@ -1241,6 +1243,10 @@ class FastLivo2Adapter(Node):
                 return dict(self._static_save_result)
             if self._mode not in {"mapping", "finalizing"}:
                 raise InvalidFastLivo2Frame("requested mapping session is not active")
+            if self._odom_health.diagnostics()["latched"]:
+                raise InvalidFastLivo2Frame(
+                    "cannot save a map after a latched odometry fault"
+                )
             minimum = self._obstacle_min_height
             maximum = self._obstacle_max_height
             with self._static_lock:
