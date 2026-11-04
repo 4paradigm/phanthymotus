@@ -82,15 +82,6 @@ BLIND = "blind"          # no usable observation — distinct from "nothing seen
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 
-# Observation freshness is a contract with the chassis, not a tuning knob of
-# the visual policy.  R1 declares 500 ms and Tianyi declares 600 ms.  A missing
-# declaration keeps the historical 500 ms behaviour, while 600 ms is a hard
-# safety ceiling: accepting a larger value would let a freshly generated
-# command carry an arbitrarily old picture past the driver's observation-age
-# check.
-DEFAULT_MAX_OBS_AGE_MS = 500
-MAX_NEGOTIATED_OBS_AGE_MS = 600
-
 # A distance schedule, not online plant identification. Bounds are fixed so a
 # stalled chassis cannot learn an ever-larger command or a new speed floor.
 ADAPTIVE_FWD_MAX_SCALE = 3.0
@@ -236,10 +227,7 @@ class Config:
     idle_timeout_s: float = 10.0
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
-    # Replaced from descriptor.rate.max_obs_age_ms by ``adopt_limits``.  Do not
-    # raise this locally: the descriptor is the shared producer/consumer
-    # contract and MAX_NEGOTIATED_OBS_AGE_MS is the absolute ceiling.
-    max_obs_age_ms: int = DEFAULT_MAX_OBS_AGE_MS
+    max_obs_age_ms: int = 600
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
     # Confidence needed to **start** following something. Below this a
@@ -656,38 +644,6 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """
     notes: list[str] = []
     notes.extend(_adopt_footprint(config, descriptor))
-
-    # The driver's descriptor is the authority for how old an observation may
-    # be when a command reaches it.  Keeping the same value here prevents Navi
-    # from producing commands the sink will necessarily reject.  Missing or
-    # malformed declarations retain the established 500 ms contract; no
-    # descriptor can widen it past the reviewed 600 ms ceiling.
-    rate_block = (descriptor or {}).get("rate") or {}
-    rate_is_mapping = isinstance(rate_block, dict)
-    declared_age = (rate_block.get("max_obs_age_ms")
-                    if rate_is_mapping else rate_block)
-    valid_age = (rate_is_mapping
-                 and not isinstance(declared_age, bool)
-                 and isinstance(declared_age, (int, float))
-                 and math.isfinite(declared_age)
-                 and declared_age > 0)
-    if valid_age:
-        adopted_age = min(int(declared_age), MAX_NEGOTIATED_OBS_AGE_MS)
-        # A positive fractional value below 1 ms must not turn into a zero-ms
-        # contract after conversion.
-        adopted_age = max(1, adopted_age)
-        config.max_obs_age_ms = adopted_age
-        if declared_age > MAX_NEGOTIATED_OBS_AGE_MS:
-            notes.append(
-                f"下游声明的观测有效期 {declared_age:g} ms 超过安全硬上限 "
-                f"{MAX_NEGOTIATED_OBS_AGE_MS} ms，已压回；不会让旧观测通过")
-    else:
-        config.max_obs_age_ms = DEFAULT_MAX_OBS_AGE_MS
-        if declared_age is not None:
-            notes.append(
-                f"下游的 rate.max_obs_age_ms={declared_age!r} 不可用，"
-                f"按默认 {DEFAULT_MAX_OBS_AGE_MS} ms（安全上限 "
-                f"{MAX_NEGOTIATED_OBS_AGE_MS} ms）")
     limits = (descriptor or {}).get("limits") or {}
     floors = list(limits.get("min_magnitude") or [])
     lower = list(limits.get("lower") or [])

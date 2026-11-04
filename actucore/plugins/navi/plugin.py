@@ -86,23 +86,6 @@ _IGNORED_LEGACY_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw",
                                     "stop_tolerance_m"))
 
 
-def _ros_header_stamp_ms(message):
-    """Best-effort source timestamp from a ROS message header.
-
-    It is diagnostic only.  Freshness continues to use the local callback
-    arrival time because camera and controller clocks are not guaranteed to be
-    synchronised; exposing both is what lets an operator distinguish transport
-    delay from decode time without making an unsafe clock assumption.
-    """
-    try:
-        stamp = message.header.stamp
-        sec, nanosec = int(stamp.sec), int(stamp.nanosec)
-        total = sec * 1000 + nanosec // 1_000_000
-        return total if total > 0 else None
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        return None
-
-
 def _sensor_qos():
     """BEST_EFFORT, to match what every producer this card reads actually uses.
 
@@ -203,17 +186,6 @@ class NaviPlugin:
         self._depth_map = None
         self._depth_bands = {}
         self._depth_ms = 0
-        # Depth has two clocks worth seeing. ``_depth_receive_ms`` is callback
-        # entry (transport complete), while ``_depth_ms`` is the timestamp of
-        # the latest *usable* decoded map/summary.  They are usually equal for
-        # a successful map; keeping both means a decoder failure does not look
-        # like the camera stopped publishing.
-        self._depth_receive_ms = 0
-        self._depth_receive_gap_ms = None
-        self._depth_receive_gap_max_ms = None
-        self._depth_decode_ms = None
-        self._depth_decode_max_ms = None
-        self._depth_source_ms = None
         self._odom = None
         self._odom_ms = 0
         self._odom_interface = {}
@@ -473,17 +445,6 @@ class NaviPlugin:
         })
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
         self._limit_notes.extend(policy_mod.adopt_response(self._config, descriptor))
-
-        # These are per-run diagnostics.  Retaining the previous run's last
-        # receipt time would count the whole stop/restart interval as a camera
-        # delivery gap and send the next investigation in the wrong direction.
-        with self._obs_lock:
-            self._depth_receive_ms = 0
-            self._depth_receive_gap_ms = None
-            self._depth_receive_gap_max_ms = None
-            self._depth_decode_ms = None
-            self._depth_decode_max_ms = None
-            self._depth_source_ms = None
 
         rate = negotiate.effective_rate(capabilities, descriptor,
                                         self._cfg.get("rate_hz"))
@@ -949,7 +910,6 @@ class NaviPlugin:
     def _info(self):
         with self._lock:
             decision = self._last_decision
-            observation = self._observation_diagnostics()
             return {
                 "state": ("running" if self._running and not self._paused else
                           "paused" if self._running else "idle"),
@@ -973,7 +933,6 @@ class NaviPlugin:
                                "format": "image/jpeg"}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
-                "max_obs_age_ms": self._config.max_obs_age_ms,
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
                            "stop_tolerance_m": self._config.stop_tolerance_m,
@@ -991,10 +950,6 @@ class NaviPlugin:
                            "obstacle_stop_m": self._config.obstacle_stop_m,
                            "slow_distance_m": self._config.slow_distance_m},
                 "published": self._published,
-                # End-to-end freshness, not just "the topic exists".  The
-                # depth timings separate camera/bridge gaps from local decode
-                # cost, which otherwise both present as a blind Navi tick.
-                "observation": observation,
                 "gains": {
                     "forward": {"base": self._config.k_fwd,
                                 "effective": getattr(decision, "k_fwd_effective", None)},
@@ -1403,12 +1358,6 @@ class NaviPlugin:
                 self._recent.append(payload)
             elif role == "depth_summary":
                 self._depth_bands = depth_mod.bands_from_summary(payload)
-                source_ms = payload.get("stamp_ms")
-                if (isinstance(source_ms, bool)
-                        or not isinstance(source_ms, (int, float))
-                        or not math.isfinite(source_ms) or source_ms <= 0):
-                    source_ms = None
-                self._record_depth_receive_locked(now, source_ms, 0.0)
                 self._depth_ms = now
             elif role == "odom":
                 # All three axes the policy uses, not just `vx`. The stuck
@@ -1447,62 +1396,23 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
-    def _record_depth_receive_locked(self, received_ms, source_ms=None,
-                                     decode_ms=None):
-        """Update timing counters while ``_obs_lock`` is already held."""
-        if self._depth_receive_ms:
-            gap = max(0.0, float(received_ms - self._depth_receive_ms))
-            self._depth_receive_gap_ms = round(gap, 3)
-            if (self._depth_receive_gap_max_ms is None
-                    or gap > self._depth_receive_gap_max_ms):
-                self._depth_receive_gap_max_ms = round(gap, 3)
-        self._depth_receive_ms = int(received_ms)
-        self._depth_source_ms = int(source_ms) if source_ms is not None else None
-        if decode_ms is not None:
-            decode_ms = max(0.0, float(decode_ms))
-            self._depth_decode_ms = round(decode_ms, 3)
-            if (self._depth_decode_max_ms is None
-                    or decode_ms > self._depth_decode_max_ms):
-                self._depth_decode_max_ms = round(decode_ms, 3)
-
-    def _set_depth_map(self, depth, *, received_ms=None, decode_ms=None,
-                       source_stamp_ms=None):
-        # Timestamp at callback entry, not after decode. A slow decoder must
-        # make the observation older; stamping it on completion would disguise
-        # the exact latency this safety check exists to catch.
-        received_ms = (int(time.time() * 1000)
-                       if received_ms is None else int(received_ms))
+    def _set_depth_map(self, depth):
         with self._obs_lock:
             self._depth_map = depth
             self._depth_bands = depth_mod.nearest_by_band(depth)
-            self._record_depth_receive_locked(received_ms, source_stamp_ms,
-                                              decode_ms)
-            self._depth_ms = received_ms
+            self._depth_ms = int(time.time() * 1000)
 
     def _on_depth_map(self, message):
-        received_ms = int(time.time() * 1000)
-        started = time.monotonic()
-        source_ms = _ros_header_stamp_ms(message)
         data = bytes(getattr(message, "data", b"") or b"")
         if not data:
             return
         try:
             depth = depth_mod.decode(data)
         except depth_mod.DepthError as error:
-            decode_ms = (time.monotonic() - started) * 1000.0
-            # A bad payload still proves the transport is alive. Keep its
-            # receive/decode timing visible, but do not refresh `_depth_ms`:
-            # unusable depth must not pass the freshness gate.
-            with self._obs_lock:
-                self._record_depth_receive_locked(received_ms, source_ms,
-                                                  decode_ms)
             with self._lock:
                 self._last_error = f"深度图解码失败：{error}"
             return
-        decode_ms = (time.monotonic() - started) * 1000.0
-        self._set_depth_map(depth, received_ms=received_ms,
-                            decode_ms=decode_ms,
-                            source_stamp_ms=source_ms)
+        self._set_depth_map(depth)
 
     def _open_publisher(self):
         from rclpy.node import Node
@@ -1526,79 +1436,6 @@ class NaviPlugin:
 
     # ── the loop ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _age_ms(now_ms, stamp_ms):
-        return int(now_ms - stamp_ms) if stamp_ms else None
-
-    def _observation_diagnostics_locked(self, now_ms):
-        """Freshness and depth pipeline timing; caller holds ``_obs_lock``."""
-        max_age = int(self._config.max_obs_age_ms)
-        ages = {
-            "objects": self._age_ms(now_ms, self._objects_ms),
-            "depth": self._age_ms(now_ms, self._depth_ms),
-            "odom": self._age_ms(now_ms, self._odom_ms),
-        }
-
-        def fresh(name, value, limit_ms=max_age):
-            age = ages[name]
-            # A negative age means the wall clock moved backwards. Treat it as
-            # unknown rather than allowing an old frame to remain "fresh"
-            # until the clock catches up again.
-            return (value is not None and age is not None
-                    and 0 <= age <= limit_ms)
-
-        return {
-            "max_obs_age_ms": max_age,
-            "ages_ms": ages,
-            "fresh": {
-                "objects": fresh("objects", self._objects),
-                # A summary may legitimately have no pixels/map. Its receive
-                # timestamp still represents a usable depth observation.
-                "depth": (ages["depth"] is not None
-                          and 0 <= ages["depth"] <= max_age),
-                # Odom has its own producer timing contract, selected by the
-                # bound topic. Do not widen or narrow it merely because the
-                # visual/chassis observation contract changed.
-                "odom": fresh("odom", self._odom,
-                              int(self._odom_max_age_ms)),
-            },
-            "depth_timing": {
-                "receive_age_ms": self._age_ms(now_ms, self._depth_receive_ms),
-                "receive_gap_ms": self._depth_receive_gap_ms,
-                "max_receive_gap_ms": self._depth_receive_gap_max_ms,
-                "decode_ms": self._depth_decode_ms,
-                "max_decode_ms": self._depth_decode_max_ms,
-                # Source time is shown, never used for freshness: the camera
-                # and this process may not share a clock.
-                "source_age_ms": self._age_ms(now_ms, self._depth_source_ms),
-            },
-        }
-
-    def _observation_diagnostics(self, now_ms=None):
-        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
-        with self._obs_lock:
-            return self._observation_diagnostics_locked(now_ms)
-
-    def _observation_snapshot(self):
-        """One atomic data/timestamp snapshot for a policy tick.
-
-        The returned observation timestamp is the oldest *required fresh*
-        input (objects and depth). Reading it after releasing ``_obs_lock`` can
-        mix a new objects timestamp with an old depth frame and make an old
-        decision look fresh downstream.
-        """
-        now_ms = int(time.time() * 1000)
-        with self._obs_lock:
-            diagnostics = self._observation_diagnostics_locked(now_ms)
-            freshness = diagnostics["fresh"]
-            objects = self._objects if freshness["objects"] else None
-            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
-                     if freshness["depth"] else None)
-            odom = self._odom if freshness["odom"] else None
-            obs_ms = (min(self._objects_ms, self._depth_ms)
-                      if objects is not None and depth is not None else None)
-        return objects, depth, odom, obs_ms, diagnostics
-
     def observation(self):
         """The three inputs, with anything stale replaced by None.
 
@@ -1606,42 +1443,17 @@ class NaviPlugin:
         and "never arrived" are the same thing to the decision — both mean the
         card cannot see, and both must stop the robot.
         """
-        objects, depth, odom, _, _ = self._observation_snapshot()
+        now = int(time.time() * 1000)
+        max_age = self._config.max_obs_age_ms
+        with self._obs_lock:
+            objects = self._objects if now - self._objects_ms <= max_age else None
+            fresh_depth = now - self._depth_ms <= max_age
+            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
+                     if fresh_depth else None)
+            odom_age = now - self._odom_ms
+            odom = (self._odom
+                    if 0 <= odom_age <= self._odom_max_age_ms else None)
         return objects, depth, odom
-
-    @staticmethod
-    def _blind_reason(diagnostics, objects, depth):
-        missing = []
-        max_age = diagnostics["max_obs_age_ms"]
-        ages = diagnostics["ages_ms"]
-        if objects is None:
-            age = ages["objects"]
-            if age is None:
-                missing.append("vop(objects) missing")
-            elif age < 0:
-                missing.append(
-                    f"vop(objects) clock invalid: timestamp is {-age}ms in the future")
-            else:
-                missing.append(f"vop(objects) stale: {age}ms > {max_age}ms")
-        if depth is None:
-            age = ages["depth"]
-            if age is None:
-                detail = "depth missing"
-            elif age < 0:
-                detail = f"depth clock invalid: timestamp is {-age}ms in the future"
-            else:
-                detail = f"depth stale: {age}ms > {max_age}ms"
-            timing = diagnostics["depth_timing"]
-            if timing["receive_gap_ms"] is not None:
-                detail += f" (receive gap {timing['receive_gap_ms']:g}ms"
-                if timing["decode_ms"] is not None:
-                    detail += f", decode {timing['decode_ms']:g}ms"
-                detail += ")"
-            missing.append(detail)
-        if not missing:
-            missing.append("required observation unavailable")
-        return ("observation stale or missing: " + "; ".join(missing)
-                + "; publishing nothing, leaving the stop to the downstream watchdog")
 
     def next_command(self):
         """One tick of the policy, as a message or None.
@@ -1653,13 +1465,10 @@ class NaviPlugin:
         dt = (now - self._last_tick) if self._last_tick else 1.0 / self._rate_hz
         self._last_tick = now
 
-        objects, depth, odom, obs_ms, diagnostics = self._observation_snapshot()
+        objects, depth, odom = self.observation()
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt)
-        if decision.status == policy_mod.BLIND:
-            decision = replace(decision, reason=self._blind_reason(
-                diagnostics, objects, depth))
         self._last_decision = decision
         if not decision.publishes:
             return None
@@ -1675,11 +1484,8 @@ class NaviPlugin:
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
 
-        # A publishing decision necessarily has both required observations.
-        # Keep a defensive fallback for custom policies/tests without ever
-        # reading one timestamp outside the atomic snapshot above.
-        return self._command_message(values, now,
-                                     obs_ms if obs_ms is not None else int(now * 1000))
+        obs_ms = self._objects_ms or int(now * 1000)
+        return self._command_message(values, now, obs_ms)
 
     def _command_message(self, values, now, obs_ms):
         """Build one guarded normal-navigation command."""
