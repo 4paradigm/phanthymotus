@@ -127,23 +127,16 @@ adapter 只消费 mapper 运行统计和 FAST-LIVO2 raw odom/cloud，负责 TF�
 几何契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable` 或
 `raw_odom_discontinuity`，不会继续生成伪正常地图；几何跳变会在当前
 地图会话内锁存，需要重置或切换地图会话才能恢复。
-每次 ActuCore 运行会话使用 rosbag2 snapshot 在内存中保留最近约 5 秒
-的全频 LiDAR、IMU、FAST-LIVO2 raw odom 和 IMU 传播 odom；首次
-`raw_odom_discontinuity` 后再采 5 秒，仅落盘一份 MCAP 到
-`/opt/phanthy-motus/data/navigation/fast_livo2/recordings/faults/`。`status.fault_capture`
-显示 `armed/post_trigger/saved/error`、触发原因、产物目录和
-`diagnostic_summary.json`；摘要会对齐 Driver 发布、FAST-LIVO2 实际
-callback/处理和 adapter 输出计数，因此旧录包中的低帧率不再被直接误判为
-雷达源降频。没有故障时
-停卡会丢弃空快照，不会将常态全频数据写入磁盘。录包进程不创建独立
-进程组，会随 FAST-LIVO2 runtime 的 stop/restart 一起回收，避免多个全频
-recorder 重复订阅传感器。FAST-LIVO2 输入使用 Reliable：LiDAR 默认只保留
+卡片不再启动自动故障录包，`status.fault_capture.state` 保留为 `disabled`。
+已有故障录包和离线摘要保留；诊断、里程计锁存与停止时的保存保护不受影响。
+`sensor_rejection` 仍发布但不再自动落盘；需要现场证据时使用监控台手动录制。
+仅更新卡片配置不会停止旧版 supervisor 的录包；升级运行镜像后才生效，升级前
+须确认没有正在收尾的录包，并单独获准停止或重启。FAST-LIVO2 输入使用 Reliable：LiDAR 默认只保留
 最新 2 帧，IMU 默认保留 400 帧（按 200 Hz 约 2 秒）的积分历史，两个深度
 均可在卡片配置中调整。上游 NodeOptions 会自动声明命令行覆盖，
 因此运行补丁只读取这些值，不再二次 `declare_parameter`；基础镜像
 构建会使用同样的参数执行一次真实启动检查。计算瞬时
-积压时丢弃旧点云，但不丢掉两帧 LiDAR 之间不可替代的 IMU 运动量；
-故障录包仍使用 Best Effort snapshot，不反压传感器链路。
+积压时丢弃旧点云，但不丢掉两帧 LiDAR 之间不可替代的 IMU 运动量。
 mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale` 放入
 `sensor_contract_issues`；已确认的静态 TF 不会因此丢失。只要 FAST-LIVO2
 自己的 odom/cloud 仍新鲜且 frame、TF 与 odom 连续性有效，就不会重复阻断输出。
@@ -189,7 +182,7 @@ Nav2 规划控制；连接 RGB 后才启动语义导航。未连 RGB 时，`capt
 完整的静态插件配置样例见 [config.example.json](config.example.json)，内容放在
 ActuCore 配置的 `plugins.controlled_semantic_spatial` 下。旧键 `plugins.navigation`
 不再接受，须迁移后启动；其中 `semantic.vlm.api_key` 必须通过部署配置或环境注入真实值，不能提交凭据。
-### 卡片配置（15 项）
+### 卡片配置（14 项）
 
 以下配置仅在停卡时修改、下次启动生效；无热更新：
 
@@ -199,7 +192,6 @@ ActuCore 配置的 `plugins.controlled_semantic_spatial` 下。旧键 `plugins.n
 | `obstacle_min_height_m` | `-0.30` | map frame 障碍高度下界，米 |
 | `obstacle_max_height_m` | `0.30` | map frame 障碍高度上界，米 |
 | `map_view_enabled` | `true` | Canvas 地图预览 |
-| `fault_capture_enabled` | `true` | 开发故障采集；正式发布门槛见下文 |
 | `rotate_reengage_rad` | `0.15` | 重新转向偏差，弧度 |
 | `min_x_mps` | `0.3` | X 非零输出死区，非最低巡航速度 |
 | `max_x_mps` | `1.0` | X 最大输出速度，米/秒 |
@@ -257,12 +249,9 @@ adapter 及 Nav2 两个 launch。Nav2 参数重写同时设置 local/global 的 
 不兼容的自定义参数结构拒绝启动。配置缺失、非有限或倒序在创建子进程前拒绝。
 运行中仍禁止更改，停卡后配置、下次启动生效；不提供跨节点热更新。
 只统一高度语义，不承诺累计静态图与实时局部图逐格相等。
-`map_view_enabled` 和 `fault_capture_enabled` 默认均为 `true`，用于真机
-性能 A/B；只能停卡后配置，并在下次启动生效。关闭前者只停止 Canvas 点云
-编码/发布，不改变 FAST-LIVO2 或 Nav2 输入；关闭后者只停止短时故障快照。
-**正式 release 的发布门槛：`fault_capture_enabled` 默认必须为 `false`。**
-当前开发基线仍为 `true`，本次保留用于开发采集，仅记录该待发布门槛；不引入
-开发/生产模式或擅自切换默认，不能将本次修改称为已满足正式发布条件。
+`map_view_enabled` 默认 `true`，只能停卡后配置并在下次启动生效。关闭它只停止
+Canvas 点云编码/发布，不改变 FAST-LIVO2 或 Nav2 输入。旧配置中的
+`fault_capture_enabled` 被忽略，不会重新启用自动录包。
 
 Canvas 的转向速度只暴露单一 `rotate_speed_rps`，默认
 `0.3 rad/s`。小于设定幅值的非零 yaw proposal 归零，达到阈值后保留方向并
@@ -322,8 +311,7 @@ FAST-LIVO2 内部 LiDAR/IMU buffer span、adapter latest-only 丢弃数和 rosba
 
 真机每个阶段运行 300 秒，由现场的只读诊断工具采集容器 CPU/内存、
 Jetson `tegrastats`、进程 CPU 和完整 pipeline 状态。依次测量静止定位、
-同一路线导航，并在停卡后分别配置：两项均关闭、只开
-`map_view_enabled`、只开 `fault_capture_enabled`、两项均开启。每阶段记录
+同一路线导航，并在停卡后分别关闭或开启 `map_view_enabled`。每阶段记录
 CPU 平均/P95、Driver LiDAR 发布率、mapper callback/处理率、最大帧间隔、
 adapter 丢弃和 odom discontinuity 次数。先用跨层计数确认丢帧发生在哪一层，
 再决定优化 Driver、DDS、FAST-LIVO2 或显示/录制；不能用“清 topic”掩盖

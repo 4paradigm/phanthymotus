@@ -26,7 +26,6 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "obstacle_min_height_m": -0.30,
     "obstacle_max_height_m": 0.30,
     "map_view_enabled": True,
-    "fault_capture_enabled": True,
 }
 
 FAST_LIVO2_CONFIG_SCHEMA = {
@@ -101,14 +100,6 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "description": (
                 "Publish the Canvas map view; disable on the next card start "
                 "for a CPU A/B measurement"
-            ),
-        },
-        "fault_capture_enabled": {
-            "type": "boolean",
-            "default": True,
-            "description": (
-                "Keep a short full-rate ring buffer and save it only on the "
-                "first raw odometry discontinuity"
             ),
         },
     },

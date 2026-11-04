@@ -26,11 +26,8 @@ from std_msgs.msg import String
 
 from .frame_adapter_core import normalize_obstacle_height_range
 from .fault_diagnostics import (
-    ADAPTER_DIAGNOSTICS_TOPIC,
     BRIDGE_STATUS_TOPIC,
     MAPPER_RUNTIME_TOPIC,
-    SENSOR_REJECTION_TOPIC,
-    write_fault_summary,
 )
 from .pipeline_diagnostics import PipelineDiagnostics
 from .runtime_core import controlled_stop_succeeded
@@ -49,16 +46,8 @@ _MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912
 _MAX_MAP_MANIFEST_BYTES = 65_536
 _MAP_CONTROL_RESPONSE_GRACE_SEC = 5.0
 _MAP_CONTROL_DISCOVERY_TIMEOUT_SEC = 5.0
-_FAULT_CAPTURE_PRE_SEC = 5.0
-_FAULT_CAPTURE_POST_SEC = 5.0
-_FAULT_CAPTURE_CACHE_BYTES = 512 * 1024 * 1024
-_FAULT_CAPTURE_ROOT = Path("/opt/phanthy-motus/data/navigation/fast_livo2/recordings/faults")
-_FAULT_CAPTURE_QOS_PATH = Path(__file__).with_name("fault_capture_qos.yaml")
 _DEFAULT_LIDAR_QOS_DEPTH = 2
 _DEFAULT_IMU_QOS_DEPTH = 400
-_RAW_IMU_PROPAGATED_ODOM_TOPIC = (
-    "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom"
-)
 
 
 class FastLivo2Supervisor(Node):
@@ -107,15 +96,6 @@ class FastLivo2Supervisor(Node):
         self._pipeline_diagnostics = PipelineDiagnostics()
         self._map_control_responses: dict[str, dict] = {}
         self._pending_map_control_requests: set[str] = set()
-        self._fault_capture_lock = threading.Lock()
-        self._fault_capture_process: subprocess.Popen | None = None
-        self._fault_capture_timer: threading.Timer | None = None
-        self._fault_capture_directory: Path | None = None
-        self._fault_capture_state = "starting"
-        self._fault_capture_enabled = True
-        self._fault_capture_error: str | None = None
-        self._fault_capture_trigger: dict | None = None
-        self._fault_capture_summary: str | None = None
         self._condition = threading.Condition(self._lock)
         self._map_root = Path(str(self.get_parameter("map_root").value))
         self._map_root.mkdir(parents=True, exist_ok=True)
@@ -169,15 +149,7 @@ class FastLivo2Supervisor(Node):
             diagnostic_qos,
             callback_group=callbacks,
         )
-        self.create_subscription(
-            String,
-            SENSOR_REJECTION_TOPIC,
-            self._on_sensor_rejection,
-            10,
-            callback_group=callbacks,
-        )
         self.create_timer(1.0, self._publish_heartbeat)
-        self._arm_fault_capture()
 
     def _on_diagnostics(self, message: String) -> None:
         try:
@@ -203,262 +175,11 @@ class FastLivo2Supervisor(Node):
     def _on_mapper_runtime(self, message: String) -> None:
         self._observe_pipeline_json("mapper", message)
 
-    def _on_sensor_rejection(self, message: String) -> None:
-        try:
-            payload = json.loads(message.data)
-        except (TypeError, ValueError):
-            return
-        if (
-            isinstance(payload, dict)
-            and payload.get("error_code") == "raw_odom_discontinuity"
-        ):
-            self._trigger_fault_capture(payload)
-
-    def _fault_capture_command(self, output_directory: Path) -> list[str]:
-        return [
-            "ros2",
-            "bag",
-            "record",
-            "--storage",
-            "mcap",
-            "--output",
-            str(output_directory),
-            "--max-cache-size",
-            str(_FAULT_CAPTURE_CACHE_BYTES),
-            "--snapshot-mode",
-            "--no-discovery",
-            "--qos-profile-overrides-path",
-            str(_FAULT_CAPTURE_QOS_PATH),
-            str(self.get_parameter("lidar_topic").value),
-            str(self.get_parameter("imu_topic").value),
-            str(self.get_parameter("raw_odom_topic").value),
-            _RAW_IMU_PROPAGATED_ODOM_TOPIC,
-            SENSOR_REJECTION_TOPIC,
-            str(self.get_parameter("bridge_status_topic").value),
-            str(self.get_parameter("mapper_runtime_topic").value),
-            str(self.get_parameter("diagnostics_topic").value),
-        ]
-
-    def _arm_fault_capture(self) -> None:
-        if not getattr(self, "_fault_capture_enabled", True):
-            with self._fault_capture_lock:
-                self._fault_capture_state = "disabled"
-            return
-        try:
-            _FAULT_CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
-            session = (
-                time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-                + "-"
-                + uuid.uuid4().hex[:8]
-            )
-            directory = _FAULT_CAPTURE_ROOT / session
-            process = subprocess.Popen(
-                self._fault_capture_command(directory),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                # Keep the recorder in the FAST-LIVO2 launch process group so
-                # runtime stop/restart cannot leave a full-rate recorder behind.
-                start_new_session=False,
-            )
-            time.sleep(0.25)
-            if process.poll() is not None:
-                raise RuntimeError(
-                    f"ros2 bag snapshot recorder exited with {process.returncode}"
-                )
-        except (OSError, RuntimeError) as exc:
-            with self._fault_capture_lock:
-                self._fault_capture_state = "error"
-                self._fault_capture_error = f"{type(exc).__name__}: {exc}"
-            self.get_logger().error(
-                f"cannot arm FAST-LIVO2 fault capture: {exc}"
-            )
-            return
-        with self._fault_capture_lock:
-            self._fault_capture_process = process
-            self._fault_capture_directory = directory
-            self._fault_capture_state = "armed"
-            self._fault_capture_error = None
-            self._fault_capture_summary = None
-
-    def _trigger_fault_capture(self, event: dict) -> None:
-        with self._fault_capture_lock:
-            process = self._fault_capture_process
-            if (
-                self._fault_capture_state != "armed"
-                or process is None
-                or process.poll() is not None
-            ):
-                return
-            self._fault_capture_state = "post_trigger"
-            self._fault_capture_trigger = {
-                "reason": "raw_odom_discontinuity",
-                "detail": str(event.get("reason", event.get("detail", "")))[:500],
-                "trigger_unix_ns": time.time_ns(),
-            }
-            timer = threading.Timer(
-                _FAULT_CAPTURE_POST_SEC,
-                self._save_fault_capture,
-            )
-            timer.daemon = True
-            self._fault_capture_timer = timer
-            timer.start()
-
-    @staticmethod
-    def _stop_fault_capture_process(process: subprocess.Popen) -> None:
-        if process.poll() is not None:
-            return
-        process.send_signal(signal.SIGINT)
-        try:
-            process.wait(timeout=10.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5.0)
-
-    def _save_fault_capture(self) -> None:
-        with self._fault_capture_lock:
-            if self._fault_capture_state != "post_trigger":
-                return
-            process = self._fault_capture_process
-            directory = self._fault_capture_directory
-            self._fault_capture_state = "saving"
-        error = None
-        summary_error = None
-        summary_path = None
-        try:
-            if process is None or directory is None or process.poll() is not None:
-                raise RuntimeError("snapshot recorder is not running")
-            completed = subprocess.run(
-                [
-                    "ros2",
-                    "service",
-                    "call",
-                    "/rosbag2_recorder/snapshot",
-                    "rosbag2_interfaces/srv/Snapshot",
-                ],
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=10.0,
-            )
-            output = f"{completed.stdout}\n{completed.stderr}"
-            if completed.returncode != 0 or not re.search(
-                r"success\s*[=:]\s*true",
-                output,
-                re.IGNORECASE,
-            ):
-                raise RuntimeError(
-                    "rosbag2 snapshot service failed: " + output.strip()[:500]
-                )
-            self._stop_fault_capture_process(process)
-            if not (directory / "metadata.yaml").is_file() or not any(
-                directory.glob("*.mcap")
-            ):
-                raise RuntimeError("snapshot did not produce an MCAP artifact")
-            try:
-                summary_path = write_fault_summary(
-                    directory,
-                    self._fault_capture_trigger,
-                )
-            except Exception as exc:  # The saved MCAP remains the primary receipt.
-                summary_error = f"{type(exc).__name__}: {exc}"
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            if process is not None:
-                try:
-                    self._stop_fault_capture_process(process)
-                except (OSError, subprocess.TimeoutExpired) as stop_exc:
-                    error += f"; stop_failed:{stop_exc}"
-        with self._fault_capture_lock:
-            self._fault_capture_process = None
-            self._fault_capture_timer = None
-            self._fault_capture_state = "saved" if error is None else "error"
-            self._fault_capture_error = error or summary_error
-            self._fault_capture_summary = (
-                None if summary_path is None else str(summary_path)
-            )
-        if error is None:
-            self.get_logger().warning(
-                f"saved first FAST-LIVO2 odom fault capture to {directory}"
-            )
-            if summary_error is not None:
-                self.get_logger().error(
-                    f"fault capture summary failed but MCAP was retained: {summary_error}"
-                )
-        else:
-            self.get_logger().error(
-                f"cannot save FAST-LIVO2 odom fault capture: {error}"
-            )
-
     def _fault_capture_snapshot(self) -> dict:
-        lock = getattr(self, "_fault_capture_lock", None)
-        if lock is None:
-            return {"state": "unavailable"}
-        with lock:
-            process = self._fault_capture_process
-            if (
-                self._fault_capture_state in {"armed", "post_trigger"}
-                and process is not None
-                and process.poll() is not None
-            ):
-                self._fault_capture_state = "error"
-                self._fault_capture_error = (
-                    "snapshot recorder exited with "
-                    f"{process.returncode}"
-                )
-            return {
-                "state": self._fault_capture_state,
-                "directory": (
-                    None
-                    if self._fault_capture_directory is None
-                    else str(self._fault_capture_directory)
-                ),
-                "pre_window_sec": _FAULT_CAPTURE_PRE_SEC,
-                "post_window_sec": _FAULT_CAPTURE_POST_SEC,
-                "cache_bytes": _FAULT_CAPTURE_CACHE_BYTES,
-                "pid": (
-                    process.pid
-                    if process is not None and process.poll() is None
-                    else None
-                ),
-                "trigger": (
-                    None
-                    if self._fault_capture_trigger is None
-                    else dict(self._fault_capture_trigger)
-                ),
-                "error": self._fault_capture_error,
-                "summary": self._fault_capture_summary,
-            }
-
-    def _discard_armed_fault_capture(self) -> None:
-        with self._fault_capture_lock:
-            timer = self._fault_capture_timer
-            process = self._fault_capture_process
-            directory = self._fault_capture_directory
-            state = self._fault_capture_state
-            if timer is not None:
-                timer.cancel()
-            self._fault_capture_timer = None
-        if state == "saving" and timer is not None:
-            timer.join(timeout=15.0)
-            with self._fault_capture_lock:
-                if self._fault_capture_state in {"saved", "error"}:
-                    return
-        if state == "post_trigger":
-            self._save_fault_capture()
-            return
-        if process is not None:
-            self._stop_fault_capture_process(process)
-        if (
-            state == "armed"
-            and directory is not None
-            and directory.parent.resolve() == _FAULT_CAPTURE_ROOT.resolve()
-            and directory.exists()
-        ):
-            shutil.rmtree(directory)
-        with self._fault_capture_lock:
-            self._fault_capture_process = None
-            if self._fault_capture_state == "armed":
-                self._fault_capture_state = "discarded"
+        # Keep the status schema for clients of older card versions.
+        return {"state": "disabled", "directory": None, "pid": None,
+                "pre_window_sec": None, "post_window_sec": None, "cache_bytes": None,
+                "trigger": None, "error": None, "summary": None}
 
     def _on_map_control_status(self, message: String) -> None:
         try:
@@ -561,10 +282,8 @@ class FastLivo2Supervisor(Node):
                 }
             depths[key] = value
         map_view_enabled = args.get("map_view_enabled", True)
-        fault_capture_enabled = args.get(
-            "fault_capture_enabled",
-            getattr(self, "_fault_capture_enabled", True),
-        )
+        # Accept legacy card configurations without re-enabling the removed recorder.
+        fault_capture_enabled = args.get("fault_capture_enabled", False)
         if not isinstance(map_view_enabled, bool) or not isinstance(
             fault_capture_enabled, bool
         ):
@@ -589,19 +308,9 @@ class FastLivo2Supervisor(Node):
                 "lidar": self._lidar_qos_depth,
                 "imu": self._imu_qos_depth,
             }
-            previous_fault_capture_enabled = getattr(
-                self, "_fault_capture_enabled", True
-            )
-            self._fault_capture_enabled = fault_capture_enabled
-            if previous_fault_capture_enabled and not fault_capture_enabled:
-                self._discard_armed_fault_capture()
-                with self._fault_capture_lock:
-                    self._fault_capture_state = "disabled"
-            elif not previous_fault_capture_enabled and fault_capture_enabled:
-                self._arm_fault_capture()
             result["runtime_features"] = {
                 "map_view_enabled": map_view_enabled,
-                "fault_capture_enabled": fault_capture_enabled,
+                "fault_capture_enabled": False,
             }
         return result
 
@@ -1843,7 +1552,6 @@ class FastLivo2Supervisor(Node):
                     self._runtime_session_id = None
                     self._runtime_mode = "idle"
                     self._pending_mapping_finalize = None
-            self._discard_armed_fault_capture()
         finally:
             return super().destroy_node()
 

@@ -322,8 +322,8 @@ fail closed。
 ## 运行诊断
 
 FAST-LIVO2 adapter 在拒绝 LiDAR、IMU、odom 或 registered cloud 时发布
-`/ubuntu/navigation/fast_livo2/sensor_rejection`。故障快照录制独立于
-已移除的数据采集功能。
+`/ubuntu/navigation/fast_livo2/sensor_rejection`。卡片不再启动自动故障快照；
+该诊断仍保留，旧录包不删除。
 
 ## 统一卡片连线与构建
 

@@ -26,6 +26,9 @@ class ConfigError(ValueError):
 
 
 def _validated_config(base: dict, updates: dict) -> dict:
+    # Previously persisted card settings must not re-enable the removed recorder.
+    base = {key: value for key, value in base.items() if key != "fault_capture_enabled"}
+    updates = {key: value for key, value in updates.items() if key != "fault_capture_enabled"}
     unknown = sorted(set(updates) - set(FAST_LIVO2_CONFIG_DEFAULTS))
     if unknown:
         raise ConfigError("unsupported config fields: " + ",".join(unknown))
@@ -74,10 +77,7 @@ def _validated_config(base: dict, updates: dict) -> dict:
         )
     if result.get("input_max_age_ms") != 500:
         raise ConfigError("input_max_age_ms is fixed to 500")
-    for key in (
-        "map_view_enabled",
-        "fault_capture_enabled",
-    ):
+    for key in ("map_view_enabled",):
         if not isinstance(result.get(key), bool):
             raise ConfigError(f"{key} must be a boolean")
     return result
@@ -203,7 +203,6 @@ class FastLivo2Plugin:
                 "lidar_qos_depth": self._cfg["lidar_qos_depth"],
                 "imu_qos_depth": self._cfg["imu_qos_depth"],
                 "map_view_enabled": self._cfg["map_view_enabled"],
-                "fault_capture_enabled": self._cfg["fault_capture_enabled"],
             }
         )
         if obstacle_result.get("status") == "error":

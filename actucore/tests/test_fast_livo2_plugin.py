@@ -110,6 +110,17 @@ def _bindings(plugin: FastLivo2Plugin) -> list[dict]:
 
 
 class FastLivo2PluginTest(unittest.TestCase):
+    def test_legacy_fault_capture_setting_is_ignored_on_load_and_config(self) -> None:
+        for value in (True, False):
+            backend = ReadyBackend()
+            plugin = FastLivo2Plugin({"fault_capture_enabled": value}, None, backend=backend)
+            configured = plugin.dispatch("fast_livo2", {"action": "config", "fault_capture_enabled": value})
+            self.assertEqual(configured["state"], "configured")
+            self.assertNotIn("fault_capture_enabled", configured["config"])
+            started = plugin.dispatch("fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)})
+            self.assertEqual(started["state"], "ready")
+            self.assertNotIn("fault_capture_enabled", backend.calls[0][1])
+
     def test_info_reports_actual_bound_sensor_topics(self) -> None:
         plugin = FastLivo2Plugin({}, None, backend=ReadyBackend())
         topics = {"lidar": "/robot/cloud", "imu": "/robot/imu"}
@@ -166,7 +177,6 @@ class FastLivo2PluginTest(unittest.TestCase):
                 "lidar_qos_depth": 2,
                 "imu_qos_depth": 400,
                 "map_view_enabled": True,
-                "fault_capture_enabled": True,
             },
         )
 
@@ -466,7 +476,6 @@ class FastLivo2PluginTest(unittest.TestCase):
                     "lidar_qos_depth": 3,
                     "imu_qos_depth": 600,
                     "map_view_enabled": True,
-                    "fault_capture_enabled": True,
                 },
             ),
         )

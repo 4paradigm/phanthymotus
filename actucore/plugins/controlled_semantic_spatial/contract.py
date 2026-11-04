@@ -35,7 +35,7 @@ LEGACY_CONFIG_FIELDS = (
     "lidar_topic", "rgb_topic", "imu_topic",
     "mapping_request_timeout_sec", "mapping_discovery_timeout_sec",
     "planning_request_timeout_sec", "planning_discovery_timeout_sec",
-    "lidar_qos_depth", "imu_qos_depth", "map_voxel_size_m",
+    "lidar_qos_depth", "imu_qos_depth", "map_voxel_size_m", "fault_capture_enabled",
 )
 
 
@@ -58,7 +58,6 @@ def _config_properties() -> dict:
         "obstacle_min_height_m": deepcopy(mapping["obstacle_min_height_m"]),
         "obstacle_max_height_m": deepcopy(mapping["obstacle_max_height_m"]),
         "map_view_enabled": deepcopy(mapping["map_view_enabled"]),
-        "fault_capture_enabled": deepcopy(mapping["fault_capture_enabled"]),
         "rotate_reengage_rad": deepcopy(planning["rotate_reengage_rad"]),
     }
     for key in (
@@ -87,7 +86,6 @@ def _config_properties() -> dict:
         "obstacle_min_height_m": "障碍最低高度（m）",
         "obstacle_max_height_m": "障碍最高高度（m）",
         "map_view_enabled": "地图预览",
-        "fault_capture_enabled": "故障采集",
         "rotate_reengage_rad": "重新转向偏差（rad）",
         "min_x_mps": "X 输出死区（m/s）", "max_x_mps": "X 最大速度（m/s）",
         "min_y_mps": "Y 输出死区（m/s）", "max_y_mps": "Y 最大速度（m/s）",

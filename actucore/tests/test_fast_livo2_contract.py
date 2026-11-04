@@ -82,7 +82,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertEqual(config["obstacle_min_height_m"]["default"], -0.30)
         self.assertEqual(config["obstacle_max_height_m"]["default"], 0.30)
         self.assertTrue(config["map_view_enabled"]["default"])
-        self.assertTrue(config["fault_capture_enabled"]["default"])
+        self.assertNotIn("fault_capture_enabled", config)
         self.assertNotIn("collection_enabled", config)
         self.assertNotIn("collection_directory", config)
         self.assertNotIn("start_recording", actions)

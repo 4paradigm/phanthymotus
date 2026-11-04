@@ -344,7 +344,8 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertIn("obstacle_min_height_m", properties)
         self.assertIn("obstacle_max_height_m", properties)
         self.assertTrue(properties["map_view_enabled"]["default"])
-        self.assertTrue(properties["fault_capture_enabled"]["default"])
+        self.assertNotIn("fault_capture_enabled", config_fields)
+        self.assertNotIn("default", properties["fault_capture_enabled"])
         self.assertNotIn("lidar_qos_depth", config_fields)
         self.assertNotIn("imu_qos_depth", config_fields)
         self.assertNotIn("default", properties["lidar_qos_depth"])
@@ -2034,7 +2035,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                     "obstacle_min_height_m": -0.8,
                     "obstacle_max_height_m": 0.4,
                     "map_view_enabled": False,
-                    "fault_capture_enabled": False,
                 },
             ),
             plugin._mapping.calls,
@@ -2131,12 +2131,21 @@ class SimplifiedNavigationConfigTest(unittest.TestCase):
         return ControlledSemanticSpatialPlugin({}, 'ubuntu', None, runtime=FakeRuntime(),
             semantic_plugin=FakeComponent('semantic'), **kwargs)
 
-    def test_card_has_exactly_fifteen_options_and_legacy_only_in_input_schema(self):
+    def test_obsolete_capture_settings_are_ignored_from_saved_card_config(self):
+        for cfg in ({'fault_capture_enabled': True}, {'mapping': {'fault_capture_enabled': True}}):
+            plugin = ControlledSemanticSpatialPlugin(cfg, 'ubuntu', None, runtime=FakeRuntime(),
+                                                     semantic_plugin=FakeComponent('semantic'))
+            self.assertIsNone(plugin._config_error)
+            info = plugin.dispatch(plugin.PREFIX, {'action': 'info'})
+            self.assertIn('fault_capture_enabled', info['ignored_legacy_fields'])
+            self.assertNotIn('fault_capture_enabled', info['mapping']['config'])
+
+    def test_card_has_exactly_fourteen_options_and_legacy_only_in_input_schema(self):
         tool = controlled_semantic_spatial_tool_definition('ubuntu')
         props = tool['configSchema']['properties']
         self.assertEqual(set(props), {
             'obstacle_min_height_m', 'obstacle_max_height_m', 'map_view_enabled',
-            'fault_capture_enabled', 'rotate_reengage_rad', 'min_x_mps', 'max_x_mps',
+            'rotate_reengage_rad', 'min_x_mps', 'max_x_mps',
             'min_y_mps', 'max_y_mps', 'rotate_speed_rps', 'vlm_base_url', 'vlm_api_key',
             'vlm_model', 'vlm_timeout_sec', 'inflation_radius_m'})
         radius = props['inflation_radius_m']

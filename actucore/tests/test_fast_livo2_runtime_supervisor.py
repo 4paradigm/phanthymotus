@@ -212,130 +212,21 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIsNone(supervisor._pending_localization_stop_error)
         self.assertEqual(supervisor._unload_map()["status"], "idle")
 
-    def test_first_odom_discontinuity_triggers_one_delayed_snapshot(self) -> None:
+    def test_legacy_fault_capture_configuration_cannot_start_recorder(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
-        supervisor._fault_capture_lock = threading.Lock()
-        supervisor._fault_capture_process = mock.Mock(pid=123)
-        supervisor._fault_capture_process.poll.return_value = None
-        supervisor._fault_capture_timer = None
-        supervisor._fault_capture_directory = Path("/recordings/fault")
-        supervisor._fault_capture_state = "armed"
-        supervisor._fault_capture_error = None
-        supervisor._fault_capture_trigger = None
-        timers = []
-
-        class FakeTimer:
-            def __init__(self, interval, callback):
-                self.interval = interval
-                self.callback = callback
-                self.daemon = False
-                self.started = False
-                timers.append(self)
-
-            def start(self):
-                self.started = True
-
-        with mock.patch.object(SUPERVISOR_MODULE.threading, "Timer", FakeTimer):
-            supervisor._on_sensor_rejection(
-                SimpleNamespace(data=json.dumps({"error_code": "other"}))
-            )
-            supervisor._on_sensor_rejection(
-                SimpleNamespace(
-                    data=json.dumps(
-                        {
-                            "error_code": "raw_odom_discontinuity",
-                            "reason": "linear speed 13.221 m/s exceeds 10.000 m/s",
-                        }
-                    )
-                )
-            )
-            supervisor._on_sensor_rejection(
-                SimpleNamespace(
-                    data=json.dumps(
-                        {
-                            "error_code": "raw_odom_discontinuity",
-                            "reason": "later fault",
-                        }
-                    )
-                )
-            )
-
-        self.assertEqual(supervisor._fault_capture_state, "post_trigger")
-        self.assertEqual(len(timers), 1)
-        self.assertEqual(timers[0].interval, 5.0)
-        self.assertTrue(timers[0].started)
-        self.assertTrue(timers[0].daemon)
-        self.assertEqual(
-            supervisor._fault_capture_trigger["detail"],
-            "linear speed 13.221 m/s exceeds 10.000 m/s",
-        )
-
-    def test_fault_capture_uses_full_rate_raw_topics_and_snapshot_mode(self) -> None:
-        supervisor = object.__new__(FastLivo2Supervisor)
-        topics = {
-            "lidar_topic": "/ubuntu/navigation/lidar",
-            "imu_topic": "/ubuntu/navigation/imu",
-            "raw_odom_topic": "/ubuntu/navigation/fast_livo2/raw/odom",
-            "bridge_status_topic": "/ubuntu/navigation/_bridge_status",
-            "mapper_runtime_topic": "/ubuntu/navigation/fast_livo2/mapper_runtime",
-            "diagnostics_topic": "/ubuntu/navigation/fast_livo2/diagnostics",
-        }
-        supervisor.get_parameter = lambda name: SimpleNamespace(
-            value=topics[name]
-        )
-
-        command = supervisor._fault_capture_command(Path("/recordings/fault"))
-
-        self.assertIn("--snapshot-mode", command)
-        self.assertIn("--no-discovery", command)
-        qos_flag = command.index("--qos-profile-overrides-path")
-        qos_path = Path(command[qos_flag + 1])
-        self.assertTrue(qos_path.is_file())
-        qos = qos_path.read_text(encoding="utf-8")
-        self.assertIn("/ubuntu/navigation/lidar:", qos)
-        self.assertIn("/ubuntu/navigation/imu:", qos)
-        self.assertIn("reliability: best_effort", qos)
-        self.assertIn("depth: 400", qos)
-        self.assertIn("/ubuntu/navigation/lidar", command)
-        self.assertIn("/ubuntu/navigation/imu", command)
-        self.assertIn("/ubuntu/navigation/fast_livo2/raw/odom", command)
-        self.assertIn(
-            "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom",
-            command,
-        )
-        self.assertIn("/ubuntu/navigation/_bridge_status", command)
-        self.assertIn("/ubuntu/navigation/fast_livo2/mapper_runtime", command)
-        self.assertNotIn("/ubuntu/navigation/collection/lidar", command)
-
-    def test_fault_capture_stays_in_runtime_process_group(self) -> None:
-        supervisor = object.__new__(FastLivo2Supervisor)
-        supervisor._fault_capture_lock = threading.Lock()
-        supervisor.get_parameter = lambda name: SimpleNamespace(
-            value={
-                "lidar_topic": "/navigation/lidar",
-                "imu_topic": "/navigation/imu",
-                "raw_odom_topic": "/navigation/raw_odom",
-                "bridge_status_topic": "/navigation/bridge_status",
-                "mapper_runtime_topic": "/navigation/mapper_runtime",
-                "diagnostics_topic": "/navigation/diagnostics",
-            }[name]
-        )
-        process = mock.Mock()
-        process.poll.return_value = None
-
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            SUPERVISOR_MODULE, "_FAULT_CAPTURE_ROOT", Path(directory)
-        ), mock.patch.object(
-            SUPERVISOR_MODULE.subprocess, "Popen", return_value=process
-        ) as popen, mock.patch.object(SUPERVISOR_MODULE.time, "sleep"):
-            supervisor._arm_fault_capture()
-
-        self.assertFalse(popen.call_args.kwargs["start_new_session"])
-        FastLivo2Supervisor._stop_fault_capture_process(process)
-        process.send_signal.assert_called_once_with(SUPERVISOR_MODULE.signal.SIGINT)
-        process.kill.assert_not_called()
-
-
+        supervisor._lock = threading.RLock()
+        supervisor._adapter_execute = mock.Mock(return_value={"status": "ok"})
+        for requested in (True, False):
+            with mock.patch.object(SUPERVISOR_MODULE.subprocess, "Popen") as popen:
+                result = supervisor._configure_runtime({
+                    "min_height_m": -0.3, "max_height_m": 0.3,
+                    "fault_capture_enabled": requested,
+                })
+            popen.assert_not_called()
+            self.assertFalse(result["runtime_features"]["fault_capture_enabled"])
+            self.assertEqual(supervisor._fault_capture_snapshot()["state"], "disabled")
+        self.assertFalse(hasattr(supervisor, "_arm_fault_capture"))
+        self.assertFalse(hasattr(supervisor, "_trigger_fault_capture"))
 
     def test_adapter_rejection_logs_are_sampled_and_recovery_is_reported(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)

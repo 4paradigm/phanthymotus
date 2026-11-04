@@ -85,6 +85,12 @@ class ControlledSemanticSpatialPlugin:
             **dict(raw_cfg.pop("semantic", {}) or {}),
         }
         self._ignored_legacy_fields = set()
+        if "fault_capture_enabled" in raw_cfg:
+            raw_cfg.pop("fault_capture_enabled")
+            self._ignored_legacy_fields.add("fault_capture_enabled")
+        if "fault_capture_enabled" in mapping_cfg:
+            mapping_cfg.pop("fault_capture_enabled")
+            self._ignored_legacy_fields.add("fault_capture_enabled")
         for config, fields, defaults in (
             (mapping_cfg, _FIXED_MAPPING_FIELDS, FAST_LIVO2_CONFIG_DEFAULTS),
             (planning_cfg, _FIXED_PLANNING_FIELDS, NAV2_CONFIG_DEFAULTS),
@@ -732,7 +738,6 @@ class ControlledSemanticSpatialPlugin:
                     ("obstacle_min_height_m", "obstacle_min_height_m"),
                     ("obstacle_max_height_m", "obstacle_max_height_m"),
                     ("map_view_enabled", "map_view_enabled"),
-                    ("fault_capture_enabled", "fault_capture_enabled"),
                 )
                 if source in updates
             },
