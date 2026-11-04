@@ -91,6 +91,12 @@ verified ground truth. The original archive SHA-256 is
 - With a **hypothetical**, unvalidated 200 ms maximum pose bracket, 199/317
   cloud times align and 118 are rejected. The common-clock assumption itself
   still needs independent verification.
+- A further bracket-width sensitivity sweep on the same recording produced
+  0, 69, 180, 199, 301, 316, 317 and 317 aligned frames at 50, 100, 150,
+  200, 250, 300, 350 and 500 ms respectively (317 frames total). A wider
+  bracket improves coverage but does not prove interpolation accuracy. These
+  counts must not be used to choose a production threshold without measured
+  timing and motion-error bounds.
 - Both single-frame descriptors processed all 317 frames. For the exploratory
   pair 10 and 305, neither method ranked the other frame in its top five in
   either direction. There are no labelled queries, so recall is unknown.
