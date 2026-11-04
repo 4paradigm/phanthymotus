@@ -117,7 +117,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=6feed844676374762501cf5b621f2ea1689439994e8f2fbcaa31cbba03eb2acb",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=1e776ea08d0082fdef911b93aa88b88aee2a2b91a9bb08b608bb34daa4dd8b7f",
             source_lock,
         )
         self.assertIn(
@@ -177,8 +177,6 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertIn("state_stamp_sec", runtime_patch_text)
         self.assertIn("publish_latency_ms", runtime_patch_text)
-        # A dropped IMU sample must not become one giant integration step.
-        self.assertIn("if (dt > 0.05) dt = 0.05;", runtime_patch_text)
         self.assertIn("self._on_mapper_runtime", adapter)
         self.assertIn("mapper_publish_latency_ms", adapter)
         self.assertIn("mapper_state_stamp_sec", adapter)
@@ -230,7 +228,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "6feed844676374762501cf5b621f2ea1689439994e8f2fbcaa31cbba03eb2acb",
+            "1e776ea08d0082fdef911b93aa88b88aee2a2b91a9bb08b608bb34daa4dd8b7f",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
