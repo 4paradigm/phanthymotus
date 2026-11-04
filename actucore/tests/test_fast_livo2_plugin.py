@@ -174,8 +174,8 @@ class FastLivo2PluginTest(unittest.TestCase):
             {
                 "min_height_m": -0.30,
                 "max_height_m": 0.30,
-                "lidar_qos_depth": 2,
-                "imu_qos_depth": 400,
+                "lidar_qos_depth": 100,
+                "imu_qos_depth": 2000,
                 "map_view_enabled": True,
             },
         )
@@ -482,9 +482,9 @@ class FastLivo2PluginTest(unittest.TestCase):
 
         for key, value in (
             ("lidar_qos_depth", 0),
-            ("lidar_qos_depth", 33),
+            ("lidar_qos_depth", 257),
             ("imu_qos_depth", True),
-            ("imu_qos_depth", 4001),
+            ("imu_qos_depth", 8001),
         ):
             with self.subTest(key=key, value=value):
                 rejected = FastLivo2Plugin(

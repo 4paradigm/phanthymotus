@@ -117,7 +117,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=e3f4ab3cb4b9de98a7d30b402e4c0d53666abf77538eb3516ddb7e70c993e42a",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=1dce6118522a36c3242f27c1c7873714dfc272787ad518bc55a507c5284536c5",
             source_lock,
         )
         self.assertIn(
@@ -132,11 +132,11 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
         runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
         self.assertIn(
-            'get_parameter_or("lidar_qos_depth", point_cloud_queue_depth, 2)',
+            'get_parameter_or("lidar_qos_depth", point_cloud_queue_depth, 100)',
             runtime_patch_text,
         )
         self.assertIn(
-            'get_parameter_or("imu_qos_depth", imu_queue_depth, 400)',
+            'get_parameter_or("imu_qos_depth", imu_queue_depth, 2000)',
             runtime_patch_text,
         )
         self.assertNotIn('declare_parameter<int>("lidar_qos_depth"', runtime_patch_text)
@@ -154,8 +154,8 @@ class FastLivo2ContractTest(unittest.TestCase):
             base_dockerfile,
         )
         self.assertIn("--params-file /tmp/navigation_lio.yaml", base_dockerfile)
-        self.assertIn("-p lidar_qos_depth:=2", base_dockerfile)
-        self.assertIn("-p imu_qos_depth:=400", base_dockerfile)
+        self.assertIn("-p lidar_qos_depth:=100", base_dockerfile)
+        self.assertIn("-p imu_qos_depth:=2000", base_dockerfile)
         self.assertIn("rclcpp::KeepLast", runtime_patch_text)
         self.assertIn("point_cloud_qos.reliable().durability_volatile()", runtime_patch_text)
         self.assertIn("imu_qos.reliable().durability_volatile()", runtime_patch_text)
@@ -214,7 +214,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "e3f4ab3cb4b9de98a7d30b402e4c0d53666abf77538eb3516ddb7e70c993e42a",
+            "1dce6118522a36c3242f27c1c7873714dfc272787ad518bc55a507c5284536c5",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

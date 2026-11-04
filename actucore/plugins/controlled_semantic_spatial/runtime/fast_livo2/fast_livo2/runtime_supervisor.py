@@ -46,8 +46,11 @@ _MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912
 _MAX_MAP_MANIFEST_BYTES = 65_536
 _MAP_CONTROL_RESPONSE_GRACE_SEC = 5.0
 _MAP_CONTROL_DISCOVERY_TIMEOUT_SEC = 5.0
-_DEFAULT_LIDAR_QOS_DEPTH = 2
-_DEFAULT_IMU_QOS_DEPTH = 400
+# Cover a 10 s processing stall without letting the transport discard samples:
+# 10 s at 10 Hz LiDAR and 200 Hz IMU. A discarded IMU sample leaves a gap that
+# the ESKF integrates as one step, which has produced multi-metre pose jumps.
+_DEFAULT_LIDAR_QOS_DEPTH = 100
+_DEFAULT_IMU_QOS_DEPTH = 2000
 
 
 class FastLivo2Supervisor(Node):
@@ -270,8 +273,8 @@ class FastLivo2Supervisor(Node):
     def _configure_runtime(self, args: dict) -> dict:
         depths = {}
         for key, default, maximum in (
-            ("lidar_qos_depth", _DEFAULT_LIDAR_QOS_DEPTH, 32),
-            ("imu_qos_depth", _DEFAULT_IMU_QOS_DEPTH, 4000),
+            ("lidar_qos_depth", _DEFAULT_LIDAR_QOS_DEPTH, 256),
+            ("imu_qos_depth", _DEFAULT_IMU_QOS_DEPTH, 8000),
         ):
             value = args.get(key, getattr(self, f"_{key}", default))
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:

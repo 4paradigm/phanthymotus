@@ -63,8 +63,8 @@ def _validated_config(base: dict, updates: dict) -> dict:
             raise ConfigError(f"{key} must be within [{minimum}, {maximum}]")
         result[key] = value
     for key, minimum, maximum in (
-        ("lidar_qos_depth", 1, 32),
-        ("imu_qos_depth", 1, 4000),
+        ("lidar_qos_depth", 1, 256),
+        ("imu_qos_depth", 1, 8000),
     ):
         value = result.get(key)
         if isinstance(value, bool) or not isinstance(value, int):
