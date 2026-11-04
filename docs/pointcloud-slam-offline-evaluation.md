@@ -5,6 +5,17 @@ a Perception SLAM card, do not subscribe to a robot, and never accept or publish
 loop edges. A geometric match or a caller-supplied `verified` boolean is not
 independent proof of a loop. Do not use synthetic graph weights on robot data.
 
+The separate `plugins/pointcloud_slam_keyframes.py` implements bounded local
+keyframe storage for future integration. It assumes its caller supplies a
+validated, time-aligned tracking pose and cloud already expressed in the pose
+child frame. It retains the original cloud timestamp in nanoseconds and checks
+that it agrees with the aligned pose's millisecond timestamp. A lost signal
+blocks the current segment until a new segment is
+provided. Segment IDs cannot be reused, and a full store rejects new frames
+rather than evicting historical points. It does not subscribe to inputs,
+establish clock synchronization, validate loops, or merge submaps; the runtime
+must handle a full store and signal tracking loss. It is not a SLAM card.
+
 ## Inputs and reproducibility
 
 The experimental reader currently supports the recorded
