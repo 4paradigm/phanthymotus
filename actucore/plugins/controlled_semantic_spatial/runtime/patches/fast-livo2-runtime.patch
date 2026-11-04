@@ -97,22 +97,6 @@ index 17f07c2..7666b6a 100644
 -#endif
 \ No newline at end of file
 +#endif
-diff --git a/src/IMU_Processing.cpp b/src/IMU_Processing.cpp
-index 7985552..0c22130 100755
---- a/src/IMU_Processing.cpp
-+++ b/src/IMU_Processing.cpp
-@@ -373,6 +373,11 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
-         offs_t = prop_end_time - prop_beg_time;
-       }
- 
-+      // A transport gap (dropped IMU samples, a stalled callback loop) turns
-+      // into one giant integration step here and moves the state by metres.
-+      // Bound the step so the estimate degrades instead of teleporting; the
-+      // following LiDAR update pulls the state back.
-+      if (dt > 0.05) dt = 0.05;
-       dt_all += dt;
-       // printf("[ LIO Propagation ] dt: %lf \n", dt);
- 
 diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 index 4b92dfe..8bc6974 100755
 --- a/src/LIVMapper.cpp
