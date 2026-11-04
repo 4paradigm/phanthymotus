@@ -36,8 +36,13 @@ There is deliberately no default extrinsic or claimed safe timing limit.
 
 Keyframes create one odometry-only graph per segment. The GTSAM adapter accepts
 only a consecutive odometry chain and explicit positive noise sigmas; a manual
-Python call can optimize a graph captured from the input node. It accepts no
-loop edges and does not publish poses, maps, or map-to-odom corrections. The
+Python call can optimize a graph captured from the input node, then rebuild each
+segment's local keyframe points using the resulting pose snapshot. Returned
+snapshots carry the segment frame and last cloud capture stamp; independently
+anchored segments are not combined. A synthetic loop test also exercises
+history rebuilding, but uses the separate experimental graph tool and does not
+validate a real loop. The runtime backend accepts no loop edges and does not
+publish poses, maps, or map-to-odom corrections. The
 current Perception image does not include GTSAM, and its Jetson compatibility
 has not been built or tested. The card therefore exposes no map output, and
 its running state means only that the experimental input subscriptions started.

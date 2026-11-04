@@ -83,10 +83,17 @@ class SlamInputNode(Node):
                 self.stream.last_error = str(error)
 
     def optimize_odometry(self, *, sigmas):
-        """Experimental explicit invocation; produces no published map or loops."""
+        """Return experimental per-segment snapshots; publish nothing."""
         from .pointcloud_slam_backend import optimize_odometry_graph
+        from .pointcloud_slam_map import rebuild_segment
         with self._lock:
             graphs = self.stream.graph()
-        return [{'segment_id': graph['segment_id'],
-                 'poses': optimize_odometry_graph(graph, sigmas=sigmas)}
-                for graph in graphs]
+            segments = self.stream.store.segments
+        result = []
+        for graph, segment in zip(graphs, segments):
+            poses = optimize_odometry_graph(graph, sigmas=sigmas)
+            result.append({'segment_id': segment.segment_id, 'poses': poses,
+                           'frame_id': segment.frames[0].pose.frame_id,
+                           'last_cloud_stamp_ns': segment.frames[-1].cloud_stamp_ns,
+                           'map_points': rebuild_segment(segment, poses)})
+        return result
