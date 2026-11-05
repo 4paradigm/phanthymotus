@@ -298,6 +298,7 @@ class _PointCloudNode(Node):
         self._cloud_pub = self.create_publisher(UInt8MultiArray, self._cloud_topic, _PUB_QOS)
         self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
         self._metric_cloud_enabled = False
+        self._input_format = None
         self._metric_cloud_topic = (input_topic or "/perception") + "/pointcloud_metric"
         self._metric_cloud_pub = None
         self._metric_lock = threading.Lock()
@@ -343,22 +344,23 @@ class _PointCloudNode(Node):
                         CompressedImage, self._input_topic_right, self._right_cb, _LOW_LAT_QOS))
             elif self._input_topic:
                 if self._mode == "depth":
-                    # z16 用 Image，zlib 用 CompressedImage；两路都订上，
-                    # 哪个来数据用哪个（摄像头驱动只会发其中一种）。
-                    self._subs.append(self.create_subscription(
-                        Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
-                    if not self._metric_cloud_enabled:
+                    # Prefer the declared ROS type; some RMWs reject two types
+                    # on one topic. Preserve the legacy fallback if unknown.
+                    if self._input_format not in ("image/depth-zlib", "image/jpeg"):
+                        self._subs.append(self.create_subscription(
+                            Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
+                    if not self._metric_cloud_enabled and self._input_format not in ("sensor/depth-f32", "image/depth-z16"):
                         self._subs.append(self.create_subscription(
                             CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
                 elif self._mode == "auto":
-                    # 话题名不说明载的是什么（"/camera/image_raw" 也可能是
-                    # z16 深度）：Image + CompressedImage 都订上，回调按消息
-                    # 真实类型分派 —— Image→depth-z16；CompressedImage.format
-                    # 含 depth→depth-zlib，否则当 jpeg 走 mono。
-                    self._subs.append(self.create_subscription(
-                        Image, self._input_topic, self._auto_image_cb, _LOW_LAT_QOS))
-                    self._subs.append(self.create_subscription(
-                        CompressedImage, self._input_topic, self._auto_comp_cb, _LOW_LAT_QOS))
+                    # Use upstream type declarations when present; unknown
+                    # sources retain legacy message-based detection.
+                    if self._input_format not in ("image/depth-zlib", "image/jpeg"):
+                        self._subs.append(self.create_subscription(
+                            Image, self._input_topic, self._auto_image_cb, _LOW_LAT_QOS))
+                    if self._input_format not in ("sensor/depth-f32", "image/depth-z16"):
+                        self._subs.append(self.create_subscription(
+                            CompressedImage, self._input_topic, self._auto_comp_cb, _LOW_LAT_QOS))
                 else:  # mono
                     self._subs.append(self.create_subscription(
                         CompressedImage, self._input_topic, self._jpeg_cb, _LOW_LAT_QOS))
@@ -1222,6 +1224,7 @@ class PointCloudPerceptionPlugin:
                 node._ensure_mono_model = self._ensure_model_bg
             with self._nodes_lock:
                 upstream = self._upstream_camera.get(node_key) or {}
+            node._input_format = upstream.get("format")
             # A/B 模式的反投影内参兜底用上游 K（见 _pinhole_for）；
             # stereo 的 K 是双目标定的，不掺上游单目声明。
             if mode in ("depth", "mono", "auto"):

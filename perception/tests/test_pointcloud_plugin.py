@@ -64,6 +64,23 @@ def _decode_cloud(raw: bytes) -> np.ndarray:
     return np.frombuffer(raw[8:], dtype="<f4").reshape(n, 3)
 
 
+@pytest.mark.parametrize(('format_name', 'expected'), [
+    ('sensor/depth-f32', '_auto_image_cb'),
+    ('image/depth-z16', '_auto_image_cb'),
+    ('image/depth-zlib', '_auto_comp_cb'),
+    ('image/jpeg', '_auto_comp_cb'),
+])
+def test_declared_input_format_uses_only_its_ros_message_type(format_name, expected):
+    plugin, executor = _plugin()
+    result = plugin.dispatch('pointcloud', {
+        'action': 'start', 'input_topic': '/camera/depth',
+        'camera_info': {'/camera/depth': {'format': format_name}},
+    })
+    assert result['state'] == 'running'
+    assert [sub.callback.__name__ for sub in executor.nodes[0].subscriptions] == [expected]
+    plugin.dispatch('pointcloud', {'action': 'stop'})
+
+
 @pytest.mark.parametrize("endian,big", [("<", 0), (">", 1)])
 def test_metric_float_depth_keeps_metres_with_row_padding(endian, big):
     rows = [np.array([1.0, 2.5, 99.0], dtype=endian + "f4").tobytes(),
