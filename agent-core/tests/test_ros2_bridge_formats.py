@@ -45,3 +45,61 @@ def test_an_unknown_format_still_returns_none():
     """Declining is right for a format nobody can decode; the bug was the set
     of formats, not the declining."""
     assert ros2_bridge._resolve_msg_type("application/x-nonsense") is None
+
+
+def test_slam_preview_format_uses_binary_ros_message():
+    assert ros2_bridge._resolve_msg_type('sensor/slam-preview') is _msg.UInt8MultiArray
+
+
+def test_slam_preview_snapshot_is_relayed_as_binary(monkeypatch):
+    import asyncio
+    from api import inspection
+    topic, raw = '/test/slam-preview', b'\xff\x00\x01'
+    monkeypatch.setitem(inspection._topic_registry, topic, {'format': 'sensor/slam-preview'})
+    monkeypatch.setitem(inspection._last_frame, topic, raw)
+    monkeypatch.setattr(inspection, '_ensure_primary_sub', lambda *a: None)
+    unsubscribed = []
+    monkeypatch.setattr(ros2_bridge, 'unsubscribe', lambda key: unsubscribed.append(key))
+    inspection._active_primary_subs.add(topic)
+    class Socket:
+        def __init__(self):
+            self.binary = []
+            self.text = []
+        async def accept(self):
+            pass
+        async def send_text(self, message):
+            self.text.append(message)
+            if len(self.text) > 1:
+                raise RuntimeError('wrongly relayed as text')
+        async def send_bytes(self, data):
+            self.binary.append(data)
+            raise RuntimeError('done')
+    socket = Socket()
+    asyncio.run(inspection.bus_ws(socket, topic.lstrip('/')))
+    assert socket.binary == [raw] and len(socket.text) == 1
+    assert unsubscribed == ['__primary__#' + topic]
+    assert topic not in inspection._last_frame
+
+
+def test_slam_preview_registration_does_not_subscribe_without_viewers(monkeypatch):
+    from api import inspection
+    calls = []
+    monkeypatch.setattr(inspection, '_ensure_primary_sub', lambda *a: calls.append(a))
+    inspection._ensure_registered_sub('/preview', 'sensor/slam-preview', None)
+    assert calls == []
+
+
+def test_slow_preview_consumer_receives_latest_bounded_frames(monkeypatch):
+    import asyncio
+    from api import inspection
+    topic = '/test/slow-preview'
+    queue = asyncio.Queue(maxsize=2)
+    monkeypatch.setitem(inspection._topic_registry, topic, {'format': 'sensor/slam-preview'})
+    monkeypatch.setitem(inspection._topic_queues, topic, [queue])
+    async def feed():
+        push = inspection._push_factory(topic)
+        await push(b'old', 'sensor/slam-preview')
+        await push(b'middle', 'sensor/slam-preview')
+        await push(b'latest', 'sensor/slam-preview')
+        return [queue.get_nowait(), queue.get_nowait()]
+    assert asyncio.run(feed()) == [b'middle', b'latest']

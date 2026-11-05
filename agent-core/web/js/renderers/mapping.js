@@ -16,6 +16,7 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { decodeSlamPreview } from './slam-preview-codec.js';
 
 const MAX_POINTS = 80000;
 
@@ -298,5 +299,31 @@ export const MappingRenderer = {
     this._positions = null;
     this._colors = null;
     this._followBtn = null;
+  },
+};
+
+// Same bounded packet layout, but a distinct format and persistent label so an
+// odometry-only preview cannot be mistaken for a validated SLAM map.
+export const SlamPreviewRenderer = {
+  ...MappingRenderer,
+  name: 'slam-preview',
+  canRender: (hint) => hint === 'sensor/slam-preview',
+  mount(container) {
+    MappingRenderer.mount.call(this, container);
+    const badge = document.createElement('div');
+    badge.style.cssText = 'position:absolute;left:8px;top:8px;z-index:11;padding:4px 7px;' +
+      'background:#6c4215;color:#fff;border-radius:4px;font-size:12px;pointer-events:none;' +
+      'max-width:80%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    badge.textContent = '里程计预览 · 未验证 · 无回环 · 关键帧位置';
+    this._previewBadge = badge;
+    this._el.appendChild(badge);
+  },
+  onData(buffer) {
+    const decoded = decodeSlamPreview(buffer);
+    if (!decoded) return;
+    if (this._previewBadge) {
+      this._previewBadge.textContent = `里程计预览 · 未验证 · 无回环 · 关键帧位置 · ${decoded.meta.frame_id} / ${decoded.meta.segment_id}`;
+    }
+    MappingRenderer.onData.call(this, decoded.payload);
   },
 };

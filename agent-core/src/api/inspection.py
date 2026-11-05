@@ -73,7 +73,12 @@ def _push_factory(topic: str):
             try:
                 q.put_nowait(data)
             except asyncio.QueueFull:
-                pass  # drop frame for slow consumer
+                if msg_fmt == 'sensor/slam-preview':
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(data)
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):
+                        pass
         # 处理 perf_span 类型消息（来自 perception TTS 等组件）
         if topic == '/perception/perf_spans':
             try:
@@ -127,7 +132,7 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
 def _ensure_registered_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     # Large computational streams are subscribed only when a viewer opens
     # them; registering a port must not duplicate continuous camera traffic.
-    if fmt not in ('sensor/depth-f32', 'sensor/pointcloud2'):
+    if fmt not in ('sensor/depth-f32', 'sensor/pointcloud2', 'sensor/slam-preview'):
         _ensure_primary_sub(topic, fmt, loop)
 
 
@@ -296,7 +301,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
     # Ensure DDS subscription is active (no-op if already running)
     _ensure_primary_sub(topic, fmt, loop)
 
-    q: asyncio.Queue = asyncio.Queue(maxsize=4096)
+    q: asyncio.Queue = asyncio.Queue(maxsize=2 if fmt == 'sensor/slam-preview' else 4096)
     _topic_queues.setdefault(topic, []).append(q)
 
     try:
@@ -306,7 +311,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
         # Push cached snapshot immediately (so page refresh shows current map).
         snapshot = _last_frame.get(topic)
         if snapshot:
-            if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+            if fmt in ('sensor/pointcloud', 'sensor/mapping', 'sensor/slam-preview'):
                 await websocket.send_bytes(snapshot)
             elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
                 await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
@@ -317,7 +322,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
                 data = await asyncio.wait_for(q.get(), timeout=5.0)
                 if data is None:
                     break  # signal to stop
-                if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+                if fmt in ('sensor/pointcloud', 'sensor/mapping', 'sensor/slam-preview'):
                     await websocket.send_bytes(data)
                 elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
                     await websocket.send_text(data.decode('utf-8', errors='replace'))
@@ -334,7 +339,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
         queues = _topic_queues.get(topic, [])
         if q in queues:
             queues.remove(q)
-        if not queues and fmt in ('sensor/depth-f32', 'sensor/pointcloud2'):
+        if not queues and fmt in ('sensor/depth-f32', 'sensor/pointcloud2', 'sensor/slam-preview'):
             ros2_bridge.unsubscribe(f'__primary__#{topic}')
             _active_primary_subs.discard(topic)
             _last_frame.pop(topic, None)

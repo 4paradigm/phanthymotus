@@ -250,7 +250,7 @@ def _resolve_msg_type(fmt: str):
             pass
         # Unitree G1: DDS AudioData_ — 不经 ROS2，此处不需要订阅
         return None
-    if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+    if fmt in ('sensor/pointcloud', 'sensor/mapping', 'sensor/slam-preview'):
         try:
             from std_msgs.msg import UInt8MultiArray
             return UInt8MultiArray

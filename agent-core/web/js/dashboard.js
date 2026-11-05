@@ -12,10 +12,11 @@ import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
 import { PointCloudRenderer } from './renderers/pointcloud.js';
+import { SlamPreviewRenderer } from './renderers/mapping.js';
 import { OdomRenderer, odomPreview } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, PointCloudRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, PointCloudRenderer, SlamPreviewRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 
@@ -27,6 +28,7 @@ class SkillBuffer {
   constructor(wsUrl, hint) {
     this._wsUrl   = wsUrl;
     this._hint    = hint;
+    this._capacity = hint === 'sensor/slam-preview' ? 1 : PREVIEW_CAPACITY;
     this._frames  = [];          // ring buffer (ArrayBuffer[])
     this._pos     = 0;           // write head (mod PREVIEW_CAPACITY)
     this._full    = false;
@@ -52,7 +54,7 @@ class SkillBuffer {
       let buf;
       if (ev.data instanceof ArrayBuffer) {
         // Binary frame — skip if odd byte length (not valid PCM s16)
-        if (ev.data.byteLength % 2 !== 0) return;
+        if (this._hint !== 'sensor/slam-preview' && ev.data.byteLength % 2 !== 0) return;
         buf = ev.data;
       } else {
         // Text frame (JSON ASR result, ping, meta) — skip pure keepalive pings
@@ -64,7 +66,7 @@ class SkillBuffer {
       }
       // Store in ring buffer
       this._frames[this._pos] = buf;
-      this._pos = (this._pos + 1) % PREVIEW_CAPACITY;
+      this._pos = (this._pos + 1) % this._capacity;
       if (!this._full && this._pos === 0) this._full = true;
       // Forward to active consumer
       this._consumer?.(buf, this._hint);
@@ -76,10 +78,10 @@ class SkillBuffer {
    *  onDataFn(buf, hint, isReplay) — isReplay=true for historical frames. */
   attach(onDataFn) {
     this._consumer = onDataFn;
-    const len   = this._full ? PREVIEW_CAPACITY : this._pos;
+    const len   = this._full ? this._capacity : this._pos;
     const start = this._full ? this._pos : 0;
     for (let i = 0; i < len; i++) {
-      const frame = this._frames[(start + i) % PREVIEW_CAPACITY];
+      const frame = this._frames[(start + i) % this._capacity];
       if (frame) onDataFn(frame, this._hint, true);  // isReplay=true
     }
   }
