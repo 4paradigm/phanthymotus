@@ -111,8 +111,8 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("static_angular_bin_deg", 1.0)
         self.declare_parameter("static_grid_margin_m", 6.0)
         self.declare_parameter("static_pose_match_tolerance_sec", 0.05)
-        self.declare_parameter("obstacle_min_height_m", -0.30)
-        self.declare_parameter("obstacle_max_height_m", 0.30)
+        self.declare_parameter("obstacle_min_height_m", -0.80)
+        self.declare_parameter("obstacle_max_height_m", 0.10)
 
         self._source_max_age = float(self.get_parameter("source_max_age_sec").value)
         self._mapper_runtime_max_age = float(

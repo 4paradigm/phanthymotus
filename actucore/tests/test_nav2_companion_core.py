@@ -605,8 +605,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(params.count("data_type: PointCloud2"), 2)
         # Both costmaps' layer and source templates use the mapping default;
         # the launch rewriter replaces all four bands with the configured band.
-        self.assertEqual(params.count("min_obstacle_height: -0.30"), 4)
-        self.assertEqual(params.count("max_obstacle_height: 0.30"), 4)
+        self.assertEqual(params.count("min_obstacle_height: -0.80"), 4)
+        self.assertEqual(params.count("max_obstacle_height: 0.10"), 4)
         self.assertEqual(params.count("from the single mapping-card height configuration"), 2)
         self.assertIn("global_frame: map", params)
         self.assertIn("rolling_window: true", params)
@@ -664,7 +664,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         for expected in (
             "plugin: segmented_controller::SegmentedController",
             "rotate_exit_rad: 0.05",
-            "rotate_reengage_rad: 0.15",
+            "rotate_reengage_rad: 0.30",
             "approach_speed_mps: 0.30",
             "cruise_speed_mps: 1.0",
             "segment_tolerance_m: 0.18",

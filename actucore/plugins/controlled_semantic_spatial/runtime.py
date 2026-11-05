@@ -98,7 +98,7 @@ class ControlledSemanticSpatialRuntime:
         namespace: str = "ubuntu",
         input_topics: dict[str, str] | None = None,
         control_interface: dict | None = None,
-        rotate_reengage_rad: float = 0.15,
+        rotate_reengage_rad: float = 0.30,
         obstacle_min_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_min_height_m"],
         obstacle_max_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_max_height_m"],
         inflation_radius_m: float = 0.55,
@@ -162,7 +162,7 @@ class ControlledSemanticSpatialRuntime:
     def _launch_arguments(
         namespace: str, input_topics: dict[str, str] | None,
         control_interface: dict | None = None,
-        rotate_reengage_rad: float = 0.15,
+        rotate_reengage_rad: float = 0.30,
         obstacle_min_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_min_height_m"],
         obstacle_max_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_max_height_m"],
         inflation_radius_m: float = 0.55,

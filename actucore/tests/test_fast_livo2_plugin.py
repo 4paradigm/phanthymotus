@@ -172,8 +172,8 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(
             backend.calls[0][1],
             {
-                "min_height_m": -0.30,
-                "max_height_m": 0.30,
+                "min_height_m": -0.80,
+                "max_height_m": 0.10,
                 "lidar_qos_depth": 100,
                 "imu_qos_depth": 2000,
                 "map_view_enabled": True,

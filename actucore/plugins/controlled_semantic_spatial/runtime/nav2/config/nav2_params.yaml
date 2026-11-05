@@ -90,7 +90,7 @@ controller_server:
     FollowPath:
       plugin: segmented_controller::SegmentedController
       rotate_exit_rad: 0.05
-      rotate_reengage_rad: 0.15
+      rotate_reengage_rad: 0.30
       # The proposal bridge applies the card's fixed rotate_speed_rps cap.
       rotate_speed_rps: 2.0
       approach_distance_m: 0.50
@@ -126,8 +126,8 @@ local_costmap:
         # from the single mapping-card height configuration before node startup.
         # Layer marking and source buffering must share the same map-z limits;
         # otherwise some points can clear without being eligible for marking.
-        min_obstacle_height: -0.30
-        max_obstacle_height: 0.30
+        min_obstacle_height: -0.80
+        max_obstacle_height: 0.10
         observation_sources: registered_cloud
         registered_cloud:
           topic: /ubuntu/navigation/cloud_registered
@@ -139,8 +139,8 @@ local_costmap:
           clearing: true
           marking: true
           # Template fallback; overwritten alongside the layer band at launch.
-          min_obstacle_height: -0.30
-          max_obstacle_height: 0.30
+          min_obstacle_height: -0.80
+          max_obstacle_height: 0.10
           obstacle_min_range: 0.20
           obstacle_max_range: 8.0
           raytrace_min_range: 0.20
@@ -181,8 +181,8 @@ global_costmap:
         # from the single mapping-card height configuration before node startup.
         # Layer marking and source buffering must share the same map-z limits;
         # otherwise some points can clear without being eligible for marking.
-        min_obstacle_height: -0.30
-        max_obstacle_height: 0.30
+        min_obstacle_height: -0.80
+        max_obstacle_height: 0.10
         observation_sources: registered_cloud
         registered_cloud:
           topic: /ubuntu/navigation/cloud_registered
@@ -194,8 +194,8 @@ global_costmap:
           clearing: true
           marking: true
           # Template fallback; overwritten alongside the layer band at launch.
-          min_obstacle_height: -0.30
-          max_obstacle_height: 0.30
+          min_obstacle_height: -0.80
+          max_obstacle_height: 0.10
           obstacle_min_range: 0.20
           obstacle_max_range: 8.0
           raytrace_min_range: 0.20

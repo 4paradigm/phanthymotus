@@ -83,7 +83,7 @@ def test_launch_wires_json_as_string(monkeypatch):
     assert rewritten.kwargs['convert_types'] is True
     assert rewritten.kwargs['param_rewrites']['rotate_reengage_rad'].args == ('rotate_reengage_rad',)
     assert rewritten.kwargs['param_rewrites']['rotate_exit_rad'].args == ('rotate_exit_rad',)
-    assert declarations['rotate_reengage_rad'] == '0.15'
+    assert declarations['rotate_reengage_rad'] == '0.30'
     assert declarations['rotate_exit_rad'] == '0.05'
     node = next(item for item in items if item.kwargs.get('executable') == 'planner_command_bridge')
     params = node.kwargs['parameters'][0]
