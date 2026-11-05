@@ -1,17 +1,26 @@
 """Opt-in experimental input card with clearly labelled odometry preview."""
 import json
 import math
+import os
+import re
 import threading
 
 from .pointcloud_slam_ros import SlamInputNode
 from .pointcloud_slam_stream import SlamStream, _rigid
 from utils.ros_lifecycle import dispose_node
 
+_ARCHIVE_DIR = '/models/pointcloud_slam'
+
+def _archive_path(name):
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name):
+        raise ValueError('archive name must contain only letters, digits, _ or -')
+    return os.path.join(_ARCHIVE_DIR, name + '.json')
+
 
 TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False,
           'description': '实验性点云与里程计输入；可选未验证里程计预览，尚无真实回环',
           'inputSchema': {'type': 'object', 'properties': {
-              'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config']},
+              'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config', 'save_map']},
               'input_topics': {'type': 'array', 'items': {'type': 'string'}},
               'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'}}, 'required': ['action']},
           'configSchema': {'type': 'object', 'properties': {
@@ -33,6 +42,8 @@ TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False
               'preview_backend': {'type': 'string', 'enum': ['raw', 'gtsam', 'geometry_experimental'], 'description': '预览后端；几何候选仍未验证'},
               'preview_geometry': {'type': 'string', 'description': '实验性几何检索、配准和图参数的 JSON 对象'},
               'preview_relocalization': {'type': 'boolean', 'default': False, 'description': '实验性双子图重定位预览，结果未经验证'},
+              'archive_name': {'type': 'string', 'description': '地图存档名称，仅字母、数字、下划线和连字符'},
+              'restore_archive': {'type': 'boolean', 'default': False, 'description': '启动时显式恢复存档，仍须重新定位'},
               'preview_interval_s': {'type': 'number', 'description': '预览间隔（秒）'},
               'preview_max_points': {'type': 'integer', 'description': '预览点数上限'},
               'preview_odom_sigmas': {'type': 'string', 'description': 'GTSAM 六维噪声 JSON 数组'},
@@ -90,7 +101,9 @@ class PointCloudSlamPlugin:
                         updates['child_from_cloud'] = _rigid(updates['child_from_cloud']).tolist()
                     if 'preview_geometry' in updates and not isinstance(updates['preview_geometry'], dict):
                         raise ValueError('preview_geometry must be an object')
-                    for key in ('clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled', 'preview_relocalization'):
+                    if 'archive_name' in updates:
+                        _archive_path(updates['archive_name'])
+                    for key in ('clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled', 'preview_relocalization', 'restore_archive'):
                         if key in updates and type(updates[key]) is not bool:
                             raise ValueError(key + ' must be boolean')
                     for key in ('max_pending', 'max_cloud_points', 'max_frames', 'max_points', 'preview_max_points'):
@@ -116,6 +129,20 @@ class PointCloudSlamPlugin:
         if action == 'stop':
             self.stop()
             return {'state': 'idle'}
+        if action == 'save_map':
+            with self._lock:
+                try:
+                    if self._node is None:
+                        raise ValueError('card is not running')
+                    path = _archive_path(self._config.get('archive_name'))
+                    from .pointcloud_slam_archive import save_archive
+                    os.makedirs(_ARCHIVE_DIR, exist_ok=True)
+                    with self._node._lock:
+                        save_archive(path, self._node.stream.store, self._node._segment_links,
+                                     self._node._segment_loops, self._config)
+                    return {'state': 'saved', 'path': path}
+                except (ValueError, TypeError, OSError, KeyError) as error:
+                    return {'state': 'error', 'message': str(error)}
         if action == 'info':
             with self._lock:
                 node = self._node
@@ -167,6 +194,11 @@ class PointCloudSlamPlugin:
                     'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
             try:
                 stream = SlamStream(**{key: self._config[key] for key in keys})
+                links, loops = [], {}
+                if self._config.get('restore_archive') is True:
+                    from .pointcloud_slam_archive import load_archive
+                    stream.store, links, loops = load_archive(_archive_path(self._config.get('archive_name')),
+                        self._config, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
                 cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
                 preview = None
                 if self._config.get('preview_enabled') is True:
@@ -179,6 +211,7 @@ class PointCloudSlamPlugin:
                                'geometry': self._config.get('preview_geometry'),
                                'relocalization': self._config.get('preview_relocalization', False)}
                 node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
+                node._segment_links, node._segment_loops = links, loops
                 try:
                     self._executor.add_node(node)
                     node.start_preview()

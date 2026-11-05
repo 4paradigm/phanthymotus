@@ -60,13 +60,13 @@ anchored segments are not combined. A synthetic loop test also exercises
 history rebuilding, but uses the separate experimental graph tool and does not
 validate a real loop. The default live backends accept no loop edges. The
 experimental geometry backend below publishes provisional results only. The
-current Perception image does not include GTSAM or Open3D; target installation
-and Jetson compatibility have not been established.
+Jetson dependency installation and target compatibility must be verified by the
+image build and runtime tests.
 
 For diagnostics only, set `preview_enabled: true` to advertise the separate
 `sensor/slam-preview` output and a `data/json` status output under the resolved
-cloud topic. The preview is a snapshot of the active segment's accumulated local
-keyframes, never a merged multi-segment map. Its renderer always labels it as
+cloud topic. Raw previews contain the active segment; the experimental geometry
+preview can include provisionally connected segments. Its renderer labels it as
 unvalidated and without loop closure; its pose indicator is the last keyframe,
 not a separately updated live robot pose. Each binary packet begins with a 4-byte
 little-endian metadata length, followed by bounded UTF-8 JSON
@@ -116,16 +116,22 @@ inter-segment hypotheses and per-segment loop candidates are retained in memory
 across later frames and tracking loss, then jointly optimized; storage and search
 are bounded by the configured keyframe and candidate capacities. The status
 reports `unvalidated_hypothesis`, never an accepted loop. A failed search keeps
-the segment separate. This in-memory state is not saved or restored across card
-or process restarts. Neither this prototype nor a geometric gate establishes
+the segment separate. Neither this prototype nor a geometric gate establishes
 safe segment merging or a production relocalization result.
 
-The Jetson Dockerfile does not currently install either experimental backend
-dependency. Open3D 0.18 publishes a CPython 3.10 ARM64 wheel; GTSAM 4.2 does
-not publish one for ARM64 on PyPI. The jp6.1 base uses Python 3.10. A successful
-image build without these dependencies does not prove the geometry backend can
-start; a compatible GTSAM build, image installation and target import test are
-still required. Preserve the image's NumPy pin when resolving dependencies.
+Set `archive_name` to an alphanumeric, underscore or hyphen name and call the
+card's `save_map` action to atomically write `/models/pointcloud_slam/NAME.json`.
+With `restore_archive: true`, startup explicitly loads that file and rejects a
+different frame, clock, extrinsic, geometry configuration or resource limit.
+The archive includes local points, poses and provisional constraints, not a
+validated map. Restore requires a new segment and does not assert tracking or
+localization. A reused segment ID or backwards measurement timestamps are
+rejected. Save is explicit; abrupt process termination does not save new work.
+
+For jp6.1 the Dockerfile installs Open3D 0.18 and builds GTSAM 4.2 Python
+bindings from pinned upstream source, preserving the base NumPy pin. Image
+build includes import checks; Jetson runtime and performance still require
+target validation. Other JetPack lines do not receive these dependencies.
 
 ## Inputs and reproducibility
 

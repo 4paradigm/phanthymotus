@@ -266,3 +266,41 @@ def test_relocalization_setting_is_explicit_and_forwarded_to_node():
     assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
     assert executor.nodes[0]._preview['relocalization'] is True
     plugin.shutdown()
+
+
+def test_map_save_and_explicit_restore_require_new_segment(tmp_path, monkeypatch):
+    from test_pointcloud_slam_stream import odom
+    import plugins.pointcloud_slam_plugin as module
+    monkeypatch.setattr(module, '_ARCHIVE_DIR', str(tmp_path))
+    executor = _FakeExecutor()
+    cfg = {**config(), 'archive_name': 'example'}
+    plugin = PointCloudSlamPlugin(cfg, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    node = executor.nodes[0]
+    node.stream.odom(odom(1000), now=1., measurement_now_ns=1_000_000_000)
+    node.stream.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1., measurement_now_ns=1_000_000_000)
+    assert plugin.dispatch('pointcloud_slam', {'action': 'save_map'})['state'] == 'saved'
+    plugin.stop()
+    restored = PointCloudSlamPlugin({**cfg, 'restore_archive': True}, executor)
+    assert restored.dispatch('pointcloud_slam', args)['state'] == 'running'
+    node = executor.nodes[0]
+    assert len(node.stream.store.segments) == 1
+    assert node.stream.store.requires_new_segment
+    assert node.stream.status(now=1.)['odometry'] != 'tracking'
+    node.stream.odom(odom(1100), now=1.1, measurement_now_ns=1_100_000_000)
+    node.stream.cloud(1_100_000_000, 'camera', [[1, 2, 3]], now=1.1, measurement_now_ns=1_100_000_000)
+    assert len(node.stream.store.segments) == 1
+    assert 'new segment' in node.stream.last_error
+    node.stream.odom(odom(1200, segment='b'), now=1.2, measurement_now_ns=1_200_000_000)
+    node.stream.cloud(1_200_000_000, 'camera', [[1, 2, 3]], now=1.2, measurement_now_ns=1_200_000_000)
+    assert [s.segment_id for s in node.stream.store.segments] == ['a', 'b']
+    restored.stop()
+
+
+def test_map_archive_name_rejects_path_traversal():
+    plugin = PointCloudSlamPlugin(config(), _FakeExecutor())
+    assert plugin.dispatch('pointcloud_slam', {'action': 'config', 'archive_name': '../bad'})['state'] == 'error'
