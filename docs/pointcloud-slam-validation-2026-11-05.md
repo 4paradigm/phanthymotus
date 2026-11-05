@@ -204,3 +204,42 @@ per-attempt budget. Future network behavior remains unverified.
 A controlled slow-body test reproduced curl28 under a short budget; the revised
 progress command completed and verified 100,000 bytes in about 3 seconds
 with multiple genuine progress updates. The pinned archive/checksum is unchanged.
+
+
+## Completed Bumi offline target validation
+
+The resource-limited, network-isolated native build completed with exit 0.
+The GTSAM build/install step took 2381 seconds, including serial LTO over 128
+partitions; quiet LTO was making progress and was not a failed build. Final
+image checks passed imports, identity ICP, and a one-node Pose3 optimization.
+This is a local test overlay, not an official PR image or SLAM acceptance.
+
+A separate runtime overlay removes inherited application modules and copies
+snapshot `187c612beaac5ac6a2c5bdc36ba29f53c1310886`; all runtime source directories
+remain identical through `864ec5e`. Byte/hash comparison matched all 129 files
+in plugins, utils, deploy, main.py and config.yaml against the committed snapshot.
+
+- Image: `local/phanthymotus-perception:slam187-offline-test`, ARM64.
+- Docker image ID: `sha256:3e07006d63f2816e2058402f1a011f7ab6779d4b29689c9a880fef5563a8dace`.
+- NumPy 1.26.4, Open3D 0.18.0, GTSAM distribution 4.2a9, built from the pinned
+  source commit/archive described above.
+- Target Python 3.10 regression: **319 passed, 1 skipped** in 40.04 seconds,
+  covering all `test_pointcloud_slam_*.py` and `test_pointcloud_plugin.py`.
+  The skip requires fake-cv2-only SGBM stubs; actual OpenCV is present here.
+  Pytest plugin autoload was disabled; no unavailable-geometry skips remained.
+- Both committed target scripts passed again against `/work` in this image:
+  real-rclpy lifecycle/fault/archive checks via direct callbacks, and real DDS
+  synthetic f32/zlib contracts (19,200 points each, exact capture headers).
+- Runtime tests used no network, one CPU and 1–2 GiB memory. Existing Perception,
+  Driver and Core service containers were not replaced. No motion was commanded.
+
+Robot evidence logs: `/tmp/bumi-slam-build-98-offline-v2.log`,
+`/tmp/slam187-target-tests.log`, `/tmp/slam187-target-runtime.log`.
+Physical extrinsics, independent clocks, labelled scene negatives, actual loop
+closures, corrected historical maps and endpoint ground truth remain unverified.
+
+The formal build provenance problem remains open: after pushing `864ec5e`, PR
+metadata/fork advertised that commit but the upstream pull head still returned
+`0d2cb78`. Request comment 6656953463 was followed by explicit provenance warning
+6657004807. The labelled SHA alone must not establish which Dockerfile was built.
+No repeated full build was requested while that job was outstanding.
