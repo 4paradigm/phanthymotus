@@ -116,7 +116,8 @@ local_costmap:
       width: 5
       height: 5
       resolution: 0.05
-      footprint: "[[0.32, 0.28], [0.32, -0.28], [-0.32, -0.28], [-0.32, 0.28]]"
+      footprint: "[[0.15, 0.0], [0.106, 0.226], [0.0, 0.32], [-0.106, 0.226], [-0.15, 0.0], [-0.106, -0.226], [0.0, -0.32], [0.106, -0.226]]"
+      footprint_padding: 0.01
       plugins: [obstacle_layer, inflation_layer]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -163,7 +164,8 @@ global_costmap:
       height: 12
       resolution: 0.05
       track_unknown_space: false
-      footprint: "[[0.32, 0.28], [0.32, -0.28], [-0.32, -0.28], [-0.32, 0.28]]"
+      footprint: "[[0.15, 0.0], [0.106, 0.226], [0.0, 0.32], [-0.106, 0.226], [-0.15, 0.0], [-0.106, -0.226], [0.0, -0.32], [0.106, -0.226]]"
+      footprint_padding: 0.01
       plugins: [static_layer, obstacle_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
@@ -171,7 +173,7 @@ global_costmap:
         map_topic: /ubuntu/navigation/static_map
         map_subscribe_transient_local: true
         subscribe_to_updates: false
-        footprint_clearing_enabled: false
+        footprint_clearing_enabled: true
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true

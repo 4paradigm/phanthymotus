@@ -104,7 +104,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("map_load_max_points", 200000)
         self.declare_parameter("static_map_load_max_points", 200000)
         self.declare_parameter("live_cloud_max_bytes", 67108864)
-        self.declare_parameter("source_max_age_sec", 0.5)
+        self.declare_parameter("source_max_age_sec", 1.0)
         self.declare_parameter("mapper_runtime_max_age_sec", 3.0)
         self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("map_voxel_size_m", 0.10)

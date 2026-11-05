@@ -36,7 +36,7 @@
       exposure_time_init: 0.0
     preprocess:
       point_filter_num: 1
-      filter_size_surf: 0.1
+      filter_size_surf: 0.2
       lidar_type: 7
       scan_line: 4
       blind: 0.5
@@ -59,7 +59,7 @@
       b_acc_cov: 0.001
       b_gyr_cov: 0.001
     lio:
-      max_iterations: 5
+      max_iterations: 3
       dept_err: 0.02
       beam_err: 0.15
       min_eigen_value: 0.005
