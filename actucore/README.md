@@ -410,7 +410,7 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 ```
 
 两个平台使用同一个 `Dockerfile.jetson`，脚本按 JetPack 选择直接继承的基座。
-JetPack 5.11 默认继承已发布、按 `@sha256` 锁定的 `actucore-navigation-base`，
+JetPack 5.11 默认继承版本化的 `actucore-navigation-base:jp511-v1`，
 提供 navigation 与 VLA `mock` / `vla_cloud`，不提供本地 SmolVLA 推理。
 JetPack 6.1 继承原有 `jetson-base-actucore:jp61-torch`，保留 torch / lerobot
 本地推理、`vla`、`navi` 和工具；新 navigation 默认关闭，尚未验证或提供其运行时，
@@ -418,20 +418,22 @@ JetPack 6.1 继承原有 `jetson-base-actucore:jp61-torch`，保留 torch / lero
 的构建步骤。JP6 最终镜像构造未启动的 Bundle，检查公开工具为 `vla`、`navi`
 且新 navigation 默认关闭；这不会启动 ROS、HTTP、模型推理或卡片。外部自定义
 配置不受该默认值限制，不应在 JP6.1 上启用尚未提供运行时的新 navigation。
-直接调用 `docker build` 时 `Dockerfile.jetson` 默认使用 JP5 基座；推荐通过上述
-脚本选择平台。
+`jp511-v1` 尚需发布后日常构建才能使用。直接调用 `docker build` 时必须显式传入
+`BASE_IMAGE` 和正确的 `JP_VERSION`；推荐通过上述脚本选择平台。
 
 JP5 基座预编译锁定版本的 FAST-LIVO2、Nav2 和系统依赖；日常镜像直接继承它，
 只重编仓库自有 ROS 包。基座包含日常构建所需编译依赖，并非最终镜像仅有
 install space；第三方源码和 build/log 不保留。临时验证另一个 JP5 基线时可显式
-设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的 `@sha256` 引用。
-`BASE_REGISTRY` 和 `BASE_NAMESPACE` 可选择镜像仓库；JP5 的基座引用固定 digest，
-该仓库必须包含对应 digest。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+设置 `ACTUCORE_NAVIGATION_BASE_IMAGE` 指定非 `latest` 的版本标签。
+`BASE_REGISTRY` 和 `BASE_NAMESPACE` 可选择镜像仓库，该仓库必须包含所选标签。
+无推送凭据时，基座按这两个变量命名并只在本机构建；如发布到另一仓库，日常
+构建须用 `BASE_REGISTRY` / `BASE_NAMESPACE` 指向发布位置。
+只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
 重新构建基础镜像；配置推送时脚本也会推送：
 
 ```bash
-GIT_MIRROR_PREFIX=https://ghfast.top/ \
-  ./deploy/build_actucore.sh --base --mirror tuna
+NAVIGATION_BASE_TAG=jp511-v1 GIT_MIRROR_PREFIX=https://ghfast.top/ \
+  ./deploy/prepare_navigation_base.sh --mirror tuna
 ```
 
 最终镜像阶段会检查 FAST-LIVO2 与 Nav2 原生节点的动态链接、加载配置中的全部
@@ -443,8 +445,12 @@ navigation base 和日常 ActuCore 的 C++ 编译步骤。
 
 基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时须考虑两个
 平台的依赖差异；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈才进入
-`Dockerfile.base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
+`prepare_navigation_base.sh`。基础镜像必须在原生 ARM64 构建，脚本拒绝
 再次走耗时且容易超时的 x86 QEMU 交叉编译。
+基座标签发布后不得覆盖；依赖变化应使用新版本号并更新日常构建的默认标签。
+固定标签本身不能阻止仓库覆盖，发布时仍须记录并核验镜像 digest。
+旧的 `build_actucore.sh --base` 仍转发到新入口，并同样要求设置
+`NAVIGATION_BASE_TAG`。JP6.1 基座构建仅保留实验入口，不表示支持 JP6 导航。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 

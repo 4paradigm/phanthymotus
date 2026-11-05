@@ -1,5 +1,5 @@
 # One Jetson application Dockerfile; build_actucore.sh selects the matching base.
-# JP5.11 uses the published ActuCore build base; JP6.1 retains its VLA base.
+# JP5.11 uses a versioned navigation base; JP6.1 retains its VLA base.
 # Build context: repository root.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}

@@ -96,17 +96,17 @@ for the duration of a motion is the wrong shape.
 ## Jetson only
 
 Both platforms use `Dockerfile.jetson` directly from their selected base.
-JP 5.11 uses the published, digest-pinned navigation base built by `Dockerfile.base`;
+JP 5.11 uses the versioned navigation base built by `prepare_navigation_base.sh`;
 it supports navigation and remote VLA, but not local SmolVLA. JP 6.1 uses the
 existing VLA base and retains local VLA, while new navigation is disabled and
-not yet validated. `deploy/build_actucore.sh` takes no `--variant`; `--base`
-rebuilds the heavy base only on native ARM64. Build context is the **repo root**, not
+not yet validated. `deploy/build_actucore.sh` takes no `--variant`; the separate
+base preparation entry builds the heavy base only on native ARM64. Build context is the **repo root**, not
 `actucore/`, because the image also needs `deploy/ros-base/audio_msgs/` — so
 `COPY` paths inside it are `actucore/…`. A PR adding a `COPY` with a path relative
 to `actucore/` will fail the build.
 
 Keep the daily image thin: FAST-LIVO2/Nav2 and their system dependencies belong
-in the digest-pinned navigation base, while repository-owned ROS packages are
+in the versioned navigation base, while repository-owned ROS packages are
 rebuilt in `Dockerfile.jetson`. Flag changes that silently rebuild the full
 third-party stack in every PR or add heavyweight dependencies to unrelated
 images.

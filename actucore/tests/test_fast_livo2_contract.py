@@ -95,9 +95,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         source_lock = (runtime / "fast_livo2-source.lock").read_text(
             encoding="utf-8"
         )
-        base_dockerfile = (ACTUCORE_ROOT / "Dockerfile.base").read_text(
-            encoding="utf-8"
-        )
+        base_dockerfile = (
+            ACTUCORE_ROOT.parent / "deploy" / "prepare_navigation_base.sh"
+        ).read_text(encoding="utf-8")
         dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
@@ -113,26 +113,29 @@ class FastLivo2ContractTest(unittest.TestCase):
         flush_patch = runtime / "patches" / "fast-livo2-pcd-flush.patch"
         livox_messages = runtime / "livox_ros_driver2_msgs"
 
-        self.assertIn(
-            "FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea",
-            source_lock,
-        )
-        for key, patch in (
-            ("FAST_LIVO2_RUNTIME_PATCH_SHA256", runtime_patch),
-            ("FAST_LIVO2_PCD_SAVE_PATCH_SHA256", pcd_patch),
-            ("FAST_LIVO2_PCD_FLUSH_PATCH_SHA256", flush_patch),
+        nav2_lock = (runtime / "nav2-source.lock").read_text(encoding="utf-8")
+        for key, patch, lock in (
+            ("FAST_LIVO2_RUNTIME_PATCH_SHA256", runtime_patch, source_lock),
+            ("FAST_LIVO2_PCD_SAVE_PATCH_SHA256", pcd_patch, source_lock),
+            ("FAST_LIVO2_PCD_FLUSH_PATCH_SHA256", flush_patch, source_lock),
+            (
+                "NAVIGATION2_RUNTIME_PATCH_SHA256",
+                runtime / "patches" / "nav2-without-velocity-smoother.patch",
+                nav2_lock,
+            ),
         ):
             with self.subTest(patch=patch.name):
                 declared = re.findall(
-                    rf"^{key}=([0-9a-f]{{64}})$", source_lock, re.MULTILINE
+                    rf"^{key}=([0-9a-f]{{64}})$", lock, re.MULTILINE
                 )
                 self.assertEqual(len(declared), 1)
                 self.assertEqual(
                     hashlib.sha256(patch.read_bytes()).hexdigest(), declared[0]
                 )
-                self.assertEqual(
-                    re.findall(rf"^ARG {key}=([^\s]+)$", base_dockerfile, re.MULTILINE),
-                    [declared[0], declared[0]],
+                self.assertIn(f"ARG {key}\n", base_dockerfile)
+                self.assertRegex(
+                    base_dockerfile,
+                    rf'"\$\{{{key}\}}"\s*\\\s*/tmp/{re.escape(patch.name)} \| sha256sum -c -',
                 )
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
@@ -275,8 +278,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             "/opt/phanthy-motus/data/navigation/fast_livo2/maps:"
             "/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw", service
         )
-        # 录包用 mcap，它由 base（dustynv 的 rosinstall 列表里带）提供，
-        # 卡片侧只声明 exec_depend；镜像必须留下可核对的 ROS 包清单。
+        # 镜像必须留下可核对的 ROS 包清单。
         self.assertIn(
             "> /opt/actucore-ros-package-lock.txt", base_dockerfile
         )

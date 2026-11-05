@@ -89,7 +89,8 @@ if [ "${JP_VERSION}" = "6.1" ]; then
     echo "[info] JP6.1: VLA providers enabled; navigation is unavailable on this image."
 else
     BASE_IMAGE="${ACTUCORE_NAVIGATION_BASE_IMAGE:-${BASE_REPOSITORY}/actucore-navigation-base:jp511-v1}"
-    if [[ "${BASE_IMAGE}" != *:* || "${BASE_IMAGE}" == *:latest || "${BASE_IMAGE}" == *@* ]]; then
+    BASE_TAG="${BASE_IMAGE##*/}"
+    if [[ "${BASE_TAG}" != *:* || "${BASE_TAG}" == *:latest || "${BASE_TAG}" == *: || "${BASE_IMAGE}" == *@* ]]; then
         echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE must use a versioned, non-latest tag" >&2
         exit 2
     fi

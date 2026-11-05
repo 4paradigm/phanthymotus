@@ -1,9 +1,9 @@
 # FAST-LIVO2 第三方依赖锁
 
-JP5.11 ActuCore 镜像直接继承锁定 digest 的导航基座，不再继承或拉取
+JP5.11 ActuCore 镜像直接继承版本化导航基座，不再继承或拉取
 `phanthy-fast-livo2`；导航基座本身基于按 JetPack 版本锁定 digest 的 `jetson-base`。
 `fast_livo2-source.lock` 锁定 3 个上游仓库 revision 和三个运行时补丁哈希；
-`actucore/Dockerfile.base` 在基座构建中校验、应用补丁并从源码编译完整
+`deploy/prepare_navigation_base.sh` 在基座构建中校验、应用补丁并从源码编译完整
 FAST-LIVO2 工作区。JP6.1 日常镜像沿用 VLA 基座，新 navigation 默认关闭且尚未验证。
 
 - FAST-LIVO2 ROS 2/MID360 fork:

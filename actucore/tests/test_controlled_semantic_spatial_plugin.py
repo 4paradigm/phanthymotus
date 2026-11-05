@@ -494,7 +494,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
 
     def test_navigation_base_owns_locked_third_party_builds(self):
         base_dockerfile = (
-            ACTUCORE_ROOT / "Dockerfile.base"
+            ACTUCORE_ROOT.parent / "deploy" / "prepare_navigation_base.sh"
         ).read_text(
             encoding="utf-8"
         )
@@ -515,12 +515,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             for name in ("fast_livo2-source.lock", "nav2-source.lock")
         ]
 
-        self.assertRegex(
-            base_dockerfile,
-            r"ARG ACTUCORE_NAVIGATION_PARENT_IMAGE="
-            r"bj-warehouse\.tencentcloudcr\.com/phanthy-motus/"
-            r"jetson-base:jp511-torch@sha256:[0-9a-f]{64}",
-        )
+        self.assertIn("ARG ACTUCORE_NAVIGATION_PARENT_IMAGE", base_dockerfile)
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
         self.assertIn(
             "FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_builder",
@@ -549,7 +544,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             "ARG GIT_MIRROR_PREFIX=https://ghfast.top/", base_dockerfile
         )
         self.assertIn(
-            'GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"', build_script
+            'GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"', base_dockerfile
         )
         self.assertLess(
             base_dockerfile.index("git config --global"),
@@ -576,8 +571,8 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
                     continue
                 variable, separator, _ = assignment.partition("=")
                 self.assertEqual(separator, "=")
-                self.assertIn(f'"{variable}=${{{variable}}}"', build_script)
-        self.assertIn("jetson-base:jp61-torch@sha256:", build_script)
+                self.assertIn(f'"{variable}=${{{variable}}}"', base_dockerfile)
+        self.assertIn("jetson-base:jp61-torch@sha256:", base_dockerfile)
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
         self.assertIn("FROM ${BASE_IMAGE}", dockerfile)
@@ -590,18 +585,9 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertIn("rm -rf /work/plugins/controlled_semantic_spatial/runtime", dockerfile)
         self.assertIn("test ! -e /work/plugins/controlled_semantic_spatial/runtime", dockerfile)
         self.assertIn("COPY actucore/plugins/    /work/plugins/", dockerfile)
-        self.assertIn("actucore-navigation-base@sha256:", dockerfile)
-        self.assertNotIn("missing-digest", dockerfile)
-        self.assertIn("--base", build_script)
-        self.assertIn("ACTUCORE_NAVIGATION_BASE_IMAGE override", build_script)
-        self.assertIn('"BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}"', build_script)
-        self.assertIn(
-            "actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b",
-            build_script,
-        )
         self.assertIn(
             "build the navigation base on native ARM64, not through QEMU",
-            build_script,
+            base_dockerfile,
         )
         self.assertNotIn("git fetch", dockerfile)
         self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
@@ -666,7 +652,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             "NAVIGATION2_RUNTIME_PATCH_SHA256",
             "BEHAVIORTREE_CPP_COMMIT",
         ):
-            self.assertIn(f'"{variable}=${{{variable}}}"', build_script)
+            self.assertIn(f'"{variable}=${{{variable}}}"', base_dockerfile)
         for removed in (
             "LIVOX_ROS_DRIVER2_REPO",
             "LIVOX_ROS_DRIVER2_COMMIT",

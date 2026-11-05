@@ -28,16 +28,21 @@ case "${JP_VERSION}" in
     5.11) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
     6.1) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
 esac
+if [ "${JP_VERSION}" = "6.1" ]; then
+    echo "[warning] JP6.1 navigation base is experimental and not supported by daily ActuCore builds." >&2
+fi
 PUSH_ENABLED=true
 if [ -z "${REGISTRY:-}" ] || [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_PASSWORD:-}" ] || [ -z "${IMAGE_NAMESPACE:-}" ]; then
     echo "[info] Registry not configured — building locally only (no push)."
     PUSH_ENABLED=false
-    REGISTRY="${REGISTRY:-local}"
-    IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-phanthy-motus}"
+    REGISTRY="${REGISTRY:-${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}}"
+    IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-${BASE_NAMESPACE:-phanthy-motus}}"
 fi
-DATE="$(date +%y%m%d)"
-COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
-FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore-navigation-base:release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
+if [[ ! "${NAVIGATION_BASE_TAG:-}" =~ ^jp${JP_ARG}-v[1-9][0-9]*$ ]]; then
+    echo "ERROR=set NAVIGATION_BASE_TAG to a new immutable version, e.g. jp${JP_ARG}-v1" >&2
+    exit 2
+fi
+FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore-navigation-base:${NAVIGATION_BASE_TAG}"
 BUILD_ARGS=("BUILD_JOBS=${BUILD_JOBS}")
 NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/controlled_semantic_spatial/runtime"
 GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"
@@ -102,12 +107,12 @@ cat > "${TMPFILE}" <<'DOCKERFILE'
 # Build context: repo root (phanthymotus/).
 #
 # Usage (direct GitHub by default; opt in to a Git proxy when needed):
-#   GIT_MIRROR_PREFIX=https://ghfast.top/ ./deploy/build_actucore.sh --base --mirror tuna
+#   NAVIGATION_BASE_TAG=jp511-v1 ./deploy/prepare_navigation_base.sh --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG ACTUCORE_NAVIGATION_PARENT_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6
+ARG ACTUCORE_NAVIGATION_PARENT_IMAGE
 FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_builder
 ARG PYPI_MIRROR APT_MIRROR
 
@@ -117,42 +122,42 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # 并行度：Orin 8 核 16G 上 -j4 是不 OOM 的上限（nav2_costmap_2d 最吃内存）
 ARG BUILD_JOBS=4
 
-# ── 源码锁（由 deploy/build_actucore.sh 从 *-source.lock 传入）───────
+# ── 源码锁（由本脚本从 *-source.lock 传入）──────────────────────────
 ARG GIT_MIRROR_PREFIX=
-ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
-ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
-ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e
-ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe
-ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
-ARG RPG_VIKIT_REPO=https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git
-ARG RPG_VIKIT_COMMIT=0b5548d9adab58128f3a59a507e96a83acfa8fdf
-ARG SOPHUS_REPO=https://github.com/strasdat/Sophus.git
-ARG SOPHUS_COMMIT=de0f8d3d92bf776271e16de56d1803940ebccab9
-ARG NAVIGATION2_REPO=https://github.com/ros-navigation/navigation2.git
-ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
-ARG NAVIGATION2_RUNTIME_PATCH_SHA256=ccf9b2d64ef9332aa1d3b9792c2ef1ae70cde87f3ef7c71ed467a8d5b4f06383
-ARG BEHAVIORTREE_CPP_REPO=https://github.com/BehaviorTree/BehaviorTree.CPP.git
-ARG BEHAVIORTREE_CPP_COMMIT=9d624dc7797b4752e5f8616793ffcee4b540a185
-ARG ANGLES_REPO=https://github.com/ros/angles.git
-ARG ANGLES_COMMIT=4b71a44dd2b3a24d7af30bf94b0ba34ece1d0558
-ARG BOND_CORE_REPO=https://github.com/ros/bond_core.git
-ARG BOND_CORE_COMMIT=1e589099eb383e488e6078154018cd382a792ea8
-ARG DIAGNOSTICS_REPO=https://github.com/ros/diagnostics.git
-ARG DIAGNOSTICS_COMMIT=de779cfd3bff7975f158971c58bedf0581148f9a
-ARG NAVIGATION_MSGS_REPO=https://github.com/ros-planning/navigation_msgs.git
-ARG NAVIGATION_MSGS_COMMIT=1d8683359734a2c829b5cdb6b5a4e015bbbcb6a5
-ARG LASER_GEOMETRY_REPO=https://github.com/ros-perception/laser_geometry.git
-ARG LASER_GEOMETRY_COMMIT=d53b925d25b4b5657261a44f4479365965cc2363
-ARG PCL_MSGS_REPO=https://github.com/ros-perception/pcl_msgs.git
-ARG PCL_MSGS_COMMIT=8a925a7c4626df52dba7ccc5bda5900d63678880
-ARG PERCEPTION_PCL_REPO=https://github.com/ros-perception/perception_pcl.git
-ARG PERCEPTION_PCL_COMMIT=67a5c2ba4c4de3ca21c5cd495812a01ced3fb69a
-ARG ROSBAG2_STORAGE_MCAP_REPO=https://github.com/ros-tooling/rosbag2_storage_mcap.git
-ARG ROSBAG2_STORAGE_MCAP_COMMIT=c1c2159679921a4f4392f370172c28e7b3b01452
-ARG MCAP_REPO=https://github.com/foxglove/mcap.git
-ARG MCAP_COMMIT=dc6561d9ba867901709e36526dcf7f7359861e9c
-ARG LZ4_REPO=https://github.com/lz4/lz4.git
-ARG LZ4_COMMIT=d44371841a2f1728a3f36839fd4b7e872d0927d3
+ARG FAST_LIVO2_REPO
+ARG FAST_LIVO2_COMMIT
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256
+ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256
+ARG RPG_VIKIT_REPO
+ARG RPG_VIKIT_COMMIT
+ARG SOPHUS_REPO
+ARG SOPHUS_COMMIT
+ARG NAVIGATION2_REPO
+ARG NAVIGATION2_COMMIT
+ARG NAVIGATION2_RUNTIME_PATCH_SHA256
+ARG BEHAVIORTREE_CPP_REPO
+ARG BEHAVIORTREE_CPP_COMMIT
+ARG ANGLES_REPO
+ARG ANGLES_COMMIT
+ARG BOND_CORE_REPO
+ARG BOND_CORE_COMMIT
+ARG DIAGNOSTICS_REPO
+ARG DIAGNOSTICS_COMMIT
+ARG NAVIGATION_MSGS_REPO
+ARG NAVIGATION_MSGS_COMMIT
+ARG LASER_GEOMETRY_REPO
+ARG LASER_GEOMETRY_COMMIT
+ARG PCL_MSGS_REPO
+ARG PCL_MSGS_COMMIT
+ARG PERCEPTION_PCL_REPO
+ARG PERCEPTION_PCL_COMMIT
+ARG ROSBAG2_STORAGE_MCAP_REPO
+ARG ROSBAG2_STORAGE_MCAP_COMMIT
+ARG MCAP_REPO
+ARG MCAP_COMMIT
+ARG LZ4_REPO
+ARG LZ4_COMMIT
 
 # 每个 revision 都必须是完整 40 位 SHA —— 分支名/短 SHA 会让镜像不可复现
 RUN for revision in \
@@ -614,11 +619,11 @@ RUN source /opt/ros/humble/install/setup.bash && \
 # install spaces cross this boundary; source, build and log trees stay behind.
 FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime
 ARG APT_MIRROR
-ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
-ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e
-ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe
-ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
-ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
+ARG FAST_LIVO2_COMMIT
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256
+ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256
+ARG NAVIGATION2_COMMIT
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -695,7 +700,7 @@ fi
 do_build "${TMPFILE}" "${REPO_ROOT}" "${FULL_IMAGE}" "${BUILD_ARGS[@]}"
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"
-    echo "ACTUCORE_NAVIGATION_BASE_IMAGE=$(docker image inspect --format '{{index .RepoDigests 0}}' "${FULL_IMAGE}")"
+    echo "NAVIGATION_BASE_DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "${FULL_IMAGE}")"
 else
     echo "Done. Image built locally: ${FULL_IMAGE}"
 fi

@@ -1,6 +1,7 @@
 """Run the real build entry point with Docker replaced in an isolated tree."""
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -10,46 +11,66 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+NAVIGATION_BASE = re.search(
+    r'actucore-navigation-base:([\w.-]+)',
+    (ROOT / 'deploy/build_actucore.sh').read_text(),
+).group(1)
 
 
-@pytest.mark.parametrize('args,extra,dockerfile', [
-    ([], {}, 'Dockerfile.jetson'),
-    (['--jp-version', '6.1'], {}, 'Dockerfile.jetson'),
-    (['--base'], {}, 'Dockerfile.base'),
-    (['--base', '--jp-version', '6.1'], {}, 'Dockerfile.base'),
-    ([], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'Dockerfile.jetson'),
-    (['--base'], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'Dockerfile.base'),
-    (['--jp-version', '6.1'], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'Dockerfile.jetson'),
-    ([], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image@sha256:' + 'a' * 64}, 'Dockerfile.jetson'),
-    ([], {'BUILD_JOBS': '0'}, None),
-    ([], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image:latest'}, None),
-    (['--jp-version', '6.1'], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image@sha256:' + 'a' * 64}, None),
+@pytest.mark.parametrize('entry,args,extra,kind', [
+    ('build_actucore.sh', [], {}, 'app'),
+    ('build_actucore.sh', ['--jp-version', '6.1'], {}, 'app'),
+    ('build_actucore.sh', [], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'app'),
+    ('build_actucore.sh', ['--jp-version', '6.1'], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'app'),
+    ('build_actucore.sh', [], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'example.com/image:custom-v2'}, 'app'),
+    ('prepare_navigation_base.sh', [], {'NAVIGATION_BASE_TAG': 'jp511-v1'}, 'base'),
+    ('prepare_navigation_base.sh', ['--jp-version', '6.1'], {'NAVIGATION_BASE_TAG': 'jp61-v1'}, 'base'),
+    ('build_actucore.sh', ['--base'], {'NAVIGATION_BASE_TAG': 'jp511-v1'}, 'base'),
+    ('build_actucore.sh', ['--base', '--jp-version', '6.1'], {'NAVIGATION_BASE_TAG': 'jp61-v1'}, 'base'),
+    ('prepare_navigation_base.sh', [], {'NAVIGATION_BASE_TAG': 'jp511-v2', 'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot', 'BUILD_JOBS': '2', 'GIT_MIRROR_PREFIX': 'https://proxy/', 'TEST_MIRROR': 'tuna'}, 'base'),
+    ('build_actucore.sh', [], {'BUILD_JOBS': '0'}, None),
+    ('build_actucore.sh', [], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image:latest'}, None),
+    ('build_actucore.sh', [], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'registry:5000/image'}, None),
+    ('build_actucore.sh', ['--jp-version', '6.1'], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image:jp511-v1'}, None),
+    ('prepare_navigation_base.sh', [], {}, None),
+    ('prepare_navigation_base.sh', [], {'NAVIGATION_BASE_TAG': 'latest'}, None),
+    ('prepare_navigation_base.sh', [], {'NAVIGATION_BASE_TAG': 'jp61-v1'}, None),
+    ('prepare_navigation_base.sh', [], {'NAVIGATION_BASE_TAG': 'jp511-v1', 'BUILD_JOBS': '0'}, None),
+    ('prepare_navigation_base.sh', [], {'NAVIGATION_BASE_TAG': 'jp511-v1', 'TEST_ARCH': 'x86_64'}, None),
 ])
-def test_platform_build_selection(tmp_path, args, extra, dockerfile):
+def test_platform_build_selection(tmp_path, entry, args, extra, kind):
     deploy = tmp_path / 'deploy'
     deploy.mkdir()
-    for name in ('build_actucore.sh', 'build_common.sh'):
+    for name in ('build_actucore.sh', 'prepare_navigation_base.sh', 'build_common.sh'):
         shutil.copyfile(ROOT / 'deploy' / name, deploy / name)
     locks = Path('actucore/plugins/controlled_semantic_spatial/runtime')
     (tmp_path / locks).mkdir(parents=True)
+    lock_values = {}
     for name in ('fast_livo2-source.lock', 'nav2-source.lock'):
-        shutil.copyfile(ROOT / locks / name, tmp_path / locks / name)
+        content = (ROOT / locks / name).read_text()
+        (tmp_path / locks / name).write_text(content)
+        lock_values.update(line.split('=', 1) for line in content.splitlines()
+                           if line and not line.startswith('#'))
     bins = tmp_path / 'bin'
     bins.mkdir()
     log = tmp_path / 'docker.jsonl'
+    generated = tmp_path / 'generated.Dockerfile'
     scripts = {
-        'uname': '#!/bin/sh\necho aarch64\n',
+        'uname': '#!/bin/sh\necho "${TEST_ARCH:-aarch64}"\n',
         'git': '#!/bin/sh\necho abcdef0\n',
-        'docker': f'#!{sys.executable}\nimport json,sys\nwith open({str(log)!r}, "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")\n',
+        'docker': (f'#!{sys.executable}\nimport json,sys,pathlib\n'
+                   f'with open({str(log)!r}, "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                   f'p=pathlib.Path(sys.argv[sys.argv.index("--file")+1])\n'
+                   f'if p.exists(): pathlib.Path({str(generated)!r}).write_text(p.read_text())\n'),
     }
     for name, body in scripts.items():
         (bins / name).write_text(body)
         (bins / name).chmod(0o755)
-    # No inherited registry credentials, .env, Docker socket or real Docker.
     env = {'PATH': f'{bins}:/usr/bin:/bin', 'HOME': str(tmp_path), **extra}
-    result = subprocess.run(['bash', str(deploy / 'build_actucore.sh'), '--mirror', 'none', *args],
+    mirror = extra.get('TEST_MIRROR', 'none')
+    result = subprocess.run(['bash', str(deploy / entry), '--mirror', mirror, *args],
                             env=env, capture_output=True, text=True, timeout=10)
-    if dockerfile is None:
+    if kind is None:
         assert result.returncode != 0
         assert not log.exists()
         return
@@ -57,23 +78,39 @@ def test_platform_build_selection(tmp_path, args, extra, dockerfile):
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     assert len(calls) == 1 and calls[0][0] == 'build'
     call = calls[0]
-    assert Path(call[call.index('--file') + 1]).name == dockerfile
+    build_args = dict(call[index + 1].split('=', 1) for index, item in enumerate(call)
+                      if item == '--build-arg')
+    assert build_args['BUILD_JOBS'] == extra.get('BUILD_JOBS', '4')
+    assert build_args['PYPI_MIRROR'] == (
+        'https://pypi.tuna.tsinghua.edu.cn/simple/' if mirror == 'tuna'
+        else 'https://pypi.org/simple/'
+    )
+    assert build_args['APT_MIRROR'] == ('mirrors.tuna.tsinghua.edu.cn' if mirror == 'tuna' else '')
+    assert call[-1] == str(tmp_path)
     jp61 = ['--jp-version', '6.1'] == args[-2:]
-    if dockerfile == 'Dockerfile.jetson':
-        assert f"JP_VERSION={'61' if jp61 else '511'}" in call
-        base = next(arg for arg in call if arg.startswith('BASE_IMAGE='))
+    if kind == 'app':
+        assert Path(call[call.index('--file') + 1]).name == 'Dockerfile.jetson'
+        assert build_args['JP_VERSION'] == ('61' if jp61 else '511')
+        base = build_args['BASE_IMAGE']
         if jp61:
             assert base.endswith('/jetson-base-actucore:jp61-torch')
         elif 'ACTUCORE_NAVIGATION_BASE_IMAGE' in extra:
-            assert base == 'BASE_IMAGE=' + extra['ACTUCORE_NAVIGATION_BASE_IMAGE']
+            assert base == extra['ACTUCORE_NAVIGATION_BASE_IMAGE']
         else:
-            assert '/actucore-navigation-base@sha256:' in base
-        assert not any(arg.startswith('ACTUCORE_RUNTIME_BASE_IMAGE=') for arg in call)
+            assert base.endswith('/actucore-navigation-base:' + NAVIGATION_BASE)
     else:
-        base = next(arg for arg in call if arg.startswith('ACTUCORE_NAVIGATION_PARENT_IMAGE='))
+        base = build_args['ACTUCORE_NAVIGATION_PARENT_IMAGE']
         assert f"jetson-base:jp{'61' if jp61 else '511'}-torch@sha256:" in base
+        registry = extra.get('BASE_REGISTRY', 'bj-warehouse.tencentcloudcr.com')
+        namespace = extra.get('BASE_NAMESPACE', 'phanthy-motus')
+        assert call[call.index('--tag') + 1] == (
+            f"{registry}/{namespace}/actucore-navigation-base:{extra['NAVIGATION_BASE_TAG']}"
+        )
+        assert {key: build_args[key] for key in lock_values} == lock_values
+        assert build_args['GIT_MIRROR_PREFIX'] == extra.get('GIT_MIRROR_PREFIX', '')
+        assert 'FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_builder' in generated.read_text()
     if 'BASE_REGISTRY' in extra:
-        assert base.split('=', 1)[1].startswith('mirror.example/robot/')
+        assert base.startswith('mirror.example/robot/')
 
 
 def test_final_image_contains_entry_point_dependencies():
@@ -148,9 +185,9 @@ def test_final_native_check_fails_closed(tmp_path, output, status, success):
     assert (result.returncode == 0) is success, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize('dockerfile', ['Dockerfile.base', 'Dockerfile.jetson'])
+@pytest.mark.parametrize('dockerfile', ['deploy/prepare_navigation_base.sh', 'actucore/Dockerfile.jetson'])
 def test_card_runtime_copy_sources_exist(dockerfile):
-    lines = (ROOT / 'actucore' / dockerfile).read_text().splitlines()
+    lines = (ROOT / dockerfile).read_text().splitlines()
     prefix = 'COPY actucore/plugins/controlled_semantic_spatial/runtime/'
     sources = [line.split()[1] for line in lines if line.startswith(prefix)]
     assert sources

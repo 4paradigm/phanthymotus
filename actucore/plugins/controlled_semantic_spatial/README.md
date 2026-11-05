@@ -396,7 +396,7 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 `jetson-base:jp<JP_VERSION>-torch@sha256:<digest>`（Ubuntu 20.04 / Python
 3.8，ROS Humble 是 `/opt/ros/humble/install` 下的源码 install-space）。基础镜像
 按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并按非重叠顺序应用三份运行时补丁，再编译
-FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜像，只重编
+FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过版本标签固定该基础镜像，只重编
 仓库自有的 `fast_livo2`、`nav2`、`segmented_controller`。默认输入使用
 标准 PointCloud2；基础镜像只内置 FAST-LIVO2 编译所需的两条 Livox 消息定义，
 不再编译未运行的 Livox SDK2/Driver。
@@ -420,9 +420,10 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 `14,665,479,002` bytes，增加 `878,889,499` bytes（约 `0.82 GiB` / `6.38%`）。
 该数据由上海 G1 上的 `docker image inspect --format '{{.Size}}'` 实测；增加的是
 磁盘、首次拉取和部署传输成本，不代表同等幅度的运行时 CPU/内存增长。稳定且昂贵的
-第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
-不再重复编译它们。JP5 日常镜像直接继承已发布的基座；更新基座时须发布并固定新的
-精确 digest。Core、Perception 和 JP6 日常镜像不继承该导航基座。基座使用
+第三方依赖因此预编译进可复用、版本化的 navigation base，日常 PR 构建
+不再重复编译它们。JP5 日常镜像继承所选基座；更新依赖须发布新版本标签并记录
+digest。固定标签不能阻止覆盖，发布后不得覆盖旧版本。Core、Perception 和 JP6
+日常镜像不继承该导航基座。基座使用
 builder/runtime 双阶段，在运行阶段复制三个 ROS install-space 和包锁，不保留
 `/opt/ros_deps_ws`、`/opt/fast_livo_ws`、`/opt/nav2_ws` 的源码、build 与 log
 目录，但保留日常构建所需的编译依赖，且会被 JP5 最终镜像继承。上述 `0.82 GiB`
@@ -452,7 +453,7 @@ Canvas 外部连线 topic 必须是完整绝对 ROS 名称：以 `/` 开头，�
 
 这是仓库默认的 ActuCore 构建入口，两个 JetPack 平台均使用同一个
 `actucore/Dockerfile.jetson`，无需 Navigation 专用 wrapper。JP 5.11 日常镜像
-直接继承已发布的 digest-pinned navigation base，FAST-LIVO2/Nav2 不再重编；
+继承版本化 navigation base，FAST-LIVO2/Nav2 不再重编；`jp511-v1` 须先发布；
 VLA 可使用 `mock` 和 `vla_cloud`，不含本地 SmolVLA。JP 6.1 使用原有 VLA
 基座（`./deploy/build_actucore.sh --jp-version 6.1 --mirror tuna`），保留本地
 VLA 能力，但新 navigation 默认关闭且尚未验证，不接受 navigation base 覆盖。
@@ -460,15 +461,15 @@ VLA 能力，但新 navigation 默认关闭且尚未验证，不接受 navigatio
 只有锁定源码、补丁或系统依赖变化时，维护者才执行：
 
 ```bash
-GIT_MIRROR_PREFIX=https://ghfast.top/ \
-  ./deploy/build_actucore.sh --base --mirror tuna
+NAVIGATION_BASE_TAG=jp511-v1 GIT_MIRROR_PREFIX=https://ghfast.top/ \
+  ./deploy/prepare_navigation_base.sh --mirror tuna
 ```
 
 构建机内存较小时可设置 `BUILD_JOBS=2`，限制 navigation base 与日常
 ActuCore 镜像的 C++ 并行编译数；默认值仍为 4。
 
-基础镜像必须在原生 ARM64 构建；成功并推送后会输出可写回构建配置的精确
-digest。它不是运行时 service，也不注册 Resource Center。日常构建成功后脚本输出
+基础镜像必须在原生 ARM64 构建；成功并推送后应记录输出的精确 digest。
+它不是运行时 service，也不注册 Resource Center。日常构建成功后脚本输出
 `ACTUCORE_BUILD_DURATION_SEC=<秒数>`，用于比较依赖精简前后的真机构建耗时。
 
 临时验收脚本属于现场环境，不随卡片源码发布。日常镜像统一使用仓库默认的
