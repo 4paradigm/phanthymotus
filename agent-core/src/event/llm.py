@@ -2245,6 +2245,9 @@ class Event:
         viewer_restricted = _viewer_channel_restricted(trigger_event)
         tool_restricted = bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
+        # Principal ACLs must be enforced at dispatch, not by model prompt alone.
+        from channel.tool_policy import allowed_for_principals
+        channel_principals = trigger_event.get('_channel_principals', [])
         replied_message_ids: set[str] = set()
 
         global _reported_turn_msgs
@@ -2362,6 +2365,11 @@ class Event:
                 schema for schema in bound_schemas
                 if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted)
             ]
+        if channel_principals:
+            system_tools = [t for t in system_tools if allowed_for_principals(
+                channel_principals, t['schema']['name'])]
+            bound_schemas = [s for s in bound_schemas if allowed_for_principals(
+                channel_principals, s['name'])]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
             + [{'type': 'function', 'function': s} for s in bound_schemas]
@@ -2645,6 +2653,12 @@ class Event:
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
                         'mutating, actuator, processor, or delegated execution tools.'
                     )
+                elif (channel_principals and name == 'mcp__channel__channel_reply'
+                      and args.get('source_message_id') not in
+                      trigger_event.get('_channel_message_ids', [])):
+                    result = 'Error: Channel reply must target a message from the current turn.'
+                elif channel_principals and not allowed_for_principals(channel_principals, name):
+                    result = 'Error: Channel ACL/tool_filter denies this tool for a sender in this turn.'
                 elif (bot_restricted and name == 'mcp__channel__channel_reply'
                       and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
                     result = (

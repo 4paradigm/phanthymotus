@@ -486,6 +486,9 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
         '_channel_message_ids': channel_message_ids(batch),
+        '_channel_principals': list(dict.fromkeys(
+            (str(p.get('platform', '')), str(p.get('user_id', '')))
+            for p in _human_channel_payloads(batch))),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }

@@ -30,6 +30,25 @@ import config
 router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
 
 
+def _safe_channel(entry: dict) -> dict:
+    result = dict(entry)
+    cfg = dict(result.get('config') or {})
+    for key in ('access_token', 'bot_token', 'app_token', 'app_secret', 'token'):
+        if key in cfg:
+            cfg[key] = '***' if cfg[key] else ''
+    result['config'] = cfg
+    return result
+
+
+def _validate_channel_config(platform: str, cfg: dict) -> None:
+    if platform == 'qq':
+        from channel.adapters.qq_onebot import validate_qq_config
+        try:
+            validate_qq_config(cfg)
+        except ValueError as exc:
+            raise fastapi.HTTPException(400, str(exc)) from None
+
+
 # ── Channel CRUD ─────────────────────────────────────────────────────────────
 
 @router.get('/list')
@@ -48,6 +67,7 @@ class AddChannelReq(BaseModel):
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
+    _validate_channel_config(req.platform, req.config)
     if req.bot_to_bot_enabled and not supports_bot_to_bot(req.platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{req.platform}"')
@@ -72,7 +92,7 @@ async def add_channel(req: AddChannelReq):
     # 如果 enabled，立即启动
     if req.enabled:
         await manager.restart_adapter(req.id)
-    return {'channel': entry}
+    return {'channel': _safe_channel(entry)}
 
 
 class UpdateChannelReq(BaseModel):
@@ -92,6 +112,23 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
+    if target_platform == 'qq':
+        if 'config' in updates:
+            # A blank token in the edit form means keep the existing secret.
+            merged = dict(current.get('config') or {})
+            supplied = updates['config']
+            secrets = ('access_token', 'access_token_env', 'access_token_file')
+            new_sources = [key for key in secrets if supplied.get(key)]
+            if len(new_sources) == 1:
+                # Credential source changes must not accidentally keep the old
+                # source and reject an otherwise valid rotation.
+                for key in secrets:
+                    if key != new_sources[0]:
+                        merged.pop(key, None)
+            merged.update({key: value for key, value in supplied.items()
+                           if key not in secrets or value})
+            updates['config'] = merged
+        _validate_channel_config('qq', updates.get('config', current.get('config') or {}))
     if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{target_platform}"')
@@ -108,7 +145,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
         raise fastapi.HTTPException(400, str(e))
     # 重启 adapter 以应用新配置
     await manager.restart_adapter(channel_id)
-    return {'channel': result}
+    return {'channel': _safe_channel(result)}
 
 
 @router.delete('/{channel_id}')
