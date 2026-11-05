@@ -101,7 +101,7 @@ def test_preview_does_not_publish_if_odometry_becomes_stale_during_rebuild():
     callbacks['/o'](NS(data=json.dumps(odom(1000))))
     callbacks['/c'](cloud())
     times = iter([1., 3.])
-    node._clock = lambda: next(times)
+    node._receipt_clock = lambda: next(times)
     node.publish_preview_once()
     pubs = {pub.topic: pub for pub in node.publishers}
     assert not pubs['/preview'].messages
