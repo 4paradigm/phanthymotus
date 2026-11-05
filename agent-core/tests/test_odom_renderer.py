@@ -31,14 +31,17 @@ OdomRenderer.mount(box);
 const send=(x)=>OdomRenderer.onData(JSON.stringify(x));
 const sample={schema:'motus.odom/1', stamp_ms:1234, twist:[1,null,null,null,null,0.5],
  pose:{position:[1,2,3],quaternion:[0,0,0,1],frame_id:'odom',child_frame_id:'base'},
- vendor:{motus_slam:{status:'tracking',segment_id:'run-1'}}};
+ vendor:{turn_angle_deg:90,displacement_m:2.123456,pose_reference:'body_axes',reason:'ok',
+ motus_slam:{status:'tracking',segment_id:'run-1'}}};
 send(sample);
 let text=box.children[0].textContent;
 if (!text.includes('1.000') || !text.includes('odom') || !text.includes('run-1')) throw Error(text);
+if (!text.includes('90.0') || !text.includes('2.123') || !text.includes('body_axes')) throw Error(text);
 const findTitle=(el, title)=>el.title===title || el.children.some(c=>findTitle(c,title));
 if (!findTitle(box, 'run-1')) throw Error('full segment must remain accessible');
 sample.vendor.motus_slam.status='degraded'; send(sample);
 text=box.children[0].textContent;
+if (text.includes('2.123') || text.includes('90.0')) throw Error('untrusted summary remains visible: '+text);
 if (text.includes('1.000, 2.000, 3.000')) throw Error('untrusted pose remains visible: '+text);
 sample.vendor.motus_slam.status='unknown'; send(sample);
 if (box.children[0].textContent.includes('1.000, 2.000, 3.000')) throw Error('unknown pose remains visible');

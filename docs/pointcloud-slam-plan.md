@@ -11,6 +11,16 @@ the robot image before implementation and deployment.
 
 ### Implementation under review
 
+2026-11-05 compatibility update: the SLAM branch selectively ports PR #367
+commit `7b1a3ec` rather than replacing its pointcloud implementation. It also
+accepts qualified `image/depth-zlib`: exactly 640x480 little-endian uint16
+millimetres compressed with zlib, declared measured/pinhole with mapped capture
+time. Zero pixels are invalid. The header is preserved unchanged. The existing
+`32FC1` metre path remains supported and is still the deployed Bumi baseline.
+Neither format proves the camera-to-pose extrinsic or cross-sensor clock relation.
+The older f32-only description below records the original interface proposal;
+see `pointcloud-slam-validation-2026-11-05.md` for the current integration gates.
+
 The feature branch merges PR #269 at the snapshot above. The independent Bumi
 Driver branch proposes a second Depth-card output: `32FC1` in metres, with the
 depth source's mapped capture timestamp, the aligned optical frame and a

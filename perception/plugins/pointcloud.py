@@ -145,7 +145,7 @@ TOOLS = [
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
                 "calibration": {"type": "string", "description": "标定 JSON 或 /models 下的标定文件路径", "scope": "instance"},
                 "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
-                                 "description": "启用计算输出；仅用于时间戳为采集时刻的 32FC1 米制深度和对应的实测内参"},
+                                 "description": "启用计算输出；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
                 "cal_a": {"type": "number", "description": "mono 模式站点标定指数 a（d^a），同 visual_depth", "default": 1.0, "scope": "instance"},
                 "cal_b": {"type": "number", "description": "mono 模式站点标定偏移 b（乘 e^b），同 visual_depth", "default": 0.0, "scope": "instance"},
             },
@@ -207,7 +207,7 @@ def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
             log.warning(f"[pointcloud] depth-zlib decompress failed"
                         f"（第 {_zlib_fail_count} 帧）: {str(error)[:200]}")
         return None, getattr(msg, "format", "depth-zlib")
-    if len(raw) < 640 * 480 * 2:
+    if len(raw) != 640 * 480 * 2:
         return None, "depth-zlib"
     _zlib_fail_count = 0
     depth = np.frombuffer(raw[:640 * 480 * 2], dtype="<u2").reshape(480, 640).astype(np.float32) * 0.001
@@ -312,7 +312,8 @@ class _PointCloudNode(Node):
                     if self._input_format not in ("image/depth-zlib", "image/jpeg"):
                         self._subs.append(self.create_subscription(
                             Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
-                    if not self._metric_cloud_enabled and self._input_format not in ("sensor/depth-f32", "image/depth-z16"):
+                    if (self._input_format == "image/depth-zlib" or
+                            (not self._metric_cloud_enabled and self._input_format not in ("sensor/depth-f32", "image/depth-z16"))):
                         self._subs.append(self.create_subscription(
                             CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
                 elif self._mode == "auto":
@@ -525,7 +526,8 @@ class _PointCloudNode(Node):
         xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
                                  self._min_depth_m, self._max_depth_m)
         self._publish(xyz)
-        if self._metric_cloud_enabled and enc == "32FC1":
+        if self._metric_cloud_enabled and (enc == "32FC1" or
+                (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
             self._publish_metric(xyz, msg, w, h)
         elif self._metric_cloud_enabled:
             self._metric_skip('unsupported_encoding')
@@ -1369,15 +1371,15 @@ class PointCloudPerceptionPlugin:
                 node = nodes[instance_id]
                 if node._input_topic:
                     topics_in.append({"topic": node._input_topic,
-                                      "format": "sensor/depth-f32" if node._metric_cloud_enabled else "image/jpeg"})
+                                      "format": node._input_format or ("sensor/depth-f32" if node._metric_cloud_enabled else "image/jpeg")})
                 if node._input_topic_right:
                     topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
             else:
                 for node in nodes.values():
                     if node._input_topic and all(t["topic"] != node._input_topic for t in topics_in):
                         topics_in.append({"topic": node._input_topic,
-                                          "format": "sensor/depth-f32" if node._metric_cloud_enabled else
-                                                    "image/depth-z16" if node._mode == "depth" else "image/jpeg"})
+                                          "format": node._input_format or ("sensor/depth-f32" if node._metric_cloud_enabled else
+                                                    "image/depth-z16" if node._mode == "depth" else "image/jpeg")})
                     if node._input_topic_right and all(t["topic"] != node._input_topic_right for t in topics_in):
                         topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
             # 每实例一对输出话题；多实例时不再用 output_topics_for(None)
@@ -1446,8 +1448,22 @@ class PointCloudPerceptionPlugin:
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
             icfg = self._instance_configs.get(node_key, {})
             metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
+            if metric_enabled and input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+                declared = _camera_for_topic(args.get("camera_info"), input_topic)
+                if declared.get("format") == "image/depth-zlib":
+                    vendor = declared.get("vendor") or {}
+                    if (declared.get("schema") != "motus.camera/1"
+                            or declared.get("source") != "derived-from-K"
+                            or declared.get("distortion_model") != "pinhole"
+                            or declared.get("width") != 640 or declared.get("height") != 480
+                            or not isinstance(vendor, dict)
+                            or vendor.get("depth_unit") != "mm"
+                            or vendor.get("depth_source") != "measured"
+                            or vendor.get("timestamp_semantics") != "source_capture_mapped"):
+                        return {"state": "error", "message": "metric compressed depth requires measured 640x480 millimetres, pinhole intrinsics and capture timestamps"}
             # Canvas start supplies the resolved topic but not `mode`; the
-            # metric contract itself unambiguously requires float depth.
+            # metric contract itself unambiguously requires depth input.
             if metric_enabled and mode == "auto":
                 mode = "depth"
             if metric_enabled and calibration is None and input_topic:
@@ -1463,10 +1479,11 @@ class PointCloudPerceptionPlugin:
                 except (TypeError, ValueError):
                     supported_K = False
                 if (declared.get("schema") == "motus.camera/1"
-                        and declared.get("format") == "sensor/depth-f32"
+                        and declared.get("format") in ("sensor/depth-f32", "image/depth-zlib")
                         and declared.get("source") == "derived-from-K"
                         and declared.get("distortion_model") == "pinhole"
-                        and isinstance(vendor, dict) and vendor.get("depth_unit") == "m"
+                        and isinstance(vendor, dict)
+                        and vendor.get("depth_unit") == ("mm" if declared.get("format") == "image/depth-zlib" else "m")
                         and vendor.get("timestamp_semantics") == "source_capture_mapped"
                         and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K):
                     calibration = dict(fx=K[0], fy=K[4], cx=K[2], cy=K[5],
@@ -1534,8 +1551,8 @@ class PointCloudPerceptionPlugin:
                     return {"state": "error", "message": "metric_cloud requires depth mode and measured intrinsics"}
                 from plugins.camera_info import for_topic as _camera_for_topic
                 source = _camera_for_topic(args.get('camera_info'), input_topic)
-                if source.get('format') and source['format'] != 'sensor/depth-f32':
-                    return {'state': 'error', 'message': 'metric_cloud requires sensor/depth-f32 input'}
+                if source.get('format') and source['format'] not in ('sensor/depth-f32', 'image/depth-zlib'):
+                    return {'state': 'error', 'message': 'metric_cloud requires sensor/depth-f32 or qualified image/depth-zlib input'}
                 try:
                     values = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
                     dimensions = [calibration[k] for k in ("width", "height")]
