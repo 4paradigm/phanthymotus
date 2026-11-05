@@ -189,6 +189,7 @@ async function _start(gen, wsUrl, onStateChange, getOptions) {
 
     _workletNode = processor;
     _active = true;
+    _resumeWhenAllowed(_audioCtx);
     onStateChange(true);
     return true;
   } catch (err) {
@@ -225,4 +226,32 @@ function _stopMic() {
 
 export function isMicActive() {
   return _active;
+}
+
+/**
+ * Running, but the browser has not let the audio graph start yet.
+ *
+ * An AudioContext created without a user gesture — which is exactly the
+ * post-refresh re-arm, nobody has clicked anything — starts `suspended`, and a
+ * suspended graph never calls `onaudioprocess`. The socket is open, the card
+ * says recording, the log said "已恢复", and not one frame is sent. Measured
+ * on Orin 5: 58 frames in the first 0.3 s after a click-started start, 0 in
+ * 30 s after a refresh.
+ */
+export function isMicSuspended() {
+  return _active && !!_audioCtx && _audioCtx.state === 'suspended';
+}
+
+function _resumeWhenAllowed(ctx) {
+  if (ctx.state !== 'suspended') return;
+  ctx.resume().catch(() => {});      // allowed already on some browsers
+  // Otherwise the first gesture anywhere on the page unlocks it. Capture phase,
+  // so a handler that stops propagation cannot swallow it.
+  if (typeof document === 'undefined') return;
+  const kick = () => {
+    if (_audioCtx === ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+  };
+  for (const type of ['pointerdown', 'keydown']) {
+    document.addEventListener(type, kick, { once: true, capture: true });
+  }
 }

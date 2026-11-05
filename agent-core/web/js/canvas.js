@@ -15,7 +15,7 @@ import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
-import { startMicStream, stopMicStream, isMicActive } from './mic-stream.js';
+import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
 import { sessionId } from './session.js';
@@ -309,7 +309,16 @@ async function _rearmBrowserSources() {
         : '浏览器麦克风未授权，刷新后未自动恢复');
     } else {
       _startCardMic(micCard)
-        .then(ok => { if (ok) _logActivity('project', '刷新后已恢复浏览器麦克风'); })
+        .then(ok => {
+          if (!ok) return;
+          // Not "已恢复" while the browser still holds the audio graph — that
+          // claim is what made a silent microphone look healthy.
+          if (isMicSuspended()) {
+            _logActivity('warn', '浏览器麦克风已重新连接，但浏览器要求先在页面上点一下才会开始收音');
+          } else {
+            _logActivity('project', '刷新后已恢复浏览器麦克风');
+          }
+        })
         .catch(err => _logActivity('warn', `刷新后恢复：${err.message}`));
     }
   }

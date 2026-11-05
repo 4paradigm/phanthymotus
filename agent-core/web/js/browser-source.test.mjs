@@ -57,7 +57,12 @@ class FakeWebSocket {
 
 class FakeAudioContext {
   static all = [];
-  constructor() { this.sampleRate = 48000; this.closed = false; FakeAudioContext.all.push(this); }
+  static startState = 'running';
+  constructor() {
+    this.sampleRate = 48000; this.closed = false; this.state = FakeAudioContext.startState;
+    this.resumes = 0; FakeAudioContext.all.push(this);
+  }
+  resume() { this.resumes++; if (this.unlocked) this.state = 'running'; return Promise.resolve(); }
   createMediaStreamSource() { return { connect() {} }; }
   createScriptProcessor() { this.processor = { connect() {}, disconnect() {} }; return this.processor; }
   createGain() { return { gain: {}, connect() {} }; }
@@ -94,6 +99,8 @@ async function grant(label = 'Mic B') {
   await flush();
 }
 
+const gestureListeners = [];
+
 const mic = await import('./mic-stream.js');
 
 beforeEach(() => {
@@ -103,6 +110,8 @@ beforeEach(() => {
   media.stoppedTracks = 0;
   FakeWebSocket.all.length = 0;
   FakeAudioContext.all.length = 0;
+  FakeAudioContext.startState = 'running';
+  gestureListeners.length = 0;
 });
 
 const DEVICE = 'b'.repeat(64);
@@ -282,6 +291,32 @@ test('a running stream still converts 48 kHz to 16 kHz Int16 and sends it', asyn
   assert.equal(new Int16Array(sent[0]).length, 1600);
 });
 
+test('a mic started without a gesture says so, and the first click unlocks it', async () => {
+  // The post-refresh re-arm: nobody has clicked, so the AudioContext starts
+  // suspended and onaudioprocess never runs — an open socket sending nothing.
+  FakeAudioContext.startState = 'suspended';
+  const run = mic.startMicStream('wss://h/ws/mic', () => {}, async () => ({}));
+  await grant();
+  await run;
+  const ctx = FakeAudioContext.all[0];
+  assert.equal(mic.isMicSuspended(), true);
+  assert.ok(ctx.resumes >= 1, 'it tries resume() straight away');
+  assert.deepEqual(gestureListeners.map((l) => l.type).sort(), ['keydown', 'pointerdown']);
+
+  ctx.unlocked = true;                 // the browser now allows it...
+  gestureListeners.find((l) => l.type === 'pointerdown').fn();   // ...on a click
+  assert.equal(ctx.state, 'running');
+  assert.equal(mic.isMicSuspended(), false);
+});
+
+test('a mic started by a click is not reported as suspended', async () => {
+  const run = mic.startMicStream('wss://h/ws/mic', () => {}, async () => ({}));
+  await grant();
+  await run;
+  assert.equal(mic.isMicSuspended(), false);
+  assert.equal(gestureListeners.length, 0);
+});
+
 test('stop releases the track, the audio context and the socket', async () => {
   const run = mic.startMicStream('wss://h/ws/mic', () => {}, async () => ({}));
   await grant();
@@ -305,6 +340,7 @@ test('the legacy toggle still stops a start that is in flight', async () => {
 
 const videos = [];
 globalThis.document = {
+  addEventListener(type, fn) { gestureListeners.push({ type, fn }); },
   body: { appendChild() {} },
   createElement(tag) {
     if (tag === 'video') {
