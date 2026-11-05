@@ -204,6 +204,17 @@ but noise, gates and initial guesses remain uncalibrated. Its
 computed map-to-odom correction is an experimental output, never published or
 fed back to raw odometry.
 
+`plugins/pointcloud_slam_incremental_backend.py` connects reciprocal ICP,
+explicit geometry gates and graph optimization to incremental, bounded
+single-segment keyframes. Geometry-passing candidates are retained across
+appends; historical odometry cannot be rewritten and a segment transition is
+rejected. Each snapshot rebuilds historical points and computes `map_from_odom`.
+It is a serialized experimental component, not connected to the live ROS card:
+it neither retrieves candidates nor accepts, publishes, or validates real loop
+edges. Run it off callback threads, and do not enable it on robot data until
+registration thresholds, place identity, physical timing and extrinsics have
+been independently validated.
+
 ## Bumi exploratory run, 2026-11-04
 
 The 2026-11-02 recording contains 317 cloud frames, one reported odometry

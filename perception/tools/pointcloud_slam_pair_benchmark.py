@@ -63,6 +63,7 @@ def main():
                             'gate_sha256': _sha256_file(tools_dir / 'pointcloud_slam_geometry_gate.py'),
                             'gate_impl_sha256': _sha256_file(tools_dir.parent / 'plugins/pointcloud_slam_geometry.py'),
                             'registration_sha256': _sha256_file(tools_dir / 'pointcloud_slam_registration_experiment.py'),
+                            'registration_impl_sha256': _sha256_file(tools_dir.parent / 'plugins/pointcloud_slam_registration.py'),
                             'reader_sha256': _sha256_file(tools_dir / 'pointcloud_slam_retrieval.py'),
                             'open3d_version': open3d.__version__}
     result['parameters'] = {key: spec[key] for key in ('voxel_m', 'max_distance_m', 'thresholds')}
