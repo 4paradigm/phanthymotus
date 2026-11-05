@@ -5,6 +5,20 @@ import pytest
 from tools.pointcloud_slam_retrieval import rank_candidates, evaluate_labels, scan_context_ring
 
 
+def test_retrieval_can_diversify_candidate_times_without_changing_scores():
+    descriptors = np.array([[0.], [.1], [.11], [.12], [.2]])
+    ranked = rank_candidates(descriptors, [100., 0., 1., 2., 20.], 0, 5., 2,
+                             candidate_separation_s=5.)
+    assert [item['index'] for item in ranked] == [1, 4]
+    assert ranked[0]['distance'] == pytest.approx(.1)
+
+
+def test_retrieval_rejects_invalid_candidate_separation():
+    with pytest.raises(ValueError):
+        rank_candidates(np.array([[0.], [1.]]), [0., 10.], 0, 1., 1,
+                        candidate_separation_s=float('nan'))
+
+
 def test_excludes_same_and_temporally_adjacent_frames_and_ranks_by_distance():
     descriptors = np.array([[0., 0.], [.1, 0.], [.2, 0.], [1., 0.]])
     ranked = rank_candidates(descriptors, [0., 1., 20., 30.], 0, 5., 2)

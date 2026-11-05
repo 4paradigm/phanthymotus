@@ -48,19 +48,28 @@ def scan_context_ring(points, rings=20, sectors=60, radius_m=6.):
     return grid.mean(axis=1)
 
 
-def rank_candidates(descriptors, stamps_s, query, min_separation_s, top_k):
+def rank_candidates(descriptors, stamps_s, query, min_separation_s, top_k, *, candidate_separation_s=0.):
     values = np.asarray(descriptors, dtype=float)
     if (values.ndim != 2 or len(values) != len(stamps_s) or not np.isfinite(values).all()
             or not np.isfinite(np.asarray(stamps_s, dtype=float)).all()):
         raise ValueError('invalid descriptors or timestamps')
-    if not 0 <= query < len(values) or top_k < 1 or min_separation_s < 0:
+    if (not 0 <= query < len(values) or top_k < 1 or min_separation_s < 0 or
+            not math.isfinite(candidate_separation_s) or candidate_separation_s < 0):
         raise ValueError('invalid query or retrieval parameters')
     scores = []
     for i, row in enumerate(values):
         if i == query or abs(stamps_s[query] - stamps_s[i]) < min_separation_s:
             continue
         scores.append({'index': i, 'distance': float(np.linalg.norm(row - values[query]))})
-    return sorted(scores, key=lambda item: (item['distance'], item['index']))[:top_k]
+    selected = []
+    for item in sorted(scores, key=lambda item: (item['distance'], item['index'])):
+        if any(abs(stamps_s[item['index']] - stamps_s[prev['index']]) < candidate_separation_s
+               for prev in selected):
+            continue
+        selected.append(item)
+        if len(selected) == top_k:
+            break
+    return selected
 
 
 def evaluate_labels(rankings, labels, top_k):
@@ -108,6 +117,8 @@ def main():
     parser.add_argument('recording', type=Path, help='directory containing manifest.json, cloud.jsonl and cloud.xyz')
     parser.add_argument('--stride', type=int, default=1)
     parser.add_argument('--min-separation-s', type=float, default=10.)
+    parser.add_argument('--candidate-separation-s', type=float, default=0.,
+                        help='experimental minimum time between ranked candidates; 0 disables')
     parser.add_argument('--top-k', type=int, default=5)
     parser.add_argument('--voxel-m', type=float, default=.08)
     parser.add_argument('--labels', type=Path, help='JSON list of {query: cloud index, positive: [cloud indices]}')
@@ -116,7 +127,9 @@ def main():
     parser.add_argument('--max-gap-ms', type=float, help='experimental maximum pose interpolation gap')
     parser.add_argument('--assume-shared-clock', action='store_true', help='explicitly assume cloud and odometry share a clock')
     args = parser.parse_args()
-    if args.stride < 1 or args.top_k < 1 or not math.isfinite(args.voxel_m) or args.voxel_m <= 0 or not math.isfinite(args.min_separation_s) or args.min_separation_s < 0:
+    if (args.stride < 1 or args.top_k < 1 or not math.isfinite(args.voxel_m) or args.voxel_m <= 0
+            or not math.isfinite(args.min_separation_s) or args.min_separation_s < 0
+            or not math.isfinite(args.candidate_separation_s) or args.candidate_separation_s < 0):
         parser.error('invalid stride, separation, top-k or voxel size')
     if args.submap_frames < 1 or args.submap_frames % 2 != 1:
         parser.error('submap-frames must be a positive odd number')
@@ -205,11 +218,13 @@ def main():
            'submap_frames': args.submap_frames, 'skipped_frame_indices': skipped,
            'max_gap_ms': args.max_gap_ms, 'assume_shared_clock': args.assume_shared_clock,
            'extrinsic': extrinsic_info,
-           'min_separation_s': args.min_separation_s, 'top_k': args.top_k,
+           'min_separation_s': args.min_separation_s,
+           'candidate_separation_s': args.candidate_separation_s, 'top_k': args.top_k,
            'label_source': str(args.labels) if args.labels else None,
            'status': 'exploratory retrieval only; no geometric validation or loop edges', 'methods': {}}
     for name, features in [('scan_context_ring', rings), ('mean_fpfh', fpfhs)]:
-        rankings = {i: rank_candidates(features, stamps, i, args.min_separation_s, args.top_k)
+        rankings = {i: rank_candidates(features, stamps, i, args.min_separation_s, args.top_k,
+                                       candidate_separation_s=args.candidate_separation_s)
                     for i in range(len(selected))}
         metrics = evaluate_labels(rankings, translated, args.top_k)
         out['methods'][name] = {'metrics': metrics, 'rankings': {

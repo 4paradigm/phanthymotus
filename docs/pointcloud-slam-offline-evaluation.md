@@ -151,6 +151,10 @@ independently labelled. A run rejects labels for frames it did not process and
 reports recall only for supplied labels. Self-matches are forbidden. Top-k
 retrieval recall is not a geometric-verification false-positive rate; a labelled
 negative-pair evaluation and independent threshold set are still required.
+`--candidate-separation-s` optionally suppresses candidates close in time to
+already selected candidates, after ranking by descriptor distance. It defaults
+to zero (disabled); an experimental value does not establish loop validity or
+select a calibrated production threshold.
 
 The reciprocal ICP diagnostic accepts an externally supplied initial transform
 and reports directional fitness, inlier RMSE, correspondence counts and cycle
