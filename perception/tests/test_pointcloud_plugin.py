@@ -2460,3 +2460,48 @@ def test_multi_instance_info_never_reports_default_topics():
                              {"action": "info", "instance_id": "/cam/a"})
     assert [t["topic"] for t in info_a["topic_out"]] == [
         "/cam/a/pointcloud", "/cam/a/pointcloud_summary"]
+
+
+def metric_zlib_declaration():
+    return {'schema': 'motus.camera/1', 'topic': '/depth', 'format': 'image/depth-zlib',
+            'id': 'optical', 'source': 'derived-from-K', 'distortion_model': 'pinhole',
+            'width': 640, 'height': 480, 'K': [2., 0., 0., 0., 2., 0., 0., 0., 1.],
+            'vendor': {'depth_unit': 'mm', 'depth_source': 'measured',
+                       'timestamp_semantics': 'source_capture_mapped'}}
+
+
+def test_metric_zlib_uses_supported_transport_and_preserves_geometry_and_header():
+    plugin, executor = _plugin({'metric_cloud': True})
+    result = plugin.dispatch('start', {'input_topic': '/depth',
+                                       'camera_info': [metric_zlib_declaration()]})
+    assert result['state'] == 'running'
+    node = executor.nodes[0]
+    assert [s.callback.__name__ for s in node.subscriptions] == ['_depth_comp_cb']
+    pixels = np.zeros((480, 640), dtype='<u2')
+    pixels[0, 0] = pixels[0, 4] = 2000
+    msg = _FakeCompressedImage(zlib.compress(pixels.tobytes()), fmt='16UC1; compressedDepth zlib')
+    msg.header.frame_id = 'optical'
+    msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+    node._depth_comp_cb(msg)
+    pub = next(p for p in node.publishers if p.topic == '/depth/pointcloud_metric')
+    _wait_until(lambda: bool(pub.raw_messages))
+    cloud = pub.raw_messages[0]
+    np.testing.assert_allclose(np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 3),
+                               [[0., 0., 2.], [4., 0., 2.]])
+    assert cloud.header.frame_id == 'optical'
+    assert (cloud.header.stamp.sec, cloud.header.stamp.nanosec) == (123, 456)
+    info = plugin.dispatch('info', {'instance_id': '/depth'})
+    assert info['topic_in'] == [{'topic': '/depth', 'format': 'image/depth-zlib'}]
+    node.stop()
+
+
+@pytest.mark.parametrize('field,bad', [('depth_unit', 'm'), ('depth_source', 'estimated'),
+                                      ('timestamp_semantics', 'publication')])
+def test_metric_zlib_rejects_unproven_source_even_with_explicit_calibration(field, bad):
+    declaration = metric_zlib_declaration()
+    declaration['vendor'][field] = bad
+    plugin, executor = _plugin({'metric_cloud': True, 'calibration': {
+        'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 640, 'height': 480}})
+    result = plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})
+    assert result['state'] == 'error'
+    assert not executor.nodes

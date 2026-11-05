@@ -12,14 +12,15 @@ the robot image before implementation and deployment.
 ### Implementation under review
 
 The feature branch merges PR #269 at the snapshot above. The independent Bumi
-Driver branch proposes a second Depth-card output: `32FC1` in metres, with the
+Driver branch proposes a second Depth-card output: `image/depth-zlib`, a 640x480 little-endian
+uint16 millimetre buffer compressed directly with zlib, with the
 depth source's mapped capture timestamp, the aligned optical frame and a
 topic-specific runtime intrinsics declaration. It shares the existing camera
 pipeline and its frame-time mapper with VO but does not depend on the VO card's
 enable switch. The older public compressed depth still has publication
 timestamps and must not be used for the computational output.
 
-The point-cloud card's opt-in `metric_cloud: true` expects `sensor/depth-f32`
+The point-cloud card's opt-in `metric_cloud: true` accepts capture-timed `image/depth-zlib` (CompressedImage)
 and measured `fx`, `fy`, `cx`, `cy`, `width`, and `height` for the actual
 aligned depth image. They may come from explicit configuration or a matching
 runtime pinhole camera declaration; FOV fallbacks and unknown distortion are
@@ -29,13 +30,17 @@ odometry; a ROS header alone cannot prove that assertion. It publishes
 `<input>/pointcloud_metric` as `sensor/pointcloud2` (`PointCloud2`, float32
 little-endian XYZ in metres in the input's physical optical frame), while
 retaining both existing visualization and summary outputs. It rejects missing
-frame/stamp and uncalibrated or different-sized input. Only `32FC1` produces
-the computational output. The input header travels through the bounded worker
+frame/stamp and uncalibrated or different-sized input. The compressed depth declaration must additionally identify
+`depth_unit=mm`, `depth_source=measured` and
+`timestamp_semantics=source_capture_mapped`; estimated or unproven sources
+remain visualization-only. Existing explicitly configured `32FC1` inputs
+remain supported. Millimetre quantization uses rounding (up to 0.5 mm depth
+error); 0 and values beyond 65535 mm are invalid. The input header travels through the bounded worker
 queue to the cloud unchanged; no callback-arrival timestamp is substituted.
 
-The Core bridge maps `sensor/depth-f32` to Image and `sensor/pointcloud2` to
-PointCloud2. Canvas receives a JSON metadata preview (not a geometry stream)
-for these new formats; full messages including headers are consumed over ROS.
+The public Bumi metric-depth output reuses the existing `image/depth-zlib`
+CompressedImage mapping and depth renderer. `sensor/pointcloud2` maps to
+PointCloud2 and has a JSON metadata preview (not a geometry stream); full messages including headers are consumed over ROS.
 Registration alone does not eagerly subscribe to these large streams; opening
 their preview does.
 The existing `sensor/pointcloud` visualization wire format remains unchanged.
@@ -127,3 +132,7 @@ If geometric feasibility or input provenance fails, preserve the reproducible
 failure and stop the dependent integration; never present accumulation as SLAM
 or add RGB as a hidden dependency. Recordings, robot credentials and large
 artifacts stay outside the repository.
+
+Bumi visual odometry now advertises only `state/odom`. Its segment turn angle
+and displacement are in `vendor.turn_angle_deg` and `vendor.displacement_m`,
+rendered directly by Core without a second `data/json` status stream.

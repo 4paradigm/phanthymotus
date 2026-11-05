@@ -30,11 +30,16 @@ export const OdomRenderer = {
     const twist = Array.isArray(msg.twist) ? msg.twist : [];
     const vector = (v, n) => Array.isArray(v) && v.length === n
       ? v.map(x => typeof x === 'number' && Number.isFinite(x) ? x.toFixed(3) : '—').join(', ') : '—';
+    const number = (v, digits=3) => typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '—';
     const text = v => typeof v === 'string' && v ? v : '—';
     this._el.textContent = [
       `状态: ${status}`,
       `分段: ${text(meta.segment_id)}`,
       `位置: ${vector(pose?.position, 3)} m`,
+      `本段位移: ${number(pose ? vendor.displacement_m : null)} m`,
+      `本段转角: ${number(vendor.turn_angle_deg, 1)} °`,
+      `参考系: ${text(vendor.pose_reference)}`,
+      `原因: ${text(vendor.reason)}`,
       `姿态 (x, y, z, w): ${vector(pose?.quaternion, 4)}`,
       `坐标系: ${text(pose?.frame_id)} → ${text(pose?.child_frame_id)}`,
       `速度 (vx, vy, vz): ${vector(twist.slice(0, 3), 3)} m/s`,
