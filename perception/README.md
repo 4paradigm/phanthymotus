@@ -2324,8 +2324,9 @@ renderer caps it at 40000 points, and the plugin decimates to `max_points`
 
 ### Calibration
 
-Depth/mono only need intrinsics — `{fx, fy, cx, cy}` or `{hfov}` (default 90°,
-zero-config). Stereo needs either `{fx, cx, cy, Tx}` (already-rectified pair) or
+Depth/mono visualization can use `{hfov}` (default 90°) as an approximation;
+metric output needs the real intrinsics `{fx, fy, cx, cy}` and depth scale.
+Stereo needs either `{fx, cx, cy, Tx}` (already-rectified pair) or
 a full `stereoCalibrate` blob (`K1/K2/D1/D2/R/T`, rectified at runtime).
 
 **Driver-declared stereo (zero-config):** when both input topics carry
@@ -2337,31 +2338,15 @@ Priority: start param > instance config > global config > driver declaration
 peer is matched by camera `id` (topics change through processors; ids do not),
 so a mismatched pair — stereo inputs swapped, or two unrelated cameras — is
 rejected at start instead of silently producing a wrong cloud. A declaration
-that exists but is incomplete is an error, not a fallback to capture-only;
-no declarations at all keeps the old contract below. `info` reports
+that exists but is incomplete is an error; missing calibration also prevents
+stereo startup. `info` reports
 `calibration_source` per instance (`measured`-style source from the declaration
 vs `configured`) so a wrong cloud has a direction to investigate.
 
-**Stereo bootstrap:** a stereo card can be started *without* calibration — it
-subscribes, pairs frames within a 50 ms sync window, and stores the latest pair
-for the `calibrate` action, but publishes no cloud. Hold a checkerboard
-(default 9×6 inner corners, 0.025 m squares) in front of both cameras and call
-`calibrate` once per pose until `pairs` (default 15) are collected — a repeated
-call on the same pair of frames is rejected (`same_pose`), so each sample needs
-fresh frames with the board moved. The result is an RMS-graded blob saved under
-`/models/stereo_calib/` and returned in the reply for pasting back into the
-card's `calibration` config. Restart the card to publish. Tiering is explicit,
-not inferred: by default the full `K1/K2/D1/D2/R/T` blob is kept and the card
-rectifies at runtime; pass `pre_rectified: true` only when the upstream
-guarantees the two streams are already stereo-rectified — that shortcut keeps
-just `{fx, cx, cy, Tx}` and skips per-frame rectification. (Measuring the
-epipolar Δy *after* `stereoRectify` cannot discriminate: rectification
-row-aligns both views by construction, so the residual is ≈ 0 for any
-calibration.)
-
-The reverse ordering is a deadlock we shipped once: `calibrate` requires a
-running stereo node, and stereo `start` used to require a calibration first —
-a new card could never collect the frames it needed to produce one.
+The point-cloud card has no calibration action. Use the stereo camera's
+upstream calibration declarations or provide a previously measured calibration
+blob through the card configuration. A rectified blob is appropriate only
+when the upstream guarantees that the input pair is already rectified.
 
 ### Mono engine loading
 

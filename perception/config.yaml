@@ -261,10 +261,9 @@ plugins:
   #   A. depth map   (image/depth-z16 Image | image/depth-zlib CompressedImage)
   #   B. mono RGB    (image/jpeg) — reuses visual_depth's TensorRT engine
   #   C. stereo pair (image/jpeg × 2)   — SGBM + reprojectImageTo3D
-  # A/B are zero-config (hfov defaults to 90°); C wants calibration, which the
-  # card's calibrate action produces on the spot and persists under
-  # /models/stereo_calib/. Engine load (B only) is lazy on first start, like
-  # visual_depth.
+  # A/B allow approximate visual output (hfov defaults to 90°); metric output
+  # requires real intrinsics. C requires calibration from the upstream camera
+  # declarations or configuration. Engine load (B only) is lazy on first start.
   pointcloud:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
@@ -279,7 +278,7 @@ plugins:
     cal_a: 1.0
     cal_b: 0.0
 
-  # Experimental input/odometry graph only; no loop closure or map output yet.
+  # Experimental input, geometry and map previews; no validated loop closure.
   # See docs/pointcloud-slam-offline-evaluation.md for required verified
   # clock, extrinsic and bounded-resource configuration. Never enable by default.
   pointcloud_slam:

@@ -97,6 +97,8 @@ class SlamInputNode(Node):
         self._preview = preview
         self._loop_search = loop_search
         self._loop_segment = None
+        self._segment_links = []
+        self._segment_loops = {}
         self._preview_stop = threading.Event()
         self._preview_wake = threading.Event()
         self._preview_worker = None
@@ -235,6 +237,8 @@ class SlamInputNode(Node):
                   'stamp_ns': str(segment.frames[-1].cloud_stamp_ns) if segment else None,
                   'backend': self._preview['backend'], 'last_error': status['last_error']}
         packet = None
+        staged_links = None
+        staged_loops = None
         if segment is None and geometry:
             self._loop_search = None
             self._loop_segment = None
@@ -255,27 +259,52 @@ class SlamInputNode(Node):
                               map_pose=np.asarray(poses[-1]).tolist(),
                               map_from_odom=np.asarray(loop['map_from_odom']).tolist())
                 points = loop['after_map']
+                if self._preview.get('relocalization'):
+                    staged_loops = dict(self._segment_loops)
+                    staged_loops[segment.segment_id] = [
+                        {'source': candidate['source'], 'target': candidate['target'],
+                         'transform': candidate['diagnostic']['forward']['transform']}
+                        for candidate in self._loop_search._graph._candidates]
                 if self._preview.get('relocalization') and len(segments) > 1:
-                    result['relocalization'] = 'unavailable' if len(segments) > 2 else 'searching'
-                    if len(segments) == 2:
+                    result['relocalization'] = 'searching'
+                    links = list(self._segment_links)
+                    connected = {segments[0].segment_id} | {link['source'] for link in links}
+                    if segment.segment_id not in connected:
                         from .pointcloud_slam_relocalization import relocalize_pair
                         opts = self._preview['geometry']
-                        merged = relocalize_pair(segments[0], graphs[0], segment, graph,
-                            descriptor_voxel_m=opts['descriptor_voxel_m'],
-                            max_candidates=opts['max_per_frame'],
-                            thresholds=opts['thresholds'], odom_sigmas=opts['odom_sigmas'],
-                            loop_sigmas=opts['loop_sigmas'], huber_k=opts['huber_k'],
-                            voxel_m=opts['voxel_m'], max_distance_m=opts['max_distance_m'],
-                            max_total_frames=self.stream.store._max_frames,
-                            max_total_points=self.stream.store._max_points)
-                        if merged['hypothesis_created']:
-                            poses = merged['source_poses']
-                            points = merged['map_points']
-                            result.update(relocalization='unvalidated_hypothesis',
-                                map_segments=[segments[0].segment_id, segment.segment_id],
-                                frame_id=segments[0].frames[0].pose.frame_id + '_experimental_map',
-                                map_pose=np.asarray(poses[-1]).tolist(),
-                                map_from_odom=np.asarray(merged['map_from_source_odom']).tolist())
+                        for old, old_graph in zip(segments[:-1], graphs[:-1]):
+                            if old.segment_id not in connected:
+                                continue
+                            merged = relocalize_pair(old, old_graph, segment, graph,
+                                descriptor_voxel_m=opts['descriptor_voxel_m'],
+                                max_candidates=opts['max_per_frame'],
+                                thresholds=opts['thresholds'], odom_sigmas=opts['odom_sigmas'],
+                                loop_sigmas=opts['loop_sigmas'], huber_k=opts['huber_k'],
+                                voxel_m=opts['voxel_m'], max_distance_m=opts['max_distance_m'],
+                                max_total_frames=self.stream.store._max_frames,
+                                max_total_points=self.stream.store._max_points)
+                            if merged['hypothesis_created']:
+                                links.append({'target': old.segment_id, 'source': segment.segment_id,
+                                    'target_index': merged['target_index'], 'source_index': merged['source_index'],
+                                    'transform': merged['diagnostic']['forward']['transform']})
+                                connected.add(segment.segment_id)
+                                break
+                    if segment.segment_id in connected:
+                        from .pointcloud_slam_multigraph import optimize_multisegment
+                        selected = [(s, g) for s, g in zip(segments, graphs) if s.segment_id in connected]
+                        opts = self._preview['geometry']
+                        merged = optimize_multisegment([s for s, _ in selected], [g for _, g in selected], links,
+                            odom_sigmas=opts['odom_sigmas'], loop_sigmas=opts['loop_sigmas'],
+                            huber_k=opts['huber_k'], max_total_frames=self.stream.store._max_frames,
+                            max_total_points=self.stream.store._max_points,
+                            segment_loops={key: value for key, value in staged_loops.items() if key in connected})
+                        poses, points = merged['poses'][-1], merged['map_points']
+                        staged_links = links
+                        result.update(relocalization='unvalidated_hypothesis',
+                            map_segments=merged['segment_ids'], segment_links=len(links),
+                            frame_id=segments[0].frames[0].pose.frame_id + '_experimental_map',
+                            map_pose=np.asarray(poses[-1]).tolist(),
+                            map_from_odom=np.asarray(merged['map_from_active_odom']).tolist())
             elif self._preview['backend'] == 'gtsam':
                 from .pointcloud_slam_backend import optimize_odometry_graph
                 poses = optimize_odometry_graph(graph, sigmas=self._preview['sigmas'])
@@ -305,6 +334,9 @@ class SlamInputNode(Node):
                 result.pop('map_from_odom', None)
                 result.pop('map_segments', None)
                 result.pop('relocalization', None)
+                result.pop('segment_links', None)
+                staged_links = None
+                staged_loops = None
             # Do not publish a snapshot after its segment/frame changed during work.
             current = self.stream.store.segments
             current_active = self.stream._poses[-1].segment_id if self.stream._poses else None
@@ -320,6 +352,10 @@ class SlamInputNode(Node):
                         self.stream._check_measurement_time(segment.frames[-1].cloud_stamp_ns, measurement_now)
                     except ValueError:
                         return
+            if staged_links is not None:
+                self._segment_links = staged_links
+            if staged_loops is not None:
+                self._segment_loops = staged_loops
             if packet is not None:
                 msg = UInt8MultiArray()
                 msg.data = packet

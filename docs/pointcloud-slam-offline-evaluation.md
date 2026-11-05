@@ -109,14 +109,23 @@ published as **unvalidated** previews; accepted-loop counts remain zero.
 The worker runs without map viewers, and clears pose and correction on input
 loss, error, or stop. An additional opt-in `preview_relocalization` setting
 tests the latest active keyframe against descriptor-ranked keyframes from a
-single preceding segment. FPFH fast global registration supplies an initial
+connected preceding segment. FPFH fast global registration supplies an initial
 alignment independently of the two odometry origins; reciprocal ICP and the
-explicit geometry gates precede a two-segment graph hypothesis and rebuilt
-preview. The status reports `unvalidated_hypothesis`, never an accepted loop.
-The hypothesis is recomputed from odometry edges and is not retained as a
-multi-segment graph; more than two segments report `unavailable`. A failed
-search keeps the segments separate. Neither this prototype nor a geometric
-gate establishes safe segment merging or a production relocalization result.
+explicit geometry gates precede a graph hypothesis and rebuilt preview. Passing
+inter-segment hypotheses and per-segment loop candidates are retained in memory
+across later frames and tracking loss, then jointly optimized; storage and search
+are bounded by the configured keyframe and candidate capacities. The status
+reports `unvalidated_hypothesis`, never an accepted loop. A failed search keeps
+the segment separate. This in-memory state is not saved or restored across card
+or process restarts. Neither this prototype nor a geometric gate establishes
+safe segment merging or a production relocalization result.
+
+The Jetson Dockerfile does not currently install either experimental backend
+dependency. Open3D 0.18 publishes a CPython 3.10 ARM64 wheel; GTSAM 4.2 does
+not publish one for ARM64 on PyPI. The jp6.1 base uses Python 3.10. A successful
+image build without these dependencies does not prove the geometry backend can
+start; a compatible GTSAM build, image installation and target import test are
+still required. Preserve the image's NumPy pin when resolving dependencies.
 
 ## Inputs and reproducibility
 

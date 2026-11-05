@@ -509,4 +509,67 @@ def test_lost_during_relocalization_clears_hypothesis_and_outputs(monkeypatch):
     status = json.loads(pubs['/status'].messages[-1])
     assert status['state'] == 'lost'
     assert 'map_segments' not in status and 'relocalization' not in status
+    assert node._segment_links == []
     assert json.loads(pubs['/preview/map_to_odom'].messages[-1])['transform'] is None
+
+
+def test_live_multigraph_keeps_links_across_three_segments_and_frames(monkeypatch):
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_segment_merge import make_two_segments
+    from test_pointcloud_slam_incremental_backend import add_frame
+    import plugins.pointcloud_slam_relocalization as relocation
+    s = make_two_segments()
+    points = s.store.segments[-1].frames[-1].points
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .1}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.6, preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts,
+        'relocalization': True})
+    pubs = {p.topic: p for p in node.publishers}
+    node.publish_preview_once()
+    first = json.loads(pubs['/status'].messages[-1])
+    assert len(first['map_segments']) == 2
+    s.odom(odom(1500, status='lost'), now=1.5)
+    add_frame(s, 1600, -3, points, segment='c')
+    node.publish_preview_once()
+    third = json.loads(pubs['/status'].messages[-1])
+    assert third['map_segments'] == [segment.segment_id for segment in s.store.segments]
+    assert third['relocalization'] == 'unvalidated_hypothesis'
+    assert third['segment_links'] == 2
+    monkeypatch.setattr(relocation, 'relocalize_pair', lambda *a, **k: (_ for _ in ()).throw(AssertionError('must retain links')))
+    node.publish_preview_once()
+    assert json.loads(pubs['/status'].messages[-1])['segment_links'] == 2
+
+
+def test_submap_loop_constraints_survive_tracking_loss():
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import make_stream, add_frame
+    s = make_stream(); points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    for t, x in [(1000, 0), (1100, 1.2), (1200, 2.2), (1300, .5)]:
+        add_frame(s, t, x, points)
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.5, preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts,
+        'relocalization': True})
+    node.publish_preview_once()
+    first = s.store.segments[0].segment_id
+    assert len(node._segment_loops[first]) >= 1
+    s.odom(odom(1400, status='lost'), now=1.4)
+    node.publish_preview_once()
+    assert len(node._segment_loops[first]) >= 1
+    add_frame(s, 1500, 9, points, segment='b')
+    node.publish_preview_once()
+    status = json.loads({p.topic: p for p in node.publishers}['/status'].messages[-1])
+    assert status['map_segments'] == [first, 'b']
+    assert len(node._segment_loops[first]) >= 1
