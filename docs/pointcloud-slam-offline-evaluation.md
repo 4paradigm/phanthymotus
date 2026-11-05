@@ -40,6 +40,10 @@ The card is disabled by default. To start it, `plugins.pointcloud_slam` needs
 `clock_relation_verified: true` and `extrinsic_calibrated: true`; these flags
 do not constitute evidence, so set them only after independent verification.
 There is deliberately no default extrinsic or claimed safe timing limit.
+The canvas exposes these fields in the card's configuration; enter
+`child_from_cloud` as a JSON 4x4 matrix. Configuration is rejected while the
+card is running and changes take effect on the next start. The two verification
+checkboxes default to false and are operator assertions, not calibration.
 When a producer changes only the *name* of a physically identical child frame
 per segment, `child_frame` may contain one explicit `{segment_id}` placeholder
 (for example `{segment_id}_base`). The deployment must independently establish

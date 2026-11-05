@@ -1,19 +1,45 @@
 """Opt-in experimental input card with clearly labelled odometry preview."""
+import json
+import math
 import threading
 
 from .pointcloud_slam_ros import SlamInputNode
-from .pointcloud_slam_stream import SlamStream
+from .pointcloud_slam_stream import SlamStream, _rigid
 from utils.ros_lifecycle import dispose_node
 
 
 TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False,
           'description': '实验性点云与里程计输入；可选未验证里程计预览，尚无真实回环',
           'inputSchema': {'type': 'object', 'properties': {
-              'action': {'type': 'string', 'enum': ['start', 'stop', 'info']},
+              'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config']},
               'input_topics': {'type': 'array', 'items': {'type': 'string'}},
               'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'}}, 'required': ['action']},
+          'configSchema': {'type': 'object', 'properties': {
+              'cloud_frame': {'type': 'string', 'description': '点云坐标系'},
+              'child_frame': {'type': 'string', 'description': '位姿参考点坐标系；支持 {segment_id} 模板'},
+              'clock_id': {'type': 'string', 'description': '已验证的输入时钟'},
+              'clock_relation_verified': {'type': 'boolean', 'default': False, 'description': '仅在独立验证时钟关系后启用'},
+              'extrinsic_calibrated': {'type': 'boolean', 'default': False, 'description': '仅在实测外参后启用'},
+              'child_from_cloud': {'type': 'string', 'description': '实测 T_child_cloud：4×4 JSON 数组'},
+              'max_gap_ms': {'type': 'number', 'description': '最大位姿插值间隔（ms）'},
+              'max_age_s': {'type': 'number', 'description': '接收超时（秒）'},
+              'max_measurement_age_ms': {'type': 'number', 'description': '最大采集时间年龄（ms）'},
+              'max_future_skew_ms': {'type': 'number', 'description': '允许未来时钟偏差（ms）'},
+              'max_pending': {'type': 'integer', 'description': '待匹配点云上限'},
+              'max_cloud_points': {'type': 'integer', 'description': '单帧点数上限'},
+              'max_frames': {'type': 'integer', 'description': '关键帧数量上限'},
+              'max_points': {'type': 'integer', 'description': '关键帧总点数上限'},
+              'preview_enabled': {'type': 'boolean', 'default': False, 'description': '启用未验证里程计预览'},
+              'preview_backend': {'type': 'string', 'enum': ['raw', 'gtsam'], 'description': '预览后端'},
+              'preview_interval_s': {'type': 'number', 'description': '预览间隔（秒）'},
+              'preview_max_points': {'type': 'integer', 'description': '预览点数上限'},
+              'preview_odom_sigmas': {'type': 'string', 'description': 'GTSAM 六维噪声 JSON 数组'},
+          }},
           'topic_in': [{'format': 'state/odom'}, {'format': 'sensor/pointcloud2'}],
           'topic_out': [{'format': 'sensor/slam-preview'}, {'format': 'data/json'}]}]
+
+for _setting in TOOLS[0]['configSchema']['properties'].values():
+    _setting['scope'] = 'instance'
 
 
 class PointCloudSlamPlugin:
@@ -42,6 +68,41 @@ class PointCloudSlamPlugin:
 
     def dispatch(self, name, args):
         action = args.get('action', name)
+        if action == 'config':
+            with self._lock:
+                if self._node is not None:
+                    return {'state': 'error', 'message': 'stop the card before changing configuration'}
+                updates = {k: v for k, v in args.items()
+                           if k in TOOLS[0]['configSchema']['properties'] and v is not None and v != ''}
+                try:
+                    for key in ('child_from_cloud', 'preview_odom_sigmas'):
+                        if isinstance(updates.get(key), str):
+                            updates[key] = json.loads(updates[key])
+                    if 'child_from_cloud' in updates:
+                        updates['child_from_cloud'] = _rigid(updates['child_from_cloud']).tolist()
+                    for key in ('clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled'):
+                        if key in updates and type(updates[key]) is not bool:
+                            raise ValueError(key + ' must be boolean')
+                    for key in ('max_pending', 'max_cloud_points', 'max_frames', 'max_points', 'preview_max_points'):
+                        if key in updates and (type(updates[key]) is not int or updates[key] <= 0):
+                            raise ValueError(key + ' must be a positive integer')
+                    for key in ('max_gap_ms', 'max_age_s', 'max_measurement_age_ms', 'max_future_skew_ms', 'preview_interval_s'):
+                        if key in updates:
+                            value = updates[key]
+                            if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                                    not math.isfinite(value) or value < 0 or
+                                    (value == 0 and key != 'max_future_skew_ms')):
+                                raise ValueError(key + ' has an invalid value')
+                    merged = {**self._config, **updates}
+                    keys = ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud',
+                            'max_gap_ms', 'max_age_s', 'max_pending', 'max_cloud_points',
+                            'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
+                    if all(key in merged for key in keys):
+                        SlamStream(**{key: merged[key] for key in keys})
+                except (ValueError, TypeError) as error:
+                    return {'state': 'error', 'message': str(error)}
+                self._config.update(updates)
+                return {'state': 'configured', 'config': dict(self._config)}
         if action == 'stop':
             self.stop()
             return {'state': 'idle'}

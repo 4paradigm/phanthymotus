@@ -1,7 +1,7 @@
 """The experimental card binds both inputs and stops only its own node."""
 import numpy as np
 
-from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
+from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin, TOOLS
 from vision_stubs import _FakeExecutor
 
 
@@ -12,6 +12,39 @@ def config():
             'max_age_s': 1, 'max_pending': 2, 'max_cloud_points': 100,
             'max_frames': 10, 'max_points': 1000, 'max_measurement_age_ms': 300,
             'max_future_skew_ms': 20}
+
+
+def test_canvas_configuration_supplies_required_start_settings():
+    import json
+    props = TOOLS[0]['configSchema']['properties']
+    required = set(config())
+    assert required <= set(props)
+    assert all(props[key]['scope'] == 'instance' for key in required)
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin({}, executor)
+    settings = {**config(), 'child_from_cloud': json.dumps(config()['child_from_cloud'])}
+    assert plugin.dispatch('pointcloud_slam', {'action': 'config', **settings})['state'] == 'configured'
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    assert plugin.dispatch('pointcloud_slam', {'action': 'config', 'max_frames': 5})['state'] == 'error'
+    plugin.dispatch('pointcloud_slam', {'action': 'stop'})
+
+
+def test_canvas_configuration_rejects_malformed_matrix_without_changes():
+    plugin = PointCloudSlamPlugin({}, _FakeExecutor())
+    result = plugin.dispatch('pointcloud_slam', {'action': 'config', 'child_from_cloud': 'not json'})
+    assert result['state'] == 'error'
+    assert 'child_from_cloud' not in plugin._config
+
+
+def test_canvas_configuration_rejects_invalid_partial_limits():
+    plugin = PointCloudSlamPlugin({}, _FakeExecutor())
+    result = plugin.dispatch('pointcloud_slam', {'action': 'config', 'max_frames': -1})
+    assert result['state'] == 'error'
+    assert 'max_frames' not in plugin._config
 
 
 def test_start_uses_formats_regardless_of_order_and_stops_only_own_node():
