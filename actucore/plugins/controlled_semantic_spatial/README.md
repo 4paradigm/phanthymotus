@@ -475,25 +475,23 @@ digest。它不是运行时 service，也不注册 Resource Center。日常构�
 `./deploy/build_actucore.sh --mirror tuna` 构建；现场脚本只应负责环境预检和替换
 单个 ActuCore 容器，不得发送导航目标或速度指令。
 
-正式 `actucore/deploy/service.yml` 也只有 `actucore` 一个 service。地图和
-录制目录作为该容器的持久化 volume；不再定义 `fast_livo2` 或 `nav2` service。
+正式 `actucore/deploy/service.yml` 也只有 `actucore` 一个 service。地图目录
+作为该容器的持久化 volume；不再定义 `fast_livo2` 或 `nav2` service。
 首次部署前由现场操作者创建可写目录：
 
 ```bash
 sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 \
-  /opt/phanthy-motus/data/navigation/fast_livo2/maps \
-  /opt/phanthy-motus/data/navigation/fast_livo2/recordings
+  /opt/phanthy-motus/data/navigation/fast_livo2/maps
 ```
 
-升级时不会自动迁移旧目录 `/opt/phanthy-motus/data/fast_livo2/{maps,recordings}`。
-现场操作者应先停卡并备份，核对新目录是否已有数据和同名文件，再将旧地图及
-录制数据迁移至上述对应新目录并核对权限；不要直接覆盖已有数据。旧数采数据
-不会自动导出；请在升级前备份并使用旧版本处理。移除静态或已保存卡片配置中的
+升级时不会自动迁移旧地图目录 `/opt/phanthy-motus/data/fast_livo2/maps`。
+现场操作者应先停卡并备份，核对新目录是否已有数据和同名文件，再迁移旧地图并
+核对权限；不要直接覆盖已有数据。历史录包目录不会自动迁移或删除；请在升级前
+备份并使用旧版本处理。移除静态或已保存卡片配置中的
 `collection_enabled` 和 `collection_directory`，严格 schema 不再接受这些键。
 地图容器内路径仍为 `/opt/fast_livo_ws/src/fast_livo/Log/pcd`。
 
-地图与故障录制目录不会自动清理；单次地图会话受 512 MiB 安全上限，历史
-地图及故障快照仍占用磁盘，操作者应在停卡后按需归档或删除。
+地图目录不会自动清理；单次地图会话受 512 MiB 安全上限，历史地图仍占用磁盘。
 
 ## 第三方与验收边界
 
