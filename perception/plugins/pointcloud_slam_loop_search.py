@@ -4,10 +4,12 @@ No result from this module is a verified loop. Parameters require independent
 positive and hard-negative evaluation before use for real mapping.
 """
 import math
+import time
 import numpy as np
 
 from .pointcloud_slam_incremental_backend import ExperimentalLoopGraph
 from .pointcloud_slam_keyframes import Segment
+from .pointcloud_slam_map import rebuild_segment
 
 
 def _descriptor(points, voxel):
@@ -45,7 +47,9 @@ class ExperimentalLoopSearch:
         self._descriptors, self._stamps = [], []
         self._segment_id, self._attempts, self._skips, self._last = None, 0, 0, None
 
-    def update(self, segment, graph):
+    def update(self, segment, graph, *, online=False, max_points=None):
+        started = time.perf_counter()
+        descriptor_s = graph_s = 0.
         if (not isinstance(segment, Segment) or not segment.frames or
                 graph.get('segment_id') != segment.segment_id or
                 (self._segment_id is not None and segment.segment_id != self._segment_id) or
@@ -55,16 +59,27 @@ class ExperimentalLoopSearch:
         if self._segment_id is None:
             self._segment_id = segment.segment_id
         first_new = len(self._descriptors)
+        # Online retrieval samples the newest frame instead of accumulating a
+        # descriptor backlog. All frames still participate in graph/map history.
+        selected_indices = ({0, len(segment.frames) - 1} if online else
+                            set(range(first_new, len(segment.frames))))
         for index in range(first_new, len(segment.frames)):
+            if index not in selected_indices:
+                self._descriptors.append(None)
+                self._stamps.append(segment.frames[index].cloud_stamp_ns)
+                continue
             frame = segment.frames[index]
+            tick = time.perf_counter()
             try:
                 desc = _descriptor(frame.points, self._voxel)
             except ValueError:
                 desc = None
+            descriptor_s += time.perf_counter() - tick
+            tick = time.perf_counter()
             partial = Segment(segment.segment_id, segment.frames[:index+1])
             subgraph = {'segment_id': segment.segment_id, 'poses': graph['poses'][:index+1],
                         'edges': graph['edges'][:index]}
-            result = self._graph.update(partial, subgraph)
+            result = self._graph.update(partial, subgraph, build_maps=False)
             selected = []
             eligible = [i for i in range(index) if desc is not None and self._descriptors[i] is not None]
             for old in sorted(eligible, key=lambda i: (float(np.linalg.norm(desc-self._descriptors[i])), i)):
@@ -80,10 +95,11 @@ class ExperimentalLoopSearch:
                     break
                 initial = np.linalg.inv(subgraph['poses'][old]) @ subgraph['poses'][index]
                 count = len(result['passed_candidates'])
-                result = self._graph.update(partial, subgraph, candidate=(index, old, initial))
+                result = self._graph.update(partial, subgraph, candidate=(index, old, initial), build_maps=False)
                 self._attempts += 1
                 if len(result['passed_candidates']) > count:
                     break
+            graph_s += time.perf_counter() - tick
             self._descriptors.append(desc)
             self._stamps.append(frame.cloud_stamp_ns)
             if desc is None:
@@ -91,6 +107,16 @@ class ExperimentalLoopSearch:
             self._last = {**result, 'candidate_attempts': self._attempts, 'descriptor_skips': self._skips}
         if first_new == len(segment.frames):
             # Revalidate the snapshot even when no new descriptor is required.
-            result = self._graph.update(segment, graph)
+            tick = time.perf_counter()
+            result = self._graph.update(segment, graph, build_maps=False)
+            graph_s += time.perf_counter() - tick
             self._last = {**result, 'candidate_attempts': self._attempts, 'descriptor_skips': self._skips}
+        tick = time.perf_counter()
+        self._last['before_map'] = (None if online else rebuild_segment(segment, graph['poses']))
+        self._last['after_map'] = rebuild_segment(segment, self._last['poses'], max_points=max_points)
+        self._last['descriptor_unindexed'] = sum(d is None for d in self._descriptors) - self._skips
+        self._last['timings_ms'] = {'descriptor': descriptor_s * 1000,
+            'registration_and_graph': graph_s * 1000,
+            'map': (time.perf_counter() - tick) * 1000,
+            'total': (time.perf_counter() - started) * 1000}
         return self._last

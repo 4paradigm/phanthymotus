@@ -103,6 +103,8 @@ class SlamInputNode(Node):
         self._preview_wake = threading.Event()
         self._preview_worker = None
         self._preview_errors = 0
+        self._compute_started = None
+        self._status_worker = None
         try:
             if preview:
                 self._preview_pub = self.create_publisher(UInt8MultiArray, preview['topic'], _QOS)
@@ -144,6 +146,9 @@ class SlamInputNode(Node):
         if self._preview and self._preview_worker is None:
             self._preview_worker = threading.Thread(target=self._preview_loop, daemon=True,
                                                      name='pointcloud_slam_preview')
+            self._status_worker = threading.Thread(target=self._status_loop, daemon=True,
+                                                   name='pointcloud_slam_status')
+            self._status_worker.start()
             self._preview_worker.start()
             self._preview_wake.set()
 
@@ -151,6 +156,8 @@ class SlamInputNode(Node):
         already_stopped = self._preview_stop.is_set()
         self._preview_stop.set()
         self._preview_wake.set()
+        if self._status_worker:
+            self._status_worker.join(timeout=3.)
         if self._preview_worker:
             self._preview_worker.join(timeout=3.)
             if self._preview_worker.is_alive():
@@ -168,6 +175,23 @@ class SlamInputNode(Node):
                     'state': 'stopped', 'transform': None, 'accepted_loops': 0})
                 self._map_correction_pub.publish(message)
 
+    def _status_loop(self):
+        # Geometry can be slow; input health must remain observable independently.
+        while not self._preview_stop.wait(min(1., self._preview['interval_s'])):
+            with self._lock:
+                compute_started = self._compute_started
+                if compute_started is None or self._preview_stop.is_set():
+                    continue
+                now_ns = (self._measurement_clock_ns() if self.stream._poses and
+                          self.stream.max_measurement_age_ms is not None else None)
+                status = self.stream.status(now=self._receipt_clock(), measurement_now_ns=now_ns)
+                message = String()
+                message.data = json.dumps({**status, 'kind': 'slam_compute_status',
+                    'state': status['odometry'], 'computing': True,
+                    'compute_elapsed_ms': (time.perf_counter() - compute_started) * 1000,
+                    'accepted_loops': 0}, allow_nan=False)
+                self._preview_status_pub.publish(message)
+
     def _preview_loop(self):
         last = 0.
         while not self._preview_stop.is_set():
@@ -178,6 +202,7 @@ class SlamInputNode(Node):
             delay = self._preview['interval_s'] - (time.monotonic() - last)
             if delay > 0 and self._preview_stop.wait(delay):
                 break
+            self._compute_started = time.perf_counter()
             try:
                 self.publish_preview_once()
                 self._preview_errors = 0
@@ -205,12 +230,15 @@ class SlamInputNode(Node):
                 self._preview_errors += 1
                 if self._preview_errors == 1 or self._preview_errors % 100 == 0:
                     log.exception('SLAM preview failed (%d)', self._preview_errors)
+            finally:
+                self._compute_started = None
             last = time.monotonic()
 
     def publish_preview_once(self):
         """Publish a bounded diagnostic snapshot, never an accepted SLAM map."""
         from .pointcloud_slam_map import rebuild_segment
         from .pointcloud_slam_preview import encode_preview
+        started = time.perf_counter()
         preview_subscribed = self._preview_pub.get_subscription_count() > 0
         with self._lock:
             measurement_now = (self._measurement_clock_ns()
@@ -250,8 +278,11 @@ class SlamInputNode(Node):
                     from .pointcloud_slam_loop_search import ExperimentalLoopSearch
                     self._loop_search = ExperimentalLoopSearch(**self._preview['geometry'])
                     self._loop_segment = segment.segment_id
-                loop = self._loop_search.update(segment, graph)
+                loop = self._loop_search.update(segment, graph, online=True,
+                                                max_points=self._preview['max_points'])
                 poses = loop['poses']
+                result['timings_ms'] = loop['timings_ms']
+                result['descriptor_unindexed'] = loop['descriptor_unindexed']
                 result.update(candidate_count=len(loop['passed_candidates']),
                               candidate_attempts=loop['candidate_attempts'],
                               descriptor_skips=loop['descriptor_skips'],
@@ -309,11 +340,12 @@ class SlamInputNode(Node):
             elif self._preview['backend'] == 'gtsam':
                 from .pointcloud_slam_backend import optimize_odometry_graph
                 poses = optimize_odometry_graph(graph, sigmas=self._preview['sigmas'])
-                points = rebuild_segment(segment, poses)
+                points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             else:
-                points = rebuild_segment(segment, poses)
+                points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             if preview_subscribed:
                 packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=result)
+        result['compute_ms'] = (time.perf_counter() - started) * 1000
         with self._lock:
             if self._preview_stop.is_set():
                 return
@@ -352,7 +384,14 @@ class SlamInputNode(Node):
                     try:
                         self.stream._check_measurement_time(segment.frames[-1].cloud_stamp_ns, measurement_now)
                     except ValueError:
-                        return
+                        # This is still a valid historical map, not a current pose.
+                        # Keep its capture stamp; never substitute publish/arrival time.
+                        result['state'] = 'historical_snapshot'
+                        result.pop('map_pose', None)
+                        result.pop('map_from_odom', None)
+                        if packet is not None:
+                            packet = encode_preview(points, poses[-1],
+                                max_points=self._preview['max_points'], metadata=result)
             if staged_links is not None:
                 self._segment_links = staged_links
             if staged_loops is not None:

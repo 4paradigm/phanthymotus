@@ -10,7 +10,7 @@ def map_from_odom(map_from_child, odom_from_child):
     return _rigid(map_from_child) @ np.linalg.inv(_rigid(odom_from_child))
 
 
-def rebuild_segment(segment, poses):
+def rebuild_segment(segment, poses, *, max_points=None):
     """Apply one pose per keyframe without merging independent segments.
 
     The caller must supply poses in keyframe order in this segment's own map
@@ -21,5 +21,17 @@ def rebuild_segment(segment, poses):
     if not segment.frames:
         raise ValueError('segment has no keyframes')
     matrices = [_rigid(pose) for pose in poses]
-    return np.concatenate([frame.points @ matrix[:3, :3].T + matrix[:3, 3]
-                           for frame, matrix in zip(segment.frames, matrices)], axis=0)
+    total = sum(len(frame.points) for frame in segment.frames)
+    if max_points is not None and (type(max_points) is not int or max_points <= 0):
+        raise ValueError('positive preview point budget required')
+    indices = (np.linspace(0, total - 1, max_points, dtype=int)
+               if max_points is not None and total > max_points else None)
+    chunks, offset = [], 0
+    for frame, matrix in zip(segment.frames, matrices):
+        points = frame.points
+        if indices is not None:
+            selected = indices[(indices >= offset) & (indices < offset + len(points))] - offset
+            points = points[selected]
+        chunks.append(points @ matrix[:3, :3].T + matrix[:3, 3])
+        offset += len(frame.points)
+    return np.concatenate(chunks, axis=0)

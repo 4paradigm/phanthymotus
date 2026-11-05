@@ -54,3 +54,15 @@ def test_map_odom_correction_composes_to_optimized_pose_without_mutating_raw_odo
     assert correction[0, 3] == pytest.approx(-.5)
     np.testing.assert_allclose(correction @ odom, optimized)
     assert odom[0, 3] == 2.
+
+
+def test_preview_budget_samples_before_transform_and_preserves_history():
+    s = stream(max_cloud_points=4, max_points=20)
+    for t, x in [(1000, 0), (1100, 10)]:
+        s.odom(odom(t, x), now=t / 1000)
+        s.cloud(t * 1_000_000, 'camera', [[i, 0, 0] for i in range(4)], now=t / 1000)
+    segment, graph = s.store.segments[0], s.graph()[0]
+    full = rebuild_segment(segment, graph['poses'])
+    bounded = rebuild_segment(segment, graph['poses'], max_points=3)
+    np.testing.assert_allclose(bounded, full[[0, 3, 7]])
+    assert sum(len(f.points) for f in segment.frames) == 8

@@ -365,3 +365,49 @@ replaced the measurement clock and missed it. The live SLAM instance was stopped
 receipt timing is now named `_receipt_clock`. The real-rclpy lifecycle check now
 asserts the untouched ROS clock and default measurement clock before injecting
 synthetic timestamps. No producer or odometry code was changed.
+
+### Preview starvation repair (after f00acc4)
+
+The live input store continued growing while a 20-second subscriber observation
+received neither preview nor status. Geometry processed every queued frame,
+repeated graph optimization and rebuilt both complete maps per candidate; status
+shared this worker. A completed snapshot older than the input measurement-age
+limit was silently discarded whenever new input had arrived. Later inspection
+also found the independent 300-keyframe storage limit had been reached.
+
+Online retrieval now computes descriptors for the first anchor and newest frame
+of a batch, retaining all frames/poses but explicitly reporting unindexed frames.
+There is no deferred descriptor queue. Intermediate candidate steps omit map
+materialization. The final preview samples the global point index before
+transforming points (40,000 points on Bumi); retained history and offline full-map
+outputs remain intact. This trades retrieval coverage for bounded online work;
+it does not validate the candidates. A separate worker reports input health and
+elapsed computation while geometry is busy. Completed historical snapshots keep
+their capture stamp and clear current pose/correction output when too old. Lost,
+segment changes and invalid inputs still suppress map publication.
+
+Resource-limited Bumi comparison: 2 CPUs, 2 GiB, no network, same eight captured
+clouds (~18.9k points each) replayed with a **synthetic stationary trajectory**,
+four added frames per update. These are performance fixtures, not loop truth.
+Old code: 20 updates through 80 frames, median 2.156 s, p95 2.975 s, max 3.015 s.
+New code: 75 updates through 300 frames, median 0.514 s, p95 0.675 s, max 2.116 s
+(first initialization). At 300 frames: descriptors 236 ms, registration/graph
+212 ms (optimization 204 ms), bounded map 147 ms, total 596 ms. Raw logs retained
+on Bumi at `/tmp/slam-perf-old-batch.jsonl` and `/tmp/slam-perf-fixed.jsonl`.
+Single-thread OpenMP did not improve the observed descriptor latency and was not
+added to the deployment configuration.
+
+Validation: 179 SLAM tests pass on both local real-geometry environment and Bumi
+Python 3.10/Open3D/GTSAM, including slow compute status, aged snapshot starvation,
+map-budget historical coverage, lost/segment protection and bounded retrieval.
+The isolated real-rclpy lifecycle/archive restoration check also passes. Initial
+target test invocation accidentally mixed mounted and installed namespace-package
+modules; corrected working directory/PYTHONPATH selects the mounted source first.
+Code review found a status-thread timestamp race, fixed by capturing one local
+compute-start value. No remaining blocking findings.
+
+Limits: the 300-frame/6-million-point retention cap still intentionally stops
+fusion without discarding history; this is not unlimited mapping. Connected
+multi-segment relocalization still has a full-map rebuilding path and is **off**
+in the Bumi profile, so the bounded-map performance result applies to that
+single-segment configuration. No Driver/odometry code or source timing was changed.

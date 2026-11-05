@@ -28,7 +28,7 @@ class ExperimentalLoopGraph:
         self._max_candidates = max_candidates
         self._segment_id, self._frames, self._poses, self._edges, self._candidates = None, (), (), (), ()
 
-    def update(self, segment, graph, *, candidate=None):
+    def update(self, segment, graph, *, candidate=None, build_maps=True):
         """Update one immutable segment snapshot and optionally test one candidate.
 
         Candidate is ``(source_index, target_index, T_target_source_initial)``.
@@ -72,8 +72,8 @@ class ExperimentalLoopGraph:
             pending.append({'source': source, 'target': target, 'diagnostic': diagnostic})
         result = optimize_candidates(graph, pending, thresholds=self._thresholds,
             odom_sigmas=self._odom_sigmas, loop_sigmas=self._loop_sigmas, huber_k=self._huber_k)
-        before = rebuild_segment(segment, poses)
-        after = rebuild_segment(segment, result['poses'])
+        before = rebuild_segment(segment, poses) if build_maps else None
+        after = rebuild_segment(segment, result['poses']) if build_maps else None
         correction = map_from_odom(result['poses'][-1], poses[-1])
         passing = {(c['source'], c['target']) for c in result['passed_candidates']}
         self._candidates = tuple(c for c in pending if (c['source'], c['target']) in passing)

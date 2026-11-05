@@ -288,8 +288,8 @@ def test_geometry_worker_discards_result_if_tracking_is_lost_during_optimization
         'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
         'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts})
     original = ExperimentalLoopSearch.update
-    def lose_during_update(self, *args):
-        result = original(self, *args)
+    def lose_during_update(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
         node._odom(NS(data=json.dumps(odom(1100, status='lost'))))
         return result
     monkeypatch.setattr(ExperimentalLoopSearch, 'update', lose_during_update)
@@ -303,7 +303,8 @@ def test_geometry_worker_discards_result_if_tracking_is_lost_during_optimization
     assert json.loads(pubs['/preview/map_to_odom'].messages[-1])['transform'] is None
 
 
-def test_geometry_worker_can_publish_fresh_snapshot_while_new_frame_arrives(monkeypatch):
+@pytest.mark.parametrize("completed_ns", [1_400_000_000, 2_400_000_000])
+def test_geometry_worker_can_publish_fresh_snapshot_while_new_frame_arrives(monkeypatch, completed_ns):
     pytest.importorskip('gtsam'); pytest.importorskip('open3d')
     import json
     from test_pointcloud_slam_geometry_gate import thresholds
@@ -319,20 +320,26 @@ def test_geometry_worker_can_publish_fresh_snapshot_while_new_frame_arrives(monk
         'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
         'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
         'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
-    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.4, measurement_clock_ns=lambda: 1_400_000_000,
+    measurement = [1_400_000_000]
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.4, measurement_clock_ns=lambda: measurement[0],
         preview={'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
                  'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts})
     original = ExperimentalLoopSearch.update
-    def append_during_update(self, *args):
-        result = original(self, *args)
-        s.odom(odom(1400, .6), now=1.4, measurement_now_ns=1_400_000_000)
-        s.cloud(1_400_000_000, 'camera', points, now=1.4, measurement_now_ns=1_400_000_000)
+    def append_during_update(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        measurement[0] = completed_ns
+        s.odom(odom(completed_ns // 1_000_000, .6), now=1.4, measurement_now_ns=completed_ns)
+        s.cloud(completed_ns, 'camera', points, now=1.4, measurement_now_ns=completed_ns)
         return result
     monkeypatch.setattr(ExperimentalLoopSearch, 'update', append_during_update)
     node.publish_preview_once()
     pubs = {p.topic: p for p in node.publishers}
     assert pubs['/preview'].messages
-    assert json.loads(pubs['/status'].messages[-1])['stamp_ns'] == '1300000000'
+    status = json.loads(pubs['/status'].messages[-1])
+    assert status['stamp_ns'] == '1300000000'
+    if completed_ns > 2_000_000_000:
+        assert status['state'] == 'historical_snapshot'
+        assert json.loads(pubs['/preview/pose'].messages[-1])['pose'] is None
 
 
 def test_geometry_worker_error_clears_published_pose_and_correction(monkeypatch):
@@ -401,7 +408,7 @@ def test_preview_worker_reports_backend_error_in_status(monkeypatch):
     callbacks = {sub.topic: sub.callback for sub in node.subscriptions}
     callbacks['/o'](NS(data=json.dumps(odom(1000))))
     callbacks['/c'](cloud())
-    monkeypatch.setattr(map_module, 'rebuild_segment', lambda *a: (_ for _ in ()).throw(ValueError('broken graph')))
+    monkeypatch.setattr(map_module, 'rebuild_segment', lambda *a, **kw: (_ for _ in ()).throw(ValueError('broken graph')))
     pubs = {pub.topic: pub for pub in node.publishers}
     node.start_preview()
     try:
@@ -444,9 +451,9 @@ def test_inflight_preview_is_dropped_when_tracking_is_lost(monkeypatch):
     callbacks['/o'](NS(data=json.dumps(odom(1000))))
     callbacks['/c'](cloud())
     original = map_module.rebuild_segment
-    def lost_during_rebuild(*args):
+    def lost_during_rebuild(*args, **kwargs):
         callbacks['/o'](NS(data=json.dumps(odom(1100, status='lost'))))
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(map_module, 'rebuild_segment', lost_during_rebuild)
     node.publish_preview_once()
     pubs = {pub.topic: pub for pub in node.publishers}
@@ -577,3 +584,27 @@ def test_submap_loop_constraints_survive_tracking_loss():
     status = json.loads({p.topic: p for p in node.publishers}['/status'].messages[-1])
     assert status['map_segments'] == [first, 'b']
     assert len(node._segment_loops[first]) >= 1
+
+
+def test_status_keeps_reporting_while_preview_computation_is_blocked(monkeypatch):
+    import json
+    import threading
+    from vision_stubs import _wait_until
+    node = SlamInputNode('/o', '/c', stream(), clock=lambda: 1., preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 10,
+        'interval_s': .1, 'backend': 'raw'})
+    entered, release = threading.Event(), threading.Event()
+    def slow():
+        entered.set()
+        release.wait(2)
+    monkeypatch.setattr(node, 'publish_preview_once', slow)
+    node.start_preview()
+    try:
+        assert entered.wait(1)
+        pubs = {p.topic: p for p in node.publishers}
+        assert _wait_until(lambda: any(json.loads(m).get('computing') for m in pubs['/status'].messages))
+        assert not pubs['/preview'].messages
+    finally:
+        release.set()
+        node.stop_preview()
+    assert not node._status_worker.is_alive()

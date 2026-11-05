@@ -49,3 +49,23 @@ def test_invalid_descriptor_skips_candidate_search_but_keeps_odometry_history():
     assert len(result['poses']) == 2
     assert result['descriptor_skips'] == 1
     assert result['candidate_attempts'] == 0
+
+
+def test_online_backlog_keeps_all_poses_but_bounds_descriptor_and_map_work(monkeypatch):
+    import plugins.pointcloud_slam_loop_search as module
+    s = make_stream(); p = np.random.default_rng(7).uniform(-1, 1, (300, 3))
+    for i in range(4):
+        add_frame(s, 1000 + 100*i, 0, p)
+    calls = []
+    original = module._descriptor
+    def descriptor(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(module, '_descriptor', descriptor)
+    worker = search()
+    result = worker.update(s.store.segments[0], s.graph()[0], online=True, max_points=50)
+    assert len(calls) == 2  # First anchor and newest frame; no growing catch-up queue.
+    assert len(result['poses']) == 4
+    assert len(result['after_map']) <= 50
+    assert result['descriptor_unindexed'] == 2
+    assert result['timings_ms']['total'] > 0
