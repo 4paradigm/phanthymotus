@@ -83,6 +83,7 @@ def rig(monkeypatch):
     # Set by individual tests. A card absent from here declares nothing, which
     # is the normal case for almost every card in the repository.
     declarations: dict = {}
+    odometry: dict = {}
 
     async def _call(mcp_id, req, timeout_s=None):
         args = dict(req.arguments)
@@ -95,6 +96,8 @@ def rig(monkeypatch):
             data = {'state': 'idle', 'topic_out': topic_outs.get(card_id, [])}
             if card_id in declarations:
                 data['camera_info'] = declarations[card_id]
+            if card_id in odometry:
+                data.update(odometry[card_id])
             return {'code': 200, 'data': data}
         return {'code': 200, 'data': {'state': 'idle'}}
 
@@ -131,7 +134,7 @@ def rig(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
 
     return types.SimpleNamespace(starts=starts, events=events, infos=infos,
-                                 declarations=declarations, topic_outs=topic_outs)
+                                 declarations=declarations, topic_outs=topic_outs, odometry=odometry)
 
 
 def _run(layout) -> bool:
@@ -148,6 +151,8 @@ def _errors(events):
 def test_slam_gets_live_input_formats_by_topic_not_connection_order(rig):
     rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'sensor/pointcloud2'}]
     rig.topic_outs[DEPTH] = [{'topic': DEPTH_TOPIC, 'format': 'state/odom'}]
+    declaration = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profile': 'motus_slam/1'}}
+    rig.odometry[DEPTH] = {'odom_interface': declaration, 'odom_topic': DEPTH_TOPIC}
     layout = {'cards': [_card(CAM, 'cloud'), _card(DEPTH, 'odom'),
                         _card(NAVI, 'pointcloud_slam')],
               'connections': [_conn(CAM, NAVI, '/stale/cloud'),
@@ -155,6 +160,20 @@ def test_slam_gets_live_input_formats_by_topic_not_connection_order(rig):
     _run(layout)
     assert rig.starts[NAVI]['input_bindings'] == {
         CAM_TOPIC: 'sensor/pointcloud2', DEPTH_TOPIC: 'state/odom'}
+    assert rig.starts[NAVI]['odom_interfaces'] == {DEPTH_TOPIC: declaration}
+
+
+def test_slam_does_not_guess_capability_for_ambiguous_odom_ports(rig):
+    rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'sensor/pointcloud2'}]
+    rig.topic_outs[DEPTH] = [{'topic': DEPTH_TOPIC, 'format': 'state/odom'},
+                             {'topic': '/other/odom', 'format': 'state/odom'}]
+    rig.odometry[DEPTH] = {'odom_interface': {'schema': 'motus.odom/1',
+                              'slam_pose': {'available': True, 'profile': 'motus_slam/1'}}}
+    layout = {'cards': [_card(CAM, 'cloud'), _card(DEPTH, 'odom'),
+                        _card(NAVI, 'pointcloud_slam')],
+              'connections': [_conn(CAM, NAVI, CAM_TOPIC), _conn(DEPTH, NAVI, DEPTH_TOPIC)]}
+    _run(layout)
+    assert 'odom_interfaces' not in rig.starts[NAVI]
 
 
 # ── it arrives, keyed by the topic the consumer bound ────────────────────────

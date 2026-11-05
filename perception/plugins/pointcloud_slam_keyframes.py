@@ -11,6 +11,10 @@ import numpy as np
 from .pointcloud_slam_odom import PoseSample
 
 
+class CapacityError(ValueError):
+    """A frame does not fit without discarding retained history."""
+
+
 @dataclass(frozen=True)
 class Keyframe:
     pose: PoseSample
@@ -39,6 +43,10 @@ class KeyframeStore:
     def segments(self):
         return tuple(Segment(segment_id, tuple(frames)) for segment_id, frames in self._segments)
 
+    @property
+    def requires_new_segment(self):
+        return self._lost and bool(self._segments)
+
     def mark_lost(self):
         self._lost = True
 
@@ -53,7 +61,7 @@ class KeyframeStore:
             raise ValueError('local cloud must contain Nx3 points')
         if (self._frame_count >= self._max_frames or
                 self._point_count + len(points) > self._max_points):
-            raise ValueError('keyframe capacity reached')
+            raise CapacityError('keyframe capacity reached')
         try:
             points = np.asarray(points, dtype=np.float64)
             if not np.isfinite(points).all():

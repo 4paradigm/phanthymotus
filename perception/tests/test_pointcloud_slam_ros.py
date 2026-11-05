@@ -46,3 +46,14 @@ def test_two_subscriptions_feed_keyframe_store():
     callbacks['/dynamic/cloud'](cloud())
     assert len(s.store.segments[0].frames) == 1
     assert set(callbacks) == {'/dynamic/odom', '/dynamic/cloud'}
+
+
+def test_node_uses_measurement_clock_for_age_checks():
+    import json
+    s = stream(max_measurement_age_ms=200, max_future_skew_ms=20)
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 5.,
+                         measurement_clock_ns=lambda: 5_000_000_000)
+    callbacks = {sub.topic: sub.callback for sub in node.subscriptions}
+    callbacks['/o'](NS(data=json.dumps(odom(1000))))
+    callbacks['/c'](cloud())
+    assert not s.store.segments

@@ -255,9 +255,12 @@ class PerceptionBundle:
 
         slam_cfg = plugins_cfg.get("pointcloud_slam") or {}
         if slam_cfg.get("enabled", False):
-            from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
-            self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor))
-            log.info("PointCloudSlamPlugin loaded (experimental input only)")
+            try:
+                from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
+                self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor))
+                log.info("PointCloudSlamPlugin loaded (experimental input only)")
+            except Exception:
+                log.error("PointCloudSlamPlugin failed to load; continuing without SLAM", exc_info=True)
 
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket

@@ -57,10 +57,12 @@ def decode_cloud(msg, *, max_points):
 class SlamInputNode(Node):
     """Subscribe only to explicitly resolved topics; does not control producers."""
 
-    def __init__(self, odom_topic, cloud_topic, stream, *, clock=time.monotonic):
+    def __init__(self, odom_topic, cloud_topic, stream, *, clock=time.monotonic,
+                 measurement_clock_ns=None):
         super().__init__('pointcloud_slam_input')
         self.stream = stream
         self._clock = clock
+        self._measurement_clock_ns = measurement_clock_ns or (lambda: self.get_clock().now().nanoseconds)
         self._lock = threading.Lock()
         self.create_subscription(String, odom_topic, self._odom, _QOS)
         self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
@@ -71,13 +73,18 @@ class SlamInputNode(Node):
         except (TypeError, ValueError):
             sample = None
         with self._lock:
-            self.stream.odom(sample, now=self._clock())
+            measurement_now = (self._measurement_clock_ns()
+                               if self.stream.max_measurement_age_ms is not None else None)
+            self.stream.odom(sample, now=self._clock(), measurement_now_ns=measurement_now)
 
     def _cloud(self, msg):
         try:
             stamp, frame, points = decode_cloud(msg, max_points=self.stream.max_cloud_points)
             with self._lock:
-                self.stream.cloud(stamp, frame, points, now=self._clock())
+                measurement_now = (self._measurement_clock_ns()
+                                   if self.stream.max_measurement_age_ms is not None else None)
+                self.stream.cloud(stamp, frame, points, now=self._clock(),
+                                  measurement_now_ns=measurement_now)
         except ValueError as error:
             with self._lock:
                 self.stream.last_error = str(error)
@@ -97,3 +104,9 @@ class SlamInputNode(Node):
                            'last_cloud_stamp_ns': segment.frames[-1].cloud_stamp_ns,
                            'map_points': rebuild_segment(segment, poses)})
         return result
+
+    def status(self):
+        with self._lock:
+            measurement_now = (self._measurement_clock_ns()
+                               if self.stream._poses and self.stream.max_measurement_age_ms is not None else None)
+            return self.stream.status(now=self._clock(), measurement_now_ns=measurement_now)

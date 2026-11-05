@@ -279,6 +279,12 @@ plugins:
     cal_a: 1.0
     cal_b: 0.0
 
+  # Experimental input/odometry graph only; no loop closure or map output yet.
+  # See docs/pointcloud-slam-offline-evaluation.md for required verified
+  # clock, extrinsic and bounded-resource configuration. Never enable by default.
+  pointcloud_slam:
+    enabled: false
+
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities
   # from a skeleton-action model. No second inference runtime: a second ONNX
