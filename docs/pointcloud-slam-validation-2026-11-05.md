@@ -411,3 +411,24 @@ fusion without discarding history; this is not unlimited mapping. Connected
 multi-segment relocalization still has a full-map rebuilding path and is **off**
 in the Bumi profile, so the bounded-map performance result applies to that
 single-segment configuration. No Driver/odometry code or source timing was changed.
+
+Deployment verification for runtime 67464c6: local image
+`local/phanthymotus-perception:slam-67464c6-trial`, 18 source files byte-matched;
+37 focused tests also passed against the built image. Only Perception was
+recreated. Driver and Core container IDs/start times remained unchanged. The
+previous 300-frame session was explicitly saved and backed up on Bumi as
+`/tmp/slam-before-67464c6.json` (323 MiB) before starting a new trial session.
+
+A 120.049-second read-only live DDS observation received 193 clouds, 39 preview
+packets with 39 strictly increasing capture timestamps and distinct packet
+hashes, and 76 status messages. Odometry stayed tracking. Preview interval:
+median 2.941 s, maximum 3.787 s. Compute time: median 829 ms, maximum 1688 ms.
+Each preview contained at most 40,000 points. Historical-snapshot output was
+observed when compute exceeded freshness, rather than silently dropping all map
+updates; these outputs did not claim a current pose. Raw report is
+`/tmp/slam-live-progress-67464c6.json` on Bumi. No movement commands were sent.
+This verifies continued publication during the measured window, **not** unlimited
+map growth: the operator correctly noted that the remaining 300-frame global
+retention limit is inadequate for full-map sessions. Storage/submap lifecycle
+and actual keyframe selection require further work; increasing a constant is
+not sufficient. Do not describe complete-map acceptance as finished.
