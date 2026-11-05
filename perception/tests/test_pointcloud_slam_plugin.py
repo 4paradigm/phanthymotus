@@ -47,6 +47,43 @@ def test_canvas_configuration_rejects_invalid_partial_limits():
     assert 'max_frames' not in plugin._config
 
 
+def test_geometry_preview_options_are_received_from_canvas():
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    props = TOOLS[0]['configSchema']['properties']
+    assert 'geometry_experimental' in props['preview_backend']['enum']
+    assert 'preview_geometry' in props
+    plugin = PointCloudSlamPlugin(config(), _FakeExecutor())
+    assert plugin.dispatch('pointcloud_slam', {'action': 'config',
+        'preview_geometry': json.dumps(opts)})['state'] == 'configured'
+    assert plugin._config['preview_geometry'] == opts
+
+
+def test_geometry_preview_starts_and_stops_with_explicit_configuration():
+    import pytest
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    from test_pointcloud_slam_geometry_gate import thresholds
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin({**config(), 'preview_enabled': True,
+        'preview_backend': 'geometry_experimental', 'preview_geometry': opts}, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    node = executor.nodes[0]
+    plugin.shutdown()
+    assert not executor.nodes and not node._preview_worker.is_alive()
+
+
 def test_start_uses_formats_regardless_of_order_and_stops_only_own_node():
     executor = _FakeExecutor()
     plugin = PointCloudSlamPlugin(config(), executor)
@@ -63,6 +100,19 @@ def test_start_uses_formats_regardless_of_order_and_stops_only_own_node():
     assert info['input_status']['odometry'] == 'waiting'
     plugin.dispatch('pointcloud_slam', {'action': 'stop'})
     assert not executor.nodes and node.destroyed
+
+
+def test_bundle_shutdown_retires_slam_node_and_preview_worker():
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin({**config(), 'preview_enabled': True}, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    node = executor.nodes[0]
+    plugin.shutdown()
+    assert not executor.nodes and node.destroyed and not node._preview_worker.is_alive()
 
 
 def test_start_fails_closed_for_unverified_clock_or_missing_bindings():

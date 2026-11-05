@@ -1,9 +1,10 @@
 # Offline point-cloud SLAM feasibility experiments
 
-These tools evaluate retrieval and demonstrate graph optimization. They are not
-a Perception SLAM card, do not subscribe to a robot, and never accept or publish
-loop edges. A geometric match or a caller-supplied `verified` boolean is not
-independent proof of a loop. Do not use synthetic graph weights on robot data.
+The offline tools evaluate retrieval and demonstrate graph optimization. The
+experimental live card below can also run provisional geometry and graph
+optimization; its candidates are not verified real-world loop closures. A
+geometric match is not independent proof of a loop. Do not use synthetic graph
+weights on robot data.
 
 The separate `plugins/pointcloud_slam_keyframes.py` implements bounded local
 keyframe storage for future integration. It assumes its caller supplies a
@@ -57,10 +58,10 @@ segment's local keyframe points using the resulting pose snapshot. Returned
 snapshots carry the segment frame and last cloud capture stamp; independently
 anchored segments are not combined. A synthetic loop test also exercises
 history rebuilding, but uses the separate experimental graph tool and does not
-validate a real loop. The live backend accepts no loop edges and does not
-publish corrected poses, SLAM maps, or map-to-odom corrections. The current
-Perception image does not include GTSAM, and its Jetson compatibility has not
-been built or tested.
+validate a real loop. The default live backends accept no loop edges. The
+experimental geometry backend below publishes provisional results only. The
+current Perception image does not include GTSAM or Open3D; target installation
+and Jetson compatibility have not been established.
 
 For diagnostics only, set `preview_enabled: true` to advertise the separate
 `sensor/slam-preview` output and a `data/json` status output under the resolved
@@ -86,7 +87,7 @@ positive values in rotation-then-translation tangent order). Neither mode can
 detect or accept loops. `preview_interval_s` defaults to 1 second (allowed
 range 0.1–60 seconds), and
 `preview_max_points` to 40000 (hard limit 80000); the preview is only rebuilt
-when a ROS subscriber is present. The agent-core bridge subscribes to this
+when a ROS subscriber is present for these two modes. The agent-core bridge subscribes to this
 large stream on demand and bounds slow viewers' queues to two snapshots; the
 dashboard retains only the latest preview snapshot. The
 worker stops independently of upstream producers. The preview format wraps
@@ -95,7 +96,20 @@ to avoid implying SLAM validity. Its full browser/WebGL and target ROS paths sti
 validation. A card `running` state means subscriptions started, not SLAM ready.
 The card `info()` includes input freshness, queue drops, capacity and segment
 state; `tracking` there describes only the input odometry, not SLAM validity.
-The ROS tests use stubs; the input adapter has not been validated on a robot.
+The ROS tests use stubs; the full input adapter has not been validated on a robot.
+
+`preview_backend: geometry_experimental` additionally requires GTSAM, Open3D,
+and an explicit `preview_geometry` JSON object with descriptor voxel size,
+candidate limits and temporal separation, registration thresholds, graph noise
+and optimizer settings. See `ExperimentalLoopSearch` for the required keys;
+none have been calibrated for deployment. Mean FPFH proposes candidates and
+bidirectional ICP and geometry gates filter them before graph optimization.
+The optimized historical points, map pose and map-to-odom transform are
+published as **unvalidated** previews; accepted-loop counts remain zero.
+The worker runs without map viewers, and clears pose and correction on input
+loss, error, or stop. A separate bounded two-segment prototype requires a
+caller-provided initial alignment and is not connected to live relocalization.
+Neither this prototype nor a geometric gate establishes safe segment merging.
 
 ## Inputs and reproducibility
 

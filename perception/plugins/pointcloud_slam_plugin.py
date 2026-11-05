@@ -30,13 +30,17 @@ TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False
               'max_frames': {'type': 'integer', 'description': '关键帧数量上限'},
               'max_points': {'type': 'integer', 'description': '关键帧总点数上限'},
               'preview_enabled': {'type': 'boolean', 'default': False, 'description': '启用未验证里程计预览'},
-              'preview_backend': {'type': 'string', 'enum': ['raw', 'gtsam'], 'description': '预览后端'},
+              'preview_backend': {'type': 'string', 'enum': ['raw', 'gtsam', 'geometry_experimental'], 'description': '预览后端；几何候选仍未验证'},
+              'preview_geometry': {'type': 'string', 'description': '实验性几何检索、配准和图参数的 JSON 对象'},
               'preview_interval_s': {'type': 'number', 'description': '预览间隔（秒）'},
               'preview_max_points': {'type': 'integer', 'description': '预览点数上限'},
               'preview_odom_sigmas': {'type': 'string', 'description': 'GTSAM 六维噪声 JSON 数组'},
           }},
           'topic_in': [{'format': 'state/odom'}, {'format': 'sensor/pointcloud2'}],
-          'topic_out': [{'format': 'sensor/slam-preview'}, {'format': 'data/json'}]}]
+          'topic_out': [{'format': 'sensor/slam-preview', 'desc': '未验证地图预览'},
+                        {'format': 'data/json', 'desc': '状态'},
+                        {'format': 'data/json', 'desc': '实验地图位姿'},
+                        {'format': 'data/json', 'desc': '实验 map→odom'}]}]
 
 for _setting in TOOLS[0]['configSchema']['properties'].values():
     _setting['scope'] = 'instance'
@@ -66,6 +70,9 @@ class PointCloudSlamPlugin:
                 node.stop_preview()
                 dispose_node(self._executor, node, label='pointcloud_slam')
 
+    def shutdown(self):
+        self.stop()
+
     def dispatch(self, name, args):
         action = args.get('action', name)
         if action == 'config':
@@ -75,11 +82,13 @@ class PointCloudSlamPlugin:
                 updates = {k: v for k, v in args.items()
                            if k in TOOLS[0]['configSchema']['properties'] and v is not None and v != ''}
                 try:
-                    for key in ('child_from_cloud', 'preview_odom_sigmas'):
+                    for key in ('child_from_cloud', 'preview_odom_sigmas', 'preview_geometry'):
                         if isinstance(updates.get(key), str):
                             updates[key] = json.loads(updates[key])
                     if 'child_from_cloud' in updates:
                         updates['child_from_cloud'] = _rigid(updates['child_from_cloud']).tolist()
+                    if 'preview_geometry' in updates and not isinstance(updates['preview_geometry'], dict):
+                        raise ValueError('preview_geometry must be an object')
                     for key in ('clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled'):
                         if key in updates and type(updates[key]) is not bool:
                             raise ValueError(key + ' must be boolean')
@@ -113,6 +122,9 @@ class PointCloudSlamPlugin:
                 outputs = ([{'topic': node._preview['topic'], 'format': 'sensor/slam-preview'},
                             {'topic': node._preview['status_topic'], 'format': 'data/json'}]
                            if node and node._preview else [])
+                if node and node._preview and node._preview['backend'] == 'geometry_experimental':
+                    outputs += [{'topic': node._preview['topic'] + '/pose', 'format': 'data/json'},
+                                {'topic': node._preview['topic'] + '/map_to_odom', 'format': 'data/json'}]
                 return {'state': 'running' if node else 'idle',
                         'desc': '实验输入与未验证里程计预览；无真实回环',
                         'topic_in': [{'topic': topic, 'format': fmt}
@@ -162,7 +174,8 @@ class PointCloudSlamPlugin:
                                'backend': self._config.get('preview_backend', 'raw'),
                                'interval_s': self._config.get('preview_interval_s', 1.),
                                'max_points': self._config.get('preview_max_points', 40000),
-                               'sigmas': self._config.get('preview_odom_sigmas')}
+                               'sigmas': self._config.get('preview_odom_sigmas'),
+                               'geometry': self._config.get('preview_geometry')}
                 node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
                 try:
                     self._executor.add_node(node)

@@ -189,6 +189,196 @@ def test_gtsam_preview_runs_real_odom_backend():
     assert json.loads(pubs['/preview_status'].messages[-1])['backend'] == 'gtsam'
 
 
+def test_geometry_worker_updates_historical_preview_without_touching_odom():
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import make_stream, add_frame
+    from test_pointcloud_slam_preview import unpack
+    s = make_stream(); points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    for t, x in [(1000, 0), (1100, 1.2), (1200, 2.2), (1300, .5)]:
+        add_frame(s, t, x, points)
+    original = s.graph()[0]['poses'][-1].copy()
+    options = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.3, preview={
+        'topic': '/preview', 'status_topic': '/preview_status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': options})
+    node.publish_preview_once()
+    pubs = {p.topic: p for p in node.publishers}
+    meta, _ = unpack(pubs['/preview'].messages[-1])
+    status = json.loads(pubs['/preview_status'].messages[-1])
+    assert meta['kind'] == 'unvalidated_geometry_preview' and meta['candidate_count'] == 1
+    assert status['accepted_loops'] == 0 and status['candidate_count'] == 1
+    np.testing.assert_allclose(np.asarray(status['map_from_odom']) @ original,
+                               np.asarray(status['map_pose']), atol=1e-6)
+    np.testing.assert_allclose(s.graph()[0]['poses'][-1], original)
+    pose_out = json.loads(pubs['/preview/pose'].messages[-1])
+    correction = json.loads(pubs['/preview/map_to_odom'].messages[-1])
+    assert pose_out['kind'] == 'unvalidated_geometry_pose'
+    assert correction['kind'] == 'unvalidated_map_to_odom'
+    np.testing.assert_allclose(np.asarray(correction['transform']) @ original,
+                               np.asarray(pose_out['pose']), atol=1e-6)
+
+
+def test_geometry_worker_processes_without_a_map_viewer():
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import make_stream, add_frame
+    s = make_stream(); points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    for t, x in [(1000, 0), (1100, 1.2), (1200, 2.2), (1300, .5)]: add_frame(s, t, x, points)
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.3, preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts})
+    pubs = {p.topic: p for p in node.publishers}
+    pubs['/preview'].subscription_count = 0
+    node.publish_preview_once()
+    assert not pubs['/preview'].messages
+    assert json.loads(pubs['/status'].messages[-1])['candidate_count'] == 1
+
+
+def test_geometry_worker_starts_new_unmerged_graph_after_segment_reset():
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import make_stream, add_frame
+    s = make_stream(); points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    for t, x in [(1000, 0), (1100, 1.2), (1200, 2.2), (1300, .5)]: add_frame(s, t, x, points)
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.5, preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts})
+    node.publish_preview_once()
+    s.odom(odom(1400, status='lost'), now=1.4)
+    add_frame(s, 1500, 5, points, segment='b')
+    node.publish_preview_once()
+    pubs = {p.topic: p for p in node.publishers}
+    status = json.loads(pubs['/status'].messages[-1])
+    assert status['segment_id'] == 'b' and status['candidate_count'] == 0
+    assert len(s.store.segments) == 2
+
+
+def test_geometry_worker_discards_result_if_tracking_is_lost_during_optimization(monkeypatch):
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import make_stream, add_frame
+    from plugins.pointcloud_slam_loop_search import ExperimentalLoopSearch
+    s = make_stream(); points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    add_frame(s, 1000, 0, points)
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1., preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts})
+    original = ExperimentalLoopSearch.update
+    def lose_during_update(self, *args):
+        result = original(self, *args)
+        node._odom(NS(data=json.dumps(odom(1100, status='lost'))))
+        return result
+    monkeypatch.setattr(ExperimentalLoopSearch, 'update', lose_during_update)
+    node.publish_preview_once()
+    pubs = {p.topic: p for p in node.publishers}
+    assert not pubs['/preview'].messages
+    status = json.loads(pubs['/status'].messages[-1])
+    assert status['state'] == 'lost' and 'map_pose' not in status
+    assert node._loop_search is None
+    assert json.loads(pubs['/preview/pose'].messages[-1])['pose'] is None
+    assert json.loads(pubs['/preview/map_to_odom'].messages[-1])['transform'] is None
+
+
+def test_geometry_worker_can_publish_fresh_snapshot_while_new_frame_arrives(monkeypatch):
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import add_frame
+    from plugins.pointcloud_slam_loop_search import ExperimentalLoopSearch
+    s = stream(max_cloud_points=400, max_frames=8, max_points=4000,
+               max_measurement_age_ms=500, max_future_skew_ms=20)
+    points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    for t, x in [(1000, 0), (1100, 1.2), (1200, 2.2), (1300, .5)]:
+        s.odom(odom(t, x), now=t/1000, measurement_now_ns=t*1_000_000)
+        s.cloud(t*1_000_000, 'camera', points, now=t/1000, measurement_now_ns=t*1_000_000)
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.4, measurement_clock_ns=lambda: 1_400_000_000,
+        preview={'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+                 'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts})
+    original = ExperimentalLoopSearch.update
+    def append_during_update(self, *args):
+        result = original(self, *args)
+        s.odom(odom(1400, .6), now=1.4, measurement_now_ns=1_400_000_000)
+        s.cloud(1_400_000_000, 'camera', points, now=1.4, measurement_now_ns=1_400_000_000)
+        return result
+    monkeypatch.setattr(ExperimentalLoopSearch, 'update', append_during_update)
+    node.publish_preview_once()
+    pubs = {p.topic: p for p in node.publishers}
+    assert pubs['/preview'].messages
+    assert json.loads(pubs['/status'].messages[-1])['stamp_ns'] == '1300000000'
+
+
+def test_geometry_worker_error_clears_published_pose_and_correction(monkeypatch):
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from vision_stubs import _wait_until
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_incremental_backend import make_stream, add_frame
+    from plugins.pointcloud_slam_loop_search import ExperimentalLoopSearch
+    s = make_stream(); points = np.random.default_rng(42).uniform(-1, 1, (300, 3))
+    add_frame(s, 1000, 0, points)
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1., preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': .1, 'backend': 'geometry_experimental', 'geometry': opts})
+    monkeypatch.setattr(ExperimentalLoopSearch, 'update', lambda *args: (_ for _ in ()).throw(ValueError('backend failure')))
+    pubs = {p.topic: p for p in node.publishers}
+    node.start_preview()
+    try:
+        assert _wait_until(lambda: pubs['/preview/pose'].messages)
+    finally:
+        node.stop_preview()
+    poses = [json.loads(message) for message in pubs['/preview/pose'].messages]
+    corrections = [json.loads(message) for message in pubs['/preview/map_to_odom'].messages]
+    assert any(p['state'] == 'error' and p['pose'] is None for p in poses)
+    assert any(c['state'] == 'error' and c['transform'] is None for c in corrections)
+    assert poses[-1]['state'] == corrections[-1]['state'] == 'stopped'
+
+
+def test_geometry_stop_clears_pose_without_stopping_sources():
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .8}
+    node = SlamInputNode('/o', '/c', stream(), clock=lambda: 1., preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 10,
+        'interval_s': .1, 'backend': 'geometry_experimental', 'geometry': opts})
+    node.start_preview(); node.stop_preview()
+    pubs = {p.topic: p for p in node.publishers}
+    assert json.loads(pubs['/preview/pose'].messages[-1])['state'] == 'stopped'
+    assert json.loads(pubs['/preview/map_to_odom'].messages[-1])['transform'] is None
+    assert {sub.topic for sub in node.subscriptions} == {'/o', '/c'}
+
+
 def test_invalid_preview_configuration_does_not_leak_ros_node():
     from vision_stubs import _FakeNode
     with pytest.raises(ValueError):

@@ -322,7 +322,10 @@ export const SlamPreviewRenderer = {
     const decoded = decodeSlamPreview(buffer);
     if (!decoded) return;
     if (this._previewBadge) {
-      this._previewBadge.textContent = `里程计预览 · 未验证 · 无回环 · 关键帧位置 · ${decoded.meta.frame_id} / ${decoded.meta.segment_id}`;
+      const label = decoded.meta.kind === 'unvalidated_geometry_preview'
+        ? `几何候选优化预览 · 未验证 · 候选 ${decoded.meta.candidate_count}`
+        : '里程计预览 · 未验证 · 无回环';
+      this._previewBadge.textContent = `${label} · 关键帧位置 · ${decoded.meta.frame_id} / ${decoded.meta.segment_id}`;
     }
     MappingRenderer.onData.call(this, decoded.payload);
   },

@@ -38,3 +38,13 @@ def test_preview_rejects_invalid_coordinates_and_unbounded_count():
         encode_preview([[0, 0, 0]], np.eye(4), max_points=80001, metadata=META)
     with pytest.raises(ValueError):
         encode_preview([[0, 0, 0]], np.eye(4), max_points=10, metadata={})
+
+
+def test_geometry_preview_is_explicitly_unvalidated_and_cannot_claim_loops():
+    meta = {**META, 'backend': 'geometry_experimental', 'candidate_count': 2}
+    header, _ = unpack(encode_preview([[0, 0, 0]], np.eye(4), max_points=10, metadata=meta))
+    assert header['kind'] == 'unvalidated_geometry_preview'
+    assert header['candidate_count'] == 2 and header['accepted_loops'] == 0
+    with pytest.raises(ValueError):
+        encode_preview([[0, 0, 0]], np.eye(4), max_points=10,
+                       metadata={**meta, 'candidate_count': -1})

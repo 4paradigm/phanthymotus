@@ -62,6 +62,7 @@ class SlamInputNode(Node):
 
     def __init__(self, odom_topic, cloud_topic, stream, *, clock=time.monotonic,
                  measurement_clock_ns=None, preview=None):
+        loop_search = None
         if preview is not None:
             if not isinstance(preview, dict):
                 raise ValueError('invalid diagnostic preview settings')
@@ -69,7 +70,7 @@ class SlamInputNode(Node):
             if (not isinstance(interval, (int, float)) or isinstance(interval, bool) or
                     not math.isfinite(interval) or not .1 <= interval <= 60. or
                     type(count) is not int or not 0 < count <= 80000 or
-                    preview.get('backend') not in ('raw', 'gtsam') or
+                    preview.get('backend') not in ('raw', 'gtsam', 'geometry_experimental') or
                     any(not isinstance(preview.get(k), str) or not preview[k].strip()
                         for k in ('topic', 'status_topic')) or preview['topic'] == preview['status_topic']):
                 raise ValueError('invalid diagnostic preview settings')
@@ -78,12 +79,21 @@ class SlamInputNode(Node):
                 if sigmas.shape != (6,) or not np.isfinite(sigmas).all() or np.any(sigmas <= 0):
                     raise ValueError('gtsam preview requires six positive noise sigmas')
                 import gtsam  # noqa: F401 — fail startup if target dependency is unavailable
+            if preview['backend'] == 'geometry_experimental':
+                import gtsam  # noqa: F401
+                import open3d  # noqa: F401
+                from .pointcloud_slam_loop_search import ExperimentalLoopSearch
+                if not isinstance(preview.get('geometry'), dict):
+                    raise ValueError('explicit geometry settings required')
+                loop_search = ExperimentalLoopSearch(**preview['geometry'])
         super().__init__('pointcloud_slam_input')
         self.stream = stream
         self._clock = clock
         self._measurement_clock_ns = measurement_clock_ns or (lambda: self.get_clock().now().nanoseconds)
         self._lock = threading.Lock()
         self._preview = preview
+        self._loop_search = loop_search
+        self._loop_segment = None
         self._preview_stop = threading.Event()
         self._preview_wake = threading.Event()
         self._preview_worker = None
@@ -92,6 +102,9 @@ class SlamInputNode(Node):
             if preview:
                 self._preview_pub = self.create_publisher(UInt8MultiArray, preview['topic'], _QOS)
                 self._preview_status_pub = self.create_publisher(String, preview['status_topic'], _QOS)
+                if preview['backend'] == 'geometry_experimental':
+                    self._map_pose_pub = self.create_publisher(String, preview['topic'] + '/pose', _QOS)
+                    self._map_correction_pub = self.create_publisher(String, preview['topic'] + '/map_to_odom', _QOS)
             self.create_subscription(String, odom_topic, self._odom, _QOS)
             self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
         except Exception:
@@ -130,6 +143,7 @@ class SlamInputNode(Node):
             self._preview_wake.set()
 
     def stop_preview(self):
+        already_stopped = self._preview_stop.is_set()
         self._preview_stop.set()
         self._preview_wake.set()
         if self._preview_worker:
@@ -138,7 +152,16 @@ class SlamInputNode(Node):
                 log.warning('SLAM preview worker still stopping')
         # A publisher already in progress holds this lock; wait before node disposal.
         with self._lock:
-            pass
+            if (not already_stopped and self._preview and
+                    self._preview['backend'] == 'geometry_experimental'):
+                message = String()
+                message.data = json.dumps({'kind': 'unvalidated_geometry_pose',
+                    'state': 'stopped', 'pose': None, 'accepted_loops': 0})
+                self._map_pose_pub.publish(message)
+                message = String()
+                message.data = json.dumps({'kind': 'unvalidated_map_to_odom',
+                    'state': 'stopped', 'transform': None, 'accepted_loops': 0})
+                self._map_correction_pub.publish(message)
 
     def _preview_loop(self):
         last = 0.
@@ -158,10 +181,22 @@ class SlamInputNode(Node):
                     self.stream.last_error = 'preview error: ' + str(error)[:200]
                     if not self._preview_stop.is_set():
                         message = String()
-                        message.data = json.dumps({'kind': 'unvalidated_odometry_preview',
+                        message.data = json.dumps({'kind': ('unvalidated_geometry_preview'
+                            if self._preview['backend'] == 'geometry_experimental' else 'unvalidated_odometry_preview'),
                             'state': 'error', 'accepted_loops': 0,
                             'last_error': self.stream.last_error}, allow_nan=False)
                         self._preview_status_pub.publish(message)
+                        if self._preview['backend'] == 'geometry_experimental':
+                            self._loop_search = None
+                            self._loop_segment = None
+                            message = String()
+                            message.data = json.dumps({'kind': 'unvalidated_geometry_pose',
+                                'state': 'error', 'pose': None, 'accepted_loops': 0})
+                            self._map_pose_pub.publish(message)
+                            message = String()
+                            message.data = json.dumps({'kind': 'unvalidated_map_to_odom',
+                                'state': 'error', 'transform': None, 'accepted_loops': 0})
+                            self._map_correction_pub.publish(message)
                 self._preview_errors += 1
                 if self._preview_errors == 1 or self._preview_errors % 100 == 0:
                     log.exception('SLAM preview failed (%d)', self._preview_errors)
@@ -184,8 +219,10 @@ class SlamInputNode(Node):
                 graph = segment = None
             else:
                 segment = segments[-1]
-                graph = self.stream.graph()[-1] if preview_subscribed else None
-        result = {'kind': 'unvalidated_odometry_preview',
+                graph = self.stream.graph()[-1] if (preview_subscribed or
+                         self._preview['backend'] == 'geometry_experimental') else None
+        geometry = self._preview['backend'] == 'geometry_experimental'
+        result = {'kind': 'unvalidated_geometry_preview' if geometry else 'unvalidated_odometry_preview',
                   'state': 'stale' if status['odometry'] == 'tracking' and status['cloud'] == 'stale' else status['odometry'],
                   'cloud_state': status['cloud'],
                   'integration': status['integration'], 'accepted_loops': 0,
@@ -194,13 +231,34 @@ class SlamInputNode(Node):
                   'stamp_ns': str(segment.frames[-1].cloud_stamp_ns) if segment else None,
                   'backend': self._preview['backend'], 'last_error': status['last_error']}
         packet = None
-        if segment is not None and preview_subscribed:
+        if segment is None and geometry:
+            self._loop_search = None
+            self._loop_segment = None
+        if segment is not None and (preview_subscribed or geometry):
             poses = graph['poses']
-            if self._preview['backend'] == 'gtsam':
+            if geometry:
+                if self._loop_search is None or self._loop_segment != segment.segment_id:
+                    from .pointcloud_slam_loop_search import ExperimentalLoopSearch
+                    self._loop_search = ExperimentalLoopSearch(**self._preview['geometry'])
+                    self._loop_segment = segment.segment_id
+                loop = self._loop_search.update(segment, graph)
+                poses = loop['poses']
+                result.update(candidate_count=len(loop['passed_candidates']),
+                              candidate_attempts=loop['candidate_attempts'],
+                              descriptor_skips=loop['descriptor_skips'],
+                              odom_frame=segment.frames[0].pose.frame_id,
+                              frame_id=segment.frames[0].pose.frame_id + '_experimental_map',
+                              map_pose=np.asarray(poses[-1]).tolist(),
+                              map_from_odom=np.asarray(loop['map_from_odom']).tolist())
+                points = loop['after_map']
+            elif self._preview['backend'] == 'gtsam':
                 from .pointcloud_slam_backend import optimize_odometry_graph
                 poses = optimize_odometry_graph(graph, sigmas=self._preview['sigmas'])
-            packet = encode_preview(rebuild_segment(segment, poses), poses[-1],
-                                    max_points=self._preview['max_points'], metadata=result)
+                points = rebuild_segment(segment, poses)
+            else:
+                points = rebuild_segment(segment, poses)
+            if preview_subscribed:
+                packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=result)
         with self._lock:
             if self._preview_stop.is_set():
                 return
@@ -209,20 +267,32 @@ class SlamInputNode(Node):
             latest_status = self.stream.status(now=self._clock(), measurement_now_ns=measurement_now)
             if (latest_status['odometry'] != 'tracking' or latest_status['cloud'] != 'active' or
                     latest_status['integration'] != 'collecting_unverified'):
+                if geometry:
+                    self._loop_search = None
+                    self._loop_segment = None
                 packet = None
                 state = ('stale' if latest_status['odometry'] == 'tracking' and latest_status['cloud'] == 'stale'
                          else latest_status['odometry'])
                 result.update(state=state, cloud_state=latest_status['cloud'], integration=latest_status['integration'],
                               last_error=latest_status['last_error'], segment_id=None,
                               frame_id=None, stamp_ns=None)
+                result.pop('map_pose', None)
+                result.pop('map_from_odom', None)
             # Do not publish a snapshot after its segment/frame changed during work.
             current = self.stream.store.segments
             current_active = self.stream._poses[-1].segment_id if self.stream._poses else None
-            if segment is not None and latest_status['odometry'] == 'tracking' and (
-                    not current or current_active != segment.segment_id or
-                    current[-1].frames[-1].cloud_stamp_ns != segment.frames[-1].cloud_stamp_ns):
-                self._preview_wake.set()
-                return
+            if segment is not None and latest_status['odometry'] == 'tracking':
+                if not current or current_active != segment.segment_id:
+                    self._preview_wake.set()
+                    return
+                if current[-1].frames[-1].cloud_stamp_ns != segment.frames[-1].cloud_stamp_ns:
+                    self._preview_wake.set()
+                    if not geometry or measurement_now is None:
+                        return
+                    try:
+                        self.stream._check_measurement_time(segment.frames[-1].cloud_stamp_ns, measurement_now)
+                    except ValueError:
+                        return
             if packet is not None:
                 msg = UInt8MultiArray()
                 msg.data = packet
@@ -230,6 +300,20 @@ class SlamInputNode(Node):
             message = String()
             message.data = json.dumps(result, allow_nan=False)
             self._preview_status_pub.publish(message)
+            if geometry:
+                common = {'state': result['state'], 'stamp_ns': result['stamp_ns'],
+                          'segment_id': result['segment_id'], 'map_frame': result['frame_id'],
+                          'odom_frame': result.get('odom_frame'), 'accepted_loops': 0,
+                          'candidate_count': result.get('candidate_count', 0)}
+                message = String()
+                message.data = json.dumps({**common, 'kind': 'unvalidated_geometry_pose',
+                    'child_frame': segment.frames[-1].pose.child_frame_id if result['segment_id'] else None,
+                    'pose': result.get('map_pose')}, allow_nan=False)
+                self._map_pose_pub.publish(message)
+                message = String()
+                message.data = json.dumps({**common, 'kind': 'unvalidated_map_to_odom',
+                    'transform': result.get('map_from_odom')}, allow_nan=False)
+                self._map_correction_pub.publish(message)
 
     def optimize_odometry(self, *, sigmas):
         """Return experimental per-segment snapshots; publish nothing."""

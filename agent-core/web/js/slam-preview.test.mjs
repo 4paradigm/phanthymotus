@@ -30,6 +30,14 @@ test('invalid metadata and unvalidated loop claims cannot be rendered', () => {
   assert.equal(decodeSlamPreview(new ArrayBuffer(4)), null);
 });
 
+test('geometry hypothesis is labelled and cannot claim validated loops', () => {
+  const meta = {...metadata, kind: 'unvalidated_geometry_preview',
+    backend: 'geometry_experimental', candidate_count: 2};
+  assert.equal(decodeSlamPreview(packet(meta)).meta.candidate_count, 2);
+  assert.equal(decodeSlamPreview(packet({...meta, accepted_loops: 1})), null);
+  assert.equal(decodeSlamPreview(packet({...meta, candidate_count: -1})), null);
+});
+
 test('dashboard keeps the latest preview, including odd-length packets', () => {
   const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
   const start = source.indexOf('class SkillBuffer {');
