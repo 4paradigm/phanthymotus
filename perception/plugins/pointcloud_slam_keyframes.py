@@ -59,9 +59,6 @@ class KeyframeStore:
         points = np.asarray(points)
         if points.ndim != 2 or points.shape[1] != 3 or not len(points):
             raise ValueError('local cloud must contain Nx3 points')
-        if (self._frame_count >= self._max_frames or
-                self._point_count + len(points) > self._max_points):
-            raise CapacityError('keyframe capacity reached')
         try:
             points = np.asarray(points, dtype=np.float64)
             if not np.isfinite(points).all():
@@ -81,11 +78,20 @@ class KeyframeStore:
                     raise ValueError('pose frames or clock changed within segment')
             elif any(segment_id == pose.segment_id for segment_id, _ in self._segments):
                 raise ValueError('segment cannot be reused')
-        # Immutable bytes prevent callers from mutating retained map history.
-        points = np.frombuffer(points.tobytes(), dtype=np.float64).reshape(-1, 3)
+        points = self._retain(pose, points, cloud_stamp_ns)
+        if points is None:
+            return False
         if not self._segments or pose.segment_id != self._segments[-1][0]:
             self._segments.append((pose.segment_id, []))
         self._segments[-1][1].append(Keyframe(pose, cloud_stamp_ns, points))
         self._frame_count += 1
         self._point_count += len(points)
         self._lost = False
+        return True
+
+    def _retain(self, pose, points, stamp):
+        if (self._frame_count >= self._max_frames or
+                self._point_count + len(points) > self._max_points):
+            raise CapacityError('keyframe capacity reached')
+        # Immutable bytes prevent callers from mutating retained map history.
+        return np.frombuffer(points.tobytes(), dtype=np.float64).reshape(-1, 3)

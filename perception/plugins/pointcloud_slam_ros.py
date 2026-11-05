@@ -1,5 +1,6 @@
 """ROS input adapter for the experimental, odometry-only SLAM graph."""
 import json
+import hashlib
 import math
 import threading
 import time
@@ -99,6 +100,10 @@ class SlamInputNode(Node):
         self._loop_segment = None
         self._segment_links = []
         self._segment_loops = {}
+        self._rolling_searches = {}
+        self._history_snapshots = {}
+        self._history_publishers = {}
+        self._history_published_at = {}
         self._preview_stop = threading.Event()
         self._preview_wake = threading.Event()
         self._preview_worker = None
@@ -208,6 +213,9 @@ class SlamInputNode(Node):
                 self._preview_errors = 0
             except Exception as error:
                 with self._lock:
+                    from .pointcloud_slam_paged_store import StorageError
+                    if isinstance(error, StorageError):
+                        self.stream.store.storage_error = str(error)
                     self.stream.last_error = 'preview error: ' + str(error)[:200]
                     if not self._preview_stop.is_set():
                         message = String()
@@ -234,11 +242,68 @@ class SlamInputNode(Node):
                 self._compute_started = None
             last = time.monotonic()
 
+    def history_topics(self):
+        """Expose archived coordinate systems separately, never merge source segments."""
+        if not self._preview or not self._preview.get('persistent_history'):
+            return []
+        with self._lock:
+            active = (self.stream._poses[-1].segment_id if self.stream._poses and
+                      not self.stream.store.requires_new_segment else None)
+            topics = []
+            for segment in self.stream.store.segments:
+                if segment.segment_id == active:
+                    continue
+                topic = self._preview['topic'] + '/history/' + hashlib.sha256(
+                    segment.segment_id.encode()).hexdigest()[:16]
+                if topic not in self._history_publishers and not self._preview_stop.is_set():
+                    self._history_publishers[topic] = self.create_publisher(UInt8MultiArray, topic, _QOS)
+                topics.append({'topic': topic, 'format': 'sensor/slam-preview',
+                               'segment_id': segment.segment_id})
+            return topics
+
+    def _publish_history_previews(self):
+        from .pointcloud_slam_keyframes import Segment
+        from .pointcloud_slam_stream import _matrix
+        from .pointcloud_slam_map import rebuild_segment
+        from .pointcloud_slam_preview import encode_preview
+        for output in self.history_topics():
+            topic, sid = output['topic'], output['segment_id']
+            with self._lock:
+                if self._preview_stop.is_set(): return
+                pub = self._history_publishers[topic]
+                if not pub.get_subscription_count():
+                    self._history_published_at.pop(topic, None)
+                    continue
+                if time.monotonic() - self._history_published_at.get(topic, -10.) < 10.:
+                    continue
+                segment = next(s for s in self.stream.store.segments if s.segment_id == sid)
+                snapshot = self._history_snapshots.get(sid)
+            # A checkpoint may include a few inputs newer than its last optimized
+            # snapshot. Display that snapshot exactly, without relabelling raw tail.
+            if snapshot:
+                poses = [np.asarray(p) for p in snapshot['poses']]
+                segment = Segment(sid, segment.frames[:len(poses)])
+            else:
+                poses = [_matrix(f.pose) for f in segment.frames]
+            metadata = {'segment_id': sid, 'frame_id': segment.frames[0].pose.frame_id + '_archive',
+                        'stamp_ns': str(segment.frames[-1].cloud_stamp_ns),
+                        'backend': 'geometry_experimental' if snapshot else 'raw',
+                        'candidate_count': snapshot.get('candidate_count', 0) if snapshot else 0,
+                        'state': 'historical_snapshot', 'input_validation': self._preview.get('input_validation')}
+            points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
+            packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata)
+            with self._lock:
+                if self._preview_stop.is_set(): return
+                message = UInt8MultiArray(); message.data = packet
+                pub.publish(message)
+                self._history_published_at[topic] = time.monotonic()
+
     def publish_preview_once(self):
         """Publish a bounded diagnostic snapshot, never an accepted SLAM map."""
         from .pointcloud_slam_map import rebuild_segment
         from .pointcloud_slam_preview import encode_preview
         started = time.perf_counter()
+        self._publish_history_previews()
         preview_subscribed = self._preview_pub.get_subscription_count() > 0
         with self._lock:
             measurement_now = (self._measurement_clock_ns()
@@ -252,9 +317,9 @@ class SlamInputNode(Node):
                 graph = segment = None
             else:
                 segment = segments[-1]
-                graphs = self.stream.graph() if (preview_subscribed or
-                         self._preview['backend'] == 'geometry_experimental') else None
-                graph = graphs[-1] if graphs else None
+                graphs = (self.stream.graph() if not self._preview.get('persistent_history') and
+                          (preview_subscribed or self._preview['backend'] == 'geometry_experimental') else None)
+                graph = graphs[-1] if graphs else {'poses': []}
         geometry = self._preview['backend'] == 'geometry_experimental'
         result = {'kind': 'unvalidated_geometry_preview' if geometry else 'unvalidated_odometry_preview',
                   'input_validation': self._preview.get('input_validation'),
@@ -268,22 +333,38 @@ class SlamInputNode(Node):
         packet = None
         staged_links = None
         staged_loops = None
+        staged_history = None
         if segment is None and geometry:
             self._loop_search = None
             self._loop_segment = None
         if segment is not None and (preview_subscribed or geometry):
             poses = graph['poses']
             if geometry:
-                if self._loop_search is None or self._loop_segment != segment.segment_id:
-                    from .pointcloud_slam_loop_search import ExperimentalLoopSearch
-                    self._loop_search = ExperimentalLoopSearch(**self._preview['geometry'])
-                    self._loop_segment = segment.segment_id
-                loop = self._loop_search.update(segment, graph, online=True,
-                                                max_points=self._preview['max_points'])
+                if self._preview.get('persistent_history'):
+                    from .pointcloud_slam_rolling import RollingGeometryHistory
+                    if segment.segment_id not in self._rolling_searches:
+                        self._rolling_searches[segment.segment_id] = RollingGeometryHistory(
+                            self._preview['geometry'], window_frames=self.stream.store._max_frames,
+                            window_points=self.stream.store._max_points)
+                    loop = self._rolling_searches[segment.segment_id].update(
+                        segment, max_points=self._preview['max_points'])
+                    staged_history = {'candidate_count': loop['candidate_count'],
+                                      'poses': [p.tolist() for p in loop['poses']],
+                                      'stamps': [f.cloud_stamp_ns for f in segment.frames]}
+                    result.update(submaps=loop['submaps'], active_keyframes=loop['active_keyframes'],
+                                  frozen_keyframes=loop['frozen_keyframes'],
+                                  history_policy='frozen_submaps_no_global_loop_correction')
+                else:
+                    if self._loop_search is None or self._loop_segment != segment.segment_id:
+                        from .pointcloud_slam_loop_search import ExperimentalLoopSearch
+                        self._loop_search = ExperimentalLoopSearch(**self._preview['geometry'])
+                        self._loop_segment = segment.segment_id
+                    loop = self._loop_search.update(segment, graph, online=True,
+                                                    max_points=self._preview['max_points'])
                 poses = loop['poses']
                 result['timings_ms'] = loop['timings_ms']
                 result['descriptor_unindexed'] = loop['descriptor_unindexed']
-                result.update(candidate_count=len(loop['passed_candidates']),
+                result.update(candidate_count=loop.get('candidate_count', len(loop['passed_candidates'])),
                               candidate_attempts=loop['candidate_attempts'],
                               descriptor_skips=loop['descriptor_skips'],
                               odom_frame=segment.frames[0].pose.frame_id,
@@ -370,6 +451,7 @@ class SlamInputNode(Node):
                 result.pop('segment_links', None)
                 staged_links = None
                 staged_loops = None
+                staged_history = None
             # Do not publish a snapshot after its segment/frame changed during work.
             current = self.stream.store.segments
             current_active = self.stream._poses[-1].segment_id if self.stream._poses else None
@@ -381,6 +463,7 @@ class SlamInputNode(Node):
                     self._preview_wake.set()
                     if not geometry or measurement_now is None:
                         return
+                if geometry and measurement_now is not None and result.get('map_pose') is not None:
                     try:
                         self.stream._check_measurement_time(segment.frames[-1].cloud_stamp_ns, measurement_now)
                     except ValueError:
@@ -392,6 +475,8 @@ class SlamInputNode(Node):
                         if packet is not None:
                             packet = encode_preview(points, poses[-1],
                                 max_points=self._preview['max_points'], metadata=result)
+            if staged_history is not None:
+                self._history_snapshots[segment.segment_id] = staged_history
             if staged_links is not None:
                 self._segment_links = staged_links
             if staged_loops is not None:

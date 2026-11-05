@@ -45,3 +45,10 @@ preview_geometry:
     min_correspondences: 30
     max_cycle_translation_m: 0.03
     max_cycle_angle_deg: 2
+# Keep full local point history on disk; max_frames/max_points bound one active batch.
+# No additional canvas fields: these are device deployment budgets.
+persistent_history:
+  max_disk_bytes: 2147483648
+  reserve_bytes: 1073741824
+  min_translation_m: 0.1
+  min_rotation_deg: 10.0

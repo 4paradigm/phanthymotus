@@ -4,6 +4,7 @@ import math
 import os
 import re
 import threading
+import uuid
 from copy import deepcopy
 
 from .pointcloud_slam_ros import SlamInputNode
@@ -151,8 +152,13 @@ class PointCloudSlamPlugin:
                     from .pointcloud_slam_archive import save_archive
                     os.makedirs(_ARCHIVE_DIR, exist_ok=True)
                     with self._node._lock:
-                        save_archive(path, self._node.stream.store, self._node._segment_links,
-                                     self._node._segment_loops, self._config)
+                        if self._config.get('persistent_history'):
+                            from .pointcloud_slam_paged_archive import save_paged_archive
+                            save_paged_archive(path, self._node.stream.store,
+                                               self._node._history_snapshots, self._config)
+                        else:
+                            save_archive(path, self._node.stream.store, self._node._segment_links,
+                                         self._node._segment_loops, self._config)
                     return {'state': 'saved', 'path': path}
                 except (ValueError, TypeError, OSError, KeyError) as error:
                     return {'state': 'error', 'message': str(error)}
@@ -166,6 +172,8 @@ class PointCloudSlamPlugin:
                 if node and node._preview and node._preview['backend'] == 'geometry_experimental':
                     outputs += [{'topic': node._preview['topic'] + '/pose', 'format': 'data/json'},
                                 {'topic': node._preview['topic'] + '/map_to_odom', 'format': 'data/json'}]
+                if node:
+                    outputs += node.history_topics()
                 return {'state': 'running' if node else 'idle',
                         'input_validation': self._input_validation(),
                         'desc': '实验输入与未验证里程计预览；无真实回环',
@@ -209,17 +217,31 @@ class PointCloudSlamPlugin:
                     'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
             try:
                 stream = SlamStream(**{key: self._config[key] for key in keys})
-                links, loops = [], {}
+                links, loops, history = [], {}, {}
+                persistent = self._config.get('persistent_history')
+                if persistent and (self._config.get('preview_backend') != 'geometry_experimental' or
+                                   self._config.get('preview_relocalization')):
+                    raise ValueError('paged history requires bounded geometry without cross-segment relocalization')
                 if self._config.get('restore_archive') is True:
-                    from .pointcloud_slam_archive import load_archive
-                    stream.store, links, loops = load_archive(_archive_path(self._config.get('archive_name')),
-                        self._config, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
+                    if persistent:
+                        from .pointcloud_slam_paged_archive import load_paged_archive
+                        stream.store, history = load_paged_archive(_archive_path(self._config.get('archive_name')),
+                            self._config, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
+                    else:
+                        from .pointcloud_slam_archive import load_archive
+                        stream.store, links, loops = load_archive(_archive_path(self._config.get('archive_name')),
+                            self._config, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
+                elif persistent:
+                    from .pointcloud_slam_paged_store import PagedKeyframeStore
+                    stream.store = PagedKeyframeStore(os.path.join(_ARCHIVE_DIR, 'sessions', uuid.uuid4().hex),
+                        max_frames=self._config['max_frames'], max_points=self._config['max_points'], **persistent)
                 cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
                 preview = None
                 if self._config.get('preview_enabled') is True:
                     preview = {'topic': cloud_topic + '/slam_odom_preview',
                                'input_validation': self._input_validation(),
                                'status_topic': cloud_topic + '/slam_odom_preview_status',
+                               'persistent_history': bool(persistent),
                                'backend': self._config.get('preview_backend', 'raw'),
                                'interval_s': self._config.get('preview_interval_s', 1.),
                                'max_points': self._config.get('preview_max_points', 40000),
@@ -228,6 +250,7 @@ class PointCloudSlamPlugin:
                                'relocalization': self._config.get('preview_relocalization', False)}
                 node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
                 node._segment_links, node._segment_loops = links, loops
+                node._history_snapshots = history
                 try:
                     self._executor.add_node(node)
                     node.start_preview()
@@ -235,7 +258,7 @@ class PointCloudSlamPlugin:
                     node.stop_preview()
                     dispose_node(self._executor, node, label='pointcloud_slam')
                     raise
-            except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as error:
+            except (ImportError, KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
                 return {'state': 'error', 'message': str(error)}
             self._topics = dict(bindings)
             self._node = node

@@ -432,3 +432,51 @@ map growth: the operator correctly noted that the remaining 300-frame global
 retention limit is inadequate for full-map sessions. Storage/submap lifecycle
 and actual keyframe selection require further work; increasing a constant is
 not sufficient. Do not describe complete-map acceptance as finished.
+
+### Persistent history replaces the global 300-frame cap
+
+The operator requested implementation rather than deferring the retention limit.
+The Bumi profile now uses disk-paged immutable keyframes with a 2 GiB session disk
+budget and a 1 GiB free-space reserve. The existing 300-frame/6-million-point
+settings bound **one active optimization batch**, not total map history. Translation
+of 0.1 m or rotation of 10 degrees selects a new keyframe relative to the last
+successfully committed frame. Cloud health still updates on stationary frames.
+Real source segment changes always retain a first frame and remain unmerged.
+No new canvas configuration fields were added.
+
+Point files are written/fsynced/renamed before journal commit; failures latch a
+storage fault and preserve committed history. Readers open one mapping at a time,
+select points before copying, and release it. Each fixed batch overlaps its prior
+batch by one anchor, using full SE(3) alignment `M_anchor @ inverse(L_anchor)`.
+Completed batch poses are frozen; this does not implement globally correcting
+old batches through cross-batch loop closure. Old points stay visible in the
+current source segment's bounded preview. Distinct archived source segments have
+separate history output topics retaining their original coordinates and capture
+time; they are never emitted as a current pose. Explicit restore still requires
+a new source segment for new fusion.
+
+Small checkpoints reference checked point files and immutable optimized-history
+snapshots. Oversized checkpoint metadata is rejected before replacing a prior
+save; corrupt/missing files and configuration/verification-policy mismatch reject
+restore. Raw point files remain in the session directory and are not embedded in
+a huge JSON document. No silent eviction, invented segment, arrival-time capture
+stamp or raw-odometry overwrite is introduced.
+
+Validation: 192 SLAM tests passed on both host and Bumi (final target run: 27.83 s). New real-rclpy
+DDS lifecycle check passed: 12 synthetic keyframes with a 3-frame window, multiple
+batches, live preview output, save/stop/restore, separate historical output while
+waiting for a new source segment, and complete node disposal. This is isolated
+ROS domain 89 with no network or live robot commands.
+
+Bumi resource-limited replay: 2 CPUs / 2 GiB, 620 captured real clouds reused with
+an explicitly synthetic moving/rotating trajectory, 3 batches. All 620 frames and
+history poses retained; active window never exceeded 300. Compute median 1.129 s,
+p95 1.853 s, maximum 2.224 s; append median 17.87 ms, max 123.94 ms. Process peak
+RSS 331720 KiB (324 MiB); observed container usage around 499 MiB including cache.
+Point/journal storage 282172383 bytes; checkpoint 378637 bytes, save 0.068 s,
+restore 4.408 s. Restored keyframe count 620 and history poses exactly equal.
+Report: `/tmp/slam-paged-validation/result.json` and log
+`/tmp/slam-paged-benchmark.log` on Bumi. This proves bounded runtime growth beyond
+300 and restoration, not real-scene global SLAM accuracy. Final directory-fsync
+and separate history-display changes receive target regression checks before
+service deployment.

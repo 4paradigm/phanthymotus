@@ -47,7 +47,7 @@ class ExperimentalLoopSearch:
         self._descriptors, self._stamps = [], []
         self._segment_id, self._attempts, self._skips, self._last = None, 0, 0, None
 
-    def update(self, segment, graph, *, online=False, max_points=None):
+    def update(self, segment, graph, *, online=False, max_points=None, build_map=True):
         started = time.perf_counter()
         descriptor_s = graph_s = 0.
         if (not isinstance(segment, Segment) or not segment.frames or
@@ -113,7 +113,8 @@ class ExperimentalLoopSearch:
             self._last = {**result, 'candidate_attempts': self._attempts, 'descriptor_skips': self._skips}
         tick = time.perf_counter()
         self._last['before_map'] = (None if online else rebuild_segment(segment, graph['poses']))
-        self._last['after_map'] = rebuild_segment(segment, self._last['poses'], max_points=max_points)
+        self._last['after_map'] = (rebuild_segment(segment, self._last['poses'], max_points=max_points)
+                                   if build_map else None)
         self._last['descriptor_unindexed'] = sum(d is None for d in self._descriptors) - self._skips
         self._last['timings_ms'] = {'descriptor': descriptor_s * 1000,
             'registration_and_graph': graph_s * 1000,

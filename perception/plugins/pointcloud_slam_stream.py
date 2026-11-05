@@ -112,13 +112,18 @@ class SlamStream:
                 cloud_state = 'stale'
         integration = ('waiting_for_tracking' if odom_state != 'tracking' else
                        'waiting_for_new_segment' if self.store.requires_new_segment else
+                       'storage_fault' if getattr(self.store, 'storage_error', '') else
                        'capacity_reached' if self._capacity_reached else
                        'collecting_unverified')
         return {'odometry': odom_state, 'cloud': cloud_state, 'pending_clouds': len(self._pending),
                 'integration': integration,
                 'dropped_pending': self._dropped_pending, 'segments': len(segments),
                 'keyframes': sum(len(segment.frames) for segment in segments),
-                'last_error': last_error}
+                'last_error': last_error,
+                'storage': ({'mode': 'paged', 'disk_bytes': self.store.disk_bytes,
+                             'skipped_stationary': self.store.skipped_stationary,
+                             'active_frame_limit': self.store._max_frames}
+                            if hasattr(self.store, 'disk_bytes') else {'mode': 'memory'})}
 
     def _check_measurement_time(self, stamp_ns, measurement_now_ns):
         if self.max_measurement_age_ms is None:

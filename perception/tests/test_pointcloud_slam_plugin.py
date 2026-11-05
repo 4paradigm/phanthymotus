@@ -339,3 +339,58 @@ def test_deployed_trial_profile_waits_for_data_without_claiming_calibration():
     node._odom(NS(data=json.dumps(odom(1010, status='lost'))))
     assert node.status()['odometry'] == 'lost'
     plugin.stop()
+
+
+def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, monkeypatch):
+    import json
+    import pytest
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    from types import SimpleNamespace as NS
+    import plugins.pointcloud_slam_plugin as module
+    import plugins.pointcloud_slam_rolling as rolling
+    from plugins.pointcloud_slam_ros import SlamInputNode
+    from test_pointcloud_slam_rolling import FakeSearch
+    from test_pointcloud_slam_stream import odom
+    from test_pointcloud_slam_ros import cloud
+    from test_pointcloud_slam_geometry_gate import thresholds
+    monkeypatch.setattr(module,'_ARCHIVE_DIR',str(tmp_path))
+    monkeypatch.setattr(SlamInputNode,'start_preview',lambda self:None)
+    monkeypatch.setattr(rolling,'ExperimentalLoopSearch',FakeSearch)
+    settings={**config(),'max_frames':3,'archive_name':'paged','preview_enabled':True,
+        'preview_backend':'geometry_experimental','persistent_history':{
+            'max_disk_bytes':10_000_000,'reserve_bytes':0,'min_translation_m':.1,'min_rotation_deg':10},
+        'preview_geometry':{'descriptor_voxel_m':.08,'min_separation_s':.25,
+            'candidate_separation_s':.01,'max_per_frame':2,'max_candidates':4,
+            'thresholds':thresholds(),'odom_sigmas':[.1]*6,'loop_sigmas':[.05]*6,
+            'huber_k':1.,'voxel_m':.04,'max_distance_m':.8}}
+    args={'action':'start','input_topics':['/o','/c'],
+          'input_bindings':{'/o':'state/odom','/c':'sensor/pointcloud2'},
+          'odom_interfaces':{'/o':{'schema':'motus.odom/1','slam_pose':{'available':True,'profile':'motus_slam/1'}}}}
+    p=PointCloudSlamPlugin(settings,_FakeExecutor())
+    assert p.dispatch('pointcloud_slam',args)['state']=='running'
+    n=p._node;now=[1.];n._receipt_clock=lambda:now[0];n._measurement_clock_ns=lambda:int(now[0]*1e9)
+    for i in range(12):
+        now[0]=(1000+i*100)/1000
+        n._odom(NS(data=json.dumps(odom(1000+i*100,x=i))))
+        c=cloud();c.header.stamp.sec=int(now[0]);c.header.stamp.nanosec=(i%10)*100_000_000
+        n._cloud(c);n.publish_preview_once()
+    assert n.status()['keyframes']==12
+    assert n.status()['integration']=='collecting_unverified'
+    assert n._history_snapshots['a']['poses']
+    assert p.dispatch('pointcloud_slam',{'action':'save_map'})['state']=='saved'
+    p.stop()
+    p=PointCloudSlamPlugin({**settings,'restore_archive':True},_FakeExecutor())
+    assert p.dispatch('pointcloud_slam',args)['state']=='running'
+    assert p._node.stream.store._frame_count==12
+    assert len(p._node._history_snapshots['a']['poses'])==12
+    p._node.publish_preview_once()
+    outputs=p.dispatch('pointcloud_slam',{'action':'info'})['topic_out']
+    history_topics=[o['topic'] for o in outputs if '/history/' in o['topic']]
+    assert len(history_topics)==1
+    pubs={pub.topic:pub for pub in p._node.publishers}
+    from test_pointcloud_slam_preview import unpack
+    meta,_=unpack(pubs[history_topics[0]].messages[-1])
+    assert meta['segment_id']=='a' and meta['state']=='historical_snapshot'
+    assert not pubs['/c/slam_odom_preview'].messages
+    assert p._node.stream.store.requires_new_segment
+    p.stop()
