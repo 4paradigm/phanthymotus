@@ -18,7 +18,7 @@ bad at both.
   2. travel towards it      vx and vy, decomposed along its bearing
   3. turn to face it        wz from the same bearing, at the same time
   4. slow and sidestep for obstacles the depth bands report
-  5. stop at `stop_distance_m`, and say so
+  5. stop within `stop_distance_m + stop_tolerance_m`, and say so
 
 ── all three axes move together, and that is the whole point ────────────────
 
@@ -31,12 +31,12 @@ stop-turn-go gait, which on r1_sz read as a lurch at every bearing correction.
 
 ── the robot cannot move slowly, and that shapes everything above ───────────
 
-A legged base has to assemble a whole gait cycle, so below some speed it does
-not move at all — R1 needs 0.4 m/s and 1.0 rad/s, and under that the SDK accepts
-the command, returns 0, and nothing happens. So a proportional law cannot make a
-small correction *slowly*; it can only make it *briefly*. Every axis is
-therefore a switch with hysteresis (`Gate`) whose magnitude, once on, is lifted
-to at least the floor (`_lift`).
+A legged base may have to assemble a whole gait cycle, so below its declared
+minimum magnitude it does not move at all even though the SDK accepted the
+command. A proportional law then cannot make a small correction *slowly*; it
+can only make it *briefly*. Every axis is therefore a switch with hysteresis
+(`Gate`) whose magnitude, once on, is lifted to the Driver-declared floor
+(`_lift`).
 
 Two consequences that are not obvious and were both bugs here:
 
@@ -82,6 +82,14 @@ BLIND = "blind"          # no usable observation — distinct from "nothing seen
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 
+# A distance schedule, not online plant identification. Bounds are fixed so a
+# stalled chassis cannot learn an ever-larger command or a new speed floor.
+ADAPTIVE_FWD_MAX_SCALE = 3.0
+ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
+ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
+ADAPTIVE_YAW_MIN_SCALE = 0.5
+ADAPTIVE_YAW_MAX_SCALE = 1.0
+
 
 @dataclass
 class Config:
@@ -105,6 +113,11 @@ class Config:
     """
 
     stop_distance_m: float = 0.8
+    # Arrival may finish this far before the nominal camera-to-target distance.
+    # Five centimetres is the generic camera-depth tolerance. Live
+    # target/heading requirements still apply; this is not a tolerance for
+    # stale or predicted observations. Callers may request zero per action.
+    stop_tolerance_m: float = 0.05
     slow_distance_m: float = 1.5
     obstacle_stop_m: float = 0.6
     # Lateral offset that still allows full speed. **Not a gate** — past it the
@@ -142,8 +155,14 @@ class Config:
     # above 0 keeps the robot moving through the correction, which is what makes
     # the path an arc instead of a sequence of stops.
     align_min_scale: float = 0.45
-    k_yaw: float = 1.2
-    k_fwd: float = 0.6
+    k_yaw: float = 0.6
+    k_fwd: float = 0.9
+    adaptive_k_fwd: bool = False
+    adaptive_k_yaw: bool = True
+    # Optional effective P derived from the downstream Driver's declared yaw
+    # response.  Navi never measures or persists a robot-specific plant model;
+    # the component that owns the hardware owns that declaration.
+    response_yaw_gain: float | None = None
     vx_max: float = 1.0
     vy_max: float = 1.0
     wz_max: float = 1.5
@@ -189,14 +208,10 @@ class Config:
     # ...and stays engaged at least this long, so one noisy frame cannot end a
     # turn that has only just started.
     min_dwell_s: float = 0.25
-    # Searching turns at this rate. It must clear the robot's deadband or the
-    # search commands are snapped to zero and the robot simply stands there
-    # while the card reports "searching" — which is what happened on r1_sz once
-    # the deadband handling went in: R1 needs 1.0 rad/s and this was 0.4.
-    #
-    # Every speed in this file has to be read against `min_magnitude`; a value
-    # that looks conservatively slow may be one the robot cannot execute at all.
-    search_rate: float = 1.0
+    # Generic search rate. Driver limits safety-clamp it at start and the shared
+    # command path applies the declared yaw deadband, so this policy does not
+    # carry a robot-specific search speed.
+    search_rate: float = 0.6
     # Backstop only. The sweep below is what normally ends a search, because it
     # is behavioural — "I have turned all the way round and it is not here" —
     # whereas a clock says nothing about what the robot did with the time.
@@ -212,7 +227,7 @@ class Config:
     idle_timeout_s: float = 10.0
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
-    max_obs_age_ms: int = 500
+    max_obs_age_ms: int = 600
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
     # Confidence needed to **start** following something. Below this a
@@ -320,6 +335,55 @@ class Config:
     # facing" turned out to be.
     floor_wz_moving: float = 0.0
 
+    def __post_init__(self):
+        for key in ("response_yaw_gain",):
+            value = getattr(self, key)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{key} must be a finite nonnegative number") from error
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            setattr(self, key, value)
+        for flag in ("adaptive_k_fwd", "adaptive_k_yaw"):
+            if type(getattr(self, flag)) is not bool:
+                raise ValueError(f"{flag} must be a boolean")
+        for key, adaptive, maximum in (("k_fwd", self.adaptive_k_fwd, ADAPTIVE_FWD_MAX_SCALE),
+                                       ("k_yaw", self.adaptive_k_yaw, ADAPTIVE_YAW_MAX_SCALE)):
+            if isinstance(getattr(self, key), bool):
+                raise ValueError(f"{key} must be finite and nonnegative")
+            try:
+                base_gain = float(getattr(self, key))
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{key} must be finite and nonnegative") from error
+            if not math.isfinite(base_gain) or base_gain < 0:
+                raise ValueError(f"{key} must be finite and nonnegative")
+            if adaptive and not math.isfinite(base_gain * maximum):
+                raise ValueError(f"adaptive {key} and its maximum must be finite and nonnegative")
+            setattr(self, key, base_gain)
+        for key in ("stop_distance_m", "stop_tolerance_m"):
+            value = getattr(self, key)
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{key} must be a finite nonnegative number") from error
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            setattr(self, key, value)
+        if not math.isfinite(self.arrival_distance_m):
+            raise ValueError("stop_distance_m + stop_tolerance_m must be finite")
+
+    @property
+    def arrival_distance_m(self):
+        """Maximum camera-to-target range that satisfies the distance test."""
+        return self.stop_distance_m + self.stop_tolerance_m
+
 
 @dataclass
 class Gate:
@@ -380,6 +444,9 @@ class State:
     searching_for_s: float = 0.0
     searched_rad: float = 0.0
     commanded_vx: float = 0.0
+    adaptive_fwd_scale: float = 1.0
+    adaptive_yaw_scale: float = 1.0
+    avoidance_yaw_override: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     idle_for_s: float = 0.0
@@ -399,6 +466,8 @@ class Decision:
     reason: str = ""
     distance_m: float | None = None
     bearing: float | None = None
+    k_fwd_effective: float | None = None
+    k_yaw_effective: float | None = None
 
     @property
     def publishes(self) -> bool:
@@ -409,12 +478,10 @@ def apply_deadband(values, min_magnitude) -> list:
     """Lift each axis out of the robot's deadband, or drop it to zero.
 
     Some robots do nothing at all below a threshold — a legged base has to
-    assemble a whole gait cycle, so there is no "creep slowly" regime. R1 needs
-    0.4 m/s and 1.0 rad/s. Below that the SDK accepts the command, returns 0,
-    and the robot stands still, so a policy emitting a smooth ramp towards zero
-    spends its entire life commanding motion and producing none — with every
-    layer in between reporting success. That is exactly how it presented on
-    r1_sz: 159 commands applied, no errors anywhere, a motionless robot.
+    assemble a whole gait cycle, so there may be no "creep slowly" regime.
+    Below its threshold the SDK may accept the command while the robot stands
+    still, so a policy emitting a smooth ramp towards zero can spend its entire
+    life commanding motion and producing none.
 
     The threshold is the robot's, declared in its descriptor, so this function
     takes it as data rather than knowing any robot's numbers.
@@ -566,12 +633,11 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     who set `vx_max: 0.2` is owed the news that this robot cannot go that slowly,
     rather than a robot that ignores the setting.
 
-    Two directions, and both were real failures on r1_sz:
+    Two directions are handled:
 
-    * **Up, off the deadband.** `wz_max` defaulted to 0.8 against a 1.0 rad/s
-      floor, so the policy's entire output range was unexecutable and every turn
-      command snapped to 0 or ±1.0. Nothing reported anything — the SDK accepted
-      all of it.
+    * **Up, off the deadband.** A ceiling below the Driver-declared floor makes
+      the policy's entire output range unexecutable and every nonzero command
+      snap to that floor.
     * **Down, into the descriptor's limits.** A ceiling above `limits.upper` is
       a command `ControlSink` rejects, at the full command rate, for the whole
       run.
@@ -582,6 +648,15 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     floors = list(limits.get("min_magnitude") or [])
     lower = list(limits.get("lower") or [])
     upper = list(limits.get("upper") or [])
+
+    # Whether lateral motion exists is a hardware fact. Hidden UI defaults
+    # must not be able to turn a pinned vy axis back on (or disable one that the
+    # downstream explicitly exposes).
+    try:
+        config.use_lateral = not (
+            float(lower[1]) == 0.0 and float(upper[1]) == 0.0)
+    except (IndexError, TypeError, ValueError):
+        pass
 
     def at(row, index):
         try:
@@ -648,9 +723,8 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         # not make the robot creep around its own deadband.  It is still a
         # chassis command and alternates signs while sweeping, so its usable
         # magnitude is the smaller of the positive and negative yaw bounds.
-        # Bumi exposed this gap: its 0.83 rad/s yaw limit accepted normal
-        # steering after negotiation while the default 1.0 rad/s search was
-        # rejected at every tick.
+        # Without this separate clamp, normal steering may negotiate correctly
+        # while a fixed-rate search is rejected at every tick.
         if index == 5:
             yaw_lower = signed_at(lower, index)
             yaw_upper = signed_at(upper, index)
@@ -662,20 +736,64 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
                 search_cap = max(0.0, -yaw_lower)
             else:
                 search_cap = None
+            # Search uses the generic 0.6 rad/s default and is safety-clamped
+            # by the Driver's executable bidirectional yaw envelope. Deadband
+            # lifting happens later, per command, in the shared control path.
             candidate = config.search_rate
             if search_cap is not None:
                 candidate = min(candidate, search_cap)
-            if floor and candidate < floor:
+            if (floor and search_cap is not None
+                    and search_cap + 1e-9 < floor):
                 if config.search_rate != 0.0:
                     notes.append(
-                        f"search_rate 的可用上限 {candidate:g} 低于偏航最小可执行量 "
-                        f"{floor:g}，已停用搜索转身")
+                        f"search_rate 的双向上限 {search_cap:g} 低于偏航最小"
+                        f"可执行量 {floor:g}，已停用搜索转身")
                 config.search_rate = 0.0
-            elif candidate < config.search_rate:
+            elif candidate != config.search_rate:
                 notes.append(f"search_rate 超过下游双向允许的 {candidate:g}，已压回")
                 config.search_rate = candidate
 
     return notes
+
+
+def adopt_response(config: Config, descriptor: dict) -> list[str]:
+    """Adopt the Driver-owned yaw response declaration, when present.
+
+    ``response.wz`` describes the plant behind the velocity interface.  Navi
+    uses it to choose an effective proportional gain, but does not calibrate,
+    persist, or identify that plant itself. Missing data keeps the generic
+    0.6 P controller and its target-offset schedule.
+    """
+    response = (descriptor or {}).get("response") or {}
+    yaw = response.get("wz") if isinstance(response, dict) else None
+    config.response_yaw_gain = None
+    if yaw is None:
+        return []
+    if not isinstance(yaw, dict):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+    try:
+        source = yaw["source"]
+        numeric = (yaw["gain"], yaw["delay_s"], yaw["settling_s"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+    if (not isinstance(source, str)
+            or any(isinstance(value, bool)
+                   or not isinstance(value, (int, float)) for value in numeric)):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+    source = source.strip().lower()
+    gain, delay_s, settling_s = map(float, numeric)
+    if (source not in {"measured", "vendor-spec", "estimate"}
+            or not all(math.isfinite(value) for value in (gain, delay_s, settling_s))
+            or gain <= 0 or delay_s < 0 or settling_s < 0):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+
+    effective_gain = max(0.5, min(2.5, gain))
+    penalty = 1.0 + 0.2 * delay_s + 0.1 * settling_s
+    config.response_yaw_gain = max(
+        0.2, min(1.2, (config.k_yaw / effective_gain) / penalty))
+    return [f"已采用下游 response.wz：转向P={config.response_yaw_gain:.3f}"
+            f"（source={source}, gain={gain:g}, delay={delay_s:g}s, "
+            f"settling={settling_s:g}s）"]
 
 
 def select_target(objects, name: str, config: Config):
@@ -749,6 +867,14 @@ def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
     decision = _account_idle(_decide(detections, depth, odom, config, state, dt),
                              state, config, dt)
+    if (decision.values is None or decision.values[0] <= 0
+            or decision.status in (ARRIVED, FAILED, IDLE, BLIND, SEARCHING, ALIGNING)):
+        # Do not carry an increased approach gain through a hold, search or
+        # blocked corridor and release it as a jump on the next approach.
+        state.adaptive_fwd_scale = 1.0
+    if (decision.values is None
+            or decision.status in (ARRIVED, FAILED, IDLE, BLIND)):
+        state.adaptive_yaw_scale = 1.0
     # Remember what we asked for, so the tracker can compensate for our own
     # motion on the next tick even with no odometry wired.
     if decision.values is not None:
@@ -757,6 +883,77 @@ def step(*, detections, depth, odom, config: Config, state: State,
     else:
         state.commanded = (0.0, 0.0, 0.0)
     return decision
+
+
+def _forward_gain(config: Config, state: State, distance, live: bool,
+                  within: bool, dt: float) -> float:
+    """Bounded distance-based gain scheduling for a live forward approach.
+
+    The nominal distance error and all later avoidance/speed limits are
+    untouched. Closer targets use up to three times the configured P gain,
+    approached at a bounded rate; no observation or motor bias is calibrated.
+    """
+    if (not config.adaptive_k_fwd or not live or distance is None or within
+            or config.k_fwd == 0):
+        state.adaptive_fwd_scale = 1.0
+        return config.k_fwd
+    window = max(0.1, config.slow_distance_m - config.stop_distance_m)
+    error = max(0.0, distance - config.stop_distance_m)
+    # This rational schedule keeps the settled, unsaturated P speed monotone
+    # in distance error: approaching the target does not increase that speed.
+    target = ADAPTIVE_FWD_MAX_SCALE / (
+        1.0 + (ADAPTIVE_FWD_MAX_SCALE - 1.0) * min(1.0, error / window))
+    previous = max(1.0, min(ADAPTIVE_FWD_MAX_SCALE, state.adaptive_fwd_scale))
+    elapsed = min(ADAPTIVE_FWD_MAX_DT, max(0.0, dt)) if math.isfinite(dt) else 0.0
+    change = ADAPTIVE_FWD_SCALE_RATE * elapsed
+    state.adaptive_fwd_scale = max(previous - change, min(previous + change, target))
+    return config.k_fwd * state.adaptive_fwd_scale
+
+
+def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
+              dt: float) -> float:
+    """Schedule only the gain applied to the current target's bearing.
+
+    Large offsets retain the nominal response. Near the image centre, reducing
+    gain limits repeated over-corrections. This uses no turn history or latency
+    compensation; search speed and obstacle-gap turns remain separate laws.
+    """
+    if config.response_yaw_gain is not None:
+        state.adaptive_yaw_scale = 1.0
+        return config.response_yaw_gain
+    if not config.adaptive_k_yaw:
+        state.adaptive_yaw_scale = 1.0
+        return config.k_yaw
+    previous = max(ADAPTIVE_YAW_MIN_SCALE,
+                   min(ADAPTIVE_YAW_MAX_SCALE, state.adaptive_yaw_scale))
+    if not live:
+        # Brief coasting still emits a predicted turn. Keep its last gain,
+        # rather than jumping back to nominal on a single missed observation.
+        # A true loss of track resets the schedule in `_search`.
+        state.adaptive_yaw_scale = previous
+        return config.k_yaw * previous
+    fraction = min(1.0, max(0.0, abs(bearing) / max(1e-6, config.align_full_stop)))
+    target = ADAPTIVE_YAW_MIN_SCALE + (ADAPTIVE_YAW_MAX_SCALE - ADAPTIVE_YAW_MIN_SCALE) * fraction
+    elapsed = min(ADAPTIVE_FWD_MAX_DT, max(0.0, dt)) if math.isfinite(dt) else 0.0
+    change = ADAPTIVE_FWD_SCALE_RATE * elapsed
+    state.adaptive_yaw_scale = max(previous - change, min(previous + change, target))
+    return config.k_yaw * state.adaptive_yaw_scale
+
+
+def _measured_yaw_rate(odom):
+    """Actual angular feedback for ego-motion tracking.
+
+    Freshness is enforced by the card before this observation reaches policy.
+    JSON booleans, missing axes and non-finite readings are not measurements.
+    """
+    value = (odom or {}).get("wz")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _ego_twist(odom, state: State):
@@ -776,7 +973,7 @@ def _ego_twist(odom, state: State):
         return commanded, False
     out, measured = [], True
     for index, name in enumerate(("vx", "vy", "wz")):
-        value = odom.get(name)
+        value = _measured_yaw_rate(odom) if name == "wz" else odom.get(name)
         if value is None:
             measured = False
             out.append(commanded[index])
@@ -854,9 +1051,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # depends on something not known yet at this point — whether the robot ends
     # up translating — so the decision is deferred to `_finalise_yaw` once vx is
     # settled. See `floor_wz_moving`.
-    raw_wz = _clamp(-config.k_yaw * bearing, config.wz_max)
+    live = track.observed
+    yaw_gain = _yaw_gain(config, state, bearing, live, dt)
+    # Pure proportional steering. odom.wz remains an observation for
+    # ego-motion tracking, but is never fed back into the command as a hidden
+    # D-like term.
+    raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
-    within = distance is not None and distance <= config.stop_distance_m
+    within = distance is not None and distance <= config.arrival_distance_m
     if within:
         state.close_for_s += dt
     else:
@@ -877,7 +1079,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # declare the journey over, so arrival needs a live fix. Without one the
     # code below falls through to the obstacle logic, which will stop for the
     # thing that is actually there and say so.
-    live = track.observed
     if within and live and (abs(bearing) <= config.arrive_align_tol
                             or state.close_for_s >= config.arrive_patience_s):
         state.arrived = True
@@ -886,6 +1087,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
         # should not look like a dropped link in the driver's log.
         return Decision(_twist(0.0, 0.0, 0.0), ARRIVED,
                         f"target at {distance:.2f} m, stop distance reached"
+                        + f" (threshold {config.arrival_distance_m:.2f} m = "
+                          f"{config.stop_distance_m:.2f} m + "
+                          f"{config.stop_tolerance_m:.2f} m tolerance)"
                         + ("" if abs(bearing) <= config.arrive_align_tol else
                            f" (still {bearing:+.2f} off-centre after "
                            f"{state.close_for_s:.1f}s in range; not waiting to "
@@ -909,14 +1113,21 @@ def _decide(detections, depth, odom, config: Config, state: State,
         wz = _finalise_yaw(raw_wz, False, bearing, config, state, dt)
         return Decision(_twist(0.0, 0.0, wz), ALIGNING,
                         f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
-                        distance_m=distance, bearing=bearing)
+                        distance_m=distance, bearing=bearing,
+                        k_yaw_effective=yaw_gain)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
+    forward_gain = _forward_gain(config, state, distance, live, within, dt)
     if distance is not None:
-        speed = min(speed, max(0.0, config.k_fwd
+        speed = min(speed, max(0.0, forward_gain
                                * (distance - config.stop_distance_m) * align))
         reason = f"target at {distance:.2f} m"
+
+    if within:
+        # Distance is already acceptable. Wait for the existing heading/live
+        # conditions without creeping towards the nominal, tighter distance.
+        speed = 0.0
 
     if within and not live:
         # Inside the stop distance by the tracker's reckoning, but the position
@@ -942,8 +1153,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
                        state, dt)
+    tracking_wz = raw_wz
+    state.avoidance_yaw_override = False
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
                                             status, reason, state)
+    if within and config.stop_tolerance_m > 0 and (vx or vy):
+        # Avoidance may propose a sidestep after the approach has stopped.
+        # A configured arrival tolerance also holds that translation while
+        # heading/live-fix checks finish; retain the avoidance yaw decision.
+        vx = vy = 0.0
+        reason += "; holding translation within arrival tolerance"
 
     # **Blocked is an outcome, not a mood.** Trying to get round something is
     # the right first response, and it is what `_avoid` just did — but a robot
@@ -969,8 +1188,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
         return Decision(None, FAILED, stuck, distance_m=distance, bearing=bearing)
 
     state.commanded_vx = vx
+    tracking_yaw_used = raw_wz == tracking_wz and not state.avoidance_yaw_override
     return Decision(_twist(vx, vy, wz), status, reason,
-                    distance_m=distance, bearing=bearing)
+                    distance_m=distance, bearing=bearing,
+                    k_fwd_effective=forward_gain if distance is not None and not within else None,
+                    k_yaw_effective=yaw_gain if tracking_yaw_used else None)
 
 
 def _account_idle(decision: Decision, state: State, config: Config,
@@ -1288,6 +1510,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
         # — bounded, derived, and about a third of what wz_max was commanding.
         gap_angle = math.atan2(keep, max(ahead, 0.1))
         wz = _clamp(-sign * config.k_yaw * gap_angle, config.wz_max)
+        if state is not None:
+            state.avoidance_yaw_override = True
         # `sign` indexes the **offset corridor** (+1 = the one displaced to the
         # right), while the body frame has y pointing **left** — so the sidestep
         # takes the opposite sign. Getting this wrong steps into the obstacle it
@@ -1374,6 +1598,7 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     every extra second of spin sweeps the shoulders through space no corridor
     has checked.
     """
+    state.adaptive_yaw_scale = 1.0
     state.missing_frames += 1
     if state.missing_frames < config.lost_frames:
         # Briefly occluded — a person walking past. Emitting nothing for a few

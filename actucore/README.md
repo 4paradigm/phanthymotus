@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前有一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+**当前提供 `vla` 与 `navi` 卡片，均默认开启。** `enabled` 只决定卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
 
 ## `vla` 卡片
 
@@ -112,6 +112,81 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 
 **这是反应式视觉伺服，不是导航栈。** 没有地图、没有全局路径、绕不过 U 形障碍，
 也不会后退（深度图对身后一无所知）。要建图规划是另一条路线。
+
+### 卡片参数与 Driver 能力
+
+`navi` 位于 **ActuCore**，修改后构建、部署 ActuCore 镜像。Perception 继续提供检测和
+深度数据，这些参数不需要修改 Perception 镜像。
+
+卡片配置只保留通用策略参数：
+
+| 参数 | 含义 | 默认值 |
+|---|---|---|
+| `stop_distance_m` | 期望停止距离，相机到目标的距离，m | 0.8 |
+| `stop_tolerance_m` | **仅限单次 `navigate_to`** 的到达容差，不是卡片 `config`，m | 0.05 |
+
+前进P默认 0.9，转向P默认 0.6，搜索转速默认 0.6rad/s。这些不再放到
+画布配置表单中。`navi` 启动时从下游 `control_interface` 读取速度上限、
+横移能力、死区和可选的 `response.wz`，再得到实际有效值。因此机器人差异属于
+Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协商后的只读值。
+
+设置默认停止距离：
+
+```json
+{
+  "name": "navi",
+  "arguments": {
+    "action": "config",
+    "stop_distance_m": 1.2
+  }
+}
+```
+
+`config` 只更新默认停止距离；容器重启后保留设置需保存到画布或部署 YAML。
+
+`stop_tolerance_m` 也可在 `navigate_to` 动作中单次指定。到达的距离条件为
+`距离 <= stop_distance_m + stop_tolerance_m`：例如停止距离 1.2 m、容差 0.1 m，
+距离不大于 1.3 m 即满足距离条件。仍要求有效的当前观测，并保留原有对正/等待判据；
+容差不允许用预测轨迹或过旧数据判定到达。默认容差为 0.05m，用于容纳相机测距误差。
+`navigate_to` 返回值和 `info.config` 都提供这两个参数及其和 `arrival_distance_m`。
+每次动作省略容差时都恢复 0.05m；覆盖值不写入卡片或部署配置。
+
+### 默认前进P与高级启动兼容
+
+默认启动配置为 `k_fwd: 0.9`、`adaptive_k_fwd: false`，因此前进增益固定为 0.9。
+`info.last.k_fwd_effective` 显示这一拍实际使用的前进增益；未使用时返回 null。
+速度上限、底盘限制、避障和到达条件仍决定最终指令。
+
+仅为兼容已有高级部署，启动 YAML 仍保留名义增益和 `adaptive_k_fwd`；画布与运行时
+`config` 均不提供这些选项。默认保持前进增益固定，不执行按距离自适应。
+
+### 转向 P 与 Driver 响应
+
+目标跟随默认使用 `k_yaw=0.6`，并按目标在画面中的偏移在 0.5–1 倍之间有界调度；
+靠近中心时减小增益以抑制反复纠偏。控制保持纯 P，不在 navi 中做在线辨识、
+机型特判或主动转向标定。
+
+若下游 Driver 在 `control_interface.response.wz` 声明 `source`、`gain`、
+`delay_s` 和 `settling_s`，navi 会据此派生有效转向 P。`source` 只接受
+`measured`、`vendor-spec` 或 `estimate`；声明缺失或无效时回到通用 0.6。
+速度范围、横移能力、搜索转速上限和死区同样来自 Driver 描述符。
+`info.gains.yaw.source` 为 `driver_response` 或 `adaptive_default`，
+并在 `info.config` 中显示最终采用的只读值。
+
+接入 `state/odom` 时，Agent Core 会把上游 `odom_interface` 按实际话题传给 navi。
+navi 校验 `motus.odom/1` 契约（`timing.stamp_source` 只接受 `robot` 或
+`received`），并按 `rate_hz`、`timing.stamp_source` 和
+`timing.max_measurement_delay_ms` 计算里程计有效期：
+`max(100ms, 3 × 周期 + 最大测量延迟)`。旧 Driver 未声明时使用 500ms，并在
+`degraded` 中说明；缺失声明不会阻断项目启动。
+`info.config` 同时返回实际 `obstacle_stop_m`、`slow_distance_m` 和
+`arrival_distance_m`。若障碍停车距离达到或超过到达阈值，`degraded` 会提示目标可能
+先被当作障碍挡停。例如停止距离 0.4m、容差 0.05m 的到达阈值是 0.45m，若障碍停车
+仍为 0.6m，提高前进P也不能让机器人越过它；增益策略不会降低该距离。
+
+自适应增益不执行距离校准。硬件深度与卷尺不一致时，应先核对 RGB/深度配准、同一
+取样区域及多个距离处的读数；一个测点的偏差不能作为整段量程的固定补偿。
+例如真实 0.4m 稳定读成 0.6m，提高前进P或调整转向P都不能修正这 0.2m 的测距偏差。
 
 ### vx / vy / wz 是同一拍发出去的
 
