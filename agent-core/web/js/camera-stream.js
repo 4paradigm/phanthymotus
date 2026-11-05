@@ -7,9 +7,15 @@
  * `image/jpeg` — the format the on-robot camera drivers emit — so any vision
  * card consumes it with no special case.
  *
- *   import { toggleCameraStream, isCameraActive } from './camera-stream.js';
- *   await toggleCameraStream(wsUrl, onStateChange, { fps: 12 });
+ *   import { startCameraStream, stopCameraStream, isCameraActive } from './camera-stream.js';
+ *   await startCameraStream(wsUrl, onStateChange, async () => ({ deviceId, fps: 12 }));
+ *   stopCameraStream();
+ *
+ * Same start/stop contract as mic-stream.js: start is idempotent, and stop
+ * cancels a start that has not finished yet.
  */
+import { deviceConstraint } from './browser-source.js';
+
 let _stream = null;
 let _ws = null;
 let _timer = null;
@@ -19,6 +25,10 @@ let _canvas = null;
 let _rvfcArmed = false;
 let _sent = 0;
 let _startedAt = 0;
+// Bumped by every start and stop; an in-flight start checks it after each
+// await and backs out, releasing what it holds, once it has changed.
+let _generation = 0;
+let _starting = null;
 
 export const DEFAULTS = { width: 640, height: 480, fps: 12, quality: 0.7 };
 
@@ -84,7 +94,7 @@ export function achievedFps() {
 export async function warmPermission(deviceId) {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: deviceId ? { deviceId: { exact: deviceId } } : true, audio: false,
+      video: deviceId ? deviceConstraint(deviceId) : true, audio: false,
     });
     stream.getTracks().forEach(t => t.stop());
     return true;
@@ -105,58 +115,122 @@ export async function listCameras() {
   }
 }
 
+/** The `video` constraint for getUserMedia. Exported for the tests. */
+export function cameraConstraints(deviceId) {
+  return deviceId ? deviceConstraint(deviceId) : { facingMode: 'user' };
+}
+
 /**
- * Toggle the browser camera.
+ * Start the browser camera. Already running or starting → the same promise.
+ *
+ * Both start paths (start-project, post-refresh re-arm) can arrive together,
+ * and `_active` is only set once the video plays and the WebSocket is open, so
+ * a plain "is it active" check let both through and opened two streams.
+ *
+ * `getOptions` runs after the generation is taken, so a stop during the
+ * config read cancels the start too.
+ *
+ * @param {string} wsUrl        e.g. wss://host/ws/camera
+ * @param {(active:boolean)=>void} onStateChange
+ * @param {() => Promise<{fps?:number, deviceId?:string, width?:number, quality?:number}>} [getOptions]
+ * @returns {Promise<boolean>} true when streaming; false if stopped while starting
+ */
+export function startCameraStream(wsUrl, onStateChange, getOptions) {
+  if (_active) return Promise.resolve(true);
+  if (_starting) return _starting;
+  const gen = ++_generation;
+  const run = _start(gen, wsUrl, onStateChange, getOptions);
+  _starting = run;
+  const clear = () => { if (_starting === run) _starting = null; };
+  run.then(clear, clear);
+  return run;
+}
+
+/** Stop the camera, cancelling a start still in progress. No-op when idle. */
+export function stopCameraStream() {
+  _generation++;
+  _starting = null;
+  _stopCamera();
+}
+
+/**
+ * Toggle the browser camera. Kept for old callers; prefer start/stop.
  * @param {string} wsUrl        e.g. wss://host/ws/camera
  * @param {(active:boolean)=>void} onStateChange
  * @param {{fps?:number, deviceId?:string, width?:number, quality?:number}} opts
  */
 export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
-  if (_active) {
-    _stopCamera();
+  if (_active || _starting) {
+    stopCameraStream();
     onStateChange(false);
     return;
   }
+  await startCameraStream(wsUrl, onStateChange, async () => opts);
+}
 
-  const fps = clampFps(opts.fps ?? DEFAULTS.fps);
-  const quality = opts.quality ?? DEFAULTS.quality;
-  const target = opts.width ?? DEFAULTS.width;
+async function _start(gen, wsUrl, onStateChange, getOptions) {
+  // Held locally until everything is up, then committed. A cancelled start
+  // finds the module state already cleared by stopCameraStream, so only these
+  // need releasing.
+  let stream = null, video = null, ws = null;
+  const cancelled = () => gen !== _generation;
+  const release = () => {
+    if (ws) { try { ws.close(); } catch { /* already closed */ } }
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (video) { video.srcObject = null; video.remove(); }
+  };
 
   try {
-    _stream = await navigator.mediaDevices.getUserMedia({
-      video: opts.deviceId
-        ? { deviceId: { exact: opts.deviceId } }
-        : { facingMode: 'user' },
+    const opts = (getOptions ? await getOptions() : null) || {};
+    if (cancelled()) return false;
+
+    const fps = clampFps(opts.fps ?? DEFAULTS.fps);
+    const quality = opts.quality ?? DEFAULTS.quality;
+    const target = opts.width ?? DEFAULTS.width;
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: cameraConstraints(opts.deviceId),
       audio: false,
     });
+    if (cancelled()) { release(); return false; }
+    const track = stream.getVideoTracks()[0];
+    console.info(`[camera] capturing: ${track ? track.label || '(unlabelled)' : '(no track)'}`
+      + (opts.deviceId ? ' (selected device)' : ' (browser default)'));
 
-    _video = document.createElement('video');
-    _video.srcObject = _stream;
-    _video.muted = true;
-    _video.playsInline = true;
+    video = document.createElement('video');
+    video.srcObject = stream;
+    video.muted = true;
+    video.playsInline = true;
     // Attached to the document, off-screen. A detached <video> is not
     // *presented*, and requestVideoFrameCallback fires per presented frame —
     // so a video element that never enters the DOM delivers a trickle. Measured
     // on a live session: 2 fps out of a 12 fps request, with the network, the
     // server and the DDS publish all verified clean at 12.4 fps.
-    _video.style.cssText =
+    video.style.cssText =
       'position:fixed;left:-10000px;top:0;width:2px;height:2px;opacity:0;pointer-events:none';
-    document.body.appendChild(_video);
-    await _video.play();
+    document.body.appendChild(video);
+    await video.play();
+    if (cancelled()) { release(); return false; }
 
-    const size = fitCapture(_video.videoWidth, _video.videoHeight, target);
-    _canvas = document.createElement('canvas');
-    _canvas.width = size.width;
-    _canvas.height = size.height;
-    const ctx = _canvas.getContext('2d');
+    const size = fitCapture(video.videoWidth, video.videoHeight, target);
+    const canvas = document.createElement('canvas');
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const ctx = canvas.getContext('2d');
 
-    _ws = new WebSocket(wsUrl);
-    _ws.binaryType = 'arraybuffer';
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    let wsTimer;
     await new Promise((resolve, reject) => {
-      _ws.onopen = resolve;
-      _ws.onerror = () => reject(new Error('WebSocket connection failed'));
-      setTimeout(() => reject(new Error('WS timeout')), 5000);
-    });
+      ws.onopen = resolve;
+      ws.onerror = () => reject(new Error('WebSocket connection failed'));
+      wsTimer = setTimeout(() => reject(new Error('WS timeout')), 5000);
+    }).finally(() => clearTimeout(wsTimer));
+    if (cancelled()) { release(); return false; }
+
+    // Commit. From here on _stopCamera owns them.
+    _stream = stream; _video = video; _canvas = canvas; _ws = ws;
+    stream = video = ws = null;
 
     let sending = false;
     const interval = 1000 / fps;
@@ -222,7 +296,10 @@ export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
     _sent = 0;
     _startedAt = performance.now();
     onStateChange(true);
+    return true;
   } catch (err) {
+    release();
+    if (cancelled()) return false;   // the stop already got what it asked for
     _stopCamera();
     onStateChange(false);
     throw err;
