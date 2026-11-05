@@ -243,3 +243,87 @@ metadata/fork advertised that commit but the upstream pull head still returned
 `0d2cb78`. Request comment 6656953463 was followed by explicit provenance warning
 6657004807. The labelled SHA alone must not establish which Dockerfile was built.
 No repeated full build was requested while that job was outstanding.
+
+
+## Authorized deployment and read-only calibration audit
+
+At the operator's explicit request, Perception was switched to the local
+`slam187-offline-test` image and `pointcloud_slam.enabled` was persisted as true
+in `/opt/phanthy-motus/perception-slam-config.yaml`, mounted read-only at
+`/work/config.yaml`. The tool is discoverable and reports idle. This enables
+card discovery, not fusion or a claim of calibrated inputs.
+
+The canvas startup failure was traced to the old Core lacking `input_bindings`
+and `odom_interfaces`, despite receiving both topic names. After inspecting the
+actual candidate image source, Core was upgraded through `/api/system/update`
+and its restart helper to `release.261105.8c424ea` (registry digest
+`sha256:5a3a6f229b2a0d8d36ecc2982bc7e4e6e2e7227cf03ed63f2d5b27cd5a14d378`).
+Helper exited 0; the running Core contains both bindings and declaration paths.
+Ten camera-info/SLAM startup contract tests passed in a separate network-isolated
+container of this image with mocked tool dispatch. Pytest autoload was disabled
+because the system pytest and installed anyio plugin were incompatible. No live
+whole-canvas start or motion command was issued. Driver remains unchanged.
+
+Backups: `/opt/phanthy-motus/docker-compose.before-slam187.yml`,
+`docker-compose.before-slam-enable.yml`, and `/tmp/slam-compose-before-core.yml`.
+The latter retains the enabled SLAM deployment with the previous Core image.
+
+Two 20-second subscriber-only samples checked camera parameters, static TF and
+capture provenance. The detailed second sample observed 150 camera metadata
+messages, 34 metric depth frames, 36 point clouds and 358 odometry messages:
+
+- RGB optical frame: `ubuntu_rgb_optical`, 640x480. K=(fx 603.85986328125,
+  fy 603.5826416015625, cx 324.97772216796875, cy 250.24855041503906), D=zeros.
+  SDK depth scale 0.0010000000474974513 m/unit; published depth is 32FC1 metres.
+  These are runtime/SDK declarations, not a physical accuracy calibration.
+- The operator confirms a shared optical origin. Active-segment TF agrees with
+  zero translation but has quaternion xyzw=(-0.5,0.5,-0.5,0.5). Thus the axes
+  differ: T_child_cloud rotation rows are (0,0,1),(-1,0,0),(0,-1,0).
+  The running VO explicitly reports `body_axes` and assumed-level-forward
+  calibration. This verifies the software coordinate convention, not a measured
+  body origin or mounting calibration. Identity rotation would be incorrect.
+- Static TF retains 32 segment-specific parents for the optical child. Only
+  the current odometry segment's transform was used in this audit; a generic
+  global TF lookup must not be assumed unambiguous.
+- All 150 metadata samples report `global_time`; each mapped stamp exactly
+  equals int(SDK source_ms*1e6), with no receive-time substitution. RGB/depth
+  skew was 0.017664–0.018176 ms. Receive-minus-RGB-capture age was 53.09–69.22 ms.
+- All odometry stamp_ms values preserve visual_stamp_ns truncated to ms.
+  106 of 116 distinct visual stamps matched received RGB frames; 33 of 36
+  clouds matched received metric-depth stamps. Unmatched observations were
+  not declared validated; bounded sampling/DDS coverage is incomplete.
+- Odometry was tracking; capture-to-publication age was 224.73–505.86 ms
+  (median 319.38 ms). Thresholds were not relaxed. Controller-IMU rotation
+  assistance still reports `read_completion`, so independent timing of the
+  full estimator input chain remains unverified.
+
+Raw local evidence: `/private/tmp/slam-calibration-audit-result.json` and
+`/private/tmp/slam-calibration-audit-detailed.json` (also under `/tmp` on Bumi).
+No calibration verification flags were set. Physical depth/registration accuracy
+needs a measured target; a known-size board or flat target with reliable distance
+measurements is the next operator preparation. Motion sampling must be announced
+and remains under operator control.
+
+
+## Formal build 30736ef: HTTP/2 stream failure
+
+PR result comment 6657255497 confirms the corrected curl progress/1800s/2400s
+command was actually used. The transfer then failed with curl92, HTTP/2 stream
+CANCEL, at build time 864.8s (download began at 180.8s). This is neither the idle
+watchdog nor GTSAM compilation. Core succeeded as release.261105.c66214b;
+Perception still has no successful formal artifact.
+
+The source download now requests HTTP/1.1 and enables --retry-all-errors so
+transport failures outside curl's default retry set are retried, retaining all
+existing time/low-speed bounds and the mandatory SHA-256. The operation is a
+read-only GET to a regular output file. A controlled truncated-body test showed
+the previous flags failing with curl18 after one request; the revised flags
+retried and produced the exact complete payload in two requests. This exercises
+partial-transfer recovery, not an exact reproduction of the remote HTTP/2 fault.
+Target curl 7.81.0 supports both flags. Runner connectivity remains unverified
+until the formal build succeeds.
+
+The same truncated-transfer test also passed using curl 7.81.0 in a separate
+network-isolated Bumi container. A real HTTP/1.1 archive download on the host
+completed and matched the pinned SHA-256
+`48c760e17a8b6c0e59fcc1d6a71602907fedbb9c39ba400d13f998dab1fd5080`.
