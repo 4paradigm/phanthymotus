@@ -21,18 +21,30 @@ must handle a full store and signal tracking loss. It is not a SLAM card.
 An opt-in `pointcloud_slam` card now subscribes to `state/odom` and
 `sensor/pointcloud2`. Agent-core passes the formats from live producer `info()`
 keyed by resolved topic; unknown or ambiguous bindings are rejected. Canvas
-connection order is not an input role. The ROS adapter checks PointCloud2 XYZ
+connection order is not an input role. The selected odometry producer must
+advertise the `motus_slam/1` pose capability in its runtime `info()`; a
+velocity-only `state/odom` port is rejected. The ROS adapter checks PointCloud2 XYZ
 layout and capture header; a bounded buffer waits for a compatible odometry
 bracket and transforms points using `T_child_cloud`. The monotonic receipt
-clock detects stale input only and is not substituted for capture time.
+clock detects stream interruptions and is not substituted for capture time.
+The card separately checks measurement age against its ROS clock for incoming
+and queued measurements. This requires the measurement stamps to have been
+verified comparable to that ROS clock; configuring a clock name or assertion
+does not establish the relationship. ROS-clock behavior on the target, including
+simulated time and clock resets, remains to be tested.
 
 The card is disabled by default. To start it, `plugins.pointcloud_slam` needs
 `enabled`, `cloud_frame`, `child_frame`, `clock_id`, `child_from_cloud`,
-`max_gap_ms`, `max_age_s`, `max_pending`, `max_cloud_points`, `max_frames`, and
-`max_points`. It also requires the operator assertions
+`max_gap_ms`, `max_age_s`, `max_measurement_age_ms`, `max_future_skew_ms`,
+`max_pending`, `max_cloud_points`, `max_frames`, and `max_points`. It also requires the operator assertions
 `clock_relation_verified: true` and `extrinsic_calibrated: true`; these flags
 do not constitute evidence, so set them only after independent verification.
 There is deliberately no default extrinsic or claimed safe timing limit.
+When a producer changes only the *name* of a physically identical child frame
+per segment, `child_frame` may contain one explicit `{segment_id}` placeholder
+(for example `{segment_id}_base`). The deployment must independently establish
+that the same calibrated `T_child_cloud` applies to all those frames; the
+placeholder does not measure or infer the physical transform.
 
 Keyframes create one odometry-only graph per segment. The GTSAM adapter accepts
 only a consecutive odometry chain and explicit positive noise sigmas; a manual
@@ -46,6 +58,8 @@ publish poses, maps, or map-to-odom corrections. The
 current Perception image does not include GTSAM, and its Jetson compatibility
 has not been built or tested. The card therefore exposes no map output, and
 its running state means only that the experimental input subscriptions started.
+The card `info()` includes input freshness, queue drops, capacity and segment
+state; `tracking` there describes only the input odometry, not SLAM validity.
 The ROS tests use stubs; the input adapter has not been validated on a robot.
 
 ## Inputs and reproducibility
@@ -122,6 +136,34 @@ Reusing an earlier estimate is not independent validation; the initial result
 must name the same source and target indices. A no-correspondence result reports
 unknown RMSE rather than a misleading zero.
 
+For a later independently labelled set, `pointcloud_slam_pair_benchmark.py`
+reads a JSON spec with explicit `voxel_m`, `max_distance_m`, `thresholds`, and
+`pairs`. Every pair supplies original recording indices `source` and `target`,
+an independently established boolean `match`, and a 4x4 `initial` transform
+mapping source points to target points. Thresholds require `min_fitness`,
+`max_rmse_m`, `min_correspondences`, `max_cycle_translation_m`, and
+`max_cycle_angle_deg`. Run:
+
+```sh
+OMP_NUM_THREADS=1 python3 perception/tools/pointcloud_slam_pair_benchmark.py \
+  RECORDING LABELLED_SPEC.json > pair-results.json
+```
+
+The report hashes the recording, spec, tools, and records the Open3D version.
+Its recall and false-positive rate describe only the provided pairs; they are
+unknown when the corresponding positive or negative class is absent. Threshold
+passing is an experiment, not an accepted loop. Reciprocal ICP can still match
+unrelated but similar geometry; labels must not be derived from odometry or the
+same registration result, and thresholds need separate evaluation data.
+
+`pointcloud_slam_candidate_graph.py` provides a separate synthetic/offline
+experiment connecting the explicit geometry gates to a robust GTSAM factor and
+rebuilding history. It inverts the source-to-target ICP transform for the
+corresponding GTSAM between factor. It does not feed the live card or accept
+real loop edges; noise, gates and initial guesses remain uncalibrated. Its
+computed map-to-odom correction is an experimental output, never published or
+fed back to raw odometry.
+
 ## Bumi exploratory run, 2026-11-04
 
 The 2026-11-02 recording contains 317 cloud frames, one reported odometry
@@ -134,6 +176,12 @@ verified ground truth. The original archive SHA-256 is
 - With a **hypothetical**, unvalidated 200 ms maximum pose bracket, 199/317
   cloud times align and 118 are rejected. The common-clock assumption itself
   still needs independent verification.
+- For the 3412 recorded tracking samples containing both `stamp_ms` and
+  `vendor.published_ns`, the recorded publication-minus-measurement difference
+  had median 278.62 ms, p95 390.37 ms, p99 432.26 ms and max 560.55 ms.
+  This is a historical publisher-side distribution, not end-to-end latency,
+  synchronization proof or a production age threshold; it assumes the two
+  recorded fields are comparable and the millisecond stamp is rounded down.
 - A further bracket-width sensitivity sweep on the same recording produced
   0, 69, 180, 199, 301, 316, 317 and 317 aligned frames at 50, 100, 150,
   200, 250, 300, 350 and 500 ms respectively (317 frames total). A wider

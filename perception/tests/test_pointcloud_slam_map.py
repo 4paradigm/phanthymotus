@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from plugins.pointcloud_slam_map import rebuild_segment
+from plugins.pointcloud_slam_map import rebuild_segment, map_from_odom
 from test_pointcloud_slam_stream import odom, stream
 
 
@@ -43,3 +43,14 @@ def test_two_segments_are_rebuilt_separately():
     assert len(maps) == 2
     assert maps[0].tolist() == [[1., 0., 0.]]
     assert maps[1].tolist() == [[11., 0., 0.]]
+
+
+def test_map_odom_correction_composes_to_optimized_pose_without_mutating_raw_odom():
+    odom = np.eye(4)
+    odom[0, 3] = 2.
+    optimized = np.eye(4)
+    optimized[0, 3] = 1.5
+    correction = map_from_odom(optimized, odom)
+    assert correction[0, 3] == pytest.approx(-.5)
+    np.testing.assert_allclose(correction @ odom, optimized)
+    assert odom[0, 3] == 2.
