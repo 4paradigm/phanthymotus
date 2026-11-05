@@ -98,3 +98,61 @@ verification proposes an experimental merge. No correction replaces raw odometry
 Only after dependency/build checks and real input gates are satisfied should the
 operator drive labelled loops and negatives. Record proposed/correct loop edges,
 pre/post trajectories and historical maps, and measured endpoint errors separately.
+
+
+## Target isolation checks on the deployed base image
+
+The operator confirmed that calibration/clock/negative-label evidence is not yet
+available and requested continued isolation testing. No live verification flags
+were changed.
+
+A `git archive` snapshot of `1742cc4` was mounted read-only into disposable
+containers based on the deployed Perception image. Containers used `--network
+none --cpus 1 --memory 1g`; ROS checks used a separate `ROS_DOMAIN_ID=173`.
+
+- Target Python 3.10 focused tests: **205 passed, 15 skipped**. Use
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`; automatic image pytest plugins initially
+  pulled in GTSAM-dependent tests during collection, blocking even dependency-free
+  tests. The remaining 15 skips explicitly require missing GTSAM/Open3D.
+- `pointcloud_slam_target_lifecycle.py`: real rclpy node creation/destruction,
+  synthetic message callbacks, missing-calibration gate, capture-stamp preservation,
+  wrong-frame rejection, lost handling, independent segments, save/stop/restore,
+  and restored history requiring a new segment all passed. The source sentinel
+  node survived card stops. This check does not test DDS transport.
+- `pointcloud_slam_target_depth_transport.py`: real DDS publisher/subscriber
+  transport passed separately for both qualified zlib and f32. Each synthetic
+  640x480 constant-2m frame yielded 19,200 metric points; the first point was
+  (-1.6, -1.2, 2.0) m. Source capture headers matched exactly. Input format
+  reporting and stopping only the card's nodes also passed.
+
+The scripts are under `perception/tools/`. Run only in the isolated container,
+with the perception source root in `PYTHONPATH`, after sourcing the ROS setup.
+Their synthetic calibration and clock settings describe the generated fixtures;
+they provide no evidence about Bumi's physical extrinsic or sensor clocks. They
+create no motion publisher. Geometry backend dependency/preview validation is
+still separate from these base-image checks.
+
+
+## Open3D target dependency failure and correction
+
+The first offline build reached GTSAM Python binding compilation. An independent
+check in the same base image then reproduced `import open3d` failing with
+`ModuleNotFoundError: plotly`. The ARM64 wheel declares Dash/Werkzeug/nbformat
+and imports Plotly/Dash unconditionally through visualization, even for ICP.
+The previous `--no-deps` wheel install plus three small packages was insufficient.
+That build was explicitly cancelled (exit 130), not recorded as a successful
+GTSAM image or compiler failure.
+
+The Dockerfile now installs pinned Dash 2.18.2 and nbformat 5.10.4 with their
+resolver-managed dependencies, retains the NumPy ABI pin, and imports Open3D
+**before** compiling GTSAM. On this Ubuntu base, installing Flask also encountered
+a non-uninstallable distutils blinker 1.4; install only blinker 1.9.0 with
+`--ignore-installed`, shadowing it under /usr/local without removing distro files.
+A fresh network-isolated target container with the corrected dependency recipe
+passed Open3D 0.18.0 import and ICP and retained NumPy 1.26.4.
+
+The second local offline build separates dependency preflight, cached GTSAM
+compilation, and final import/ICP/graph checks. It retains the 2-core/6-GiB limits
+and no build network. GTSAM availability remains unverified until its final
+checks succeed. The operator will report the GitHub build result; this chat no
+longer polls that build.
