@@ -237,13 +237,50 @@ def test_pinhole_of_defaults_to_90_degrees():
     assert np.allclose([fx, fy], [50.0, 50.0])  # w/2
 
 
-def test_load_calibration_blob_accepts_dict_json_and_file(tmp_path):
+def test_load_calibration_blob_accepts_dict_json_and_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(pcm, 'CALIBRATION_ROOT', str(tmp_path), raising=False)
     blob = {"fx": 100.0, "cx": 5, "cy": 5, "Tx": 0.02}
     assert pcm.load_calibration_blob(blob) is blob
     assert pcm.load_calibration_blob('{"fx": 1}') == {"fx": 1}
     path = tmp_path / "calib.json"
     path.write_text('{"fx": 2}', encoding="utf-8")
     assert pcm.load_calibration_blob(str(path)) == {"fx": 2}
+
+
+def test_calibration_files_cannot_escape_models_via_path_or_symlink(tmp_path, monkeypatch):
+    root = tmp_path / 'models'
+    root.mkdir()
+    monkeypatch.setattr(pcm, 'CALIBRATION_ROOT', str(root), raising=False)
+    outside = tmp_path / 'secret.json'
+    outside.write_text('{"fx": 123}', encoding='utf-8')
+    (root / 'escape.json').symlink_to(outside)
+    inside = root / 'allowed.json'
+    inside.write_text('{"fx": 2}', encoding='utf-8')
+    (root / 'inside.json').symlink_to(inside)
+    sibling = tmp_path / 'models-other'; sibling.mkdir()
+    (sibling / 'calib.json').write_text('{"fx": 999}', encoding='utf-8')
+    assert pcm.load_calibration_blob(str(outside)) is None
+    assert pcm.load_calibration_blob(str(root / '..' / 'secret.json')) is None
+    assert pcm.load_calibration_blob(str(root / 'escape.json')) is None
+    assert pcm.load_calibration_blob(str(sibling / 'calib.json')) is None
+    assert pcm.load_calibration_blob(str(root / 'inside.json')) == {'fx': 2}
+
+
+def test_calibration_directory_swap_cannot_escape_after_resolution(tmp_path, monkeypatch):
+    root = tmp_path / 'models'; root.mkdir()
+    sub = root / 'sub'; sub.mkdir()
+    (sub / 'calib.json').write_text('{"fx": 2}', encoding='utf-8')
+    outside = tmp_path / 'outside'; outside.mkdir()
+    (outside / 'calib.json').write_text('{"fx": 123}', encoding='utf-8')
+    monkeypatch.setattr(pcm, 'CALIBRATION_ROOT', str(root))
+    real_open = pcm.os.open
+    def swap_then_open(path, flags, *args, **kwargs):
+        if path == 'sub' and kwargs.get('dir_fd') is not None:
+            sub.rename(root / 'old-sub')
+            sub.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(pcm.os, 'open', swap_then_open)
+    assert pcm.load_calibration_blob(str(sub / 'calib.json')) is None
 
 
 def test_load_calibration_blob_rejects_junk():

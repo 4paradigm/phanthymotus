@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import stat
 import struct
 import time
 from typing import Optional
@@ -19,6 +20,7 @@ from typing import Optional
 import numpy as np
 
 log = logging.getLogger(__name__)
+CALIBRATION_ROOT = '/models'
 
 # pointcloud.js 的 MAX_POINTS / MAX_POINTS_PER_FRAME 上限
 MAX_POINTS = 40000
@@ -168,12 +170,37 @@ def load_calibration_blob(value) -> Optional[dict]:
         return json.loads(text)
     except Exception:
         pass
-    if os.path.isfile(text):
+    try:
+        root = os.path.realpath(CALIBRATION_ROOT)
+        resolved = os.path.realpath(text)
+        if os.path.commonpath((root, resolved)) != root or resolved == root:
+            return None
+        parts = os.path.relpath(resolved, root).split(os.sep)
+        # Anchor each open to the model directory and reject swapped symlinks.
+        # The /models mount and directory tree must be managed by trusted users;
+        # a concurrently moved directory is not contained by openat alone.
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            with open(text, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception as error:
-            log.error(f"[pointcloud] cannot read calibration file {text}: {error}")
+            for part in parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=directory)
+                os.close(directory)
+                directory = child
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                with os.fdopen(fd, 'r', encoding='utf-8') as fh:
+                    fd = -1
+                    return json.load(fh)
+            finally:
+                if fd != -1:
+                    os.close(fd)
+        finally:
+            os.close(directory)
+    except (OSError, ValueError, UnicodeError) as error:
+        log.error(f"[pointcloud] cannot read calibration file {text}: {error}")
     return None
 
 
