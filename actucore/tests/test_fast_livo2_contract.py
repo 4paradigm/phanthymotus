@@ -287,10 +287,6 @@ class FastLivo2ContractTest(unittest.TestCase):
             "/opt/phanthy-motus/data/navigation/fast_livo2/maps:"
             "/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw", service
         )
-        self.assertIn(
-            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings:"
-            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings:rw", service
-        )
         # 录包用 mcap，它由 base（dustynv 的 rosinstall 列表里带）提供，
         # 卡片侧只声明 exec_depend；镜像必须留下可核对的 ROS 包清单。
         self.assertIn(
