@@ -12,6 +12,7 @@
  */
 
 import { showToast } from './toast.js';
+import { openUsbPairing, supportsUsbPairing } from './usb-pairing.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -1409,6 +1410,18 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  if (supportsUsbPairing(mcp) && ['hand', 'hand_gesture', 'glove_teleop', 'usb_pairing'].includes(toolName)) {
+    const footer = el.querySelector('.canvas-card-footer') || el.querySelector('.canvas-card-body-wrap');
+    const pairButton = document.createElement('button');
+    pairButton.type = 'button';
+    pairButton.className = 'canvas-view-btn canvas-usb-pairing-btn';
+    pairButton.textContent = 'USB 设备配对';
+    pairButton.addEventListener('click', event => {
+      event.stopPropagation();
+      openUsbPairing(mcpId, { onComplete: () => showToast('USB 配对已保存，请重新开始预览并标定') });
+    });
+    footer?.appendChild(pairButton);
+  }
   return el;
 }
 

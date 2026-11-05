@@ -289,6 +289,9 @@ function _buildControllerSection(controllers) {
 function _renderGroupedTools(grid, defaultMcp, tools, useChip) {
   const groups = {};
   for (const tool of tools) {
+    // USB pairing is a setup dialog on an existing device card, not a
+    // separate canvas capability. Keep the MCP tool for dialog RPC calls.
+    if (tool.name === 'usb_pairing') continue;
     const t = tool.type || '';
     (groups[t] = groups[t] || []).push(tool);
   }
