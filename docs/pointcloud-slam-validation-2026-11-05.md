@@ -357,3 +357,11 @@ accidentally imported the old image source via /work; it correctly rejected the
 unverified profile. Repeating with the source snapshot as working directory
 verified the intended changed implementation. Narrow independent review reported
 no actionable correctness findings.
+
+First live trial exposed an existing ROS-clock name collision: SlamInputNode's
+`self._clock = time.monotonic` overwrote rclpy Node's own `_clock`, so actual
+measurement callbacks raised AttributeError. Earlier synthetic lifecycle tests
+replaced the measurement clock and missed it. The live SLAM instance was stopped;
+receipt timing is now named `_receipt_clock`. The real-rclpy lifecycle check now
+asserts the untouched ROS clock and default measurement clock before injecting
+synthetic timestamps. No producer or odometry code was changed.

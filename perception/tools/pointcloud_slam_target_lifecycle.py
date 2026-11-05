@@ -48,6 +48,9 @@ with tempfile.TemporaryDirectory(prefix='synthetic-slam-') as archive:
         plugin=module.PointCloudSlamPlugin(cfg,executor)
         assert plugin.dispatch('pointcloud_slam',args)['state']=='running'
         node=plugin._node
+        # Exercise the real ROS clock before synthetic measurement overrides.
+        assert node.get_clock().now().nanoseconds > 0
+        assert node._measurement_clock_ns() > 0
         feed(node,1000)
         assert count(node)==1
         assert node.stream.store.segments[0].frames[0].cloud_stamp_ns==1000000000

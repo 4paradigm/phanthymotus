@@ -91,7 +91,7 @@ class SlamInputNode(Node):
                 raise ValueError('relocalization requires experimental geometry backend')
         super().__init__('pointcloud_slam_input')
         self.stream = stream
-        self._clock = clock
+        self._receipt_clock = clock
         self._measurement_clock_ns = measurement_clock_ns or (lambda: self.get_clock().now().nanoseconds)
         self._lock = threading.Lock()
         self._preview = preview
@@ -124,7 +124,7 @@ class SlamInputNode(Node):
         with self._lock:
             measurement_now = (self._measurement_clock_ns()
                                if self.stream.max_measurement_age_ms is not None else None)
-            self.stream.odom(sample, now=self._clock(), measurement_now_ns=measurement_now)
+            self.stream.odom(sample, now=self._receipt_clock(), measurement_now_ns=measurement_now)
         self._preview_wake.set()
 
     def _cloud(self, msg):
@@ -133,7 +133,7 @@ class SlamInputNode(Node):
             with self._lock:
                 measurement_now = (self._measurement_clock_ns()
                                    if self.stream.max_measurement_age_ms is not None else None)
-                self.stream.cloud(stamp, frame, points, now=self._clock(),
+                self.stream.cloud(stamp, frame, points, now=self._receipt_clock(),
                                   measurement_now_ns=measurement_now)
         except ValueError as error:
             with self._lock:
@@ -215,7 +215,7 @@ class SlamInputNode(Node):
         with self._lock:
             measurement_now = (self._measurement_clock_ns()
                                if self.stream._poses and self.stream.max_measurement_age_ms is not None else None)
-            status = self.stream.status(now=self._clock(), measurement_now_ns=measurement_now)
+            status = self.stream.status(now=self._receipt_clock(), measurement_now_ns=measurement_now)
             segments = self.stream.store.segments
             active = self.stream._poses[-1].segment_id if self.stream._poses else None
             if (status['odometry'] != 'tracking' or status['cloud'] != 'active' or
@@ -319,7 +319,7 @@ class SlamInputNode(Node):
                 return
             measurement_now = (self._measurement_clock_ns()
                                if self.stream._poses and self.stream.max_measurement_age_ms is not None else None)
-            latest_status = self.stream.status(now=self._clock(), measurement_now_ns=measurement_now)
+            latest_status = self.stream.status(now=self._receipt_clock(), measurement_now_ns=measurement_now)
             if (latest_status['odometry'] != 'tracking' or latest_status['cloud'] != 'active' or
                     latest_status['integration'] != 'collecting_unverified'):
                 if geometry:
@@ -400,4 +400,4 @@ class SlamInputNode(Node):
         with self._lock:
             measurement_now = (self._measurement_clock_ns()
                                if self.stream._poses and self.stream.max_measurement_age_ms is not None else None)
-            return self.stream.status(now=self._clock(), measurement_now_ns=measurement_now)
+            return self.stream.status(now=self._receipt_clock(), measurement_now_ns=measurement_now)
