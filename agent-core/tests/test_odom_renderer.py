@@ -15,7 +15,9 @@ def test_odom_renderer_displays_pose_and_clears_it_when_lost(tmp_path):
     source = (WEB / 'renderers' / 'odom.js').read_text().replace('export const OdomRenderer', 'const OdomRenderer').replace('export function odomPreview', 'function odomPreview')
     harness = r'''
 class Element {
-  constructor() { this.children=[]; this.style={}; this.textContent=''; }
+  constructor() { this.children=[]; this.style={}; this._text=''; this.title=''; }
+  set textContent(value) { this._text=value; this.children=[]; }
+  get textContent() { return this._text + this.children.map(c => c.textContent).join(''); }
   appendChild(e) { this.children.push(e); }
   remove() {}
 }
@@ -33,9 +35,16 @@ const sample={schema:'motus.odom/1', stamp_ms:1234, twist:[1,null,null,null,null
 send(sample);
 let text=box.children[0].textContent;
 if (!text.includes('1.000') || !text.includes('odom') || !text.includes('run-1')) throw Error(text);
+const findTitle=(el, title)=>el.title===title || el.children.some(c=>findTitle(c,title));
+if (!findTitle(box, 'run-1')) throw Error('full segment must remain accessible');
+sample.vendor.motus_slam.status='degraded'; send(sample);
+text=box.children[0].textContent;
+if (text.includes('1.000, 2.000, 3.000')) throw Error('untrusted pose remains visible: '+text);
+sample.vendor.motus_slam.status='unknown'; send(sample);
+if (box.children[0].textContent.includes('1.000, 2.000, 3.000')) throw Error('unknown pose remains visible');
 sample.pose=null; sample.vendor.motus_slam.status='lost'; send(sample);
 text=box.children[0].textContent;
-if (!text.includes('lost') || !text.includes('位置: —')) throw Error(text);
+if (!text.includes('lost') || !text.includes('位置') || !text.includes('—')) throw Error(text);
 sample.twist={}; send(sample);
 now=6001; timer();
 if (!box.children[0].textContent.includes('已暂停')) throw Error('missing stale notice');

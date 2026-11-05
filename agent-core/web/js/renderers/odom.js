@@ -6,7 +6,7 @@ export const OdomRenderer = {
   mount(container) {
     this._el = document.createElement('div');
     this._el.className = 'renderer-odom';
-    this._el.style.cssText = 'padding:10px 12px;white-space:pre-wrap;overflow:auto;font:12px/1.7 var(--font-mono,monospace)';
+    this._el.style.cssText = 'padding:14px 16px;overflow:auto;font:13px/1.5 var(--font-sans,sans-serif);color:var(--text-primary, #292725)';
     this._el.textContent = '等待里程计数据';
     this._lastAt = null;
     this._timer = setInterval(() => {
@@ -26,23 +26,37 @@ export const OdomRenderer = {
     const vendor = msg.vendor || {};
     const meta = vendor.motus_slam || vendor;
     const status = typeof meta.status === 'string' ? meta.status : '未知';
-    const pose = status === 'lost' || status === 'initializing' ? null : msg.pose;
+    const pose = status === 'tracking' ? msg.pose : null;
     const twist = Array.isArray(msg.twist) ? msg.twist : [];
     const vector = (v, n) => Array.isArray(v) && v.length === n
       ? v.map(x => typeof x === 'number' && Number.isFinite(x) ? x.toFixed(3) : '—').join(', ') : '—';
     const text = v => typeof v === 'string' && v ? v : '—';
-    this._el.textContent = [
-      `状态: ${status}`,
-      `分段: ${text(meta.segment_id)}`,
-      `位置: ${vector(pose?.position, 3)} m`,
-      `姿态 (x, y, z, w): ${vector(pose?.quaternion, 4)}`,
-      `坐标系: ${text(pose?.frame_id)} → ${text(pose?.child_frame_id)}`,
-      `速度 (vx, vy, vz): ${vector(twist.slice(0, 3), 3)} m/s`,
-      `角速度 (wx, wy, wz): ${vector(twist.slice(3, 6), 3)} rad/s`,
-      `采样时间: ${Number.isSafeInteger(msg.stamp_ms) ? msg.stamp_ms + ' ms' : '—'}`,
-      `时钟: ${text(meta.clock_id)}；测量年龄: 未知`,
-      `协方差: ${Array.isArray(pose?.covariance) && pose.covariance.length === 36 ? '已提供' : '未知'}`,
-    ].join('\n');
+    const rows = [
+      ['状态', status], ['位置', `${vector(pose?.position, 3)} m`],
+      ['姿态 x, y, z, w', vector(pose?.quaternion, 4)],
+      ['线速度 m/s', vector(twist.slice(0, 3), 3)],
+      ['角速度 rad/s', vector(twist.slice(3, 6), 3)],
+      ['分段', text(meta.segment_id)], ['参考坐标系', text(pose?.frame_id)],
+      ['位姿参考点', text(pose?.child_frame_id)],
+      ['采样时间', Number.isSafeInteger(msg.stamp_ms) ? msg.stamp_ms + ' ms' : '—'],
+      ['时钟', text(meta.clock_id)], ['测量年龄', '未知'],
+      ['协方差', Array.isArray(pose?.covariance) && pose.covariance.length === 36 ? '已提供' : '未知'],
+    ];
+    this._el.textContent = '';
+    for (const [label, value] of rows) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:grid;grid-template-columns:minmax(85px, auto) minmax(0, 1fr);gap:12px;padding:4px 0;align-items:baseline';
+      const key = document.createElement('span');
+      key.style.cssText = 'color:var(--text-secondary, #77716b);font-size:12px';
+      key.textContent = label;
+      const content = document.createElement('span');
+      content.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:12px/1.5 var(--font-mono,monospace)';
+      content.textContent = value;
+      content.title = value;
+      row.appendChild(key);
+      row.appendChild(content);
+      this._el.appendChild(row);
+    }
   },
 
   onEvent() {},
