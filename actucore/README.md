@@ -9,7 +9,14 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前有一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+| 卡片及配置键 | 职责 |
+|---|---|
+| `vla` | 模型策略，通过可插拔 provider 生成控制指令。 |
+| `navi` | 反应式视觉伺服，不提供建图或全局路径规划。 |
+| `controlled_semantic_spatial` | 建图、定位、路径导航与语义航点；详见[导航卡片文档](plugins/controlled_semantic_spatial/README.md)。 |
+
+`enabled` 决定卡片是否注册，不会自动启动运动。`controlled_semantic_spatial`
+与 `navi` 不得同时向相同控制 topic 发布；物理执行仍由下游驱动负责。
 
 ## `vla` 卡片
 
@@ -72,7 +79,8 @@ SmolVLA 的天花板是 `max_action_dim: 32` —— 训练时把动作补到 32 
 
 - **不自启动。** bundle 生命周期的 `start()` 故意什么都不做，策略不能因为容器重启就继续跑。
 - **不声明 `x-completion`。** 策略跑到被停为止，没有"完成"；声明了会让一个 ACP pending 挂住整张卡片的生命周期，把其它所有 actuator 堵在 barrier 后面。
-- **`x-resource` + 两个 interrupt hook** 都指向 `stop`。
+- **资源和打断分工。** `x-resource` 声明占用的资源；两个 interrupt hook 调用
+  `interrupt`，停止输出并丢弃当前动作片段；`stop` 用于停止卡片。
 - 推理失败时**发布空**而不是重发上一条：接收端的 watchdog 会让机械臂停住，而重发会让它继续按一个已经不在跑的策略动。
 
 真正保证安全的东西在驱动侧 —— `common/control.ControlSink` 逐条检查、静默即 hold、受力即停。这个分工是刻意的：actucore 这个进程可能崩溃、被 OOM kill、或者丢掉网络，这三种情况都不能是"机器人靠它停下来"。
@@ -86,7 +94,7 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 | | |
 |---|---|
 | MCP HTTP | `http://<host>:15730/mcp` |
-| SSE（ACP 完成事件） | `http://<host>:15730/sse` |
+| SSE（ACP 完成事件） | `http://<host>:15730/mcp/sse` |
 | 容器 | `embodied-actucore` |
 | 镜像 | `<registry>/<namespace>/actucore:<tag>` |
 | 注册类别 | `actucore` |
@@ -348,10 +356,10 @@ r1_sz 上一条追人的轨迹就这样被重捕到一个灭火器/路锥上（v
 像发散，而一次出处不明的测量值不了多少钱。
 
 ```bash
-docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_fov.py wall
-docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_fov.py object --width 0.60 --target box
-docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_odom_drift.py static --seconds 60
-docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_odom_drift.py landmark --target chair --seconds 120
+docker exec -it embodied-actucore python3 /work/tools/measure_fov.py wall
+docker exec -it embodied-actucore python3 /work/tools/measure_fov.py object --width 0.60 --target box
+docker exec -it embodied-actucore python3 /work/tools/measure_odom_drift.py static --seconds 60
+docker exec -it embodied-actucore python3 /work/tools/measure_odom_drift.py landmark --target chair --seconds 120
 ```
 
 **`measure_fov.py`** 回答两个问题，不只一个。`half_fov_rad` 是个配置值不是读数，
@@ -397,24 +405,29 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 
 ## 构建与运行
 
-只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
+ActuCore 仅提供 Jetson 镜像，两条 JetPack 线的卡片支持如下：
+
+| 平台 | 卡片支持 |
+|---|---|
+| JetPack 5.11（默认） | `controlled_semantic_spatial`、`navi` 和 VLA 的 `mock` / `vla_cloud`；不含本地 SmolVLA。 |
+| JetPack 6.1 | `vla`（含本地 SmolVLA）和 `navi`；`controlled_semantic_spatial` 默认关闭，运行时未提供且未验证。 |
 
 ```bash
-./deploy/build_actucore.sh                    # JetPack 5.11（默认，与 build_perception.sh 一致）
-./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1，带本机推理
-./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
+./deploy/build_actucore.sh                 # JetPack 5.11（默认）
+./deploy/build_actucore.sh --mirror tuna   # 指定 pip / apt 源
+./deploy/build_actucore.sh --jp-version 6.1 # 保留 VLA 本地推理，新 navigation 未启用
 ```
 
-**同一份 Dockerfile，两个 base**，应用层逐字节一样：
+JP5 日常构建使用版本化导航基座；默认的 `jp511-v1` 须先构建到本机或发布才能使用。
+导航依赖变化时，在原生 ARM64 上使用新版本号单独构建基座，例如：
 
-| | base | 可用 provider | 大小 |
-|---|---|---|---|
-| jp5.11（默认） | `jetson-base`（共享的那个） | `mock` + `vla_cloud` | ~13.8 GB |
-| jp6.1 | `jetson-base-actucore`（CUDA torch 2.9 + lerobot） | 全部 | ~18.6 GB |
+```bash
+NAVIGATION_BASE_TAG=jp511-v2 ./deploy/prepare_navigation_base.sh --mirror tuna
+```
 
-这个差别是**被迫的，不是取舍**：jp5.11 是 CUDA 11.4，而 lerobot 要 `torch >= 2.2.1`，PyTorch 官方矩阵里 torch 2.2 的最低 CUDA 是 11.8 —— 那条线上**不可能**有本机推理。`smolvla` 在那里会在 start 时直接拒绝并说明原因。完整调研见 `deploy/prepare_actucore_base.sh`。
-
-jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）。加本机模型卡片时，如果它的依赖不在 base 里，放在它自己的 `RUN` 层，不要预装在共享基础层里。
+发布后的基座标签不得覆盖；依赖变化时使用新版本号。固定标签本身不能阻止
+仓库覆盖，发布时仍须记录并核验镜像 digest。构建参数及导航运行约束见
+[导航卡片文档](plugins/controlled_semantic_spatial/README.md#构建与本地部署验收)。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 
@@ -431,11 +444,12 @@ jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）�
 | `get_tools()` | `-> list[dict]` | 返回工具 metadata 列表 |
 | `dispatch(name, args)` | `-> dict \| None` | 返回 `None` 会让 MCP 报 `-32601` |
 
-可选：`start()` / `stop()` —— 只有在 `main.py` 的注册块里显式调用才会被执行。
+可选：`start()` / `stop()`。注册卡片不自动启动运动；Bundle 退出时统一调用
+已注册卡片的 `stop()`，尽力清理其资源。
 
 ### 四个必须知道的坑
 
-1. **`PREFIX` 不能含下划线。** `dispatch()` 用 `full_name.partition("_")` 拆前缀，所以 `PREFIX = "vla"` 可以，`PREFIX = "grasp_policy"` 永远匹配不上。
+1. **`PREFIX` 可以含下划线。** `dispatch()` 按完整名称或最长的 `PREFIX_` 边界匹配；避免不同卡片注册相同前缀或有歧义的工具名。
 2. **`inputSchema.properties.action.enum` 必须包含 `"info"`。** Agent Core 靠它探活 —— 它会挑出 action enum 里有 `info` 的工具，用 `{"action": "info"}` 调一次（`agent-core/src/api/mcp_manage.py`）。没有 `info` 的卡片会一直是离线状态。
 3. **`dispatch()` 必须返回 plain dict**，例如 `{"state": "running"}`。MCP HTTP handler 会自己包成 JSON-RPC 的 content 格式。**不要**返回已经包好的 `[{"type": "text", ...}]`，那会二次编码并让前端解析失败。
 4. **`x-completion` / `x-hooks` 放在 `inputSchema` 里面**，不是工具顶层。
@@ -475,7 +489,7 @@ TOOLS = [
 ]
 ```
 
-**`type` 的含义** —— 它决定 Agent Core 怎么调度这个工具：`sensor` 连续调用会被批量并行；`actuator` 和 `processor` 要过 ACP barrier，dispatch 前会等所有 pending 动作完成；`resource` 是静态资源（如 URDF）。没声明 `type` 的工具默认按需要 barrier 处理（安全侧）。判定逻辑在 `agent-core/src/event/llm.py` 的 `_needs_barrier()`。
+**`type` 的含义** —— 它决定 Agent Core 怎么调度这个工具：`sensor` 连续调用会被批量并行；`actuator` 和 `processor` 要过 ACP barrier，按上游 `x-resource` 和调用者顺序等待冲突动作；未声明资源时保守互斥；`resource` 是静态资源（如 URDF）。没声明 `type` 的工具默认按需要 barrier 处理（安全侧）。判定逻辑在 `agent-core/src/event/llm.py` 的 `_needs_barrier()`。
 
 **`configSchema` 的 `scope`** —— `shared` 是整个卡片共享一份配置，`instance` 是每张画布卡片一份。
 
@@ -492,12 +506,13 @@ TOOLS = [
        self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
        log.info("XPlugin loaded")
    ```
-4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
+4. 该卡片需要的依赖加到 `Dockerfile.jetson` 自己的 `RUN` 层
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）必须在注册块中校验类型和该
+runtime adapter 的支持范围；不要用 hostname 猜测机器人 namespace。
 
-完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。
+本层最完整的范例是 `plugins/controlled_semantic_spatial/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。
 
 ### 要发 `motus.control/1` 指令流的卡片
 

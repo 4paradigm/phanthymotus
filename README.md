@@ -48,6 +48,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 
 > Editable source: [`docs/architecture.svg`](docs/architecture.svg) — re-export the PNG after changing it.
 
+ActuCore ships the robot-independent `controlled_semantic_spatial` navigation
+contract. Its bundled FAST-LIVO2/Nav2 adapter and current hardware acceptance
+cover G1; other bodies require compatible adapters and their own acceptance.
+The older architecture list's no-cards statement is superseded by this contract.
+
 The platform runs a single **sense → think → act** loop:
 
 `Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Driver·Actuator → Hardware`
@@ -719,6 +724,10 @@ Cards reference devices by MCP `server_name`, not by the machine-local
 
 Deploy and manage Agent Core and hardware driver containers from the dashboard.
 
+The Agent Core `ROS_BASE_IMAGE` contract includes ROS Humble `rclpy`,
+`sensor_msgs`, and `nav_msgs`; the downstream build imports the concrete bridge
+message types and fails immediately if a replacement base omits that contract.
+
 ![Deploy](docs/images/deploy.png)
 
 ## Deployment Architecture
@@ -878,4 +887,3 @@ its dashboard.
 ## License
 
 [Apache License 2.0](LICENSE)
-
