@@ -182,3 +182,25 @@ The full production timeout/retry flags also successfully downloaded the pinned
 archive on the host; its SHA-256 matched
 `48c760e17a8b6c0e59fcc1d6a71602907fedbb9c39ba400d13f998dab1fd5080`.
 This verifies the normal path on the host, not connectivity from the build runner.
+
+
+## Formal build 0d2cb78: slow transfer, not compiler failure
+
+The next operator-reported result (PR comment 6656702999) materially refines the
+earlier hypothesis. Open3D import completed and the download stage was reached.
+Curl reported exit28 after each 120s attempt, receiving 3,987,475 and 3,737,945
+bytes respectively out of 29,687,819. The 120s cap was too short for this runner's
+observed roughly 31–33 KB/s average transfer rate. No GTSAM compile had started.
+
+The revised command exposes curl's real byte-count/speed progress (removes silent
+mode), retains the 30s/1024B/s low-speed bound and 20s connect bound, and permits
+1800s per attempt with a 2400s retry budget. A final attempt can extend beyond the
+retry budget; the absolute build cap remains in force. The review worker reads
+output chunks, so carriage-return progress updates refresh its idle timer. This
+is transfer telemetry, not an unrelated heartbeat; the 600s watchdog is unchanged.
+At the observed rate the 29.7MB archive needs roughly 15–16 minutes, within the new
+per-attempt budget. Future network behavior remains unverified.
+
+A controlled slow-body test reproduced curl28 under a short budget; the revised
+progress command completed and verified 100,000 bytes in about 3 seconds
+with multiple genuine progress updates. The pinned archive/checksum is unchanged.
