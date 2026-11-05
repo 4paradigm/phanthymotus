@@ -1,4 +1,4 @@
-"""Opt-in experimental input card: odometry graph only, no SLAM map output."""
+"""Opt-in experimental input card with clearly labelled odometry preview."""
 import threading
 
 from .pointcloud_slam_ros import SlamInputNode
@@ -7,13 +7,13 @@ from utils.ros_lifecycle import dispose_node
 
 
 TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False,
-          'description': '实验性点云与里程计输入及分段图；尚不输出 SLAM 地图或回环',
+          'description': '实验性点云与里程计输入；可选未验证里程计预览，尚无真实回环',
           'inputSchema': {'type': 'object', 'properties': {
               'action': {'type': 'string', 'enum': ['start', 'stop', 'info']},
               'input_topics': {'type': 'array', 'items': {'type': 'string'}},
               'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'}}, 'required': ['action']},
           'topic_in': [{'format': 'state/odom'}, {'format': 'sensor/pointcloud2'}],
-          'topic_out': []}]
+          'topic_out': [{'format': 'sensor/slam-preview'}, {'format': 'data/json'}]}]
 
 
 class PointCloudSlamPlugin:
@@ -37,6 +37,7 @@ class PointCloudSlamPlugin:
             node, self._node = self._node, None
             self._topics = {}
             if node is not None:
+                node.stop_preview()
                 dispose_node(self._executor, node, label='pointcloud_slam')
 
     def dispatch(self, name, args):
@@ -48,11 +49,14 @@ class PointCloudSlamPlugin:
             with self._lock:
                 node = self._node
                 input_status = node.status() if node else {'odometry': 'waiting'}
+                outputs = ([{'topic': node._preview['topic'], 'format': 'sensor/slam-preview'},
+                            {'topic': node._preview['status_topic'], 'format': 'data/json'}]
+                           if node and node._preview else [])
                 return {'state': 'running' if node else 'idle',
-                        'desc': '实验输入与里程计图；无回环和地图输出',
+                        'desc': '实验输入与未验证里程计预览；无真实回环',
                         'topic_in': [{'topic': topic, 'format': fmt}
                                      for topic, fmt in self._topics.items()],
-                        'topic_out': [],
+                        'topic_out': outputs,
                         'input_status': input_status,
                         'last_error': input_status.get('last_error', '')}
         if action != 'start':
@@ -90,14 +94,24 @@ class PointCloudSlamPlugin:
             try:
                 stream = SlamStream(**{key: self._config[key] for key in keys})
                 cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
-                node = SlamInputNode(odom_topic, cloud_topic, stream)
+                preview = None
+                if self._config.get('preview_enabled') is True:
+                    preview = {'topic': cloud_topic + '/slam_odom_preview',
+                               'status_topic': cloud_topic + '/slam_odom_preview_status',
+                               'backend': self._config.get('preview_backend', 'raw'),
+                               'interval_s': self._config.get('preview_interval_s', 1.),
+                               'max_points': self._config.get('preview_max_points', 40000),
+                               'sigmas': self._config.get('preview_odom_sigmas')}
+                node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
                 try:
                     self._executor.add_node(node)
+                    node.start_preview()
                 except Exception:
-                    node.destroy_node()
+                    node.stop_preview()
+                    dispose_node(self._executor, node, label='pointcloud_slam')
                     raise
-            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            except (ImportError, KeyError, TypeError, ValueError, RuntimeError) as error:
                 return {'state': 'error', 'message': str(error)}
             self._topics = dict(bindings)
             self._node = node
-            return {'state': 'running', 'message': '实验输入已启动；无回环或地图输出'}
+            return {'state': 'running', 'message': '实验输入已启动；预览未验证，无真实回环'}

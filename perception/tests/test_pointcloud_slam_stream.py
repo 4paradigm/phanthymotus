@@ -208,3 +208,15 @@ def test_late_odom_is_ignored_without_refreshing_or_locking_segment():
     s.odom(odom(1100), now=1.2)
     s.cloud(1_100_000_000, 'camera', [[2, 0, 0]], now=1.2)
     assert len(s.store.segments[0].frames) == 2
+
+
+def test_cloud_freshness_requires_new_capture_not_repeated_frame():
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    assert s.status(now=1.)['cloud'] == 'waiting'
+    s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
+    assert s.status(now=1.)['cloud'] == 'active'
+    with pytest.raises(ValueError, match='timestamp'):
+        s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.5)
+    s.odom(odom(2100), now=2.1)
+    assert s.status(now=2.1)['cloud'] == 'stale'

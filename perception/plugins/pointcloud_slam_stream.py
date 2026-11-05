@@ -70,6 +70,8 @@ class SlamStream:
         self._poses = deque(maxlen=512)
         self._pending = deque()
         self._last_received = None
+        self._last_cloud_received = None
+        self._last_cloud_stamp_ns = None
         self.last_error = ''
         self._odom_state = 'waiting'
         self._dropped_pending = 0
@@ -99,11 +101,20 @@ class SlamStream:
                 last_error = str(error)
                 odom_state = 'stale'
         segments = self.store.segments
+        cloud_state = 'waiting'
+        if self._last_cloud_received is not None:
+            cloud_state = 'active'
+            try:
+                if now - self._last_cloud_received > self.max_age_s:
+                    raise ValueError('pointcloud receipt stale')
+                self._check_measurement_time(self._last_cloud_stamp_ns, measurement_now_ns)
+            except ValueError:
+                cloud_state = 'stale'
         integration = ('waiting_for_tracking' if odom_state != 'tracking' else
                        'waiting_for_new_segment' if self.store.requires_new_segment else
                        'capacity_reached' if self._capacity_reached else
                        'collecting_unverified')
-        return {'odometry': odom_state, 'pending_clouds': len(self._pending),
+        return {'odometry': odom_state, 'cloud': cloud_state, 'pending_clouds': len(self._pending),
                 'integration': integration,
                 'dropped_pending': self._dropped_pending, 'segments': len(segments),
                 'keyframes': sum(len(segment.frames) for segment in segments),
@@ -169,6 +180,8 @@ class SlamStream:
             raise ValueError('odometry stale or unavailable')
         if type(stamp_ns) is not int or stamp_ns <= 0 or frame != self.cloud_frame:
             raise ValueError('invalid cloud frame or timestamp')
+        if self._last_cloud_stamp_ns is not None and stamp_ns <= self._last_cloud_stamp_ns:
+            raise ValueError('cloud timestamp did not increase')
         self._check_measurement_time(stamp_ns, measurement_now_ns)
         points = np.asarray(points)
         if points.ndim != 2 or points.shape[1] != 3 or not 0 < len(points) <= self.max_cloud_points:
@@ -176,6 +189,8 @@ class SlamStream:
         points = np.asarray(points, dtype=float)
         if not np.isfinite(points).all():
             raise ValueError('cloud must be finite')
+        self._last_cloud_stamp_ns = stamp_ns
+        self._last_cloud_received = now
         if len(self._pending) == self.max_pending:
             self._pending.popleft()
             self._dropped_pending += 1

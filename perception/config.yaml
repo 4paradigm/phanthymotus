@@ -284,6 +284,9 @@ plugins:
   # clock, extrinsic and bounded-resource configuration. Never enable by default.
   pointcloud_slam:
     enabled: false
+    # Optional diagnostic only: preview_enabled: true; preview_backend: raw
+    # (or gtsam with a separately installed backend and explicit noise sigmas).
+    # Preview is unvalidated odometry accumulation, not a loop-closed SLAM map.
 
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities

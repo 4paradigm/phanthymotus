@@ -98,3 +98,66 @@ def test_missing_optional_slam_module_does_not_stop_perception_bundle(monkeypatc
     monkeypatch.setattr(builtins, '__import__', failing)
     bundle = PerceptionBundle({'plugins': {'pointcloud_slam': {'enabled': True}}}, _FakeExecutor())
     assert not bundle.owns('pointcloud_slam')
+
+
+def test_opt_in_preview_runs_worker_publishes_and_stops_only_its_node():
+    import json
+    from types import SimpleNamespace as NS
+    from test_pointcloud_slam_stream import odom
+    from test_pointcloud_slam_ros import cloud
+    from vision_stubs import _wait_until
+    cfg = {**config(), 'preview_enabled': True, 'preview_backend': 'raw',
+           'preview_interval_s': .1, 'preview_max_points': 10}
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin(cfg, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    node = executor.nodes[0]
+    node._clock = lambda: 1.
+    node._measurement_clock_ns = lambda: 1_000_000_000
+    callbacks = {s.topic: s.callback for s in node.subscriptions}
+    callbacks['/o'](NS(data=json.dumps(odom(1000))))
+    callbacks['/c'](cloud())
+    info = plugin.dispatch('pointcloud_slam', {'action': 'info'})
+    assert {'topic': '/c/slam_odom_preview', 'format': 'sensor/slam-preview'} in info['topic_out']
+    pub = next(p for p in node.publishers if p.topic == '/c/slam_odom_preview')
+    assert _wait_until(lambda: len(pub.messages) > 0)
+    plugin.dispatch('pointcloud_slam', {'action': 'stop'})
+    assert not executor.nodes and not node._preview_worker.is_alive()
+
+
+def test_preview_start_failure_removes_node_from_executor(monkeypatch):
+    from plugins.pointcloud_slam_ros import SlamInputNode
+    monkeypatch.setattr(SlamInputNode, 'start_preview',
+                        lambda self: (_ for _ in ()).throw(RuntimeError('worker failed')))
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin({**config(), 'preview_enabled': True}, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'error'
+    assert not executor.nodes
+
+
+def test_gtsam_preview_fails_closed_if_backend_is_missing(monkeypatch):
+    import builtins
+    original = builtins.__import__
+    def failing(name, *args, **kwargs):
+        if name == 'gtsam':
+            raise ImportError('gtsam unavailable')
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', failing)
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin({**config(), 'preview_enabled': True,
+             'preview_backend': 'gtsam', 'preview_odom_sigmas': [.1] * 6}, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    result = plugin.dispatch('pointcloud_slam', args)
+    assert result['state'] == 'error' and 'gtsam' in result['message']
+    assert not executor.nodes
