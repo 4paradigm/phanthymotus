@@ -44,7 +44,7 @@ class HeightBandConfigTest(unittest.TestCase):
         data = template()
         band = (FAST_LIVO2_CONFIG_DEFAULTS['obstacle_min_height_m'],
                 FAST_LIVO2_CONFIG_DEFAULTS['obstacle_max_height_m'])
-        self.assertEqual(band, (-.30, .30))
+        self.assertEqual(band, (-.80, .10))
         self.assertEqual(limits(data), [band] * 4)
         for name in ('local_costmap', 'global_costmap'):
             params = data[name][name]['ros__parameters']

@@ -182,7 +182,7 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
 
     def test_heading_threshold_defaults_and_invalid_values(self) -> None:
         plugin = Nav2Plugin({}, None, backend=ReadyBackend())
-        self.assertEqual(plugin.dispatch("nav2", {"action": "info"})["config"]["rotate_reengage_rad"], 0.15)
+        self.assertEqual(plugin.dispatch("nav2", {"action": "info"})["config"]["rotate_reengage_rad"], 0.30)
         for value in (0.05, 0.1, 0.15, 0.35):
             with self.subTest(value=value):
                 result = plugin.dispatch("nav2", {"action": "config", "rotate_reengage_rad": value})

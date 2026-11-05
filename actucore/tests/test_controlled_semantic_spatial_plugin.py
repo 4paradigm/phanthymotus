@@ -2246,7 +2246,7 @@ class SimplifiedNavigationConfigTest(unittest.TestCase):
         info = plugin.dispatch(plugin.PREFIX, {'action': 'info'})
         self.assertEqual(info['inflation_radius_m'], .55)
         self.assertEqual(info['ignored_legacy_fields'], [])
-        self.assertEqual(info['mapping']['config']['obstacle_min_height_m'], -.3)
+        self.assertEqual(info['mapping']['config']['obstacle_min_height_m'], -.8)
 
 
 class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):

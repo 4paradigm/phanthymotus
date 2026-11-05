@@ -23,8 +23,8 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "lidar_qos_depth": 100,
     "imu_qos_depth": 2000,
     "map_voxel_size_m": 0.10,
-    "obstacle_min_height_m": -0.30,
-    "obstacle_max_height_m": 0.30,
+    "obstacle_min_height_m": -0.80,
+    "obstacle_max_height_m": 0.10,
     "map_view_enabled": True,
 }
 
@@ -79,7 +79,7 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "type": "number",
             "minimum": -3.0,
             "maximum": 3.0,
-            "default": -0.30,
+            "default": -0.80,
             "description": (
                 "Lowest map-frame Z retained as a 2D navigation obstacle; "
                 "lower points remain visible in map_view"
@@ -89,7 +89,7 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "type": "number",
             "minimum": -3.0,
             "maximum": 3.0,
-            "default": 0.30,
+            "default": 0.10,
             "description": (
                 "Highest map-frame Z retained as a 2D navigation obstacle; "
                 "higher points remain visible in map_view"

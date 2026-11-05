@@ -22,7 +22,7 @@ NAV2_CONFIG_DEFAULTS = {
     "shadow_only": True,
     "request_timeout_sec": 30.0,
     "discovery_timeout_sec": 5.0,
-    "rotate_reengage_rad": 0.15,
+    "rotate_reengage_rad": 0.30,
     "input_max_age_ms": 500,
     "min_x_mps": 0.30,
     "max_x_mps": 1.0,
@@ -62,7 +62,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "type": "number",
             "minimum": 0.05,
             "maximum": 0.35,
-            "default": 0.15,
+            "default": 0.30,
             "description": "Maximum heading error in radians while driving before stopping to turn; applies on next start",
         },
         "input_max_age_ms": {

@@ -18,8 +18,8 @@ plugins:
       lidar_qos_depth: 2
       imu_qos_depth: 400
       map_voxel_size_m: 0.10
-      obstacle_min_height_m: -0.30
-      obstacle_max_height_m: 0.30
+      obstacle_min_height_m: -0.80
+      obstacle_max_height_m: 0.10
     planning:
       backend: ros_topic
       shadow_only: true

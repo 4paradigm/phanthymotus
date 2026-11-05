@@ -92,7 +92,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("obstacle_min_height_m"),
             DeclareLaunchArgument("obstacle_max_height_m"),
             DeclareLaunchArgument("inflation_radius_m"),
-            DeclareLaunchArgument("rotate_reengage_rad", default_value="0.15"),
+            DeclareLaunchArgument("rotate_reengage_rad", default_value="0.30"),
             DeclareLaunchArgument("rotate_exit_rad", default_value="0.05"),
             DeclareLaunchArgument(
                 "command_topic",
