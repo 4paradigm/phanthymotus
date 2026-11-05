@@ -670,18 +670,21 @@ print('[build] zxing-cpp:', version('zxing-cpp'), 'ok,', \
 # GTSAM 4.2 has no CPython 3.10 aarch64 wheel, so build the official pinned
 # source. Keep the base NumPy ABI; do not let either install replace it.
 ARG SLAM_GTSAM_COMMIT=4f66a491ffc83cf092d0d818b11dc35135521612
+ARG SLAM_GTSAM_SHA256=48c760e17a8b6c0e59fcc1d6a71602907fedbb9c39ba400d13f998dab1fd5080
 RUN if [ "${JP_VERSION}" = "61" ]; then \
       set -eu; . /etc/jetpack.env; \
       mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real; \
       printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
       apt-get update; apt-get install -y --no-install-recommends \
-        git cmake build-essential python3-dev libboost-all-dev; \
+        curl ca-certificates cmake build-essential python3-dev libboost-all-dev; \
       mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig; \
       ldconfig || echo '[build] ldconfig skipped under emulation'; \
       pip3 install --no-cache-dir -i "${PYPI_MIRROR}" "numpy==${NUMPY_VERSION}" pyparsing addict pyquaternion configargparse; \
       pip3 install --no-cache-dir --no-deps -i "${PYPI_MIRROR}" 'open3d==0.18.0'; \
-      git clone --branch 4.2 --depth 1 https://github.com/borglab/gtsam.git /tmp/gtsam; \
-      test "$(git -C /tmp/gtsam rev-parse HEAD)" = "${SLAM_GTSAM_COMMIT}"; \
+      curl -fsSL --retry 4 --retry-delay 3 --connect-timeout 20 \
+        "https://codeload.github.com/borglab/gtsam/tar.gz/${SLAM_GTSAM_COMMIT}" -o /tmp/gtsam.tar.gz; \
+      echo "${SLAM_GTSAM_SHA256}  /tmp/gtsam.tar.gz" | sha256sum -c -; \
+      mkdir /tmp/gtsam; tar -xzf /tmp/gtsam.tar.gz --strip-components=1 -C /tmp/gtsam; \
       cmake -S /tmp/gtsam -B /tmp/gtsam-build -DCMAKE_BUILD_TYPE=Release \
         -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
         -DGTSAM_BUILD_UNSTABLE=OFF -DGTSAM_BUILD_PYTHON=ON -DGTSAM_PYTHON_VERSION=3.10 \
@@ -690,7 +693,7 @@ RUN if [ "${JP_VERSION}" = "61" ]; then \
       cmake --build /tmp/gtsam-build --target python-install --parallel 2; \
       LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}" python3 -c \
         "import numpy as n,open3d as o,gtsam as g; assert n.__version__ == '${NUMPY_VERSION}'; assert o.__version__ == '0.18.0'; p=o.geometry.PointCloud(o.utility.Vector3dVector(n.array([[0.,0.,0.],[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]))); r=o.pipelines.registration.registration_icp(p,p,0.1,n.eye(4)); assert r.fitness == 1.; graph=g.NonlinearFactorGraph(); v=g.Values(); v.insert(0,g.Pose3()); graph.add(g.PriorFactorPose3(0,g.Pose3(),g.noiseModel.Diagonal.Sigmas(n.ones(6)))); assert g.LevenbergMarquardtOptimizer(graph,v).optimize().atPose3(0).matrix().shape == (4,4)"; \
-      rm -rf /tmp/gtsam /tmp/gtsam-build /var/lib/apt/lists/*; \
+      rm -rf /tmp/gtsam /tmp/gtsam-build /tmp/gtsam.tar.gz /var/lib/apt/lists/*; \
     fi
 
 EXPOSE 15720
