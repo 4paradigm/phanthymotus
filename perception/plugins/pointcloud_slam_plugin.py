@@ -32,6 +32,7 @@ TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False
               'preview_enabled': {'type': 'boolean', 'default': False, 'description': '启用未验证里程计预览'},
               'preview_backend': {'type': 'string', 'enum': ['raw', 'gtsam', 'geometry_experimental'], 'description': '预览后端；几何候选仍未验证'},
               'preview_geometry': {'type': 'string', 'description': '实验性几何检索、配准和图参数的 JSON 对象'},
+              'preview_relocalization': {'type': 'boolean', 'default': False, 'description': '实验性双子图重定位预览，结果未经验证'},
               'preview_interval_s': {'type': 'number', 'description': '预览间隔（秒）'},
               'preview_max_points': {'type': 'integer', 'description': '预览点数上限'},
               'preview_odom_sigmas': {'type': 'string', 'description': 'GTSAM 六维噪声 JSON 数组'},
@@ -89,7 +90,7 @@ class PointCloudSlamPlugin:
                         updates['child_from_cloud'] = _rigid(updates['child_from_cloud']).tolist()
                     if 'preview_geometry' in updates and not isinstance(updates['preview_geometry'], dict):
                         raise ValueError('preview_geometry must be an object')
-                    for key in ('clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled'):
+                    for key in ('clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled', 'preview_relocalization'):
                         if key in updates and type(updates[key]) is not bool:
                             raise ValueError(key + ' must be boolean')
                     for key in ('max_pending', 'max_cloud_points', 'max_frames', 'max_points', 'preview_max_points'):
@@ -175,7 +176,8 @@ class PointCloudSlamPlugin:
                                'interval_s': self._config.get('preview_interval_s', 1.),
                                'max_points': self._config.get('preview_max_points', 40000),
                                'sigmas': self._config.get('preview_odom_sigmas'),
-                               'geometry': self._config.get('preview_geometry')}
+                               'geometry': self._config.get('preview_geometry'),
+                               'relocalization': self._config.get('preview_relocalization', False)}
                 node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
                 try:
                     self._executor.add_node(node)

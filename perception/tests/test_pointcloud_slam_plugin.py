@@ -244,3 +244,25 @@ def test_gtsam_preview_fails_closed_if_backend_is_missing(monkeypatch):
     result = plugin.dispatch('pointcloud_slam', args)
     assert result['state'] == 'error' and 'gtsam' in result['message']
     assert not executor.nodes
+
+
+def test_relocalization_setting_is_explicit_and_forwarded_to_node():
+    import pytest
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    from test_pointcloud_slam_geometry_gate import thresholds
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .1}
+    assert TOOLS[0]['configSchema']['properties']['preview_relocalization']['default'] is False
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin({**config(), 'preview_enabled': True,
+        'preview_backend': 'geometry_experimental', 'preview_geometry': opts,
+        'preview_relocalization': True}, executor)
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    assert executor.nodes[0]._preview['relocalization'] is True
+    plugin.shutdown()

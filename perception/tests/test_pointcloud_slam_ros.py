@@ -454,3 +454,59 @@ def test_preview_rejects_unbounded_update_rate():
     with pytest.raises(ValueError):
         SlamInputNode('/o', '/c', stream(), preview={'topic': '/p', 'status_topic': '/s',
                       'max_points': 10, 'interval_s': .001, 'backend': 'raw'})
+
+
+def test_experimental_relocalization_rebuilds_both_segment_histories():
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_segment_merge import make_two_segments
+    s = make_two_segments()
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .1}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.4, preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts,
+        'relocalization': True})
+    pubs = {p.topic: p for p in node.publishers}
+    pubs['/preview'].subscription_count = 1
+    node.publish_preview_once()
+    status = json.loads(pubs['/status'].messages[-1])
+    assert status['relocalization'] == 'unvalidated_hypothesis'
+    assert status['map_segments'] == [s.store.segments[0].segment_id, 'b']
+    assert status['accepted_loops'] == 0
+    assert pubs['/preview'].messages
+    correction = json.loads(pubs['/preview/map_to_odom'].messages[-1])
+    np.testing.assert_allclose(np.asarray(correction['transform']) @ s.graph()[-1]['poses'][-1],
+                               np.asarray(status['map_pose']), atol=1e-6)
+
+
+def test_lost_during_relocalization_clears_hypothesis_and_outputs(monkeypatch):
+    pytest.importorskip('gtsam'); pytest.importorskip('open3d')
+    import json
+    from test_pointcloud_slam_geometry_gate import thresholds
+    from test_pointcloud_slam_segment_merge import make_two_segments
+    import plugins.pointcloud_slam_relocalization as relocation
+    s = make_two_segments()
+    opts = {'descriptor_voxel_m': .08, 'min_separation_s': .25,
+        'candidate_separation_s': .01, 'max_per_frame': 2, 'max_candidates': 4,
+        'thresholds': thresholds(), 'odom_sigmas': [.1]*6, 'loop_sigmas': [.05]*6,
+        'huber_k': 1., 'voxel_m': .04, 'max_distance_m': .1}
+    node = SlamInputNode('/o', '/c', s, clock=lambda: 1.4, preview={
+        'topic': '/preview', 'status_topic': '/status', 'max_points': 2000,
+        'interval_s': 1., 'backend': 'geometry_experimental', 'geometry': opts,
+        'relocalization': True})
+    original = relocation.relocalize_pair
+    def lose(*args, **kwargs):
+        result = original(*args, **kwargs)
+        node._odom(NS(data=json.dumps(odom(1500, status='lost'))))
+        return result
+    monkeypatch.setattr(relocation, 'relocalize_pair', lose)
+    pubs = {p.topic: p for p in node.publishers}
+    node.publish_preview_once()
+    status = json.loads(pubs['/status'].messages[-1])
+    assert status['state'] == 'lost'
+    assert 'map_segments' not in status and 'relocalization' not in status
+    assert json.loads(pubs['/preview/map_to_odom'].messages[-1])['transform'] is None

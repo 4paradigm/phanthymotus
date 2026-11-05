@@ -86,6 +86,9 @@ class SlamInputNode(Node):
                 if not isinstance(preview.get('geometry'), dict):
                     raise ValueError('explicit geometry settings required')
                 loop_search = ExperimentalLoopSearch(**preview['geometry'])
+            if type(preview.get('relocalization', False)) is not bool or (
+                    preview.get('relocalization') and preview['backend'] != 'geometry_experimental'):
+                raise ValueError('relocalization requires experimental geometry backend')
         super().__init__('pointcloud_slam_input')
         self.stream = stream
         self._clock = clock
@@ -219,8 +222,9 @@ class SlamInputNode(Node):
                 graph = segment = None
             else:
                 segment = segments[-1]
-                graph = self.stream.graph()[-1] if (preview_subscribed or
+                graphs = self.stream.graph() if (preview_subscribed or
                          self._preview['backend'] == 'geometry_experimental') else None
+                graph = graphs[-1] if graphs else None
         geometry = self._preview['backend'] == 'geometry_experimental'
         result = {'kind': 'unvalidated_geometry_preview' if geometry else 'unvalidated_odometry_preview',
                   'state': 'stale' if status['odometry'] == 'tracking' and status['cloud'] == 'stale' else status['odometry'],
@@ -251,6 +255,27 @@ class SlamInputNode(Node):
                               map_pose=np.asarray(poses[-1]).tolist(),
                               map_from_odom=np.asarray(loop['map_from_odom']).tolist())
                 points = loop['after_map']
+                if self._preview.get('relocalization') and len(segments) > 1:
+                    result['relocalization'] = 'unavailable' if len(segments) > 2 else 'searching'
+                    if len(segments) == 2:
+                        from .pointcloud_slam_relocalization import relocalize_pair
+                        opts = self._preview['geometry']
+                        merged = relocalize_pair(segments[0], graphs[0], segment, graph,
+                            descriptor_voxel_m=opts['descriptor_voxel_m'],
+                            max_candidates=opts['max_per_frame'],
+                            thresholds=opts['thresholds'], odom_sigmas=opts['odom_sigmas'],
+                            loop_sigmas=opts['loop_sigmas'], huber_k=opts['huber_k'],
+                            voxel_m=opts['voxel_m'], max_distance_m=opts['max_distance_m'],
+                            max_total_frames=self.stream.store._max_frames,
+                            max_total_points=self.stream.store._max_points)
+                        if merged['hypothesis_created']:
+                            poses = merged['source_poses']
+                            points = merged['map_points']
+                            result.update(relocalization='unvalidated_hypothesis',
+                                map_segments=[segments[0].segment_id, segment.segment_id],
+                                frame_id=segments[0].frames[0].pose.frame_id + '_experimental_map',
+                                map_pose=np.asarray(poses[-1]).tolist(),
+                                map_from_odom=np.asarray(merged['map_from_source_odom']).tolist())
             elif self._preview['backend'] == 'gtsam':
                 from .pointcloud_slam_backend import optimize_odometry_graph
                 poses = optimize_odometry_graph(graph, sigmas=self._preview['sigmas'])
@@ -278,6 +303,8 @@ class SlamInputNode(Node):
                               frame_id=None, stamp_ns=None)
                 result.pop('map_pose', None)
                 result.pop('map_from_odom', None)
+                result.pop('map_segments', None)
+                result.pop('relocalization', None)
             # Do not publish a snapshot after its segment/frame changed during work.
             current = self.stream.store.segments
             current_active = self.stream._poses[-1].segment_id if self.stream._poses else None

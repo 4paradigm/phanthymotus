@@ -107,9 +107,16 @@ bidirectional ICP and geometry gates filter them before graph optimization.
 The optimized historical points, map pose and map-to-odom transform are
 published as **unvalidated** previews; accepted-loop counts remain zero.
 The worker runs without map viewers, and clears pose and correction on input
-loss, error, or stop. A separate bounded two-segment prototype requires a
-caller-provided initial alignment and is not connected to live relocalization.
-Neither this prototype nor a geometric gate establishes safe segment merging.
+loss, error, or stop. An additional opt-in `preview_relocalization` setting
+tests the latest active keyframe against descriptor-ranked keyframes from a
+single preceding segment. FPFH fast global registration supplies an initial
+alignment independently of the two odometry origins; reciprocal ICP and the
+explicit geometry gates precede a two-segment graph hypothesis and rebuilt
+preview. The status reports `unvalidated_hypothesis`, never an accepted loop.
+The hypothesis is recomputed from odometry edges and is not retained as a
+multi-segment graph; more than two segments report `unavailable`. A failed
+search keeps the segments separate. Neither this prototype nor a geometric
+gate establishes safe segment merging or a production relocalization result.
 
 ## Inputs and reproducibility
 
