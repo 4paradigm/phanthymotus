@@ -14,7 +14,8 @@
 - [x] Add fixed-batch geometry history with an overlap anchor and global preview sampling. Verify >600 frames/two transitions with rotation, continuous map coordinates, retained old points, and true-segment isolation. Bound active frames and points.
 - [x] Integrate plugin/profile, input status, save/restore and preview lifecycle. Reject incompatible relocalization mode for paged history rather than silently dropping constraints. Verify restore of frozen poses and strict verification-policy checks.
 - [x] Run local/target tests and resource-limited >600-keyframe replay. Measure computation, memory and map changes. Review the implementation before deployment.
-- [ ] Preserve current trial history, deploy Perception only, verify live progress and new retention behavior, commit/push and request updated PR build/review. No robot motion commands.
+- [x] Preserve current trial history, deploy Perception only and verify live progress and new retention behavior.
+- [ ] Push final deployment evidence and request updated PR build/review. No robot motion commands.
 
 
 Ruling: use independent history output topics per real source segment on restore/reset; never overlay unrelated frames. A saved geometry snapshot displays its exact optimized prefix, while an archive without any computed snapshot is explicitly an odometry preview. An end-to-end restore test verifies actual history packets, not only loaded dictionaries.

@@ -480,3 +480,23 @@ Report: `/tmp/slam-paged-validation/result.json` and log
 300 and restoration, not real-scene global SLAM accuracy. Final directory-fsync
 and separate history-display changes receive target regression checks before
 service deployment.
+
+Capacity-fix deployment: runtime `cbb6c1a` is running as
+`local/phanthymotus-perception:slam-cbb6c1a-trial`. All 21 SLAM source files match
+the commit byte-for-byte. The built image itself passed the real DDS paged
+lifecycle/restore/history-preview check. Perception alone was recreated; Driver
+and Core IDs/start times remained unchanged. Previous legacy trial data is
+backed up on Bumi at `/tmp/slam-before-paged-history.json`.
+
+Post-deployment 60.021-second read-only observation: 105 clouds, 22 previews,
+12 distinct capture stamps (nondecreasing), 36 status messages, odometry tracking
+throughout. Repeated stamps while stationary are expected with motion-selected
+keyframes. Preview interval median 2.588 s / max 3.536 s; compute median 496 ms /
+max 1431 ms; at most 40000 preview points. Later live info reported 152 retained
+keyframes, 270 stationary inputs skipped, 68049299 bytes on disk, active-frame
+limit 300, and continued collection. A live save succeeded in 135 ms. Observed
+Perception memory was 1.097 GiB including its other pipelines; OOMKilled=false.
+Live report: `/tmp/slam-live-progress-cbb6c1a.json` on Bumi. No motion commands,
+Driver modifications or odometry resets were issued. The >300-capacity proof is
+the isolated 620-keyframe replay; the observed live session has not yet reached
+that count and does not establish real loop/accuracy acceptance.
