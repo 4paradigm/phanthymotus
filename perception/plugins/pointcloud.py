@@ -300,6 +300,10 @@ class _PointCloudNode(Node):
         self._metric_cloud_enabled = False
         self._metric_cloud_topic = (input_topic or "/perception") + "/pointcloud_metric"
         self._metric_cloud_pub = None
+        self._metric_lock = threading.Lock()
+        self._metric_published = 0
+        self._metric_skipped = {}
+        self._metric_last_skip = None
 
         self._subs: list = []
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -376,6 +380,8 @@ class _PointCloudNode(Node):
         with self._lifecycle_lock:
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
+                if self._worker.is_alive():
+                    log.warning('[pointcloud] worker still stopping after timeout; model load may be non-cancellable')
             self._worker = None
             self._running = False
             return self._state("idle")
@@ -520,6 +526,8 @@ class _PointCloudNode(Node):
                         self._mode = "mono" if kind == "jpeg" else "depth"
                     if kind == "jpeg":
                         self._maybe_load_mono_model()
+                        if self._stop_event.is_set():
+                            break
                         self._emit_mono(payload)
                     else:
                         self._emit_depth(payload)
@@ -545,6 +553,8 @@ class _PointCloudNode(Node):
     def _emit_depth(self, msg):
         depth_m, enc = _decode_depth_message(msg)
         if depth_m is None:
+            if self._metric_cloud_enabled:
+                self._metric_skip('invalid_depth')
             return
         h, w = depth_m.shape[:2]
         fx, fy, cx, cy = self._pinhole_for(w, h)
@@ -554,25 +564,52 @@ class _PointCloudNode(Node):
         self._publish(xyz)
         if self._metric_cloud_enabled and enc == "32FC1":
             self._publish_metric(xyz, msg, w, h)
+        elif self._metric_cloud_enabled:
+            self._metric_skip('unsupported_encoding')
+
+    def _metric_skip(self, reason):
+        with self._metric_lock:
+            count = self._metric_skipped.get(reason, 0) + 1
+            self._metric_skipped[reason] = count
+            self._metric_last_skip = reason
+        if count == 1 or count % 100 == 0:
+            log.warning('[pointcloud] metric cloud skipped: %s (%d)', reason, count)
+
+    def _metric_status(self):
+        with self._metric_lock:
+            return {'published': self._metric_published, 'skipped': dict(self._metric_skipped),
+                    'last_skip_reason': self._metric_last_skip}
 
     def _publish_metric(self, xyz, source, width, height):
+        if self._stop_event.is_set():
+            return
         # An opt-in asserts that this source's stamp is capture time. A header
         # alone cannot distinguish capture time from publication time.
         calibration = self._calibration
         header = getattr(source, "header", None)
         stamp = getattr(header, "stamp", None)
-        if (not xyz.size or not isinstance(calibration, dict)
-                or calibration.get("width") != width or calibration.get("height") != height
-                or not all(k in calibration for k in ("fx", "fy", "cx", "cy"))
-                or not getattr(header, "frame_id", "") or stamp is None
-                or getattr(stamp, "sec", 0) <= 0
-                or not 0 <= getattr(stamp, "nanosec", -1) < 1_000_000_000):
+        if not xyz.size:
+            self._metric_skip('empty_cloud')
+            return
+        if (not isinstance(calibration, dict) or calibration.get('width') != width or
+                calibration.get('height') != height or
+                not all(k in calibration for k in ('fx', 'fy', 'cx', 'cy'))):
+            self._metric_skip('calibration_mismatch')
+            return
+        if not getattr(header, 'frame_id', ''):
+            self._metric_skip('missing_frame')
+            return
+        sec, nanosec = getattr(stamp, 'sec', None), getattr(stamp, 'nanosec', None)
+        if type(sec) is not int or sec <= 0 or type(nanosec) is not int or not 0 <= nanosec < 1_000_000_000:
+            self._metric_skip('invalid_capture_stamp')
             return
         try:
             intrinsics = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
             if not all(np.isfinite(intrinsics)) or min(intrinsics[:2]) <= 0:
+                self._metric_skip('invalid_intrinsics')
                 return
         except (TypeError, ValueError):
+            self._metric_skip('invalid_intrinsics')
             return
         cloud = PointCloud2()
         cloud.header = header
@@ -584,6 +621,8 @@ class _PointCloudNode(Node):
         cloud.is_dense = True
         cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
         self._metric_cloud_pub.publish(cloud)
+        with self._metric_lock:
+            self._metric_published += 1
 
     # B: RGB → 单目深度引擎 → 反投影
     def _emit_mono(self, jpeg_bytes: bytes):
@@ -617,6 +656,8 @@ class _PointCloudNode(Node):
         横向坐标系统性偏差。K 是像素单位、分辨率变了必须缩放。
         """
         if self._calibration:
+            if calibration_tier(self._calibration) != 'pinhole':
+                raise ValueError('depth/mono requires pinhole calibration')
             return pinhole_of(self._calibration, w, h)
         upstream = getattr(self, "_upstream_intrinsics", None)
         if upstream:
@@ -627,6 +668,14 @@ class _PointCloudNode(Node):
             if scaled:
                 return (float(scaled[0]), float(scaled[4]),
                         float(scaled[2]), float(scaled[5]))
+        fov = getattr(self, '_upstream_fov', None)
+        if fov:
+            fx = (w / 2.) / np.tan(fov[0])
+            fy = (h / 2.) / np.tan(fov[1]) if fov[1] is not None else fx
+            return float(fx), float(fy), w / 2., h / 2.
+        if not getattr(self, '_warned_fov_fallback', False):
+            log.warning('[pointcloud] no usable intrinsics or field of view; display uses approximate 90-degree fallback')
+            self._warned_fov_fallback = True
         return intrinsics_from_hfov(w, h, 90.0)
 
     def _model_for_mono(self):
@@ -692,7 +741,7 @@ class _PointCloudNode(Node):
         self._publish(xyz)
 
     def _publish(self, xyz: np.ndarray):
-        if xyz.shape[0] == 0:
+        if self._stop_event.is_set() or xyz.shape[0] == 0:
             return
         self._frame_count += 1
         msg = UInt8MultiArray()
@@ -808,6 +857,8 @@ def _pinhole_params(blob: dict, w: int, h: int) -> tuple:
     卡片 running 却一帧不出。start/config 预检与 _pinhole_for 共用这一份
     （两处各写一遍必然漂移），坏配置当场报清楚。w/h 只用于 hfov 兜底换算，
     预检传典型分辨率即可（fx 正性与分辨率无关，hfov 的 fx 恒正）。"""
+    if any(k in blob and blob[k] is None for k in ('cx', 'cy')):
+        raise ValueError('pinhole principal point cannot be null')
     try:
         fx = float(blob.get("fx") or 0.0)
         fy = float(blob.get("fy") or 0.0)
@@ -942,6 +993,7 @@ class PointCloudPerceptionPlugin:
         self._min_depth_m = float(plugin_cfg.get("min_depth_m", 0.1))
         self._max_depth_m = float(plugin_cfg.get("max_depth_m", 10.0))
         self._calibration = load_calibration_blob(plugin_cfg.get("calibration"))
+        self._calibration_raw = plugin_cfg.get('calibration')
         # mono 模式的引擎与站点标定（复用 visual_depth 的下载器与机制）
         self._cal_a = float(plugin_cfg.get("cal_a", 1.0))
         self._cal_b = float(plugin_cfg.get("cal_b", 0.0))
@@ -1044,11 +1096,10 @@ class PointCloudPerceptionPlugin:
         with self._pending_lock:
             starts = self._model_pending_starts
             self._model_pending_starts = []
-        # 队列由 _bg_start 独占 drained（stop 先摘条目再让 _bg_start 看到
-        # 空队——pending_lock 串行，不会漏也不会重放），drained 条目必然
-        # 活着：stop 过的卡片条目已被摘走，不存在"被停掉的条目落节点"。
-        for entry in starts:
-            self._start_node(*entry)
+            # Serialize draining and node creation with stop, so a drained
+            # request cannot recreate a node after its stop has returned.
+            for entry in starts:
+                self._start_node(*entry)
 
     # ── node 生命周期 ──────────────────────────────────────────────────────
 
@@ -1176,9 +1227,30 @@ class PointCloudPerceptionPlugin:
             if mode in ("depth", "mono", "auto"):
                 K = upstream.get("K")
                 if isinstance(K, (list, tuple)) and len(K) == 9:
-                    node._upstream_intrinsics = (
-                        [float(v) for v in K],
-                        upstream.get("width"), upstream.get("height"))
+                    try:
+                        matrix = np.asarray(K, dtype=float).reshape(3, 3)
+                        dimensions = (upstream.get('width'), upstream.get('height'))
+                        valid = (np.isfinite(matrix).all() and matrix[0, 0] > 0 and matrix[1, 1] > 0
+                                 and abs(matrix[0, 1]) < 1e-9 and abs(matrix[1, 0]) < 1e-9
+                                 and np.allclose(matrix[2], [0, 0, 1])
+                                 and all(type(v) is int and v > 0 for v in dimensions))
+                        if valid:
+                            node._upstream_intrinsics = (matrix.reshape(-1).tolist(), *dimensions)
+                    except (TypeError, ValueError):
+                        pass
+                half_h, half_v = upstream.get('half_fov_rad'), upstream.get('half_fov_v_rad')
+                if (isinstance(half_h, (float, int)) and not isinstance(half_h, bool)
+                        and np.isfinite(half_h) and 0 < half_h < np.pi / 2
+                        and (half_v is None or (isinstance(half_v, (float, int))
+                             and not isinstance(half_v, bool) and np.isfinite(half_v)
+                             and 0 < half_v < np.pi / 2))):
+                    node._upstream_fov = (half_h, half_v)
+                node._calibration_source = (
+                    ('configured-fov-approximate' if 'hfov' in calibration else 'configured')
+                    if isinstance(calibration, dict) and calibration else
+                    'declared-K' if getattr(node, '_upstream_intrinsics', None) else
+                    'declared-fov-approximate' if getattr(node, '_upstream_fov', None) else
+                    '90-degree-fallback')
             if mode == "stereo" and calibration:
                 # 标定来源（info() 报告用）：声明层拼出的 blob 带 source 字段
                 # （驱动出厂标定），用户配置的 blob 没有 —— 区分"型号常量在
@@ -1188,8 +1260,12 @@ class PointCloudPerceptionPlugin:
                     isinstance(calibration, dict)
                     and calibration.get("source")) else "configured"
             self._executor.add_node(node)
+            try:
+                node.start()
+            except Exception:
+                dispose_node(self._executor, node, label=f'pointcloud/{node_key}')
+                raise
             self._nodes[node_key] = node
-        node.start()
         log.info(f"[pointcloud] node started (background): mode={mode} "
                  f"{input_topic or '(none)'}{' +' + right_topic if right_topic else ''}")
 
@@ -1222,10 +1298,10 @@ class PointCloudPerceptionPlugin:
         的 GPU 资源（TRT 引擎随进程走），不比照 visual_depth 关 backend。"""
         with self._pending_lock:
             self._model_pending_starts = []
-        with self._nodes_lock:
-            keys = list(self._nodes)
-        for key in keys:
-            self._retire_node(key)
+            with self._nodes_lock:
+                keys = list(self._nodes)
+            for key in keys:
+                self._retire_node(key)
 
     # ── calibrate（stereo）────────────────────────────────────────────────
 
@@ -1403,7 +1479,9 @@ class PointCloudPerceptionPlugin:
         批解析器——两处各写一遍必然漂移（review 第 17 轮 Issue 1）。"""
         blob = load_calibration_blob(raw_value)
         if blob is None:
-            return None
+            return 'configured calibration is unreadable or invalid' if raw_value else None
+        if not isinstance(blob, dict):
+            return 'configured calibration must be a JSON object'
         tier = calibration_tier(blob)
         try:
             if tier == "pinhole":
@@ -1486,6 +1564,8 @@ class PointCloudPerceptionPlugin:
                     # 标定来源：声明层（驱动型号级出厂标定）还是用户配置 ——
                     # 出云错了排查方向完全不同。
                     "calibration_source": getattr(node, "_calibration_source", None),
+                    "capture_only": node._mode == 'stereo' and calibration_tier(node._calibration) not in ('raw', 'rectified'),
+                    "metric_cloud": node._metric_status() if node._metric_cloud_enabled else None,
                 }
                 for key, node in nodes.items()
             }
@@ -1560,6 +1640,11 @@ class PointCloudPerceptionPlugin:
             return info
 
         elif action == "start":
+            node_key_for_calibration = instance_id or args.get('input_topic') or ((args.get('input_topics') or [''])[0]) or _DEFAULT_INSTANCE
+            instance_calibration = (self._instance_configs.get(node_key_for_calibration) or {}).get('calibration')
+            raw_calibration = args.get('calibration') or instance_calibration or self._calibration_raw
+            if raw_calibration and not isinstance(load_calibration_blob(raw_calibration), dict):
+                return {'state': 'error', 'message': 'configured calibration is unreadable or invalid'}
             try:
                 mode, input_topic, right_topic, calibration, declared_note = \
                     self._resolve_mode(args, instance_id)
@@ -1642,6 +1727,8 @@ class PointCloudPerceptionPlugin:
                 # stereo 已在上面要求双路，这里覆盖其余全部模式。
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
+            if calibration and mode in ('auto', 'depth', 'mono') and calibration_tier(calibration) in ('raw', 'rectified'):
+                return {'state': 'error', 'message': 'depth/mono requires pinhole calibration, not stereo calibration'}
             if calibration and calibration_tier(calibration) == "pinhole":
                 # review 第 16 轮建议：depth/mono 的显式 pinhole 内参
                 # （fx/fy/cx/cy 或 hfov）同样在 start 时预检——fx=0/NaN
@@ -1656,6 +1743,10 @@ class PointCloudPerceptionPlugin:
             if metric_enabled:
                 if mode != "depth" or not isinstance(calibration, dict):
                     return {"state": "error", "message": "metric_cloud requires depth mode and measured intrinsics"}
+                from plugins.camera_info import for_topic as _camera_for_topic
+                source = _camera_for_topic(args.get('camera_info'), input_topic)
+                if source.get('format') and source['format'] != 'sensor/depth-f32':
+                    return {'state': 'error', 'message': 'metric_cloud requires sensor/depth-f32 input'}
                 try:
                     values = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
                     dimensions = [calibration[k] for k in ("width", "height")]
@@ -1664,6 +1755,12 @@ class PointCloudPerceptionPlugin:
                         raise ValueError
                 except (KeyError, TypeError, ValueError):
                     return {"state": "error", "message": "metric_cloud requires finite measured fx/fy/cx/cy and image width/height"}
+            with self._nodes_lock:
+                existing = self._nodes.get(node_key)
+                if existing and (existing._input_topic != (input_topic or '') or
+                                 existing._input_topic_right != (right_topic or '') or
+                                 (mode != 'auto' and existing._mode != mode)):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its inputs or mode'}
             # 先记录再起节点（同 visual_depth）：loading 期间 info() 也能回答；
             # 空声明同样记录 —— 重启不再带声明时要替换旧值而不是留过期镜头。
             # stereo 两路各记一份：声明层标定（_stereo_blob_from_declarations）
@@ -1717,7 +1814,6 @@ class PointCloudPerceptionPlugin:
 
         elif action == "stop":
             if instance_id:
-                result = self._retire_node(instance_id)
                 # review 第 14 轮：stop 必须取消该卡片 pending 的 mono
                 # 启动——它可能还在等共享模型下载，否则 _bg_start 落完
                 # 加载后会把已停掉卡片按旧 topic 重新拉起。节点尚未落地
@@ -1728,15 +1824,16 @@ class PointCloudPerceptionPlugin:
                     self._model_pending_starts = [
                         e for e in self._model_pending_starts
                         if e[0] != instance_id]
+                    result = self._retire_node(instance_id)
                 return result if result is not None else {"state": "idle"}
             # review 第 15 轮：全停（不带 instance_id）同样要清 pending 队列
             # ——否则还在等共享模型下载的显式 mono 实例会在加载落地后被
             # _bg_start 按"已停掉"的状态重新拉起（回复却已是 idle）。
             with self._pending_lock:
                 self._model_pending_starts = []
-            with self._nodes_lock:
-                keys = list(self._nodes.keys())
-            results = [key for key in keys if self._retire_node(key) is not None]
+                with self._nodes_lock:
+                    keys = list(self._nodes.keys())
+                results = [key for key in keys if self._retire_node(key) is not None]
             return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
 
         elif action == "config":
@@ -1774,6 +1871,7 @@ class PointCloudPerceptionPlugin:
                 self._max_depth_m = float(cfg["max_depth_m"])
             if "calibration" in cfg:
                 self._calibration = load_calibration_blob(cfg["calibration"])
+                self._calibration_raw = cfg['calibration']
             if "metric_cloud" in cfg:
                 self._plugin_cfg["metric_cloud"] = cfg["metric_cloud"]
             if any(k in cfg for k in ("cal_a", "cal_b")):

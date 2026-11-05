@@ -11,10 +11,11 @@ import { ImageRenderer }    from './renderers/image.js';
 import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { PointCloudRenderer } from './renderers/pointcloud.js';
 import { OdomRenderer, odomPreview } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, PointCloudRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 

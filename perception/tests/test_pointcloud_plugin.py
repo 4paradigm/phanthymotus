@@ -129,6 +129,35 @@ def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
     node.stop()
 
 
+def test_metric_info_explains_missing_frame_and_wrong_encoding():
+    plugin, executor = _plugin({'metric_cloud': True, 'calibration': {
+        'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}})
+    plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth'})
+    node = executor.nodes[0]
+    msg = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
+                     width=1, height=1, step=4)
+    msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+    node._emit_depth(msg)
+    info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
+    assert info['published'] == 0 and info['last_skip_reason'] == 'missing_frame'
+    assert info['skipped']['missing_frame'] == 1
+    bad = _FakeImage(data=np.array([2000], dtype='<u2').tobytes(), encoding='16UC1',
+                     width=1, height=1, step=2)
+    node._emit_depth(bad)
+    info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
+    assert info['last_skip_reason'] == 'unsupported_encoding'
+    node.stop()
+
+
+def test_metric_start_rejects_explicit_non_metric_upstream_format():
+    calibration = {'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}
+    plugin, executor = _plugin({'metric_cloud': True, 'calibration': calibration})
+    declaration = {**_UPSTREAM_DECL, 'topic': '/depth', 'format': 'image/depth-z16'}
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
+                                             'input_topic': '/depth', 'camera_info': [declaration]})
+    assert result['state'] == 'error' and not executor.nodes
+
+
 def test_metric_cloud_does_not_start_with_inferred_intrinsics():
     plugin, executor = _plugin({"metric_cloud": True})
     result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
@@ -883,6 +912,7 @@ def test_stereo_start_without_calibration_runs_capture_only():
     assert reply["state"] == "running"
     node = executor.nodes[0]
     assert node._mode == "stereo"
+    assert plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/cam/left']['capture_only'] is True
 
     # 左右帧照常配对存帧（calibrate 的输入），但 unknown 档不出云
     node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
@@ -2377,6 +2407,118 @@ def test_pinhole_for_uses_upstream_k_rescaled_across_resolutions():
     fx, fy, cx, cy = node._pinhole_for(640, 360)
     assert fx == pytest.approx(350.0) and fy == pytest.approx(350.0)
     assert cx == pytest.approx(320.0) and cy == pytest.approx(180.0)
+
+
+def test_display_fallback_uses_declared_fov_without_claiming_metric_calibration():
+    declaration = {**_UPSTREAM_DECL, 'K': None, 'half_fov_rad': np.pi / 6,
+                   'half_fov_v_rad': None}
+    plugin, executor = _plugin()
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
+        'input_topic': '/cam/rgb', 'camera_info': [declaration]})
+    assert result['state'] == 'running'
+    node = executor.nodes[0]
+    fx, fy, _, _ = node._pinhole_for(640, 480)
+    assert fx == pytest.approx(320 / np.tan(np.pi / 6))
+    assert fy == pytest.approx(fx)
+    assert plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/cam/rgb']['calibration_source'] == 'declared-fov-approximate'
+    node.stop()
+    metric, _ = _plugin({'metric_cloud': True})
+    assert metric.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
+        'input_topic': '/cam/rgb', 'camera_info': [declaration]})['state'] == 'error'
+
+
+def test_invalid_upstream_k_does_not_override_usable_fov():
+    declaration = {**_UPSTREAM_DECL, 'K': [float('nan')] * 9,
+                   'half_fov_rad': np.pi / 6, 'half_fov_v_rad': None}
+    plugin, executor = _plugin()
+    plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
+        'input_topic': '/cam/rgb', 'camera_info': [declaration]})
+    node = executor.nodes[0]
+    assert node._pinhole_for(640, 480)[0] == pytest.approx(320 / np.tan(np.pi / 6))
+    node.stop()
+
+
+@pytest.mark.parametrize('calibration', [RAW_BLOB, RECTIFIED_BLOB, {'fx': 10, 'cx': None}])
+def test_depth_rejects_incompatible_or_null_pinhole_calibration(calibration):
+    plugin, executor = _plugin({'calibration': calibration})
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth'})
+    assert result['state'] == 'error'
+    assert not executor.nodes
+
+
+def test_explicit_unreadable_calibration_is_error_not_capture_only():
+    plugin, executor = _plugin({'calibration': '/definitely/missing/calibration.json'})
+    args = {'action': 'start', 'mode': 'stereo', 'input_topics': ['/left', '/right']}
+    assert plugin.dispatch('pointcloud', args)['state'] == 'error'
+    assert not executor.nodes
+    plugin, executor = _plugin()
+    assert plugin.dispatch('pointcloud', {'action': 'config',
+        'calibration': '/definitely/missing/calibration.json'})['state'] == 'error'
+
+
+def test_worker_does_not_emit_after_stop_during_model_load(monkeypatch):
+    node = pc._PointCloudNode('auto', '/cam', None, None, fps=2, max_points=100,
+                              min_depth_m=.1, max_depth_m=10., cal_a=1., cal_b=0., node_suffix='test')
+    entered, release = threading.Event(), threading.Event()
+    emitted = []
+    def load():
+        entered.set()
+        release.wait(2)
+    monkeypatch.setattr(node, '_maybe_load_mono_model', load)
+    monkeypatch.setattr(node, '_emit_mono', lambda payload: emitted.append(payload))
+    worker = threading.Thread(target=node._worker_loop)
+    worker.start()
+    node._frame_queue.put(('jpeg', b'data'))
+    assert entered.wait(1)
+    node.request_stop()
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive() and emitted == []
+
+
+def test_publish_after_stop_is_suppressed():
+    node = pc._PointCloudNode('depth', '/cam', None, None, fps=2, max_points=100,
+                              min_depth_m=.1, max_depth_m=10., cal_a=1., cal_b=0., node_suffix='test')
+    node.request_stop()
+    node._publish(np.array([[0., 0., 1.]]))
+    assert not _cloud_pub(node).messages and not _summary_pub(node).messages
+
+
+def test_stop_during_drained_pending_start_does_not_resurrect_node(monkeypatch):
+    plugin, executor = _plugin()
+    plugin._model = object()
+    plugin._model_pending_starts = [('card', 'mono', '/cam', None, None)]
+    entered, release = threading.Event(), threading.Event()
+    original = plugin._start_node
+    def blocked(*args):
+        entered.set()
+        assert release.wait(3)
+        return original(*args)
+    monkeypatch.setattr(plugin, '_start_node', blocked)
+    worker = threading.Thread(target=plugin._bg_start)
+    worker.start()
+    assert entered.wait(1)
+    stopper = threading.Thread(target=lambda: plugin.dispatch('pointcloud',
+                              {'action': 'stop', 'instance_id': 'card'}))
+    stopper.start()
+    stopper.join(.2)
+    release.set()
+    worker.join(3)
+    stopper.join(3)
+    assert not worker.is_alive() and not stopper.is_alive()
+    assert not executor.nodes
+
+
+def test_running_instance_rejects_input_rebinding():
+    plugin, executor = _plugin()
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'instance_id': 'card',
+                                            'mode': 'depth', 'input_topic': '/first'})
+    assert result['state'] == 'running'
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'instance_id': 'card',
+                                            'mode': 'depth', 'input_topic': '/second'})
+    assert result['state'] == 'error'
+    assert executor.nodes[0]._input_topic == '/first'
+    plugin.dispatch('pointcloud', {'action': 'stop', 'instance_id': 'card'})
 
 
 def test_pinhole_for_falls_back_to_90deg_without_anything():
