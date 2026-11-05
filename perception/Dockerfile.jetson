@@ -686,7 +686,9 @@ RUN if [ "${JP_VERSION}" = "61" ]; then \
         'dash==2.18.2' 'nbformat==5.10.4'; \
       pip3 install --no-cache-dir --no-deps -i "${PYPI_MIRROR}" 'open3d==0.18.0'; \
       python3 -c "import open3d as o; assert o.__version__ == '0.18.0'"; \
-      curl -fsSL --retry 4 --retry-delay 3 --connect-timeout 20 \
+      echo "[slam-build] Downloading pinned GTSAM source (bounded transfer and retries)"; \
+      curl -fsSL --retry 4 --retry-delay 3 --retry-max-time 240 \
+        --connect-timeout 20 --max-time 120 --speed-limit 1024 --speed-time 30 \
         "https://codeload.github.com/borglab/gtsam/tar.gz/${SLAM_GTSAM_COMMIT}" -o /tmp/gtsam.tar.gz; \
       echo "${SLAM_GTSAM_SHA256}  /tmp/gtsam.tar.gz" | sha256sum -c -; \
       mkdir /tmp/gtsam; tar -xzf /tmp/gtsam.tar.gz --strip-components=1 -C /tmp/gtsam; \

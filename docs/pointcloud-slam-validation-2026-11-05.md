@@ -156,3 +156,29 @@ compilation, and final import/ICP/graph checks. It retains the 2-core/6-GiB limi
 and no build network. GTSAM availability remains unverified until its final
 checks succeed. The operator will report the GitHub build result; this chat no
 longer polls that build.
+
+
+## Formal build 1742cc4 idle-timeout diagnosis
+
+The operator reported the result; inspection of PR comment 6656005306 showed:
+`[agent] Build killed: no output for 600s (908s into the run)`.
+This is the build agent's idle watchdog, not a reported OOM or compiler failure.
+The actual log now contains codeload/checksum code, confirming the stale-ref
+problem was bypassed for this build. Last output was Open3D installation at
+290.3s; there is no archive checksum or CMake output. The next command is silent
+curl, so a stalled archive transfer is the supported hypothesis, not a proven
+compiler hang. Connect timeout alone did not bound the response-body transfer.
+
+The download now has a 120s per-attempt maximum, a 240s retry budget, a 30s
+low-speed timeout below 1024 bytes/s, and an explicit stage log. The retry budget
+is checked between attempts, so an in-progress final attempt can run past 240s;
+the per-attempt cap still prevents reaching the 600s idle watchdog. SHA-256
+validation remains mandatory. No watchdog setting was loosened or fake heartbeat
+added. A local stalled-body HTTP reproduction showed the old connect-only command
+outliving a 3s harness, while scaled transfer/retry limits exited with curl28
+within the 5s test bound.
+
+The full production timeout/retry flags also successfully downloaded the pinned
+archive on the host; its SHA-256 matched
+`48c760e17a8b6c0e59fcc1d6a71602907fedbb9c39ba400d13f998dab1fd5080`.
+This verifies the normal path on the host, not connectivity from the build runner.
