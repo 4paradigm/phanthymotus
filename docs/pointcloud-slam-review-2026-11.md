@@ -5,6 +5,11 @@ independent development branch. It does not claim a target image build or a
 robot acceptance. The card remains experimental and does not publish a SLAM
 map, accepted loop, or map-to-odom correction.
 
+Later work added an opt-in, explicitly labelled `sensor/slam-preview` odometry
+accumulation and status stream; this is not the validated SLAM map requested by
+the review. Details and remaining output limitations are documented in
+`pointcloud-slam-offline-evaluation.md`.
+
 ## Verified and addressed in code
 
 - A fixed child frame blocked Bumi's segment-specific `segment_id + '_base'`

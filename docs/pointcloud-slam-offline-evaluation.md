@@ -53,11 +53,42 @@ segment's local keyframe points using the resulting pose snapshot. Returned
 snapshots carry the segment frame and last cloud capture stamp; independently
 anchored segments are not combined. A synthetic loop test also exercises
 history rebuilding, but uses the separate experimental graph tool and does not
-validate a real loop. The runtime backend accepts no loop edges and does not
-publish poses, maps, or map-to-odom corrections. The
-current Perception image does not include GTSAM, and its Jetson compatibility
-has not been built or tested. The card therefore exposes no map output, and
-its running state means only that the experimental input subscriptions started.
+validate a real loop. The live backend accepts no loop edges and does not
+publish corrected poses, SLAM maps, or map-to-odom corrections. The current
+Perception image does not include GTSAM, and its Jetson compatibility has not
+been built or tested.
+
+For diagnostics only, set `preview_enabled: true` to advertise the separate
+`sensor/slam-preview` output and a `data/json` status output under the resolved
+cloud topic. The preview is a snapshot of the active segment's accumulated local
+keyframes, never a merged multi-segment map. Its renderer always labels it as
+unvalidated and without loop closure; its pose indicator is the last keyframe,
+not a separately updated live robot pose. Each binary packet begins with a 4-byte
+little-endian metadata length, followed by bounded UTF-8 JSON
+`motus.slam-preview/1` (segment, source frame, cloud measurement stamp as a
+decimal nanosecond string, backend and zero accepted loops), then the existing
+17-byte mapping header and XYZ data. Metadata and points therefore belong to
+the same snapshot; the separate status stream reports current input state.
+When tracking is lost or either input becomes stale, no map snapshot is
+published and status reports the input state. Repeated or backwards cloud
+measurement timestamps do not refresh freshness;
+clients must heed status or stream timeouts rather than treating an old display
+as current.
+
+`preview_backend: raw` uses the odometry chain without graph optimization;
+`preview_backend: gtsam` invokes the odometry-only optimizer and requires a
+working target GTSAM installation plus explicit `preview_odom_sigmas` (six
+positive values in rotation-then-translation tangent order). Neither mode can
+detect or accept loops. `preview_interval_s` defaults to 1 second (allowed
+range 0.1–60 seconds), and
+`preview_max_points` to 40000 (hard limit 80000); the preview is only rebuilt
+when a ROS subscriber is present. The agent-core bridge subscribes to this
+large stream on demand and bounds slow viewers' queues to two snapshots; the
+dashboard retains only the latest preview snapshot. The
+worker stops independently of upstream producers. The preview format wraps
+legacy mapping packet bytes in metadata and is distinct from `sensor/mapping`
+to avoid implying SLAM validity. Its full browser/WebGL and target ROS paths still need
+validation. A card `running` state means subscriptions started, not SLAM ready.
 The card `info()` includes input freshness, queue drops, capacity and segment
 state; `tracking` there describes only the input odometry, not SLAM validity.
 The ROS tests use stubs; the input adapter has not been validated on a robot.
@@ -160,7 +191,8 @@ same registration result, and thresholds need separate evaluation data.
 experiment connecting the explicit geometry gates to a robust GTSAM factor and
 rebuilding history. It inverts the source-to-target ICP transform for the
 corresponding GTSAM between factor. It does not feed the live card or accept
-real loop edges; noise, gates and initial guesses remain uncalibrated. Its
+real loop edges; its core is packaged in `plugins/pointcloud_slam_experimental_backend.py`,
+but noise, gates and initial guesses remain uncalibrated. Its
 computed map-to-odom correction is an experimental output, never published or
 fed back to raw odometry.
 

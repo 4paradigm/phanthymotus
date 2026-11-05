@@ -61,6 +61,7 @@ def main():
                             'cloud_data_sha256': _sha256_file(args.recording / 'cloud.xyz'),
                             'script_sha256': _sha256_file(Path(__file__)),
                             'gate_sha256': _sha256_file(tools_dir / 'pointcloud_slam_geometry_gate.py'),
+                            'gate_impl_sha256': _sha256_file(tools_dir.parent / 'plugins/pointcloud_slam_geometry.py'),
                             'registration_sha256': _sha256_file(tools_dir / 'pointcloud_slam_registration_experiment.py'),
                             'reader_sha256': _sha256_file(tools_dir / 'pointcloud_slam_retrieval.py'),
                             'open3d_version': open3d.__version__}

@@ -4,7 +4,8 @@ import pytest
 
 pytest.importorskip('gtsam')
 pytest.importorskip('open3d')
-from tools.pointcloud_slam_candidate_graph import optimize_candidates, experiment_snapshot
+from plugins.pointcloud_slam_experimental_backend import optimize_candidates
+from tools.pointcloud_slam_candidate_graph import experiment_snapshot
 from tools.pointcloud_slam_registration_experiment import registration_diagnostics
 from test_pointcloud_slam_geometry_gate import thresholds
 from test_pointcloud_slam_stream import odom, stream
@@ -31,6 +32,14 @@ def test_synthetic_icp_gate_moves_history_while_rejecting_no_overlap():
     np.testing.assert_allclose(snapshot['map_from_odom'] @ s.graph()[0]['poses'][-1],
                                result['poses'][-1], atol=1e-6)
     assert snapshot['loop_accepted'] is False
+    from plugins.pointcloud_slam_preview import encode_preview
+    from test_pointcloud_slam_preview import unpack
+    packet = encode_preview(snapshot['after_map'], result['poses'][-1], max_points=10,
+                            metadata={'segment_id': 'a', 'frame_id': 'odom',
+                                      'stamp_ns': '1300000000', 'backend': 'raw'})
+    _, body = unpack(packet)
+    decoded = np.frombuffer(body[17:], dtype='<f4').reshape(-1, 3)
+    np.testing.assert_allclose(decoded, snapshot['after_map'], atol=1e-6)
 
 
 def test_invalid_geometry_transform_is_never_inserted():
