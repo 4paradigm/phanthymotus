@@ -55,11 +55,10 @@ def _started_planner(backend, completions):
     return planner
 
 
-def test_both_cards_expose_same_standard_hook_and_keep_navigation_hook():
+def test_both_cards_only_expose_navigation_scoped_interrupt():
     planning = nav2_tool_definition("ubuntu")["inputSchema"]["x-hooks"]
     unified = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]["x-hooks"]
-    assert planning["on_interrupt_all"] == {"action": "stop_nav"}
-    assert planning["on_interrupt_navigation"] == {"action": "stop_nav"}
+    assert planning == {"on_interrupt_navigation": {"action": "stop_nav"}}
     assert unified == planning
 
 
@@ -67,7 +66,7 @@ def test_planning_hook_uses_existing_cancel_path_and_emits_terminal_once():
     backend, completions = FakeBackend(), []
     planner = _started_planner(backend, completions)
     assert planner.dispatch("nav2", _goal())["status"] == "navigating"
-    hook = planner.get_tools()[0]["inputSchema"]["x-hooks"]["on_interrupt_all"]
+    hook = planner.get_tools()[0]["inputSchema"]["x-hooks"]["on_interrupt_navigation"]
     stopped = planner.dispatch("nav2", dict(hook))
     assert stopped["status"] == "stopped"
     assert backend.calls == [("navigate_to_pose", "goal-1"), ("stop_nav", "goal-1")]
@@ -82,7 +81,7 @@ def test_unconfirmed_interrupt_retains_goal_and_does_not_complete():
     backend, completions = FakeBackend(confirm=False), []
     planner = _started_planner(backend, completions)
     assert planner.dispatch("nav2", _goal())["status"] == "navigating"
-    hook = planner.get_tools()[0]["inputSchema"]["x-hooks"]["on_interrupt_all"]
+    hook = planner.get_tools()[0]["inputSchema"]["x-hooks"]["on_interrupt_navigation"]
     result = planner.dispatch("nav2", dict(hook))
     assert result["error_code"] == "navigation_stop_pending"
     assert completions == []
@@ -107,7 +106,7 @@ def test_unified_dispatch_routes_hook_through_generation_fenced_planner():
                               planning_plugin=planner)
     plugin._started = True
     plugin._generation = object()
-    hook = plugin.get_tools()[0]["inputSchema"]["x-hooks"]["on_interrupt_all"]
+    hook = plugin.get_tools()[0]["inputSchema"]["x-hooks"]["on_interrupt_navigation"]
     assert plugin.dispatch(plugin.PREFIX, dict(hook))["status"] == "stopped"
     assert planner.calls == [("nav2", {"action": "stop_nav"})]
     plugin._stop_requested.set()
