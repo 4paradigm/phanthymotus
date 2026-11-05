@@ -65,7 +65,9 @@ def test_diagnostic_preview_publishes_one_segment_and_truthful_status():
     s = stream()
     node = SlamInputNode('/o', '/c', s, clock=lambda: 1., preview={
         'topic': '/preview', 'status_topic': '/preview_status',
-        'max_points': 10, 'interval_s': 1., 'backend': 'raw'})
+        'max_points': 10, 'interval_s': 1., 'backend': 'raw',
+        'input_validation': {'policy': 'experimental', 'clock_relation_verified': False,
+                             'extrinsic_calibrated': False}})
     callbacks = {sub.topic: sub.callback for sub in node.subscriptions}
     callbacks['/o'](NS(data=json.dumps(odom(1000))))
     callbacks['/c'](cloud())
@@ -76,8 +78,10 @@ def test_diagnostic_preview_publishes_one_segment_and_truthful_status():
     metadata, body = unpack(packet)
     assert struct.unpack('<fffBI', bytes(body[:17]))[-1] == 1
     assert metadata['segment_id'] == 'a' and metadata['frame_id'] == 'odom'
+    assert metadata['input_validation']['policy'] == 'experimental'
     status = json.loads(pubs['/preview_status'].messages[-1])
     assert status['kind'] == 'unvalidated_odometry_preview'
+    assert status['input_validation']['clock_relation_verified'] is False
     assert status['segment_id'] == 'a' and status['accepted_loops'] == 0
     assert status['stamp_ns'] == '1000000000'
     callbacks['/o'](NS(data=json.dumps(odom(1100, status='lost'))))

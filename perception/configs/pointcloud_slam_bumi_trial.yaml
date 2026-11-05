@@ -1,0 +1,47 @@
+# Bumi deployment profile: same optical origin, body-axis convention audited
+# on 2026-11-05. Not a measured body-origin calibration or accepted SLAM.
+# Merge under plugins.pointcloud_slam in the device's Perception config.
+enabled: true
+input_policy: experimental
+clock_relation_verified: false
+extrinsic_calibrated: false
+cloud_frame: ubuntu_rgb_optical
+child_frame: '{segment_id}_base'
+clock_id: ros
+child_from_cloud:
+  - [0, 0, 1, 0]
+  - [-1, 0, 0, 0]
+  - [0, -1, 0, 0]
+  - [0, 0, 0, 1]
+max_gap_ms: 400
+max_measurement_age_ms: 1500
+max_future_skew_ms: 100
+max_age_s: 2
+max_pending: 10
+max_cloud_points: 20000
+max_frames: 300
+max_points: 6000000
+preview_enabled: true
+preview_backend: geometry_experimental
+preview_interval_s: 2
+preview_max_points: 40000
+preview_relocalization: false
+archive_name: bumi_trial
+restore_archive: false
+preview_geometry:
+  descriptor_voxel_m: 0.1
+  min_separation_s: 10
+  candidate_separation_s: 3
+  max_per_frame: 1
+  max_candidates: 20
+  voxel_m: 0.08
+  max_distance_m: 0.3
+  odom_sigmas: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+  loop_sigmas: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+  huber_k: 1
+  thresholds:
+    min_fitness: 0.6
+    max_rmse_m: 0.05
+    min_correspondences: 30
+    max_cycle_translation_m: 0.03
+    max_cycle_angle_deg: 2

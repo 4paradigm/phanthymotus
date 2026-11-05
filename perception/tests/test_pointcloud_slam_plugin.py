@@ -304,3 +304,38 @@ def test_map_save_and_explicit_restore_require_new_segment(tmp_path, monkeypatch
 def test_map_archive_name_rejects_path_traversal():
     plugin = PointCloudSlamPlugin(config(), _FakeExecutor())
     assert plugin.dispatch('pointcloud_slam', {'action': 'config', 'archive_name': '../bad'})['state'] == 'error'
+
+
+def test_deployed_trial_profile_waits_for_data_without_claiming_calibration():
+    cfg = {**config(), 'input_policy': 'experimental',
+           'clock_relation_verified': False, 'extrinsic_calibrated': False}
+    executor = _FakeExecutor()
+    plugin = PointCloudSlamPlugin(cfg, executor)
+    props = plugin.get_tools()[0]['configSchema']['properties']
+    assert set(props) == {'preview_enabled', 'archive_name', 'restore_archive'}
+    plugin.dispatch('pointcloud_slam', {'action': 'config', 'max_gap_ms': 9999,
+                                      'clock_relation_verified': True})
+    assert plugin._config['max_gap_ms'] == 200
+    assert plugin._config['clock_relation_verified'] is False
+    args = {'action': 'start', 'input_topics': ['/o', '/c'],
+            'input_bindings': {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
+            'odom_interfaces': {'/o': {'schema': 'motus.odom/1', 'slam_pose': {
+                'available': True, 'profile': 'motus_slam/1'}}}}
+    assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+    info = plugin.dispatch('pointcloud_slam', {'action': 'info'})
+    assert info['input_status']['odometry'] == 'waiting'
+    assert info['input_validation']['policy'] == 'experimental'
+    assert info['input_validation']['clock_relation_verified'] is False
+    assert info['input_validation']['extrinsic_calibrated'] is False
+    import json
+    from types import SimpleNamespace as NS
+    from test_pointcloud_slam_stream import odom
+    from test_pointcloud_slam_ros import cloud
+    node = executor.nodes[0]
+    node._measurement_clock_ns = lambda: 1_000_000_000
+    node._odom(NS(data=json.dumps(odom(1000))))
+    node._cloud(cloud())
+    assert len(node.stream.store.segments[0].frames) == 1
+    node._odom(NS(data=json.dumps(odom(1010, status='lost'))))
+    assert node.status()['odometry'] == 'lost'
+    plugin.stop()

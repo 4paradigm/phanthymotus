@@ -229,6 +229,7 @@ class SlamInputNode(Node):
                 graph = graphs[-1] if graphs else None
         geometry = self._preview['backend'] == 'geometry_experimental'
         result = {'kind': 'unvalidated_geometry_preview' if geometry else 'unvalidated_odometry_preview',
+                  'input_validation': self._preview.get('input_validation'),
                   'state': 'stale' if status['odometry'] == 'tracking' and status['cloud'] == 'stale' else status['odometry'],
                   'cloud_state': status['cloud'],
                   'integration': status['integration'], 'accepted_loops': 0,
@@ -365,6 +366,7 @@ class SlamInputNode(Node):
             self._preview_status_pub.publish(message)
             if geometry:
                 common = {'state': result['state'], 'stamp_ns': result['stamp_ns'],
+                          'input_validation': result['input_validation'],
                           'segment_id': result['segment_id'], 'map_frame': result['frame_id'],
                           'odom_frame': result.get('odom_frame'), 'accepted_loops': 0,
                           'candidate_count': result.get('candidate_count', 0)}

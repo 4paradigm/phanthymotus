@@ -327,3 +327,33 @@ The same truncated-transfer test also passed using curl 7.81.0 in a separate
 network-isolated Bumi container. A real HTTP/1.1 archive download on the host
 completed and matched the pinned SHA-256
 `48c760e17a8b6c0e59fcc1d6a71602907fedbb9c39ba400d13f998dab1fd5080`.
+
+## Simple-start trial deployment change
+
+The operator authorized a direct trial without new calibration work and asked
+that technical parameters not appear in the ordinary configuration panel.
+An explicit device-side `input_policy: experimental` now exposes only preview,
+archive name and restore controls. Hidden legacy canvas settings cannot override
+that profile. Default strict behavior is unchanged. Experimental policy and the
+actual (false) verification flags are included in info/preview metadata and
+archive configuration; strict restore rejects an experimental archive.
+
+The Bumi profile is `perception/configs/pointcloud_slam_bumi_trial.yaml`. It uses
+only the audited same-origin axis convention, with a 400ms interpolation bound,
+1500ms measurement-age bound and bounded storage/candidate processing. These are
+trial settings, not validated motion thresholds. Other robots require their own
+deployment profile; generic automatic TF discovery is not implemented here.
+
+Startup does not require a first pose: subscriptions enter running/waiting, late
+tracking inputs can create keyframes, and lost still stops integration. The
+existing format/capability, capture-time, frame, segment and capacity checks stay
+in effect. No Driver or visual-odometry lifecycle code is modified.
+
+Validation of this change: all 175 SLAM tests passed on the host and in the
+network-isolated Bumi target environment. The deployment profile also started
+with real rclpy nodes and the experimental geometry backend before any input
+frame existed, reported waiting, and stopped cleanly. An initial profile check
+accidentally imported the old image source via /work; it correctly rejected the
+unverified profile. Repeating with the source snapshot as working directory
+verified the intended changed implementation. Narrow independent review reported
+no actionable correctness findings.

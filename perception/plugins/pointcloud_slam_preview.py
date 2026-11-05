@@ -37,6 +37,8 @@ def encode_preview(points, pose, *, max_points, metadata):
               'stamp_ns': metadata['stamp_ns'], 'backend': metadata['backend'], 'accepted_loops': 0}
     if geometry:
         header['candidate_count'] = metadata['candidate_count']
+    if metadata.get('input_validation') is not None:
+        header['input_validation'] = metadata['input_validation']
     header_bytes = json.dumps(header, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     if len(header_bytes) > 2048:
         raise ValueError('preview metadata too large')

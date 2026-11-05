@@ -69,3 +69,15 @@ def test_restore_rejects_geometry_configuration_change(tmp_path):
     save_archive(path, stream.store, [], {}, {**settings(), 'preview_geometry': {'voxel_m': .1}})
     with pytest.raises(ValueError, match='configuration'):
         load_archive(path, {**settings(), 'preview_geometry': {'voxel_m': .2}}, max_frames=10, max_points=4000)
+
+
+def test_experimental_archive_cannot_silently_become_strict(tmp_path):
+    import json
+    path = tmp_path / 'trial.json'
+    cfg = {**settings(), 'input_policy': 'experimental',
+           'clock_relation_verified': False, 'extrinsic_calibrated': False}
+    save_archive(path, make_two_segments().store, [], {}, cfg)
+    assert json.loads(path.read_text())['configuration']['input_policy'] == 'experimental'
+    load_archive(path, cfg, max_frames=10, max_points=4000)
+    with pytest.raises(ValueError, match='configuration'):
+        load_archive(path, settings(), max_frames=10, max_points=4000)

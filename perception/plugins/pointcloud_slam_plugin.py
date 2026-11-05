@@ -4,6 +4,7 @@ import math
 import os
 import re
 import threading
+from copy import deepcopy
 
 from .pointcloud_slam_ros import SlamInputNode
 from .pointcloud_slam_stream import SlamStream, _rigid
@@ -69,7 +70,19 @@ class PointCloudSlamPlugin:
         self._lock = threading.RLock()
 
     def get_tools(self):
+        if self._config.get('input_policy') == 'experimental':
+            tools = deepcopy(TOOLS)
+            props = tools[0]['configSchema']['properties']
+            tools[0]['configSchema']['properties'] = {
+                k: {**props[k], 'default': self._config.get(k, props[k].get('default'))}
+                for k in ('preview_enabled', 'archive_name', 'restore_archive')}
+            return tools
         return TOOLS
+
+    def _input_validation(self):
+        return {'policy': self._config.get('input_policy', 'strict'),
+                'clock_relation_verified': self._config.get('clock_relation_verified') is True,
+                'extrinsic_calibrated': self._config.get('extrinsic_calibrated') is True}
 
     def start(self):
         pass  # Canvas start supplies the two resolved inputs.
@@ -92,7 +105,7 @@ class PointCloudSlamPlugin:
                 if self._node is not None:
                     return {'state': 'error', 'message': 'stop the card before changing configuration'}
                 updates = {k: v for k, v in args.items()
-                           if k in TOOLS[0]['configSchema']['properties'] and v is not None and v != ''}
+                           if k in self.get_tools()[0]['configSchema']['properties'] and v is not None and v != ''}
                 try:
                     for key in ('child_from_cloud', 'preview_odom_sigmas', 'preview_geometry'):
                         if isinstance(updates.get(key), str):
@@ -154,6 +167,7 @@ class PointCloudSlamPlugin:
                     outputs += [{'topic': node._preview['topic'] + '/pose', 'format': 'data/json'},
                                 {'topic': node._preview['topic'] + '/map_to_odom', 'format': 'data/json'}]
                 return {'state': 'running' if node else 'idle',
+                        'input_validation': self._input_validation(),
                         'desc': '实验输入与未验证里程计预览；无真实回环',
                         'topic_in': [{'topic': topic, 'format': fmt}
                                      for topic, fmt in self._topics.items()],
@@ -183,8 +197,9 @@ class PointCloudSlamPlugin:
                     not isinstance(capability, dict) or capability.get('available') is not True or
                     capability.get('profile') != 'motus_slam/1'):
                 return {'state': 'error', 'message': 'odometry source lacks declared SLAM pose capability'}
-            if (self._config.get('clock_relation_verified') is not True or
-                    self._config.get('extrinsic_calibrated') is not True):
+            if (self._config.get('input_policy') != 'experimental' and
+                    (self._config.get('clock_relation_verified') is not True or
+                     self._config.get('extrinsic_calibrated') is not True)):
                 return {'state': 'error', 'message': 'verified clock relation and measured extrinsic required'}
             if (self._config.get('max_measurement_age_ms') is None or
                     self._config.get('max_future_skew_ms') is None):
@@ -203,6 +218,7 @@ class PointCloudSlamPlugin:
                 preview = None
                 if self._config.get('preview_enabled') is True:
                     preview = {'topic': cloud_topic + '/slam_odom_preview',
+                               'input_validation': self._input_validation(),
                                'status_topic': cloud_topic + '/slam_odom_preview_status',
                                'backend': self._config.get('preview_backend', 'raw'),
                                'interval_s': self._config.get('preview_interval_s', 1.),

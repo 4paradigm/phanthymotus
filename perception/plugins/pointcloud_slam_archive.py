@@ -17,6 +17,10 @@ def _configuration(settings):
         raise ValueError('archive configuration required')
     result['child_from_cloud'] = _rigid(settings['child_from_cloud']).tolist()
     result['preview_geometry'] = settings.get('preview_geometry')
+    if settings.get('input_policy') == 'experimental':
+        result.update(input_policy='experimental',
+                      clock_relation_verified=settings.get('clock_relation_verified') is True,
+                      extrinsic_calibrated=settings.get('extrinsic_calibrated') is True)
     if result['preview_geometry'] is not None and not isinstance(result['preview_geometry'], dict):
         raise ValueError('archive geometry configuration must be an object')
     return result
