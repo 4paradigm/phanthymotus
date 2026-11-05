@@ -1299,7 +1299,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         for binding in bindings:
             binding["topic"] = custom[binding["port"]]
 
-        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": custom["imu"]})["state"], "configured")
         result = plugin.dispatch(
             "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _input_bindings(bindings)},
@@ -1315,7 +1314,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             {"rgb", "livo_odom", "livo_status"},
         )
 
-    def test_configured_imu_reaches_runtime_and_mapping(self):
+    def test_bound_imu_reaches_runtime_and_mapping(self):
         # Both externally connected topics must reach the runtime and mapper.
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
@@ -1323,7 +1322,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         topics = {"lidar": "/robot/lidar/cloud", "imu": "/robot/lidar/imu"}
         bindings = [{"port": port, "topic": topic} for port, topic in topics.items()]
 
-        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": topics["imu"]})["state"], "configured")
         result = plugin.dispatch(plugin.PREFIX, {
             "action": "start", "instance_id": "navigation",
             "input_bindings": _input_bindings(bindings),

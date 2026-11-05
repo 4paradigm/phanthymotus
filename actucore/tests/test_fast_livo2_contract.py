@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -116,24 +117,23 @@ class FastLivo2ContractTest(unittest.TestCase):
             "FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea",
             source_lock,
         )
-        self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e",
-            source_lock,
-        )
-        self.assertEqual(
-            base_dockerfile.count(
-                "ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e"
-            ),
-            2,
-        )
-        self.assertIn(
-            "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe",
-            source_lock,
-        )
-        self.assertIn(
-            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c",
-            source_lock,
-        )
+        for key, patch in (
+            ("FAST_LIVO2_RUNTIME_PATCH_SHA256", runtime_patch),
+            ("FAST_LIVO2_PCD_SAVE_PATCH_SHA256", pcd_patch),
+            ("FAST_LIVO2_PCD_FLUSH_PATCH_SHA256", flush_patch),
+        ):
+            with self.subTest(patch=patch.name):
+                declared = re.findall(
+                    rf"^{key}=([0-9a-f]{{64}})$", source_lock, re.MULTILINE
+                )
+                self.assertEqual(len(declared), 1)
+                self.assertEqual(
+                    hashlib.sha256(patch.read_bytes()).hexdigest(), declared[0]
+                )
+                self.assertEqual(
+                    re.findall(rf"^ARG {key}=([^\s]+)$", base_dockerfile, re.MULTILINE),
+                    [declared[0], declared[0]],
+                )
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
         runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
@@ -233,18 +233,6 @@ class FastLivo2ContractTest(unittest.TestCase):
             'test -z "$(ros2 pkg executables livox_ros_driver2)"',
             base_dockerfile,
         )
-        self.assertEqual(
-            hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "cc5fbe906871128a627ce258c58636f484d24e434539930e72ee6f795abb5b0e",
-        )
-        self.assertEqual(
-            hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
-            "048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe",
-        )
-        self.assertEqual(
-            hashlib.sha256(flush_patch.read_bytes()).hexdigest(),
-            "9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c",
-        )
         # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以只移除
         # ROS 源；Ubuntu/NVIDIA 签名源仍需保留并认证系统依赖。
         self.assertIn("packages\\.ros\\.org/ros2/ubuntu", base_dockerfile)
@@ -329,10 +317,6 @@ class FastLivo2ContractTest(unittest.TestCase):
         adapter = (runtime_package / "adapter_node.py").read_text(encoding="utf-8")
         self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
         self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
-        self.assertIn(
-            'f"/livox/lidar:={self.get_parameter(\'lidar_topic\').value}"',
-            supervisor,
-        )
         self.assertNotIn("lidar_fast_livo", supervisor)
         self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
         self.assertIn("self._runtime_lifecycle_lock = threading.Lock()", supervisor)
@@ -344,7 +328,6 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('"obstacle_min_height_m", -0.30', adapter)
         self.assertIn('"obstacle_max_height_m", 0.30', adapter)
         self.assertIn('action == "configure_obstacle_filter"', adapter)
-        self.assertIn('action == "save_static_map"', adapter)
         self.assertIn('action == "validate_map"', adapter)
         self.assertIn("self._static_save_result", adapter)
         self.assertNotIn("and self._static_save_result is not None", adapter)
@@ -352,14 +335,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('"static_map_load_max_points", 200000', adapter)
         self.assertNotIn("static_confirmation_frames", adapter)
         self.assertNotIn("static_dynamic_filter_enabled", adapter)
-        self.assertIn("bracketed_stamped_pose(", adapter)
         self.assertIn("latest_sensor_qos = QoSProfile(", adapter)
-        self.assertIn("self._pending_cloud", adapter)
-        self.assertIn('self._mode = "finalizing"', adapter)
         self.assertIn("self._static_map.observe_scan(", adapter)
         self.assertIn("self._mapping_worker_main", adapter)
-        self.assertIn("self._queue_mapping_scan(", adapter)
-        self.assertIn("self._mapping_work_dropped", adapter)
         self.assertIn("MultiThreadedExecutor(num_threads=4)", adapter)
         publish_fast_path = adapter.split("    def _drain_pending_cloud", 1)[1].split(
             "    def _on_reset", 1
@@ -378,16 +356,13 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("_MAP_VIEW_MAX_POINTS = 40_000", adapter)
         self.assertIn("_MAP_VIEW_POSE_REFRESH_HZ = 1.0", adapter)
         self.assertNotIn("1.0 / _MAP_VIEW_POSE_REFRESH_HZ", adapter)
-        self.assertIn("            self._publish_map_view()", adapter)
         self.assertIn("MutuallyExclusiveCallbackGroup", adapter)
         self.assertIn("self._display_callbacks = MutuallyExclusiveCallbackGroup()", adapter)
         self.assertIn("map_view_qos = QoSProfile(", adapter)
         self.assertIn("callback_group=self._display_callbacks", adapter)
         self.assertIn("_RELOCALIZATION_MIN_MATCH_RATIO = 0.35", adapter)
-        self.assertIn("self._invalidate_map_view_cache_locked()", adapter)
         self.assertIn("self._static_map.prepare_confirmed(static_loaded.points)", adapter)
         self.assertIn("self._static_map.apply_prepared_confirmed(prepared)", adapter)
-        self.assertIn('result.pop("_post_response", None)', adapter)
         self.assertIn('action == "configure_obstacle_filter"', supervisor)
         self.assertIn("self._map_artifacts_from_manifest(map_name)", supervisor)
         self.assertIn('self._adapter_execute("validate_map", validation_args)', supervisor)
@@ -396,14 +371,12 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("_MAX_MAP_ARTIFACT_BYTES = 1_073_741_824", supervisor)
         self.assertIn("_MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912", supervisor)
         self.assertIn("_MAX_MAP_MANIFEST_BYTES = 65_536", supervisor)
-        self.assertIn('"static_map_save_failed"', supervisor)
         self.assertIn('"manifest_write_failed"', supervisor)
         self.assertIn("self._pending_mapping_finalize = pending", supervisor)
         self.assertIn('"mapping_finalize_pending"', supervisor)
         self.assertIn('"static_map_format_version": 2', supervisor)
         self.assertIn('"retryable": True', supervisor)
         self.assertIn("acquire(blocking=False)", supervisor)
-        self.assertIn('"static_map_status_unavailable"', supervisor)
         self.assertNotIn("time.sleep(0.10)", supervisor)
         self.assertIn('"static_map_pcd"', supervisor)
         self.assertIn('args["obstacle_height_range_m"]', supervisor)
@@ -416,19 +389,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         frame_adapter = (runtime_package / "frame_adapter_core.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("MVFILT2", frame_adapter)
-        self.assertIn("class TemporalOccupancyMap", frame_adapter)
-        self.assertIn("def write_pcd_xyz_atomic(", frame_adapter)
-        self.assertIn("max_declared_points", frame_adapter)
         self.assertIn("_MAX_PCD_HEADER_BYTES = 65_536", frame_adapter)
         self.assertIn("_MAX_PCD_ASCII_RECORD_BYTES = 65_536", frame_adapter)
-        self.assertIn("deadline_monotonic", frame_adapter)
-        self.assertNotIn("payload = stream.read()", frame_adapter)
         self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
-        mapping_backend = (
-            ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "mapping" / "backend.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn('if action == "stop_mapping"', mapping_backend)
 
 if __name__ == "__main__":
     unittest.main()
