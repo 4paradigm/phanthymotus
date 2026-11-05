@@ -23,11 +23,7 @@ plugins/pointcloud.py — PointCloudPerceptionPlugin: 3D 点云，三种输入�
 stereoCalibrate blob（未校正，自动 rectify）。双目的标定优先级：start 参数
 > 实例 config > 全局配置 > 驱动层声明（两条输入的 motus.camera/1 里带
 stereo_peer + K/D 时自动拼 raw 档 blob，见 _stereo_blob_from_declarations
-—— 型号级出厂标定的零配置路径）。`calibrate` action 面向 C：
-现场棋盘格采样（同一对帧不算新姿态）→ stereoCalibrate → 默认保留完整
-raw blob（运行时 rectify；只有明确 pre_rectified=true 才落快捷档 ——
-rectify 后的 Δy 对任何标定都 ≈ 0，不能拿来分档）→ 落盘
-/models/stereo_calib/ 并返回可粘贴回配置的 blob。
+—— 型号级出厂标定的零配置路径）。双目标定缺失时拒绝启动。
 
 纯数学在 plugins/pointcloud_math.py（不依赖 cv2 / rclpy，本地可测）。
 """
@@ -51,8 +47,8 @@ from std_msgs.msg import String, UInt8MultiArray
 from plugins.pointcloud_math import (
     MAX_POINTS, CALIB_DIR,
     backproject_depth, calibration_tier, decimate_cloud, decimation_stride,
-    default_calib_name, encode_packet, filter_cloud, intrinsics_from_hfov,
-    load_calibration_blob, pinhole_of, Q_from_baseline, sanitize_calib_name,
+    encode_packet, filter_cloud, intrinsics_from_hfov,
+    load_calibration_blob, pinhole_of, Q_from_baseline,
     summarize_cloud,
 )
 from utils.ros_lifecycle import dispose_node
@@ -78,9 +74,6 @@ _PUB_QOS = QoSProfile(
 
 # 双目两帧允许的最大时间差（秒）——超过就丢掉旧帧
 _STEREO_SYNC_S = 0.05
-
-# calibrate action 的采样节奏：默认收 15 对，每对之间停一拍让手挪棋盘格
-_CALIB_PAIRS_TARGET = 15
 
 
 def output_topics_for(input_topic: Optional[str]) -> tuple[str, str]:
@@ -111,7 +104,7 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "config", "calibrate"],
+                    "enum": ["start", "stop", "info", "config"],
                     "description": "Action to perform",
                 },
                 "input_topic": {
@@ -129,20 +122,7 @@ TOOLS = [
                 },
                 "calibration": {
                     "type": "string",
-                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目留空时自动尝试驱动声明的 stereo_peer（型号级出厂标定）。没标定也可以先 start（只采集不出云），再用 calibrate 现场标定后把 blob 填回来重启",
-                },
-                "board_w": {"type": "integer", "description": "calibrate 用：棋盘格内角点列数（默认 9）"},
-                "board_h": {"type": "integer", "description": "calibrate 用：棋盘格内角点行数（默认 6）"},
-                "square_m": {"type": "number", "description": "calibrate 用：棋盘格格距（米，默认 0.025）"},
-                "pairs": {"type": "integer", "description": "calibrate 用：要采集的棋盘格姿态数（默认 15）"},
-                "name": {"type": "string", "description": "calibrate 用：标定结果文件名（默认按时间戳），落在 /models/stereo_calib/ 下。只能含字母/数字/点/下划线/连字符"},
-                "pre_rectified": {
-                    "type": "boolean",
-                    "description": (
-                        "calibrate 用：默认 false。只有当上游保证左右两路已经过立体校正"
-                        "（行对齐、无畸变）才设 true —— 此时只保留 Q 反投影四要素（运行时跳过 rectify）。"
-                        "默认保留完整标定 blob，运行时逐帧 rectify"
-                    ),
+                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目留空时自动尝试驱动声明的 stereo_peer（型号级出厂标定）；标定缺失时无法启动",
                 },
             },
             "required": ["action"],
@@ -154,18 +134,6 @@ TOOLS = [
                 "stop": {"params": [], "description": "停止点云输出"},
                 "info": {"params": [], "description": "查看状态、模式与输出话题"},
                 "config": {"params": ["calibration"], "description": "更新实例配置（calibration / fps / max_points 等），需重启实例生效"},
-                "calibrate": {
-                    "params": ["board_w", "board_h", "square_m", "pairs", "name", "pre_rectified"],
-                    "description": (
-                        "双目标定：把棋盘格举到双目前，保持左右同帧可见，"
-                        "每换一个姿态调用一次直到采满 pairs（默认 15）对"
-                        "（还是同一对帧会被拒，挪动棋盘出新帧再调）。"
-                        "完成后返回 rms / 角点数 / 标定 blob（可直接粘贴进卡片配置），"
-                        "并落盘到 /models/stereo_calib/。默认保留完整 blob（运行时 rectify）；"
-                        "只有上游明确保证已 pre-rectified 才用快捷档。"
-                        "需要卡片以双目模式 start 过（无标定也可以 start，只采集不出云）"
-                    ),
-                },
             },
         },
         "configSchema": {
@@ -319,11 +287,6 @@ class _PointCloudNode(Node):
         self._last_emit_time = 0.0
         self._frame_count = 0
         self._running = False
-        # calibrate 用：最近一对左右帧（解好色的 BGR），棋盘格检测在
-        # calibrate 线程里做，不在回调里做。_stereo_pair_seq 随每对新帧
-        # 自增 —— calibrate 靠它识别"还是同一帧"（review 指出的重复采样）。
-        self._last_stereo_pair: Optional[tuple] = None
-        self._stereo_pair_seq = 0
         self._lifecycle_lock = threading.RLock()
 
     # ── 生命周期（同 visual_depth：request_stop 不拿锁；stop 只收 worker）──
@@ -517,8 +480,6 @@ class _PointCloudNode(Node):
             try:
                 if self._mode == "stereo":
                     left, right = self._stereo_queue.get(timeout=1.0)
-                    self._last_stereo_pair = (left, right)
-                    self._stereo_pair_seq += 1
                     self._emit_stereo(left, right)
                 else:
                     kind, payload = self._frame_queue.get(timeout=1.0)
@@ -709,8 +670,7 @@ class _PointCloudNode(Node):
         blob = self._calibration
         tier = calibration_tier(blob)
         if tier not in ("raw", "rectified"):
-            # 无标定 stereo 是合法的"标定采集"状态（start 允许，见 dispatch）：
-            # 只配对存帧供 calibrate 用，不出云。
+            # 缺少标定时不生成点云。
             return
         fx, cx, cy, Tx, left_u, right_u = _rectify_pair(
             left, right, blob, getattr(self, "_rectify_cache", None))
@@ -1017,9 +977,6 @@ class PointCloudPerceptionPlugin:
         # _upstream_camera_right 只在 stereo 两路时记录（右目自己的声明）。
         self._upstream_camera: dict[str, dict] = {}
         self._upstream_camera_right: dict[str, dict] = {}
-        # calibrate 的采集状态：{(instance_id): {"pairs": [...], "target": N}}
-        self._cal_sessions: dict[str, dict] = {}
-        self._cal_lock = threading.Lock()
 
     # ── lazy engine（mono 模式，与 visual_depth 同一机制与下载器）──────────
 
@@ -1285,8 +1242,6 @@ class PointCloudPerceptionPlugin:
         node.request_stop()
         result = node.stop()
         dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
-        with self._cal_lock:
-            self._cal_sessions.pop(node_key, None)
         return result
 
     def shutdown(self) -> None:
@@ -1306,178 +1261,13 @@ class PointCloudPerceptionPlugin:
             for key in keys:
                 self._retire_node(key)
 
-    # ── calibrate（stereo）────────────────────────────────────────────────
-
-    def _stereo_pair_for_calibration(self, instance_id: str) -> tuple:
-        """取标定用的 (pair, seq)。seq 随每对新帧自增，calibrate 靠它
-        区分"新姿态"与"同一帧重复调用"（review 指出的重复采样）。"""
-        with self._nodes_lock:
-            node = self._nodes.get(instance_id) if instance_id else None
-            if node is None:
-                node = self._nodes.get(_DEFAULT_INSTANCE)
-            if node is None and len(self._nodes) == 1:
-                node = next(iter(self._nodes.values()))
-        if node is None:
-            raise ValueError("no stereo instance running — start the card on both cameras first")
-        if node._mode != "stereo":
-            raise ValueError(f"instance is in {node._mode} mode, calibrate needs stereo")
-        pair = node._last_stereo_pair
-        if pair is None:
-            raise ValueError("no stereo frame received yet — check both cameras are publishing")
-        return pair, node._stereo_pair_seq
-
-    def _calibrate(self, args: dict, instance_id: str) -> dict:
-        import cv2
-
-        board_w = int(args.get("board_w", 9))
-        board_h = int(args.get("board_h", 6))
-        square = float(args.get("square_m", 0.025))
-        target = int(args.get("pairs", _CALIB_PAIRS_TARGET))
-        # review 第 13 轮：0/负数会一路走到 OpenCV（square=0 时物方点全为零
-        # 的退化标定、board_w=0 时 pattern_size 非法），先于任何 cv2 调用
-        # 用 bad_input 拒绝，而不是让请求在库层以 cryptic 错误收场。
-        if board_w < 1 or board_h < 1 or square <= 0.0 or target < 1:
-            return {"ok": False, "reason": "bad_input",
-                    "detail": f"board_w/board_h/pairs 须 >= 1、square_m 须 > 0，收到: "
-                              f"board_w={board_w} board_h={board_h} square_m={square} "
-                              f"pairs={target}"}
-        name = args.get("name") or default_calib_name()
-        name, name_error = sanitize_calib_name(name)
-        if name is None:
-            # 文件名带路径分隔符会写出 CALIB_DIR 之外（review 指出的路径
-            # 穿越），拒绝整个请求而不是换个名字替它落盘。
-            return {"ok": False, "reason": "bad_name", "detail": name_error}
-
-        # 图比棋盘还小时 findChessboardCorners 内部 adaptiveThreshold 断言
-        # 失败直接抛 cv2.error（镜像里 8×6 帧 + 9×6 棋盘就是这么炸的），
-        # 提前按尺寸拒绝并给出能看懂的回复。
-        (left, right), pair_seq = self._stereo_pair_for_calibration(instance_id)
-        if left.shape[0] < board_h or left.shape[1] < board_w:
-            return {"ok": False, "reason": "no_checkerboard",
-                    "detail": f"帧只有 {left.shape[1]}x{left.shape[0]}，"
-                              f"放不下 {board_w}x{board_h} 的棋盘格"}
-        gray_l = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
-        gray_r = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
-        pattern_size = (board_w, board_h)
-        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-        try:
-            found_l, corners_l = cv2.findChessboardCorners(gray_l, pattern_size, flags)
-            found_r, corners_r = cv2.findChessboardCorners(gray_r, pattern_size, flags)
-        except cv2.error as error:
-            # 图能容纳棋盘但检测仍可能断言失败（过小/纯色帧）—— 按文档
-            # 契约回 no_checkerboard，而不是让 MCP 请求抛异常。
-            return {"ok": False, "reason": "no_checkerboard", "detail": str(error)}
-        if not (found_l and found_r):
-            return {"ok": False, "reason": "no_checkerboard",
-                    "detail": f"两张图里没找到 {board_w}x{board_h} 的棋盘格。"
-                              "确认左右同帧都能看到完整棋盘、光线充足、棋盘平整不反光"}
-        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
-        corners_l = cv2.cornerSubPix(gray_l, corners_l, (11, 11), (-1, -1), crit)
-        corners_r = cv2.cornerSubPix(gray_r, corners_r, (11, 11), (-1, -1), crit)
-
-        with self._cal_lock:
-            session = self._cal_sessions.setdefault(
-                instance_id or _DEFAULT_INSTANCE, {"pairs": [], "target": target})
-            session["target"] = target
-            # 同一对帧（seq 未变）不允许计为新姿态：连打 15 次 calibrate
-            # 不挪棋盘会采到 15 份相同观测，stereoCalibrate 拟合出貌似
-            # 成功的退化标定。等下一对帧（seq 变了）才继续收。
-            last_seq = session.get("pair_seq")
-            if last_seq is not None and last_seq == pair_seq:
-                return {
-                    "ok": False, "reason": "same_pose",
-                    "pairs_used": len(session["pairs"]), "pairs_target": target,
-                    "message": "还是同一对帧（没检测到新画面）。挪动棋盘格换个姿态，"
-                               "确认左右相机出新帧后再调用一次",
-                }
-            session["pair_seq"] = pair_seq
-            session["pairs"].append((corners_l, corners_r, gray_l.shape[::-1]))
-            pairs = list(session["pairs"])
-        if len(pairs) < target:
-            return {
-                "ok": True, "state": "collecting",
-                "pairs_used": len(pairs), "pairs_target": target,
-                "message": f"已采 {len(pairs)}/{target} 对。换一个棋盘姿态/角度再调用一次 calibrate",
-            }
-
-        objp = np.zeros((board_w * board_h, 3), dtype=np.float64)
-        objp[:, :2] = np.mgrid[0:board_w, 0:board_h].T.reshape(-1, 2)
-        objp *= square
-        obj_points = [objp] * len(pairs)
-        img_points_l = [p[0] for p in pairs]
-        img_points_r = [p[1] for p in pairs]
-        size = pairs[0][2]
-
-        # 不用 CALIB_FIX_INTRINSIC（把 K 钉死就拟合不出外参）：
-        # 让 stereoCalibrate 同时拟合左右 K/D 与外参，K 用 hfov 估计做初值。
-        w_img, h_img = size
-        fx_seed = (w_img / 2.0) / np.tan(np.radians(90.0) / 2.0)  # 90° hfov → w/2
-        K1 = np.array([[fx_seed, 0, w_img / 2], [0, fx_seed, h_img / 2], [0, 0, 1]], dtype=np.float64)
-        K2 = K1.copy()
-        D1 = np.zeros(4); D2 = np.zeros(4)
-        rms, K1, D1, K2, D2, R, T, E, F = cv2.stereoCalibrate(
-            obj_points, img_points_l, img_points_r,
-            K1, D1, K2, D2, size,
-            criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5))
-        # 分档只认显式声明：stereoRectify 本来就把两图都旋转到共线行，
-        # rectify 之后量的 Δy 对任何标定都 ≈ 0，拿它分档必然永远落
-        # rectified 档、把刚算出来的 raw blob 丢掉（review 指出的回归：
-        # 运行时会跳过去畸变，SGBM 吃的是畸变图）。默认保留完整 raw
-        # blob（运行时 rectify）；只有调用方明确 pre_rectified=true
-        # （上游保证两路已做立体校正）才落快捷档。
-        if args.get("pre_rectified"):
-            # 已校正：只需要 Q 矩阵的四要素。objp 以米建，T 即米，无需 mm 换算。
-            # T 是 (3,1)：float(T[0]) 撞 numpy 弃用警告，用 ravel()[0]。
-            blob = {"fx": float(K1[0, 0]), "cx": float(K1[0, 2]),
-                    "cy": float(K1[1, 2]),
-                    "Tx": abs(float(np.asarray(T).ravel()[0])),
-                    "rms": round(float(rms), 4), "pairs_used": len(pairs)}
-            tier = "rectified"
-        else:
-            blob = {
-                "K1": K1.tolist(), "D1": D1.tolist(),
-                "K2": K2.tolist(), "D2": D2.tolist(),
-                "R": R.tolist(), "T": T.tolist(),
-                "board": {"w": board_w, "h": board_h, "square_m": square},
-                "rms": round(float(rms), 4),
-                "pairs_used": len(pairs),
-            }
-            tier = "raw"
-
-        try:
-            os.makedirs(CALIB_DIR, exist_ok=True)
-            path = os.path.join(CALIB_DIR, f"{name}.json")
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(blob, fh, ensure_ascii=False, indent=2)
-            saved_to = path
-        except Exception as error:  # noqa: BLE001 — non-fatal
-            log.warning(f"[pointcloud] could not persist calibration: {error}")
-            saved_to = None
-
-        with self._cal_lock:
-            self._cal_sessions.pop(instance_id or _DEFAULT_INSTANCE, None)
-        return {
-            "ok": True, "state": "done", "tier": tier,
-            "rms": round(float(rms), 4), "pairs_used": len(pairs),
-            "calibration": blob,
-            "saved_to": saved_to,
-            "message": (
-                f"标定完成（{tier}）。把 calibration 字段粘贴进卡片配置"
-                + (f"，或直接引用文件 {saved_to}" if saved_to else "（落盘失败，请手动保存 blob）")
-            ),
-        }
-
-    # ── dispatch ──────────────────────────────────────────────────────────
-
     def get_tools(self) -> list:
         return TOOLS
 
     def _validate_calibration(self, raw_value) -> Optional[str]:
         """校验一份 calibration 配置值（实例或全局 config 共用）。
 
-        返回 None 表示可用（或没带标定/档位 unknown——unknown 照收：stereo
-        无标定启动走 capture-only，calibrate 采完再填回来，这是第 6/10 轮
-        就立下的契约）；返回字符串即拒绝原因。start 的预检在 dispatch 里
+        返回 None 表示可用或未配置；返回字符串即拒绝原因。start 的预检在 dispatch 里
         分档做过了，config 没有模式上下文，这里按 blob 自己的档位挑同一
         批解析器——两处各写一遍必然漂移（review 第 17 轮 Issue 1）。"""
         blob = load_calibration_blob(raw_value)
@@ -1691,11 +1481,7 @@ class PointCloudPerceptionPlugin:
                         # 落 capture-only 让人以为是没标定。
                         return {"state": "error",
                                 "message": f"驱动声明的 stereo 标定不完整：{declared_note}"}
-                    # review 指出的死锁：calibrate 需要运行中的 stereo 节点，
-                    # 而 stereo 又要求先有标定 —— 新卡片永远走不进第一次标定。
-                    # 放行无标定启动：节点照常订阅配对存帧（_emit_stereo 的
-                    # unknown 档不出云），calibrate 采完把 blob 填回配置重启。
-                    log.info("[pointcloud] stereo start without calibration: capture-only")
+                    return {"state": "error", "message": "stereo 模式需要上游或配置提供完整标定"}
                 elif calibration_tier(calibration) == "rectified":
                     # review 第 6/10 轮：以前只查 Tx（Tx=0 → Q[3,2] 每帧除零）。
                     # 但 Q 的其余输入同样致命：fx=0 → Z=fx·Tx/w 恒 0，云被
@@ -1881,14 +1667,5 @@ class PointCloudPerceptionPlugin:
                 self._cal_a = float(cfg.get("cal_a", self._cal_a))
                 self._cal_b = float(cfg.get("cal_b", self._cal_b))
             return {"status": "configured", "config": cfg}
-
-        elif action == "calibrate":
-            try:
-                return self._calibrate(args, instance_id)
-            except ValueError as error:
-                return {"ok": False, "reason": "bad_input", "detail": str(error)}
-            except AttributeError as error:
-                # fake cv2（host 测试）没实现棋盘 API；真环境不会走到
-                return {"ok": False, "reason": "cv2_unavailable", "detail": str(error)}
 
         return None

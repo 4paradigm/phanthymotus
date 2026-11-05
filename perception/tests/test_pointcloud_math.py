@@ -297,23 +297,3 @@ def test_calibration_tier_classification():
     assert pcm.calibration_tier({"fx": 1, "fy": 1}) == "pinhole"
     assert pcm.calibration_tier({}) == "unknown"
     assert pcm.calibration_tier({"rms": 0.1}) == "unknown"
-
-
-# ── sanitize_calib_name（review issue 3：路径穿越）────────────────────────────
-
-def test_sanitize_calib_name_accepts_plain_names():
-    ok, err = pcm.sanitize_calib_name("stereo_20240101_120000")
-    assert ok == "stereo_20240101_120000" and err is None
-    ok, err = pcm.sanitize_calib_name("my-calib.v2")
-    assert ok == "my-calib.v2" and err is None
-
-
-def test_sanitize_calib_name_blocks_path_traversal():
-    for bad in ("../../etc/passwd", "a/b", "a\\b", "..", ".", "", None, "  ", "a;b"):
-        ok, err = pcm.sanitize_calib_name(bad)
-        assert ok is None, f"{bad!r} should be rejected"
-        assert err
-
-
-def test_default_calib_name_is_sanitizable():
-    assert pcm.sanitize_calib_name(pcm.default_calib_name())[0] is not None

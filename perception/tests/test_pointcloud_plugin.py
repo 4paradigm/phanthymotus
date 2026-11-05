@@ -7,7 +7,7 @@ tests/test_pointcloud_plugin.py — pointcloud 插件层测试（host-side, no G
        却不发布）——用假 cv2 验证 stereoRectify 之后 Tx 来自 T；
     2. auto 模式按消息真实类型分派，不再嗅探话题名——z16 深度 Image 发在
        不含 "depth" 的话题上也必须出云；
-    3. calibrate 的 name 不允许路径穿越。
+    3. 点云计算沿用上游声明的标定信息。
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
 """
@@ -62,6 +62,14 @@ def _decode_cloud(raw: bytes) -> np.ndarray:
     magic, n = struct.unpack("<II", raw[:8])
     assert magic == 12
     return np.frombuffer(raw[8:], dtype="<f4").reshape(n, 3)
+
+
+def test_pointcloud_no_longer_advertises_or_executes_calibration_action():
+    tool = pc.TOOLS[0]
+    assert 'calibrate' not in tool['inputSchema']['properties']['action']['enum']
+    assert 'calibrate' not in tool['inputSchema'].get('x-action-params', {})
+    plugin, _ = _plugin()
+    assert plugin.dispatch('pointcloud', {'action': 'calibrate'}) is None
 
 
 @pytest.mark.parametrize(('format_name', 'expected'), [
@@ -919,33 +927,12 @@ def test_decimation_stride_on_flattened_cloud_matches_ceil_n_over_max():
 
 # ── stereo 生命周期与 info 契约 ───────────────────────────────────────────────
 
-def test_stereo_start_without_calibration_runs_capture_only():
-    """review 指出的死锁回归：calibrate 要运行中的 stereo 节点，stereo 又
-    要求先有标定 → 新卡片永远进不了第一次标定。无标定 stereo 现在以
-    capture-only 启动（订阅/配对/存帧，不出云），calibrate 可用。"""
+def test_stereo_start_without_calibration_reports_missing_metadata():
     plugin, executor = _plugin(cfg={"fps": 1000})
     reply = plugin.dispatch("pointcloud", {
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "running"
-    node = executor.nodes[0]
-    assert node._mode == "stereo"
-    assert plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/cam/left']['capture_only'] is True
-
-    # 左右帧照常配对存帧（calibrate 的输入），但 unknown 档不出云
-    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
-    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
-    assert _wait_until(lambda: node._last_stereo_pair is not None)
-    _wait_until(lambda: False, timeout=0.2)
-    assert _cloud_pub(node).messages == []
-
-    # calibrate 不再报 "no stereo instance"，而是走到棋盘检测。
-    # fake cv2 没实现棋盘 API → cv2_unavailable；真 cv2 下 8×6 帧放不下
-    # 9×6 棋盘，尺寸预检 → no_checkerboard（此前直接 cv2.error 炸掉
-    # 整个请求 —— review 指出、镜像里复现的崩溃）。两者都说明已越过
-    # "没有实例"这一步。
-    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "first"})
-    assert reply["ok"] is False
-    assert reply["reason"] in ("no_checkerboard", "cv2_unavailable")
+    assert reply["state"] == "error" and "标定" in reply["message"]
+    assert not executor.nodes
 
 
 def test_stereo_start_requires_both_topics():
@@ -1005,8 +992,9 @@ def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
     # 直接把 OpenCV 干 abort（套件 61% 处硬中止就是它）。本测试只关心
     # 配对逻辑，emit 换 no-op —— 与 test_stereo_pairing_publishes_with_
     # rectified_blob 同一做法。
+    emitted = []
     def _noop_emit(self_inner, left, right):
-        pass
+        emitted.append((left, right))
 
     original = type(node)._emit_stereo
     type(node)._emit_stereo = _noop_emit
@@ -1017,15 +1005,15 @@ def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
         node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_001))
         _wait_until(lambda: False, timeout=0.2)
         assert node._stereo_queue.empty(), "拍摄时刻差 1 s 的帧不得配对"
-        assert node._stereo_pair_seq == 0, "错配帧不得进 worker"
+        assert not emitted, "错配帧不得进 worker"
 
         # 场景 2：真同步对——拍摄时刻同刻（stamp 相同），即使左帧回调早
-        # 到达（模拟传输/调度抖动），也必须配对成功。用 seq 断言而不是
+        # 到达（模拟传输/调度抖动），也必须配对成功。用 worker 调用断言而不是
         # 队列非空：worker 取走队列极快，查队列是竞态。
         node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
         _wait_until(lambda: False, timeout=0.05)   # 左帧先到，右帧在"路上"
         node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
-        assert _wait_until(lambda: node._stereo_pair_seq >= 1), \
+        assert _wait_until(lambda: len(emitted) >= 1), \
             "同刻拍摄、回调错峰到达的帧必须配对"
 
         # 场景 3：无 stamp（老驱动不写 header）→ 退回到达时刻，窗口内仍
@@ -1035,7 +1023,7 @@ def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
         node._last_emit_time = 0.0
         node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
         node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
-        assert _wait_until(lambda: node._stereo_pair_seq >= 2)
+        assert _wait_until(lambda: len(emitted) >= 2)
     finally:
         type(node)._emit_stereo = original
 
@@ -1258,267 +1246,6 @@ class _FakeStereoRectify:
 
 def _install_fake_stereo_rectify():
     return _FakeStereoRectify().install()
-
-
-# ── review issue 3：calibrate 文件名校验 ──────────────────────────────────────
-
-def test_calibrate_rejects_a_traversal_name():
-    """'../../x' 之类 name 会写出 /models/stereo_calib 之外 —— 必须拒绝。"""
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB),
-                                    "fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-
-    depth = np.zeros((6, 8, 3), dtype=np.uint8)
-    node._last_stereo_pair = (depth, depth.copy())
-
-    # 找不到棋盘格也无所谓：name 校验在棋盘检测之前，坏名先被拒。
-    reply = plugin.dispatch("pointcloud", {
-        "action": "calibrate", "name": "../../evil"})
-    assert reply["ok"] is False
-    assert reply["reason"] == "bad_name"
-
-
-def test_calibrate_rejects_path_like_and_dotted_names():
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB),
-                                    "fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-    depth = np.zeros((6, 8, 3), dtype=np.uint8)
-    node._last_stereo_pair = (depth, depth.copy())
-
-    for bad in ("a/b", "a\\b", "..", ".", "x;rm", "pct%"):
-        reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": bad})
-        assert reply["ok"] is False, bad
-        assert reply["reason"] == "bad_name", bad
-
-
-def test_calibrate_without_stereo_instance_says_so():
-    plugin, executor = _plugin()
-    reply = plugin.dispatch("pointcloud", {"action": "calibrate"})
-    assert reply["ok"] is False
-
-
-def test_calibrate_rejects_frame_too_small_for_board():
-    """review 指出、镜像里复现的崩溃：8×6 帧配 9×6 棋盘时
-    findChessboardCorners 的 adaptiveThreshold 断言失败抛 cv2.error，
-    dispatch 只接 ValueError → MCP 请求直接异常。尺寸预检 + cv2.error
-    捕获后都按 no_checkerboard 契约回复。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-
-    small = np.zeros((6, 8, 3), dtype=np.uint8)  # 8 列 < board_w=9
-    node._last_stereo_pair = (small, small.copy())
-    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "t"})
-    if reply["reason"] == "cv2_unavailable":
-        pytest.skip("fake cv2 has no chessboard API — size precheck untested here")
-    assert reply["ok"] is False
-    assert reply["reason"] == "no_checkerboard"
-
-
-def test_calibrate_rejects_cv2_error_as_no_checkerboard(monkeypatch):
-    """真 cv2 下图能容纳棋盘仍可能断言失败（纯色/过小）—— cv2.error
-    必须落回 no_checkerboard 契约，不能让请求抛异常。用假检测触发。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-
-    big = np.zeros((60, 80, 3), dtype=np.uint8)  # 放得下 9×6，过尺寸预检
-    node._last_stereo_pair = (big, big.copy())
-
-    import cv2
-
-    class _Cv2Error(Exception):
-        pass
-
-    def _boom(gray, pattern, flags):
-        raise _Cv2Error("adaptiveThreshold assertion failed")
-
-    monkeypatch.setattr(cv2, "findChessboardCorners", _boom, raising=False)
-    # fake cv2 没有 cv2.error 名字 —— 插件里 except cv2.error 需要它存在
-    monkeypatch.setattr(cv2, "error", _Cv2Error, raising=False)
-    # flags 常量同样缺（在 try 之外取值，缺了会先撞 AttributeError）
-    monkeypatch.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
-    monkeypatch.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
-    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "t"})
-    assert reply["ok"] is False
-    assert reply["reason"] == "no_checkerboard"
-
-
-def test_calibrate_rejects_degenerate_parameters():
-    """review 第 13 轮：board_w=0 / board_h<0 / square_m=0 / pairs=0 等
-    退化参数不得到达 OpenCV（square=0 时物方点全为零、pattern_size
-    非法），必须在任何 cv2 调用前按 bad_input 契约回复。"""
-    plugin, _ = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    for bad in ({"board_w": 0}, {"board_h": -1}, {"square_m": 0.0}, {"pairs": 0}):
-        reply = plugin.dispatch("pointcloud", {"action": "calibrate", **bad})
-        if reply.get("reason") == "cv2_unavailable":
-            pytest.skip("fake cv2 has no chessboard API")
-        assert reply["ok"] is False
-        assert reply["reason"] == "bad_input"
-        assert "board_w" in str(reply["detail"])
-
-
-def test_calibrate_same_pair_is_not_a_new_pose():
-    """review 指出的重复采样：连打 15 次 calibrate 不挪棋盘，会采到 15 份
-    相同观测，stereoCalibrate 拟合出貌似成功的退化标定。同一对帧（seq
-    未变）必须被拒（same_pose），新帧才算新姿态。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-
-    # 假棋盘检测：图够大就"找到"角点，坐标随灰度图尺寸变（模拟不同姿态）。
-    import cv2
-
-    def _fake_find(gray, pattern, flags):
-        pts = np.array([[[(i % gray.shape[1]), (j % gray.shape[0])]]
-                        for i in range(pattern[0]) for j in range(pattern[1])],
-                       dtype=np.float32)
-        return True, pts
-
-    def _fake_subpix(gray, corners, win, zone, crit):
-        return corners
-
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(cv2, "findChessboardCorners", _fake_find, raising=False)
-    monkey.setattr(cv2, "cornerSubPix", _fake_subpix, raising=False)
-    # fake cv2 缺棋盘检测用的常量与 cv2.error —— 一并补上
-    monkey.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
-    monkey.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
-    monkey.setattr(cv2, "error", Exception, raising=False)
-    monkey.setattr(cv2, "TERM_CRITERIA_EPS", 1, raising=False)
-    monkey.setattr(cv2, "TERM_CRITERIA_MAX_ITER", 2, raising=False)
-    try:
-        node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
-        node._stereo_pair_seq = 1
-        first = plugin.dispatch("pointcloud", {
-            "action": "calibrate", "pairs": 3, "name": "t"})
-        # 采集未满 3 对会停在 collecting（不碰 stereoCalibrate）。
-        assert first["ok"] is True
-        assert first["state"] == "collecting"
-        assert first["pairs_used"] == 1
-
-        # 同一对帧（seq 没变）：拒绝，不计数
-        again = plugin.dispatch("pointcloud", {
-            "action": "calibrate", "pairs": 3, "name": "t"})
-        assert again["ok"] is False
-        assert again["reason"] == "same_pose"
-        assert again["pairs_used"] == 1
-
-        # 新帧（seq 变了）：重新计数，pairs_used 前进
-        node._stereo_pair_seq = 2
-        fresh = plugin.dispatch("pointcloud", {
-            "action": "calibrate", "pairs": 3, "name": "t"})
-        assert fresh["ok"] is True
-        assert fresh["pairs_used"] == 2
-    finally:
-        monkey.undo()
-
-
-def _calib_monkeypatch():
-    """calibrate 走通全程需要的假 cv2 棋盘 API：能"找到"角点（坐标随
-    灰度图尺寸变，模拟不同姿态）+ 假 stereoCalibrate 返回 9 元组。"""
-    import cv2
-
-    def _fake_find(gray, pattern, flags):
-        pts = np.array([[(i % gray.shape[1]), (j % gray.shape[0])]
-                        for i in range(pattern[0]) for j in range(pattern[1])],
-                       dtype=np.float32).reshape(-1, 1, 2)
-        return True, pts
-
-    def _fake_subpix(gray, corners, win, zone, crit):
-        return corners
-
-    def _fake_stereo_calibrate(obj, l, r, K1, D1, K2, D2, size, criteria=None):
-        # 与真 stereoCalibrate 同构的 9 元组返回；K/D 就用初值。
-        return (0.5,
-                np.asarray(K1, dtype=np.float64).copy(),
-                np.asarray(D1, dtype=np.float64).copy(),
-                np.asarray(K2, dtype=np.float64).copy(),
-                np.asarray(D2, dtype=np.float64).copy(),
-                np.eye(3, dtype=np.float64),
-                np.array([[-0.05], [0.0], [0.0]], dtype=np.float64),
-                np.eye(3, dtype=np.float64),
-                np.eye(3, dtype=np.float64))
-
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(cv2, "findChessboardCorners", _fake_find, raising=False)
-    monkey.setattr(cv2, "cornerSubPix", _fake_subpix, raising=False)
-    monkey.setattr(cv2, "stereoCalibrate", _fake_stereo_calibrate, raising=False)
-    monkey.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
-    monkey.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
-    monkey.setattr(cv2, "error", Exception, raising=False)
-    monkey.setattr(cv2, "TERM_CRITERIA_EPS", 1, raising=False)
-    monkey.setattr(cv2, "TERM_CRITERIA_MAX_ITER", 2, raising=False)
-    return monkey
-
-
-def _collect_calib_pairs(plugin, node, target):
-    """推进采集到 target 对（每对前自增 seq 模拟新帧）。"""
-    reply = None
-    for seq in range(1, target + 1):
-        node._stereo_pair_seq = seq
-        reply = plugin.dispatch("pointcloud", {
-            "action": "calibrate", "pairs": target, "name": "t"})
-    return reply
-
-
-def test_calibrate_done_keeps_raw_blob_by_default():
-    """review High：旧的"rectify 后量 Δy 分档"是同义反复 —— stereoRectify
-    本来就把两图行对齐，任何标定 rectify 后 Δy ≈ 0，必然落 rectified 档、
-    把刚算出的 raw K1/K2/D1/D2/R/T 丢掉 → 运行时跳过去畸变，SGBM 吃
-    畸变图。默认必须保留 raw blob。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-    node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
-
-    monkey = _calib_monkeypatch()
-    try:
-        reply = _collect_calib_pairs(plugin, node, 3)
-        assert reply["ok"] is True
-        assert reply["state"] == "done"
-        assert reply["tier"] == "raw"
-        blob = reply["calibration"]
-        for key in ("K1", "D1", "K2", "D2", "R", "T"):
-            assert key in blob, key
-        assert "epipolar_dy_px" not in reply
-        assert "epipolar_dy_px" not in blob
-    finally:
-        monkey.undo()
-
-
-def test_calibrate_pre_rectified_flag_lands_rectified_shortcut():
-    """只有调用方显式 pre_rectified=true（上游保证两路已立体校正）才落
-    rectified 快捷档 —— blob 只剩 Q 反投影四要素。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
-    node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
-
-    monkey = _calib_monkeypatch()
-    try:
-        node._stereo_pair_seq = 1
-        reply = plugin.dispatch("pointcloud", {
-            "action": "calibrate", "pairs": 1, "name": "t",
-            "pre_rectified": True})
-        assert reply["ok"] is True
-        assert reply["tier"] == "rectified"
-        assert set(reply["calibration"]) == {"fx", "cx", "cy", "Tx",
-                                             "rms", "pairs_used"}
-        assert reply["calibration"]["Tx"] == pytest.approx(0.05)
-    finally:
-        monkey.undo()
 
 
 # ── review issue 2：rectified 档 Tx=0 启动即拒 ────────────────────────────────
@@ -2200,19 +1927,6 @@ def test_declared_calib_missing_right_k_reports_the_gap():
         "camera_info": decls})
     assert reply["state"] == "error"
     assert "右目" in reply["message"] and "K" in reply["message"]
-
-
-def test_no_declarations_at_all_still_starts_capture_only():
-    """两条输入都没声明（旧驱动）→ 维持老契约：capture-only 启动，
-    calibrate 照常可用。声明层是加分项不是新门槛。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "running"
-    node = executor.nodes[0]
-    assert not node._calibration  # capture-only：unknown 档不出云
-    # 无标定即无来源（info() 里报 None）
-    assert getattr(node, "_calibration_source", None) is None
 
 
 def test_auto_mode_two_inputs_also_uses_declared_calibration():
