@@ -5,14 +5,13 @@
 # 没有 CPU 变体。navigation 卡片本身不用 GPU，但和它们共用这一个镜像。
 #
 # FAST-LIVO2 与 Nav2 在 ActuCore base 中从锁定源码编译；JP5.11 日常
-# 镜像直接继承锁定 digest 的基座并编译仓库自有 ROS 包。
+# 镜像直接继承版本化基座并编译仓库自有 ROS 包。
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
 #   ./build_actucore.sh --jp-version 6.1         # VLA / navi，保留上游本地推理
 #   ./build_actucore.sh --mirror tuna
-#   ./build_actucore.sh --base --mirror tuna     # 依赖变化时才构建 navigation base
-#   BUILD_JOBS=2 ./build_actucore.sh --base --mirror tuna  # 小内存 ARM64 主机
+#   ./prepare_navigation_base.sh --mirror tuna  # 依赖变化时构建 navigation base
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,14 +24,21 @@ if [ -f "${ENV_FILE}" ]; then
     source "${ENV_FILE}"
 fi
 
+# Compatibility for existing callers; the separate entry owns base builds.
+for arg in "$@"; do
+    if [ "${arg}" = "--base" ]; then
+        args=()
+        for item in "$@"; do [ "${item}" = "--base" ] || args+=("${item}"); done
+        exec bash "${SCRIPT_DIR}/prepare_navigation_base.sh" "${args[@]}"
+    fi
+done
+
 eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
 JP_VERSION="5.11"
-BUILD_BASE=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --base) BUILD_BASE=true; shift ;;
         --jp-version) JP_VERSION="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -69,87 +75,26 @@ jetpack_vars "${JP_VERSION}" || exit 1
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"
 BASE_REPOSITORY="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}"
-case "${JP_VERSION}" in
-    5.11) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
-    6.1) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
-esac
-
+DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
+IMAGE_NAME="actucore"
+TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 CARDS_JSON='[{"name":"controlled_semantic_spatial","type":"processor"},{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
-if ! ${BUILD_BASE} && [ "${JP_VERSION}" = "6.1" ]; then
+if [ "${JP_VERSION}" = "6.1" ]; then
     if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
         echo "ERROR=JP6.1 navigation runtime is not supported; build VLA without a navigation override" >&2
         exit 2
     fi
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
-    IMAGE_NAME="actucore"
-    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-    BASE_IMAGE="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}/jetson-base-actucore:jp${JP_ARG}-torch"
-    BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${BASE_IMAGE}")
+    BASE_IMAGE="${BASE_REPOSITORY}/jetson-base-actucore:jp${JP_ARG}-torch"
     CARDS_JSON='[{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
     echo "[info] JP6.1: VLA providers enabled; navigation is unavailable on this image."
-elif ${BUILD_BASE}; then
-    if ! ${IS_ARM64}; then
-        echo "ERROR=build the navigation base on native ARM64, not through QEMU" >&2
-        exit 2
-    fi
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.base"
-    IMAGE_NAME="actucore-navigation-base"
-    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-
-    NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/controlled_semantic_spatial/runtime"
-    GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"
-    source "${NAV_RUNTIME_DIR}/fast_livo2-source.lock"
-    source "${NAV_RUNTIME_DIR}/nav2-source.lock"
-    BUILD_ARGS+=(
-        "ACTUCORE_NAVIGATION_PARENT_IMAGE=${NAVIGATION_PARENT_IMAGE}"
-        "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
-        "FAST_LIVO2_REPO=${FAST_LIVO2_REPO}"
-        "FAST_LIVO2_COMMIT=${FAST_LIVO2_COMMIT}"
-        "FAST_LIVO2_RUNTIME_PATCH_SHA256=${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
-        "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}"
-        "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}"
-        "RPG_VIKIT_REPO=${RPG_VIKIT_REPO}"
-        "RPG_VIKIT_COMMIT=${RPG_VIKIT_COMMIT}"
-        "SOPHUS_REPO=${SOPHUS_REPO}"
-        "SOPHUS_COMMIT=${SOPHUS_COMMIT}"
-        "NAVIGATION2_REPO=${NAVIGATION2_REPO}"
-        "NAVIGATION2_COMMIT=${NAVIGATION2_COMMIT}"
-        "NAVIGATION2_RUNTIME_PATCH_SHA256=${NAVIGATION2_RUNTIME_PATCH_SHA256}"
-        "BEHAVIORTREE_CPP_REPO=${BEHAVIORTREE_CPP_REPO}"
-        "BEHAVIORTREE_CPP_COMMIT=${BEHAVIORTREE_CPP_COMMIT}"
-        "ANGLES_REPO=${ANGLES_REPO}"
-        "ANGLES_COMMIT=${ANGLES_COMMIT}"
-        "BOND_CORE_REPO=${BOND_CORE_REPO}"
-        "BOND_CORE_COMMIT=${BOND_CORE_COMMIT}"
-        "DIAGNOSTICS_REPO=${DIAGNOSTICS_REPO}"
-        "DIAGNOSTICS_COMMIT=${DIAGNOSTICS_COMMIT}"
-        "NAVIGATION_MSGS_REPO=${NAVIGATION_MSGS_REPO}"
-        "NAVIGATION_MSGS_COMMIT=${NAVIGATION_MSGS_COMMIT}"
-        "LASER_GEOMETRY_REPO=${LASER_GEOMETRY_REPO}"
-        "LASER_GEOMETRY_COMMIT=${LASER_GEOMETRY_COMMIT}"
-        "PCL_MSGS_REPO=${PCL_MSGS_REPO}"
-        "PCL_MSGS_COMMIT=${PCL_MSGS_COMMIT}"
-        "PERCEPTION_PCL_REPO=${PERCEPTION_PCL_REPO}"
-        "PERCEPTION_PCL_COMMIT=${PERCEPTION_PCL_COMMIT}"
-        "ROSBAG2_STORAGE_MCAP_REPO=${ROSBAG2_STORAGE_MCAP_REPO}"
-        "ROSBAG2_STORAGE_MCAP_COMMIT=${ROSBAG2_STORAGE_MCAP_COMMIT}"
-        "MCAP_REPO=${MCAP_REPO}"
-        "MCAP_COMMIT=${MCAP_COMMIT}"
-        "LZ4_REPO=${LZ4_REPO}"
-        "LZ4_COMMIT=${LZ4_COMMIT}"
-    )
 else
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
-    IMAGE_NAME="actucore"
-    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-    DEFAULT_NAVIGATION_BASE_IMAGE="${BASE_REPOSITORY}/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
-    ACTUCORE_NAVIGATION_BASE_IMAGE="${ACTUCORE_NAVIGATION_BASE_IMAGE:-${DEFAULT_NAVIGATION_BASE_IMAGE}}"
-    if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-        echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
+    BASE_IMAGE="${ACTUCORE_NAVIGATION_BASE_IMAGE:-${BASE_REPOSITORY}/actucore-navigation-base:jp511-v1}"
+    if [[ "${BASE_IMAGE}" != *:* || "${BASE_IMAGE}" == *:latest || "${BASE_IMAGE}" == *@* ]]; then
+        echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE must use a versioned, non-latest tag" >&2
         exit 2
     fi
-    BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
 fi
+BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${BASE_IMAGE}")
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${TAG}"
 
@@ -181,12 +126,8 @@ else
     echo "Done. Image built locally: ${FULL_IMAGE}"
 fi
 
-if ${BUILD_BASE} && ${PUSH_ENABLED}; then
-    echo "ACTUCORE_NAVIGATION_BASE_IMAGE=$(docker image inspect --format '{{index .RepoDigests 0}}' "${FULL_IMAGE}")"
-fi
-
 # ── 注册到 resource-center（可选）────────────────────────────────────────────
-if ! ${BUILD_BASE} && ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     # Ask only if there is a terminal to ask on; otherwise sync (the key being
     # set is the opt-in). Test by opening /dev/tty, not with `[ -e ]`: the device
     # node exists in any container, but opening it without a controlling

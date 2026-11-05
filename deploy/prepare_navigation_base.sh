@@ -1,3 +1,89 @@
+#!/usr/bin/env bash
+# Build the versioned navigation base; run only when its dependencies change.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/build_common.sh"
+if [ -f "${SCRIPT_DIR}/.env" ]; then source "${SCRIPT_DIR}/.env"; fi
+eval "$(parse_mirror_arg "$@")"
+JP_VERSION="5.11"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --jp-version) JP_VERSION="$2"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+jetpack_vars "${JP_VERSION}" || exit 1
+if ! ${IS_ARM64}; then
+    echo "ERROR=build the navigation base on native ARM64, not through QEMU" >&2
+    exit 2
+fi
+BUILD_JOBS="${BUILD_JOBS:-4}"
+if [[ ! "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR=BUILD_JOBS must be a positive integer" >&2
+    exit 2
+fi
+BASE_REPOSITORY="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}"
+case "${JP_VERSION}" in
+    5.11) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
+    6.1) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
+esac
+PUSH_ENABLED=true
+if [ -z "${REGISTRY:-}" ] || [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_PASSWORD:-}" ] || [ -z "${IMAGE_NAMESPACE:-}" ]; then
+    echo "[info] Registry not configured — building locally only (no push)."
+    PUSH_ENABLED=false
+    REGISTRY="${REGISTRY:-local}"
+    IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-phanthy-motus}"
+fi
+DATE="$(date +%y%m%d)"
+COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
+FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore-navigation-base:release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
+BUILD_ARGS=("BUILD_JOBS=${BUILD_JOBS}")
+NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/controlled_semantic_spatial/runtime"
+GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"
+source "${NAV_RUNTIME_DIR}/fast_livo2-source.lock"
+source "${NAV_RUNTIME_DIR}/nav2-source.lock"
+BUILD_ARGS+=(
+    "ACTUCORE_NAVIGATION_PARENT_IMAGE=${NAVIGATION_PARENT_IMAGE}"
+    "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
+    "FAST_LIVO2_REPO=${FAST_LIVO2_REPO}"
+    "FAST_LIVO2_COMMIT=${FAST_LIVO2_COMMIT}"
+    "FAST_LIVO2_RUNTIME_PATCH_SHA256=${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
+    "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}"
+    "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}"
+    "RPG_VIKIT_REPO=${RPG_VIKIT_REPO}"
+    "RPG_VIKIT_COMMIT=${RPG_VIKIT_COMMIT}"
+    "SOPHUS_REPO=${SOPHUS_REPO}"
+    "SOPHUS_COMMIT=${SOPHUS_COMMIT}"
+    "NAVIGATION2_REPO=${NAVIGATION2_REPO}"
+    "NAVIGATION2_COMMIT=${NAVIGATION2_COMMIT}"
+    "NAVIGATION2_RUNTIME_PATCH_SHA256=${NAVIGATION2_RUNTIME_PATCH_SHA256}"
+    "BEHAVIORTREE_CPP_REPO=${BEHAVIORTREE_CPP_REPO}"
+    "BEHAVIORTREE_CPP_COMMIT=${BEHAVIORTREE_CPP_COMMIT}"
+    "ANGLES_REPO=${ANGLES_REPO}"
+    "ANGLES_COMMIT=${ANGLES_COMMIT}"
+    "BOND_CORE_REPO=${BOND_CORE_REPO}"
+    "BOND_CORE_COMMIT=${BOND_CORE_COMMIT}"
+    "DIAGNOSTICS_REPO=${DIAGNOSTICS_REPO}"
+    "DIAGNOSTICS_COMMIT=${DIAGNOSTICS_COMMIT}"
+    "NAVIGATION_MSGS_REPO=${NAVIGATION_MSGS_REPO}"
+    "NAVIGATION_MSGS_COMMIT=${NAVIGATION_MSGS_COMMIT}"
+    "LASER_GEOMETRY_REPO=${LASER_GEOMETRY_REPO}"
+    "LASER_GEOMETRY_COMMIT=${LASER_GEOMETRY_COMMIT}"
+    "PCL_MSGS_REPO=${PCL_MSGS_REPO}"
+    "PCL_MSGS_COMMIT=${PCL_MSGS_COMMIT}"
+    "PERCEPTION_PCL_REPO=${PERCEPTION_PCL_REPO}"
+    "PERCEPTION_PCL_COMMIT=${PERCEPTION_PCL_COMMIT}"
+    "ROSBAG2_STORAGE_MCAP_REPO=${ROSBAG2_STORAGE_MCAP_REPO}"
+    "ROSBAG2_STORAGE_MCAP_COMMIT=${ROSBAG2_STORAGE_MCAP_COMMIT}"
+    "MCAP_REPO=${MCAP_REPO}"
+    "MCAP_COMMIT=${MCAP_COMMIT}"
+    "LZ4_REPO=${LZ4_REPO}"
+    "LZ4_COMMIT=${LZ4_COMMIT}"
+)
+TMPFILE="$(mktemp)"
+trap 'rm -f "${TMPFILE}"' EXIT
+cat > "${TMPFILE}" <<'DOCKERFILE'
 # ── ActuCore Jetson build base ─────────────────────────────────────
 # Base: jetson-base:jp${JP_VERSION}-torch
 #   Ubuntu 20.04 / Python 3.8, ROS Humble 以**源码 install-space** 装在
@@ -600,3 +686,16 @@ LABEL org.opencontainers.image.title="Phanthy Motus ActuCore Navigation Build Ba
       org.opencontainers.image.fast-livo2-pcd-save-patch="${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" \
       org.opencontainers.image.fast-livo2-pcd-flush-patch="${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" \
       org.opencontainers.image.navigation2-revision="${NAVIGATION2_COMMIT}"
+
+DOCKERFILE
+select_mirror
+if ${PUSH_ENABLED}; then
+    echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+fi
+do_build "${TMPFILE}" "${REPO_ROOT}" "${FULL_IMAGE}" "${BUILD_ARGS[@]}"
+if ${PUSH_ENABLED}; then
+    do_push "${FULL_IMAGE}"
+    echo "ACTUCORE_NAVIGATION_BASE_IMAGE=$(docker image inspect --format '{{index .RepoDigests 0}}' "${FULL_IMAGE}")"
+else
+    echo "Done. Image built locally: ${FULL_IMAGE}"
+fi
