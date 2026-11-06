@@ -1410,7 +1410,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
-  if (supportsUsbPairing(mcp) && ['hand', 'hand_gesture', 'glove_teleop', 'usb_pairing'].includes(toolName)) {
+  if (supportsUsbPairing(mcp) && toolName === 'glove_teleop') {
     const footer = el.querySelector('.canvas-card-footer') || el.querySelector('.canvas-card-body-wrap');
     const pairButton = document.createElement('button');
     pairButton.type = 'button';
