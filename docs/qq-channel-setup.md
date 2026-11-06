@@ -1,4 +1,6 @@
-# PhanthyMotus QQ Channel — 本机接入手册
+# PhanthyMotus QQ Channel — 通用 Channel 接入与部署
+
+> **Bumi 机器人独立运行（无需 Windows 电脑）**：参见 [`deploy/qq/README-bumi.md`](../deploy/qq/README-bumi.md)。本 PR 包含 QQ Adapter 与 NapCat 模板，但**不自动安装 NapCat**；机器人必须另外运行 NapCat，再完成断电脑验收。
 
 ## 范围与版本
 
