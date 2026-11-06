@@ -28,11 +28,14 @@ class VisibilityView:
         return (np.floor(np.clip(x, 0, width-1)/4).astype(int),
                 np.floor(np.clip(y, 0, height-1)/4).astype(int), z, inside)
 
+    def visible(self, projected, limit):
+        u, v, z, inside = self.project(projected)
+        depth = self.depth[v, u]
+        return inside & np.isfinite(depth) & (z <= depth + limit)
+
     def score(self, target, transform, limit):
         projected = self.points @ transform[:3, :3].T + transform[:3, 3]
-        u, v, z, inside = target.project(projected)
-        depth = target.depth[v, u]
-        keep = inside & np.isfinite(depth) & (z <= depth + limit)
+        keep = target.visible(projected, limit)
         bands = self.bands[keep]
         counts = np.bincount(bands, minlength=3)
         distances = target.tree.query(projected)[0]
@@ -50,3 +53,35 @@ def split_decision(score, min_coverage, max_error, min_count):
     return dict(coverage=score['coverage'] >= min_coverage,
                 range_support=min(score['counts']) >= min_count,
                 visible_error=score['error_m'] is not None and score['error_m'] <= max_error)
+
+class ReferenceWindow(VisibilityView):
+    """A deduplicated reference in the first view's coordinates with real camera visibility."""
+
+    def __init__(self, raw_points, views, poses, voxel):
+        self.views = views
+        self.from_anchor = [np.linalg.inv(pose) @ poses[0] for pose in poses]
+        chunks, depths = [], []
+        for points, view, transform in zip(raw_points, views, self.from_anchor):
+            inverse = np.linalg.inv(transform)
+            chunks.append(points @ inverse[:3, :3].T + inverse[:3, 3])
+            depths.append(view.project(points)[2])
+        points = np.concatenate(chunks)
+        origin = points.min(axis=0) - voxel/2
+        keys = np.floor((points-origin)/voxel).astype(np.int64)
+        _, groups, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+        self.points = np.zeros((len(counts), 3))
+        np.add.at(self.points, groups, points)
+        self.points /= counts[:, None]
+        self.tree = cKDTree(self.points)
+        # Each centroid inherits the acquisition depth of its nearest contributor.
+        distance = np.linalg.norm(points-self.points[groups], axis=1)
+        ordered = np.lexsort((np.arange(len(points)), distance, groups))
+        representatives = ordered[np.r_[True, np.diff(groups[ordered]) != 0]]
+        self.bands = np.digitize(np.concatenate(depths)[representatives], [2., 4.])
+
+    def visible(self, projected, limit):
+        keep = np.zeros(len(projected), dtype=bool)
+        for view, transform in zip(self.views, self.from_anchor):
+            local = projected @ transform[:3, :3].T + transform[:3, 3]
+            keep |= view.visible(local, limit)
+        return keep
