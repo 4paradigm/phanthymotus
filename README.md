@@ -558,7 +558,16 @@ Two rules follow, both of which were learned the hard way:
   having had the canvas page open — which is why the ASR panel used not to be there
   until you visited the canvas.
 
-Frontend tests: `node --test agent-core/web/js/*.test.mjs` (no dependencies; run from the repository root so the shell expands the glob).
+Frontend tests (run from the repository root):
+
+```sh
+npm ci
+npm test
+```
+
+The locked development dependencies include Three.js for real quaternion/matrix
+regression tests. `npm ci` is required before the first run; after installation,
+tests run without network access. See [frontend test notes](agent-core/web/README.tests.md).
 
 #### Stopping is two stages, and they have different guarantees
 

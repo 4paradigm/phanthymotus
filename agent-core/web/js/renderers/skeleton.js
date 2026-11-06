@@ -215,10 +215,13 @@ export const SkeletonRenderer = {
         const jointGroup = new THREE.Group();
         jointGroup.position.set(j.origin.x, j.origin.y, j.origin.z);
 
-        // Apply base RPY rotation (static offset)
-        // URDF fixed-axis roll/pitch/yaw composes as Rz(yaw) Ry(pitch) Rx(roll).
-        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'ZYX');
-        jointGroup.rotation.copy(euler);
+        // URDF fixed-axis RPY: Rz(yaw) * Ry(pitch) * Rx(roll), acting on
+        // column vectors. Compose explicitly to avoid intrinsic Euler-order
+        // naming ambiguity. The origin is separate from the joint's motion.
+        const originRotation = new THREE.Matrix4().makeRotationZ(j.rpy.z)
+          .multiply(new THREE.Matrix4().makeRotationY(j.rpy.y))
+          .multiply(new THREE.Matrix4().makeRotationX(j.rpy.x));
+        jointGroup.quaternion.setFromRotationMatrix(originRotation);
 
         parentObj.add(jointGroup);
 

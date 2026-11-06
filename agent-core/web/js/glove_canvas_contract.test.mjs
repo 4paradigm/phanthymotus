@@ -171,15 +171,22 @@ for (const [roll, pitch, yaw] of [[0, -0.9163, 1.8064], [0, -0.9163, -1.8076], [
     renderer._parseAndBuild('<synthetic-urdf/>');
     const origin = renderer._links.thumb.parent;
     origin.updateMatrix();
-    const expected = new THREE.Matrix4().makeRotationZ(yaw)
-      .multiply(new THREE.Matrix4().makeRotationY(pitch))
-      .multiply(new THREE.Matrix4().makeRotationX(roll));
+    // Closed-form fixed-axis RPY matrix: independent of the renderer's
+    // Matrix4 multiplication chain and of Three.js Euler conversion.
+    const cr = Math.cos(roll), sr = Math.sin(roll);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const expected = new THREE.Matrix4().set(
+      cy*cp, cy*sp*sr-sy*cr, cy*sp*cr+sy*sr, 0,
+      sy*cp, sy*sp*sr+cy*cr, sy*sp*cr-cy*sr, 0,
+      -sp, cp*sr, cp*cr, 0,
+      0, 0, 0, 1,
+    );
     origin.matrix.elements.forEach((value, i) =>
       assert.ok(Math.abs(value - expected.elements[i]) < 1e-12, `matrix element ${i}`));
     const expectedQuaternion = new THREE.Quaternion().setFromRotationMatrix(expected);
     assert.ok(Math.abs(origin.quaternion.dot(expectedQuaternion)) > 1 - 1e-12);
-    // A switch to XYZ must fail for these mixed-axis rotations. The renderer
-    // calls Euler.copy(), which really updates Group.quaternion in this test.
+    // Negative control: intrinsic XYZ differs from fixed-axis URDF RPY.
     const wrong = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(roll, pitch, yaw, 'XYZ'));
     assert.ok(Math.max(...wrong.elements.map((v, i) => Math.abs(v - expected.elements[i]))) > 0.1);
   });
