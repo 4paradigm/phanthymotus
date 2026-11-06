@@ -1,6 +1,6 @@
 # PhanthyMotus QQ Channel — 通用 Channel 接入与部署
 
-> **Bumi 机器人独立运行（无需 Windows 电脑）**：参见 [`deploy/qq/README-bumi.md`](../deploy/qq/README-bumi.md)。本 PR 包含 QQ Adapter 与 NapCat 模板，但**不自动安装 NapCat**；机器人必须另外运行 NapCat，再完成断电脑验收。
+> **部署边界**：本 PR 仅交付 QQ Adapter 及 Core 集成。正式 Bumi 运行需另外经公司构建、审核、授权部署 NapCat Driver；本仓库的 Compose 只供本地开发。公司镜像及真机验收顺序见 [Bumi 部署契约](../deploy/qq/README-bumi.md)。
 
 ## 范围与版本
 
@@ -17,10 +17,10 @@
 
 机器人语音与音乐必须通过既有 Canvas 绑定的工具单独执行，不由 QQ Adapter 直接调用。
 
-## 安装与连接（Windows 11 / WSL Ubuntu 24.04）
+## 本地开发与连接（Windows 11 / WSL Ubuntu 24.04；不用于正式 Bumi 部署）
 
 1. 在 WSL Docker 中先检查现有实例：`docker ps -a`、`docker images`、`ss -ltn`。**已有 NapCat 不得重复登录相同 QQ**。
-2. 若没有 NapCat，优先使用官方支持 amd64/arm64 的 Docker 镜像，在独立目录使用 `deploy/qq/compose.napcat.yaml`。设置仅供本机使用的 `WEBUI_TOKEN` 后运行 `docker compose --env-file .env -f compose.napcat.yaml up -d`。
+2. 若本地没有 NapCat，可在个人开发机使用 `deploy/qq/compose.napcat.yaml` 调试；该 Compose 引用第三方镜像，**不得作为公司机器人端交付方式**。本地设置独立 `WEBUI_TOKEN`，再执行 `docker compose --env-file .env -f compose.napcat.yaml up -d`。
 3. 在 NapCat WebUI 的连接配置中创建并启用 **正向 WebSocket 服务器**，监听 3001。为 **OneBot WS** 设置独立的高强度 Access Token（与 WebUI Token 不同）；不要关闭鉴权。手机扫码登录专用 QQ 账号；不要保存二维码、QQ 密码或登录态到 Git。
 4. Agent Core 目前使用 Docker **host 网络**，若 NapCat 将宿主机端口映射到 `127.0.0.1:3001`，则 Agent Core 可用 `ws://127.0.0.1:3001/`。若将来改用 bridge 网络，不能复制这个地址，需用可达的容器服务名/IP。
 5. Agent Core 的 Settings → Channels → Add，选择 **QQ (OneBot / NapCat)**，填 `Channel ID=qq_main`、`ws_url`、OneBot `Access Token`，保留 `Private only`，启用。
@@ -32,8 +32,9 @@
 ## QQ 用户授权
 
 - 新 QQ 用户**强制**以 `viewer` 注册，即使其他 Channel 全局默认角色为 `operator`。
-- viewer 可对话回复、读取被允许的只读工具，不能点歌或控制执行器。
+- QQ V1 不论用户 ACL 角色，只允许 `channel_reply` 与 `finish`；不能读取其他 Agent 工具或控制执行器。
 - QQ V1 为纯文本通道：即使明确授予 `operator` 或 `owner` 且 `tool_filter=*`，服务端仍仅允许 `channel_reply` 与 `finish`，不执行音频、运动、导航、Shell 或子代理工具。
+- QQ 到达时会进入独立任务队列，不允许 Steering 注入已运行的其他高权限任务；QQ 会话不读取/保存 Agent 全局对话历史，且不同 QQ 聊天分开处理。
 - TTS、Speaker 和点歌需要独立的后续 PR、授权策略和真机验收；不要仅修改 Prompt 或 ACL 角色就尝试开放。
 - 不要通过 system prompt 代替 ACL；撤权应立即生效。HTTP 管理 API 需通过既有 Agent Core 身份验证访问。
 
