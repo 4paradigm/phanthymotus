@@ -20,7 +20,10 @@ export function decodePairingResponse(body) {
   return result;
 }
 
-export async function callUsbPairing(mcpId, action, sessionId, fetchImpl = globalThis.fetch) {
+export async function callUsbPairing(mcpId, action, sessionId, fetchImpl = globalThis.fetch,
+                                    ensureEdit = async () => false) {
+  // Recheck on every step: the edit lock may be lost while the dialog is open.
+  if (!(await ensureEdit())) throw new Error('需要画布编辑权限才能进行 USB 配对');
   const arguments_ = { action };
   if (sessionId) arguments_.session_id = sessionId;
   const response = await fetchImpl(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
@@ -55,7 +58,10 @@ export function pairingStep(state) {
   return step;
 }
 
-export function openUsbPairing(mcpId, { onComplete } = {}) {
+export async function openUsbPairing(mcpId, { onComplete, ensureEdit = async () => false } = {}) {
+  if (!(await ensureEdit())) return;
+  const callPairing = (action, sessionId) =>
+    callUsbPairing(mcpId, action, sessionId, globalThis.fetch, ensureEdit);
   // One modal per browser: two tabs are additionally isolated by driver sessions.
   if (document.querySelector('.usb-pairing-dialog')) return;
   const previousFocus = document.activeElement;
@@ -103,7 +109,7 @@ export function openUsbPairing(mcpId, { onComplete } = {}) {
     if (cancelFailed) { close(); return; }
     setBusy(true);
     try {
-      if (sessionId) await callUsbPairing(mcpId, 'cancel', sessionId);
+      if (sessionId) await callPairing('cancel', sessionId);
       close();
     } catch (err) {
       error.textContent = `${err.message}。可关闭向导；遗留会话将在闲置 10 分钟后自动释放。`;
@@ -120,7 +126,7 @@ export function openUsbPairing(mcpId, { onComplete } = {}) {
     error.textContent = '';
     setBusy(true);
     try {
-      const result = await callUsbPairing(mcpId, pairingStep(state).action, sessionId);
+      const result = await callPairing(pairingStep(state).action, sessionId);
       // Validate before changing the view; an error never advances the step.
       pairingStep(result.state);
       state = result.state;

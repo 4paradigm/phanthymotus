@@ -1416,9 +1416,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     pairButton.type = 'button';
     pairButton.className = 'canvas-view-btn canvas-usb-pairing-btn';
     pairButton.textContent = 'USB 设备配对';
-    pairButton.addEventListener('click', event => {
+    pairButton.addEventListener('click', async event => {
       event.stopPropagation();
-      openUsbPairing(mcpId, { onComplete: () => showToast('USB 配对已保存，请重新开始预览并标定') });
+      if (!(await _ensureEdit())) return;
+      await openUsbPairing(mcpId, { ensureEdit: _ensureEdit,
+        onComplete: () => showToast('USB 配对已保存，请重新开始预览并标定') });
     });
     footer?.appendChild(pairButton);
   }
