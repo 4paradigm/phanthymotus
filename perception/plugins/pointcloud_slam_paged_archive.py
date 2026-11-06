@@ -40,10 +40,10 @@ def load_paged_archive(path, settings, *, max_frames, max_points, read_only=Fals
         with path.open('rb') as src: raw=src.read(MAX_CHECKPOINT_BYTES+1)
         if len(raw)>MAX_CHECKPOINT_BYTES: raise ValueError('paged checkpoint too large')
         data=json.loads(raw)
+        if read_only:
+            # A saved map has its own coordinate frames, calibration and storage policy.
+            settings = data['configuration']
         expected = configuration(settings)
-        if read_only and isinstance(data.get('configuration'), dict):
-            # Display stored poses without rerunning the current registration policy.
-            expected['preview_geometry'] = data['configuration'].get('preview_geometry')
         if (data.get('schema')!='motus.experimental-slam-paged/1' or
                 data.get('configuration')!=expected):
             raise ValueError('paged archive configuration mismatch')

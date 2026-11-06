@@ -90,7 +90,7 @@ class SlamInputNode(Node):
             if type(preview.get('relocalization', False)) is not bool or (
                     preview.get('relocalization') and preview['backend'] != 'geometry_experimental'):
                 raise ValueError('relocalization requires experimental geometry backend')
-        super().__init__('pointcloud_slam_input')
+        super().__init__('pointcloud_slam_history' if odom_topic is None and cloud_topic is None else 'pointcloud_slam_input')
         self.stream = stream
         self._receipt_clock = clock
         self._measurement_clock_ns = measurement_clock_ns or (lambda: self.get_clock().now().nanoseconds)
@@ -131,6 +131,8 @@ class SlamInputNode(Node):
         except (TypeError, ValueError):
             sample = None
         with self._lock:
+            if self._preview_stop.is_set():
+                return
             measurement_now = (self._measurement_clock_ns()
                                if self.stream.max_measurement_age_ms is not None else None)
             self.stream.odom(sample, now=self._receipt_clock(), measurement_now_ns=measurement_now)
@@ -140,6 +142,8 @@ class SlamInputNode(Node):
         try:
             stamp, frame, points = decode_cloud(msg, max_points=self.stream.max_cloud_points)
             with self._lock:
+                if self._preview_stop.is_set():
+                    return
                 measurement_now = (self._measurement_clock_ns()
                                    if self.stream.max_measurement_age_ms is not None else None)
                 self.stream.cloud(stamp, frame, points, now=self._receipt_clock(),
@@ -291,7 +295,7 @@ class SlamInputNode(Node):
                             for edge in (snapshot or {}).get('map_edges', [])),
                         'input_validation': self._preview.get('input_validation')}
             points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
-            packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata)
+            packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata, trajectory=poses)
             with self._lock:
                 if self._preview_stop.is_set(): return
                 message = UInt8MultiArray(); message.data = packet
@@ -446,7 +450,7 @@ class SlamInputNode(Node):
                                 'stamp_ms': sample.stamp_ms, 'published_ms': wall_ms,
                                 'expires_ms': wall_ms + min(self.stream.max_measurement_age_ms - max(0., age_ms),
                                                             self.stream.max_age_s * 1000)}
-                packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=result)
+                packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=result, trajectory=poses)
         result['compute_ms'] = (time.perf_counter() - started) * 1000
         with self._lock:
             if self._preview_stop.is_set():
@@ -496,7 +500,7 @@ class SlamInputNode(Node):
                         result.pop('map_from_odom', None)
                         if packet is not None:
                             packet = encode_preview(points, poses[-1],
-                                max_points=self._preview['max_points'], metadata=result)
+                                max_points=self._preview['max_points'], metadata=result, trajectory=poses)
             if staged_history is not None:
                 self._history_snapshots[segment.segment_id] = staged_history
             if staged_links is not None:

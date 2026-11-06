@@ -433,7 +433,9 @@ function mountRenderer(skill) {
     const inHint = topicIn.format || 'activity';
     const InRenderer = RENDERERS.find(r => r.canRender(inHint)) || ActivityRenderer;
     _inRenderer = Object.assign(Object.create(Object.getPrototypeOf(InRenderer)), InRenderer);
-    _inRenderer.mount(inBody, skill.id + '_in');
+    _inRenderer.mount(inBody, _inRenderer.name === 'slam-preview'
+      ? {toolbar: inPanel.querySelector('.topic-fmt'), scope: topicIn.topic?.includes('/history/') ? 'history' : 'live'}
+      : skill.id + '_in');
 
     // Attach to background buffer (replay last N frames then receive live data)
     const inBuf = _buffers[skill.id]?.in;
@@ -460,7 +462,9 @@ function mountRenderer(skill) {
     outPanel.appendChild(outBody);
     rendererWrap.appendChild(outPanel);
     _activeRenderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
-    _activeRenderer.mount(outBody, skill.id);
+    _activeRenderer.mount(outBody, _activeRenderer.name === 'slam-preview'
+      ? {toolbar: outPanel.querySelector('.topic-fmt'), scope: topicOut.topic?.includes('/history/') ? 'history' : 'live'}
+      : skill.id);
   } else {
     // Single panel
     const dir    = hasIn ? 'in_topic' : 'out_topic';
@@ -479,7 +483,9 @@ function mountRenderer(skill) {
     bodyEl.className = 'renderer-panel-body';
     rendererWrap.appendChild(bodyEl);
     _activeRenderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
-    _activeRenderer.mount(bodyEl, skill.id);
+    _activeRenderer.mount(bodyEl, _activeRenderer.name === 'slam-preview'
+      ? {toolbar: singleHeader.querySelector('.topic-fmt'), scope: topic?.includes('/history/') ? 'history' : 'live'}
+      : skill.id);
   }
 
   content.appendChild(rendererWrap);

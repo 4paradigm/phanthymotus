@@ -31,3 +31,16 @@ export function currentOdomMarker(meta, now) {
       !m.xyz.every(Number.isFinite) || !Number.isFinite(m.yaw)) return null;
   return m;
 }
+
+// The preview uses map XYZ. Three.js draws map Y toward -Z and height along +Y.
+export const MAX_TRAJECTORY_POINTS = 64;
+export function writeTrajectoryPositions(points, target) {
+  if (!Array.isArray(points) || points.length < 2 || points.length > MAX_TRAJECTORY_POINTS) return 0;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (!Array.isArray(p) || p.length !== 3 ||
+        !p.every(value => typeof value === 'number' && Number.isFinite(Math.fround(value)))) return 0;
+    target.set([p[0], p[2], -p[1]], i * 3);
+  }
+  return points.length;
+}

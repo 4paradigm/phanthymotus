@@ -283,7 +283,8 @@ def test_map_save_and_explicit_restore_require_new_segment(tmp_path, monkeypatch
     node = executor.nodes[0]
     node.stream.odom(odom(1000), now=1., measurement_now_ns=1_000_000_000)
     node.stream.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1., measurement_now_ns=1_000_000_000)
-    assert plugin.dispatch('pointcloud_slam', {'action': 'save_map'})['state'] == 'saved'
+    from plugins.pointcloud_slam_archive import save_archive
+    save_archive(tmp_path / 'example.json', node.stream.store, [], {}, cfg)
     plugin.stop()
     restored = PointCloudSlamPlugin({**cfg, 'restore_archive': True}, executor)
     assert restored.dispatch('pointcloud_slam', args)['state'] == 'running'
@@ -367,7 +368,15 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
           'input_bindings':{'/o':'state/odom','/c':'sensor/pointcloud2'},
           'odom_interfaces':{'/o':{'schema':'motus.odom/1','slam_pose':{'available':True,'profile':'motus_slam/1'}}}}
     p=PointCloudSlamPlugin(settings,_FakeExecutor())
-    assert p.dispatch('pointcloud_slam',args)['state']=='running'
+    def call(action, **kw):
+        return p.dispatch('pointcloud_slam', {'action': action, **kw})
+    ready = p.dispatch('pointcloud_slam', args)
+    assert ready['state'] == 'ready'
+    assert len(ready['topic_out']) == 4 and ready['topic_out'] == call('info')['topic_out']
+    assert p._node is None
+    assert call('start_mapping', map_name='../bad')['state'] == 'error'
+    started = call('start_mapping', map_name='走廊')
+    assert started['state'] == 'running' and started['topic_out'] == ready['topic_out']
     n=p._node;now=[1.];n._receipt_clock=lambda:now[0];n._measurement_clock_ns=lambda:int(now[0]*1e9)
     for i in range(12):
         now[0]=(1000+i*100)/1000
@@ -377,41 +386,75 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     assert n.status()['keyframes']==12
     assert n.status()['integration']=='collecting_unverified'
     assert n._history_snapshots['a']['poses']
-    assert p.dispatch('pointcloud_slam',{'action':'save_map'})['state']=='saved'
-    p.stop()
-    p=PointCloudSlamPlugin({**settings,'restore_archive':True},_FakeExecutor())
-    assert p.dispatch('pointcloud_slam',args)['state']=='running'
-    assert p._node.stream.store._frame_count==12
-    assert len(p._node._history_snapshots['a']['poses'])==12
-    p._node.publish_preview_once()
-    outputs=p.dispatch('pointcloud_slam',{'action':'info'})['topic_out']
-    history_topics=[o['topic'] for o in outputs if '/history/' in o['topic']]
-    assert len(history_topics)==1
-    pubs={pub.topic:pub for pub in p._node.publishers}
+    # A failed automatic save can be retried without appending a second revision.
+    from plugins import pointcloud_slam_library as library
+    from vision_stubs import _wait_until
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError('disk full')
+        patch.setattr(library, 'save_revision', fail)
+        assert call('stop_mapping', request_id='retry1')['state'] == 'error'
+    assert call('info')['state'] == 'save_pending'
+    assert call('start_mapping', map_name='other')['state'] == 'error'
+    assert call('stop_mapping', background=True, request_id='after_disk_full')['state'] == 'working'
+    assert _wait_until(lambda: call('operation_status', request_id='after_disk_full')['state'] == 'saved')
+    saved = call('stop_mapping', request_id='retry1')
+    assert saved['revision'] == 1 and saved['keyframes'] == 12
+    assert call('start_mapping', map_name='走廊')['state'] == 'error'
+    assert not list((tmp_path / 'sessions').iterdir())
+    assert call('start_mapping', map_name='Second')['state'] == 'running'
+    live = p._node
+    # A delayed stop retry for the previous session must leave live capture alone.
+    assert call('stop_mapping', request_id='retry1')['map_id'] == saved['map_id']
+    assert p._node is live
+    entry = {'map_id': saved['map_id'], 'revision': 1}
+    assert call('select_map', map_id=saved['map_id'], background=True, request_id='view1')['state'] == 'working'
+    assert _wait_until(lambda: call('operation_status', request_id='view1')['state'] == 'map_selected')
+    viewed = call('operation_status', request_id='view1')
+    assert viewed['tracking'] is False and p._node is live
+    assert not p._view.subscriptions and p._view.stream.store.directory is None
+    p._view.publish_preview_once()
+    topic = viewed['topic_out'][0]['topic']
+    assert viewed['topic_out'][0]['segment_id'] == 'a'
+    assert topic not in [o['topic'] for o in call('info')['topic_out']]
     from test_pointcloud_slam_preview import unpack
-    meta,_=unpack(pubs[history_topics[0]].messages[-1])
-    assert meta['segment_id']=='a' and meta['state']=='historical_snapshot'
-    assert not pubs['/c/slam_odom_preview'].messages
-    assert p._node.stream.store.requires_new_segment
-    p.stop()
-
-    # Named copies survive stop, release of the draft, and removal of its source files.
-    import shutil
-    saved = p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': '走廊', 'request_id': 'retry1'})
-    assert saved['state'] == 'saved' and saved['revision'] == 1
-    assert saved == p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': '走廊', 'request_id': 'retry1'})
-    assert p.dispatch('pointcloud_slam', {'action': 'unload_map'})['state'] == 'idle'
-    shutil.rmtree(tmp_path / 'sessions')
-    loaded = p.dispatch('pointcloud_slam', {'action': 'load_map', 'map_name': '走廊'})
-    assert loaded['state'] == 'map_loaded' and loaded['tracking'] is False
-    assert not p._node.subscriptions and p._node.stream.store.directory is None
-    p._node.publish_preview_once()
-    topic = p.dispatch('pointcloud_slam', {'action': 'info'})['topic_out'][0]['topic']
-    pub = next(pub for pub in p._node.publishers if pub.topic == topic)
+    pub = next(pub for pub in p._view.publishers if pub.topic == topic)
     meta, _ = unpack(pub.messages[-1])
     assert meta['captured_frames'] == meta['optimized_frames'] == 12
-    assert p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': 'x'})['state'] == 'error'
-    p.stop()
+    tag = call('tag_place', **entry, segment_id='a', tag_name='Door', x=2, y=-1)['tag']
+    assert call('list_tags', **entry)['tags'] == [tag]
+    assert call('list_maps')['maps'][0]['tag_count'] == 1
+    assert call('tag_place', **entry, segment_id='a', tag_name='Entrance', x=1, y=-2,
+                yaw=.5, tag_id=tag['id'])['tag']['name'] == 'Entrance'
+    assert call('untag_place', **entry, tag_id=tag['id'])['state'] == 'ok'
+    assert call('list_tags', **entry)['tags'] == []
+    call('close_map_view', map_id='different')
+    assert p._view is not None
+    assert call('delete_map', map_id=saved['map_id'])['state'] == 'deleted'
+    assert p._view is None and p._node is live
+    assert call('stop_mapping')['saved'] is False
+    assert call('list_maps')['maps'] == []
+    assert call('start_mapping', map_name='Third')['state'] == 'running'
+    node = p._node
+    node.stream.odom(odom(1000), now=1., measurement_now_ns=1_000_000_000)
+    node.stream.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1., measurement_now_ns=1_000_000_000)
+    assert call('stop')['state'] == 'idle'
+    assert call('info')['state'] == 'idle'
+    assert [e['name'] for e in call('list_maps')['maps']] == ['Third']
+    assert call('start_mapping', map_name='Fourth')['state'] == 'error'
+
+    # Existing standalone paged checkpoints can be explicitly imported into a named capture.
+    from plugins.pointcloud_slam_paged_archive import save_paged_archive
+    from test_pointcloud_slam_paged_store import add, store
+    old = store(tmp_path / 'sessions')
+    add(old, 0)
+    save_paged_archive(tmp_path / 'paged.json', old, {}, settings)
+    p = PointCloudSlamPlugin({**settings, 'restore_archive': True}, _FakeExecutor())
+    assert p.dispatch('pointcloud_slam', args)['state'] == 'ready'
+    assert call('start_mapping', map_name='Imported')['state'] == 'running'
+    assert p._node.stream.store.requires_new_segment
+    assert call('stop_mapping')['keyframes'] == 1
+    assert old.directory.is_dir()
 
 
 def test_paged_card_exposes_only_extrinsic_and_applies_it():

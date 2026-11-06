@@ -8,7 +8,7 @@ import numpy as np
 from .pointcloud_slam_stream import _rigid
 
 
-def encode_preview(points, pose, *, max_points, metadata):
+def encode_preview(points, pose, *, max_points, metadata, trajectory=()):
     """Encode bounded metadata followed by one diagnostic mapping packet."""
     if type(max_points) is not int or not 0 < max_points <= 80000:
         raise ValueError('preview point limit must be between 1 and 80000')
@@ -46,6 +46,19 @@ def encode_preview(points, pose, *, max_points, metadata):
     if metadata.get('input_validation') is not None:
         header['input_validation'] = metadata['input_validation']
     header_bytes = json.dumps(header, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    if len(trajectory) >= 2:
+        indices = np.linspace(0, len(trajectory) - 1, min(64, len(trajectory)), dtype=int)
+        positions = [np.asarray(trajectory[i])[:3, 3].round(3).tolist() for i in indices]
+        while len(positions) >= 2:
+            extra = json.dumps(positions, allow_nan=False, separators=(',', ':')).encode()
+            candidate = header_bytes[:-1] + b',"trajectory_xyz":' + extra + b'}'
+            if len(candidate) <= 2048:
+                header_bytes = candidate
+                break
+            # Keep both ends as the remaining space varies with frame IDs and live metadata.
+            if len(positions) == 2:
+                break
+            positions = positions[:-1:2] + positions[-1:]
     if len(header_bytes) > 2048:
         raise ValueError('preview metadata too large')
     body = struct.pack('<fffBI', matrix[0, 3], matrix[1, 3], yaw, 3, len(xyz)) + xyz.tobytes()

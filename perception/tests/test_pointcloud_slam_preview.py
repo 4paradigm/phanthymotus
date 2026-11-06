@@ -48,3 +48,15 @@ def test_geometry_preview_is_explicitly_unvalidated_and_cannot_claim_loops():
     with pytest.raises(ValueError):
         encode_preview([[0, 0, 0]], np.eye(4), max_points=10,
                        metadata={**meta, 'candidate_count': -1})
+
+
+def test_segment_trajectory_preserves_endpoints_and_packet_budget():
+    poses = [np.eye(4) for _ in range(125)]
+    for i, pose in enumerate(poses):
+        pose[:3, 3] = (1.123 * i, -2.123 * i, 0.125)
+    packet = encode_preview([[0, 0, 0]], poses[-1], max_points=1, trajectory=poses,
+                            metadata={**META, 'segment_id': 's' * 256, 'frame_id': 'f' * 256})
+    assert struct.unpack('<I', packet[:4])[0] <= 2048
+    trajectory = unpack(packet)[0]['trajectory_xyz']
+    assert 2 <= len(trajectory) <= 64
+    np.testing.assert_allclose([trajectory[0], trajectory[-1]], [poses[i][:3, 3] for i in (0, -1)])

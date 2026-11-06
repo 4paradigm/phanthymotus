@@ -264,7 +264,7 @@ function _applyProjectState(running) {
   _projectStateKnown = true;
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning && !btn.dataset.mapActions);
+    btn.classList.toggle('locked', !_projectRunning);
   });
   // Idempotent: both helpers no-op when their stream is already active, so the
   // start-project path and the cross-tab project_state event cannot double-start.
@@ -461,6 +461,11 @@ export async function initCanvas(initialMcps) {
       _teardown = _newTeardown(event.payload?.cards || []);
       _renderTeardown();
     } else if (event.type === 'project_stop_item') {
+      const item = event.payload;
+      if (item?.tool === 'pointcloud_slam' && item.card_id) {
+        const controls = document.querySelector(`[data-card-id="${CSS.escape(item.card_id)}"] .slam-actions`);
+        controls?.dispatchEvent(new Event('slam-stop-result'));
+      }
       if (_teardown) {
         _applyTeardownItem(_teardown, event.payload || {});
         _renderTeardown();
@@ -1204,7 +1209,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     const _SYSTEM_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const _TOPIC_KEY_RE = /input.*topic|topic.*in|output.*topic|topic.*out/i;
-    const fieldsHtml = Object.entries(props).map(([key, def]) => {
+    const namedSlam = toolName === 'pointcloud_slam' && !!schema?.['x-action-params']?.start_mapping;
+    const fieldsHtml = namedSlam ? '' : Object.entries(props).map(([key, def]) => {
       // Hide auto-populated topic fields for processor cards
       if ((effectiveType === 'processor' || effectiveType === 'actuator') && _TOPIC_KEY_RE.test(key)) return '';
       const isReq = required.includes(key);
@@ -1289,6 +1295,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       _removeCard(id);
     });
 
+    if (namedSlam) {
+      const controls = document.createElement('div');
+      controls.className = 'canvas-card-body slam-actions';
+      el.querySelector('.canvas-card-footer').before(controls);
+      import('./slam-library.js').then(({ mountSlamActions }) => {
+        if (controls.parentNode) mountSlamActions(controls, mcpId, id, _ensureEdit);
+      }).catch(error => _showResult(el, String(error), true));
+    }
+
     // x-action-params: 根据选中的 action 动态显隐参数字段
     const actionParams = schema?.['x-action-params'];
     if (actionParams) {
@@ -1347,10 +1362,6 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     const execBtn = el.querySelector('.canvas-exec-btn');
     if (execBtn) {
-      if (toolName === 'pointcloud_slam' && actionParams?.load_map) {
-        execBtn.dataset.mapActions = 'true';
-        execBtn.classList.remove('locked');
-      }
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (!(await _ensureEdit())) return;
@@ -2751,21 +2762,6 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     }
   });
 
-  if (btn.dataset.mapActions && ['save_map', 'load_map'].includes(args.action)) {
-    if (!args.map_name) {
-      _showResult(el, '请输入地图名称', true);
-      btn.disabled = false;
-      btn.textContent = '▶ 执行';
-      return;
-    }
-    const operation = JSON.stringify([args.action, args.map_name]);
-    if (btn.dataset.saveName !== operation || !btn.dataset.saveRequest) {
-      btn.dataset.saveName = operation;
-      btn.dataset.saveRequest = Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16).padStart(8, '0')).join('');
-    }
-    args.request_id = btn.dataset.saveRequest;
-    args.background = true;
-  }
   // Inject instance_id from card identity so multiInstance tools can resolve device_path
   if (instanceId && !args.instance_id) args.instance_id = instanceId;
 
@@ -2795,16 +2791,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ tool: toolName, arguments: args }),
     });
-    let json = await res.json();
-    while (args.background && json.code === 200 && _parseMcpCallResult(json)?.state === 'working') {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({tool: toolName, arguments: {action: 'operation_status', request_id: args.request_id}}),
-      });
-      json = await response.json();
-    }
-
+    const json = await res.json();
     if (json.code === 200) {
       const spec = _toolObj?.inputSchema?.['x-workbench'];
       if (spec?.protocol === 'motus.workbench/1' && args.action === spec.entry) {
@@ -2814,7 +2801,6 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
         return;
       }
       const resultText = _formatCallResult(json.data);
-      if (args.background) delete btn.dataset.saveRequest;
       _showResult(el, resultText, false);
       // The panel can afford a 144-entry list; one log line cannot.
       _logActivity('mcp_result', `${toolName} → ${_truncate(resultText, 400)}`);

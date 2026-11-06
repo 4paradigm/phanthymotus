@@ -60,7 +60,8 @@ with tempfile.TemporaryDirectory(prefix='synthetic-slam-') as archive:
         assert count(node)==1
         feed(node,1300,segment='b')
         assert count(node)==2 and len(node.stream.graph())==2
-        assert plugin.dispatch('pointcloud_slam',{'action':'save_map'})['state']=='saved'
+        from plugins.pointcloud_slam_archive import save_archive
+        save_archive(module._archive_path('synthetic'), node.stream.store, [], {}, cfg)
         plugin.stop()
         assert executor.get_nodes()==[source]
         plugin=module.PointCloudSlamPlugin({**cfg,'restore_archive':True},executor)

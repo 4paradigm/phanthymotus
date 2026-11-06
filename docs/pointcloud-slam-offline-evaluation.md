@@ -119,14 +119,18 @@ reports `unvalidated_hypothesis`, never an accepted loop. A failed search keeps
 the segment separate. Neither this prototype nor a geometric gate establishes
 safe segment merging or a production relocalization result.
 
-Set `archive_name` to an alphanumeric, underscore or hyphen name and call the
-card's `save_map` action to atomically write `/models/pointcloud_slam/NAME.json`.
-With `restore_archive: true`, startup explicitly loads that file and rejects a
-different frame, clock, extrinsic, geometry configuration or resource limit.
-The archive includes local points, poses and provisional constraints, not a
-validated map. Restore requires a new segment and does not assert tracking or
-localization. A reused segment ID or backwards measurement timestamps are
-rejected. Save is explicit; abrupt process termination does not save new work.
+For the persistent-history profile, project start resolves the inputs and leaves
+the card ready. Call `start_mapping(map_name)` to begin a new named capture and
+`stop_mapping()` to stop and save its full history. A failed save can be retried
+with the same action. Normal project stop also saves an active named capture.
+Saved maps have stable IDs. Use `list_maps` and `select_map(map_id)` to view a
+snapshot independently of capture. Select a segment before placing a tag in
+its XY plane. Tags belong to a map revision and segment. The 2D view projects
+the captured points and does not classify reachable ground. Closing the viewer
+releases the preview node. Deleting a map removes its revisions and tags.
+Migrate previous save calls to named capture and replace old read-only load
+calls with `select_map`. Existing named archives remain readable. Legacy
+standalone checkpoints can still be restored explicitly using `restore_archive`.
 
 For jp6.1 the Dockerfile installs Open3D 0.18 and builds GTSAM 4.2 Python
 bindings from pinned upstream source, preserving the base NumPy pin. Image

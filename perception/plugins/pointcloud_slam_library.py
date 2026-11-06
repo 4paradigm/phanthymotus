@@ -1,4 +1,5 @@
 """Named, self-contained revisions of paged SLAM maps on one filesystem."""
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -6,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -21,36 +23,163 @@ def _sync_dir(path):
         os.close(fd)
 
 
+_MAP_ID = re.compile(r'[0-9a-f]{32}')
+
+
+@contextmanager
+def _maps_locked(root, exclusive=True):
+    maps = Path(root) / 'maps'
+    if maps.is_symlink():
+        raise ValueError('invalid map library directory')
+    maps.mkdir(parents=True, exist_ok=True)
+    with (maps / '.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield maps
+
+
+def _manifest(maps, map_id):
+    if not isinstance(map_id, str) or not _MAP_ID.fullmatch(map_id):
+        raise ValueError('invalid map id')
+    directory = maps / map_id
+    path = directory / 'manifest.json'
+    if directory.is_symlink() or path.is_symlink() or not path.is_file():
+        raise ValueError('unknown map')
+    with path.open() as src:
+        entry = json.load(src)
+    if entry['id'] != map_id:
+        raise ValueError('map id does not match directory')
+    return entry
+
+
+def _entries(maps):
+    return [_manifest(maps, path.name) for path in sorted(maps.iterdir())
+            if _MAP_ID.fullmatch(path.name) and not path.is_symlink()
+            and (path / 'manifest.json').is_file()]
+
+
 def map_entries(root):
-    entries = []
-    for path in sorted((Path(root) / 'maps').glob('*/manifest.json')):
-        with path.open() as src:
-            entries.append(json.load(src))
-    return entries
+    if not (Path(root) / 'maps').is_dir():
+        return []
+    with _maps_locked(root, False) as maps:
+        return [dict(entry, tag_count=sum(len(tags) for tags in entry.get('tags', {}).values()))
+                for entry in _entries(maps)]
 
 
-def save_revision(root, records, history, settings, name, bound_id, request_id):
+def validate_map_name(name):
     if not isinstance(name, str):
         raise ValueError('map name required')
     name = unicodedata.normalize('NFC', name.strip())
-    if not name or len(name) > 64 or any(ord(c) < 32 or c in '/\\' for c in name):
+    if not name or len(name) > 64 or any(unicodedata.category(c) == 'Cc' or c in '/\\' for c in name):
         raise ValueError('invalid map name')
+    return name
+
+
+def delete_map(root, map_id):
+    with _maps_locked(root) as maps:
+        _manifest(maps, map_id)
+        with tempfile.TemporaryDirectory(dir=maps, prefix='.deleting-') as stage:
+            os.replace(maps / map_id, Path(stage) / 'map')
+            _sync_dir(maps)
+
+
+def _write_json(temp, target, obj, limit=None):
+    with temp.open('w') as out:
+        json.dump(obj, out, allow_nan=False, separators=(',', ':'))
+        out.flush()
+        if limit and out.tell() > limit:
+            raise ValueError('map snapshot metadata exceeds capacity')
+        os.fsync(out.fileno())
+    os.replace(temp, target)
+    _sync_dir(target.parent)
+
+
+def _revision(maps, map_id, revision):
+    entry = _manifest(maps, map_id)
+    if type(revision) is not int or not any(s['revision'] == revision for s in entry['saves']):
+        raise ValueError('unknown map revision')
+    return entry
+
+
+def _segments(maps, map_id, revision):
+    with (maps / map_id / f'{revision}.json').open() as src:
+        frames = json.load(src)['frames']
+    return list(dict.fromkeys(frame['pose']['segment_id'] for frame in frames))
+
+
+def revision_segments(root, map_id, revision):
+    with _maps_locked(root, False) as maps:
+        _revision(maps, map_id, revision)
+        return _segments(maps, map_id, revision)
+
+
+def list_tags(root, map_id, revision):
+    with _maps_locked(root, False) as maps:
+        entry = _revision(maps, map_id, revision)
+        return entry.get('tags', {}).get(str(revision), [])
+
+
+def _change_tag(root, map_id, revision, tag_id, tag):
+    with _maps_locked(root) as maps:
+        entry = _revision(maps, map_id, revision)
+        tags = entry.setdefault('tags', {}).setdefault(str(revision), [])
+        if tag_id is not None:
+            previous = next((t for t in tags if t['id'] == tag_id), None)
+            if previous is None:
+                raise ValueError('unknown map tag')
+            tags.remove(previous)
+        if tag is not None:
+            if tag['segment_id'] not in _segments(maps, map_id, revision):
+                raise ValueError('unknown map segment')
+            if any(t['name'] == tag['name'] for t in tags):
+                raise ValueError('tag name already in use')
+            tag['id'] = tag_id or uuid.uuid4().hex
+            tags.append(tag)
+        with tempfile.TemporaryDirectory(dir=maps) as tmp:
+            _write_json(Path(tmp) / 'meta.tmp', maps / map_id / 'manifest.json', entry)
+        return tag
+
+
+def _tag(name, x, y, yaw, segment_id):
+    name = validate_map_name(name)
+    coords = (x, y) if yaw is None else (x, y, yaw)
+    if any(type(v) not in (int, float) or not -sys.float_info.max <= v <= sys.float_info.max for v in coords):
+        raise ValueError('tag coordinates must be finite numbers')
+    return {'name': name, 'x': x, 'y': y, 'yaw': yaw, 'segment_id': segment_id}
+
+
+def create_tag(root, map_id, revision, name, x, y, yaw=None, *, segment_id):
+    return _change_tag(root, map_id, revision, None, _tag(name, x, y, yaw, segment_id))
+
+
+def update_tag(root, map_id, revision, tag_id, name, x, y, yaw=None, *, segment_id):
+    if not tag_id:
+        raise ValueError('tag id required')
+    return _change_tag(root, map_id, revision, tag_id, _tag(name, x, y, yaw, segment_id))
+
+
+def delete_tag(root, map_id, revision, tag_id):
+    if not tag_id:
+        raise ValueError('tag id required')
+    _change_tag(root, map_id, revision, tag_id, None)
+
+
+def save_revision(root, records, history, settings, name, bound_id, request_id):
+    name = validate_map_name(name)
     if not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', request_id):
         raise ValueError('invalid save request id')
     if not records:
         raise ValueError('no keyframes to save')
     root = Path(root)
-    maps = root / 'maps'
-    maps.mkdir(exist_ok=True)
-    with (maps / '.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        entries = map_entries(root)
+    with _maps_locked(root) as maps:
+        entries = _entries(maps)
         for entry in entries:
             for saved in entry['saves']:
                 if saved['request_id'] == request_id:
                     if entry['name'] != name or saved['source'] != records[0]['session']:
                         raise ValueError('save request id reused')
                     return entry['id'], saved['revision'], True
+        if bound_id is not None and not any(item['id'] == bound_id for item in entries):
+            raise ValueError('bound map no longer exists')
         entry = next((item for item in entries if item['name'] == name), None)
         if entry and entry['id'] != bound_id:
             raise ValueError('map name already in use')
@@ -80,22 +209,12 @@ def save_revision(root, records, history, settings, name, bound_id, request_id):
                 _sync_dir(target.parent)
             data = {'schema': 'motus.experimental-slam-paged/1', 'configuration': configuration(settings),
                     'frames': records, 'history': history}
-            def write_json(target, obj, limit=None):
-                temp = stage / 'meta.tmp'
-                with temp.open('w') as out:
-                    json.dump(obj, out, allow_nan=False, separators=(',', ':'))
-                    out.flush()
-                    if limit and out.tell() > limit:
-                        raise ValueError('map snapshot metadata exceeds capacity')
-                    os.fsync(out.fileno())
-                os.replace(temp, target)
-                _sync_dir(target.parent)
             _sync_dir(dest / 'sessions')
-            write_json(dest / f'{revision}.json', data, MAX_CHECKPOINT_BYTES)
+            _write_json(stage / 'meta.tmp', dest / f'{revision}.json', data, MAX_CHECKPOINT_BYTES)
             entry['saves'].append({'request_id': request_id, 'revision': revision,
-                                   'source': records[0]['session']})
+                                   'source': records[0]['session'], 'keyframes': len(records)})
             entry['revision'] = revision
-            write_json(dest / 'manifest.json', entry)
+            _write_json(stage / 'meta.tmp', dest / 'manifest.json', entry)
             if dest != final:
                 os.replace(dest, final)
             _sync_dir(maps)

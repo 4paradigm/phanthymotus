@@ -347,7 +347,8 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
         <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
       </div>
       ${modeHtml}
-      <span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>
+      ${format === 'sensor/slam-preview' ? '<span class="slam-view-controls"></span>'
+        : `<span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>`}
     </div>
     <div class="monitor-card-body"></div>
     <div class="monitor-card-empty">
@@ -359,7 +360,9 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const body = el.querySelector('.monitor-card-body');
   const renderer = _createRenderer(format, defaultMode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, renderer.name === 'slam-preview'
+    ? {toolbar: body.parentElement.querySelector('.slam-view-controls'), scope: topicPath.includes('/history/') ? 'history' : 'live'}
+    : _topicMcpMap[topicPath] || 'dashboard');
 
   const ws = _connectWs(topicPath, format, renderer);
   const card = { el, renderer, ws, format, mode: defaultMode, col, row, colSpan, rowSpan };
@@ -529,7 +532,7 @@ const HOLD_SLOP = 8;
 
 /** Controls inside a card that must keep their own click behaviour. */
 function _isInteractive(target) {
-  return !!target.closest('.monitor-card-modes, .monitor-card-resize, button, a, input, select, textarea');
+  return !!target.closest('.renderer-slam-preview, .monitor-card-modes, .monitor-card-resize, button, a, input, select, textarea');
 }
 
 function _beginPointer(e, topicPath, kind) {
@@ -730,7 +733,7 @@ function _onPointerEnd() {
   document.removeEventListener('touchmove', _blockTouchScroll, { passive: false });
 
   if (changed) _saveLayout();
-  if (resized) _refreshRenderer(topicPath);
+  if (resized && card.format !== 'sensor/slam-preview') _refreshRenderer(topicPath);
 }
 
 /**

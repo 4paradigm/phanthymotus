@@ -54,7 +54,8 @@ with tempfile.TemporaryDirectory(prefix='synthetic-paged-') as directory:
     module._ARCHIVE_DIR = directory
     try:
         plugin = module.PointCloudSlamPlugin(config, executor)
-        assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
+        assert plugin.dispatch('pointcloud_slam', args)['state'] == 'ready'
+        assert plugin.dispatch('pointcloud_slam', {'action':'start_mapping', 'map_name':'synthetic'})['state'] == 'running'
         wait_for(lambda: odom_pub.get_subscription_count() and cloud_pub.get_subscription_count())
         for i in range(12):
             ms = source.get_clock().now().nanoseconds // 1000000
@@ -75,23 +76,22 @@ with tempfile.TemporaryDirectory(prefix='synthetic-paged-') as directory:
             wait_for(lambda: plugin._node.stream.store._frame_count == i+1)
         wait_for(lambda: len(plugin._node._history_snapshots.get('synthetic_a',{}).get('poses',[])) == 12 and live)
         assert any(s.get('submaps',0)>1 for s in statuses)
-        assert plugin.dispatch('pointcloud_slam',{'action':'save_map'})['state']=='saved'
-        plugin.stop()
-        plugin=module.PointCloudSlamPlugin({**config,'restore_archive':True},executor)
-        assert plugin.dispatch('pointcloud_slam',args)['state']=='running'
-        assert plugin._node.stream.store._frame_count==12 and plugin._node.stream.store.requires_new_segment
-        topics=plugin.dispatch('pointcloud_slam',{'action':'info'})['topic_out']
+        saved = plugin.dispatch('pointcloud_slam', {'action':'stop_mapping'})
+        assert saved['state']=='saved'
+        selected = plugin.dispatch('pointcloud_slam', {'action':'select_map', 'map_id':saved['map_id']})
+        assert selected['state']=='map_selected' and not selected['tracking']
+        topics=selected['topic_out']
         history=next(t['topic'] for t in topics if '/history/' in t['topic'])
         source.create_subscription(UInt8MultiArray,history,lambda msg:archived.append(bytes(msg.data)),qos)
         wait_for(lambda: bool(archived))
         length=struct.unpack('<I',archived[-1][:4])[0]; meta=json.loads(archived[-1][4:4+length])
         assert meta['segment_id']=='synthetic_a' and meta['state']=='historical_snapshot'
-        assert not plugin._node.stream._poses
+        assert not plugin._view.stream._poses
         plugin.stop()
         assert executor.get_nodes()==[source]
         print(json.dumps({'result':'passed','synthetic':True,'dds_transport_tested':True,
                           'keyframes':12,'window_limit':3,'live_previews':len(live),
-                          'restored_history_previews':len(archived),'restored_requires_new_segment':True}))
+                          'restored_history_previews':len(archived),'history_has_live_pose':False}))
     finally:
         if plugin: plugin.stop()
         executor.remove_node(source); source.destroy_node(); executor.shutdown(); rclpy.shutdown()

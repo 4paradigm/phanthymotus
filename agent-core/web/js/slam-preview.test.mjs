@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { decodeSlamPreview, currentOdomMarker } from './renderers/slam-preview-codec.js';
+import { decodeSlamPreview, currentOdomMarker, writeTrajectoryPositions } from './renderers/slam-preview-codec.js';
 
 function packet(meta) {
   const header = new TextEncoder().encode(JSON.stringify(meta));
@@ -61,4 +61,18 @@ test('only an explicit fresh estimated pose can place the SLAM marker', () => {
   assert.equal(currentOdomMarker({...metadata, odom_marker: marker}, 2000), marker);
   assert.equal(currentOdomMarker({...metadata, odom_marker: marker}, 2500), null);
   assert.equal(currentOdomMarker({...metadata, odom_marker: {...marker, yaw: NaN}}, 2000), null);
+});
+
+test('each preview replaces its bounded map-frame trajectory, including missing or invalid paths', () => {
+  const positions = new Float32Array(64 * 3);
+  const path = [[1, 2, 3], [-4, -5, -6]];
+  assert.equal(writeTrajectoryPositions(path, positions), 2);
+  assert.deepEqual([...positions.slice(0, 6)], [1, 3, -2, -4, -6, 5]);
+  for (const invalid of [undefined, [], [path[0]], [...path, [Infinity, 0, 0]],
+      [...path, [1e99, 0, 0]], [...path, ['3', 0, 0]], Array(65).fill(path[0])]) {
+    assert.equal(writeTrajectoryPositions(invalid, positions), 0);
+  }
+  const full = Array(64).fill([1, -2, 3]);
+  const decoded = decodeSlamPreview(packet({...metadata, trajectory_xyz: full}));
+  assert.equal(writeTrajectoryPositions(decoded.meta.trajectory_xyz, positions), 64);
 });

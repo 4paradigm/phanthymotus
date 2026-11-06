@@ -360,3 +360,11 @@ def test_the_endpoint_returns_before_the_teardown_finishes(rig):
         api_config._stop_teardown_task.cancel()
 
     run(scenario())
+
+
+def test_map_archive_stop_has_its_own_deadline(rig):
+    cards = [CARDS[-1], {'id': 'map', 'mcpId': 'mcp-2', 'toolName': 'pointcloud_slam'}]
+    assert all(item['ok'] for item in run(api_config._stop_cards(cards)))
+    deadlines = {tool: timeout for _, tool, _, timeout in rig.calls}
+    assert deadlines['tts'] == api_config.STOP_CARD_TIMEOUT_S
+    assert deadlines['pointcloud_slam'] > deadlines['tts']
