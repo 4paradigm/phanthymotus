@@ -22,7 +22,9 @@ def _archive_path(name):
 TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False,
           'description': '实验性点云与里程计输入；可选未验证里程计预览，尚无真实回环',
           'inputSchema': {'type': 'object', 'properties': {
-              'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config', 'save_map']},
+              'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config', 'save_map', 'list_maps', 'load_map', 'unload_map', 'operation_status']},
+              'map_name': {'type': 'string'}, 'map_id': {'type': 'string'},
+              'request_id': {'type': 'string'}, 'background': {'type': 'boolean'}, 'discard_unsaved': {'type': 'boolean'},
               'input_topics': {'type': 'array', 'items': {'type': 'string'}},
               'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'}}, 'required': ['action']},
           'configSchema': {'type': 'object', 'properties': {
@@ -68,9 +70,30 @@ class PointCloudSlamPlugin:
         self._executor = executor
         self._node = None
         self._topics = {}
+        self._paused = None
+        self._map_id = None
+        self._read_only = False
+        self._saved_cutoff = None
+        self._saving = False
+        self._operation_lock = threading.Lock()
+        self._operation = {}
+        self._session_settings = {}
+        self._session_topics = {}
         self._lock = threading.RLock()
 
     def get_tools(self):
+        if self._config.get('persistent_history'):
+            tools = deepcopy(TOOLS)
+            tools[0]['configSchema']['properties'] = {}
+            schema = tools[0]['inputSchema']
+            schema['x-action-params'] = {action: {'params': params} for action, params in
+                [('save_map', ['map_name']), ('list_maps', []), ('load_map', ['map_name']),
+                 ('unload_map', ['discard_unsaved'])]}
+            schema['properties']['action']['oneOf'] = [
+                {'const': action, 'title': title} for action, title in
+                [('save_map', '保存地图'), ('list_maps', '已保存地图'), ('load_map', '打开地图'),
+                 ('unload_map', '关闭地图')]]
+            return tools
         if self._config.get('input_policy') == 'experimental':
             tools = deepcopy(TOOLS)
             props = tools[0]['configSchema']['properties']
@@ -85,6 +108,17 @@ class PointCloudSlamPlugin:
                 'clock_relation_verified': self._config.get('clock_relation_verified') is True,
                 'extrinsic_calibrated': self._config.get('extrinsic_calibrated') is True}
 
+    def _stream(self):
+        keys = ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud',
+                'max_gap_ms', 'max_age_s', 'max_pending', 'max_cloud_points',
+                'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
+        return SlamStream(**{key: self._config[key] for key in keys})
+
+    @staticmethod
+    def _cutoff(node):
+        return (node.stream.store._frame_count,
+                dict(node._history_snapshots))
+
     def start(self):
         pass  # Canvas start supplies the two resolved inputs.
 
@@ -92,6 +126,10 @@ class PointCloudSlamPlugin:
         with self._lock:
             node, self._node = self._node, None
             self._topics = {}
+            if self._read_only:
+                self._read_only, self._map_id = False, None
+            elif node is not None:
+                self._paused = node if self._session_settings.get('persistent_history') else None
             if node is not None:
                 node.stop_preview()
                 dispose_node(self._executor, node, label='pointcloud_slam')
@@ -101,6 +139,121 @@ class PointCloudSlamPlugin:
 
     def dispatch(self, name, args):
         action = args.get('action', name)
+        if action == 'operation_status':
+            request = args.get('request_id')
+            with self._operation_lock:
+                if request and self._operation.get('request_id') == request:
+                    return dict(self._operation)
+            from .pointcloud_slam_library import map_entries
+            for entry in map_entries(_ARCHIVE_DIR):
+                for saved in entry['saves']:
+                    if saved['request_id'] == request:
+                        return {'state': 'saved', 'map_id': entry['id'], 'revision': saved['revision']}
+            return {'state': 'error', 'message': 'unknown map operation'}
+        if args.get('background') is True and action in ('save_map', 'load_map'):
+            request = args.get('request_id')
+            if not isinstance(request, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request):
+                return {'state': 'error', 'message': 'request id required'}
+            with self._operation_lock:
+                current = self._operation
+                identity = (action, args.get('map_name'), args.get('map_id'))
+                if current.get('request_id') == request:
+                    if current['identity'] != identity:
+                        return {'state': 'error', 'message': 'map request id reused'}
+                    return dict(current)
+                if current.get('state') == 'working':
+                    return {'state': 'error', 'message': 'map operation already in progress'}
+                self._operation = {'state': 'working', 'request_id': request, 'identity': identity}
+                def run():
+                    try:
+                        result = self._dispatch(action, {**args, 'background': False})
+                    except Exception as error:
+                        result = {'state': 'error', 'message': str(error)}
+                    with self._operation_lock:
+                        self._operation.update(result)
+                threading.Thread(target=run, name='slam_map_operation', daemon=True).start()
+                return dict(self._operation)
+        with self._operation_lock:
+            if self._operation.get('state') == 'working' and action not in ('info', 'stop', 'list_maps'):
+                return {'state': 'error', 'message': 'map operation already in progress'}
+        return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
+        if action == 'list_maps':
+            from .pointcloud_slam_library import map_entries
+            return {'state': 'ok', 'maps': [{k: e[k] for k in ('id', 'name', 'revision')}
+                                             for e in map_entries(_ARCHIVE_DIR)]}
+        if action == 'unload_map':
+            with self._lock:
+                if self._saving or (self._node is not None and not self._read_only):
+                    return {'state': 'error', 'message': 'stop mapping before unloading'}
+                if self._paused and self._cutoff(self._paused) != self._saved_cutoff and args.get('discard_unsaved') is not True:
+                    return {'state': 'error', 'message': 'save or explicitly discard unsaved frames'}
+                self.stop()
+                self._paused = self._map_id = self._saved_cutoff = None
+                self._read_only = False
+                return {'state': 'idle'}
+        if action == 'load_map':
+            from .pointcloud_slam_library import map_entries
+            from .pointcloud_slam_paged_archive import load_paged_archive
+            with self._lock:
+                if self._saving or (self._node and not self._read_only):
+                    return {'state': 'error', 'message': 'stop mapping before opening a map'}
+                if self._paused and self._cutoff(self._paused) != self._saved_cutoff:
+                    return {'state': 'error', 'message': 'save or discard unsaved frames first'}
+                try:
+                    entry = next((e for e in map_entries(_ARCHIVE_DIR) if e['id'] == args.get('map_id') or e['name'] == args.get('map_name')), None)
+                    if not entry:
+                        raise ValueError('unknown map')
+                    cfg = self._config
+                    path = os.path.join(_ARCHIVE_DIR, 'maps', entry['id'], str(entry['revision']) + '.json')
+                    stream = self._stream()
+                    stream.store, history = load_paged_archive(path, cfg, max_frames=cfg['max_frames'],
+                                                              max_points=cfg['max_points'], read_only=True)
+                    preview = {'topic': '/pointcloud_slam/maps/' + 'm' + entry['id'],
+                               'status_topic': '/pointcloud_slam/map_view_status', 'backend': 'raw',
+                               'persistent_history': True, 'interval_s': 1.,
+                               'max_points': cfg.get('preview_max_points', 40000),
+                               'input_validation': self._input_validation()}
+                    node = SlamInputNode(None, None, stream, preview=preview)
+                    node._history_snapshots = history
+                    try:
+                        self._executor.add_node(node)
+                        node.start_preview()
+                    except Exception:
+                        node.stop_preview()
+                        dispose_node(self._executor, node, label='pointcloud_slam')
+                        raise
+                    if self._read_only:
+                        self.stop()
+                    self._paused = self._saved_cutoff = None
+                    self._node, self._map_id, self._read_only = node, entry['id'], True
+                    return {'state': 'map_loaded', 'tracking': False, 'topic_out': node.history_topics()}
+                except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
+                    return {'state': 'error', 'message': str(error)}
+        if action == 'save_map' and 'map_name' in args:
+            from .pointcloud_slam_library import save_revision
+            with self._lock:
+                node = self._node or self._paused
+                if self._saving or self._read_only or not node or not self._session_settings.get('persistent_history'):
+                    return {'state': 'error', 'message': 'no writable paged session or save in progress'}
+                with node._lock:
+                    records = list(node.stream.store.records)
+                    history = dict(node._history_snapshots)
+                    cutoff = self._cutoff(node)
+                self._saving = True
+            try:
+                map_id, revision, replay = save_revision(_ARCHIVE_DIR, records, history, self._session_settings,
+                    args['map_name'], self._map_id, args.get('request_id', uuid.uuid4().hex))
+                with self._lock:
+                    if not replay:
+                        self._map_id, self._saved_cutoff = map_id, cutoff
+                return {'state': 'saved', 'map_id': map_id, 'revision': revision}
+            except (ValueError, TypeError, KeyError, OSError) as error:
+                return {'state': 'error', 'message': str(error)}
+            finally:
+                with self._lock:
+                    self._saving = False
         if action == 'config':
             with self._lock:
                 if self._node is not None:
@@ -146,8 +299,8 @@ class PointCloudSlamPlugin:
         if action == 'save_map':
             with self._lock:
                 try:
-                    if self._node is None:
-                        raise ValueError('card is not running')
+                    if self._node is None or self._read_only:
+                        raise ValueError('no active writable map')
                     path = _archive_path(self._config.get('archive_name'))
                     from .pointcloud_slam_archive import save_archive
                     os.makedirs(_ARCHIVE_DIR, exist_ok=True)
@@ -173,8 +326,12 @@ class PointCloudSlamPlugin:
                     outputs += [{'topic': node._preview['topic'] + '/pose', 'format': 'data/json'},
                                 {'topic': node._preview['topic'] + '/map_to_odom', 'format': 'data/json'}]
                 if node:
-                    outputs += node.history_topics()
-                return {'state': 'running' if node else 'idle',
+                    if self._read_only:
+                        outputs = node.history_topics()
+                    else:
+                        outputs += node.history_topics()
+                return {'state': ('map_loaded' if self._read_only else 'running' if node else 'paused' if self._paused else 'idle'),
+                        'map_id': self._map_id,
                         'input_validation': self._input_validation(),
                         'desc': '实验输入与未验证里程计预览；无真实回环',
                         'topic_in': [{'topic': topic, 'format': fmt}
@@ -212,17 +369,21 @@ class PointCloudSlamPlugin:
             if (self._config.get('max_measurement_age_ms') is None or
                     self._config.get('max_future_skew_ms') is None):
                 return {'state': 'error', 'message': 'measurement age and clock skew limits required'}
-            keys = ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud',
-                    'max_gap_ms', 'max_age_s', 'max_pending', 'max_cloud_points',
-                    'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
             try:
-                stream = SlamStream(**{key: self._config[key] for key in keys})
+                stream = self._stream()
                 links, loops, history = [], {}, {}
                 persistent = self._config.get('persistent_history')
                 if persistent and (self._config.get('preview_backend') != 'geometry_experimental' or
                                    self._config.get('preview_relocalization')):
                     raise ValueError('paged history requires bounded geometry without cross-segment relocalization')
-                if self._config.get('restore_archive') is True:
+                if self._read_only or self._saving:
+                    raise ValueError('unload the read-only map or wait for the save')
+                if self._paused:
+                    if self._session_settings != self._config or self._session_topics != bindings:
+                        raise ValueError('unload the previous map before changing its inputs or settings')
+                    stream.store = self._paused.stream.store
+                    history = self._paused._history_snapshots
+                elif self._config.get('restore_archive') is True:
                     if persistent:
                         from .pointcloud_slam_paged_archive import load_paged_archive
                         stream.store, history = load_paged_archive(_archive_path(self._config.get('archive_name')),
@@ -237,7 +398,7 @@ class PointCloudSlamPlugin:
                         max_frames=self._config['max_frames'], max_points=self._config['max_points'], **persistent)
                 cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
                 preview = None
-                if self._config.get('preview_enabled') is True:
+                if persistent or self._config.get('preview_enabled') is True:
                     preview = {'topic': cloud_topic + '/slam_odom_preview',
                                'input_validation': self._input_validation(),
                                'status_topic': cloud_topic + '/slam_odom_preview_status',
@@ -260,6 +421,9 @@ class PointCloudSlamPlugin:
                     raise
             except (ImportError, KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
                 return {'state': 'error', 'message': str(error)}
+            self._paused = None
+            self._session_settings = deepcopy(self._config)
+            self._session_topics = dict(bindings)
             self._topics = dict(bindings)
             self._node = node
             return {'state': 'running', 'message': '实验输入已启动；预览未验证，无真实回环'}

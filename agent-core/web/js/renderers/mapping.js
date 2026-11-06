@@ -310,6 +310,22 @@ export const SlamPreviewRenderer = {
   canRender: (hint) => hint === 'sensor/slam-preview',
   mount(container) {
     MappingRenderer.mount.call(this, container);
+    this._overview = true;
+    this._followRobot = false;
+    this._updateFollowBtn();
+    this._points.frustumCulled = false;
+    this._controls.addEventListener('start', () => { this._overview = false; });
+    this._followBtn.addEventListener('click', () => { this._overview = false; });
+    const overview = document.createElement('button');
+    overview.textContent = '全图';
+    overview.style.cssText = 'position:absolute;right:42px;top:8px;z-index:11;cursor:pointer';
+    overview.onclick = () => {
+      this._followRobot = false;
+      this._overview = true;
+      this._updateFollowBtn();
+      this._fitOverview();
+    };
+    this._el.appendChild(overview);
     const badge = document.createElement('div');
     badge.style.cssText = 'position:absolute;left:8px;top:8px;z-index:11;padding:4px 7px;' +
       'background:#6c4215;color:#fff;border-radius:4px;font-size:12px;pointer-events:none;' +
@@ -325,8 +341,26 @@ export const SlamPreviewRenderer = {
       const label = decoded.meta.kind === 'unvalidated_geometry_preview'
         ? `几何候选优化预览 · 未验证 · 候选 ${decoded.meta.candidate_count}`
         : '里程计预览 · 未验证 · 无回环';
-      this._previewBadge.textContent = `${label} · 关键帧位置 · ${decoded.meta.frame_id} / ${decoded.meta.segment_id}`;
+      const coverage = Number.isSafeInteger(decoded.meta.captured_frames)
+        ? ` · 共 ${decoded.meta.captured_frames} 帧，里程计延伸 ${decoded.meta.captured_frames - decoded.meta.optimized_frames} 帧` : '';
+      this._previewBadge.textContent = `${label}${coverage} · 关键帧位置 · ${decoded.meta.frame_id} / ${decoded.meta.segment_id}`;
     }
     MappingRenderer.onData.call(this, decoded.payload);
+    if (this._overview) this._fitOverview();
+  },
+  _fitOverview() {
+    const count = this._points.geometry.drawRange.count;
+    if (!count) return;
+    const box = new THREE.Box3().setFromArray(this._positions.subarray(0, count * 3));
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    const vertical = THREE.MathUtils.degToRad(this._camera.fov / 2);
+    const angle = Math.min(vertical, Math.atan(Math.tan(vertical) * this._camera.aspect));
+    const distance = Math.max(1, sphere.radius) * 1.1 / Math.sin(angle);
+    const direction = this._camera.position.clone().sub(this._controls.target).normalize();
+    this._controls.target.copy(sphere.center);
+    this._camera.position.copy(sphere.center).addScaledVector(direction, distance);
+    this._camera.far = Math.max(500, distance + sphere.radius * 2);
+    this._camera.updateProjectionMatrix();
+    this._controls.update();
   },
 };

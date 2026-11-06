@@ -34,7 +34,7 @@ def save_paged_archive(path, store, history, settings):
         if os.path.exists(temp): os.unlink(temp)
 
 
-def load_paged_archive(path, settings, *, max_frames, max_points):
+def load_paged_archive(path, settings, *, max_frames, max_points, read_only=False):
     path=Path(path);root=path.parent/'sessions'
     try:
         with path.open('rb') as src: raw=src.read(MAX_CHECKPOINT_BYTES+1)
@@ -46,7 +46,7 @@ def load_paged_archive(path, settings, *, max_frames, max_points):
         frames,history=data['frames'],data['history']
         if not isinstance(frames,list) or not isinstance(history,dict):
             raise ValueError('invalid paged checkpoint')
-        store=PagedKeyframeStore(root/uuid.uuid4().hex,max_frames=max_frames,max_points=max_points,
+        store=PagedKeyframeStore(None if read_only else root/uuid.uuid4().hex,max_frames=max_frames,max_points=max_points,
                                  **settings['persistent_history'])
         for record in frames:
             if (not isinstance(record['session'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',record['session']) or
@@ -72,7 +72,7 @@ def load_paged_archive(path, settings, *, max_frames, max_points):
             store._restore_ref=points
             store.add(pose,points,cloud_stamp_ns=record['stamp_ns'])
             store._restore_ref=None
-            journal_size=store._append_record(record)
+            journal_size=0 if read_only else store._append_record(record)
             store.records.append(record);store.disk_bytes+=size+journal_size
         segments={s.segment_id:s for s in store.segments}
         for key,snapshot in history.items():

@@ -66,3 +66,21 @@ def test_preview_budget_samples_before_transform_and_preserves_history():
     bounded = rebuild_segment(segment, graph['poses'], max_points=3)
     np.testing.assert_allclose(bounded, full[[0, 3, 7]])
     assert sum(len(f.points) for f in segment.frames) == 8
+
+
+def test_saved_overview_includes_frames_after_optimization_cutoff():
+    from plugins.pointcloud_slam_map import history_poses
+
+    s = stream(max_frames=310, max_points=310)
+    for index in range(310):
+        stamp = 1000 + index * 10
+        s.odom(odom(stamp, index), now=stamp / 1000)
+        s.cloud(stamp * 1_000_000, 'camera', [[0, 0, 0]], now=stamp / 1000)
+    segment = s.store.segments[0]
+    prefix = history_poses(segment, None)[:300]
+    prefix[-1][0, 3] -= 5
+    poses = history_poses(segment, {'poses': prefix})
+    assert len(poses) == 310
+    assert poses[300][0, 3] == 295
+    points = rebuild_segment(segment, poses, max_points=40)
+    assert points[[0, -1], 0].tolist() == [0, 304]

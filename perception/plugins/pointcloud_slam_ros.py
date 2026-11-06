@@ -117,8 +117,10 @@ class SlamInputNode(Node):
                 if preview['backend'] == 'geometry_experimental':
                     self._map_pose_pub = self.create_publisher(String, preview['topic'] + '/pose', _QOS)
                     self._map_correction_pub = self.create_publisher(String, preview['topic'] + '/map_to_odom', _QOS)
-            self.create_subscription(String, odom_topic, self._odom, _QOS)
-            self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
+            if odom_topic is not None:
+                self.create_subscription(String, odom_topic, self._odom, _QOS)
+            if cloud_topic is not None:
+                self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
         except Exception:
             self.destroy_node()
             raise
@@ -253,8 +255,10 @@ class SlamInputNode(Node):
             for segment in self.stream.store.segments:
                 if segment.segment_id == active:
                     continue
-                topic = self._preview['topic'] + '/history/' + hashlib.sha256(
-                    segment.segment_id.encode()).hexdigest()[:16]
+                suffix = hashlib.sha256(segment.segment_id.encode()).hexdigest()[:16]
+                if suffix[0].isdigit():
+                    suffix = 's' + suffix
+                topic = self._preview['topic'] + '/history/' + suffix
                 if topic not in self._history_publishers and not self._preview_stop.is_set():
                     self._history_publishers[topic] = self.create_publisher(UInt8MultiArray, topic, _QOS)
                 topics.append({'topic': topic, 'format': 'sensor/slam-preview',
@@ -262,9 +266,7 @@ class SlamInputNode(Node):
             return topics
 
     def _publish_history_previews(self):
-        from .pointcloud_slam_keyframes import Segment
-        from .pointcloud_slam_stream import _matrix
-        from .pointcloud_slam_map import rebuild_segment
+        from .pointcloud_slam_map import rebuild_segment, history_poses
         from .pointcloud_slam_preview import encode_preview
         for output in self.history_topics():
             topic, sid = output['topic'], output['segment_id']
@@ -278,18 +280,14 @@ class SlamInputNode(Node):
                     continue
                 segment = next(s for s in self.stream.store.segments if s.segment_id == sid)
                 snapshot = self._history_snapshots.get(sid)
-            # A checkpoint may include a few inputs newer than its last optimized
-            # snapshot. Display that snapshot exactly, without relabelling raw tail.
-            if snapshot:
-                poses = [np.asarray(p) for p in snapshot['poses']]
-                segment = Segment(sid, segment.frames[:len(poses)])
-            else:
-                poses = [_matrix(f.pose) for f in segment.frames]
+            poses = history_poses(segment, snapshot)
             metadata = {'segment_id': sid, 'frame_id': segment.frames[0].pose.frame_id + '_archive',
                         'stamp_ns': str(segment.frames[-1].cloud_stamp_ns),
                         'backend': 'geometry_experimental' if snapshot else 'raw',
                         'candidate_count': snapshot.get('candidate_count', 0) if snapshot else 0,
-                        'state': 'historical_snapshot', 'input_validation': self._preview.get('input_validation')}
+                        'state': 'historical_snapshot', 'captured_frames': len(segment.frames),
+                        'optimized_frames': len(snapshot['poses']) if snapshot else 0,
+                        'input_validation': self._preview.get('input_validation')}
             points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata)
             with self._lock:

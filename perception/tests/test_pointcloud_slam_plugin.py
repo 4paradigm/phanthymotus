@@ -394,3 +394,21 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     assert not pubs['/c/slam_odom_preview'].messages
     assert p._node.stream.store.requires_new_segment
     p.stop()
+
+    # Named copies survive stop, release of the draft, and removal of its source files.
+    import shutil
+    saved = p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': '走廊', 'request_id': 'retry1'})
+    assert saved['state'] == 'saved' and saved['revision'] == 1
+    assert saved == p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': '走廊', 'request_id': 'retry1'})
+    assert p.dispatch('pointcloud_slam', {'action': 'unload_map'})['state'] == 'idle'
+    shutil.rmtree(tmp_path / 'sessions')
+    loaded = p.dispatch('pointcloud_slam', {'action': 'load_map', 'map_name': '走廊'})
+    assert loaded['state'] == 'map_loaded' and loaded['tracking'] is False
+    assert not p._node.subscriptions and p._node.stream.store.directory is None
+    p._node.publish_preview_once()
+    topic = p.dispatch('pointcloud_slam', {'action': 'info'})['topic_out'][0]['topic']
+    pub = next(pub for pub in p._node.publishers if pub.topic == topic)
+    meta, _ = unpack(pub.messages[-1])
+    assert meta['captured_frames'] == meta['optimized_frames'] == 12
+    assert p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': 'x'})['state'] == 'error'
+    p.stop()

@@ -111,3 +111,34 @@ def test_oversized_checkpoint_preserves_previous_file(tmp_path,monkeypatch):
     monkeypatch.setattr(archive,'MAX_CHECKPOINT_BYTES',1)
     with pytest.raises(ValueError): archive.save_paged_archive(path,s,{},cfg)
     assert path.read_bytes()==old
+
+
+def test_named_map_revisions_are_independent_and_preserve_last_commit(tmp_path, monkeypatch):
+    import shutil
+    from plugins.pointcloud_slam_library import save_revision, map_entries
+    from test_pointcloud_slam_archive import settings
+
+    cfg = settings()
+    cfg['persistent_history'] = {'max_disk_bytes': 10_000_000, 'reserve_bytes': 0}
+    frames = store(tmp_path / 'sessions')
+    add(frames, 0)
+    def save(name, bound_id, request):
+        return save_revision(tmp_path, frames.records, {}, cfg, name, bound_id, request)
+    first, revision, replay = save('一楼', None, 'first')
+    assert revision == 1 and not replay
+    add(frames, 1)
+    assert save('一楼', first, 'second') == (first, 2, False)
+    assert save('一楼', first, 'first') == (first, 1, True)
+    with pytest.raises(ValueError):
+        save('一楼', None, 'conflict')
+    other, revision, _ = save('副本', first, 'copy')
+    assert other != first and revision == 1
+    add(frames, 2)
+    def fail(*args):
+        raise OSError('simulated disk full')
+    monkeypatch.setattr(shutil, 'copyfile', fail)
+    for name in ('一楼', '未完成'):
+        with pytest.raises(OSError):
+            save(name, first, 'fail')
+    assert {m['name']: m['revision'] for m in map_entries(tmp_path)} == {'一楼': 2, '副本': 1}
+    assert sum(path.is_dir() for path in (tmp_path / 'maps').iterdir()) == 2

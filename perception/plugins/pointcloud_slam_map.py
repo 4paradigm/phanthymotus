@@ -2,12 +2,23 @@
 import numpy as np
 
 from .pointcloud_slam_keyframes import Segment
-from .pointcloud_slam_stream import _rigid
+from .pointcloud_slam_stream import _rigid, _matrix
 
 
 def map_from_odom(map_from_child, odom_from_child):
     """Compute T_map_odom for the same child and capture instant."""
     return _rigid(map_from_child) @ np.linalg.inv(_rigid(odom_from_child))
+
+
+def history_poses(segment, snapshot):
+    """Extend one segment's optimized prefix using relative odometry at the seam."""
+    poses = [np.asarray(p) for p in snapshot['poses']] if snapshot else []
+    cutoff = len(poses)
+    if cutoff < len(segment.frames):
+        correction = (map_from_odom(poses[-1], _matrix(segment.frames[cutoff - 1].pose))
+                      if cutoff else np.eye(4))
+        poses.extend(correction @ _matrix(frame.pose) for frame in segment.frames[cutoff:])
+    return poses
 
 
 def rebuild_segment(segment, poses, *, max_points=None):

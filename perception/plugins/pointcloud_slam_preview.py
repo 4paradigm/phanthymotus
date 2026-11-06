@@ -37,6 +37,8 @@ def encode_preview(points, pose, *, max_points, metadata):
               'stamp_ns': metadata['stamp_ns'], 'backend': metadata['backend'], 'accepted_loops': 0}
     if metadata.get('state') == 'historical_snapshot':
         header['state'] = 'historical_snapshot'
+        if 'captured_frames' in metadata:
+            header.update(captured_frames=metadata['captured_frames'], optimized_frames=metadata['optimized_frames'])
     if geometry:
         header['candidate_count'] = metadata['candidate_count']
     if metadata.get('input_validation') is not None:

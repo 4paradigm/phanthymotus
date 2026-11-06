@@ -56,8 +56,9 @@ class PagedKeyframeStore(KeyframeStore):
                 any(isinstance(x, bool) or not isinstance(x, (int, float)) or
                     not math.isfinite(x) or x < 0 for x in (min_translation_m, min_rotation_deg))):
             raise ValueError('invalid persistent history budget or keyframe threshold')
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=False)
+        self.directory = Path(directory) if directory is not None else None
+        if self.directory is not None:
+            self.directory.mkdir(parents=True, exist_ok=False)
         self.max_disk_bytes, self.reserve_bytes = max_disk_bytes, reserve_bytes
         self.min_translation_m, self.min_rotation_deg = min_translation_m, min_rotation_deg
         self.disk_bytes, self.storage_error, self.skipped_stationary = 0, '', 0
@@ -85,6 +86,8 @@ class PagedKeyframeStore(KeyframeStore):
     def _retain(self, pose, points, stamp):
         if self._restore_ref is not None:
             return self._restore_ref
+        if self.directory is None:
+            raise StorageError('map is read only')
         if self.storage_error:
             raise StorageError(self.storage_error)
         if self._segments and pose.segment_id == self._segments[-1][0]:
