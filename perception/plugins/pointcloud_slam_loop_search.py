@@ -38,6 +38,7 @@ class ExperimentalLoopSearch:
                 (descriptor_voxel_m, min_separation_s, candidate_separation_s)) or
                 descriptor_voxel_m == 0 or type(max_per_frame) is not int or max_per_frame <= 0):
             raise ValueError('invalid explicit candidate search settings')
+        self.revisit = None
         self._voxel = descriptor_voxel_m
         self._separation_ns = min_separation_s * 1e9
         self._candidate_separation_ns = candidate_separation_s * 1e9
@@ -59,9 +60,9 @@ class ExperimentalLoopSearch:
         if self._segment_id is None:
             self._segment_id = segment.segment_id
         first_new = len(self._descriptors)
-        # Online retrieval samples the newest frame instead of accumulating a
-        # descriptor backlog. All frames still participate in graph/map history.
-        selected_indices = ({0, len(segment.frames) - 1} if online else
+        # Revisit confirmation needs consecutive moving frames even when several
+        # keyframes arrive between preview ticks. Legacy previews sample the latest.
+        selected_indices = ({0, len(segment.frames) - 1} if online and self.revisit is None else
                             set(range(first_new, len(segment.frames))))
         for index in range(first_new, len(segment.frames)):
             if index not in selected_indices:
@@ -82,14 +83,21 @@ class ExperimentalLoopSearch:
             result = self._graph.update(partial, subgraph, build_maps=False)
             selected = []
             eligible = [i for i in range(index) if desc is not None and self._descriptors[i] is not None]
-            for old in sorted(eligible, key=lambda i: (float(np.linalg.norm(desc-self._descriptors[i])), i)):
-                if frame.cloud_stamp_ns - self._stamps[old] < self._separation_ns:
-                    continue
-                if any(abs(self._stamps[old]-self._stamps[i]) < self._candidate_separation_ns for i in selected):
-                    continue
-                selected.append(old)
-                if len(selected) == self._max_per_frame:
-                    break
+            ranked = sorted(eligible, key=lambda j: (float(np.linalg.norm(desc-self._descriptors[j])), j))
+            historical = [j for j in ranked if frame.cloud_stamp_ns-self._stamps[j] >= self._separation_ns]
+            if self.revisit is not None:
+                if len(result['passed_candidates']) < self._max_candidates:
+                    confirmed = self.revisit.update(partial.frames, subgraph['poses'], historical[:3])
+                    self._attempts = self.revisit.attempts
+                    if confirmed is not None:
+                        result = self._graph.update(partial, subgraph, confirmed=confirmed, build_maps=False)
+            else:
+                for old in historical:
+                    if any(abs(self._stamps[old]-self._stamps[i]) < self._candidate_separation_ns for i in selected):
+                        continue
+                    selected.append(old)
+                    if len(selected) == self._max_per_frame:
+                        break
             for old in selected:
                 if len(result['passed_candidates']) >= self._max_candidates:
                     break

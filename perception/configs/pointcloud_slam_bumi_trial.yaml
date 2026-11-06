@@ -13,7 +13,8 @@ child_from_cloud:
   - [-1, 0, 0, 0]
   - [0, -1, 0, 0]
   - [0, 0, 0, 1]
-max_gap_ms: 400
+# Same capture-time interpolation limit as the Bumi revisit replay.
+max_gap_ms: 200
 max_measurement_age_ms: 1500
 max_future_skew_ms: 100
 max_age_s: 2

@@ -109,7 +109,9 @@ def test_metric_float_depth_rejects_short_rows():
 def test_metric_cloud_preserves_header_and_optical_coordinates():
     plugin, executor = _plugin({"metric_cloud": True, "calibration": {
         "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 2, "height": 1}})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    camera = {"schema": "motus.camera/1", "topic": "/depth", "id": "optical_sensor"}
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth",
+                                   "camera_info": {"/depth": camera}})
     node = executor.nodes[0]
     msg = _FakeImage(data=np.array([2., 2.], dtype="<f4").tobytes(),
                      encoding="32FC1", width=2, height=1, step=8)
@@ -127,6 +129,9 @@ def test_metric_cloud_preserves_header_and_optical_coordinates():
     info = plugin.dispatch("pointcloud", {"action": "info"})
     assert {"topic": "/depth/pointcloud_metric", "format": "sensor/pointcloud2"} in info["topic_out"]
     assert {"topic": "/depth", "format": "sensor/depth-f32"} in info["topic_in"]
+    projection = next(c for c in info["camera_info"] if c["topic"] == pub.topic)
+    assert projection["id"] == camera["id"]
+    assert projection["K"] == [2., 0., 0., 0., 2., 0., 0., 0., 1.]
     node.stop()
 
 

@@ -1428,6 +1428,20 @@ class PointCloudPerceptionPlugin:
                 instance_id,
                 args.get("input_topic") or (args.get("input_topics") or [""])[0] or "",
                 nodes, cloud_topic, summary_topic)
+            from plugins.camera_info import inherit
+            for key, metric_node in nodes.items():
+                if not metric_node._metric_cloud_enabled or (instance_id in nodes and key != instance_id):
+                    continue
+                with self._nodes_lock:
+                    upstream = self._upstream_camera.get(key)
+                c = metric_node._calibration
+                declaration = inherit(upstream, topic=metric_node._metric_cloud_topic,
+                    fmt="sensor/pointcloud2", stage="perception/pointcloud",
+                    width=c['width'], height=c['height'])
+                if declaration:
+                    declaration[0]['K'] = [float(c['fx']), 0., float(c['cx']), 0.,
+                                           float(c['fy']), float(c['cy']), 0., 0., 1.]
+                    camera_out.extend(declaration)
             if camera_out:
                 info["camera_info"] = camera_out
             if camera_note:

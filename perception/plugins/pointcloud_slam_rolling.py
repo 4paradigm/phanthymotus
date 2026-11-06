@@ -12,17 +12,25 @@ from .pointcloud_slam_stream import _matrix
 
 
 class RollingGeometryHistory:
-    def __init__(self, options, *, window_frames, window_points):
+    def __init__(self, options, *, window_frames, window_points, camera=None, optical_from_child=None):
         if type(window_frames) is not int or window_frames < 2 or type(window_points) is not int or window_points <= 0:
             raise ValueError('bounded window must fit at least two keyframes')
         self.options, self.window_frames, self.window_points = dict(options), window_frames, window_points
         self.segment_id = None
         self.poses, self.frames = [], ()
         self.start, self.submaps = 0, 1
-        self.worker = ExperimentalLoopSearch(**options)
+        self.camera, self.optical = camera, optical_from_child
+        self.worker = self._worker()
         self.anchor = None
         self.frozen_edges = []
         self.frozen_attempts = self.frozen_skips = self.frozen_unindexed = 0
+
+    def _worker(self):
+        worker = ExperimentalLoopSearch(**self.options)
+        if self.camera and 'max_forward_depth_score_m' in self.options['thresholds']:
+            from .pointcloud_slam_revisit import RevisitSearch
+            worker.revisit = RevisitSearch(self.camera, self.optical, self.options)
+        return worker
 
     def update(self, segment, *, max_points):
         began = time.perf_counter()
@@ -55,6 +63,10 @@ class RollingGeometryHistory:
             edges = [{'source_stamp_ns': part.frames[c['source']].cloud_stamp_ns,
                       'target_stamp_ns': part.frames[c['target']].cloud_stamp_ns}
                      for c in loop['passed_candidates']]
+            for edge, candidate in zip(edges, loop['passed_candidates']):
+                if 'confirmation_stamps_ns' in candidate:
+                    edge['target_from_source'] = candidate['target_from_source']
+                    edge['confirmation_stamps_ns'] = candidate['confirmation_stamps_ns']
             if end == len(segment.frames): break
             self.frozen_edges.extend(edges)
             self.frozen_attempts += loop['candidate_attempts']
@@ -62,7 +74,7 @@ class RollingGeometryHistory:
             self.frozen_unindexed += loop['descriptor_unindexed']
             self.start = end-1
             self.anchor = mapped[-1].copy()
-            self.worker = ExperimentalLoopSearch(**self.options)
+            self.worker = self._worker()
             self.submaps += 1
         self.frames = segment.frames
         tick = time.perf_counter()

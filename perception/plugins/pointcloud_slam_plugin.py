@@ -417,6 +417,17 @@ class PointCloudSlamPlugin:
                                'sigmas': self._config.get('preview_odom_sigmas'),
                                'geometry': self._config.get('preview_geometry'),
                                'relocalization': self._config.get('preview_relocalization', False)}
+                if preview and persistent:
+                    from .camera_info import for_topic
+                    camera = for_topic(args.get('camera_info'), cloud_topic)
+                    k = camera.get('K')
+                    size = (camera.get('width'), camera.get('height'))
+                    if (camera.get('schema') == 'motus.camera/1' and
+                            all(type(v) is int and v > 0 for v in size) and
+                            isinstance(k, (tuple, list)) and len(k) == 9 and
+                            all(isinstance(v, (float,int)) and math.isfinite(v) for v in k)
+                            and min(k[0],k[4]) > 0):
+                        preview['camera'] = (*size, k[0], k[4], k[2], k[5])
                 node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
                 node._segment_links, node._segment_loops = links, loops
                 node._history_snapshots = history

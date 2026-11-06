@@ -64,6 +64,9 @@ def optimize_candidates(graph, candidates, *, thresholds, odom_sigmas, loop_sigm
         forward = _rigid(diagnostic['forward']['transform'])
         factors.add(gtsam.BetweenFactorPose3(source, target,
                     gtsam.Pose3(np.linalg.inv(forward)), loop_noise))
+        if 'confirmation_stamps_ns' in candidate:
+            entry['confirmation_stamps_ns'] = list(candidate['confirmation_stamps_ns'])
+            entry['target_from_source'] = forward.tolist()
         passed.append(entry)
     optimized = gtsam.LevenbergMarquardtOptimizer(factors, values).optimize()
     return {'poses': [optimized.atPose3(i).matrix() for i in range(len(poses))],

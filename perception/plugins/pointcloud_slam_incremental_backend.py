@@ -28,7 +28,7 @@ class ExperimentalLoopGraph:
         self._max_candidates = max_candidates
         self._segment_id, self._frames, self._poses, self._edges, self._candidates = None, (), (), (), ()
 
-    def update(self, segment, graph, *, candidate=None, build_maps=True):
+    def update(self, segment, graph, *, candidate=None, confirmed=None, build_maps=True):
         """Update one immutable segment snapshot and optionally test one candidate.
 
         Candidate is ``(source_index, target_index, T_target_source_initial)``.
@@ -54,6 +54,12 @@ class ExperimentalLoopGraph:
                     for edge, old in zip(edges, self._edges))):
             raise ValueError('previous odometry graph edges changed')
         pending = list(self._candidates)
+        if confirmed is not None:
+            if len(pending) >= self._max_candidates:
+                raise ValueError('candidate capacity reached')
+            if candidate is not None:
+                raise ValueError('only one candidate may be tested per update')
+            pending.append(confirmed)
         if candidate is not None:
             if not isinstance(candidate, (tuple, list)) or len(candidate) != 3:
                 raise ValueError('candidate requires source, target and initial transform')

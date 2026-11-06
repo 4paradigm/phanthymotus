@@ -287,6 +287,8 @@ class SlamInputNode(Node):
                         'candidate_count': snapshot.get('candidate_count', 0) if snapshot else 0,
                         'state': 'historical_snapshot', 'captured_frames': len(segment.frames),
                         'optimized_frames': len(snapshot['poses']) if snapshot else 0,
+                        'confirmed_revisit_count': sum('confirmation_stamps_ns' in edge
+                            for edge in (snapshot or {}).get('map_edges', [])),
                         'input_validation': self._preview.get('input_validation')}
             points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata)
@@ -343,12 +345,14 @@ class SlamInputNode(Node):
                     if segment.segment_id not in self._rolling_searches:
                         self._rolling_searches[segment.segment_id] = RollingGeometryHistory(
                             self._preview['geometry'], window_frames=self.stream.store._max_frames,
-                            window_points=self.stream.store._max_points)
+                            window_points=self.stream.store._max_points, camera=self._preview.get('camera'),
+                            optical_from_child=np.linalg.inv(self.stream.extrinsic))
                     loop = self._rolling_searches[segment.segment_id].update(
                         segment, max_points=self._preview['max_points'])
                     staged_history = {'candidate_count': loop['candidate_count'], 'map_edges': loop['map_edges'],
                                       'poses': [p.tolist() for p in loop['poses']],
                                       'stamps': [f.cloud_stamp_ns for f in segment.frames]}
+                    result['confirmed_revisit_count'] = sum('confirmation_stamps_ns' in edge for edge in loop['map_edges'])
                     result.update(latest_map_edge=loop['map_edges'][-1] if loop['map_edges'] else None,
                                   submaps=loop['submaps'], active_keyframes=loop['active_keyframes'],
                                   frozen_keyframes=loop['frozen_keyframes'],
@@ -511,7 +515,8 @@ class SlamInputNode(Node):
                           'input_validation': result['input_validation'],
                           'segment_id': result['segment_id'], 'map_frame': result['frame_id'],
                           'odom_frame': result.get('odom_frame'), 'accepted_loops': 0,
-                          'candidate_count': result.get('candidate_count', 0)}
+                          'candidate_count': result.get('candidate_count', 0),
+                          'confirmed_revisit_count': result.get('confirmed_revisit_count', 0)}
                 message = String()
                 message.data = json.dumps({**common, 'kind': 'unvalidated_geometry_pose',
                     'child_frame': segment.frames[-1].pose.child_frame_id if result['segment_id'] else None,
