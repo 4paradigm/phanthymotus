@@ -424,6 +424,24 @@ class SlamInputNode(Node):
             else:
                 points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             if preview_subscribed:
+                # The cloud and the live odometry estimate have independent capture stamps.
+                # Only extrapolate within this segment, using its map-to-odom correction.
+                if geometry and result.get('map_from_odom') is not None and self.stream.max_measurement_age_ms is not None:
+                    from .pointcloud_slam_stream import _matrix
+                    with self._lock:
+                        sample = self.stream._poses[-1] if self.stream._poses else None
+                        now_ns = self._measurement_clock_ns()
+                        wall_ms = time.time() * 1000
+                    if sample and sample.segment_id == segment.segment_id:
+                        age_ms = now_ns / 1e6 - sample.stamp_ms
+                        if -self.stream.max_future_skew_ms <= age_ms < self.stream.max_measurement_age_ms:
+                            live = np.asarray(result['map_from_odom']) @ _matrix(sample)
+                            result['odom_marker'] = {
+                                'xyz': live[:3, 3].tolist(),
+                                'yaw': math.atan2(live[1, 0], live[0, 0]),
+                                'stamp_ms': sample.stamp_ms, 'published_ms': wall_ms,
+                                'expires_ms': wall_ms + min(self.stream.max_measurement_age_ms - max(0., age_ms),
+                                                            self.stream.max_age_s * 1000)}
                 packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=result)
         result['compute_ms'] = (time.perf_counter() - started) * 1000
         with self._lock:
@@ -438,6 +456,7 @@ class SlamInputNode(Node):
                     self._loop_search = None
                     self._loop_segment = None
                 packet = None
+                result.pop('odom_marker', None)
                 state = ('stale' if latest_status['odometry'] == 'tracking' and latest_status['cloud'] == 'stale'
                          else latest_status['odometry'])
                 result.update(state=state, cloud_state=latest_status['cloud'], integration=latest_status['integration'],

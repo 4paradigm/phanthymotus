@@ -33,7 +33,8 @@ TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False
               'clock_id': {'type': 'string', 'description': '已验证的输入时钟'},
               'clock_relation_verified': {'type': 'boolean', 'default': False, 'description': '仅在独立验证时钟关系后启用'},
               'extrinsic_calibrated': {'type': 'boolean', 'default': False, 'description': '仅在实测外参后启用'},
-              'child_from_cloud': {'type': 'string', 'description': '实测 T_child_cloud：4×4 JSON 数组'},
+              'child_from_cloud': {'type': 'string', 'title': '相机到里程计参考点的外参',
+                                   'description': '从点云坐标系到位姿参考系的 4×4 矩阵，平移单位为米。'},
               'max_gap_ms': {'type': 'number', 'description': '最大位姿插值间隔（ms）'},
               'max_age_s': {'type': 'number', 'description': '接收超时（秒）'},
               'max_measurement_age_ms': {'type': 'number', 'description': '最大采集时间年龄（ms）'},
@@ -84,7 +85,10 @@ class PointCloudSlamPlugin:
     def get_tools(self):
         if self._config.get('persistent_history'):
             tools = deepcopy(TOOLS)
-            tools[0]['configSchema']['properties'] = {}
+            extrinsic = tools[0]['configSchema']['properties']['child_from_cloud']
+            if self._config.get('child_from_cloud') is not None:
+                extrinsic['default'] = json.dumps(self._config['child_from_cloud'])
+            tools[0]['configSchema']['properties'] = {'child_from_cloud': extrinsic}
             schema = tools[0]['inputSchema']
             schema['x-action-params'] = {action: {'params': params} for action, params in
                 [('save_map', ['map_name']), ('list_maps', []), ('load_map', ['map_name']),
@@ -100,6 +104,10 @@ class PointCloudSlamPlugin:
             tools[0]['configSchema']['properties'] = {
                 k: {**props[k], 'default': self._config.get(k, props[k].get('default'))}
                 for k in ('preview_enabled', 'archive_name', 'restore_archive')}
+            extrinsic = props['child_from_cloud']
+            if self._config.get('child_from_cloud') is not None:
+                extrinsic['default'] = json.dumps(self._config['child_from_cloud'])
+            tools[0]['configSchema']['properties']['child_from_cloud'] = extrinsic
             return tools
         return TOOLS
 

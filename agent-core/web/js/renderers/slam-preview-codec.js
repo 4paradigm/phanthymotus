@@ -22,3 +22,12 @@ export function decodeSlamPreview(buffer) {
     return null;
   }
 }
+
+// A cached map may outlive its pose. Older packets carry only a keyframe pose.
+export function currentOdomMarker(meta, now) {
+  const m = meta.odom_marker;
+  if (!m || !Number.isSafeInteger(m.stamp_ms) || !Number.isFinite(m.expires_ms) ||
+      !Number.isFinite(m.published_ms) || now < m.published_ms || m.expires_ms <= now || !Array.isArray(m.xyz) || m.xyz.length !== 3 ||
+      !m.xyz.every(Number.isFinite) || !Number.isFinite(m.yaw)) return null;
+  return m;
+}

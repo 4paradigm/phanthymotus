@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { decodeSlamPreview } from './renderers/slam-preview-codec.js';
+import { decodeSlamPreview, currentOdomMarker } from './renderers/slam-preview-codec.js';
 
 function packet(meta) {
   const header = new TextEncoder().encode(JSON.stringify(meta));
@@ -53,4 +53,12 @@ test('dashboard keeps the latest preview, including odd-length packets', () => {
   buffer.attach(frame => replay.push(frame.byteLength));
   assert.deepEqual(replay, [5]);
   assert.equal(buffer._frames.length, 1);
+});
+
+test('only an explicit fresh estimated pose can place the SLAM marker', () => {
+  const marker = {stamp_ms: 1700, published_ms: 1800, expires_ms: 2500, xyz: [1, 2, 3], yaw: .5};
+  assert.equal(currentOdomMarker(metadata, 2000), null);
+  assert.equal(currentOdomMarker({...metadata, odom_marker: marker}, 2000), marker);
+  assert.equal(currentOdomMarker({...metadata, odom_marker: marker}, 2500), null);
+  assert.equal(currentOdomMarker({...metadata, odom_marker: {...marker, yaw: NaN}}, 2000), null);
 });

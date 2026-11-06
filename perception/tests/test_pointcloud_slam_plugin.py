@@ -312,7 +312,7 @@ def test_deployed_trial_profile_waits_for_data_without_claiming_calibration():
     executor = _FakeExecutor()
     plugin = PointCloudSlamPlugin(cfg, executor)
     props = plugin.get_tools()[0]['configSchema']['properties']
-    assert set(props) == {'preview_enabled', 'archive_name', 'restore_archive'}
+    assert set(props) == {'child_from_cloud', 'preview_enabled', 'archive_name', 'restore_archive'}
     plugin.dispatch('pointcloud_slam', {'action': 'config', 'max_gap_ms': 9999,
                                       'clock_relation_verified': True})
     assert plugin._config['max_gap_ms'] == 200
@@ -412,3 +412,18 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     assert meta['captured_frames'] == meta['optimized_frames'] == 12
     assert p.dispatch('pointcloud_slam', {'action': 'save_map', 'map_name': 'x'})['state'] == 'error'
     p.stop()
+
+
+def test_paged_card_exposes_only_extrinsic_and_applies_it():
+    import json
+    settings = {**config(), 'persistent_history': {'max_disk_bytes': 100000, 'reserve_bytes': 0}}
+    card = PointCloudSlamPlugin(settings, _FakeExecutor())
+    props = card.get_tools()[0]['configSchema']['properties']
+    assert list(props) == ['child_from_cloud']
+    assert props['child_from_cloud']['scope'] == 'instance'
+    assert json.loads(props['child_from_cloud']['default']) == settings['child_from_cloud']
+    matrix = np.eye(4)
+    matrix[0, 3] = .12
+    assert card.dispatch('pointcloud_slam', {'action': 'config', 'child_from_cloud': json.dumps(matrix.tolist())})['state'] == 'configured'
+    np.testing.assert_array_equal(card._stream().extrinsic, matrix)
+    assert card.dispatch('pointcloud_slam', {'action': 'config', 'child_from_cloud': '[[1]]'})['state'] == 'error'

@@ -337,6 +337,12 @@ def test_geometry_worker_can_publish_fresh_snapshot_while_new_frame_arrives(monk
     assert pubs['/preview'].messages
     status = json.loads(pubs['/status'].messages[-1])
     assert status['stamp_ns'] == '1300000000'
+    from test_pointcloud_slam_preview import unpack
+    meta, _ = unpack(pubs['/preview'].messages[-1])
+    assert meta['odom_marker']['stamp_ms'] == completed_ns // 1_000_000
+    assert meta['stamp_ns'] == '1300000000'
+    np.testing.assert_allclose(meta['odom_marker']['xyz'],
+                               (np.asarray(node._loop_search._last['map_from_odom']) @ [.6, 0, 0, 1])[:3])
     if completed_ns > 2_000_000_000:
         assert status['state'] == 'historical_snapshot'
         assert json.loads(pubs['/preview/pose'].messages[-1])['pose'] is None

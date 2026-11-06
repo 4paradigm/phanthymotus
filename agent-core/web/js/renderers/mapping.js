@@ -16,7 +16,7 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { decodeSlamPreview } from './slam-preview-codec.js';
+import { decodeSlamPreview, currentOdomMarker } from './slam-preview-codec.js';
 
 const MAX_POINTS = 80000;
 
@@ -302,8 +302,8 @@ export const MappingRenderer = {
   },
 };
 
-// Same bounded packet layout, but a distinct format and persistent label so an
-// odometry-only preview cannot be mistaken for a validated SLAM map.
+// Keyframe poses in the binary map payload are retained for older readers.
+// Only the separately timestamped odometry estimate can drive the live marker.
 export const SlamPreviewRenderer = {
   ...MappingRenderer,
   name: 'slam-preview',
@@ -311,6 +311,11 @@ export const SlamPreviewRenderer = {
   mount(container) {
     MappingRenderer.mount.call(this, container);
     this._overview = true;
+    this._robotMesh.visible = false;
+    this._followBtn.hidden = true;
+    this._followBtn.style.display = 'none';
+    this._followBtn.title = '跟随里程计估计位置';
+    this._robotPos = new THREE.Vector3();
     this._followRobot = false;
     this._updateFollowBtn();
     this._points.frustumCulled = false;
@@ -326,27 +331,40 @@ export const SlamPreviewRenderer = {
       this._fitOverview();
     };
     this._el.appendChild(overview);
-    const badge = document.createElement('div');
-    badge.style.cssText = 'position:absolute;left:8px;top:8px;z-index:11;padding:4px 7px;' +
-      'background:#6c4215;color:#fff;border-radius:4px;font-size:12px;pointer-events:none;' +
-      'max-width:80%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-    badge.textContent = '里程计预览 · 未验证 · 无回环 · 关键帧位置';
-    this._previewBadge = badge;
-    this._el.appendChild(badge);
+    this._overviewBtn = overview;
   },
   onData(buffer) {
     const decoded = decodeSlamPreview(buffer);
     if (!decoded) return;
-    if (this._previewBadge) {
-      const label = decoded.meta.kind === 'unvalidated_geometry_preview'
-        ? `几何候选优化预览 · 未验证 · 候选 ${decoded.meta.candidate_count}`
-        : '里程计预览 · 未验证 · 无回环';
-      const coverage = Number.isSafeInteger(decoded.meta.captured_frames)
-        ? ` · 共 ${decoded.meta.captured_frames} 帧，里程计延伸 ${decoded.meta.captured_frames - decoded.meta.optimized_frames} 帧` : '';
-      this._previewBadge.textContent = `${label}${coverage} · 关键帧位置 · ${decoded.meta.frame_id} / ${decoded.meta.segment_id}`;
-    }
     MappingRenderer.onData.call(this, decoded.payload);
+    const marker = currentOdomMarker(decoded.meta, Date.now());
+    clearTimeout(this._markerTimer);
+    this._robotMesh.visible = !!marker;
+    this._followBtn.hidden = !marker;
+    this._followBtn.style.display = marker ? 'flex' : 'none';
+    this._overviewBtn.title = decoded.meta.state === 'historical_snapshot'
+      ? '查看完整地图快照' : '查看当前子图全貌';
+    if (marker) {
+      const [x, y, z] = marker.xyz;
+      this._robotPos.set(x, z, -y);
+      this._robotMesh.position.copy(this._robotPos);
+      this._robotMesh.rotation.set(0, marker.yaw, 0);
+      this._markerTimer = setTimeout(() => this._hideMarker(), Math.max(0, marker.expires_ms - Date.now()));
+    } else {
+      this._hideMarker();
+    }
     if (this._overview) this._fitOverview();
+  },
+  _hideMarker() {
+    this._robotMesh.visible = false;
+    this._followRobot = false;
+    this._followBtn.style.display = 'none';
+    this._updateFollowBtn();
+  },
+  unmount() {
+    clearTimeout(this._markerTimer);
+    this._overviewBtn = null;
+    MappingRenderer.unmount.call(this);
   },
   _fitOverview() {
     const count = this._points.geometry.drawRange.count;

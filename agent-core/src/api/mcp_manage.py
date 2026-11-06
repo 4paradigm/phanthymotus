@@ -1327,7 +1327,9 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
-            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
+            # SLAM owns one map session; its extrinsic applies when starting capture.
+            # Reopening or saving that session must not reconfigure a running node.
+            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG and (req.tool != 'pointcloud_slam' or action == 'start'):
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
 
@@ -1369,6 +1371,8 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                         cfg_content = (cfg_result.get('content') or [{}])[0].get('text', '{}')
                         try:
                             parsed = json.loads(cfg_content)
+                            if req.tool == 'pointcloud_slam' and parsed.get('state') == 'error':
+                                return {'code': 400, 'message': parsed.get('message') or 'SLAM 配置无效', 'data': None}
                             if not parsed.get('adapter_ok', True):
                                 return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
                         except (json.JSONDecodeError, IndexError):

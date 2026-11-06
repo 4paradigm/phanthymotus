@@ -39,6 +39,8 @@ def encode_preview(points, pose, *, max_points, metadata):
         header['state'] = 'historical_snapshot'
         if 'captured_frames' in metadata:
             header.update(captured_frames=metadata['captured_frames'], optimized_frames=metadata['optimized_frames'])
+    if 'odom_marker' in metadata:
+        header['odom_marker'] = metadata['odom_marker']
     if geometry:
         header['candidate_count'] = metadata['candidate_count']
     if metadata.get('input_validation') is not None:
