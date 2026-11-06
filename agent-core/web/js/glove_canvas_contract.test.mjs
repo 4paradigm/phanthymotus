@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import * as THREE from 'three';
 
 const canvas = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
 const skeleton = readFileSync(new URL('./renderers/skeleton.js', import.meta.url), 'utf8');
@@ -90,14 +91,6 @@ test('generic execute button sends the bound card identity', async () => {
   assert.equal(calls[0][3], 'left-instance');
 });
 
-function rotate(vector, axis, angle) {
-  const [x, y, z] = vector;
-  const c = Math.cos(angle), s = Math.sin(angle);
-  if (axis === 'X') return [x, c*y-s*z, s*y+c*z];
-  if (axis === 'Y') return [c*x+s*z, y, -s*x+c*z];
-  return [c*x-s*y, s*x+c*y, z];
-}
-
 function previewRenderer() {
   const context = { TextDecoder };
   const source = skeleton.replace(/^import .*;\s*$/gm, '')
@@ -148,25 +141,16 @@ test('other robot streams retain direct joint updates and cancel glove smoothing
   assert.equal(angles.at(-1), -0.5);
 });
 
-for (const yaw of [1.8064, -1.8076]) {
-  test(`URDF thumb origin uses fixed-axis RPY, yaw=${yaw}`, () => {
-    class Group {
-      constructor() {
-        this.children = [];
-        this.position = { set() {} };
-        this.rotation = { copy(euler) { this.euler = euler; } };
-      }
-      add(child) { child.parent = this; this.children.push(child); }
-    }
-    class Euler {
-      constructor(x, y, z, order) { Object.assign(this, { x, y, z, order }); }
-    }
+// Real Three.js (same r164 series as index.html), not an Euler-order mock.
+// Compare the renderer's quaternion/matrix with independent URDF composition.
+for (const [roll, pitch, yaw] of [[0, -0.9163, 1.8064], [0, -0.9163, -1.8076], [0.4, -0.7, 1.2]]) {
+  test(`real Three.js URDF origin matrix matches Rz Ry Rx: ${roll},${pitch},${yaw}`, () => {
     const attributes = map => ({ getAttribute: key => map[key] });
     const joint = {
       getAttribute: key => ({ name: 'thumb_origin', type: 'fixed' })[key],
       querySelector: tag => ({
         parent: attributes({ link: 'palm' }), child: attributes({ link: 'thumb' }),
-        origin: attributes({ xyz: '0 0 0', rpy: `0 -0.9163 ${yaw}` }),
+        origin: attributes({ xyz: '0 0 0', rpy: `${roll} ${pitch} ${yaw}` }),
         axis: attributes({ xyz: '0 1 0' }),
       })[tag],
     };
@@ -176,23 +160,27 @@ for (const yaw of [1.8064, -1.8076]) {
           ? [attributes({ name: 'palm' }), attributes({ name: 'thumb' })] : [joint] };
       }
     }
-    const context = {
-      DOMParser,
-      THREE: { Group, Euler, Vector3: class {}, Mesh: Group,
-        SphereGeometry: class {}, MeshPhongMaterial: class {} },
-    };
+    const context = { DOMParser, THREE };
     const source = skeleton.replace(/^import .*;\s*$/gm, '')
       .replace('export const SkeletonRenderer =', 'globalThis.renderer =');
     vm.runInNewContext(source, context);
     const renderer = context.renderer;
-    renderer._scene = { add() {} };
+    renderer._scene = new THREE.Scene();
     renderer._joints = {}; renderer._links = {};
     renderer._addBoneVisual = () => {};
     renderer._parseAndBuild('<synthetic-urdf/>');
-    const euler = renderer._links.thumb.parent.rotation.euler;
-    let actual = [1, 0, 0];
-    for (const axis of [...euler.order].reverse()) actual = rotate(actual, axis, euler[axis.toLowerCase()]);
-    const expected = [Math.cos(yaw)*Math.cos(-0.9163), Math.sin(yaw)*Math.cos(-0.9163), -Math.sin(-0.9163)];
-    actual.forEach((value, index) => assert.ok(Math.abs(value-expected[index]) < 1e-10));
+    const origin = renderer._links.thumb.parent;
+    origin.updateMatrix();
+    const expected = new THREE.Matrix4().makeRotationZ(yaw)
+      .multiply(new THREE.Matrix4().makeRotationY(pitch))
+      .multiply(new THREE.Matrix4().makeRotationX(roll));
+    origin.matrix.elements.forEach((value, i) =>
+      assert.ok(Math.abs(value - expected.elements[i]) < 1e-12, `matrix element ${i}`));
+    const expectedQuaternion = new THREE.Quaternion().setFromRotationMatrix(expected);
+    assert.ok(Math.abs(origin.quaternion.dot(expectedQuaternion)) > 1 - 1e-12);
+    // A switch to XYZ must fail for these mixed-axis rotations. The renderer
+    // calls Euler.copy(), which really updates Group.quaternion in this test.
+    const wrong = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(roll, pitch, yaw, 'XYZ'));
+    assert.ok(Math.max(...wrong.elements.map((v, i) => Math.abs(v - expected.elements[i]))) > 0.1);
   });
 }
