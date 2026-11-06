@@ -51,3 +51,28 @@ def test_confusion_counts_require_both_classes_and_do_not_claim_accuracy_without
     assert result['false_positive_rate'] is None
     with pytest.raises(ValueError):
         summarize([{'match': 'unknown', 'passes': True}])
+
+
+def test_forward_depth_score_counts_missing_matches_and_requires_each_stratum():
+    import numpy as np
+    from plugins.pointcloud_slam_registration import _forward_depth_score
+
+    points = np.array([[1., 0, 0], [3., 0, 0], [5., 0, 0], [6., 0, 0]])
+    pairs = np.array([[0, 0], [1, 1], [2, 2]])
+    assert _forward_depth_score(points, points, pairs, np.eye(4), .3) == pytest.approx(.3 / np.sqrt(6))
+    assert _forward_depth_score(points[:2], points, pairs[:2], np.eye(4), .3) is None
+
+
+def test_profile_score_does_not_bypass_cycle_or_global_default():
+    gate = thresholds()
+    del gate['max_rmse_m']
+    gate['max_forward_depth_score_m'] = .09
+    d = diagnostic()
+    for key in ['forward', 'reverse']:
+        d[key].update(rmse_m=.10, forward_depth_score_m=.082)
+    assert classify_registration(d, gate)['passes']
+    assert not classify_registration(d, thresholds())['passes']
+    d['cycle_translation_m'] = .08
+    assert classify_registration(d, gate)['failed'] == ['cycle_translation_m']
+    del d['reverse']['forward_depth_score_m']
+    assert 'reverse_depth_score' in classify_registration(d, gate)['failed']

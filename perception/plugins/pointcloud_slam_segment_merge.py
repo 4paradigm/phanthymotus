@@ -45,7 +45,8 @@ def experimental_segment_merge(target, target_graph, source, source_graph, *,
         for pose in graph['poses']:
             _rigid(pose)
     diagnostic = registration_diagnostics(source.frames[source_index].points,
-        target.frames[target_index].points, initial, voxel_m=voxel_m, max_distance_m=max_distance_m)
+        target.frames[target_index].points, initial, voxel_m=voxel_m, max_distance_m=max_distance_m,
+        forward_depth_score='max_forward_depth_score_m' in thresholds)
     gate = classify_registration(diagnostic, thresholds)
     result = {'hypothesis_created': False, 'loop_accepted': False,
               'failed': gate['failed'], 'diagnostic': diagnostic}

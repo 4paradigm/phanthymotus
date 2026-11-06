@@ -13,8 +13,12 @@ def classify_registration(diagnostic, thresholds):
         raise ValueError('explicit thresholds required')
     fitness = thresholds.get('min_fitness')
     count = thresholds.get('min_correspondences')
+    stratified = 'max_forward_depth_score_m' in thresholds
+    if stratified and 'max_rmse_m' in thresholds:
+        raise ValueError('select exactly one registration error metric')
+    score_limit = 'max_forward_depth_score_m' if stratified else 'max_rmse_m'
     bounds = [thresholds.get(k) for k in
-              ('max_rmse_m', 'max_cycle_translation_m', 'max_cycle_angle_deg')]
+              (score_limit, 'max_cycle_translation_m', 'max_cycle_angle_deg')]
     if (not _number(fitness) or not 0 <= fitness <= 1 or
             type(count) is not int or count <= 0 or
             any(not _number(v) or v <= 0 for v in bounds)):
@@ -28,9 +32,9 @@ def classify_registration(diagnostic, thresholds):
         value = data.get('fitness')
         if not _number(value) or not fitness <= value <= 1:
             failed.append(direction + '_fitness')
-        value = data.get('rmse_m')
+        value = data.get('forward_depth_score_m' if stratified else 'rmse_m')
         if not _number(value) or not 0 <= value <= bounds[0]:
-            failed.append(direction + '_rmse')
+            failed.append(direction + ('_depth_score' if stratified else '_rmse'))
         value = data.get('correspondences')
         if type(value) is not int or value < count:
             failed.append(direction + '_correspondences')

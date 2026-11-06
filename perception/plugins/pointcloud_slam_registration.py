@@ -6,7 +6,20 @@ import numpy as np
 from .pointcloud_slam_stream import _rigid
 
 
-def registration_diagnostics(source, target, initial, *, voxel_m, max_distance_m):
+def _forward_depth_score(source, target, pairs, transform, limit):
+    """Equal-weight depth strata in an X-forward camera-origin child frame."""
+    bands = np.digitize(source[:, 0], (2., 4.))
+    counts = np.bincount(bands, minlength=3)
+    if np.any(counts == 0):
+        return None
+    squared = np.full(len(source), limit ** 2)
+    src, dst = pairs.reshape(-1, 2).T
+    delta = source[src] @ transform[:3, :3].T + transform[:3, 3] - target[dst]
+    squared[src] = np.sum(delta ** 2, axis=1)
+    return float(np.sqrt(np.mean(np.bincount(bands, weights=squared) / counts)))
+
+
+def registration_diagnostics(source, target, initial, *, voxel_m, max_distance_m, forward_depth_score=False):
     """Refine an externally supplied initial transform in both directions.
 
     Directional fitness, error, and round-trip agreement describe the result;
@@ -33,8 +46,13 @@ def registration_diagnostics(source, target, initial, *, voxel_m, max_distance_m
                                      reg.TransformationEstimationPointToPoint(),
                                      reg.ICPConvergenceCriteria(max_iteration=60))
         count = len(value.correspondence_set)
-        return {'fitness': value.fitness, 'rmse_m': value.inlier_rmse if count else None,
+        result = {'fitness': value.fitness, 'rmse_m': value.inlier_rmse if count else None,
                 'correspondences': count, 'transform': value.transformation.tolist()}
+        if forward_depth_score:
+            result['forward_depth_score_m'] = _forward_depth_score(
+                np.asarray(a.points), np.asarray(b.points), np.asarray(value.correspondence_set),
+                value.transformation, max_distance_m)
+        return result
     forward = refine(clouds[0], clouds[1], initial)
     reverse = refine(clouds[1], clouds[0], np.linalg.inv(initial))
     cycle_translation, cycle_angle = None, None

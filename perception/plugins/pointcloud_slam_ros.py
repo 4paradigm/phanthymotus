@@ -346,10 +346,11 @@ class SlamInputNode(Node):
                             window_points=self.stream.store._max_points)
                     loop = self._rolling_searches[segment.segment_id].update(
                         segment, max_points=self._preview['max_points'])
-                    staged_history = {'candidate_count': loop['candidate_count'],
+                    staged_history = {'candidate_count': loop['candidate_count'], 'map_edges': loop['map_edges'],
                                       'poses': [p.tolist() for p in loop['poses']],
                                       'stamps': [f.cloud_stamp_ns for f in segment.frames]}
-                    result.update(submaps=loop['submaps'], active_keyframes=loop['active_keyframes'],
+                    result.update(latest_map_edge=loop['map_edges'][-1] if loop['map_edges'] else None,
+                                  submaps=loop['submaps'], active_keyframes=loop['active_keyframes'],
                                   frozen_keyframes=loop['frozen_keyframes'],
                                   history_policy='frozen_submaps_no_global_loop_correction')
                 else:

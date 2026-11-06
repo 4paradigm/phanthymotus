@@ -68,7 +68,8 @@ class ExperimentalLoopGraph:
                 raise ValueError('candidate capacity reached')
             diagnostic = registration_diagnostics(segment.frames[source].points,
                 segment.frames[target].points, initial, voxel_m=self._voxel_m,
-                max_distance_m=self._max_distance_m)
+                max_distance_m=self._max_distance_m,
+                forward_depth_score='max_forward_depth_score_m' in self._thresholds)
             pending.append({'source': source, 'target': target, 'diagnostic': diagnostic})
         result = optimize_candidates(graph, pending, thresholds=self._thresholds,
             odom_sigmas=self._odom_sigmas, loop_sigmas=self._loop_sigmas, huber_k=self._huber_k)

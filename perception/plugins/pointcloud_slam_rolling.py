@@ -21,7 +21,8 @@ class RollingGeometryHistory:
         self.start, self.submaps = 0, 1
         self.worker = ExperimentalLoopSearch(**options)
         self.anchor = None
-        self.frozen_candidates = self.frozen_attempts = self.frozen_skips = self.frozen_unindexed = 0
+        self.frozen_edges = []
+        self.frozen_attempts = self.frozen_skips = self.frozen_unindexed = 0
 
     def update(self, segment, *, max_points):
         began = time.perf_counter()
@@ -51,8 +52,11 @@ class RollingGeometryHistory:
             self.poses[self.start:end] = mapped
             descriptor_ms += loop['timings_ms']['descriptor']
             graph_ms += loop['timings_ms']['registration_and_graph']
+            edges = [{'source_stamp_ns': part.frames[c['source']].cloud_stamp_ns,
+                      'target_stamp_ns': part.frames[c['target']].cloud_stamp_ns}
+                     for c in loop['passed_candidates']]
             if end == len(segment.frames): break
-            self.frozen_candidates += len(loop['passed_candidates'])
+            self.frozen_edges.extend(edges)
             self.frozen_attempts += loop['candidate_attempts']
             self.frozen_skips += loop['descriptor_skips']
             self.frozen_unindexed += loop['descriptor_unindexed']
@@ -66,7 +70,8 @@ class RollingGeometryHistory:
         return {'poses':list(self.poses),'after_map':points,
                 'map_from_odom':map_from_odom(self.poses[-1],_matrix(segment.frames[-1].pose)),
                 'passed_candidates':loop['passed_candidates'],
-                'candidate_count':self.frozen_candidates+len(loop['passed_candidates']),
+                'candidate_count':len(self.frozen_edges)+len(edges),
+                'map_edges':self.frozen_edges + edges,
                 'candidate_attempts':self.frozen_attempts+loop['candidate_attempts'],
                 'descriptor_skips':self.frozen_skips+loop['descriptor_skips'],
                 'descriptor_unindexed':self.frozen_unindexed+loop['descriptor_unindexed'],
