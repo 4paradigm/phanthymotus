@@ -19,6 +19,20 @@ def _forward_depth_score(source, target, pairs, transform, limit):
     return float(np.sqrt(np.mean(np.bincount(bands, weights=squared) / counts)))
 
 
+def _clouds(source, target, voxel_m):
+    import open3d as o3d
+    clouds = []
+    for value in (source, target):
+        points = np.asarray(value, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError('expected Nx3 cloud')
+        points = points[np.isfinite(points).all(axis=1)]
+        cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        cloud = cloud.voxel_down_sample(voxel_m)
+        clouds.append(cloud)
+    return clouds
+
+
 def registration_diagnostics(source, target, initial, *, voxel_m, max_distance_m, forward_depth_score=False):
     """Refine an externally supplied initial transform in both directions.
 
@@ -29,17 +43,9 @@ def registration_diagnostics(source, target, initial, *, voxel_m, max_distance_m
     if not all(math.isfinite(v) and v > 0 for v in (voxel_m, max_distance_m)):
         raise ValueError('voxel size and correspondence distance must be positive')
     initial = _rigid(initial)
-    clouds = []
-    for value in (source, target):
-        points = np.asarray(value, dtype=float)
-        if points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError('expected Nx3 cloud')
-        points = points[np.isfinite(points).all(axis=1)]
-        cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-        cloud = cloud.voxel_down_sample(voxel_m)
-        if len(cloud.points) < 3:
-            raise ValueError('insufficient finite points')
-        clouds.append(cloud)
+    clouds = _clouds(source, target, voxel_m)
+    if any(len(cloud.points) < 3 for cloud in clouds):
+        raise ValueError('insufficient finite points')
     reg = o3d.pipelines.registration
     def refine(a, b, transform):
         value = reg.registration_icp(a, b, max_distance_m, transform,
@@ -66,3 +72,28 @@ def registration_diagnostics(source, target, initial, *, voxel_m, max_distance_m
             'loop_accepted': False}
 
 
+
+def fixed_overlap(source, target, transform, geometry):
+    """Score a predicted pose in both directions without an ICP update."""
+    import open3d as o3d
+    a, b = _clouds(source, target, geometry['voxel_m'])
+    thresholds = geometry['thresholds']
+    if min(len(a.points), len(b.points)) < 3:
+        return [{'passes': False, 'reason': 'insufficient_points'}]
+    limit = geometry['max_distance_m']
+    scores = []
+    for src, dst, pose in ((a, b, transform), (b, a, np.linalg.inv(transform))):
+        result = o3d.pipelines.registration.evaluate_registration(src, dst, limit, pose)
+        pairs = np.asarray(result.correspondence_set)
+        if 'max_forward_depth_score_m' in thresholds:
+            error = _forward_depth_score(np.asarray(src.points), np.asarray(dst.points),
+                                         pairs, pose, limit)
+            bound = thresholds['max_forward_depth_score_m']
+        else:
+            error = result.inlier_rmse
+            bound = thresholds['max_rmse_m']
+        scores.append({'fitness': result.fitness, 'error_m': error, 'count': len(pairs),
+                       'passes': bool(result.fitness >= thresholds['min_fitness'] and
+                                      len(pairs) >= thresholds['min_correspondences'] and
+                                      error is not None and error <= bound)})
+    return scores
