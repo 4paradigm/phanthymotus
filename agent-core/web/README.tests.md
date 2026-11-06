@@ -3,14 +3,17 @@
 From the repository root:
 
 ```sh
-npm --prefix agent-core/web ci
-npm --prefix agent-core/web test
+npm ci
+npm test
 ```
 
 CI/review runners must install the locked development dependency before running
 `node --test agent-core/web/js/*.test.mjs`. Tests then run without network access.
 `three@0.164.1` matches the r164 series loaded by the page import map. It is a
-test-only dependency; the browser import map and production image are unchanged.
+test-only dependency installed in the repository-root `node_modules/`. The Core
+Docker build context is `agent-core/`, so neither this directory nor the root npm
+manifests are sent to Docker. No `.dockerignore` change is needed. The browser
+import map and production runtime dependencies are unchanged.
 
 The URDF regression invokes the renderer's `_parseAndBuild` with real Three.js
 Group/Euler/Quaternion/Matrix4 objects. Only XML input and bone visual creation

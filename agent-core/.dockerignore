@@ -1,2 +1,0 @@
-# Frontend test dependencies must not be copied into the production image.
-**/node_modules/
