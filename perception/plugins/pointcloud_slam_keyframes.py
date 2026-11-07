@@ -68,9 +68,9 @@ class KeyframeStore:
         if self._segments:
             current_id, frames = self._segments[-1]
             previous = frames[-1].pose
-            if pose.stamp_ms <= previous.stamp_ms:
-                raise ValueError('keyframe timestamps must increase')
             if pose.segment_id == current_id:
+                if pose.stamp_ms <= previous.stamp_ms:
+                    raise ValueError('keyframe timestamps must increase')
                 if self._lost:
                     raise ValueError('recovery requires a new segment')
                 if (pose.frame_id, pose.child_frame_id, pose.clock_id) != (

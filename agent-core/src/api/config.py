@@ -715,10 +715,23 @@ async def _do_start_project_impl():
             # a source declared nothing.
             args['camera_info'] = camera_info
 
-        if input_bindings:
-            args['input_bindings'] = input_bindings
-        if odom_interfaces:
-            args['odom_interfaces'] = odom_interfaces
+        declared = ((find_tool(mcp_id, tool_name).get('inputSchema') or {})
+                    .get('properties') or {})
+        input_metadata = None
+        if 'input_metadata' in declared:
+            input_metadata, metadata_error = _upstream_input_metadata(card_id)
+            if metadata_error:
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id,
+                    'status': 'error', 'message': metadata_error,
+                }})
+                errors.append(tool_name)
+                return
+        for key, value in (('input_bindings', input_bindings),
+                           ('odom_interfaces', odom_interfaces),
+                           ('input_metadata', input_metadata)):
+            if value and key in declared:
+                args[key] = value
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -926,7 +939,7 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
-    def _slam_input_bindings(card_id: str) -> dict:
+    def _upstream_input_bindings(card_id: str) -> dict:
         """Bind only formats reported by the currently running producer."""
         bindings, ambiguous = {}, set()
         for conn in (c for c in connections if c.get('toCardId') == card_id):
@@ -947,7 +960,7 @@ async def _do_start_project_impl():
                 bindings[topic] = fmt
         return bindings
 
-    def _slam_odom_interfaces(card_id: str) -> dict:
+    def _upstream_odom_interfaces(card_id: str) -> dict:
         """Associate producer capability with its actual state/odom port."""
         result = {}
         for conn in (c for c in connections if c.get('toCardId') == card_id):
@@ -962,6 +975,22 @@ async def _do_start_project_impl():
                      (not declared_topic and len(odom_topics) == 1))):
                 result[topic] = source['odom_interface']
         return result
+
+    def _upstream_input_metadata(card_id: str) -> tuple[dict, str]:
+        """Route producer facts only from the output port this card consumes."""
+        out = {}
+        for conn in (c for c in connections if c.get('toCardId') == card_id):
+            topic = _topic_of_connection(conn)
+            source = resolved_info.get(conn.get('fromCardId')) or {}
+            if 'input_metadata' not in source:
+                continue
+            declarations = source['input_metadata']
+            if not isinstance(declarations, list):
+                return {}, f"source {conn.get('fromCardId')} input_metadata for {topic} must be a list"
+            for entry in declarations:
+                if isinstance(entry, dict) and entry.get('topic') == topic and topic not in out:
+                    out[topic] = entry
+        return out, ''
 
     def _upstream_camera_info(card_id: str) -> dict:
         """What this card's sources say about the optics behind each input.
@@ -999,7 +1028,7 @@ async def _do_start_project_impl():
                 # same topic is already reported as a clash by `_topic_clash`;
                 # silently taking whichever card started last would make the
                 # optics disagree with the clash message.
-                if topic and topic not in out:
+                if topic == _topic_of_connection(conn) and topic and topic not in out:
                     out[topic] = entry
         return out
 
@@ -1131,10 +1160,8 @@ async def _do_start_project_impl():
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
                                  camera_info=_upstream_camera_info(card.get('id', '')),
-                                 input_bindings=_slam_input_bindings(card.get('id', ''))
-                                 if card.get('toolName') == 'pointcloud_slam' else None,
-                                 odom_interfaces=_slam_odom_interfaces(card.get('id', ''))
-                                 if card.get('toolName') == 'pointcloud_slam' else None)
+                                 input_bindings=_upstream_input_bindings(card.get('id', '')),
+                                 odom_interfaces=_upstream_odom_interfaces(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:

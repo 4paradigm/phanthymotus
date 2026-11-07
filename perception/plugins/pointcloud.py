@@ -30,6 +30,8 @@ stereo_peer + K/D 时自动拼 raw 档 blob，见 _stereo_blob_from_declarations
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import os
@@ -114,6 +116,10 @@ TOOLS = [
                 "input_topics": {
                     "type": "array", "items": {"type": "string"},
                     "description": "双目模式的左右话题列表：第一路=左目，第二路=右目。单输入时忽略此参数",
+                },
+                "input_metadata": {
+                    "type": "object",
+                    "description": "Producer measurement declarations keyed by connected input topic",
                 },
                 "mode": {
                     "type": "string",
@@ -269,6 +275,12 @@ class _PointCloudNode(Node):
         self._input_format = None
         self._metric_cloud_topic = (input_topic or "/perception") + "/pointcloud_metric"
         self._metric_cloud_pub = None
+        self._metric_metadata_topic = self._metric_cloud_topic + "/metadata"
+        self._metric_metadata_source_topic = None
+        self._metric_metadata_pub = None
+        self._metric_metadata_lock = threading.Lock()
+        self._metric_pending_clouds = {}
+        self._metric_pending_metadata = {}
         self._metric_lock = threading.Lock()
         self._metric_published = 0
         self._metric_skipped = {}
@@ -328,6 +340,9 @@ class _PointCloudNode(Node):
                 else:  # mono
                     self._subs.append(self.create_subscription(
                         CompressedImage, self._input_topic, self._jpeg_cb, _LOW_LAT_QOS))
+            if self._metric_metadata_source_topic:
+                self._subs.append(self.create_subscription(
+                    String, self._metric_metadata_source_topic, self._metric_metadata_cb, _PUB_QOS))
             if self._subs:
                 self._worker = threading.Thread(target=self._worker_loop, daemon=True,
                                                 name=f"pointcloud_worker_{self._input_topic}")
@@ -350,6 +365,9 @@ class _PointCloudNode(Node):
                     log.warning('[pointcloud] worker still stopping after timeout; model load may be non-cancellable')
             self._worker = None
             self._running = False
+            with self._metric_metadata_lock:
+                self._metric_pending_clouds.clear()
+                self._metric_pending_metadata.clear()
             return self._state("idle")
 
     def _state(self, state: str) -> dict:
@@ -586,8 +604,48 @@ class _PointCloudNode(Node):
         cloud.is_dense = True
         cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
         self._metric_cloud_pub.publish(cloud)
+        if self._metric_metadata_pub is not None:
+            key = (sec * 1_000_000_000 + nanosec, header.frame_id,
+                   hashlib.sha256(bytes(source.data)).hexdigest())
+            self._pair_metric_metadata(key, cloud_digest=hashlib.sha256(cloud.data).hexdigest())
         with self._metric_lock:
             self._metric_published += 1
+
+    def _metric_metadata_cb(self, msg):
+        if self._stop_event.is_set():
+            return
+        try:
+            packet = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(packet, dict) or packet.get('schema') != 'motus.slam_frame/1':
+            return
+        stamp, frame, digest = (packet.get(k) for k in ('stamp_ns', 'frame_id', 'data_sha256'))
+        if (type(stamp) is not int or stamp <= 0 or not isinstance(frame, str) or not frame
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(c not in '0123456789abcdef' for c in digest)):
+            return
+        self._pair_metric_metadata((stamp, frame, digest), packet=packet)
+
+    def _pair_metric_metadata(self, key, *, packet=None, cloud_digest=None):
+        # A reset can reuse stamp/frame. Bind evidence to the exact source
+        # payload, then replace its digest with that of the projected cloud.
+        with self._metric_metadata_lock:
+            if self._stop_event.is_set():
+                return
+            if packet is not None:
+                self._metric_pending_metadata.setdefault(key, packet)
+            if cloud_digest is not None:
+                self._metric_pending_clouds.setdefault(key, cloud_digest)
+            if key in self._metric_pending_metadata and key in self._metric_pending_clouds:
+                output = dict(self._metric_pending_metadata.pop(key))
+                output['data_sha256'] = self._metric_pending_clouds.pop(key)
+                msg = String()
+                msg.data = json.dumps(output)
+                self._metric_metadata_pub.publish(msg)
+            for pending in (self._metric_pending_metadata, self._metric_pending_clouds):
+                while len(pending) > 10:
+                    pending.pop(next(iter(pending)))
 
     # B: RGB → 单目深度引擎 → 反投影
     def _emit_mono(self, jpeg_bytes: bytes):
@@ -979,6 +1037,7 @@ class PointCloudPerceptionPlugin:
         # _upstream_camera_right 只在 stereo 两路时记录（右目自己的声明）。
         self._upstream_camera: dict[str, dict] = {}
         self._upstream_camera_right: dict[str, dict] = {}
+        self._upstream_input_metadata: dict[str, dict] = {}
 
     # ── lazy engine（mono 模式，与 visual_depth 同一机制与下载器）──────────
 
@@ -1183,7 +1242,13 @@ class PointCloudPerceptionPlugin:
                 node._ensure_mono_model = self._ensure_model_bg
             with self._nodes_lock:
                 upstream = self._upstream_camera.get(node_key) or {}
-            node._input_format = upstream.get("format")
+            declaration = self._upstream_input_metadata.get(node_key) or {}
+            node._input_format = declaration.get("format") or upstream.get("format")
+            metadata_topic = declaration.get("frame_metadata_topic")
+            if node._metric_cloud_enabled and isinstance(metadata_topic, str) and metadata_topic:
+                node._metric_metadata_source_topic = metadata_topic
+                node._metric_metadata_pub = node.create_publisher(
+                    String, node._metric_metadata_topic, _PUB_QOS)
             # A/B 模式的反投影内参兜底用上游 K（见 _pinhole_for）；
             # stereo 的 K 是双目标定的，不掺上游单目声明。
             if mode in ("depth", "mono", "auto"):
@@ -1241,6 +1306,7 @@ class PointCloudPerceptionPlugin:
             # 的光学参数回答 info()（同 visual_depth 的注释）。
             self._upstream_camera.pop(node_key, None)
             self._upstream_camera_right.pop(node_key, None)
+            self._upstream_input_metadata.pop(node_key, None)
         node.request_stop()
         result = node.stop()
         dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
@@ -1429,11 +1495,18 @@ class PointCloudPerceptionPlugin:
                 args.get("input_topic") or (args.get("input_topics") or [""])[0] or "",
                 nodes, cloud_topic, summary_topic)
             from plugins.camera_info import inherit
+            metadata_out = []
             for key, metric_node in nodes.items():
                 if not metric_node._metric_cloud_enabled or (instance_id in nodes and key != instance_id):
                     continue
                 with self._nodes_lock:
                     upstream = self._upstream_camera.get(key)
+                    declaration = copy.deepcopy(self._upstream_input_metadata.get(key))
+                if declaration:
+                    declaration.update(topic=metric_node._metric_cloud_topic, kind="cloud",
+                                       format="sensor/pointcloud2", length_unit="m",
+                                       frame_metadata_topic=metric_node._metric_metadata_topic)
+                    metadata_out.append(declaration)
                 c = metric_node._calibration
                 declaration = inherit(upstream, topic=metric_node._metric_cloud_topic,
                     fmt="sensor/pointcloud2", stage="perception/pointcloud",
@@ -1442,6 +1515,8 @@ class PointCloudPerceptionPlugin:
                     declaration[0]['K'] = [float(c['fx']), 0., float(c['cx']), 0.,
                                            float(c['fy']), float(c['cy']), 0., 0., 1.]
                     camera_out.extend(declaration)
+            if metadata_out:
+                info["input_metadata"] = metadata_out
             if camera_out:
                 info["camera_info"] = camera_out
             if camera_note:
@@ -1575,12 +1650,21 @@ class PointCloudPerceptionPlugin:
                         raise ValueError
                 except (KeyError, TypeError, ValueError):
                     return {"state": "error", "message": "metric_cloud requires finite measured fx/fy/cx/cy and image width/height"}
+            declarations = args.get("input_metadata")
+            if 'input_metadata' in args and (not isinstance(declarations, dict) or
+                    (input_topic in declarations and
+                     (not isinstance(declarations[input_topic], dict) or not declarations[input_topic]))):
+                return {'state': 'error', 'message': 'input_metadata must map input topics to nonempty declaration objects'}
+            declaration = declarations.get(input_topic) if isinstance(declarations, dict) else None
+            declaration = copy.deepcopy(declaration) if isinstance(declaration, dict) else {}
             with self._nodes_lock:
                 existing = self._nodes.get(node_key)
                 if existing and (existing._input_topic != (input_topic or '') or
                                  existing._input_topic_right != (right_topic or '') or
-                                 (mode != 'auto' and existing._mode != mode)):
-                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its inputs or mode'}
+                                 (mode != 'auto' and existing._mode != mode) or
+                                 declaration != self._upstream_input_metadata.get(node_key, {})):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its inputs, mode or metadata'}
+                self._upstream_input_metadata[node_key] = declaration
             # 先记录再起节点（同 visual_depth）：loading 期间 info() 也能回答；
             # 空声明同样记录 —— 重启不再带声明时要替换旧值而不是留过期镜头。
             # stereo 两路各记一份：声明层标定（_stereo_blob_from_declarations）

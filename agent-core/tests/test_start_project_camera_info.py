@@ -84,6 +84,12 @@ def rig(monkeypatch):
     # is the normal case for almost every card in the repository.
     declarations: dict = {}
     odometry: dict = {}
+    metadata: dict = {}
+    schemas = {
+        "pointcloud_slam": {"inputSchema": {"properties": {
+            "input_bindings": {}, "odom_interfaces": {}}}},
+    }
+    monkeypatch.setattr(config_api, "find_tool", lambda mcp_id, tool: schemas.get(tool, {}))
 
     async def _call(mcp_id, req, timeout_s=None):
         args = dict(req.arguments)
@@ -98,6 +104,8 @@ def rig(monkeypatch):
                 data['camera_info'] = declarations[card_id]
             if card_id in odometry:
                 data.update(odometry[card_id])
+            if card_id in metadata:
+                data['input_metadata'] = metadata[card_id]
             return {'code': 200, 'data': data}
         return {'code': 200, 'data': {'state': 'idle'}}
 
@@ -134,7 +142,8 @@ def rig(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
 
     return types.SimpleNamespace(starts=starts, events=events, infos=infos,
-                                 declarations=declarations, topic_outs=topic_outs, odometry=odometry)
+                                 declarations=declarations, topic_outs=topic_outs, odometry=odometry,
+                                 metadata=metadata, schemas=schemas)
 
 
 def _run(layout) -> bool:
@@ -309,3 +318,86 @@ def test_no_extra_round_trip_is_taken_for_it(rig):
 
     assert rig.infos, 'info() 一次都没被调用 —— 这条测试在空转'
     assert rig.infos.count(CAM) == 1, f'camera 被 info() 了 {rig.infos.count(CAM)} 次'
+
+
+def test_renamed_consumer_receives_only_declared_port_contracts(rig):
+    rig.schemas['renamed_mapper'] = {'inputSchema': {'properties': {
+        'input_metadata': {}, 'input_bindings': {}, 'odom_interfaces': {}}}}
+    cloud = {'schema': 'motus.slam_input/1', 'topic': CAM_TOPIC,
+             'kind': 'cloud', 'clock': {'verified': False, 'uncertainty_ns': None}}
+    pose = {'schema': 'motus.slam_input/1', 'topic': DEPTH_TOPIC, 'kind': 'pose'}
+    odom = {'schema': 'motus.odom/1', 'slam_pose': {'available': True}}
+    rig.metadata[CAM] = [cloud]
+    rig.metadata[DEPTH] = [pose]
+    rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'sensor/pointcloud2'}]
+    rig.topic_outs[DEPTH] = [{'topic': DEPTH_TOPIC, 'format': 'state/odom'}]
+    rig.odometry[DEPTH] = {'odom_interface': odom, 'odom_topic': DEPTH_TOPIC}
+    _run({'cards': [_card(CAM, 'source_a'), _card(DEPTH, 'source_b'),
+                    _card(NAVI, 'renamed_mapper')],
+          'connections': [_conn(DEPTH, NAVI, '/stale/pose'),
+                          _conn(CAM, NAVI, '/stale/cloud')]})
+    assert rig.starts[NAVI]['input_metadata'] == {DEPTH_TOPIC: pose, CAM_TOPIC: cloud}
+    assert rig.starts[NAVI]['input_bindings'] == {
+        DEPTH_TOPIC: 'state/odom', CAM_TOPIC: 'sensor/pointcloud2'}
+    assert rig.starts[NAVI]['odom_interfaces'] == {DEPTH_TOPIC: odom}
+    assert rig.infos.count(CAM) == 1
+
+
+def test_unconnected_sibling_declarations_do_not_reach_consumer(rig):
+    rig.schemas['metadata_consumer'] = {'inputSchema': {'properties': {'input_metadata': {}}}}
+    connected = {'topic': CAM2_TOPIC, 'schema': 'motus.slam_input/1', 'kind': 'depth'}
+    rig.metadata[CAM] = [{'topic': CAM_TOPIC, 'kind': 'pose'}, connected]
+    rig.declarations[CAM] = [_decl(CAM_TOPIC), _decl(CAM2_TOPIC, id='connected-camera')]
+    rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'state/odom'},
+                          {'topic': CAM2_TOPIC, 'format': 'image/depth-zlib'}]
+    conn = {**_conn(CAM, NAVI, '/stale/topic'), 'fromPortIdx': '1'}
+    _run({'cards': [_card(CAM, 'two_outputs'), _card(NAVI, 'metadata_consumer')],
+          'connections': [conn]})
+    assert rig.starts[NAVI]['input_metadata'] == {CAM2_TOPIC: connected}
+    assert rig.starts[NAVI]['camera_info'] == {CAM2_TOPIC: _decl(CAM2_TOPIC, id='connected-camera')}
+
+
+@pytest.mark.parametrize('name', ['strict_old_consumer', 'pointcloud_slam'])
+def test_undeclared_consumer_gets_no_new_kwargs_even_with_slam_name(rig, name):
+    rig.schemas[name] = {'inputSchema': {'properties': {
+        'action': {}, 'instance_id': {}, 'input_topic': {}}}}
+    rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'state/odom'}]
+    rig.metadata[CAM] = [{'topic': CAM_TOPIC, 'schema': 'motus.slam_input/1'}]
+    rig.odometry[CAM] = {'odom_interface': {'schema': 'motus.odom/1'}}
+    assert _run({'cards': [_card(CAM, 'source'), _card(NAVI, name)],
+                 'connections': [_conn(CAM, NAVI, CAM_TOPIC)]}) is not False
+    assert set(rig.starts[NAVI]) == {'action', 'instance_id', 'input_topic'}
+
+
+def test_routable_malformed_metadata_is_preserved_for_consumer_validation(rig):
+    rig.schemas['validator'] = {'inputSchema': {'properties': {'input_metadata': {}}}}
+    malformed = {'topic': CAM_TOPIC, 'schema': 'motus.slam_input/99',
+                 'clock': None, 'stamp_source': 'unknown'}
+    rig.metadata[CAM] = [malformed]
+    _run({'cards': [_card(CAM, 'source'), _card(NAVI, 'validator')],
+          'connections': [_conn(CAM, NAVI, CAM_TOPIC)]})
+    assert rig.starts[NAVI]['input_metadata'] == {CAM_TOPIC: malformed}
+
+
+@pytest.mark.parametrize('metadata', [None, {}, 'bad-shape', {CAM_TOPIC: {'kind': 'cloud'}}])
+def test_explicit_non_list_source_metadata_blocks_declared_consumer(rig, metadata):
+    rig.schemas['metadata_consumer'] = {'inputSchema': {'properties': {'input_metadata': {}}}}
+    rig.metadata[CAM] = metadata
+    result = _run({'cards': [_card(CAM, 'source'), _card(NAVI, 'metadata_consumer')],
+                   'connections': [_conn(CAM, NAVI, CAM_TOPIC)]})
+    assert result is False
+    assert NAVI not in rig.starts
+    errors = _errors(rig.events)
+    assert len(errors) == 1
+    assert errors[0]['tool'] == 'metadata_consumer'
+    assert 'input_metadata' in errors[0]['message']
+    assert CAM_TOPIC in errors[0]['message']
+    assert config.main['core']['project_running'] is False
+
+
+def test_legacy_consumer_does_not_adopt_or_validate_new_source_metadata(rig):
+    rig.metadata[CAM] = None
+    assert _run({'cards': [_card(CAM, 'source'), _card(NAVI, 'strict_old_consumer')],
+                 'connections': [_conn(CAM, NAVI, CAM_TOPIC)]}) is not False
+    assert 'input_metadata' not in rig.starts[NAVI]
+    assert not _errors(rig.events)

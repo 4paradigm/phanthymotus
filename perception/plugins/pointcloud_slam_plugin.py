@@ -38,7 +38,8 @@ TOOLS = [{'name': 'pointcloud_slam', 'type': 'processor', 'multiInstance': False
           'inputSchema': {'type': 'object', 'properties': {
               'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config']},
               'input_topics': {'type': 'array', 'items': {'type': 'string'}},
-              'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'}}, 'required': ['action']},
+              'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
+              'input_metadata': {'type': 'object'}}, 'required': ['action']},
           'configSchema': {'type': 'object', 'properties': {
               'cloud_frame': {'type': 'string', 'description': 'Point cloud frame'},
               'child_frame': {'type': 'string', 'description': 'Pose reference frame, supports {segment_id}'},
@@ -83,6 +84,8 @@ class PointCloudSlamPlugin:
         self._executor = executor
         self._node = None
         self._topics = {}
+        self._resolved_inputs = None
+        self._input_diagnostics = []
         self._project_inputs = None
         self._pending = None
         self._map_name = None
@@ -130,15 +133,18 @@ class PointCloudSlamPlugin:
         return TOOLS
 
     def _input_validation(self):
+        settings = (self._resolved_inputs or {}).get('settings', self._config)
         return {'policy': self._config.get('input_policy', 'strict'),
-                'clock_relation_verified': self._config.get('clock_relation_verified') is True,
-                'extrinsic_calibrated': self._config.get('extrinsic_calibrated') is True}
+                'clock_relation_verified': settings.get('clock_relation_verified') is True,
+                'extrinsic_calibrated': settings.get('extrinsic_calibrated') is True}
 
     def _stream(self):
         keys = ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud',
                 'max_gap_ms', 'max_age_s', 'max_pending', 'max_cloud_points',
                 'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
-        return SlamStream(**{key: self._config[key] for key in keys})
+        settings = {**self._config, **(self._resolved_inputs or {}).get('settings', {})}
+        return SlamStream(**{key: settings[key] for key in keys},
+                          input_contract=self._resolved_inputs)
 
     def start(self):
         pass  # Canvas start supplies the two resolved inputs.
@@ -312,6 +318,8 @@ class PointCloudSlamPlugin:
                         'map_name': self._map_name, 'selected_map_id': self._view_id,
                         'last_stop': self._last_stop,
                         'input_validation': self._input_validation(),
+                        'resolved_inputs': deepcopy((self._resolved_inputs or {}).get('inputs', {})),
+                        'input_diagnostics': deepcopy(self._input_diagnostics),
                         'desc': 'Experimental odometry and point-cloud preview',
                         'topic_in': [{'topic': topic, 'format': fmt}
                                      for topic, fmt in self._topics.items()],
@@ -341,9 +349,27 @@ class PointCloudSlamPlugin:
                     not isinstance(capability, dict) or capability.get('available') is not True or
                     capability.get('profile') != 'motus_slam/1'):
                 return {'state': 'error', 'message': 'odometry source lacks declared SLAM pose capability'}
+            self._resolved_inputs = None
+            self._input_diagnostics = []
+            if 'input_metadata' in args:
+                from .pointcloud_slam_input import resolve_inputs, InputContractError
+                try:
+                    self._resolved_inputs = resolve_inputs(args['input_metadata'], bindings,
+                        experimental=self._config.get('input_policy') == 'experimental')
+                    if (self._config.get('preview_backend') == 'geometry_experimental' and
+                            self._resolved_inputs['inputs'][next(t for t, f in bindings.items()
+                                if f == 'sensor/pointcloud2')]['observation_model'] != 'pinhole'):
+                        raise InputContractError([dict(topic='', field='observation_model',
+                            reason='lidar geometry scoring is not implemented in this batch')])
+                except InputContractError as error:
+                    self._resolved_inputs = None
+                    self._input_diagnostics = error.diagnostics
+                    return {'state': 'error', 'message': str(error),
+                            'input_diagnostics': deepcopy(self._input_diagnostics)}
+            validation = self._input_validation()
             if (self._config.get('input_policy') != 'experimental' and
-                    (self._config.get('clock_relation_verified') is not True or
-                     self._config.get('extrinsic_calibrated') is not True)):
+                    (validation['clock_relation_verified'] is not True or
+                     validation['extrinsic_calibrated'] is not True)):
                 return {'state': 'error', 'message': 'verified clock relation and measured extrinsic required'}
             if (self._config.get('max_measurement_age_ms') is None or
                     self._config.get('max_future_skew_ms') is None):
@@ -379,6 +405,7 @@ class PointCloudSlamPlugin:
         bindings = args['input_bindings']
         odom_topic = next(t for t, f in bindings.items() if f == 'state/odom')
         session_directory = None
+        settings = {**self._config, **(self._resolved_inputs or {}).get('settings', {})}
         try:
             stream = self._stream()
             links, loops, history = [], {}, {}
@@ -390,7 +417,7 @@ class PointCloudSlamPlugin:
                 if self._config.get('restore_archive') is True:
                     from .pointcloud_slam_paged_archive import load_paged_archive
                     stream.store, history = load_paged_archive(_archive_path(self._config.get('archive_name')),
-                        self._config, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
+                        settings, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
                     session_directory = stream.store.directory
                 else:
                     from .pointcloud_slam_paged_store import PagedKeyframeStore
@@ -400,7 +427,7 @@ class PointCloudSlamPlugin:
             elif self._config.get('restore_archive') is True:
                 from .pointcloud_slam_archive import load_archive
                 stream.store, links, loops = load_archive(_archive_path(self._config.get('archive_name')),
-                    self._config, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
+                    settings, max_frames=self._config['max_frames'], max_points=self._config['max_points'])
             cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
             preview = None
             if persistent or self._config.get('preview_enabled') is True:
@@ -439,7 +466,7 @@ class PointCloudSlamPlugin:
             if session_directory:
                 shutil.rmtree(session_directory, ignore_errors=True)
             return {'state': 'error', 'message': str(error)}
-        self._session_settings = deepcopy(self._config)
+        self._session_settings = deepcopy(settings)
         self._topics = dict(bindings)
         self._node = node
         return {'state': 'running', 'message': 'Experimental inputs started'}

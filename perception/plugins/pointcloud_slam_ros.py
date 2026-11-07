@@ -121,6 +121,9 @@ class SlamInputNode(Node):
                 self.create_subscription(String, odom_topic, self._odom, _QOS)
             if cloud_topic is not None:
                 self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
+                if stream.input_contract:
+                    self.create_subscription(String, stream.input_contract['frame_metadata_topic'],
+                                             self._cloud_metadata, _QOS)
         except Exception:
             self.destroy_node()
             raise
@@ -138,6 +141,21 @@ class SlamInputNode(Node):
             self.stream.odom(sample, now=self._receipt_clock(), measurement_now_ns=measurement_now)
         self._preview_wake.set()
 
+    def _cloud_metadata(self, msg):
+        try:
+            packet = json.loads(msg.data)
+            with self._lock:
+                if self._preview_stop.is_set():
+                    return
+                measurement_now = (self._measurement_clock_ns()
+                                   if self.stream.max_measurement_age_ms is not None else None)
+                self.stream.cloud_metadata(packet, now=self._receipt_clock(),
+                                           measurement_now_ns=measurement_now)
+        except (TypeError, ValueError) as error:
+            with self._lock:
+                self.stream.last_error = str(error)
+        self._preview_wake.set()
+
     def _cloud(self, msg):
         try:
             stamp, frame, points = decode_cloud(msg, max_points=self.stream.max_cloud_points)
@@ -147,7 +165,9 @@ class SlamInputNode(Node):
                 measurement_now = (self._measurement_clock_ns()
                                    if self.stream.max_measurement_age_ms is not None else None)
                 self.stream.cloud(stamp, frame, points, now=self._receipt_clock(),
-                                  measurement_now_ns=measurement_now)
+                                  measurement_now_ns=measurement_now,
+                                  data_sha256=hashlib.sha256(bytes(msg.data)).hexdigest()
+                                      if self.stream.input_contract else None)
         except ValueError as error:
             with self._lock:
                 self.stream.last_error = str(error)
