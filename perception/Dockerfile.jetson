@@ -659,7 +659,8 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
     }; \
     fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}"; \
     fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da; \
-    rtabmap_packages='message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
+    fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e; \
+    rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
     add_missing_rtabmap_dependencies() { \
       dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; shift 3; \
       missing_packages=''; \
@@ -683,8 +684,6 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
       69b50c6db906b2044502b00c1b35dc97ec8a40ce image_transport; \
     add_missing_rtabmap_dependencies laser_geometry ros-perception/laser_geometry \
       d53b925d25b4b5657261a44f4479365965cc2363 laser_geometry; \
-    add_missing_rtabmap_dependencies geometry2 ros2/geometry2 \
-      404b7224d623d614f18fa9738dbf1716403d857e tf2_eigen; \
     rtabmap_rcutils="$(readlink -f /opt/ros/humble/install/lib/librcutils.so)"; \
     rtabmap_builtin="$(readlink -f /opt/ros/humble/install/lib/libbuiltin_interfaces__rosidl_generator_c.so)"; \
     rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
@@ -802,9 +801,9 @@ EXPOSE 15721
 # the failure would surface at runtime as a missing rclpy, not at build time.
 RUN . /etc/jetpack.env; \
     PTH="/usr/local/lib/python${PY_ABI}/dist-packages/ros_ws.pth"; \
-    find /ros_ws/install -name "site-packages" -type d > "${PTH}" && \
+    find /opt/rtabmap_ros -type d \( -name "site-packages" -o -name "dist-packages" \) > "${PTH}" && \
+    find /ros_ws/install -name "site-packages" -type d >> "${PTH}" && \
     find /opt/ros/humble/install -name "site-packages" -type d >> "${PTH}" && \
-    find /opt/rtabmap_ros -type d \( -name "site-packages" -o -name "dist-packages" \) >> "${PTH}" && \
     echo "[build] ${PTH}:" && cat "${PTH}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
