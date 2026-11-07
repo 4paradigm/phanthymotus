@@ -50,3 +50,35 @@ def test_window_point_budget_and_real_segment_separation(tmp_path, monkeypatch):
     assert max(FakeSearch.sizes)==3
     add(s,10,segment='b')
     with pytest.raises(ValueError): w.update(s.segments[1],max_points=10)
+
+
+def test_rolling_keeps_explicit_strategy_and_window_budgets_between_batches(tmp_path):
+    pytest.importorskip('open3d'); pytest.importorskip('gtsam')
+    from test_pointcloud_slam_strategy import options
+    from test_pointcloud_slam_observation import lidar, scoring
+    opts = options(); spec = scoring(True)
+    opts['thresholds'].pop('max_rmse_m')
+    opts['thresholds'].update(max_range_stratified_rmse_m=.09, score_contract=spec)
+    opts['min_separation_s'] = 1000.
+    s = store(tmp_path)
+    for i in range(7): add(s, i)
+    worker = RollingGeometryHistory(opts, window_frames=3, window_points=100,
+        observation=lidar(), scoring=spec, revisit={'enabled': False})
+    result = worker.update(s.segments[0], max_points=10)
+    assert result['resolved_observation']['kind'] == 'lidar'
+    assert result['resolved_scoring'] == spec and result['compatibility'] == []
+    assert result['resource_profile']['window_frames'] == 3
+    assert result['resource_profile']['window_points'] == 100
+    assert result['resource_profile']['preview_max_points'] == 10
+    assert result['submaps'] == 3
+
+
+def test_optional_camera_kwargs_cannot_override_an_explicit_legacy_child_x_profile():
+    from test_pointcloud_slam_strategy import options
+    opts = options(); opts['thresholds'].pop('max_rmse_m')
+    opts['thresholds']['max_forward_depth_score_m'] = .09
+    opts['legacy_profile'] = 'child_x_depth'
+    worker = RollingGeometryHistory(opts, window_frames=3, window_points=100,
+        camera=(160, 120, 100., 100., 80., 60.), optical_from_child=np.eye(4))
+    assert worker.worker.revisit is None
+    assert worker.strategy_snapshot()['resolved_scoring']['metric_id'] == 'legacy_child_x_depth'

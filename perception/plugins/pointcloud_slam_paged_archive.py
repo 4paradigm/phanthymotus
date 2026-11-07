@@ -7,7 +7,7 @@ import re
 import tempfile
 import uuid
 
-from .pointcloud_slam_archive import _configuration
+from .pointcloud_slam_archive import _configuration, archive_metadata, archived_metadata
 from .pointcloud_slam_odom import decode_slam_odom
 from .pointcloud_slam_paged_store import PagedKeyframeStore, DiskPoints
 from .pointcloud_slam_stream import _rigid
@@ -21,7 +21,9 @@ def configuration(settings):
 
 def save_paged_archive(path, store, history, settings):
     # Call under the input lock; history snapshots are committed immutable lists.
-    data={'schema':'motus.experimental-slam-paged/1', 'configuration':configuration(settings),
+    data={'schema':'motus.experimental-slam-paged/2', 'configuration':configuration(settings),
+          'resolved':archive_metadata(settings, segment_ids=[s.segment_id for s in store.segments],
+                                      inherited=getattr(store, 'archive_metadata', None)),
           'frames':store.records, 'history':history}
     fd,temp=tempfile.mkstemp(prefix='.slam-',dir=Path(path).parent)
     try:
@@ -44,7 +46,7 @@ def load_paged_archive(path, settings, *, max_frames, max_points, read_only=Fals
             # A saved map has its own coordinate frames, calibration and storage policy.
             settings = data['configuration']
         expected = configuration(settings)
-        if (data.get('schema')!='motus.experimental-slam-paged/1' or
+        if (data.get('schema') not in ('motus.experimental-slam-paged/1','motus.experimental-slam-paged/2') or
                 data.get('configuration')!=expected):
             raise ValueError('paged archive configuration mismatch')
         frames,history=data['frames'],data['history']
@@ -74,7 +76,8 @@ def load_paged_archive(path, settings, *, max_frames, max_points, read_only=Fals
                     pose.child_frame_id!=settings['child_frame'].replace('{segment_id}',pose.segment_id)):
                 raise ValueError('archived pose frame or clock mismatch')
             store._restore_ref=points
-            store.add(pose,points,cloud_stamp_ns=record['stamp_ns'])
+            store.add(pose,points,cloud_stamp_ns=record['stamp_ns'],
+                      capture_context=record.get('capture_context'))
             store._restore_ref=None
             journal_size=0 if read_only else store._append_record(record)
             store.records.append(record);store.disk_bytes+=size+journal_size
@@ -85,7 +88,20 @@ def load_paged_archive(path, settings, *, max_frames, max_points, read_only=Fals
             expected=[f.cloud_stamp_ns for f in segments[key].frames[:len(snapshot['stamps'])]]
             if snapshot['stamps']!=expected: raise ValueError('history capture stamps mismatch')
             for pose in snapshot['poses']: _rigid(pose)
+        store.archive_metadata=archived_metadata(data)
         store.mark_lost()
         return store,history
     except (OSError,KeyError,TypeError,UnicodeError,json.JSONDecodeError) as error:
         raise ValueError('invalid paged map archive') from error
+
+
+def inspect_paged_archive(path):
+    with Path(path).open('rb') as src:
+        raw = src.read(MAX_CHECKPOINT_BYTES + 1)
+    if len(raw) > MAX_CHECKPOINT_BYTES:
+        raise ValueError('paged checkpoint too large')
+    data = json.loads(raw)
+    if data.get('schema') not in ('motus.experimental-slam-paged/1', 'motus.experimental-slam-paged/2'):
+        raise ValueError('unsupported paged map archive')
+    configuration(data['configuration'])
+    return data['configuration'], archived_metadata(data)

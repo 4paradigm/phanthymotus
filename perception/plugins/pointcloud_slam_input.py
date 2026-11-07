@@ -50,6 +50,14 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
     clock = cloud.get('clock')
     clock = clock if isinstance(clock, dict) else {}
     require(isinstance(clock.get('mapping'), str) and bool(clock['mapping'].strip()), cloud_topic, 'clock.mapping')
+    pose_clock = pose.get('clock') if isinstance(pose.get('clock'), dict) else {}
+    independent = pose.get('source_id') != cloud.get('source_id')
+    relation_id = clock.get('relation_id') if independent else None
+    verified = clock.get('verified') is True and pose_clock.get('verified') is True
+    if independent:
+        require(verified and isinstance(relation_id, str) and bool(relation_id.strip()) and
+                relation_id != 'unknown' and pose_clock.get('relation_id') == relation_id,
+                cloud_topic, 'clock.relation_id', 'independent sources require both verified relation proofs')
     cloud_mount, pose_mount = cloud.get('extrinsic'), pose.get('extrinsic')
     extrinsic = pose_mount if isinstance(pose_mount, dict) else cloud_mount
     extrinsic = extrinsic if isinstance(extrinsic, dict) else {}
@@ -59,7 +67,9 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
             from .pointcloud_slam_stream import _rigid
             same = (cloud_mount.get('parent_frame') == pose_mount.get('parent_frame') and
                     cloud_mount.get('child_frame') == pose_mount.get('child_frame') and
-                    np.allclose(_rigid(cloud_mount.get('matrix')), _rigid(pose_mount.get('matrix')), atol=1e-6))
+                    cloud_mount.get('mode', 'static') == pose_mount.get('mode', 'static') and
+                    (cloud_mount == pose_mount if cloud_mount.get('mode') == 'dynamic' else
+                     np.allclose(_rigid(cloud_mount.get('matrix')), _rigid(pose_mount.get('matrix')), atol=1e-6)))
         except (AttributeError, TypeError, ValueError):
             same = False
         require(same, cloud_topic, 'extrinsic', 'conflicting producer transforms')
@@ -70,24 +80,33 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
             cloud_topic, 'extrinsic', 'must explicitly map cloud frame into pose child frame')
     for key in ('source', 'version'):
         require(isinstance(extrinsic.get(key), str) and bool(extrinsic[key].strip()), cloud_topic, 'extrinsic.' + key)
+    mode = extrinsic.get('mode', 'static')
+    require(mode in ('static', 'dynamic'), cloud_topic, 'extrinsic.mode')
     matrix = None
-    try:
-        from .pointcloud_slam_stream import _rigid
-        matrix = _rigid(extrinsic.get('matrix')).tolist()
-    except (TypeError, ValueError):
-        require(False, cloud_topic, 'extrinsic.matrix', 'must be a rigid 4x4 transform')
+    if mode == 'dynamic':
+        require(extrinsic.get('source') == 'tf', cloud_topic, 'extrinsic.source', 'dynamic transform must use tf')
+        require('matrix' not in extrinsic, cloud_topic, 'extrinsic.matrix', 'dynamic declaration must not contain a static matrix')
+    else:
+        try:
+            from .pointcloud_slam_stream import _rigid
+            matrix = _rigid(extrinsic.get('matrix')).tolist()
+        except (TypeError, ValueError):
+            require(False, cloud_topic, 'extrinsic.matrix', 'must be a rigid 4x4 transform')
     if not experimental:
-        require(clock.get('verified') is True, cloud_topic, 'clock', 'must be verified for strict policy')
+        require(verified, cloud_topic, 'clock', 'must be verified for strict policy')
         require(extrinsic.get('calibrated') is True, cloud_topic, 'extrinsic', 'must be verified by calibration for strict policy')
     if diagnostics:
         raise InputContractError(diagnostics)
     return dict(inputs=inputs, frame_metadata_topic=sidecar, experimental=experimental,
+                extrinsic=deepcopy(extrinsic),
+                clock_relation_mode='verified_relation' if independent else 'shared_source',
+                relation_id=relation_id,
                 settings=dict(cloud_frame=frame, child_frame=child, clock_id=cloud['clock_id'],
-                              child_from_cloud=matrix, clock_relation_verified=clock.get('verified') is True,
+                              child_from_cloud=matrix, extrinsic_mode=mode, clock_relation_verified=verified,
                               extrinsic_calibrated=extrinsic.get('calibrated') is True))
 
 
-def frame_identity(packet, *, clock_id, experimental=False, payload=False):
+def frame_identity(packet, *, clock_id, experimental=False, payload=False, relation_id=None):
     """Validate an individual measurement's provenance, returning its epoch key."""
     if not isinstance(packet, dict) or packet.get('schema') != 'motus.slam_frame/1':
         raise ValueError('measurement provenance is required')
@@ -116,6 +135,9 @@ def frame_identity(packet, *, clock_id, experimental=False, payload=False):
     if error is not None and (isinstance(error, bool) or not isinstance(error, (int, float)) or
                               not math.isfinite(error) or error < 0):
         raise ValueError('invalid measurement mapping uncertainty')
+    if relation_id is not None and (mapping.get('relation_id') != relation_id or
+                                    mapping.get('verified') is not True or error is None):
+        raise ValueError('measurement verified clock relation evidence is required')
     if not experimental and (mapping.get('verified') is not True or error is None):
         raise ValueError('measurement mapping is not verified')
     if payload and (not isinstance(packet.get('data_sha256'), str) or

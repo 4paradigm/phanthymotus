@@ -35,20 +35,23 @@ def coarse_alignment(source, target, *, voxel_m, max_distance_m):
 
 
 def relocalize_pair(target, target_graph, source, source_graph, *,
-                    descriptor_voxel_m, max_candidates, **merge_options):
+                    descriptor_voxel_m, max_candidates, observation=None, scoring=None,
+                    legacy_profile=None, target_observation=None, **merge_options):
     """Try bounded descriptor-ranked frame pairs; never certify a real loop."""
     from .pointcloud_slam_keyframes import Segment
     from .pointcloud_slam_loop_search import _descriptor
-    from .pointcloud_slam_segment_merge import experimental_segment_merge
+    from .pointcloud_slam_segment_merge import experimental_segment_merge, _merge_strategy
     if (not isinstance(target, Segment) or not isinstance(source, Segment) or
             not target.frames or not source.frames or target.segment_id == source.segment_id or
             type(max_candidates) is not int or max_candidates <= 0):
         raise ValueError('distinct nonempty segments and positive candidate limit required')
+    strategy = _merge_strategy(merge_options['thresholds'], observation=observation, scoring=scoring,
+                               legacy_profile=legacy_profile, target_observation=target_observation)
     source_index = len(source.frames) - 1
     try:
         query = _descriptor(source.frames[source_index].points, descriptor_voxel_m)
     except ValueError:
-        return {'hypothesis_created': False, 'loop_accepted': False, 'attempts': 0}
+        return {**strategy, 'hypothesis_created': False, 'loop_accepted': False, 'attempts': 0}
     candidates = []
     for i, frame in enumerate(target.frames):
         try:
@@ -65,7 +68,9 @@ def relocalize_pair(target, target_graph, source, source_graph, *,
         if initial is None:
             continue
         result = experimental_segment_merge(target, target_graph, source, source_graph,
-            target_index=index, source_index=source_index, initial=initial, **merge_options)
+            target_index=index, source_index=source_index, initial=initial,
+            observation=observation, scoring=scoring, legacy_profile=legacy_profile,
+            target_observation=target_observation, **merge_options)
         if result['hypothesis_created']:
             return {**result, 'attempts': attempts, 'target_index': index, 'source_index': source_index}
-    return {'hypothesis_created': False, 'loop_accepted': False, 'attempts': attempts}
+    return {**strategy, 'hypothesis_created': False, 'loop_accepted': False, 'attempts': attempts}

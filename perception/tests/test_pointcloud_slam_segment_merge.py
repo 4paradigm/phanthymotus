@@ -66,3 +66,72 @@ def test_cross_segment_registration_direction_is_source_to_target():
                                       source_index=0, initial=initial, **options())
     assert result['hypothesis_created']
     assert result['source_poses'][0][0, 3] == pytest.approx(2, abs=.01)
+
+
+def modeled_pair(radial=False):
+    """Two child frames observe one sensor scene with different capture mounts."""
+    from dataclasses import replace
+    from plugins.pointcloud_slam_keyframes import Segment
+    from test_pointcloud_slam_observation import pinhole, lidar, scoring
+    rng = np.random.default_rng(92)
+    ranges = np.repeat([1., 3., 5.], 100)
+    uv = rng.uniform(-.2, .2, (len(ranges), 2))
+    depth = ranges+rng.uniform(-.03, .03, len(ranges))
+    raw = np.column_stack((uv*depth[:, None], depth))
+    if radial:
+        raw = raw[:, [2, 0, 1]]
+    a = np.array([[0, 0, 1, 2], [-1, 0, 0, 3], [0, -1, 0, 0], [0, 0, 0, 1.]])
+    b = a.copy(); b[0, 3] += 1.
+    stream = make_stream()
+    add_frame(stream, 1000, 0, raw@a[:3, :3].T+a[:3, 3])
+    stream.odom(odom(1100, status='lost'), now=1.1)
+    add_frame(stream, 1200, 9, raw@b[:3, :3].T+b[:3, 3], segment='b')
+    segments = [Segment(s.segment_id, tuple(replace(f, capture_context={'child_from_cloud': t.tolist()})
+                    for f in s.frames)) for s, t in zip(stream.store.segments, (a, b))]
+    observation = lidar() if radial else pinhole()
+    observation.update(transform_mode='per_capture', sensor_from_child=None)
+    spec = scoring(radial)
+    opts = options(); opts['thresholds'].pop('max_rmse_m')
+    opts['thresholds'].update(max_range_stratified_rmse_m=.05, score_contract=spec)
+    return (*segments, *stream.graph(), a@np.linalg.inv(b), observation, spec, opts)
+
+
+@pytest.mark.parametrize('radial', [False, True])
+def test_explicit_cross_segment_models_keep_independent_capture_origins(radial):
+    target, source, a, b, initial, observation, spec, opts = modeled_pair(radial)
+    result = experimental_segment_merge(target, a, source, b, target_index=0, source_index=0,
+        initial=initial, observation=observation, scoring=spec, **opts)
+    assert result['hypothesis_created'] and result['loop_accepted'] is False
+    assert result['resolved_scoring'] == spec and result['compatibility'] == []
+    diagnostic = result['diagnostic']
+    assert diagnostic['forward']['score_metadata'] == spec
+    assert diagnostic['reverse']['score_metadata'] == spec
+    assert diagnostic['forward']['range_stratified_rmse_m'] == pytest.approx(0., abs=1e-10)
+
+
+def test_explicit_legacy_visible_merge_cannot_fall_back_to_child_x_depth():
+    from plugins.pointcloud_slam_observation import legacy_scoring
+    target, source, a, b, initial, observation, spec, opts = modeled_pair()
+    opts['thresholds'].pop('max_range_stratified_rmse_m')
+    opts['thresholds'].update(max_forward_depth_score_m=.05,
+                               score_contract=legacy_scoring(visible=True))
+    result = experimental_segment_merge(target, a, source, b, target_index=0, source_index=0,
+        initial=initial, observation=observation, legacy_profile='visible_optical_depth', **opts)
+    assert result['hypothesis_created']
+    assert result['diagnostic']['score_metadata']['metric_id'] == 'legacy_visible_optical_depth'
+    assert result['compatibility'] and result['resolved_scoring']['range_definition'] == 'sensor_optical_z'
+
+
+def test_explicit_merge_rejects_unbound_thresholds_and_missing_capture_evidence():
+    from dataclasses import replace
+    from plugins.pointcloud_slam_keyframes import Segment
+    target, source, a, b, initial, observation, spec, opts = modeled_pair()
+    call = dict(target_index=0, source_index=0, initial=initial, observation=observation)
+    with pytest.raises(ValueError):
+        experimental_segment_merge(target, a, source, b, scoring=spec, **call, **options())
+    source = Segment(source.segment_id, (replace(source.frames[0], capture_context=None),))
+    with pytest.raises(ValueError, match='capture'):
+        experimental_segment_merge(target, a, source, b, scoring=spec, **call, **opts)
+    with pytest.raises(ValueError):
+        experimental_segment_merge(target, a, source, b, scoring=spec,
+            legacy_profile='visible_optical_depth', **call, **opts)

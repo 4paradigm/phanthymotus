@@ -5,6 +5,7 @@ extrinsic. ``now`` is monotonic receipt time, used only to detect stale input;
 it is never substituted for a measurement timestamp. Calls must be serialized.
 """
 from collections import deque, OrderedDict
+from copy import deepcopy
 import math
 
 import numpy as np
@@ -39,7 +40,7 @@ class SlamStream:
     def __init__(self, *, cloud_frame, child_frame, clock_id, child_from_cloud,
                  max_gap_ms, max_age_s, max_pending, max_cloud_points,
                  max_frames, max_points, max_measurement_age_ms=None,
-                 max_future_skew_ms=None, input_contract=None):
+                 max_future_skew_ms=None, input_contract=None, extrinsic_mode='static'):
         if any(not isinstance(s, str) or not s.strip() for s in
                (cloud_frame, child_frame, clock_id)):
             raise ValueError('cloud frame, child frame and verified clock required')
@@ -63,7 +64,13 @@ class SlamStream:
         self.max_measurement_age_ms = max_measurement_age_ms
         self.max_future_skew_ms = max_future_skew_ms
         self.cloud_frame, self.child_frame, self.clock_id = cloud_frame, child_frame, clock_id
-        self.extrinsic = _rigid(child_from_cloud)
+        self.extrinsic_mode = (input_contract['settings'].get('extrinsic_mode', extrinsic_mode)
+                               if input_contract else extrinsic_mode)
+        if self.extrinsic_mode not in ('static', 'dynamic'):
+            raise ValueError('unsupported extrinsic mode')
+        if self.extrinsic_mode == 'dynamic' and child_from_cloud is not None:
+            raise ValueError('dynamic extrinsic cannot use a startup matrix')
+        self.extrinsic = None if self.extrinsic_mode == 'dynamic' else _rigid(child_from_cloud)
         self.max_gap_ms, self.max_age_s = max_gap_ms, max_age_s
         self.max_pending, self.max_cloud_points = max_pending, max_cloud_points
         self.store = KeyframeStore(max_frames=max_frames, max_points=max_points)
@@ -77,6 +84,11 @@ class SlamStream:
         self._input_segment = None
         self._retired_identities = set()
         self._pose_measurement = None
+        self._cloud_identity = None
+        self._cloud_measurement = None
+        self._cloud_segment = None
+        self._retired_cloud_identities = set()
+        self._required_new_segment = None
         self._cloud_metadata = OrderedDict()
         self._unmatched_clouds = OrderedDict()
         self.last_error = ''
@@ -120,7 +132,8 @@ class SlamStream:
                 self._check_measurement_time(self._last_cloud_stamp_ns, measurement_now_ns)
             except ValueError:
                 cloud_state = 'stale'
-        integration = ('waiting_for_tracking' if odom_state != 'tracking' else
+        integration = ('waiting_for_new_segment' if self._required_new_segment is not None else
+                       'waiting_for_tracking' if odom_state != 'tracking' else
                        'waiting_for_new_segment' if self.store.requires_new_segment else
                        'storage_fault' if getattr(self.store, 'storage_error', '') else
                        'capacity_reached' if self._capacity_reached else
@@ -163,16 +176,10 @@ class SlamStream:
                     raise ValueError('pose_reference changed or unknown; restart inputs')
                 measurement = quality.get('measurement')
                 identity = frame_identity(measurement, clock_id=self.clock_id,
-                    experimental=self.input_contract['experimental'])
+                    experimental=self.input_contract['experimental'],
+                    relation_id=self.input_contract.get('relation_id'))
                 if measurement['stamp_ns'] // 1_000_000 != pose.stamp_ms:
                     raise ValueError('pose measurement timestamp mismatch')
-                if (self._input_identity is not None and identity != self._input_identity and
-                        pose.segment_id == self._input_segment):
-                    raise ValueError('input epoch/generation change requires a new segment')
-                if (identity == self._input_identity and self._pose_measurement is not None and
-                        (measurement['mapping'] != self._pose_measurement['mapping'] or
-                         measurement['source_clock'] != self._pose_measurement['source_clock'])):
-                    raise ValueError('clock mapping changed without a new epoch')
                 if identity in self._retired_identities:
                     self.last_error = 'retired input epoch/generation dropped'
                     return
@@ -195,21 +202,31 @@ class SlamStream:
                 self._lose()
             return
         try:
-            if (self._poses and pose.segment_id == self._poses[-1].segment_id and
-                    pose.stamp_ms < self._poses[-1].stamp_ms):
-                self.last_error = 'late odometry sample dropped'
-                return
             self._check_measurement_time(pose.stamp_ms * 1_000_000, measurement_now_ns)
             expected_child = self.child_frame.replace('{segment_id}', pose.segment_id)
             if pose.clock_id != self.clock_id or pose.child_frame_id != expected_child:
                 raise ValueError('pose clock or child frame mismatch')
+            if self.input_contract:
+                same_segment = pose.segment_id == self._input_segment
+                changed = self._input_identity is not None and identity != self._input_identity
+                mapping_changed = (identity == self._input_identity and self._pose_measurement is not None and
+                    (measurement['mapping'] != self._pose_measurement['mapping'] or
+                     measurement['source_clock'] != self._pose_measurement['source_clock']))
+                if self._required_new_segment == pose.segment_id or (same_segment and (changed or mapping_changed)):
+                    self._required_new_segment = self._input_segment
+                    raise ValueError('input epoch/generation or clock mapping change requires a new segment')
+            if (self._poses and pose.segment_id == self._poses[-1].segment_id and
+                    pose.stamp_ms < self._poses[-1].stamp_ms):
+                self.last_error = 'late odometry sample dropped'
+                return
             if self.input_contract:
                 if self._input_identity is not None and identity != self._input_identity:
                     self._retired_identities.add(self._input_identity)
                     self._lose()
                 self._input_identity = identity
                 self._input_segment = pose.segment_id
-                self._pose_measurement = measurement
+                self._pose_measurement = deepcopy(measurement)
+                self._required_new_segment = None
             if self._poses and pose == self._poses[-1]:
                 return
             if self._poses and pose.segment_id != self._poses[-1].segment_id:
@@ -232,22 +249,74 @@ class SlamStream:
         self._odom_state = 'tracking'
         self._drain(now, measurement_now_ns)
 
+    def _capture_context(self, packet):
+        declaration = self.input_contract.get('extrinsic', {})
+        if self.extrinsic_mode == 'dynamic':
+            evidence = packet.get('extrinsic')
+            if not isinstance(evidence, dict):
+                raise ValueError('dynamic extrinsic capture evidence is required')
+            expected = dict(stamp_ns=packet['stamp_ns'], clock_id=packet['clock_id'],
+                            clock_epoch=packet['clock_epoch'],
+                            parent_frame=self.child_frame.replace('{segment_id}', self._input_segment or ''),
+                            child_frame=packet['frame_id'], source=declaration['source'],
+                            version=declaration['version'])
+            if any(evidence.get(k) != v for k, v in expected.items()):
+                raise ValueError('dynamic extrinsic timestamp/clock/frame/source/version mismatch')
+            matrix = _rigid(evidence.get('matrix'))
+        else:
+            evidence, matrix = declaration, self.extrinsic
+        return deepcopy(dict(child_from_cloud=matrix.tolist(), extrinsic=evidence,
+                             measurement=packet))
+
     def cloud_metadata(self, packet, *, now, measurement_now_ns=None):
         if not self.input_contract:
             return
         from .pointcloud_slam_input import frame_identity
         try:
             identity = frame_identity(packet, clock_id=self.clock_id, payload=True,
-                experimental=self.input_contract['experimental'])
-            if identity != self._input_identity:
-                raise ValueError('cloud epoch/generation does not match current pose')
+                experimental=self.input_contract['experimental'],
+                relation_id=self.input_contract.get('relation_id'))
             if packet['frame_id'] != self.cloud_frame:
                 raise ValueError('cloud metadata frame mismatch')
-            if (packet['mapping'] != self._pose_measurement['mapping'] or
-                    packet['source_clock'] != self._pose_measurement['source_clock']):
-                raise ValueError('cloud and pose clock mapping evidence differs')
+            self._check_measurement_time(packet['stamp_ns'], measurement_now_ns)
+            context = self._capture_context(packet)
+            independent = self.input_contract.get('clock_relation_mode') == 'verified_relation'
+            if not independent:
+                if identity != self._input_identity:
+                    raise ValueError('cloud epoch/generation does not match current pose')
+                if (packet['mapping'] != self._pose_measurement['mapping'] or
+                        packet['source_clock'] != self._pose_measurement['source_clock']):
+                    raise ValueError('cloud and pose clock mapping evidence differs')
+            else:
+                if identity in self._retired_cloud_identities:
+                    raise ValueError('retired cloud epoch/generation dropped')
+                changed = self._cloud_identity is not None and identity != self._cloud_identity
+                mapping_changed = (identity == self._cloud_identity and
+                    self._cloud_measurement is not None and
+                    (packet['mapping'] != self._cloud_measurement['mapping'] or
+                     packet['source_clock'] != self._cloud_measurement['source_clock']))
+                if mapping_changed and self._cloud_segment == self._input_segment:
+                    self._required_new_segment = self._input_segment
+                    self._lose()
+                    raise ValueError('cloud clock mapping changed; a new segment is required')
+                if changed:
+                    self._retired_cloud_identities.add(self._cloud_identity)
+                    self._pending.clear()
+                    self._cloud_metadata.clear()
+                    self._unmatched_clouds.clear()
+                    self._last_cloud_stamp_ns = self._last_cloud_received = None
+                    if self._cloud_segment == self._input_segment:
+                        self._required_new_segment = self._input_segment
+                        self._lose()
+                self._cloud_identity = identity
+                self._cloud_measurement = deepcopy(packet)
+                if self._required_new_segment is not None:
+                    raise ValueError('cloud source restart requires a new pose segment')
+                if self._input_identity is None or identity[:2] != self._input_identity[:2]:
+                    raise ValueError('cloud normalized clock epoch does not match current pose')
+                self._cloud_segment = self._input_segment
             key = (packet['stamp_ns'], packet['frame_id'], packet['data_sha256'])
-            self._cloud_metadata[key] = packet
+            self._cloud_metadata[key] = context
             while len(self._cloud_metadata) > self.max_pending:
                 self._cloud_metadata.popitem(last=False)
             self._pair_cloud(key, now=now, measurement_now_ns=measurement_now_ns)
@@ -261,17 +330,18 @@ class SlamStream:
                 self.last_error = 'cloud payload does not match measurement metadata'
             return
         points, received = self._unmatched_clouds.pop(key)
-        self._cloud_metadata.pop(key)
+        context = self._cloud_metadata.pop(key)
         if now - received > self.max_age_s:
             self.last_error = 'pointcloud receipt stale while waiting for metadata'
             return
         self._accept_cloud(key[0], key[1], points, now=now, received=received,
-                           measurement_now_ns=measurement_now_ns)
+                           measurement_now_ns=measurement_now_ns, capture_context=context)
 
-    def cloud(self, stamp_ns, frame, points, *, now, measurement_now_ns=None, data_sha256=None):
+    def cloud(self, stamp_ns, frame, points, *, now, measurement_now_ns=None, data_sha256=None,
+              capture_context=None):
         if not self.input_contract:
             return self._accept_cloud(stamp_ns, frame, points, now=now,
-                                      measurement_now_ns=measurement_now_ns)
+                                      measurement_now_ns=measurement_now_ns, capture_context=capture_context)
         if type(stamp_ns) is not int or stamp_ns <= 0 or frame != self.cloud_frame:
             raise ValueError('invalid cloud frame or timestamp')
         if self._last_received is None or now - self._last_received > self.max_age_s:
@@ -290,7 +360,8 @@ class SlamStream:
             self._dropped_pending += 1
         self._pair_cloud(key, now=now, measurement_now_ns=measurement_now_ns)
 
-    def _accept_cloud(self, stamp_ns, frame, points, *, now, measurement_now_ns=None, received=None):
+    def _accept_cloud(self, stamp_ns, frame, points, *, now, measurement_now_ns=None, received=None,
+                      capture_context=None):
         if self._last_received is None or now - self._last_received > self.max_age_s:
             self._lose()
             raise ValueError('odometry stale or unavailable')
@@ -305,18 +376,22 @@ class SlamStream:
         points = np.asarray(points, dtype=float)
         if not np.isfinite(points).all():
             raise ValueError('cloud must be finite')
+        if self.extrinsic_mode == 'dynamic' and capture_context is None:
+            raise ValueError('dynamic extrinsic capture context is required')
+        if capture_context is not None:
+            _rigid(capture_context.get('child_from_cloud'))
         self._last_cloud_stamp_ns = stamp_ns
         self._last_cloud_received = now if received is None else received
         if len(self._pending) == self.max_pending:
             self._pending.popleft()
             self._dropped_pending += 1
-        self._pending.append((stamp_ns, points.copy(), self._last_cloud_received))
+        self._pending.append((stamp_ns, points.copy(), self._last_cloud_received, deepcopy(capture_context)))
         self._drain(now, measurement_now_ns)
 
     def _drain(self, now, measurement_now_ns):
         remaining = deque()
         while self._pending:
-            stamp, points, received = self._pending.popleft()
+            stamp, points, received, context = self._pending.popleft()
             if now - received > self.max_age_s:
                 continue
             try:
@@ -325,12 +400,13 @@ class SlamStream:
                 self.last_error = str(error)
                 continue
             if stamp > self._poses[-1].stamp_ms * 1_000_000:
-                remaining.append((stamp, points, received))
+                remaining.append((stamp, points, received, context))
                 continue
             try:
                 pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
-                local = points @ self.extrinsic[:3, :3].T + self.extrinsic[:3, 3]
-                self.store.add(pose, local, cloud_stamp_ns=stamp)
+                matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
+                local = points @ matrix[:3, :3].T + matrix[:3, 3]
+                self.store.add(pose, local, cloud_stamp_ns=stamp, capture_context=context)
                 self._capacity_reached = False
             except CapacityError as error:
                 self.last_error = str(error)

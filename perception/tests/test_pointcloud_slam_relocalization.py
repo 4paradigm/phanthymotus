@@ -71,3 +71,39 @@ def test_relocalization_does_not_merge_when_geometry_gate_rejects():
     assert result['attempts'] == 2
     assert not result['hypothesis_created'] and result['loop_accepted'] is False
     assert 'map_points' not in result
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_relocalization_preserves_explicit_model_and_legacy_visible_semantics(legacy):
+    from plugins.pointcloud_slam_relocalization import relocalize_pair
+    from plugins.pointcloud_slam_observation import legacy_scoring
+    from test_pointcloud_slam_segment_merge import modeled_pair
+    target, source, a, b, initial, observation, spec, opts = modeled_pair()
+    strategy = dict(observation=observation, scoring=spec)
+    if legacy:
+        opts['thresholds'].pop('max_range_stratified_rmse_m')
+        opts['thresholds'].update(max_forward_depth_score_m=.05,
+                                   score_contract=legacy_scoring(visible=True))
+        strategy = dict(observation=observation, legacy_profile='visible_optical_depth')
+    result = relocalize_pair(target, a, source, b, descriptor_voxel_m=.08,
+                             max_candidates=1, **strategy, **opts)
+    assert result['hypothesis_created'] and result['loop_accepted'] is False
+    assert result['attempts'] == 1
+    assert result['resolved_scoring']['metric_id'] == ('legacy_visible_optical_depth' if legacy else
+                                                      'range_stratified_rmse')
+
+
+def test_sparse_relocalization_still_validates_and_reports_the_selected_strategy():
+    from dataclasses import replace
+    from plugins.pointcloud_slam_keyframes import Segment
+    from plugins.pointcloud_slam_relocalization import relocalize_pair
+    from test_pointcloud_slam_segment_merge import modeled_pair, options
+    target, source, a, b, initial, observation, spec, opts = modeled_pair()
+    source = Segment(source.segment_id, (replace(source.frames[0], points=np.ones((2, 3))),))
+    result = relocalize_pair(target, a, source, b, descriptor_voxel_m=.08,
+        max_candidates=1, observation=observation, scoring=spec, **opts)
+    assert result['attempts'] == 0 and not result['hypothesis_created']
+    assert result['resolved_scoring'] == spec and result['compatibility'] == []
+    with pytest.raises(ValueError):
+        relocalize_pair(target, a, source, b, descriptor_voxel_m=.08,
+            max_candidates=1, observation=observation, scoring=spec, **options())

@@ -13,6 +13,7 @@ import unicodedata
 import uuid
 
 from .pointcloud_slam_paged_archive import configuration, MAX_CHECKPOINT_BYTES
+from .pointcloud_slam_archive import archive_metadata
 
 
 def _sync_dir(path):
@@ -82,6 +83,18 @@ def delete_map(root, map_id):
             _sync_dir(maps)
 
 
+
+def rename_map(root, map_id, name):
+    name = validate_map_name(name)
+    with _maps_locked(root) as maps:
+        entry = _manifest(maps, map_id)
+        if any(other['id'] != map_id and other['name'] == name for other in _entries(maps)):
+            raise ValueError('map name already in use')
+        entry['name'] = name
+        with tempfile.TemporaryDirectory(dir=maps) as stage:
+            _write_json(Path(stage) / 'manifest.tmp', maps / map_id / 'manifest.json', entry)
+        return entry
+
 def _write_json(temp, target, obj, limit=None):
     with temp.open('w') as out:
         json.dump(obj, out, allow_nan=False, separators=(',', ':'))
@@ -110,6 +123,14 @@ def revision_segments(root, map_id, revision):
     with _maps_locked(root, False) as maps:
         _revision(maps, map_id, revision)
         return _segments(maps, map_id, revision)
+
+
+def revision_plane(root, map_id, revision, segment_id):
+    from .pointcloud_slam_paged_archive import inspect_paged_archive
+    with _maps_locked(root, False) as maps:
+        _revision(maps, map_id, revision)
+        _, resolved = inspect_paged_archive(maps / map_id / f'{revision}.json')
+        return resolved.get('segment_metadata', {}).get(segment_id, {}).get('map_plane')
 
 
 def list_tags(root, map_id, revision):
@@ -207,7 +228,9 @@ def save_revision(root, records, history, settings, name, bound_id, request_id):
                     os.fsync(f.fileno())
                 os.replace(copy, target)
                 _sync_dir(target.parent)
-            data = {'schema': 'motus.experimental-slam-paged/1', 'configuration': configuration(settings),
+            data = {'schema': 'motus.experimental-slam-paged/2', 'configuration': configuration(settings),
+                    'resolved': archive_metadata(settings, segment_ids=list(dict.fromkeys(
+                        record['pose']['segment_id'] for record in records))),
                     'frames': records, 'history': history}
             _sync_dir(dest / 'sessions')
             _write_json(stage / 'meta.tmp', dest / f'{revision}.json', data, MAX_CHECKPOINT_BYTES)

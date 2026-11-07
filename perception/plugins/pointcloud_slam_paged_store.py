@@ -1,5 +1,6 @@
 """Durable local keyframes; paging does not establish global SLAM correctness."""
 from dataclasses import asdict
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -83,7 +84,7 @@ class PagedKeyframeStore(KeyframeStore):
                 raise
         return len(encoded)
 
-    def _retain(self, pose, points, stamp):
+    def _retain(self, pose, points, stamp, capture_context=None):
         if self._restore_ref is not None:
             return self._restore_ref
         if self.directory is None:
@@ -114,6 +115,8 @@ class PagedKeyframeStore(KeyframeStore):
             file_size = path.stat().st_size
             record = {'pose': asdict(pose), 'stamp_ns': stamp, 'file': path.name,
                       'count': len(points), 'session': self.directory.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+            if capture_context is not None:
+                record['capture_context'] = deepcopy(capture_context)
             journal_size = self._append_record(record)
         except OSError as error:
             self.storage_error = 'map storage fault: ' + str(error)

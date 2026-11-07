@@ -5,6 +5,7 @@ import math
 import threading
 import time
 import logging
+from copy import deepcopy
 
 import numpy as np
 from rclpy.node import Node
@@ -285,8 +286,16 @@ class SlamInputNode(Node):
                 topic = self._preview['topic'] + '/history/' + suffix
                 if topic not in self._history_publishers and not self._preview_stop.is_set():
                     self._history_publishers[topic] = self.create_publisher(UInt8MultiArray, topic, _QOS)
+                archived = self._preview.get('archive_metadata') or {}
+                evidence = (archived.get('segment_metadata') or {}).get(segment.segment_id, archived)
+                context = deepcopy(self._preview.get('map_view') or {})
+                context.update(schema='motus.map-view/1', scope='history',
+                    map_id=context.get('map_id'), revision=context.get('revision'),
+                    segment_id=segment.segment_id, frame_id=segment.frames[0].pose.frame_id + '_archive',
+                    plane=evidence.get('map_plane') if evidence.get('map_plane') == 'xy' else None)
+                context.setdefault('actions', {})
                 topics.append({'topic': topic, 'format': 'sensor/slam-preview',
-                               'segment_id': segment.segment_id})
+                               'segment_id': segment.segment_id, 'metadata': {'map_view': context}})
             return topics
 
     def _publish_history_previews(self):
@@ -313,7 +322,8 @@ class SlamInputNode(Node):
                         'optimized_frames': len(snapshot['poses']) if snapshot else 0,
                         'confirmed_revisit_count': sum('confirmation_stamps_ns' in edge
                             for edge in (snapshot or {}).get('map_edges', [])),
-                        'input_validation': self._preview.get('input_validation')}
+                        'input_validation': deepcopy(((self._preview.get('archive_metadata') or {}).get('segment_metadata') or {}).get(sid,
+                            self._preview.get('archive_metadata') or {}).get('evidence', self._preview.get('input_validation')))}
             points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata, trajectory=poses)
             with self._lock:
@@ -346,6 +356,7 @@ class SlamInputNode(Node):
                 graph = graphs[-1] if graphs else {'poses': []}
         geometry = self._preview['backend'] == 'geometry_experimental'
         result = {'kind': 'unvalidated_geometry_preview' if geometry else 'unvalidated_odometry_preview',
+                  **deepcopy(self._preview.get('strategy', {})),
                   'input_validation': self._preview.get('input_validation'),
                   'state': 'stale' if status['odometry'] == 'tracking' and status['cloud'] == 'stale' else status['odometry'],
                   'cloud_state': status['cloud'],
@@ -369,11 +380,12 @@ class SlamInputNode(Node):
                     if segment.segment_id not in self._rolling_searches:
                         self._rolling_searches[segment.segment_id] = RollingGeometryHistory(
                             self._preview['geometry'], window_frames=self.stream.store._max_frames,
-                            window_points=self.stream.store._max_points, camera=self._preview.get('camera'),
-                            optical_from_child=np.linalg.inv(self.stream.extrinsic))
+                            window_points=self.stream.store._max_points)
                     loop = self._rolling_searches[segment.segment_id].update(
                         segment, max_points=self._preview['max_points'])
                     staged_history = {'candidate_count': loop['candidate_count'], 'map_edges': loop['map_edges'],
+                                      **{k: deepcopy(loop[k]) for k in ('resolved_observation', 'resolved_scoring',
+                                          'algorithm_profile', 'resource_profile', 'compatibility') if k in loop},
                                       'poses': [p.tolist() for p in loop['poses']],
                                       'stamps': [f.cloud_stamp_ns for f in segment.frames]}
                     result['confirmed_revisit_count'] = sum('confirmation_stamps_ns' in edge for edge in loop['map_edges'])
@@ -389,6 +401,8 @@ class SlamInputNode(Node):
                     loop = self._loop_search.update(segment, graph, online=True,
                                                     max_points=self._preview['max_points'])
                 poses = loop['poses']
+                result.update({k: deepcopy(loop[k]) for k in ('resolved_observation', 'resolved_scoring',
+                    'algorithm_profile', 'resource_profile', 'compatibility') if k in loop})
                 result['timings_ms'] = loop['timings_ms']
                 result['descriptor_unindexed'] = loop['descriptor_unindexed']
                 result.update(candidate_count=loop.get('candidate_count', len(loop['passed_candidates'])),
@@ -421,6 +435,8 @@ class SlamInputNode(Node):
                                 thresholds=opts['thresholds'], odom_sigmas=opts['odom_sigmas'],
                                 loop_sigmas=opts['loop_sigmas'], huber_k=opts['huber_k'],
                                 voxel_m=opts['voxel_m'], max_distance_m=opts['max_distance_m'],
+                                observation=opts.get('observation'), scoring=opts.get('scoring'),
+                                legacy_profile=opts.get('legacy_profile'),
                                 max_total_frames=self.stream.store._max_frames,
                                 max_total_points=self.stream.store._max_points)
                             if merged['hypothesis_created']:

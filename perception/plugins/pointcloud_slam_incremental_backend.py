@@ -4,25 +4,28 @@ The caller must serialize access and run registration outside ROS callbacks. Thi
 single-segment prototype has no retrieval, calibrated thresholds or safety case.
 """
 import math
+from copy import deepcopy
 
 from .pointcloud_slam_experimental_backend import optimize_candidates
 from .pointcloud_slam_geometry import classify_registration
 from .pointcloud_slam_keyframes import Segment
 from .pointcloud_slam_map import map_from_odom, rebuild_segment
 from .pointcloud_slam_registration import registration_diagnostics
+from .pointcloud_slam_observation import observation_for_frame
 
 
 class ExperimentalLoopGraph:
     """Retain bounded geometry-passing candidates and rebuild map history."""
 
     def __init__(self, *, thresholds, odom_sigmas, loop_sigmas, huber_k,
-                 voxel_m, max_distance_m, max_candidates):
+                 voxel_m, max_distance_m, max_candidates, observation=None, scoring=None):
         classify_registration({}, thresholds)
         if (type(max_candidates) is not int or max_candidates <= 0 or
                 any(isinstance(x, bool) or not isinstance(x, (int, float)) or
                     not math.isfinite(x) or x <= 0 for x in (voxel_m, max_distance_m))):
             raise ValueError('positive finite registration settings and capacity required')
-        self._thresholds = dict(thresholds)
+        self._thresholds = deepcopy(thresholds)
+        self._observation, self._scoring = deepcopy(observation), deepcopy(scoring)
         self._odom_sigmas, self._loop_sigmas, self._huber_k = tuple(odom_sigmas), tuple(loop_sigmas), huber_k
         self._voxel_m, self._max_distance_m = voxel_m, max_distance_m
         self._max_candidates = max_candidates
@@ -75,7 +78,11 @@ class ExperimentalLoopGraph:
             diagnostic = registration_diagnostics(segment.frames[source].points,
                 segment.frames[target].points, initial, voxel_m=self._voxel_m,
                 max_distance_m=self._max_distance_m,
-                forward_depth_score='max_forward_depth_score_m' in self._thresholds)
+                forward_depth_score='max_forward_depth_score_m' in self._thresholds,
+                **(dict(observation=observation_for_frame(self._observation, segment.frames[source]),
+                        target_observation=observation_for_frame(self._observation, segment.frames[target]),
+                        scoring=self._scoring)
+                   if self._observation is not None else {}))
             pending.append({'source': source, 'target': target, 'diagnostic': diagnostic})
         result = optimize_candidates(graph, pending, thresholds=self._thresholds,
             odom_sigmas=self._odom_sigmas, loop_sigmas=self._loop_sigmas, huber_k=self._huber_k)

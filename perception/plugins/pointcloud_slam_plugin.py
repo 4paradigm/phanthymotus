@@ -26,6 +26,7 @@ _MAP_ACTIONS = {
     'stop_mapping': ('Stop mapping and save', []),
     'list_maps': ('List maps', []),
     'select_map': ('View saved map', ['map_id']),
+    'rename_map': ('Rename saved map', ['map_id', 'map_name']),
     'close_map_view': ('Close map view', ['map_id']),
     'delete_map': ('Delete saved map', ['map_id']),
     'tag_place': ('Tag place', ['map_id', 'revision', 'segment_id', 'tag_name', 'x', 'y', 'yaw', 'tag_id']),
@@ -93,10 +94,12 @@ class PointCloudSlamPlugin:
         self._last_stop = None
         self._view = None
         self._view_id = None
+        self._closed_outputs = []
         self._operation_lock = threading.Lock()
         self._operation = {}
         self._worker = None
         self._session_settings = {}
+        self._strategy = {}
         self._lock = threading.RLock()
 
     def get_tools(self):
@@ -115,6 +118,20 @@ class PointCloudSlamPlugin:
             schema['properties']['action']['enum'] += [*_MAP_ACTIONS, 'operation_status']
             schema['x-action-params'] = {action: {'params': params}
                                          for action, (_, params) in _MAP_ACTIONS.items()}
+            schema['properties']['map_id']['x-resource-options'] = {
+                'action': 'list_maps', 'items': 'maps', 'value': 'id', 'label': 'name'}
+            schema['x-map-manager'] = {'schema': 'motus.map-manager/1', 'actions': {
+                key: key for key in ('list_maps', 'select_map', 'rename_map', 'delete_map', 'close_map_view')}}
+            actions = {key: {'requires_project': key == 'start_mapping'} for key in _MAP_ACTIONS}
+            actions['operation_status'] = {'internal': True}
+            actions['delete_map']['confirm'] = '删除地图及其全部版本和地点？'
+            for key in ('stop_mapping', 'select_map'):
+                actions[key].update(background=True, status_action='operation_status',
+                                    pending_states=['working'], error_states=['error'], poll_interval_ms=500)
+            schema['x-action-lifecycle'] = {'schema': 'motus.action-lifecycle/1',
+                                          'config_actions': ['start'], 'actions': actions}
+            schema['x-stop'] = {'timeout_s': 300}
+
             schema['properties']['action']['oneOf'] = [
                 {'const': action, 'title': _MAP_ACTIONS[action][0] if action in _MAP_ACTIONS else action}
                 for action in schema['properties']['action']['enum']]
@@ -144,13 +161,45 @@ class PointCloudSlamPlugin:
                 'max_frames', 'max_points', 'max_measurement_age_ms', 'max_future_skew_ms')
         settings = {**self._config, **(self._resolved_inputs or {}).get('settings', {})}
         return SlamStream(**{key: settings[key] for key in keys},
+                          extrinsic_mode=settings.get('extrinsic_mode', 'static'),
                           input_contract=self._resolved_inputs)
+
+    def _geometry_options(self, args):
+        options = deepcopy(self._config.get('preview_geometry'))
+        if not isinstance(options, dict):
+            raise ValueError('explicit geometry settings required')
+        from .camera_info import for_topic
+        from .pointcloud_slam_observation import resolve_observation, resolve_scoring
+        topic = next(t for t, f in args['input_bindings'].items() if f == 'sensor/pointcloud2')
+        declaration = deepcopy((self._resolved_inputs or {}).get('inputs', {}).get(topic))
+        if declaration is not None:
+            declaration['extrinsic'] = deepcopy(self._resolved_inputs['extrinsic'])
+        camera = for_topic(args.get('camera_info'), topic)
+        settings = {**self._config, **(self._resolved_inputs or {}).get('settings', {})}
+        profile = options.get('legacy_profile')
+        if declaration is None and profile == 'visible_optical_depth':
+            declaration = {'observation_model': 'pinhole', 'source_id': camera.get('id'),
+                           'frame_id': settings.get('cloud_frame')}
+        if declaration is not None:
+            options['observation'] = resolve_observation(declaration, camera, settings['child_from_cloud'])
+            if profile is None:
+                score = resolve_scoring(options.get('scoring'), options['observation'])
+                gates = options.get('thresholds', {})
+                if (gates.get('score_contract') != score or 'max_range_stratified_rmse_m' not in gates or
+                        'max_forward_depth_score_m' in gates or 'max_rmse_m' in gates):
+                    raise ValueError('new score requires matching threshold contract')
+        return options
 
     def start(self):
         pass  # Canvas start supplies the two resolved inputs.
 
     def _dispose(self, node):
         if node is not None:
+            preview = node._preview or {}
+            self._closed_outputs.extend(t for t in (preview.get('topic'), preview.get('status_topic')) if t)
+            if preview.get('backend') == 'geometry_experimental' and preview.get('topic'):
+                self._closed_outputs.extend([preview['topic'] + '/pose', preview['topic'] + '/map_to_odom'])
+            self._closed_outputs.extend(node._history_publishers)
             node.stop_preview()
             dispose_node(self._executor, node, label='pointcloud_slam')
 
@@ -179,6 +228,8 @@ class PointCloudSlamPlugin:
         with node._lock:
             records = list(node.stream.store.records)
             history = dict(node._history_snapshots)
+            archived = getattr(node.stream.store, 'archive_metadata', {})
+            self._session_settings['segment_metadata'] = deepcopy(archived.get('segment_metadata', {}))
         if records:
             map_id, revision, _ = save_revision(_ARCHIVE_DIR, records, history, self._session_settings,
                                                 self._map_name, None, self._save_request)
@@ -217,6 +268,15 @@ class PointCloudSlamPlugin:
             raise RuntimeError(result['message'])
 
     def dispatch(self, name, args):
+        result = self._dispatch_action(name, args)
+        if isinstance(result, dict):
+            with self._lock:
+                closed, self._closed_outputs = self._closed_outputs, []
+            if closed:
+                result = {**result, 'closed_topics': list(dict.fromkeys(closed))}
+        return result
+
+    def _dispatch_action(self, name, args):
         action = args.get('action', name)
         if action == 'operation_status':
             request = args.get('request_id')
@@ -319,11 +379,13 @@ class PointCloudSlamPlugin:
                         'last_stop': self._last_stop,
                         'input_validation': self._input_validation(),
                         'resolved_inputs': deepcopy((self._resolved_inputs or {}).get('inputs', {})),
+                        **deepcopy(self._strategy),
                         'input_diagnostics': deepcopy(self._input_diagnostics),
                         'desc': 'Experimental odometry and point-cloud preview',
                         'topic_in': [{'topic': topic, 'format': fmt}
                                      for topic, fmt in self._topics.items()],
-                        'topic_out': self._live_outputs(),
+                        'topic_out': self._live_outputs() + (self._view.history_topics() if self._view else []),
+                        'archive_metadata': deepcopy(getattr(self._view.stream.store, 'archive_metadata', None)) if self._view else None,
                         'input_status': input_status,
                         'last_error': input_status.get('last_error', '')}
         if action != 'start':
@@ -356,11 +418,6 @@ class PointCloudSlamPlugin:
                 try:
                     self._resolved_inputs = resolve_inputs(args['input_metadata'], bindings,
                         experimental=self._config.get('input_policy') == 'experimental')
-                    if (self._config.get('preview_backend') == 'geometry_experimental' and
-                            self._resolved_inputs['inputs'][next(t for t, f in bindings.items()
-                                if f == 'sensor/pointcloud2')]['observation_model'] != 'pinhole'):
-                        raise InputContractError([dict(topic='', field='observation_model',
-                            reason='lidar geometry scoring is not implemented in this batch')])
                 except InputContractError as error:
                     self._resolved_inputs = None
                     self._input_diagnostics = error.diagnostics
@@ -374,6 +431,12 @@ class PointCloudSlamPlugin:
             if (self._config.get('max_measurement_age_ms') is None or
                     self._config.get('max_future_skew_ms') is None):
                 return {'state': 'error', 'message': 'measurement age and clock skew limits required'}
+            if (self._config.get('preview_backend') == 'geometry_experimental' and
+                    (self._config.get('preview_enabled') is True or self._config.get('persistent_history'))):
+                try:
+                    self._geometry_options(args)
+                except (KeyError, TypeError, ValueError) as error:
+                    return {'state': 'error', 'message': str(error)}
             if self._config.get('persistent_history'):
                 self._project_inputs = deepcopy(args)
                 self._topics = dict(bindings)
@@ -392,7 +455,11 @@ class PointCloudSlamPlugin:
         if not preview:
             return []
         topic = preview['topic']
-        outputs = [{'topic': topic, 'format': 'sensor/slam-preview'},
+        plane = self._session_settings.get('map_plane')
+        outputs = [{'topic': topic, 'format': 'sensor/slam-preview', 'metadata': {'map_view': {
+                        'schema': 'motus.map-view/1', 'scope': 'live', 'map_id': None,
+                        'name': self._map_name, 'revision': None, 'segment_id': None,
+                        'frame_id': None, 'plane': plane if plane == 'xy' else None, 'actions': {}}}},
                    {'topic': preview['status_topic'], 'format': 'data/json'}]
         if preview['backend'] == 'geometry_experimental':
             outputs.extend([{'topic': topic + '/pose', 'format': 'data/json'},
@@ -433,26 +500,27 @@ class PointCloudSlamPlugin:
             if persistent or self._config.get('preview_enabled') is True:
                 preview = {'topic': cloud_topic + '/slam_odom_preview',
                            'input_validation': self._input_validation(),
+                           'archive_metadata': deepcopy(getattr(stream.store, 'archive_metadata', None)),
                            'status_topic': cloud_topic + '/slam_odom_preview_status',
                            'persistent_history': bool(persistent),
                            'backend': self._config.get('preview_backend', 'raw'),
                            'interval_s': self._config.get('preview_interval_s', 1.),
                            'max_points': self._config.get('preview_max_points', 40000),
                            'sigmas': self._config.get('preview_odom_sigmas'),
-                           'geometry': self._config.get('preview_geometry'),
+                           'geometry': self._geometry_options(args) if self._config.get('preview_backend') == 'geometry_experimental' else None,
                            'relocalization': self._config.get('preview_relocalization', False)}
-            if preview and persistent:
-                from .camera_info import for_topic
-                camera = for_topic(args.get('camera_info'), cloud_topic)
-                k = camera.get('K')
-                size = (camera.get('width'), camera.get('height'))
-                if (camera.get('schema') == 'motus.camera/1' and
-                        all(type(v) is int and v > 0 for v in size) and
-                        isinstance(k, (tuple, list)) and len(k) == 9 and
-                        all(isinstance(v, (float,int)) and math.isfinite(v) for v in k)
-                        and min(k[0],k[4]) > 0):
-                    preview['camera'] = (*size, k[0], k[4], k[2], k[5])
             node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
+            self._strategy = node._loop_search.strategy_snapshot() if node._loop_search else {}
+            if self._strategy:
+                self._strategy['resource_profile'].update({key: settings.get(key) for key in
+                    ('max_frames', 'max_points', 'max_pending', 'max_cloud_points', 'preview_max_points')})
+                if persistent:
+                    self._strategy['resource_profile'].update(window_frames=settings['max_frames'],
+                        window_points=settings['max_points'], persistent_history=deepcopy(persistent))
+                settings.update(deepcopy(self._strategy))
+            settings['resolved_inputs'] = deepcopy((self._resolved_inputs or {}).get('inputs', {}))
+            if preview:
+                preview['strategy'] = deepcopy(self._strategy)
             node._segment_links, node._segment_loops = links, loops
             node._history_snapshots = history
             try:
@@ -516,16 +584,27 @@ class PointCloudSlamPlugin:
             if self._executor is None:
                 raise ValueError('ROS executor unavailable')
             if self._view_id != map_id:
-                cfg = self._config
+                from .pointcloud_slam_paged_archive import inspect_paged_archive
                 path = os.path.join(_ARCHIVE_DIR, 'maps', map_id, str(entry['revision']) + '.json')
-                stream = self._stream()
-                stream.store, history = load_paged_archive(path, cfg, max_frames=cfg['max_frames'],
-                                                          max_points=cfg['max_points'], read_only=True)
+                cfg, archived = inspect_paged_archive(path)
+                resources = archived.get('resource_profile') or {}
+                max_frames, max_points = resources.get('max_frames', 300), resources.get('max_points', 6000000)
+                stream = SlamStream(cloud_frame=cfg['cloud_frame'], child_frame=cfg['child_frame'],
+                    clock_id=cfg['clock_id'], child_from_cloud=cfg['child_from_cloud'],
+                    extrinsic_mode=cfg.get('extrinsic_mode', 'static'),
+                    max_gap_ms=200, max_age_s=2, max_pending=1, max_cloud_points=1000000,
+                    max_frames=max(2, max_frames), max_points=max_points)
+                stream.store, history = load_paged_archive(path, {}, max_frames=max(2, max_frames),
+                                                          max_points=max_points, read_only=True)
                 preview = {'topic': '/pointcloud_slam/maps/m' + map_id,
                            'status_topic': '/pointcloud_slam/map_view_status', 'backend': 'raw',
                            'persistent_history': True, 'interval_s': 1.,
                            'max_points': cfg.get('preview_max_points', 40000),
-                           'input_validation': self._input_validation()}
+                           'input_validation': deepcopy(archived['evidence']),
+                           'archive_metadata': archived,
+                           'map_view': {'schema': 'motus.map-view/1', 'scope': 'history',
+                               'map_id': map_id, 'name': entry['name'], 'revision': entry['revision'],
+                               'actions': {key:key for key in ('list_tags','tag_place','untag_place')}}}
                 node = SlamInputNode(None, None, stream, preview=preview)
                 node._history_snapshots = history
                 try:
@@ -537,7 +616,19 @@ class PointCloudSlamPlugin:
                 self._close_view()
                 self._view, self._view_id = node, map_id
             return {'state': 'map_selected', 'map_id': map_id, 'map_name': entry['name'],
-                    'revision': entry['revision'], 'tracking': False, 'topic_out': self._view.history_topics()}
+                    'revision': entry['revision'], 'tracking': False,
+                    'archive_metadata': deepcopy(self._view.stream.store.archive_metadata),
+                    'topic_out': self._view.history_topics()}
+        if action == 'rename_map':
+            entry = library.rename_map(_ARCHIVE_DIR, map_id, args.get('map_name'))
+            if self._last_stop and self._last_stop.get('map_id') == map_id:
+                self._last_stop['map_name'] = entry['name']
+            outputs = []
+            if self._view_id == map_id:
+                self._view._preview['map_view']['name'] = entry['name']
+                outputs = self._view.history_topics()
+            return {'state': 'renamed', 'map_id': map_id, 'map_name': entry['name'],
+                    'revision': entry['revision'], 'topic_out': outputs}
         if action == 'delete_map':
             if self._view_id == map_id:
                 self._close_view()
@@ -546,6 +637,8 @@ class PointCloudSlamPlugin:
                 self._last_stop = None
             return {'state': 'deleted', 'map_id': map_id}
         if action == 'tag_place':
+            if library.revision_plane(_ARCHIVE_DIR, map_id, revision, args.get('segment_id')) != 'xy':
+                raise ValueError('tag picking requires a declared archived xy plane')
             values = (args.get('tag_name'), args.get('x'), args.get('y'), args.get('yaw'))
             if args.get('tag_id'):
                 tag = library.update_tag(_ARCHIVE_DIR, map_id, revision, args['tag_id'], *values,

@@ -5,6 +5,7 @@ cloud timestamp, with points transformed into the pose child frame. This class
 does not detect loops, optimize a graph, or establish timestamp synchronization.
 """
 from dataclasses import dataclass
+from copy import deepcopy
 
 import numpy as np
 
@@ -20,6 +21,7 @@ class Keyframe:
     pose: PoseSample
     cloud_stamp_ns: int
     points: np.ndarray
+    capture_context: dict = None
 
 
 @dataclass(frozen=True)
@@ -50,7 +52,7 @@ class KeyframeStore:
     def mark_lost(self):
         self._lost = True
 
-    def add(self, pose, points, *, cloud_stamp_ns):
+    def add(self, pose, points, *, cloud_stamp_ns, capture_context=None):
         if not isinstance(pose, PoseSample):
             raise ValueError('validated tracking pose required')
         if (type(cloud_stamp_ns) is not int or cloud_stamp_ns <= 0 or
@@ -78,18 +80,19 @@ class KeyframeStore:
                     raise ValueError('pose frames or clock changed within segment')
             elif any(segment_id == pose.segment_id for segment_id, _ in self._segments):
                 raise ValueError('segment cannot be reused')
-        points = self._retain(pose, points, cloud_stamp_ns)
+        capture_context = deepcopy(capture_context)
+        points = self._retain(pose, points, cloud_stamp_ns, capture_context)
         if points is None:
             return False
         if not self._segments or pose.segment_id != self._segments[-1][0]:
             self._segments.append((pose.segment_id, []))
-        self._segments[-1][1].append(Keyframe(pose, cloud_stamp_ns, points))
+        self._segments[-1][1].append(Keyframe(pose, cloud_stamp_ns, points, capture_context))
         self._frame_count += 1
         self._point_count += len(points)
         self._lost = False
         return True
 
-    def _retain(self, pose, points, stamp):
+    def _retain(self, pose, points, stamp, capture_context=None):
         if (self._frame_count >= self._max_frames or
                 self._point_count + len(points) > self._max_points):
             raise CapacityError('keyframe capacity reached')

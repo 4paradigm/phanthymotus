@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
+from copy import deepcopy
 
 from .pointcloud_slam_keyframes import KeyframeStore
 from .pointcloud_slam_odom import decode_slam_odom
@@ -15,7 +16,15 @@ def _configuration(settings):
     result = {key: settings[key] for key in ('cloud_frame', 'child_frame', 'clock_id')}
     if any(not isinstance(v, str) or not v.strip() for v in result.values()):
         raise ValueError('archive configuration required')
-    result['child_from_cloud'] = _rigid(settings['child_from_cloud']).tolist()
+    mode = settings.get('extrinsic_mode', 'static')
+    if mode == 'dynamic':
+        if settings.get('child_from_cloud') is not None:
+            raise ValueError('dynamic archive cannot use a startup transform')
+        result.update(extrinsic_mode='dynamic', child_from_cloud=None)
+    elif mode == 'static':
+        result['child_from_cloud'] = _rigid(settings['child_from_cloud']).tolist()
+    else:
+        raise ValueError('unsupported archive extrinsic mode')
     result['preview_geometry'] = settings.get('preview_geometry')
     if settings.get('input_policy') == 'experimental':
         result.update(input_policy='experimental',
@@ -26,15 +35,57 @@ def _configuration(settings):
     return result
 
 
+
+_RESOLVED_FIELDS = ('resolved_inputs', 'resolved_observation', 'resolved_scoring',
+                    'algorithm_profile', 'resource_profile', 'compatibility', 'map_plane')
+
+
+def archive_metadata(settings, *, segment_ids=(), inherited=None):
+    """Snapshot actual resolved facts; a legacy segment never acquires new proof."""
+    result = {key: deepcopy(settings.get(key)) for key in _RESOLVED_FIELDS}
+    if result['map_plane'] not in (None, 'xy'):
+        raise ValueError('unsupported map annotation plane')
+    result.update(schema='motus.slam_archive_metadata/1', evidence={
+        'source': 'resolved_inputs' if result['resolved_inputs'] is not None else 'explicit_configuration',
+        'policy': settings.get('input_policy', 'strict'),
+        'clock_relation_verified': settings.get('clock_relation_verified'),
+        'extrinsic_calibrated': settings.get('extrinsic_calibrated')})
+    segments = deepcopy(settings.get('segment_metadata') or
+                        (inherited or {}).get('segment_metadata') or {})
+    for sid in segment_ids:
+        segments.setdefault(sid, deepcopy(result))
+    result['segment_metadata'] = segments
+    return result
+
+
+def archived_metadata(data):
+    """Read evidence from the archive only, keeping old unknowns explicit."""
+    if data.get('schema', '').endswith('/2'):
+        result = data.get('resolved')
+        if not isinstance(result, dict) or result.get('schema') != 'motus.slam_archive_metadata/1':
+            raise ValueError('archive resolved metadata required')
+        return deepcopy(result)
+    result = archive_metadata(data['configuration'])
+    result['evidence']['source'] = 'legacy_archive'
+    result['segment_metadata'] = {
+        entry['pose']['segment_id']: deepcopy(result) for entry in data['frames']}
+    return result
+
+
 def save_archive(path, store, links, loops, settings):
     """Atomically replace a map archive, leaving any prior file on failure."""
     config = _configuration(settings)
     frames = []
     for segment in store.segments:
         for frame in segment.frames:
-            frames.append({'pose': asdict(frame.pose), 'stamp_ns': frame.cloud_stamp_ns,
-                           'points': frame.points.tolist()})
-    data = {'schema': 'motus.experimental-slam-archive/1', 'configuration': config,
+            entry = {'pose': asdict(frame.pose), 'stamp_ns': frame.cloud_stamp_ns,
+                     'points': frame.points.tolist()}
+            if frame.capture_context is not None:
+                entry['capture_context'] = deepcopy(frame.capture_context)
+            frames.append(entry)
+    data = {'schema': 'motus.experimental-slam-archive/2', 'configuration': config,
+            'resolved': archive_metadata(settings, segment_ids=[s.segment_id for s in store.segments],
+                                          inherited=getattr(store, 'archive_metadata', None)),
             'frames': frames, 'links': links, 'loops': loops}
     path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path))
@@ -50,7 +101,7 @@ def save_archive(path, store, links, loops, settings):
             os.unlink(temp)
 
 
-def load_archive(path, settings, *, max_frames, max_points):
+def load_archive(path, settings, *, max_frames, max_points, read_only=False):
     """Load into a new store; validate limits and require a new input segment."""
     store = KeyframeStore(max_frames=max_frames, max_points=max_points)
     limit = 65536 + max_frames * 8192 + max_points * 256
@@ -60,8 +111,10 @@ def load_archive(path, settings, *, max_frames, max_points):
         if len(raw) > limit:
             raise ValueError('archive too large')
         data = json.loads(raw)
-        if not isinstance(data, dict) or data.get('schema') != 'motus.experimental-slam-archive/1':
+        if not isinstance(data, dict) or data.get('schema') not in ('motus.experimental-slam-archive/1', 'motus.experimental-slam-archive/2'):
             raise ValueError('unsupported archive schema')
+        if read_only:
+            settings = data['configuration']
         if data.get('configuration') != _configuration(settings):
             raise ValueError('archive configuration mismatch')
         frames, links, loops = data['frames'], data['links'], data['loops']
@@ -79,7 +132,8 @@ def load_archive(path, settings, *, max_frames, max_points):
                 raise ValueError('archive clock mismatch')
             if sample.child_frame_id != settings['child_frame'].replace('{segment_id}', sample.segment_id):
                 raise ValueError('archive child frame mismatch')
-            store.add(sample, entry['points'], cloud_stamp_ns=entry['stamp_ns'])
+            store.add(sample, entry['points'], cloud_stamp_ns=entry['stamp_ns'],
+                      capture_context=entry.get('capture_context'))
         ids = {s.segment_id: len(s.frames) for s in store.segments}
         connected = {store.segments[0].segment_id} if store.segments else set()
         if len(links) > max_frames or len(loops) > max_frames:
@@ -104,6 +158,7 @@ def load_archive(path, settings, *, max_frames, max_points):
                         not 0 <= a < ids[segment] or not 0 <= b < ids[segment]):
                     raise ValueError('invalid archive loop')
                 _rigid(loop['transform'])
+        store.archive_metadata = archived_metadata(data)
         store.mark_lost()
         return store, links, loops
     except (OSError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as error:

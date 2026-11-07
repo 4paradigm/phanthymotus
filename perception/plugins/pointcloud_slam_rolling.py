@@ -4,6 +4,7 @@ The overlap anchor maintains one source segment's map coordinates. No cross-batc
 loop acceptance or global optimization of frozen history is claimed.
 """
 import time
+from copy import deepcopy
 import numpy as np
 from .pointcloud_slam_keyframes import Segment
 from .pointcloud_slam_loop_search import ExperimentalLoopSearch
@@ -12,10 +13,16 @@ from .pointcloud_slam_stream import _matrix
 
 
 class RollingGeometryHistory:
-    def __init__(self, options, *, window_frames, window_points, camera=None, optical_from_child=None):
+    def __init__(self, options, *, window_frames, window_points, observation=None, scoring=None,
+                 revisit=None, camera=None, optical_from_child=None):
         if type(window_frames) is not int or window_frames < 2 or type(window_points) is not int or window_points <= 0:
             raise ValueError('bounded window must fit at least two keyframes')
-        self.options, self.window_frames, self.window_points = dict(options), window_frames, window_points
+        self.options, self.window_frames, self.window_points = deepcopy(options), window_frames, window_points
+        for key, value in (('observation', observation), ('scoring', scoring), ('revisit', revisit)):
+            if value is not None:
+                if key in self.options and self.options[key] != value:
+                    raise ValueError('conflicting explicit ' + key + ' settings')
+                self.options[key] = deepcopy(value)
         self.segment_id = None
         self.poses, self.frames = [], ()
         self.start, self.submaps = 0, 1
@@ -24,13 +31,26 @@ class RollingGeometryHistory:
         self.anchor = None
         self.frozen_edges = []
         self.frozen_attempts = self.frozen_skips = self.frozen_unindexed = 0
+        self.frozen_confirmation_evaluations = 0
 
     def _worker(self):
         worker = ExperimentalLoopSearch(**self.options)
-        if self.camera and 'max_forward_depth_score_m' in self.options['thresholds']:
+        if (self.camera and self.options.get('observation') is None and self.options.get('legacy_profile') is None
+                and 'max_forward_depth_score_m' in self.options['thresholds']):
             from .pointcloud_slam_revisit import RevisitSearch
+            from .pointcloud_slam_observation import legacy_scoring
             worker.revisit = RevisitSearch(self.camera, self.optical, self.options)
+            worker.scoring = legacy_scoring(visible=True)
+            worker.algorithm_profile['revisit'] = deepcopy(worker.revisit.policy)
+            worker.resource_profile.update(confirmation_evaluations_per_frame=1,
+                                           online_descriptor_policy='consecutive_frames')
+            worker.compatibility = ['legacy camera kwargs select legacy_visible_optical_depth; original thresholds retained']
         return worker
+
+    def strategy_snapshot(self):
+        snapshot = self.worker.strategy_snapshot()
+        snapshot['resource_profile'].update(window_frames=self.window_frames, window_points=self.window_points)
+        return snapshot
 
     def update(self, segment, *, max_points):
         began = time.perf_counter()
@@ -72,6 +92,7 @@ class RollingGeometryHistory:
             self.frozen_attempts += loop['candidate_attempts']
             self.frozen_skips += loop['descriptor_skips']
             self.frozen_unindexed += loop['descriptor_unindexed']
+            self.frozen_confirmation_evaluations += loop.get('confirmation_evaluations', 0)
             self.start = end-1
             self.anchor = mapped[-1].copy()
             self.worker = self._worker()
@@ -79,12 +100,17 @@ class RollingGeometryHistory:
         self.frames = segment.frames
         tick = time.perf_counter()
         points = rebuild_segment(segment,self.poses,max_points=max_points)
-        return {'poses':list(self.poses),'after_map':points,
+        snapshot = {key: deepcopy(loop[key]) for key in ('resolved_observation', 'resolved_scoring',
+            'algorithm_profile', 'resource_profile', 'compatibility') if key in loop}
+        snapshot.setdefault('resource_profile', {}).update(window_frames=self.window_frames,
+            window_points=self.window_points, preview_max_points=max_points)
+        return {**snapshot, 'poses':list(self.poses),'after_map':points,
                 'map_from_odom':map_from_odom(self.poses[-1],_matrix(segment.frames[-1].pose)),
                 'passed_candidates':loop['passed_candidates'],
                 'candidate_count':len(self.frozen_edges)+len(edges),
                 'map_edges':self.frozen_edges + edges,
                 'candidate_attempts':self.frozen_attempts+loop['candidate_attempts'],
+                'confirmation_evaluations':self.frozen_confirmation_evaluations+loop.get('confirmation_evaluations', 0),
                 'descriptor_skips':self.frozen_skips+loop['descriptor_skips'],
                 'descriptor_unindexed':self.frozen_unindexed+loop['descriptor_unindexed'],
                 'submaps':self.submaps,'active_keyframes':len(part.frames),

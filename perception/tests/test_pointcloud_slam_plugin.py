@@ -205,7 +205,8 @@ def test_opt_in_preview_runs_worker_publishes_and_stops_only_its_node():
     callbacks['/o'](NS(data=json.dumps(odom(1000))))
     callbacks['/c'](cloud())
     info = plugin.dispatch('pointcloud_slam', {'action': 'info'})
-    assert {'topic': '/c/slam_odom_preview', 'format': 'sensor/slam-preview'} in info['topic_out']
+    assert any(o['topic'] == '/c/slam_odom_preview' and o['format'] == 'sensor/slam-preview'
+               and o['metadata']['map_view']['scope'] == 'live' for o in info['topic_out'])
     pub = next(p for p in node.publishers if p.topic == '/c/slam_odom_preview')
     assert _wait_until(lambda: len(pub.messages) > 0)
     plugin.dispatch('pointcloud_slam', {'action': 'stop'})
@@ -357,7 +358,7 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     monkeypatch.setattr(module,'_ARCHIVE_DIR',str(tmp_path))
     monkeypatch.setattr(SlamInputNode,'start_preview',lambda self:None)
     monkeypatch.setattr(rolling,'ExperimentalLoopSearch',FakeSearch)
-    settings={**config(),'max_frames':3,'archive_name':'paged','preview_enabled':True,
+    settings={**config(),'max_frames':3,'archive_name':'paged','preview_enabled':True,'map_plane':'xy',
         'preview_backend':'geometry_experimental','persistent_history':{
             'max_disk_bytes':10_000_000,'reserve_bytes':0,'min_translation_m':.1,'min_rotation_deg':10},
         'preview_geometry':{'descriptor_voxel_m':.08,'min_separation_s':.25,
@@ -376,7 +377,9 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     assert p._node is None
     assert call('start_mapping', map_name='../bad')['state'] == 'error'
     started = call('start_mapping', map_name='走廊')
-    assert started['state'] == 'running' and started['topic_out'] == ready['topic_out']
+    assert started['state'] == 'running'
+    assert [o['topic'] for o in started['topic_out']] == [o['topic'] for o in ready['topic_out']]
+    assert started['topic_out'][0]['metadata']['map_view']['name'] == '走廊'
     n=p._node;now=[1.];n._receipt_clock=lambda:now[0];n._measurement_clock_ns=lambda:int(now[0]*1e9)
     for i in range(12):
         now[0]=(1000+i*100)/1000
@@ -416,7 +419,7 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     p._view.publish_preview_once()
     topic = viewed['topic_out'][0]['topic']
     assert viewed['topic_out'][0]['segment_id'] == 'a'
-    assert topic not in [o['topic'] for o in call('info')['topic_out']]
+    assert topic in [o['topic'] for o in call('info')['topic_out']]
     from test_pointcloud_slam_preview import unpack
     pub = next(pub for pub in p._view.publishers if pub.topic == topic)
     meta, _ = unpack(pub.messages[-1])
