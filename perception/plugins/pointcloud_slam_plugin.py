@@ -252,7 +252,8 @@ class PointCloudSlamPlugin:
                 return dict(self._operation)
         with self._operation_lock:
             busy = self._project_stopping or self._blocking_stops or self._save_status['state'] == 'saving'
-            if (busy or self._operation.get('state') == 'working') and action not in ('info', 'stop', 'list_maps'):
+            if ((busy or self._operation.get('state') == 'working') and action not in ('info', 'stop', 'list_maps')
+                    and not (action == 'config' and (self._node or self._pending))):
                 raise ValueError('map operation already in progress')
             if action == 'select_map':
                 self._selecting_views += 1
@@ -302,8 +303,7 @@ class PointCloudSlamPlugin:
                         'input_status': self._node.status() if self._node else {'odometry': 'waiting'}}
         with self._lock:
             if action == 'config':
-                if self._node or self._pending:
-                    raise ValueError('stop mapping before changing configuration')
+                mapping = self._node is not None or self._pending is not None
                 try:
                     retired = _RETIRED.intersection(args)
                     if retired:
@@ -326,8 +326,13 @@ class PointCloudSlamPlugin:
                     if all(merged.get(k) is not None for k in ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')):
                         self._validate({**merged, **(self._resolved_inputs or {}).get('settings', {})})
                 except (ValueError, TypeError) as error:
-                    self._config_error = str(error)
+                    if not mapping:
+                        self._config_error = str(error)
                     raise
+                if mapping:
+                    if merged != self._config:
+                        raise ValueError('stop mapping before changing configuration')
+                    return {'state': 'configured', 'config': dict(self._config)}
                 self._config = merged
                 self._config_error = None
                 return {'state': 'configured', 'config': dict(self._config)}

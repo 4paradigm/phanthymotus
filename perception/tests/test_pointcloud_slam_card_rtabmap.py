@@ -198,6 +198,56 @@ def test_running_configuration_replay_cannot_change_mapping_or_poison_save(card)
     assert call(card, 'stop_mapping', request_id='save')['state'] == 'saved'
 
 
+@pytest.mark.parametrize('phase', ['mapping', 'pending', 'saving'])
+def test_core_bumi_configuration_replay_is_noop_through_mapping_and_save(card, phase):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    node = capture(card)
+    original = card._config
+    entered, release = threading.Event(), threading.Event()
+    if phase == 'pending':
+        node.failure = 'retryable save failure'
+        assert call(card, 'stop_mapping', request_id='replay')['state'] == 'error'
+        node.failure = None
+    elif phase == 'saving':
+        node.before_close = lambda: (entered.set(), release.wait(5))
+        assert call(card, 'stop_mapping', request_id='replay', background=True)['state'] == 'working'
+        assert entered.wait(1)
+    try:
+        result = call(card, 'config', robot='Bumi', instance_id='existing-slam-card')
+        assert result['state'] == 'configured'
+        assert result['config'] == original
+        assert card._config is original and card._config_error is None
+        assert (card._node or card._pending) is node
+    finally:
+        release.set()
+        if phase == 'pending' and card._pending is not None:
+            call(card, 'stop_mapping', request_id='replay')
+    if phase == 'saving':
+        assert _wait_until(lambda: call(card, 'operation_status', request_id='replay')['state'] == 'saved')
+        saved = call(card, 'operation_status', request_id='replay')
+    else:
+        saved = call(card, 'stop_mapping', request_id='replay')
+    assert saved['state'] == 'saved'
+    assert call(card, 'list_maps')['maps'][0]['id'] == saved['map_id']
+    assert call(card, 'start_mapping', map_name='After replay')['state'] == 'running'
+
+
+@pytest.mark.parametrize('pending', [False, True])
+@pytest.mark.parametrize('updates', [{'robot': 'G1'}, {'robot': 'unknown'}, {'preview_enabled': True}])
+def test_active_configuration_changes_are_rejected_without_poisoning_valid_settings(card, pending, updates):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    node = capture(card)
+    original = dict(card._config)
+    if pending:
+        node.failure = 'retryable save failure'
+        assert call(card, 'stop_mapping', request_id='unchanged')['state'] == 'error'
+        node.failure = None
+    assert call(card, 'config', **updates)['state'] == 'error'
+    assert card._config == original and card._config_error is None
+    assert call(card, 'stop_mapping', request_id='unchanged')['state'] == 'saved'
+    assert call(card, 'start_mapping', map_name='Still valid')['state'] == 'running'
+
+
 def test_native_revision_preserves_unverified_input_evidence(card):
     capture(card)
     saved = call(card, 'stop_mapping', request_id='evidence')
