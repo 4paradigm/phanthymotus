@@ -11,9 +11,10 @@ import { ImageRenderer }    from './renderers/image.js';
 import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { OdomRenderer } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 
@@ -26,6 +27,7 @@ class SkillBuffer {
     this._wsUrl   = wsUrl;
     this._hint    = hint;
     this._frames  = [];          // ring buffer (ArrayBuffer[])
+    this._receivedAt = [];
     this._pos     = 0;           // write head (mod PREVIEW_CAPACITY)
     this._full    = false;
     this._ws      = null;
@@ -49,8 +51,8 @@ class SkillBuffer {
     ws.onmessage = (ev) => {
       let buf;
       if (ev.data instanceof ArrayBuffer) {
-        // Binary frame — skip if odd byte length (not valid PCM s16)
-        if (ev.data.byteLength % 2 !== 0) return;
+        // Preserve existing format filtering; odometry packets can have odd byte lengths.
+        if (this._hint !== 'state/odom' && ev.data.byteLength % 2 !== 0) return;
         buf = ev.data;
       } else {
         // Text frame (JSON ASR result, ping, meta) — skip pure keepalive pings
@@ -61,24 +63,29 @@ class SkillBuffer {
         buf = new TextEncoder().encode(ev.data).buffer;
       }
       // Store in ring buffer
+      const receivedAt = this._hint === 'state/odom' ? Date.now() : undefined;
       this._frames[this._pos] = buf;
+      if (receivedAt !== undefined) this._receivedAt[this._pos] = receivedAt;
       this._pos = (this._pos + 1) % PREVIEW_CAPACITY;
       if (!this._full && this._pos === 0) this._full = true;
       // Forward to active consumer
-      this._consumer?.(buf, this._hint);
+      if (this._hint === 'state/odom') this._consumer?.(buf, this._hint, false, receivedAt);
+      else this._consumer?.(buf, this._hint);
     };
     this._ws = ws;
   }
 
   /** Replay buffered frames into a renderer, then register it as consumer.
-   *  onDataFn(buf, hint, isReplay) — isReplay=true for historical frames. */
+   *  onDataFn(buf, hint, isReplay, receivedAt) — preserve odometry receipt age during replay. */
   attach(onDataFn) {
     this._consumer = onDataFn;
     const len   = this._full ? PREVIEW_CAPACITY : this._pos;
     const start = this._full ? this._pos : 0;
     for (let i = 0; i < len; i++) {
       const frame = this._frames[(start + i) % PREVIEW_CAPACITY];
-      if (frame) onDataFn(frame, this._hint, true);  // isReplay=true
+      if (!frame) continue;
+      if (this._hint === 'state/odom') onDataFn(frame, this._hint, true, this._receivedAt[(start + i) % PREVIEW_CAPACITY]);
+      else onDataFn(frame, this._hint, true);
     }
   }
 
@@ -430,12 +437,12 @@ function mountRenderer(skill) {
     // Attach to background buffer (replay last N frames then receive live data)
     const inBuf = _buffers[skill.id]?.in;
     if (inBuf) {
-      inBuf.attach((buf, fmt, isReplay) => isReplay ? _inRenderer?.onDataSilent?.(buf) : _inRenderer?.onData?.(buf, fmt));
+      inBuf.attach((buf, fmt, isReplay, receivedAt) => _deliverFrame(_inRenderer, buf, fmt, isReplay, receivedAt));
     } else if (topicIn.topic) {
       // Buffer not ready yet (device came online after initial ping) — create on demand
       const inWsUrl = _wsUrlFor('/ws/bus' + topicIn.topic);
       const buf = _ensureBuffer(skill.id, inWsUrl, inHint, 'in');
-      buf?.attach((b, fmt, isReplay) => isReplay ? _inRenderer?.onDataSilent?.(b) : _inRenderer?.onData?.(b, fmt));
+      buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_inRenderer, b, fmt, isReplay, receivedAt));
     }
 
     // Right panel: topic_out (actual renderer)
@@ -493,30 +500,38 @@ function mountRenderer(skill) {
   console.log(`[attach] skill=${skill.id} outBuf=${!!outBuf} inBuf=${!!inBuf} activeBuf=${!!activeBuf} ws_path=${skill.ws_path}`);
   if (activeBuf) {
     let replayCount = 0, liveCount = 0;
-    activeBuf.attach((buf, fmt, isReplay) => {
-      if (isReplay) { replayCount++; _activeRenderer?.onDataSilent?.(buf); }
+    activeBuf.attach((buf, fmt, isReplay, receivedAt) => {
+      if (isReplay) { replayCount++; }
       else {
         if (liveCount === 0) console.log(`[audio:live] first live frame after ${replayCount} replay frames, skill=${skill.id}`);
         liveCount++;
-        _activeRenderer?.onData?.(buf, fmt);
       }
+      _deliverFrame(_activeRenderer, buf, fmt, isReplay, receivedAt);
     });
     console.log(`[attach] attached to activeBuf, replay frames will be silent`);
   } else if (skill.ws_path) {
     // Buffer not ready yet — create on demand
     const buf = _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out');
     console.log(`[attach] created on-demand outBuf for ws_path=${skill.ws_path}`);
-    buf?.attach((b, fmt, isReplay) => isReplay ? _activeRenderer?.onDataSilent?.(b) : _activeRenderer?.onData?.(b, fmt));
+    buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_activeRenderer, b, fmt, isReplay, receivedAt));
   } else if (hasIn && topicIn?.topic) {
     // No out buffer and no ws_path — wire directly to in_topic stream
     const inWsUrl = _wsUrlFor('/ws/bus' + topicIn.topic);
     const buf = _ensureBuffer(skill.id, inWsUrl, hint, 'in');
     console.log(`[attach] wired to in_topic=${topicIn.topic}`);
-    buf?.attach((b, fmt, isReplay) => isReplay ? _activeRenderer?.onDataSilent?.(b) : _activeRenderer?.onData?.(b, fmt));
+    buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_activeRenderer, b, fmt, isReplay, receivedAt));
   } else {
     console.log('[preview] no ws_path for skill', skill.id);
   }
   _attachedSkillId = skill.id;
+}
+
+function _deliverFrame(renderer, buffer, format, isReplay, receivedAt) {
+  if (renderer?.name === 'odom') {
+    const receive = isReplay ? renderer.onDataSilent : renderer.onData;
+    receive?.call(renderer, buffer, format, { receivedAt });
+  } else if (isReplay) renderer?.onDataSilent?.(buffer);
+  else renderer?.onData?.(buffer, format);
 }
 
 // ── Activity log ──────────────────────────────────────────────────────────────

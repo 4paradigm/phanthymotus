@@ -17,6 +17,7 @@ import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
 import { TactileRenderer }  from './renderers/tactile.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
+import { OdomRenderer } from './renderers/odom.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
@@ -275,9 +276,9 @@ async function _fetchAndBuild() {
       // and CSS grid answered by inventing implicit ones: measured on a 420px
       // viewport the single real column collapsed to 2px and two cards with it.
       const col = Math.max(0, Math.min(_totalCols - colSpan, saved.col));
-      placed.push({ topicPath, col, row: saved.row, colSpan, rowSpan, mode: saved.mode || 'log' });
+      placed.push({ topicPath, col, row: saved.row, colSpan, rowSpan, mode: saved.mode || (topicDetails[topicPath]?.format === 'state/odom' ? 'kv' : 'log') });
     } else {
-      fresh.push({ topicPath, colSpan, rowSpan, mode: 'log' });
+      fresh.push({ topicPath, colSpan, rowSpan, mode: topicDetails[topicPath]?.format === 'state/odom' ? 'kv' : 'log' });
     }
   }
   // Saved positions can also collide with each other — a layout written before
@@ -328,7 +329,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const fmtClass = _formatClass(format);
   const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
-  const isJson = format === 'data/json' || format?.startsWith('text/');
+  const isJson = format === 'state/odom' || format === 'data/json' || format?.startsWith('text/');
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
@@ -358,7 +359,8 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const body = el.querySelector('.monitor-card-body');
   const renderer = _createRenderer(format, defaultMode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, format === 'state/odom' ? {mode: defaultMode, showModeToggle: false}
+    : _topicMcpMap[topicPath] || 'dashboard');
 
   const ws = _connectWs(topicPath, format, renderer);
   const card = { el, renderer, ws, format, mode: defaultMode, col, row, colSpan, rowSpan };
@@ -471,7 +473,8 @@ function _refreshRenderer(topicPath) {
   card.renderer?.unmount?.();
   body.innerHTML = '';
   const renderer = _createRenderer(card.format, card.mode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, card.format === 'state/odom' ? {mode: card.mode, showModeToggle: false}
+    : _topicMcpMap[topicPath] || 'dashboard');
   card.renderer = renderer;
   // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
   // not resolved yet, and a mode switch on such a card must not throw.
@@ -485,11 +488,13 @@ function _switchMode(topicPath, newMode, modeBtns) {
   if (!card || card.mode === newMode) return;
   card.mode = newMode;
   modeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === newMode));
-  _refreshRenderer(topicPath);
+  if (card.format === 'state/odom') card.renderer.setMode(newMode);
+  else _refreshRenderer(topicPath);
   _saveLayout();
 }
 
 function _createRenderer(format, mode) {
+  if (OdomRenderer.canRender(format)) return Object.assign({}, OdomRenderer);
   if (mode === 'kv') {
     return Object.assign(Object.create(Object.getPrototypeOf(KvLatestRenderer)), KvLatestRenderer);
   }
@@ -729,7 +734,7 @@ function _onPointerEnd() {
   document.removeEventListener('touchmove', _blockTouchScroll, { passive: false });
 
   if (changed) _saveLayout();
-  if (resized) _refreshRenderer(topicPath);
+  if (resized && card.format !== 'state/odom') _refreshRenderer(topicPath);
 }
 
 /**

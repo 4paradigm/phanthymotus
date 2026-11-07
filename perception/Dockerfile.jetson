@@ -92,12 +92,12 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # builds fall back to ld.so's default search path, which already covers the
 # /usr/lib/aarch64-linux-gnu these packages install into.
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+    mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
     chmod +x /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg libvips42 && \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -365,12 +365,12 @@ RUN . /etc/jetpack.env; \
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
 # step that actually failed on `--jp-version 6.1`, because layers 1-11 were
 # cached and it was the first apt install to run.
-RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+RUN mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
     chmod +x /usr/sbin/ldconfig && \
     apt-get update && \
     apt-get install -y --no-install-recommends espeak-ng && \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
@@ -405,12 +405,12 @@ COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-require
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ] && \
        ! python3 -c "import os,sysconfig;raise SystemExit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)"; then \
       echo '[build] CPython headers missing — installing python3-dev for the source builds' && \
-      mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+      mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
       printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
       chmod +x /usr/sbin/ldconfig && \
       apt-get update && \
       apt-get install -y --no-install-recommends python3-dev && \
-      mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+      mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
       { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
       rm -rf /var/lib/apt/lists/*; \
     fi
@@ -580,12 +580,132 @@ assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
 print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
-# ── Application code ───────────────────────────────────────────────
+# Native dependencies are cached independently of application changes.
 WORKDIR /work
+# Native RTAB-Map 0.22.1 + its Humble wrapper, built against each image's ROS,
+# OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
+RUN set -e; . /etc/jetpack.env; \
+    case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
+    mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
+    apt-get update; apt-get install -y --no-install-recommends \
+      curl ca-certificates git cmake build-essential python3-dev libpcl-dev \
+      libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
+      libsqlite3-dev zlib1g-dev libssl-dev; \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig; \
+    ldconfig || echo '[build] ldconfig skipped under emulation'; \
+    . /opt/ros/humble/install/setup.bash; \
+    rtabmap_python="$(command -v python3)"; \
+    python3 -c "import cv2,numpy; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[rtabmap-build] OpenCV',cv2.__version__,'Python ${PY_ABI}')"; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
+# The full archive includes GUI assets and datasets. Fetch only the pinned
+# headless sources; keep completed Git objects when a transfer is interrupted.
+RUN set -e; \
+    rtabmap_source=/tmp/rtabmap-ws/src/rtabmap; \
+    mkdir -p "${rtabmap_source}"; \
+    git -C "${rtabmap_source}" init -q; \
+    git -C "${rtabmap_source}" remote add origin https://github.com/introlab/rtabmap.git; \
+    git -C "${rtabmap_source}" config http.version HTTP/1.1; \
+    git -C "${rtabmap_source}" config http.lowSpeedLimit 1024; \
+    git -C "${rtabmap_source}" config http.lowSpeedTime 30; \
+    for source_attempt in 1 2; do \
+      echo "[rtabmap-build] fetching pinned core sources, attempt ${source_attempt}/2"; \
+      if GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" fetch --depth=1 --filter=blob:none origin "${RTABMAP_CORE_COMMIT}" && \
+        git -C "${rtabmap_source}" sparse-checkout init --cone && \
+        git -C "${rtabmap_source}" sparse-checkout set cmake_modules corelib utilite && \
+        GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" checkout --detach "${RTABMAP_CORE_COMMIT}"; then break; fi; \
+      if [ "${source_attempt}" -eq 2 ]; then exit 1; fi; \
+      sleep 3; \
+    done; \
+    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"; \
+    . /opt/ros/humble/install/setup.bash; \
+    cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
+      -DWITH_GTSAM=OFF -DWITH_OPEN3D=OFF -DWITH_G2O=OFF -DWITH_TORO=ON \
+      -DWITH_CERES=OFF -DWITH_PYTHON=OFF -DWITH_TORCH=OFF -DWITH_POINTMATCHER=OFF \
+      -DWITH_PDAL=OFF -DWITH_OCTOMAP=OFF -DWITH_OPENNI=OFF -DWITH_OPENNI2=OFF \
+      -DWITH_FREENECT=OFF -DWITH_FREENECT2=OFF -DWITH_K4A=OFF \
+      -DWITH_REALSENSE=OFF -DWITH_REALSENSE2=OFF -DWITH_ZED=OFF -DWITH_ZEDOC=OFF \
+      -DWITH_FLYCAPTURE2=OFF -DWITH_DC1394=OFF -DWITH_MYNTEYE=OFF \
+      -DWITH_OPENGV=OFF -DWITH_MRPT=OFF -DWITH_VERTIGO=OFF -DWITH_FASTCV=OFF; \
+    cmake --build /tmp/rtabmap-core-build --target install --parallel 2; \
+    rm -rf /tmp/rtabmap-ws /tmp/rtabmap-core-build
+
+ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
+# A wrapper/dependency download failure must not discard the compiled core.
+RUN set -e; . /opt/ros/humble/install/setup.bash; \
+    rtabmap_python="$(command -v python3)"; \
+    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
+    mkdir -p /tmp/rtabmap-ws/src; \
+    fetch_rtabmap_source() { \
+      source_name="$1"; source_repo="$2"; source_commit="$3"; \
+      for source_attempt in 1 2; do \
+        echo "[rtabmap-build] fetching ${source_name}, attempt ${source_attempt}/2"; \
+        if curl -fL --http1.1 --proto '=https' --tlsv1.2 \
+          --connect-timeout 20 --max-time 1800 --speed-limit 1024 --speed-time 30 \
+          "https://codeload.github.com/${source_repo}/tar.gz/${source_commit}" -o "/tmp/${source_name}.tar.gz"; then \
+          break; \
+        fi; \
+        rm -f "/tmp/${source_name}.tar.gz"; \
+        if [ "${source_attempt}" -eq 2 ]; then return 1; fi; \
+        sleep 3; \
+      done; \
+      mkdir -p "/tmp/rtabmap-ws/src/${source_name}"; \
+      tar -xzf "/tmp/${source_name}.tar.gz" --strip-components=1 -C "/tmp/rtabmap-ws/src/${source_name}"; \
+      rm "/tmp/${source_name}.tar.gz"; \
+    }; \
+    fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}"; \
+    fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da; \
+    fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e; \
+    rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
+    add_missing_rtabmap_dependencies() { \
+      dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; shift 3; \
+      missing_packages=''; \
+      for dependency_package in "$@"; do \
+        if ! ros2 pkg prefix "${dependency_package}" >/dev/null 2>&1; then \
+          missing_packages="${missing_packages} ${dependency_package}"; \
+        fi; \
+      done; \
+      if [ -n "${missing_packages}" ]; then \
+        fetch_rtabmap_source "${dependency_name}" "${dependency_repo}" "${dependency_commit}"; \
+        rtabmap_packages="${rtabmap_packages}${missing_packages}"; \
+      fi; \
+    }; \
+    add_missing_rtabmap_dependencies perception_pcl ros-perception/perception_pcl \
+      ca66aa21f28b7e2848870f08faace81554e78437 pcl_conversions pcl_ros; \
+    add_missing_rtabmap_dependencies diagnostics ros/diagnostics \
+      a1b95037eeab10592a8268be2a67cadaad6673da diagnostic_updater; \
+    add_missing_rtabmap_dependencies vision_opencv ros-perception/vision_opencv \
+      066793a23e5d06d76c78ca3d69824a501c3554fd cv_bridge image_geometry; \
+    add_missing_rtabmap_dependencies image_common ros-perception/image_common \
+      69b50c6db906b2044502b00c1b35dc97ec8a40ce image_transport; \
+    add_missing_rtabmap_dependencies laser_geometry ros-perception/laser_geometry \
+      d53b925d25b4b5657261a44f4479365965cc2363 laser_geometry; \
+    rtabmap_rcutils="$(readlink -f /opt/ros/humble/install/lib/librcutils.so)"; \
+    rtabmap_builtin="$(readlink -f /opt/ros/humble/install/lib/libbuiltin_interfaces__rosidl_generator_c.so)"; \
+    rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
+    test -f "${rtabmap_rcutils}"; test -f "${rtabmap_builtin}"; test -f "${rtabmap_crypto}"; \
+    cd /tmp/rtabmap-ws; \
+    MAKEFLAGS=-j2 colcon build --merge-install --install-base /opt/rtabmap_ros \
+      --executor sequential --packages-select ${rtabmap_packages} --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF \
+      -DPython3_EXECUTABLE="${rtabmap_python}" -DPYTHON_EXECUTABLE="${rtabmap_python}" \
+      -Drcutils_LIB:FILEPATH="${rtabmap_rcutils}" \
+      -Dbuiltin_interfaces__rosidl_generator_c_LIB:FILEPATH="${rtabmap_builtin}" \
+      -Dcrypto_LIB:FILEPATH="${rtabmap_crypto}" \
+      '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
+      -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
+    cd /work; rm -rf /tmp/rtabmap-ws
+
+# ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/configs/   /work/configs/
 COPY perception/deploy/    /deploy/
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
@@ -666,6 +786,8 @@ print('[build] zxing-cpp:', version('zxing-cpp'), 'ok,', \
       'try_invert' in zxingcpp.read_barcodes.__doc__.splitlines()[0] and 'with try_invert' or 'no try_invert')" \
       || echo "[build] zxing-cpp: NOT INSTALLED — the barcode card will report decoder_unavailable"
 
+COPY perception/tools/rtabmap_pointcloud_smoke.py /work/tools/rtabmap_pointcloud_smoke.py
+
 EXPOSE 15720
 EXPOSE 15721
 
@@ -679,13 +801,18 @@ EXPOSE 15721
 # the failure would surface at runtime as a missing rclpy, not at build time.
 RUN . /etc/jetpack.env; \
     PTH="/usr/local/lib/python${PY_ABI}/dist-packages/ros_ws.pth"; \
-    find /ros_ws/install -name "site-packages" -type d > "${PTH}" && \
+    find /opt/rtabmap_ros -type d \( -name "site-packages" -o -name "dist-packages" \) > "${PTH}" && \
+    find /ros_ws/install -name "site-packages" -type d >> "${PTH}" && \
     find /opt/ros/humble/install -name "site-packages" -type d >> "${PTH}" && \
     echo "[build] ${PTH}:" && cat "${PTH}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+ENV LD_LIBRARY_PATH="/opt/rtabmap_ros/lib:/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/opt/rtabmap_ros:/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+
+# Runs directly, outside pytest and its ROS stubs, without GPU/camera access.
+# Also checks generated Python typesupport through the runtime .pth/ENV paths.
+RUN ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=127 python3 /work/tools/rtabmap_pointcloud_smoke.py
 
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
@@ -698,5 +825,6 @@ CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
+     source /opt/rtabmap_ros/setup.bash && \
      source /etc/dla-fallback.env && \
      python3 /work/main.py"]

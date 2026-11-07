@@ -10,6 +10,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
+  pointcloud       点云（深度图反投影 / 单目深度估计 / 双目立体匹配）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
@@ -232,6 +233,34 @@ class PerceptionBundle:
             from plugins.measure import MeasurePlugin
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
+
+        pcl_cfg = plugins_cfg.get("pointcloud") or {}
+        if pcl_cfg.get("enabled", False):
+            import re, socket
+            namespace = pcl_cfg.get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pointcloud import PointCloudPerceptionPlugin
+            # Guarded like visual_depth: the stereo/mono path pulls in cv2 and
+            # the mono engine only lazily, but a bad config must still not take
+            # the rest of the stack down. The card simply does not appear.
+            try:
+                self._plugins.append(
+                    PointCloudPerceptionPlugin(pcl_cfg, namespace, executor)
+                )
+                log.info("PointCloudPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PointCloudPerceptionPlugin failed to load; continuing without pointcloud",
+                          exc_info=True)
+
+        slam_cfg = plugins_cfg.get("pointcloud_slam") or {}
+        if slam_cfg.get("enabled", False):
+            try:
+                from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
+                self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor))
+                log.info("PointCloudSlamPlugin loaded (RTAB-Map point-cloud mapping)")
+            except Exception:
+                log.error("PointCloudSlamPlugin failed to load; continuing without SLAM", exc_info=True)
 
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
