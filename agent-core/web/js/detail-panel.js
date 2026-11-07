@@ -104,7 +104,7 @@ export function showTopicDetail(topicPath, format) {
 
   const hint     = format || 'activity';
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
-  _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
+  _textLike = Renderer === OdomRenderer || Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');
