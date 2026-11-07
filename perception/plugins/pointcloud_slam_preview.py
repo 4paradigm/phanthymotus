@@ -8,6 +8,11 @@ import numpy as np
 from .pointcloud_slam_stream import _rigid
 
 
+def mapping_payload(packet):
+    """Return the existing mapping body from an encoded native preview."""
+    return packet[4 + struct.unpack_from('<I', packet)[0]:]
+
+
 def encode_preview(points, pose, *, max_points, metadata, trajectory=()):
     """Encode bounded metadata followed by one diagnostic mapping packet."""
     if type(max_points) is not int or not 0 < max_points <= 80000:

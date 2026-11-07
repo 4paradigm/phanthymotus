@@ -108,12 +108,6 @@ const _lastSkillEvents = {};
 
 function _ensureBuffer(skillId, wsUrl, hint, side /* 'out'|'in' */) {
   if (!_buffers[skillId]) _buffers[skillId] = { out: null, in: null };
-  const existing = _buffers[skillId][side];
-  if (existing && wsUrl && existing._wsUrl !== wsUrl &&
-      (hint === 'state/odom' || existing._hint === 'state/odom')) {
-    existing.destroy();
-    _buffers[skillId][side] = null;
-  }
   if (!_buffers[skillId][side] && wsUrl) {
     _buffers[skillId][side] = new SkillBuffer(wsUrl, hint);
   }
@@ -500,8 +494,7 @@ function mountRenderer(skill) {
 
   // Attach to background preview buffer (replay + live stream)
   // For devices with only topic_in (e.g. speaker), fall back to inBuf.
-  const outBuf = hint === 'state/odom' && skill.ws_path
-    ? _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out') : _buffers[skill.id]?.out;
+  const outBuf = _buffers[skill.id]?.out;
   const inBuf  = _buffers[skill.id]?.in;
   const activeBuf = outBuf || (!skill.ws_path && hasIn ? inBuf : null);
   console.log(`[attach] skill=${skill.id} outBuf=${!!outBuf} inBuf=${!!inBuf} activeBuf=${!!activeBuf} ws_path=${skill.ws_path}`);

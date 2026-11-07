@@ -20,6 +20,41 @@ _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
 log = logging.getLogger(__name__)
 
 
+def discover_input_bindings(input_topics):
+    """Resolve native publisher types, allowing one second for DDS discovery."""
+    if (not isinstance(input_topics, list) or len(input_topics) != 2 or
+            any(not isinstance(topic, str) or not topic.strip() for topic in input_topics) or
+            len(set(input_topics)) != 2):
+        raise ValueError('two distinct native ROS input topics required')
+    formats = {'sensor_msgs/msg/PointCloud2': 'sensor/pointcloud2',
+               'std_msgs/msg/String': 'state/odom'}
+    node = Node('pointcloud_slam_input_discovery')
+    try:
+        deadline = time.monotonic() + 1.
+        while True:
+            bindings = {}
+            for topic in input_topics:
+                # Core may monitor even a native cloud through a String subscriber.
+                # Only publisher endpoints identify the connected producer's type.
+                types = {endpoint.topic_type for endpoint in node.get_publishers_info_by_topic(topic)}
+                if not types:
+                    continue
+                if len(types) != 1 or not types <= formats.keys():
+                    raise ValueError('ambiguous or unsupported native ROS input type: ' + topic)
+                bindings[topic] = formats[next(iter(types))]
+            if len(bindings) == 2:
+                if set(bindings.values()) != {'state/odom', 'sensor/pointcloud2'}:
+                    raise ValueError('native ROS inputs require one String pose and one PointCloud2 cloud')
+                return bindings
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                missing = ', '.join(topic for topic in input_topics if topic not in bindings)
+                raise ValueError('native ROS input discovery timed out: ' + missing)
+            time.sleep(min(.05, remaining))
+    finally:
+        node.destroy_node()
+
+
 def decode_cloud(msg, *, max_points):
     """Read finite XYZ float32 points, including padded and organized clouds."""
     try:
@@ -63,7 +98,7 @@ class SlamInputNode(Node):
     """Subscribe only to explicitly resolved topics; does not control producers."""
 
     def __init__(self, odom_topic, cloud_topic, stream, *, clock=time.monotonic,
-                 measurement_clock_ns=None, preview=None):
+                 measurement_clock_ns=None, preview=None, capture_stop=None):
         loop_search = None
         if preview is not None:
             if not isinstance(preview, dict):
@@ -96,6 +131,8 @@ class SlamInputNode(Node):
         self._receipt_clock = clock
         self._measurement_clock_ns = measurement_clock_ns or (lambda: self.get_clock().now().nanoseconds)
         self._lock = threading.Lock()
+        self._project_stop = capture_stop if capture_stop is not None else threading.Event()
+        self._capture_stop = threading.Event()
         self._preview = preview
         self._loop_search = loop_search
         self._loop_segment = None
@@ -135,7 +172,7 @@ class SlamInputNode(Node):
         except (TypeError, ValueError):
             sample = None
         with self._lock:
-            if self._preview_stop.is_set():
+            if self._preview_stop.is_set() or self._capture_stop.is_set() or self._project_stop.is_set():
                 return
             measurement_now = (self._measurement_clock_ns()
                                if self.stream.max_measurement_age_ms is not None else None)
@@ -146,7 +183,7 @@ class SlamInputNode(Node):
         try:
             packet = json.loads(msg.data)
             with self._lock:
-                if self._preview_stop.is_set():
+                if self._preview_stop.is_set() or self._capture_stop.is_set() or self._project_stop.is_set():
                     return
                 measurement_now = (self._measurement_clock_ns()
                                    if self.stream.max_measurement_age_ms is not None else None)
@@ -161,7 +198,7 @@ class SlamInputNode(Node):
         try:
             stamp, frame, points = decode_cloud(msg, max_points=self.stream.max_cloud_points)
             with self._lock:
-                if self._preview_stop.is_set():
+                if self._preview_stop.is_set() or self._capture_stop.is_set() or self._project_stop.is_set():
                     return
                 measurement_now = (self._measurement_clock_ns()
                                    if self.stream.max_measurement_age_ms is not None else None)
@@ -175,7 +212,8 @@ class SlamInputNode(Node):
         self._preview_wake.set()
 
     def start_preview(self):
-        if self._preview and self._preview_worker is None:
+        if (self._preview and self._preview_worker is None and
+                not self._capture_stop.is_set() and not self._project_stop.is_set()):
             self._preview_worker = threading.Thread(target=self._preview_loop, daemon=True,
                                                      name='pointcloud_slam_preview')
             self._status_worker = threading.Thread(target=self._status_loop, daemon=True,
@@ -184,7 +222,11 @@ class SlamInputNode(Node):
             self._preview_worker.start()
             self._preview_wake.set()
 
+    def freeze_capture(self):
+        self._capture_stop.set()
+
     def stop_preview(self):
+        self.freeze_capture()
         already_stopped = self._preview_stop.is_set()
         self._preview_stop.set()
         self._preview_wake.set()
@@ -294,13 +336,14 @@ class SlamInputNode(Node):
                     segment_id=segment.segment_id, frame_id=segment.frames[0].pose.frame_id + '_archive',
                     plane=evidence.get('map_plane') if evidence.get('map_plane') == 'xy' else None)
                 context.setdefault('actions', {})
-                topics.append({'topic': topic, 'format': 'sensor/slam-preview',
+                topics.append({'topic': topic, 'format': self._preview.get('wire_format', 'sensor/slam-preview'),
+                               'desc': 'Experimental map snapshot; marker is the last captured frame pose',
                                'segment_id': segment.segment_id, 'metadata': {'map_view': context}})
             return topics
 
     def _publish_history_previews(self):
         from .pointcloud_slam_map import rebuild_segment, history_poses
-        from .pointcloud_slam_preview import encode_preview
+        from .pointcloud_slam_preview import encode_preview, mapping_payload
         for output in self.history_topics():
             topic, sid = output['topic'], output['segment_id']
             with self._lock:
@@ -326,6 +369,8 @@ class SlamInputNode(Node):
                             self._preview.get('archive_metadata') or {}).get('evidence', self._preview.get('input_validation')))}
             points = rebuild_segment(segment, poses, max_points=self._preview['max_points'])
             packet = encode_preview(points, poses[-1], max_points=self._preview['max_points'], metadata=metadata, trajectory=poses)
+            if self._preview.get('wire_format') == 'sensor/mapping':
+                packet = mapping_payload(packet)
             with self._lock:
                 if self._preview_stop.is_set(): return
                 message = UInt8MultiArray(); message.data = packet
@@ -335,7 +380,7 @@ class SlamInputNode(Node):
     def publish_preview_once(self):
         """Publish a bounded diagnostic snapshot, never an accepted SLAM map."""
         from .pointcloud_slam_map import rebuild_segment
-        from .pointcloud_slam_preview import encode_preview
+        from .pointcloud_slam_preview import encode_preview, mapping_payload
         started = time.perf_counter()
         self._publish_history_previews()
         preview_subscribed = self._preview_pub.get_subscription_count() > 0
@@ -545,7 +590,7 @@ class SlamInputNode(Node):
                 self._segment_loops = staged_loops
             if packet is not None:
                 msg = UInt8MultiArray()
-                msg.data = packet
+                msg.data = mapping_payload(packet) if self._preview.get('wire_format') == 'sensor/mapping' else packet
                 self._preview_pub.publish(msg)
             message = String()
             message.data = json.dumps(result, allow_nan=False)

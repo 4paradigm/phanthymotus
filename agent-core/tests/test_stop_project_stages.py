@@ -360,20 +360,3 @@ def test_the_endpoint_returns_before_the_teardown_finishes(rig):
         api_config._stop_teardown_task.cancel()
 
     run(scenario())
-
-
-def test_map_archive_stop_has_its_own_bounded_deadline(rig, monkeypatch):
-    outer_deadlines = []
-    wait_for = asyncio.wait_for
-
-    async def bounded_wait(coro, timeout):
-        outer_deadlines.append(timeout)
-        return await wait_for(coro, timeout)
-
-    monkeypatch.setattr(asyncio, 'wait_for', bounded_wait)
-    cards = [CARDS[-1], {'id': 'map', 'mcpId': 'mcp-2', 'toolName': 'pointcloud_slam'}]
-    assert all(item['ok'] for item in run(api_config._stop_cards(cards)))
-    deadlines = {tool: timeout for _, tool, _, timeout in rig.calls}
-    assert deadlines['tts'] == api_config.STOP_CARD_TIMEOUT_S
-    assert deadlines['pointcloud_slam'] == 300.0
-    assert sorted(outer_deadlines) == [api_config.STOP_CARD_TIMEOUT_S, 300.0]

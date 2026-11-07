@@ -99,7 +99,6 @@ def test_map_tool_declares_generic_resources_actions_and_owner_independent_capab
     assert schema['properties']['map_id']['x-resource-options']==dict(action='list_maps',items='maps',value='id',label='name')
     assert schema['x-map-manager']['schema']=='motus.map-manager/1'
     assert schema['x-action-lifecycle']['actions']['select_map']['background'] is True
-    assert schema['x-stop']['timeout_s']==300
 
 
 def dynamic_configuration():

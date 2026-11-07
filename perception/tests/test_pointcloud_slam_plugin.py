@@ -31,6 +31,7 @@ def test_canvas_configuration_supplies_required_start_settings():
     assert plugin.dispatch('pointcloud_slam', args)['state'] == 'running'
     assert plugin.dispatch('pointcloud_slam', {'action': 'config', 'max_frames': 5})['state'] == 'error'
     plugin.dispatch('pointcloud_slam', {'action': 'stop'})
+    plugin.shutdown()
 
 
 def test_canvas_configuration_rejects_malformed_matrix_without_changes():
@@ -99,6 +100,7 @@ def test_start_uses_formats_regardless_of_order_and_stops_only_own_node():
     assert info['topic_out'] == []
     assert info['input_status']['odometry'] == 'waiting'
     plugin.dispatch('pointcloud_slam', {'action': 'stop'})
+    plugin.shutdown()
     assert not executor.nodes and node.destroyed
 
 
@@ -210,6 +212,7 @@ def test_opt_in_preview_runs_worker_publishes_and_stops_only_its_node():
     pub = next(p for p in node.publishers if p.topic == '/c/slam_odom_preview')
     assert _wait_until(lambda: len(pub.messages) > 0)
     plugin.dispatch('pointcloud_slam', {'action': 'stop'})
+    plugin.shutdown()
     assert not executor.nodes and not node._preview_worker.is_alive()
 
 
@@ -443,6 +446,7 @@ def test_managed_paged_history_continues_and_restores_beyond_window(tmp_path, mo
     node.stream.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1., measurement_now_ns=1_000_000_000)
     assert call('stop')['state'] == 'idle'
     assert call('info')['state'] == 'idle'
+    assert _wait_until(lambda: call('info')['save_state'] == 'saved')
     assert [e['name'] for e in call('list_maps')['maps']] == ['Third']
     assert call('start_mapping', map_name='Fourth')['state'] == 'error'
 

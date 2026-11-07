@@ -327,10 +327,10 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
   // Apply grid placement
   _applyPlacement(el, col, row, colSpan, rowSpan);
 
-  const fmtClass = _formatClass(format === 'state/odom' ? 'data/json' : format);
+  const fmtClass = _formatClass(format);
   const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
   const isJson = format === 'state/odom' || format === 'data/json' || format?.startsWith('text/');
-  const defaultMode = (isJson && savedMode) ? savedMode : format === 'state/odom' ? 'kv' : 'log';
+  const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
     ? `<div class="monitor-card-modes">

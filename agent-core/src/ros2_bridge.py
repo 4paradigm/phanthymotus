@@ -22,7 +22,6 @@ cb 签名: async def cb(data: bytes, fmt: str) -> None
 """
 
 import asyncio
-import json
 import sys
 import threading
 
@@ -123,24 +122,6 @@ def stop() -> None:
     print('[ros2_bridge] stopped')
 
 
-def _pointcloud2_metadata(msg) -> bytes:
-    """Canvas preview only; consumers subscribe to the complete ROS message."""
-    return json.dumps({
-        'stamp': {'sec': msg.header.stamp.sec, 'nanosec': msg.header.stamp.nanosec},
-        'frame_id': msg.header.frame_id, 'width': msg.width, 'height': msg.height,
-        'point_step': msg.point_step, 'row_step': msg.row_step,
-        'is_bigendian': msg.is_bigendian,
-    }).encode('utf-8')
-
-
-def _depth_f32_metadata(msg) -> bytes:
-    return json.dumps({
-        'stamp': {'sec': msg.header.stamp.sec, 'nanosec': msg.header.stamp.nanosec},
-        'frame_id': msg.header.frame_id, 'width': msg.width, 'height': msg.height,
-        'encoding': msg.encoding, 'step': msg.step,
-    }).encode('utf-8')
-
-
 def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop, cb) -> None:
     """订阅 topic；每收到一帧就在 loop 中 schedule cb(data: bytes, fmt: str)。"""
     if not _HAS_RCLPY or not _running:
@@ -162,10 +143,7 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
     def _on_msg(msg):
         try:
             raw = msg.data
-            data = (_pointcloud2_metadata(msg) if fmt == 'sensor/pointcloud2' else
-                    _depth_f32_metadata(msg) if fmt == 'sensor/depth-f32' else
-                    raw if isinstance(raw, bytes) else
-                    (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw)))
+            data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
             msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
@@ -230,18 +208,6 @@ def publish(topic: str, data: str) -> None:
 
 def _resolve_msg_type(fmt: str):
     """根据 data format 返回对应的 ROS2 消息类型，未知返回 None。"""
-    if fmt == 'sensor/pointcloud2':
-        try:
-            from sensor_msgs.msg import PointCloud2
-            return PointCloud2
-        except ImportError:
-            return None
-    if fmt == 'sensor/depth-f32':
-        try:
-            from sensor_msgs.msg import Image
-            return Image
-        except ImportError:
-            return None
     if fmt.startswith('audio/'):
         try:
             from audio_msgs.msg import AudioChunk
@@ -250,7 +216,7 @@ def _resolve_msg_type(fmt: str):
             pass
         # Unitree G1: DDS AudioData_ — 不经 ROS2，此处不需要订阅
         return None
-    if fmt in ('sensor/pointcloud', 'sensor/mapping', 'sensor/slam-preview'):
+    if fmt in ('sensor/pointcloud', 'sensor/mapping'):
         try:
             from std_msgs.msg import UInt8MultiArray
             return UInt8MultiArray

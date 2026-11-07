@@ -19,7 +19,6 @@ import os
 import pathlib
 import sys
 import tempfile
-import types
 
 import pytest
 
@@ -98,60 +97,3 @@ def test_a_consumer_still_cannot_change_the_format(clean):
     _register(TOPIC, 'image/depth-zlib', 'mcp-perception')
     _register(TOPIC, 'image/jpeg', 'mcp-ocr', producer=False)
     assert inspection._topic_registry[TOPIC]['format'] == 'image/depth-zlib'
-
-
-@pytest.mark.parametrize('fmt', ['sensor/depth-f32', 'sensor/pointcloud2'])
-def test_native_inputs_keep_main_subscription_behavior(clean, fmt):
-    _register(TOPIC, fmt, 'mcp-producer')
-    _register(TOPIC, fmt, 'mcp-consumer', producer=False)
-    assert inspection._topic_registry[TOPIC]['format'] == fmt
-    assert clean == [(TOPIC, fmt), (TOPIC, fmt)]
-
-
-def test_native_topic_view_close_keeps_main_subscription_and_cache(monkeypatch):
-    topic = '/metric-depth'
-    inspection._topic_registry[topic] = {'format': 'sensor/depth-f32'}
-    monkeypatch.setitem(inspection._last_frame, topic, b'{"width":640}')
-    unsubscribed = []
-    monkeypatch.setattr(inspection, '_ensure_primary_sub',
-                        lambda topic, fmt, loop: inspection._active_primary_subs.add(topic))
-    monkeypatch.setattr(inspection.ros2_bridge, 'unsubscribe', unsubscribed.append)
-
-    async def accept():
-        pass
-
-    async def send_text(text):
-        if text == '{"width":640}':
-            asyncio.get_running_loop().call_soon(
-                lambda: inspection._topic_queues[topic][0].put_nowait(None))
-
-    ws = types.SimpleNamespace(accept=accept, send_text=send_text)
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        inspection.bus_ws(ws, topic.lstrip('/')))
-    assert unsubscribed == []
-    assert topic in inspection._active_primary_subs
-    assert inspection._last_frame[topic] == b'{"width":640}'
-
-
-def test_large_topic_keeps_subscription_for_another_viewer(monkeypatch):
-    topic = '/metric-depth-two-viewers'
-    inspection._topic_registry[topic] = {'format': 'sensor/depth-f32'}
-    other_viewer = asyncio.Queue()
-    inspection._topic_queues[topic] = [other_viewer]
-    unsubscribed = []
-    monkeypatch.setattr(inspection, '_ensure_primary_sub',
-                        lambda topic, fmt, loop: inspection._active_primary_subs.add(topic))
-    monkeypatch.setattr(inspection.ros2_bridge, 'unsubscribe', unsubscribed.append)
-
-    async def accept():
-        pass
-
-    async def send_text(_text):
-        asyncio.get_running_loop().call_soon(
-            lambda: inspection._topic_queues[topic][-1].put_nowait(None))
-
-    ws = types.SimpleNamespace(accept=accept, send_text=send_text)
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        inspection.bus_ws(ws, topic.lstrip('/')))
-    assert not unsubscribed
-    assert inspection._topic_queues.pop(topic) == [other_viewer]

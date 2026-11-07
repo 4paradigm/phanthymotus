@@ -8,7 +8,7 @@ import threading
 import uuid
 from copy import deepcopy
 
-from .pointcloud_slam_ros import SlamInputNode
+from .pointcloud_slam_ros import SlamInputNode, discover_input_bindings
 from .pointcloud_slam_stream import SlamStream, _rigid
 from utils.ros_lifecycle import dispose_node
 
@@ -98,6 +98,16 @@ class PointCloudSlamPlugin:
         self._operation_lock = threading.Lock()
         self._operation = {}
         self._worker = None
+        self._save_lock = threading.Lock()
+        self._save_status = {'state': 'idle'}
+        self._capture_stop = threading.Event()
+        self._config_error = None
+        self._legacy_core = True
+        self._project_stopping = False
+        self._selecting_views = 0
+        self._views_idle = threading.Event()
+        self._views_idle.set()
+        self._blocking_stops = 0
         self._session_settings = {}
         self._strategy = {}
         self._lock = threading.RLock()
@@ -130,8 +140,6 @@ class PointCloudSlamPlugin:
                                     pending_states=['working'], error_states=['error'], poll_interval_ms=500)
             schema['x-action-lifecycle'] = {'schema': 'motus.action-lifecycle/1',
                                           'config_actions': ['start'], 'actions': actions}
-            schema['x-stop'] = {'timeout_s': 300}
-
             schema['properties']['action']['oneOf'] = [
                 {'const': action, 'title': _MAP_ACTIONS[action][0] if action in _MAP_ACTIONS else action}
                 for action in schema['properties']['action']['enum']]
@@ -196,10 +204,11 @@ class PointCloudSlamPlugin:
     def _dispose(self, node):
         if node is not None:
             preview = node._preview or {}
-            self._closed_outputs.extend(t for t in (preview.get('topic'), preview.get('status_topic')) if t)
-            if preview.get('backend') == 'geometry_experimental' and preview.get('topic'):
-                self._closed_outputs.extend([preview['topic'] + '/pose', preview['topic'] + '/map_to_odom'])
-            self._closed_outputs.extend(node._history_publishers)
+            with self._operation_lock:
+                self._closed_outputs.extend(t for t in (preview.get('topic'), preview.get('status_topic')) if t)
+                if preview.get('backend') == 'geometry_experimental' and preview.get('topic'):
+                    self._closed_outputs.extend([preview['topic'] + '/pose', preview['topic'] + '/map_to_odom'])
+                self._closed_outputs.extend(node._history_publishers)
             node.stop_preview()
             dispose_node(self._executor, node, label='pointcloud_slam')
 
@@ -217,50 +226,133 @@ class PointCloudSlamPlugin:
 
     def _stop_mapping(self, request=None):
         from .pointcloud_slam_library import save_revision
-        if self._node is None and self._pending is None:
-            return self._last_stop or {'state': 'ready' if self._project_inputs else 'idle'}
-        if self._node is not None:
-            self._pending = self._node
-            self._dispose(self._node)
-            self._node = None
-            self._save_request = request or uuid.uuid4().hex
-        node = self._pending
-        with node._lock:
-            records = list(node.stream.store.records)
-            history = dict(node._history_snapshots)
-            archived = getattr(node.stream.store, 'archive_metadata', {})
-            self._session_settings['segment_metadata'] = deepcopy(archived.get('segment_metadata', {}))
-        if records:
-            map_id, revision, _ = save_revision(_ARCHIVE_DIR, records, history, self._session_settings,
-                                                self._map_name, None, self._save_request)
-            result = {'state': 'saved', 'map_id': map_id, 'map_name': self._map_name,
-                      'revision': revision, 'keyframes': len(records), 'request_id': self._save_request}
-        else:
-            result = {'state': 'ready', 'message': 'No keyframes captured', 'saved': False}
-        shutil.rmtree(node.stream.store.directory, ignore_errors=True)
-        self._pending = self._map_name = self._save_request = None
-        self._last_stop = result
-        return result
+        with self._save_lock:
+            with self._lock:
+                if self._node is None and self._pending is None:
+                    return self._last_stop or {'state': 'ready' if self._project_inputs else 'idle'}
+                node = self._node
+                if node is not None:
+                    node.freeze_capture()
+                    self._pending, self._node = node, None
+                    self._save_request = request or uuid.uuid4().hex
+                pending = self._pending
+            with self._operation_lock:
+                self._save_status = {'state': 'saving', 'request_id': self._save_request}
+            try:
+                if node is not None:
+                    self._dispose(node)
+                with pending._lock:
+                    records = list(pending.stream.store.records)
+                    history = dict(pending._history_snapshots)
+                    archived = getattr(pending.stream.store, 'archive_metadata', {})
+                    self._session_settings['segment_metadata'] = deepcopy(archived.get('segment_metadata', {}))
+                if records:
+                    map_id, revision, _ = save_revision(_ARCHIVE_DIR, records, history, self._session_settings,
+                                                        self._map_name, None, self._save_request)
+                    result = {'state': 'saved', 'map_id': map_id, 'map_name': self._map_name,
+                              'revision': revision, 'keyframes': len(records), 'request_id': self._save_request}
+                else:
+                    result = {'state': 'ready', 'message': 'No keyframes captured', 'saved': False}
+                shutil.rmtree(pending.stream.store.directory, ignore_errors=True)
+                with self._lock:
+                    self._pending = self._map_name = self._save_request = None
+                    self._last_stop = result
+            except Exception as error:
+                with self._operation_lock:
+                    self._save_status = {'state': 'error', 'message': str(error),
+                                         'request_id': self._save_request}
+                raise
+            with self._operation_lock:
+                self._save_status = dict(result, state='saved' if result['state'] == 'saved' else 'idle')
+            return result
+
+    def _stop_project(self):
+        # The shared event also reaches a node whose constructor is still running.
+        with self._operation_lock:
+            already_stopped = self._capture_stop.is_set()
+            self._capture_stop.set()
+            if self._node is not None:
+                self._node.freeze_capture()
+            if self._project_stopping or self._blocking_stops or (
+                    already_stopped and self._save_status['state'] != 'error' and
+                    self._view is None and not self._selecting_views and
+                    self._operation.get('state') != 'working'):
+                return self._stop_ack()
+            self._project_stopping = True
+            previous = self._worker
+            request = self._save_request or uuid.uuid4().hex
+            self._save_status = {'state': 'saving' if self._config.get('persistent_history') else 'idle',
+                                 'request_id': request}
+            def finish():
+                if previous:
+                    previous.join()
+                try:
+                    self._views_idle.wait()
+                    with self._lock:
+                        view, self._view = self._view, None
+                        self._view_id = self._project_inputs = None
+                        self._topics = {}
+                    self._dispose(view)
+                    if self._config.get('persistent_history'):
+                        result = self._stop_mapping(request)
+                    else:
+                        with self._lock:
+                            node, self._node = self._node, None
+                        self._dispose(node)
+                        result = {'state': 'idle'}
+                    with self._operation_lock:
+                        self._save_status = dict(result, state='saved' if result['state'] == 'saved' else 'idle')
+                        self._project_stopping = False
+                except Exception as error:
+                    with self._operation_lock:
+                        self._save_status = {'state': 'error', 'message': str(error), 'request_id': request}
+                        self._project_stopping = False
+            self._worker = threading.Thread(target=finish, name='slam_project_save', daemon=True)
+            self._worker.start()
+            return self._stop_ack()
+
+    def _stop_ack(self):
+        return {'state': 'idle', 'capture_stopped': True,
+                'save_state': ('saving' if self._project_stopping and self._config.get('persistent_history')
+                               else self._save_status['state']),
+                'save_result': dict(self._save_status)}
 
     def stop(self):
         # A submitted view or save must finish before project teardown.
         with self._operation_lock:
+            self._blocking_stops += 1
+            self._capture_stop.set()
+            if self._node is not None:
+                self._node.freeze_capture()
             worker = self._worker
-        if worker:
-            worker.join()
-        with self._lock:
-            self._close_view()
-            self._project_inputs = None
-            self._topics = {}
+        try:
+            if worker:
+                worker.join()
+            self._views_idle.wait()
+            with self._operation_lock:
+                save_error = dict(self._save_status) if self._save_status['state'] == 'error' else None
+            with self._lock:
+                view, self._view = self._view, None
+                self._view_id = None
+                self._project_inputs = None
+                self._topics = {}
+                node = self._node if not self._config.get('persistent_history') else None
+                if node is not None:
+                    self._node = None
+            self._dispose(view)
+            if save_error:
+                return save_error
             if self._config.get('persistent_history'):
                 try:
                     result = self._stop_mapping()
                 except (ValueError, TypeError, KeyError, OSError) as error:
                     return {'state': 'error', 'message': str(error)}
                 return {**result, 'state': 'idle'}
-            self._dispose(self._node)
-            self._node = None
+            self._dispose(node)
             return {'state': 'idle'}
+        finally:
+            with self._operation_lock:
+                self._blocking_stops -= 1
 
     def shutdown(self):
         result = self.stop()
@@ -270,7 +362,7 @@ class PointCloudSlamPlugin:
     def dispatch(self, name, args):
         result = self._dispatch_action(name, args)
         if isinstance(result, dict):
-            with self._lock:
+            with self._operation_lock:
                 closed, self._closed_outputs = self._closed_outputs, []
             if closed:
                 result = {**result, 'closed_topics': list(dict.fromkeys(closed))}
@@ -283,6 +375,9 @@ class PointCloudSlamPlugin:
             with self._operation_lock:
                 if request and self._operation.get('request_id') == request:
                     return dict(self._operation)
+                if request and self._save_status.get('request_id') == request:
+                    return dict(self._save_status, state='working' if self._save_status['state'] == 'saving'
+                                else self._save_status['state'])
             from .pointcloud_slam_library import map_entries
             for entry in map_entries(_ARCHIVE_DIR):
                 for saved in entry['saves']:
@@ -301,6 +396,8 @@ class PointCloudSlamPlugin:
                         return {'state': 'error', 'message': 'map request id reused'}
                     if current.get('state') != 'error':
                         return dict(current)
+                if self._project_stopping or self._blocking_stops or self._save_status['state'] == 'saving':
+                    return {'state': 'error', 'message': 'map save already in progress'}
                 if current.get('state') == 'working':
                     return {'state': 'error', 'message': 'map operation already in progress'}
                 self._operation = {'state': 'working', 'request_id': request, 'identity': identity}
@@ -315,22 +412,36 @@ class PointCloudSlamPlugin:
                 self._worker.start()
                 return dict(self._operation)
         with self._operation_lock:
+            if (self._project_stopping or self._blocking_stops or self._save_status['state'] == 'saving') and action not in ('info', 'stop', 'list_maps'):
+                return {'state': 'error', 'message': 'map save already in progress'}
             if self._operation.get('state') == 'working' and action not in ('info', 'stop', 'list_maps'):
                 return {'state': 'error', 'message': 'map operation already in progress'}
-        return self._dispatch(action, args)
+            if action == 'select_map':
+                self._selecting_views += 1
+                self._views_idle.clear()
+        try:
+            return self._dispatch(action, args)
+        finally:
+            if action == 'select_map':
+                with self._operation_lock:
+                    self._selecting_views -= 1
+                    if not self._selecting_views:
+                        self._views_idle.set()
 
     def _dispatch(self, action, args):
         if action in _MAP_ACTIONS:
             if not self._config.get('persistent_history'):
                 return {'state': 'error', 'message': 'Named maps require persistent history'}
-            with self._lock:
-                try:
+            try:
+                if action == 'stop_mapping':
                     return self._map_action(action, args)
-                except (ImportError, KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
-                    return {'state': 'error', 'message': str(error)}
+                with self._lock:
+                    return self._map_action(action, args)
+            except (ImportError, KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
+                return {'state': 'error', 'message': str(error)}
         if action == 'config':
             with self._lock:
-                if self._node is not None:
+                if self._node is not None or self._pending is not None:
                     return {'state': 'error', 'message': 'stop the card before changing configuration'}
                 updates = {k: v for k, v in args.items()
                            if k in self.get_tools()[0]['configSchema']['properties'] and v is not None and v != ''}
@@ -364,20 +475,39 @@ class PointCloudSlamPlugin:
                     if all(key in merged for key in keys):
                         SlamStream(**{key: merged[key] for key in keys})
                 except (ValueError, TypeError) as error:
+                    self._config_error = str(error)
                     return {'state': 'error', 'message': str(error)}
                 self._config.update(updates)
+                self._config_error = None
                 return {'state': 'configured', 'config': dict(self._config)}
         if action == 'stop':
-            return self.stop()
+            return self._stop_project()
         if action == 'info':
+            with self._operation_lock:
+                save_status = deepcopy(self._save_status)
+                if self._project_stopping and self._config.get('persistent_history'):
+                    save_status['state'] = 'saving'
+                stopped = self._capture_stop.is_set()
+                stopping = self._project_stopping
+            if stopping:
+                return {'state': 'idle', 'capture_stopped': True, 'save_state': save_status['state'],
+                        'save_result': save_status, 'last_stop': deepcopy(self._last_stop),
+                        'topic_in': [], 'topic_out': [], 'input_status': {'odometry': 'waiting'}}
             with self._lock:
                 node = self._node
                 input_status = node.status() if node else {'odometry': 'waiting'}
-                return {'state': ('running' if node else 'save_pending' if self._pending else
+                return {'state': ('idle' if stopped else 'running' if node else 'save_pending' if self._pending else
                                   'ready' if self._project_inputs else 'idle'),
+                        'capture_stopped': stopped,
                         'map_name': self._map_name, 'selected_map_id': self._view_id,
                         'last_stop': self._last_stop,
+                        'save_state': save_status['state'], 'save_result': save_status,
                         'input_validation': self._input_validation(),
+                        'input_compatibility': {'mode': 'legacy_core' if self._legacy_core else 'explicit',
+                            'role_source': ('not_resolved' if not self._topics else
+                                            'native_ros_publishers' if self._legacy_core else 'input_bindings'),
+                            'producer_metadata_provided': self._resolved_inputs is not None,
+                            'validation_source': 'input_metadata' if self._resolved_inputs else 'explicit_configuration'},
                         'resolved_inputs': deepcopy((self._resolved_inputs or {}).get('inputs', {})),
                         **deepcopy(self._strategy),
                         'input_diagnostics': deepcopy(self._input_diagnostics),
@@ -393,9 +523,22 @@ class PointCloudSlamPlugin:
         with self._lock:
             if self._node is not None:
                 return {'state': 'error', 'message': 'already running'}
+            with self._operation_lock:
+                if self._project_stopping or self._save_status['state'] == 'saving' or self._pending is not None:
+                    return {'state': 'error', 'message': 'finish the pending map save before starting'}
+                if self._config_error:
+                    return {'state': 'error', 'message': 'invalid configuration: ' + self._config_error}
+                self._capture_stop = threading.Event()
             if self._executor is None:
                 return {'state': 'error', 'message': 'ROS executor unavailable'}
             bindings, topics = args.get('input_bindings'), args.get('input_topics')
+            legacy_core = 'input_bindings' not in args
+            if legacy_core:
+                try:
+                    bindings = discover_input_bindings(topics)
+                except (ValueError, RuntimeError, AttributeError) as error:
+                    return {'state': 'error', 'message': str(error)}
+                args = {**args, 'input_bindings': bindings}
             if (not isinstance(bindings, dict) or not isinstance(topics, list) or
                     len(topics) != 2 or any(not isinstance(t, str) or not t.strip() for t in topics) or
                     any(not isinstance(f, str) for f in bindings.values()) or
@@ -407,9 +550,10 @@ class PointCloudSlamPlugin:
             interfaces = args.get('odom_interfaces')
             interface = interfaces.get(odom_topic) if isinstance(interfaces, dict) else None
             capability = interface.get('slam_pose') if isinstance(interface, dict) else None
-            if (not isinstance(interface, dict) or interface.get('schema') != 'motus.odom/1' or
+            if ((not legacy_core or 'odom_interfaces' in args) and
+                    (not isinstance(interface, dict) or interface.get('schema') != 'motus.odom/1' or
                     not isinstance(capability, dict) or capability.get('available') is not True or
-                    capability.get('profile') != 'motus_slam/1'):
+                    capability.get('profile') != 'motus_slam/1')):
                 return {'state': 'error', 'message': 'odometry source lacks declared SLAM pose capability'}
             self._resolved_inputs = None
             self._input_diagnostics = []
@@ -437,6 +581,7 @@ class PointCloudSlamPlugin:
                     self._geometry_options(args)
                 except (KeyError, TypeError, ValueError) as error:
                     return {'state': 'error', 'message': str(error)}
+            self._legacy_core = legacy_core
             if self._config.get('persistent_history'):
                 self._project_inputs = deepcopy(args)
                 self._topics = dict(bindings)
@@ -449,14 +594,16 @@ class PointCloudSlamPlugin:
         elif self._project_inputs:
             cloud = next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2')
             preview = {'topic': cloud + '/slam_odom_preview', 'status_topic': cloud + '/slam_odom_preview_status',
-                       'backend': self._config.get('preview_backend')}
+                       'backend': self._config.get('preview_backend'),
+                       'wire_format': 'sensor/mapping' if self._legacy_core else 'sensor/slam-preview'}
         else:
             preview = None
         if not preview:
             return []
         topic = preview['topic']
         plane = self._session_settings.get('map_plane')
-        outputs = [{'topic': topic, 'format': 'sensor/slam-preview', 'metadata': {'map_view': {
+        outputs = [{'topic': topic, 'format': preview.get('wire_format', 'sensor/slam-preview'),
+                    'desc': 'Experimental map snapshot; marker is the last captured frame pose', 'metadata': {'map_view': {
                         'schema': 'motus.map-view/1', 'scope': 'live', 'map_id': None,
                         'name': self._map_name, 'revision': None, 'segment_id': None,
                         'frame_id': None, 'plane': plane if plane == 'xy' else None, 'actions': {}}}},
@@ -499,6 +646,7 @@ class PointCloudSlamPlugin:
             preview = None
             if persistent or self._config.get('preview_enabled') is True:
                 preview = {'topic': cloud_topic + '/slam_odom_preview',
+                           'wire_format': 'sensor/mapping' if self._legacy_core else 'sensor/slam-preview',
                            'input_validation': self._input_validation(),
                            'archive_metadata': deepcopy(getattr(stream.store, 'archive_metadata', None)),
                            'status_topic': cloud_topic + '/slam_odom_preview_status',
@@ -509,7 +657,8 @@ class PointCloudSlamPlugin:
                            'sigmas': self._config.get('preview_odom_sigmas'),
                            'geometry': self._geometry_options(args) if self._config.get('preview_backend') == 'geometry_experimental' else None,
                            'relocalization': self._config.get('preview_relocalization', False)}
-            node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview)
+            node = SlamInputNode(odom_topic, cloud_topic, stream, preview=preview,
+                                 capture_stop=self._capture_stop)
             self._strategy = node._loop_search.strategy_snapshot() if node._loop_search else {}
             if self._strategy:
                 self._strategy['resource_profile'].update({key: settings.get(key) for key in
@@ -537,6 +686,8 @@ class PointCloudSlamPlugin:
         self._session_settings = deepcopy(settings)
         self._topics = dict(bindings)
         self._node = node
+        if self._capture_stop.is_set():
+            return {'state': 'idle', 'capture_stopped': True, 'message': 'Input start canceled'}
         return {'state': 'running', 'message': 'Experimental inputs started'}
 
 
@@ -544,6 +695,8 @@ class PointCloudSlamPlugin:
         from . import pointcloud_slam_library as library
         map_id, revision = args.get('map_id'), args.get('revision')
         if action == 'start_mapping':
+            if self._config_error:
+                raise ValueError('invalid configuration: ' + self._config_error)
             if self._node or self._pending:
                 raise ValueError('Stop mapping and finish the pending save first')
             if not self._project_inputs:
@@ -597,6 +750,7 @@ class PointCloudSlamPlugin:
                 stream.store, history = load_paged_archive(path, {}, max_frames=max(2, max_frames),
                                                           max_points=max_points, read_only=True)
                 preview = {'topic': '/pointcloud_slam/maps/m' + map_id,
+                           'wire_format': 'sensor/mapping' if self._legacy_core else 'sensor/slam-preview',
                            'status_topic': '/pointcloud_slam/map_view_status', 'backend': 'raw',
                            'persistent_history': True, 'interval_s': 1.,
                            'max_points': cfg.get('preview_max_points', 40000),

@@ -7,13 +7,12 @@ export const OdomRenderer = {
   canRender: hint => hint === 'state/odom',
 
   mount(container, options = {}) {
-    this._options = typeof options === 'string' ? { stateKey: options } : options;
-    this._mode = this._options.mode === 'log' ? 'log' : 'kv';
+    this._mode = options.mode === 'log' ? 'log' : 'kv';
     this._records = [];
     this._el = document.createElement('div');
     this._el.className = 'renderer-odom';
     this._el.style.cssText = 'height:100%;min-height:0;display:flex;flex-direction:column;gap:6px;padding:6px';
-    if (this._options.showModeToggle !== false) {
+    if (options.showModeToggle !== false) {
       const modes = document.createElement('div');
       modes.className = 'odom-modes monitor-card-modes';
       for (const [mode, label] of [['log', '日志'], ['kv', '最新']]) {
@@ -77,15 +76,21 @@ export const OdomRenderer = {
   },
 
   _renderLatest(record) {
-    const open = [...this._body.querySelectorAll('details')].map(detail => detail.open);
-    this._body.textContent = '';
-    this._appendRecord(record);
-    this._body.querySelectorAll('details').forEach((detail, index) => { detail.open = open[index] || false; });
+    const row = this._body.firstChild;
+    if (!row) { this._appendRecord(record); return; }
+    row._record = record;
+    const fields = projectOdom(record.value);
+    row.querySelectorAll('.kv-value').forEach((value, index) => { value.textContent = fields[index].text; });
+    row.querySelectorAll('.odom-detail').forEach((detail, index) => {
+      detail.querySelector('pre').textContent = JSON.stringify(valueAtPath(record.value, ODOM_DETAILS[index].path) ?? null, null, 2);
+    });
+    row.querySelector('.odom-raw').querySelector('pre').textContent = record.raw;
   },
 
   _appendRecord(record) {
     const row = document.createElement('div');
     row.className = 'odom-record';
+    row._record = record;
     if (this._mode === 'log') {
       const time = document.createElement('div');
       time.className = 'log-time'; time.textContent = new Date(record.receivedAt).toLocaleTimeString();
@@ -115,7 +120,7 @@ export const OdomRenderer = {
     const copy = document.createElement('button');
     copy.type = 'button'; copy.className = 'odom-copy monitor-card-mode-btn'; copy.textContent = '复制';
     copy.onclick = async () => {
-      try { await copyRawText(record.raw, this._el); copy.textContent = '已复制'; }
+      try { await copyRawText(row._record.raw, this._el); copy.textContent = '已复制'; }
       catch { copy.textContent = '复制失败'; }
     };
     const text = document.createElement('pre'); text.textContent = record.raw;

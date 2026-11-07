@@ -155,6 +155,35 @@ test('receipt freshness is separate from unknown acquisition age and ignores kee
   } finally { Date.now = savedNow; globalThis.setInterval = savedInterval; globalThis.clearInterval = savedClear; }
 });
 
+test('live latest updates keep raw controls stable and copy the current packet', async () => {
+  const { OdomRenderer } = await import('./renderers/odom.js');
+  const { box, renderer, send } = mount(OdomRenderer);
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  let copied;
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {
+    clipboard: { writeText: async text => { copied = text; } },
+  } });
+  try {
+    const sample = odom(); send(sample);
+    const raw = box.querySelector('.odom-raw');
+    const button = box.querySelector('.odom-copy');
+    raw.open = true;
+    sample.pose.position = [4, 5, 6]; send(sample);
+    assert.equal(box.querySelector('.odom-raw'), raw);
+    assert.equal(box.querySelector('.odom-copy'), button);
+    assert.equal(raw.open, true);
+    assert.match(box.querySelector('.odom-summary').textContent, /4, 5, 6/);
+    assert.match(box.querySelector('.odom-detail').textContent, /4/);
+    assert.equal(raw.querySelector('pre').textContent, JSON.stringify(sample));
+    await button.onclick();
+    assert.equal(copied, JSON.stringify(sample));
+  } finally {
+    renderer.unmount();
+    if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
 test('odometry renderer accepts only its dedicated format', async () => {
   const { OdomRenderer } = await import('./renderers/odom.js');
   assert.equal(OdomRenderer.canRender('state/odom'), true);

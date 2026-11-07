@@ -661,8 +661,7 @@ async def _do_start_project_impl():
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
                                  control_interface: dict = None,
-                                 camera_info: dict = None, input_bindings: dict = None,
-                                 odom_interfaces: dict = None):
+                                 camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -714,24 +713,6 @@ async def _do_start_project_impl():
             # frame, and reports in `info().degraded` what it had to assume when
             # a source declared nothing.
             args['camera_info'] = camera_info
-
-        declared = ((find_tool(mcp_id, tool_name).get('inputSchema') or {})
-                    .get('properties') or {})
-        input_metadata = None
-        if 'input_metadata' in declared:
-            input_metadata, metadata_error = _upstream_input_metadata(card_id)
-            if metadata_error:
-                await push_event({'type': 'project_start_item', 'payload': {
-                    'tool': tool_name, 'mcp_id': mcp_id,
-                    'status': 'error', 'message': metadata_error,
-                }})
-                errors.append(tool_name)
-                return
-        for key, value in (('input_bindings', input_bindings),
-                           ('odom_interfaces', odom_interfaces),
-                           ('input_metadata', input_metadata)):
-            if value and key in declared:
-                args[key] = value
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -939,59 +920,6 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
-    def _upstream_input_bindings(card_id: str) -> dict:
-        """Bind only formats reported by the currently running producer."""
-        bindings, ambiguous = {}, set()
-        for conn in (c for c in connections if c.get('toCardId') == card_id):
-            topic = _topic_of_connection(conn)
-            outputs = resolved_topics.get(conn.get('fromCardId')) or []
-            formats = {entry.get('format') for entry in outputs
-                       if isinstance(entry, dict) and entry.get('topic') == topic
-                       and isinstance(entry.get('format'), str) and entry.get('format')}
-            if len(formats) != 1 or topic in ambiguous:
-                ambiguous.add(topic)
-                bindings.pop(topic, None)
-                continue
-            fmt = next(iter(formats))
-            if topic in bindings and bindings[topic] != fmt:
-                ambiguous.add(topic)
-                bindings.pop(topic, None)
-            else:
-                bindings[topic] = fmt
-        return bindings
-
-    def _upstream_odom_interfaces(card_id: str) -> dict:
-        """Associate producer capability with its actual state/odom port."""
-        result = {}
-        for conn in (c for c in connections if c.get('toCardId') == card_id):
-            topic = _topic_of_connection(conn)
-            source = resolved_info.get(conn.get('fromCardId')) or {}
-            outputs = source.get('topic_out') or []
-            odom_topics = [entry.get('topic') for entry in outputs if isinstance(entry, dict)
-                           and entry.get('format') == 'state/odom' and entry.get('topic')]
-            declared_topic = source.get('odom_topic')
-            if (topic in odom_topics and isinstance(source.get('odom_interface'), dict) and
-                    ((declared_topic and declared_topic == topic) or
-                     (not declared_topic and len(odom_topics) == 1))):
-                result[topic] = source['odom_interface']
-        return result
-
-    def _upstream_input_metadata(card_id: str) -> tuple[dict, str]:
-        """Route producer facts only from the output port this card consumes."""
-        out = {}
-        for conn in (c for c in connections if c.get('toCardId') == card_id):
-            topic = _topic_of_connection(conn)
-            source = resolved_info.get(conn.get('fromCardId')) or {}
-            if 'input_metadata' not in source:
-                continue
-            declarations = source['input_metadata']
-            if not isinstance(declarations, list):
-                return {}, f"source {conn.get('fromCardId')} input_metadata for {topic} must be a list"
-            for entry in declarations:
-                if isinstance(entry, dict) and entry.get('topic') == topic and topic not in out:
-                    out[topic] = entry
-        return out, ''
-
     def _upstream_camera_info(card_id: str) -> dict:
         """What this card's sources say about the optics behind each input.
 
@@ -1159,9 +1087,7 @@ async def _do_start_project_impl():
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
-                                 camera_info=_upstream_camera_info(card.get('id', '')),
-                                 input_bindings=_upstream_input_bindings(card.get('id', '')),
-                                 odom_interfaces=_upstream_odom_interfaces(card.get('id', '')))
+                                 camera_info=_upstream_camera_info(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
@@ -1222,16 +1148,13 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
         rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
-        # A named SLAM session freezes input, then copies and verifies its map archive.
-        # Other cards, including motion actuators, keep their independent short deadline.
-        deadline = 300.0 if tool_name == 'pointcloud_slam' else STOP_CARD_TIMEOUT_S
         try:
             async def stop_and_confirm():
                 action = 'stop'
                 while True:
                     result = await mcp_call_tool(card.get('mcpId', ''), MCPCallRequest(
                         tool=tool_name, arguments={'action': action, 'instance_id': card.get('id', '')}),
-                        timeout_s=deadline)
+                        timeout_s=STOP_CARD_TIMEOUT_S)
                     if result.get('code') != 200:
                         raise RuntimeError(result.get('message') or '设备拒绝停止请求')
                     payload = payload_of(result)
@@ -1252,17 +1175,17 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
                     # its actual state within the existing per-card deadline --
                     # and never spend the whole budget on one sleep, or a short
                     # deadline gets no read at all.
-                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, deadline / 4))
+                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
                     action = 'info'
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
             # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
-            await _aio.wait_for(stop_and_confirm(), deadline)
+            await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
             entry['ok'] = True
         except _aio.TimeoutError:
             # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
             # 下来的卡片意味着那台设备可能还在跑。
-            entry['error'] = f'停止未确认（{deadline:g}s 死线）；请检查设备状态'
+            entry['error'] = f'停止未确认（{STOP_CARD_TIMEOUT_S:g}s 死线）；请检查设备状态'
         except Exception as error:  # noqa: BLE001
             entry['error'] = str(error) or type(error).__name__
         if progress:

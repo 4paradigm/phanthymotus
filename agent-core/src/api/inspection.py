@@ -299,7 +299,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
     # Push cached snapshot immediately (so page refresh shows current map)
     snapshot = _last_frame.get(topic)
     if snapshot:
-        if fmt in ('sensor/pointcloud', 'sensor/mapping', 'sensor/slam-preview'):
+        if fmt in ('sensor/pointcloud', 'sensor/mapping'):
             await websocket.send_bytes(snapshot)
         elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
             await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
@@ -315,7 +315,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
                 data = await asyncio.wait_for(q.get(), timeout=5.0)
                 if data is None:
                     break  # signal to stop
-                if fmt in ('sensor/pointcloud', 'sensor/mapping', 'sensor/slam-preview'):
+                if fmt in ('sensor/pointcloud', 'sensor/mapping'):
                     await websocket.send_bytes(data)
                 elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
                     await websocket.send_text(data.decode('utf-8', errors='replace'))
