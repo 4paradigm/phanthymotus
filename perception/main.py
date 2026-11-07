@@ -196,6 +196,11 @@ class PerceptionBundle:
                 log.error("PhanthyMusicPlugin failed to load; continuing without phanthy_music",
                           exc_info=True)
 
+        if plugins_cfg.get("undistort", {}).get("enabled", True):
+            from plugins.undistort import UndistortPlugin
+            self._plugins.append(UndistortPlugin(plugins_cfg.get("undistort", {}), executor))
+            log.info("UndistortPlugin loaded")
+
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["vop"].get("namespace", "").strip()
