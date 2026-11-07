@@ -4711,16 +4711,6 @@ html, body {
 .slam-view-modes .monitor-card-mode-btn {
   transition: none;
 }
-.detail-subtitle .slam-view-modes,
-.topic-fmt .slam-view-modes {
-  height: 1lh;
-  box-sizing: border-box;
-}
-.detail-subtitle .slam-view-modes button,
-.topic-fmt .slam-view-modes button {
-  padding-block: 0;
-  line-height: 1;
-}
 .monitor-card-mode-btn:not(:last-child) {
   border-right: 1px solid var(--border);
 }
@@ -9820,24 +9810,3 @@ html, body {
 @media (max-width: 760px) {
   .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
 }
-
-.slam-actions { display:flex; flex-wrap:wrap; gap:5px }
-.slam-actions output { width:100%; overflow-wrap:anywhere }
-.slam-actions output:empty { display:none }
-.slam-actions button,.slam-library button,.slam-library select {
-  font:inherit; color:inherit; background:var(--bg-card, #faf8f3); border:1px solid var(--border, #ccc);
-  border-radius:5px; padding:3px 7px; cursor:pointer;
-}
-.slam-library { margin:auto; width:min(92vw,1000px); max-height:90vh; overflow:auto; color:var(--text);
-  background:var(--bg-card,#faf8f3); border:1px solid var(--border,#ccc); border-radius:10px; padding:12px }
-.slam-library::backdrop { background:#0007 }
-.slam-library header,.slam-library aside > div,.slam-library .slam-places { display:flex; align-items:center; gap:6px }
-.slam-library header { margin-bottom:8px; height:32px }
-.slam-library header strong,.slam-library aside button:first-child { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-.slam-columns { display:grid; grid-template-columns:minmax(95px,22%) minmax(0,1fr); gap:10px }
-.slam-library aside { max-height:62vh; overflow:auto }
-.slam-library aside > div { margin-bottom:5px }
-.slam-viewport { height:clamp(200px,55vh,600px); position:relative }
-.slam-library .slam-places { flex-wrap:wrap; margin-top:6px }
-.slam-places > span { display:inline-flex; align-items:center; gap:2px }
-.slam-library footer { margin-top:6px; font-size:13px }

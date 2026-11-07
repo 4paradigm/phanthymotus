@@ -10,7 +10,6 @@ import { VideoRenderer }    from './renderers/video.js';
 import { ImageRenderer }    from './renderers/image.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
-import { OdomRenderer } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 import { PointCloudRenderer } from './renderers/pointcloud.js';
 import { MappingRenderer, SlamPreviewRenderer } from './renderers/mapping.js';
@@ -21,7 +20,7 @@ import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, SlamPreviewRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, SlamPreviewRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // Column count by viewport width. Desktop used to be a flat 5 whatever the
 // window was, which is only right near 1080p: at 1280 a column is 237px and a
@@ -164,6 +163,18 @@ function _pointerCell(e) {
   return { x, y };
 }
 
+async function _slamCall(mcpId, action, args = {}) {
+  const response = await fetch('/api/mcp/' + encodeURIComponent(mcpId) + '/call', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tool: 'pointcloud_slam', arguments: {action, ...args}}),
+  });
+  const json = await response.json();
+  if (json.code !== 200) throw Error(json.message || '地图读取失败');
+  const result = Array.isArray(json.data) ? JSON.parse(json.data[0].text) : json.data;
+  if (!result || result.state === 'error') throw Error(result?.message || '地图操作失败');
+  return result;
+}
+
 async function _fetchAndBuild() {
   let mcps = [];
   let topicDetails = {};
@@ -235,6 +246,24 @@ async function _fetchAndBuild() {
     }
   }
 
+  // A selected archive is a separate publisher, outside the live canvas wiring.
+  const savedViews = new Map();
+  for (const card of canvasCards.filter(c => c.toolName === 'pointcloud_slam')) {
+    try {
+      const info = await _slamCall(card.mcpId, 'info');
+      if (!info.selected_map_id) continue;
+      const map = (await _slamCall(card.mcpId, 'list_maps')).maps.find(m => m.id === info.selected_map_id);
+      if (!map) continue;
+      const {tags} = await _slamCall(card.mcpId, 'list_tags', {map_id: map.id, revision: map.revision});
+      for (const detail of Object.values(topicDetails)) {
+        if (detail.mcp_id !== card.mcpId || detail.format !== 'sensor/slam-preview' ||
+            !detail.topic.startsWith('/pointcloud_slam/maps/m' + map.id + '/history/')) continue;
+        topicSet.add(detail.topic);
+        savedViews.set(detail.topic, {map, tags, mcpId: card.mcpId});
+      }
+    } catch (error) { console.warn('[monitor] saved SLAM map:', error.message); }
+  }
+
   // Fallback: fill _topicMcpMap from /api/topics mcp_id for any topic not yet mapped
   for (const t of Object.values(topicDetails)) {
     if (t.topic && t.mcp_id && !_topicMcpMap[t.topic]) {
@@ -301,7 +330,7 @@ async function _fetchAndBuild() {
   for (const c of settled) {
     const detail = topicDetails[c.topicPath];
     _createCard(c.topicPath, detail?.format || 'activity', detail?.status || 'offline',
-                c.col, c.row, c.colSpan, c.rowSpan, c.mode);
+                c.col, c.row, c.colSpan, c.rowSpan, c.mode, savedViews.get(c.topicPath));
   }
   // Persist what was just decided. Auto-placement used to be recomputed on every
   // load against whatever order the API happened to return, so a card nobody had
@@ -319,7 +348,7 @@ function _overlapsAny(c, others) {
     c.row < o.row + o.rowSpan && c.row + c.rowSpan > o.row);
 }
 
-function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, savedMode) {
+function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, savedMode, savedView) {
   const el = document.createElement('div');
   el.className = 'monitor-card';
   el.dataset.topic = topicPath;
@@ -327,9 +356,9 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
   // Apply grid placement
   _applyPlacement(el, col, row, colSpan, rowSpan);
 
-  const fmtClass = _formatClass(format);
+  const fmtClass = _formatClass(format === 'state/odom' ? 'data/json' : format);
   const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
-  const isJson = format === 'data/json' || format?.startsWith('text/');
+  const isJson = format === 'state/odom' || TextRenderer.canRender(format);
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
@@ -343,7 +372,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
     <div class="monitor-card-header">
       <div class="monitor-card-dot ${_esc(status)}"></div>
       <div class="monitor-card-names">
-        <span class="monitor-card-topic">${_esc(shortName)}</span>
+        <span class="monitor-card-topic">${_esc(savedView?.map.name || shortName)}</span>
         <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
       </div>
       ${modeHtml}
@@ -364,6 +393,37 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
     ? {toolbar: body.parentElement.querySelector('.slam-view-controls'), scope: topicPath.includes('/history/') ? 'history' : 'live'}
     : _topicMcpMap[topicPath] || 'dashboard');
 
+  if (savedView) {
+    const {map, mcpId} = savedView;
+    let tags = savedView.tags;
+    const showTags = () => renderer.setTags(tags.filter(tag => tag.segment_id === renderer.segmentId));
+    const title = el.querySelector('.monitor-card-topic');
+    renderer.setTagSelectHandler(tag => { title.textContent = map.name + ' · ' + tag.name; });
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'monitor-card-mode-btn';
+    button.textContent = '+';
+    button.title = '在二维地图标记地点';
+    const controls = el.querySelector('.slam-view-controls .slam-view-modes');
+    controls.append(button);
+    renderer.onSegment = showTags;
+    button.onclick = async () => {
+      if (!renderer.segmentId) return;
+      const {ensureEdit} = await import('./canvas.js');
+      if (!await ensureEdit()) return;
+      renderer.setPickHandler(async point => {
+        renderer.setPickHandler(null);
+        const name = window.prompt('地点名称')?.trim();
+        if (!name) return;
+        const args = {map_id: map.id, revision: map.revision};
+        try {
+          await _slamCall(mcpId, 'tag_place', {...args, segment_id: renderer.segmentId, tag_name: name, ...point});
+          tags = (await _slamCall(mcpId, 'list_tags', args)).tags;
+          if (el.isConnected) showTags();
+        } catch (error) { window.alert(error.message); }
+      });
+    };
+  }
   const ws = _connectWs(topicPath, format, renderer);
   const card = { el, renderer, ws, format, mode: defaultMode, col, row, colSpan, rowSpan };
   _cards.set(topicPath, card);
@@ -497,7 +557,7 @@ function _createRenderer(format, mode) {
   if (mode === 'kv') {
     return Object.assign(Object.create(Object.getPrototypeOf(KvLatestRenderer)), KvLatestRenderer);
   }
-  const hint = format || 'activity';
+  const hint = format === 'state/odom' ? 'data/json' : format || 'activity';
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
   return Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
 }

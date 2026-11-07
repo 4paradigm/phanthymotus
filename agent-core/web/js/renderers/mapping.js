@@ -496,6 +496,10 @@ export const SlamPreviewRenderer = {
   onData(buffer) {
     const decoded = decodeSlamPreview(buffer);
     if (!decoded) return;
+    if (this.segmentId !== decoded.meta.segment_id) {
+      this.segmentId = decoded.meta.segment_id;
+      this.onSegment?.();
+    }
     MappingRenderer.onData.call(this, decoded.payload);
     const path = this._trajectory.geometry;
     const attr = path.attributes.position;
