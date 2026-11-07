@@ -63,6 +63,20 @@ def test_single_word_prefix_still_resolves(bundle_cls):
     assert bundle.owns("ocr") is True
 
 
+def test_undistort_is_registered_without_loading_a_model(bundle_cls):
+    from vision_stubs import _FakeExecutor
+    bundle = bundle_cls({"plugins": {
+        "echo_cancellation": {"enabled": False},
+        "audio_mixer": {"enabled": False},
+    }}, _FakeExecutor())
+    try:
+        assert bundle.owns("undistort")
+        assert any(tool["name"] == "undistort" for tool in bundle.get_all_tools())
+        assert bundle.dispatch("undistort", {"action": "info"})["state"] == "idle"
+    finally:
+        bundle.shutdown()
+
+
 def test_underscored_prefix_resolves(bundle_cls):
     """The regression this resolver exists for."""
     face = _StubPlugin("face_recognition")
