@@ -150,10 +150,3 @@ async function copyRawText(raw, container) {
     if (!document.execCommand('copy')) throw new Error('Copy unavailable');
   } finally { input.remove(); }
 }
-
-/** Prefer an advertised odometry preview without modifying the producer's port order. */
-export function odomPreview(skill) {
-  const topic = (skill.topic_out || []).find(port => port.format === 'state/odom' && port.topic);
-  return topic ? { path: '/ws/bus' + topic.topic, hint: topic.format, topic }
-    : { path: skill.ws_path, hint: skill.render_hint || 'activity', topic: skill.topic_out?.[0] || null };
-}

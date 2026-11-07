@@ -15,8 +15,9 @@ import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
-import { toggleMicStream, isMicActive } from './mic-stream.js';
-import { toggleCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
+import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
+import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
+import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
@@ -220,9 +221,70 @@ async function _granted(name) {
   }
 }
 
+function _browserWsUrl(path) {
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${wsProto}://${location.host}${path}`;
+}
+
+function _syncMicBtn(card, active) {
+  const micBtn = card.el?.querySelector('.canvas-mic-btn');
+  if (micBtn) {
+    micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+    micBtn.classList.toggle('recording', active);
+  }
+}
+
+/**
+ * The one way a `remote_mic` card's microphone is started — start-project and
+ * the post-refresh re-arm both come through here.
+ *
+ * Both used to call the streamer with no options, so the device saved on the
+ * card never reached getUserMedia and the browser opened its default. The
+ * card's own instance config is read fresh at every start, so a device changed
+ * while stopped takes effect on the next start. See browser-source.js for why a
+ * failed read is an error rather than "no device chosen".
+ *
+ * Resolves true when capturing, false when a stop cancelled it; rejects with an
+ * operator-readable message.
+ */
+function _startCardMic(card) {
+  let deviceId = '';
+  return startMicStream(_browserWsUrl('/ws/mic'), (active) => _syncMicBtn(card, active),
+    async () => {
+      const opts = micOptions(await fetchInstanceConfig(card.mcpId, card.toolName, card.id));
+      deviceId = opts.deviceId;
+      return opts;
+    },
+  ).catch((err) => { throw new Error(describeMediaError(err, 'microphone', deviceId)); });
+}
+
+/**
+ * Same for `remote_camera`, whose saved device, fps and width were ignored the
+ * same way. `warm` takes the permission prompt first (see _startProject); the
+ * returned `ready` settles once that is done, or as soon as the start finishes
+ * if it never got that far.
+ */
+function _startCardCamera(card, { warm = false } = {}) {
+  let deviceId = '';
+  let warmed;
+  const ready = new Promise((resolve) => { warmed = resolve; });
+  const run = startCameraStream(_browserWsUrl('/ws/camera'), () => {}, async () => {
+    try {
+      const opts = cameraOptions(await fetchInstanceConfig(card.mcpId, card.toolName, card.id));
+      deviceId = opts.deviceId;
+      if (warm) await warmPermission(deviceId);
+      return opts;
+    } finally {
+      warmed();
+    }
+  }).catch((err) => { throw new Error(describeMediaError(err, 'camera', deviceId)); });
+  // An already-running or already-starting stream never calls getOptions.
+  run.then(warmed, warmed);
+  return { run, ready };
+}
+
 async function _rearmBrowserSources() {
   if (!_projectRunning) return;
-  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
 
   const cameraCard = _cards.find(c => c.toolName === 'remote_camera');
   if (cameraCard && !isCameraActive()) {
@@ -232,9 +294,9 @@ async function _rearmBrowserSources() {
         ? '浏览器摄像头需要手动重新开启（此浏览器无法查询权限状态）'
         : '浏览器摄像头未授权，刷新后未自动恢复');
     } else {
-      toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {})
-        .then(() => _logActivity('project', '刷新后已恢复浏览器摄像头'))
-        .catch(err => _logActivity('warn', `摄像头恢复失败: ${err.message}`));
+      _startCardCamera(cameraCard).run
+        .then(ok => { if (ok) _logActivity('project', '刷新后已恢复浏览器摄像头'); })
+        .catch(err => _logActivity('warn', `刷新后恢复：${err.message}`));
     }
   }
 
@@ -246,14 +308,18 @@ async function _rearmBrowserSources() {
         ? '浏览器麦克风需要手动重新开启（此浏览器无法查询权限状态）'
         : '浏览器麦克风未授权，刷新后未自动恢复');
     } else {
-      toggleMicStream(`${wsProto}://${location.host}/ws/mic`, (active) => {
-        const micBtn = micCard.el?.querySelector('.canvas-mic-btn');
-        if (micBtn) {
-          micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-          micBtn.classList.toggle('recording', active);
-        }
-      }).then(() => _logActivity('project', '刷新后已恢复浏览器麦克风'))
-        .catch(err => _logActivity('warn', `麦克风恢复失败: ${err.message}`));
+      _startCardMic(micCard)
+        .then(ok => {
+          if (!ok) return;
+          // Not "已恢复" while the browser still holds the audio graph — that
+          // claim is what made a silent microphone look healthy.
+          if (isMicSuspended()) {
+            _logActivity('warn', '浏览器麦克风已重新连接，但浏览器要求先在页面上点一下才会开始收音');
+          } else {
+            _logActivity('project', '刷新后已恢复浏览器麦克风');
+          }
+        })
+        .catch(err => _logActivity('warn', `刷新后恢复：${err.message}`));
     }
   }
 }
@@ -264,10 +330,12 @@ function _applyProjectState(running) {
   _projectStateKnown = true;
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning && !btn.dataset.mapActions);
+    btn.classList.toggle('locked', !_projectRunning);
   });
-  // Idempotent: both helpers no-op when their stream is already active, so the
-  // start-project path and the cross-tab project_state event cannot double-start.
+  // Idempotent: startMicStream/startCameraStream return the in-flight start
+  // rather than opening a second stream, so the start-project path and the
+  // cross-tab project_state event cannot double-start. (Checking "is it
+  // active" was not enough: a stream only becomes active once it is fully up.)
   if (_projectRunning) _rearmBrowserSources();
 }
 export function redrawCanvas() { _scheduleRedraw(); }
@@ -1214,7 +1282,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         // Filter system actions from processor cards
         let enumVals = def.enum;
         if (key === 'action') {
-          enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v) && !(toolName === 'pointcloud_slam' && v === 'operation_status'));
+          enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
           // The page owns internal actions; the card exposes its entry and public actions.
           if (schema['x-workbench'] && schema['x-action-params']) {
             enumVals = enumVals.filter(v => v === schema['x-workbench'].entry || v in schema['x-action-params']);
@@ -1222,7 +1290,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         }
         if (!enumVals.length) return '';  // hide field entirely if no options left
         const titles = Object.fromEntries((def.oneOf || []).map(o => [o.const, o.title || o.const]));
-        const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(toolName === 'pointcloud_slam' ? v : titles[v] || v)}</option>`).join('');
+        const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titles[v] || v)}</option>`).join('');
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
@@ -1347,10 +1415,6 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     const execBtn = el.querySelector('.canvas-exec-btn');
     if (execBtn) {
-      if (toolName === 'pointcloud_slam' && actionParams?.start_mapping) {
-        execBtn.dataset.mapActions = 'true';
-        execBtn.classList.remove('locked');
-      }
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (!(await _ensureEdit())) return;
@@ -2112,15 +2176,8 @@ async function _startProject() {
   // 立即启动浏览器麦克风（与 API 调用并行，解决 self-check 时序问题）
   const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
   if (remoteMicCard && !isMicActive()) {
-    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-    toggleMicStream(wsUrl, (active) => {
-      const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
-      if (micBtn) {
-        micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-        micBtn.classList.toggle('recording', active);
-      }
-    }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
+    _startCardMic(remoteMicCard)
+      .catch(err => _logActivity('warn', err.message));
   }
 
   // Same trick as the mic: start the browser camera in parallel with the API
@@ -2134,10 +2191,9 @@ async function _startProject() {
   // remembered. Warming it here takes the person out of the critical path.
   const remoteCameraCard = _cards.find(c => c.toolName === 'remote_camera');
   if (remoteCameraCard && !isCameraActive()) {
-    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    await warmPermission();
-    toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {})
-      .catch(err => _logActivity('warn', `Camera failed to start: ${err.message}`));
+    const { run, ready } = _startCardCamera(remoteCameraCard, { warm: true });
+    run.catch(err => _logActivity('warn', err.message));
+    await ready;
   }
 
   // Call unified backend start-project
@@ -2267,16 +2323,13 @@ async function _stopProject() {
   // 停止本身。
   try {
     for (const card of _cards) {
-      if (card.toolName === 'remote_camera' && isCameraActive()) {
-        toggleCameraStream('', () => {}).catch(() => {});
-      }
-      if (card.toolName === 'remote_mic' && isMicActive()) {
-        toggleMicStream('', () => {}).catch(() => {});
-        const micBtn = card.el?.querySelector('.canvas-mic-btn');
-        if (micBtn) {
-          micBtn.textContent = '\uD83C\uDF99 开始录音';
-          micBtn.classList.remove('recording');
-        }
+      // Unconditional, not "if active": a stream still starting is not
+      // active yet, and skipping it let the start finish after the stop and
+      // go on sending into a stopped project.
+      if (card.toolName === 'remote_camera') stopCameraStream();
+      if (card.toolName === 'remote_mic') {
+        stopMicStream();
+        _syncMicBtn(card, false);
       }
     }
   } catch (err) {
@@ -2742,7 +2795,6 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
     const key = input.dataset.key;
-    if (btn.dataset.mapActions && input.closest('.canvas-field')?.style.display === 'none') return;
     const val = input.value.trim();
     if (val !== '') {
       if (input.type === 'number') args[key] = Number(val);
@@ -2752,33 +2804,6 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     }
   });
 
-  if (btn.dataset.mapActions && args.action === 'delete_map') {
-    try {
-      const listed = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({tool: toolName, arguments: {action: 'list_maps'}}),
-      });
-      const entry = _parseMcpCallResult(await listed.json())?.maps?.find(m => m.id === args.map_id);
-      if (!entry) throw Error('未找到地图');
-      if (!window.confirm(`删除「${entry.name}」的 ${entry.revision} 个版本和 ${entry.tag_count} 个地点？`)) return;
-    } catch (error) {
-      _showResult(el, String(error), true);
-      return;
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '▶ 执行';
-    }
-    btn.disabled = true;
-  }
-  if (btn.dataset.mapActions && ['stop_mapping', 'select_map'].includes(args.action)) {
-    const operation = JSON.stringify([args.action, args.map_id]);
-    if (btn.dataset.saveName !== operation || !btn.dataset.saveRequest) {
-      btn.dataset.saveName = operation;
-      btn.dataset.saveRequest = Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16).padStart(8, '0')).join('');
-    }
-    args.request_id = btn.dataset.saveRequest;
-    args.background = true;
-  }
   // Inject instance_id from card identity so multiInstance tools can resolve device_path
   if (instanceId && !args.instance_id) args.instance_id = instanceId;
 
@@ -2808,15 +2833,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ tool: toolName, arguments: args }),
     });
-    let json = await res.json();
-    while (args.background && json.code === 200 && _parseMcpCallResult(json)?.state === 'working') {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({tool: toolName, arguments: {action: 'operation_status', request_id: args.request_id}}),
-      });
-      json = await response.json();
-    }
+    const json = await res.json();
 
     if (json.code === 200) {
       const spec = _toolObj?.inputSchema?.['x-workbench'];
@@ -2827,8 +2844,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
         return;
       }
       const resultText = _formatCallResult(json.data);
-      if (args.background) delete btn.dataset.saveRequest;
-      _showResult(el, resultText, btn.dataset.mapActions && _parseMcpCallResult(json)?.state === 'error');
+      _showResult(el, resultText, false);
       // The panel can afford a 144-entry list; one log line cannot.
       _logActivity('mcp_result', `${toolName} → ${_truncate(resultText, 400)}`);
     } else {

@@ -101,16 +101,17 @@ def test_a_consumer_still_cannot_change_the_format(clean):
 
 
 @pytest.mark.parametrize('fmt', ['sensor/depth-f32', 'sensor/pointcloud2'])
-def test_large_computation_topics_do_not_subscribe_at_registration(clean, fmt):
+def test_native_inputs_keep_main_subscription_behavior(clean, fmt):
     _register(TOPIC, fmt, 'mcp-producer')
     _register(TOPIC, fmt, 'mcp-consumer', producer=False)
     assert inspection._topic_registry[TOPIC]['format'] == fmt
-    assert clean == []
+    assert clean == [(TOPIC, fmt), (TOPIC, fmt)]
 
 
-def test_large_topic_preview_releases_subscription_when_connection_closes(monkeypatch):
+def test_native_topic_view_close_keeps_main_subscription_and_cache(monkeypatch):
     topic = '/metric-depth'
     inspection._topic_registry[topic] = {'format': 'sensor/depth-f32'}
+    monkeypatch.setitem(inspection._last_frame, topic, b'{"width":640}')
     unsubscribed = []
     monkeypatch.setattr(inspection, '_ensure_primary_sub',
                         lambda topic, fmt, loop: inspection._active_primary_subs.add(topic))
@@ -119,14 +120,17 @@ def test_large_topic_preview_releases_subscription_when_connection_closes(monkey
     async def accept():
         pass
 
-    async def send_text(_text):
-        raise inspection.fastapi.WebSocketDisconnect()
+    async def send_text(text):
+        if text == '{"width":640}':
+            asyncio.get_running_loop().call_soon(
+                lambda: inspection._topic_queues[topic][0].put_nowait(None))
 
     ws = types.SimpleNamespace(accept=accept, send_text=send_text)
     asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
         inspection.bus_ws(ws, topic.lstrip('/')))
-    assert unsubscribed == ['__primary__#' + topic]
-    assert topic not in inspection._active_primary_subs
+    assert unsubscribed == []
+    assert topic in inspection._active_primary_subs
+    assert inspection._last_frame[topic] == b'{"width":640}'
 
 
 def test_large_topic_keeps_subscription_for_another_viewer(monkeypatch):
@@ -143,7 +147,8 @@ def test_large_topic_keeps_subscription_for_another_viewer(monkeypatch):
         pass
 
     async def send_text(_text):
-        raise inspection.fastapi.WebSocketDisconnect()
+        asyncio.get_running_loop().call_soon(
+            lambda: inspection._topic_queues[topic][-1].put_nowait(None))
 
     ws = types.SimpleNamespace(accept=accept, send_text=send_text)
     asyncio.get_event_loop_policy().new_event_loop().run_until_complete(

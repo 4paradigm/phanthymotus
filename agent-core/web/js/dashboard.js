@@ -11,12 +11,10 @@ import { ImageRenderer }    from './renderers/image.js';
 import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
-import { PointCloudRenderer } from './renderers/pointcloud.js';
-import { SlamPreviewRenderer } from './renderers/mapping.js';
-import { OdomRenderer, odomPreview } from './renderers/odom.js';
+import { OdomRenderer } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, PointCloudRenderer, SlamPreviewRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 
@@ -28,7 +26,6 @@ class SkillBuffer {
   constructor(wsUrl, hint) {
     this._wsUrl   = wsUrl;
     this._hint    = hint;
-    this._capacity = hint === 'sensor/slam-preview' ? 1 : PREVIEW_CAPACITY;
     this._frames  = [];          // ring buffer (ArrayBuffer[])
     this._receivedAt = [];
     this._pos     = 0;           // write head (mod PREVIEW_CAPACITY)
@@ -55,7 +52,7 @@ class SkillBuffer {
       let buf;
       if (ev.data instanceof ArrayBuffer) {
         // Preserve existing format filtering; odometry packets can have odd byte lengths.
-        if (this._hint !== 'sensor/slam-preview' && this._hint !== 'state/odom' && ev.data.byteLength % 2 !== 0) return;
+        if (this._hint !== 'state/odom' && ev.data.byteLength % 2 !== 0) return;
         buf = ev.data;
       } else {
         // Text frame (JSON ASR result, ping, meta) — skip pure keepalive pings
@@ -69,7 +66,7 @@ class SkillBuffer {
       const receivedAt = this._hint === 'state/odom' ? Date.now() : undefined;
       this._frames[this._pos] = buf;
       if (receivedAt !== undefined) this._receivedAt[this._pos] = receivedAt;
-      this._pos = (this._pos + 1) % this._capacity;
+      this._pos = (this._pos + 1) % PREVIEW_CAPACITY;
       if (!this._full && this._pos === 0) this._full = true;
       // Forward to active consumer
       if (this._hint === 'state/odom') this._consumer?.(buf, this._hint, false, receivedAt);
@@ -79,15 +76,15 @@ class SkillBuffer {
   }
 
   /** Replay buffered frames into a renderer, then register it as consumer.
-   *  onDataFn(buf, hint, isReplay, receivedAt) — preserve receipt age during replay. */
+   *  onDataFn(buf, hint, isReplay, receivedAt) — preserve odometry receipt age during replay. */
   attach(onDataFn) {
     this._consumer = onDataFn;
-    const len   = this._full ? this._capacity : this._pos;
+    const len   = this._full ? PREVIEW_CAPACITY : this._pos;
     const start = this._full ? this._pos : 0;
     for (let i = 0; i < len; i++) {
-      const frame = this._frames[(start + i) % this._capacity];
+      const frame = this._frames[(start + i) % PREVIEW_CAPACITY];
       if (!frame) continue;
-      if (this._hint === 'state/odom') onDataFn(frame, this._hint, true, this._receivedAt[(start + i) % this._capacity]);
+      if (this._hint === 'state/odom') onDataFn(frame, this._hint, true, this._receivedAt[(start + i) % PREVIEW_CAPACITY]);
       else onDataFn(frame, this._hint, true);
     }
   }
@@ -111,8 +108,10 @@ const _lastSkillEvents = {};
 
 function _ensureBuffer(skillId, wsUrl, hint, side /* 'out'|'in' */) {
   if (!_buffers[skillId]) _buffers[skillId] = { out: null, in: null };
-  if (_buffers[skillId][side] && wsUrl && _buffers[skillId][side]._wsUrl !== wsUrl) {
-    _buffers[skillId][side].destroy();
+  const existing = _buffers[skillId][side];
+  if (existing && wsUrl && existing._wsUrl !== wsUrl &&
+      (hint === 'state/odom' || existing._hint === 'state/odom')) {
+    existing.destroy();
     _buffers[skillId][side] = null;
   }
   if (!_buffers[skillId][side] && wsUrl) {
@@ -292,12 +291,13 @@ function _wsUrlFor(path) {
 
 function _startPreviewBuffers(skill) {
   if (!skill.online) return;
-  const preview = odomPreview(skill);
+  const topicOut = skill.topic_out?.[0];
   const topicIn  = skill.topic_in?.[0];
 
   // out buffer: skill.ws_path (the primary stream)
-  if (preview.path) {
-    _ensureBuffer(skill.id, _wsUrlFor(preview.path), preview.hint, 'out');
+  if (skill.ws_path) {
+    const hint = skill.render_hint || 'activity';
+    _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out');
   }
   // in buffer: /ws/bus + topic_in path
   if (topicIn?.topic) {
@@ -379,12 +379,11 @@ function mountRenderer(skill) {
     _inRenderer = null;
   }
 
-  const preview  = odomPreview(skill);
-  const hint     = preview.hint;
+  const hint     = skill.render_hint || 'activity';
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
 
   const topicIn  = skill.topic_in?.[0]  || null;
-  const topicOut = preview.topic;
+  const topicOut = skill.topic_out?.[0] || null;
   const hasIn    = !!(topicIn?.topic || topicIn?.format);
   const hasOut   = !!(topicOut?.topic || topicOut?.format);
   const isSplit  = hasIn && hasOut;
@@ -501,7 +500,8 @@ function mountRenderer(skill) {
 
   // Attach to background preview buffer (replay + live stream)
   // For devices with only topic_in (e.g. speaker), fall back to inBuf.
-  const outBuf = preview.path ? _ensureBuffer(skill.id, _wsUrlFor(preview.path), hint, 'out') : null;
+  const outBuf = hint === 'state/odom' && skill.ws_path
+    ? _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out') : _buffers[skill.id]?.out;
   const inBuf  = _buffers[skill.id]?.in;
   const activeBuf = outBuf || (!skill.ws_path && hasIn ? inBuf : null);
   console.log(`[attach] skill=${skill.id} outBuf=${!!outBuf} inBuf=${!!inBuf} activeBuf=${!!activeBuf} ws_path=${skill.ws_path}`);
@@ -516,9 +516,9 @@ function mountRenderer(skill) {
       _deliverFrame(_activeRenderer, buf, fmt, isReplay, receivedAt);
     });
     console.log(`[attach] attached to activeBuf, replay frames will be silent`);
-  } else if (preview.path) {
+  } else if (skill.ws_path) {
     // Buffer not ready yet — create on demand
-    const buf = _ensureBuffer(skill.id, _wsUrlFor(preview.path), hint, 'out');
+    const buf = _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out');
     console.log(`[attach] created on-demand outBuf for ws_path=${skill.ws_path}`);
     buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_activeRenderer, b, fmt, isReplay, receivedAt));
   } else if (hasIn && topicIn?.topic) {

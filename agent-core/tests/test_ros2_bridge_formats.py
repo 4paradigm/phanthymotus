@@ -73,23 +73,16 @@ def test_slam_preview_snapshot_is_relayed_as_binary(monkeypatch):
                 raise RuntimeError('wrongly relayed as text')
         async def send_bytes(self, data):
             self.binary.append(data)
-            raise RuntimeError('done')
+            asyncio.get_running_loop().call_soon(
+                lambda: inspection._topic_queues[topic][0].put_nowait(None))
     socket = Socket()
     asyncio.run(inspection.bus_ws(socket, topic.lstrip('/')))
     assert socket.binary == [raw] and len(socket.text) == 1
-    assert unsubscribed == ['__primary__#' + topic]
-    assert topic not in inspection._last_frame
+    assert unsubscribed == []
+    assert inspection._last_frame[topic] == raw
 
 
-def test_slam_preview_registration_does_not_subscribe_without_viewers(monkeypatch):
-    from api import inspection
-    calls = []
-    monkeypatch.setattr(inspection, '_ensure_primary_sub', lambda *a: calls.append(a))
-    inspection._ensure_registered_sub('/preview', 'sensor/slam-preview', None)
-    assert calls == []
-
-
-def test_slow_preview_consumer_receives_latest_bounded_frames(monkeypatch):
+def test_full_preview_queue_keeps_main_frame_order(monkeypatch):
     import asyncio
     from api import inspection
     topic = '/test/slow-preview'
@@ -102,4 +95,4 @@ def test_slow_preview_consumer_receives_latest_bounded_frames(monkeypatch):
         await push(b'middle', 'sensor/slam-preview')
         await push(b'latest', 'sensor/slam-preview')
         return [queue.get_nowait(), queue.get_nowait()]
-    assert asyncio.run(feed()) == [b'middle', b'latest']
+    assert asyncio.run(feed()) == [b'old', b'middle']

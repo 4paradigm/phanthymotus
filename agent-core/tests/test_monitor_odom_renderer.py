@@ -24,10 +24,10 @@ const TextRenderer={name:'text',canRender:f=>f==='data/json'};
 const KvLatestRenderer={name:'kv-latest'};
 const OdomRenderer={name:'odom',canRender:f=>f==='state/odom'};
 const VideoRenderer={},ImageRenderer={},AudioRenderer={},LidarRenderer={},ControlRenderer={},
-PointCloudRenderer={},MappingRenderer={},SlamPreviewRenderer={},SkeletonRenderer={},Pose2dRenderer={},
+PointCloudRenderer={},MappingRenderer={},SkeletonRenderer={},Pose2dRenderer={},
 TactileRenderer={},CameraRenderer={},DepthRenderer={},DepthZlibRenderer={};
 for (const renderer of [VideoRenderer,ImageRenderer,AudioRenderer,LidarRenderer,ControlRenderer,
-PointCloudRenderer,MappingRenderer,SlamPreviewRenderer,SkeletonRenderer,Pose2dRenderer,TactileRenderer,
+PointCloudRenderer,MappingRenderer,SkeletonRenderer,Pose2dRenderer,TactileRenderer,
 CameraRenderer,DepthRenderer,DepthZlibRenderer]) renderer.canRender=()=>false;
 const assert=(yes,message)=>{if(!yes)throw Error(message)};
 '''

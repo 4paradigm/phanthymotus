@@ -155,21 +155,15 @@ test('receipt freshness is separate from unknown acquisition age and ignores kee
   } finally { Date.now = savedNow; globalThis.setInterval = savedInterval; globalThis.clearInterval = savedClear; }
 });
 
-test('odometry preview prefers odometry without reordering output ports', async () => {
-  const { odomPreview, OdomRenderer } = await import('./renderers/odom.js');
-  const first = { topic: '/status', format: 'data/json' };
-  const pose = { topic: '/odom', format: 'state/odom', metadata: { presentation: { fields: [] } } };
-  const skill = { ws_path: '/ws/bus/status', render_hint: 'data/json', topic_out: [first, pose] };
-  assert.deepEqual(odomPreview(skill), { path: '/ws/bus/odom', hint: 'state/odom', topic: pose });
-  assert.equal(skill.topic_out[0], first);
-  assert.equal(odomPreview({ ws_path: '/ws/bus/other', render_hint: 'data/json' }).path, '/ws/bus/other');
+test('odometry renderer accepts only its dedicated format', async () => {
+  const { OdomRenderer } = await import('./renderers/odom.js');
   assert.equal(OdomRenderer.canRender('state/odom'), true);
   assert.equal(OdomRenderer.canRender('data/json'), false);
   assert.equal(OdomRenderer.canRender('text/plain'), false);
 });
 
 test('detail and dashboard specialize odometry while ordinary JSON keeps its original text route', async () => {
-  const { OdomRenderer, odomPreview } = await import('./renderers/odom.js');
+  const { OdomRenderer } = await import('./renderers/odom.js');
   const profile = { schema: 'motus.presentation/1', fields: [{ path: 'voltage', label: '电压', unit: 'V' }] };
   for (const [view, format] of ['detail-panel', 'dashboard'].flatMap(view =>
     ['data/json', 'state/odom'].map(format => [view, format]))) {
@@ -183,7 +177,7 @@ test('detail and dashboard specialize odometry while ordinary JSON keeps its ori
     const inert = { canRender: () => false };
     const names = source.match(/const RENDERERS = \[([^\]]+)\]/)[1].split(',').map(name => name.trim());
     const context = { ...Object.fromEntries(names.map(name => [name, inert])),
-      OdomRenderer, TextRenderer, odomPreview,
+      OdomRenderer, TextRenderer,
       ActivityRenderer: inert, document: globalThis.document, TextEncoder, TextDecoder, ArrayBuffer,
       console: { log() {}, debug() {}, warn() {} }, location: { protocol: 'http:', host: 'localhost' },
       setTimeout() {}, clearTimeout() {}, setInterval() {}, clearInterval() {},
@@ -198,7 +192,8 @@ test('detail and dashboard specialize odometry while ordinary JSON keeps its ori
       if (view === 'detail-panel') {
         exposed.initDetailPanel(); exposed.showTopicDetail('/custom/status', format, { presentation: profile });
       } else exposed.mountRenderer({ id: 'custom', topic_out: [{ topic: '/custom/status', format,
-        metadata: { presentation: profile } }], ws_path: '/ws/bus/custom/status', render_hint: format });
+        metadata: { presentation: profile } }, {topic:'/secondary/odom',format:'state/odom'}],
+        ws_path: '/ws/bus/custom/status', render_hint: format });
       const body = elements.get(view === 'detail-panel' ? 'detail-body' : 'renderer-content');
       if (format === 'state/odom') {
         assert.ok(body.querySelector('.renderer-odom'), `${view} must render odometry directly`);
@@ -284,6 +279,47 @@ test('dashboard buffers odd-length odometry and preserves original receipt age o
     renderer.onDataSilent(replay[0].frame, 'state/odom', { receivedAt: replay[0].receivedAt });
     assert.match(box.querySelector('.odom-freshness').textContent, /7.0 s · 陈旧/);
   } finally { renderer.unmount(); Date.now = savedNow; buffer.destroy(); }
+});
+
+test('dashboard keeps the original non-odom binary filtering, ring history and callback arity', () => {
+  const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
+  const start = source.indexOf('class SkillBuffer {');
+  const end = source.indexOf('\n}\n', start) + 2;
+  for (const format of ['data/json', 'audio/pcm', 'sensor/slam-preview']) {
+    const sockets = [];
+    const SkillBuffer = runInNewContext(`const PREVIEW_CAPACITY = 100; (${source.slice(start, end)})`, {
+      ArrayBuffer, TextEncoder, console: { log() {} },
+      WebSocket: class { constructor() { sockets.push(this); } close() {} },
+    });
+    const buffer = new SkillBuffer('ws://original', format);
+    try {
+      for (let i = 0; i < 102; i++) sockets[0].onmessage({ data: new Uint16Array([i]).buffer });
+      sockets[0].onmessage({ data: new Uint8Array([255]).buffer });
+      sockets[0].onmessage({ data: '{"type":"ping"}' });
+      const replay = [];
+      buffer.attach((...args) => replay.push(args));
+      assert.equal(replay.length, 100, `${format} retains the original preview history`);
+      assert.equal(new Uint16Array(replay[0][0])[0], 2);
+      assert.equal(new Uint16Array(replay.at(-1)[0])[0], 101);
+      assert.ok(replay.every(args => args.length === 3 && args[2] === true));
+      sockets[0].onmessage({ data: new Uint16Array([102]).buffer });
+      assert.equal(replay.at(-1).length, 2, 'live callbacks keep their original signature');
+    } finally { buffer.destroy(); }
+  }
+});
+
+test('dashboard preserves the original non-odom renderer callback signatures', () => {
+  const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function _deliverFrame(');
+  const end = source.indexOf('\n}\n', start) + 2;
+  const deliver = runInNewContext(`(${source.slice(start, end)})`);
+  const calls = [];
+  const renderer = { name: 'text', onData: (...args) => calls.push(args),
+    onDataSilent: (...args) => calls.push(args) };
+  const frame = new ArrayBuffer(2);
+  deliver(renderer, frame, 'data/json', true, 1000);
+  deliver(renderer, frame, 'data/json', false, 1000);
+  assert.deepEqual(calls, [[frame], [frame, 'data/json']]);
 });
 
 test('yaw requires explicit z-up xyzw axes, a valid quaternion and tracking', async () => {

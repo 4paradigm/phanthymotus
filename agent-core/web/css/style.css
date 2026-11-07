@@ -4703,14 +4703,6 @@ html, body {
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
 }
-/* Keep SLAM controls within the existing format line in compact panel headers. */
-.slam-view-modes {
-  width: max-content;
-}
-/* A frame's active projection and button state must change together. */
-.slam-view-modes .monitor-card-mode-btn {
-  transition: none;
-}
 .monitor-card-mode-btn:not(:last-child) {
   border-right: 1px solid var(--border);
 }

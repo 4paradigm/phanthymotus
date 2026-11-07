@@ -1028,7 +1028,7 @@ async def _do_start_project_impl():
                 # same topic is already reported as a clash by `_topic_clash`;
                 # silently taking whichever card started last would make the
                 # optics disagree with the clash message.
-                if topic == _topic_of_connection(conn) and topic and topic not in out:
+                if topic and topic not in out:
                     out[topic] = entry
         return out
 

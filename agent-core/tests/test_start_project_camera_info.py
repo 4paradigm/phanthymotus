@@ -243,6 +243,18 @@ def test_two_cameras_do_not_bleed_into_each_other(rig):
     assert got[CAM2_TOPIC]['half_fov_rad'] is None
 
 
+def test_legacy_consumer_keeps_all_camera_declarations_from_connected_producer(rig):
+    rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'image/jpeg'},
+                          {'topic': CAM2_TOPIC, 'format': 'image/jpeg'}]
+    rig.declarations[CAM] = [_decl(CAM_TOPIC), _decl(CAM2_TOPIC, id='side-camera')]
+    _run({'cards': [_card(CAM, 'dual_camera'), _card(NAVI, 'navi')],
+          'connections': [_conn(CAM, NAVI, CAM_TOPIC)]})
+
+    assert rig.starts[NAVI]['input_topic'] == CAM_TOPIC
+    assert rig.starts[NAVI]['camera_info'] == {
+        CAM_TOPIC: _decl(CAM_TOPIC), CAM2_TOPIC: _decl(CAM2_TOPIC, id='side-camera')}
+
+
 # ── an upstream that declares nothing is not a fault ─────────────────────────
 
 def test_a_source_that_declares_nothing_still_starts_the_project(rig):
@@ -343,18 +355,16 @@ def test_renamed_consumer_receives_only_declared_port_contracts(rig):
     assert rig.infos.count(CAM) == 1
 
 
-def test_unconnected_sibling_declarations_do_not_reach_consumer(rig):
+def test_unconnected_sibling_input_metadata_does_not_reach_consumer(rig):
     rig.schemas['metadata_consumer'] = {'inputSchema': {'properties': {'input_metadata': {}}}}
     connected = {'topic': CAM2_TOPIC, 'schema': 'motus.slam_input/1', 'kind': 'depth'}
     rig.metadata[CAM] = [{'topic': CAM_TOPIC, 'kind': 'pose'}, connected]
-    rig.declarations[CAM] = [_decl(CAM_TOPIC), _decl(CAM2_TOPIC, id='connected-camera')]
     rig.topic_outs[CAM] = [{'topic': CAM_TOPIC, 'format': 'state/odom'},
                           {'topic': CAM2_TOPIC, 'format': 'image/depth-zlib'}]
     conn = {**_conn(CAM, NAVI, '/stale/topic'), 'fromPortIdx': '1'}
     _run({'cards': [_card(CAM, 'two_outputs'), _card(NAVI, 'metadata_consumer')],
           'connections': [conn]})
     assert rig.starts[NAVI]['input_metadata'] == {CAM2_TOPIC: connected}
-    assert rig.starts[NAVI]['camera_info'] == {CAM2_TOPIC: _decl(CAM2_TOPIC, id='connected-camera')}
 
 
 @pytest.mark.parametrize('name', ['strict_old_consumer', 'pointcloud_slam'])
@@ -395,8 +405,9 @@ def test_explicit_non_list_source_metadata_blocks_declared_consumer(rig, metadat
     assert config.main['core']['project_running'] is False
 
 
-def test_legacy_consumer_does_not_adopt_or_validate_new_source_metadata(rig):
-    rig.metadata[CAM] = None
+@pytest.mark.parametrize('metadata', [None, {}, 'bad-shape', {CAM_TOPIC: {'kind': 'cloud'}}])
+def test_legacy_consumer_does_not_adopt_or_validate_new_source_metadata(rig, metadata):
+    rig.metadata[CAM] = metadata
     assert _run({'cards': [_card(CAM, 'source'), _card(NAVI, 'strict_old_consumer')],
                  'connections': [_conn(CAM, NAVI, CAM_TOPIC)]}) is not False
     assert 'input_metadata' not in rig.starts[NAVI]
