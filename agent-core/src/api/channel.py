@@ -30,6 +30,33 @@ import config
 router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
 
 
+def _safe_channel(entry: dict) -> dict:
+    result = dict(entry)
+    cfg = dict(result.get('config') or {})
+    for key in ('access_token', 'bot_token', 'app_token', 'app_secret', 'token'):
+        if key in cfg:
+            cfg[key] = '***' if cfg[key] else ''
+    result['config'] = cfg
+    return result
+
+
+def _validate_channel_config(platform: str, cfg: dict, *, allow_legacy_inline: bool = False) -> None:
+    if platform == 'qq':
+        try:
+            if 'app_secret' in cfg and not allow_legacy_inline:
+                raise ValueError(
+                    'Inline QQ AppSecret is not accepted; use '
+                    'app_secret_env or app_secret_file')
+            protocol = cfg.get('protocol', 'official')
+            if protocol == 'official':
+                from channel.adapters.qq_official import validate_qq_official_config
+                validate_qq_official_config(cfg)
+            else:
+                raise ValueError('Unsupported QQ protocol')
+        except (ValueError, AttributeError) as exc:
+            raise fastapi.HTTPException(400, str(exc)) from None
+
+
 # ── Channel CRUD ─────────────────────────────────────────────────────────────
 
 @router.get('/list')
@@ -48,6 +75,7 @@ class AddChannelReq(BaseModel):
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
+    _validate_channel_config(req.platform, req.config)
     if req.bot_to_bot_enabled and not supports_bot_to_bot(req.platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{req.platform}"')
@@ -72,7 +100,7 @@ async def add_channel(req: AddChannelReq):
     # 如果 enabled，立即启动
     if req.enabled:
         await manager.restart_adapter(req.id)
-    return {'channel': entry}
+    return {'channel': _safe_channel(entry)}
 
 
 class UpdateChannelReq(BaseModel):
@@ -92,6 +120,39 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
+    if target_platform == 'qq':
+        if 'config' in updates:
+            merged = dict(current.get('config') or {})
+            supplied = updates['config']
+            if not isinstance(supplied, dict):
+                raise fastapi.HTTPException(400, 'QQ configuration must be an object')
+            if 'app_secret' in supplied:
+                raise fastapi.HTTPException(
+                    400, 'Inline QQ AppSecret is no longer accepted; '
+                         'migrate to app_secret_env or app_secret_file')
+            old_protocol = merged.get('protocol', 'official')
+            new_protocol = supplied.get('protocol', old_protocol)
+            if old_protocol != new_protocol:
+                merged = {}
+            credential_keys = (
+                'access_token', 'access_token_env', 'access_token_file',
+                'app_secret', 'app_secret_env', 'app_secret_file',
+            )
+            provided = [key for key in credential_keys if supplied.get(key)]
+            if len(provided) > 1:
+                raise fastapi.HTTPException(400, 'Use only one QQ credential source')
+            if provided:
+                for key in credential_keys:
+                    merged.pop(key, None)
+            merged.update({key: value for key, value in supplied.items()
+                           if key not in credential_keys or value})
+            updates['config'] = merged
+        # Keep old inline credentials usable until explicitly migrated.
+        # Editing legacy QQ config requires switching to a secret reference;
+        # enable/disable updates remain backwards compatible.
+        _validate_channel_config(
+            'qq', updates.get('config', current.get('config') or {}),
+            allow_legacy_inline=('config' not in updates))
     if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{target_platform}"')
@@ -108,7 +169,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
         raise fastapi.HTTPException(400, str(e))
     # 重启 adapter 以应用新配置
     await manager.restart_adapter(channel_id)
-    return {'channel': result}
+    return {'channel': _safe_channel(result)}
 
 
 @router.delete('/{channel_id}')

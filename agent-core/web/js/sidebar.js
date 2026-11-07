@@ -1057,7 +1057,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         for (const ch of channels) {
           const opt = document.createElement('option');
           opt.value = ch.id;
-          opt.textContent = `${ch.id} (${ch.platform})`;
+          opt.textContent = `${ch.id} (${ch.platform === 'qq' ? (ch.qq_protocol === 'official' ? 'QQ 官方' : 'QQ OneBot') : ch.platform})`;
           if (saved === ch.id) opt.selected = true;
           input.appendChild(opt);
         }
@@ -1424,7 +1424,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         for (const ch of channels) {
           const opt = document.createElement('option');
           opt.value = ch.id;
-          opt.textContent = `${ch.id} (${ch.platform})`;
+          opt.textContent = `${ch.id} (${ch.platform === 'qq' ? (ch.qq_protocol === 'official' ? 'QQ 官方' : 'QQ OneBot') : ch.platform})`;
           if (saved === ch.id) opt.selected = true;
           input.appendChild(opt);
         }
