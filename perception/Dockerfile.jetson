@@ -658,7 +658,8 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
       rm "/tmp/${source_name}.tar.gz"; \
     }; \
     fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}"; \
-    rtabmap_packages='rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
+    fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da; \
+    rtabmap_packages='message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
     add_missing_rtabmap_dependencies() { \
       dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; shift 3; \
       missing_packages=''; \
