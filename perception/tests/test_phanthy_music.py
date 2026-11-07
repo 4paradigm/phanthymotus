@@ -488,11 +488,12 @@ class AsmrCardTests(unittest.TestCase):
 class MCPTests(unittest.TestCase):
     def test_real_http_tools_list_dispatch_and_log_redaction(self):
         import main
-        # echo_cancellation is default-on, so it has to be switched off
-        # explicitly for the bundle to hold just this card — the tool list
-        # below is asserted exactly.
+        # echo_cancellation and undistort are default-on, so they have to be
+        # switched off explicitly for the bundle to hold just this card — the
+        # tool list below is asserted exactly.
         bundle = main.PerceptionBundle({'plugins': {'phanthy_music': {'enabled': True, 'catalogue_type': 'mock'},
                                                    'echo_cancellation': {'enabled': False},
+                                                   'undistort': {'enabled': False},
                                                    'audio_mixer': {'enabled': False}}}, _FakeExecutor())
         captured = io.StringIO()
         handler = logging.StreamHandler(captured)
