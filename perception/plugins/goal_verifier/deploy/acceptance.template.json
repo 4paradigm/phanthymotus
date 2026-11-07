@@ -1,0 +1,22 @@
+{
+  "record_type": "onsite_acceptance_unfilled",
+  "operator": null,
+  "piper_installation_id": null,
+  "package_sha256": null,
+  "source_commit": null,
+  "core_version_and_workbench_host": null,
+  "mcp_registration_receipt": null,
+  "camera_identity_topic_domain_type": null,
+  "capture_clock_and_view_evidence": null,
+  "configuration_sha256": null,
+  "doctor_report": null,
+  "before_real_observation_and_image": null,
+  "manual_move_into_goal_pass_evidence": null,
+  "manual_move_outside_goal_fail_evidence": null,
+  "occluded_target_inconclusive_evidence": null,
+  "duplicate_and_reset_evidence": null,
+  "dashboard_screenshots_and_video": null,
+  "robot_control_not_started": null,
+  "actual_visual_acceptance_passed": null,
+  "remaining_reason": null
+}
