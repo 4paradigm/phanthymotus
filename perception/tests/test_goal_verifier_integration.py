@@ -4,6 +4,7 @@ from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import threading
@@ -120,6 +121,75 @@ def test_real_http_mcp_initialization_discovery_errors_and_stop():
         server.shutdown()
         server.server_close()
         worker.join(1)
+
+
+@pytest.mark.parametrize("entry", ["module", "deploy_script"])
+def test_standalone_entry_installs_logsafe_before_startup(tmp_path, entry):
+    root = Path(__file__).resolve().parents[2]
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(dict(piper_id="OFFLINE-LOGGING-TEST", sources={})))
+    # A fresh interpreter avoids inheriting the bundle's already-installed writer.
+    # Delegate to the real installer; guard parsing and exercise actual logging.
+    probe = tmp_path / "python-probe"
+    probe.write_text("#!" + sys.executable + "\n" + r'''
+import argparse, logging, runpy, sys
+from utils import logsafe
+
+def assert_installed():
+    assert isinstance(sys.stdout, logsafe.LineAtomicStream)
+    assert isinstance(sys.stderr, logsafe.LineAtomicStream)
+
+real_install = logsafe.install
+def install(*args, **kwargs):
+    real_install(*args, **kwargs)
+    assert_installed()
+    logging.warning("logsafe-entry:\x1b[31mREADY\x1b[0m\x00")
+logsafe.install = install
+
+real_parser_init = argparse.ArgumentParser.__init__
+def parser(self, *args, **kwargs):
+    assert_installed()
+    real_parser_init(self, *args, **kwargs)
+argparse.ArgumentParser.__init__ = parser
+
+assert sys.argv[1:3] == ["-m", "plugins.goal_verifier.server"]
+sys.argv = sys.argv[2:]
+runpy.run_module("plugins.goal_verifier.server", run_name="__main__")
+''')
+    probe.chmod(0o700)
+    env = {**os.environ, "PYTHONPATH": str(root / "perception"),
+           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+           "GOAL_PYTHON": str(probe), "GOAL_CONFIG": str(cfg), "GOAL_PORT": "0"}
+    if entry == "module":
+        command = [sys.executable, str(probe), "-m", "plugins.goal_verifier.server",
+                   "--config", str(cfg), "--port", "0"]
+    else:
+        command = ["bash", str(root / "perception/plugins/goal_verifier/deploy/start.sh")]
+    process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    try:
+        assert select.select([process.stdout], [], [], 10)[0], "MCP startup timed out"
+        line = process.stdout.readline()
+        assert line, "MCP exited before announcing its endpoint"
+        started = json.loads(line)
+        assert started["motion_capability"] is False
+        url = started["mcp_url"]
+        assert rpc(url, "initialize")["protocolVersion"] == "2024-11-05"
+        assert rpc(url, "tools/list")["tools"][0]["name"] == NAME
+        info = rpc(url, "tools/call", dict(name=NAME, arguments=dict(action="info")))
+        assert json.loads(info["content"][0]["text"])["motion_capability"] is False
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            _, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+    assert process.returncode == 0, stderr
+    assert "logsafe-entry:READY" in stderr
+    assert "\x1b" not in stderr and "\x00" not in stderr
 
 
 def test_perception_http_does_not_log_session_capabilities(monkeypatch, caplog):

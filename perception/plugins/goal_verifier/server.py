@@ -153,6 +153,11 @@ def handler(plugin):
 
 
 def main():
+    # Before argument parsing, plugin imports or startup output; library imports
+    # continue to use their host process's logging setup.
+    from utils import logsafe
+
+    logsafe.install()
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1"])
