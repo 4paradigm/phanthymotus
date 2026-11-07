@@ -221,6 +221,84 @@ def test_saving_displayed_defaults_preserves_loaded_sensor_policy_and_budgets(ca
     assert props['cloud_frame']['default'] == 'sensor'
 
 
+def test_bumi_profile_wins_over_stale_manual_form_fields_and_saves_verified_evidence(card):
+    stale = {key: prop['default'] for key, prop in
+             card.get_tools()[0]['configSchema']['properties'].items() if 'default' in prop}
+    stale.update(robot='Bumi', cloud_frame='old_sensor', child_from_cloud='invalid')
+    result = call(card, 'config', **stale)
+    assert result['state'] == 'configured'
+    assert result['config']['cloud_frame'] == 'ubuntu_rgb_optical'
+    assert result['config']['child_frame'] == '{segment_id}_base'
+    assert result['config']['clock_id'] == 'ros'
+    assert result['config']['child_from_cloud'] == [[0, 0, 1, 0], [-1, 0, 0, 0],
+                                                  [0, -1, 0, 0], [0, 0, 0, 1]]
+    assert result['config']['input_policy'] == 'strict'
+    assert result['config']['max_cloud_points'] == 20000
+    capture(card)
+    saved = call(card, 'stop_mapping', request_id='bumi-profile')
+    manifest = Path(module._ARCHIVE_DIR) / 'maps' / saved['map_id'] / '1.json'
+    evidence = json.loads(manifest.read_text())['resolved']['input_validation']
+    assert evidence == {'policy': 'strict', 'clock_relation_verified': True,
+                        'extrinsic_calibrated': True}
+
+
+@pytest.mark.parametrize('selector', [{'robot': '其他'}, {}])
+def test_manual_and_legacy_config_after_bumi_do_not_retain_profile_selection(card, selector):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    result = call(card, 'config', **settings(), **selector)
+    assert result['state'] == 'configured'
+    assert result['config']['robot'] == '其他'
+    assert result['config']['cloud_frame'] == 'sensor'
+    assert result['config']['child_from_cloud'] == [[1, 0, 0, 0], [0, 1, 0, 0],
+                                                  [0, 0, 1, 0], [0, 0, 0, 1]]
+    assert result['config']['input_policy'] == 'experimental'
+    assert call(card, 'info')['input_validation'] == {
+        'clock_relation_verified': False, 'extrinsic_calibrated': False}
+    ready(card)
+
+
+@pytest.mark.parametrize('robot', ['G1', 'Tianyi'])
+def test_pending_robot_selection_clears_bumi_facts_and_explains_missing_odometry(card, robot):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    result = call(card, 'config', robot=robot, child_from_cloud='stale invalid matrix')
+    assert result['state'] == 'configured'
+    assert result['config']['robot'] == robot
+    assert not result['config'].get('cloud_frame')
+    assert not result['config'].get('child_from_cloud')
+    assert call(card, 'info')['input_validation'] == {
+        'clock_relation_verified': False, 'extrinsic_calibrated': False}
+    result = card.dispatch('pointcloud_slam', arguments())
+    assert result['state'] == 'error'
+    assert robot in result['message'] and 'odom' in result['message']
+    assert card._node is None
+
+
+def test_unknown_robot_selection_is_rejected(card):
+    result = call(card, 'config', robot='unknown')
+    assert result['state'] == 'error'
+    assert 'robot' in result['message']
+
+
+def test_switching_ready_bumi_to_pending_robot_cannot_start_a_native_session(card):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    ready(card)
+    assert call(card, 'config', robot='G1')['state'] == 'configured'
+    result = call(card, 'start_mapping', map_name='Hall')
+    assert result['state'] == 'error'
+    assert 'G1' in result['message'] and 'odom' in result['message']
+    assert card._node is None
+
+
+def test_sparse_legacy_config_cannot_inherit_bumi_verification_for_a_different_sensor(card):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    manual = {key: value for key, value in settings().items() if key in
+              ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')}
+    result = call(card, 'config', **manual)
+    assert result['state'] == 'error'
+    assert 'verified' in result['message']
+    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'error'
+
+
 @pytest.mark.parametrize('action', ['start', 'stop', 'info', 'config', 'operation_status'])
 def test_core_json_schema_validation_accepts_lifecycle_actions(card, action):
     jsonschema = pytest.importorskip('jsonschema')

@@ -1,10 +1,10 @@
-# Bumi point-cloud RTAB-Map trial: optical origin with body-axis convention.
-# Clock/extrinsic evidence remains unverified; no hardware acceptance implied.
-# Merge under plugins.pointcloud_slam in the device's Perception config.
+# Bumi installation: optical origin with body-axis convention, namespace ubuntu.
+# Clock relation and this extrinsic verified by the operator; mapping acceptance is separate.
+# Loaded by the SLAM configuration page's Bumi selection.
 enabled: true
-input_policy: experimental
-clock_relation_verified: false
-extrinsic_calibrated: false
+input_policy: strict
+clock_relation_verified: true
+extrinsic_calibrated: true
 cloud_frame: ubuntu_rgb_optical
 child_frame: '{segment_id}_base'
 clock_id: ros

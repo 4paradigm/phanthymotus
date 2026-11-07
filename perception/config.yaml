@@ -279,9 +279,9 @@ plugins:
     cal_b: 0.0
 
   # RTAB-Map mapping from native PointCloud2 and existing odometry.
-  # Configure capture clocks and cloud-to-pose extrinsics before enabling.
+  # Select a robot preset or manual sensor settings on the card before mapping.
   pointcloud_slam:
-    enabled: false
+    enabled: true
 
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities

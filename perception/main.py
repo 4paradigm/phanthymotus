@@ -258,7 +258,7 @@ class PerceptionBundle:
             try:
                 from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
                 self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor))
-                log.info("PointCloudSlamPlugin loaded (experimental input only)")
+                log.info("PointCloudSlamPlugin loaded (RTAB-Map point-cloud mapping)")
             except Exception:
                 log.error("PointCloudSlamPlugin failed to load; continuing without SLAM", exc_info=True)
 

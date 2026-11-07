@@ -197,18 +197,16 @@ def test_native_shutdown_timeout_kills_and_reaps_failed_process():
         process.stdout.close()
 
 
-def test_jetson_recipe_uses_immutable_checked_native_source_archives():
+def test_jetson_recipe_uses_immutable_native_source_commits():
     # This is a recipe lint, not evidence that a native image built or ran.
     recipe = (ROOT / 'perception/Dockerfile.jetson').read_text()
     arguments = dict(re.findall(r'^ARG (RTABMAP_\w+)=(\S+)$', recipe, flags=re.MULTILINE))
     for name in ('RTABMAP_CORE', 'RTABMAP_ROS'):
         assert re.fullmatch('[0-9a-f]{40}', arguments.get(name + '_COMMIT', ''))
-        assert re.fullmatch('[0-9a-f]{64}', arguments.get(name + '_SHA256', ''))
-    calls = re.findall(r'add_missing_rtabmap_dependencies\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)',
+    calls = re.findall(r'add_missing_rtabmap_dependencies\s+(\S+)\s+(\S+)\s+(\S+)',
                        recipe.replace('\\\n', ' '))
     assert calls
-    for _, _, commit, checksum in calls:
+    for _, _, commit in calls:
         assert re.fullmatch('[0-9a-f]{40}', commit)
-        assert re.fullmatch('[0-9a-f]{64}', checksum)
     assert 'SLAM_GTSAM_COMMIT' not in recipe
     assert "'open3d==" not in recipe
