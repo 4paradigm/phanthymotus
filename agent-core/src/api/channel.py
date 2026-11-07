@@ -40,9 +40,13 @@ def _safe_channel(entry: dict) -> dict:
     return result
 
 
-def _validate_channel_config(platform: str, cfg: dict) -> None:
+def _validate_channel_config(platform: str, cfg: dict, *, allow_legacy_inline: bool = False) -> None:
     if platform == 'qq':
         try:
+            if 'app_secret' in cfg and not allow_legacy_inline:
+                raise ValueError(
+                    'Inline QQ AppSecret is not accepted; use '
+                    'app_secret_env or app_secret_file')
             protocol = cfg.get('protocol', 'official')
             if protocol == 'official':
                 from channel.adapters.qq_official import validate_qq_official_config
@@ -122,6 +126,10 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
             supplied = updates['config']
             if not isinstance(supplied, dict):
                 raise fastapi.HTTPException(400, 'QQ configuration must be an object')
+            if 'app_secret' in supplied:
+                raise fastapi.HTTPException(
+                    400, 'Inline QQ AppSecret is no longer accepted; '
+                         'migrate to app_secret_env or app_secret_file')
             old_protocol = merged.get('protocol', 'official')
             new_protocol = supplied.get('protocol', old_protocol)
             if old_protocol != new_protocol:
@@ -139,7 +147,12 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
             merged.update({key: value for key, value in supplied.items()
                            if key not in credential_keys or value})
             updates['config'] = merged
-        _validate_channel_config('qq', updates.get('config', current.get('config') or {}))
+        # Keep old inline credentials usable until explicitly migrated.
+        # Editing legacy QQ config requires switching to a secret reference;
+        # enable/disable updates remain backwards compatible.
+        _validate_channel_config(
+            'qq', updates.get('config', current.get('config') or {}),
+            allow_legacy_inline=('config' not in updates))
     if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{target_platform}"')

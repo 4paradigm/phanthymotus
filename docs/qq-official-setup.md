@@ -49,42 +49,50 @@ chat logs, session files, or any unredacted channel configuration.
 
 ## Configure the QQ Channel
 
-### Option A: Dashboard (quick setup)
+### Option A: Dashboard (environment variable reference)
 
-1. Open the running Agent Core Dashboard and navigate to **Channels**.
-2. Add **QQ Official**, choose a unique channel ID (for example
-   `qq_official_main`), and enter the Tencent Bot **AppID** and **AppSecret**
-   in the password field. Set the channel to enabled.
-3. Verify the Channel status reports connected and no health error.
-4. Open the Canvas. Configure the `channel_request` sensor Card and
-   `channel_reply` executable Card to use **the same exact channel ID**.
-5. Wire `channel_request -> decision_core`, and give `decision_core` an
-   **executor connection** to `channel_reply`. Start the Canvas project.
-6. Send one private QQ message. Confirm that the reply reaches the same
-   private chat.
+1. In an approved Core deployment, make the environment variable `QQ_OFFICIAL_APP_SECRET`
+   available **inside the running Agent Core container**, not only on Windows.
+   Do not put its value in the Dashboard, PR, source code or logs.
+2. In Dashboard -> Channels, choose QQ Official and enter a unique Channel ID
+   and Tencent Bot AppID.
+3. Select Existing Core environment variable; enter its **name**, not its
+   value. Alternatively, select Mounted credential file only if a managed
+   secret is already mounted at `/run/qq-official-app-secret`.
+4. Enable the Channel and confirm connected status with no health error.
+5. In Canvas, set the same Channel ID on the `channel_request` sensor Card and
+   the `channel_reply` executable Card. Wire `channel_request` to `decision_core`, and
+   add the executor connection from `decision_core` to `channel_reply`.
+6. Start Canvas and verify a real QQ private-text round trip.
 
-The Dashboard **quick-add form uses the raw AppSecret field**. It does not
-expose an environment-variable/file selector, even though the backend
-supports those sources. Do not assume Dashboard entry automatically creates
-a persistent environment-variable secret.
+The QQ Dashboard sends **only credential references**, never the credential
+value. If the Core service cannot access the configured environment variable
+or file, correct the deployment configuration before enabling the Channel.
 
-### Option B: managed secret source (production)
+### Option B: approved configuration API
 
-An operator may configure the Channel through the authorized Channel API or
-approved configuration mechanism instead of entering the AppSecret in the UI.
-Use `protocol=official`, `private_only=true`, the Bot AppID, and **exactly
-one** credential source:
+The authorized Channel API accepts `protocol` set to official,
+`private_only` set to true, the Bot AppID and **exactly one** credential
+reference:
 
-| Credential field | Value / condition |
+| Configuration field | Accepted value |
 | --- | --- |
-| `app_secret_env` | Environment variable name matching `QQ_OFFICIAL_...`; must be present in the **Core container** |
-| `app_secret_file` | Exactly `/run/qq-official-app-secret`; file must be mounted and readable by the Core process |
-| `app_secret` | Inline AppSecret (Dashboard quick setup); avoid when a managed secret source is available |
+| `app_secret_env` | Environment variable starting with `QQ_OFFICIAL_`, available in the Core container |
+| `app_secret_file` | Exactly `/run/qq-official-app-secret`, readable by the Core process |
 
-Use only one of these sources. Do not mix old OneBot `access_token` or
-`ws_url` settings into this official protocol configuration. The official
-Gateway establishes its own outbound connection; this Channel does not
-require a public inbound webhook, a NAT tunnel, or NapCat.
+New QQ Channel POST/PUT requests with inline `app_secret` are rejected.
+Previously saved inline credentials remain *readable* for existing runtimes,
+so upgrades do not immediately disconnect a working Bot. Existing legacy
+Channels can be enabled, disabled or restarted without rewriting config;
+to edit them, first choose an environment or file reference in Configure.
+
+When a legacy Channel is migrated, the new config no longer includes the
+old inline field. Old data backups still require secure handling, and the
+Bot credential should be rotated following a successful migration if the
+previous value was stored in plaintext. Do not delete runtime data volumes.
+
+Official QQ uses an outbound Gateway connection and does not require
+OneBot, NapCat, public webhook or NAT tunnel.
 
 ## Review and installation
 
@@ -112,7 +120,7 @@ Machine Owner authorization and acceptance evidence.
 Local unit/integration checks from the repository root:
 
 ```bash
-python -m pytest agent-core/tests/test_qq_official.py agent-core/tests/test_qq_official_canvas.py agent-core/tests/test_qq_official_sdk_contract.py agent-core/tests/test_qq_api_security.py agent-core/tests/test_qq_channel_integration.py agent-core/tests/test_qq_security_isolation.py agent-core/tests/test_qq_policy_async.py -q
+python -m pytest agent-core/tests/test_qq_official.py agent-core/tests/test_qq_official_canvas.py agent-core/tests/test_qq_official_sdk_contract.py agent-core/tests/test_qq_api_security.py agent-core/tests/test_qq_channel_integration.py agent-core/tests/test_qq_security_isolation.py agent-core/tests/test_qq_policy_async.py agent-core/tests/test_qq_credential_migration.py agent-core/tests/test_qq_real_sdk_delivery.py -q
 python -m compileall -q agent-core/src
 node --check agent-core/web/js/channels.js
 node --check agent-core/web/js/sidebar.js

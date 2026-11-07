@@ -237,6 +237,7 @@ class QQOfficialAdapter(ChannelAdapter):
             if len(self._attempted_replies) > _SEEN_LIMIT:
                 self._attempted_replies.popitem(last=False)
         try:
+            # SDK 1.2.2: retries=1 means ONE TOTAL ATTEMPT, not one extra retry.
             # A timeout is NOT proof that sending failed. No blind retries.
             await self._api.send_text(
                 "c2c", msg.chat_id, msg.text,
