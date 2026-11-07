@@ -1,0 +1,18 @@
+{
+  "example_only": true,
+  "arguments": {
+    "action": "start_session",
+    "request_id": "replace-with-a-new-request-id",
+    "task_id": "your-piper-operation",
+    "source_id": "camera_input",
+    "selector": {"class_name": "your_target_class"},
+    "goal": {
+      "units": "normalized",
+      "frame_id": "replace-with-the-actual-optical-frame",
+      "shape": "circle",
+      "center": [0.75, 0.5],
+      "radius": 0.08,
+      "tolerance": 0
+    }
+  }
+}
