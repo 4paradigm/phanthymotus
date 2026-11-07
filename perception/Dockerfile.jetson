@@ -92,12 +92,11 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # builds fall back to ld.so's default search path, which already covers the
 # /usr/lib/aarch64-linux-gnu these packages install into.
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
-    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
-    chmod +x /usr/sbin/ldconfig && \
+    cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
+    ln -sf /bin/true /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg libvips42 && \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -365,12 +364,11 @@ RUN . /etc/jetpack.env; \
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
 # step that actually failed on `--jp-version 6.1`, because layers 1-11 were
 # cached and it was the first apt install to run.
-RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
-    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
-    chmod +x /usr/sbin/ldconfig && \
+RUN cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
+    ln -sf /bin/true /usr/sbin/ldconfig && \
     apt-get update && \
     apt-get install -y --no-install-recommends espeak-ng && \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
@@ -405,12 +403,11 @@ COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-require
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ] && \
        ! python3 -c "import os,sysconfig;raise SystemExit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)"; then \
       echo '[build] CPython headers missing — installing python3-dev for the source builds' && \
-      mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
-      printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
-      chmod +x /usr/sbin/ldconfig && \
+      cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
+      ln -sf /bin/true /usr/sbin/ldconfig && \
       apt-get update && \
       apt-get install -y --no-install-recommends python3-dev && \
-      mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+      mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
       { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
       rm -rf /var/lib/apt/lists/*; \
     fi
@@ -584,21 +581,61 @@ print('[build] janome ok, no kanji left: %s' % out)"; \
 WORKDIR /work
 # Native RTAB-Map 0.22.1 + its Humble wrapper, built against each image's ROS,
 # OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
-ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
-ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
 RUN set -e; . /etc/jetpack.env; \
     case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
-    mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real; \
-    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
+    cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
+    ln -sf /bin/true /usr/sbin/ldconfig; \
     apt-get update; apt-get install -y --no-install-recommends \
-      curl ca-certificates cmake build-essential python3-dev libpcl-dev \
+      curl ca-certificates git cmake build-essential python3-dev libpcl-dev \
       libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
       libsqlite3-dev zlib1g-dev libssl-dev; \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig; \
+    mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig; \
     ldconfig || echo '[build] ldconfig skipped under emulation'; \
     . /opt/ros/humble/install/setup.bash; \
     rtabmap_python="$(command -v python3)"; \
     python3 -c "import cv2,numpy; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[rtabmap-build] OpenCV',cv2.__version__,'Python ${PY_ABI}')"; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
+# The full archive includes GUI assets and datasets. Fetch only the pinned
+# headless sources; keep completed Git objects when a transfer is interrupted.
+RUN set -e; \
+    rtabmap_source=/tmp/rtabmap-ws/src/rtabmap; \
+    mkdir -p "${rtabmap_source}"; \
+    git -C "${rtabmap_source}" init -q; \
+    git -C "${rtabmap_source}" remote add origin https://github.com/introlab/rtabmap.git; \
+    git -C "${rtabmap_source}" config http.version HTTP/1.1; \
+    git -C "${rtabmap_source}" config http.lowSpeedLimit 1024; \
+    git -C "${rtabmap_source}" config http.lowSpeedTime 30; \
+    for source_attempt in 1 2; do \
+      echo "[rtabmap-build] fetching pinned core sources, attempt ${source_attempt}/2"; \
+      if GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" fetch --depth=1 --filter=blob:none origin "${RTABMAP_CORE_COMMIT}" && \
+        git -C "${rtabmap_source}" sparse-checkout init --cone && \
+        git -C "${rtabmap_source}" sparse-checkout set cmake_modules corelib utilite && \
+        GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" checkout --detach "${RTABMAP_CORE_COMMIT}"; then break; fi; \
+      if [ "${source_attempt}" -eq 2 ]; then exit 1; fi; \
+      sleep 3; \
+    done; \
+    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"; \
+    . /opt/ros/humble/install/setup.bash; \
+    cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
+      -DWITH_GTSAM=OFF -DWITH_OPEN3D=OFF -DWITH_G2O=OFF -DWITH_TORO=ON \
+      -DWITH_CERES=OFF -DWITH_PYTHON=OFF -DWITH_TORCH=OFF -DWITH_POINTMATCHER=OFF \
+      -DWITH_PDAL=OFF -DWITH_OCTOMAP=OFF -DWITH_OPENNI=OFF -DWITH_OPENNI2=OFF \
+      -DWITH_FREENECT=OFF -DWITH_FREENECT2=OFF -DWITH_K4A=OFF \
+      -DWITH_REALSENSE=OFF -DWITH_REALSENSE2=OFF -DWITH_ZED=OFF -DWITH_ZEDOC=OFF \
+      -DWITH_FLYCAPTURE2=OFF -DWITH_DC1394=OFF -DWITH_MYNTEYE=OFF \
+      -DWITH_OPENGV=OFF -DWITH_MRPT=OFF -DWITH_VERTIGO=OFF -DWITH_FASTCV=OFF; \
+    cmake --build /tmp/rtabmap-core-build --target install --parallel 2; \
+    rm -rf /tmp/rtabmap-ws /tmp/rtabmap-core-build
+
+ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
+# A wrapper/dependency download failure must not discard the compiled core.
+RUN set -e; . /opt/ros/humble/install/setup.bash; \
+    rtabmap_python="$(command -v python3)"; \
+    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
     mkdir -p /tmp/rtabmap-ws/src; \
     fetch_rtabmap_source() { \
       source_name="$1"; source_repo="$2"; source_commit="$3"; \
@@ -617,19 +654,6 @@ RUN set -e; . /etc/jetpack.env; \
       tar -xzf "/tmp/${source_name}.tar.gz" --strip-components=1 -C "/tmp/rtabmap-ws/src/${source_name}"; \
       rm "/tmp/${source_name}.tar.gz"; \
     }; \
-    fetch_rtabmap_source rtabmap introlab/rtabmap "${RTABMAP_CORE_COMMIT}"; \
-    cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
-      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
-      -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
-      -DWITH_GTSAM=OFF -DWITH_OPEN3D=OFF -DWITH_G2O=OFF -DWITH_TORO=ON \
-      -DWITH_CERES=OFF -DWITH_PYTHON=OFF -DWITH_TORCH=OFF -DWITH_POINTMATCHER=OFF \
-      -DWITH_PDAL=OFF -DWITH_OCTOMAP=OFF -DWITH_OPENNI=OFF -DWITH_OPENNI2=OFF \
-      -DWITH_FREENECT=OFF -DWITH_FREENECT2=OFF -DWITH_K4A=OFF \
-      -DWITH_REALSENSE=OFF -DWITH_REALSENSE2=OFF -DWITH_ZED=OFF -DWITH_ZEDOC=OFF \
-      -DWITH_FLYCAPTURE2=OFF -DWITH_DC1394=OFF -DWITH_MYNTEYE=OFF \
-      -DWITH_OPENGV=OFF -DWITH_MRPT=OFF -DWITH_VERTIGO=OFF -DWITH_FASTCV=OFF; \
-    cmake --build /tmp/rtabmap-core-build --target install --parallel 2; \
-    touch /tmp/rtabmap-ws/src/rtabmap/COLCON_IGNORE; \
     fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}"; \
     rtabmap_packages='rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
     add_missing_rtabmap_dependencies() { \
@@ -671,7 +695,7 @@ RUN set -e; . /etc/jetpack.env; \
       -Dcrypto_LIB:FILEPATH="${rtabmap_crypto}" \
       '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
       -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
-    cd /work; rm -rf /tmp/rtabmap-ws /tmp/rtabmap-core-build /var/lib/apt/lists/*
+    cd /work; rm -rf /tmp/rtabmap-ws
 
 # ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
