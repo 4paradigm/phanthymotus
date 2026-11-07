@@ -1080,7 +1080,6 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                     return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
                 # Wait up to 10s for browser to connect and send audio chunks
                 # (browser mic is started in parallel by frontend before this API call)
-                import asyncio
                 initial_count = _start_mod._mic_chunk_count
                 for _ in range(20):  # 20 × 0.5s = 10s
                     if _start_mod._mic_chunk_count > initial_count:
@@ -1118,7 +1117,6 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                     return {'code': 200, 'data': {
                         'state': 'error',
                         'message': 'ROS2 camera publisher not available'}}
-                import asyncio
                 initial = _start_mod._camera_frame_count
                 for _ in range(20):            # 20 x 0.5s = 10s
                     if _start_mod._camera_frame_count > initial:
