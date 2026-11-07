@@ -30,6 +30,8 @@ mkdir -m 700 "$GOAL_DATA"
 
 独立venv的固定依赖面向Python3.10及以上；Jetson镜像使用镜像自身匹配的Python/NumPy/OpenCV，不使用该固定依赖覆盖NVIDIA栈。先source**现有**ROS Humble环境，再建立自己的venv，保留rclpy可见性：
 
+`deploy/requirements.txt` 仅供独立环境使用，官方 Perception Docker 构建不会安装它，因此不会增加官方镜像的依赖体积。安装这些依赖会增加独立环境体积，尤其是 `opencv-python-headless`。
+
 ```bash
 source /opt/ros/humble/setup.bash
 python3 -m venv --system-site-packages /absolute/own/piper-goal-run-UNIQUE/venv
@@ -52,7 +54,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 - piper_id：自己确认的PiPER安装标识，不伪装SDK序列号。
 - source_id：软件来源键；camera_id：已核对的物理相机身份；frame_id：实际消息header；distortion：实际raw/rectified。
-- topic、domain_id、message_type：从实际ROS图确认。compressed只接受JPEG，raw为bgr8/rgb8。不可凭Topic名字认定类型。
+- domain_id：平台 ROS Domain 固定为 42，所有 ROS 数据源须显式填写 JSON 整数 `42`。其他数字、`"42"`、布尔值均拒绝，不会自动纠正；外部 executor 的 Context 也必须是域 42。
+- topic、message_type：从实际ROS图确认。compressed只接受JPEG，raw为bgr8/rgb8。不可凭Topic名字认定类型。
 - stamp_semantics=capture、capture_time_record：实际核实header stamp来自采集时刻的依据。ROS消息有header不等于其语义自动可信；静态图片发布器的发送时间不能作为采集时间。优先使用经核对的原始相机采集流或有真实采集元数据的标准生产者，不能把该静态照片时间改标签。
 - 图像源view_id、view_mode=fixed、fixed_view_record：确认本次图像目标比较期间拍摄几何不变的记录；相机移动、缩放/裁剪后不可沿用。移动相机用逐帧注册的规范观测及对应测量标定，不能贴一个固定view标签。
 - color模式classes：自己选择的类别名、颜色名、HSV范围、最小面积。它是显式颜色类，不冒充YOLO语义识别。多个同类同颜色物体会产生身份歧义，首次验收可选视觉上明显且可区分的目标。
@@ -61,7 +64,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 normalized用于已经符合Observation v1的生产者。ROS topic中的原VOP JSON缺少采集时间/身份不能直接接；CLI/接口会拒绝。真实驱动若只输出无header的JPEG字节流，也不能把接收时间假装采集时间。
 
-Topic、域和消息类型都应从本次实际视觉环境确认，不预设相机或安装场景。新视觉进程可单独加入实际视觉域，不需要PiPER控制Owner改域或连接CAN。
+Topic和消息类型应从本次实际视觉环境确认，不预设相机或安装场景。核实来源遵守平台 `ROS_DOMAIN_ID=42` 约定；不符合时记录阻塞，不修改 PiPER 控制 Owner 或公共服务的域，也不连接 CAN。
 
 ## 4. 一键只读预检
 

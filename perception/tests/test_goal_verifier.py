@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import threading
 import time
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import numpy as np
@@ -13,9 +15,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from plugins.goal_verifier.contracts import NAME, OBSERVATION, Refusal
+from plugins.goal_verifier.configuration import validate
 from plugins.goal_verifier.engine import Engine
 from plugins.goal_verifier.plugin import GoalVerifierPlugin
-from plugins.goal_verifier.sources import from_vop, color_objects
+from plugins.goal_verifier.sources import Sources, from_vop, color_objects
 
 
 def config():
@@ -34,6 +37,263 @@ def config():
             )
         },
     )
+
+
+INVALID_ROS_DOMAINS = [0, 41, 43, 232, True, False, "42", 42.0, None]
+
+
+def ros_config(kind="ros_normalized", domain_id=42):
+    cfg = config()
+    cfg["sources"]["cam"].update(
+        kind=kind,
+        domain_id=domain_id,
+        topic="/synthetic/goal_verifier",
+        stamp_semantics="capture",
+        capture_time_record="SYNTHETIC-UNIT-CAPTURE",
+        message_type="raw",
+        view_id="synthetic-view",
+        view_mode="fixed",
+        fixed_view_record="SYNTHETIC-UNIT-FIXED-VIEW",
+        classes=[dict(class_name="bottle", color="red")],
+    )
+    return cfg
+
+
+@pytest.mark.parametrize("kind", ["ros_normalized", "ros_image"])
+def test_ros_configuration_accepts_integer_domain_42(kind):
+    cfg = ros_config(kind)
+    accepted = validate(cfg)
+    assert accepted == cfg and accepted is not cfg
+    assert type(accepted["sources"]["cam"]["domain_id"]) is int
+
+
+@pytest.mark.parametrize("kind", ["ros_normalized", "ros_image"])
+@pytest.mark.parametrize("domain_id", INVALID_ROS_DOMAINS)
+def test_ros_configuration_rejects_other_domains_without_correction(kind, domain_id):
+    cfg = ros_config(kind, domain_id)
+    with pytest.raises(Refusal) as exc:
+        validate(cfg)
+    assert exc.value.code == "INVALID_ROS_DOMAIN"
+    assert cfg["sources"]["cam"]["domain_id"] is domain_id
+
+
+@pytest.fixture
+def ros_startup(monkeypatch):
+    """Local ROS doubles; no DDS participant or hardware is started."""
+    import rclpy
+    import rclpy.executors
+    import rclpy.node
+
+    context = SimpleNamespace(
+        get_domain_id=Mock(return_value=42), try_shutdown=Mock(), shutdown=Mock()
+    )
+    executor = SimpleNamespace(
+        context=context,
+        add_node=Mock(),
+        remove_node=Mock(),
+        spin=Mock(),
+        shutdown=Mock(),
+    )
+    init = Mock()
+    node = Mock()
+    context_module = ModuleType("rclpy.context")
+    context_module.Context = Mock(return_value=context)
+    monkeypatch.setitem(sys.modules, "rclpy.context", context_module)
+    monkeypatch.setattr(rclpy, "init", init)
+    monkeypatch.setattr(rclpy.node, "Node", node)
+    executor_factory = Mock(return_value=executor)
+    monkeypatch.setattr(rclpy.executors, "MultiThreadedExecutor", executor_factory)
+    monkeypatch.setattr(sys.modules["sensor_msgs.msg"], "Image", Mock(), raising=False)
+    return SimpleNamespace(
+        init=init,
+        context=context,
+        executor=executor,
+        executor_factory=executor_factory,
+        node=node,
+    )
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("kind", ["ros_normalized", "ros_image"])
+def test_ros_startup_uses_domain_42_for_all_sources(
+    ros_startup, monkeypatch, external, kind
+):
+    monkeypatch.setenv("ROS_DOMAIN_ID", "41")
+    cfg = ros_config(kind)
+    cfg["sources"]["second"] = dict(cfg["sources"]["cam"], source_id="second")
+    sources = Sources(cfg, None)
+    try:
+        sources.start_ros(ros_startup.executor if external else None)
+        if external:
+            ros_startup.init.assert_not_called()
+        else:
+            ros_startup.init.assert_called_once_with(
+                context=ros_startup.context, domain_id=42
+            )
+        assert ros_startup.node.call_count == 2
+        assert ros_startup.executor.add_node.call_count == 2
+        for call in ros_startup.node.call_args_list:
+            assert call.kwargs["context"] is ros_startup.context
+    finally:
+        sources.close()
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("domain_id", INVALID_ROS_DOMAINS)
+def test_ros_startup_rechecks_domain_before_any_ros_side_effect(
+    ros_startup, external, domain_id
+):
+    # Bypass configuration validation to exercise the independent startup guard.
+    cfg = ros_config()
+    cfg["sources"]["second"] = dict(
+        cfg["sources"]["cam"], source_id="second", domain_id=domain_id
+    )
+    sources = Sources(cfg, None)
+    with pytest.raises(Refusal) as exc:
+        sources.start_ros(ros_startup.executor if external else None)
+    assert exc.value.code == "INVALID_ROS_DOMAIN"
+    ros_startup.init.assert_not_called()
+    ros_startup.node.assert_not_called()
+    ros_startup.executor.add_node.assert_not_called()
+    assert not sources.nodes and sources.ros is None
+
+
+@pytest.mark.parametrize("domain_id", INVALID_ROS_DOMAINS)
+def test_ros_startup_rejects_external_context_outside_integer_domain_42(
+    ros_startup, domain_id
+):
+    ros_startup.context.get_domain_id.return_value = domain_id
+    sources = Sources(ros_config(), None)
+    with pytest.raises(Refusal) as exc:
+        sources.start_ros(ros_startup.executor)
+    assert exc.value.code == "ROS_CONTEXT_DOMAIN_MISMATCH"
+    ros_startup.init.assert_not_called()
+    ros_startup.node.assert_not_called()
+
+
+def test_ros_startup_rejects_external_context_without_domain_api(ros_startup):
+    del ros_startup.context.get_domain_id
+    with pytest.raises(Refusal) as exc:
+        Sources(ros_config(), None).start_ros(ros_startup.executor)
+    assert exc.value.code == "ROS_CONTEXT_DOMAIN_MISMATCH"
+    ros_startup.init.assert_not_called()
+    ros_startup.node.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["init", "executor", "context"])
+def test_ros_startup_failure_releases_owned_context(ros_startup, stage):
+    failure = RuntimeError("synthetic startup failure")
+    if stage == "init":
+        ros_startup.init.side_effect = failure
+    elif stage == "executor":
+        ros_startup.executor_factory.side_effect = failure
+    else:
+        ros_startup.context.get_domain_id.side_effect = failure
+    sources = Sources(ros_config(), None)
+    with pytest.raises(RuntimeError, match="synthetic startup failure"):
+        sources.start_ros()
+    assert sources.closed and not sources.nodes
+    assert sources.ros is None and sources.thread is None
+    ros_startup.context.try_shutdown.assert_called_once_with()
+    ros_startup.node.assert_not_called()
+    if stage == "context":
+        ros_startup.executor.shutdown.assert_called_once_with(timeout_sec=2)
+    else:
+        ros_startup.executor.shutdown.assert_not_called()
+    sources.close()
+    ros_startup.context.try_shutdown.assert_called_once_with()
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("kind", ["ros_normalized", "ros_image"])
+@pytest.mark.parametrize("stage", ["node", "subscription", "add_node"])
+def test_ros_startup_failure_releases_partial_subscriptions(
+    ros_startup, external, kind, stage
+):
+    failure = RuntimeError("synthetic startup failure")
+    first, second = Mock(), Mock()
+    ros_startup.node.side_effect = [first, failure if stage == "node" else second]
+    if stage == "subscription":
+        second.create_subscription.side_effect = failure
+    elif stage == "add_node":
+        ros_startup.executor.add_node.side_effect = [True, failure]
+    cfg = ros_config(kind)
+    cfg["sources"]["second"] = dict(cfg["sources"]["cam"], source_id="second")
+    sources = Sources(cfg, None)
+    with pytest.raises(RuntimeError, match="synthetic startup failure"):
+        sources.start_ros(ros_startup.executor if external else None)
+    assert sources.closed and not sources.nodes
+    assert sources.ros is None and sources.thread is None
+    created = [first] if stage == "node" else [first, second]
+    for node in created:
+        node.destroy_node.assert_called_once_with()
+        ros_startup.executor.remove_node.assert_any_call(node)
+    if external:
+        ros_startup.executor.shutdown.assert_not_called()
+        ros_startup.context.try_shutdown.assert_not_called()
+        ros_startup.context.shutdown.assert_not_called()
+    else:
+        ros_startup.executor.shutdown.assert_called_once_with(timeout_sec=2)
+        ros_startup.context.try_shutdown.assert_called_once_with()
+    sources.close()
+    for node in created:
+        node.destroy_node.assert_called_once_with()
+
+
+@pytest.mark.parametrize("stage", ["construct", "start", "started"])
+def test_ros_startup_failure_releases_owned_thread(ros_startup, monkeypatch, stage):
+    import plugins.goal_verifier.sources as source_module
+
+    stopped = threading.Event()
+    worker = threading.Thread(target=stopped.wait, daemon=True)
+    real_start = worker.start
+    failure = RuntimeError("synthetic startup failure")
+    factory = Mock(return_value=worker)
+    if stage == "construct":
+        factory.side_effect = failure
+    else:
+
+        def fail_start():
+            if stage == "started":
+                real_start()
+            raise failure
+
+        monkeypatch.setattr(worker, "start", fail_start)
+    monkeypatch.setattr(source_module.threading, "Thread", factory)
+    ros_startup.executor.shutdown.side_effect = lambda **_: stopped.set()
+    sources = Sources(ros_config(), None)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic startup failure"):
+            sources.start_ros()
+        assert sources.closed and not sources.nodes
+        assert sources.ros is None and sources.thread is None
+        assert not worker.is_alive()
+        ros_startup.context.try_shutdown.assert_called_once_with()
+        ros_startup.node.return_value.destroy_node.assert_called_once_with()
+        sources.close()
+    finally:
+        stopped.set()
+        if worker.ident is not None:
+            worker.join(2)
+
+
+@pytest.mark.parametrize("stage", ["remove_node", "destroy_node", "shutdown"])
+def test_ros_cleanup_attempts_all_resources_even_if_one_cleanup_fails(
+    ros_startup, stage
+):
+    sources = Sources(ros_config(), None)
+    sources.start_ros()
+    node = ros_startup.node.return_value
+    target = node if stage == "destroy_node" else ros_startup.executor
+    getattr(target, stage).side_effect = RuntimeError("synthetic cleanup failure")
+    with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+        sources.close()
+    node.destroy_node.assert_called_once_with()
+    ros_startup.executor.remove_node.assert_called_once_with(node)
+    ros_startup.executor.shutdown.assert_called_once_with(timeout_sec=2)
+    ros_startup.context.try_shutdown.assert_called_once_with()
+    assert not sources.nodes and sources.ros is None and sources.thread is None
+    sources.close()
 
 
 class Clock:

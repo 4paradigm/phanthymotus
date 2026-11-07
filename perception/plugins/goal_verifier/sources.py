@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from collections import OrderedDict
+from contextlib import ExitStack
 import base64
 import hashlib
 import threading
@@ -340,6 +341,20 @@ class Sources:
         ]
         if not bindings:
             return
+        for _, b in bindings:
+            need(
+                type(b.get("domain_id")) is int and b["domain_id"] == 42,
+                "INVALID_ROS_DOMAIN",
+            )
+        domains = {b["domain_id"] for _, b in bindings}
+        need(len(domains) == 1, "ONE_VISUAL_DOMAIN_PER_SERVICE")
+        try:
+            self._start_ros(bindings, executor)
+        except Exception:
+            self.close()
+            raise
+
+    def _start_ros(self, bindings, executor):
         import rclpy
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -350,23 +365,21 @@ class Sources:
             from rclpy.context import Context
             from rclpy.executors import MultiThreadedExecutor
 
-            domains = {b["domain_id"] for _, b in bindings}
-            need(len(domains) == 1, "ONE_VISUAL_DOMAIN_PER_SERVICE")
             context = Context()
-            rclpy.init(context=context, domain_id=next(iter(domains)))
+            # Retain ownership even if init or executor construction fails.
+            self.ros = (context, None)
+            rclpy.init(context=context, domain_id=42)
             executor = MultiThreadedExecutor(context=context)
             self.ros = (context, executor)
+        context = executor.context
+        domain = getattr(context, "get_domain_id", None)
+        need(callable(domain), "ROS_CONTEXT_DOMAIN_MISMATCH")
+        domain_id = domain()
+        need(
+            type(domain_id) is int and domain_id == 42,
+            "ROS_CONTEXT_DOMAIN_MISMATCH",
+        )
         for key, b in bindings:
-            need(
-                type(b["domain_id"]) is int and 0 <= b["domain_id"] <= 232,
-                "INVALID_ROS_DOMAIN",
-            )
-            context = executor.context
-            domain = getattr(context, "get_domain_id", None)
-            need(
-                callable(domain) and domain() == b["domain_id"],
-                "ROS_CONTEXT_DOMAIN_MISMATCH",
-            )
             node = Node("piper_goal_" + uuid4().hex[:12], context=context)
             self.nodes.append((node, executor))
             if b["kind"] == "ros_normalized":
@@ -407,14 +420,19 @@ class Sources:
             self.frames.clear()
             self.previews.clear()
             self.condition.notify_all()
-        for node, executor in self.nodes:
-            executor.remove_node(node)
-            node.destroy_node()
-        self.nodes = []
-        if self.ros:
-            context, executor = self.ros
-            executor.shutdown(timeout_sec=2)
-            context.shutdown()
-            if self.thread:
-                self.thread.join(2)
-            self.ros = None
+        nodes, self.nodes = self.nodes, []
+        ros, self.ros = self.ros, None
+        thread, self.thread = self.thread, None
+        # LIFO cleanup keeps going if one operation raises; shared executors
+        # and their Context are never shut down by this source.
+        with ExitStack() as cleanup:
+            if thread is not None and thread.ident is not None:
+                cleanup.callback(thread.join, 2)
+            if ros:
+                context, executor = ros
+                cleanup.callback(context.try_shutdown)
+                if executor is not None:
+                    cleanup.callback(executor.shutdown, timeout_sec=2)
+            for node, executor in nodes:
+                cleanup.callback(node.destroy_node)
+                cleanup.callback(executor.remove_node, node)

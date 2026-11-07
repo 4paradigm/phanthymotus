@@ -58,7 +58,7 @@ def validate(config):
             text(b["topic"])
             need(b["topic"].startswith("/"), "INVALID_TOPIC")
             need(
-                type(b["domain_id"]) is int and 0 <= b["domain_id"] <= 232,
+                type(b.get("domain_id")) is int and b["domain_id"] == 42,
                 "INVALID_ROS_DOMAIN",
             )
         if kind == "ros_image":

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Optional LOCAL developer setup. Does not install system libraries/services.
+# Downloaded CDN JavaScript SHA256 values are an audit manifest only.
+# No trusted expected hashes are compared; this is not integrity verification.
 set -euo pipefail
 TASK_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
 cd "$TASK_ROOT"

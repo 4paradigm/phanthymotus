@@ -2,7 +2,7 @@
 
 Tool：`piper_object_goal_verifier`；类型：Perception processor。专门服务松灵 PiPER 的推动、抓取放置及其他物体位置调整结果验证，也支持用人工移动物体做独立验收。**不执行运动，不导入 PiPER SDK/CAN/URDF，不依赖旧 Visual Push。**
 
-相机、Topic、ROS域、PiPER安装标识、桌面/工具参数均不写死。首次验收可用固定相机，但不是唯一部署场景。移动相机需要逐帧拍摄几何与有效标定；证据不足时返回 INCONCLUSIVE。
+平台 ROS Domain 固定为 42；所有 ROS 数据源必须显式配置整数 `domain_id: 42`，其他数字、字符串和布尔值均拒绝，不自动纠正。启动时再次检查数据源及 executor 的 Context，并以 42 初始化自己的 ROS Context。相机、Topic、PiPER安装标识、桌面/工具参数由现场配置。首次验收可用固定相机，但不是唯一部署场景。移动相机需要逐帧拍摄几何与有效标定；证据不足时返回 INCONCLUSIVE。
 
 ## 能回答什么
 
@@ -47,6 +47,10 @@ PYTHONPATH=perception python -m plugins.goal_verifier.server --config /own/run/c
 也可在授权维护的 Perception 配置中启用插件；默认 disabled。现场不一定有兼容前端/Perception/VOP，doctor 会检查，不据端口号推断。部署包生成不等于现场安装成功。
 
 The official image copies this directory to `/work/plugins/goal_verifier`.
+`deploy/requirements.txt` is only for a separately managed standalone environment;
+the official Perception Docker build does not install it, so it adds no dependency
+layers to that image. Installing it increases the standalone environment's size,
+notably through `opencv-python-headless`; do not apply it over Jetson's bundled stack.
 The existing Perception entrypoint reads `CONFIG_PATH` (default `/work/config.yaml`).
 An operator-provided full config may enable `plugins.piper_object_goal_verifier.enabled`
 and supply its source bindings. Disabled-by-default means an unchanged image configuration
@@ -58,6 +62,9 @@ explicit `start`. The existing default-enabled Resource Center card list is unch
 Run `GOAL_TEST_PYTHON=/own/python bash perception/plugins/goal_verifier/deploy/run-tests.sh`.
 The browser harness `perception/tools/goal_verifier_e2e.py --full-core-lifespan --ros-input`
 uses the actual Core/MCP/native workbench and ROS2 transport with explicitly synthetic images.
+Its optional developer setup script `deploy/prepare-browser.sh` records downloaded
+CDN JavaScript SHA256 values in a manifest for auditing. It does not compare them
+with trusted expected hashes and does not perform integrity verification.
 Without `--full-core-lifespan` it uses an HTTP-only lifecycle; these are different test scopes.
 ROS/image contracts and official VOP decoding use real source; inference substitutes in unit tests
 are not evidence of official TensorRT inference.
