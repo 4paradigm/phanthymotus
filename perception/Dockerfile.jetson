@@ -580,8 +580,95 @@ assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
 print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
-# ── Application code ───────────────────────────────────────────────
+# Native dependencies are cached independently of application changes.
 WORKDIR /work
+# Native RTAB-Map 0.22.1 + its Humble wrapper, built against each image's ROS,
+# OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
+ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
+ARG RTABMAP_CORE_SHA256=59564aabf68d4d37f90d60b9e8de9436c2f4f5b084d5fe404f741826fc6e0e73
+ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
+ARG RTABMAP_ROS_SHA256=e4c5973693888bb5f3924832624e84dd3f9db12d17f82e149a2cc5512da4240d
+RUN set -e; . /etc/jetpack.env; \
+    case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
+    mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real; \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
+    apt-get update; apt-get install -y --no-install-recommends \
+      curl ca-certificates cmake build-essential python3-dev libpcl-dev \
+      libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
+      libsqlite3-dev zlib1g-dev libssl-dev; \
+    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig; \
+    ldconfig || echo '[build] ldconfig skipped under emulation'; \
+    . /opt/ros/humble/install/setup.bash; \
+    rtabmap_python="$(command -v python3)"; \
+    python3 -c "import cv2,numpy; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[rtabmap-build] OpenCV',cv2.__version__,'Python ${PY_ABI}')"; \
+    mkdir -p /tmp/rtabmap-ws/src; \
+    fetch_rtabmap_source() { \
+      source_name="$1"; source_repo="$2"; source_commit="$3"; source_sha="$4"; \
+      curl -fL --proto '=https' --tlsv1.2 --retry 4 --retry-connrefused --retry-delay 3 \
+        --connect-timeout 20 --max-time 1800 --speed-limit 1024 --speed-time 30 \
+        "https://codeload.github.com/${source_repo}/tar.gz/${source_commit}" -o "/tmp/${source_name}.tar.gz"; \
+      echo "${source_sha}  /tmp/${source_name}.tar.gz" | sha256sum -c -; \
+      mkdir -p "/tmp/rtabmap-ws/src/${source_name}"; \
+      tar -xzf "/tmp/${source_name}.tar.gz" --strip-components=1 -C "/tmp/rtabmap-ws/src/${source_name}"; \
+      rm "/tmp/${source_name}.tar.gz"; \
+    }; \
+    fetch_rtabmap_source rtabmap introlab/rtabmap "${RTABMAP_CORE_COMMIT}" "${RTABMAP_CORE_SHA256}"; \
+    cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
+      -DWITH_GTSAM=OFF -DWITH_OPEN3D=OFF -DWITH_G2O=OFF -DWITH_TORO=ON \
+      -DWITH_CERES=OFF -DWITH_PYTHON=OFF -DWITH_TORCH=OFF -DWITH_POINTMATCHER=OFF \
+      -DWITH_PDAL=OFF -DWITH_OCTOMAP=OFF -DWITH_OPENNI=OFF -DWITH_OPENNI2=OFF \
+      -DWITH_FREENECT=OFF -DWITH_FREENECT2=OFF -DWITH_K4A=OFF \
+      -DWITH_REALSENSE=OFF -DWITH_REALSENSE2=OFF -DWITH_ZED=OFF -DWITH_ZEDOC=OFF \
+      -DWITH_FLYCAPTURE2=OFF -DWITH_DC1394=OFF -DWITH_MYNTEYE=OFF \
+      -DWITH_OPENGV=OFF -DWITH_MRPT=OFF -DWITH_VERTIGO=OFF -DWITH_FASTCV=OFF; \
+    cmake --build /tmp/rtabmap-core-build --target install --parallel 2; \
+    touch /tmp/rtabmap-ws/src/rtabmap/COLCON_IGNORE; \
+    fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}" "${RTABMAP_ROS_SHA256}"; \
+    rtabmap_packages='rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
+    add_missing_rtabmap_dependencies() { \
+      dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; dependency_sha="$4"; shift 4; \
+      missing_packages=''; \
+      for dependency_package in "$@"; do \
+        if ! ros2 pkg prefix "${dependency_package}" >/dev/null 2>&1; then \
+          missing_packages="${missing_packages} ${dependency_package}"; \
+        fi; \
+      done; \
+      if [ -n "${missing_packages}" ]; then \
+        fetch_rtabmap_source "${dependency_name}" "${dependency_repo}" "${dependency_commit}" "${dependency_sha}"; \
+        rtabmap_packages="${rtabmap_packages}${missing_packages}"; \
+      fi; \
+    }; \
+    add_missing_rtabmap_dependencies perception_pcl ros-perception/perception_pcl \
+      ca66aa21f28b7e2848870f08faace81554e78437 c66ecf29ec7626771f8e3783adab8c0867f3e815052875444fe6a6cebae16188 pcl_conversions pcl_ros; \
+    add_missing_rtabmap_dependencies diagnostics ros/diagnostics \
+      a1b95037eeab10592a8268be2a67cadaad6673da 74da212f1ed675179d2a97eaed93ff14267a0e3bbdfb803c5e8efa5b0576c753 diagnostic_updater; \
+    add_missing_rtabmap_dependencies vision_opencv ros-perception/vision_opencv \
+      066793a23e5d06d76c78ca3d69824a501c3554fd 97f9f95788078dd722ed55e2d8a6da7b81cddf8c497b62f83cb46f022328c813 cv_bridge image_geometry; \
+    add_missing_rtabmap_dependencies image_common ros-perception/image_common \
+      69b50c6db906b2044502b00c1b35dc97ec8a40ce 78fad3ad43b17f162801afed107df77c101795341669e2df335df0d7676d5373 image_transport; \
+    add_missing_rtabmap_dependencies laser_geometry ros-perception/laser_geometry \
+      d53b925d25b4b5657261a44f4479365965cc2363 681ab6f7fd7559ec681f27272154372968ecbd76c26dac3454457db020a2f8f2 laser_geometry; \
+    add_missing_rtabmap_dependencies geometry2 ros2/geometry2 \
+      404b7224d623d614f18fa9738dbf1716403d857e 80c1070f46141199cb8940edf250ade15a11e3aa41542758f8ed864e37eb1071 tf2_eigen; \
+    rtabmap_rcutils="$(readlink -f /opt/ros/humble/install/lib/librcutils.so)"; \
+    rtabmap_builtin="$(readlink -f /opt/ros/humble/install/lib/libbuiltin_interfaces__rosidl_generator_c.so)"; \
+    rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
+    test -f "${rtabmap_rcutils}"; test -f "${rtabmap_builtin}"; test -f "${rtabmap_crypto}"; \
+    cd /tmp/rtabmap-ws; \
+    MAKEFLAGS=-j2 colcon build --merge-install --install-base /opt/rtabmap_ros \
+      --executor sequential --packages-select ${rtabmap_packages} --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF \
+      -DPython3_EXECUTABLE="${rtabmap_python}" -DPYTHON_EXECUTABLE="${rtabmap_python}" \
+      -Drcutils_LIB:FILEPATH="${rtabmap_rcutils}" \
+      -Dbuiltin_interfaces__rosidl_generator_c_LIB:FILEPATH="${rtabmap_builtin}" \
+      -Dcrypto_LIB:FILEPATH="${rtabmap_crypto}" \
+      '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
+      -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
+    cd /work; rm -rf /tmp/rtabmap-ws /tmp/rtabmap-core-build /var/lib/apt/lists/*
+
+# ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
@@ -666,42 +753,7 @@ print('[build] zxing-cpp:', version('zxing-cpp'), 'ok,', \
       'try_invert' in zxingcpp.read_barcodes.__doc__.splitlines()[0] and 'with try_invert' or 'no try_invert')" \
       || echo "[build] zxing-cpp: NOT INSTALLED — the barcode card will report decoder_unavailable"
 
-# JP6.1: the SLAM geometry preview needs Open3D and GTSAM Python bindings.
-# GTSAM 4.2 has no CPython 3.10 aarch64 wheel, so build the official pinned
-# source. Keep the base NumPy ABI; do not let either install replace it.
-# Dash requires a newer blinker than Ubuntu's non-uninstallable distutils copy.
-# Install that one package in /usr/local without removing the distro copy.
-ARG SLAM_GTSAM_COMMIT=4f66a491ffc83cf092d0d818b11dc35135521612
-ARG SLAM_GTSAM_SHA256=48c760e17a8b6c0e59fcc1d6a71602907fedbb9c39ba400d13f998dab1fd5080
-RUN if [ "${JP_VERSION}" = "61" ]; then \
-      set -eu; . /etc/jetpack.env; \
-      mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real; \
-      printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
-      apt-get update; apt-get install -y --no-install-recommends \
-        curl ca-certificates cmake build-essential python3-dev libboost-all-dev; \
-      mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig; \
-      ldconfig || echo '[build] ldconfig skipped under emulation'; \
-      pip3 install --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" 'blinker==1.9.0'; \
-      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" "numpy==${NUMPY_VERSION}" pyparsing addict pyquaternion configargparse \
-        'dash==2.18.2' 'nbformat==5.10.4'; \
-      pip3 install --no-cache-dir --no-deps -i "${PYPI_MIRROR}" 'open3d==0.18.0'; \
-      python3 -c "import open3d as o; assert o.__version__ == '0.18.0'"; \
-      echo "[slam-build] Downloading pinned GTSAM source (bounded transfer and retries)"; \
-      curl -fL --http1.1 --retry 4 --retry-all-errors --retry-delay 3 --retry-max-time 2400 \
-        --connect-timeout 20 --max-time 1800 --speed-limit 1024 --speed-time 30 \
-        "https://codeload.github.com/borglab/gtsam/tar.gz/${SLAM_GTSAM_COMMIT}" -o /tmp/gtsam.tar.gz; \
-      echo "${SLAM_GTSAM_SHA256}  /tmp/gtsam.tar.gz" | sha256sum -c -; \
-      mkdir /tmp/gtsam; tar -xzf /tmp/gtsam.tar.gz --strip-components=1 -C /tmp/gtsam; \
-      cmake -S /tmp/gtsam -B /tmp/gtsam-build -DCMAKE_BUILD_TYPE=Release \
-        -DGTSAM_BUILD_TESTS=OFF -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
-        -DGTSAM_BUILD_UNSTABLE=OFF -DGTSAM_BUILD_PYTHON=ON -DGTSAM_PYTHON_VERSION=3.10 \
-        -DGTSAM_WITH_TBB=OFF -DGTSAM_BUILD_WITH_MARCH_NATIVE=OFF; \
-      cmake --build /tmp/gtsam-build --target install --parallel 2; \
-      cmake --build /tmp/gtsam-build --target python-install --parallel 2; \
-      LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}" python3 -c \
-        "import numpy as n,open3d as o,gtsam as g; assert n.__version__ == '${NUMPY_VERSION}'; assert o.__version__ == '0.18.0'; p=o.geometry.PointCloud(o.utility.Vector3dVector(n.array([[0.,0.,0.],[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]))); r=o.pipelines.registration.registration_icp(p,p,0.1,n.eye(4)); assert r.fitness == 1.; graph=g.NonlinearFactorGraph(); v=g.Values(); v.insert(0,g.Pose3()); graph.add(g.PriorFactorPose3(0,g.Pose3(),g.noiseModel.Diagonal.Sigmas(n.ones(6)))); assert g.LevenbergMarquardtOptimizer(graph,v).optimize().atPose3(0).matrix().shape == (4,4)"; \
-      rm -rf /tmp/gtsam /tmp/gtsam-build /tmp/gtsam.tar.gz /var/lib/apt/lists/*; \
-    fi
+COPY perception/tools/rtabmap_pointcloud_smoke.py /work/tools/rtabmap_pointcloud_smoke.py
 
 EXPOSE 15720
 EXPOSE 15721
@@ -718,11 +770,16 @@ RUN . /etc/jetpack.env; \
     PTH="/usr/local/lib/python${PY_ABI}/dist-packages/ros_ws.pth"; \
     find /ros_ws/install -name "site-packages" -type d > "${PTH}" && \
     find /opt/ros/humble/install -name "site-packages" -type d >> "${PTH}" && \
+    find /opt/rtabmap_ros -type d \( -name "site-packages" -o -name "dist-packages" \) >> "${PTH}" && \
     echo "[build] ${PTH}:" && cat "${PTH}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+ENV LD_LIBRARY_PATH="/opt/rtabmap_ros/lib:/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/opt/rtabmap_ros:/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+
+# Runs directly, outside pytest and its ROS stubs, without GPU/camera access.
+# Also checks generated Python typesupport through the runtime .pth/ENV paths.
+RUN ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=127 python3 /work/tools/rtabmap_pointcloud_smoke.py
 
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
@@ -735,5 +792,6 @@ CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
+     source /opt/rtabmap_ros/setup.bash && \
      source /etc/dla-fallback.env && \
      python3 /work/main.py"]

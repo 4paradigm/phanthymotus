@@ -1,6 +1,4 @@
 """Capture-time sensor transforms and explicitly related independent clocks."""
-from copy import deepcopy
-import json
 
 import numpy as np
 import pytest
@@ -71,8 +69,9 @@ def test_pending_clouds_use_each_capture_transform_and_copy_evidence():
     first['extrinsic']['matrix'][0][3] = 99
     first['mapping']['version'] = 'mutated'
     s.odom(measured_odom(1200), now=1.)
-    frames = s.store.segments[0].frames
-    assert [f.points.tolist() for f in frames] == [[[3., 0., 0.]], [[5., 0., 0.]]]
+    frames = s.accepted
+    assert [f.cloud for f in frames] == [[[1, 0, 0]], [[1, 0, 0]]]
+    assert [f.child_from_cloud[0, 3] for f in frames] == [2, 4]
     assert frames[0].capture_context['child_from_cloud'][0][3] == 2
     assert frames[0].capture_context['measurement']['mapping']['version'] == '1'
     assert frames[0].capture_context['extrinsic']['stamp_ns'] == 1_050_000_000
@@ -87,7 +86,7 @@ def test_invalid_dynamic_capture_never_fuses(field, bad):
     value = tf_packet()
     value['extrinsic'][field] = bad
     fuse(s, value)
-    assert not s.store.segments
+    assert not s.accepted
     assert 'extrinsic' in s.last_error
 
 
@@ -95,7 +94,7 @@ def test_missing_dynamic_capture_never_uses_identity():
     s = stream(input_contract=contract(dynamic=True), child_from_cloud=None)
     s.odom(measured_odom(), now=1.)
     fuse(s, packet())
-    assert not s.store.segments
+    assert not s.accepted
     assert 'extrinsic' in s.last_error
 
 
@@ -107,7 +106,7 @@ def test_independent_raw_clocks_and_generations_share_only_verified_normalized_c
     s = stream(input_contract=result)
     s.odom(independent_odom(), now=1.)
     fuse(s, independent_packet())
-    assert len(s.store.segments[0].frames) == 1
+    assert len(s.accepted) == 1
 
 
 @pytest.mark.parametrize('field', ['verified', 'relation_id', 'uncertainty_ns'])
@@ -117,7 +116,7 @@ def test_independent_frame_requires_complete_relation_proof(field):
     value = independent_packet()
     value['mapping'][field] = None
     fuse(s, value)
-    assert not s.store.segments
+    assert not s.accepted
     assert 'relation' in s.last_error or 'mapping' in s.last_error
 
 
@@ -142,7 +141,7 @@ def test_cloud_restart_requires_new_pose_segment_and_recovers_lower_stamps():
     assert s.status(now=1.)['odometry'] != 'tracking'
     s.odom(independent_odom(100, 'b'), now=1.)
     fuse(s, independent_packet(100, 'cloud/2'))
-    assert [seg.segment_id for seg in s.store.segments] == ['a', 'b']
+    assert [frame.pose.segment_id for frame in s.accepted] == ['a', 'b']
     s.cloud_metadata(independent_packet(1100), now=1.)
     assert 'retired' in s.last_error
     assert s._cloud_identity[-1] == 'cloud/2'
@@ -154,25 +153,10 @@ def test_pose_restart_keeps_independent_cloud_generation_and_rejects_old_pose():
     fuse(s, independent_packet())
     s.odom(independent_odom(100, 'b', 'pose/2'), now=1.)
     fuse(s, independent_packet(100))
-    assert [seg.segment_id for seg in s.store.segments] == ['a', 'b']
+    assert [frame.pose.segment_id for frame in s.accepted] == ['a', 'b']
     s.odom(independent_odom(1100), now=1.)
     assert 'retired' in s.last_error
     assert s._input_identity[-1] == 'pose/2'
-
-
-def test_paged_capture_context_is_a_snapshot_in_frame_and_journal(tmp_path):
-    from plugins.pointcloud_slam_paged_store import PagedKeyframeStore
-    from plugins.pointcloud_slam_odom import decode_slam_odom
-    store = PagedKeyframeStore(tmp_path/'session', max_frames=2, max_points=10,
-                               max_disk_bytes=100000, reserve_bytes=0)
-    context = dict(child_from_cloud=np.eye(4).tolist(), extrinsic={'version': '1'})
-    store.add(decode_slam_odom(measured_odom()), [[1, 0, 0]], cloud_stamp_ns=1_000_000_000,
-              capture_context=context)
-    context['extrinsic']['version'] = 'changed'
-    assert store.segments[0].frames[0].capture_context['extrinsic']['version'] == '1'
-    assert store.records[0]['capture_context']['extrinsic']['version'] == '1'
-    record = json.loads((tmp_path/'session'/'frames.jsonl').read_text())
-    assert record['capture_context'] == store.records[0]['capture_context']
 
 
 @pytest.mark.parametrize('kind', ['generation', 'mapping'])
@@ -215,7 +199,7 @@ def test_dynamic_child_placeholder_uses_validated_pose_segment():
     evidence = tf_packet()
     evidence['extrinsic']['parent_frame'] = 'body_a'
     fuse(s, evidence)
-    assert len(s.store.segments[0].frames) == 1
+    assert len(s.accepted) == 1
 
 
 def test_dynamic_without_contract_cannot_fuse_without_capture_context():

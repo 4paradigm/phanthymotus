@@ -278,14 +278,10 @@ plugins:
     cal_a: 1.0
     cal_b: 0.0
 
-  # Experimental input, geometry and map previews; no validated loop closure.
-  # See docs/pointcloud-slam-offline-evaluation.md for required verified
-  # clock, extrinsic and bounded-resource configuration. Never enable by default.
+  # RTAB-Map mapping from native PointCloud2 and existing odometry.
+  # Configure capture clocks and cloud-to-pose extrinsics before enabling.
   pointcloud_slam:
     enabled: false
-    # Optional diagnostic only: preview_enabled: true; preview_backend: raw
-    # (or gtsam with a separately installed backend and explicit noise sigmas).
-    # Preview is unvalidated odometry accumulation, not a loop-closed SLAM map.
 
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities

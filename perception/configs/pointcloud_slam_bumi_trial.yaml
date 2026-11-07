@@ -1,5 +1,5 @@
-# Bumi deployment profile: same optical origin, body-axis convention audited
-# on 2026-11-05. Not a measured body-origin calibration or accepted SLAM.
+# Bumi point-cloud RTAB-Map trial: optical origin with body-axis convention.
+# Clock/extrinsic evidence remains unverified; no hardware acceptance implied.
 # Merge under plugins.pointcloud_slam in the device's Perception config.
 enabled: true
 input_policy: experimental
@@ -20,39 +20,10 @@ max_future_skew_ms: 100
 max_age_s: 2
 max_pending: 10
 max_cloud_points: 20000
-max_frames: 300
-max_points: 6000000
-preview_enabled: true
-preview_backend: geometry_experimental
+voxel_size_m: 0.08
+max_working_nodes: 300
+max_update_ms: 100
+max_disk_bytes: 2147483648
+reserve_bytes: 1073741824
 preview_interval_s: 2
 preview_max_points: 40000
-preview_relocalization: false
-archive_name: bumi_trial
-restore_archive: false
-preview_geometry:
-  legacy_profile: visible_optical_depth
-  descriptor_voxel_m: 0.1
-  min_separation_s: 10
-  candidate_separation_s: 3
-  max_per_frame: 1
-  max_candidates: 20
-  voxel_m: 0.08
-  max_distance_m: 0.3
-  odom_sigmas: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-  loop_sigmas: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
-  huber_k: 1
-  thresholds:
-    min_fitness: 0.6
-    # Operator-scoped distinct-place scene. Hard-negative validation waived.
-    # Retains the original visible optical-depth support and missing-match penalty.
-    max_forward_depth_score_m: 0.09
-    min_correspondences: 30
-    max_cycle_translation_m: 0.03
-    max_cycle_angle_deg: 2
-# Keep full local point history on disk; max_frames/max_points bound one active batch.
-# No additional canvas fields: these are device deployment budgets.
-persistent_history:
-  max_disk_bytes: 2147483648
-  reserve_bytes: 1073741824
-  min_translation_m: 0.1
-  min_rotation_deg: 10.0

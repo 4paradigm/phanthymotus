@@ -1,4 +1,4 @@
-"""Bounded live-input state and odometry graph; loop acceptance is not implemented.
+"""Bounded admission of raw clouds paired with validated external odometry.
 
 The caller must establish the declared clock relation and calibrate the
 extrinsic. ``now`` is monotonic receipt time, used only to detect stale input;
@@ -8,38 +8,15 @@ from collections import deque, OrderedDict
 from copy import deepcopy
 import math
 
-import numpy as np
-
 from .pointcloud_slam_alignment import align_pose
-from .pointcloud_slam_keyframes import CapacityError, KeyframeStore
 from .pointcloud_slam_odom import decode_slam_odom
-
-
-def _rigid(value):
-    m = np.asarray(value, dtype=float)
-    if (m.shape != (4, 4) or not np.isfinite(m).all() or
-            not np.allclose(m[3], [0, 0, 0, 1], atol=1e-6) or
-            not np.allclose(m[:3, :3].T @ m[:3, :3], np.eye(3), atol=1e-6) or
-            not np.isclose(np.linalg.det(m[:3, :3]), 1., atol=1e-6)):
-        raise ValueError('extrinsic must be a rigid transform')
-    return m.copy()
-
-
-def _matrix(pose):
-    x, y, z, w = pose.quaternion
-    x, y, z, w = np.asarray([x, y, z, w]) / np.linalg.norm([x, y, z, w])
-    m = np.eye(4)
-    m[:3, :3] = [[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
-                  [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
-                  [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]]
-    m[:3, 3] = pose.position
-    return m
+from .pointcloud_slam_transforms import rigid as _rigid
 
 
 class SlamStream:
     def __init__(self, *, cloud_frame, child_frame, clock_id, child_from_cloud,
                  max_gap_ms, max_age_s, max_pending, max_cloud_points,
-                 max_frames, max_points, max_measurement_age_ms=None,
+                 on_frame, max_measurement_age_ms=None,
                  max_future_skew_ms=None, input_contract=None, extrinsic_mode='static'):
         if any(not isinstance(s, str) or not s.strip() for s in
                (cloud_frame, child_frame, clock_id)):
@@ -73,7 +50,10 @@ class SlamStream:
         self.extrinsic = None if self.extrinsic_mode == 'dynamic' else _rigid(child_from_cloud)
         self.max_gap_ms, self.max_age_s = max_gap_ms, max_age_s
         self.max_pending, self.max_cloud_points = max_pending, max_cloud_points
-        self.store = KeyframeStore(max_frames=max_frames, max_points=max_points)
+        self.on_frame = on_frame
+        self._segments = OrderedDict()
+        self._requires_new_segment = False
+        self._admitted = 0
         self._poses = deque(maxlen=512)
         self._pending = deque()
         self._last_received = None
@@ -94,14 +74,13 @@ class SlamStream:
         self.last_error = ''
         self._odom_state = 'waiting'
         self._dropped_pending = 0
-        self._capacity_reached = False
 
     @property
     def pending_count(self):
         return len(self._pending)
 
     def _lose(self):
-        self.store.mark_lost()
+        self._requires_new_segment = bool(self._segments)
         self._poses.clear()
         self._pending.clear()
         self._last_received = None
@@ -122,7 +101,6 @@ class SlamStream:
             except ValueError as error:
                 last_error = str(error)
                 odom_state = 'stale'
-        segments = self.store.segments
         cloud_state = 'waiting'
         if self._last_cloud_received is not None:
             cloud_state = 'active'
@@ -134,21 +112,14 @@ class SlamStream:
                 cloud_state = 'stale'
         integration = ('waiting_for_new_segment' if self._required_new_segment is not None else
                        'waiting_for_tracking' if odom_state != 'tracking' else
-                       'waiting_for_new_segment' if self.store.requires_new_segment else
-                       'storage_fault' if getattr(self.store, 'storage_error', '') else
-                       'capacity_reached' if self._capacity_reached else
+                       'waiting_for_new_segment' if self._poses and self._poses[-1].segment_id in self._segments and
+                           (self._requires_new_segment or self._poses[-1].segment_id != next(reversed(self._segments))) else
                        'waiting_for_cloud_metadata' if self.input_contract and self._unmatched_clouds else
-                       'collecting_unverified')
+                       'admitting')
         return {'odometry': odom_state, 'cloud': cloud_state, 'pending_clouds': len(self._pending),
-                'integration': integration,
-                'dropped_pending': self._dropped_pending, 'segments': len(segments),
-                'unmatched_clouds': len(self._unmatched_clouds),
-                'keyframes': sum(len(segment.frames) for segment in segments),
-                'last_error': last_error,
-                'storage': ({'mode': 'paged', 'disk_bytes': self.store.disk_bytes,
-                             'skipped_stationary': self.store.skipped_stationary,
-                             'active_frame_limit': self.store._max_frames}
-                            if hasattr(self.store, 'disk_bytes') else {'mode': 'memory'})}
+                'integration': integration, 'dropped_pending': self._dropped_pending,
+                'segments': len(self._segments), 'admitted_frames': self._admitted,
+                'unmatched_clouds': len(self._unmatched_clouds), 'last_error': last_error}
 
     def _check_measurement_time(self, stamp_ns, measurement_now_ns):
         if self.max_measurement_age_ms is None:
@@ -329,53 +300,46 @@ class SlamStream:
                    for k in (self._cloud_metadata if key in self._unmatched_clouds else self._unmatched_clouds)):
                 self.last_error = 'cloud payload does not match measurement metadata'
             return
-        points, received = self._unmatched_clouds.pop(key)
+        cloud, received = self._unmatched_clouds.pop(key)
         context = self._cloud_metadata.pop(key)
         if now - received > self.max_age_s:
             self.last_error = 'pointcloud receipt stale while waiting for metadata'
             return
-        self._accept_cloud(key[0], key[1], points, now=now, received=received,
+        self._accept_cloud(key[0], key[1], cloud, now=now, received=received,
                            measurement_now_ns=measurement_now_ns, capture_context=context)
 
-    def cloud(self, stamp_ns, frame, points, *, now, measurement_now_ns=None, data_sha256=None,
-              capture_context=None):
-        if not self.input_contract:
-            return self._accept_cloud(stamp_ns, frame, points, now=now,
-                                      measurement_now_ns=measurement_now_ns, capture_context=capture_context)
+    def cloud(self, stamp_ns, frame, cloud, *, now, point_count=None, measurement_now_ns=None,
+              data_sha256=None, capture_context=None):
+        """Retain the opaque native message; XYZ validation belongs to the ROS adapter."""
         if type(stamp_ns) is not int or stamp_ns <= 0 or frame != self.cloud_frame:
             raise ValueError('invalid cloud frame or timestamp')
         if self._last_received is None or now - self._last_received > self.max_age_s:
+            self._lose()
             raise ValueError('odometry stale or unavailable')
         self._check_measurement_time(stamp_ns, measurement_now_ns)
-        points = np.asarray(points, dtype=float)
-        if (points.ndim != 2 or points.shape[1] != 3 or
-                not 0 < len(points) <= self.max_cloud_points or not np.isfinite(points).all()):
-            raise ValueError('invalid cloud size or coordinates')
+        count = len(cloud) if point_count is None else point_count
+        if type(count) is not int or not 0 < count <= self.max_cloud_points:
+            raise ValueError('invalid cloud size or capacity')
+        if not self.input_contract:
+            return self._accept_cloud(stamp_ns, frame, deepcopy(cloud), now=now,
+                measurement_now_ns=measurement_now_ns, capture_context=capture_context)
         if not isinstance(data_sha256, str) or len(data_sha256) != 64:
             raise ValueError('cloud payload digest is required')
         key = (stamp_ns, frame, data_sha256)
-        self._unmatched_clouds[key] = (points.copy(), now)
+        self._unmatched_clouds[key] = (deepcopy(cloud), now)
         while len(self._unmatched_clouds) > self.max_pending:
             self._unmatched_clouds.popitem(last=False)
             self._dropped_pending += 1
         self._pair_cloud(key, now=now, measurement_now_ns=measurement_now_ns)
 
-    def _accept_cloud(self, stamp_ns, frame, points, *, now, measurement_now_ns=None, received=None,
+    def _accept_cloud(self, stamp_ns, frame, cloud, *, now, measurement_now_ns=None, received=None,
                       capture_context=None):
         if self._last_received is None or now - self._last_received > self.max_age_s:
             self._lose()
             raise ValueError('odometry stale or unavailable')
-        if type(stamp_ns) is not int or stamp_ns <= 0 or frame != self.cloud_frame:
-            raise ValueError('invalid cloud frame or timestamp')
         if self._last_cloud_stamp_ns is not None and stamp_ns <= self._last_cloud_stamp_ns:
             raise ValueError('cloud timestamp did not increase')
         self._check_measurement_time(stamp_ns, measurement_now_ns)
-        points = np.asarray(points)
-        if points.ndim != 2 or points.shape[1] != 3 or not 0 < len(points) <= self.max_cloud_points:
-            raise ValueError('invalid cloud size')
-        points = np.asarray(points, dtype=float)
-        if not np.isfinite(points).all():
-            raise ValueError('cloud must be finite')
         if self.extrinsic_mode == 'dynamic' and capture_context is None:
             raise ValueError('dynamic extrinsic capture context is required')
         if capture_context is not None:
@@ -385,44 +349,37 @@ class SlamStream:
         if len(self._pending) == self.max_pending:
             self._pending.popleft()
             self._dropped_pending += 1
-        self._pending.append((stamp_ns, points.copy(), self._last_cloud_received, deepcopy(capture_context)))
+        self._pending.append((stamp_ns, cloud, self._last_cloud_received, deepcopy(capture_context)))
         self._drain(now, measurement_now_ns)
 
     def _drain(self, now, measurement_now_ns):
         remaining = deque()
         while self._pending:
-            stamp, points, received, context = self._pending.popleft()
+            stamp, cloud, received, context = self._pending.popleft()
             if now - received > self.max_age_s:
                 continue
             try:
                 self._check_measurement_time(stamp, measurement_now_ns)
-            except ValueError as error:
-                self.last_error = str(error)
-                continue
-            if stamp > self._poses[-1].stamp_ms * 1_000_000:
-                remaining.append((stamp, points, received, context))
-                continue
-            try:
+                if not self._poses:
+                    continue
+                if stamp > self._poses[-1].stamp_ms * 1_000_000:
+                    remaining.append((stamp, cloud, received, context))
+                    continue
                 pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
+                frames = (pose.frame_id, pose.child_frame_id, pose.clock_id)
+                if pose.segment_id in self._segments:
+                    if pose.segment_id != next(reversed(self._segments)):
+                        raise ValueError('retired segment cannot be reused')
+                    if self._requires_new_segment:
+                        raise ValueError('recovery requires a new segment')
+                    if self._segments[pose.segment_id] != frames:
+                        self._requires_new_segment = True
+                        raise ValueError('pose frames or clock changed within segment')
                 matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
-                local = points @ matrix[:3, :3].T + matrix[:3, 3]
-                self.store.add(pose, local, cloud_stamp_ns=stamp, capture_context=context)
-                self._capacity_reached = False
-            except CapacityError as error:
-                self.last_error = str(error)
-                self._capacity_reached = True
+                self.on_frame(stamp, cloud, pose, matrix.copy(), deepcopy(context))
+                self._segments[pose.segment_id] = frames
+                self._requires_new_segment = False
+                self._admitted += 1
             except ValueError as error:
                 self.last_error = str(error)
-                continue
         self._pending = remaining
-
-    def graph(self):
-        """Return separate odometry-only graphs with no claimed loop edges."""
-        result = []
-        for segment in self.store.segments:
-            poses = [_matrix(frame.pose) for frame in segment.frames]
-            edges = [{'from': i - 1, 'to': i,
-                      'transform': np.linalg.inv(poses[i - 1]) @ poses[i]}
-                     for i in range(1, len(poses))]
-            result.append({'segment_id': segment.segment_id, 'poses': poses, 'edges': edges})
-        return result

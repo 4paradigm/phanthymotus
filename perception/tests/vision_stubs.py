@@ -89,6 +89,14 @@ class _FakeNode:
     def get_clock(self):
         return _FakeClock()
 
+    def create_timer(self, interval, callback):
+        timer = types.SimpleNamespace(interval=interval, callback=callback, cancelled=False)
+        timer.cancel = lambda: setattr(timer, 'cancelled', True)
+        return timer
+
+    def destroy_timer(self, timer):
+        timer.cancel()
+
 
 class _FakeClock:
     def now(self):

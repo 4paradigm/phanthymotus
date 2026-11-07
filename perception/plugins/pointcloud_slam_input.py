@@ -64,7 +64,7 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
     if cloud_mount is not None and pose_mount is not None:
         try:
             import numpy as np
-            from .pointcloud_slam_stream import _rigid
+            from .pointcloud_slam_transforms import rigid as _rigid
             same = (cloud_mount.get('parent_frame') == pose_mount.get('parent_frame') and
                     cloud_mount.get('child_frame') == pose_mount.get('child_frame') and
                     cloud_mount.get('mode', 'static') == pose_mount.get('mode', 'static') and
@@ -88,7 +88,7 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
         require('matrix' not in extrinsic, cloud_topic, 'extrinsic.matrix', 'dynamic declaration must not contain a static matrix')
     else:
         try:
-            from .pointcloud_slam_stream import _rigid
+            from .pointcloud_slam_transforms import rigid as _rigid
             matrix = _rigid(extrinsic.get('matrix')).tolist()
         except (TypeError, ValueError):
             require(False, cloud_topic, 'extrinsic.matrix', 'must be a rigid 4x4 transform')
