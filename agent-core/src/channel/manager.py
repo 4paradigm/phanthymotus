@@ -590,6 +590,9 @@ class ChannelManager:
         platform = ch_cfg['platform']
 
         cls = _ADAPTER_CLASSES.get(platform)
+        if platform == 'qq' and (ch_cfg.get('config') or {}).get('protocol') == 'official':
+            from channel.adapters.qq_official import QQOfficialAdapter
+            cls = QQOfficialAdapter
         if cls is None:
             msg = f'[channel] No adapter for platform: {platform}. Supported: telegram, slack, feishu'
             print(msg)
@@ -677,7 +680,8 @@ class ChannelManager:
             user = acl.get_user(msg.platform, msg.user_id)
             if user is None:
                 channel_settings = self._get_channel_settings()
-                default_role = channel_settings.get('default_role', 'viewer')
+                default_role = ('viewer' if msg.platform == 'qq' else
+                                channel_settings.get('default_role', 'viewer'))
                 auto_approve = channel_settings.get('auto_approve', True)
                 if auto_approve:
                     acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
@@ -687,7 +691,8 @@ class ChannelManager:
                     if adapter:
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
-                            text='Pending approval. An admin has been notified.'
+                            text='Pending approval. An admin has been notified.',
+                            reply_to_message_id=msg.message_id if msg.platform == 'qq' else '',
                         ))
                     return
 
@@ -884,6 +889,7 @@ class ChannelManager:
                 files=attachments,
                 mention_open_id=mention_open_id,
                 expect_reply=expect_reply,
+                reply_to_message_id=ctx.get('message_id', ''),
             ))
             parts = []
             if text:
@@ -969,6 +975,10 @@ class ChannelManager:
                 'trusted_bots': ch_cfg.get('trusted_bots', []),
                 'status': adapter.status() if adapter else 'disconnected',
                 'health_error': '' if not health or health[0] else health[1],
+                'qq_protocol': (ch_cfg.get('config', {}).get('protocol', 'official')
+                                if ch_cfg['platform'] == 'qq' else ''),
+                'qq_app_id': (ch_cfg.get('config', {}).get('app_id', '')
+                              if ch_cfg['platform'] == 'qq' else ''),
                 'active_input': channel_id in self.active_input_channels,
                 'active_output': channel_id in self.active_output_channels,
             })

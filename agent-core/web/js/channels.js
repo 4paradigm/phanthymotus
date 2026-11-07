@@ -19,6 +19,10 @@ export function initChannels() {
   _overlay.addEventListener('click', (e) => { if (e.target === _overlay) _close(); });
   _addBtn.addEventListener('click', _showAddForm);
   _channelList.addEventListener('click', _handleChannelAction);
+  _channelList.addEventListener('click', (event) => {
+    if (!event.target.closest?.('#qq-official-quick-add')) return;
+    _showAddForm({ official: true });
+  });
   _usersList.addEventListener('click', _handleUserAction);
   _usersList.addEventListener('change', _handleUserRoleChange);
   document.getElementById('channel-user-form-add').addEventListener('click', _submitUser);
@@ -53,7 +57,8 @@ function _renderChannels(channels) {
     _channelList.innerHTML = `
       <div class="channel-empty">
         <p>No channels configured</p>
-        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a Telegram, Slack, or Feishu bot to enable remote messaging control</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a Telegram, Slack, Feishu, or QQ Official bot to enable messaging.</p>
+        <button id="qq-official-quick-add" type="button" class="btn-primary" style="margin-top:12px">创建 QQ 官方机器人</button>
       </div>`;
     return;
   }
@@ -76,6 +81,7 @@ function _renderChannels(channels) {
           <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
             Trusted Bots: ${(ch.trusted_bots || []).length}
           </button>` : ''}
+        ${ch.platform === 'qq' ? `<button class="btn-ghost btn-sm" data-channel-action="qq-edit">Configure</button>` : ''}
         <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
         <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" data-channel-action="delete">Delete</button>
@@ -86,7 +92,8 @@ function _renderChannels(channels) {
 
 // ── Add channel form ──────────────────────────────────────────────────────────
 
-function _showAddForm() {
+function _showAddForm({ official = false } = {}) {
+  if (document.getElementById('channel-add-form')) return;
   const formHtml = `
     <div class="channel-add-form" id="channel-add-form">
       <div class="channel-form-row">
@@ -96,11 +103,21 @@ function _showAddForm() {
           <option value="slack">Slack</option>
           <option value="feishu">Feishu (飞书)</option>
           <option value="lan">LAN (机器人之间)</option>
+          <option value="qq">QQ Official</option>
         </select>
       </div>
       <div class="channel-form-row">
         <label>ID</label>
         <input type="text" id="channel-form-id" placeholder="e.g. telegram_main" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-protocol-row">
+        <label>QQ Protocol</label>
+        <select id="channel-form-qq-protocol">
+          <option value="official">Official QQ Bot</option>
+        </select>
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-private-row">
+        <label><input type="checkbox" checked disabled /> Private only (V1)</label>
       </div>
       <div class="channel-form-row" id="channel-form-token-row">
         <label>Bot Token</label>
@@ -151,19 +168,38 @@ function _showAddForm() {
     // the hint says where trust actually comes from — an empty form with no
     // explanation reads like something failed to load.
     const isLan = p === 'lan';
+    const isQQ = p === 'qq';
+    const isOfficial = isQQ && document.getElementById('channel-form-qq-protocol').value === 'official';
     document.getElementById('channel-form-lan-hint').classList.toggle('hidden', !isLan);
 
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
-    document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
-    document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-qq-protocol-row').classList.toggle('hidden', !isQQ);
+    document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu && !isOfficial);
+    document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu && !isOfficial);
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
-    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan);
+    document.getElementById('channel-form-qq-private-row').classList.toggle('hidden', !isQQ);
+    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan || isOfficial);
   }
 
   platformSel.addEventListener('change', updateFormFields);
+  document.getElementById('channel-form-qq-protocol').addEventListener('change', updateFormFields);
   updateFormFields();
+  if (official) {
+    platformSel.value = 'qq';
+    document.getElementById('channel-form-qq-protocol').value = 'official';
+    document.getElementById('channel-form-id').value = 'qq_official_main';
+    updateFormFields();
+    fetch('/api/canvas/tool-configs').then(r => r.json()).then(result => {
+      const entries = Object.entries(result.data || {});
+      const candidate = entries.find(([key, cfg]) =>
+        key.startsWith('channel:channel_request:') &&
+        typeof cfg?.channel_id === 'string' && cfg.channel_id.toLowerCase().includes('qq'));
+      if (candidate && document.getElementById('channel-form-id'))
+        document.getElementById('channel-form-id').value = candidate[1].channel_id;
+    }).catch(() => {});
+  }
 
   document.getElementById('channel-form-submit').addEventListener('click', () => _submitAdd(form));
   document.getElementById('channel-form-cancel').addEventListener('click', () => form.remove());
@@ -187,7 +223,13 @@ async function _submitAdd(formEl) {
 
   const config = {};
 
-  if (platform === 'telegram') {
+  if (platform === 'qq') {
+    if (!appId || !appSecret) { alert('QQ App ID and App Secret are required'); return; }
+    config.protocol = 'official';
+    config.private_only = true;
+    config.app_id = appId;
+    config.app_secret = appSecret;
+  } else if (platform === 'telegram') {
     if (!token) { alert('Bot Token is required'); return; }
     config.bot_token = token;
   } else if (platform === 'slack') {
@@ -246,10 +288,52 @@ function _handleChannelAction(e) {
   switch (btn.dataset.channelAction) {
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
     case 'trusted-bots': _showTrustedBots(channel, item); break;
+    case 'qq-edit': _showQQEdit(channel, item); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
     case 'delete':     _channelDelete(channel.id); break;
   }
+}
+
+function _showQQEdit(channel, item) {
+  const prev = item.querySelector('[data-qq-edit-form]');
+  if (prev) { prev.remove(); return; }
+  const form = document.createElement('div');
+  form.className = 'channel-add-form';
+  form.dataset.qqEditForm = '1';
+  form.innerHTML =
+    '<div class="channel-form-row"><label>App ID</label><input data-qq-app-id type="text" /></div>' +
+    '<div class="channel-form-row"><label>App Secret (blank keeps current)</label>' +
+    '<input data-qq-app-secret type="password" autocomplete="new-password" /></div>' +
+    '<div class="channel-form-row"><label>Private only (V1)</label></div>' +
+    '<div class="channel-form-actions"><button class="btn-primary" data-qq-save>Save & Restart</button>' +
+    '<button class="btn-ghost" data-qq-cancel>Cancel</button></div>';
+  item.appendChild(form);
+  form.querySelector('[data-qq-app-id]').value = channel.qq_app_id || '';
+  form.querySelector('[data-qq-cancel]').addEventListener('click', () => form.remove());
+  form.querySelector('[data-qq-save]').addEventListener('click', async () => {
+    const appId = form.querySelector('[data-qq-app-id]').value.trim();
+    const credential = form.querySelector('[data-qq-app-secret]').value.trim();
+    if (!appId) { alert('App ID is required'); return; }
+    const config = { protocol: 'official', private_only: true, app_id: appId };
+    if (credential) config.app_secret = credential;
+    const saveBtn = form.querySelector('[data-qq-save]');
+    saveBtn.disabled = true;
+    try {
+      const res = await fetch('/api/channel/' + encodeURIComponent(channel.id), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config }),
+      });
+      if (!res.ok) {
+        const response = await res.json().catch(() => ({}));
+        throw new Error(response.detail || 'QQ update failed');
+      }
+      _loadChannels();
+    } catch (e) {
+      alert('QQ configuration failed: ' + e.message);
+      saveBtn.disabled = false;
+    }
+  });
 }
 
 async function _channelSetBotToBot(id, enabled, btn) {
