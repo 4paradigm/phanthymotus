@@ -92,11 +92,12 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # builds fall back to ld.so's default search path, which already covers the
 # /usr/lib/aarch64-linux-gnu these packages install into.
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
-    ln -sf /bin/true /usr/sbin/ldconfig && \
+    mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
+    chmod +x /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg libvips42 && \
-    mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -364,11 +365,12 @@ RUN . /etc/jetpack.env; \
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
 # step that actually failed on `--jp-version 6.1`, because layers 1-11 were
 # cached and it was the first apt install to run.
-RUN cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
-    ln -sf /bin/true /usr/sbin/ldconfig && \
+RUN mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
+    chmod +x /usr/sbin/ldconfig && \
     apt-get update && \
     apt-get install -y --no-install-recommends espeak-ng && \
-    mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
@@ -403,11 +405,12 @@ COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-require
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ] && \
        ! python3 -c "import os,sysconfig;raise SystemExit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)"; then \
       echo '[build] CPython headers missing — installing python3-dev for the source builds' && \
-      cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
-      ln -sf /bin/true /usr/sbin/ldconfig && \
+      mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
+      printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
+      chmod +x /usr/sbin/ldconfig && \
       apt-get update && \
       apt-get install -y --no-install-recommends python3-dev && \
-      mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
+      mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
       { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
       rm -rf /var/lib/apt/lists/*; \
     fi
@@ -583,13 +586,13 @@ WORKDIR /work
 # OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
 RUN set -e; . /etc/jetpack.env; \
     case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
-    cp -a /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
-    ln -sf /bin/true /usr/sbin/ldconfig; \
+    mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
     apt-get update; apt-get install -y --no-install-recommends \
       curl ca-certificates git cmake build-essential python3-dev libpcl-dev \
       libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
       libsqlite3-dev zlib1g-dev libssl-dev; \
-    mv /tmp/ldconfig.perception-orig /usr/sbin/ldconfig; \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig; \
     ldconfig || echo '[build] ldconfig skipped under emulation'; \
     . /opt/ros/humble/install/setup.bash; \
     rtabmap_python="$(command -v python3)"; \
