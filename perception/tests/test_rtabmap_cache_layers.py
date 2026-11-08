@@ -44,6 +44,16 @@ def test_native_source_fetches_have_independent_cache_boundaries():
     assert '--executor sequential' in ros_build
 
 
+def test_native_compiles_reuse_persistent_cache_separated_by_jetpack():
+    _, core_build, _, ros_build = layers()
+    for build in (core_build, ros_build):
+        assert build.startswith('--mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache ')
+        assert 'export CCACHE_DIR=/var/cache/rtabmap-ccache' in build
+        assert '-DCMAKE_C_COMPILER_LAUNCHER=ccache' in build
+        assert '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' in build
+        assert 'CCACHE_COMPILERCHECK=content' in build
+
+
 def shell_fixture(tmp_path):
     """Use real shells/files/tar; replace only unavailable network/ROS/build tools."""
     ros = tmp_path / 'ros'
@@ -86,6 +96,8 @@ colcon() {
 
 
 def run_layer(script, tmp_path, prelude, *, missing=(), build_status=0):
+    # BuildKit consumes mount flags; the remainder runs in the build shell.
+    script = re.sub(r'^--mount=\S+\s+', '', script)
     for old, new in (
         ('/opt/ros/humble/install', tmp_path / 'ros'),
         ('/usr/lib/aarch64-linux-gnu', tmp_path / 'lib'),
@@ -123,6 +135,8 @@ def test_ros_package_selection_survives_a_fresh_build_shell(tmp_path, missing):
     assert selected == BASE_PACKAGES + [p for p in OPTIONAL_PACKAGES if p in missing]
     assert any(arg.startswith('-DPython3_EXECUTABLE=/') for arg in args)
     assert any(arg.startswith('-DPYTHON_EXECUTABLE=/') for arg in args)
+    assert '-DCMAKE_C_COMPILER_LAUNCHER=ccache' in args
+    assert '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache' in args
     assert (tmp_path / 'build-library-path').read_text().strip() == (
         str(tmp_path / 'local/lib') + ':/fixture/underlay')
     assert (tmp_path / 'downloads').read_bytes() == download_log

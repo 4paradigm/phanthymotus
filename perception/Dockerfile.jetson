@@ -589,7 +589,7 @@ RUN set -e; . /etc/jetpack.env; \
     mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
     apt-get update; apt-get install -y --no-install-recommends \
-      curl ca-certificates git cmake build-essential python3-dev libpcl-dev \
+      curl ca-certificates git cmake ccache build-essential python3-dev libpcl-dev \
       libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
       libsqlite3-dev zlib1g-dev libssl-dev; \
     mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig; \
@@ -623,8 +623,12 @@ RUN set -e; \
 
 # Commit the complete checkout before compiling. A failed build can reuse this
 # source layer; partial object files from the failed RUN are not a Docker cache.
-RUN set -e; . /opt/ros/humble/install/setup.bash; \
+# Keep successful compiler results even if the review build hits its time limit.
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; . /opt/ros/humble/install/setup.bash; \
+    export CCACHE_DIR=/var/cache/rtabmap-ccache CCACHE_COMPILERCHECK=content; \
     cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
       -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
       -DWITH_GTSAM=OFF -DWITH_OPEN3D=OFF -DWITH_G2O=OFF -DWITH_TORO=ON \
@@ -690,7 +694,9 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
 
 # RUN starts a fresh shell: reload both the ROS environment and the selection
 # made against this image's underlay, including only its missing dependencies.
-RUN set -e; . /opt/ros/humble/install/setup.bash; \
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; . /opt/ros/humble/install/setup.bash; \
+    export CCACHE_DIR=/var/cache/rtabmap-ccache CCACHE_COMPILERCHECK=content; \
     rtabmap_python="$(command -v python3)"; \
     export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
     test -s /tmp/rtabmap-ws/packages.list; \
@@ -703,6 +709,7 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
     MAKEFLAGS=-j2 colcon build --merge-install --install-base /opt/rtabmap_ros \
       --executor sequential --packages-select ${rtabmap_packages} --cmake-args \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DPython3_EXECUTABLE="${rtabmap_python}" -DPYTHON_EXECUTABLE="${rtabmap_python}" \
       -Drcutils_LIB:FILEPATH="${rtabmap_rcutils}" \
       -Dbuiltin_interfaces__rosidl_generator_c_LIB:FILEPATH="${rtabmap_builtin}" \
