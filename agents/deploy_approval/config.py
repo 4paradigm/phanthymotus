@@ -34,6 +34,10 @@ DEFAULT_GITHUB_REPOS = (
     "4paradigm/phanthymotus-driver",
 )
 
+# Repository policy files are small control-plane inputs, not arbitrary GitHub
+# blobs. Keep a stricter bound than the general API response limit.
+MAX_REPO_POLICY_FILE_BYTES = 1024 * 1024
+
 
 # Compatibility names for the legacy defaults, not runtime authorization gates.
 SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS)
@@ -409,31 +413,62 @@ def _load_secrets_config(path: str) -> dict:
     return result
 
 
-def _load_test_reviewers(path: str) -> list[str]:
-    """Load the independent acceptance allowlist; absence always fails closed."""
-    try:
-        data = _load_yaml_mapping(path)
-    except (OSError, ValueError) as exc:
-        logger.warning("independent acceptance reviewer list unavailable (%s)",
-                       type(exc).__name__)
-        return []
-    if not data:
-        return []
+def _validate_test_reviewers_data(data: object) -> list[str]:
+    """Validate the existing version-1 reviewer allowlist schema."""
+    if not isinstance(data, dict):
+        raise ValueError("test_reviewers YAML must be a mapping")
     reviewers = data.get("reviewers")
     if (set(data) != {"version", "reviewers"}
             or type(data.get("version")) is not int or data.get("version") != 1
             or not isinstance(reviewers, list) or not reviewers):
-        logger.warning("independent acceptance reviewer list has an invalid schema")
-        return []
+        raise ValueError("test_reviewers YAML has an invalid schema or is empty")
     normalized = []
     for login in reviewers:
         if (not isinstance(login, str) or not _LOGIN_RE.fullmatch(login.strip())
                 or login.strip().lower().endswith("[bot]")
                 or login.strip().lower() in normalized):
-            logger.warning("independent acceptance reviewer list has an invalid entry")
-            return []
+            raise ValueError("test_reviewers YAML contains an invalid reviewer login")
         normalized.append(login.strip().lower())
     return normalized
+
+
+def parse_test_reviewers_yaml(content: bytes | str) -> list[str]:
+    """Parse and validate a repository-provided reviewer YAML document.
+
+    This uses the same schema and GitHub-login checks as the protected local
+    file loader while allowing the per-repository GitHub snapshot to be
+    validated before it is installed in memory.
+    """
+    if isinstance(content, bytes):
+        if len(content) > MAX_REPO_POLICY_FILE_BYTES:
+            raise ValueError("test_reviewers YAML exceeds the policy file size limit")
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("test_reviewers YAML must be UTF-8") from None
+    if not isinstance(content, str):
+        raise ValueError("test_reviewers YAML must be UTF-8 text")
+    if len(content) > MAX_REPO_POLICY_FILE_BYTES:
+        raise ValueError("test_reviewers YAML exceeds the policy file size limit")
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError:
+        # Parser messages may include source lines; keep diagnostics generic.
+        raise ValueError("test_reviewers YAML is malformed") from None
+    return _validate_test_reviewers_data(data)
+
+
+def _load_test_reviewers(path: str) -> list[str]:
+    """Load the legacy local acceptance file; absence always fails closed."""
+    try:
+        data = _load_yaml_mapping(path)
+        if not data:
+            return []
+        return _validate_test_reviewers_data(data)
+    except (OSError, ValueError) as exc:
+        logger.warning("independent acceptance reviewer list unavailable (%s)",
+                       type(exc).__name__)
+        return []
 
 
 def load_config() -> Config:

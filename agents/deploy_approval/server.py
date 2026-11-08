@@ -69,6 +69,11 @@ _STATUS_LABEL_SPECS = (
         "Deploy Approval: Machine Owner action required",
     ),
     (
+        "status: deploying",
+        "1D76DB",
+        "Deploy Approval: deployment in progress",
+    ),
+    (
         "status: testing",
         "1D76DB",
         "Deploy Approval: deployment complete; human testing required",
@@ -118,6 +123,7 @@ _LABEL_SPECS: dict[str, tuple[str, str]] = {
     "status: reviewing": ("5319E7", "Deploy Approval: current HEAD is being reviewed"),
     "status: deploy-ready": ("0E8A16", "Deploy Approval: reviewed HEAD is ready for deploy request"),
     "status: deploy-requested": ("FBCA04", "Deploy Approval: Machine Owner action required"),
+    "status: deploying": ("1D76DB", "Deploy Approval: deployment in progress"),
     "status: testing": ("1D76DB", "Deploy Approval: deployment complete; human testing required"),
     "status: acceptance-required": ("FBCA04", "Deploy Approval: testing complete; independent acceptance required"),
     "status: succeeded": ("0E8A16", "Deploy Approval: human validation passed"),
@@ -283,7 +289,24 @@ def create_app(config: Config | None = None):
     config = config or load_config()
     config.github_repos = validate_repository_names(config.github_repos)
     policy = Policy(config)
-    policy.load_machines()
+    if set(config.github_repos).isdisjoint(DEFAULT_GITHUB_REPOS):
+        try:
+            # Keep the legacy no-repo Policy API available for deployments
+            # outside the controlled repository-scoped policy flow.
+            policy.load_machines()
+        except Exception as exc:
+            policy.machines = {}
+            logger.warning(
+                "legacy global machine owners file is unavailable (%s); "
+                "legacy machine policy remains fail-closed",
+                type(exc).__name__,
+            )
+    else:
+        # A single local owner list must never become a fallback shared by the
+        # controlled repositories. Their policies load independently from main.
+        logger.info(
+            "using repository-scoped machine policy; legacy global machine owners are not loaded",
+        )
 
     # Create shared GitHub App auth provider first
     github_auth = github_app_auth.create_github_app_auth()

@@ -52,6 +52,7 @@ _ALLOWED_STATUS_LABELS = frozenset({
     "status: reviewing",
     "status: deploy-ready",
     "status: deploy-requested",
+    "status: deploying",
     "status: testing",
     "status: acceptance-required",
     "status: succeeded",
@@ -409,7 +410,7 @@ def _validate_hidden_state(data: dict) -> dict:
     status = data.get("status", "")
     allowed_statuses = {
         "review-required", "reviewing", "deploy-ready",
-        "deploy-requested", "testing", "succeeded",
+        "deploy-requested", "deploying", "testing", "succeeded",
         "failed",
     }
     if status not in allowed_statuses:
@@ -718,8 +719,8 @@ def _validate_hidden_state(data: dict) -> dict:
         machine = args.get("machine", "")
         if not isinstance(machine, str) or not machine:
             raise MalformedHiddenStateError("approve_deploy executing/uncertain requires machine arg")
-    if command.get("phase") == "uncertain" and status != "deploy-requested":
-        raise MalformedHiddenStateError("uncertain command phase requires status deploy-requested")
+    if command.get("phase") == "uncertain" and status not in {"deploying", "deploy-requested"}:
+        raise MalformedHiddenStateError("uncertain command phase requires a pending deployment status")
 
     last_processed = data.get("last_processed_comment_id")
     if isinstance(last_processed, bool) or not isinstance(last_processed, int) or last_processed < 0:
@@ -731,10 +732,10 @@ def _validate_hidden_state(data: dict) -> dict:
                  and acceptance_request["acceptance_comment_id"] > last_processed)):
         raise MalformedHiddenStateError("acceptance_request comments exceed the persisted cursor")
 
-    if status in {"deploy-ready", "deploy-requested", "testing", "succeeded", "failed"}:
+    if status in {"deploy-ready", "deploy-requested", "deploying", "testing", "succeeded", "failed"}:
         if not review_evidence:
             raise MalformedHiddenStateError(f"review_evidence must be non-empty for status {status!r}")
-    if status in {"deploy-requested", "testing", "succeeded", "failed"}:
+    if status in {"deploy-requested", "deploying", "testing", "succeeded", "failed"}:
         if not components:
             raise MalformedHiddenStateError(f"components must be non-empty for status {status!r}")
     if status == "succeeded" and test_result != "pass":
@@ -1325,8 +1326,8 @@ class GitHubStateProxy:
 
     @staticmethod
     def _evidence_visible_description(envelope: dict) -> str:
-        """Keep internal record comments folded while retaining the v1 marker."""
-        return "<details>\n<summary>自动保存的内部证据记录（无需操作）</summary>\n</details>"
+        """Keep the record envelope recoverable without rendering storage copy."""
+        return "<!-- deploy-approval-evidence-record:v1 -->"
 
     async def ensure_visible_evidence_archive_comments(
         self, repo: str, pr_number: int, limit: int = 10,

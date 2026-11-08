@@ -10,7 +10,7 @@ Commands:
 
 State machine (hidden state only):
   review-required -> reviewing -> deploy-ready -> deploy-requested
-  -> testing -> succeeded | failed
+  -> deploying -> testing -> succeeded | failed
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import re
 import inspect
+import ipaddress
 
 import asyncio
 import logging
@@ -240,7 +241,8 @@ class DeployController:
         self.policy = policy
         self.github = github
         self._agent_core_factory = agent_core_factory
-        self._core_clients: dict[str, AgentCoreClient] = {}
+        self._core_clients: dict[tuple[str, str], AgentCoreClient] = {}
+        self._core_client_fingerprints: dict[tuple[str, str], tuple[str, str, str]] = {}
         self.cos = CosClient(config)
         self._case_runner: CaseRunner | None = None
         self._evidence_lock = asyncio.Lock()
@@ -256,34 +258,137 @@ class DeployController:
             except Exception:
                 pass
         self._core_clients.clear()
+        self._core_client_fingerprints.clear()
 
     # ── Core helpers ──
 
     async def _core_for_node(
-        self, node_id: str, *, timeout: float | None = None,
+        self, node_id: str, repo: str, *, timeout: float | None = None,
     ) -> AgentCoreClient:
-        if node_id in self._core_clients:
-            return self._core_clients[node_id]
-        client = await self._resolve_core_client(node_id, timeout=timeout)
-        self._core_clients[node_id] = client
+        repo_key = repo.casefold()
+        try:
+            machines = self.policy.get_machines(repo=repo)
+        except Exception as exc:
+            await self._close_core_clients_for_repo(repo_key)
+            raise DeployControllerError(
+                f"cannot verify current machine policy for {repo}: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(machines, list):
+            await self._close_core_clients_for_repo(repo_key)
+            raise DeployControllerError(
+                f"cannot verify current machine policy for {repo}"
+            )
+
+        current_bindings: dict[tuple[str, str], tuple[str, str, str]] = {}
+        for current in machines:
+            alias = getattr(current, "alias", "")
+            current_node_id = getattr(current, "node_id", "")
+            node_host = getattr(current, "node_host", "")
+            if not all(isinstance(value, str) and value for value in
+                       (alias, current_node_id, node_host)):
+                continue
+            token = self._agent_core_token(alias)
+            credential_fingerprint = self._credential_fingerprint(token)
+            if self._agent_core_factory is not None and not credential_fingerprint:
+                credential_fingerprint = "injected-factory"
+            current_bindings[(repo_key, alias)] = (
+                current_node_id, node_host, credential_fingerprint,
+            )
+
+        # Policy may refresh machine IPs, node IDs, aliases, or credentials
+        # while this controller remains alive. Drop any cached connection whose
+        # repository binding no longer matches the current public policy view.
+        for key in list(self._core_clients):
+            if key[0] != repo_key:
+                continue
+            if self._core_client_fingerprints.get(key) != current_bindings.get(key):
+                await self._close_core_client(key)
+
+        matches = [machine for machine in machines
+                   if getattr(machine, "node_id", None) == node_id]
+        if len(matches) != 1:
+            detail = "not present" if not matches else "ambiguous"
+            raise DeployControllerError(
+                f"machine node {node_id!r} is {detail} in the current policy for {repo}; no Agent Core request was sent"
+            )
+        machine = matches[0]
+        alias = getattr(machine, "alias", "")
+        node_host = getattr(machine, "node_host", "")
+        token = self._agent_core_token(alias)
+        if not isinstance(node_host, str) or not node_host:
+            raise DeployControllerError(
+                f"machine {alias!r} has no current node_host in {repo}; no Agent Core request was sent"
+            )
+        if self._agent_core_factory is None and not token:
+            raise DeployControllerError(
+                f"no current agent_core_token is configured for machine {alias!r} in {repo}; no Agent Core request was sent"
+            )
+        self._assert_repo_machine_credential_scope(repo, machine)
+        fingerprint = (
+            node_id, node_host,
+            self._credential_fingerprint(token) or "injected-factory",
+        )
+        key = (repo_key, alias)
+        cached = self._core_clients.get(key)
+        if cached is not None and self._core_client_fingerprints.get(key) == fingerprint:
+            return cached
+        if cached is not None:
+            await self._close_core_client(key)
+
+        client = await self._resolve_core_client(
+            node_id, repo, machine=machine, token=token, timeout=timeout,
+        )
+        if any(
+            key[0] != repo_key and existing is client
+            for key, existing in self._core_clients.items()
+        ):
+            raise DeployControllerError(
+                f"Agent Core client factory reused one connection across repositories for machine {alias!r}; no request was sent"
+            )
+        # Fail closed if the policy/credential binding changed while the new
+        # client was being verified. Never cache or use a stale destination.
+        try:
+            refreshed = self.policy.get_machines(repo=repo)
+        except Exception as exc:
+            await self._close_client(client)
+            raise DeployControllerError(
+                f"cannot confirm current machine policy for {repo}: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(refreshed, list):
+            await self._close_client(client)
+            raise DeployControllerError(
+                f"cannot confirm current machine policy for {repo}"
+            )
+        refreshed_matches = [item for item in refreshed
+                             if getattr(item, "alias", None) == alias]
+        if (len(refreshed_matches) != 1
+                or self._machine_connection_fingerprint(refreshed_matches[0]) != fingerprint
+                or self._credential_fingerprint(self._agent_core_token(alias))
+                != self._credential_fingerprint(token)):
+            await self._close_client(client)
+            raise DeployControllerError(
+                f"machine configuration or credentials changed while verifying {alias!r} in {repo}; no deployment was started"
+            )
+        self._core_clients[key] = client
+        self._core_client_fingerprints[key] = fingerprint
         return client
 
     async def _resolve_core_client(
-        self, node_id: str, *, timeout: float | None = None,
+        self, node_id: str, repo: str, *, machine=None, token: str = "",
+        timeout: float | None = None,
     ) -> AgentCoreClient:
         if self._agent_core_factory is not None:
             client = self._agent_core_factory(node_id)
             if client is not None:
                 return client
-        machine = self.policy.get_machine_by_node_id(node_id)
-        if machine is None or not machine.node_host:
+        if (machine is None or machine.node_id != node_id
+                or not isinstance(machine.node_host, str) or not machine.node_host):
             raise DeployControllerError(
                 f"machine node {node_id!r} is missing a configured node_host"
             )
-        token = self.config.agent_core_tokens.get(machine.alias)
         if not token:
             raise DeployControllerError(
-                f"no agent_core_token configured for machine {machine.alias!r}"
+                f"no agent_core_token configured for machine {machine.alias!r} in {repo}"
             )
         base_url = f"https://{machine.node_host}:15678"
         # This deployment path keeps the policy-bound legacy HTTPS + token contract.
@@ -312,6 +417,85 @@ class DeployController:
                 f"Agent Core {node_id} unreachable: {e}"
             )
         return core
+
+    @staticmethod
+    def _credential_fingerprint(token: str | None) -> str:
+        if not isinstance(token, str) or not token:
+            return ""
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _agent_core_token(self, alias: str) -> str:
+        tokens = getattr(self.config, "agent_core_tokens", {})
+        token = tokens.get(alias) if isinstance(tokens, dict) else None
+        return token if isinstance(token, str) and token else ""
+
+    def _assert_repo_machine_credential_scope(self, repo: str, machine) -> None:
+        """Reject alias-only credentials when another repo maps that alias elsewhere."""
+        active_repos = getattr(self.config, "active_repos", [])
+        if not isinstance(active_repos, list):
+            raise DeployControllerError("cannot verify active repository machine credential scope")
+        for other_repo in active_repos:
+            if not isinstance(other_repo, str) or other_repo.casefold() == repo.casefold():
+                continue
+            try:
+                status = self.policy.repo_policy_status(other_repo)
+                if not isinstance(status, dict):
+                    raise ValueError("invalid repository policy status")
+                if not status.get("machines_configured"):
+                    # An unconfigured repository has no machine binding to
+                    # collide with. Its own get_machines(repo=...) remains
+                    # empty and therefore fails closed independently.
+                    continue
+                other_machines = self.policy.get_machines(repo=other_repo)
+            except DeployControllerError:
+                raise
+            except Exception as exc:
+                raise DeployControllerError(
+                    f"cannot confirm machine alias credential scope for {repo}: {type(exc).__name__}"
+                ) from exc
+            if not isinstance(other_machines, list):
+                raise DeployControllerError(
+                    f"cannot confirm machine alias credential scope for {repo}"
+                )
+            for other in other_machines:
+                if (getattr(other, "alias", "").casefold()
+                        != getattr(machine, "alias", "").casefold()):
+                    continue
+                endpoints_differ = (
+                    getattr(other, "node_id", "") != getattr(machine, "node_id", "")
+                    or getattr(other, "node_host", "") != getattr(machine, "node_host", "")
+                )
+                detail = "different endpoints" if endpoints_differ else "the same endpoint"
+                raise DeployControllerError(
+                    f"machine alias {machine.alias!r} is used by {repo} and {other_repo} for {detail}, but Agent Core credentials are keyed only by alias; configure repository-distinct aliases and credentials before deployment"
+                )
+
+    def _machine_connection_fingerprint(self, machine) -> tuple[str, str, str]:
+        alias = getattr(machine, "alias", "")
+        return (
+            str(getattr(machine, "node_id", "") or ""),
+            str(getattr(machine, "node_host", "") or ""),
+            self._credential_fingerprint(self._agent_core_token(alias))
+            or ("injected-factory" if self._agent_core_factory is not None else ""),
+        )
+
+    async def _close_core_client(self, key: tuple[str, str]) -> None:
+        client = self._core_clients.pop(key, None)
+        self._core_client_fingerprints.pop(key, None)
+        if client is not None:
+            await self._close_client(client)
+
+    @staticmethod
+    async def _close_client(client) -> None:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+    async def _close_core_clients_for_repo(self, repo_key: str) -> None:
+        for key in list(self._core_clients):
+            if key[0] == repo_key:
+                await self._close_core_client(key)
 
     def _get_case_runner(self) -> CaseRunner:
         if self._case_runner is None:
@@ -1092,9 +1276,14 @@ class DeployController:
                 and latest["fingerprint"] == candidate["fingerprint"]
             )
 
+        machine_groups = self._get_machine_groups_for_components(
+            candidate["components"], repo,
+        )
         markdown = comments_mod.deploy_ready(
             repo, pr_number, current_head, candidate["builds"],
             review_evidence=candidate["snapshot"],
+            machine_groups=machine_groups,
+            components=candidate["components"],
         )
         try:
             written = await self._write_lifecycle_with_history(
@@ -1107,7 +1296,15 @@ class DeployController:
         except Exception:
             logger.warning("review recovery write failed %s#%s", repo, pr_number)
             return state
-        return next_state if written else state
+        if not written:
+            return state
+        await self._post_deploy_ready_notice(
+            repo, pr_number, head_sha=current_head,
+            round_id=round_id_for_state(next_state),
+            review_evidence=candidate["snapshot"],
+            components=candidate["components"],
+        )
+        return next_state
 
     async def _resolve_commit_prefix_for_head(
         self,
@@ -1590,6 +1787,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Cannot verify `/request_deploy` author identity.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1597,11 +1795,12 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "No deploy approval lifecycle found. Wait for review lifecycle reconciliation first.",
+                    comment_id=comment_id,
                 )
                 return True
             pr_head = pr_data.get("head", {}).get("sha", "")
             if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
-                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.")
+                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.", comment_id=comment_id)
                 return True
             if pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
@@ -1613,17 +1812,27 @@ class DeployController:
             if _current_status in ("deploy-ready", "succeeded", "failed"):
                 if comment_id <= state.get("last_processed_comment_id", 0):
                     return True
-            elif _current_status in ("deploy-requested", "testing"):
+            elif _current_status in ("deploy-requested", "deploying", "testing"):
                 logger.warning(
                     "STALE_COMMAND_IGNORED kind=request_deploy comment_id=%s current_status=%s",
                     comment_id, _current_status,
                 )
                 await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                approval_guidance = await self._approval_command_guidance(
+                    repo, pr_number,
+                )
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    f"`/request_deploy` was not applied because this round is already `{_current_status}`. "
+                    + approval_guidance,
+                    topic="request-deploy-already-processed",
+                )
                 return True
             else:
                 await self._post_command_not_ready(
                     repo, pr_number, _current_status,
                     "Wait for the PR to reach `deploy-ready` status before requesting deployment.",
+                    comment_id=comment_id,
                 )
                 return True
             pr_user = pr_data.get("user", {})
@@ -1632,12 +1841,14 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Cannot verify PR author identity.",
+                    comment_id=comment_id,
                 )
                 return True
             if comment_author_id != pr_author_id:
                 await self._post_error(
                     repo, pr_number,
                     "Only the PR author can use `/request_deploy`.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1655,6 +1866,7 @@ class DeployController:
                         repo, pr_number,
                         "A newer Review Agent protocol comment is not from the configured trusted "
                         "Review Agent. No deployment request was created.",
+                        comment_id=comment_id,
                     )
                     return True
                 evidence = await self._review_evidence_from_comments(repo, pr_number, pr_head, comments)
@@ -1670,6 +1882,7 @@ class DeployController:
                     repo, pr_number,
                     "No completed review evidence found for this HEAD. "
                     "Wait for Review Agent to complete.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1678,6 +1891,7 @@ class DeployController:
                     repo, pr_number,
                     "Review request, required build matrix or run provenance is missing or ambiguous. "
                     "No deployment can be requested from unbound review evidence.",
+                    comment_id=comment_id,
                 )
                 return True
             # Convert evidence builds to BuildInfo
@@ -1690,12 +1904,14 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Failed to resolve component snapshot for this HEAD.",
+                    comment_id=comment_id,
                 )
                 return True
             if not components:
                 await self._post_error(
                     repo, pr_number,
                     "No deployable builds found for this HEAD.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1707,6 +1923,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Review evidence commit could not be resolved to the current PR HEAD.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1718,8 +1935,8 @@ class DeployController:
             # A ready lifecycle is the developer-visible review snapshot. If
             # the latest trusted run changed before this command was handled,
             # consume this request without silently treating the new findings
-            # as already reviewed. Reconciliation will publish the new result
-            # and require a fresh /request_deploy comment.
+            # as already reviewed. Reconciliation will publish the new result;
+            # direct approval can then proceed from the refreshed deploy-ready state.
             if _current_status == "deploy-ready":
                 persisted_evidence = state.get("review_evidence", {})
                 persisted_components = state.get("components", [])
@@ -1731,13 +1948,14 @@ class DeployController:
                     await self._post_error(
                         repo, pr_number,
                         "Review evidence changed after this `deploy-ready` snapshot. "
-                        "Read the latest Review Agent result, wait for lifecycle reconciliation, "
-                        "then post a NEW `/request_deploy`.",
+                        "Read the latest Review Agent result and wait for lifecycle reconciliation. "
+                        "When the current Summary returns to `deploy-ready`, approve directly; `/request_deploy` is optional.",
+                        comment_id=comment_id,
                     )
                     return True
 
             # Determine compatible machine groups
-            machine_groups = self._get_machine_groups_for_components(components)
+            machine_groups = self._get_machine_groups_for_components(components, repo)
 
             # Preserve the original round before replacing the active snapshot.
             previous_state = copy.deepcopy(state)
@@ -1775,7 +1993,27 @@ class DeployController:
             )
             if not written:
                 return False
-            await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+            await self._project_status_best_effort(repo, pr_number, "deploy-requested")
+            command_lines = self._machine_notice_lines(
+                machine_groups, repo, mention_owners=True,
+                test_only=self._is_test_only_pr(pr_data),
+            )
+            if not command_lines:
+                command_lines = [
+                    "当前没有适配且可访问的机器，无法生成可执行的 IP 审批命令。"
+                    "请检查当前仓库机器配置和 Agent Core 访问。"
+                ]
+            await self._post_bound_notice(
+                repo, pr_number, head_sha=pr_head,
+                round_id=round_id_for_state(state), comment_id=comment_id,
+                topic="deployment-requested-next-approver",
+                expected_command_kind="request_deploy",
+                message="\n".join([
+                    f"已为 HEAD `{_short(pr_head)}` 的本轮 `{round_id_for_state(state)}` 请求部署审批。",
+                    "以下是已匹配机器的完整审批命令及其负责人：",
+                    *command_lines,
+                ]),
+            )
             return True
 
         except Exception as e:
@@ -1796,21 +2034,72 @@ class DeployController:
             if state is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No active deployment found. Use `/request_deploy` first.",
+                    "No trusted lifecycle is available for this HEAD. Wait for `deploy-ready`; then you can approve directly. `/request_deploy` is optional.",
+                    comment_id=comment_id,
                 )
                 return True
 
             pr_head = pr_data.get("head", {}).get("sha", "")
             if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
-                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.")
+                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.", comment_id=comment_id)
                 return True
             if pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
                     repo, pr_number, state, pr_head, comment_id,
                 )
                 return True
+            initial_lifecycle_state = copy.deepcopy(state)
 
             _current_status = state.get("status", "")
+            if _current_status == "deploy-ready":
+                if comment_id <= state.get("last_processed_comment_id", 0):
+                    return True
+                if (not state.get("review_evidence") or not state.get("components")
+                        or not await self._fresh_review_evidence_matches_state(
+                            repo, pr_number, pr_head, state.get("review_evidence", {}),
+                            expected_components=state.get("components", []),
+                        )):
+                    await self._post_error(
+                        repo, pr_number,
+                        "Current HEAD build or Review Agent evidence is missing, stale, or changed. "
+                        "Wait for lifecycle reconciliation to publish trusted `deploy-ready` evidence.",
+                        comment_id=comment_id,
+                    )
+                    return True
+                ready_state = copy.deepcopy(state)
+                state = self._init_hidden_state(
+                    head_sha=pr_head, status="deploy-requested",
+                    review_evidence=ready_state.get("review_evidence", {}),
+                    components=ready_state.get("components", []),
+                )
+                state["round_id"] = make_round_id(pr_head, comment_id)
+                state["round_started_at"] = utc_now()
+                state["round_archive"] = ready_state.get("round_archive")
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": "", "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                _current_status = "deploy-requested"
+
+            if _current_status == "deploying":
+                phase = state.get("command", {}).get("phase")
+                if phase == "executing":
+                    await self._handle_uncertain_if_needed(repo, pr_number, state)
+                elif phase == "uncertain":
+                    await self._recover_uncertain_deployment_tick(
+                        repo, pr_number, state, pr_data,
+                    )
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "A deployment is already in progress or its POST outcome is being verified. "
+                    "No retry was started; wait for the current deployment status to be confirmed.",
+                    topic="deployment-already-in-progress",
+                )
+                return True
+
             if _current_status == "deploy-requested":
                 pass  # normal path continues below
             elif _current_status in ("testing", "succeeded", "failed"):
@@ -1819,11 +2108,17 @@ class DeployController:
                     comment_id, _current_status,
                 )
                 await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    f"`/approve_deploy` was not started because the current round is already `{_current_status}`.",
+                    topic="approve-deploy-already-processed",
+                )
                 return True
             else:
                 await self._post_command_not_ready(
                     repo, pr_number, _current_status,
-                    "Deploy Approval is not yet in `deploy-requested` state. Wait for Review Agent to complete and Developer to run `/request_deploy`.",
+                    "Wait for trusted Review Agent build and review evidence. Once the lifecycle reaches `deploy-ready`, its Summary will show the current executable machine commands; `/request_deploy` remains optional.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1834,6 +2129,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "PR is not open. Deploy only when PR is open and unmerged.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1841,6 +2137,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Deployment requires PR ready-for-review / non-draft.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -1855,17 +2152,100 @@ class DeployController:
                 return True
 
             # Resolve machine selector (alias or IPv4) to canonical MachineInfo
+            machine_selector = machine_alias
+            if not machine_alias:
+                remaining_for_selection = [
+                    component for component in state.get("components", [])
+                    if component.get("component_id") not in _component_id_set(
+                        state.get("deployments", []),
+                    )
+                ]
+                groups = self._get_machine_groups_for_components(
+                    remaining_for_selection, repo,
+                )
+                remaining_ids = {
+                    component.get("component_id") for component in remaining_for_selection
+                    if isinstance(component, dict)
+                }
+                full_groups = [
+                    group for group in groups
+                    if remaining_ids and remaining_ids.issubset(set(group.get("component_ids", [])))
+                ]
+                if len(full_groups) == 1:
+                    options = full_groups
+                elif len(full_groups) > 1:
+                    options = full_groups
+                else:
+                    options = groups
+                if len(options) != 1 or not full_groups:
+                    command_lines = self._machine_notice_lines(
+                        options, repo, mention_owners=False,
+                        test_only=self._is_test_only_pr(pr_data),
+                    )
+                    if not command_lines:
+                        explanation = (
+                            "No deployable machine matches the remaining components' target, platform, "
+                            "variant, and driver path, or its Agent Core access is unavailable. "
+                            "Check this repository's machine policy and machine access configuration."
+                        )
+                    elif full_groups:
+                        explanation = "Several fully compatible machines are available. Choose one explicitly:"
+                    else:
+                        explanation = (
+                            "No single machine covers every remaining component. Choose an adapted "
+                            "machine explicitly for partial deployment:"
+                        )
+                    reply = "\n".join([
+                        explanation,
+                        *command_lines,
+                        "Use one of the complete IP commands above; no machine was selected automatically.",
+                    ])
+                    await self._post_command_reply(
+                        repo, pr_number, comment_id, reply,
+                        topic="approve-deploy-machine-selection",
+                    )
+                    return True
+                machine_alias = str(options[0].get("ip", "") or "")
+
             try:
-                machine = Policy.resolve_machine_selector(machine_alias, self.policy.machines)
+                machine_map = {item.alias: item for item in self.policy.get_machines(repo=repo)}
+                machine = Policy.resolve_machine_selector(machine_alias, machine_map)
             except PolicyError as e:
-                await self._post_error(repo, pr_number, str(e))
+                deployed_ids = _component_id_set(state.get("deployments", []))
+                remaining_components = [
+                    component for component in state.get("components", [])
+                    if isinstance(component, dict)
+                    and component.get("component_id") not in deployed_ids
+                ]
+                try:
+                    available_commands = self._machine_notice_lines(
+                        self._get_machine_groups_for_components(remaining_components, repo),
+                        repo, mention_owners=False,
+                        test_only=self._is_test_only_pr(pr_data),
+                    )
+                except Exception as exc:
+                    logger.warning("compatible machine list unavailable %s#%s exception=%s",
+                                   repo, pr_number, type(exc).__name__)
+                    available_commands = []
+                suggestion = (
+                    "\nAvailable compatible commands:\n" + "\n".join(available_commands)
+                    if available_commands else "\nNo compatible deployable machine is currently available; check repository machine policy and machine access."
+                )
+                await self._post_error(
+                    repo, pr_number,
+                    f"{e} Choose an exact command from the compatible machine list below.{suggestion}",
+                    comment_id=comment_id,
+                )
                 return True
 
             # Preserve the ORIGINAL selector (IPv4 or alias) from the comment
             # for exact revalidation. Canonical alias is used for state/persistence.
-            machine_selector = machine_alias
+            # Retain the selector from the original comment (empty for automatic selection).
             # Use canonical alias for all state persistence
             machine_alias = machine.alias
+            approved_machine_binding = (
+                machine.alias, machine.node_id, machine.node_host,
+            )
 
             # Check permissions async
             await self._check_approval_permissions(
@@ -1886,13 +2266,14 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     f"No remaining components to deploy for machine `{machine_alias}`.",
+                    comment_id=comment_id,
                 )
                 return True
 
 
             compatible_remaining_ids = set(
                 self._get_component_ids_for_machine(
-                    machine_alias, undeployed_components,
+                    machine_alias, undeployed_components, repo,
                 )
             )
 
@@ -1904,6 +2285,14 @@ class DeployController:
 
             if not selected_components:
                 # Selected machine covers zero remaining components.
+                if not self._machine_is_deployable(machine):
+                    selection_problem = (
+                        f"Machine `{machine_alias}` is not deployable because its Agent Core endpoint or access is unavailable."
+                    )
+                else:
+                    selection_problem = (
+                        f"Machine `{machine_alias}` does not match any remaining component's target, platform, variant, and driver path."
+                    )
                 state["status"] = "deploy-requested"
                 state["command"] = {
                     "comment_id": comment_id,
@@ -1915,38 +2304,65 @@ class DeployController:
                 markdown = comments_mod.deploy_requested(
                     repo, pr_number, pr_head,
                     state["components"],
-                    self._get_machine_groups_for_components(undeployed_components),
+                    self._get_machine_groups_for_components(undeployed_components, repo),
                     gate_note=[
-                        f"Machine `{machine_alias}` does not cover any remaining component.",
+                        selection_problem,
                         "ZERO deploy POST.",
-                        "Send a NEW `/approve_deploy machine=<alias-or-ip>` for a compatible machine.",
+                        "Use one of the complete IP approval commands in this Summary for a compatible machine.",
                     ],
-                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                    deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                 )
                 event = {
                     "event": f"Machine `{machine_alias}` selected",
                     "machine": machine_alias,
                     "timestamp": comments_mod.beijing_now_str(),
                 }
-                await self._write_lifecycle_with_history(
+                written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=event,
+                    expected_lifecycle_state=initial_lifecycle_state,
                 )
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                if not written:
+                    return False
+                await self._project_status_best_effort(repo, pr_number, "deploy-requested")
+                compatible_groups = self._get_machine_groups_for_components(
+                    undeployed_components, repo,
+                )
+                command_lines = self._machine_notice_lines(
+                    compatible_groups, repo, mention_owners=False,
+                    test_only=self._is_test_only_pr(pr_data),
+                )
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    selection_problem + " "
+                    + ("Try one of these commands:\n" + "\n".join(command_lines)
+                       if command_lines else "No compatible machine is configured; check this repository's machine policy."),
+                    topic="approve-deploy-incompatible-machine",
+                )
                 return True
 
 
             try:
-                await self._write_lifecycle_with_history(
+                preflight_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
                         repo, pr_number, state, machine, selected_components, "Approval received; checking",
                     ), event=None,
+                    expected_lifecycle_state=initial_lifecycle_state,
                 )
+                if not preflight_written:
+                    return False
+                initial_lifecycle_state = copy.deepcopy(state)
                 node_id = machine.node_id
-                core = await self._core_for_node(node_id)
+                core = await self._core_for_node(node_id, repo)
                 preflight = await self._preflight_running_images(core, selected_components)
             except (AgentCoreError, DeployControllerError, TimeoutError, OSError) as exc:
                 # This try block contains read-only preflight and no deploy POST.
+                safe_reason = type(exc).__name__
+                if (isinstance(exc, DeployControllerError)
+                        and ("Agent Core credentials are keyed only by alias" in str(exc)
+                             or "cannot confirm whether alias" in str(exc)
+                             or "cannot confirm machine alias credential scope" in str(exc))):
+                    safe_reason = str(exc)
                 fresh = await self.proxy.read_hidden_state(repo, pr_number)
                 if fresh != state:
                     return False
@@ -1957,13 +2373,22 @@ class DeployController:
                 state["last_processed_comment_id"] = comment_id
                 markdown = self._deployment_progress_markdown(
                     repo, pr_number, state, machine, selected_components,
-                    f"Preflight failed ({type(exc).__name__}); target machine/runtime unavailable or invalid. ZERO deploy POST. Send a NEW approval after recovery.",
+                    f"Preflight failed ({safe_reason}); target machine/runtime unavailable or invalid. ZERO deploy POST. Send a NEW approval after recovery.",
                 )
-                await self._write_lifecycle_with_history(
+                preflight_failure_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown,
                     event={"event": "Preflight failed: ZERO deploy POST", "machine": machine_alias,
                            "ip": machine.node_host, "reason": type(exc).__name__,
                            "timestamp": comments_mod.beijing_now_str()},
+                    expected_lifecycle_state=fresh,
+                )
+                if not preflight_failure_written:
+                    return False
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    f"Deployment did not start because machine `{machine_alias}` failed its read-only preflight ({safe_reason}). "
+                    "No deploy POST was sent. Resolve the machine/runtime issue, then use a current complete IP command from the Lifecycle Summary.",
+                    topic="deployment-preflight-check-failed",
                 )
                 return True
             for item in preflight:
@@ -1994,6 +2419,7 @@ class DeployController:
                     await self._post_error(
                         repo, pr_number,
                         "Deployment requires PR ready-for-review / non-draft.",
+                        comment_id=comment_id,
                     )
                 await self._invalidate_review_required(
                     repo,
@@ -2029,9 +2455,12 @@ class DeployController:
                     "machine": machine_alias,
                     "timestamp": comments_mod.beijing_now_str(),
                 }
-                await self._write_lifecycle_with_history(
+                revoked_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=event,
+                    expected_lifecycle_state=initial_lifecycle_state,
                 )
+                if not revoked_written:
+                    return False
                 return True
 
             # Fresh actor permission re-check
@@ -2050,6 +2479,7 @@ class DeployController:
                     await self._post_error(
                         repo, pr_number,
                         "Deployment requires PR ready-for-review / non-draft.",
+                        comment_id=comment_id,
                     )
                 await self._invalidate_review_required(
                     repo,
@@ -2110,39 +2540,16 @@ class DeployController:
             # be in flight, not every component selected for this approval.
             ordered_components = self._order_components_for_deploy(selected_components)
 
-            # Write executing state only after ALL gates pass.
-            # Persist the complete template before any deploy POST.
-            state["command"] = {
-                "comment_id": comment_id,
-                "kind": "approve_deploy",
-                "phase": "executing",
-                "args": {
-                    "machine": machine_alias,
-                    "actor": actor,
-                    "pending_component_ids": [ordered_components[0]["component_id"]],
-                },
-            }
-            await self._write_lifecycle_with_history(
-                repo, pr_number, state,
-                self._deployment_progress_markdown(
-                    repo, pr_number, state, machine, selected_components, "Deploying",
-                ), event=None,
-            )
-
-            new_deployments = []
-            deploy_error = None
-            deploy_outcome_uncertain = False
-            deploy_preflight_unavailable = False
-            # Pre-flight visible history capacity before unsafe deploy POST
+            # Reserve visible history capacity before marking the command as
+            # in flight. Archive writes are safe, but an archive failure must
+            # not leave a false deploying state for a POST that never started.
             prospective = comments_mod.deploy_requested(
                 repo, pr_number, pr_head,
                 state.get("components", []),
-                self._get_machine_groups_for_components(state.get("components", [])),
+                self._get_machine_groups_for_components(state.get("components", []), repo),
                 deployments=state.get("deployments", []),
                 last_lifecycle_event=comments_mod.beijing_now_str(),
             )
-            # Pass a conservative deployment event reservation so preflight
-            # measures: base renderer + existing history + this event
             deploy_reservation = {
                 "event": "Machine `<alias>` deployed",
                 "machine": "<alias>",
@@ -2154,6 +2561,44 @@ class DeployController:
                 reserved_event=deploy_reservation,
             )
 
+            # Write executing state only after ALL gates pass.
+            # Persist the complete template before any deploy POST.
+            state["status"] = "deploying"
+            state["command"] = {
+                "comment_id": comment_id,
+                "kind": "approve_deploy",
+                "phase": "executing",
+                "args": {
+                    "machine": machine_alias,
+                    "actor": actor,
+                    "node_id": machine.node_id,
+                    "node_host": machine.node_host,
+                    "pending_component_ids": [ordered_components[0]["component_id"]],
+                },
+            }
+            state["last_processed_comment_id"] = comment_id
+            executing_written = await self._write_lifecycle_with_history(
+                repo, pr_number, state,
+                self._deployment_progress_markdown(
+                    repo, pr_number, state, machine, selected_components, "Deploying",
+                ), event=None,
+                expected_lifecycle_state=validated_state,
+            )
+            if not executing_written:
+                return False
+            persisted_lifecycle_state = copy.deepcopy(state)
+            try:
+                await self.proxy.project_status_label(repo, pr_number, "deploying")
+            except Exception as exc:
+                logger.warning("deploying label projection %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
+            round_id = round_id_for_state(state)
+            deployment_started_notice_posted = False
+
+            new_deployments = []
+            deploy_error = None
+            deploy_outcome_uncertain = False
+            deploy_preflight_unavailable = False
             # Sequential per-component deploy; POST success followed by
             # post-deploy runtime verification before recording as deployed.
             for comp in ordered_components:
@@ -2171,13 +2616,191 @@ class DeployController:
                 command_args = dict(state["command"].get("args", {}))
                 command_args["pending_component_ids"] = [component_id]
                 state["command"]["args"] = command_args
-                await self._write_lifecycle_with_history(
+                pending_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
                         repo, pr_number, state, machine, [comp],
                         "Deploying and verifying Core" if comp_target == "core" else "Deploying component",
                     ), event=None,
+                    expected_lifecycle_state=persisted_lifecycle_state,
                 )
+                if not pending_written:
+                    return False
+                persisted_lifecycle_state = copy.deepcopy(state)
+
+                # Machine policy refreshes independently of the controller.
+                # Recheck endpoint, compatibility, ownership, and the cached
+                # connection binding immediately before each possible POST.
+                try:
+                    current_machine = self.policy.get_machine(machine_alias, repo=repo)
+                except Exception as exc:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        f"Current machine policy could not be verified ({type(exc).__name__}).",
+                    )
+                if current_machine is None:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "The approved machine is no longer present in this repository's current policy.",
+                    )
+                if (current_machine.alias, current_machine.node_id, current_machine.node_host) != approved_machine_binding:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "The machine alias now points to a different node ID or IP than the one that passed preflight.",
+                    )
+                try:
+                    current_compatible_ids = set(self._get_component_ids_for_machine(
+                        machine_alias, [comp], repo,
+                    ))
+                except Exception as exc:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        f"Current machine compatibility could not be verified ({type(exc).__name__}).",
+                    )
+                if component_id not in current_compatible_ids:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "The current machine policy no longer adapts to this component's target, platform, variant, or driver path.",
+                    )
+                try:
+                    await self._check_approval_permissions(current_machine, actor, repo)
+                except PolicyError as exc:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        f"Approval authority could not be revalidated ({str(exc)}).",
+                    )
+                try:
+                    machine_after_permission = self.policy.get_machine(machine_alias, repo=repo)
+                except Exception as exc:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        f"Machine policy changed while approval authority was checked ({type(exc).__name__}).",
+                    )
+                if (machine_after_permission is None
+                        or (machine_after_permission.alias,
+                            machine_after_permission.node_id,
+                            machine_after_permission.node_host) != approved_machine_binding
+                        or tuple(sorted(str(owner).casefold() for owner in
+                                        (machine_after_permission.owners or [])))
+                        != tuple(sorted(str(owner).casefold() for owner in
+                                        (current_machine.owners or [])))):
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "Machine ownership or endpoint policy changed during final authorization; submit a new approval.",
+                    )
+                current_core_key = (repo.casefold(), machine_alias)
+                if (self._core_clients.get(current_core_key) is not core
+                        or self._core_client_fingerprints.get(current_core_key)
+                        != self._machine_connection_fingerprint(machine_after_permission)):
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "The Agent Core target or configured credential changed after preflight; review the current configuration and submit a new approval.",
+                    )
+                machine = machine_after_permission
+                node_id = machine.node_id
+
+                if not deployment_started_notice_posted:
+                    await self._post_bound_notice(
+                        repo, pr_number, head_sha=pr_head, round_id=round_id,
+                        comment_id=comment_id, topic="deployment-started",
+                        expected_command_kind="approve_deploy",
+                        message=(f"Deployment is in progress for HEAD `{_short(pr_head)}` in round `"
+                                 f"{round_id}`. The Controller is completing final pre-POST checks for "
+                                 f"machine `{machine.node_host}`."),
+                    )
+                    deployment_started_notice_posted = True
+
+                    # Posting the notice awaits GitHub. Recheck the synchronous
+                    # policy snapshot before entering the deploy client.
+                    try:
+                        latest_machine = self.policy.get_machine(machine_alias, repo=repo)
+                    except Exception as exc:
+                        return await self._block_machine_policy_change(
+                            repo, pr_number, persisted_lifecycle_state,
+                            persisted_lifecycle_state, comment_id, machine_alias, actor,
+                            f"Machine policy could not be confirmed after posting the deployment notice ({type(exc).__name__}); no deploy POST was sent.",
+                        )
+                    if (latest_machine is None
+                            or (latest_machine.alias, latest_machine.node_id,
+                                latest_machine.node_host) != approved_machine_binding
+                            or tuple(sorted(str(owner).casefold() for owner in
+                                            (latest_machine.owners or [])))
+                            != tuple(sorted(str(owner).casefold() for owner in
+                                            (machine.owners or [])))
+                            or self._core_clients.get(current_core_key) is not core
+                            or self._core_client_fingerprints.get(current_core_key)
+                            != self._machine_connection_fingerprint(latest_machine)):
+                        return await self._block_machine_policy_change(
+                            repo, pr_number, persisted_lifecycle_state,
+                            persisted_lifecycle_state, comment_id, machine_alias, actor,
+                            "Machine policy or credentials changed while the deployment notice was being posted; no deploy POST was sent.",
+                        )
+                # The lifecycle and start notice both await GitHub. Recheck the
+                # PR, the exact approval comment, permissions, and the current
+                # policy binding immediately before each possible POST.
+                try:
+                    execution_pr = await self.proxy.get_pr(repo, pr_number)
+                except Exception:
+                    logger.warning("final deployment PR check unavailable %s#%s", repo, pr_number)
+                    return True
+                execution_head = execution_pr.get("head") if isinstance(execution_pr, dict) else None
+                if (not isinstance(execution_pr, dict)
+                        or execution_pr.get("state") != "open"
+                        or execution_pr.get("merged")
+                        or execution_pr.get("draft") is True
+                        or not isinstance(execution_head, dict)
+                        or execution_head.get("sha") != pr_head):
+                    return True
+                if await self._revalidate_approve_comment(
+                    repo, comment_id, actor_id, machine_selector,
+                ) is None:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "The approval comment changed after final authorization; no deploy POST was sent. Submit a new approval.",
+                    )
+                try:
+                    await self._check_approval_permissions(machine, actor, repo)
+                except PolicyError as exc:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        f"Approval authority changed before the deploy POST ({exc}); no deploy POST was sent.",
+                    )
+                try:
+                    final_machine = self.policy.get_machine(machine_alias, repo=repo)
+                except Exception as exc:
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        f"Current machine policy could not be verified immediately before deployment ({type(exc).__name__}).",
+                    )
+                if (final_machine is None
+                        or (final_machine.alias, final_machine.node_id,
+                            final_machine.node_host) != approved_machine_binding
+                        or tuple(sorted(str(owner).casefold() for owner in
+                                        (final_machine.owners or [])))
+                        != tuple(sorted(str(owner).casefold() for owner in
+                                        (machine.owners or [])))
+                        or self._core_clients.get(current_core_key) is not core
+                        or self._core_client_fingerprints.get(current_core_key)
+                        != self._machine_connection_fingerprint(final_machine)):
+                    return await self._block_machine_policy_change(
+                        repo, pr_number, persisted_lifecycle_state,
+                        persisted_lifecycle_state, comment_id, machine_alias, actor,
+                        "Machine endpoint, ownership, or credentials changed during final deployment checks; no deploy POST was sent.",
+                    )
+                machine = final_machine
+                node_id = machine.node_id
                 # Route core through self-update path; non-core via existing path
                 if comp_target == "core":
                     # Core has no automated case; runtime_id is always "core"
@@ -2229,12 +2852,16 @@ class DeployController:
                         deploy_error = str(e)
                         break
 
-                    await self._write_lifecycle_with_history(
+                    verifying_written = await self._write_lifecycle_with_history(
                         repo, pr_number, state,
                         self._deployment_progress_markdown(
                             repo, pr_number, state, machine, [comp], "Verifying target image",
                         ), event=None,
+                        expected_lifecycle_state=persisted_lifecycle_state,
                     )
+                    if not verifying_written:
+                        return False
+                    persisted_lifecycle_state = copy.deepcopy(state)
                     # Post-deploy verification: confirm target image is actually running
                     verified, health_evidence = await self._verify_deployed_runtime(
                         core, node_id, component_id, runtime_id, image_ref,
@@ -2273,24 +2900,33 @@ class DeployController:
                     self._get_machine_groups_for_components([
                         c for c in state.get("components", [])
                         if c.get("component_id", "") not in _component_id_set(state["deployments"])
-                    ]),
+                    ], repo),
                     gate_note=[
                         "Agent Core status could not be confirmed; no POST was sent for the remaining component.",
                         "Deployment remains pending. Send a NEW approval after status checks recover.",
                     ],
-                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                    deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                 )
-                await self._write_lifecycle_with_history(
+                deferred_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown,
                     event={"event": "Deploy preflight deferred: zero POST for remaining component",
                            "machine": machine_alias, "timestamp": comments_mod.beijing_now_str()},
+                    expected_lifecycle_state=persisted_lifecycle_state,
                 )
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                if not deferred_written:
+                    return False
+                await self._project_status_best_effort(repo, pr_number, "deploy-requested")
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "Deployment did not start because Agent Core preflight could not confirm the target. "
+                    "No deploy POST was sent; after the machine recovers, post a new approval command.",
+                    topic="deployment-preflight-failed",
+                )
                 return True
 
             if deploy_outcome_uncertain:
                 state["deployments"] = list(existing_deployments) + list(new_deployments)
-                state["status"] = "deploy-requested"
+                state["status"] = "deploying"
                 state["command"] = {
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
@@ -2298,13 +2934,15 @@ class DeployController:
                     "args": {
                         "machine": machine_alias,
                         "actor": actor,
+                        "node_id": node_id,
+                        "node_host": machine.node_host,
                         "pending_component_ids": [component_id],
                     },
                 }
                 state["last_processed_comment_id"] = comment_id
                 approve_attempt["outcome"] = "uncertain"
                 self._record_approve_attempt(state, approve_attempt)
-                markdown = comments_mod.deploy_requested(
+                markdown = self._deploy_requested_markdown(
                     repo,
                     pr_number,
                     pr_head,
@@ -2312,7 +2950,7 @@ class DeployController:
                     self._get_machine_groups_for_components([
                         c for c in state.get("components", [])
                         if c.get("component_id", "") not in _component_id_set(state["deployments"])
-                    ]),
+                    ], repo),
                     gate_note=[
                         "### Restart Recovery",
                         "",
@@ -2320,7 +2958,8 @@ class DeployController:
                         "The Controller will periodically verify the target status without repeating the POST.",
                         "Keep this deployment pending until the exact target is confirmed.",
                     ],
-                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                    deployments=self._enrich_deployments_for_render(state["deployments"], repo),
+                    display_status="deploying",
                 )
                 event = {
                     "event": "Deploy outcome uncertain",
@@ -2328,10 +2967,21 @@ class DeployController:
                     "machine": machine_alias,
                     "timestamp": comments_mod.beijing_now_str(),
                 }
-                await self._write_lifecycle_with_history(
+                uncertain_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=event,
+                    expected_lifecycle_state=persisted_lifecycle_state,
                 )
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                if not uncertain_written:
+                    return False
+                await self._project_status_best_effort(repo, pr_number, "deploying")
+                await self._post_bound_notice(
+                    repo, pr_number, head_sha=pr_head,
+                    round_id=round_id_for_state(state), comment_id=comment_id,
+                    topic="deployment-outcome-uncertain",
+                    expected_command_kind="approve_deploy",
+                    message=("The deployment POST outcome is uncertain. The controller will check "
+                             "the machine status and will not repeat the POST automatically."),
+                )
                 return True
 
             if deploy_error is not None:
@@ -2357,13 +3007,24 @@ class DeployController:
                     "machine": machine_alias,
                     "timestamp": comments_mod.beijing_now_str(),
                 }
-                await self._write_lifecycle_with_history(
+                failed_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=event,
+                    expected_lifecycle_state=persisted_lifecycle_state,
                 )
-                await self.proxy.project_status_label(repo, pr_number, "failed")
+                if not failed_written:
+                    return False
+                await self._project_status_best_effort(repo, pr_number, "failed")
+                await self._post_bound_notice(
+                    repo, pr_number, head_sha=pr_head,
+                    round_id=round_id_for_state(state), comment_id=comment_id,
+                    topic="deployment-failed", expected_command_kind="approve_deploy",
+                    message=(f"Deployment failed for HEAD `{_short(pr_head)}` in round "
+                             f"`{round_id_for_state(state)}`. Final status: `failed`."),
+                )
 
                 # One-shot runtime log snapshot for failed path
                 runtime_logs = await self._snapshot_terminal_runtime_logs(
+                    repo,
                     state.get("components", []),
                     state.get("deployments", []),
                 )
@@ -2476,31 +3137,53 @@ class DeployController:
                     c for c in components
                     if c.get("component_id", "") not in deployed_component_ids
                 ]
+                remaining_groups = self._get_machine_groups_for_components(remaining, repo)
+                remaining_commands = self._machine_notice_lines(
+                    remaining_groups, repo, mention_owners=False,
+                    test_only=self._is_test_only_pr(pr_data),
+                )
                 markdown = comments_mod.deploy_requested(
                     repo, pr_number, pr_head,
                     state["components"],
-                    self._get_machine_groups_for_components(remaining),
+                    remaining_groups,
                     gate_note=[
                         "### Partial coverage completed",
                         "",
                         f"Machine `{machine_alias}` deployed its compatible components.",
                         f"Remaining components need additional machine approval.",
-                        "Send a NEW `/approve_deploy machine=<alias-or-ip>`.",
+                        *(remaining_commands or ["No trusted compatible machine with a unique IPv4 address is available for the remaining components."]),
                     ],
-                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                    deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                 )
-                machine_info = self.policy.get_machine(machine_alias)
+                machine_info = self.policy.get_machine(machine_alias, repo=repo)
                 deploy_event = {
                     "event": f"Machine `{machine_alias}` deployed",
                     "machine": machine_alias,
                     "ip": machine_info.node_host if machine_info else "",
                     "timestamp": comments_mod.beijing_now_str(),
                 }
-                await self._write_lifecycle_with_history(
+                partial_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=deploy_event,
+                    expected_lifecycle_state=persisted_lifecycle_state,
                 )
+                if not partial_written:
+                    return False
                 await self._save_deployed_machine_log(repo, pr_number, state, machine_alias)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                await self._project_status_best_effort(repo, pr_number, "deploy-requested")
+                notice_lines = self._machine_notice_lines(
+                    remaining_groups, repo, mention_owners=True,
+                    test_only=self._is_test_only_pr(pr_data),
+                )
+                await self._post_bound_notice(
+                    repo, pr_number, head_sha=pr_head,
+                    round_id=round_id_for_state(state), comment_id=comment_id,
+                    topic="partial-deployment-next-approver",
+                    expected_command_kind="approve_deploy",
+                    message="\n".join([
+                        "Partial deployment completed. The remaining components need another machine approval.",
+                        *notice_lines,
+                    ]),
+                )
                 return True
 
             # All components deployed -> durable testing state FIRST
@@ -2510,7 +3193,7 @@ class DeployController:
             # Build testing markdown WITHOUT advisory case result
             testing_markdown = comments_mod.testing(
                 repo, pr_number, pr_head, case_result="",
-                deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                deployments=self._enrich_deployments_for_render(state.get("deployments", []), repo),
                 components=state.get("components", []),
                 deployments_complete=(bool(all_component_ids)
                                       and all_component_ids.issubset(deployed_component_ids)),
@@ -2518,7 +3201,7 @@ class DeployController:
             # The LAST machine also gets its own per-machine history event,
             # mirroring the partial-coverage path, so every successful machine
             # appears exactly once in the visible History (newest-first).
-            machine_info = self.policy.get_machine(machine_alias)
+            machine_info = self.policy.get_machine(machine_alias, repo=repo)
             last_machine_event = {
                 "event": f"Machine `{machine_alias}` deployed",
                 "machine": machine_alias,
@@ -2533,18 +3216,41 @@ class DeployController:
             # Atomic: write BOTH "All components deployed" and "Machine deployed"
             # in a single hidden-state/comment write so a crash cannot leave
             # incomplete History.  Newest-first: All components, then Machine.
-            await self._write_lifecycle_with_history(
+            testing_written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, testing_markdown,
                 events=[event_all, last_machine_event],
+                expected_lifecycle_state=persisted_lifecycle_state,
             )
+            if not testing_written:
+                return False
             # Project status label "testing" SECOND
             await self._save_deployed_machine_log(repo, pr_number, state, machine_alias)
-            await self.proxy.project_status_label(repo, pr_number, "testing")
+            await self._project_status_best_effort(repo, pr_number, "testing")
+            upload_url = await self._current_testing_upload_url(
+                repo, pr_number, head_sha=pr_head,
+                round_id=round_id_for_state(state),
+                approval_comment_id=comment_id,
+            )
+            upload_message = (
+                f"本轮测试视频/图片上传入口：[打开上传页面](<{upload_url}>)。"
+                if upload_url else
+                "当前轮安全上传入口不可用，请从 PR Summary 查看上传状态；不要使用旧轮次链接。"
+            )
+            await self._post_bound_notice(
+                repo, pr_number, head_sha=pr_head,
+                round_id=round_id_for_state(state), comment_id=comment_id,
+                topic="deployment-complete-testing-next",
+                expected_command_kind="approve_deploy",
+                message=(f"部署已完成，Lifecycle 已进入 `testing`。当前 HEAD 为 `{_short(pr_head)}`，"
+                         f"round 为 `{round_id_for_state(state)}`。下一步请进行测试。\n\n"
+                         f"{upload_message}\n\n"
+                         "测试完成后，请由本轮 Machine Owner 执行 `/request_acceptance`。"),
+            )
 
             return True
 
         except PolicyError as e:
-            await self._post_error(repo, pr_number, str(e))
+            await self._post_error(repo, pr_number, str(e), comment_id=comment_id)
             return True
         except Exception as e:
             logger.error(
@@ -2553,7 +3259,7 @@ class DeployController:
             )
             raise
 
-    def _all_required_components_deployed(self, state: dict) -> bool:
+    def _all_required_components_deployed(self, state: dict, repo: str) -> bool:
         """Validate every required component has a trusted deployment record."""
         components = state.get("components")
         deployments = state.get("deployments")
@@ -2583,7 +3289,7 @@ class DeployController:
             if len(records) != 1:
                 return False
             alias = records[0].get("machine")
-            if not isinstance(alias, str) or not alias or self.policy.get_machine(alias) is None:
+            if not isinstance(alias, str) or not alias or self.policy.get_machine(alias, repo=repo) is None:
                 return False
         return True
 
@@ -2661,7 +3367,7 @@ class DeployController:
         cmd = parse_command(expected_comment.get("body", ""))
         if (cmd.kind != "record_test" or cmd.result not in ("pass", "fail")
                 or expected_state.get("status") != "testing"
-                or not self._all_required_components_deployed(expected_state)
+                or not self._all_required_components_deployed(expected_state, repo)
                 or not await self._restart_record_test_comment_is_current(
                     repo, expected_state, expected_comment)):
             return False
@@ -2714,7 +3420,7 @@ class DeployController:
         if (fresh.get("head_sha") != original.get("head_sha")
                 or fresh.get("cos") != original.get("cos")):
             return None
-        if not self._all_required_components_deployed(fresh):
+        if not self._all_required_components_deployed(fresh, repo):
             return None
         if result == "pass":
             for key in (
@@ -2797,7 +3503,7 @@ class DeployController:
                     or not isinstance(args.get("summary"), str)
                     or not state.get("components") or not state.get("deployments")
                     or not state.get("review_evidence")
-                    or not self._all_required_components_deployed(state)):
+                    or not self._all_required_components_deployed(state, repo)):
                 logger.warning("COS retry lacks original evidence %s#%s", repo, pr_number)
                 return
             comment = await self.proxy.get_comment(repo, cid)
@@ -2818,6 +3524,7 @@ class DeployController:
                 now=datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00")),
             )
             runtime_logs = await self._snapshot_terminal_runtime_logs(
+                repo,
                 state.get("components", []), state.get("deployments", []),
             )
             if not await self._terminal_cos_context_is_current(repo, pr_number, state, comment):
@@ -2849,7 +3556,7 @@ class DeployController:
             if result == "pass":
                 markdown = comments_mod.succeeded_comment(
                     repo, pr_number, head,
-                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                    deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                     components=state["components"], **render_kwargs,
                 )
             else:
@@ -2878,21 +3585,29 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "/request_acceptance 仅适用于开放、未合并且非 Draft 的 PR。",
+                    comment_id=comment_id,
                 )
                 return True
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
-                await self._post_error(repo, pr_number, "当前没有可验收的部署记录。")
+                await self._post_error(repo, pr_number, "当前没有可验收的部署记录。", comment_id=comment_id)
                 return True
             state = copy.deepcopy(state)
             head = pr.get("head", {}).get("sha", "")
             round_id = round_id_for_state(state)
+            if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) and head != state.get("head_sha"):
+                await self._supersede_head_drift(
+                    repo, pr_number, state, head, comment_id,
+                    command_kind="request_acceptance",
+                )
+                return True
             if (state.get("status") != "testing" or state.get("head_sha") != head
                     or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
-                    or not self._all_required_components_deployed(state)):
+                    or not self._all_required_components_deployed(state, repo)):
                 await self._post_command_not_ready(
                     repo, pr_number, state.get("status", "unknown"),
                     "所有本轮部署完成并进入 testing 后，Machine Owner 才能请求独立验收。",
+                    comment_id=comment_id,
                 )
                 return True
             try:
@@ -2900,10 +3615,11 @@ class DeployController:
             except (TypeError, ValueError):
                 owner_id = 0
             if (owner_id <= 0 or not isinstance(actor, str)
-                    or not self._is_deployed_machine_owner(actor, state)):
+                    or not self._is_deployed_machine_owner(actor, state, repo)):
                 await self._post_error(
                     repo, pr_number,
                     "只有本轮实际部署机器的 Machine Owner 可以执行 /request_acceptance。",
+                    comment_id=comment_id,
                 )
                 return True
             if type(comment_id) is not int or comment_id <= state.get("last_processed_comment_id", 0):
@@ -2945,20 +3661,9 @@ class DeployController:
                     "requested_at": comment["created_at"],
                 }
 
-            configured_reviewers = getattr(self.config, "test_reviewers", [])
-            eligible_reviewers = []
-            seen_reviewers = set()
-            if isinstance(configured_reviewers, list):
-                for reviewer in configured_reviewers:
-                    if (not isinstance(reviewer, str)
-                            or not _LOGIN_RE.fullmatch(reviewer.strip())
-                            or reviewer.strip().casefold().endswith("[bot]")):
-                        continue
-                    reviewer_key = reviewer.strip().casefold()
-                    if reviewer_key in seen_reviewers:
-                        continue
-                    seen_reviewers.add(reviewer_key)
-                    eligible_reviewers.append(reviewer.strip())
+            reviewers_configured, eligible_reviewers = self._eligible_acceptance_reviewers(
+                repo, pr,
+            )
 
             state["command"] = {
                 "comment_id": comment_id,
@@ -2969,11 +3674,11 @@ class DeployController:
             state["last_processed_comment_id"] = comment_id
             markdown = comments_mod.testing(
                 repo, pr_number, head,
-                deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                deployments=self._enrich_deployments_for_render(state.get("deployments", []), repo),
                 components=state.get("components", []),
                 deployments_complete=True,
                 acceptance_pending=True,
-                acceptance_reviewers_configured=bool(configured_reviewers),
+                acceptance_reviewers_configured=reviewers_configured,
                 acceptance_reviewers=eligible_reviewers,
             )
             event = None
@@ -2998,9 +3703,27 @@ class DeployController:
             except Exception as exc:
                 logger.warning("acceptance label projection %s#%s exception=%s",
                                repo, pr_number, type(exc).__name__)
+            reviewer_notice = self._acceptance_reviewer_guidance(
+                repo, pr, reviewers_configured, eligible_reviewers,
+            )
+            record_test_instruction = (
+                "当前仓库验收白名单中的获授权账号可执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                if reviewers_configured else
+                "配置有效的当前仓库验收名单后，获授权账号才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+            )
+            await self._post_bound_notice(
+                repo, pr_number, head_sha=head, round_id=round_id,
+                comment_id=comment_id, topic="acceptance-requested",
+                expected_command_kind="request_acceptance",
+                message="\n".join([
+                    f"本轮测试已完成，当前等待独立验收：`{round_id}`。",
+                    reviewer_notice,
+                    record_test_instruction,
+                ]),
+            )
             return True
         except PolicyError as exc:
-            await self._post_error(repo, pr_number, str(exc))
+            await self._post_error(repo, pr_number, str(exc), comment_id=comment_id)
             return True
         except Exception as exc:
             logger.error("handle_request_acceptance %s#%s: %s",
@@ -3022,7 +3745,8 @@ class DeployController:
             if state is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No active deployment found. Use `/request_deploy` first.",
+                    "当前 PR 没有有效的 Deploy Approval Lifecycle。请先查看 PR Summary，等待生命周期状态更新后再记录测试结果。",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -3030,7 +3754,7 @@ class DeployController:
             state = copy.deepcopy(state)
             pr_head = pr_data.get("head", {}).get("sha", "")
             if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
-                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.")
+                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.", comment_id=comment_id)
                 return True
             if pr_head != state.get("head_sha", ""):
                 if _recovery_comment is not None:
@@ -3052,7 +3776,7 @@ class DeployController:
                         and _current_status == ("succeeded" if result == "pass" else "failed")
                         and state.get("test_result") == result
                         and terminal_command.get("args", {}).get("result") == result):
-                    if not self._all_required_components_deployed(state):
+                    if not self._all_required_components_deployed(state, repo):
                         return False
                     await self._check_record_test_permissions(
                         repo, actor, state, actor_id=actor_id,
@@ -3065,11 +3789,42 @@ class DeployController:
                     comment_id, _current_status,
                 )
                 await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    f"`/record_test` was already finalized for this round. Current status: `{_current_status}`.",
+                    topic="record-test-already-processed",
+                )
                 return True
             else:
+                if _current_status in {"review-required", "reviewing"}:
+                    not_ready_message = (
+                        "当前 HEAD 尚无完整可信的审核和构建结果，请等待 Review Agent 完成并更新 PR Summary。"
+                    )
+                elif _current_status == "deploy-ready":
+                    approval_guidance = await self._approval_command_guidance(
+                        repo, pr_number,
+                    )
+                    not_ready_message = (
+                        "当前 HEAD 的审核和构建已完成，Lifecycle 为 `deploy-ready`。"
+                        "可以直接审批适配机器，无需先执行 `/request_deploy`。\n"
+                        + approval_guidance
+                    )
+                elif _current_status == "deploy-requested":
+                    not_ready_message = (
+                        "当前 Lifecycle 为 `deploy-requested`，正在等待机器审批。请查看 PR Summary 中的可执行机器命令并等待部署完成。"
+                    )
+                elif _current_status == "deploying":
+                    not_ready_message = (
+                        "当前部署正在执行或确认结果，请等待部署状态更新后再记录测试结果。"
+                    )
+                else:
+                    not_ready_message = (
+                        f"当前 Lifecycle 状态为 `{_current_status or 'unknown'}`，尚不能记录测试结果。请查看当前 PR Summary。"
+                    )
                 await self._post_command_not_ready(
                     repo, pr_number, _current_status,
-                    "Deployment has not yet reached `testing` state. Complete all required component deployments first.",
+                    not_ready_message,
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -3080,6 +3835,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "PR is not open. Record test only when PR is open and unmerged.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -3092,11 +3848,12 @@ class DeployController:
                         deployed_component_ids.add(cid)
             all_component_ids = {c.get("component_id", "") for c in components}
             if (not all_component_ids or not all_component_ids.issubset(deployed_component_ids)
-                    or not self._all_required_components_deployed(state)):
+                    or not self._all_required_components_deployed(state, repo)):
                 await self._post_error(
                     repo, pr_number,
                     "Not all components are deployed yet. "
                     "Complete all machine approvals before recording test result.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -3156,7 +3913,7 @@ class DeployController:
             # Write the terminal visible lifecycle comment
             if result == "pass":
                 enriched = self._enrich_deployments_for_render(
-                    state.get("deployments", []),
+                    state.get("deployments", []), repo,
                 )
                 terminal_markdown = comments_mod.succeeded_comment(
                     repo, pr_number, pr_head,
@@ -3201,6 +3958,13 @@ class DeployController:
             except Exception as exc:
                 logger.warning("record_test label projection %s#%s exception=%s",
                                repo, pr_number, type(exc).__name__)
+            await self._post_bound_notice(
+                repo, pr_number, head_sha=pr_head,
+                round_id=round_id_for_state(state), comment_id=comment_id,
+                topic="test-result-recorded", expected_command_kind="record_test",
+                message=(f"Test result recorded as `{result}` for HEAD `{_short(pr_head)}` "
+                         f"in round `{round_id_for_state(state)}`. Final status: `{state['status']}`."),
+            )
             # Failures are logged/backed off internally and cannot undo or block
             # consumption of this durably completed business command.
             await self._retry_terminal_cos(repo, pr_number, state)
@@ -3209,7 +3973,7 @@ class DeployController:
 
 
         except PolicyError as e:
-            await self._post_error(repo, pr_number, str(e))
+            await self._post_error(repo, pr_number, str(e), comment_id=comment_id)
             return True
         except Exception as e:
             logger.error(
@@ -3233,6 +3997,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "No deploy approval state found for this PR.",
+                    comment_id=comment_id,
                 )
                 return True
 
@@ -3301,7 +4066,7 @@ class DeployController:
 
 
     def _get_component_ids_for_machine(
-        self, machine_alias: str, components: list[dict],
+        self, machine_alias: str, components: list[dict], repo: str,
     ) -> list[str]:
         """Return component_ids compatible with this machine.
 
@@ -3314,12 +4079,13 @@ class DeployController:
           non-empty driver_path matching one of machine.driver_paths.
         - No empty-value bypass.
         """
-        machine = self.policy.get_machine(machine_alias)
-        if machine is None:
+        machine = self.policy.get_machine(machine_alias, repo=repo)
+        if machine is None or not self._machine_is_deployable(machine):
             return []
         result = []
         for comp in components:
-            if not self.policy.machine_supports_target(machine_alias, comp.get("target", "")):
+            if not self.policy.machine_supports_target(
+                    machine_alias, comp.get("target", ""), repo=repo):
                 continue
             comp_platform = comp.get("resolved_platform", "")
             if not comp_platform or not machine.platforms or comp_platform not in machine.platforms:
@@ -3335,8 +4101,17 @@ class DeployController:
             result.append(comp.get("component_id", ""))
         return result
 
+    def _machine_is_deployable(self, machine) -> bool:
+        if (machine is None or not getattr(machine, "node_id", "")
+                or not getattr(machine, "node_host", "")):
+            return False
+        if self._agent_core_factory is not None:
+            return True
+        tokens = getattr(self.config, "agent_core_tokens", {})
+        return isinstance(tokens, dict) and bool(tokens.get(getattr(machine, "alias", "")))
+
     def _get_machine_groups_for_components(
-        self, components: list[dict],
+        self, components: list[dict], repo: str,
     ) -> list[dict]:
         """Determine compatible machine groups for the given components.
 
@@ -3347,7 +4122,15 @@ class DeployController:
         multi-machine deployment where no single machine covers all
         remaining components.
         """
-        machines = self.policy.get_machines()
+        machines = self.policy.get_machines(repo=repo)
+        ip_counts: dict[str, int] = {}
+        for machine in machines:
+            try:
+                address = ipaddress.ip_address(getattr(machine, "node_host", ""))
+            except ValueError:
+                continue
+            if address.version == 4:
+                ip_counts[str(address)] = ip_counts.get(str(address), 0) + 1
         required_ids = {
             comp.get("component_id", "")
             for comp in components
@@ -3355,10 +4138,20 @@ class DeployController:
         }
         groups = []
         for m in machines:
+            if not self._machine_is_deployable(m):
+                continue
+            try:
+                address = ipaddress.ip_address(m.node_host)
+            except ValueError:
+                continue
+            if address.version != 4 or ip_counts.get(str(address)) != 1:
+                # Approval suggestions use literal IPs. An IP shared by
+                # multiple aliases cannot be resolved safely by that command.
+                continue
             compatible = []
             for comp in components:
                 if not self.policy.machine_supports_target(
-                    m.alias, comp.get("target", ""),
+                    m.alias, comp.get("target", ""), repo=repo,
                 ):
                     continue
                 comp_platform = comp.get("resolved_platform", "")
@@ -3384,7 +4177,7 @@ class DeployController:
         return groups
 
     def _enrich_deployments_for_render(
-        self, deployments: list[dict], *, historical: bool = False,
+        self, deployments: list[dict], repo: str, *, historical: bool = False,
         historical_machine_groups: list[dict] | None = None,
     ) -> list[dict]:
         """Enrich deployment rows with machine IP for render-only display.
@@ -3432,7 +4225,7 @@ class DeployController:
                     ip = next(iter(group_matches)) if len(group_matches) == 1 else "历史未记录"
             elif (not historical and not (isinstance(ip, str) and ip.strip())
                   and isinstance(machine_alias, str) and machine_alias):
-                machine_info = self.policy.get_machine(machine_alias)
+                machine_info = self.policy.get_machine(machine_alias, repo=repo)
                 if machine_info is not None:
                     ip = machine_info.node_host or ""
             enriched.append({
@@ -3606,7 +4399,7 @@ class DeployController:
         return False, result
 
     async def _snapshot_terminal_runtime_logs(
-        self, components: list[dict], deployments: list[dict],
+        self, repo: str, components: list[dict], deployments: list[dict],
     ) -> dict[str, str]:
         """Snapshot terminal runtime logs for deployed components.
 
@@ -3640,18 +4433,20 @@ class DeployController:
                     continue
                 seen.add(seen_key)
                 source_key = f"{machine_alias}/{runtime_id}"
-                machine = self.policy.get_machine(machine_alias)
+                machine = self.policy.get_machine(machine_alias, repo=repo)
                 if machine is None:
                     result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
                     continue
                 try:
-                    core = await self._core_for_node(machine.node_id)
+                    core = await self._core_for_node(machine.node_id, repo)
                     status = await core.driver_status(runtime_id)
                     logs = status.get("logs", "") if isinstance(status, dict) else ""
                     if isinstance(logs, str) and logs:
                         result[source_key] = logs
                     else:
                         result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
+                except NameError:
+                    raise
                 except Exception:
                     result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
         return result
@@ -3751,7 +4546,9 @@ class DeployController:
                             or state.get("deployment_logs", {}).get(machine_alias) != task):
                         return
             all_logs = await asyncio.wait_for(
-                self._snapshot_terminal_runtime_logs(state.get("components", []), deployments),
+                self._snapshot_terminal_runtime_logs(
+                    repo, state.get("components", []), deployments,
+                ),
                 timeout=20,
             )
             machine_logs = {k: v for k, v in all_logs.items() if k.startswith(machine_alias + "/")}
@@ -3866,14 +4663,14 @@ class DeployController:
                 "Write, maintain, or admin access required."
             )
 
-    def _is_deployed_machine_owner(self, actor: str, state: dict) -> bool:
+    def _is_deployed_machine_owner(self, actor: str, state: dict, repo: str) -> bool:
         actor_lower = actor.strip().casefold() if isinstance(actor, str) else ""
         if not actor_lower:
             return False
         for dep in state.get("deployments", []):
             if not isinstance(dep, dict) or dep.get("phase") != "deployed":
                 continue
-            machine = self.policy.get_machine(dep.get("machine", ""))
+            machine = self.policy.get_machine(dep.get("machine", ""), repo=repo)
             if machine and any(
                 isinstance(owner, str) and owner.casefold() == actor_lower
                 for owner in (machine.owners or [])
@@ -3886,16 +4683,23 @@ class DeployController:
         comment_id=None, result="",
     ) -> None:
         """Authorize a configured allowlisted GitHub user for this round."""
-        reviewers = getattr(self.config, "test_reviewers", None)
-        if not isinstance(reviewers, list) or not reviewers:
+        reviewers = self.policy.reviewers_for_repo(repo)
+        valid_reviewers = {
+            reviewer.strip().casefold()
+            for reviewer in reviewers if isinstance(reviewer, str)
+            and _LOGIN_RE.fullmatch(reviewer.strip())
+            and not reviewer.strip().casefold().endswith("[bot]")
+        } if isinstance(reviewers, list) else set()
+        if not valid_reviewers:
             raise PolicyError(
-                "验收人白名单尚未配置；已拒绝记录测试结果，请配置 "
-                "/run/deploy-approval/test_reviewers.yaml。"
+                f"当前仓库 `{repo}` 没有有效的验收人白名单，已拒绝记录测试结果。"
+                f"请检查该仓库 main 分支的 `test_reviewers.yaml`；不会使用其他仓库的名单。"
             )
         actor_lower = actor.strip().casefold() if isinstance(actor, str) else ""
-        if not actor_lower or actor_lower not in {
-                value.casefold() for value in reviewers if isinstance(value, str)}:
-            raise PolicyError("只有 `test_reviewers.yaml` 验收人白名单中的 GitHub 用户可以执行 /record_test。")
+        if not actor_lower or actor_lower not in valid_reviewers:
+            raise PolicyError(
+                f"只有当前仓库 `{repo}` 的 `test_reviewers.yaml` 白名单用户可以执行 `/record_test`。"
+            )
         request = state.get("acceptance_request")
         try:
             expected_round = round_id_for_state(state)
@@ -4120,7 +4924,7 @@ class DeployController:
                 continue
 
             machine_alias = deployment_record.get("machine", "")
-            machine = self.policy.get_machine(machine_alias)
+            machine = self.policy.get_machine(machine_alias, repo=repo)
             if machine is None:
                 results[cid] = "fail"
                 continue
@@ -4141,7 +4945,7 @@ class DeployController:
 
             # Resolve core client (only for components with cases)
             try:
-                core = await self._core_for_node(node_id)
+                core = await self._core_for_node(node_id, repo)
             except Exception as e:
                 logger.warning("case core resolve %s: %s", cid, e)
                 results[cid] = "fail"
@@ -4482,6 +5286,40 @@ class DeployController:
                 or confirmed.get("body") != final_body):
             raise GitHubStateProxyError("preflight archive: lifecycle readback failed")
 
+    @staticmethod
+    def _set_lifecycle_summary_status(markdown: str, status: str) -> str:
+        if status not in {"deploy-requested", "deploying"}:
+            raise DeployControllerError(f"unsupported lifecycle display status {status!r}")
+        target = f"**Status:** `{status}`"
+        if target in markdown:
+            return markdown
+        alternate = "**Status:** `deploying`" if status == "deploy-requested" else "**Status:** `deploy-requested`"
+        if markdown.count(alternate) != 1:
+            raise DeployControllerError("lifecycle summary status marker is missing or ambiguous")
+        return markdown.replace(alternate, target, 1)
+
+    def _deploy_requested_markdown(
+        self, repo, pr_number, head_sha, components, machine_groups, *,
+        display_status: str = "deploy-requested", **kwargs,
+    ) -> str:
+        renderer = comments_mod.deploy_requested
+        try:
+            parameters = inspect.signature(renderer).parameters
+            supports_display_status = (
+                "display_status" in parameters
+                or any(item.kind == inspect.Parameter.VAR_KEYWORD
+                       for item in parameters.values())
+            )
+        except (TypeError, ValueError):
+            supports_display_status = False
+        if supports_display_status:
+            return renderer(
+                repo, pr_number, head_sha, components, machine_groups,
+                display_status=display_status, **kwargs,
+            )
+        markdown = renderer(repo, pr_number, head_sha, components, machine_groups, **kwargs)
+        return self._set_lifecycle_summary_status(markdown, display_status)
+
     def _deployment_progress_markdown(self, repo, pr_number, state, machine, components, phase):
         deployed = _component_id_set(state.get("deployments", []))
         remaining = [c for c in state.get("components", []) if c.get("component_id") not in deployed]
@@ -4496,12 +5334,14 @@ class DeployController:
                 ("approval received", "preflight failed")) else "deploying"),
             "timestamp": comments_mod.beijing_now_str(),
         }]
-        return comments_mod.deploy_requested(
+        display_status = "deploying" if state.get("status") == "deploying" else "deploy-requested"
+        return self._deploy_requested_markdown(
             repo, pr_number, state["head_sha"], state.get("components", []),
-            self._get_machine_groups_for_components(remaining),
-            deployments=self._enrich_deployments_for_render(display_deployments),
+            self._get_machine_groups_for_components(remaining, repo),
+            deployments=self._enrich_deployments_for_render(display_deployments, repo),
             gate_note=[f"{phase}: `{machine.alias}` / `{machine.node_host}`; components: {targets}; "
                        f"{comments_mod.beijing_now_str()}"],
+            display_status=display_status,
         )
 
     async def _archive_round(self, repo, pr_number, state, reason):
@@ -5065,40 +5905,6 @@ class DeployController:
             visible = self._replace_markdown_section(
                 visible, "### Workflow", workflow, "### Next action",
             )
-            next_action_start = visible.find("### Next action")
-            action_content_start = (next_action_start + len("### Next action")
-                                    if next_action_start >= 0 else -1)
-            next_heading = "### Current Deployment"
-            if (action_content_start >= 0
-                    and visible.find(next_heading, action_content_start) < 0):
-                candidates = [
-                    match.start() + action_content_start
-                    for match in re.finditer(r"(?m)^#{1,6}[ \t]+[^\r\n]+", visible[action_content_start:])
-                ]
-                candidates.extend(
-                    position for marker in (
-                        "<!-- evidence-projection:start -->",
-                        VISIBLE_HISTORY_START_MARKER,
-                    )
-                    if (position := visible.find(marker, action_content_start)) >= 0
-                )
-                next_heading = (
-                    visible[min(candidates):].splitlines()[0]
-                    if candidates else None
-                )
-            visible = self._replace_markdown_section(
-                visible, "### Next action",
-                ("等待独立验收人确认。" if isinstance(state.get("acceptance_request"), dict)
-                 and state["acceptance_request"].get("status") == "pending"
-                 and state["acceptance_request"].get("head_sha") == state.get("head_sha")
-                 and state["acceptance_request"].get("round_id") == current_round
-                 and getattr(self.config, "test_reviewers", [])
-                 else "独立验收名单待配置；配置前不能记录最终验收结果。"
-                 if isinstance(state.get("acceptance_request"), dict)
-                 and state["acceptance_request"].get("status") == "pending"
-                 else comments_mod._testing_next_action(confirmed_current)),
-                next_heading,
-            )
         # Presentation flags are deliberately ephemeral. Hidden state has a
         # strict schema and must never learn about browser feature config.
         render_state = copy.deepcopy(state)
@@ -5118,6 +5924,79 @@ class DeployController:
             raise GitHubStateProxyError(
                 "Evidence projection could not verify current PR head",
             )
+        if state.get("status") == "testing":
+            acceptance = state.get("acceptance_request")
+            acceptance_pending = (
+                isinstance(acceptance, dict)
+                and acceptance.get("status") == "pending"
+                and acceptance.get("head_sha") == state.get("head_sha")
+                and acceptance.get("round_id") == current_round
+            )
+            reviewers_configured, eligible_reviewers = self._eligible_acceptance_reviewers(
+                repo, pr,
+            )
+            fresh_testing = comments_mod.testing(
+                repo, pr_number, state.get("head_sha", ""),
+                deployments=self._enrich_deployments_for_render(
+                    state.get("deployments", []), repo,
+                ),
+                components=state.get("components", []),
+                evidence_complete=confirmed_current,
+                deployments_complete=deployments_complete,
+                acceptance_pending=acceptance_pending,
+                acceptance_reviewers_configured=reviewers_configured,
+                acceptance_reviewers=eligible_reviewers,
+            )
+            action_heading = re.search(r"(?m)^### Next action[ \t]*$", fresh_testing)
+            if action_heading is not None:
+                action_start = action_heading.end()
+                next_template_heading = re.search(
+                    r"(?m)^#{1,6}[ \t]+[^\r\n]+", fresh_testing[action_start:],
+                )
+                action_end = (action_start + next_template_heading.start()
+                              if next_template_heading else len(fresh_testing))
+                next_action = fresh_testing[action_start:action_end].strip()
+                if acceptance_pending and not eligible_reviewers:
+                    reviewer_guidance = self._acceptance_reviewer_guidance(
+                        repo, pr, reviewers_configured, eligible_reviewers,
+                    )
+                    if reviewers_configured:
+                        next_action = "\n\n".join((
+                            reviewer_guidance,
+                            "由当前仓库验收白名单中的获授权账号输入 `/record_test result=pass` 或 `/record_test result=fail`。",
+                        ))
+                    else:
+                        next_action = "\n\n".join((
+                            reviewer_guidance,
+                            "配置有效的当前仓库验收账号后，获授权验收人才能输入 `/record_test result=pass` 或 `/record_test result=fail`。",
+                        ))
+                action_start = visible.find("### Next action")
+                action_content_start = (action_start + len("### Next action")
+                                        if action_start >= 0 else -1)
+                next_heading = "### Current Deployment"
+                if (action_content_start >= 0
+                        and visible.find(next_heading, action_content_start) < 0):
+                    candidates = [
+                        match.start() + action_content_start
+                        for match in re.finditer(
+                            r"(?m)^#{1,6}[ \t]+[^\r\n]+",
+                            visible[action_content_start:],
+                        )
+                    ]
+                    candidates.extend(
+                        position for marker in (
+                            "<!-- evidence-projection:start -->",
+                            VISIBLE_HISTORY_START_MARKER,
+                        )
+                        if (position := visible.find(marker, action_content_start)) >= 0
+                    )
+                    next_heading = (
+                        visible[min(candidates):].splitlines()[0]
+                        if candidates else None
+                    )
+                visible = self._replace_markdown_section(
+                    visible, "### Next action", next_action, next_heading,
+                )
         try:
             from .evidence_auth import readiness
             status = readiness(self.config, self.evidence_service)
@@ -5182,7 +6061,7 @@ class DeployController:
             # This display-only copy may use current authorized machine data
             # when a legacy current-round deployment row has no captured IP.
             render_state["deployments"] = self._enrich_deployments_for_render(
-                state.get("deployments", []),
+                state.get("deployments", []), repo,
             )
         if current_round in round_numbers:
             render_state["round_number"] = round_numbers[current_round]
@@ -5529,7 +6408,7 @@ class DeployController:
                     snapshot, repo, pr_number, archive["head_sha"], archive["round_id"],
                 )
             snapshot["deployments"] = self._enrich_deployments_for_render(
-                snapshot.get("deployments", []), historical=True,
+                snapshot.get("deployments", []), repo, historical=True,
                 historical_machine_groups=snapshot.get("machine_groups"),
             )
             archive_head = archive["head_sha"]
@@ -6621,6 +7500,13 @@ class DeployController:
             repo, pr_number, state, markdown, event=event,
         )
         await self.proxy.project_status_label(repo, pr_number, "review-required")
+        await self._post_bound_notice(
+            repo, pr_number, head_sha=new_head,
+            round_id=round_id_for_state(state), comment_id=comment_id,
+            topic="pr-head-updated",
+            message=(f"The PR HEAD changed from `{_short(old_head)}` to `{_short(new_head)}`. "
+                     "The previous review and deployment approval are invalid. Wait for trusted review evidence on the new HEAD."),
+        )
 
     async def _invalidate_review_required(
         self,
@@ -6683,9 +7569,582 @@ class DeployController:
             repo, pr_number, state, markdown, event=event,
         )
         await self.proxy.project_status_label(repo, pr_number, "review-required")
+        await self._post_bound_notice(
+            repo, pr_number, head_sha=head_sha,
+            round_id=round_id_for_state(state), comment_id=comment_id,
+            topic="predeploy-validation-invalidated",
+            message=(f"Pre-deployment validation failed ({reason}). No new deploy POST was started. "
+                     "Wait for current HEAD review evidence, then submit a new approval."),
+        )
+
+    async def _current_testing_upload_url(
+        self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
+        approval_comment_id: int,
+    ) -> str:
+        """Return only the current Summary's verified upload link for this testing round."""
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            base = pr.get("base", {}) if isinstance(pr, dict) else {}
+            base_repo = base.get("repo", {}) if isinstance(base, dict) else {}
+            full_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+            if (not isinstance(pr, dict) or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")
+                    or not isinstance(full_name, str)
+                    or full_name.casefold() != repo.casefold()
+                    or (pr.get("head") or {}).get("sha") != head_sha
+                    or not isinstance(state, dict)
+                    or state.get("status") != "testing"
+                    or state.get("head_sha") != head_sha
+                    or round_id_for_state(state) != round_id):
+                return ""
+            command = state.get("command", {})
+            if (not isinstance(command, dict)
+                    or command.get("kind") != "approve_deploy"
+                    or command.get("comment_id") != approval_comment_id):
+                return ""
+
+            try:
+                from .evidence_auth import UPLOAD_PURPOSE, readiness, verify_capability
+            except Exception:
+                return ""
+            evidence_status = readiness(self.config, self.evidence_service)
+            store = getattr(self.evidence_service, "store", None)
+            if (not isinstance(evidence_status, dict)
+                    or evidence_status.get("EVIDENCE_BACKEND_READY") is not True
+                    or evidence_status.get("PUBLIC_HTTPS_INGRESS_READY") is not True
+                    or not callable(getattr(store, "dispatch", None))):
+                return ""
+
+            configured_origin = str(
+                getattr(self.config, "evidence_public_base_url", "") or "",
+            ).rstrip("/")
+            if not is_evidence_ingress_url(configured_origin):
+                return ""
+            configured_parts = urlsplit(configured_origin)
+
+            comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+            body = comment.get("body") if isinstance(comment, dict) else None
+            if not isinstance(body, str):
+                return ""
+            from .github_state_proxy import HIDDEN_STATE_MARKER
+            visible = body.split(HIDDEN_STATE_MARKER, 1)[0]
+            embedded_state = _extract_hidden_state(body)
+            if embedded_state != state:
+                return ""
+            link_match = re.search(
+                r"(?m)^\[deploy-approval-upload\]:[ \t]*<(?P<url>https://[^<>\s]+)>[ \t]*$",
+                visible,
+            )
+            if link_match is None:
+                return ""
+            candidate = comments_mod._trusted_upload_page_url(
+                link_match.group("url"), repo, pr_number,
+            )
+            if not candidate:
+                return ""
+            parsed = urlsplit(candidate)
+            if (parsed.scheme != "https"
+                    or parsed.netloc.casefold() != configured_parts.netloc.casefold()):
+                return ""
+            query = parse_qs(parsed.query, strict_parsing=True)
+            values = query.get("cap")
+            if set(query) != {"cap"} or not isinstance(values, list) or len(values) != 1:
+                return ""
+            claims = verify_capability(
+                self.config, values[0], repo, pr_number,
+                purpose=UPLOAD_PURPOSE,
+            )
+            if (claims.get("head") != head_sha
+                    or claims.get("round") != round_id
+                    or claims.get("status") != "testing"):
+                return ""
+            return candidate
+        except Exception as exc:
+            logger.warning("current testing upload link unavailable %s#%s exception=%s",
+                           repo, pr_number, type(exc).__name__)
+            return ""
+
+    async def _post_bound_notice(
+        self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
+        comment_id: int, topic: str, message: str,
+        expected_command_kind: str = "",
+        allow_bot_origin: bool = False,
+        allow_missing_state: bool = False,
+    ) -> bool:
+        """Post one command-bound public reply, confirming uncertain POSTs by readback."""
+        if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id)
+                or type(comment_id) is not int or comment_id <= 0):
+            return False
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            origin = await self.proxy.get_comment(repo, comment_id)
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception as exc:
+            logger.warning("notice preflight %s#%s failed: %s",
+                           repo, pr_number, type(exc).__name__)
+            return False
+        api_base = self.config.github_api_url.rstrip("/")
+        expected_issue_url = f"{api_base}/repos/{repo}/issues/{pr_number}"
+        expected_comment_url = f"{api_base}/repos/{repo}/issues/comments/{comment_id}"
+        if (not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("merged")
+                or pr.get("draft") or (pr.get("head") or {}).get("sha") != head_sha
+                or not isinstance(origin, dict) or origin.get("id") != comment_id
+                or origin.get("url") != expected_comment_url
+                or origin.get("issue_url") != expected_issue_url
+                or not isinstance(origin.get("created_at"), str)
+                or origin.get("updated_at") != origin.get("created_at")
+                or (self.proxy.is_bot_comment(origin) and not allow_bot_origin)
+                or not isinstance(comments, list)):
+            return False
+        if isinstance(state, dict) and state.get("head_sha") == head_sha:
+            if round_id_for_state(state) != round_id:
+                return False
+        elif (not allow_missing_state or expected_command_kind
+              or round_id != make_round_id(head_sha, comment_id)):
+            return False
+        if expected_command_kind:
+            command = state.get("command", {})
+            if (not isinstance(command, dict)
+                    or command.get("kind") != expected_command_kind
+                    or command.get("comment_id") != comment_id):
+                return False
+        identity = "\0".join((repo, str(pr_number), head_sha, round_id,
+                               str(comment_id), topic))
+        marker = "<!-- deploy-approval-notice:v1:" + hashlib.sha256(
+            identity.encode("utf-8"),
+        ).hexdigest() + " -->"
+
+        def found_marker(items):
+            return next((item for item in items
+                         if isinstance(item, dict)
+                         and isinstance(item.get("body"), str)
+                         and marker in item["body"]
+                         and self.proxy.is_bot_comment(item)), None)
+
+        if found_marker(comments):
+            return True
+        payload = message.strip()
+        if payload.startswith(comments_mod.BOT_MARKER):
+            payload = payload[len(comments_mod.BOT_MARKER):].lstrip()
+        body = "\n".join((comments_mod.BOT_MARKER, marker, "", payload))
+        try:
+            posted = await self.proxy.post_issue_comment(repo, pr_number, body)
+        except Exception as post_error:
+            # A lost response may still have created the comment. Read before
+            # returning so a retry can never blindly duplicate the notice.
+            try:
+                latest = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception as read_error:
+                logger.warning("notice POST outcome unknown %s#%s topic=%s",
+                               repo, pr_number, topic)
+                return False
+            return bool(isinstance(latest, list) and found_marker(latest))
+        if isinstance(posted, dict) and posted.get("id"):
+            body_value = posted.get("body", "")
+            if marker in body_value and self.proxy.is_bot_comment(posted):
+                return True
+        try:
+            latest = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return False
+        return bool(isinstance(latest, list) and found_marker(latest))
+
+    async def _post_deploy_ready_notice(
+        self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
+        review_evidence: dict, components: list[dict],
+    ) -> bool:
+        """Notify once for one freshly verified Review Agent result."""
+        build_comment_id = review_evidence.get("build_comment_id")
+        if type(build_comment_id) is not int or build_comment_id <= 0:
+            return False
+        event_fingerprint = hashlib.sha256(
+            repr(sorted(self._review_evidence_identity(review_evidence).items())).encode(),
+        ).hexdigest()
+        notice_identity = "\0".join((
+            repo, str(pr_number), head_sha, round_id, "deploy-ready",
+            str(build_comment_id), event_fingerprint,
+        ))
+        marker = "<!-- deploy-approval-notice:v1:" + hashlib.sha256(
+            notice_identity.encode("utf-8"),
+        ).hexdigest() + " -->"
+
+        async def context_is_current() -> bool:
+            try:
+                pr = await self.proxy.get_pr(repo, pr_number)
+                state = await self.proxy.read_hidden_state(repo, pr_number)
+            except Exception:
+                return False
+            if not isinstance(pr, dict):
+                return False
+            base = pr.get("base", {}) if isinstance(pr, dict) else {}
+            base_repo = base.get("repo", {}) if isinstance(base, dict) else {}
+            head = pr.get("head")
+            full_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+            if (pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")
+                    or pr.get("number") != pr_number
+                    or not isinstance(head, dict) or head.get("sha") != head_sha
+                    or not isinstance(full_name, str)
+                    or full_name.casefold() != repo.casefold()
+                    or not isinstance(state, dict)
+                    or state.get("status") != "deploy-ready"
+                    or state.get("head_sha") != head_sha
+                    or round_id_for_state(state) != round_id
+                    or not isinstance(state.get("review_evidence"), dict)
+                    or self._review_evidence_identity(state.get("review_evidence", {}))
+                    != self._review_evidence_identity(review_evidence)
+                    or self._canonical_component_snapshot(state.get("components", []))
+                    != self._canonical_component_snapshot(components)):
+                return False
+            return await self._fresh_review_evidence_matches_state(
+                repo, pr_number, head_sha, review_evidence,
+                expected_components=components,
+            )
+
+        def marker_exists(comments) -> bool:
+            if not isinstance(comments, list):
+                return False
+            return any(
+                isinstance(comment, dict)
+                and isinstance(comment.get("body"), str)
+                and marker in comment["body"]
+                and self.proxy.is_bot_comment(comment)
+                for comment in comments
+            )
+
+        if not await context_is_current():
+            return False
+        try:
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return False
+        if not isinstance(comments, list):
+            return False
+        if marker_exists(comments):
+            return True
+        # The trusted review may have changed while the marker read waited.
+        if not await context_is_current():
+            return False
+
+        groups = self._get_machine_groups_for_components(components, repo)
+        commands = self._machine_notice_lines(
+            groups, repo, mention_owners=False,
+        )
+        required_ids = {
+            component.get("component_id") for component in components
+            if isinstance(component, dict) and isinstance(component.get("component_id"), str)
+        }
+        full_groups = [
+            group for group in groups
+            if required_ids and required_ids.issubset(set(group.get("component_ids", [])))
+        ]
+        message_lines = [
+            f"当前 Commit `{_short(head_sha)}` 的构建和审核已完成，Lifecycle 已进入 `deploy-ready`。",
+        ]
+        if commands:
+            message_lines.extend([
+                "现在可以审批部署。可用机器及完整 IP 审批命令：",
+                *commands,
+            ])
+            if len(full_groups) == 1:
+                message_lines.extend([
+                    "只有一台机器完整适配全部组件，也可以直接执行 `/approve_deploy`。",
+                ])
+            elif len(full_groups) > 1:
+                message_lines.append("有多台机器完整适配，请从上面的 IP 命令中明确选择一台。")
+            elif required_ids:
+                message_lines.append("没有单台机器覆盖全部组件；可按上面的命令分批审批适配机器。")
+        else:
+            message_lines.append(
+                "审核和构建已完成，但当前没有适配且可访问的机器，暂时无法部署。请检查当前仓库的机器配置和 Agent Core 访问。"
+            )
+        message_lines.append("无需先执行 `/request_deploy`；该命令仍可用于显式申请部署。")
+        body = "\n".join((comments_mod.BOT_MARKER, marker, "", *message_lines))
+        if not await context_is_current():
+            return False
+        try:
+            posted = await self.proxy.post_issue_comment(repo, pr_number, body)
+        except Exception:
+            try:
+                latest = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception:
+                return False
+            return bool(isinstance(latest, list) and marker_exists(latest))
+        if (isinstance(posted, dict) and marker in posted.get("body", "")
+                and self.proxy.is_bot_comment(posted)):
+            return True
+        try:
+            latest = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return False
+        return bool(isinstance(latest, list) and marker_exists(latest))
+
+    async def _post_command_reply(
+        self, repo: str, pr_number: int, comment_id: int, message: str,
+        *, topic: str = "command-error",
+    ) -> None:
+        """Bind an operation reply to the current PR HEAD, round, and source comment."""
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+        except Exception as exc:
+            logger.warning("command reply context %s#%s unavailable: %s",
+                           repo, pr_number, type(exc).__name__)
+            return
+        head = ((pr.get("head") or {}).get("sha")
+                if isinstance(pr, dict) else "")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return
+        has_current_head_state = (
+            isinstance(state, dict) and state.get("head_sha") == head
+        )
+        if has_current_head_state:
+            round_id = round_id_for_state(state)
+        else:
+            # No persisted lifecycle round exists for the current HEAD. Bind
+            # this rejected command to a deterministic event-scoped identity.
+            round_id = make_round_id(head, comment_id)
+        await self._post_bound_notice(
+            repo, pr_number, head_sha=head, round_id=round_id,
+            comment_id=comment_id, topic=topic, message=message,
+            allow_missing_state=not has_current_head_state,
+        )
+
+    @staticmethod
+    def _is_test_only_pr(pr: dict | None) -> bool:
+        title = pr.get("title", "") if isinstance(pr, dict) else ""
+        return isinstance(title, str) and "[TEST ONLY]" in title.upper()
+
+    def _eligible_acceptance_reviewers(
+        self, repo: str, pr: dict | None,
+    ) -> tuple[bool, list[str]]:
+        try:
+            configured_reviewers = self.policy.reviewers_for_repo(repo)
+        except Exception as exc:
+            logger.warning("acceptance reviewer policy unavailable %s exception=%s",
+                           repo, type(exc).__name__)
+            return False, []
+        valid_reviewers = []
+        seen = set()
+        for reviewer in configured_reviewers if isinstance(configured_reviewers, list) else []:
+            if (not isinstance(reviewer, str)
+                    or not _LOGIN_RE.fullmatch(reviewer.strip())
+                    or reviewer.strip().casefold().endswith("[bot]")):
+                continue
+            key = reviewer.strip().casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            valid_reviewers.append(reviewer.strip())
+        eligible = valid_reviewers
+        if self._is_test_only_pr(pr):
+            # Test PRs suppress real reviewer mentions. Mention Haohao-end only
+            # when this repository's verified policy explicitly allows it.
+            eligible = ["Haohao-end" for name in eligible
+                        if name.casefold() == "haohao-end"]
+        return bool(valid_reviewers), eligible
+
+    def _acceptance_reviewer_guidance(
+        self, repo: str, pr: dict | None, reviewers_configured: bool,
+        eligible_reviewers: list[str],
+    ) -> str:
+        """Describe repo-scoped acceptance authorization without TEST ONLY leaks."""
+        if self._is_test_only_pr(pr):
+            if any(reviewer.casefold() == "haohao-end" for reviewer in eligible_reviewers):
+                return "测试验收账号 @Haohao-end 已列入当前仓库验收白名单。"
+            if reviewers_configured:
+                return (
+                    f"当前仓库 `{repo}` 已配置有效验收白名单。为避免打扰，[TEST ONLY] PR 不 @真实验收人；"
+                    "Haohao-end 不在该仓库白名单中，未获授权执行 `/record_test`。"
+                )
+            return (
+                f"当前仓库 `{repo}` 没有可确认的有效验收白名单。Haohao-end 也未获授权，"
+                "请检查该仓库 main 分支的 `test_reviewers.yaml`。"
+            )
+        if eligible_reviewers:
+            return "当前仓库有效验收人：" + " ".join(
+                f"@{reviewer}" for reviewer in eligible_reviewers
+            )
+        if not reviewers_configured:
+            return (
+                f"当前仓库 `{repo}` 没有可确认的有效验收白名单，请检查该仓库 main 分支的 `test_reviewers.yaml`。"
+            )
+        return f"当前仓库 `{repo}` 的验收白名单中没有可用的 GitHub 账号。"
+
+    def _machine_notice_lines(
+        self, groups: list[dict], repo: str, *, mention_owners: bool,
+        test_only: bool = False,
+    ) -> list[str]:
+        lines: list[str] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            ip = str(group.get("ip", "") or "").strip()
+            try:
+                parsed_ip = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if parsed_ip.version != 4:
+                continue
+            lines.append(f"`/approve_deploy machine={parsed_ip}`")
+            if mention_owners and not test_only:
+                machine = self.policy.get_machine(str(group.get("alias", "")), repo=repo)
+                owners = getattr(machine, "owners", []) if machine is not None else []
+                valid_owners = sorted({
+                    owner.strip() for owner in owners
+                    if isinstance(owner, str) and _LOGIN_RE.fullmatch(owner.strip())
+                    and not owner.strip().casefold().endswith("[bot]")
+                }, key=str.casefold)
+                if valid_owners:
+                    lines.append("对应机器负责人：" + " ".join(f"@{owner}" for owner in valid_owners))
+        return lines
+
+    async def _approval_command_guidance(self, repo: str, pr_number: int) -> str:
+        """Build executable approval guidance from the current trusted lifecycle."""
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")):
+                return "Deployment approval requires an open, unmerged, non-draft PR."
+            head = pr.get("head", {}).get("sha", "")
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                    or not isinstance(state, dict) or state.get("head_sha") != head):
+                return "The PR HEAD or lifecycle changed; wait for the current Lifecycle Summary to update before retrying."
+            status = state.get("status", "")
+            if status not in {"deploy-ready", "deploy-requested"}:
+                return f"Current lifecycle status is `{status or 'unknown'}`; wait until deployment approval is available."
+            review_evidence = state.get("review_evidence")
+            components = state.get("components")
+            if (not isinstance(review_evidence, dict) or not isinstance(components, list)
+                    or not await self._fresh_review_evidence_matches_state(
+                        repo, pr_number, head, review_evidence,
+                        expected_components=components,
+                    )):
+                return "Current HEAD does not have fresh trusted Review Agent evidence; wait for lifecycle reconciliation."
+            deployed_ids = _component_id_set(state.get("deployments", []))
+            remaining = [
+                component for component in components
+                if isinstance(component, dict)
+                and component.get("component_id") not in deployed_ids
+            ]
+            groups = self._get_machine_groups_for_components(remaining, repo)
+            commands = self._machine_notice_lines(
+                groups, repo, mention_owners=False,
+                test_only=self._is_test_only_pr(pr),
+            )
+            if not commands:
+                return "No trusted compatible machine with a unique IPv4 address is available; check this repository's machine policy and Agent Core access."
+            lines = ["Current executable machine commands:", *commands]
+            required_ids = {
+                component.get("component_id") for component in remaining
+                if isinstance(component, dict) and isinstance(component.get("component_id"), str)
+            }
+            full_groups = [
+                group for group in groups
+                if required_ids and required_ids.issubset(set(group.get("component_ids", [])))
+            ]
+            if status == "deploy-ready" and len(full_groups) == 1:
+                lines.append("Exactly one fully compatible machine is available; `/approve_deploy` also works without a machine argument.")
+            elif len(full_groups) > 1:
+                lines.append("Several fully compatible machines are available; select one of the IP commands above.")
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.warning("approval guidance unavailable %s#%s exception=%s",
+                           repo, pr_number, type(exc).__name__)
+            return "The current machine list could not be verified. Check the Lifecycle Summary before retrying."
+
+    async def _project_status_best_effort(
+        self, repo: str, pr_number: int, status: str,
+    ) -> None:
+        try:
+            await self.proxy.project_status_label(repo, pr_number, status)
+        except Exception as exc:
+            logger.warning("status label projection %s#%s status=%s exception=%s",
+                           repo, pr_number, status, type(exc).__name__)
+
+    async def _block_machine_policy_change(
+        self, repo: str, pr_number: int, state: dict, expected_state: dict,
+        comment_id: int, machine_alias: str, actor: str, reason: str,
+    ) -> bool:
+        """Persist a no-POST result when machine policy changes mid-approval."""
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+        except Exception:
+            return False
+        if (not isinstance(pr, dict) or pr.get("state") != "open"
+                or pr.get("merged") or pr.get("draft")
+                or (pr.get("head") or {}).get("sha") != state.get("head_sha")):
+            return False
+
+        blocked_state = copy.deepcopy(state)
+        blocked_state["status"] = "deploy-requested"
+        blocked_state["command"] = {
+            "comment_id": comment_id,
+            "kind": "approve_deploy",
+            "phase": "completed",
+            "args": {"machine": machine_alias, "actor": actor},
+        }
+        blocked_state["last_processed_comment_id"] = max(
+            int(blocked_state.get("last_processed_comment_id", 0) or 0),
+            comment_id,
+        )
+        deployed_ids = _component_id_set(blocked_state.get("deployments", []))
+        remaining = [
+            component for component in blocked_state.get("components", [])
+            if isinstance(component, dict)
+            and component.get("component_id") not in deployed_ids
+        ]
+        try:
+            machine_groups = self._get_machine_groups_for_components(remaining, repo)
+        except Exception as exc:
+            logger.warning("machine policy changed during approval %s#%s exception=%s",
+                           repo, pr_number, type(exc).__name__)
+            machine_groups = []
+        markdown = comments_mod.deploy_requested(
+            repo, pr_number, blocked_state.get("head_sha", ""),
+            blocked_state.get("components", []), machine_groups,
+            gate_note=[reason, "No deploy POST was sent for the pending component.",
+                       "Review the current machine list and submit a NEW approval command."],
+            deployments=self._enrich_deployments_for_render(
+                blocked_state.get("deployments", []), repo,
+            ),
+        )
+        written = await self._write_lifecycle_with_history(
+            repo, pr_number, blocked_state, markdown,
+            event={"event": "Machine policy changed before deployment",
+                   "machine": machine_alias,
+                   "timestamp": comments_mod.beijing_now_str()},
+            expected_lifecycle_state=expected_state,
+        )
+        if not written:
+            return False
+        await self._project_status_best_effort(repo, pr_number, "deploy-requested")
+        command_lines = self._machine_notice_lines(
+            machine_groups, repo, mention_owners=False,
+            test_only=self._is_test_only_pr(pr),
+        )
+        message_lines = [reason, "No deploy POST was sent for the pending component."]
+        if command_lines:
+            message_lines.extend(["Current compatible commands:", *command_lines])
+        else:
+            message_lines.append("No compatible deployable machine is currently available.")
+        await self._post_bound_notice(
+            repo, pr_number, head_sha=blocked_state["head_sha"],
+            round_id=round_id_for_state(blocked_state), comment_id=comment_id,
+            topic="machine-policy-changed-before-deploy",
+            expected_command_kind="approve_deploy",
+            message="\n".join(message_lines),
+        )
+        return True
 
     async def _post_command_not_ready(
         self, repo: str, pr_number: int, current_status: str, next_action_text: str,
+        *, comment_id: int = 0,
     ) -> None:
         """Post a non-error 'command not ready' reply comment."""
         body = "\n".join([
@@ -6698,13 +8157,18 @@ class DeployController:
             "",
             next_action_text,
         ])
-        try:
-            await self.proxy.post_issue_comment(repo, pr_number, body)
-        except GitHubError as e:
-            logger.warning("post command not ready comment %s#%s: %s", repo, pr_number, e)
+        if comment_id:
+            await self._post_command_reply(
+                repo, pr_number, comment_id, body, topic="command-not-ready",
+            )
+        else:
+            try:
+                await self.proxy.post_issue_comment(repo, pr_number, body)
+            except GitHubError as e:
+                logger.warning("post command not ready comment %s#%s: %s", repo, pr_number, e)
 
     async def _post_error(
-        self, repo: str, pr_number: int, message: str,
+        self, repo: str, pr_number: int, message: str, *, comment_id: int = 0,
     ) -> None:
         """Post an error reply comment."""
         body = "\n".join([
@@ -6713,10 +8177,16 @@ class DeployController:
             "",
             message,
         ])
-        try:
-            await self.proxy.post_issue_comment(repo, pr_number, body)
-        except GitHubError as e:
-            logger.warning("post error comment %s#%s: %s", repo, pr_number, e)
+        if comment_id:
+            topic = "command-error-" + hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+            await self._post_command_reply(
+                repo, pr_number, comment_id, body, topic=topic,
+            )
+        else:
+            try:
+                await self.proxy.post_issue_comment(repo, pr_number, body)
+            except GitHubError as e:
+                logger.warning("post error comment %s#%s: %s", repo, pr_number, e)
 
     # ── Reconcile ──
 
@@ -6754,7 +8224,7 @@ class DeployController:
                     label_status = "acceptance-required"
             if label_status in {
                 "review-required", "reviewing", "deploy-ready",
-                "deploy-requested", "testing", "acceptance-required",
+                "deploy-requested", "deploying", "testing", "acceptance-required",
                 "succeeded", "failed",
             }:
                 try:
@@ -6785,7 +8255,7 @@ class DeployController:
                         label_status = "acceptance-required"
                     if label_status in {
                         "review-required", "reviewing", "deploy-ready",
-                        "deploy-requested", "testing", "acceptance-required",
+                        "deploy-requested", "deploying", "testing", "acceptance-required",
                         "succeeded", "failed",
                     }:
                         await self.proxy.project_status_label(
@@ -6816,11 +8286,11 @@ class DeployController:
             cmd_phase = cmd.get("phase", "")
             same_head = current_head == state.get("head_sha", "")
             if (cmd_phase == "executing" and same_head
-                    and state.get("status") == "deploy-requested"):
+                    and state.get("status") in {"deploying", "deploy-requested"}):
                 await self._handle_uncertain_if_needed(repo, pr_number, state)
                 return
             if (cmd_phase == "uncertain" and same_head
-                    and state.get("status") == "deploy-requested"):
+                    and state.get("status") in {"deploying", "deploy-requested"}):
                 await self._recover_uncertain_deployment_tick(
                     repo, pr_number, state, pr_data,
                 )
@@ -6914,6 +8384,14 @@ class DeployController:
                     )
                 return
 
+            if state.get("status") == "deploying":
+                try:
+                    await self.proxy.project_status_label(repo, pr_number, "deploying")
+                except Exception as exc:
+                    logger.warning("reconcile deploying label %s#%s exception=%s",
+                                   repo, pr_number, type(exc).__name__)
+                return
+
         if pr_state != "open" or pr_merged:
             if state is not None:
                 try:
@@ -6930,6 +8408,7 @@ class DeployController:
             return
 
         # Fetch PR comments and extract review evidence from GitHub comments
+        components: list[dict] = []
         try:
             comments = await self.github.get_issue_comments(repo, pr_number)
             if not isinstance(comments, list):
@@ -7018,7 +8497,7 @@ class DeployController:
                         label_status = "acceptance-required"
                     if label_status in {
                         "review-required", "reviewing", "deploy-ready",
-                        "deploy-requested", "testing", "acceptance-required",
+                        "deploy-requested", "deploying", "testing", "acceptance-required",
                         "succeeded", "failed",
                     }:
                         await self.proxy.project_status_label(
@@ -7031,13 +8510,14 @@ class DeployController:
                     )
             return
 
+        lifecycle_before_update = copy.deepcopy(state) if isinstance(state, dict) else None
         state_was_none = state is None
         if state is None:
             state = self._init_hidden_state(
                 head_sha=current_head,
                 status=desired_status,
                 review_evidence=review_evidence_data,
-                components=[],
+                components=components if desired_status == "deploy-ready" else [],
                 deployments=[],
             )
             state["command"] = {
@@ -7054,7 +8534,7 @@ class DeployController:
             state["head_sha"] = current_head
             state["status"] = desired_status
             state["review_evidence"] = review_evidence_data
-            state["components"] = []
+            state["components"] = components if desired_status == "deploy-ready" else []
             state["deployments"] = []
             state["approve_attempts"] = []
             state["approve_attempts_total"] = 0
@@ -7068,6 +8548,12 @@ class DeployController:
                 "phase": "completed",
                 "args": {},
             }
+
+        if desired_status == "deploy-ready":
+            build_comment_id = review_evidence_data.get("build_comment_id")
+            if type(build_comment_id) is int and build_comment_id > 0:
+                state["round_id"] = make_round_id(current_head, build_comment_id)
+                state["round_started_at"] = state.get("round_started_at") or utc_now()
 
         # No-churn: only write lifecycle/history if there is a real change
         # (prev_status/prev_head/prev_evidence captured BEFORE state mutation above)
@@ -7088,6 +8574,13 @@ class DeployController:
                 logger.warning(
                     "reconcile label projection %s#%s: %s", repo, pr_number, e,
                 )
+            if desired_status == "deploy-ready":
+                await self._post_deploy_ready_notice(
+                    repo, pr_number, head_sha=current_head,
+                    round_id=round_id_for_state(state),
+                    review_evidence=state.get("review_evidence", {}),
+                    components=state.get("components", []),
+                )
         else:
             try:
                 if desired_status == "reviewing":
@@ -7095,7 +8588,12 @@ class DeployController:
                 elif desired_status == "review-required":
                     markdown = comments_mod.review_required(repo, pr_number, current_head)
                 else:
-                    markdown = comments_mod.deploy_ready(repo, pr_number, current_head, build_infos, review_evidence=review_evidence_data)
+                    markdown = comments_mod.deploy_ready(
+                        repo, pr_number, current_head, build_infos,
+                        review_evidence=review_evidence_data,
+                        machine_groups=self._get_machine_groups_for_components(components, repo),
+                        components=components,
+                    )
                 if state_was_none:
                     event = {
                         "event": "Lifecycle initialized",
@@ -7108,10 +8606,30 @@ class DeployController:
                         "lifecycle": f"`{prev_status}` \u2192 `{desired_status}`",
                         "timestamp": comments_mod.beijing_now_str(),
                     }
-                await self._write_lifecycle_with_history(
+                async def guard_deploy_ready_review() -> bool:
+                    return await self._fresh_review_evidence_matches_state(
+                        repo, pr_number, current_head, review_evidence_data,
+                        expected_components=components,
+                    )
+
+                written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=event,
+                    expected_lifecycle_state=lifecycle_before_update,
+                    write_guard=(guard_deploy_ready_review
+                                 if desired_status == "deploy-ready" else None),
                 )
-                await self.proxy.project_status_label(repo, pr_number, desired_status)
+                if not written:
+                    return
+                await self._project_status_best_effort(
+                    repo, pr_number, desired_status,
+                )
+                if desired_status == "deploy-ready":
+                    await self._post_deploy_ready_notice(
+                        repo, pr_number, head_sha=current_head,
+                        round_id=round_id_for_state(state),
+                        review_evidence=review_evidence_data,
+                        components=components,
+                    )
             except Exception as e:
                 logger.warning(
                     "reconcile lifecycle %s#%s: %s", repo, pr_number, e,
@@ -7121,6 +8639,7 @@ class DeployController:
         self, repo: str, pr_number: int, state: dict,
     ) -> None:
         """On startup, if hidden command.phase is executing, mark as uncertain."""
+        original_state = copy.deepcopy(state)
         cmd = state.get("command", {})
         if cmd.get("phase") != "executing":
             return
@@ -7133,6 +8652,7 @@ class DeployController:
         )
 
         cmd["phase"] = "uncertain"
+        state["status"] = "deploying"
         state["command"] = cmd
         comment_id = int(cmd.get("comment_id") or 0)
         old_cursor = int(state.get("last_processed_comment_id", 0) or 0)
@@ -7147,8 +8667,9 @@ class DeployController:
                 machine_alias = raw_machine
 
 
-        markdown = comments_mod.uncertain_comment(
-            repo, pr_number, state.get("head_sha", ""),
+        markdown = self._set_lifecycle_summary_status(
+            comments_mod.uncertain_comment(repo, pr_number, state.get("head_sha", "")),
+            "deploying",
         )
         markdown += (
             "\n\nThe Controller will periodically verify the exact target status. "
@@ -7161,14 +8682,32 @@ class DeployController:
         }
         if machine_alias:
             event["machine"] = machine_alias
-        await self._write_lifecycle_with_history(
+        written = await self._write_lifecycle_with_history(
             repo, pr_number, state, markdown, event=event,
+            expected_lifecycle_state=original_state,
         )
+        if not written:
+            return
         await self.proxy.project_status_label(
-            repo, pr_number, state.get("status", "review-required"),
+            repo, pr_number, "deploying",
         )
+        if comment_id:
+            try:
+                await self._post_bound_notice(
+                    repo, pr_number, head_sha=state.get("head_sha", ""),
+                    round_id=round_id_for_state(state), comment_id=comment_id,
+                    topic="deployment-recovery-waiting",
+                    expected_command_kind="approve_deploy",
+                    message=("Deployment status is still being verified after restart. "
+                             "No deploy POST will be repeated until the current result is confirmed."),
+                )
+            except Exception as exc:
+                logger.warning("uncertain notice %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
 
-    async def _recover_uncertain_deployments(self, old_state: dict, refreshed_state: dict) -> bool:
+    async def _recover_uncertain_deployments(
+        self, repo: str, old_state: dict, refreshed_state: dict,
+    ) -> bool:
         """Observe attempted components within one short budget; never repost."""
         old_command = old_state.get("command", {})
         args = old_command.get("args", {}) if isinstance(old_command, dict) else {}
@@ -7177,8 +8716,19 @@ class DeployController:
         machine_alias = args.get("machine", "")
         if not isinstance(machine_alias, str) or not machine_alias:
             return False
-        machine = self.policy.get_machine(machine_alias)
+        machine = self.policy.get_machine(machine_alias, repo=repo)
         if machine is None:
+            return False
+        expected_node_id = args.get("node_id")
+        expected_node_host = args.get("node_host")
+        if (not isinstance(expected_node_id, str) or not expected_node_id
+                or not isinstance(expected_node_host, str) or not expected_node_host
+                or machine.node_id != expected_node_id
+                or machine.node_host != expected_node_host):
+            logger.warning(
+                "uncertain deployment machine binding changed; refusing to infer completion %s machine=%s",
+                repo, machine_alias,
+            )
             return False
         old_components = old_state.get("components", [])
         if not isinstance(old_components, list):
@@ -7190,8 +8740,8 @@ class DeployController:
         old_args = args
         fresh_args = fresh_command.get("args", {}) if isinstance(fresh_command, dict) else {}
         if (
-            old_state.get("status") != "deploy-requested"
-            or refreshed_state.get("status") != "deploy-requested"
+            old_state.get("status") not in {"deploying", "deploy-requested"}
+            or refreshed_state.get("status") not in {"deploying", "deploy-requested"}
             or old_state.get("head_sha") != refreshed_state.get("head_sha")
             or round_id_for_state(old_state) != round_id_for_state(refreshed_state)
             or old_state.get("round_archive") != refreshed_state.get("round_archive")
@@ -7217,6 +8767,8 @@ class DeployController:
             or not old_args.get("actor")
             or old_args.get("machine") != fresh_args.get("machine")
             or old_args.get("actor") != fresh_args.get("actor")
+            or old_args.get("node_id") != fresh_args.get("node_id")
+            or old_args.get("node_host") != fresh_args.get("node_host")
             or old_args.get("pending_component_ids") != fresh_args.get("pending_component_ids")
             or self._review_evidence_identity(old_state.get("review_evidence", {}))
             != self._review_evidence_identity(refreshed_state.get("review_evidence", {}))
@@ -7248,7 +8800,7 @@ class DeployController:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            core = await self._core_for_node(machine.node_id, timeout=remaining)
+            core = await self._core_for_node(machine.node_id, repo, timeout=remaining)
             for component_id in dict.fromkeys(pending):
                 if component_id in deployed:
                     continue
@@ -7271,7 +8823,7 @@ class DeployController:
                 if (not old.get("target") or not old.get("review_image_tag")
                         or not old.get("image_ref")
                         or component_id not in self._get_component_ids_for_machine(
-                            machine_alias, [component],
+                            machine_alias, [component], repo,
                         )):
                     unresolved.append(component_id)
                     continue
@@ -7361,6 +8913,10 @@ class DeployController:
         if all_ids and all_ids == _component_id_set(refreshed_state.get("deployments", [])):
             refreshed_state["status"] = "testing"
             refreshed_state.pop("acceptance_request", None)
+        elif not unresolved:
+            refreshed_state["status"] = "deploy-requested"
+        else:
+            refreshed_state["status"] = "deploying"
         return not unresolved
 
     async def _recover_uncertain_deployment_tick(
@@ -7370,17 +8926,22 @@ class DeployController:
         command = state.get("command", {})
         if (not isinstance(command, dict) or command.get("kind") != "approve_deploy"
                 or command.get("phase") != "uncertain"
-                or state.get("status") != "deploy-requested"
+                or state.get("status") not in {"deploying", "deploy-requested"}
                 or pr_data.get("head", {}).get("sha") != state.get("head_sha")):
             return
         refreshed = copy.deepcopy(state)
+        if refreshed.get("status") == "deploy-requested":
+            refreshed["status"] = "deploying"
         try:
-            await self._recover_uncertain_deployments(state, refreshed)
+            await self._recover_uncertain_deployments(repo, state, refreshed)
         except Exception as exc:
             logger.warning("uncertain deployment recovery tick %s#%s failed: %s",
                            repo, pr_number, type(exc).__name__)
             return
         if refreshed == state:
+            await self._project_status_best_effort(
+                repo, pr_number, state.get("status", "deploying"),
+            )
             return
         refreshed["last_processed_comment_id"] = max(
             int(state.get("last_processed_comment_id", 0) or 0),
@@ -7401,7 +8962,7 @@ class DeployController:
         if refreshed.get("status") == "testing":
             markdown = comments_mod.testing(
                 repo, pr_number, refreshed.get("head_sha", ""), case_result="",
-                deployments=self._enrich_deployments_for_render(refreshed.get("deployments", [])),
+                deployments=self._enrich_deployments_for_render(refreshed.get("deployments", []), repo),
                 components=refreshed.get("components", []),
                 deployments_complete=deployments_complete,
             )
@@ -7416,15 +8977,16 @@ class DeployController:
                 "### Restart Recovery", "",
                 "The attempted component was verified. Remaining components require a NEW approval.",
             ])
-            markdown = comments_mod.deploy_requested(
+            markdown = self._deploy_requested_markdown(
                 repo, pr_number, refreshed.get("head_sha", ""),
                 refreshed.get("components", []),
                 self._get_machine_groups_for_components([
                     item for item in refreshed.get("components", [])
                     if item.get("component_id") not in _component_id_set(refreshed.get("deployments", []))
-                ]),
+                ], repo),
                 gate_note=gate_note,
-                deployments=self._enrich_deployments_for_render(refreshed.get("deployments", [])),
+                deployments=self._enrich_deployments_for_render(refreshed.get("deployments", []), repo),
+                display_status=refreshed.get("status", "deploy-requested"),
             )
         event = None
         if recovered_ids:
@@ -7444,8 +9006,39 @@ class DeployController:
                     await self._save_deployed_machine_log(repo, pr_number, refreshed, machine_alias)
                 except Exception:
                     logger.warning("recovered machine log save failed %s#%s", repo, pr_number)
-            if state.get("status") != refreshed.get("status"):
+            try:
                 await self.proxy.project_status_label(repo, pr_number, refreshed["status"])
+            except Exception as exc:
+                logger.warning("uncertain recovery label %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
+            if (refreshed.get("status") == "testing"
+                    and state.get("status") != "testing"):
+                await self._post_bound_notice(
+                    repo, pr_number, head_sha=refreshed["head_sha"],
+                    round_id=round_id_for_state(refreshed),
+                    comment_id=int(command.get("comment_id", 0) or 0),
+                    topic="deployment-recovered-complete",
+                    expected_command_kind="approve_deploy",
+                    message=(f"The deployment is confirmed complete for HEAD `{_short(refreshed['head_sha'])}` "
+                             f"in round `{round_id_for_state(refreshed)}`. Next, run testing and upload the test video."),
+                )
+            elif recovered_ids and refreshed.get("status") == "deploy-requested":
+                remaining = [
+                    item for item in refreshed.get("components", [])
+                    if item.get("component_id") not in _component_id_set(refreshed.get("deployments", []))
+                ]
+                lines = self._machine_notice_lines(
+                    self._get_machine_groups_for_components(remaining, repo), repo,
+                    mention_owners=True, test_only=self._is_test_only_pr(pr_data),
+                )
+                await self._post_bound_notice(
+                    repo, pr_number, head_sha=refreshed["head_sha"],
+                    round_id=round_id_for_state(refreshed),
+                    comment_id=int(command.get("comment_id", 0) or 0),
+                    topic="deployment-recovered-partial",
+                    expected_command_kind="approve_deploy",
+                    message="\n".join(["A partial deployment was confirmed. The remaining components need another approval.", *lines]),
+                )
 
     async def _refresh_uncertain_state(
         self, repo: str, pr_number: int, state: dict,
@@ -7459,6 +9052,7 @@ class DeployController:
         - "uncertain" when the rebuild could not complete but must stay pending.
         - "noop" when the PR is no longer open/active.
         """
+        original_state = copy.deepcopy(state)
         cmd = state.get("command", {})
         machine_alias = str(cmd.get("args", {}).get("machine", "") or "")
         comment_id = int(cmd.get("comment_id", 0) or 0)
@@ -7511,9 +9105,12 @@ class DeployController:
                 "lifecycle": f"`{old_status}` \u2192 `review-required`",
                 "timestamp": comments_mod.beijing_now_str(),
             }
-            await self._write_lifecycle_with_history(
+            written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, markdown, event=event,
+                expected_lifecycle_state=original_state,
             )
+            if not written:
+                return "uncertain"
             await self.proxy.project_status_label(repo, pr_number, "review-required")
             return "review-required"
 
@@ -7551,6 +9148,7 @@ class DeployController:
                 "uncertain recovery snapshot rebuild unavailable %s#%s head=%s",
                 repo, pr_number, current_head,
             )
+            state["status"] = "deploying"
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
@@ -7558,8 +9156,9 @@ class DeployController:
                 "args": dict(cmd.get("args", {}) or {}),
             }
             state["last_processed_comment_id"] = max(old_cursor, comment_id)
-            markdown = comments_mod.uncertain_comment(
-                repo, pr_number, current_head,
+            markdown = self._set_lifecycle_summary_status(
+                comments_mod.uncertain_comment(repo, pr_number, current_head),
+                "deploying",
             )
             if machine_alias:
                 markdown += "\n\n" + "\n".join([
@@ -7576,6 +9175,7 @@ class DeployController:
             }
             await self._write_lifecycle_with_history(
                 repo, pr_number, state, markdown, event=event,
+                expected_lifecycle_state=original_state,
             )
             return "uncertain"
 
@@ -7610,144 +9210,86 @@ class DeployController:
 
         snapshot_reset = evidence_changed or semantic_changed
         if snapshot_reset:
-            # Genuinely different build/evidence — reset to fresh snapshot.
-            fresh_reset_components: list[dict] = []
-            for component in fresh_components:
-                fresh_reset_components.append(
-                    self._fresh_component_runtime_binding(component)
+            # A command may have sent a POST whose result is still unknown.
+            # New evidence cannot release that machine/component binding or
+            # make the old POST safe to repeat.
+            return "uncertain"
+        # Same evidence AND same semantic keys — apply migration rules.
+        deployed_component_ids: set[str] = set()
+        for dep in state.get("deployments", []):
+            if isinstance(dep, dict) and dep.get("phase") == "deployed":
+                for cid in dep.get("component_ids", []):
+                    if isinstance(cid, str) and cid:
+                        deployed_component_ids.add(cid)
+
+        # Fail-closed: deployed components must have non-empty runtime_id.
+        # If not, keep the outcome uncertain instead of releasing its binding.
+        _migration_ok = True
+        for old_comp in old_components:
+            if not isinstance(old_comp, dict):
+                continue
+            old_cid = old_comp.get("component_id", "")
+            if (old_cid in deployed_component_ids and old_comp.get("target") != "core"):
+                runtime_id = old_comp.get("runtime_id", "")
+                if not isinstance(runtime_id, str) or not runtime_id:
+                    _migration_ok = False
+                    break
+
+        if not _migration_ok:
+            return "uncertain"
+        semantic_map: dict[tuple, dict] = {}
+        for fc in fresh_components:
+            if isinstance(fc, dict):
+                semantic_map[self._component_semantic_key(fc)] = fc
+
+        migrated: list[dict] = []
+        for old_comp in old_components:
+            if not isinstance(old_comp, dict):
+                continue
+            skey = self._component_semantic_key(old_comp)
+            fresh = semantic_map.get(skey)
+            if not fresh:
+                continue
+            old_cid = old_comp.get("component_id", "")
+            is_deployed = old_cid in deployed_component_ids
+            if is_deployed:
+                migrated_component = {
+                    "component_id": old_cid,
+                    "target": fresh["target"],
+                    "driver_path": fresh["driver_path"],
+                    "variant": fresh["variant"],
+                    "review_image_tag": fresh["review_image_tag"],
+                    "image_ref": old_comp.get("image_ref", ""),
+                    "resolved_platform": fresh["resolved_platform"],
+                }
+                migrated_component = self._fresh_component_runtime_binding(
+                    migrated_component
                 )
-            updated_state = dict(state)
-            updated_state["review_evidence"] = review_evidence_data
-            updated_state["status"] = "deploy-requested"
-            updated_state["command"] = {
-                "comment_id": comment_id,
-                "kind": "approve_deploy",
-                "phase": "completed",
-                "args": dict(cmd.get("args", {}) or {}),
-            }
-            updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
-            updated_state["components"] = fresh_reset_components
-            updated_state["deployments"] = []
-            updated_state["approve_attempts"] = []
-            updated_state["approve_attempts_total"] = 0
-            updated_state["approve_attempts_truncated"] = False
-            updated_state["case_results"] = {}
-            updated_state["test_result"] = ""
-            updated_state["cos"] = {"object_key": "", "sha256": "", "size": 0}
-        else:
-            # Same evidence AND same semantic keys — apply migration rules.
-            deployed_component_ids: set[str] = set()
-            for dep in state.get("deployments", []):
-                if isinstance(dep, dict) and dep.get("phase") == "deployed":
-                    for cid in dep.get("component_ids", []):
-                        if isinstance(cid, str) and cid:
-                            deployed_component_ids.add(cid)
-
-            # Fail-closed: deployed components must have non-empty runtime_id.
-            # If a deployed component is missing runtime_id, fall through to the
-            # reset branch instead of proceeding with migration.
-            _migration_ok = True
-            for old_comp in old_components:
-                if not isinstance(old_comp, dict):
-                    continue
-                old_cid = old_comp.get("component_id", "")
-                if (
-                    old_cid in deployed_component_ids
-                    and old_comp.get("target") != "core"
-                ):
-                    # Non-core runtime ids are dynamic and must be present
-                    # before preserving a deployed binding.  Core is static
-                    # and is normalized to "core" below.
-                    runtime_id = old_comp.get("runtime_id", "")
-                    if not isinstance(runtime_id, str) or not runtime_id:
-                        # Missing runtime_id for deployed component — reset to fresh.
-                        _migration_ok = False
-                        break
-
-            if not _migration_ok:
-                snapshot_reset = True
-                # Fall through to the reset branch below.
-                fresh_reset_components: list[dict] = []
-                for component in fresh_components:
-                    fresh_reset_components.append(
-                        self._fresh_component_runtime_binding(component)
-                    )
-                updated_state = dict(state)
-                updated_state["review_evidence"] = review_evidence_data
-                updated_state["status"] = "deploy-requested"
-                updated_state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": dict(cmd.get("args", {}) or {}),
-                }
-                updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
-                updated_state["components"] = fresh_reset_components
-                updated_state["deployments"] = []
-                updated_state["approve_attempts"] = []
-                updated_state["approve_attempts_total"] = 0
-                updated_state["approve_attempts_truncated"] = False
-                updated_state["case_results"] = {}
-                updated_state["test_result"] = ""
-                updated_state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+                if fresh["target"] != "core":
+                    migrated_component["runtime_id"] = old_comp.get("runtime_id", "")
+                migrated.append(migrated_component)
             else:
-                semantic_map: dict[tuple, dict] = {}
-                for fc in fresh_components:
-                    if isinstance(fc, dict):
-                        semantic_map[self._component_semantic_key(fc)] = fc
+                migrated.append(self._fresh_component_runtime_binding({
+                    "component_id": old_cid,
+                    "target": fresh["target"],
+                    "driver_path": fresh["driver_path"],
+                    "variant": fresh["variant"],
+                    "review_image_tag": fresh["review_image_tag"],
+                    "image_ref": fresh["image_ref"],
+                    "resolved_platform": fresh["resolved_platform"],
+                }))
 
-                migrated: list[dict] = []
-                for old_comp in old_components:
-                    if not isinstance(old_comp, dict):
-                        continue
-                    skey = self._component_semantic_key(old_comp)
-                    fresh = semantic_map.get(skey)
-                    if not fresh:
-                        continue
-                    old_cid = old_comp.get("component_id", "")
-                    is_deployed = old_cid in deployed_component_ids
-                    if is_deployed:
-                        # Rule B: preserve historical artifact
-                        migrated_component = {
-                            "component_id": old_cid,
-                            "target": fresh["target"],
-                            "driver_path": fresh["driver_path"],
-                            "variant": fresh["variant"],
-                            "review_image_tag": fresh["review_image_tag"],
-                            "image_ref": old_comp.get("image_ref", ""),
-                            "resolved_platform": fresh["resolved_platform"],
-                        }
-                        migrated_component = self._fresh_component_runtime_binding(
-                            migrated_component
-                        )
-                        if fresh["target"] != "core":
-                            migrated_component["runtime_id"] = old_comp.get(
-                                "runtime_id", ""
-                            )
-                        migrated.append(migrated_component)
-                    else:
-                        # Rule A: migrate to tag, reuse old component_id
-                        migrated.append(self._fresh_component_runtime_binding({
-                            "component_id": old_cid,
-                            "target": fresh["target"],
-                            "driver_path": fresh["driver_path"],
-                            "variant": fresh["variant"],
-                            "review_image_tag": fresh["review_image_tag"],
-                            "image_ref": fresh["image_ref"],
-                            "resolved_platform": fresh["resolved_platform"],
-                        }))
-
-                updated_state = dict(state)
-                updated_state["review_evidence"] = review_evidence_data
-                updated_state["status"] = "deploy-requested"
-                updated_state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": dict(cmd.get("args", {}) or {}),
-                }
-                updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
-                updated_state["components"] = migrated
+        updated_state = dict(state)
+        updated_state["review_evidence"] = review_evidence_data
+        updated_state["status"] = "deploying"
+        updated_state["command"] = {
+            "comment_id": comment_id,
+            "kind": "approve_deploy",
+            "phase": "completed",
+            "args": dict(cmd.get("args", {}) or {}),
+        }
+        updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
+        updated_state["components"] = migrated
 
         if snapshot_reset:
             # A fresh build must never adopt old runtime/image provenance as
@@ -7758,7 +9300,9 @@ class DeployController:
             updated_state.pop("deployment_logs", None)
             updated_state.pop("acceptance_request", None)
         old_deployment_facts = copy.deepcopy(state.get("deployments", []))
-        if not snapshot_reset and not await self._recover_uncertain_deployments(state, updated_state):
+        if not snapshot_reset and not await self._recover_uncertain_deployments(
+            repo, state, updated_state,
+        ):
             logger.warning("uncertain deployment remains pending; refusing repeated POST %s#%s", repo, pr_number)
             return "uncertain"
         recovered_machines = set()
@@ -7794,15 +9338,16 @@ class DeployController:
                 f"Send a NEW `/approve_deploy machine={machine_alias}`."
             )
         gate_note.append("fresh HEAD + actor -> FINAL PRE-DEPLOY VALIDATION")
-        markdown = comments_mod.deploy_requested(
+        markdown = self._deploy_requested_markdown(
             repo, pr_number, current_head,
             state.get("components", []),
             self._get_machine_groups_for_components([
                 c for c in state.get("components", [])
                 if c.get("component_id", "") not in _component_id_set(state.get("deployments", []))
-            ]),
+            ], repo),
             gate_note=gate_note,
-            deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+            deployments=self._enrich_deployments_for_render(state.get("deployments", []), repo),
+            display_status=state.get("status", "deploy-requested"),
         )
         if state["status"] == "testing":
             required_component_ids = {
@@ -7811,7 +9356,7 @@ class DeployController:
             }
             markdown = comments_mod.testing(
                 repo, pr_number, current_head, case_result="",
-                deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                deployments=self._enrich_deployments_for_render(state.get("deployments", []), repo),
                 components=state.get("components", []),
                 deployments_complete=(bool(required_component_ids)
                                       and required_component_ids.issubset(
@@ -7823,7 +9368,10 @@ class DeployController:
         }
         lifecycle_written = await self._write_lifecycle_with_history(
             repo, pr_number, state, markdown, event=event,
+            expected_lifecycle_state=original_state,
         )
+        if not lifecycle_written:
+            return "uncertain"
         if lifecycle_written:
             for recovered_machine in sorted(recovered_machines):
                 try:
@@ -8034,6 +9582,43 @@ class DeployController:
                 "on_command: cannot verify author for %s#%s cid=%s",
                 repo, pr_number, comment_id,
             )
+            await self._post_error(
+                repo, pr_number,
+                "Cannot verify this command's GitHub author, so no action was taken. Check the account identity and post a new command.",
+                comment_id=comment_id,
+            )
+            return True
+
+        intent = getattr(cmd, "intent", "") or cmd.kind
+        if getattr(cmd, "error", "") or getattr(cmd, "intent", ""):
+            approval_guidance = (
+                "\n" + await self._approval_command_guidance(repo, pr_number)
+                if intent == "approve_deploy" else ""
+            )
+            if getattr(cmd, "intent", ""):
+                suggestions = {
+                    "approve_deploy": "Use `/approve_deploy` with a complete machine command from the current Lifecycle Summary.",
+                    "request_deploy": "Use `/request_deploy`.",
+                    "request_acceptance": "Use `/request_acceptance`.",
+                    "record_test": "Use `/record_test result=pass` or `/record_test result=fail`.",
+                }
+                message = (f"Unrecognized deployment command. {suggestions.get(intent, 'Check `/deploy_help`.')}")
+            elif intent == "approve_deploy" and getattr(cmd, "error", "") == "missing_machine_value":
+                message = "`machine=` is empty. Use a configured machine IP from the current compatible command list, or omit the argument only when exactly one fully compatible machine is available."
+            elif intent == "approve_deploy":
+                message = "Invalid `/approve_deploy` arguments. Use a complete machine command shown below, or omit `machine` only when exactly one fully compatible machine is available."
+            elif intent == "request_deploy":
+                message = "`/request_deploy` takes no parameters. Remove extra arguments and try again."
+            elif intent == "request_acceptance":
+                message = "`/request_acceptance` takes no parameters. Remove extra arguments and try again."
+            elif intent == "record_test":
+                message = "`/record_test` requires `result=pass` or `result=fail`."
+            else:
+                message = f"Invalid `/{intent}` command syntax. Check `/deploy_help {intent}` and try again."
+            message += approval_guidance
+            await self._post_error(
+                repo, pr_number, message, comment_id=comment_id,
+            )
             return True
 
         if cmd.kind == "request_deploy":
@@ -8043,12 +9628,6 @@ class DeployController:
 
         if cmd.kind == "approve_deploy":
             machine_alias = cmd.machine_alias
-            if not machine_alias:
-                await self._post_error(
-                    repo, pr_number,
-                    "`/approve_deploy` requires `machine=<alias-or-ip>`.",
-                )
-                return True
             return await self.handle_approve_deploy(
                 repo, pr_number, comment_id,
                 machine_alias, author_login, author_id,
@@ -8061,6 +9640,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "`/record_test` requires `result=pass` or `result=fail`.",
+                    comment_id=comment_id,
                 )
                 return True
             return await self.handle_record_test(
@@ -8095,6 +9675,7 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Evidence storage is unavailable; the comment was not accepted.",
+                    comment_id=comment_id,
                 )
                 return True
             try:
@@ -8110,6 +9691,7 @@ class DeployController:
                     await self._post_error(
                         repo, pr_number,
                         f"Evidence comment rejected: {getattr(exc, 'code', 'invalid_request')}.",
+                        comment_id=comment_id,
                     )
                     return True
                 raise

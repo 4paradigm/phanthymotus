@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import shlex
 import re
+from difflib import SequenceMatcher
 from typing import Literal
 
 
@@ -48,10 +49,12 @@ class ParsedCommand:
     raw: str = ""
     comment_id: int = 0
     evidence_args: dict[str, str] | None = None
+    error: str = ""
+    intent: str = ""
 
     @property
     def is_command(self) -> bool:
-        return self.kind != "unknown"
+        return self.kind != "unknown" or bool(self.intent)
 
 
 _KNOWN = {
@@ -233,6 +236,12 @@ def parse_command(comment_text: str) -> ParsedCommand:
         try:
             tokens = shlex.split(raw_line)
         except ValueError:
+            first_token = raw_line.split(None, 1)[0]
+            name = first_token[1:].strip().lower()
+            if name in _KNOWN:
+                return ParsedCommand(
+                    kind=name, raw=raw_line.strip(), error="invalid_arguments",
+                )
             continue
         if not tokens:
             continue
@@ -241,22 +250,93 @@ def parse_command(comment_text: str) -> ParsedCommand:
             continue
         try:
             positional, kv = _parse_args(tokens[1:])
-        except ValueError:
-            continue
+        except ValueError as exc:
+            return ParsedCommand(kind=name, raw=raw_line.strip(), error=str(exc))
         allowed = _ALLOWED_KV[name]
         if any(k not in allowed for k in kv):
-            continue
+            unknown = sorted(set(kv) - allowed)
+            return ParsedCommand(
+                kind=name, raw=raw_line.strip(),
+                error=f"unknown_argument:{','.join(unknown)}",
+            )
         # request_deploy: reject any positional args or key=value args
         if name == "request_deploy":
             if positional:
-                continue
+                return ParsedCommand(kind=name, raw=raw_line.strip(), error="unexpected_argument")
             return ParsedCommand(kind="request_deploy", raw=raw_line.strip())
         if name == "request_acceptance":
             if positional or kv:
-                continue
+                return ParsedCommand(kind=name, raw=raw_line.strip(), error="unexpected_argument")
             return ParsedCommand(kind="request_acceptance", raw=raw_line.strip())
-        return _build_command(name, positional, kv, tokens[1:])
+        parsed = _build_command(name, positional, kv, tokens[1:])
+        if parsed.kind == "unknown":
+            parsed.kind = name
+            parsed.raw = raw_line.strip()
+            parsed.error = parsed.error or "invalid_arguments"
+        return parsed
     return ParsedCommand(kind="unknown", raw="")
+
+
+def _is_single_edit_or_transposition(name: str, candidate: str) -> bool:
+    """Match one likely typo without accepting arbitrary similar slash commands."""
+    if name == candidate:
+        return True
+    if abs(len(name) - len(candidate)) > 1:
+        return False
+    if (len(name) == len(candidate) + 1
+            and (name.startswith(candidate) or name.endswith(candidate))):
+        return False
+    if (len(candidate) == len(name) + 1
+            and (candidate.startswith(name) or candidate.endswith(name))):
+        return False
+    if len(name) == len(candidate):
+        differences = [index for index, (left, right) in enumerate(zip(name, candidate))
+                       if left != right]
+        if len(differences) == 1:
+            return True
+        return (
+            len(differences) == 2
+            and differences[1] == differences[0] + 1
+            and name[differences[0]] == candidate[differences[1]]
+            and name[differences[1]] == candidate[differences[0]]
+        )
+
+    shorter, longer = (name, candidate) if len(name) < len(candidate) else (candidate, name)
+    short_index = long_index = 0
+    skipped = False
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+        if skipped:
+            return False
+        skipped = True
+        long_index += 1
+    return True
+
+
+def detect_deployment_command_intent(comment_text: str) -> str:
+    """Return an exact or near-match deployment command name from a top-level line.
+
+    This deliberately ignores prose, quotes, blockquotes, fenced examples, and
+    unrelated slash commands so the watcher can answer only likely commands.
+    """
+    candidates = {"request_deploy", "approve_deploy", "request_acceptance", "record_test"}
+    for line in _iter_top_level_command_lines(comment_text or ""):
+        parts = line.split(None, 1)
+        token = parts[0] if parts else ""
+        if not token.startswith("/"):
+            continue
+        name = token[1:].strip().lower()
+        if name in candidates:
+            return name
+        closest = max(candidates, key=lambda value: SequenceMatcher(None, name, value).ratio())
+        if (len(name) >= 8
+                and SequenceMatcher(None, name, closest).ratio() >= 0.8
+                and _is_single_edit_or_transposition(name, closest)):
+            return closest
+    return ""
 
 
 def _build_command(name: str, positional: list[str], kv: dict[str, str],
@@ -267,10 +347,10 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
         return ParsedCommand(kind="request_deploy", raw=raw)
     if name == "approve_deploy":
         if positional:
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="unexpected_argument")
         machine_alias = kv.get("machine", "")
-        if not machine_alias:
-            return ParsedCommand(kind="unknown", raw="")
+        if "machine" in kv and not machine_alias:
+            return ParsedCommand(kind="unknown", raw="", error="missing_machine_value")
         return ParsedCommand(
             kind="approve_deploy", machine_alias=machine_alias, raw=raw
         )

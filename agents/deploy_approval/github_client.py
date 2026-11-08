@@ -7,8 +7,11 @@ checked via the documented API when the approval source needs it.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
+import hashlib
 
 import logging
 import math
@@ -20,7 +23,12 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import Config, validate_repository_names
+from .config import (
+    Config,
+    DEFAULT_GITHUB_REPOS,
+    MAX_REPO_POLICY_FILE_BYTES,
+    validate_repository_names,
+)
 from .clients_common import (
     SecurityError,
     enforce_body_size,
@@ -371,6 +379,104 @@ class GitHubClient:
         if not isinstance(data, dict):
             raise GitHubError("github returned a non-object payload")
         return data
+
+    async def get_repository_file_at_ref(
+        self,
+        repo: str,
+        path: str,
+        *,
+        ref: str = "main",
+        etag: str | None = None,
+    ) -> dict | None:
+        """Read one allowlisted policy file at the literal main branch.
+
+        This uses the authenticated GitHub App client, a fixed repository and
+        path allowlist, and the Contents API only. Redirects are rejected by
+        the shared transport. A 404 means the file is absent; a 304 means the
+        supplied ETag is unchanged. No API-provided URL is followed.
+        """
+        if (not isinstance(path, str)
+                or path not in {"machines.yaml", "test_reviewers.yaml"}
+                or ref != "main"):
+            raise GitHubError("repository policy file request is invalid")
+        try:
+            canonical_repo = validate_repository_names([repo])[0]
+            configured_repos = set(validate_repository_names(self.config.github_repos))
+            active_repos = set(validate_repository_names(
+                list(self.config.active_repos),
+                label="active installation repositories",
+                allow_empty=True,
+            ))
+        except (TypeError, ValueError) as exc:
+            raise GitHubError("repository policy authorization is invalid") from exc
+        if (canonical_repo not in {name.lower() for name in DEFAULT_GITHUB_REPOS}
+                or canonical_repo not in configured_repos
+                or canonical_repo not in active_repos
+                or self.config.auth_valid is not True):
+            raise GitHubPermissionError(
+                "repository policy read requires current GitHub App authorization",
+                status_code=403,
+            )
+
+        request_headers = {}
+        if (isinstance(etag, str) and 0 < len(etag) <= 512
+                and not any(ord(char) < 32 or ord(char) == 127 for char in etag)):
+            request_headers["If-None-Match"] = etag
+        response = await self._request(
+            "GET",
+            f"/repos/{canonical_repo}/contents/{path}",
+            params={"ref": "main"},
+            headers=request_headers,
+            timeout=self.config.total_timeout,
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code == 304:
+            return {"not_modified": True, "etag": response.headers.get("ETag", "")}
+        try:
+            require_2xx(response.status_code, "github get repository policy file")
+        except SecurityError as exc:
+            raise GitHubError(
+                f"github repository policy read failed with HTTP {response.status_code}",
+                status_code=response.status_code,
+            ) from exc
+
+        data = await self._read_json(response)
+        source_path = data.get("path")
+        source_sha = data.get("sha")
+        size = data.get("size")
+        encoded = data.get("content")
+        if (data.get("type") != "file" or source_path != path
+                or data.get("encoding") != "base64"
+                or not isinstance(source_sha, str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", source_sha) is None
+                or type(size) is not int or not 0 <= size <= MAX_REPO_POLICY_FILE_BYTES
+                or not isinstance(encoded, str)):
+            raise GitHubError("github repository policy file response is invalid")
+        try:
+            compact_base64 = encoded.encode("ascii").translate(None, b" \t\r\n")
+            content = base64.b64decode(compact_base64, validate=True)
+        except (UnicodeEncodeError, ValueError, binascii.Error):
+            raise GitHubError("github repository policy file encoding is invalid") from None
+        if len(content) != size:
+            raise GitHubError("github repository policy file size is invalid")
+        blob_sha = hashlib.sha1(
+            b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+        ).hexdigest()
+        if blob_sha != source_sha.lower():
+            raise GitHubError("github repository policy file integrity check failed")
+
+        response_etag = response.headers.get("ETag", "")
+        if (not isinstance(response_etag, str) or len(response_etag) > 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in response_etag)):
+            response_etag = ""
+        return {
+            "not_modified": False,
+            "path": source_path,
+            "sha": source_sha.lower(),
+            "content": content,
+            "etag": response_etag,
+        }
 
     async def get_public_git_data(
         self, repo: str, path: str, *, params: dict | None = None

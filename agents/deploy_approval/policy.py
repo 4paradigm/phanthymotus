@@ -14,8 +14,13 @@ from typing import Any
 
 import yaml
 
-from .config import Config
+from .config import (
+    Config,
+    MAX_REPO_POLICY_FILE_BYTES,
+    parse_test_reviewers_yaml,
+)
 from .models import MachineInfo
+from .repo_policy import RepositoryPolicyStore
 
 
 class PolicyError(Exception):
@@ -123,10 +128,39 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
         raise MachineLoadError(f"machine owners file not found: {path}")
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
+    return _load_machines_data(raw)
+
+
+def parse_machines_yaml(content: bytes | str) -> dict[str, MachineInfo]:
+    """Parse repository-provided machines.yaml with the standard schema checks."""
+    if isinstance(content, bytes):
+        if len(content) > MAX_REPO_POLICY_FILE_BYTES:
+            raise MachineLoadError("machines YAML exceeds the policy file size limit")
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise MachineLoadError("machines YAML must be UTF-8") from None
+    if not isinstance(content, str):
+        raise MachineLoadError("machines YAML must be UTF-8 text")
+    try:
+        content_size = len(content.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise MachineLoadError("machines YAML must be UTF-8") from None
+    if content_size > MAX_REPO_POLICY_FILE_BYTES:
+        raise MachineLoadError("machines YAML exceeds the policy file size limit")
+    try:
+        raw = yaml.safe_load(content)
+    except yaml.YAMLError:
+        # Parser errors may quote YAML lines; keep untrusted source out of logs.
+        raise MachineLoadError("machines YAML is malformed") from None
+    return _load_machines_data(raw)
+
+
+def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
     if not isinstance(raw, dict):
         raise MachineLoadError("machines YAML must be a dict at top level")
     version = raw.get("version")
-    if version != 1:
+    if type(version) is not int or version != 1:
         raise MachineLoadError(
             f"machines YAML version must be 1, got {version!r}"
         )
@@ -231,18 +265,28 @@ class Policy:
     def __init__(self, config: Config):
         self.config = config
         self.machines: dict[str, MachineInfo] = {}
+        self._repository_policies = RepositoryPolicyStore(
+            config,
+            machine_parser=parse_machines_yaml,
+            reviewer_parser=parse_test_reviewers_yaml,
+        )
 
     def load_machines(self) -> None:
         self.machines = load_machines(self.config.machine_owners_file)
 
-    def get_machine_by_node_id(self, node_id: str) -> MachineInfo | None:
-        for m in self.machines.values():
+    def get_machine_by_node_id(
+        self, node_id: str, repo: str | None = None,
+    ) -> MachineInfo | None:
+        machines = self.machines if repo is None else self._repository_policies.machines_for(repo)
+        for m in machines.values():
             if m.node_id == node_id:
                 return m
         return None
 
-    def get_machine(self, alias: str) -> MachineInfo | None:
-        return self.machines.get(alias)
+    def get_machine(self, alias: str, repo: str | None = None) -> MachineInfo | None:
+        if repo is None:
+            return self.machines.get(alias)
+        return self._repository_policies.machine_for(alias, repo)
 
     # GitHub collaborator permissions that may approve.
     COLLABORATOR_WRITE = frozenset({"write", "maintain", "admin"})
@@ -251,9 +295,22 @@ class Policy:
     def collaborator_can_approve(permission: str) -> bool:
         return isinstance(permission, str) and permission in Policy.COLLABORATOR_WRITE
 
-    def get_machines(self) -> list:
-        """Return all machines as a list."""
-        return list(self.machines.values())
+    def get_machines(self, repo: str | None = None) -> list[MachineInfo]:
+        """Return machines, optionally from one isolated repository policy."""
+        machines = self.machines if repo is None else self._repository_policies.machines_for(repo)
+        return list(machines.values())
+
+    def reviewers_for_repo(self, repo: str) -> list[str]:
+        """Return only the verified acceptance allowlist for ``repo``."""
+        return self._repository_policies.reviewers_for_repo(repo)
+
+    def repo_policy_status(self, repo: str) -> dict:
+        """Report whether this repository has independently verified policy."""
+        return self._repository_policies.status(repo)
+
+    async def refresh_if_due(self, repo: str, github_client) -> dict:
+        """Refresh one authorized repository's main-branch policy files."""
+        return await self._repository_policies.refresh_if_due(repo, github_client)
 
     @staticmethod
     def resolve_machine_selector(selector: str, machines: dict[str, "MachineInfo"]) -> "MachineInfo":
@@ -305,12 +362,14 @@ class Policy:
             "Please use a machine alias instead."
         )
 
-    def machine_supports_target(self, alias: str, target: str) -> bool:
+    def machine_supports_target(
+        self, alias: str, target: str, repo: str | None = None,
+    ) -> bool:
         """Check if a machine supports a given target based on static config.
 
         Fail closed: targets must be explicit.
         """
-        machine = self.machines.get(alias)
+        machine = self.get_machine(alias, repo=repo)
         if machine is None:
             return False
         if not machine.targets:

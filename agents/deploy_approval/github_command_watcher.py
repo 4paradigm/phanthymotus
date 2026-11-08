@@ -46,6 +46,7 @@ CANONICAL_STATUS_LABELS = frozenset({
     "status: reviewing",
     "status: deploy-ready",
     "status: deploy-requested",
+    "status: deploying",
     "status: testing",
     "status: acceptance-required",
     "status: succeeded",
@@ -53,6 +54,7 @@ CANONICAL_STATUS_LABELS = frozenset({
 })
 ACTIVE_PROJECTION_STATUS_LABELS = frozenset({
     "status: deploy-requested",
+    "status: deploying",
     "status: testing",
     "status: acceptance-required",
 })
@@ -492,6 +494,7 @@ class GitHubCommandWatcher:
         while self._running:
             try:
                 await self._refresh_active_repos_if_needed()
+                await self._refresh_active_repository_policies_if_due()
                 await self._poll_once()
             except Exception as e:
                 logger.error("command watcher poll cycle failed: %s", e)
@@ -516,6 +519,57 @@ class GitHubCommandWatcher:
                 self._wakeup.clear()
             except asyncio.TimeoutError:
                 pass
+
+    async def _refresh_repo_policy_if_due(self, repo: str) -> None:
+        """Refresh one currently authorized repo before it can handle a command."""
+        if self.config.auth_valid is not True:
+            return
+        try:
+            authorized_repos = resolve_authorized_repos(
+                self.config.github_repos, self.config.active_repos,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            logger.warning(
+                "repository policy refresh skipped because authorization is invalid (%s)",
+                type(exc).__name__,
+            )
+            return
+        if repo.casefold() not in {name.casefold() for name in authorized_repos}:
+            return
+
+        policy = getattr(self.controller, "policy", None)
+        refresh = getattr(policy, "refresh_if_due", None)
+        github_client = self._github or getattr(self.controller, "github", None)
+        if not callable(refresh) or github_client is None:
+            return
+        try:
+            await refresh(repo, github_client)
+        except Exception as exc:
+            # The policy store retains its last verified snapshot on fetch
+            # errors; an unconfigured repo remains fail-closed in its getters.
+            logger.warning(
+                "repository policy refresh failed for %s (%s)",
+                repo, type(exc).__name__,
+            )
+
+    async def _refresh_active_repository_policies_if_due(self) -> None:
+        """Load policy for each repo authorized by the current App snapshot."""
+        if self.config.auth_valid is not True:
+            return
+        try:
+            authorized_repos = resolve_authorized_repos(
+                self.config.github_repos, self.config.active_repos,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            logger.warning(
+                "repository policy startup refresh skipped because authorization is invalid (%s)",
+                type(exc).__name__,
+            )
+            return
+        for repo in authorized_repos:
+            if self.config.auth_valid is not True:
+                return
+            await self._refresh_repo_policy_if_due(repo)
 
     def diagnostics(self) -> dict:
         now = self._monotonic()
@@ -967,7 +1021,8 @@ class GitHubCommandWatcher:
                 body = comment.get("body", "")
                 is_command = (
                     isinstance(body, str)
-                    and commands_mod.parse_command(body).is_command
+                    and (commands_mod.parse_command(body).is_command
+                         or bool(commands_mod.detect_deployment_command_intent(body)))
                 )
                 if not is_command and not self._is_trusted_review_completion(comment):
                     continue
@@ -2429,6 +2484,7 @@ class GitHubCommandWatcher:
                     body = candidate.get("body", "")
                     if (not isinstance(body, str) or not body.strip()
                             or commands_mod.command_starts_line_any(body)
+                            or commands_mod.detect_deployment_command_intent(body)
                             or _top_level_command(body, "authorize_evidence")
                             or _top_level_command(body, "submit_cos_evidence")):
                         continue
@@ -2460,6 +2516,7 @@ class GitHubCommandWatcher:
                     fresh_body = fresh_comment.get("body", "")
                     if (not isinstance(fresh_body, str) or not fresh_body.strip()
                             or commands_mod.command_starts_line_any(fresh_body)
+                            or commands_mod.detect_deployment_command_intent(fresh_body)
                             or _top_level_command(fresh_body, "authorize_evidence")
                             or _top_level_command(fresh_body, "submit_cos_evidence")):
                         continue
@@ -2867,7 +2924,14 @@ class GitHubCommandWatcher:
                     return
                 continue
 
-            if not commands_mod.command_starts_line_any(fresh_body):
+            cmd = commands_mod.parse_command(fresh_body)
+            if not cmd.is_command:
+                likely_intent = commands_mod.detect_deployment_command_intent(fresh_body)
+                if likely_intent:
+                    cmd.intent = likely_intent
+                    cmd.raw = fresh_body
+
+            if not cmd.is_command:
                 if state.get("status") == "testing":
                     if native_comments_processed >= native_comment_budget:
                         return
@@ -2956,21 +3020,6 @@ class GitHubCommandWatcher:
                     state = await self.proxy.persist_cursor(
                         repo, pr_number, comment_id,
                     ) or state
-                continue
-
-            cmd = commands_mod.parse_command(fresh_body)
-            if not cmd.is_command:
-                if not await self._consume_comment_cursor(repo, pr_number, comment_id):
-                    self._finish_recent_command(
-                        repo, pr_number, comment_id,
-                        failure_reason="cursor_persist_not_confirmed",
-                    )
-                    return
-                self._finish_recent_command(
-                    repo, pr_number, comment_id,
-                    failure_reason="recognized_command_rejected_by_parser",
-                    retryable=False,
-                )
                 continue
 
             # Keep the existing one-business-action-per-PR-cycle behavior:
@@ -3158,6 +3207,8 @@ class GitHubCommandWatcher:
                     failure_reason="dispatch_pr_identity_or_head_mismatch",
                 )
                 return
+
+            await self._refresh_repo_policy_if_due(repo)
 
             # TOCTOU recheck: the auth snapshot was validated at cycle start,
             # but awaits have run since. Fail closed if authorization was
