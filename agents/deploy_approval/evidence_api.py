@@ -443,7 +443,8 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # Status is a deliberately small public projection. In particular, a
         # COS multipart UploadId and signed URLs are never public state.
         result = {k: result[k] for k in ('status', 'uploaded_parts', 'size', 'filename',
-                                         'head_sha', 'round_id', 'verified', 'sha256') if k in result}
+                                         'head_sha', 'round_id', 'verified', 'sha256',
+                                         'github_record_persisted', 'record_pending') if k in result}
     if action == 'context' and result.get('evidence_degraded') is not True:
         current_logs = {}
         for alias, log in (result.get('deployment_logs', {}) or {}).items():

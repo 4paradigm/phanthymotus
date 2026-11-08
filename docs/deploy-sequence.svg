@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg viewBox="0 0 1400 3600" width="1400" height="3600" role="img"
+<svg viewBox="0 0 1600 3600" width="1600" height="3600" role="img"
      aria-label="Deploy Approval GitHub-driven sequence diagram"
      xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -38,7 +38,7 @@
   </defs>
 
   <text x="40" y="42" class="mono title" fill="#425A4B">DEPLOY APPROVAL · GITHUB-DRIVEN SEQUENCE</text>
-  <text x="40" y="62" class="mono small">GitHub PR status labels: best-effort UI projection (not a lifecycle gate). Lifecycle: review-required · reviewing · deploy-ready · deploy-requested · testing · succeeded · failed</text>
+  <text x="40" y="62" class="mono small">GitHub PR status labels: best-effort UI projection (not the sole permission check): review-required · reviewing · deploy-ready · deploy-requested · deploying · testing · acceptance-required · succeeded · failed</text>
 
   <!-- High-level actors only -->
   <g class="mono">
@@ -62,6 +62,9 @@
 
     <rect x="1230" y="92" width="130" height="48" class="actor" fill="#EFF1F5" stroke="#6B7A8D"/>
     <text x="1295" y="122" text-anchor="middle" class="title" fill="#4F5C6B">COS</text>
+
+    <rect x="1415" y="92" width="160" height="48" class="actor" fill="#EEF4F1" stroke="#5C7A6A"/>
+    <text x="1495" y="122" text-anchor="middle" class="title" fill="#425A4B">Test Reviewer</text>
   </g>
 
   <g>
@@ -72,6 +75,7 @@
     <line x1="920" y1="140" x2="920" y2="3575" class="lifeline"/>
     <line x1="1115" y1="140" x2="1115" y2="3575" class="lifeline"/>
     <line x1="1295" y1="140" x2="1295" y2="3575" class="lifeline"/>
+    <line x1="1495" y1="140" x2="1495" y2="3575" class="lifeline"/>
   </g>
 
   <!-- ============================================================ -->
@@ -98,47 +102,49 @@
     <rect x="238" y="414" width="138" height="24" class="statusOk"/>
     <text x="307" y="430" text-anchor="middle" class="mono statusText" fill="#425A4B">status: deploy-ready</text>
 
-    <line x1="40" y1="470" x2="1360" y2="470" stroke="#E7E5E4"/>
+    <line x1="40" y1="470" x2="1560" y2="470" stroke="#E7E5E4"/>
   </g>
 
   <!-- ============================================================ -->
-  <!-- SECTION 02: EXPLICIT DEPLOY REQUEST                          -->
+  <!-- SECTION 02: OPTIONAL DEPLOY REQUEST                          -->
   <!-- ============================================================ -->
   <g id="section-02-request-deploy">
-    <text x="40" y="502" class="mono small">02 · EXPLICIT DEPLOY REQUEST · EXACT HEAD BINDING</text>
+    <text x="40" y="502" class="mono small">02 · OPTIONAL DEPLOY REQUEST · EXACT HEAD BINDING</text>
 
     <path d="M115 538 L307 538" class="orange"/>
-    <text x="211" y="529" text-anchor="middle" class="mono msg">/request_deploy</text>
+    <text x="211" y="529" text-anchor="middle" class="mono msg">/request_deploy (optional)</text>
 
     <path d="M307 576 L712 576" class="orange"/>
-    <text x="510" y="567" text-anchor="middle" class="mono msg">fresh PR + full HEAD + hidden state</text>
+    <text x="510" y="567" text-anchor="middle" class="mono msg">if requested: verify fresh PR + exact HEAD + hidden state</text>
 
     <path d="M712 700 L307 700" class="green"/>
-    <text x="510" y="691" text-anchor="middle" class="mono msg">bind exact reviewed build + immutable image snapshot</text>
+    <text x="510" y="691" text-anchor="middle" class="mono msg">bind reviewed image_ref (tag/digest) to exact HEAD (request path)</text>
 
-    <rect x="228" y="722" width="158" height="24" class="statusWait"/>
-    <text x="307" y="738" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+    <rect x="190" y="722" width="234" height="24" class="statusWait"/>
+    <text x="307" y="738" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested (if requested)</text>
 
+    <path d="M920 760 L307 760" class="orange"/>
+    <text x="614" y="751" text-anchor="middle" class="mono msg">direct Machine Owner approval from deploy-ready → Section 03</text>
 
-    <line x1="40" y1="790" x2="1360" y2="790" stroke="#E7E5E4"/>
+    <line x1="40" y1="790" x2="1560" y2="790" stroke="#E7E5E4"/>
   </g>
 
   <!-- ============================================================ -->
   <!-- SECTION 03: APPROVE / CLEAN / DEPLOY                         -->
   <!-- ============================================================ -->
   <g id="section-03-approve-deploy">
-    <text x="40" y="822" class="mono small">03 · APPROVAL · PARTIAL COVERAGE · RUNTIME EVIDENCE · DEPLOY</text>
+    <text x="40" y="822" class="mono small">03 · deploy-ready / deploy-requested → deploying → testing · PARTIAL COVERAGE · RUNTIME EVIDENCE</text>
 
     <path d="M920 858 L307 858" class="orange"/>
-    <text x="614" y="849" text-anchor="middle" class="mono msg">/approve_deploy machine=&lt;alias-or-ip&gt; → canonical alias</text>
+    <text x="614" y="849" text-anchor="middle" class="mono msg">/approve_deploy: use PR-listed compatible IP; omit machine only if exactly one machine fully matches</text>
 
     <path d="M307 898 L712 898" class="orange"/>
-    <text x="510" y="889" text-anchor="middle" class="mono msg">fresh PR HEAD (commit SHA) + fresh approver + fresh saved state</text>
+    <text x="510" y="889" text-anchor="middle" class="mono msg">fresh HEAD + authorized approver (owner or write+) + state</text>
 
     <!-- Decision box is visually isolated: branch arrows start below it. -->
     <rect x="557" y="936" width="310" height="58" class="gate"/>
     <text x="712" y="958" text-anchor="middle" class="mono statusText" fill="#9A6A32">MACHINE SUPPORT CHECK</text>
-    <text x="712" y="979" text-anchor="middle" class="mono small">select compatible undeployed subset on this machine</text>
+    <text x="712" y="979" text-anchor="middle" class="mono small">match target/platform/variant/driver_path</text>
 
     <path d="M712 1018 L307 1018" class="red"/>
     <text x="510" y="1009" text-anchor="middle" class="mono small">NOT SUPPORTED</text>
@@ -157,23 +163,19 @@
 
     <rect x="582" y="1202" width="260" height="60" class="gate"/>
     <text x="712" y="1224" text-anchor="middle" class="mono statusText" fill="#9A6A32">RUNTIME PREFLIGHT EVIDENCE</text>
-    <text x="712" y="1247" text-anchor="middle" class="mono small">non-empty is allowed; Agent Core replaces existing runtime</text>
+    <text x="712" y="1247" text-anchor="middle" class="mono small">occupied runtime may be replaced</text>
 
     <!-- Existing runtime is evidence and does not block the unsafe operation. -->
-    <path d="M712 1296 L307 1296" class="red"/>
-    <text x="510" y="1287" text-anchor="middle" class="mono msgStrong">persist executing before unsafe POST; unknown outcome → uncertain</text>
+    <path d="M712 1296 L307 1296" class="blue"/>
+    <text x="510" y="1287" text-anchor="middle" class="mono msgStrong">read persisted coverage; no unsafe POST yet</text>
 
     <rect x="228" y="1318" width="158" height="24" class="statusWait"/>
     <text x="307" y="1334" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
-    <path d="M307 1368 L920 1368" class="blue"/>
-    <text x="614" y="1359" text-anchor="middle" class="mono msg">partial success persists subset; all durable components → testing</text>
+    <path d="M307 1368 L712 1368" class="green"/>
+    <text x="510" y="1359" text-anchor="middle" class="mono msg">previous deployments + remaining compatible targets</text>
 
-    <path d="M920 1410 L307 1410" class="orange"/>
-    <text x="614" y="1401" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
-    <text x="510" y="1437" text-anchor="middle" class="mono small">new approval restarts Section 03 from fresh state</text>
-
-    <text x="728" y="1480" class="mono msgStrong">EMPTY ↓</text>
+    <text x="728" y="1480" class="mono msgStrong">CONTINUE ↓</text>
 
     <path d="M712 1510 L307 1510" class="blue"/>
     <text x="510" y="1501" text-anchor="middle" class="mono msg">re-check the approval comment + current PR HEAD</text>
@@ -194,16 +196,16 @@
 
     <path d="M712 1764 L307 1764" class="red"/>
     <text x="510" y="1755" text-anchor="middle" class="mono small">PR HEAD changed → ZERO deploy POST</text>
-    <rect x="238" y="1786" width="138" height="24" class="statusFail"/>
+    <rect x="220" y="1786" width="174" height="24" class="statusFail"/>
     <text x="307" y="1802" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: review-required</text>
 
     <text x="728" y="1846" class="mono msgStrong">VALID ↓</text>
 
     <path d="M712 1874 L307 1874" class="blue"/>
-    <text x="510" y="1865" text-anchor="middle" class="mono msgStrong">record deployment start in GitHub FIRST</text>
+    <text x="510" y="1865" text-anchor="middle" class="mono msgStrong">set status: deploying + record start in GitHub FIRST</text>
 
     <path d="M712 1920 L1115 1920" class="orange"/>
-    <text x="914" y="1911" text-anchor="middle" class="mono msg">POST /api/drivers/{id}/deploy {image: repo@sha256}</text>
+    <text x="914" y="1911" text-anchor="middle" class="mono msg">Agent Core deploy API · reviewed image_ref</text>
 
     <path d="M1115 1960 L712 1960" class="green"/>
     <text x="914" y="1951" text-anchor="middle" class="mono msg">deploy response</text>
@@ -220,57 +222,78 @@
     <path d="M712 2080 L307 2080" class="red"/>
     <text x="510" y="2071" text-anchor="middle" class="mono small">response uncertain</text>
     <rect x="228" y="2100" width="158" height="24" class="statusWait"/>
-    <text x="307" y="2116" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+    <text x="307" y="2116" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploying</text>
 
-    <path d="M920 2156 L307 2156" class="orange"/>
-    <text x="614" y="2147" text-anchor="middle" class="mono msg">Machine Owner sends NEW /approve_deploy</text>
+    <path d="M712 2144 L307 2144" class="green"/>
+    <text x="510" y="2135" text-anchor="middle" class="mono msg">partial: persist subset/log task; stay deploy-requested</text>
 
-    <text x="728" y="2198" class="mono msgStrong">ALL deploy POSTs succeeded ↓</text>
+    <path d="M920 2178 L307 2178" class="orange"/>
+    <text x="614" y="2169" text-anchor="middle" class="mono msg">NEW /approve_deploy for remaining subset (loop)</text>
+
+    <text x="728" y="2198" class="mono msgStrong">ALTERNATIVE: all required components deployed ↓</text>
 
     <path d="M712 2224 L307 2224" class="green"/>
-    <text x="510" y="2215" text-anchor="middle" class="mono msg">save deployment result + completed command</text>
+    <text x="510" y="2215" text-anchor="middle" class="mono msg">save verified deployment result + completed command</text>
 
     <rect x="236" y="2244" width="142" height="24" class="statusRun"/>
     <text x="307" y="2260" text-anchor="middle" class="mono statusText" fill="#4F5C6B">status: testing</text>
+
+    <text x="1004" y="2285" text-anchor="middle" class="mono msg">per-machine logs archived independently after deployment (best effort)</text>
   </g>
 
-  <line x1="40" y1="2306" x2="1360" y2="2306" stroke="#E7E5E4"/>
+  <line x1="40" y1="2306" x2="1560" y2="2306" stroke="#E7E5E4"/>
 
   <!-- ============================================================ -->
-  <!-- SECTION 04: HUMAN FINAL TEST                                 -->
+  <!-- SECTION 04: REQUEST ACCEPTANCE / ALLOWLISTED FINAL TEST      -->
   <!-- ============================================================ -->
   <g id="section-04-record-test">
-    <text x="40" y="2338" class="mono small">04 · HUMAN FINAL TEST · GITHUB STATE · COS EVIDENCE</text>
+    <text x="40" y="2338" class="mono small">04 · ACCEPTANCE + FINAL TEST · GITHUB STATE · COS EVIDENCE</text>
 
     <path d="M920 2376 L307 2376" class="orange"/>
-    <text x="614" y="2367" text-anchor="middle" class="mono msg">/record_test result=pass|fail [summary=...]</text>
+    <text x="614" y="2367" text-anchor="middle" class="mono msg">/request_acceptance</text>
 
     <path d="M307 2416 L712 2416" class="orange"/>
-    <text x="510" y="2407" text-anchor="middle" class="mono msg">fresh PR HEAD (commit SHA) + saved state + command actor</text>
+    <text x="510" y="2407" text-anchor="middle" class="mono msg">testing + deployed Machine Owner + HEAD/round</text>
 
-    <path d="M712 2464 L307 2464" class="green"/>
-    <text x="510" y="2455" text-anchor="middle" class="mono msgStrong">result=pass · save terminal state to GitHub FIRST</text>
-    <rect x="244" y="2484" width="126" height="24" class="statusOk"/>
-    <text x="307" y="2500" text-anchor="middle" class="mono statusText" fill="#425A4B">status: succeeded</text>
+    <!-- Evidence can be uploaded during testing; it is not an acceptance gate. -->
+    <rect x="810" y="2404" width="730" height="66" rx="6" fill="#F0F3F6" stroke="#B8C6D2" stroke-width="1.2"/>
+    <text x="827" y="2423" class="mono msgStrong">During testing: authorized upload → COS → GitHub evidence record</text>
+    <text x="827" y="2442" class="mono small">Optional; not a gate for /request_acceptance. Bound to this HEAD and round.</text>
+    <text x="827" y="2460" class="mono small">Succeeded / failed / historical rounds: read-only.</text>
 
-    <path d="M712 2538 L307 2538" class="red"/>
-    <text x="510" y="2529" text-anchor="middle" class="mono msgStrong">result=fail · save terminal state to GitHub FIRST</text>
-    <rect x="254" y="2558" width="106" height="24" class="statusFail"/>
-    <text x="307" y="2574" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: failed</text>
+    <path d="M712 2456 L307 2456" class="green"/>
+    <text x="510" y="2447" text-anchor="middle" class="mono msgStrong">persist pending acceptance request</text>
+    <rect x="238" y="2472" width="138" height="24" class="statusRun"/>
+    <text x="307" y="2488" text-anchor="middle" class="mono statusText" fill="#4F5C6B">status: testing</text>
+    <rect x="390" y="2472" width="234" height="24" class="statusWait"/>
+    <text x="507" y="2488" text-anchor="middle" class="mono statusText" fill="#9A6A32">GitHub label: acceptance-required</text>
+    <text x="307" y="2517" text-anchor="middle" class="mono small">Lifecycle remains testing; the label is a projection, not the sole permission check</text>
 
-    <text x="712" y="2612" text-anchor="middle" class="mono small">succeeded / failed already saved in GitHub</text>
-    <path d="M712 2636 L1295 2636" class="blue"/>
-    <text x="1004" y="2627" text-anchor="middle" class="mono msg">evidence.log.gz · best effort</text>
+    <!-- Test Reviewer has a separate role and per-repository allowlist from Machine Owner. -->
+    <path d="M1495 2546 L307 2546" class="orange"/>
+    <text x="901" y="2537" text-anchor="middle" class="mono msg">/record_test result=pass|fail [summary=...]</text>
 
-    <path d="M1295 2676 L712 2676" class="green"/>
-    <text x="1004" y="2667" text-anchor="middle" class="mono msg">object_key + sha256 + size</text>
+    <path d="M307 2586 L712 2586" class="orange"/>
+    <text x="510" y="2577" text-anchor="middle" class="mono msg">check this repo's test_reviewers.yaml + pending request + HEAD/round</text>
 
-    <path d="M712 2722 L307 2722" class="green"/>
-    <text x="510" y="2713" text-anchor="middle" class="mono msgStrong">Download COS evidence -> 120-second HTTPS presigned GET URL -> private COS object</text>
-    <text x="510" y="2740" text-anchor="middle" class="mono small">Temporary bearer access; URL not persisted in hidden state; bucket remains private</text>
+    <path d="M712 2624 L307 2624" class="green"/>
+    <text x="510" y="2615" text-anchor="middle" class="mono msgStrong">persist final result to GitHub FIRST</text>
+    <rect x="238" y="2634" width="138" height="24" class="statusOk"/>
+    <text x="307" y="2650" text-anchor="middle" class="mono statusText" fill="#425A4B">pass: succeeded</text>
+    <rect x="238" y="2662" width="138" height="24" class="statusFail"/>
+    <text x="307" y="2678" text-anchor="middle" class="mono statusText" fill="#8F4B4B">fail: failed</text>
+
+    <path d="M712 2692 L1295 2692" class="blue"/>
+    <text x="1004" y="2683" text-anchor="middle" class="mono msg">evidence.log.gz · best effort</text>
+
+    <path d="M1295 2730 L712 2730" class="green"/>
+    <text x="1004" y="2721" text-anchor="middle" class="mono msg">object_key + sha256 + size</text>
+
+    <path d="M712 2760 L307 2760" class="green"/>
+    <text x="510" y="2751" text-anchor="middle" class="mono msgStrong">rebind COS metadata if current</text>
   </g>
 
-  <line x1="40" y1="2780" x2="1360" y2="2780" stroke="#E7E5E4"/>
+  <line x1="40" y1="2780" x2="1560" y2="2780" stroke="#E7E5E4"/>
 
   <!-- ============================================================ -->
   <!-- SECTION 05: RESTART / RECOVERY                              -->
@@ -287,20 +310,22 @@
     <text x="712" y="2924" text-anchor="middle" class="mono small">is this still the exact reviewed PR HEAD?</text>
 
     <path d="M712 2972 L307 2972" class="green"/>
-    <text x="510" y="2963" text-anchor="middle" class="mono small">UNCHANGED</text>
+    <text x="510" y="2963" text-anchor="middle" class="mono small">UNCHANGED / pending deployment</text>
     <rect x="228" y="2994" width="158" height="24" class="statusWait"/>
     <text x="307" y="3010" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
     <path d="M920 3054 L307 3054" class="orange"/>
-    <text x="614" y="3045" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
+    <text x="614" y="3045" text-anchor="middle" class="mono msg">NEW /approve_deploy: use PR-listed compatible IP; omit machine only if exactly one machine fully matches</text>
 
     <path d="M307 3094 L712 3094" class="green"/>
     <text x="510" y="3085" text-anchor="middle" class="mono msg">continue Section 03 · select next compatible subset + runtime evidence</text>
 
     <path d="M712 3142 L307 3142" class="red"/>
-    <text x="510" y="3133" text-anchor="middle" class="mono msgStrong">PR HEAD CHANGED</text>
-    <rect x="238" y="3162" width="138" height="24" class="statusFail"/>
+    <text x="510" y="3133" text-anchor="middle" class="mono msgStrong">NEW COMMIT / PR HEAD CHANGED</text>
+    <rect x="220" y="3162" width="174" height="24" class="statusFail"/>
     <text x="307" y="3178" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: review-required</text>
+    <text x="615" y="3178" class="mono small">retain old deployment logs, videos and acceptance records read-only</text>
+    <text x="615" y="3194" class="mono small">old HEAD review and deploy request cannot be reused; restart at Section 01</text>
 
     <path d="M115 3220 L307 3220" class="blue"/>
     <text x="211" y="3211" text-anchor="middle" class="mono msg">/request_bot_review</text>
@@ -315,18 +340,20 @@
     <text x="307" y="3336" text-anchor="middle" class="mono statusText" fill="#425A4B">status: deploy-ready</text>
 
     <path d="M115 3376 L307 3376" class="orange"/>
-    <text x="211" y="3367" text-anchor="middle" class="mono msg">/request_deploy</text>
+    <text x="211" y="3367" text-anchor="middle" class="mono msg">/request_deploy (optional)</text>
+
+    <text x="610" y="3358" text-anchor="middle" class="mono small">Machine Owner may approve directly from deploy-ready without this request</text>
 
     <path d="M307 3416 L712 3416" class="orange"/>
-    <text x="510" y="3407" text-anchor="middle" class="mono msg">bind the newly reviewed PR HEAD</text>
+    <text x="510" y="3407" text-anchor="middle" class="mono msg">bind the newly reviewed PR HEAD (request path)</text>
 
-    <rect x="228" y="3436" width="158" height="24" class="statusWait"/>
-    <text x="307" y="3452" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+    <rect x="190" y="3436" width="234" height="24" class="statusWait"/>
+    <text x="307" y="3452" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested (if requested)</text>
 
     <path d="M920 3498 L307 3498" class="orange"/>
-    <text x="614" y="3489" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
+    <text x="614" y="3489" text-anchor="middle" class="mono msg">NEW /approve_deploy: use PR-listed compatible IP; omit machine only if exactly one machine fully matches</text>
 
     <path d="M307 3538 L712 3538" class="green"/>
-    <text x="510" y="3529" text-anchor="middle" class="mono msg">continue Section 03</text>
+    <text x="510" y="3529" text-anchor="middle" class="mono msg">approval starts deploying → continue Section 03</text>
   </g>
 </svg>

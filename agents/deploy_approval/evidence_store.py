@@ -16,11 +16,13 @@ from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 from .config import validate_repository_names
-from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
 
 
 class EvidenceStoreError(Exception):
     """An object is unavailable, incomplete, or failed integrity verification."""
+
+
+_SHORT_DOWNLOAD_TTL_SECONDS = 900
 
 
 def safe_filename(filename: str) -> str:
@@ -111,10 +113,9 @@ class CosAttachmentStore:
 
     @staticmethod
     def _download_ttl(ttl):
-        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
         if (isinstance(ttl, bool) or not isinstance(ttl, int)
-                or not 1 <= ttl <= EVIDENCE_PRESIGNED_URL_TTL_SECONDS):
-            raise ValueError('download TTL exceeds the configured evidence lifetime')
+                or not 1 <= ttl <= _SHORT_DOWNLOAD_TTL_SECONDS):
+            raise ValueError('download TTL must be 1..900 seconds')
         return ttl
 
     def issue_part_url(self, *, key, upload_id, part_number, ttl=900) -> dict:
@@ -131,9 +132,8 @@ class CosAttachmentStore:
                 'expires_at': (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()}
 
     def issue_download_url(self, *, key, filename, ttl=None) -> str:
-        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
         if ttl is None:
-            ttl = EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+            ttl = _SHORT_DOWNLOAD_TTL_SECONDS
         disposition = "attachment; filename=download; filename*=UTF-8''" + quote(safe_filename(filename), safe='')
         return self._sdk().get_presigned_url(
             Method='GET', Bucket=self.config.cos_bucket, Key=self._key(key), Expired=self._download_ttl(ttl),
@@ -141,7 +141,7 @@ class CosAttachmentStore:
                     'response-content-type': 'application/octet-stream'})
 
     def issue_preview_url(
-        self, *, key, filename, ttl=EVIDENCE_PRESIGNED_URL_TTL_SECONDS,
+        self, *, key, filename, ttl=_SHORT_DOWNLOAD_TTL_SECONDS,
     ) -> str:
         filename = safe_filename(filename)
         media_types = {

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import ipaddress
 import re
 import html
 import json
@@ -157,6 +158,99 @@ def _human_size(size: int) -> str:
         return f"{size / (1024 * 1024):.1f} MB"
 
 
+def evidence_upload_comment(
+    repo: str, pr_number: int, head_sha: str, round_id: str,
+    attachment_id: str, filename: str, *, download_url: str,
+    preview_url: str = "", note: str = "", public_base_url: str = "",
+) -> str:
+    """Build one safe, idempotently identifiable notification for a ready file."""
+    if (not _evidence_path(repo, pr_number)
+            or not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+            or not isinstance(round_id, str)
+            or re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id) is None
+            or not isinstance(attachment_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id) is None):
+        return ""
+
+    stable_base = _public_base(public_base_url)
+    if not stable_base:
+        return ""
+    api_path = (_evidence_path(repo, pr_number) + "/attachments/"
+                + urllib.parse.quote(attachment_id, safe=""))
+
+    def trusted_access_url(value: str, action: str) -> str:
+        if not isinstance(value, str) or len(value) > 4096:
+            return ""
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        except (TypeError, ValueError):
+            return ""
+        if (parsed.scheme != "https"
+                or parsed.netloc != urllib.parse.urlsplit(stable_base).netloc
+                or parsed.username or parsed.password or parsed.fragment
+                or parsed.path != api_path + "/" + action
+                or set(query) != {"cap"} or len(query["cap"]) != 1
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,2048}", query["cap"][0])):
+            return ""
+        return value
+
+    download_url = trusted_access_url(download_url, "download")
+    preview_url = trusted_access_url(preview_url, "preview")
+    if not download_url:
+        return ""
+    clean_filename = filename if isinstance(filename, str) and filename.strip() else "测试证据"
+    label = _escape(clean_filename.strip())
+    suffix = clean_filename.rsplit(".", 1)[-1].lower() if "." in clean_filename else ""
+    image_suffixes = {"png", "jpg", "jpeg", "gif", "webp"}
+    video_suffixes = {"mp4", "webm"}
+    lines = [
+        "### 测试证据已上传",
+        "",
+        f"已保存：[{label}](<{download_url}>)",
+    ]
+    if suffix in image_suffixes and preview_url:
+        lines.extend(["", f"![{label}](<{preview_url}>)", "", f"[下载图片](<{download_url}>)"])
+    elif suffix in video_suffixes:
+        lines[-1] = f"已保存：[{label}](<{preview_url or download_url}>)"
+        if preview_url:
+            lines.extend(["", f"[下载视频](<{download_url}>)"])
+    if isinstance(note, str) and note.strip():
+        from .evidence_builder import _redact_secrets
+
+        safe_note = _redact_secrets(note.strip())
+        safe_note = re.sub(
+            r"(?i)((?:x-evidence-secret|x-evidence-client-key|evidence-capability|capability|cap|token)\s*[=:]\s*)[^\s&;]+",
+            r"\1[已隐藏]", safe_note)
+        safe_note = re.sub(r"https?://[^\s<>()]+", "[链接已隐藏]", safe_note)
+        escaped_note = _escape(safe_note)
+        lines.extend(["", "备注：", "", *("> " + line for line in escaped_note.splitlines())])
+    notification_key = hashlib.sha256(
+        f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode("utf-8")
+    ).hexdigest()
+    return "\n".join([
+        BOT_MARKER,
+        f"<!-- deploy-approval-evidence-upload:{notification_key} -->",
+        *lines,
+    ])
+
+
+def stable_attachment_url(repo, pr_number, attachment_id, capability, *, action,
+                          public_base_url="") -> str:
+    """Build a stable Evidence route; the route signs private COS access on click."""
+    base = _public_base(public_base_url)
+    api = _evidence_path(repo, pr_number)
+    if (not base or not api or action not in {"download", "preview"}
+            or not isinstance(attachment_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id) is None
+            or not isinstance(capability, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,2048}", capability)):
+        return ""
+    path = api + "/attachments/" + urllib.parse.quote(attachment_id, safe="") + "/" + action
+    return base + path + "?" + urllib.parse.urlencode({"cap": capability})
+
+
 # ── Workflow helper ──────────────────────────────────────────────
 
 
@@ -165,64 +259,77 @@ def _workflow_lines(
     deployments_complete: bool | None = None,
     record_test_complete: bool = False,
 ) -> str:
-    """Return the fixed 8-step workflow as markdown.
+    """Keep the workflow to one sentence about the current stage."""
+    if status == "review-required":
+        return "等待开发者发起代码审查。"
+    if status == "reviewing":
+        return "代码审查进行中。"
+    if status == "deploy-ready":
+        return "构建审核已完成，可以部署。"
+    if status == "deploy-requested":
+        return "已申请部署，正在等待机器负责人审批。"
+    if status == "deploying":
+        return "正在部署，请等待结果。"
+    if status == "testing":
+        return "部署完成，现在可以测试。"
+    if status == "succeeded":
+        return "本轮部署已验收通过。"
+    if status == "failed":
+        return "本轮流程失败，请查看具体部署或验收记录。"
+    return "等待更新。"
 
-    Always forward order. [x] for complete, [ ] for pending.
-    First unchecked step marked with \u2190 **Next**.
-    If all checked, last step is marked done.
-    """
-    step_defs = [
-        ("1. Request Review", 0, "review"),
-        ("2. Review Agent completed", 1, "reviewed"),
-        ("3. Request deployment", 2, "request"),
-        ("4. Machine Owner approval(s)", 3, "approval"),
-        ("5. All required components deployed", 4, "deployment"),
-        ("6. Machine Owner uploads evidence", 4, "evidence"),
-        ("7. Record validation result", 5, "result"),
-        ("8. Deployment accepted", 6, "accepted"),
-    ]
 
-    status_levels = {
-        "review-required": 0,
-        "reviewing": 1,
-        "deploy-ready": 2,
-        "deploy-requested": 3,
-        "testing": 5,
-        "succeeded": 7,
-        "failed": 5,
-    }
-    current_level = status_levels.get(status, 0)
+def _trusted_upload_page_url(value: str, repo: str, pr_number: int) -> str:
+    """Accept only the configured HTTPS upload page for this exact PR."""
+    if not isinstance(value, str) or len(value) > 4096:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        from .config import is_evidence_ingress_url
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        expected_path = _evidence_path(repo, pr_number).replace(
+            "/api/evidence/", "/evidence/", 1,
+        )
+    except (TypeError, UnicodeError, ValueError):
+        return ""
+    if (not expected_path or not is_evidence_ingress_url(origin)
+            or parsed.path != expected_path or parsed.fragment
+            or parsed.username or parsed.password
+            or set(query) != {"cap"} or len(query["cap"]) != 1
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,2048}", query["cap"][0]) is None):
+        return ""
+    return value
 
+
+def _testing_next_action(
+    evidence_complete: bool, evidence_url: str = "", *,
+    repo: str = "", pr_number: int = 0,
+) -> str:
+    evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
     lines = []
-    next_marked = False
-    for label, required_level, step in step_defs:
-        checked = current_level > required_level
-        if status == "testing" and step == "deployment":
-            checked = bool(deployments_complete)
-        if status == "testing" and step == "evidence":
-            checked = bool(evidence_complete)
-        if status == "testing" and step == "result":
-            checked = bool(record_test_complete)
-        mark = "[x]" if checked else "[ ]"
-        line = f"- {mark} {label}"
-        if not checked and not next_marked:
-            line += " \u2190 **Next**"
-            next_marked = True
-        lines.append(line)
-
-    # If all steps are checked, no Next marker needed
-    if not next_marked:
-        return "\n".join(lines)
-
-    return "\n".join(lines)
-
-
-def _testing_next_action(evidence_complete: bool) -> str:
     if evidence_complete:
-        return ("**Machine Owner**\n\n测试完成后，请执行 `/request_acceptance`，"
-                "之后由 `test_reviewers.yaml` 白名单中的验收人记录最终结果。")
-    return ("**PR developer and deployed Machine Owner**\n\n"
-            "完成本轮验证后，由 Machine Owner 执行 `/request_acceptance` 请求验收。")
+        lines.append("测试证据已上传。如需补充视频或图片，可继续上传：")
+        if evidence_url:
+            lines.append(f"[继续上传测试视频/图片](<{evidence_url}>)")
+        else:
+            lines.extend([
+                "[继续上传测试视频/图片][deploy-approval-upload]",
+                "若入口暂不可用，请查看下方附件区的状态说明。",
+            ])
+    else:
+        lines.extend(["部署完成，现在可以测试。测试视频或图片请上传到当前轮附件页：", ""])
+        if evidence_url:
+            lines.append(f"[上传测试视频/图片](<{evidence_url}>)")
+        else:
+            lines.extend([
+                "[上传测试视频/图片][deploy-approval-upload]",
+                "若入口暂不可用，请查看下方附件区的状态说明。",
+            ])
+        lines.extend(["", "测试完成后，由本轮机器负责人在 PR 评论中输入：", "", "`/request_acceptance`"])
+        return "\n".join(lines)
+    lines.extend(["", "测试完成后，由本轮机器负责人在 PR 评论中输入：", "", "`/request_acceptance`"])
+    return "\n".join(lines)
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -305,7 +412,46 @@ def deploy_ready(
     repo: str, pr_number: int, head_sha: str,
     builds: list[BuildInfo], last_lifecycle_event: str = "",
     review_evidence: dict | None = None,
+    machine_groups: list[dict] | None = None,
+    components: list[dict] | None = None,
 ) -> str:
+    deployable_ids = {
+        component.get("component_id") for component in components or []
+        if isinstance(component, dict) and isinstance(component.get("component_id"), str)
+        and component.get("component_id")
+    }
+    if not deployable_ids:
+        deployable_ids = {
+            build.component_id for build in builds
+            if build.success and build.deployable and isinstance(build.component_id, str) and build.component_id
+        }
+    commands = []
+    full_machine_ips = set()
+    seen_ips = set()
+    for group in machine_groups or []:
+        if not isinstance(group, dict):
+            continue
+        compatible = group.get("component_ids")
+        if not isinstance(compatible, list):
+            continue
+        compatible_ids = {component for component in compatible if isinstance(component, str)}
+        if not deployable_ids or not deployable_ids.intersection(compatible_ids):
+            continue
+        try:
+            ip = ipaddress.ip_address(group.get("ip"))
+        except (TypeError, ValueError):
+            continue
+        if ip.version != 4:
+            continue
+        if deployable_ids.issubset(compatible_ids):
+            full_machine_ips.add(str(ip))
+        if str(ip) in seen_ips:
+            continue
+        seen_ips.add(str(ip))
+        alias = group.get("alias")
+        label = f"{_escape(alias)}（`{ip}`）" if isinstance(alias, str) and alias else f"`{ip}`"
+        commands.append(f"- {label}：`/approve_deploy machine={ip}`")
+
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -321,14 +467,20 @@ def deploy_ready(
         "",
         "### Next action",
         "",
-        "**Developer**",
+        "构建审核已完成，可以部署。请使用对应机器的完整命令：",
         "",
-        "`/request_deploy`",
+        *(commands or ["当前没有可用机器 IP，暂时无法生成直接部署命令。"]),
+    ]
+    if len(full_machine_ips) == 1:
+        lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写：", "", "`/approve_deploy`"])
+    lines.extend([
+        "",
+        "也可以选择用 `/request_deploy` 申请部署。",
         "",
         "### Review evidence",
         "",
         f"- **Build Result:** {'success' if builds and all(b.success for b in builds) else 'failed'}",
-    ]
+    ])
     evidence = review_evidence or {}
     if evidence.get("test_comment_id", 0) == 0:
         lines.append("- **Tests:** not run")
@@ -342,10 +494,7 @@ def deploy_ready(
     lines.extend([
         "- **Code Review:** findings available — manual review required",
         "",
-        "> Deploy Approval does not interpret Review Agent findings; "
-        "the developer/owner must read the Review Agent review comment. "
-        "The developer's `/request_deploy` confirms this manual review; "
-        "machine owner/collaborator approval is still required before deployment.",
+        "> 请先阅读 Review Agent 的审查意见，再选择上方部署命令。",
         "",
         "### Components",
         "",
@@ -364,8 +513,12 @@ def deploy_requested(
     all_components: list[dict] | None = None,
     component_snapshot: list[dict] | None = None,
     attempt: dict | None = None,
+    display_status: str = "deploy-requested",
 ) -> str:
     """status: deploy-requested with IP table, workflow, deployment, history."""
+    if (not isinstance(display_status, str)
+            or display_status not in {"deploy-requested", "deploying"}):
+        raise ValueError("display_status must be deploy-requested or deploying")
     # Build component labels
     comp_lines = []
     for c in components:
@@ -424,12 +577,38 @@ def deploy_requested(
         )
         table_lines.append(f"| `{_escape(alias)}` | {ip_str} | {comps_str} |")
 
+    remaining_ids = {
+        item.get("component_id") for item in components
+        if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+    }
+    machine_commands = []
+    seen_commands = set()
+    for group in machine_groups or []:
+        if not isinstance(group, dict):
+            continue
+        component_ids = group.get("component_ids")
+        if (not isinstance(component_ids, list)
+                or not any(component_id in remaining_ids for component_id in component_ids)):
+            continue
+        raw_ip = group.get("ip")
+        try:
+            address = ipaddress.ip_address(raw_ip)
+        except (TypeError, ValueError):
+            continue
+        if address.version != 4:
+            continue
+        command = f"/approve_deploy machine={address}"
+        if command in seen_commands:
+            continue
+        seen_commands.add(command)
+        machine_commands.append((str(group.get("alias") or ""), str(address), command))
+
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
         "",
-        "**Status:** `deploy-requested`",
+        f"**Status:** `{display_status}`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
     ]
@@ -437,15 +616,18 @@ def deploy_requested(
         "",
         "### Workflow",
         "",
-        _workflow_lines("deploy-requested"),
+        _workflow_lines(display_status),
         "",
         "### Next action",
         "",
-        "**Machine Owner**",
+        ("正在部署，请等待结果。" if display_status == "deploying"
+         else "正在等待机器负责人审批。请对应机器负责人执行下方本机的真实 IP 命令："),
         "",
-        "`/approve_deploy machine=<alias-or-ip>`",
-        "",
-        "Machine Owner may use either the machine alias or the listed IP address.",
+        *([] if display_status == "deploying" else
+          [f"- `{_escape(alias)}`（`{_escape(ip)}`）：`{command}`"
+           for alias, ip, command in machine_commands]
+          if machine_commands else
+          ["当前没有可用的机器 IP，暂时无法生成审批命令，请检查机器配置。"]),
         "",
         "### Compatible machines for remaining components",
         "",
@@ -483,58 +665,32 @@ def testing(
     acceptance_pending: bool = False,
     acceptance_reviewers_configured: bool = True,
     acceptance_reviewers: list[str] | None = None,
+    evidence_url: str = "",
 ) -> str:
     if acceptance_pending:
-        reviewers = [name for name in acceptance_reviewers or []
-                     if isinstance(name, str) and name.strip()]
-        next_action = ["### 验收人", ""]
+        reviewers = [name.strip() for name in acceptance_reviewers or []
+                     if isinstance(name, str)
+                     and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}", name.strip())]
+        next_action = []
         if reviewers:
+            waiting_for = "、".join(f"@{_escape(name)}" for name in reviewers)
             next_action.extend([
-                "本轮可验收的 GitHub 用户："
-                + "、".join(f"`@{_escape(name.strip())}`" for name in reviewers),
+                f"正在等待以下验收人确认：{waiting_for}。",
+                "其中一位验收人请在 PR 评论中执行其中一条命令：\n"
+                "- `/record_test result=pass`\n"
+                "- `/record_test result=fail`",
             ])
-            acceptance_instruction = (
-                "请名单中的任意一位验收人，在当前 PR 的 Conversation 新建一条评论，"
-                "以下两条命令二选一。"
-            )
         else:
             if not acceptance_reviewers_configured:
-                reason = (
-                    "现有 `test_reviewers.yaml` 名单未加载或为空。请管理员修复现有名单；"
-                    "当前没有可执行验收的人选。"
-                )
+                reason = "当前仓库没有配置可用的验收账号，无法验收。请管理员检查 test_reviewers.yaml。"
             else:
-                reason = (
-                    "现有 `test_reviewers.yaml` 中没有可用的有效验收人。请管理员检查现有名单配置。"
-                )
-            next_action.extend([reason])
-            acceptance_instruction = (
-                "名单恢复可用前，暂不能执行验收命令。之后请名单中的任意一位验收人，"
-                "在当前 PR 的 Conversation 新建一条评论，以下两条命令二选一。"
-            )
-        next_action.extend([
-            "",
-            "### 验收操作",
-            "",
-            acceptance_instruction,
-            "",
-            "只有现有 `test_reviewers.yaml` 白名单决定谁可以执行 `/record_test`。",
-            "",
-            "- 验收成功：`/record_test result=pass`",
-            "- 验收失败：`/record_test result=fail`",
-            "",
-            "只需执行其中一条。`summary` 是可选参数，用于补充验收说明。"
-            "将命令作为评论正文从第一列开始输入；不要加引用前缀，也不要放进 Markdown 代码块。",
-            "GitHub Review 的 Approve 按钮不能替代此业务命令。",
-            "",
-            "### 结果说明",
-            "",
-            "- `pass`：本轮状态变为 `succeeded`，验收通过。",
-            "- `fail`：本轮状态变为 `failed`，验收失败。",
-        ])
-        next_action = "\n".join(next_action)
+                reason = "验收名单中没有可用账号，无法验收。请管理员检查 test_reviewers.yaml。"
+            next_action.append(reason)
+        next_action = "\n\n".join(next_action)
     else:
-        next_action = _testing_next_action(evidence_complete)
+        next_action = _testing_next_action(
+            evidence_complete, evidence_url, repo=repo, pr_number=pr_number,
+        )
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -546,9 +702,10 @@ def testing(
         "",
         "### Workflow",
         "",
-        _workflow_lines("testing", evidence_complete=evidence_complete,
-                        deployments_complete=deployments_complete,
-                        record_test_complete=record_test_complete),
+        ("测试完成，正在等待验收人确认。" if acceptance_pending else
+         _workflow_lines("testing", evidence_complete=evidence_complete,
+                         deployments_complete=deployments_complete,
+                         record_test_complete=record_test_complete)),
         "",
         "### Next action",
         "",
@@ -679,22 +836,18 @@ def uncertain_comment(
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
         "",
-        "**Status:** `deploy-requested`",
+        "**Status:** `deploying`",
         "**Command phase:** `uncertain`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
         "### Workflow",
         "",
-        _workflow_lines("deploy-requested"),
+        _workflow_lines("deploying"),
         "",
         "### Next action",
         "",
-        "**Machine Owner**",
-        "",
-        "`/approve_deploy machine=<alias-or-ip>`",
-        "",
-        "Only a NEW `/approve_deploy` starts recovery validation.",
+        "部署结果正在核实，请等待状态更新；请勿重复提交部署审批命令。",
     ]
     lines.extend(_attempt_lines(attempt))
     if deployments:
@@ -752,7 +905,7 @@ def deploying_comment(
     details = dict(attempt or {})
     details.setdefault("phase", "executing")
     return deploy_status_comment(
-        "deploy-requested", head_sha, repo, pr_number,
+        "deploying", head_sha, repo, pr_number,
         components=components, deployments=deployments,
         machine_groups=machine_groups, attempt=details,
         last_lifecycle_event=last_lifecycle_event,
@@ -792,12 +945,9 @@ def deploy_help_text(topic: str = "") -> str:
             "用途：审批部署并将其绑定到指定机器。",
             "",
             "执行人：对应 Machine Owner，或有 write/maintain/admin 权限的协作者。",
-            "阶段：PR 状态为 deploy-requested，且机器与剩余组件兼容。",
+            "阶段：deploy-ready 时可直接审批；deploy-requested 时为常规机器审批阶段。",
             "",
-            "命令：",
-            "`/approve_deploy machine=<alias-or-ip>`",
-            "",
-            "`machine` 可填写兼容机器的别名或 IP 地址。",
+            "请使用 PR Summary 中为兼容机器列出的真实 IP 命令。仅一台机器完全适配时，可使用 `/approve_deploy`；`/request_deploy` 是可选操作。",
         ])
     if topic == "record_test":
         return "\n".join([
@@ -806,7 +956,9 @@ def deploy_help_text(topic: str = "") -> str:
             "",
             "用途：记录本轮部署验证结果。",
             "",
-            "执行人：`deploy-approval/test_reviewers.yaml` 白名单中的 GitHub 用户；该白名单是执行 `/record_test` 的唯一人员资格条件。",
+            "两个目标仓库分别维护各自的 `test_reviewers.yaml`；执行 `/record_test` 只使用当前仓库的验收名单。",
+            "执行人：当前仓库验收名单中的 GitHub 用户。部署审批权限与最终验收权限相互独立。",
+            "请求验收后，Summary 会显示当前仓库有效的 `@账号`；只有这些验收白名单账号可以执行 `/record_test`。",
             "阶段：本轮已在 testing 阶段请求验收后。",
             "",
             "参数：",
@@ -828,10 +980,12 @@ def deploy_help_text(topic: str = "") -> str:
         "命令用途、执行人和阶段：",
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
-        "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
+        "- 机器审批：对应 Machine Owner 或有 write/maintain/admin 权限的协作者；deploy-ready 时按 Summary 中兼容机器的真实 IP 命令直接审批，仅一台机器完全适配时可使用 `/approve_deploy`；deploy-requested 时按 Summary 的机器 IP 命令常规审批。`/request_deploy` 是可选操作。",
         "- `/request_acceptance`：本轮实际部署机器的 Machine Owner 在 testing 阶段请求验收；仅更新待验收标记，不结束 testing。",
-        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：`test_reviewers.yaml` 白名单中的用户在待验收阶段记录成功。",
-        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：`test_reviewers.yaml` 白名单中的用户在待验收阶段记录失败。",
+        "- 两个目标仓库分别维护自己的 `test_reviewers.yaml`；部署审批权限不会授予验收权限。",
+        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：当前仓库验收白名单中的用户在待验收阶段记录成功。",
+        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：当前仓库验收白名单中的用户在待验收阶段记录失败。",
+        "- 请求验收后，Summary 会标出当前仓库有效的 `@账号`；只有这些账号可以执行 `/record_test`。",
         "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
         "- `/deploy_help record_test`：查看验收命令说明；可在任意阶段使用。",
         "",
@@ -951,7 +1105,7 @@ def _machine_log_lines(group, key, api, origin):
             path = api + "/rounds/" + urllib.parse.quote(key[1], safe="")
             path += "/machines/" + urllib.parse.quote(machine, safe="") + "/log/download"
             url = origin + path + "?" + urllib.parse.urlencode({"cap": capability})
-            lines.append(f"- `{_escape(machine)}`：[下载机器部署日志](<{url}>)")
+            lines.append(f"- `{_escape(machine)}`：[下载部署日志](<{url}>)")
         elif status == "ready":
             lines.append(f"- `{_escape(machine)}`：已归档，下载链接暂不可用")
         elif status == "pending":
@@ -1172,53 +1326,6 @@ def render_evidence_section(
         path = api + "/attachments/" + urllib.parse.quote(attachment_id, safe="") + "/download"
         return origin + path + "?" + urllib.parse.urlencode({"cap": capability})
 
-    def trusted_cos_download_url(item, key):
-        verified_content = (
-            item.get("cos_content_verified") is True
-            or item.get("actor_verified") is True
-            and item.get("upload_method") != "signed_invite"
-        ) if isinstance(item, dict) else False
-        if (not isinstance(item, dict) or item.get("status") != "ready"
-                or item.get("deleted_at") or not verified_content
-                or item.get("cos_projection_verified") is not True
-                or item.get("head_sha") != key[0] or item.get("round_id") != key[1]
-                or not isinstance(item.get("sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
-            return ""
-        attachment_id = item.get("attachment_id")
-        filename = item.get("filename")
-        uploaded_at = first_valid_time(item.get("created_at"), item.get("uploaded_at"))
-        object_key = item.get("object_key")
-        size = item.get("size")
-        if (not isinstance(attachment_id, str) or not isinstance(filename, str)
-                or not isinstance(uploaded_at, str) or not isinstance(object_key, str)
-                or isinstance(size, bool) or not isinstance(size, int)
-                or not 1 <= size <= 512 * 1024 * 1024
-                or not callable(cos_download_url_expiry)):
-            return ""
-        try:
-            from .evidence_store import build_attachment_key
-            if object_key != build_attachment_key(
-                    repo, pr_number, key[0], key[1], attachment_id, uploaded_at, filename):
-                return ""
-            value = item.get("cos_download_url")
-            if (not isinstance(value, str) or len(value) > 8192
-                    or any(char in value for char in "\r\n<>\\\"")):
-                return ""
-            parsed = urllib.parse.urlsplit(value)
-            if (parsed.scheme != "https" or parsed.username is not None
-                    or parsed.password is not None or parsed.port is not None
-                    or parsed.fragment
-                    or urllib.parse.unquote(parsed.path.lstrip("/")) != object_key):
-                return ""
-            if cos_download_url_expiry(
-                    value, key=object_key, filename=filename,
-                    attachment_id=attachment_id) is None:
-                return ""
-            return value
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            return ""
-
     def latest_attachments(group, key):
         latest_items = {}
         for offset, item in enumerate(group.get("attachments", [])):
@@ -1437,8 +1544,6 @@ def render_evidence_section(
                 filename = filename + "（已删除）"
             download_url = ("" if deleted else
                             stable_attachment_download_url(item, key, base or upload_base))
-            if not download_url and not deleted:
-                download_url = trusted_cos_download_url(item, key)
             filename_cell = _escape(filename)
             if download_url:
                 filename_cell = f"[{filename_cell}](<{download_url}>)"
@@ -1515,10 +1620,14 @@ def render_evidence_section(
                                             group.get("machine_groups"))])
         machine_log_lines = _machine_log_lines(group, key, api, base or upload_base)
         if machine_log_lines:
-            lines.extend(["", "### 每机器部署日志", ""])
+            lines.extend(["", "### 部署日志", ""])
             lines.extend(machine_log_lines)
         attachment_page = round_attachment_page_url(key, group)
-        if attachment_page:
+        upload_entry_url = (
+            current_upload_entry_url()
+            if key == (head, current_round) else ""
+        )
+        if attachment_page and not upload_entry_url:
             lines.extend(["", f"[打开附件页](<{attachment_page}>)"])
         return lines
 
@@ -1561,6 +1670,14 @@ def render_evidence_section(
             return page_url_at(group.get("capability"), origin)
         return stable_read_page_url(key, origin)
 
+    def current_upload_entry_url():
+        if (state.get("status") != "testing"
+                or state.get("browser_upload_ready") is not True
+                or not round_read_context_valid):
+            return ""
+        candidate = page_url_at(state.get("upload_capability"), upload_base)
+        return _trusted_upload_page_url(candidate, repo, pr_number)
+
     lines = ["<!-- deploy-approval-evidence:start -->"]
     if show_current_round:
         current_key = (head, current_round)
@@ -1583,4 +1700,19 @@ def render_evidence_section(
     for url in trusted_archive_urls:
         lines.append(f"[查看原始归档](<{url}>)")
     lines.append("<!-- deploy-approval-evidence:end -->")
+    if state.get("status") == "testing":
+        upload_entry_url = current_upload_entry_url()
+        if upload_entry_url:
+            lines.extend([
+                "",
+                f"[deploy-approval-upload]: <{upload_entry_url}>",
+            ])
+        else:
+            lines.extend([
+                "",
+                '<a id="deploy-approval-upload-status"></a>',
+                "**上传入口状态：** 当前轮安全上传链接暂不可用。请检查证据服务、访问权限和可信 HTTPS 上传入口配置，或联系管理员。",
+                "",
+                "[deploy-approval-upload]: #deploy-approval-upload-status",
+            ])
     return "\n".join(lines)

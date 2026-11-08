@@ -28,6 +28,7 @@ UPLOAD_COOKIE = 'evidence-upload-capability'
 UPLOAD_MAX_FILES = 20
 UPLOAD_MAX_BYTES = 10 * 1024 * 1024 * 1024
 UPLOAD_MAX_LIFETIME_SECONDS = 30 * 24 * 60 * 60
+DOWNLOAD_MAX_LIFETIME_SECONDS = 365 * 24 * 60 * 60
 PROOF_HEADER = 'x-evidence-secret'
 NONCE_HEADER = 'x-evidence-nonce'
 PROOF_SECONDS = 24 * 60 * 60
@@ -184,6 +185,13 @@ def issue_capability(config, repo, pr_number, head_sha, round_id, purpose=PURPOS
                 or not re.fullmatch(re.escape(str(head_sha)) + r'-[0-9]+', str(round_id))
                 or type(expires_at) is not int or not now < expires_at <= now + UPLOAD_MAX_LIFETIME_SECONDS):
             raise ValueError('upload capability expiry required')
+    elif purpose == DOWNLOAD_PURPOSE:
+        now = int(time.time())
+        if expires_at is None:
+            expires_at = now + DOWNLOAD_MAX_LIFETIME_SECONDS
+        if (type(expires_at) is not int
+                or not now < expires_at <= now + DOWNLOAD_MAX_LIFETIME_SECONDS):
+            raise ValueError('download capability expiry must be within one year')
     elif expires_at is not None:
         raise ValueError('expiry is only valid for upload capabilities')
     claims = {'repo': repo, 'pr': pr_number, 'head': head_sha,
@@ -194,6 +202,7 @@ def issue_capability(config, repo, pr_number, head_sha, round_id, purpose=PURPOS
         if not isinstance(resource, str) or not 1 <= len(resource) <= 160 or any(ord(c) < 33 for c in resource):
             raise ValueError('download capability resource required')
         claims['resource'] = resource
+        claims['expires_at'] = expires_at
     elif resource is not None:
         raise ValueError('upload capability cannot carry a resource')
     body = _b64(json.dumps(claims, sort_keys=True, separators=(',', ':')).encode())
@@ -228,7 +237,12 @@ def verify_capability(config, token, repo, pr_number, *, purpose=None, resource=
                          or not int(time.time()) < claims['expires_at'] <=
                          int(time.time()) + UPLOAD_MAX_LIFETIME_SECONDS
                          or claims.get('status') != 'testing'))
-                or (claims.get('purpose') != UPLOAD_PURPOSE and 'expires_at' in claims)
+                or (claims.get('purpose') == DOWNLOAD_PURPOSE
+                    and 'expires_at' in claims
+                    and (type(claims.get('expires_at')) is not int
+                         or not int(time.time()) < claims['expires_at'] <=
+                         int(time.time()) + DOWNLOAD_MAX_LIFETIME_SECONDS))
+                or (claims.get('purpose') == PURPOSE and 'expires_at' in claims)
                 or not re.fullmatch(r'[0-9a-f]{40}', str(claims.get('head', '')))
                 or not re.fullmatch(r'[0-9a-f]{40}-[0-9]+', str(claims.get('round', '')))
                 or not claims['round'].startswith(claims['head'] + '-')):

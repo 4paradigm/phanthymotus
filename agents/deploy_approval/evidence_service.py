@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import socket
 import tempfile
@@ -31,6 +32,7 @@ from .evidence_models import (
 
 UPLOAD_MAX_NOTES = 20
 _CURRENT_CONTEXT_HISTORY_TIMEOUT_SECONDS = 8
+logger = logging.getLogger(__name__)
 
 
 class _NoopAsyncContext:
@@ -138,6 +140,154 @@ class EvidenceService:
         operation.clear()
         operation.update(canonical)
         return record
+
+    def _trusted_upload_notification(self, comment, marker):
+        if not isinstance(comment, dict) or not callable(
+                getattr(self.proxy, 'is_bot_comment', None)):
+            return False
+        body = comment.get('body')
+        user = comment.get('user')
+        if (not isinstance(body, str) or marker not in body.splitlines()
+                or not self.proxy.is_bot_comment(comment)
+                or not isinstance(user, dict)
+                or isinstance(user.get('id'), bool)
+                or not isinstance(user.get('id'), int) or user['id'] <= 0
+                or not isinstance(user.get('login'), str) or not user['login']
+                or user.get('type') not in (None, 'Bot')):
+            return False
+        return True
+
+    async def _find_upload_notification(self, repo, pr_number, marker):
+        comments = await self.proxy.get_issue_comments(repo, pr_number)
+        if not isinstance(comments, list):
+            raise EvidenceError('evidence_notification_read_failed', 503)
+        return any(self._trusted_upload_notification(comment, marker)
+                   for comment in comments)
+
+    async def _notify_ready_attachment(self, repo, pr_number, operation):
+        """Post one stable, repo/PR/HEAD/round-bound ready-file comment.
+
+        A deterministic marker plus a trusted App-authored comment makes
+        duplicate complete/resume calls and recovery after a restart idempotent.
+        If POST outcome is unclear, read back once and never blindly re-post.
+        """
+        if (not isinstance(operation, dict)
+                or operation.get('repo') != repo
+                or type(operation.get('pr_number')) is not int
+                or type(pr_number) is not int
+                or operation.get('pr_number') != pr_number
+                or operation.get('status') != 'ready'
+                or operation.get('cos_content_verified') is not True
+                or not isinstance(operation.get('object_key'), str)
+                or not operation['object_key']
+                or type(operation.get('size')) is not int or operation['size'] <= 0
+                or not isinstance(operation.get('sha256'), str)
+                or re.fullmatch(r'[0-9a-f]{64}', operation['sha256']) is None):
+            return False
+        head_sha, round_id = operation.get('head_sha'), operation.get('round_id')
+        attachment_id = operation.get('attachment_id')
+        filename = operation.get('filename')
+        if (not isinstance(head_sha, str)
+                or re.fullmatch(r'[0-9a-f]{40}', head_sha) is None
+                or not isinstance(round_id, str)
+                or re.fullmatch(re.escape(head_sha) + r'-[0-9]+', round_id) is None
+                or not isinstance(attachment_id, str)
+                or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', attachment_id) is None
+                or not isinstance(filename, str) or not filename.strip()):
+            return False
+
+        from . import comments as comments_mod, evidence_auth
+        public_base = getattr(self.config, 'evidence_public_base_url', '')
+        try:
+            capability = evidence_auth.issue_capability(
+                self.config, repo, pr_number, head_sha, round_id,
+                purpose=DOWNLOAD_PURPOSE,
+                resource='attachment:' + attachment_id,
+                expires_at=int(time.time()) + evidence_auth.DOWNLOAD_MAX_LIFETIME_SECONDS,
+            )
+            download_url = comments_mod.stable_attachment_url(
+                repo, pr_number, attachment_id, capability,
+                action='download', public_base_url=public_base,
+            )
+            suffix = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+            preview_url = ''
+            if suffix in {'png', 'jpg', 'jpeg', 'gif', 'webp'}:
+                preview_url = comments_mod.stable_attachment_url(
+                    repo, pr_number, attachment_id, capability,
+                    action='preview', public_base_url=public_base,
+                )
+            body = comments_mod.evidence_upload_comment(
+                repo, pr_number, head_sha, round_id, attachment_id, filename,
+                download_url=download_url, preview_url=preview_url,
+                note=operation.get('note', ''), public_base_url=public_base,
+            )
+        except Exception as exc:
+            logger.warning(
+                'evidence ready notification link unavailable %s#%s exception=%s',
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
+        if not body:
+            logger.warning(
+                'evidence ready notification skipped %s#%s: stable HTTPS attachment link unavailable',
+                repo, pr_number,
+            )
+            return False
+        marker = next((line for line in body.splitlines()
+                       if re.fullmatch(
+                           r'<!-- deploy-approval-evidence-upload:[0-9a-f]{64} -->', line,
+                       )), '')
+        if not marker:
+            return False
+
+        try:
+            if await self._find_upload_notification(repo, pr_number, marker):
+                return True
+        except Exception as exc:
+            logger.warning(
+                'evidence ready notification dedupe read failed %s#%s exception=%s; not posting',
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
+
+        try:
+            posted = await self.proxy.post_issue_comment(repo, pr_number, body)
+        except Exception as exc:
+            # A timeout can happen after GitHub accepted the POST. Confirm the
+            # deterministic marker before reporting uncertainty; never retry
+            # the POST from this request.
+            try:
+                confirmed = await self._find_upload_notification(repo, pr_number, marker)
+            except Exception as read_exc:
+                logger.warning(
+                    'evidence ready notification outcome unknown %s#%s post=%s read=%s',
+                    repo, pr_number, type(exc).__name__, type(read_exc).__name__,
+                )
+                return False
+            if confirmed:
+                return True
+            logger.warning(
+                'evidence ready notification was not confirmed %s#%s exception=%s; not reposting',
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
+
+        if self._trusted_upload_notification(posted, marker):
+            return True
+        try:
+            if await self._find_upload_notification(repo, pr_number, marker):
+                return True
+        except Exception as exc:
+            logger.warning(
+                'evidence ready notification confirmation failed %s#%s exception=%s',
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
+        logger.warning(
+            'evidence ready notification post was not confirmed %s#%s; not reposting',
+            repo, pr_number,
+        )
+        return False
 
     async def _store(self, action, operation, payload):
         if self.store is None or not callable(getattr(self.store, 'dispatch', None)):
@@ -1526,7 +1676,9 @@ class EvidenceService:
                         result = {'uploaded_parts': await self.store.list_parts(
                             key=operation['object_key'], upload_id=operation['upload_id'])}
                 elif operation.get('status') == 'ready':
-                    result = {'uploaded_parts': [], 'verified': True}
+                    result = {'uploaded_parts': [],
+                              'verified': operation.get('cos_content_verified') is True,
+                              'sha256': operation.get('sha256'), 'size': operation.get('size')}
                 public_fields = {'attachment_id', 'filename', 'size', 'sha256', 'note',
                                  'round_id', 'head_sha', 'status', 'created_at',
                                  'completed_at', 'actor', 'actor_login', 'part_bytes'}
@@ -1541,9 +1693,25 @@ class EvidenceService:
                 if result.get('initialization_pending'):
                     value['initialization_pending'] = True
                 if result.get('verified') is True:
-                    value['status'] = 'ready'
-                    value['sha256'] = result.get('sha256', value.get('sha256', ''))
-                    value['verified'] = True
+                    attachment_persisted = bool(
+                        saved and saved.get('status') == 'ready'
+                        and saved.get('cos_content_verified') is True
+                        and saved.get('head_sha') == source.get('head_sha')
+                        and saved.get('round_id') == source.get('round_id')
+                        and saved.get('attachment_id') == source.get('attachment_id')
+                        and saved.get('sha256') == result.get('sha256', value.get('sha256'))
+                        and saved.get('size') == source.get('size'))
+                    if attachment_persisted:
+                        value['status'] = 'ready'
+                        value['sha256'] = result.get('sha256', value.get('sha256', ''))
+                        value['verified'] = True
+                        value['github_record_persisted'] = True
+                    else:
+                        # COS may have the finished object while GitHub still
+                        # lacks its ready attachment record. Keep it resumable,
+                        # but never tell the uploader that it is complete yet.
+                        value['status'] = 'verifying'
+                        value['record_pending'] = True
                 return value
             if action in {'download', 'preview', 'log_download', 'machine_log_download'}:
                 if action in {'log_download', 'machine_log_download'}:
@@ -1650,7 +1818,7 @@ class EvidenceService:
                             and sum(invite_rows.values()) + requested_size > UPLOAD_MAX_BYTES):
                         raise EvidenceError('upload_invitation_note_byte_quota_exceeded', 413)
 
-            def public(operation, result=None):
+            def public(operation, result=None, *, attachment_persisted=False):
                 value = copy.deepcopy(operation)
                 # HTTP upload_id is a stable operation reference, never a key
                 # supplied by a browser. COS UploadId remains a recovery fact.
@@ -1672,7 +1840,9 @@ class EvidenceService:
                     and isinstance(round_id, str)
                     and re.fullmatch(re.escape(head_sha) + r'-[0-9]+', round_id) is not None
                 )
-                if (result or {}).get('verified') is True or persisted_ready:
+                if attachment_persisted:
+                    value['github_record_persisted'] = True
+                if attachment_persisted and ((result or {}).get('verified') is True or persisted_ready):
                     value['verified'] = True
                 return value
 
@@ -1702,12 +1872,29 @@ class EvidenceService:
                                                 source.get('round_id'), source.get('attachment_id')))
                 if saved and saved['status'] == 'deleted':
                     raise EvidenceError('attachment_deleted', 410)
-                if saved and saved['status'] == 'ready':
-                    return public(saved)
+                if saved and saved['status'] == 'ready' and saved.get('cos_content_verified') is True:
+                    await self._notify_ready_attachment(repo, pr_number, saved)
+                    return public(saved, attachment_persisted=True)
                 if source['status'] == 'ready':
                     await current()
-                    await self._save(repo, pr_number, 'attachment', source, 'ready')
-                    return public(source)
+                    recovered = copy.deepcopy(source)
+                    if recovered.get('cos_content_verified') is not True:
+                        result = await self.store.verify_object(
+                            key=recovered['object_key'], size=recovered['size'],
+                            metadata=self.store._identity_metadata(recovered),
+                            sha256=recovered.get('sha256') or None,
+                        )
+                        sha = result.get('sha256')
+                        if (result.get('verified') is not True or result.get('size') != recovered['size']
+                                or not isinstance(sha, str)
+                                or not re.fullmatch('[0-9a-f]{64}', sha)
+                                or (recovered.get('sha256') and recovered['sha256'] != sha)):
+                            raise EvidenceError('object_not_verified', 409)
+                        recovered.update(sha256=sha, cos_content_verified=True)
+                        await self._save(repo, pr_number, 'operation', recovered, 'ready')
+                    await self._save(repo, pr_number, 'attachment', recovered, 'ready')
+                    await self._notify_ready_attachment(repo, pr_number, recovered)
+                    return public(recovered, attachment_persisted=True)
                 await current()
                 result = await self._store('resume', source, {})
                 try:
@@ -1741,19 +1928,22 @@ class EvidenceService:
                                      completed_at=utc_now())
                     await self._save(repo, pr_number, 'operation', recovered, 'ready')
                     await self._save(repo, pr_number, 'attachment', recovered, 'ready')
+                    await self._notify_ready_attachment(repo, pr_number, recovered)
                 else:
                     if not recovered.get('object_key') or not recovered.get('upload_id'):
                         raise EvidenceError('upload_not_recoverable', 502)
                     recovered['status'] = 'uploading'
                     await self._save(repo, pr_number, 'operation', recovered, 'uploading')
-                return public(recovered, result)
+                return public(recovered, result, attachment_persisted=result.get('verified') is True)
 
             if existing and existing['status'] in {'ready', 'deleted', 'invalid'}:
                 if existing['status'] == 'invalid':
                     raise EvidenceError('round_changed', 409)
                 await current()
                 await self._save(repo, pr_number, 'attachment', existing, existing['status'])
-                return public(existing)
+                if existing.get('status') == 'ready':
+                    await self._notify_ready_attachment(repo, pr_number, existing)
+                return public(existing, attachment_persisted=existing.get('status') == 'ready')
             if action in {'init', 'note'}:
                 text = payload.get('text') or payload.get('note', '')
                 if action == 'note':
@@ -1829,8 +2019,14 @@ class EvidenceService:
                      or invite_allowed and source.get('upload_method') != 'signed_invite')
                         and action != 'delete'):
                     raise EvidenceError('upload_owner_mismatch', 403)
-                if action != 'delete' and current_attachment and current_attachment.get('status') == 'ready':
-                    return public(current_attachment)
+                if (action != 'delete' and current_attachment
+                        and current_attachment.get('status') == 'ready'):
+                    if action in {'complete', 'resume'}:
+                        await self._notify_ready_attachment(repo, pr_number, current_attachment)
+                    return public(
+                        current_attachment,
+                        attachment_persisted=True,
+                    )
                 operation = existing or {**source, 'operation_id': opid,
                                          'source_operation_id': source['operation_id'], 'request_sha256': request_hash}
                 if action == 'delete':
@@ -1914,9 +2110,10 @@ class EvidenceService:
                                  completed_at=utc_now())
                 await self._save(repo, pr_number, 'operation', operation, 'ready')
                 await self._save(repo, pr_number, 'attachment', operation, 'ready')
+                await self._notify_ready_attachment(repo, pr_number, operation)
             else:
                 if not operation.get('upload_id') or not operation.get('object_key'):
                     raise EvidenceError('upload_not_recoverable', 502)
                 operation['status'] = 'uploading'
                 await self._save(repo, pr_number, 'operation', operation, 'uploading')
-            return public(operation, result)
+            return public(operation, result, attachment_persisted=ready)
