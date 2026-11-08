@@ -8,24 +8,13 @@ plugins/pointcloud_math.py — pointcloud 插件的纯数学部分。
 
 from __future__ import annotations
 
-import json
-import logging
-import os
-import stat
 import struct
-from typing import Optional
 
 import numpy as np
 
-log = logging.getLogger(__name__)
-CALIBRATION_ROOT = '/models'
 
 # pointcloud.js 的 MAX_POINTS / MAX_POINTS_PER_FRAME 上限
 MAX_POINTS = 40000
-
-# 标定文件落盘位置（/models 是容器唯一可持久化挂载）
-CALIB_DIR = "/models/stereo_calib"
-
 
 def decimation_stride(w: int, h: int, max_points: int) -> int:
     """q5 参照：stride = ceil(sqrt(w*h/max_points))，至少 1。
@@ -155,51 +144,6 @@ def intrinsics_from_hfov(w: int, h: int, hfov_deg: float) -> tuple:
     """hfov（度）→ (fx=fy, cx, cy)，画幅 w×h 中心。零配置兜底。"""
     fx = (w / 2.0) / np.tan(np.radians(hfov_deg) / 2.0)
     return float(fx), float(fx), float(w) / 2.0, float(h) / 2.0
-
-
-def load_calibration_blob(value) -> Optional[dict]:
-    """实例配置里的 calibration：dict、JSON 字符串，或 /models 下文件路径。"""
-    if not value:
-        return None
-    if isinstance(value, dict):
-        return value
-    text = str(value)
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    try:
-        root = os.path.realpath(CALIBRATION_ROOT)
-        resolved = os.path.realpath(text)
-        if os.path.commonpath((root, resolved)) != root or resolved == root:
-            return None
-        parts = os.path.relpath(resolved, root).split(os.sep)
-        # Anchor each open to the model directory and reject swapped symlinks.
-        # The /models mount and directory tree must be managed by trusted users;
-        # a concurrently moved directory is not contained by openat alone.
-        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            for part in parts[:-1]:
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                dir_fd=directory)
-                os.close(directory)
-                directory = child
-            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                         dir_fd=directory)
-            try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    return None
-                with os.fdopen(fd, 'r', encoding='utf-8') as fh:
-                    fd = -1
-                    return json.load(fh)
-            finally:
-                if fd != -1:
-                    os.close(fd)
-        finally:
-            os.close(directory)
-    except (OSError, ValueError, UnicodeError) as error:
-        log.error(f"[pointcloud] cannot read calibration file {text}: {error}")
-    return None
 
 
 def calibration_tier(blob: dict) -> str:

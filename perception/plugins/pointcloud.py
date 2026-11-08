@@ -18,12 +18,9 @@ plugins/pointcloud.py — PointCloudPerceptionPlugin: 3D 点云，三种输入�
     {input}/pointcloud          sensor/pointcloud  UInt8MultiArray 二进制包
     {input}/pointcloud_summary  data/json           点数/范围/最近障碍摘要
 
-标定：A/B 只需 {fx, fy, cx, cy} 或 hfov（缺省 90°；上游 camera_info 声明
-了 K 时优先用 K，见 _pinhole_for）；C 需 {fx, cx, cy, Tx}（已校正）或完整
-stereoCalibrate blob（未校正，自动 rectify）。双目的标定优先级：start 参数
-> 实例 config > 全局配置 > 驱动层声明（两条输入的 motus.camera/1 里带
-stereo_peer + K/D 时自动拼 raw 档 blob，见 _stereo_blob_from_declarations
-—— 型号级出厂标定的零配置路径）。双目标定缺失时拒绝启动。
+相机参数仅来自驱动的 camera_info 声明，不接受卡片手动标定。
+A/B 显示可用 K、视场角或 90° 兜底；计算输出必须有实测深度和对应内参。
+C 由两条输入的 stereo_peer + K/D 自动拼接双目参数，缺失时拒绝启动。
 
 纯数学在 plugins/pointcloud_math.py（不依赖 cv2 / rclpy，本地可测）。
 """
@@ -47,10 +44,10 @@ from sensor_msgs.msg import CompressedImage, Image, PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 
 from plugins.pointcloud_math import (
-    MAX_POINTS, CALIB_DIR,
+    MAX_POINTS,
     backproject_depth, calibration_tier, decimate_cloud, decimation_stride,
     encode_packet, filter_cloud, intrinsics_from_hfov,
-    load_calibration_blob, pinhole_of, Q_from_baseline,
+    pinhole_of, Q_from_baseline,
     summarize_cloud,
 )
 from utils.ros_lifecycle import dispose_node
@@ -126,20 +123,16 @@ TOOLS = [
                     "enum": ["auto", "depth", "mono", "stereo"],
                     "description": "输入模式。auto（默认）：2 路输入 → 双目 stereo；1 路输入同时订阅 Image/CompressedImage 并按首帧消息类型自动选 depth（z16/zlib 深度图）或 mono（jpeg）",
                 },
-                "calibration": {
-                    "type": "string",
-                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目留空时自动尝试驱动声明的 stereo_peer（型号级出厂标定）；标定缺失时无法启动",
-                },
             },
             "required": ["action"],
             "x-action-params": {
                 "start": {
-                    "params": ["input_topic", "input_topics", "mode", "calibration"],
+                    "params": ["input_topic", "input_topics", "mode"],
                     "description": "启动。给 input_topic（单输入）或 input_topics（双目左右两路）。mode 留空则按输入与消息类型自动判定",
                 },
                 "stop": {"params": [], "description": "停止点云输出"},
                 "info": {"params": [], "description": "查看状态、模式与输出话题"},
-                "config": {"params": ["calibration"], "description": "更新实例配置（calibration / fps / max_points 等），需重启实例生效"},
+                "config": {"params": [], "description": "更新实例配置（fps / max_points / 深度范围等），变更后需重启实例生效"},
             },
         },
         "configSchema": {
@@ -149,18 +142,14 @@ TOOLS = [
                 "max_points": {"type": "integer", "description": "每帧最多点数（上限 40000，由渲染器决定）", "default": 20000, "scope": "instance"},
                 "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
-                "calibration": {"type": "string", "description": "标定 JSON 或 /models 下的标定文件路径", "scope": "instance"},
                 "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
                                  "description": "启用计算输出；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
-                "cal_a": {"type": "number", "description": "mono 模式站点标定指数 a（d^a），同 visual_depth", "default": 1.0, "scope": "instance"},
-                "cal_b": {"type": "number", "description": "mono 模式站点标定偏移 b（乘 e^b），同 visual_depth", "default": 0.0, "scope": "instance"},
             },
         },
         "topic_in": [
             {"format": "image/jpeg", "desc": "mono / stereo（左右两路）输入"},
             {"format": "image/depth-z16", "desc": "16-bit 深度图输入（毫米）"},
             {"format": "image/depth-zlib", "desc": "zlib 压缩深度图输入"},
-            {"format": "sensor/depth-f32", "desc": "32FC1 米制深度图，计算模式要求采集时间和物理 frame"},
         ],
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
@@ -249,7 +238,7 @@ class _PointCloudNode(Node):
     def __init__(self, mode: str, input_topic: Optional[str],
                  input_topic_right: Optional[str], calibration,
                  fps: float, max_points: int, min_depth_m: float,
-                 max_depth_m: float, cal_a: float, cal_b: float,
+                 max_depth_m: float,
                  node_suffix: str):
         super().__init__(f"pointcloud_{node_suffix}" if node_suffix else "pointcloud")
         self._mode = mode
@@ -261,8 +250,6 @@ class _PointCloudNode(Node):
         self._max_points = max_points
         self._min_depth_m = min_depth_m
         self._max_depth_m = max_depth_m
-        self._cal_a = cal_a
-        self._cal_b = cal_b
         self._cloud_topic, self._summary_topic = output_topics_for(input_topic)
         # raw 档 rectify 映射缓存（_rectify_pair）：blob 固定，映射只随
         # 分辨率变 —— 每帧重算 stereoRectify/initUndistortRectifyMap 是
@@ -325,7 +312,7 @@ class _PointCloudNode(Node):
                         self._subs.append(self.create_subscription(
                             Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
                     if (self._input_format == "image/depth-zlib" or
-                            (not self._metric_cloud_enabled and self._input_format not in ("sensor/depth-f32", "image/depth-z16"))):
+                            (not self._metric_cloud_enabled and self._input_format != "image/depth-z16")):
                         self._subs.append(self.create_subscription(
                             CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
                 elif self._mode == "auto":
@@ -334,7 +321,7 @@ class _PointCloudNode(Node):
                     if self._input_format not in ("image/depth-zlib", "image/jpeg"):
                         self._subs.append(self.create_subscription(
                             Image, self._input_topic, self._auto_image_cb, _LOW_LAT_QOS))
-                    if self._input_format not in ("sensor/depth-f32", "image/depth-z16"):
+                    if self._input_format != "image/depth-z16":
                         self._subs.append(self.create_subscription(
                             CompressedImage, self._input_topic, self._auto_comp_cb, _LOW_LAT_QOS))
                 else:  # mono
@@ -544,7 +531,7 @@ class _PointCloudNode(Node):
         xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
                                  self._min_depth_m, self._max_depth_m)
         self._publish(xyz)
-        if self._metric_cloud_enabled and (enc == "32FC1" or
+        if self._metric_cloud_enabled and ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
                 (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
             self._publish_metric(xyz, msg, w, h)
         elif self._metric_cloud_enabled:
@@ -659,11 +646,6 @@ class _PointCloudNode(Node):
 
         outputs, meta = model.infer(frame)
         depth_m = decode_depth(outputs, meta)
-        # 站点标定与 visual_depth 同一份实现（review 第 19 轮建议）：恒等
-        # (1.0, 0.0) 有短路、a==1.0 走乘法不走 pow 内核——Orin 上每帧省
-        # 6 ms 且数值位相同，两个用户不各养一份。
-        from plugins.visual_depth import apply_site_calibration
-        depth_m = apply_site_calibration(depth_m, self._cal_a, self._cal_b)
         h, w = depth_m.shape[:2]
         fx, fy, cx, cy = self._pinhole_for(w, h)
         stride = decimation_stride(w, h, self._max_points)
@@ -672,7 +654,7 @@ class _PointCloudNode(Node):
         self._publish(xyz)
 
     def _pinhole_for(self, w: int, h: int) -> tuple:
-        """(fx, fy, cx, cy)：实例标定 → 上游 camera_info 的 K（跨分辨率
+        """(fx, fy, cx, cy)：驱动实测参数 → 上游 camera_info 的 K（跨分辨率
         按 camera_info._rescale_K 缩放）→ hfov 90° 兜底。
 
         review 指出：上游明明声明了真实内参，反投影却按 90° hfov 硬算，
@@ -862,55 +844,12 @@ def _stereo_blob_from_declarations(left: dict, right: dict) -> tuple:
     }
     # review 第 21 轮建议：peer 的 R/T 只查了非 None，畸形值（如 1 元素的
     # T）会一路带进 worker 才炸。拼完当场用与配置 blob 同一份解析器全量
-    # 预检（长度/有限值/NaN 全查）—— 坏驱动数据在 start 就报清楚，两条
-    # 入口（用户配置 / 驱动声明）一个标准。
+    # 预检（长度/有限值/NaN 全查）—— 坏驱动数据在 start 就报清楚。
     try:
         _raw_stereo_params(blob)
     except ValueError as error:
         return None, f"声明的 stereo_peer 标定数据畸形：{error}"
     return blob, None
-
-
-def _pinhole_params(blob: dict, w: int, h: int) -> tuple:
-    """解析 pinhole 档 blob → (fx, fy, cx, cy)，全部有限、fx/fy>0。
-
-    review 第 16 轮建议：depth/mono 的显式内参与 stereo 同理——fx=0/NaN
-    让 backprojection 深度恒 0 或全 NaN，云被 filter_cloud 剔光/几何无效，
-    卡片 running 却一帧不出。start/config 预检与 _pinhole_for 共用这一份
-    （两处各写一遍必然漂移），坏配置当场报清楚。w/h 只用于 hfov 兜底换算，
-    预检传典型分辨率即可（fx 正性与分辨率无关，hfov 的 fx 恒正）。"""
-    if any(k in blob and blob[k] is None for k in ('cx', 'cy')):
-        raise ValueError('pinhole principal point cannot be null')
-    try:
-        fx = float(blob.get("fx") or 0.0)
-        fy = float(blob.get("fy") or 0.0)
-        cx = float(blob.get("cx") or 0.0)
-        cy = float(blob.get("cy") or 0.0)
-        hfov = float(blob["hfov"]) if "hfov" in blob else None
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"pinhole 标定数值异常：{error}")
-    if "hfov" in blob and fx == 0.0 and fy == 0.0:
-        if not np.isfinite(hfov) or not (0.0 < hfov < 180.0):
-            raise ValueError(
-                f"pinhole 标定的 hfov 无效（hfov={blob.get('hfov')!r}）："
-                "需要 (0, 180) 的有限角度（度），否则焦距算不出")
-        return intrinsics_from_hfov(w, h, hfov)
-    if not np.isfinite(fx) or fx <= 0:
-        raise ValueError(
-            f"pinhole 标定的焦距无效（fx={blob.get('fx')!r}）："
-            "需要正的有限值（像素），否则反投影深度恒 0、一帧云不出")
-    # fy 显式给出就得同 fx 一个标准；没给（0）才缺省取 fx。inf/NaN 混进来
-    # 会让 y 方向反投影全废，不能悄悄折到 fx。
-    if "fy" in blob and blob["fy"] is not None and (not np.isfinite(fy) or fy <= 0):
-        raise ValueError(
-            f"pinhole 标定的焦距无效（fy={blob.get('fy')!r}）："
-            "需要正的有限值（像素），否则反投影 y 坐标恒 0/全 NaN")
-    if fy == 0.0:
-        fy = fx  # 缺省与 pinhole_of 一致：fy 缺省取 fx
-    if not (np.isfinite(cx) and np.isfinite(cy)):
-        raise ValueError(
-            f"pinhole 标定的主点无效（cx={blob.get('cx')!r}, cy={blob.get('cy')!r}）")
-    return fx, fy, cx, cy
 
 
 def _rectified_params(blob: dict) -> tuple:
@@ -1014,11 +953,6 @@ class PointCloudPerceptionPlugin:
         self._max_points = max(100, min(MAX_POINTS, int(plugin_cfg.get("max_points", 20000))))
         self._min_depth_m = float(plugin_cfg.get("min_depth_m", 0.1))
         self._max_depth_m = float(plugin_cfg.get("max_depth_m", 10.0))
-        self._calibration = load_calibration_blob(plugin_cfg.get("calibration"))
-        self._calibration_raw = plugin_cfg.get('calibration')
-        # mono 模式的引擎与站点标定（复用 visual_depth 的下载器与机制）
-        self._cal_a = float(plugin_cfg.get("cal_a", 1.0))
-        self._cal_b = float(plugin_cfg.get("cal_b", 0.0))
         self._model = None
         self._model_loading = False
         self._model_load_error = None
@@ -1144,24 +1078,12 @@ class PointCloudPerceptionPlugin:
             raise ValueError(f"不支持的 mode：{mode!r}（可选 auto / depth / mono / stereo）")
         if len(topics_list) > 2:
             raise ValueError(f"input_topics 最多 2 路（左、右），收到 {len(topics_list)} 路")
-        # 标定优先级（review 第 7 轮 + 驱动声明层）：start 参数 > 实例
-        # config > 全局 plugins.pointcloud.calibration > 驱动层型号级出厂
-        # 标定（两条输入的 motus.camera/1 声明里带 stereo_peer + K/D，
-        # start 时由 dispatch 拼成 raw 档 blob）。实例档在 configSchema 里
-        # 声明为 scope: instance，全局 blob 是兜底不是覆盖 —— 以前全局配
-        # 了标定，卡片自己的实例标定就永远拿不到（falsy 才轮到它），双目
-        # 会拿错内参/基线出歪云。声明层排在最后：用户自己标的一定比型号
-        # 常量新鲜（摔过/换过镜头）。
-        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
-        with self._nodes_lock:
-            icalib = load_calibration_blob(
-                (self._instance_configs.get(node_key) or {}).get("calibration"))
-        calibration = (load_calibration_blob(args.get("calibration"))
-                       or icalib or self._calibration)
+        # 旧画布残留的手动标定不再参与计算，参数统一由驱动维护。
+        calibration = None
         if mode == "auto":
             mode = "stereo" if right_topic else "auto"
         declared_blob, declared_note = None, ""
-        if mode == "stereo" and right_topic and not calibration:
+        if mode == "stereo" and right_topic:
             from plugins.camera_info import for_topic as _camera_for_topic
 
             declared_blob, declared_note = _stereo_blob_from_declarations(
@@ -1215,21 +1137,16 @@ class PointCloudPerceptionPlugin:
             if node_key in self._nodes:
                 return
             icfg = self._instance_configs.get(node_key, {})
-            max_points = max(100, min(MAX_POINTS, int(icfg.get("max_points", self._max_points))))
+            effective = self._effective_config(icfg)
             node = _PointCloudNode(
                 mode, input_topic, right_topic,
-                # 实例 config 的标定已由 _resolve_mode 按优先级挑好
-                # （start 参数 > 实例 > 全局），这里只兜 None。
-                calibration or load_calibration_blob(icfg.get("calibration")),
-                fps=int(icfg.get("fps", self._fps)),
-                max_points=max_points,
-                min_depth_m=float(icfg.get("min_depth_m", self._min_depth_m)),
-                max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
-                cal_a=float(icfg.get("cal_a", self._cal_a)),
-                cal_b=float(icfg.get("cal_b", self._cal_b)),
+                calibration,
+                fps=effective['fps'], max_points=effective['max_points'],
+                min_depth_m=effective['min_depth_m'], max_depth_m=effective['max_depth_m'],
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
-            node._metric_cloud_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
+            node._applied_config = effective
+            node._metric_cloud_enabled = effective['metric_cloud']
             if node._metric_cloud_enabled:
                 node._metric_cloud_pub = node.create_publisher(PointCloud2, node._metric_cloud_topic, _PUB_QOS)
             if mode == "mono":
@@ -1273,19 +1190,11 @@ class PointCloudPerceptionPlugin:
                              and 0 < half_v < np.pi / 2))):
                     node._upstream_fov = (half_h, half_v)
                 node._calibration_source = (
-                    ('configured-fov-approximate' if 'hfov' in calibration else 'configured')
-                    if isinstance(calibration, dict) and calibration else
                     'declared-K' if getattr(node, '_upstream_intrinsics', None) else
                     'declared-fov-approximate' if getattr(node, '_upstream_fov', None) else
                     '90-degree-fallback')
             if mode == "stereo" and calibration:
-                # 标定来源（info() 报告用）：声明层拼出的 blob 带 source 字段
-                # （驱动出厂标定），用户配置的 blob 没有 —— 区分"型号常量在
-                # 出云"与"用户自己标的在出云"，前者错了要找驱动数据的人。
-                # capture-only（无标定）不标：来源随标定走，没有标定就没有来源。
-                node._calibration_source = calibration.get("source") if (
-                    isinstance(calibration, dict)
-                    and calibration.get("source")) else "configured"
+                node._calibration_source = calibration.get("source")
             self._executor.add_node(node)
             try:
                 node.start()
@@ -1332,36 +1241,14 @@ class PointCloudPerceptionPlugin:
     def get_tools(self) -> list:
         return TOOLS
 
-    def _validate_calibration(self, raw_value) -> Optional[str]:
-        """校验一份 calibration 配置值（实例或全局 config 共用）。
-
-        返回 None 表示可用或未配置；返回字符串即拒绝原因。start 的预检在 dispatch 里
-        分档做过了，config 没有模式上下文，这里按 blob 自己的档位挑同一
-        批解析器——两处各写一遍必然漂移（review 第 17 轮 Issue 1）。"""
-        blob = load_calibration_blob(raw_value)
-        if blob is None:
-            return 'configured calibration is unreadable or invalid' if raw_value else None
-        if not isinstance(blob, dict):
-            return 'configured calibration must be a JSON object'
-        tier = calibration_tier(blob)
-        try:
-            if tier == "pinhole":
-                _pinhole_params(blob, 640, 480)
-            elif tier == "rectified":
-                _rectified_params(blob)
-            elif tier == "raw":
-                K1, _D1, K2, _D2, _R, T = _raw_stereo_params(blob)
-                tx = float(T[0]) if T.size else 0.0
-                if not np.isfinite(tx) or abs(tx) < 1e-6:
-                    raise ValueError(
-                        f"基线异常（Tx={tx}）：T/Tx 缺失或为 0，Q 反投影必然除零")
-                if not (np.all(np.isfinite(K1)) and np.all(np.isfinite(K2))):
-                    raise ValueError("K1/K2 含非有限值（NaN/inf）")
-        except ValueError as error:
-            if tier == "raw":
-                return f"raw 标定无法使用：{error}"
-            return str(error)
-        return None
+    def _effective_config(self, cfg: dict) -> dict:
+        return {
+            'fps': int(cfg.get('fps', self._fps)),
+            'max_points': max(100, min(MAX_POINTS, int(cfg.get('max_points', self._max_points)))),
+            'min_depth_m': float(cfg.get('min_depth_m', self._min_depth_m)),
+            'max_depth_m': float(cfg.get('max_depth_m', self._max_depth_m)),
+            'metric_cloud': cfg.get('metric_cloud', self._plugin_cfg.get('metric_cloud', False)) is True,
+        }
 
     def _validate_ranges(self, cfg: dict) -> Optional[str]:
         """fps / min_depth_m / max_depth_m 的联合校验（review 第 17 轮
@@ -1437,14 +1324,14 @@ class PointCloudPerceptionPlugin:
                 node = nodes[instance_id]
                 if node._input_topic:
                     topics_in.append({"topic": node._input_topic,
-                                      "format": node._input_format or ("sensor/depth-f32" if node._metric_cloud_enabled else "image/jpeg")})
+                                      "format": node._input_format or ("image/depth-z16" if node._metric_cloud_enabled else "image/jpeg")})
                 if node._input_topic_right:
                     topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
             else:
                 for node in nodes.values():
                     if node._input_topic and all(t["topic"] != node._input_topic for t in topics_in):
                         topics_in.append({"topic": node._input_topic,
-                                          "format": node._input_format or ("sensor/depth-f32" if node._metric_cloud_enabled else
+                                          "format": node._input_format or ("image/depth-z16" if node._metric_cloud_enabled else
                                                     "image/depth-z16" if node._mode == "depth" else "image/jpeg")})
                     if node._input_topic_right and all(t["topic"] != node._input_topic_right for t in topics_in):
                         topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
@@ -1524,11 +1411,6 @@ class PointCloudPerceptionPlugin:
             return info
 
         elif action == "start":
-            node_key_for_calibration = instance_id or args.get('input_topic') or ((args.get('input_topics') or [''])[0]) or _DEFAULT_INSTANCE
-            instance_calibration = (self._instance_configs.get(node_key_for_calibration) or {}).get('calibration')
-            raw_calibration = args.get('calibration') or instance_calibration or self._calibration_raw
-            if raw_calibration and not isinstance(load_calibration_blob(raw_calibration), dict):
-                return {'state': 'error', 'message': 'configured calibration is unreadable or invalid'}
             try:
                 mode, input_topic, right_topic, calibration, declared_note = \
                     self._resolve_mode(args, instance_id)
@@ -1537,46 +1419,39 @@ class PointCloudPerceptionPlugin:
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
             icfg = self._instance_configs.get(node_key, {})
             metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
-            if metric_enabled and input_topic:
-                from plugins.camera_info import for_topic as _camera_for_topic
-                declared = _camera_for_topic(args.get("camera_info"), input_topic)
-                if declared.get("format") == "image/depth-zlib":
-                    vendor = declared.get("vendor") or {}
-                    if (declared.get("schema") != "motus.camera/1"
-                            or declared.get("source") != "derived-from-K"
-                            or declared.get("distortion_model") != "pinhole"
-                            or declared.get("width") != 640 or declared.get("height") != 480
-                            or not isinstance(vendor, dict)
-                            or vendor.get("depth_unit") != "mm"
-                            or vendor.get("depth_source") != "measured"
-                            or vendor.get("timestamp_semantics") != "source_capture_mapped"):
-                        return {"state": "error", "message": "metric compressed depth requires measured 640x480 millimetres, pinhole intrinsics and capture timestamps"}
-            # Canvas start supplies the resolved topic but not `mode`; the
-            # metric contract itself unambiguously requires depth input.
-            if metric_enabled and mode == "auto":
-                mode = "depth"
-            if metric_enabled and calibration is None and input_topic:
+            if metric_enabled:
+                # 沿用现有深度类型：毫米制 Z16 或固定 640x480 的 zlib。
+                # 仅驱动声明的实测针孔内参可开启计算输出，估计深度仍只供显示。
                 from plugins.camera_info import for_topic as _camera_for_topic
                 declared = _camera_for_topic(args.get("camera_info"), input_topic)
                 K = declared.get("K")
                 vendor = declared.get("vendor") or {}
+                fmt = declared.get("format")
                 try:
                     matrix = np.asarray(K, dtype=float).reshape(3, 3)
+                    distortion = np.asarray(declared.get('D') or [], dtype=float)
                     supported_K = (np.isfinite(matrix).all() and
                                    np.allclose(matrix[2], [0., 0., 1.]) and
-                                   abs(matrix[0, 1]) < 1e-9 and abs(matrix[1, 0]) < 1e-9)
+                                   abs(matrix[0, 1]) < 1e-9 and abs(matrix[1, 0]) < 1e-9 and
+                                   np.isfinite(distortion).all() and np.all(distortion == 0))
                 except (TypeError, ValueError):
                     supported_K = False
-                if (declared.get("schema") == "motus.camera/1"
-                        and declared.get("format") in ("sensor/depth-f32", "image/depth-zlib")
+                if not (declared.get("schema") == "motus.camera/1"
+                        and fmt in ("image/depth-z16", "image/depth-zlib")
                         and declared.get("source") == "derived-from-K"
                         and declared.get("distortion_model") == "pinhole"
                         and isinstance(vendor, dict)
-                        and vendor.get("depth_unit") == ("mm" if declared.get("format") == "image/depth-zlib" else "m")
+                        and vendor.get("depth_unit") == "mm"
+                        and vendor.get("depth_source") == "measured"
                         and vendor.get("timestamp_semantics") == "source_capture_mapped"
-                        and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K):
-                    calibration = dict(fx=K[0], fy=K[4], cx=K[2], cy=K[5],
-                                       width=declared.get("width"), height=declared.get("height"))
+                        and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K
+                        and (fmt != "image/depth-zlib" or
+                             (declared.get("width") == 640 and declared.get("height") == 480))):
+                    return {"state": "error", "message": "metric_cloud requires measured millimetre depth, driver pinhole intrinsics and capture timestamps"}
+                calibration = dict(fx=K[0], fy=K[4], cx=K[2], cy=K[5],
+                                   width=declared.get("width"), height=declared.get("height"))
+                if mode == "auto":
+                    mode = "depth"
             if mode == "stereo":
                 if not (input_topic and right_topic):
                     return {"state": "error",
@@ -1587,7 +1462,7 @@ class PointCloudPerceptionPlugin:
                         # 落 capture-only 让人以为是没标定。
                         return {"state": "error",
                                 "message": f"驱动声明的 stereo 标定不完整：{declared_note}"}
-                    return {"state": "error", "message": "stereo 模式需要上游或配置提供完整标定"}
+                    return {"state": "error", "message": "stereo 模式需要驱动声明完整相机参数"}
                 elif calibration_tier(calibration) == "rectified":
                     # review 第 6/10 轮：以前只查 Tx（Tx=0 → Q[3,2] 每帧除零）。
                     # 但 Q 的其余输入同样致命：fx=0 → Z=fx·Tx/w 恒 0，云被
@@ -1622,26 +1497,9 @@ class PointCloudPerceptionPlugin:
                 # stereo 已在上面要求双路，这里覆盖其余全部模式。
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
-            if calibration and mode in ('auto', 'depth', 'mono') and calibration_tier(calibration) in ('raw', 'rectified'):
-                return {'state': 'error', 'message': 'depth/mono requires pinhole calibration, not stereo calibration'}
-            if calibration and calibration_tier(calibration) == "pinhole":
-                # review 第 16 轮建议：depth/mono 的显式 pinhole 内参
-                # （fx/fy/cx/cy 或 hfov）同样在 start 时预检——fx=0/NaN
-                # 会让反投影深度恒 0 或全 NaN，卡片 running 却一帧不出
-                # （与 stereo 的 rectified/raw 预检同一个道理）。放在
-                # stereo 分支外：pinhole 档主要服务 depth/mono，stereo 拿到
-                # pinhole 档本来就走 capture-only。
-                try:
-                    _pinhole_params(calibration, 640, 480)
-                except ValueError as error:
-                    return {"state": "error", "message": str(error)}
             if metric_enabled:
                 if mode != "depth" or not isinstance(calibration, dict):
                     return {"state": "error", "message": "metric_cloud requires depth mode and measured intrinsics"}
-                from plugins.camera_info import for_topic as _camera_for_topic
-                source = _camera_for_topic(args.get('camera_info'), input_topic)
-                if source.get('format') and source['format'] not in ('sensor/depth-f32', 'image/depth-zlib'):
-                    return {'state': 'error', 'message': 'metric_cloud requires sensor/depth-f32 or qualified image/depth-zlib input'}
                 try:
                     values = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
                     dimensions = [calibration[k] for k in ("width", "height")]
@@ -1657,6 +1515,8 @@ class PointCloudPerceptionPlugin:
                 return {'state': 'error', 'message': 'input_metadata must map input topics to nonempty declaration objects'}
             declaration = declarations.get(input_topic) if isinstance(declarations, dict) else None
             declaration = copy.deepcopy(declaration) if isinstance(declaration, dict) else {}
+            if metric_enabled and declaration.get('format') not in (None, fmt):
+                return {'state': 'error', 'message': 'input_metadata format conflicts with driver camera_info'}
             with self._nodes_lock:
                 existing = self._nodes.get(node_key)
                 if existing and (existing._input_topic != (input_topic or '') or
@@ -1741,30 +1601,29 @@ class PointCloudPerceptionPlugin:
             return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
 
         elif action == "config":
+            # 仅接收当前卡片支持的配置；旧画布保存的手动标定键直接忽略。
             cfg = {k: v for k, v in args.items()
-                   if k not in ("action", "instance_id") and v is not None and v != ""}
-            # review 第 17 轮 Issue 1/3：实例分支以前既不校验标定也不校验
-            # 范围就落库撤节点——运行中的卡片被换成已知不可用的配置后静默
-            # 停掉，下次 start 才发现。全局分支第 16 轮只补了标定的一半。
-            error = self._validate_ranges(cfg)
-            if error is None and "calibration" in cfg:
-                error = self._validate_calibration(cfg["calibration"])
-            if error is not None:
-                return {"state": "error", "message": error}
-            if instance_id:
-                with self._nodes_lock:
-                    # review 第 18 轮 Issue 1：实例配置是补丁不是替换
-                    # （OCR 的语义）——存了双目标定后只改 fps，旧实现存成
-                    # {"fps": ...} 把标定丢掉，下次 stereo start 静默落回
-                    # capture-only、一帧云不出。
-                    previous = self._instance_configs.get(instance_id, {})
-                    merged = {**previous, **cfg}
+                   if k in TOOLS[0]['configSchema']['properties'] and v is not None and v != ""}
+            with self._nodes_lock:
+                previous = self._instance_configs.get(instance_id, {}) if instance_id else {}
+                merged = {**previous, **cfg}
+                error = self._validate_ranges(merged)
+                try:
+                    effective = self._effective_config(merged)
+                    error = error or self._validate_ranges(effective)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    error = f"配置数值异常：{exc}"
+                if error is not None:
+                    return {"state": "error", "message": error}
+                if instance_id:
                     self._instance_configs[instance_id] = merged
-                    running = instance_id in self._nodes
-                if running:
+                    running = self._nodes.get(instance_id)
+                    # 首次显式保存默认值、重复保存或等效的限幅值均保留运行实例。
+                    changed = running is not None and effective != running._applied_config
+            if instance_id:
+                if changed:
                     self._retire_node(instance_id)
-                return {"status": "configured", "instance_id": instance_id,
-                        "config": merged}
+                return {"status": "configured", "instance_id": instance_id, "config": merged}
             if "fps" in cfg:
                 self._fps = int(cfg["fps"])
             if "max_points" in cfg:
@@ -1773,14 +1632,8 @@ class PointCloudPerceptionPlugin:
                 self._min_depth_m = float(cfg["min_depth_m"])
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
-            if "calibration" in cfg:
-                self._calibration = load_calibration_blob(cfg["calibration"])
-                self._calibration_raw = cfg['calibration']
             if "metric_cloud" in cfg:
                 self._plugin_cfg["metric_cloud"] = cfg["metric_cloud"]
-            if any(k in cfg for k in ("cal_a", "cal_b")):
-                self._cal_a = float(cfg.get("cal_a", self._cal_a))
-                self._cal_b = float(cfg.get("cal_b", self._cal_b))
             return {"status": "configured", "config": cfg}
 
         return None

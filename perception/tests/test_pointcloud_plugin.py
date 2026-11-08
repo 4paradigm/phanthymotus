@@ -73,7 +73,6 @@ def test_pointcloud_no_longer_advertises_or_executes_calibration_action():
 
 
 @pytest.mark.parametrize(('format_name', 'expected'), [
-    ('sensor/depth-f32', '_auto_image_cb'),
     ('image/depth-z16', '_auto_image_cb'),
     ('image/depth-zlib', '_auto_comp_cb'),
     ('image/jpeg', '_auto_comp_cb'),
@@ -107,14 +106,13 @@ def test_metric_float_depth_rejects_short_rows():
 
 
 def test_metric_cloud_preserves_header_and_optical_coordinates():
-    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
-        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 2, "height": 1}})
-    camera = {"schema": "motus.camera/1", "topic": "/depth", "id": "optical_sensor"}
+    plugin, executor = _plugin({"metric_cloud": True})
+    camera = metric_z16_declaration()
     plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth",
                                    "camera_info": {"/depth": camera}})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2., 2.], dtype="<f4").tobytes(),
-                     encoding="32FC1", width=2, height=1, step=8)
+    msg = _FakeImage(data=np.array([2000, 2000], dtype="<u2").tobytes(),
+                     encoding="16UC1", width=2, height=1, step=4)
     msg.header.frame_id = "rgb_optical"
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
@@ -128,7 +126,7 @@ def test_metric_cloud_preserves_header_and_optical_coordinates():
     assert _cloud_pub(node).messages  # existing visualization stays available
     info = plugin.dispatch("pointcloud", {"action": "info"})
     assert {"topic": "/depth/pointcloud_metric", "format": "sensor/pointcloud2"} in info["topic_out"]
-    assert {"topic": "/depth", "format": "sensor/depth-f32"} in info["topic_in"]
+    assert {"topic": "/depth", "format": "image/depth-z16"} in info["topic_in"]
     projection = next(c for c in info["camera_info"] if c["topic"] == pub.topic)
     assert projection["id"] == camera["id"]
     assert projection["K"] == [2., 0., 0., 0., 2., 0., 0., 0., 1.]
@@ -136,12 +134,11 @@ def test_metric_cloud_preserves_header_and_optical_coordinates():
 
 
 def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
-    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
-        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    plugin, executor = _plugin({"metric_cloud": True})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2.], dtype="<f4").tobytes(),
-                     encoding="32FC1", width=1, height=1, step=4)
+    msg = _FakeImage(data=np.array([2000], dtype="<u2").tobytes(),
+                     encoding="16UC1", width=1, height=1, step=2)
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
     pub = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
@@ -152,27 +149,26 @@ def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
     assert not pub.messages
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     msg.width = 2
-    msg.step = 8
-    msg.data = np.array([2., 2.], dtype="<f4").tobytes()
+    msg.step = 4
+    msg.data = np.array([2000, 2000], dtype="<u2").tobytes()
     node._emit_depth(msg)
     assert not pub.messages
     node.stop()
 
 
 def test_metric_info_explains_missing_frame_and_wrong_encoding():
-    plugin, executor = _plugin({'metric_cloud': True, 'calibration': {
-        'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}})
-    plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth'})
+    plugin, executor = _plugin({'metric_cloud': True})
+    plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth', 'camera_info': [metric_z16_declaration(1)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
-                     width=1, height=1, step=4)
+    msg = _FakeImage(data=np.array([2000], dtype='<u2').tobytes(), encoding='16UC1',
+                     width=1, height=1, step=2)
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
     assert info['published'] == 0 and info['last_skip_reason'] == 'missing_frame'
     assert info['skipped']['missing_frame'] == 1
-    bad = _FakeImage(data=np.array([2000], dtype='<u2').tobytes(), encoding='16UC1',
-                     width=1, height=1, step=2)
+    bad = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
+                     width=1, height=1, step=4)
     node._emit_depth(bad)
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
     assert info['last_skip_reason'] == 'unsupported_encoding'
@@ -180,8 +176,7 @@ def test_metric_info_explains_missing_frame_and_wrong_encoding():
 
 
 def test_metric_start_rejects_explicit_non_metric_upstream_format():
-    calibration = {'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}
-    plugin, executor = _plugin({'metric_cloud': True, 'calibration': calibration})
+    plugin, executor = _plugin({'metric_cloud': True})
     declaration = {**_UPSTREAM_DECL, 'topic': '/depth', 'format': 'image/depth-z16'}
     result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
                                              'input_topic': '/depth', 'camera_info': [declaration]})
@@ -197,9 +192,8 @@ def test_metric_cloud_does_not_start_with_inferred_intrinsics():
 
 def test_global_config_can_enable_metric_cloud():
     plugin, executor = _plugin()
-    calibration = {"fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}
-    plugin.dispatch("pointcloud", {"action": "config", "metric_cloud": True, "calibration": calibration})
-    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    plugin.dispatch("pointcloud", {"action": "config", "metric_cloud": True})
+    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     assert result["state"] == "running"
     assert executor.nodes[0]._metric_cloud_enabled
     executor.nodes[0].stop()
@@ -207,11 +201,10 @@ def test_global_config_can_enable_metric_cloud():
 
 def test_canvas_metric_config_starts_depth_without_mode_argument():
     plugin, executor = _plugin()
-    calibration = {"fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}
     plugin.dispatch("pointcloud", {"action": "config", "instance_id": "card-1",
-                                   "metric_cloud": True, "calibration": calibration})
+                                   "metric_cloud": True})
     result = plugin.dispatch("pointcloud", {"action": "start", "instance_id": "card-1",
-                                            "input_topic": "/depth"})
+                                            "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     assert result["state"] == "running"
     node = executor.nodes[0]
     assert node._mode == "depth"
@@ -222,10 +215,10 @@ def test_canvas_metric_config_starts_depth_without_mode_argument():
 def test_metric_cloud_accepts_calibrated_depth_declaration():
     plugin, executor = _plugin()
     plugin.dispatch("pointcloud", {"action": "config", "instance_id": "card-1", "metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.],
-                   "vendor": {"depth_unit": "m", "timestamp_semantics": "source_capture_mapped"}}
+                   "vendor": {"depth_unit": "mm", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
     result = plugin.dispatch("pointcloud", {"action": "start", "instance_id": "card-1",
                                             "input_topic": "/depth", "camera_info": [declaration]})
     assert result["state"] == "running"
@@ -237,7 +230,7 @@ def test_metric_cloud_accepts_calibrated_depth_declaration():
 @pytest.mark.parametrize('source,model', [('manual', 'pinhole'), ('derived-from-K', 'unknown')])
 def test_metric_cloud_rejects_unverified_or_distorted_declaration(source, model):
     plugin, executor = _plugin({"metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": source, "distortion_model": model,
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
@@ -248,7 +241,7 @@ def test_metric_cloud_rejects_unverified_or_distorted_declaration(source, model)
 
 def test_metric_cloud_rejects_declaration_without_capture_time_semantics():
     plugin, executor = _plugin({"metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
@@ -259,10 +252,10 @@ def test_metric_cloud_rejects_declaration_without_capture_time_semantics():
 
 def test_metric_cloud_rejects_intrinsics_with_unhandled_skew():
     plugin, executor = _plugin({"metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., .2, 0., 0., 2., 0., 0., 0., 1.],
-                   "vendor": {"depth_unit": "m", "timestamp_semantics": "source_capture_mapped"}}
+                   "vendor": {"depth_unit": "mm", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
                                             "camera_info": [declaration]})
     assert result["state"] == "error"
@@ -270,29 +263,26 @@ def test_metric_cloud_rejects_intrinsics_with_unhandled_skew():
 
 
 def test_explicit_mono_mode_cannot_enable_metric_cloud():
-    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
-        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
-    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "mono", "input_topic": "/depth"})
+    plugin, executor = _plugin({"metric_cloud": True})
+    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "mono", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     assert result["state"] == "error"
     assert not executor.nodes
 
 
 def test_metric_depth_subscribes_only_to_image_type():
-    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
-        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    plugin, executor = _plugin({"metric_cloud": True})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     node = executor.nodes[0]
     assert [s.callback.__name__ for s in node.subscriptions] == ["_depth_image_cb"]
     node.stop()
 
 
 def test_metric_cloud_keeps_source_header_through_worker_queue():
-    plugin, executor = _plugin({"metric_cloud": True, "fps": 1000, "calibration": {
-        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    plugin, executor = _plugin({"metric_cloud": True, "fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2.], dtype="<f4").tobytes(),
-                     encoding="32FC1", width=1, height=1, step=4)
+    msg = _FakeImage(data=np.array([2000], dtype="<u2").tobytes(),
+                     encoding="16UC1", width=1, height=1, step=2)
     msg.header.frame_id = "optical"
     msg.header.stamp = types.SimpleNamespace(sec=456, nanosec=789)
     node._depth_image_cb(msg)
@@ -387,7 +377,8 @@ def test_auto_mode_recognizes_visual_depth_producer_format():
     assert summary["nearest"] == pytest.approx(3.0, abs=1e-3)
 
 
-def test_auto_mode_jpeg_frame_routes_to_mono():
+@pytest.mark.parametrize('legacy_config', [{}, {'cal_a': 2., 'cal_b': 3.}])
+def test_auto_mode_jpeg_frame_routes_to_mono(legacy_config):
     class _FakeModel:
         def __init__(self):
             self.calls = 0
@@ -402,7 +393,7 @@ def test_auto_mode_jpeg_frame_routes_to_mono():
             return [np.full(frame.shape[:2], 2.0, dtype=np.float32)], \
                 LetterboxMeta(1.0, 0, 0, frame.shape[1], frame.shape[0])
 
-    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin, executor = _plugin(cfg={"fps": 1000, **legacy_config})
     plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     model = _FakeModel()
@@ -412,10 +403,10 @@ def test_auto_mode_jpeg_frame_routes_to_mono():
                    if s.callback.__name__ == "_auto_comp_cb")
     comp_cb(_FakeCompressedImage(frame_bytes(8, 8), fmt="jpeg"))
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages) and model.calls >= 1)
-    summary = json.loads(_summary_pub(node).messages[0])
+    _, summary = _wait_cloud_and_summary(node)
+    assert model.calls >= 1
     assert summary["mode"] == "mono"
+    assert summary["nearest"] == pytest.approx(2.)
 
 
 def test_auto_mode_cold_start_jpeg_triggers_lazy_load_and_publishes():
@@ -850,12 +841,9 @@ def test_stereo_cap_is_honoured_on_the_flattened_cloud():
     40000 上限。抽稀必须按点数本身：ceil(N/max_points)。
 
     SGBM 反投影路径用假 cv2 走通：均匀视差 → 全帧有效 → 密集云。"""
-    plugin, executor = _plugin(cfg={"fps": 1000,
-                                    "max_points": 200,
-                                    "calibration": json.dumps(RECTIFIED_BLOB)})
-    plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    node = executor.nodes[0]
+    node = pc._PointCloudNode('stereo', '/cam/left', '/cam/right', RECTIFIED_BLOB,
+                              fps=1000, max_points=200, min_depth_m=.1, max_depth_m=10.,
+                              node_suffix='cap')
 
     import cv2
     if not getattr(cv2, "__motus_fake__", False):
@@ -936,7 +924,7 @@ def test_stereo_start_without_calibration_reports_missing_metadata():
     plugin, executor = _plugin(cfg={"fps": 1000})
     reply = plugin.dispatch("pointcloud", {
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error" and "标定" in reply["message"]
+    assert reply["state"] == "error" and "参数" in reply["message"]
     assert not executor.nodes
 
 
@@ -951,19 +939,18 @@ def test_stereo_start_requires_both_topics():
 def test_stereo_info_reports_both_input_topics():
     """agent-core 的 _dropped_inputs 在 wanted≥2 时按 info() 判定：
     双目必须报出两路，否则卡片以'忽略了一路输入'失败。"""
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB)})
+    plugin, executor = _plugin(cfg={})
     plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"], "camera_info": _stereo_declarations()})
     info = plugin.dispatch("pointcloud", {"action": "info"})
     topics = [t["topic"] for t in info["topic_in"]]
     assert topics == ["/cam/left", "/cam/right"]
 
 
 def test_stereo_frame_pairing_requires_sync_window():
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
-                                    "fps": 1000})
+    plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"], "camera_info": _stereo_declarations()})
     node = executor.nodes[0]
 
     node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
@@ -987,10 +974,9 @@ def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
     配上新左帧（两回调都在 50 ms 内到达就放行），SGBM 出错视差、发几何
     无效的云；调度抖动超窗时真同步对又被误丢。配对必须用拍摄时刻
     （header.stamp），stamp 缺失才退回到达时间。"""
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
-                                    "fps": 1000})
+    plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"], "camera_info": _stereo_declarations()})
     node = executor.nodes[0]
 
     # CI 镜像里有真 cv2：worker 会拿配上的 6x8 帧跑真 SGBM，在 qemu 下
@@ -1033,16 +1019,15 @@ def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
         type(node)._emit_stereo = original
 
 
-def test_stereo_pairing_publishes_with_rectified_blob():
-    """rectified 档端到端：左右同帧 → 配对 → worker → 发布。
+def test_stereo_pairing_publishes_with_driver_parameters():
+    """驱动参数端到端：左右同帧 → 配对 → worker → 发布。
 
     fake cv2 没实现 SGBM/reprojectImageTo3D，这里在实例上替换
     _emit_stereo，只验证链路（回调→配对→worker→发布）与协议格式。
     """
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
-                                    "fps": 1000})
+    plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"], "camera_info": _stereo_declarations()})
     node = executor.nodes[0]
 
     def _fake_emit_stereo(self_inner, left, right):
@@ -1255,71 +1240,25 @@ def _install_fake_stereo_rectify():
 
 # ── review issue 2：rectified 档 Tx=0 启动即拒 ────────────────────────────────
 
-def test_start_rejects_rectified_calibration_with_zero_tx():
-    """review Medium：Tx=0 的 rectified 标定以前 start 照收，worker 里
-    Q_from_baseline 的 -1/Tx 每帧除零。必须在 start 就报配置错误。"""
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(
-        {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0})})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error"
-    assert "Tx" in reply["message"]
-    assert executor.nodes == []
+def test_rectified_params_reject_rectified_calibration_with_zero_tx():
+    with pytest.raises(ValueError, match='Tx'):
+        pc._rectified_params({**RECTIFIED_BLOB, 'Tx': 0})
 
 
-def test_start_rejects_rectified_calibration_with_nonfinite_tx():
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(
-        {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": "abc"})})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error"
-    assert "Tx" in reply["message"]
+def test_rectified_params_reject_rectified_calibration_with_nonfinite_tx():
+    with pytest.raises(ValueError, match='Tx'):
+        pc._rectified_params({**RECTIFIED_BLOB, 'Tx': 'abc'})
 
 
-@pytest.mark.parametrize("fx,why", [
-    (0, "fx=0 → 反投影深度恒 0"),
-    (float("nan"), "fx=NaN"),
-    ("abc", "fx 非数值"),
-    (None, "fx 缺失"),
-])
-def test_start_rejects_rectified_calibration_with_unusable_fx(fx, why):
-    """review 第 10 轮 Medium：rectified 预检以前只查 Tx。
-
-    fx=0 的 blob start 照收，Q[2,3]=fx=0 → Z=fx·Tx/w 恒 0，云被
-    filter_cloud 全剔光 —— 卡片 running 却一帧不出，无任何报错。fx
-    缺失/非数值则在 _rectify_pair 里每帧抛异常，外部同样静默。
-    JSON 不能表达 NaN/None，走 start 参数传入标定 blob。
-    """
-    import math
-    blob = {"fx": fx, "cx": 160.0, "cy": 120.0, "Tx": 0.05}
-    if fx is None:
-        del blob["fx"]
-    if isinstance(fx, float) and math.isnan(fx):
-        # json.dumps 会把 NaN 写成 NaN（非严格 JSON），load_calibration_blob
-        # 用的是宽容解析，直接喂 float 也一样；这里经 start 参数绕开 JSON。
-        plugin, executor = _plugin()
-        reply = plugin.dispatch("pointcloud", {
-            "action": "start", "input_topics": ["/cam/left", "/cam/right"],
-            "calibration": blob})
-    else:
-        plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
-        reply = plugin.dispatch("pointcloud", {
-            "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error", why
-    assert "fx" in reply["message"]
-    assert executor.nodes == []
+@pytest.mark.parametrize('fx', [0, float('nan'), 'abc', None])
+def test_rectified_params_reject_unusable_fx(fx):
+    with pytest.raises(ValueError, match='fx'):
+        pc._rectified_params({**RECTIFIED_BLOB, 'fx': fx})
 
 
-def test_start_rejects_rectified_calibration_with_nonfinite_principal_point():
-    """cx/cy 非有限 → 反投影坐标全 NaN，云被剔光，同样要当场拒绝。"""
-    plugin, executor = _plugin()
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
-        "calibration": {"fx": 300.0, "cx": float("inf"), "cy": 120.0,
-                        "Tx": 0.05}})
-    assert reply["state"] == "error"
-    assert "主点" in reply["message"]
-    assert executor.nodes == []
+def test_rectified_params_reject_rectified_calibration_with_nonfinite_principal_point():
+    with pytest.raises(ValueError, match='主点'):
+        pc._rectified_params({**RECTIFIED_BLOB, 'cx': float('inf')})
 
 
 # ── review 建议：mode / input_topics 数量校验 ─────────────────────────────────
@@ -1362,62 +1301,41 @@ def test_start_rejects_explicit_mode_without_any_input(mode):
 
 # ── review 第 6 轮：start 预检 raw blob，坏配置当场报错 ─────────────────────
 
-def test_start_rejects_raw_blob_with_missing_K2():
-    """K2 缺了以前 start 照收（只查档位），首帧才在 worker 里炸 ——
-    卡片显示 running 却一云不出。"""
-    blob = json.loads(json.dumps(RAW_BLOB))
-    del blob["K2"]
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error"
-    assert "raw" in reply["message"]
-    assert executor.nodes == []
-
-
-def test_start_rejects_raw_blob_with_malformed_K1():
-    """K1 不是 9 元素（3x3 reshape 失败）同理当场报错。"""
-    blob = json.loads(json.dumps(RAW_BLOB))
-    blob["K1"] = [300, 0, 160, 0, 300, 120]  # 6 元素：reshape(3,3) 必炸
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error"
-    assert "K1/K2" in reply["message"]
-    assert executor.nodes == []
-
-
-def test_start_rejects_raw_blob_with_zero_baseline():
-    """T 全零且没有 Tx：Q 反投影必然除零，start 拒收（与 rectified 档
-    的 Tx 校验同一契约）。"""
-    blob = json.loads(json.dumps(RAW_BLOB))
-    blob["T"] = [[0.0], [0], [0]]
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error"
-    assert "基线" in reply["message"]
-    assert executor.nodes == []
-
-
-@pytest.mark.parametrize("field,bad", [
-    ("D1", [0, float("inf"), 0, 0]),
-    ("R", [[float("nan"), 0, 0], [0, 1, 0], [0, 0, 1]]),
-])
-def test_start_rejects_raw_blob_with_nonfinite_extrinsics(field, bad):
-    """review 第 10 轮建议：K 以前已查有限值，D/R 没查 —— 一个 NaN 让
-    stereoRectify 输出全 NaN，映射全废，云一帧不出且无报错。
-
-    inf/nan 过不了 JSON，走 start 参数直接传 dict。"""
-    blob = json.loads(json.dumps(RAW_BLOB))
-    blob[field] = bad
+def test_start_rejects_driver_parameters_with_missing_K2():
+    decls = _stereo_declarations()
+    decls[1]['K'] = None
     plugin, executor = _plugin()
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
-        "calibration": blob})
-    assert reply["state"] == "error"
-    assert field in reply["message"]
-    assert executor.nodes == []
+    result = plugin.dispatch('start', {'input_topics': ['/cam/left', '/cam/right'], 'camera_info': decls})
+    assert result['state'] == 'error'
+    assert not executor.nodes
+
+
+def test_start_rejects_driver_parameters_with_malformed_K1():
+    decls = _stereo_declarations()
+    decls[0]['K'] = [300, 0, 160, 0, 300, 120]
+    plugin, executor = _plugin()
+    result = plugin.dispatch('start', {'input_topics': ['/cam/left', '/cam/right'], 'camera_info': decls})
+    assert result['state'] == 'error'
+    assert not executor.nodes
+
+
+def test_start_rejects_driver_parameters_with_zero_baseline():
+    decls = _stereo_declarations()
+    decls[0]['stereo_peer']['T'] = [[0.], [0.], [0.]]
+    plugin, executor = _plugin()
+    result = plugin.dispatch('start', {'input_topics': ['/cam/left', '/cam/right'], 'camera_info': decls})
+    assert result['state'] == 'error'
+    assert not executor.nodes
+
+
+@pytest.mark.parametrize('field,bad', [('D', [0, float('inf'), 0, 0]), ('R', [[float('nan'), 0, 0], [0, 1, 0], [0, 0, 1]])])
+def test_start_rejects_driver_nonfinite_extrinsics(field, bad):
+    decls = _stereo_declarations()
+    target = decls[0] if field == 'D' else decls[0]['stereo_peer']
+    target[field] = bad
+    plugin, executor = _plugin()
+    assert plugin.dispatch('start', {'input_topics': ['/cam/left', '/cam/right'], 'camera_info': decls})['state'] == 'error'
+    assert not executor.nodes
 
 
 def test_start_accepts_a_good_raw_blob():
@@ -1428,134 +1346,27 @@ def test_start_accepts_a_good_raw_blob():
     blob["R"] = [[np.cos(theta), -np.sin(theta), 0.0],
                  [np.sin(theta), np.cos(theta), 0.0],
                  [0.0, 0.0, 1.0]]
-    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob),
-                                    "fps": 1000})
+    decls = _stereo_declarations()
+    decls[0]["stereo_peer"]["R"] = blob["R"]
+    plugin, executor = _plugin(cfg={"fps": 1000})
     reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"], "camera_info": decls})
     assert reply["state"] == "running"
     assert len(executor.nodes) == 1
 
 
 # ── review 第 16 轮建议：start/config 预检 pinhole 标定（depth/mono） ──────
 
-@pytest.mark.parametrize("field,bad,needle", [
-    ("fx", 0, "fx"),
-    ("fx", float("nan"), "fx"),
-    ("fx", "abc", "标定数值异常"),
-    ("fy", float("inf"), "fy"),
-    ("cx", float("nan"), "主点"),
-    ("cy", float("inf"), "主点"),
-    ("hfov", 0, "hfov"),      # hfov=0 → 焦距无穷
-    ("hfov", 180, "hfov"),    # hfov=180 → 焦距为 0
-    ("hfov", float("nan"), "hfov"),
-])
-def test_start_rejects_invalid_pinhole_calibration(field, bad, needle):
-    """review 第 16 轮建议：depth/mono 的显式 pinhole 内参以前 start 照收
-    —— fx=0/NaN 让反投影深度恒 0 或全 NaN，云被 filter_cloud 剔光，卡片
-    running 却一帧不出（与 stereo 的 raw/rectified 预检同一个坑）。
-    start 参数直接传 blob，绕开 JSON 对 NaN/inf 的限制。"""
-    blob = {"fx": 300.0, "fy": 300.0, "cx": 160.0, "cy": 120.0}
-    if field == "hfov":
-        blob = {"hfov": bad}
-    else:
-        blob[field] = bad
-    plugin, executor = _plugin()
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
-        "calibration": blob})
-    assert reply["state"] == "error", f"{field}={bad} 应被拒收"
-    assert needle in reply["message"]
-    assert executor.nodes == []
-
-
-def test_start_accepts_good_pinhole_calibration():
-    """预检不误伤：完整 fx/fy/cx/cy 与 hfov 档都照常启动（mono 起节点需要
-    引擎，这里用 depth 档走纯订阅路径）。fy 缺省取 fx、cx/cy 缺省放行——
-    与 pinhole_of 的缺省规则一致。"""
-    plugin, executor = _plugin()
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
-        "calibration": {"fx": 300.0, "cx": 160.0, "cy": 120.0}})
-    assert reply["state"] == "running"
-    assert len(executor.nodes) == 1
-
-    plugin2, executor2 = _plugin()
-    reply2 = plugin2.dispatch("pointcloud", {
-        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
-        "calibration": {"hfov": 90.0}})
-    assert reply2["state"] == "running"
-    assert len(executor2.nodes) == 1
-
-
-def test_config_rejects_invalid_pinhole_calibration():
-    """config 同一份预检：坏标定当场报错且不落库 —— 卡片不会以为配置已
-    生效，下一次 start 也不会再踩一遍。"""
-    plugin, _ = _plugin()
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "calibration": json.dumps({"fx": 0, "cx": 160})})
-    assert reply["state"] == "error"
-    assert plugin._calibration is None  # 未落库
-
-    # hfov 档同理
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "calibration": json.dumps({"hfov": 0})})
-    assert reply["state"] == "error"
-
-    # 合法 blob 照常落库
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config",
-        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})})
-    assert reply["status"] == "configured"
-    assert plugin._calibration["fx"] == 300.0
+@pytest.mark.parametrize('index,bad', [(0, 0), (0, float('nan')), (0, 'abc'), (4, float('inf')), (2, float('nan')), (5, float('inf')), (8, 0)])
+def test_metric_start_rejects_invalid_driver_intrinsics(index, bad):
+    decl = metric_z16_declaration()
+    decl['K'][index] = bad
+    plugin, executor = _plugin({'metric_cloud': True})
+    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [decl]})['state'] == 'error'
+    assert not executor.nodes
 
 
 # ── review 第 17 轮：实例 config 校验 / shutdown / 数值范围 ─────────────────
-
-def test_instance_config_rejects_invalid_calibration_without_retiring():
-    """review 第 17 轮 Issue 1：实例分支以前不校验就落库并撤节点——运行中
-    的卡片被换成 {"fx": 0} 后回复 configured 且节点已停，下次 start 才被
-    预检拒绝：卡片已静默停掉、还留着自己已知不可用的配置。坏标定必须
-    当场拒收：不落库、不撤节点。raw/rectified 档同理。"""
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud",
-                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
-    node = executor.nodes[0]
-    assert len(executor.nodes) == 1
-
-    # pinhole 坏值：拒收、节点还在跑、实例配置没被污染
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/depth",
-        "calibration": json.dumps({"fx": 0, "cx": 160})})
-    assert reply["state"] == "error"
-    assert len(executor.nodes) == 1          # 没撤节点
-    assert executor.nodes[0] is node
-    with plugin._nodes_lock:
-        assert "/cam/depth" not in plugin._instance_configs  # 没落库
-
-    # rectified 坏值（Tx=0）：同样拒收
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/depth",
-        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0})})
-    assert reply["state"] == "error"
-    assert "Tx" in reply["message"]
-
-    # raw 坏值（K2 缺失）：同样拒收
-    blob = json.loads(json.dumps(RAW_BLOB))
-    del blob["K2"]
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/depth",
-        "calibration": json.dumps(blob)})
-    assert reply["state"] == "error"
-
-    # 合法实例标定照常：落库 + 撤节点（等重启生效，原契约）
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/depth",
-        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})})
-    assert reply["status"] == "configured"
-    assert len(executor.nodes) == 0
-    with plugin._nodes_lock:
-        stored = plugin._instance_configs["/cam/depth"]
-    assert stored["calibration"] == json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})
 
 
 @pytest.mark.parametrize("cfg,needle", [
@@ -1631,36 +1442,14 @@ def test_plugin_shutdown_retires_all_nodes_and_clears_pending():
 # ── review 第 18 轮：实例 config 合并语义 / 有界解压 ─────────────────────────
 
 def test_instance_config_patches_instead_of_replacing():
-    """review 第 18 轮 Issue 1：实例配置是补丁不是替换（OCR 的语义）——
-    存了双目标定后只改 fps，旧实现存成 {"fps": ...} 把标定丢掉，下次
-    stereo start 静默落回 capture-only、一帧云不出。"""
-    plugin, _ = _plugin()
-    calib = json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0.05})
-    plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/left", "calibration": calib})
-    # 第二次只改 fps：标定必须还在
-    reply = plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/left", "fps": 5})
-    assert reply["status"] == "configured"
-    with plugin._nodes_lock:
-        stored = plugin._instance_configs["/cam/left"]
-    assert stored["calibration"] == calib, "只改 fps 不得丢掉已存标定"
-    assert stored["fps"] == 5
-    # 回复里带合并后的完整配置，卡片能看到最终生效值
-    assert reply["config"] == stored
-
-    # 端到端：合并后的配置真被下一次 start 用上（stereo 拿到 rectified 档
-    # 而不是 capture-only）
-    plugin2, executor2 = _plugin(cfg={"fps": 1000})
-    plugin2.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/left", "calibration": calib})
-    plugin2.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/left", "max_points": 500})
-    reply = plugin2.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "running"
-    node = executor2.nodes[0]
-    assert node._calibration["Tx"] == 0.05  # 标定活过了第二次 config
+    plugin, executor = _plugin()
+    plugin.dispatch('config', {'instance_id': 'card', 'min_depth_m': 2.})
+    result = plugin.dispatch('config', {'instance_id': 'card', 'fps': 5})
+    assert result['config'] == {'min_depth_m': 2., 'fps': 5}
+    plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth'})
+    node = executor.nodes[0]
+    assert node._min_depth_m == 2. and node._fps == 5
+    plugin.shutdown()
 
 
 def test_depth_zlib_decompress_is_bounded():
@@ -1706,62 +1495,6 @@ def test_depth_zlib_oversized_payload_does_not_reach_worker():
     from plugins.pointcloud import _decode_depth_message
     depth, enc = _decode_depth_message(msg)
     assert depth is None, "超限解压必须被拒，不得产出深度图"
-
-
-# ── review 第 7 轮：标定优先级 start 参数 > 实例 config > 全局 ────────────────
-
-def test_instance_calibration_beats_global_calibration():
-    """全局 plugins.pointcloud.calibration 配了标定时，卡片经 action=config
-    配的实例标定必须赢 —— 以前 _resolve_mode 先取全局，实例档只有全局为
-    空才轮得到，双目会拿错内参/基线出歪云。"""
-    global_blob = json.loads(json.dumps(RAW_BLOB))
-    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]  # 标记值
-    instance_blob = json.loads(json.dumps(RAW_BLOB))
-    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
-    plugin, executor = _plugin(
-        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/left",
-        "calibration": json.dumps(instance_blob)})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "running"
-    node = executor.nodes[0]
-    assert node._calibration["K1"][0][0] == 222  # 实例档胜出
-
-
-def test_start_param_beats_instance_and_global_calibration():
-    """start 参数直接带标定时最高优先：现场换标定不用先改配置。"""
-    global_blob = json.loads(json.dumps(RAW_BLOB))
-    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]
-    instance_blob = json.loads(json.dumps(RAW_BLOB))
-    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
-    inline_blob = json.loads(json.dumps(RAW_BLOB))
-    inline_blob["K1"] = [[333, 0, 160], [0, 333, 120], [0, 0, 1]]
-    plugin, executor = _plugin(
-        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
-    plugin.dispatch("pointcloud", {
-        "action": "config", "instance_id": "/cam/left",
-        "calibration": json.dumps(instance_blob)})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
-        "calibration": json.dumps(inline_blob)})
-    assert reply["state"] == "running"
-    node = executor.nodes[0]
-    assert node._calibration["K1"][0][0] == 333
-
-
-def test_global_calibration_still_applies_without_instance_one():
-    """没有实例标定时全局档照常兜底 —— 修优先级不能把全局配置弄丢。"""
-    global_blob = json.loads(json.dumps(RAW_BLOB))
-    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]
-    plugin, executor = _plugin(
-        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "running"
-    node = executor.nodes[0]
-    assert node._calibration["K1"][0][0] == 111
 
 
 # ── 驱动声明层：stereo_peer + 两条输入的 K/D 自动拼标定 ───────────────────────
@@ -1816,8 +1549,7 @@ def test_stereo_start_uses_declared_calibration_without_any_config():
 
 
 def test_declared_calibration_reports_its_source_in_info():
-    """声明层与用户配置的标定在 info() 里可区分 —— 出云错了，一个要找
-    驱动数据的人，一个要找标定的人。"""
+    """info() 报告驱动参数的来源。"""
     plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud", {
         "action": "start", "input_topics": ["/cam/left", "/cam/right"],
@@ -1826,19 +1558,8 @@ def test_declared_calibration_reports_its_source_in_info():
     (inst,) = info["instances"].values()
     assert inst["calibration_source"] == "measured"
 
-    # 对照：用户配置的标定不带 source 字段 → "configured"
-    plugin2, _ = _plugin(cfg={"fps": 1000,
-                              "calibration": json.dumps(RAW_BLOB)})
-    plugin2.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    info2 = plugin2.dispatch("pointcloud", {"action": "info"})
-    (inst2,) = info2["instances"].values()
-    assert inst2["calibration_source"] == "configured"
 
-
-def test_instance_calibration_beats_the_declared_one():
-    """优先级链：用户/实例标定 > 驱动声明 —— 用户自己标的一定比型号常量
-    新鲜（摔过/换过镜头后重标）。"""
+def test_saved_instance_calibration_cannot_override_driver_parameters():
     instance_blob = json.loads(json.dumps(RAW_BLOB))
     instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
     plugin, executor = _plugin(cfg={"fps": 1000})
@@ -1850,7 +1571,7 @@ def test_instance_calibration_beats_the_declared_one():
         "camera_info": _stereo_declarations()})
     assert reply["state"] == "running"
     node = executor.nodes[0]
-    assert node._calibration["K1"][0][0] == 222  # 实例档胜出，声明层没上场
+    assert node._calibration["K1"][0][0] == 300.0  # 仅使用驱动参数
 
 
 def test_declared_calib_missing_peer_falls_back_to_capture_only_with_error():
@@ -1878,20 +1599,6 @@ def test_declared_calib_peer_id_mismatch_rejects_swapped_inputs():
         "camera_info": decls})
     assert reply["state"] == "error"
     assert "接反" in reply["message"] or "不配对" in reply["message"]
-
-
-def test_short_T_in_config_blob_is_rejected_at_start():
-    """review 第 21 轮 Issue：{"T": [[-0.05]]} 以前过得了 start 预检
-    （T[0] 有限非零），worker 里 T.reshape(3, 1) 每帧炸 —— 卡片 running
-    却一云不出。平移向量必须恰为 3 元，start 当场报清楚。"""
-    blob = json.loads(json.dumps(RAW_BLOB))
-    blob["T"] = [[-0.05]]
-    plugin, executor = _plugin(cfg={"fps": 1000})
-    reply = plugin.dispatch("pointcloud", {
-        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
-        "calibration": json.dumps(blob)})
-    assert reply["state"] == "error"
-    assert "T 不是 3 元素" in reply["message"]
 
 
 def test_short_T_in_declared_peer_is_rejected_at_start():
@@ -2174,27 +1881,9 @@ def test_invalid_upstream_k_does_not_override_usable_fov():
     node.stop()
 
 
-@pytest.mark.parametrize('calibration', [RAW_BLOB, RECTIFIED_BLOB, {'fx': 10, 'cx': None}])
-def test_depth_rejects_incompatible_or_null_pinhole_calibration(calibration):
-    plugin, executor = _plugin({'calibration': calibration})
-    result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth'})
-    assert result['state'] == 'error'
-    assert not executor.nodes
-
-
-def test_explicit_unreadable_calibration_is_error_not_capture_only():
-    plugin, executor = _plugin({'calibration': '/definitely/missing/calibration.json'})
-    args = {'action': 'start', 'mode': 'stereo', 'input_topics': ['/left', '/right']}
-    assert plugin.dispatch('pointcloud', args)['state'] == 'error'
-    assert not executor.nodes
-    plugin, executor = _plugin()
-    assert plugin.dispatch('pointcloud', {'action': 'config',
-        'calibration': '/definitely/missing/calibration.json'})['state'] == 'error'
-
-
 def test_worker_does_not_emit_after_stop_during_model_load(monkeypatch):
     node = pc._PointCloudNode('auto', '/cam', None, None, fps=2, max_points=100,
-                              min_depth_m=.1, max_depth_m=10., cal_a=1., cal_b=0., node_suffix='test')
+                              min_depth_m=.1, max_depth_m=10., node_suffix='test')
     entered, release = threading.Event(), threading.Event()
     emitted = []
     def load():
@@ -2214,7 +1903,7 @@ def test_worker_does_not_emit_after_stop_during_model_load(monkeypatch):
 
 def test_publish_after_stop_is_suppressed():
     node = pc._PointCloudNode('depth', '/cam', None, None, fps=2, max_points=100,
-                              min_depth_m=.1, max_depth_m=10., cal_a=1., cal_b=0., node_suffix='test')
+                              min_depth_m=.1, max_depth_m=10., node_suffix='test')
     node.request_stop()
     node._publish(np.array([[0., 0., 1.]]))
     assert not _cloud_pub(node).messages and not _summary_pub(node).messages
@@ -2303,6 +1992,46 @@ def test_config_updates_global_defaults():
     assert plugin._max_depth_m == 4.0
 
 
+@pytest.mark.parametrize('initial', [False, True])
+def test_repeated_effective_config_keeps_running_instance(initial):
+    plugin, executor = _plugin()
+    cfg = {'instance_id': 'card', 'fps': 2, 'max_points': 20000,
+           'min_depth_m': .1, 'max_depth_m': 10., 'metric_cloud': False}
+    if initial:
+        plugin.dispatch('config', cfg)
+    plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth'})
+    node = executor.nodes[0]
+    result = plugin.dispatch('config', cfg)
+    assert result['status'] == 'configured'
+    assert executor.nodes == [node]
+    assert plugin._nodes['card'] is node
+    assert not node.destroyed
+
+
+def test_invalid_merged_config_keeps_running_instance_and_previous_settings():
+    plugin, executor = _plugin()
+    plugin.dispatch('config', {'instance_id': 'card', 'min_depth_m': 3., 'max_depth_m': 5.})
+    plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth'})
+    node = executor.nodes[0]
+    result = plugin.dispatch('config', {'instance_id': 'card', 'max_depth_m': 2.})
+    assert result['state'] == 'error'
+    assert executor.nodes == [node]
+    assert plugin._instance_configs['card'] == {'min_depth_m': 3., 'max_depth_m': 5.}
+
+
+def test_equivalent_clamped_config_preserves_node_but_actual_change_retires_it():
+    plugin, executor = _plugin({'max_points': 100})
+    plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth'})
+    node = executor.nodes[0]
+    plugin.dispatch('config', {'instance_id': 'card', 'max_points': 50})
+    assert executor.nodes == [node]
+    plugin.dispatch('config', {'instance_id': 'card', 'max_points': 200})
+    assert not executor.nodes and node.destroyed
+    plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth'})
+    assert executor.nodes[0]._max_points == 200
+    plugin.shutdown()
+
+
 def test_output_topics_follow_input():
     plugin, executor = _plugin()
     plugin.dispatch("pointcloud",
@@ -2346,6 +2075,106 @@ def metric_zlib_declaration():
             'width': 640, 'height': 480, 'K': [2., 0., 0., 0., 2., 0., 0., 0., 1.],
             'vendor': {'depth_unit': 'mm', 'depth_source': 'measured',
                        'timestamp_semantics': 'source_capture_mapped'}}
+
+
+def metric_z16_declaration(width=2, height=1):
+    return {**metric_zlib_declaration(), 'format': 'image/depth-z16',
+            'width': width, 'height': height}
+
+
+def test_card_exposes_existing_depth_formats_without_manual_calibration():
+    tool = pc.TOOLS[0]
+    assert {p['format'] for p in tool['topic_in']} == {
+        'image/jpeg', 'image/depth-z16', 'image/depth-zlib'}
+    for schema in ('inputSchema', 'configSchema'):
+        assert not {'calibration', 'cal_a', 'cal_b'} & tool[schema]['properties'].keys()
+    for action in tool['inputSchema']['x-action-params'].values():
+        assert 'calibration' not in action['params']
+
+
+def test_measured_z16_uses_driver_parameters_despite_saved_manual_calibration():
+    old = {'calibration': {'fx': 99., 'fy': 99., 'cx': 1., 'cy': 1.},
+           'cal_a': 2., 'cal_b': 3.}
+    plugin, executor = _plugin({'metric_cloud': True, **old})
+    plugin.dispatch('config', {'instance_id': 'card', **old})
+    result = plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth',
+        'camera_info': [metric_z16_declaration()], **old})
+    assert result['state'] == 'running'
+    node = executor.nodes[0]
+    try:
+        msg = _FakeImage(data=np.array([2000, 2000], dtype='<u2').tobytes(),
+                         encoding='16UC1', width=2, height=1, step=4)
+        msg.header.frame_id = 'optical'
+        msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+        node._emit_depth(msg)
+        pub = next(p for p in node.publishers if p.topic == '/depth/pointcloud_metric')
+        np.testing.assert_allclose(np.frombuffer(pub.raw_messages[0].data, dtype='<f4').reshape(-1, 3),
+                                   [[0., 0., 2.], [1., 0., 2.]])
+        assert not {'calibration', 'cal_a', 'cal_b'} & plugin._instance_configs['card'].keys()
+    finally:
+        plugin.shutdown()
+
+
+def test_saved_manual_calibration_cannot_enable_metric_output_without_driver_parameters():
+    plugin, executor = _plugin({'metric_cloud': True, 'calibration': {
+        'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}})
+    assert plugin.dispatch('start', {'input_topic': '/depth'})['state'] == 'error'
+    assert not executor.nodes
+
+
+@pytest.mark.parametrize('old', [
+    {'calibration': '/missing/camera.json'}, {'calibration': {'fx': 0}},
+    {'cal_a': 2., 'cal_b': 3.},
+])
+def test_saved_manual_settings_do_not_retire_or_override_display_instance(old):
+    plugin, executor = _plugin(old)
+    plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth',
+                             'camera_info': [metric_z16_declaration()], **old})
+    node = executor.nodes[0]
+    try:
+        plugin.dispatch('config', {'instance_id': 'card', **old})
+        assert executor.nodes == [node]
+        assert node._pinhole_for(2, 1) == (2., 2., 0., 0.)
+    finally:
+        plugin.shutdown()
+
+
+@pytest.mark.parametrize('field,bad', [('depth_source', 'estimated'), ('depth_source', None),
+    ('depth_unit', 'm'), ('timestamp_semantics', 'publication')])
+def test_metric_z16_requires_measured_source_units_and_capture_time(field, bad):
+    declaration = metric_z16_declaration()
+    declaration['vendor'][field] = bad
+    plugin, executor = _plugin({'metric_cloud': True})
+    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'error'
+    assert not executor.nodes
+
+
+@pytest.mark.parametrize('field,bad', [('D', [.1, 0, 0, 0]), ('width', 0), ('height', None)])
+def test_metric_rejects_distortion_and_missing_image_dimensions(field, bad):
+    declaration = metric_z16_declaration()
+    declaration[field] = bad
+    plugin, executor = _plugin({'metric_cloud': True})
+    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'error'
+    assert not executor.nodes
+
+
+@pytest.mark.parametrize('endian,big', [('<', 0), ('>', 1)])
+@pytest.mark.parametrize('encoding', ['16UC1', 'mono16'])
+def test_metric_z16_uses_row_stride_endian_and_millimetre_scale(endian, big, encoding):
+    plugin, executor = _plugin({'metric_cloud': True})
+    plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [metric_z16_declaration(2, 2)]})
+    node = executor.nodes[0]
+    msg = _FakeImage(data=np.array([[2000, 2000, 9999], [2000, 2000, 9999]], dtype=endian+'u2').tobytes(),
+                     encoding=encoding, width=2, height=2, step=6, is_bigendian=big)
+    msg.header.frame_id = 'optical'
+    msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+    try:
+        node._emit_depth(msg)
+        pub = next(p for p in node.publishers if p.topic.endswith('/pointcloud_metric'))
+        np.testing.assert_allclose(np.frombuffer(pub.raw_messages[0].data, dtype='<f4').reshape(-1, 3),
+                                   [[0., 0., 2.], [1., 0., 2.], [0., 1., 2.], [1., 1., 2.]])
+    finally:
+        plugin.shutdown()
 
 
 def test_metric_zlib_uses_supported_transport_and_preserves_geometry_and_header():

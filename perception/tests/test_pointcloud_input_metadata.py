@@ -14,8 +14,8 @@ from plugins.pointcloud import PointCloudPerceptionPlugin
 def _declaration(topic='/depth', **overrides):
     return {
         'schema': 'motus.slam_input/1', 'topic': topic, 'kind': 'depth',
-        'format': 'sensor/depth-f32', 'source_id': 'depth-camera',
-        'length_unit': 'm', 'frame_id': 'optical', 'reference_point': None,
+        'format': 'image/depth-z16', 'source_id': 'depth-camera',
+        'length_unit': 'mm', 'frame_id': 'optical', 'reference_point': None,
         'clock_id': 'ros', 'stamp_source': 'measurement',
         'observation_model': 'pinhole', 'cloud_semantics': 'depth_frame',
         'timing_model': 'instantaneous', 'frame_metadata_topic': '/capture/evidence',
@@ -26,20 +26,36 @@ def _declaration(topic='/depth', **overrides):
     }
 
 
+def _camera(topic='/depth'):
+    return {'schema': 'motus.camera/1', 'topic': topic, 'format': 'image/depth-z16',
+            'id': 'optical', 'source': 'derived-from-K', 'distortion_model': 'pinhole',
+            'width': 1, 'height': 1, 'K': [2., 0., 0., 0., 2., 0., 0., 0., 1.],
+            'vendor': {'depth_unit': 'mm', 'depth_source': 'measured',
+                       'timestamp_semantics': 'source_capture_mapped'}}
+
+
+def test_metric_rejects_conflicting_camera_and_input_transport_declarations():
+    executor = _FakeExecutor()
+    plugin = PointCloudPerceptionPlugin({'metric_cloud': True}, 'testns', executor)
+    result = plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [_camera()],
+        'input_metadata': {'/depth': _declaration(format='image/depth-zlib')}})
+    assert result['state'] == 'error'
+    assert not executor.nodes
+
+
 def _running(declaration=None, **args):
-    plugin = PointCloudPerceptionPlugin({'metric_cloud': True, 'calibration': {
-        'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}},
+    plugin = PointCloudPerceptionPlugin({'metric_cloud': True},
         'testns', _FakeExecutor())
     result = plugin.dispatch('pointcloud', {
-        'action': 'start', 'instance_id': 'depth-card', 'input_topic': '/depth',
+        'action': 'start', 'instance_id': 'depth-card', 'input_topic': '/depth', 'camera_info': [_camera()],
         'input_metadata': {'/depth': declaration or _declaration()}, **args})
     assert result['state'] == 'running'
     return plugin, plugin._executor.nodes[0]
 
 
 def _depth(value=2., stamp_ns=123_000_000_456, frame='optical'):
-    msg = _FakeImage(data=np.array([value], dtype='<f4').tobytes(),
-                     encoding='32FC1', width=1, height=1, step=4)
+    msg = _FakeImage(data=np.array([round(value * 1000)], dtype='<u2').tobytes(),
+                     encoding='16UC1', width=1, height=1, step=2)
     msg.header.frame_id = frame
     msg.header.stamp = types.SimpleNamespace(
         sec=stamp_ns // 1_000_000_000, nanosec=stamp_ns % 1_000_000_000)
@@ -191,7 +207,7 @@ def test_running_instance_refuses_metadata_change_until_stopped():
     try:
         changed = _declaration(frame_metadata_topic='/other/evidence', source_id='other-camera')
         result = plugin.dispatch('pointcloud', {
-            'action': 'start', 'instance_id': 'depth-card', 'input_topic': '/depth',
+            'action': 'start', 'instance_id': 'depth-card', 'input_topic': '/depth', 'camera_info': [_camera()],
             'input_metadata': {'/depth': changed}})
         assert result['state'] == 'error'
         assert 'stop' in result['message']
@@ -207,7 +223,7 @@ def test_multi_instance_info_selects_only_requested_output_metadata():
     try:
         other = _declaration('/other', source_id='other-camera', frame_metadata_topic='/other/meta')
         result = plugin.dispatch('pointcloud', {
-            'action': 'start', 'instance_id': 'other-card', 'input_topic': '/other',
+            'action': 'start', 'instance_id': 'other-card', 'input_topic': '/other', 'camera_info': [_camera('/other')],
             'input_metadata': {'/depth': _declaration(), '/other': other}})
         assert result['state'] == 'running'
         assert [entry['source_id'] for entry in plugin.dispatch('pointcloud', {
@@ -223,18 +239,17 @@ def test_multi_instance_info_selects_only_requested_output_metadata():
                                       {'/depth': {}}])
 def test_explicit_malformed_metadata_shape_is_rejected_without_starting(metadata):
     executor = _FakeExecutor()
-    plugin = PointCloudPerceptionPlugin({'metric_cloud': True, 'calibration': {
-        'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}},
+    plugin = PointCloudPerceptionPlugin({'metric_cloud': True},
         'testns', executor)
     result = plugin.dispatch('pointcloud', {
-        'action': 'start', 'input_topic': '/depth', 'input_metadata': metadata})
+        'action': 'start', 'input_topic': '/depth', 'camera_info': [_camera()], 'input_metadata': metadata})
     assert result['state'] == 'error'
     assert 'input_metadata' in result['message']
     assert not executor.nodes
 
 
 @pytest.mark.parametrize('metadata', [{}, {'/sibling': {}}])
-def test_no_target_declaration_keeps_legacy_manual_metric_start(metadata):
+def test_missing_sidecar_declaration_keeps_driver_calibrated_metric_start(metadata):
     plugin, node = _running(input_metadata=metadata)
     try:
         assert 'input_metadata' not in plugin.dispatch('pointcloud', {'action': 'info'})

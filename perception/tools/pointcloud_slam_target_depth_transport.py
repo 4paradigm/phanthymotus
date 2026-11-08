@@ -15,13 +15,13 @@ source=rclpy.create_node('synthetic_depth_source')
 executor.add_node(source)
 results=[]
 try:
-    for kind,typ in [('zlib',CompressedImage),('f32',Image)]:
+    for kind,typ in [('zlib',CompressedImage),('z16',Image)]:
         topic='/synthetic_validation/'+kind
-        fmt='image/depth-zlib' if kind=='zlib' else 'sensor/depth-f32'
+        fmt='image/depth-zlib' if kind=='zlib' else 'image/depth-z16'
         declaration=dict(schema='motus.camera/1',topic=topic,format=fmt,id='synthetic_optical',
             source='derived-from-K',distortion_model='pinhole',width=640,height=480,
             K=[400.,0.,320.,0.,400.,240.,0.,0.,1.],
-            vendor=dict(depth_unit='mm' if kind=='zlib' else 'm',depth_source='measured',timestamp_semantics='source_capture_mapped'))
+            vendor=dict(depth_unit='mm',depth_source='measured',timestamp_semantics='source_capture_mapped'))
         plugin=PointCloudPerceptionPlugin({'metric_cloud':True,'fps':20},'synthetic',executor)
         publisher=source.create_publisher(typ,topic,qos_profile_sensor_data)
         received=[]
@@ -36,8 +36,8 @@ try:
                 msg.format='16UC1; compressedDepth zlib'
                 msg.data=zlib.compress(np.full((480,640),2000,dtype='<u2').tobytes())
             else:
-                msg.height=480;msg.width=640;msg.encoding='32FC1';msg.step=640*4
-                msg.data=np.full((480,640),2.,dtype='<f4').tobytes()
+                msg.height=480;msg.width=640;msg.encoding='16UC1';msg.step=640*2
+                msg.data=np.full((480,640),2000,dtype='<u2').tobytes()
             deadline=time.monotonic()+8;next_send=0
             while not received and time.monotonic()<deadline:
                 if time.monotonic()>=next_send: publisher.publish(msg);next_send=time.monotonic()+.2
