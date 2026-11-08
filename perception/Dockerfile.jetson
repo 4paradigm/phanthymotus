@@ -588,7 +588,7 @@ RUN set -e; . /etc/jetpack.env; \
     case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
     mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
-    apt-get update; apt-get install -y --no-install-recommends \
+    apt-get update; apt-get install -y --no-install-recommends --no-upgrade \
       curl ca-certificates git cmake ccache build-essential python3-dev libpcl-dev \
       libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
       libsqlite3-dev zlib1g-dev libssl-dev; \
@@ -602,24 +602,29 @@ RUN set -e; . /etc/jetpack.env; \
 ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
 # The full archive includes GUI assets and datasets. Fetch only the pinned
 # headless sources; keep completed Git objects when a transfer is interrupted.
-RUN set -e; \
-    rtabmap_source=/tmp/rtabmap-ws/src/rtabmap; \
+# 固定提交的源码跨构建重试保留；与编译目录分开，避免配置过程改写缓存。
+RUN --mount=type=cache,id=perception-rtabmap-source-${RTABMAP_CORE_COMMIT},target=/var/cache/rtabmap-source,sharing=locked \
+    set -e; \
+    rtabmap_source=/var/cache/rtabmap-source; \
     mkdir -p "${rtabmap_source}"; \
     git -C "${rtabmap_source}" init -q; \
-    git -C "${rtabmap_source}" remote add origin https://github.com/introlab/rtabmap.git; \
+    git -C "${rtabmap_source}" config remote.origin.url https://github.com/introlab/rtabmap.git; \
     git -C "${rtabmap_source}" config http.version HTTP/1.1; \
     git -C "${rtabmap_source}" config http.lowSpeedLimit 1024; \
     git -C "${rtabmap_source}" config http.lowSpeedTime 30; \
     for source_attempt in 1 2; do \
       echo "[rtabmap-build] fetching pinned core sources, attempt ${source_attempt}/2"; \
-      if GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" fetch --depth=1 --filter=blob:none origin "${RTABMAP_CORE_COMMIT}" && \
+      if { git -C "${rtabmap_source}" cat-file -e "${RTABMAP_CORE_COMMIT}^{commit}" 2>/dev/null || \
+        GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" fetch --depth=1 --filter=blob:none origin "${RTABMAP_CORE_COMMIT}"; } && \
         git -C "${rtabmap_source}" sparse-checkout init --cone && \
         git -C "${rtabmap_source}" sparse-checkout set cmake_modules corelib utilite && \
         GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" checkout --detach "${RTABMAP_CORE_COMMIT}"; then break; fi; \
       if [ "${source_attempt}" -eq 2 ]; then exit 1; fi; \
       sleep 3; \
     done; \
-    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"
+    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"; \
+    mkdir -p /tmp/rtabmap-ws/src/rtabmap; \
+    cp -a "${rtabmap_source}/." /tmp/rtabmap-ws/src/rtabmap/
 
 # Commit the complete checkout before compiling. A failed build can reuse this
 # source layer; partial object files from the failed RUN are not a Docker cache.

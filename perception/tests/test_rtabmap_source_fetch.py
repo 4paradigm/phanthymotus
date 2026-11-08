@@ -77,7 +77,7 @@ def test_tar_failure_propagates_without_retrying_download(tmp_path):
     assert not (tmp_path / 'sleeps').exists()
 
 
-def run_core_fetch(tmp_path, *, interrupt_checkout=False, fail_checkout=False):
+def run_core_fetch(tmp_path, *, interrupt_checkout=False, fail_checkout=False, retry_offline=False):
     git = shutil.which('git')
     assert git
     seed = tmp_path / 'seed'
@@ -124,12 +124,21 @@ os.execv(os.environ['REAL_GIT'], [os.environ['REAL_GIT'], *sys.argv[1:]])
     core_run = next((run for run in runs if 'sparse-checkout set cmake_modules corelib utilite' in run), None)
     assert core_run is not None, 'core source must use the bounded sparse Git fetch'
     script = core_run.split('. /opt/ros/humble/install/setup.bash;')[0]
+    script = re.sub(r'^--mount=\S+\s+', '', script)
     script = script.replace('/tmp/rtabmap-ws', str(tmp_path / 'workspace'))
+    script = script.replace('/var/cache/rtabmap-source', str(tmp_path / 'source-cache'))
     env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ['PATH'], REAL_GIT=git,
                TEST_ROOT=str(tmp_path), GIT_CONFIG_GLOBAL=str(config), GIT_CONFIG_NOSYSTEM='1',
                GIT_ALLOW_PROTOCOL='file', RTABMAP_CORE_COMMIT=commit,
                INTERRUPT_CHECKOUT=str(int(interrupt_checkout)), FAIL_CHECKOUT=str(int(fail_checkout)))
     result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True, timeout=15)
+    if retry_offline:
+        assert result.returncode == 0, result.stdout + result.stderr
+        # A failed later Docker layer discards its workspace, not a cache mount.
+        shutil.rmtree(tmp_path / 'workspace')
+        origin.rename(tmp_path / 'offline-origin.git')
+        result = subprocess.run(['bash', '-c', script], env=env,
+                                capture_output=True, text=True, timeout=15)
     return result, tmp_path / 'workspace/src/rtabmap', commit, files
 
 
@@ -151,3 +160,11 @@ def test_exhausted_core_checkout_fails_before_building_partial_sources(tmp_path)
     assert result.returncode != 0
     assert (tmp_path / 'checkouts').read_text() == '2'
     assert not (source / 'corelib/src/Registration.cpp').exists()
+
+
+def test_core_sources_survive_a_new_build_when_origin_is_offline(tmp_path):
+    result, source, commit, files = run_core_fetch(tmp_path, retry_offline=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == commit
+    assert (source / 'corelib/src/Registration.cpp').read_text() == files['corelib/src/Registration.cpp']
+    assert not (source / 'data/unneeded.bin').exists()
