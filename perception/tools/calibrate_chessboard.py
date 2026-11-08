@@ -3,19 +3,21 @@
 Usage:
     python calibrate_chessboard.py <frame_dir> --out <out_dir>
         [--cols 10 --rows 13 --square 0.018]
-        [--camera-id deeprobotics/s10_pro/camera_front]
+        [--camera-id deeprobotics/s10_pro/camera_front] [--camera-desc "..."]
         [--target-width 640 --target-height 360]
 
 Detects inner corners on every frame, drops blurry / undetected / outlier
 frames, calibrates with plumb_bob (5 coeffs), rational_polynomial (8) and
 equidistant (fisheye, 4), reports RMS and per-frame error, and writes the
 undistort-card `calibration` JSON at capture resolution and scaled to the
-driver output resolution.
+driver output resolution, plus `table_entry.json`: one row for
+`perception/plugins/undistortion_runtime.CALIBRATIONS`, ready to paste.
 """
 import argparse
 import json
 import math
 import sys
+from datetime import date
 from pathlib import Path
 
 import cv2
@@ -115,6 +117,10 @@ def main():
     ap.add_argument("--rows", type=int, default=13, help="inner corners along the long edge")
     ap.add_argument("--square", type=float, default=0.018, help="square size in metres")
     ap.add_argument("--camera-id", default="deeprobotics/s10_pro/camera_front")
+    ap.add_argument("--camera-desc", default="",
+                    help="human description of the lens for the table row's `camera` field")
+    ap.add_argument("--measured-on", default="",
+                    help="unit and date for the table row (default: today's date)")
     ap.add_argument("--target-width", type=int, default=640)
     ap.add_argument("--target-height", type=int, default=360)
     ap.add_argument("--blur-keep", type=float, default=0.35,
@@ -247,6 +253,27 @@ def main():
         json.dumps(sel["calibration"], indent=2), encoding="utf-8")
     (out_dir / "calibration_card.json").write_text(
         json.dumps(sel["calibration_scaled"], indent=2), encoding="utf-8")
+
+    # One row of perception/plugins/undistortion_runtime.CALIBRATIONS, ready to
+    # paste: the scaled calibration plus where it came from. The provenance
+    # fields are what make a table row checkable later — which lens, which
+    # day, how many frames, how good the fit was.
+    entry = dict(sel["calibration_scaled"])
+    entry["K"] = [round(v, 6) if isinstance(v, float) else v for v in entry["K"]]
+    entry.update({
+        "camera": args.camera_desc or args.camera_id,
+        "measured_on": args.measured_on or date.today().isoformat(),
+        "method": (f"chessboard {args.cols}x{args.rows} inner corners, "
+                   f"{args.square * 1000:g} mm squares; perception/tools/calibrate_chessboard.py"),
+        "source_resolution": {"width": size[0], "height": size[1]},
+        "frames_used": len(results[best]["frames"]),
+        "rms_px": round(results[best]["rms"], 3),
+        "note": (f"Calibrated on the {size[0]}x{size[1]} stream and scaled to "
+                 f"{args.target_width}x{args.target_height} (K x {args.target_width / size[0]:g}, "
+                 "D unchanged)."),
+    })
+    (out_dir / "table_entry.json").write_text(
+        json.dumps({args.camera_id: entry}, indent=4, ensure_ascii=False), encoding="utf-8")
 
     # Visual check: side-by-side original / undistorted for a few frames.
     k = results[best]["k"]

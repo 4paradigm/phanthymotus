@@ -178,3 +178,102 @@ def test_bad_calibration_is_rejected_before_modifying_saved_configuration():
     assert p.dispatch("undistort", {"action": "config", "instance_id": "front",
                                    "calibration": cal})["status"] == "error"
     assert p._configs == before
+
+
+# ── automatic calibration: one card type for every camera ─────────────────────
+
+def driver_declaration(topic, ident):
+    """What a camera that knows its id but not its optics declares (S10 today)."""
+    return {"schema": "motus.camera/1", "topic": topic, "id": ident,
+            "width": 64, "height": 48, "distortion_model": "unknown",
+            "K": None, "D": None, "source": "unknown"}
+
+
+def test_four_cameras_each_pick_their_own_row_with_nothing_typed_in(monkeypatch):
+    import plugins.undistortion_runtime as runtime
+    cameras = {}
+    for i, name in enumerate(("front", "rear", "left", "right")):
+        ident = f"test/{name}"
+        row = dict(calibration(ident), K=[30 + i, 0, 32, 0, 30 + i, 24, 0, 0, 1])
+        monkeypatch.setitem(runtime.CALIBRATIONS, ident, row)
+        cameras[name] = (f"/{name}/rgb", ident, 30 + i)
+    p, executor = plugin()
+    try:
+        for name, (topic, ident, _) in cameras.items():
+            state = p.dispatch("undistort", {
+                "action": "start", "instance_id": name, "input_topic": topic,
+                "camera_info": [driver_declaration(topic, ident)]})
+            assert state["state"] == "running", state
+        assert len(executor.nodes) == 4
+        for name, (topic, ident, fx) in cameras.items():
+            info = p.dispatch("undistort", {"action": "info", "instance_id": name})
+            assert info["calibration_source"] == f"table:{ident}"
+            declared = info["camera_info"][0]
+            assert declared["id"] == ident
+            assert declared["vendor"]["undistortion"]["input_calibration"]["K"][0] == fx
+            assert "perception/undistort" in declared["pipeline"]
+        assert len({tuple(info["topic_out"][0].values())
+                    for info in (p.dispatch("undistort", {"action": "info", "instance_id": n})
+                                 for n in cameras)}) == 4
+    finally:
+        p.shutdown()
+
+
+def test_typed_in_calibration_overrides_the_table(monkeypatch):
+    import plugins.undistortion_runtime as runtime
+    monkeypatch.setitem(runtime.CALIBRATIONS, "test/front",
+                        dict(calibration(), K=[30, 0, 32, 0, 30, 24, 0, 0, 1]))
+    p, _ = plugin()
+    try:
+        state = start(p)        # types calibration() with fx = 35
+        assert state["state"] == "running"
+        assert state["calibration_source"] == "manual"
+        assert state["camera_info"][0]["vendor"]["undistortion"]["input_calibration"]["K"][0] == 35
+    finally:
+        p.shutdown()
+
+
+def test_an_upstream_declaring_its_own_k_d_overrides_the_table(monkeypatch):
+    import plugins.undistortion_runtime as runtime
+    monkeypatch.setitem(runtime.CALIBRATIONS, "test/front",
+                        dict(calibration(), K=[30, 0, 32, 0, 30, 24, 0, 0, 1]))
+    p, _ = plugin()
+    try:
+        state = p.dispatch("undistort", {
+            "action": "start", "instance_id": "front", "input_topic": "/front/rgb",
+            "camera_info": [{"topic": "/front/rgb", **calibration()}]})
+        assert state["calibration_source"] == "upstream"
+        assert state["camera_info"][0]["vendor"]["undistortion"]["input_calibration"]["K"][0] == 35
+    finally:
+        p.shutdown()
+
+
+def test_an_uncalibrated_camera_names_itself_and_the_fix_on_the_card():
+    p, executor = plugin()
+    result = p.dispatch("undistort", {
+        "action": "start", "instance_id": "rear", "input_topic": "/rear/rgb",
+        "camera_info": [driver_declaration("/rear/rgb", "acme/cam/rear")]})
+    assert result["state"] == "error"
+    assert "acme/cam/rear" in result["message"]
+    assert "calibrate_chessboard.py" in result["message"]
+    assert not executor.nodes
+
+
+def test_the_real_s10_front_camera_starts_from_the_built_in_table():
+    """The declaration the S10 driver publishes today: id and size, no K/D."""
+    p, _ = plugin()
+    topic = "/s10_pro/camera_front"
+    upstream = {"schema": "motus.camera/1", "topic": topic,
+                "id": "deeprobotics/s10_pro/camera_front", "width": 640, "height": 360,
+                "distortion_model": "unknown", "K": None, "D": None,
+                "half_fov_rad": 0.7926, "source": "measured"}
+    try:
+        state = p.dispatch("undistort", {"action": "start", "instance_id": "front",
+                                       "input_topic": topic, "camera_info": [upstream]})
+        assert state["state"] == "running", state
+        assert state["calibration_source"] == "table:deeprobotics/s10_pro/camera_front"
+        declared = state["camera_info"][0]
+        assert (declared["width"], declared["height"]) == (640, 360)
+        assert declared["half_fov_rad"] == pytest.approx(0.7926, abs=1e-3)
+    finally:
+        p.shutdown()

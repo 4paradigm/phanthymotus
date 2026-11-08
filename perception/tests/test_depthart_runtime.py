@@ -774,3 +774,73 @@ def test_a_row_without_a_backend_field_counts_as_yolo():
     row = dict(vd.CALIBRATION_PRESETS['Unitree R1'])
     row.pop('backend', None)
     assert row.get('backend', 'yolo') == 'yolo'
+
+
+S10_FRONT = 'deeprobotics/s10_pro/camera_front'
+S10_ROW = 'DeepRobotics S10 Pro front (DepthART)'
+RECTIFIED = ['perception/undistort']
+
+
+def test_s10_front_resolves_its_depthart_fit_behind_undistort():
+    cfg = {'calibration_preset': vd.CAL_AUTO}
+    assert vd._preset_for_camera(S10_FRONT, 'depthart', RECTIFIED)[0] == S10_ROW
+    assert vd._calibration_from_cfg(cfg, camera_id=S10_FRONT, backend='depthart',
+                                    pipeline=RECTIFIED) == (1.36, -0.92)
+    assert vd.calibration_origin(cfg, S10_FRONT, 'depthart', RECTIFIED) == f'auto:{S10_ROW}'
+    # A non-unit exponent: `calibrate` alone could never have produced it.
+    assert vd.CALIBRATION_PRESETS[S10_ROW]['cal_a'] != 1.0
+
+
+@pytest.mark.parametrize('pipeline', [None, [], ['perception/visual_depth']])
+def test_s10_front_fit_is_not_applied_to_unrectified_frames(pipeline):
+    """Fitted on rectified frames; DepthART's scale comes from K, and the raw
+    stream is a different, barrel-distorted lens. The engine's own fit is used
+    instead and the origin says why, so the fix (wire undistort) is visible."""
+    cfg = {'calibration_preset': vd.CAL_AUTO}
+    assert vd._preset_for_camera(S10_FRONT, 'depthart', pipeline) == (None, None)
+    assert vd._calibration_from_cfg(cfg, camera_id=S10_FRONT, backend='depthart',
+                                    pipeline=pipeline) == (1.0, 0.0)
+    assert vd.calibration_origin(cfg, S10_FRONT, 'depthart', pipeline) == \
+        f'auto:needs-undistort({S10_FRONT})'
+
+
+def test_s10_front_has_no_yolo_row():
+    # Measured under DepthART only; YOLO stays on the engine's fit, and the
+    # origin is a plain no-match rather than a misleading wiring hint.
+    cfg = {'calibration_preset': vd.CAL_AUTO}
+    assert vd._calibration_from_cfg(cfg, camera_id=S10_FRONT, backend='yolo',
+                                    pipeline=RECTIFIED) == (1.0, 0.0)
+    assert vd.calibration_origin(cfg, S10_FRONT, 'yolo', RECTIFIED) == \
+        f'auto:no-match({S10_FRONT})'
+
+
+def s10_rectified(pipeline=RECTIFIED):
+    """The declaration undistort publishes for the S10 front camera."""
+    return {'schema': 'motus.camera/1', 'id': S10_FRONT, 'width': 640, 'height': 360,
+            'distortion_model': 'plumb_bob', 'D': [0.0] * 5,
+            'K': [314.963, 0, 336.651, 0, 314.934, 182.285, 0, 0, 1],
+            'pipeline': list(pipeline)}
+
+
+def test_a_running_instance_applies_the_fit_only_behind_undistort():
+    p = make_plugin()
+    class Model:
+        def for_camera(self, camera): return self
+    p._model = Model()
+    try:
+        for key, pipeline in (('rectified', RECTIFIED), ('raw', [])):
+            # The canvas sends every schema field, so the dropdown's default arrives.
+            p.dispatch('visual_depth', {'action': 'config', 'instance_id': key,
+                                        'calibration_preset': vd.CAL_AUTO})
+            state = p.dispatch('visual_depth', {'action': 'start', 'instance_id': key,
+                                                'camera_info': s10_rectified(pipeline)})
+            assert state['state'] == 'running', state
+        assert p._pipeline_for('rectified') == RECTIFIED
+        rectified, raw = p._nodes['rectified'], p._nodes['raw']
+        assert (rectified._cal_a, rectified._cal_b) == (1.36, -0.92)
+        assert rectified.calibration_label == f'site:auto:{S10_ROW}'
+        assert (raw._cal_a, raw._cal_b) == (1.0, 0.0)
+        assert raw.calibration_label == f'model-default (auto:needs-undistort({S10_FRONT}))'
+    finally:
+        for key in ('rectified', 'raw'):
+            p.dispatch('visual_depth', {'action': 'stop', 'instance_id': key})

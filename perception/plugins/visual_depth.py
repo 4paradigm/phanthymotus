@@ -254,6 +254,34 @@ CALIBRATION_PRESETS = {
                 "两参数的 log-affine 表达不了。要更准得改 apply_site_calibration "
                 "的形式（分段或更高阶），再量点没用。",
     },
+    "DeepRobotics S10 Pro front (DepthART)": {
+        "camera_ids": ["deeprobotics/s10_pro/camera_front"],
+        "backend": "depthart",
+        # **Measured on the rectified picture, so it only applies to one.**
+        # DepthART takes its metric scale from K, and the raw S10 stream is
+        # barrel-distorted (k1 = -0.265): the same fit on unrectified frames is
+        # a different lens. `requires_pipeline` keeps `auto` from selecting this
+        # row unless the upstream declaration says `perception/undistort` ran;
+        # without it the card falls back to the engine's own fit and `info`
+        # says `auto:needs-undistort(...)`.
+        "requires_pipeline": ["perception/undistort"],
+        # Free exponent, fitted offline in log space: `calibrate` pins a = 1,
+        # which on this lens leaves 14.5% mean / 25% worst error against 7.8% /
+        # 20.6% here. Anyone re-running `calibrate` will push `cal_a` back to 1.
+        "cal_a": 1.36,
+        "cal_b": -0.92,
+        "camera": "DeepRobotics S10 Pro 前置广角 640x360，经 undistort 去畸变后（水平视场 90.8°）",
+        "measured_on": "robot_local (S10 Pro CD1), 2026-11-07/08",
+        "samples": 16,
+        "range_m": "0.6–4.0",
+        "residual_pct": 8,
+        "note": "16 个站立、正对墙面的点，两次开机会话，每点 15 帧中位数；拟合内平均 7.8%，"
+                "3.5 m 一点 20.6%（读数比 4.0 m 还大，判为坏样本但未剔除）。"
+                "未参与拟合的 0.7 / 1.3 / 2.3 m 验收误差 4.0% / 2.4% / 3.1%。"
+                "前提：机器人站立、画面里有地面（相机离地约 35 cm，0.6 m 以内地面出画，"
+                "读数不稳）；趴下时尺度明显偏大。只用墙面拟合，镂空或低于相机的物体"
+                "不能作采样目标。",
+    },
 }
 
 
@@ -475,7 +503,25 @@ def _calibration_message(samples: list) -> str:
     )
 
 
-def _preset_for_camera(camera_id: str, backend: str = "yolo"):
+def _preset_matches(preset: dict, camera_id: str, backend: str) -> bool:
+    return (camera_id in (preset.get("camera_ids") or ())
+            and preset.get("backend", "yolo") == backend)
+
+
+def _pipeline_satisfied(preset: dict, pipeline) -> bool:
+    """Whether the stages a row was measured behind all ran upstream.
+
+    A row with no `requires_pipeline` was measured on a camera's own output and
+    always qualifies. A row that does — S10 Pro's, fitted on rectified frames —
+    needs the stages named in the upstream declaration; an unknown pipeline
+    (None) does not qualify, because applying a fit measured on a different
+    picture is the silent factor-of-two this table exists to prevent.
+    """
+    required = preset.get("requires_pipeline") or ()
+    return all(stage in (pipeline or ()) for stage in required)
+
+
+def _preset_for_camera(camera_id: str, backend: str = "yolo", pipeline=None):
     """The preset row a camera identity and depth model select, or `(None, None)`.
 
     The join that makes the calibration stop being a thing somebody has to know
@@ -491,20 +537,32 @@ def _preset_for_camera(camera_id: str, backend: str = "yolo"):
 
     A row without `backend` is treated as YOLO: the table had one entry and one
     model when it was written, so that is what those numbers were measured on.
+
+    `pipeline` is the upstream declaration's stage list; a row that declares
+    `requires_pipeline` is only selected when those stages ran.
     """
     if not camera_id:
         return None, None
     for name, preset in CALIBRATION_PRESETS.items():
-        if camera_id not in (preset.get("camera_ids") or ()):
+        if not _preset_matches(preset, camera_id, backend):
             continue
-        if preset.get("backend", "yolo") != backend:
+        if not _pipeline_satisfied(preset, pipeline):
             continue
         return name, preset
     return None, None
 
 
+def _preset_blocked_by_pipeline(camera_id: str, backend: str, pipeline) -> bool:
+    """A row exists for this camera and model but its pipeline did not run."""
+    return bool(camera_id) and any(
+        _preset_matches(preset, camera_id, backend)
+        and not _pipeline_satisfied(preset, pipeline)
+        for preset in CALIBRATION_PRESETS.values())
+
+
 def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
-                          camera_id: str = "", backend: str = "yolo") -> tuple[float, float]:
+                          camera_id: str = "", backend: str = "yolo",
+                          pipeline=None) -> tuple[float, float]:
     """Resolve (cal_a, cal_b): typed-in value, then preset, then legacy, then engine.
 
     **Non-identity wins over a preset, and that test is deliberate.** The canvas
@@ -541,7 +599,7 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
             # The camera said who it is; that is enough to pick the row. No
             # match is not a failure — it is a camera nobody has measured, and
             # the honest answer is the engine's own generic fit.
-            _, preset = _preset_for_camera(camera_id, backend)
+            _, preset = _preset_for_camera(camera_id, backend, pipeline)
             if preset:
                 return float(preset["cal_a"]), float(preset["cal_b"])
         return 1.0, 0.0
@@ -562,7 +620,8 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
     return 1.0, 0.0
 
 
-def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo") -> str:
+def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo",
+                       pipeline=None) -> str:
     """Which of the four sources is in effect, for `info()`.
 
     A card whose depth is 3.2x out and a card whose depth is right look the same
@@ -577,7 +636,12 @@ def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo") ->
         if choice in CALIBRATION_PRESETS:
             return f"preset:{choice}"
         if choice == CAL_AUTO:
-            name, _ = _preset_for_camera(camera_id, backend)
+            name, _ = _preset_for_camera(camera_id, backend, pipeline)
+            if not name and _preset_blocked_by_pipeline(camera_id, backend, pipeline):
+                # A row exists for this camera and model but was measured on a
+                # rectified picture this card is not being fed — the engine's
+                # own fit is in use, and the fix is a wiring change upstream.
+                return f"auto:needs-undistort({camera_id})"
             # Which of the two "automatic" outcomes happened has to be
             # distinguishable: a card whose depth is 2.65x out and one whose
             # depth is right look identical from outside, and this is the field
@@ -962,6 +1026,11 @@ class _DepthNode(Node):
     def calibration_label(self) -> str:
         """Which fit produced **this node's** metres."""
         if self._cal_a == 1.0 and self._cal_b == 0.0:
+            # The engine's fit is in use — but if that is because a measured
+            # row exists and only the wiring keeps it out, say so: "model-default"
+            # alone reads as "nobody calibrated this camera".
+            if self._cal_origin.startswith("auto:needs-undistort"):
+                return f"model-default ({self._cal_origin})"
             return "model-default"
         return f"site:{self._cal_origin}"
 
@@ -1307,6 +1376,15 @@ class VideoDepthPerceptionPlugin:
         with self._nodes_lock:
             return camera_id(self._upstream_camera.get(node_key) or {})
 
+    def _pipeline_for(self, node_key: str) -> list:
+        """The stages the upstream declaration says ran before this card.
+
+        What a preset with `requires_pipeline` is checked against — S10 Pro's
+        row was fitted on rectified frames and must not be applied to raw ones.
+        """
+        with self._nodes_lock:
+            return list((self._upstream_camera.get(node_key) or {}).get("pipeline") or [])
+
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
         """`{"camera_info": [...]}` for an `info()` answered while loading.
 
@@ -1371,9 +1449,11 @@ class VideoDepthPerceptionPlugin:
                            _calibration_from_cfg(
                                icfg, (self._cal_a, self._cal_b),
                                camera_id=self._camera_id_for(node_key),
-                               backend=self._backend))),
+                               backend=self._backend,
+                               pipeline=self._pipeline_for(node_key)))),
                 cal_origin=calibration_origin(icfg, self._camera_id_for(node_key),
-                                              self._backend),
+                                              self._backend,
+                                              self._pipeline_for(node_key)),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
                 mask_barrel=bool(icfg.get("mask_lens_barrel",
@@ -1509,7 +1589,7 @@ class VideoDepthPerceptionPlugin:
             report.update(extra)
         return report
 
-    def _calibration_label(self, camera_id: str = "") -> str:
+    def _calibration_label(self, camera_id: str = "", pipeline=None) -> str:
         """Which fit produced these metres, and **where that fit came from**.
 
         "site" was not enough. A refit typed in by hand, one chosen from a
@@ -1523,7 +1603,7 @@ class VideoDepthPerceptionPlugin:
             return f"site:calibrate({len(self._cal_samples)} 样本)"
         if self._cal_a == 1.0 and self._cal_b == 0.0:
             return "model-default"
-        return f"site:{calibration_origin(self._plugin_cfg, camera_id, self._backend)}"
+        return f"site:{calibration_origin(self._plugin_cfg, camera_id, self._backend, pipeline)}"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.
@@ -1808,7 +1888,8 @@ class VideoDepthPerceptionPlugin:
             live = (nodes or {}).get(cam_key)
             info["calibration"] = (live.calibration_label if live is not None
                                    else self._calibration_label(
-                                       self._camera_id_for(cam_key)))
+                                       self._camera_id_for(cam_key),
+                                       self._pipeline_for(cam_key)))
             if camera_out:
                 info["camera_info"] = camera_out
             if camera_note:

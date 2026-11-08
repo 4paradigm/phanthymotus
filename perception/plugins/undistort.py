@@ -14,7 +14,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 
 from plugins.camera_info import for_topic
-from plugins.undistortion_runtime import Rectifier, validate
+from plugins.undistortion_runtime import Rectifier, resolve, validate
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 TOOLS = [{
     "name": "undistort", "type": "processor", "multiInstance": True,
-    "description": "相机去畸变：输出同一路校正 RGB，供 visual_depth、VOP 和导航共同使用。需要准确 K/D；不从墙距或厂家范围猜测内参。输出自动裁掉无效边缘。",
+    "description": "相机去畸变：输出同一路校正 RGB，供 visual_depth、VOP 和导航共同使用。参数默认自动选择：先用上游相机声明的 K/D，再按相机 id 查内置标定表；都没有就报错，不猜内参。输出自动裁掉无效边缘。",
     "inputSchema": {
         "type": "object", "required": ["action"],
         "properties": {
@@ -40,7 +40,7 @@ TOOLS = [{
         "type": "object", "properties": {
             "calibration": {
                 "type": "object", "title": "Camera calibration", "default": {}, "scope": "instance",
-                "description": "准确的 id、width、height、K、D、distortion_model。{} 表示使用上游 camera_info；缺少准确参数会报错。必须匹配实际输入流。",
+                "description": "留空 {} = 自动：先用上游相机声明的 K/D，再按相机 id 查内置标定表。只有要覆盖时才手填准确的 id、width、height、K、D、distortion_model，必须匹配实际输入流。",
                 "properties": {
                     "id": {"type": "string"},
                     "width": {"type": "integer", "minimum": 1},
@@ -166,6 +166,7 @@ class UndistortPlugin:
         self._nodes = {}
         self._declarations = {}
         self._bindings = {}
+        self._sources = {}
         self._lock = threading.RLock()
         self._closing = False
 
@@ -181,6 +182,11 @@ class UndistortPlugin:
                   "topic_out": [{"topic": output_topic(topic, key), "format": "image/jpeg"}] if topic else []}
         if camera:
             result["camera_info"] = [camera]
+        if key in self._sources:
+            # manual / upstream / table:<id> — which kind of number is
+            # rectifying this picture. A wrong table row and a correct typed-in
+            # one look identical from downstream; this is what separates them.
+            result["calibration_source"] = self._sources[key]
         if node:
             result.update(frame_count=node.frames, error=node.error,
                           last_frame_age_s=(time.monotonic() - node.last_frame_at
@@ -209,6 +215,7 @@ class UndistortPlugin:
                     self._configs[key] = copy.deepcopy(cfg)
                     if key not in self._nodes:
                         self._declarations.pop(key, None)
+                        self._sources.pop(key, None)
                     return {"status": "configured", "instance_id": key, "config": cfg}
                 if action == "info":
                     if key == "_default" and len(self._nodes) == 1:
@@ -235,8 +242,7 @@ class UndistortPlugin:
                 upstream = for_topic(args.get("camera_info"), topic)
                 if "perception/undistort" in (upstream.get("pipeline") or []):
                     raise ValueError("Input is already rectified; connect its RGB directly downstream")
-                cal = cfg["calibration"] or {field: upstream.get(field) for field in
-                                            ("id", "width", "height", "K", "D", "distortion_model")}
+                cal, source = resolve(cfg["calibration"], upstream)
                 rectifier = Rectifier(cal)
                 camera = rectifier.camera_info(upstream)
                 output = output_topic(topic, key)
@@ -252,6 +258,7 @@ class UndistortPlugin:
                 self._nodes[key] = node
                 self._declarations[key] = camera
                 self._bindings[key] = topic
+                self._sources[key] = source
                 return self._info(key)
             except (ValueError, RuntimeError) as exc:
                 return {"state": "error", "status": "error", "message": str(exc)}

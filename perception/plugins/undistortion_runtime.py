@@ -2,6 +2,16 @@
 
 The calibration must describe the actual input stream, including any vendor
 crop. Never infer a distortion model or scale a calibration across crops.
+
+Where a calibration comes from, in order (see `resolve`):
+
+1. typed into the card (`calibration` is a full object);
+2. declared by the upstream camera (`motus.camera/1` with a supported
+   distortion model and K/D) — the camera owns its optics, so a driver that
+   learns to declare them takes over from the table below;
+3. `CALIBRATIONS`, keyed on the camera id the upstream declares.
+
+Nothing found is an error naming the camera, never a guess.
 """
 from __future__ import annotations
 
@@ -9,6 +19,141 @@ import copy
 import math
 
 import numpy as np
+
+MODELS = ("plumb_bob", "rational_polynomial", "equidistant")
+
+# Chessboard calibrations measured on real lenses, keyed on `motus.camera/1` id.
+#
+# **Keyed on the id, and the id is per model, not per unit.** The driver spec
+# requires `<vendor>/<model>/<port>` to be identical on every unit of a model,
+# so a row measured on one robot is applied to every robot of that model. Lens
+# to lens variation within a model is usually small; `measured_on` says which
+# unit and when, and a robot that rectifies badly gets its own measurement
+# typed into the card, which wins over this table.
+#
+# Each row is exactly what `perception/tools/calibrate_chessboard.py` writes to
+# `table_entry.json`: K/D at the resolution the camera publishes (here the S10
+# driver's 640x360), plus where the numbers came from. Every row is validated
+# by the tests, so a typo fails there rather than on a robot.
+CALIBRATIONS = {
+    "deeprobotics/s10_pro/camera_front": {
+        "id": "deeprobotics/s10_pro/camera_front",
+        "width": 640,
+        "height": 360,
+        "distortion_model": "plumb_bob",
+        "K": [314.963248, 0, 336.650604, 0, 314.934089, 182.285271, 0, 0, 1],
+        "D": [-0.264916006540722, 0.08280010720226033, -0.00018047856465669117,
+              3.14558084286742e-05, -0.013244463692919645],
+        "camera": "DeepRobotics S10 Pro front wide (Sunplus SPCA2650 UVC, RTSP /video4)",
+        "measured_on": "2026-11-07, S10 Pro CD1 (host CA9B_NO.0), standing",
+        "method": "chessboard 10x13 inner corners, 18 mm squares; perception/tools/calibrate_chessboard.py",
+        "source_resolution": {"width": 1024, "height": 576},
+        "frames_used": 103,
+        "rms_px": 0.213,
+        "note": ("Calibrated on the 1024x576 RTSP stream and scaled to the driver's "
+                 "640x360 (K x 0.625, D unchanged). Horizontal FOV 90.8 deg after "
+                 "rectification; no invalid border at this K."),
+    },
+    "deeprobotics/s10_pro/camera_rear": {
+        "id": "deeprobotics/s10_pro/camera_rear",
+        "width": 640,
+        "height": 360,
+        "distortion_model": "plumb_bob",
+        "K": [312.750288, 0, 308.919092, 0, 312.683048, 183.364774, 0, 0, 1],
+        "D": [-0.2622894409938081, 0.08153733337528488, 0.00012089478431258563,
+              0.00040150868161954143, -0.013044993729573065],
+        "camera": "DeepRobotics S10 Pro rear wide (Sunplus SPCA2650 UVC, RTSP /video0)",
+        "measured_on": "2026-11-08, S10 Pro CD1 (host CA9B_NO.0), standing",
+        "method": "chessboard 10x13 inner corners, 18 mm squares; perception/tools/calibrate_chessboard.py",
+        "source_resolution": {"width": 1024, "height": 576},
+        "frames_used": 103,
+        "rms_px": 0.208,
+        "note": ("Calibrated on the 1024x576 RTSP stream and scaled to the driver's "
+                 "640x360 (K x 0.625, D unchanged). Horizontal FOV 91.3 deg after "
+                 "rectification; no invalid border at this K."),
+    },
+    "deeprobotics/s10_pro/camera_left": {
+        "id": "deeprobotics/s10_pro/camera_left",
+        "width": 640,
+        "height": 360,
+        "distortion_model": "plumb_bob",
+        "K": [314.208908, 0, 311.686392, 0, 314.175661, 192.549502, 0, 0, 1],
+        "D": [-0.25929876926166817, 0.07786005715673677, 0.00035419731549147994,
+              0.0005598844289782525, -0.011875881953120242],
+        "camera": "DeepRobotics S10 Pro left wide (Sunplus SPCA2650 UVC, RTSP /video2)",
+        "measured_on": "2026-11-08, S10 Pro CD1 (host CA9B_NO.0), standing",
+        "method": "chessboard 10x13 inner corners, 18 mm squares; perception/tools/calibrate_chessboard.py",
+        "source_resolution": {"width": 1024, "height": 576},
+        "frames_used": 106,
+        "rms_px": 0.222,
+        "note": ("Calibrated on the 1024x576 RTSP stream and scaled to the driver's "
+                 "640x360 (K x 0.625, D unchanged). Horizontal FOV 91.0 deg after "
+                 "rectification; no invalid border at this K."),
+    },
+    "deeprobotics/s10_pro/camera_right": {
+        "id": "deeprobotics/s10_pro/camera_right",
+        "width": 640,
+        "height": 360,
+        "distortion_model": "plumb_bob",
+        "K": [314.351144, 0, 327.541354, 0, 314.28902, 177.870404, 0, 0, 1],
+        "D": [-0.2617530191348165, 0.0801398926074851, 9.564678897937886e-05,
+              -0.0001381378356953391, -0.012449424682861728],
+        "camera": "DeepRobotics S10 Pro right wide (Sunplus SPCA2650 UVC, RTSP /video6)",
+        "measured_on": "2026-11-08, S10 Pro CD1 (host CA9B_NO.0), standing",
+        "method": "chessboard 10x13 inner corners, 18 mm squares; perception/tools/calibrate_chessboard.py",
+        "source_resolution": {"width": 1024, "height": 576},
+        "frames_used": 98,
+        "rms_px": 0.219,
+        "note": ("Calibrated on the 1024x576 RTSP stream and scaled to the driver's "
+                 "640x360 (K x 0.625, D unchanged). Horizontal FOV 91.0 deg after "
+                 "rectification; no invalid border at this K."),
+    },
+}
+
+
+def lookup(camera_id):
+    """The table row for this camera id (a deep copy), or None."""
+    row = CALIBRATIONS.get(camera_id or "")
+    return copy.deepcopy(row) if row is not None else None
+
+
+def _upstream_calibration(upstream):
+    """A calibration the upstream camera declares itself, or None.
+
+    Only a declaration naming a model this card rectifies counts. `unknown`,
+    `pinhole` or a missing model say nothing about distortion, so the table is
+    consulted instead. A declaration that *does* claim a supported model owns
+    its numbers: they are validated and an error is raised rather than quietly
+    replaced by the table.
+    """
+    if (upstream or {}).get("distortion_model") not in MODELS:
+        return None
+    return validate({key: upstream.get(key) for key in
+                     ("id", "width", "height", "K", "D", "distortion_model")})
+
+
+def resolve(explicit, upstream):
+    """`(calibration, source)` for a card: typed in, upstream, table, or an error.
+
+    `source` is `manual`, `upstream` or `table:<id>` and is reported by the
+    card, so a reader can tell which kind of number is rectifying the picture.
+    """
+    cal = validate(explicit)
+    if cal is not None:
+        return cal, "manual"
+    upstream = upstream or {}
+    cal = _upstream_calibration(upstream)
+    if cal is not None:
+        return cal, "upstream"
+    camera_id = upstream.get("id") or ""
+    row = lookup(camera_id)
+    if row is not None:
+        return validate(row), f"table:{camera_id}"
+    who = f"相机 {camera_id}" if camera_id else "上游相机（没有声明 id）"
+    raise ValueError(
+        f"{who} 没有可用的去畸变参数：上游声明里没有 K/D，内置标定表里也没有这台相机。"
+        "用 perception/tools/calibrate_chessboard.py 标定，把输出的 table_entry.json "
+        "加入 undistortion_runtime.CALIBRATIONS；或在卡片的 Camera calibration 里手填。")
 
 
 def validate(config):
@@ -24,7 +169,7 @@ def validate(config):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"undistortion {key} must be a positive integer")
     model = result.get("distortion_model")
-    if model not in ("plumb_bob", "rational_polynomial", "equidistant"):
+    if model not in MODELS:
         raise ValueError("undistortion model must be plumb_bob, rational_polynomial or equidistant")
     for key in ("K", "D"):
         values = result.get(key)
