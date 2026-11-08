@@ -619,8 +619,11 @@ RUN set -e; \
       if [ "${source_attempt}" -eq 2 ]; then exit 1; fi; \
       sleep 3; \
     done; \
-    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"; \
-    . /opt/ros/humble/install/setup.bash; \
+    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"
+
+# Commit the complete checkout before compiling. A failed build can reuse this
+# source layer; partial object files from the failed RUN are not a Docker cache.
+RUN set -e; . /opt/ros/humble/install/setup.bash; \
     cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
       -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
@@ -636,9 +639,8 @@ RUN set -e; \
 
 ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
 # A wrapper/dependency download failure must not discard the compiled core.
+# Cache all required sources and the package selection before running colcon.
 RUN set -e; . /opt/ros/humble/install/setup.bash; \
-    rtabmap_python="$(command -v python3)"; \
-    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
     mkdir -p /tmp/rtabmap-ws/src; \
     fetch_rtabmap_source() { \
       source_name="$1"; source_repo="$2"; source_commit="$3"; \
@@ -684,6 +686,15 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
       69b50c6db906b2044502b00c1b35dc97ec8a40ce image_transport; \
     add_missing_rtabmap_dependencies laser_geometry ros-perception/laser_geometry \
       d53b925d25b4b5657261a44f4479365965cc2363 laser_geometry; \
+    printf '%s\n' "${rtabmap_packages}" > /tmp/rtabmap-ws/packages.list
+
+# RUN starts a fresh shell: reload both the ROS environment and the selection
+# made against this image's underlay, including only its missing dependencies.
+RUN set -e; . /opt/ros/humble/install/setup.bash; \
+    rtabmap_python="$(command -v python3)"; \
+    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
+    test -s /tmp/rtabmap-ws/packages.list; \
+    rtabmap_packages="$(cat /tmp/rtabmap-ws/packages.list)"; \
     rtabmap_rcutils="$(readlink -f /opt/ros/humble/install/lib/librcutils.so)"; \
     rtabmap_builtin="$(readlink -f /opt/ros/humble/install/lib/libbuiltin_interfaces__rosidl_generator_c.so)"; \
     rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
