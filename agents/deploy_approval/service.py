@@ -461,13 +461,17 @@ class DeployController:
                 if (getattr(other, "alias", "").casefold()
                         != getattr(machine, "alias", "").casefold()):
                     continue
-                endpoints_differ = (
-                    getattr(other, "node_id", "") != getattr(machine, "node_id", "")
-                    or getattr(other, "node_host", "") != getattr(machine, "node_host", "")
-                )
-                detail = "different endpoints" if endpoints_differ else "the same endpoint"
+                # The same physical machine may be independently authorized by
+                # both repositories. Credentials are keyed by the exact alias,
+                # so refuse any alias spelling or endpoint identity drift.
+                if (
+                    getattr(other, "alias", "") == getattr(machine, "alias", "")
+                    and getattr(other, "node_id", "") == getattr(machine, "node_id", "")
+                    and getattr(other, "node_host", "") == getattr(machine, "node_host", "")
+                ):
+                    continue
                 raise DeployControllerError(
-                    f"machine alias {machine.alias!r} is used by {repo} and {other_repo} for {detail}, but Agent Core credentials are keyed only by alias; configure repository-distinct aliases and credentials before deployment"
+                    f"machine alias {machine.alias!r} is shared by {repo} and {other_repo} with conflicting machine identity; Agent Core credentials are keyed only by alias"
                 )
 
     def _machine_connection_fingerprint(self, machine) -> tuple[str, str, str]:
