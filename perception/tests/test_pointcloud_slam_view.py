@@ -17,6 +17,8 @@ def test_saved_map_publishes_original_packet_with_historical_identity_and_stops(
         context = output['metadata']['map_view']
         assert context['scope'] == 'history' and context['revision'] == 2
         assert context['segment_id'] == 'old/run' and context['frame_id'] == 'old_map'
+        assert not context.get('actions')
+        assert 'plane' not in context
         assert view.publishers[0].messages[-1] == packet
         view.rename('Renamed')
         assert view.outputs()[0]['metadata']['map_view']['name'] == 'Renamed'

@@ -30,9 +30,7 @@ class SavedMapView(Node):
                 metadata = deepcopy(item['metadata'])
                 metadata['map_view'] = {'schema': 'motus.map-view/1', 'scope': 'history',
                     'map_id': map_id, 'name': name, 'revision': revision,
-                    'segment_id': item['segment_id'], 'frame_id': item['frame_id'],
-                    'plane': metadata.get('map_plane'),
-                    'actions': {key: key for key in ('list_tags', 'tag_place', 'untag_place')}}
+                    'segment_id': item['segment_id'], 'frame_id': item['frame_id']}
                 self._outputs.append({'topic': topic, 'format': 'sensor/mapping',
                     'desc': 'Saved map snapshot; marker is the last captured frame pose',
                     'segment_id': item['segment_id'], 'metadata': metadata})

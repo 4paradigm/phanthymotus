@@ -28,16 +28,13 @@ _DEFAULTS = {'robot': '其他', 'input_policy': 'strict', 'clock_relation_verifi
 _RETIRED = {'preview_enabled', 'preview_backend', 'preview_geometry', 'preview_relocalization',
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
             'max_frames', 'max_points', 'persistent_history'}
-_SENSOR_KEYS = {'cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud', 'map_plane'}
+_SENSOR_KEYS = {'cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud'}
 _ACTIONS = {
     'start_mapping': ('Start mapping', ['map_name']),
     'stop_mapping': ('Stop mapping and save', []),
     'list_maps': ('List maps', []), 'select_map': ('View saved map', ['map_id']),
     'rename_map': ('Rename saved map', ['map_id', 'map_name']),
-    'close_map_view': ('Close map view', ['map_id']), 'delete_map': ('Delete saved map', ['map_id']),
-    'tag_place': ('Tag place', ['map_id', 'revision', 'segment_id', 'tag_name', 'x', 'y', 'yaw', 'tag_id']),
-    'list_tags': ('List tags', ['map_id', 'revision']),
-    'untag_place': ('Remove tag', ['map_id', 'revision', 'tag_id'])}
+    'close_map_view': ('Close map view', ['map_id']), 'delete_map': ('Delete saved map', ['map_id'])}
 
 
 def _robot_config(config):
@@ -65,7 +62,7 @@ def _config_properties():
     props['robot'].update(title='机器人', enum=['Bumi', 'G1', 'Tianyi', '其他'],
         description='Bumi 使用当前已验证预设；G1、Tianyi 预留待接入里程计。选择“其他”时手动填写高级设置，预设在保存后生效。')
     props.update({key: {'type': 'string', 'scope': 'instance'}
-                  for key in ('cloud_frame', 'child_frame', 'clock_id', 'map_plane')})
+                  for key in ('cloud_frame', 'child_frame', 'clock_id')})
     props['child_from_cloud'] = {'type': 'string', 'scope': 'instance',
         'title': 'Cloud to odometry reference transform', 'description': 'Rigid 4x4 transform, meters (JSON)'}
     props['max_update_ms']['description'] = 'RTAB-Map memory management time threshold; not a hard deadline'
@@ -79,7 +76,9 @@ class PointCloudSlamPlugin:
     PREFIX = 'pointcloud_slam'
 
     def __init__(self, config, executor):
-        self._config = _robot_config({**_DEFAULTS, **{k: v for k, v in (config or {}).items() if k not in _RETIRED}})
+        # 标点移至后续导航卡片；忽略旧画布中的标注平面，不阻止项目启动。
+        self._config = _robot_config({**_DEFAULTS, **{k: v for k, v in (config or {}).items()
+                                                     if k not in _RETIRED and k != 'map_plane'}})
         retired = sorted(_RETIRED.intersection(config or {}))
         self._config_error = ('Remove obsolete SLAM configuration: ' + ', '.join(retired)) if retired else None
         self._executor = executor
@@ -113,7 +112,7 @@ class PointCloudSlamPlugin:
         verbs = ['start', 'stop', 'info', 'config', *_ACTIONS, 'operation_status']
         actions = {key: {'requires_project': key == 'start_mapping'} for key in _ACTIONS}
         actions['operation_status'] = {'internal': True}
-        actions['delete_map']['confirm'] = '删除地图及其全部版本和地点？'
+        actions['delete_map']['confirm'] = '删除地图及其全部版本？'
         for key in ('stop_mapping', 'select_map'):
             actions[key].update(background=True, status_action='operation_status',
                 pending_states=['working'], error_states=['error'], poll_interval_ms=500)
@@ -123,9 +122,8 @@ class PointCloudSlamPlugin:
             'input_topics': {'type': 'array', 'items': {'type': 'string'}},
             'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
             'input_metadata': {'type': 'object'},
-            **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id', 'segment_id', 'tag_id', 'tag_name')},
-            'background': {'type': 'boolean'}, 'revision': {'type': 'integer'},
-            **{key: {'type': 'number'} for key in ('x', 'y', 'yaw')}}, 'required': ['action'],
+            **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id')},
+            'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': v[1]} for k, v in _ACTIONS.items()},
             'x-map-manager': {'schema': 'motus.map-manager/1', 'actions': {
                 k: k for k in ('list_maps', 'select_map', 'rename_map', 'delete_map', 'close_map_view')}},
@@ -199,8 +197,6 @@ class PointCloudSlamPlugin:
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or
                     not math.isfinite(value) or value < 0 or (value == 0 and key != 'max_future_skew_ms')):
                 raise ValueError(key + ' has an invalid value')
-        if cfg.get('map_plane') not in (None, '', 'xy'):
-            raise ValueError('map_plane must be xy when explicitly established')
 
     def dispatch(self, name, args):
         try:
@@ -563,7 +559,7 @@ class PointCloudSlamPlugin:
         from . import pointcloud_slam_library as library
         map_id, revision = args.get('map_id'), args.get('revision')
         if action == 'list_maps':
-            return {'state': 'ok', 'maps': [{k: e[k] for k in ('id', 'name', 'revision', 'tag_count')}
+            return {'state': 'ok', 'maps': [{k: e[k] for k in ('id', 'name', 'revision')}
                                            for e in library.map_entries(_ARCHIVE_DIR)]}
         if action == 'select_map':
             if self._executor is None:
@@ -607,21 +603,4 @@ class PointCloudSlamPlugin:
             if self._last_stop and self._last_stop.get('map_id') == map_id:
                 self._last_stop = None
             return {'state': 'deleted', 'map_id': map_id}
-        if action == 'tag_place':
-            if library.revision_plane(_ARCHIVE_DIR, map_id, revision, args.get('segment_id')) != 'xy':
-                raise ValueError('tag picking requires a declared archived xy plane')
-            values = (args.get('tag_name'), args.get('x'), args.get('y'), args.get('yaw'))
-            if args.get('tag_id'):
-                tag = library.update_tag(_ARCHIVE_DIR, map_id, revision, args['tag_id'], *values,
-                                         segment_id=args.get('segment_id'))
-            else:
-                tag = library.create_tag(_ARCHIVE_DIR, map_id, revision, *values,
-                                         segment_id=args.get('segment_id'))
-            return {'state': 'ok', 'tag': tag}
-        if action == 'list_tags':
-            return {'state': 'ok', 'tags': library.list_tags(_ARCHIVE_DIR, map_id, revision),
-                    'segments': library.revision_segments(_ARCHIVE_DIR, map_id, revision)}
-        if action == 'untag_place':
-            library.delete_tag(_ARCHIVE_DIR, map_id, revision, args.get('tag_id'))
-            return {'state': 'ok'}
         return None

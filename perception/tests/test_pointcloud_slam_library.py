@@ -2,7 +2,6 @@ import hashlib
 import json
 import sqlite3
 import struct
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -59,44 +58,36 @@ def test_native_save_is_self_contained_and_idempotent(tmp_path, saved):
     assert snapshots[0]['metadata']['statistics'] == {'nodes': 1}
 
 
-def test_tags_bound_to_revision_and_segment(tmp_path, saved):
+@pytest.fixture
+def legacy_annotations(tmp_path, saved):
+    map_id, _, _ = saved
+    manifest = tmp_path / 'maps' / map_id / 'manifest.json'
+    data = json.loads(manifest.read_text())
+    tags = {'1': [{'id': 'old-place', 'name': '入口', 'x': 1, 'y': 2,
+                   'yaw': 0, 'segment_id': 'a'}]}
+    data['tags'] = tags
+    manifest.write_text(json.dumps(data))
+    return tags
+
+
+def test_map_management_preserves_legacy_annotations(tmp_path, saved, legacy_annotations):
     map_id, save, _ = saved
-    assert library.list_tags(tmp_path, map_id, 1) == []
-    assert library.revision_segments(tmp_path, map_id, 1) == ['a']
-    assert library.revision_plane(tmp_path, map_id, 1, 'a') == 'xy'
-    tag = library.create_tag(tmp_path, map_id, 1, ' 前台 ', 0, 2, segment_id='a')
-    assert tag['name'] == '前台' and tag['yaw'] is None
-    save(bound=map_id, request='two')
+    manifest = tmp_path / 'maps' / map_id / 'manifest.json'
+    before = manifest.read_bytes()
+    assert library.load_map_snapshots(tmp_path, map_id)
+    assert manifest.read_bytes() == before
+    assert library.rename_map(tmp_path, map_id, '新名字')['tags'] == legacy_annotations
+    assert save('新名字', bound=map_id, request='two') == map_id
+    entry = library.map_entries(tmp_path)[0]
+    assert entry['revision'] == 2 and entry['tags'] == legacy_annotations
     copy = save('副本', bound=map_id, request='copy')
-    assert library.list_tags(tmp_path, map_id, 2) == library.list_tags(tmp_path, copy, 1) == []
-    for rev, seg, x, yaw in [(3, 'a', 1, 0), (1, 'b', 1, 0), (1, 'a', True, 0),
-                             (1, 'a', float('nan'), 1), (1, 'a', 1, float('inf'))]:
-        with pytest.raises(ValueError):
-            library.create_tag(tmp_path, map_id, rev, 'invalid', x, 1, yaw, segment_id=seg)
-    with pytest.raises(ValueError, match='already in use'):
-        library.create_tag(tmp_path, map_id, 1, '前台', 1, 1, segment_id='a')
-    updated = library.update_tag(tmp_path, map_id, 1, tag['id'], '出口', 1, 3, 0.5, segment_id='a')
-    assert updated == {**tag, 'name': '出口', 'x': 1, 'y': 3, 'yaw': .5}
-    assert library.list_tags(tmp_path, map_id, 1) == [updated]
-    library.delete_tag(tmp_path, map_id, 1, tag['id'])
-    assert library.list_tags(tmp_path, map_id, 1) == []
+    assert json.loads(manifest.read_text())['tags'] == legacy_annotations
+    copied = json.loads((tmp_path / 'maps' / copy / 'manifest.json').read_text())
+    assert not copied.get('tags')
 
 
-def test_parallel_tag_writes_and_save_preserve_edits(tmp_path, saved):
+def test_failed_changes_preserve_committed_map(tmp_path, saved, legacy_annotations, monkeypatch):
     map_id, save, _ = saved
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        writers = [pool.submit(library.create_tag, tmp_path, map_id, 1, str(i), i, i,
-                               segment_id='a') for i in range(12)]
-        revision = pool.submit(save, '地图', map_id, 'two')
-        tags = [f.result() for f in writers]
-        assert revision.result() == map_id
-    assert {t['id'] for t in library.list_tags(tmp_path, map_id, 1)} == {t['id'] for t in tags}
-    assert library.map_entries(tmp_path)[0]['revision'] == 2
-
-
-def test_failed_changes_preserve_committed_map(tmp_path, saved, monkeypatch):
-    map_id, save, _ = saved
-    tag = library.create_tag(tmp_path, map_id, 1, '出口', 0, 0, segment_id='a')
     def fail(*args):
         raise OSError('simulated commit failure')
     monkeypatch.setattr(library.os, 'replace', fail)
@@ -106,7 +97,7 @@ def test_failed_changes_preserve_committed_map(tmp_path, saved, monkeypatch):
         library.rename_map(tmp_path, map_id, '新名字')
     with pytest.raises(OSError):
         library.delete_map(tmp_path, map_id)
-    assert library.list_tags(tmp_path, map_id, 1) == [tag]
+    assert library.map_entries(tmp_path)[0]['tags'] == legacy_annotations
     assert library.map_entries(tmp_path)[0]['revision'] == 1
 
 
@@ -159,8 +150,9 @@ def test_no_snapshot_keeps_native_database_without_inventing_marker_or_plane(tmp
         tmp_path, artifacts, {'reserve_bytes': 0}, 'database only', None, 'one')
     assert revision == 1 and duplicate is False
     assert library.load_map_snapshots(tmp_path, map_id) == []
-    assert library.revision_segments(tmp_path, map_id, revision) == ['a']
-    assert library.revision_plane(tmp_path, map_id, revision, 'a') is None
+    data = json.loads((tmp_path / 'maps' / map_id / '1.json').read_text())
+    assert [segment['segment_id'] for segment in data['segments']] == ['a']
+    assert data['segments'][0]['map_plane'] is None
 
 
 def test_snapshot_checksum_prevents_viewing_modified_geometry(tmp_path, saved):
@@ -221,7 +213,7 @@ def test_database_without_snapshot_preserves_unknown_map_frame_and_plane(tmp_pat
         tmp_path, artifacts, {'reserve_bytes': 0, 'map_plane': 'xy'}, 'native only', None, 'one')
     data = json.loads((tmp_path / 'maps' / map_id / '1.json').read_text())
     assert data['segments'][0]['frame_id'] is frame_id
-    assert library.revision_plane(tmp_path, map_id, revision, 'a') is None
+    assert data['segments'][0]['map_plane'] is None
     assert library.load_map_snapshots(tmp_path, map_id) == []
 
 

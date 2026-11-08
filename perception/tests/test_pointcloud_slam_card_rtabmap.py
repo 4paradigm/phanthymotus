@@ -141,6 +141,42 @@ def test_native_database_save_is_idempotent_and_old_geometry_config_is_not_expos
     assert not set(props) & {'preview_backend', 'preview_geometry', 'preview_odom_sigmas', 'restore_archive'}
 
 
+def test_card_exposes_map_management_without_annotation_controls(card):
+    tool = card.get_tools()[0]
+    schema = tool['inputSchema']
+    removed = {'tag_place', 'list_tags', 'untag_place'}
+    assert not removed.intersection(schema['properties']['action']['enum'])
+    assert not removed.intersection(schema['x-action-params'])
+    assert not removed.intersection(schema['x-action-lifecycle']['actions'])
+    assert not {'tag_id', 'tag_name', 'segment_id', 'x', 'y', 'yaw'}.intersection(schema['properties'])
+    assert 'map_plane' not in tool['configSchema']['properties']
+    capture(card)
+    saved = call(card, 'stop_mapping')
+    assert call(card, 'list_maps')['maps'] == [
+        {'id': saved['map_id'], 'name': 'Hall', 'revision': saved['revision']}]
+
+
+@pytest.mark.parametrize('action', ['tag_place', 'list_tags', 'untag_place'])
+def test_removed_annotation_actions_cannot_modify_saved_maps(card, action):
+    capture(card)
+    saved = call(card, 'stop_mapping')
+    manifest = Path(module._ARCHIVE_DIR) / 'maps' / saved['map_id'] / 'manifest.json'
+    before = manifest.read_bytes()
+    assert call(card, action, map_id=saved['map_id'], revision=saved['revision'],
+                segment_id='run', tag_name='Entrance', x=1, y=2, tag_id='old') is None
+    assert manifest.read_bytes() == before
+
+
+def test_old_annotation_setting_does_not_prevent_project_start(card):
+    plugin = module.PointCloudSlamPlugin({**settings(), 'map_plane': 'xy'}, _FakeExecutor())
+    try:
+        ready(plugin)
+        assert 'map_plane' not in plugin._settings()
+        assert call(plugin, 'config', map_plane='xy')['state'] == 'configured'
+    finally:
+        plugin.shutdown()
+
+
 def test_project_stop_acknowledges_before_native_close_and_preserves_saving_state(card):
     node = capture(card)
     entered, release = threading.Event(), threading.Event()

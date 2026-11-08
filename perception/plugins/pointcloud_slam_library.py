@@ -12,12 +12,11 @@ import struct
 from copy import deepcopy
 
 import numpy as np
-import sys
 import tempfile
 import unicodedata
 import uuid
 
-from .pointcloud_slam_legacy import SCHEMAS, file_digest, legacy_metadata, load_legacy_snapshots
+from .pointcloud_slam_legacy import SCHEMAS, file_digest, load_legacy_snapshots
 
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 17 + 80000 * 12
@@ -69,8 +68,7 @@ def map_entries(root):
     if not (Path(root) / 'maps').is_dir():
         return []
     with _maps_locked(root, False) as maps:
-        return [dict(entry, tag_count=sum(len(tags) for tags in entry.get('tags', {}).values()))
-                for entry in _entries(maps)]
+        return _entries(maps)
 
 
 def validate_map_name(name):
@@ -118,83 +116,6 @@ def _revision(maps, map_id, revision):
     if type(revision) is not int or not any(s['revision'] == revision for s in entry['saves']):
         raise ValueError('unknown map revision')
     return entry
-
-
-def _segments(maps, map_id, revision):
-    data = _read_revision(maps / map_id / f'{revision}.json')
-    if data['schema'] == 'motus.rtabmap-map/1':
-        return [segment['segment_id'] for segment in data['segments']]
-    legacy_metadata(data)
-    return list(dict.fromkeys(frame['pose']['segment_id'] for frame in data['frames']))
-
-
-def revision_segments(root, map_id, revision):
-    with _maps_locked(root, False) as maps:
-        _revision(maps, map_id, revision)
-        return _segments(maps, map_id, revision)
-
-
-def revision_plane(root, map_id, revision, segment_id):
-    with _maps_locked(root, False) as maps:
-        _revision(maps, map_id, revision)
-        data = _read_revision(maps / map_id / f'{revision}.json')
-        if data['schema'] == 'motus.rtabmap-map/1':
-            return next((s.get('map_plane') for s in data['segments']
-                         if s['segment_id'] == segment_id), None)
-        archived = legacy_metadata(data)
-        evidence = (archived.get('segment_metadata') or {}).get(segment_id, archived)
-        return evidence.get('map_plane') if evidence.get('map_plane') == 'xy' else None
-
-
-def list_tags(root, map_id, revision):
-    with _maps_locked(root, False) as maps:
-        entry = _revision(maps, map_id, revision)
-        return entry.get('tags', {}).get(str(revision), [])
-
-
-def _change_tag(root, map_id, revision, tag_id, tag):
-    with _maps_locked(root) as maps:
-        entry = _revision(maps, map_id, revision)
-        tags = entry.setdefault('tags', {}).setdefault(str(revision), [])
-        if tag_id is not None:
-            previous = next((t for t in tags if t['id'] == tag_id), None)
-            if previous is None:
-                raise ValueError('unknown map tag')
-            tags.remove(previous)
-        if tag is not None:
-            if tag['segment_id'] not in _segments(maps, map_id, revision):
-                raise ValueError('unknown map segment')
-            if any(t['name'] == tag['name'] for t in tags):
-                raise ValueError('tag name already in use')
-            tag['id'] = tag_id or uuid.uuid4().hex
-            tags.append(tag)
-        with tempfile.TemporaryDirectory(dir=maps) as tmp:
-            _write_json(Path(tmp) / 'meta.tmp', maps / map_id / 'manifest.json', entry)
-        return tag
-
-
-def _tag(name, x, y, yaw, segment_id):
-    name = validate_map_name(name)
-    coords = (x, y) if yaw is None else (x, y, yaw)
-    if any(type(v) not in (int, float) or not -sys.float_info.max <= v <= sys.float_info.max for v in coords):
-        raise ValueError('tag coordinates must be finite numbers')
-    return {'name': name, 'x': x, 'y': y, 'yaw': yaw, 'segment_id': segment_id}
-
-
-def create_tag(root, map_id, revision, name, x, y, yaw=None, *, segment_id):
-    return _change_tag(root, map_id, revision, None, _tag(name, x, y, yaw, segment_id))
-
-
-def update_tag(root, map_id, revision, tag_id, name, x, y, yaw=None, *, segment_id):
-    if not tag_id:
-        raise ValueError('tag id required')
-    return _change_tag(root, map_id, revision, tag_id, _tag(name, x, y, yaw, segment_id))
-
-
-def delete_tag(root, map_id, revision, tag_id):
-    if not tag_id:
-        raise ValueError('tag id required')
-    _change_tag(root, map_id, revision, tag_id, None)
 
 
 def _read_revision(path):

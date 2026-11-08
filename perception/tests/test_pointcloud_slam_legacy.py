@@ -54,8 +54,6 @@ def test_legacy_view_uses_saved_optimized_prefix_and_odometry_tail_without_write
     assert snapshots[0]['metadata']['tracking'] is False
     assert snapshots[0]['metadata']['map_plane'] == 'xy'
     assert snapshots[1]['metadata']['map_plane'] is None
-    assert library.revision_segments(tmp_path, 'a' * 32, 1) == ['a', 'b']
-    assert library.revision_plane(tmp_path, 'a' * 32, 1, 'a') == 'xy'
     after = {p.relative_to(directory): (p.stat().st_mtime_ns, p.read_bytes())
              for p in directory.rglob('*') if p.is_file()}
     assert after == before
@@ -66,7 +64,6 @@ def test_legacy_v1_retains_unknown_evidence_and_has_no_annotation_plane(tmp_path
     snapshots = library.load_map_snapshots(tmp_path, 'a' * 32)
     assert snapshots[0]['metadata']['evidence']['source'] == 'legacy_archive'
     assert snapshots[0]['metadata']['map_plane'] is None
-    assert library.revision_plane(tmp_path, 'a' * 32, 1, 'a') is None
 
 
 @pytest.mark.parametrize('invalid', ['checksum', 'path', 'symlink', 'stamps', 'pose', 'dtype'])
