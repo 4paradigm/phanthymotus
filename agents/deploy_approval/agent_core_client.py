@@ -27,6 +27,7 @@ from .clients_common import (
 )
 from .config import Config, validate_agent_core_tls_mode, _load_ca_pem_config
 from .image_ref import validate_image_ref
+from .models import MachineInfo
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class AgentCoreClient:
         machine_alias: str = "",
         access_token: str = "",
         http: httpx.AsyncClient | None = None,
+        repository_machine: MachineInfo | None = None,
     ):
         self.config = config
         try:
@@ -164,15 +166,36 @@ class AgentCoreClient:
                     or access_token != configured_token
                     or any(char in _CONTROL_CHARS for char in access_token)):
                 raise AgentCoreError("legacy TLS requires the selected machine's configured token")
-            from .policy import load_machines, MachineLoadError
-            from yaml import YAMLError
-            try:
-                machines = load_machines(config.machine_owners_file)
-            except (MachineLoadError, OSError, ValueError, YAMLError) as exc:
-                raise AgentCoreError("legacy TLS requires a valid configured machine policy") from exc
-            machine = machines.get(machine_alias)
-            if machine is None or machine.node_host != node_host:
-                raise AgentCoreError("legacy TLS alias and node_host must match the machine policy")
+            if repository_machine is None:
+                # Preserve the standalone client's legacy local-policy contract.
+                from .policy import load_machines, MachineLoadError
+                from yaml import YAMLError
+                try:
+                    machines = load_machines(config.machine_owners_file)
+                except (MachineLoadError, OSError, ValueError, YAMLError) as exc:
+                    raise AgentCoreError(
+                        "legacy TLS requires a valid configured machine policy"
+                    ) from exc
+                machine = machines.get(machine_alias)
+            elif isinstance(repository_machine, MachineInfo):
+                # The controller supplies this only after selecting a machine
+                # from the authenticated, repository-scoped main-branch policy.
+                # Do not fall back to the unrelated global legacy allowlist.
+                machine = repository_machine
+            else:
+                raise AgentCoreError("invalid repository machine policy binding")
+            if (
+                machine is None
+                or machine.alias != machine_alias
+                or machine.node_host != node_host
+                or not isinstance(machine.node_id, str)
+                or not machine.node_id
+                or not isinstance(machine.owners, list)
+                or not machine.owners
+            ):
+                raise AgentCoreError(
+                    "legacy TLS alias, node identity and host must match the selected machine policy"
+                )
             try:
                 _load_ca_pem_config({"agent_core_ca_pem": config.agent_core_ca_pem})
             except ValueError as exc:

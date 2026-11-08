@@ -400,6 +400,7 @@ class DeployController:
             node_host=machine.node_host,
             machine_alias=machine.alias,
             access_token=token,
+            repository_machine=machine,
         )
         try:
             if timeout is None:
