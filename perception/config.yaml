@@ -275,9 +275,10 @@ plugins:
     max_depth_m: 10.0
 
   # RTAB-Map mapping from native PointCloud2 and existing odometry.
-  # The canvas exposes only `robot` (preset selector) and `child_from_cloud`;
-  # frames/clock/resource/RTAB-Map parameters are internal defaults that this
-  # deployment block may override (optionally including `robot`).
+  # The canvas exposes only `child_from_cloud`. This deployment block selects the
+  # robot preset: `robot: Bumi|G1|Tianyi|其他` (deployment-only, never a canvas
+  # field; Bumi supplies frames/clock/extrinsic/limits). Frames/clock/resource/
+  # RTAB-Map/preview parameters are internal defaults that this block may override.
   pointcloud_slam:
     enabled: true
 

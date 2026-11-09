@@ -54,16 +54,14 @@ def _robot_config(config):
 
 
 def _config_properties():
-    """The canvas surface: a robot preset and the one transform inputs cannot supply.
+    """The canvas surface: the one transform the inputs cannot supply.
 
-    Frames, clock and every resource/RTAB-Map/preview parameter stay internal
-    defaults (or deployment-config overrides); they are not canvas fields.
+    Robot presets, frames, clock and every resource/RTAB-Map/preview parameter
+    are deployment-config (or internal-default) behaviour; they are not canvas
+    fields. ``robot`` is therefore not a property here: a saved canvas value
+    for it is stale input and must not move the active preset.
     """
     return {
-        'robot': {'type': 'string', 'scope': 'instance', 'title': '机器人',
-                  'enum': ['Bumi', 'G1', 'Tianyi', '其他'],
-                  'description': 'Bumi 使用已验证的相机/坐标系预设；G1、Tianyi 预留待接入里程计；'
-                                 '“其他”使用手动输入或上游声明的事实。'},
         'child_from_cloud': {'type': 'string', 'scope': 'instance',
                              'title': 'Cloud to odometry reference transform',
                              'description': 'Rigid 4x4 transform, meters (JSON)'},
@@ -77,8 +75,8 @@ class PointCloudSlamPlugin:
         # 标点移至后续导航卡片；忽略旧画布中的标注平面，不阻止项目启动。
         # Retired/unknown deployment keys are ignored, never fatal: old config
         # rows and old canvas documents must not block a project start. The
-        # filtered deployment config is kept separately so switching the canvas
-        # robot selector can re-base without dragging a preset's sensor facts.
+        # filtered deployment config is kept separately so config-action
+        # updates re-base on it instead of on a possibly preset-derived state.
         deployment = {k: v for k, v in (config or {}).items()
                       if k not in _RETIRED and k != 'map_plane'}
         self._deployment_config = deepcopy(deployment)
@@ -196,11 +194,15 @@ class PointCloudSlamPlugin:
 
     @staticmethod
     def _require_preset_available(cfg):
-        """G1/Tianyi have no compatible odometry preset yet; say so before a session starts."""
+        """G1/Tianyi have no compatible odometry preset yet; say so before a session starts.
+
+        The preset comes from the deployment configuration (``pointcloud_slam.robot``),
+        never from the canvas.
+        """
         robot = cfg.get('robot')
         if robot in ('G1', 'Tianyi') and not all(cfg.get(k) for k in ('cloud_frame', 'child_frame', 'clock_id')):
             raise ValueError(robot + ' preset awaits compatible state/odom and verified sensor configuration; '
-                             'use 其他 for manually configured inputs')
+                             'set the deployment config pointcloud_slam.robot to 其他 for manually configured inputs')
 
     def _require_mapping_inputs(self, cfg):
         """The mapping session needs concrete frames and an extrinsic; fail clearly at start."""
@@ -208,11 +210,11 @@ class PointCloudSlamPlugin:
         for key in ('cloud_frame', 'child_frame', 'clock_id'):
             value = cfg.get(key)
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(key + ' is required before mapping starts: select a robot preset or let the '
-                                 'connected inputs declare it')
+                raise ValueError(key + ' is required before mapping starts: set the deployment robot preset '
+                                 'or let the connected inputs declare it')
         if cfg.get('extrinsic_mode', 'static') != 'dynamic' and cfg.get('child_from_cloud') is None:
-            raise ValueError('child_from_cloud is required before mapping starts: select a robot preset, '
-                             'set it on the card, or let the connected inputs declare it')
+            raise ValueError('child_from_cloud is required before mapping starts: set it on the card, '
+                             'set the deployment robot preset, or let the connected inputs declare it')
 
     def dispatch(self, name, args):
         try:
@@ -314,15 +316,13 @@ class PointCloudSlamPlugin:
         with self._lock:
             if action == 'config':
                 mapping = self._node is not None or self._pending is not None
-                # Only the two canvas fields are configurable; every other key
-                # (old saved canvas rows included) is ignored rather than fatal.
+                # Only the one canvas field is configurable; every other key
+                # (stale canvas rows, including a saved `robot`, and old config
+                # rows) is ignored rather than fatal. The active robot preset is
+                # read from the deployment config only, so a stale canvas value
+                # can never switch it.
                 props = _config_properties()
                 updates = {k: v for k, v in args.items() if k in props and v is not None and v != ''}
-                # Old saved projects have no selector: fall back to the
-                # deployment default, then 其他, never to the prior project's robot.
-                updates.setdefault('robot', self._deployment_config.get('robot', '其他'))
-                # Re-base on the deployment config: facts supplied by a
-                # previously selected robot preset must not leak into 其他.
                 merged = _robot_config({**_DEFAULTS, **self._deployment_config, **updates})
                 if isinstance(merged.get('child_from_cloud'), str):
                     merged['child_from_cloud'] = json.loads(merged['child_from_cloud'])
@@ -373,7 +373,6 @@ class PointCloudSlamPlugin:
                 self._input_diagnostics = deepcopy(getattr(error, 'diagnostics', []))
                 raise
         self._validate(self._settings())
-        self._require_preset_available(self._settings())
         require_runtime()
         with self._operation_lock:
             if self._project_stopping or self._blocking_stops:
