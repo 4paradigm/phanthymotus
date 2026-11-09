@@ -102,6 +102,38 @@ def test_native_pair_preserves_all_point_fields_bytes_and_exact_nanosecond_stamp
     assert raw.header.frame_id == 'camera'  # Header remapping doesn't mutate the producer message.
 
 
+
+@pytest.mark.parametrize(('malformed', 'expected_error'), [
+    ('big_endian', 'little-endian'),
+    ('row_padding', 'row padding'),
+])
+def test_native_pointcloud_rejects_big_endian_and_padded_rows_before_publish(
+        node, malformed, expected_error):
+    # decode_cloud can inspect more layouts than the native RTAB-Map converter
+    # supports. Invalid memory layouts must never reach the native publisher.
+    node._odom(NS(data=json.dumps(odom(1000))))
+    bad = cloud()
+    if malformed == 'big_endian':
+        bad.is_bigendian = True
+        bad.data = struct.pack('>ffffff', 1., 2., 3., .5, .001, 42.)
+    else:
+        bad.row_step += 8
+        bad.data += bytes(8)
+
+    node._cloud(bad)
+    assert expected_error in node.stream.last_error
+    assert node.status()['forwarded_clouds'] == 0
+    assert not NativeProcess.instances
+
+    # A malformed scan must not poison the next conforming measurement.
+    node._cloud(cloud())
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    assert len(NativeProcess.instances) == 1
+    forwarded = published(node, '/scan_cloud')[0].raw_messages[-1]
+    assert forwarded.is_bigendian is False
+    assert forwarded.row_step == forwarded.width * forwarded.point_step
+
+
 def test_invalid_lost_and_stale_vo_never_reach_native_process(node):
     send(node, status='lost')
     node._odom(NS(data='not JSON'))

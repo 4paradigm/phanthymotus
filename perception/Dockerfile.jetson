@@ -3,11 +3,10 @@
 # JP_VERSION selects the corresponding Jetson base; TensorRT plans are loaded
 # only when the runtime target matches the host TensorRT major version.
 #
-# Build context: repo root (phanthy-motus/) so we can access both
-# src/perception_stack/ and deploy/ros-base/audio_msgs/
+# Build context: repository root, including perception/ and deploy/.
 #
-# Usage:
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
+# Usage (from repo root; Jetson only):
+#   ./deploy/build_perception.sh --jp-version 6.1 --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -597,7 +596,8 @@ RUN set -e; . /etc/jetpack.env; \
     . /opt/ros/humble/install/setup.bash; \
     rtabmap_python="$(command -v python3)"; \
     python3 -c "import cv2,numpy; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[rtabmap-build] OpenCV',cv2.__version__,'Python ${PY_ABI}')"; \
-    rm -rf /var/lib/apt/lists/*
+    apt-get clean; \
+    rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
 
 ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
 # The full archive includes GUI assets and datasets. Fetch only the pinned

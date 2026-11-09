@@ -5,6 +5,7 @@ import pytest
 
 from plugins.pointcloud_slam_contract import (
     ODOM_SCHEMA, POSE_PROFILE, INPUT_SCHEMA, FRAME_SCHEMA,
+    POSE_FORMAT, CLOUD_FORMAT,
     SpatialSlamError, validate_slam_capability, validate_tracking_pose,
     validate_input_port, validate_mount, validate_frame_identity,
 )

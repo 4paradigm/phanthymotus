@@ -78,3 +78,25 @@ The source-identical Driver-side validator is
 `common/spatial_slam.py`; update it and the Perception copy in the
 same cross-repository change. The public contract name stays `/1`
 unless a breaking change warrants a new version.
+
+
+## Jetson native RTAB-Map image dependencies
+
+The native `pointcloud_slam` backend requires a pinned RTAB-Map core,
+`rtabmap_ros` Humble wrapper and compatible PCL, geometry2, ROS messages and
+Python bindings. `perception/Dockerfile.jetson` builds against the selected
+JetPack base (JP5.11/Python 3.8 or JP6.1/Python 3.10), rather than assuming an
+unversioned host installation. The repository does not currently ship an
+audited prebuilt RTAB-Map runtime bundle matching both base-image ABIs;
+adopting one would require additional native compatibility validation.
+
+**Image-size growth is expected.** The current single-stage source build
+installs `build-essential`, `libpcl-dev`, Boost, Eigen, SQLite and OpenSSL
+development packages, which add substantial weight to the image. These
+packages are required by the present native compilation approach, so this is
+not a packaging-neutral change. To avoid retaining downloaded archives in
+the new installation layer, the Dockerfile runs `apt-get clean` and removes
+`/var/cache/apt/archives/*` and `/var/lib/apt/lists/*` in that same layer.
+Removing toolchains and headers from the delivered image safely would require
+a separate multi-stage build with a verified ABI-matched runtime dependency
+closure; that larger packaging change is out of scope for this fix.
