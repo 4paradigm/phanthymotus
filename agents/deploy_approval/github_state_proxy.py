@@ -32,6 +32,7 @@ import hashlib
 import logging
 import re
 import time
+import ipaddress
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 from typing import Any
@@ -253,6 +254,8 @@ def _validate_hidden_state(data: dict) -> dict:
         "round_id", "round_started_at", "round_archive",
         "deployment_logs",
         "acceptance_request",
+        "runtime_checks",
+        "runtime_redeploy",
     }
     extra_keys = set(data.keys()) - allowed_keys
     if extra_keys:
@@ -509,6 +512,176 @@ def _validate_hidden_state(data: dict) -> dict:
                 raise MalformedHiddenStateError(f"component {cid!r} deployed more than once")
             seen_in_dep.add(cid)
             deployed_cids.add(cid)
+
+    runtime_redeploy = data.get("runtime_redeploy", [])
+    if not isinstance(runtime_redeploy, list) or len(runtime_redeploy) > 32:
+        raise MalformedHiddenStateError("runtime_redeploy must be a bounded list")
+    runtime_redeploy_bindings = set()
+    runtime_redeploy_components = set()
+    for item in runtime_redeploy:
+        if (not isinstance(item, dict)
+                or set(item) != {"machine", "ip", "component_ids"}):
+            raise MalformedHiddenStateError("runtime_redeploy entry is invalid")
+        machine = item.get("machine")
+        ip_value = item.get("ip")
+        component_ids = item.get("component_ids")
+        if (not isinstance(machine, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
+                or ".." in machine
+                or not isinstance(ip_value, str) or len(ip_value) > 45
+                or not isinstance(component_ids, list) or not component_ids
+                or len(component_ids) > 32):
+            raise MalformedHiddenStateError("runtime_redeploy fields are invalid")
+        try:
+            parsed_ip = ipaddress.ip_address(ip_value)
+        except ValueError:
+            raise MalformedHiddenStateError("runtime_redeploy.ip is invalid") from None
+        if parsed_ip.version != 4 or str(parsed_ip) != ip_value:
+            raise MalformedHiddenStateError("runtime_redeploy.ip must be canonical IPv4")
+        if any(not isinstance(cid, str) or cid not in known_cids
+               for cid in component_ids):
+            raise MalformedHiddenStateError("runtime_redeploy component binding is invalid")
+        if any(cid in deployed_cids for cid in component_ids):
+            raise MalformedHiddenStateError(
+                "runtime_redeploy component must not remain marked deployed",
+            )
+        if len(set(component_ids)) != len(component_ids):
+            raise MalformedHiddenStateError("runtime_redeploy component binding is invalid")
+        for component_id in component_ids:
+            if component_id in runtime_redeploy_components:
+                raise MalformedHiddenStateError(
+                    "runtime_redeploy component is bound more than once",
+                )
+            runtime_redeploy_components.add(component_id)
+            binding = (machine, ip_value, component_id)
+            if binding in runtime_redeploy_bindings:
+                raise MalformedHiddenStateError("duplicate runtime_redeploy binding")
+            runtime_redeploy_bindings.add(binding)
+            if len(runtime_redeploy_bindings) > 32:
+                raise MalformedHiddenStateError(
+                    "runtime_redeploy bindings exceed the bounded limit",
+                )
+
+    if "runtime_checks" in data:
+        runtime_checks = data["runtime_checks"]
+        if not isinstance(runtime_checks, list) or len(runtime_checks) > 32:
+            raise MalformedHiddenStateError("runtime_checks must be a bounded list")
+        component_by_id = {
+            component.get("component_id"): component
+            for component in components if isinstance(component, dict)
+        }
+        deployed_bindings = {
+            (deployment.get("machine"), deployment.get("ip"), component_id)
+            for deployment in deployments if isinstance(deployment, dict)
+            for component_id in deployment.get("component_ids", [])
+        }
+        seen_runtime_checks = set()
+        runtime_check_statuses = {}
+        allowed_runtime_statuses = {
+            "match", "mismatch", "not_running", "unavailable", "identity_changed",
+        }
+        for check in runtime_checks:
+            required = {
+                "machine", "ip", "component_id", "runtime_id", "target_image",
+                "observed_image", "status", "checked_at",
+            }
+            if not isinstance(check, dict) or set(check) != required:
+                raise MalformedHiddenStateError("runtime_check keys are invalid")
+            machine = check.get("machine")
+            ip_value = check.get("ip")
+            component_id = check.get("component_id")
+            runtime_id = check.get("runtime_id")
+            target_image = check.get("target_image")
+            observed_image = check.get("observed_image")
+            status_value = check.get("status")
+            checked_at = check.get("checked_at")
+            if (not isinstance(machine, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
+                    or ".." in machine
+                    or not isinstance(ip_value, str) or len(ip_value) > 45
+                    or not isinstance(component_id, str)
+                    or not re.fullmatch(r"[0-9a-f]{16}", component_id)
+                    or not isinstance(runtime_id, str) or not runtime_id
+                    or len(runtime_id) > 255
+                    or any(ord(char) < 33 or ord(char) == 127 for char in runtime_id)
+                    or not isinstance(target_image, str) or not target_image
+                    or len(target_image) > 1024
+                    or any(ord(char) < 33 or ord(char) == 127 for char in target_image)
+                    or not isinstance(observed_image, str) or len(observed_image) > 1024
+                    or any(ord(char) < 32 or ord(char) == 127 for char in observed_image)
+                    or not isinstance(status_value, str)
+                    or status_value not in allowed_runtime_statuses
+                    or not isinstance(checked_at, str) or len(checked_at) > 40):
+                raise MalformedHiddenStateError("runtime_check field is invalid")
+            try:
+                parsed_ip = ipaddress.ip_address(ip_value)
+            except ValueError:
+                raise MalformedHiddenStateError("runtime_check.ip is invalid") from None
+            if parsed_ip.version != 4 or str(parsed_ip) != ip_value:
+                raise MalformedHiddenStateError(
+                    "runtime_check.ip must be canonical IPv4",
+                )
+            try:
+                from datetime import datetime as _runtime_datetime
+                checked_time = _runtime_datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+                if checked_time.utcoffset() is None:
+                    raise ValueError("timestamp requires timezone")
+            except (AttributeError, TypeError, ValueError):
+                raise MalformedHiddenStateError("runtime_check.checked_at is invalid") from None
+            binding = (machine, str(parsed_ip), component_id)
+            legacy_alias_binding = (
+                status_value == "identity_changed"
+                and any(isinstance(deployment, dict)
+                        and deployment.get("machine") == machine
+                        and not deployment.get("ip")
+                        and component_id in deployment.get("component_ids", [])
+                        for deployment in deployments)
+            )
+            if (binding not in deployed_bindings
+                    and binding not in runtime_redeploy_bindings
+                    and not legacy_alias_binding):
+                raise MalformedHiddenStateError(
+                    "runtime_check is not bound to a deployed machine/component",
+                )
+            component = component_by_id.get(component_id)
+            if (not isinstance(component, dict)
+                    or target_image != component.get("image_ref")):
+                raise MalformedHiddenStateError(
+                    "runtime_check target image is not bound to its component",
+                )
+            expected_runtime_id = component.get("runtime_id", "")
+            if (expected_runtime_id and runtime_id != expected_runtime_id
+                    and status_value != "identity_changed"):
+                raise MalformedHiddenStateError(
+                    "runtime_check runtime ID is not bound to its component",
+                )
+            expected_observed_image = target_image
+            if component.get("target") == "core":
+                image_ref = component.get("image_ref", "")
+                slash = image_ref.rfind("/")
+                colon = image_ref.rfind(":")
+                expected_observed_image = (
+                    image_ref[colon + 1:] if colon > slash else ""
+                )
+            if status_value == "match" and observed_image != expected_observed_image:
+                raise MalformedHiddenStateError("runtime_check match images differ")
+            if status_value == "mismatch" and observed_image == expected_observed_image:
+                raise MalformedHiddenStateError("runtime_check mismatch images match")
+            identity = (machine, str(parsed_ip), component_id)
+            if identity in seen_runtime_checks:
+                raise MalformedHiddenStateError("duplicate runtime_check binding")
+            seen_runtime_checks.add(identity)
+            runtime_check_statuses[identity] = status_value
+        for binding in runtime_redeploy_bindings:
+            check_status = runtime_check_statuses.get(binding)
+            if check_status not in {"mismatch", "not_running", "unavailable", "identity_changed"}:
+                raise MalformedHiddenStateError(
+                    "runtime_redeploy requires a current non-matching runtime check",
+                )
+        if runtime_redeploy_bindings and data.get("status") in {"testing", "succeeded"}:
+            raise MalformedHiddenStateError(
+                "completed lifecycle must not retain runtime_redeploy bindings",
+            )
 
     approve_attempts = data.get("approve_attempts", [])
     if not isinstance(approve_attempts, list):

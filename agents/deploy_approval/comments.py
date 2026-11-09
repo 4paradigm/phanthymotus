@@ -121,6 +121,121 @@ def _deployment_table(deployments=None, components=None, machine_groups=None) ->
             "No deployment has been performed yet.")
 
 
+_RUNTIME_CHECKS_START = "<!-- deploy-approval-runtime-checks:start -->"
+_RUNTIME_CHECKS_END = "<!-- deploy-approval-runtime-checks:end -->"
+
+
+def _runtime_component_label(component: dict) -> str:
+    target = str(component.get("target", "") or "")
+    if target == "driver":
+        return "driver " + str(component.get("driver_path", "") or "—")
+    variant = str(component.get("variant", "") or "")
+    return f"{target} {variant}" if variant else target
+
+
+def runtime_image_checks_block(
+    runtime_checks, components, *, lifecycle_status: str = "",
+) -> str:
+    """Render bounded, verified runtime image observations for the Lifecycle Summary."""
+    if not isinstance(runtime_checks, list) or not runtime_checks:
+        return ""
+    component_map = {
+        item.get("component_id"): item for item in components or []
+        if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+    }
+    rows = []
+    status_text = {
+        "match": "运行镜像与审批镜像一致",
+        "mismatch": "运行镜像不是当前审批版本，需要重新部署",
+        "not_running": "机器组件当前未运行，需要重新确认",
+        "unavailable": "无法确认机器状态",
+        "identity_changed": "无法确认机器状态（机器绑定已变化）",
+    }
+    for check in runtime_checks:
+        if not isinstance(check, dict):
+            continue
+        component = component_map.get(check.get("component_id"), {})
+        machine = str(check.get("machine", "") or "")
+        ip_value = str(check.get("ip", "") or "")
+        target_image = str(check.get("target_image", "") or "")
+        observed_image = str(check.get("observed_image", "") or "")
+        if component.get("target") == "core" and observed_image:
+            observed_image = f"current_tag: {observed_image}"
+        checked_at = str(check.get("checked_at", "") or "")
+        status = check.get("status", "unavailable")
+        next_step = "等待下次状态检查"
+        if lifecycle_status == "deploying":
+            status_label = status_text.get(status, "无法确认机器状态")
+            status_text_value = f"部署进行中；上次只读检查：{status_label}"
+            next_step = "正在部署，请等待结果；不要重复审批"
+        elif status in {"mismatch", "not_running"}:
+            try:
+                address = ipaddress.ip_address(ip_value)
+            except ValueError:
+                address = None
+            if address is not None and address.version == 4:
+                next_step = f"`/approve_deploy machine={address}`"
+            else:
+                next_step = "先检查当前仓库的机器配置"
+        elif status == "match":
+            next_step = "无需重新部署"
+        elif status == "identity_changed":
+            next_step = "检查当前仓库的机器白名单与绑定"
+        rows.append("| " + " | ".join((
+            f"`{_escape(machine)}`",
+            f"`{_escape(ip_value)}`",
+            _escape(_runtime_component_label(component)),
+            f"`{_escape(target_image)}`",
+            f"`{_escape(observed_image)}`" if observed_image else "未取得",
+            _escape(checked_at),
+            _escape(status_text_value if lifecycle_status == "deploying"
+                    else status_text.get(status, "无法确认机器状态")),
+            next_step,
+        )) + " |")
+    if not rows:
+        return ""
+    return "\n".join([
+        _RUNTIME_CHECKS_START,
+        "### 已部署组件镜像检查",
+        "",
+        "| 机器 | IP | 组件 | 审批目标镜像 | 当前镜像 | 最后检查 | 状态 | 下一步 |",
+        "|---|---|---|---|---|---|---|---|",
+        *rows,
+        "",
+        "`/request_deploy` 是可选操作，可直接按上方实际 IP 命令审批。",
+        _RUNTIME_CHECKS_END,
+    ])
+
+
+def update_runtime_image_checks(
+    markdown: str, runtime_checks, components, *, lifecycle_status: str = "",
+) -> str:
+    """Replace only the runtime-check section, keeping the rest of the summary intact."""
+    if not isinstance(markdown, str):
+        return markdown
+    start_count = markdown.count(_RUNTIME_CHECKS_START)
+    end_count = markdown.count(_RUNTIME_CHECKS_END)
+    if start_count != end_count or start_count > 1:
+        return markdown
+    updated = markdown
+    if start_count:
+        start = updated.index(_RUNTIME_CHECKS_START)
+        end = updated.index(_RUNTIME_CHECKS_END, start) + len(_RUNTIME_CHECKS_END)
+        updated = updated[:start].rstrip() + updated[end:]
+    block = runtime_image_checks_block(
+        runtime_checks, components, lifecycle_status=lifecycle_status,
+    )
+    if not block:
+        return updated.rstrip()
+    insert_at = updated.find("<!-- deploy-approval-visible-history:start -->")
+    if insert_at < 0:
+        history_heading = re.search(r"(?m)^### History\s*$", updated)
+        insert_at = history_heading.start() if history_heading else len(updated)
+    prefix = updated[:insert_at].rstrip()
+    suffix = updated[insert_at:].lstrip()
+    return "\n\n".join(part for part in (prefix, block, suffix) if part)
+
+
 def _build_table(builds: list[BuildInfo]) -> str:
     """Render the build results table for deploy-ready comment."""
     lines = [

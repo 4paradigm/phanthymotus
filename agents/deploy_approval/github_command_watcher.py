@@ -1381,6 +1381,13 @@ class GitHubCommandWatcher:
         command = state.get("command") if isinstance(state, dict) else None
         args = command.get("args") if isinstance(command, dict) else None
         pending_ids = args.get("pending_component_ids") if isinstance(args, dict) else None
+        deployments = state.get("deployments", []) if isinstance(state, dict) else []
+        has_deployed_components = (
+            isinstance(deployments, list)
+            and any(isinstance(item, dict) and item.get("phase") == "deployed"
+                    and isinstance(item.get("component_ids"), list)
+                    and bool(item.get("component_ids")) for item in deployments)
+        )
         projected_label = None
         same_head = isinstance(state, dict) and state.get("head_sha") == head_sha
         if same_head:
@@ -1414,6 +1421,7 @@ class GitHubCommandWatcher:
             "updated_at": updated_at, "head_sha": head_sha,
             "cursor": cursor if isinstance(cursor, int) and not isinstance(cursor, bool) else None,
             "status": state.get("status") if isinstance(state, dict) else None,
+            "has_deployed_components": has_deployed_components,
             "projected_label": projected_label,
             "requires_reconcile": requires_reconcile,
             "processed_at": self._monotonic(),
@@ -1895,8 +1903,15 @@ class GitHubCommandWatcher:
                         continue
                     self._draft_label_retry_after.pop((repo, number), None)
                     self._draft_label_attempts.pop((repo, number), None)
+                    cached_schedule = self._pr_reconcile_cache.get((repo, number), {})
+                    terminal_runtime_due = (
+                        bool(status_labels.intersection({"status: succeeded", "status: failed"}))
+                        and isinstance(cached_schedule, dict)
+                        and cached_schedule.get("has_deployed_components") is True
+                    )
                     if (not status_labels
-                            or status_labels.intersection(ACTIVE_PROJECTION_STATUS_LABELS)):
+                            or status_labels.intersection(ACTIVE_PROJECTION_STATUS_LABELS)
+                            or terminal_runtime_due):
                         active_pr_numbers.append(number)
                 baseline_all = repo in self._pending_baseline_repos
                 selected = list(priority_attempted.get(repo, []))
