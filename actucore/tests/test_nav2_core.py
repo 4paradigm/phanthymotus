@@ -40,8 +40,6 @@ class FakeBackend:
 
     def execute(self, action: str, args: dict, *, nav_id: str | None) -> dict:
         self.calls.append((action, dict(args), nav_id))
-        if action == "wait_navigation_done":
-            return {"status": "arrived"}
         if action == "navigate_to_pose":
             return {"status": "navigating"}
         if action == "stop_nav":
@@ -92,10 +90,7 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(args["speed"], 0.50)
         self.assertEqual(args["mode"], 0)
 
-        terminal = self.core.dispatch(
-            {"action": "wait_navigation_done", "stall_timeout": 2}
-        )
-        self.assertEqual(terminal["status"], "arrived")
+        self.backend.emit_terminal("lease-001")
         self.assertIsNone(self.core.info()["active_nav_id"])
         self.assertEqual(self.completions[-1]["status"], "arrived")
 
@@ -117,7 +112,7 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(args["speed"], 0.30)
         self.assertEqual(nav_id, "lease-min-speed")
 
-    def test_async_arrival_releases_task_and_preserves_wait_receipt(self) -> None:
+    def test_async_arrival_releases_task_and_emits_completion(self) -> None:
         first = self.core.dispatch(
             {
                 "action": "navigate_to_pose",
@@ -133,12 +128,9 @@ class Nav2CoreTest(unittest.TestCase):
 
         self.assertIsNone(self.core.info()["active_nav_id"])
         self.assertEqual(self.completions[-1]["action_id"], "lease-first")
-        terminal = self.core.dispatch(
-            {"action": "wait_navigation_done", "stall_timeout": 2}
-        )
-        self.assertEqual(terminal["status"], "arrived")
-        self.assertEqual(terminal["nav_id"], "lease-first")
-        self.assertTrue(terminal["terminal_replayed"])
+        self.assertEqual(self.completions[-1]["status"], "arrived")
+        removed = self.core.dispatch({"action": "wait_navigation_done"})
+        self.assertEqual(removed["error_code"], "unsupported_action")
 
         second = self.core.dispatch(
             {
@@ -445,7 +437,6 @@ class RosTopicNavigationBackendTest(unittest.TestCase):
         backend._condition = threading.Condition()
         backend._last_status = {}
         backend._responses = {}
-        backend._navigation = {}
         received = []
         backend._terminal_callback = received.append
 
@@ -470,7 +461,6 @@ class RosTopicNavigationBackendTest(unittest.TestCase):
         backend._condition = threading.Condition()
         backend._last_status = {}
         backend._responses = {}
-        backend._navigation = {}
         received = []
         backend._terminal_callback = received.append
 

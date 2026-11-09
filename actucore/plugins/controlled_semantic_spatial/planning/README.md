@@ -127,10 +127,11 @@ Driver 的 TTL 保证。
 | --- | --- | --- |
 | `config` | X/Y/yaw 的最小/最大速度绝对值 | 卡片停止时配置，下次 `start` 生效 |
 | `navigate_to_pose` | `x`、`y`、`yaw`、`speed?` | 先校验全局代价地图目标格，通过后在 `map` frame 中非阻塞创建导航任务 |
-| `wait_navigation_done` | `stall_timeout?` | 等待到达、取消、超时或错误 |
 | `pause_nav` | 无 | 暂停当前导航 |
 | `resume_nav` | 无 | 恢复已暂停导航 |
 | `stop_nav` | 无 | 取消任务并发布终态零速 |
+
+导航完成由统一卡片通过 ACP 主动回调；不提供额外等待动作或 `stall_timeout` 参数。
 
 `start_mapping`、`stop_mapping`、地图 CRUD、tag CRUD 和 `navigate_to_tag` 已从
 Nav2 公共合同移除。这些能力如果需要，应由 FAST-LIVO2/位置服务单独暴露，

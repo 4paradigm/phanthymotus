@@ -336,28 +336,29 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
 
 - 生命周期：`info`、`config`、`start`、`stop`
 - 建图/定位：`start_mapping`、`stop_mapping`、`load_map`、`relocalize`
-- 规划控制：`navigate_to_pose`、`wait_navigation_done`、`pause_nav`、
+- 规划控制：`navigate_to_pose`、`pause_nav`、
   `resume_nav`、`stop_nav`
 - 语义地点：`capture`、`navigate`
 
-`navigate_to_pose` 保持非阻塞；需要在同一调用链内等待结果时仍使用
-`wait_navigation_done`。Nav2 异步上报同一 `nav_id` 的到达、取消、停止、
-超时或失败终态时，卡片会立即释放活动任务，下一个导航无需再手工
-`stop_nav` 解锁；终态后迟到的 `wait_navigation_done` 会幂等返回已保存的
-终态回执。不同 `nav_id` 的迟到消息不会解锁当前任务。
+`navigate_to_pose` 保持非阻塞；完成等待由 ACP 协议处理，不再暴露额外等待工具。
+Nav2 异步上报同一 `nav_id` 的到达、取消、停止、超时或失败终态时，
+卡片会立即释放活动任务，下一个导航无需再手工 `stop_nav` 解锁。
+不同 `nav_id` 的迟到消息不会解锁当前任务。
 
 ### ACP 完成事件
 
 `navigate_to_pose` 与语义 `navigate` 都在 `inputSchema.x-completion` 中声明为
-长时动作，接受目标后返回相同值的 `nav_id`/`action_id`。Nav2 上报终态时，ActuCore 通过 SSE 发布
-匹配的 `action_complete`，Agent Core 因而不会把“已开始导航”误当成“已到达”。
+长时动作，接受目标后返回相同值的 `nav_id`/`action_id`。Nav2 上报终态时，ActuCore
+参考 `navi` 在后台线程 POST `/api/acp/complete`，携带同一个 `action_id`；
+到达映射为 `completed`，停止/取消为 `cancelled`，失败/超时为 `failed`，
+原始导航状态保留在 `result`。不重复广播 SSE 完成事件。
 该完成回执确认 Nav2 任务终态；它不包含 Driver 物理停稳 ACK。
 `terminal_confirmed` 同样指 Nav2 终态确认。现场必须另行核验实际停车，
-不能用 SSE 事件替代停车验收。
+不能用 ACP 事件替代停车验收。
 ACP barrier 沿用上游的物理资源与调用顺序规则；本卡片尚未声明跨本体
-`x-resource`，因此按未声明资源保守互斥，不承诺与 TTS 并发。本卡片的
-`wait_navigation_done`、`pause_nav`、`resume_nav`、`stop_nav` 是明确的控制旁路，
-系统打断则通过 `on_interrupt_navigation` 调用 `stop_nav`。
+`x-resource`，因此按未声明资源保守互斥，不承诺与 TTS 并发。
+`stop_nav` 通过 `on_interrupt_navigation` 注册为中断动作；
+不声明当前 Core 不消费的 `passthrough_actions`，不承诺暂停/恢复能绕过屏障。
 
 Canvas 手动执行 `navigate_to_pose` 时，Agent Core 只透明转发 MCP
 请求。planner 接受目标后生成新 `nav_id`，用于内部任务状态和速度候选栅栏；

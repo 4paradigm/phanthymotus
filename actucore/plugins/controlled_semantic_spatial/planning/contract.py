@@ -7,7 +7,6 @@ from copy import deepcopy
 
 NAV2_ACTIONS = (
     "navigate_to_pose",
-    "wait_navigation_done",
     "pause_nav",
     "resume_nav",
     "stop_nav",
@@ -144,17 +143,7 @@ NAV2_ACTION_PARAMS = {
         "params": ["x", "y", "yaw", "speed", "mode"],
         "description": (
             "Navigate to coordinates with obstacle detouring (non-blocking). "
-            "MUST be followed by a "
-            "separate wait_navigation_done call in the same turn to wait for "
-            "arrival before proceeding."
-        ),
-    },
-    "wait_navigation_done": {
-        "params": ["stall_timeout"],
-        "description": (
-            "Block until the previous navigate_to_pose "
-            "completes. Returns on arrival, timeout, or error. Always call "
-            "after navigate_to_pose."
+            "System automatically waits for arrival via ACP barrier."
         ),
     },
     "pause_nav": {"params": [], "description": "Pause navigation"},
@@ -313,15 +302,6 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "default": 0,
                     "description": "Navigation mode: 0 (obstacle detouring)",
                 },
-                "stall_timeout": {
-                    "type": "number",
-                    "minimum": 1.0,
-                    "maximum": 3600.0,
-                    "default": 90.0,
-                    "description": (
-                        "Seconds without movement before declaring timeout (default 90)"
-                    ),
-                },
                 "instance_id": {
                     "type": "string",
                     "description": "Canvas card instance identifier",
@@ -349,12 +329,6 @@ def nav2_tool_definition(namespace: str) -> dict:
             "x-completion": {
                 "actions": ["navigate_to_pose"],
                 "timeout": 3600,
-                "passthrough_actions": [
-                    "wait_navigation_done",
-                    "pause_nav",
-                    "resume_nav",
-                    "stop_nav",
-                ],
             },
             "x-hooks": {
                 "on_interrupt_navigation": {"action": "stop_nav"},

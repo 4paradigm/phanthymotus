@@ -161,7 +161,10 @@ CONTROLLED_SEMANTIC_SPATIAL_ACTION_PARAMS = {
     },
     "navigate": {
         "params": ["query"],
-        "description": "Match a visual waypoint and start Nav2 with the same lease",
+        "description": (
+            "Match a visual waypoint and start Nav2 with the same lease. "
+            "System automatically waits for arrival via ACP barrier."
+        ),
     },
     "info": {"params": [], "description": "Read the unified navigation state"},
     "config": {

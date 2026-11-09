@@ -374,16 +374,15 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         tool = controlled_semantic_spatial_tool_definition("ubuntu")
         completion = tool["inputSchema"]["x-completion"]
         self.assertEqual(completion["actions"], ["navigate_to_pose", "navigate"])
-        self.assertEqual(
-            set(completion["passthrough_actions"]),
-            {"wait_navigation_done", "pause_nav", "resume_nav", "stop_nav"},
-        )
+        self.assertNotIn("passthrough_actions", completion)
         self.assertEqual(
             tool["inputSchema"]["x-hooks"]["on_interrupt_navigation"],
             {"action": "stop_nav"},
         )
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
-        self.assertIn("wait_navigation_done", actions)
+        self.assertNotIn("wait_navigation_done", actions)
+        self.assertNotIn("stall_timeout", tool["inputSchema"]["properties"])
+        self.assertNotIn("wait_navigation_done", str(tool))
         self.assertIn("stop_nav", actions)
 
     def test_formal_service_has_exactly_one_container(self):

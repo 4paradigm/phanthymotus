@@ -705,11 +705,6 @@ class PlannerCommandNode(Node):
             return self._resume(nav_id)
         if action == "stop_nav":
             return self._stop(nav_id)
-        if action == "wait_navigation_done":
-            raise CommandError(
-                "invalid_request",
-                "wait_navigation_done is handled by the ActuCore adapter",
-            )
         raise CommandError("unsupported_action", f"unsupported action: {action}")
 
     def _navigate_to_pose(

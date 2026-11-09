@@ -410,12 +410,12 @@ class GoalReplaySafetyTest(unittest.TestCase):
         self.assertEqual(core.dispatch({"action": "stop_nav"})["status"], "stopped")
 
     def test_unconfirmed_error_does_not_release_active_for_callback_or_control(self):
-        for origin in ("callback", "stop_nav", "wait_navigation_done"):
+        for origin in ("callback", "stop_nav"):
             with self.subTest(origin=origin):
                 backend = Backend(lambda _id: {"status": "navigating"})
                 original = backend.execute
                 def execute(action, args, *, nav_id):
-                    if action in ("stop_nav", "wait_navigation_done"):
+                    if action == "stop_nav":
                         backend.calls.append((action, nav_id))
                         return {"status": "error", "error": "unknown outcome"}
                     return original(action, args, nav_id=nav_id)
@@ -434,23 +434,15 @@ class GoalReplaySafetyTest(unittest.TestCase):
                 self.assertEqual(core.dispatch({"action": "stop_nav"})["status"], "stopped")
 
     def test_confirmed_error_is_terminal(self):
-        for origin in ("direct", "callback", "wait_navigation_done"):
+        for origin in ("direct", "callback"):
             with self.subTest(origin=origin):
                 backend = Backend(lambda _id: {"status": "error", "terminal_confirmed": True}
                                   if origin == "direct" else {"status": "navigating"})
-                original = backend.execute
-                def execute(action, args, *, nav_id):
-                    if action == "wait_navigation_done":
-                        return {"status": "error", "terminal_confirmed": True}
-                    return original(action, args, nav_id=nav_id)
-                backend.execute = execute
                 core = Nav2Core(backend)
                 core.dispatch(goal())
                 if origin == "callback":
                     backend.callback({"nav_id": "goal-1", "status": "error",
                                       "terminal_confirmed": True})
-                if origin == "wait_navigation_done":
-                    core.dispatch({"action": origin})
                 self.assertIsNone(core.info()["active_nav_id"])
                 self.assertEqual(core.dispatch(goal())["status"], "error")
                 self.assertTrue(core.dispatch(goal())["idempotent_replay"])

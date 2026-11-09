@@ -60,7 +60,6 @@ class UnavailableNavigationBackend:
 
 _NAVIGATE_ACTIONS = {"navigate_to_pose"}
 _NAV_CONTROL_ACTIONS = {
-    "wait_navigation_done",
     "pause_nav",
     "resume_nav",
     "stop_nav",
@@ -123,14 +122,6 @@ def _normalize(action: str, args: dict) -> dict:
         normalized["speed"] = speed
         normalized["mode"] = 0
 
-    if action == "wait_navigation_done":
-        timeout = _number(args, "stall_timeout", default=90.0)
-        if not 1.0 <= timeout <= 3600.0:
-            raise NavigationBackendError(
-                "invalid_argument", "stall_timeout must be within [1, 3600] seconds"
-            )
-        normalized["stall_timeout"] = timeout
-
     return normalized
 
 
@@ -163,7 +154,6 @@ class Nav2Core:
         self._active_start_state: str | None = None
         self._active_start_token: object | None = None
         self._trusted_tokens: dict[str, object] = {}
-        self._last_terminal_result: dict | None = None
         self._trusted_requests: OrderedDict[str, tuple[tuple[str, object], ...]] = (
             OrderedDict()
         )
@@ -273,7 +263,6 @@ class Nav2Core:
             self._active_nav_id = nav_id
             self._active_start_state = "pending"
             self._active_start_token = start_token
-            self._last_terminal_result = None
             if trusted_nav_id:
                 self._trusted_tokens[trusted_nav_id] = start_token
                 self._trusted_requests[trusted_nav_id] = fingerprint
@@ -334,17 +323,8 @@ class Nav2Core:
         with self._lock:
             nav_id = self._active_nav_id
             start_token = self._active_start_token
-            terminal_result = (
-                dict(self._last_terminal_result)
-                if self._last_terminal_result is not None
-                else None
-            )
 
         if not nav_id:
-            if action == "wait_navigation_done" and terminal_result is not None:
-                terminal_result["action"] = action
-                terminal_result["terminal_replayed"] = True
-                return terminal_result
             if action == "stop_nav":
                 return {
                     "action": action,
@@ -425,7 +405,6 @@ class Nav2Core:
             self._active_nav_id = None
             self._active_start_state = None
             self._active_start_token = None
-            self._last_terminal_result = result
             if nav_id in self._trusted_requests:
                 self._terminal_results[nav_id] = dict(result)
                 self._terminal_results.move_to_end(nav_id)

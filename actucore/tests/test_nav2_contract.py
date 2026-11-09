@@ -33,7 +33,6 @@ class Nav2ContractTest(unittest.TestCase):
             actions[4:],
             [
                 "navigate_to_pose",
-                "wait_navigation_done",
                 "pause_nav",
                 "resume_nav",
                 "stop_nav",

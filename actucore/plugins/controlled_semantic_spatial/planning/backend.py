@@ -115,7 +115,6 @@ class RosTopicNavigationBackend:
 
         self._condition = threading.Condition()
         self._responses: dict[str, dict] = {}
-        self._navigation: dict[str, dict] = {}
         # Per-call entries exist only until the request exits; this is not a
         # lifecycle tombstone and does not fence future calls using the same ID.
         self._pending_goal_commands: dict[object, tuple[str | None, bool]] = {}
@@ -145,13 +144,6 @@ class RosTopicNavigationBackend:
             return result
 
     def execute(self, action: str, args: dict, *, nav_id: str | None) -> dict:
-        if action == "wait_navigation_done":
-            if nav_id is None:
-                raise NavigationBackendError(
-                    "no_active_navigation", "wait requires a navigation id"
-                )
-            return self._wait_navigation(nav_id, args["stall_timeout"])
-
         payload = self._request(action, args, nav_id=nav_id)
         if payload.get("status") == "error":
             raise NavigationBackendError(
@@ -194,15 +186,6 @@ class RosTopicNavigationBackend:
                 and isinstance(nav_id, str)
                 and nav_id
             ):
-                previous = self._navigation.get(nav_id, {})
-                progress_seq = payload.get("progress_seq")
-                if progress_seq != previous.get("progress_seq"):
-                    payload["progress_received_at"] = time.monotonic()
-                else:
-                    payload["progress_received_at"] = previous.get(
-                        "progress_received_at", time.monotonic()
-                    )
-                self._navigation[nav_id] = dict(payload)
                 if _is_confirmed_terminal(payload) and self._terminal_callback is not None:
                     terminal_callback = self._terminal_callback
                     terminal_payload = dict(payload)
@@ -277,42 +260,3 @@ class RosTopicNavigationBackend:
             if token is not None:
                 with self._condition:
                     self._pending_goal_commands.pop(token, None)
-
-    def _wait_navigation(self, nav_id: str, stall_timeout: float) -> dict:
-        with self._condition:
-            progress_at = time.monotonic()
-            progress_seq = None
-            while True:
-                if self._closed:
-                    raise NavigationBackendError("backend_closed", "backend is closed")
-                state = self._navigation.get(nav_id)
-                if state:
-                    status = state.get("status") or state.get("state")
-                    if _is_confirmed_terminal(state):
-                        return dict(state)
-                    if status == "paused":
-                        return dict(state)
-                    if state.get("progress_seq") != progress_seq:
-                        progress_seq = state.get("progress_seq")
-                        progress_at = state.get("progress_received_at", time.monotonic())
-                remaining = stall_timeout - (time.monotonic() - progress_at)
-                if remaining <= 0:
-                    break
-                self._condition.wait(timeout=min(remaining, 0.5))
-
-        stop_result = self._request("stop_nav", {}, nav_id=nav_id)
-        stop_status = stop_result.get("status")
-        terminal_confirmed = stop_result.get("terminal_confirmed") is True
-        if stop_status not in {"stopped", "cancelled"} or not terminal_confirmed:
-            raise NavigationBackendError(
-                "navigation_stalled_stop_unconfirmed",
-                "navigation stalled and Nav2 did not confirm a terminal stop",
-            )
-        return {
-            "status": "timeout",
-            "nav_id": nav_id,
-            "error_code": "navigation_stalled",
-            "error": f"no navigation progress for {stall_timeout:.1f}s",
-            "stop_result": stop_status,
-            "terminal_confirmed": True,
-        }
