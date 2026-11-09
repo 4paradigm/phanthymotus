@@ -401,9 +401,10 @@ plugins:
     stuck_window_s: 3.0
     stuck_speed_ratio: 0.2
 
-    # 任何一路观测比这个旧，就什么都不发，交给下游 watchdog 把底盘停住。
+    # 检测或深度观测比这个旧，就什么都不发，交给下游 watchdog 把底盘停住。
+    # 未声明有效 timing 的 odom 也使用这个有效期；有声明时独立计算。
     # 拿上一条指令顶着才是危险的。
-    max_obs_age_ms: 600
+    max_obs_age_ms: 1000
 
     # ── 目标跟踪（plugins/navi/track.py）─────────────────────────────────
     # 开始追一个目标的置信度门槛。

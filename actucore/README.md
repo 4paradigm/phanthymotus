@@ -177,8 +177,12 @@ Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协
 navi 校验 `motus.odom/1` 契约（`timing.stamp_source` 只接受 `robot` 或
 `received`），并按 `rate_hz`、`timing.stamp_source` 和
 `timing.max_measurement_delay_ms` 计算里程计有效期：
-`max(100ms, 3 × 周期 + 最大测量延迟)`。旧 Driver 未声明时使用 500ms，并在
+`max(100ms, 3 × 周期 + 最大测量延迟)`。旧 Driver 未声明或声明无效时使用
+通用 `max_obs_age_ms`（默认 1000ms），并在
 `degraded` 中说明；缺失声明不会阻断项目启动。
+检测和深度观测也使用 `max_obs_age_ms`：1000ms 仍有效，超过 1000ms 时停止发布
+运动指令，交给下游 watchdog 停车；有效的 odom timing 不随此配置放宽。
+`info.config.max_obs_age_ms` 返回实际观测有效期，便于部署后核对。
 `info.config` 同时返回实际 `obstacle_stop_m`、`slow_distance_m` 和
 `arrival_distance_m`。若障碍停车距离达到或超过到达阈值，`degraded` 会提示目标可能
 先被当作障碍挡停。例如停止距离 0.4m、容差 0.05m 的到达阈值是 0.45m，若障碍停车

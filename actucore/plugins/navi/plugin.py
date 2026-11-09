@@ -935,6 +935,7 @@ class NaviPlugin:
                 "rate_hz": self._rate_hz,
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
+                           "max_obs_age_ms": self._config.max_obs_age_ms,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -1498,7 +1499,7 @@ class NaviPlugin:
             source=f"mcp__actucore__{self.PREFIX}",
             stamp_ms=int(now * 1000),
             # When the picture this was computed from was taken, not now. A
-            # command generated this instant from a 900 ms old frame is the
+            # command generated this instant from a 1100 ms old frame is the
             # characteristic failure here, and only this number catches it.
             obs_stamp_ms=obs_ms,
             ttl_ms=self._ttl_ms,

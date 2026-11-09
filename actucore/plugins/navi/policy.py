@@ -227,7 +227,7 @@ class Config:
     idle_timeout_s: float = 10.0
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
-    max_obs_age_ms: int = 600
+    max_obs_age_ms: int = 1000
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
     # Confidence needed to **start** following something. Below this a

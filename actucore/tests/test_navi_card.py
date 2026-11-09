@@ -712,6 +712,7 @@ def test_generic_defaults_are_visible_only_in_info():
     assert info["config"]["k_yaw"] == 0.6
     assert info["config"]["k_fwd"] == 0.9
     assert info["config"]["search_rate"] == 0.6
+    assert info["config"]["max_obs_age_ms"] == 1000
     assert info["config"]["stop_tolerance_m"] == 0.05
     assert info["config"]["arrival_distance_m"] == pytest.approx(0.85)
     assert info["gains"]["yaw"]["source"] == "adaptive_default"
@@ -824,6 +825,28 @@ def test_odom_timing_selects_the_bound_topic_and_computes_freshness():
     assert card._odom_max_age_ms == 420
 
 
+@pytest.mark.parametrize("age_ms", [420, 421])
+def test_declared_odom_timing_is_independent_of_visual_freshness(monkeypatch, age_ms):
+    card = _card()
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._adopt_odom_interface({
+        "schema": "motus.odom/1", "rate_hz": 10,
+        "timing": {"stamp_source": "received",
+                   "max_measurement_delay_ms": 120},
+    }, bound_topic="/robot/state/odom")
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+    card._objects_ms = card._depth_ms = now_ms - 900
+    card._odom = {"vx": 0.1, "vy": 0.0, "wz": 0.0}
+    card._odom_ms = now_ms - age_ms
+
+    objects, depth, odom = card.observation()
+    assert objects is card._objects
+    assert depth is not None
+    assert odom == (card._odom if age_ms == 420 else None)
+
+
 @pytest.mark.parametrize("interface", [
     {},
     {"schema": "wrong", "rate_hz": 10,
@@ -838,25 +861,50 @@ def test_odom_timing_selects_the_bound_topic_and_computes_freshness():
 def test_missing_or_invalid_odom_timing_falls_back_without_blocking(interface):
     card = _card()
     card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
-    assert card._odom_max_age_ms == 600
+    assert card._odom_max_age_ms == 1000
     assert card._limit_notes
 
 
-def test_visual_observation_accepts_600ms_and_rejects_601ms(monkeypatch):
+@pytest.mark.parametrize("age_ms", [900, 1000, 1001])
+@pytest.mark.parametrize("role", ["objects", "depth"])
+def test_visual_observation_freshness_boundary(monkeypatch, age_ms, role):
     card = _card()
     now_ms = 123_456
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
     card._objects = {"objects": []}
     card._depth_bands = {"center": 2.0}
 
-    card._objects_ms = card._depth_ms = now_ms - 600
+    card._objects_ms = card._depth_ms = now_ms
+    setattr(card, f"_{role}_ms", now_ms - age_ms)
     objects, depth, _ = card.observation()
-    assert objects is card._objects
-    assert depth == {"map": None, "bands": {"center": 2.0}}
+    if role == "objects" and age_ms > 1000:
+        assert objects is None
+    else:
+        assert objects is card._objects
+    if role == "depth" and age_ms > 1000:
+        assert depth is None
+    else:
+        assert depth == {"map": None, "bands": {"center": 2.0}}
 
-    card._objects_ms = card._depth_ms = now_ms - 601
-    objects, depth, _ = card.observation()
-    assert objects is None and depth is None
+
+@pytest.mark.parametrize("age_ms", [900, 1000, 1001])
+def test_visual_age_controls_publication_without_rewriting_stamp(monkeypatch, age_ms):
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card = _card()
+    assert _first_command(card) is not None
+    card._config.max_obs_age_ms = 1000
+    card._objects_ms = card._depth_ms = now_ms - age_ms
+
+    message = card.next_command()
+    if age_ms > 1000:
+        assert message is None
+        assert card._last_decision.status == navi_plugin.policy_mod.BLIND
+    else:
+        assert message is not None
+        assert message["stamp_ms"] == now_ms
+        assert message["obs_stamp_ms"] == now_ms - age_ms
+        assert message["ttl_ms"] == card._ttl_ms == 300
 
 
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
