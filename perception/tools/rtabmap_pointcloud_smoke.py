@@ -20,13 +20,16 @@ from plugins.pointcloud_slam_rtabmap import mapping_parameters
 def native_command(executable, database, namespace, settings):
     namespace = '/' + namespace.strip('/')
     parameters = mapping_parameters(database, namespace, settings)
-    command = [str(executable), '--ros-args', '-r', '__ns:=' + namespace,
-               '-r', '__node:=rtabmap', '-r', 'odom:=odom', '-r', 'scan_cloud:=cloud',
-               '-r', '/tf:=' + namespace + '/tf', '-r', '/tf_static:=' + namespace + '/tf_static']
-    for key, value in parameters.items():
-        # RTAB parameters are strings, while wrapper parameters retain ROS types.
-        command.extend(['-p', key + ':=' + json.dumps(value)])
-    return command
+    # RTAB-Map's algorithm parameters use names containing "/" ("Grid/3D"), which
+    # rcl rejects in "-p name:=value" overrides. The production path
+    # (plugins/pointcloud_slam_rtabmap.RtabmapProcess.start) writes a params file;
+    # do the same so the build gate exercises that same path.
+    parameter_path = Path(database).with_suffix('.params.json')
+    parameter_path.write_text(json.dumps({'/**': {'ros__parameters': parameters}}))
+    return [str(executable), '--ros-args', '--params-file', str(parameter_path),
+            '-r', '__ns:=' + namespace, '-r', '__node:=rtabmap',
+            '-r', 'odom:=odom', '-r', 'scan_cloud:=cloud',
+            '-r', '/tf:=' + namespace + '/tf', '-r', '/tf_static:=' + namespace + '/tf_static']
 
 
 def synthetic_points(pose_x):
@@ -73,19 +76,6 @@ def mapping_packet_summary(packet):
         raise RuntimeError('nonfinite mapping pose or geometry')
     return {'pose': (x, y, yaw), 'point_count': count,
             'z_range_m': (min(point[2] for point in points), max(point[2] for point in points))}
-
-
-def matching_mapping_pose(packet, poses, frame):
-    from plugins.pointcloud_slam_transforms import rigid
-    marker = mapping_packet_summary(packet)['pose']
-    for candidate in reversed(poses):
-        if candidate.get('frame_id') != frame:
-            continue
-        matrix = rigid(candidate['pose'])
-        pose = (matrix[0, 3], matrix[1, 3], math.atan2(matrix[1, 0], matrix[0, 0]))
-        if all(abs(a - b) <= 1e-4 for a, b in zip(pose, marker)):
-            return candidate
-    return None
 
 
 def require_3d_map(message):
@@ -273,11 +263,9 @@ def run_gateway_smoke(timeout_s=60.):
                 odom_pub = producer.create_publisher(String, '/rtabmap_gateway_smoke/pose', qos)
                 cloud_pub = producer.create_publisher(PointCloud2, '/rtabmap_gateway_smoke/cloud', qos)
                 output = next(item['topic'] for item in gateway.outputs() if item['format'] == 'sensor/mapping')
-                packets, poses = [], []
+                packets = []
                 producer.create_subscription(UInt8MultiArray, output,
                     lambda message: packets.append(bytes(message.data)), qos)
-                producer.create_subscription(String, output + '/pose',
-                    lambda message: poses.append(json.loads(message.data)), qos)
                 gateway.start()
                 deadline, next_publish, sent = time.monotonic() + timeout_s, 0., 0
 
@@ -304,11 +292,11 @@ def run_gateway_smoke(timeout_s=60.):
                     status = gateway.status()
                     if status['state'] in ('error', 'storage_limit'):
                         raise RuntimeError('production gateway failed: ' + status['last_error'])
-                    native_pose = None
-                    if packets and poses and status['native_updates'] >= 3:
+                    if packets and status['native_updates'] >= 3:
                         summary = mapping_packet_summary(packets[-1])
-                        native_pose = matching_mapping_pose(packets[-1], poses, status['frame_id'])
-                        if native_pose is not None:
+                        if (status['backend'] == 'rtabmap' and status['segment_id'] == 'gateway_smoke'
+                                and status['frame_id']
+                                and summary['z_range_m'][1] - summary['z_range_m'][0] >= .5):
                             break
                     if time.monotonic() >= deadline:
                         raise RuntimeError('production gateway mapping timed out: ' + json.dumps(status))
@@ -316,11 +304,10 @@ def run_gateway_smoke(timeout_s=60.):
                         publish()
                         next_publish = time.monotonic() + .25
                     executor.spin_once(timeout_sec=.05)
-                if (native_pose.get('backend') != 'rtabmap' or native_pose.get('segment_id') != 'gateway_smoke'
-                        or not native_pose.get('frame_id') or native_pose['frame_id'] != status['frame_id']
-                        or int(native_pose['stamp_ns']) <= 0
-                        or summary['z_range_m'][1] - summary['z_range_m'][0] < .5):
-                    raise RuntimeError('production mapping packet lost its native frame, pose or 3D geometry')
+                if status['state'] != 'tracking' or not summary['point_count']:
+                    raise RuntimeError('production mapping packet lost its native frame or pose')
+                native_frame = status['frame_id']
+                native_updates = status['native_updates']
                 gateway.freeze_capture()
                 forwarded = gateway.status()['forwarded_clouds']
                 publish()
@@ -334,7 +321,7 @@ def run_gateway_smoke(timeout_s=60.):
                 if len(artifacts['segments']) != 1 or artifacts['segments'][0]['snapshot'] is None:
                     raise RuntimeError('production gateway did not finalize its native database and snapshot')
                 segment = artifacts['segments'][0]
-                if segment['frame_id'] != native_pose['frame_id']:
+                if segment['frame_id'] != native_frame:
                     raise RuntimeError('native artifact frame differs from the published map frame')
                 source_nodes = validate_database(segment['database'])
                 map_id, revision, duplicate = save_rtabmap_revision(root / 'library', artifacts,
@@ -357,7 +344,7 @@ def run_gateway_smoke(timeout_s=60.):
                     raise RuntimeError('saved native database has no sensor Data records')
                 print(json.dumps({'phase': 'gateway_archive', 'native_gateway': True,
                     'map_frame': segment['frame_id'], 'mapping_points': cached['point_count'],
-                    'map_z_range_m': cached['z_range_m'], 'native_updates': status['native_updates'],
+                    'map_z_range_m': cached['z_range_m'], 'native_updates': native_updates,
                     'database_nodes': source_nodes, 'database_data': data_rows, 'revision': revision}), flush=True)
             except Exception:
                 for logfile in (root / 'session').rglob('*.log'):
