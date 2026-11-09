@@ -102,7 +102,7 @@ def test_independent_raw_clocks_and_generations_share_only_verified_normalized_c
     result = contract(independent=True)
     assert result['clock_relation_mode'] == 'verified_relation'
     assert result['relation_id'] == 'sync/1'
-    assert result['settings']['clock_relation_verified'] is True
+    assert 'clock_relation_verified' not in result['settings']
     s = stream(input_contract=result)
     s.odom(independent_odom(), now=1.)
     fuse(s, independent_packet())

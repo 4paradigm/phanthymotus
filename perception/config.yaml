@@ -275,7 +275,9 @@ plugins:
     max_depth_m: 10.0
 
   # RTAB-Map mapping from native PointCloud2 and existing odometry.
-  # Select a robot preset or manual sensor settings on the card before mapping.
+  # The canvas exposes only `robot` (preset selector) and `child_from_cloud`;
+  # frames/clock/resource/RTAB-Map parameters are internal defaults that this
+  # deployment block may override (optionally including `robot`).
   pointcloud_slam:
     enabled: true
 

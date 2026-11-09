@@ -101,9 +101,10 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
                 extrinsic=deepcopy(extrinsic),
                 clock_relation_mode='verified_relation' if independent else 'shared_source',
                 relation_id=relation_id,
+                # No operator-assertion flags travel with the resolved settings:
+                # they were a card policy, not producer evidence.
                 settings=dict(cloud_frame=frame, child_frame=child, clock_id=cloud['clock_id'],
-                              child_from_cloud=matrix, extrinsic_mode=mode, clock_relation_verified=verified,
-                              extrinsic_calibrated=extrinsic.get('calibrated') is True))
+                              child_from_cloud=matrix, extrinsic_mode=mode))
 
 
 def frame_identity(packet, *, clock_id, experimental=False, payload=False, relation_id=None):

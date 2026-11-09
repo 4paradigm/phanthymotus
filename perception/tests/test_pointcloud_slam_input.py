@@ -51,8 +51,9 @@ def test_resolver_uses_producer_frames_and_preserves_unverified_evidence():
     value = resolved()
     assert value['settings']['cloud_frame'] == 'camera'
     assert value['settings']['child_frame'] == 'body'
-    assert value['settings']['clock_relation_verified'] is False
-    assert value['settings']['extrinsic_calibrated'] is False
+    # Operator-assertion flags are gone; the contract carries producer evidence only.
+    assert 'clock_relation_verified' not in value['settings']
+    assert 'extrinsic_calibrated' not in value['settings']
     assert value['inputs']['/c']['clock']['uncertainty_ns'] is None
     assert value['frame_metadata_topic'] == '/c/metadata'
 
@@ -74,7 +75,7 @@ def test_resolver_rejects_unsupported_cloud_facts(field, value, reason):
         resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'}, experimental=True)
 
 
-def test_strict_policy_requires_real_clock_and_transform_evidence():
+def test_default_resolution_requires_real_clock_and_transform_evidence():
     from plugins.pointcloud_slam_input import resolve_inputs
     with pytest.raises(ValueError, match='verified'):
         resolve_inputs(declarations(), {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
@@ -160,7 +161,9 @@ def test_pose_producer_can_supply_actual_sensor_mount_without_depth_assumptions(
     metadata['/o']['extrinsic'] = mount
     result = resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'}, experimental=True)
     assert result['settings']['child_from_cloud'][0][3] == .24
-    assert result['settings']['extrinsic_calibrated'] is True
+    # The evidence stays on the declaration; it is not repackaged as a card flag.
+    assert 'extrinsic_calibrated' not in result['settings']
+    assert result['extrinsic']['calibrated'] is True
 
 
 def test_conflicting_transform_declarations_are_rejected():

@@ -1,4 +1,5 @@
 """Card lifecycle with real catalog persistence and a stand-in native process."""
+from copy import deepcopy
 import json
 from pathlib import Path
 import sqlite3
@@ -15,8 +16,7 @@ from vision_stubs import _FakeExecutor, _FakeNode, _wait_until
 def settings():
     return {'cloud_frame': 'sensor', 'child_frame': '{segment_id}_base', 'clock_id': 'ros',
             'child_from_cloud': [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-            'input_policy': 'experimental', 'clock_relation_verified': False,
-            'extrinsic_calibrated': False, 'reserve_bytes': 0}
+            'reserve_bytes': 0}
 
 
 def arguments():
@@ -155,8 +155,7 @@ def test_native_database_save_is_idempotent_and_old_geometry_config_is_not_expos
     assert len(maps) == 1 and maps[0]['name'] == 'Hall'
     assert list(Path(module._ARCHIVE_DIR).glob('maps/*/revisions/*/*.db'))
     props = card.get_tools()[0]['configSchema']['properties']
-    assert 'voxel_size_m' in props and 'max_working_nodes' in props
-    assert not set(props) & {'preview_backend', 'preview_geometry', 'preview_odom_sigmas', 'restore_archive'}
+    assert set(props) == {'robot', 'child_from_cloud'}
 
 
 def test_card_exposes_map_management_without_annotation_controls(card):
@@ -229,13 +228,13 @@ def test_failed_save_retains_staging_database_for_retry(card):
     assert len(call(card, 'list_maps')['maps']) == 1
 
 
-def test_ready_configuration_error_prevents_using_stale_extrinsic(card):
+def test_rejected_configuration_does_not_poison_the_previous_valid_extrinsic(card):
     ready(card)
     assert call(card, 'config', child_from_cloud='invalid')['state'] == 'error'
-    assert call(card, 'start_mapping', map_name='Hall')['state'] == 'error'
-    assert card._node is None
-    assert call(card, 'config', child_from_cloud=json.dumps(settings()['child_from_cloud']))['state'] == 'configured'
+    # The rejected value never entered the config, so the previous valid
+    # matrix is still what mapping uses.
     assert call(card, 'start_mapping', map_name='Hall')['state'] == 'running'
+    assert card._node is not None
 
 
 @pytest.mark.parametrize('interfaces', [['invalid'], {'/pose': 'invalid'}, {'/pose': {'slam_pose': 'invalid'}}])
@@ -270,7 +269,7 @@ def test_core_bumi_configuration_replay_is_noop_through_mapping_and_save(card, p
         result = call(card, 'config', robot='Bumi', instance_id='existing-slam-card')
         assert result['state'] == 'configured'
         assert result['config'] == original
-        assert card._config is original and card._config_error is None
+        assert card._config is original
         assert (card._node or card._pending) is node
     finally:
         release.set()
@@ -297,35 +296,39 @@ def test_active_configuration_changes_are_rejected_without_poisoning_valid_setti
         assert call(card, 'stop_mapping', request_id='unchanged')['state'] == 'error'
         node.failure = None
     assert call(card, 'config', **updates)['state'] == 'error'
-    assert card._config == original and card._config_error is None
+    assert card._config == original
     assert call(card, 'stop_mapping', request_id='unchanged')['state'] == 'saved'
     assert call(card, 'start_mapping', map_name='Still valid')['state'] == 'running'
 
 
-def test_native_revision_preserves_unverified_input_evidence(card):
+def test_native_revision_records_input_provenance_without_policy_flags(card):
     capture(card)
     saved = call(card, 'stop_mapping', request_id='evidence')
     path = Path(module._ARCHIVE_DIR) / 'maps' / saved['map_id'] / '1.json'
-    evidence = json.loads(path.read_text())['resolved']
-    assert evidence['input_validation']['clock_relation_verified'] is False
-    assert evidence['input_validation']['extrinsic_calibrated'] is False
-    assert evidence['input_validation']['policy'] == 'experimental'
-    assert evidence['resolved_inputs'] == {}
+    resolved = json.loads(path.read_text())['resolved']
+    assert resolved['resolved_inputs'] == {}
+    assert 'input_validation' not in resolved
+    assert 'extrinsic_calibrated' not in resolved and 'clock_relation_verified' not in resolved
 
 
-def test_saving_displayed_defaults_preserves_loaded_sensor_policy_and_budgets(card):
-    card._config.update(max_cloud_points=20000, preview_interval_s=2)
-    props = card.get_tools()[0]['configSchema']['properties']
-    displayed = {key: value['default'] for key, value in props.items() if 'default' in value}
-    result = call(card, 'config', **displayed)
-    assert result['state'] == 'configured'
-    assert result['config']['input_policy'] == 'experimental'
-    assert result['config']['max_cloud_points'] == 20000
-    assert result['config']['preview_interval_s'] == 2
-    assert props['cloud_frame']['default'] == 'sensor'
+def test_saving_displayed_defaults_preserves_loaded_resource_budgets():
+    plugin = module.PointCloudSlamPlugin({**settings(), 'max_cloud_points': 20000,
+                                          'preview_interval_s': 2}, _FakeExecutor())
+    try:
+        props = plugin.get_tools()[0]['configSchema']['properties']
+        displayed = {key: value['default'] for key, value in props.items() if 'default' in value}
+        result = call(plugin, 'config', **displayed)
+        assert result['state'] == 'configured'
+        assert result['config']['max_cloud_points'] == 20000
+        assert result['config']['preview_interval_s'] == 2
+        # Frames come from deployment config/preset, never from the canvas fields.
+        assert result['config']['cloud_frame'] == 'sensor'
+        assert set(props) == {'robot', 'child_from_cloud'}
+    finally:
+        plugin.shutdown()
 
 
-def test_bumi_profile_wins_over_stale_manual_form_fields_and_saves_verified_evidence(card):
+def test_bumi_profile_wins_over_stale_manual_form_fields(card):
     stale = {key: prop['default'] for key, prop in
              card.get_tools()[0]['configSchema']['properties'].items() if 'default' in prop}
     stale.update(robot='Bumi', cloud_frame='old_sensor', child_from_cloud='invalid')
@@ -336,14 +339,14 @@ def test_bumi_profile_wins_over_stale_manual_form_fields_and_saves_verified_evid
     assert result['config']['clock_id'] == 'ros'
     assert result['config']['child_from_cloud'] == [[0, 0, 1, 0], [-1, 0, 0, 0],
                                                   [0, -1, 0, 0], [0, 0, 0, 1]]
-    assert result['config']['input_policy'] == 'strict'
     assert result['config']['max_cloud_points'] == 20000
+    for key in ('input_policy', 'clock_relation_verified', 'extrinsic_calibrated'):
+        assert key not in result['config']
     capture(card)
     saved = call(card, 'stop_mapping', request_id='bumi-profile')
     manifest = Path(module._ARCHIVE_DIR) / 'maps' / saved['map_id'] / '1.json'
-    evidence = json.loads(manifest.read_text())['resolved']['input_validation']
-    assert evidence == {'policy': 'strict', 'clock_relation_verified': True,
-                        'extrinsic_calibrated': True}
+    resolved = json.loads(manifest.read_text())['resolved']
+    assert resolved['resolved_inputs'] == {} and 'input_validation' not in resolved
 
 
 @pytest.mark.parametrize('selector', [{'robot': '其他'}, {}])
@@ -355,9 +358,8 @@ def test_manual_and_legacy_config_after_bumi_do_not_retain_profile_selection(car
     assert result['config']['cloud_frame'] == 'sensor'
     assert result['config']['child_from_cloud'] == [[1, 0, 0, 0], [0, 1, 0, 0],
                                                   [0, 0, 1, 0], [0, 0, 0, 1]]
-    assert result['config']['input_policy'] == 'experimental'
-    assert call(card, 'info')['input_validation'] == {
-        'clock_relation_verified': False, 'extrinsic_calibrated': False}
+    assert 'input_policy' not in result['config']
+    assert 'input_validation' not in call(card, 'info')
     ready(card)
 
 
@@ -369,8 +371,7 @@ def test_pending_robot_selection_clears_bumi_facts_and_explains_missing_odometry
     assert result['config']['robot'] == robot
     assert not result['config'].get('cloud_frame')
     assert not result['config'].get('child_from_cloud')
-    assert call(card, 'info')['input_validation'] == {
-        'clock_relation_verified': False, 'extrinsic_calibrated': False}
+    assert 'input_validation' not in call(card, 'info')
     result = card.dispatch('pointcloud_slam', arguments())
     assert result['state'] == 'error'
     assert robot in result['message'] and 'odom' in result['message']
@@ -393,14 +394,17 @@ def test_switching_ready_bumi_to_pending_robot_cannot_start_a_native_session(car
     assert card._node is None
 
 
-def test_sparse_legacy_config_cannot_inherit_bumi_verification_for_a_different_sensor(card):
+def test_manual_config_after_bumi_uses_manual_sensor_facts_without_flags(card):
     assert call(card, 'config', robot='Bumi')['state'] == 'configured'
     manual = {key: value for key, value in settings().items() if key in
               ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')}
     result = call(card, 'config', **manual)
-    assert result['state'] == 'error'
-    assert 'verified' in result['message']
-    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'error'
+    assert result['state'] == 'configured'
+    assert result['config']['robot'] == '其他'
+    assert result['config']['cloud_frame'] == 'sensor'
+    assert result['config']['child_from_cloud'] == [[1, 0, 0, 0], [0, 1, 0, 0],
+                                                  [0, 0, 1, 0], [0, 0, 0, 1]]
+    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
 
 
 @pytest.mark.parametrize('action', ['start', 'stop', 'info', 'config', 'operation_status'])
@@ -607,3 +611,128 @@ def test_stop_waits_for_view_already_admitted_before_selection_lock(card, monkey
         stop.join(2)
         card.stop()
     assert not card._executor.nodes and card._view is None
+
+
+def test_canvas_config_surface_is_robot_and_extrinsic_only(card):
+    props = card.get_tools()[0]['configSchema']['properties']
+    assert set(props) == {'robot', 'child_from_cloud'}
+    assert props['robot']['enum'] == ['Bumi', 'G1', 'Tianyi', '其他']
+    assert props['robot']['scope'] == 'instance'
+    assert props['child_from_cloud']['scope'] == 'instance'
+    assert props['child_from_cloud']['title'] and props['child_from_cloud']['description']
+    assert 'advanced' not in props['robot'] and 'advanced' not in props['child_from_cloud']
+    for removed in ('cloud_frame', 'child_frame', 'clock_id', 'voxel_size_m', 'max_working_nodes',
+                    'max_update_ms', 'preview_interval_s', 'preview_max_points', 'input_policy',
+                    'clock_relation_verified', 'extrinsic_calibrated'):
+        assert removed not in props
+
+
+def test_retired_canvas_config_keys_are_ignored_not_fatal(card):
+    original = deepcopy(card._config)
+    result = call(card, 'config', robot='其他', input_policy='experimental',
+                  clock_relation_verified=True, extrinsic_calibrated=False,
+                  preview_enabled=True, cloud_frame='old')
+    assert result['state'] == 'configured'
+    assert result['config'] == original
+    for key in ('input_policy', 'clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled'):
+        assert key not in card._config
+
+
+def test_deployment_resource_overrides_survive_robot_switch(card):
+    plugin = module.PointCloudSlamPlugin({**settings(), 'max_gap_ms': 123,
+                                          'voxel_size_m': .05,
+                                          'preview_max_points': 20000}, _FakeExecutor())
+    props = plugin.get_tools()[0]['configSchema']['properties']
+    displayed = {key: value['default'] for key, value in props.items() if 'default' in value}
+    try:
+        assert plugin._settings()['max_gap_ms'] == 123
+        assert call(plugin, 'config', **displayed)['state'] == 'configured'
+        assert plugin._settings()['max_gap_ms'] == 123
+        assert call(plugin, 'config', robot='Bumi')['state'] == 'configured'
+        # A preset owns the sensor facts and its own resource values while selected.
+        assert plugin._settings()['max_gap_ms'] == 200
+        assert call(plugin, 'config', robot='其他')['state'] == 'configured'
+        # Switching back re-bases on the deployment config, not the preset.
+        assert plugin._settings()['max_gap_ms'] == 123
+        assert plugin._settings()['voxel_size_m'] == .05
+        assert plugin._settings()['preview_max_points'] == 20000
+    finally:
+        plugin.shutdown()
+
+
+def test_missing_frames_and_extrinsic_fail_at_mapping_start_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, '_ARCHIVE_DIR', str(tmp_path))
+    monkeypatch.setattr(module, 'RtabmapNode', Session, raising=False)
+    monkeypatch.setattr(module, 'require_runtime', lambda: None, raising=False)
+    card = module.PointCloudSlamPlugin({}, _FakeExecutor())
+    try:
+        assert call(card, 'config', child_from_cloud=json.dumps([[1, 0, 0, 0], [0, 1, 0, 0],
+                                                                [0, 0, 1, 0], [0, 0, 0, 1]]))['state'] == 'configured'
+        assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+        result = call(card, 'start_mapping', map_name='Hall')
+        assert result['state'] == 'error' and 'cloud_frame' in result['message']
+        assert card._node is None
+    finally:
+        card.shutdown()
+    framed = module.PointCloudSlamPlugin({'cloud_frame': 'sensor', 'child_frame': '{segment_id}_base',
+                                          'clock_id': 'ros'}, _FakeExecutor())
+    try:
+        assert framed.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+        result = call(framed, 'start_mapping', map_name='Hall')
+        assert result['state'] == 'error' and 'child_from_cloud' in result['message']
+    finally:
+        framed.shutdown()
+
+
+def test_input_metadata_route_still_prepares_and_starts(card):
+    from test_pointcloud_slam_input import declarations
+    declared = declarations()
+    metadata = {'/pose': declared['/o'], '/cloud': declared['/c']}
+    metadata['/pose'] = {**metadata['/pose'], 'topic': '/pose'}
+    metadata['/cloud'] = {**metadata['/cloud'], 'topic': '/cloud'}
+    for port in metadata.values():
+        port['clock'] = {'mapping': 'shared_camera_mapper', 'verified': True, 'uncertainty_ns': 10}
+    metadata['/cloud']['extrinsic']['calibrated'] = True
+    result = card.dispatch('pointcloud_slam', {**arguments(), 'input_metadata': metadata})
+    assert result['state'] == 'ready'
+    settings = card._settings()
+    assert settings['cloud_frame'] == 'camera'
+    assert settings['child_frame'] == 'body'
+    assert settings['clock_id'] == 'clock'
+    assert call(card, 'start_mapping', map_name='Declared')['state'] == 'running'
+    assert 'input_validation' not in call(card, 'info')
+
+
+def test_bumi_preset_starts_in_legacy_core_mode_without_any_flags(card, monkeypatch):
+    assert call(card, 'config', robot='Bumi')['state'] == 'configured'
+    monkeypatch.setattr(module, 'discover_input_bindings', lambda topics:
+                        {'/cloud': 'sensor/pointcloud2', '/pose': 'state/odom'})
+    result = call(card, 'start', input_topics=['/cloud', '/pose'], input_topic='/cloud')
+    assert result['state'] == 'ready'
+    assert card._legacy_core is True
+    assert call(card, 'info')['input_compatibility']['mode'] == 'legacy_core'
+    assert call(card, 'start_mapping', map_name='Legacy Bumi')['state'] == 'running'
+    settings = card._session_settings
+    assert settings['cloud_frame'] == 'ubuntu_rgb_optical'
+    assert settings['child_frame'] == '{segment_id}_base'
+    assert settings['clock_id'] == 'ros'
+    assert settings['child_from_cloud'] == [[0, 0, 1, 0], [-1, 0, 0, 0],
+                                            [0, -1, 0, 0], [0, 0, 0, 1]]
+    for key in ('input_policy', 'clock_relation_verified', 'extrinsic_calibrated', 'input_validation'):
+        assert key not in settings
+
+
+def test_deployment_robot_default_survives_config_replay_without_selector(card):
+    plugin = module.PointCloudSlamPlugin({'robot': 'Bumi'}, _FakeExecutor())
+    try:
+        props = plugin.get_tools()[0]['configSchema']['properties']
+        assert props['robot']['default'] == 'Bumi'
+        # An old saved row full of retired fields replays harmlessly.
+        result = call(plugin, 'config', input_policy='experimental', max_frames=5,
+                      clock_relation_verified=False)
+        assert result['state'] == 'configured'
+        assert result['config']['robot'] == 'Bumi'
+        assert result['config']['cloud_frame'] == 'ubuntu_rgb_optical'
+        assert 'input_policy' not in result['config']
+    finally:
+        plugin.shutdown()
