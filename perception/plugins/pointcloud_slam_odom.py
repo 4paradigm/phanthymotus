@@ -7,6 +7,8 @@ consumer's responsibility. This parser does not turn lost samples into poses.
 from dataclasses import dataclass
 import math
 
+from .pointcloud_slam_contract import validate_tracking_pose
+
 
 @dataclass(frozen=True)
 class PoseSample:
@@ -55,6 +57,7 @@ def decode_bumi_odom(sample):
 
 def decode_slam_odom(sample):
     """Decode the common SLAM profile; stream freshness is checked separately."""
+    validate_tracking_pose(sample)
     if not isinstance(sample, dict) or sample.get("schema") != "motus.odom/1":
         raise ValueError("unsupported odometry schema")
     units = sample.get("units")

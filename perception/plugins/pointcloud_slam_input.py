@@ -1,7 +1,11 @@
 """ROS-free admission of producer-declared spatial inputs and frame evidence."""
 from copy import deepcopy
-import math
-import re
+
+from .pointcloud_slam_contract import (
+    INPUT_SCHEMA, FRAME_SCHEMA, POSE_FORMAT, CLOUD_FORMAT,
+    SpatialSlamError, validate_input_port, validate_mount,
+    validate_frame_identity,
+)
 
 
 class InputContractError(ValueError):
@@ -27,9 +31,9 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
             require(False, topic, 'input_metadata')
             continue
         inputs[topic] = deepcopy(d)
-        require(d.get('schema') == 'motus.slam_input/1', topic, 'schema')
+        require(d.get('schema') == INPUT_SCHEMA, topic, 'schema')
         require(d.get('topic') == topic and d.get('format') == fmt, topic, 'topic/format')
-        require(d.get('kind') == ('pose' if fmt == 'state/odom' else 'cloud'), topic, 'kind')
+        require(d.get('kind') == ('pose' if fmt == POSE_FORMAT else 'cloud'), topic, 'kind')
         for key in ('source_id', 'clock_id', 'reference_point'):
             require(isinstance(d.get(key), str) and bool(d[key].strip()) and d[key] != 'unknown', topic, key)
         require(d.get('stamp_source') == 'measurement', topic, 'stamp_source')
@@ -97,6 +101,19 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
         require(extrinsic.get('calibrated') is True, cloud_topic, 'extrinsic', 'must be verified by calibration for strict policy')
     if diagnostics:
         raise InputContractError(diagnostics)
+    # Keep wire-level validation shared with driver authors, while preserving
+    # the existing topic/field diagnostics above for canvas error reporting.
+    for topic, declaration in inputs.items():
+        try:
+            validate_input_port(declaration)
+        except SpatialSlamError as error:
+            raise InputContractError([dict(topic=topic, field='contract', reason=str(error))]) from error
+    try:
+        validate_mount(extrinsic, parent_frame=child, child_frame=frame,
+                       require_calibrated=not experimental)
+    except SpatialSlamError as error:
+        raise InputContractError([dict(topic=cloud_topic, field='extrinsic',
+                                       reason=str(error))]) from error
     return dict(inputs=inputs, frame_metadata_topic=sidecar, experimental=experimental,
                 extrinsic=deepcopy(extrinsic),
                 clock_relation_mode='verified_relation' if independent else 'shared_source',
@@ -108,40 +125,12 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
 
 
 def frame_identity(packet, *, clock_id, experimental=False, payload=False, relation_id=None):
-    """Validate an individual measurement's provenance, returning its epoch key."""
-    if not isinstance(packet, dict) or packet.get('schema') != 'motus.slam_frame/1':
-        raise ValueError('measurement provenance is required')
-    if type(packet.get('stamp_ns')) is not int or packet['stamp_ns'] <= 0:
-        raise ValueError('invalid measurement stamp_ns')
-    for key in ('frame_id', 'clock_id', 'clock_epoch', 'source_generation', 'source_clock'):
-        if not isinstance(packet.get(key), str) or not packet[key].strip() or packet[key] == 'unknown':
-            raise ValueError('measurement ' + key + ' is unknown')
-    if packet['clock_id'] != clock_id:
-        raise ValueError('measurement clock_id mismatch')
-    source = packet.get('source_stamp')
-    if (isinstance(source, bool) or not isinstance(source, (int, float)) or
-            not math.isfinite(source) or source < 0 or packet.get('source_unit') not in ('ms', 'ns')):
-        raise ValueError('original measurement timestamp/unit is required')
-    mapping = packet.get('mapping')
-    if not isinstance(mapping, dict) or any(not isinstance(mapping.get(k), str) or not mapping[k]
-                                            for k in ('method', 'version')):
-        raise ValueError('measurement clock mapping is required')
-    offset = mapping.get('offset_ns')
-    if isinstance(offset, bool) or not isinstance(offset, (int, float)) or not math.isfinite(offset):
-        raise ValueError('measurement mapping offset is required')
-    factor = 1_000_000 if packet['source_unit'] == 'ms' else 1
-    if int(source * factor) + offset != packet['stamp_ns']:
-        raise ValueError('measurement clock mapping does not reproduce stamp_ns')
-    error = mapping.get('uncertainty_ns')
-    if error is not None and (isinstance(error, bool) or not isinstance(error, (int, float)) or
-                              not math.isfinite(error) or error < 0):
-        raise ValueError('invalid measurement mapping uncertainty')
-    if relation_id is not None and (mapping.get('relation_id') != relation_id or
-                                    mapping.get('verified') is not True or error is None):
-        raise ValueError('measurement verified clock relation evidence is required')
-    if not experimental and (mapping.get('verified') is not True or error is None):
-        raise ValueError('measurement mapping is not verified')
-    if payload and (not isinstance(packet.get('data_sha256'), str) or
-                    not re.fullmatch('[0-9a-f]{64}', packet['data_sha256'])):
-        raise ValueError('measurement payload digest is required')
-    return packet['clock_id'], packet['clock_epoch'], packet['source_generation']
+    """The shared motus.slam_frame/1 contract used for exact frame pairing.
+
+    Preserve the historical experimental argument for ROS-free tests and the
+    strict Perception caller; only a verified producer may assert sync.
+    """
+    return validate_frame_identity(packet, clock_id=clock_id,
+                                   strict=not experimental,
+                                   require_digest=payload,
+                                   relation_id=relation_id)

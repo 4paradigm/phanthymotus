@@ -8,6 +8,19 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## Spatial SLAM Input Contract
+
+The generic `pointcloud_slam` card requires native
+`sensor_msgs/msg/PointCloud2` and tracking `motus.odom/1` with the
+`motus_slam/1` pose profile. The canonical
+[driver-author protocol](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)
+specifies timing, frame, mounting, `motus.slam_input/1` declarations and
+`motus.slam_frame/1` per-frame provenance. This repository keeps a
+pure-Python runtime copy in `plugins/pointcloud_slam_contract.py` and
+consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
+The implementation must not infer calibrated mounting or verified
+cross-sensor clocks from a robot model or nearby timestamps.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
