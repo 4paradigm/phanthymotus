@@ -153,7 +153,7 @@ class RtabmapNode(Node):
         self._Info, self._MapGraph = Info, MapGraph
         self._settings = deepcopy(settings)
         self._settings.update((input_contract or {}).get('settings', {}))
-        for key, default in dict(voxel_size_m=.08, max_working_nodes=300, max_update_ms=100,
+        for key, default in dict(voxel_size_m=.08, max_working_nodes=3000, max_update_ms=3000,
                 max_disk_bytes=2*1024**3, reserve_bytes=1024**3,
                 preview_interval_s=1., preview_max_points=40000).items():
             self._settings.setdefault(key, default)

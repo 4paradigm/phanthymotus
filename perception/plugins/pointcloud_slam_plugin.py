@@ -22,7 +22,7 @@ _DEFAULTS = {'robot': '其他', 'input_policy': 'strict', 'clock_relation_verifi
              'extrinsic_calibrated': False, 'max_gap_ms': 200, 'max_age_s': 2,
              'max_measurement_age_ms': 1500, 'max_future_skew_ms': 100,
              'max_pending': 10, 'max_cloud_points': 1000000,
-             'voxel_size_m': .08, 'max_working_nodes': 300, 'max_update_ms': 100,
+             'voxel_size_m': .08, 'max_working_nodes': 3000, 'max_update_ms': 3000,
              'max_disk_bytes': 2147483648, 'reserve_bytes': 1073741824,
              'preview_interval_s': 1, 'preview_max_points': 40000}
 _RETIRED = {'preview_enabled', 'preview_backend', 'preview_geometry', 'preview_relocalization',

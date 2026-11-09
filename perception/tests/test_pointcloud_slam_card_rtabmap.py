@@ -125,6 +125,24 @@ def test_missing_native_runtime_prevents_false_ready(card, monkeypatch):
     assert not card._executor.nodes
 
 
+def test_budget_defaults_are_generic_and_not_robot_preset_values(card):
+    props = card.get_tools()[0]['configSchema']['properties']
+    assert props['max_working_nodes']['default'] == 3000
+    assert props['max_update_ms']['default'] == 3000
+    # The Bumi preset keeps only the installation contract; budgets stay generic.
+    result = call(card, 'config', robot='Bumi')
+    assert result['state'] == 'configured'
+    assert result['config']['max_working_nodes'] == 3000
+    assert result['config']['max_update_ms'] == 3000
+    assert result['config']['cloud_frame'] == 'ubuntu_rgb_optical'
+    # An explicit card/deployment value is no longer overwritten by the preset.
+    result = call(card, 'config', robot='Bumi', max_working_nodes=1500, max_update_ms=2000)
+    assert result['state'] == 'configured'
+    assert result['config']['max_working_nodes'] == 1500
+    assert result['config']['max_update_ms'] == 2000
+    assert result['config']['cloud_frame'] == 'ubuntu_rgb_optical'
+
+
 def test_native_database_save_is_idempotent_and_old_geometry_config_is_not_exposed(card):
     node = capture(card)
     saved = call(card, 'stop_mapping', request_id='save1')
