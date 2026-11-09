@@ -20,6 +20,7 @@ from std_msgs.msg import String, UInt8MultiArray
 
 from .pointcloud_slam_rtabmap import RtabmapProcess
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
+from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 
@@ -185,8 +186,7 @@ class RtabmapNode(Node):
         self._disk_bytes = 0
         self._session_dir = Path(session_dir).resolve()
         self._namespace = '/pointcloud_slam/session_' + uuid.uuid4().hex
-        self._map_topic = cloud_topic + '/slam_odom_preview'
-        self._status_topic = cloud_topic + '/slam_odom_preview_status'
+        self._map_topic = PREVIEW_TOPIC
         self._receipt_clock = time.monotonic
         super().__init__('pointcloud_slam_gateway')
         self._measurement_clock_ns = lambda: getattr(self.get_clock().now(), 'nanoseconds', None)
@@ -197,7 +197,6 @@ class RtabmapNode(Node):
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame)
             self._map_pub = self.create_publisher(UInt8MultiArray, self._map_topic, _QOS)
-            self._status_pub = self.create_publisher(String, self._status_topic, _QOS)
             self.create_subscription(String, odom_topic, self._odom, _QOS)
             self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
             if input_contract:
@@ -422,8 +421,6 @@ class RtabmapNode(Node):
             except (OSError, RuntimeError) as error:
                 self._runtime_error = str(error)
                 self.freeze_capture()
-            message = String(); message.data = json.dumps(self.status(), allow_nan=False)
-            self._status_pub.publish(message)
 
     @staticmethod
     def _stamp(msg):
@@ -511,8 +508,8 @@ class RtabmapNode(Node):
             last_error=self._runtime_error or self._stop_reason or health['last_error'])
 
     def outputs(self):
-        return [{'topic': self._map_topic, 'format': 'sensor/mapping', 'desc': 'Map snapshot; marker is last mapped pose'},
-                {'topic': self._status_topic, 'format': 'data/json'}]
+        return [{'topic': self._map_topic, 'format': 'sensor/mapping',
+                 'desc': 'Live or saved RTAB-Map preview'}]
 
     def close(self):
         self.freeze_capture()

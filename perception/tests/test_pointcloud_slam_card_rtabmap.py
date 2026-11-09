@@ -58,8 +58,7 @@ class Session(_FakeNode):
         self.closed = True
 
     def outputs(self):
-        return [{'topic': '/cloud/slam_odom_preview', 'format': 'sensor/mapping'},
-                {'topic': '/cloud/slam_odom_preview_status', 'format': 'data/json'}]
+        return [{'topic': '/pointcloud_slam/map', 'format': 'sensor/mapping'}]
 
     def status(self):
         return {'backend': 'rtabmap', 'odometry': 'tracking', 'accepted_clouds': 1}
@@ -105,7 +104,8 @@ def test_card_starts_mapping_with_cloud_and_existing_odom_without_rgbd(card):
     assert info['backend'] == 'rtabmap'
     assert call(card, 'start_mapping', map_name='Hall')['state'] == 'running'
     assert card._node.inputs == ('/pose', '/cloud')
-    assert call(card, 'info')['topic_out'][0]['format'] == 'sensor/mapping'
+    assert call(card, 'info')['topic_out'] == card.get_tools()[0]['topic_out']
+    assert len(card.get_tools()[0]['topic_out']) == 1
 
 
 def test_legacy_core_roles_use_native_publisher_discovery(card, monkeypatch):
@@ -175,6 +175,8 @@ def test_card_exposes_map_management_without_annotation_controls(card):
     assert not removed.intersection(schema['properties']['action']['enum'])
     assert not removed.intersection(schema['x-action-params'])
     assert not removed.intersection(schema['x-action-lifecycle']['actions'])
+    assert 'close_map_view' not in schema['properties']['action']['enum']
+    assert 'close_map_view' not in schema['x-map-manager']['actions']
     assert not {'tag_id', 'tag_name', 'segment_id', 'x', 'y', 'yaw'}.intersection(schema['properties'])
     assert 'map_plane' not in tool['configSchema']['properties']
     capture(card)
@@ -768,3 +770,41 @@ def test_deployment_bumi_preset_survives_stale_canvas_replay(card):
         assert 'input_policy' not in result['config']
     finally:
         plugin.shutdown()
+
+def test_stable_single_mapping_output_and_tianyi_style_switch(card):
+    from plugins.pointcloud_slam_preview import PREVIEW_TOPIC
+    expected = card.get_tools()[0]['topic_out']
+    assert expected == [{'topic': PREVIEW_TOPIC, 'format': 'sensor/mapping',
+                         'desc': 'Live or saved RTAB-Map preview'}]
+    assert call(card, 'info')['topic_out'] == expected
+    assert card.dispatch('pointcloud_slam', arguments())['topic_out'] == expected
+    running = call(card, 'start_mapping', map_name='Hall')
+    assert running['topic_out'] == expected
+    assert call(card, 'select_map', map_id='0' * 32)['state'] == 'error'
+    saved = call(card, 'stop_mapping')
+    assert saved['state'] == 'saved'
+    selected = call(card, 'select_map', map_id=saved['map_id'])
+    assert selected['topic_out'] == expected
+    assert selected['preview_segment_count'] == 1
+    assert card._view.publishers[0].topic == PREVIEW_TOPIC
+    assert call(card, 'info')['topic_out'] == expected
+    previous_view = card._view
+    # Starting another session switches back to the live stream.
+    resumed = call(card, 'start_mapping', map_name='Next')
+    assert resumed['state'] == 'running' and resumed['topic_out'] == expected
+    assert previous_view.destroyed and card._view is None
+    assert call(card, 'info')['topic_out'] == expected
+    assert 'closed_topics' not in resumed
+
+
+def test_reselect_saved_map_is_idempotent_and_renames_without_ports(card):
+    capture(card)
+    saved = call(card, 'stop_mapping')
+    selected = call(card, 'select_map', map_id=saved['map_id'])
+    view = card._view
+    assert call(card, 'select_map', map_id=saved['map_id'])['topic_out'] == selected['topic_out']
+    assert card._view is view
+    renamed = call(card, 'rename_map', map_id=saved['map_id'], map_name='Lobby')
+    assert renamed['topic_out'] == selected['topic_out']
+    assert view.outputs()[0]['metadata']['map_view']['name'] == 'Lobby'
+    assert 'closed_topics' not in renamed

@@ -11,6 +11,7 @@ import uuid
 import yaml
 
 from .pointcloud_slam_input import resolve_inputs
+from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_ros import RtabmapNode, discover_input_bindings
 from .pointcloud_slam_rtabmap import require_runtime
 from .pointcloud_slam_transforms import rigid
@@ -34,7 +35,7 @@ _ACTIONS = {
     'stop_mapping': ('Stop mapping and save', []),
     'list_maps': ('List maps', []), 'select_map': ('View saved map', ['map_id']),
     'rename_map': ('Rename saved map', ['map_id', 'map_name']),
-    'close_map_view': ('Close map view', ['map_id']), 'delete_map': ('Delete saved map', ['map_id'])}
+    'delete_map': ('Delete saved map', ['map_id'])}
 
 
 def _robot_config(config):
@@ -102,7 +103,6 @@ class PointCloudSlamPlugin:
         self._save_lock = threading.Lock()
         self._worker = None
         self._operation = {}
-        self._closed_outputs = []
 
     def get_tools(self):
         props = _config_properties()
@@ -126,7 +126,7 @@ class PointCloudSlamPlugin:
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': v[1]} for k, v in _ACTIONS.items()},
             'x-map-manager': {'schema': 'motus.map-manager/1', 'actions': {
-                k: k for k in ('list_maps', 'select_map', 'rename_map', 'delete_map', 'close_map_view')}},
+                k: k for k in ('list_maps', 'select_map', 'rename_map', 'delete_map')}},
             'x-action-lifecycle': {'schema': 'motus.action-lifecycle/1', 'config_actions': ['start'], 'actions': actions}}
         schema['properties']['map_id']['x-resource-options'] = {
             'action': 'list_maps', 'items': 'maps', 'value': 'id', 'label': 'name'}
@@ -134,30 +134,22 @@ class PointCloudSlamPlugin:
                  'description': 'RTAB-Map point-cloud mapping with existing odometry',
                  'inputSchema': schema, 'configSchema': {'type': 'object', 'properties': props},
                  'topic_in': [{'format': 'state/odom'}, {'format': 'sensor/pointcloud2'}],
-                 'topic_out': [{'format': 'sensor/mapping', 'desc': 'RTAB-Map point cloud'},
-                               {'format': 'data/json', 'desc': 'Mapping status'}]}]
+                 'topic_out': self._outputs()}]
 
     def start(self):
         pass  # Canvas start supplies the connected native inputs.
 
     def _outputs(self):
-        if self._node:
-            return self._node.outputs()
-        if not self._project_inputs:
-            return []
-        cloud = next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2')
-        topic = cloud + '/slam_odom_preview'
-        return [{'topic': topic, 'format': 'sensor/mapping'},
-                {'topic': cloud + '/slam_odom_preview_status', 'format': 'data/json'}]
+        # Stable even before project start and after it stops. The saved-map
+        # viewer and native mapping node take turns publishing this one topic.
+        return [{'topic': PREVIEW_TOPIC, 'format': 'sensor/mapping',
+                 'desc': 'Live or saved RTAB-Map preview'}]
 
     def _dispose(self, node):
         if node is None:
             return
-        outputs = node.outputs()
         node.close()
         dispose_node(self._executor, node, label=self.PREFIX)
-        with self._operation_lock:
-            self._closed_outputs.extend(o['topic'] for o in outputs)
 
     def _close_view(self):
         view, self._view = self._view, None
@@ -218,14 +210,9 @@ class PointCloudSlamPlugin:
 
     def dispatch(self, name, args):
         try:
-            result = self._dispatch_action(args.get('action', name), args)
+            return self._dispatch_action(args.get('action', name), args)
         except (ImportError, ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
-            result = {'state': 'error', 'message': str(error)}
-        with self._operation_lock:
-            closed, self._closed_outputs = self._closed_outputs, []
-        if closed and isinstance(result, dict):
-            result = {**result, 'closed_topics': list(dict.fromkeys(closed))}
-        return result
+            return {'state': 'error', 'message': str(error)}
 
     def _dispatch_action(self, action, args):
         if action == 'operation_status':
@@ -297,7 +284,7 @@ class PointCloudSlamPlugin:
                 stopping = self._project_stopping or self._blocking_stops
             if stopping:
                 return {'state': 'idle', 'capture_stopped': True, 'backend': 'rtabmap',
-                        'save_state': save['state'], 'save_result': save, 'topic_in': [], 'topic_out': []}
+                        'save_state': save['state'], 'save_result': save, 'topic_in': [], 'topic_out': self._outputs()}
             with self._lock:
                 return {'state': 'idle' if self._capture_stop.is_set() else
                         'running' if self._node else 'save_pending' if self._pending else
@@ -311,7 +298,7 @@ class PointCloudSlamPlugin:
                             'producer_metadata_provided': self._resolved_inputs is not None},
                         'input_diagnostics': deepcopy(self._input_diagnostics),
                         'topic_in': [{'topic': t, 'format': f} for t, f in self._topics.items()],
-                        'topic_out': self._outputs() + (self._view.outputs() if self._view else []),
+                        'topic_out': self._outputs(),
                         'input_status': self._node.status() if self._node else {'odometry': 'waiting'}}
         with self._lock:
             if action == 'config':
@@ -407,6 +394,9 @@ class PointCloudSlamPlugin:
             node = RtabmapNode(next(t for t, f in self._topics.items() if f == 'state/odom'),
                 next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2'), settings,
                 session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop)
+            # A new mapping session replaces the saved view, never competes for
+            # the single mapping topic.
+            self._close_view()
             self._executor.add_node(node)
             node.start()
         except Exception:
@@ -562,6 +552,8 @@ class PointCloudSlamPlugin:
         if action == 'select_map':
             if self._executor is None:
                 raise ValueError('ROS executor unavailable')
+            if self._node is not None or self._pending is not None:
+                raise ValueError('stop mapping and finish saving before viewing a saved map')
             entry = next((e for e in library.map_entries(_ARCHIVE_DIR) if e['id'] == map_id), None)
             if entry is None:
                 raise ValueError('unknown map')
@@ -569,23 +561,24 @@ class PointCloudSlamPlugin:
             if self._view_id != (map_id, revision):
                 snapshots = library.load_map_snapshots(_ARCHIVE_DIR, map_id, revision,
                     max_points=self._config['preview_max_points'])
+                if not snapshots:
+                    raise ValueError('saved map has no viewable snapshot')
                 view = SavedMapView(map_id, revision, entry['name'], snapshots,
                                     interval_s=self._config['preview_interval_s'])
+                # A new publisher must not start before the old one is closed.
+                self._close_view()
                 try:
                     self._executor.add_node(view)
                     view.start()
                 except Exception:
                     self._dispose(view)
                     raise
-                self._close_view()
                 self._view, self._view_id = view, (map_id, revision)
             return {'state': 'map_selected', 'map_id': map_id, 'map_name': entry['name'],
-                    'revision': revision, 'tracking': False,
-                    'snapshot_available': bool(self._view.outputs()), 'topic_out': self._view.outputs()}
-        if action == 'close_map_view':
-            if self._view_id and self._view_id[0] == map_id:
-                self._close_view()
-            return {'state': 'ok'}
+                    'revision': revision, 'tracking': False, 'snapshot_available': True,
+                    'preview_segment_id': self._view.selected_segment_id,
+                    'preview_segment_count': self._view.segment_count,
+                    'topic_out': self._outputs()}
         if action == 'rename_map':
             entry = library.rename_map(_ARCHIVE_DIR, map_id, args.get('map_name'))
             if self._last_stop and self._last_stop.get('map_id') == map_id:
@@ -593,7 +586,7 @@ class PointCloudSlamPlugin:
             if self._view_id and self._view_id[0] == map_id:
                 self._view.rename(entry['name'])
             return {'state': 'renamed', 'map_id': map_id, 'map_name': entry['name'],
-                    'topic_out': self._view.outputs() if self._view else []}
+                    'topic_out': self._outputs()}
         if action == 'delete_map':
             if self._view_id and self._view_id[0] == map_id:
                 self._close_view()

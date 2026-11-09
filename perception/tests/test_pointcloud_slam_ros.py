@@ -139,16 +139,16 @@ def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
             orientation=NS(x=0., y=0., z=0., w=1.))],
         map_to_odom=NS(translation=NS(x=7., y=8., z=0.), rotation=NS(x=0., y=0., z=0., w=1.))))
     cloud_sub.callback(cloud(frame='native_map'))
-    packet = published(node, '/slam_odom_preview')[0].messages[-1]
+    packet = published(node, '/pointcloud_slam/map')[0].messages[-1]
     assert struct.unpack('<fffBI', bytes(packet[:17])) == (7., 8., 0., 3, 1)
     node.close()
     saved = node.artifacts()['segments'][0]
     assert saved['frame_id'] == 'native_map' and saved['snapshot'] == packet
     assert [(output['topic'], output['format']) for output in node.outputs()] == [
-        ('/c/slam_odom_preview', 'sensor/mapping'),
-        ('/c/slam_odom_preview_status', 'data/json')]
-    assert [publisher.topic for publisher in node.publishers if publisher.topic.startswith('/c/')] == [
-        '/c/slam_odom_preview', '/c/slam_odom_preview_status']
+        ('/pointcloud_slam/map', 'sensor/mapping')]
+    assert [publisher.topic for publisher in node.publishers
+            if publisher.topic == '/pointcloud_slam/map'] == ['/pointcloud_slam/map']
+    assert not any(p.topic.endswith('slam_odom_preview_status') for p in node.publishers)
 
 
 def test_native_info_counts_real_accepted_closures_without_duplicate_inflation(node):
@@ -168,7 +168,7 @@ def test_nonfinite_native_output_never_publishes_a_mapping_packet(node):
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
     sub = next(s for s in node.subscriptions if s.topic.endswith('/cloud_map'))
     sub.callback(cloud(frame='native_map', points=[(float('inf'), 0., 0.)]))
-    assert not published(node, '/slam_odom_preview')[0].messages
+    assert not published(node, '/pointcloud_slam/map')[0].messages
 
 
 def test_freeze_during_slow_native_start_is_immediate_and_cannot_resume(tmp_path, monkeypatch):
@@ -276,7 +276,7 @@ def test_native_snapshot_requires_matching_frame_and_capture_stamp(node):
         map_to_odom=NS(translation=NS(x=0., y=0., z=0.), rotation=NS(x=0., y=0., z=0., w=1.))))
     output.callback(cloud(frame='map_b'))
     output.callback(cloud(1_000_000_001, frame='map_a'))
-    assert not published(node, '/slam_odom_preview')[0].messages
+    assert not published(node, '/pointcloud_slam/map')[0].messages
 
 
 def test_loss_while_engine_starts_blocks_already_queued_pair(tmp_path, monkeypatch):

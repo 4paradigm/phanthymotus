@@ -6,6 +6,9 @@ import numpy as np
 
 from .pointcloud_slam_transforms import rigid
 
+# One stable canvas output for live and archived maps (Tianyi-style).
+PREVIEW_TOPIC = '/pointcloud_slam/map'
+
 
 def encode_mapping(points, pose, *, max_points):
     if type(max_points) is not int or not 0 < max_points <= 80000:
