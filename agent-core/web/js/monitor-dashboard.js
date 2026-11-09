@@ -17,11 +17,28 @@ import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
 import { TactileRenderer }  from './renderers/tactile.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
-import { OdomRenderer } from './renderers/odom.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+
+/**
+ * 渲染用的 hint：odom 与 data/json 共用同一套通用 JSON 渲染。
+ *
+ * 卡片/流本身的 format 保持原值（订阅、样式类、默认模式都用它），
+ * 只有「用哪个渲染器」这一层归一。
+ */
+function _rendererHint(format) {
+  const hint = format || 'activity';
+  return hint === 'state/odom' ? 'data/json' : hint;
+}
+
+/** JSON-ish 的卡片才有日志/最新两种模式——odom 现在也是其中之一。 */
+function _isJsonFormat(format) {
+  const hint = _rendererHint(format);
+  return hint === 'data/json' || hint.startsWith('text/');
+}
+
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // Column count by viewport width. Desktop used to be a flat 5 whatever the
 // window was, which is only right near 1080p: at 1280 a column is 237px and a
@@ -329,7 +346,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const fmtClass = _formatClass(format);
   const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
-  const isJson = format === 'state/odom' || format === 'data/json' || format?.startsWith('text/');
+  const isJson = _isJsonFormat(format);
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
@@ -359,8 +376,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const body = el.querySelector('.monitor-card-body');
   const renderer = _createRenderer(format, defaultMode);
-  renderer.mount(body, format === 'state/odom' ? {mode: defaultMode, showModeToggle: false}
-    : _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
 
   const ws = _connectWs(topicPath, format, renderer);
   const card = { el, renderer, ws, format, mode: defaultMode, col, row, colSpan, rowSpan };
@@ -473,8 +489,7 @@ function _refreshRenderer(topicPath) {
   card.renderer?.unmount?.();
   body.innerHTML = '';
   const renderer = _createRenderer(card.format, card.mode);
-  renderer.mount(body, card.format === 'state/odom' ? {mode: card.mode, showModeToggle: false}
-    : _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
   card.renderer = renderer;
   // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
   // not resolved yet, and a mode switch on such a card must not throw.
@@ -488,17 +503,15 @@ function _switchMode(topicPath, newMode, modeBtns) {
   if (!card || card.mode === newMode) return;
   card.mode = newMode;
   modeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === newMode));
-  if (card.format === 'state/odom') card.renderer.setMode(newMode);
-  else _refreshRenderer(topicPath);
+  _refreshRenderer(topicPath);
   _saveLayout();
 }
 
 function _createRenderer(format, mode) {
-  if (OdomRenderer.canRender(format)) return Object.assign({}, OdomRenderer);
   if (mode === 'kv') {
     return Object.assign(Object.create(Object.getPrototypeOf(KvLatestRenderer)), KvLatestRenderer);
   }
-  const hint = format || 'activity';
+  const hint = _rendererHint(format);
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
   return Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
 }
@@ -734,7 +747,7 @@ function _onPointerEnd() {
   document.removeEventListener('touchmove', _blockTouchScroll, { passive: false });
 
   if (changed) _saveLayout();
-  if (resized && card.format !== 'state/odom') _refreshRenderer(topicPath);
+  if (resized) _refreshRenderer(topicPath);
 }
 
 /**

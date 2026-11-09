@@ -12,7 +12,6 @@ import { VideoRenderer }    from './renderers/video.js';
 import { ImageRenderer }    from './renderers/image.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
-import { OdomRenderer } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
@@ -20,7 +19,18 @@ import { TactileRenderer }  from './renderers/tactile.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+
+/**
+ * 渲染用的 hint：odom 与 data/json 共用同一套通用 JSON 渲染。
+ *
+ * bus 订阅的 format 仍是 state/odom（传输层照旧），这里只决定用哪个渲染器，
+ * 于是里程计和普通 JSON 走完全相同的日志/字段展示，不再有专用渲染器。
+ */
+function _rendererHint(format) {
+  const hint = format || 'activity';
+  return hint === 'state/odom' ? 'data/json' : hint;
+}
 
 let _panel    = null;
 let _renderer = null;
@@ -100,9 +110,9 @@ export function showTopicDetail(topicPath, format) {
   const body = document.getElementById('detail-body');
   body.innerHTML = '';
 
-  const hint     = format || 'activity';
+  const hint     = _rendererHint(format);
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
-  _textLike = Renderer === OdomRenderer || Renderer === TextRenderer || Renderer === ActivityRenderer;
+  _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');

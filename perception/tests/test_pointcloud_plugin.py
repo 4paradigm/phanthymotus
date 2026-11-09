@@ -88,21 +88,23 @@ def test_declared_input_format_uses_only_its_ros_message_type(format_name, expec
     plugin.dispatch('pointcloud', {'action': 'stop'})
 
 
+def test_float_depth_frames_are_rejected():
+    """点云卡片不接收 32FC1 米制浮点深度：驱动侧只有 uint16 毫米深度，
+    浮点帧按不可用拒掉，绝不拿它当米制值反投影。"""
+    msg = _FakeImage(data=np.array([[1.0, 2.5], [3.0, 4.0]], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=2, height=2, step=8)
+    assert pc._decode_depth_message(msg) == (None, "32FC1")
+
+
 @pytest.mark.parametrize("endian,big", [("<", 0), (">", 1)])
-def test_metric_float_depth_keeps_metres_with_row_padding(endian, big):
-    rows = [np.array([1.0, 2.5, 99.0], dtype=endian + "f4").tobytes(),
-            np.array([3.0, 4.0, 99.0], dtype=endian + "f4").tobytes()]
-    msg = _FakeImage(data=b"".join(rows), encoding="32FC1", width=2,
-                     height=2, step=12, is_bigendian=big)
+def test_uint16_depth_keeps_metres_with_row_padding(endian, big):
+    rows = [np.array([1000, 2500, 9999], dtype=endian + "u2").tobytes() + b"pp",
+            np.array([3000, 4000, 9999], dtype=endian + "u2").tobytes() + b"pp"]
+    msg = _FakeImage(data=b"".join(rows), encoding="16UC1", width=3,
+                     height=2, step=8, is_bigendian=big)
     result, encoding = pc._decode_depth_message(msg)
-    assert encoding == "32FC1"
-    np.testing.assert_allclose(result, [[1.0, 2.5], [3.0, 4.0]])
-
-
-def test_metric_float_depth_rejects_short_rows():
-    msg = _FakeImage(data=b"\0" * 12, encoding="32FC1", width=2,
-                     height=2, step=6)
-    assert pc._decode_depth_message(msg)[0] is None
+    assert encoding == "16UC1"
+    np.testing.assert_allclose(result, [[1.0, 2.5, 9.999], [3.0, 4.0, 9.999]])
 
 
 def test_metric_cloud_preserves_header_and_optical_coordinates():
@@ -156,7 +158,7 @@ def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
     node.stop()
 
 
-def test_metric_info_explains_missing_frame_and_wrong_encoding():
+def test_metric_info_explains_missing_frame_and_rejected_float_depth():
     plugin, executor = _plugin({'metric_cloud': True})
     plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth', 'camera_info': [metric_z16_declaration(1)]})
     node = executor.nodes[0]
@@ -167,11 +169,12 @@ def test_metric_info_explains_missing_frame_and_wrong_encoding():
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
     assert info['published'] == 0 and info['last_skip_reason'] == 'missing_frame'
     assert info['skipped']['missing_frame'] == 1
+    # 32FC1 不再被解码，帧在 _decode_depth_message 就被拒（invalid_depth）。
     bad = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
                      width=1, height=1, step=4)
     node._emit_depth(bad)
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
-    assert info['last_skip_reason'] == 'unsupported_encoding'
+    assert info['last_skip_reason'] == 'invalid_depth'
     node.stop()
 
 

@@ -144,10 +144,11 @@ def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
     node.close()
     saved = node.artifacts()['segments'][0]
     assert saved['frame_id'] == 'native_map' and saved['snapshot'] == packet
-    pose = json.loads(published(node, '/pose')[0].messages[-1])
-    assert pose['frame_id'] == 'native_map' and pose['stamp_ns'] == '1000000000'
-    assert {x['format'] for x in node.outputs()} == {'sensor/mapping', 'data/json'}
-    assert len(node.outputs()) == 4
+    assert [(output['topic'], output['format']) for output in node.outputs()] == [
+        ('/c/slam_odom_preview', 'sensor/mapping'),
+        ('/c/slam_odom_preview_status', 'data/json')]
+    assert [publisher.topic for publisher in node.publishers if publisher.topic.startswith('/c/')] == [
+        '/c/slam_odom_preview', '/c/slam_odom_preview_status']
 
 
 def test_native_info_counts_real_accepted_closures_without_duplicate_inflation(node):

@@ -169,28 +169,25 @@ _zlib_fail_count = 0
 def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
     """z16 Image 或 depth-zlib CompressedImage → (深度图[米], 编码名)。
 
-    返回 (None, 编码名) 表示该帧不可用。zlib 帧解出来是 640x480 uint16 毫米
-    —— 与 visual_depth 的发布格式一致，解码端共用同一约定。
+    只接受 16UC1/mono16 的 uint16 毫米深度帧；32FC1 等浮点深度帧（米制）
+    点云卡片不支持，直接返回 None 拒绝。返回 (None, 编码名) 表示该帧不可用。
+    zlib 帧解出来是 640x480 uint16 毫米 —— 与 visual_depth 的发布格式一致，
+    解码端共用同一约定。
     """
     import cv2
 
     global _zlib_fail_count
 
     if isinstance(msg, Image):
-        if msg.encoding not in ("16UC1", "mono16", "32FC1"):
+        if msg.encoding not in ("16UC1", "mono16"):
             return None, msg.encoding
-        itemsize = 4 if msg.encoding == "32FC1" else 2
         needed = int(msg.height) * int(msg.step)
-        if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * itemsize or len(msg.data) < needed:
+        if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
             return None, msg.encoding
-        dtype = np.dtype((">" if msg.is_bigendian else "<") +
-                         ("f4" if itemsize == 4 else "u2"))
+        dtype = np.dtype((">" if msg.is_bigendian else "<") + "u2")
         depth = np.ndarray((msg.height, msg.width), dtype=dtype,
-                           buffer=bytes(msg.data[:needed]), strides=(msg.step, itemsize))
-        depth = depth.astype(np.float32)
-        if itemsize == 2:
-            depth *= 0.001
-        return depth, msg.encoding
+                           buffer=bytes(msg.data[:needed]), strides=(msg.step, 2))
+        return depth.astype(np.float32) * 0.001, msg.encoding
 
     # CompressedImage: image/depth-zlib
     data = bytes(msg.data)

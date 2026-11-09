@@ -148,9 +148,7 @@ class PointCloudSlamPlugin:
         cloud = next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2')
         topic = cloud + '/slam_odom_preview'
         return [{'topic': topic, 'format': 'sensor/mapping'},
-                {'topic': cloud + '/slam_odom_preview_status', 'format': 'data/json'},
-                {'topic': topic + '/pose', 'format': 'data/json'},
-                {'topic': topic + '/map_to_odom', 'format': 'data/json'}]
+                {'topic': cloud + '/slam_odom_preview_status', 'format': 'data/json'}]
 
     def _dispose(self, node):
         if node is None:

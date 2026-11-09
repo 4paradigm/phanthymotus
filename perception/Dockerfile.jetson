@@ -108,7 +108,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
 RUN cd /ros_ws && \
     . /opt/ros/humble/install/setup.bash && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+    colcon build --event-handlers console_direct+ --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # ── Python deps ────────────────────────────────────────────────────
 # PyYAML goes first, on its own, with --ignore-installed. The jp5.11 base is
@@ -711,7 +711,7 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
     rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
     test -f "${rtabmap_rcutils}"; test -f "${rtabmap_builtin}"; test -f "${rtabmap_crypto}"; \
     cd /tmp/rtabmap-ws; \
-    MAKEFLAGS=-j2 colcon build --merge-install --install-base /opt/rtabmap_ros \
+    MAKEFLAGS=-j2 colcon build --event-handlers console_direct+ --merge-install --install-base /opt/rtabmap_ros \
       --executor sequential --packages-select ${rtabmap_packages} --cmake-args \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \

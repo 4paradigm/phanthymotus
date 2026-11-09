@@ -54,6 +54,23 @@ def test_native_compiles_reuse_persistent_cache_separated_by_jetpack():
         assert 'CCACHE_COMPILERCHECK=content' in build
 
 
+def test_every_colcon_build_streams_console_output():
+    """CI review builds are killed after 600 s without output; colcon's default
+    event handler batches progress per package, so a real compile looks hung.
+    Each build must forward output directly — and do it before --cmake-args,
+    whose values would otherwise swallow the flag."""
+    recipe = DOCKERFILE.read_text().replace('\\\n', ' ')
+    commands = [command for command in re.findall(r'^RUN (.*)$', recipe, re.M)
+                if 'colcon build' in command]
+    assert len(commands) == 2, 'audio_msgs and the pinned RTAB-Map workspace build'
+    for command in commands:
+        for invocation in re.findall(r'colcon build[^;]*', command):
+            forwarded = invocation.find('--event-handlers console_direct+')
+            cmake_args = invocation.find('--cmake-args')
+            assert forwarded >= 0, invocation
+            assert cmake_args < 0 or forwarded < cmake_args, invocation
+
+
 def shell_fixture(tmp_path):
     """Use real shells/files/tar; replace only unavailable network/ROS/build tools."""
     ros = tmp_path / 'ros'

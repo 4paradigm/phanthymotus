@@ -1,8 +1,8 @@
 """Run the odometry behavior contract through the browser ES modules.
 
-The dedicated renderer reads standard motus.odom/1 directly; ordinary JSON
-keeps its original route. Tests exercise both real view mount paths, pose
-validity, snapshot replacement, raw copying and log history.
+`state/odom` no longer has a dedicated renderer: it goes through the same generic
+JSON renderers as `data/json`. The test file checks field display, invalid frames,
+preview-buffer transport and that the removed odometry renderer modules are gone.
 """
 import os
 import pathlib

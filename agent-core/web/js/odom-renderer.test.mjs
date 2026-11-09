@@ -1,26 +1,56 @@
+/**
+ * 方案 A：`state/odom` 不再有专用渲染器，与 `data/json` 走同一套通用 JSON 渲染。
+ *
+ * 这个文件原来整套测试的是 renderers/odom.js 的固定字段分组、最新/日志模式和
+ * 原始数据展开。那些模块已删除，现在验证的是替代契约：
+ *  1. detail-panel / dashboard / monitor-dashboard 选渲染器时把 state/odom 归一为
+ *     data/json（订阅与展示的 format 仍是真实值）；
+ *  2. motus.odom/1 经 TextRenderer（日志）与 KvLatestRenderer（最新）可读，字段
+ *     出现在输出里；非法/非 JSON 帧不崩溃；
+ *  3. bus 对 state/odom 发的是二进制帧且长度可能为奇数，预览缓冲不能丢帧；
+ *  4. 旧的 odom 专用模块与引用确实清理干净。
+ */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { TextRenderer } from './renderers/text.js';
+import { KvLatestRenderer } from './renderers/kv-latest.js';
+
+// ── 最小 fake DOM ─────────────────────────────────────────────────────────────
+//
+// 渲染器直接把 HTML 写进 innerHTML，所以 textContent 也把这段 HTML 算进去：
+// 断言只关心键和值是否出现在输出里，不关心标签结构。
 
 class Element {
   constructor(tag = 'div') {
-    this.tagName = tag.toUpperCase(); this.children = []; this.style = {}; this.dataset = {};
-    this.className = ''; this._text = ''; this.hidden = false;
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.style = {};
+    this.dataset = {};
+    this.className = '';
     this.classList = { add() {}, remove() {}, toggle() {} };
+    this._text = '';
+    this._html = '';
+    this.hidden = false;
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
   }
-  set textContent(value) { this._text = String(value ?? ''); this.children = []; }
-  get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
+  set textContent(value) { this._text = String(value ?? ''); this._html = ''; this.children = []; }
+  get textContent() { return this._text + this._html + this.children.map(child => child.textContent).join(''); }
+  set innerHTML(html) { this._html = String(html ?? ''); this._text = ''; this.children = []; }
+  get innerHTML() { return this._html; }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
   append(...children) { children.forEach(child => this.appendChild(child)); }
-  removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentElement = null; }
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) { this.children.splice(index, 1); child.parentElement = null; }
+  }
   remove() { this.parentElement?.removeChild(this); }
   addEventListener(name, fn) { this['on' + name] = fn; }
-  select() { document.activeElement = this; }
   querySelectorAll(selector) {
-    const match = el => selector[0] === '.' ? el.className.split(' ').includes(selector.slice(1))
+    const match = el => selector[0] === '.'
+      ? el.className.split(' ').includes(selector.slice(1))
       : el.tagName === selector.toUpperCase();
     return this.children.flatMap(child => [...(match(child) ? [child] : []), ...child.querySelectorAll(selector)]);
   }
@@ -28,381 +58,280 @@ class Element {
   get firstChild() { return this.children[0]; }
 }
 
-function mount(template, options) {
-  globalThis.document = { createElement: tag => new Element(tag), createTextNode: text => {
-    const el = new Element('text'); el.textContent = text; return el;
-  } };
-  const box = new Element();
-  const renderer = Object.assign({}, template);
-  renderer.mount(box, options);
-  return { box, renderer, send: value => renderer.onData(new TextEncoder().encode(JSON.stringify(value)).buffer) };
-}
-
-test('ordinary JSON latest keeps its original accumulated-field update behavior', () => {
-  const { box, renderer, send } = mount(KvLatestRenderer);
-  try {
-    send({ preserved: 7, reading: { n: 1 } });
-    send({ reading: { n: 0 } });
-    assert.match(box.textContent, /preserved7/);
-    assert.match(box.textContent, /reading.n0/);
-    assert.equal(box.querySelector('.odom-summary'), null);
-    assert.equal(box.querySelector('.odom-raw'), null);
-  } finally { renderer.unmount(); }
-});
-
-const odom = () => ({ schema: 'motus.odom/1', stamp_ms: 1234, frame: 'body',
-  twist: [0, null, null, null, null, 0.5],
-  pose: { position: [1, 2, 3], quaternion: [0, 0, 0, 1], frame_id: 'odom', child_frame_id: 'camera' },
-  vendor: { displacement_m: 44.444, turn_angle_deg: 99.999,
-    motus_slam: { status: 'tracking', segment_id: 'run-1', reason: 'ok', stamp_source: 'measurement' } },
-});
-
-test('odom summary rejects nonnumeric and nonfinite measured axes without changing raw data', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer } = mount(OdomRenderer);
-  try {
-    const raw = '{"schema":"motus.odom/1","pose":{"position":[1e400,2,false]},"twist":[1e400,true,null,null,null,"0"],"vendor":{"motus_slam":{"status":"tracking"}}}';
-    renderer.onData(raw);
-    const summary=box.querySelector('.odom-summary').textContent;
-    assert.doesNotMatch(summary,/Infinity|false|true/);
-    assert.match(summary,/位置—, 2, — m/);
-    assert.match(summary,/vx—/);assert.match(summary,/vy—/);assert.match(summary,/wz—/);
-    assert.match(box.querySelector('.odom-raw').textContent,/1e400/);
-  } finally { renderer.unmount(); }
-});
-
-test('one odometry profile clears untrusted pose while preserving measured zero and raw history', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer, send } = mount(OdomRenderer, { format: 'state/odom' });
-  try {
-    const sample = odom(); send(sample);
-    assert.equal(box.querySelector('.odom-log'), null, 'default is latest');
-    const summary = () => box.querySelector('.odom-summary').textContent;
-    assert.match(summary(), /1, 2, 3/);
-    assert.match(summary(), /camera|odom/);
-    assert.match(summary(), /vx0 m\/s/);
-    assert.match(summary(), /vy—/);
-    assert.doesNotMatch(summary(), /44.444|99.999/);
-    for (const status of ['lost', 'degraded', 'unknown']) {
-      sample.vendor.motus_slam.status = status; send(sample);
-      assert.match(summary(), new RegExp(status));
-      assert.doesNotMatch(summary(), /1, 2, 3/);
-    }
-    sample.pose = null; send(sample);
-    assert.match(summary(), /位置—/);
-    renderer.setMode('log');
-    assert.ok(box.querySelector('.odom-log'));
-    assert.match(box.querySelector('.odom-summary').textContent, /1, 2, 3/);
-    assert.match(box.querySelector('.odom-raw').textContent, /44.444/);
-    renderer.setMode('kv');
-    assert.doesNotMatch(summary(), /1, 2, 3/);
-    send({ schema: 'motus.odom/1', twist: [0, null, null, null, null, 0] });
-    assert.match(summary(), /unknown/);
-    assert.match(summary(), /位置—/);
-  } finally { renderer.unmount(); }
-});
-
-test('standard odometry needs no presentation configuration and preserves exact raw history', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer, send } = mount(OdomRenderer, { format: 'state/odom', showModeToggle: false });
-  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
-  let copied;
-  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {
-    clipboard: { writeText: async text => { copied = text; } },
-  } });
-  try {
-    const sample = odom(); sample.vendor.diagnostic = '{"n":0}';
-    const raw = JSON.stringify(sample, null, 2) + '\n';
-    renderer.onData(new TextEncoder().encode(raw).buffer);
-    assert.equal(box.querySelector('.odom-modes'), null);
-    const summary = box.querySelector('.odom-summary').textContent;
-    assert.match(summary, /位置1, 2, 3 m/); assert.match(summary, /vx0 m\/s/);
-    assert.doesNotMatch(summary, /diagnostic|44.444/);
-    assert.match(box.querySelector('.odom-detail').textContent, /完整位姿/);
-    assert.equal(box.querySelector('.odom-raw').querySelector('pre').textContent, raw);
-    await box.querySelector('.odom-copy').onclick(); assert.equal(copied, raw);
-    renderer.setMode('log');
-    assert.equal(box.querySelector('.odom-summary').textContent, summary);
-    assert.equal(box.querySelector('.odom-raw').querySelector('pre').textContent, raw);
-    sample.vendor.motus_slam.status = 'lost'; send(sample);
-    const entries = box.querySelectorAll('.odom-record');
-    assert.match(entries[0].querySelector('.odom-summary').textContent, /位置1, 2, 3 m/);
-    assert.match(entries[1].querySelector('.odom-summary').textContent, /位置—/);
-    for (let i = 0; i < 60; i++) send(sample);
-    assert.equal(box.querySelectorAll('.odom-record').length, 50);
-  } finally {
-    renderer.unmount();
-    if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator);
-    else delete globalThis.navigator;
-  }
-});
-
-test('receipt freshness is separate from unknown acquisition age and ignores keepalives', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const savedNow = Date.now, savedInterval = globalThis.setInterval, savedClear = globalThis.clearInterval;
-  let now = 1000, tick, cleared = false;
-  Date.now = () => now; globalThis.setInterval = fn => { tick = fn; return 42; };
-  globalThis.clearInterval = () => { cleared = true; };
-  const { box, renderer, send } = mount(OdomRenderer, { format: 'state/odom' });
-  try {
-    send(odom());
-    assert.match(box.querySelector('.odom-summary').textContent, /测量年龄未知/);
-    assert.match(box.querySelector('.odom-freshness').textContent, /0/);
-    now = 7001; send({ type: 'ping' }); tick();
-    assert.match(box.querySelector('.odom-freshness').textContent, /陈旧/);
-    assert.match(box.querySelector('.odom-summary').textContent, /tracking/);
-    renderer.unmount(); assert.equal(cleared, true);
-  } finally { Date.now = savedNow; globalThis.setInterval = savedInterval; globalThis.clearInterval = savedClear; }
-});
-
-test('live latest updates keep raw controls stable and copy the current packet', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer, send } = mount(OdomRenderer);
-  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
-  let copied;
-  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {
-    clipboard: { writeText: async text => { copied = text; } },
-  } });
-  try {
-    const sample = odom(); send(sample);
-    const raw = box.querySelector('.odom-raw');
-    const button = box.querySelector('.odom-copy');
-    raw.open = true;
-    sample.pose.position = [4, 5, 6]; send(sample);
-    assert.equal(box.querySelector('.odom-raw'), raw);
-    assert.equal(box.querySelector('.odom-copy'), button);
-    assert.equal(raw.open, true);
-    assert.match(box.querySelector('.odom-summary').textContent, /4, 5, 6/);
-    assert.match(box.querySelector('.odom-detail').textContent, /4/);
-    assert.equal(raw.querySelector('pre').textContent, JSON.stringify(sample));
-    await button.onclick();
-    assert.equal(copied, JSON.stringify(sample));
-  } finally {
-    renderer.unmount();
-    if (originalNavigator) Object.defineProperty(globalThis, 'navigator', originalNavigator);
-    else delete globalThis.navigator;
-  }
-});
-
-test('odometry renderer accepts only its dedicated format', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  assert.equal(OdomRenderer.canRender('state/odom'), true);
-  assert.equal(OdomRenderer.canRender('data/json'), false);
-  assert.equal(OdomRenderer.canRender('text/plain'), false);
-});
-
-test('detail and dashboard specialize odometry while ordinary JSON keeps its original text route', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const profile = { schema: 'motus.presentation/1', fields: [{ path: 'voltage', label: '电压', unit: 'V' }] };
-  for (const [view, format] of ['detail-panel', 'dashboard'].flatMap(view =>
-    ['data/json', 'state/odom'].map(format => [view, format]))) {
-    const elements = new Map(); const sockets = [];
-    mount(KvLatestRenderer).renderer.unmount(); // install the same small DOM used above
-    globalThis.document.getElementById = id => {
+function installDom() {
+  const elements = new Map();
+  const document = {
+    createElement: tag => new Element(tag),
+    createTextNode: text => { const el = new Element('text'); el.textContent = text; return el; },
+    getElementById: id => {
       if (!elements.has(id)) elements.set(id, new Element());
       return elements.get(id);
-    };
-    const source = readFileSync(new URL(`./${view}.js`, import.meta.url), 'utf8');
-    const inert = { canRender: () => false };
-    const names = source.match(/const RENDERERS = \[([^\]]+)\]/)[1].split(',').map(name => name.trim());
-    const context = { ...Object.fromEntries(names.map(name => [name, inert])),
-      OdomRenderer, TextRenderer,
-      ActivityRenderer: inert, document: globalThis.document, TextEncoder, TextDecoder, ArrayBuffer,
-      console: { log() {}, debug() {}, warn() {} }, location: { protocol: 'http:', host: 'localhost' },
-      setTimeout() {}, clearTimeout() {}, setInterval() {}, clearInterval() {},
-      openDetailPanelMobile() {}, closeDetailPanelMobile() {}, onMotusEvent() {}, offMotusEvent() {},
-      WebSocket: class { constructor() { sockets.push(this); } close() {} },
-    };
-    const api = view === 'detail-panel'
-      ? '{ initDetailPanel, showTopicDetail, close: _cleanup, textLike: () => _textLike }'
-      : '{ mountRenderer, close: () => _activeRenderer.unmount() }';
-    const exposed = runInNewContext(source.replace(/^import .*;\n/gm, '').replace(/^export /gm, '') + '\n' + `(${api})`, context);
+    },
+  };
+  globalThis.document = document;
+  return { document, elements };
+}
+
+// ── 视图加载 ──────────────────────────────────────────────────────────────────
+//
+// 三个视图都是浏览器 ES module：没有构建步骤，直接在 vm 里去掉 import/export
+// 后注入渲染器与 DOM 桩，沿用旧测试验证真实挂载路径的做法。
+
+function _stubRenderer(name, canRender = () => false) {
+  return { name, canRender, mount() {}, unmount() {}, onData() {}, onDataSilent() {}, onEvent() {} };
+}
+
+function _rendererNames(source) {
+  return source.match(/const RENDERERS = \[([^\]]+)\]/)[1].split(',').map(name => name.trim());
+}
+
+function _loadView(view, apiExpression) {
+  const source = readFileSync(new URL(`./${view}.js`, import.meta.url), 'utf8')
+    .replace(/^import .*;\n/gm, '')
+    .replace(/^export /gm, '');
+  const sockets = [];
+  const context = {};
+  for (const name of _rendererNames(source)) context[name] = _stubRenderer(name);
+  Object.assign(context, {
+    TextRenderer, KvLatestRenderer,
+    ActivityRenderer: _stubRenderer('activity', () => true),
+    document: globalThis.document,
+    console: { log() {}, debug() {}, warn() {}, error() {} },
+    location: { protocol: 'http:', host: 'localhost' },
+    setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
+    openDetailPanelMobile() {}, closeDetailPanelMobile() {},
+    onMotusEvent() {}, offMotusEvent() {},
+    TextEncoder, TextDecoder, ArrayBuffer,
+    WebSocket: class {
+      constructor(url) { this.url = url; sockets.push(this); }
+      close() {}
+    },
+  });
+  return { exposed: runInNewContext(source + `\n(${apiExpression})`, context), sockets };
+}
+
+// ── 样例 ──────────────────────────────────────────────────────────────────────
+
+const odom = () => ({
+  schema: 'motus.odom/1',
+  stamp_ms: 1234,
+  frame: 'body',
+  pose: { position: [1, 2, 3], quaternion: [0, 0, 0.7071, 0.7071], frame_id: 'odom', child_frame_id: 'camera' },
+  twist: [0.5, null, null, null, null, 0.1],
+  vendor: { displacement_m: 44.444, turn_angle_deg: 99.999,
+    motus_slam: { status: 'tracking', segment_id: 'run-1', reason: 'ok', stamp_source: 'measurement', clock_id: 'clk' } },
+});
+
+const encode = value => new TextEncoder().encode(JSON.stringify(value)).buffer;
+
+/** bus 对 state/* 走 send_bytes；JSON 文本的字节数奇偶随机，这里固定成奇数。 */
+function oddLengthFrame(value) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const padded = bytes.byteLength % 2 === 0 ? new TextEncoder().encode(JSON.stringify(value) + ' ') : bytes;
+  assert.equal(padded.byteLength % 2, 1);
+  return padded.buffer;
+}
+
+// ── detail panel ──────────────────────────────────────────────────────────────
+
+test('detail panel renders state/odom through the same JSON text route as data/json', () => {
+  for (const format of ['state/odom', 'data/json']) {
+    const { elements } = installDom();
+    const { exposed, sockets } = _loadView('detail-panel',
+      '{ initDetailPanel, showTopicDetail, close: _cleanup, textLike: () => _textLike }');
     try {
-      if (view === 'detail-panel') {
-        exposed.initDetailPanel(); exposed.showTopicDetail('/custom/status', format, { presentation: profile });
-      } else exposed.mountRenderer({ id: 'custom', topic_out: [{ topic: '/custom/status', format,
-        metadata: { presentation: profile } }, {topic:'/secondary/odom',format:'state/odom'}],
-        ws_path: '/ws/bus/custom/status', render_hint: format });
-      const body = elements.get(view === 'detail-panel' ? 'detail-body' : 'renderer-content');
-      if (format === 'state/odom') {
-        assert.ok(body.querySelector('.renderer-odom'), `${view} must render odometry directly`);
-        sockets[0].onmessage({ data: JSON.stringify(odom()) });
-        assert.match(body.querySelector('.odom-summary').textContent, /位置1, 2, 3 m/);
-        assert.match(body.querySelector('.odom-raw').textContent, /motus.odom/);
-      } else {
-        assert.ok(body.querySelector('.renderer-text'), `${view} must keep ordinary JSON on TextRenderer`);
-        sockets[0].onmessage({ data: '{"voltage":0,"diagnostics":{"all":true}}' });
-        assert.ok(body.querySelector('.log-entry'));
-        assert.equal(body.querySelector('.renderer-odom'), null);
-        assert.equal(body.querySelector('.odom-summary'), null);
-      }
-      if (view === 'detail-panel') assert.equal(exposed.textLike(), true, 'canvas stale notice cannot cover text or odometry');
+      exposed.initDetailPanel();
+      exposed.showTopicDetail('/r1/state/odom', format);
+
+      const body = elements.get('detail-body');
+      assert.ok(body.querySelector('.renderer-text'), `${format} must mount TextRenderer`);
+      assert.equal(body.querySelector('.renderer-odom'), null, 'no dedicated odometry renderer is left');
+      // 归一的是渲染器选择，面板上显示的仍是订阅到的真实 format。
+      assert.equal(elements.get('detail-subtitle').textContent, `format: ${format}`);
+      assert.equal(exposed.textLike(), true, 'stale-canvas notice must not cover JSON logs');
+
+      sockets[0].onmessage({ data: encode(odom()) });
+      assert.ok(body.querySelector('.renderer-text').querySelector('.log-entry'),
+        `${format} frame must render as a generic JSON log entry`);
+      assert.match(body.textContent, /motus\.odom\/1/);
+      assert.match(body.textContent, /segment_id/);
+      assert.match(body.textContent, /tracking/);
+      assert.match(body.textContent, /position/);
     } finally { exposed.close(); }
   }
 });
 
-test('text and ASR continue to use the existing streaming text behavior', () => {
-  const { box, renderer, send } = mount(TextRenderer);
-  try {
-    send({ text: '你好', asr_complete_ts: 1234 });
-    assert.equal(box.querySelector('.asr-line').textContent, 'ASR你好');
-    renderer.onData(new TextEncoder().encode('plain streaming text').buffer);
-    assert.match(box.textContent, /plain streaming text/);
-    assert.equal(box.querySelector('.renderer-odom'), null);
-  } finally { renderer.unmount(); }
-});
+// ── dashboard ─────────────────────────────────────────────────────────────────
 
-test('an unspecified or receive-based stamp never claims to be a known acquisition time', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer, send } = mount(OdomRenderer, 'legacy-state-key');
-  try {
-    const sample = odom(); delete sample.vendor.motus_slam.stamp_source;
-    send(sample);
-    assert.match(box.querySelector('.odom-summary').textContent, /采样时间未知/);
-    sample.vendor.motus_slam.stamp_source = 'receive'; send(sample);
-    assert.match(box.querySelector('.odom-summary').textContent, /采样时间未知/);
-    sample.vendor.motus_slam.stamp_source = 'measurement'; send(sample);
-    assert.match(box.querySelector('.odom-summary').textContent, /采样时间1234 ms/);
-  } finally { renderer.unmount(); }
-});
-
-test('odometry rejects unrelated JSON and clears absent current pose without losing raw expansion', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer, send } = mount(OdomRenderer, { format: 'state/odom' });
-  try {
-    send(odom()); box.querySelector('.odom-raw').open = true;
-    send({ schema: 'motus.odom/1', pose: null, twist: [0, null, null, null, null, 0],
-      vendor: { motus_slam: { status: 'lost' } } });
-    assert.doesNotMatch(box.querySelector('.odom-summary').textContent, /1, 2, 3/);
-    assert.match(box.querySelector('.odom-summary').textContent, /位置—/);
-    assert.equal(box.querySelector('.odom-raw').open, true);
-    const current = box.querySelector('.odom-summary').textContent;
-    for (const unrelated of [null, [1, 2], { pose: 'unrelated' }, { type: 'meta' }]) send(unrelated);
-    assert.equal(box.querySelector('.odom-summary').textContent, current);
-  } finally { renderer.unmount(); }
-});
-
-test('dashboard buffers odd-length odometry and preserves original receipt age on replay', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
-  const start = source.indexOf('class SkillBuffer {');
-  const end = source.indexOf('\n}\n', start) + 2;
-  const sockets = []; let now = 1000;
-  const SkillBuffer = runInNewContext(`const PREVIEW_CAPACITY = 100; (${source.slice(start, end)})`, {
-    ArrayBuffer, TextEncoder, Date: { now: () => now }, console: { log() {} },
-    WebSocket: class { constructor() { sockets.push(this); } close() {} },
+test('dashboard keeps the declared output topic and renders state/odom as JSON', () => {
+  installDom();
+  const { exposed, sockets } = _loadView('dashboard',
+    '{ mountRenderer, deliver: _deliverFrame, rendererHint: _rendererHint }');
+  exposed.mountRenderer({
+    id: 'bumi', name: 'Bumi', server_name: 'Bumi',
+    render_hint: 'state/odom',
+    ws_path: '/ws/bus/r1/state/odom',
+    topic_out: [{ topic: '/r1/state/odom', format: 'state/odom' }, { topic: '/r1/view', format: 'image/jpeg' }],
+    topic_in: [],
   });
-  const buffer = new SkillBuffer('ws://status', 'state/odom');
-  const text = JSON.stringify(odom());
-  const raw = new TextEncoder().encode(text + (text.length % 2 === 0 ? ' ' : '')).buffer;
-  assert.equal(raw.byteLength % 2, 1);
-  sockets[0].onmessage({ data: raw });
-  const replay = [];
-  now = 8000;
-  buffer.attach((frame, hint, historical, receivedAt) => replay.push({ frame, receivedAt }));
-  assert.equal(replay.length, 1);
-  assert.equal(replay[0].receivedAt, 1000);
-  const savedNow = Date.now; Date.now = () => now;
-  const { box, renderer } = mount(OdomRenderer, { format: 'state/odom' });
-  try {
-    renderer.onDataSilent(replay[0].frame, 'state/odom', { receivedAt: replay[0].receivedAt });
-    assert.match(box.querySelector('.odom-freshness').textContent, /7.0 s · 陈旧/);
-  } finally { renderer.unmount(); Date.now = savedNow; buffer.destroy(); }
+
+  const content = globalThis.document.getElementById('renderer-content');
+  const rendererWrap = content.children[1];
+  const bodyEl = rendererWrap.children[1];
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].url, 'ws://localhost/ws/bus/r1/state/odom',
+    'preview still targets the topic_out the card declares');
+  assert.match(rendererWrap.children[0].innerHTML, /\/r1\/state\/odom/);
+  assert.ok(bodyEl.querySelector('.renderer-text'), 'state/odom uses the generic JSON renderer');
+  assert.equal(bodyEl.querySelector('.renderer-odom'), null);
+
+  // 二进制 + 奇数长度：预览缓冲的 odom 传输特例必须保住，不能丢帧。
+  sockets[0].onmessage({ data: oddLengthFrame(odom()) });
+  const entry = bodyEl.querySelector('.log-entry');
+  assert.ok(entry, 'odd-length binary odometry frame must reach the renderer');
+  assert.match(entry.textContent, /motus\.odom\/1/);
+  assert.match(entry.textContent, /tracking/);
+  assert.match(bodyEl.textContent, /position/);
 });
 
-test('dashboard keeps the original non-odom binary filtering, ring history and callback arity', () => {
+test('dashboard renders a state/odom in_topic with the same JSON renderer', () => {
+  installDom();
+  const { exposed } = _loadView('dashboard', '{ mountRenderer }');
+  exposed.mountRenderer({
+    id: 'navi', name: 'Navi',
+    render_hint: 'control/twist',
+    ws_path: '/ws/bus/r1/cmd',
+    topic_out: [{ topic: '/r1/cmd', format: 'control/twist' }],
+    topic_in: [{ topic: '/r1/state/odom', format: 'state/odom' }],
+  });
+
+  const content = globalThis.document.getElementById('renderer-content');
+  const inBody = content.children[1].children[0].children[0];
+  assert.ok(inBody.querySelector('.renderer-text'), 'in_topic state/odom uses TextRenderer');
+  assert.equal(inBody.querySelector('.renderer-odom'), null);
+});
+
+test('dashboard routes replay frames silently and live frames with their format', () => {
+  installDom();
+  const { exposed } = _loadView('dashboard', '{ deliver: _deliverFrame }');
+  const calls = [];
+  const renderer = {
+    onData: (...args) => calls.push(args),
+    onDataSilent: (...args) => calls.push(['silent', ...args]),
+  };
+  const frame = new ArrayBuffer(2);
+  exposed.deliver(renderer, frame, 'state/odom', true);
+  exposed.deliver(renderer, frame, 'state/odom', false);
+  // odom 与其它 format 没有任何区别：回放静默、实时带 format。
+  assert.deepEqual(calls, [['silent', frame], [frame, 'state/odom']]);
+});
+
+test('preview buffer keeps history and the odometry binary exception', () => {
   const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
   const start = source.indexOf('class SkillBuffer {');
   const end = source.indexOf('\n}\n', start) + 2;
-  for (const format of ['data/json', 'audio/pcm', 'sensor/slam-preview']) {
+  const load = hint => {
     const sockets = [];
     const SkillBuffer = runInNewContext(`const PREVIEW_CAPACITY = 100; (${source.slice(start, end)})`, {
       ArrayBuffer, TextEncoder, console: { log() {} },
-      WebSocket: class { constructor() { sockets.push(this); } close() {} },
+      WebSocket: class { constructor(url) { this.url = url; sockets.push(this); } close() {} },
     });
-    const buffer = new SkillBuffer('ws://original', format);
+    return { buffer: new SkillBuffer('ws://preview', hint), socket: () => sockets[0] };
+  };
+
+  // JSON 日志：环形历史 100 帧，回放回调仍是 (frame, hint, true)。
+  const { buffer, socket } = load('data/json');
+  try {
+    for (let i = 0; i < 102; i++) socket().onmessage({ data: new Uint16Array([i]).buffer });
+    socket().onmessage({ data: '{"type":"ping"}' });
+    const replay = [];
+    buffer.attach((...args) => replay.push(args));
+    assert.equal(replay.length, 100);
+    assert.equal(new Uint16Array(replay[0][0])[0], 2);
+    assert.equal(new Uint16Array(replay.at(-1)[0])[0], 101);
+    assert.ok(replay.every(args => args.length === 3 && args[1] === 'data/json' && args[2] === true));
+    socket().onmessage({ data: new Uint16Array([102]).buffer });
+    assert.equal(replay.at(-1).length, 2, 'live callbacks are (frame, hint)');
+  } finally { buffer.destroy(); }
+
+  // 奇数长度的二进制帧：对普通 format 丢弃（原有 PCM 过滤），对 state/odom 放行。
+  for (const [hint, accepted] of [['data/json', false], ['state/odom', true]]) {
+    const preview = load(hint);
     try {
-      for (let i = 0; i < 102; i++) sockets[0].onmessage({ data: new Uint16Array([i]).buffer });
-      sockets[0].onmessage({ data: new Uint8Array([255]).buffer });
-      sockets[0].onmessage({ data: '{"type":"ping"}' });
+      preview.socket().onmessage({ data: new Uint8Array([1]).buffer });
       const replay = [];
-      buffer.attach((...args) => replay.push(args));
-      assert.equal(replay.length, 100, `${format} retains the original preview history`);
-      assert.equal(new Uint16Array(replay[0][0])[0], 2);
-      assert.equal(new Uint16Array(replay.at(-1)[0])[0], 101);
-      assert.ok(replay.every(args => args.length === 3 && args[2] === true));
-      sockets[0].onmessage({ data: new Uint16Array([102]).buffer });
-      assert.equal(replay.at(-1).length, 2, 'live callbacks keep their original signature');
-    } finally { buffer.destroy(); }
+      preview.buffer.attach((...args) => replay.push(args));
+      assert.equal(replay.length, accepted ? 1 : 0, `${hint} odd-length frame handling`);
+    } finally { preview.buffer.destroy(); }
   }
 });
 
-test('dashboard preserves the original non-odom renderer callback signatures', () => {
-  const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
-  const start = source.indexOf('function _deliverFrame(');
-  const end = source.indexOf('\n}\n', start) + 2;
-  const deliver = runInNewContext(`(${source.slice(start, end)})`);
-  const calls = [];
-  const renderer = { name: 'text', onData: (...args) => calls.push(args),
-    onDataSilent: (...args) => calls.push(args) };
-  const frame = new ArrayBuffer(2);
-  deliver(renderer, frame, 'data/json', true, 1000);
-  deliver(renderer, frame, 'data/json', false, 1000);
-  assert.deepEqual(calls, [[frame], [frame, 'data/json']]);
+// ── 通用 JSON 渲染器 ──────────────────────────────────────────────────────────
+
+test('odometry JSON is readable through both generic JSON renderers', () => {
+  const { document } = installDom();
+
+  // 日志模式：每帧一条，键和值都在输出里。
+  const logBox = document.createElement('div');
+  const logRenderer = Object.assign({}, TextRenderer);
+  logRenderer.mount(logBox);
+  try {
+    assert.doesNotThrow(() => logRenderer.onData(encode(odom())));
+    assert.equal(logBox.querySelectorAll('.log-entry').length, 1);
+    for (const expected of [/schema/, /motus\.odom\/1/, /stamp_ms/, /status/, /tracking/, /segment_id/, /position/]) {
+      assert.match(logBox.textContent, expected, `log view shows ${expected}`);
+    }
+    // 非 JSON 帧按纯文本展示，不抛异常。
+    logRenderer.onData(new TextEncoder().encode('not json at all').buffer);
+    assert.match(logBox.textContent, /not json at all/);
+    // keepalive ping 不占一行。
+    const before = logBox.querySelectorAll('.log-entry').length;
+    logRenderer.onData(encode({ type: 'ping' }));
+    assert.equal(logBox.querySelectorAll('.log-entry').length, before);
+  } finally { logRenderer.unmount(); }
+
+  // 最新模式：顶层字段各自一格，嵌套对象整体成一个可读值。
+  const latestBox = document.createElement('div');
+  const latestRenderer = Object.assign({}, KvLatestRenderer);
+  latestRenderer.mount(latestBox);
+  try {
+    assert.doesNotThrow(() => latestRenderer.onData(encode(odom())));
+    for (const expected of [/pose\.position/, /1, 2, 3/, /vendor\.motus_slam/, /tracking/, /stamp_ms/]) {
+      assert.match(latestBox.textContent, expected, `latest view shows ${expected}`);
+    }
+    // 非法 JSON 被忽略而不是炸掉，已有内容保留。
+    assert.doesNotThrow(() => latestRenderer.onData(new TextEncoder().encode('{"schema":').buffer));
+    assert.match(latestBox.textContent, /pose\.position/);
+  } finally { latestRenderer.unmount(); }
 });
 
-test('yaw requires explicit z-up xyzw axes, a valid quaternion and tracking', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const { box, renderer, send } = mount(OdomRenderer, { format: 'state/odom' });
-  try {
-    const sample = odom(); send(sample);
-    const summary = () => box.querySelector('.odom-summary').textContent;
-    assert.match(summary(), /yaw未知/);
-    sample.vendor.motus_slam.pose_axes = { quaternion_order: 'xyzw', up_axis: 'z' };
-    send(sample); assert.match(summary(), /yaw0 rad/);
-    sample.pose.quaternion = [0, 0, Math.SQRT1_2, Math.SQRT1_2];
-    send(sample); assert.match(summary(), /yaw1.571 rad/);
-    for (const axes of [{ quaternion_order: 'wxyz', up_axis: 'z' },
-      { quaternion_order: 'xyzw', up_axis: 'x' }, { quaternion_order: 'xyzw', up_axis: 'y' },
-      { up_axis: 'z' }]) {
-      sample.vendor.motus_slam.pose_axes = axes; send(sample); assert.match(summary(), /yaw未知/);
-    }
-    sample.vendor.motus_slam.pose_axes = { quaternion_order: 'xyzw', up_axis: 'z' };
-    for (const quaternion of [[0, 0, 0, 0], [0, 0, null, 1], [0, 0, 1], ['0', 0, 0, 1]]) {
-      sample.pose.quaternion = quaternion; send(sample); assert.match(summary(), /yaw未知/);
-    }
-    sample.pose.quaternion = [0, 0, 0, 1]; sample.vendor.motus_slam.status = 'lost';
-    send(sample); assert.match(summary(), /yaw未知/);
-  } finally { renderer.unmount(); }
-  const mounted = mount(OdomRenderer, { format: 'state/odom' });
-  try {
-    const sample = odom(); sample.pose.quaternion = [0, 0, 2 * Math.SQRT1_2, 2 * Math.SQRT1_2];
-    sample.vendor.motus_slam.pose_axes = { quaternion_order: 'xyzw', up_axis: 'z' };
-    mounted.send(sample);
-    assert.match(mounted.box.querySelector('.odom-summary').textContent, /yaw1.571 rad/);
-  } finally { mounted.renderer.unmount(); }
+// ── monitor dashboard ────────────────────────────────────────────────────────
+
+test('monitor dashboard routes state/odom through the same renderers as data/json', () => {
+  installDom();
+  const { exposed } = _loadView('monitor-dashboard',
+    '{ createRenderer: _createRenderer, rendererHint: _rendererHint, isJsonFormat: _isJsonFormat }');
+
+  assert.equal(exposed.rendererHint('state/odom'), 'data/json');
+  assert.equal(exposed.isJsonFormat('state/odom'), true);
+  for (const mode of ['log', 'kv']) {
+    assert.equal(exposed.createRenderer('state/odom', mode).name,
+      exposed.createRenderer('data/json', mode).name,
+      `${mode} mode must not special-case odometry`);
+  }
+  assert.equal(exposed.createRenderer('state/odom', 'log').name, 'text');
+  assert.equal(exposed.createRenderer('state/odom', 'kv').name, 'kv-latest');
+  assert.equal(exposed.isJsonFormat('image/jpeg'), false);
 });
 
-test('copying raw data works on HTTP pages without the secure Clipboard API', async () => {
-  const { OdomRenderer } = await import('./renderers/odom.js');
-  const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
-  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {} });
-  const { box, renderer } = mount(OdomRenderer, { format: 'state/odom' });
-  let copied;
-  document.execCommand = command => {
-    if (command !== 'copy') return false;
-    copied = document.activeElement.value; return true;
-  };
-  try {
-    const raw = JSON.stringify(odom(), null, 2) + '\n';
-    renderer.onData(new TextEncoder().encode(raw).buffer);
-    await box.querySelector('.odom-copy').onclick();
-    assert.equal(copied, raw);
-    assert.equal(box.querySelector('textarea'), null);
-    assert.equal(box.querySelector('.odom-copy').textContent, '已复制');
-  } finally {
-    renderer.unmount();
-    if (savedNavigator) Object.defineProperty(globalThis, 'navigator', savedNavigator);
-    else delete globalThis.navigator;
+// ── 清理 ──────────────────────────────────────────────────────────────────────
+
+test('the dedicated odometry renderer modules are gone and unreferenced', async () => {
+  await assert.rejects(() => import('./renderers/odom.js'), 'renderers/odom.js must be deleted');
+  await assert.rejects(() => import('./renderers/odom-presentation.js'), 'odom-presentation.js must be deleted');
+  for (const view of ['detail-panel.js', 'dashboard.js', 'monitor-dashboard.js']) {
+    const source = readFileSync(new URL(`./${view}`, import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /OdomRenderer|odom-presentation|renderers\/odom/,
+      `${view} must not keep a dangling odometry renderer reference`);
   }
 });

@@ -11,10 +11,20 @@ import { ImageRenderer }    from './renderers/image.js';
 import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
-import { OdomRenderer } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+
+/**
+ * 选渲染器用的 hint：odom 与 data/json 共用同一套通用 JSON 渲染。
+ *
+ * 流格式保持原值（bus 对 state/odom 发二进制帧，SkillBuffer 的传输特例不能动），
+ * 这里只把渲染归一到 data/json。
+ */
+function _rendererHint(format) {
+  const hint = format || 'activity';
+  return hint === 'state/odom' ? 'data/json' : hint;
+}
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 
@@ -27,7 +37,6 @@ class SkillBuffer {
     this._wsUrl   = wsUrl;
     this._hint    = hint;
     this._frames  = [];          // ring buffer (ArrayBuffer[])
-    this._receivedAt = [];
     this._pos     = 0;           // write head (mod PREVIEW_CAPACITY)
     this._full    = false;
     this._ws      = null;
@@ -63,20 +72,17 @@ class SkillBuffer {
         buf = new TextEncoder().encode(ev.data).buffer;
       }
       // Store in ring buffer
-      const receivedAt = this._hint === 'state/odom' ? Date.now() : undefined;
       this._frames[this._pos] = buf;
-      if (receivedAt !== undefined) this._receivedAt[this._pos] = receivedAt;
       this._pos = (this._pos + 1) % PREVIEW_CAPACITY;
       if (!this._full && this._pos === 0) this._full = true;
       // Forward to active consumer
-      if (this._hint === 'state/odom') this._consumer?.(buf, this._hint, false, receivedAt);
-      else this._consumer?.(buf, this._hint);
+      this._consumer?.(buf, this._hint);
     };
     this._ws = ws;
   }
 
   /** Replay buffered frames into a renderer, then register it as consumer.
-   *  onDataFn(buf, hint, isReplay, receivedAt) — preserve odometry receipt age during replay. */
+   *  onDataFn(buf, hint, isReplay) — isReplay=true for historical frames. */
   attach(onDataFn) {
     this._consumer = onDataFn;
     const len   = this._full ? PREVIEW_CAPACITY : this._pos;
@@ -84,8 +90,7 @@ class SkillBuffer {
     for (let i = 0; i < len; i++) {
       const frame = this._frames[(start + i) % PREVIEW_CAPACITY];
       if (!frame) continue;
-      if (this._hint === 'state/odom') onDataFn(frame, this._hint, true, this._receivedAt[(start + i) % PREVIEW_CAPACITY]);
-      else onDataFn(frame, this._hint, true);
+      onDataFn(frame, this._hint, true);
     }
   }
 
@@ -374,7 +379,7 @@ function mountRenderer(skill) {
   }
 
   const hint     = skill.render_hint || 'activity';
-  const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
+  const Renderer = RENDERERS.find(r => r.canRender(_rendererHint(hint))) || ActivityRenderer;
 
   const topicIn  = skill.topic_in?.[0]  || null;
   const topicOut = skill.topic_out?.[0] || null;
@@ -430,19 +435,19 @@ function mountRenderer(skill) {
 
     // Mount a renderer for in_topic based on its format — no playback (monitoring only)
     const inHint = topicIn.format || 'activity';
-    const InRenderer = RENDERERS.find(r => r.canRender(inHint)) || ActivityRenderer;
+    const InRenderer = RENDERERS.find(r => r.canRender(_rendererHint(inHint))) || ActivityRenderer;
     _inRenderer = Object.assign(Object.create(Object.getPrototypeOf(InRenderer)), InRenderer);
     _inRenderer.mount(inBody, skill.id + '_in');
 
     // Attach to background buffer (replay last N frames then receive live data)
     const inBuf = _buffers[skill.id]?.in;
     if (inBuf) {
-      inBuf.attach((buf, fmt, isReplay, receivedAt) => _deliverFrame(_inRenderer, buf, fmt, isReplay, receivedAt));
+      inBuf.attach((buf, fmt, isReplay) => _deliverFrame(_inRenderer, buf, fmt, isReplay));
     } else if (topicIn.topic) {
       // Buffer not ready yet (device came online after initial ping) — create on demand
       const inWsUrl = _wsUrlFor('/ws/bus' + topicIn.topic);
       const buf = _ensureBuffer(skill.id, inWsUrl, inHint, 'in');
-      buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_inRenderer, b, fmt, isReplay, receivedAt));
+      buf?.attach((b, fmt, isReplay) => _deliverFrame(_inRenderer, b, fmt, isReplay));
     }
 
     // Right panel: topic_out (actual renderer)
@@ -500,37 +505,35 @@ function mountRenderer(skill) {
   console.log(`[attach] skill=${skill.id} outBuf=${!!outBuf} inBuf=${!!inBuf} activeBuf=${!!activeBuf} ws_path=${skill.ws_path}`);
   if (activeBuf) {
     let replayCount = 0, liveCount = 0;
-    activeBuf.attach((buf, fmt, isReplay, receivedAt) => {
+    activeBuf.attach((buf, fmt, isReplay) => {
       if (isReplay) { replayCount++; }
       else {
         if (liveCount === 0) console.log(`[audio:live] first live frame after ${replayCount} replay frames, skill=${skill.id}`);
         liveCount++;
       }
-      _deliverFrame(_activeRenderer, buf, fmt, isReplay, receivedAt);
+      _deliverFrame(_activeRenderer, buf, fmt, isReplay);
     });
     console.log(`[attach] attached to activeBuf, replay frames will be silent`);
   } else if (skill.ws_path) {
     // Buffer not ready yet — create on demand
     const buf = _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out');
     console.log(`[attach] created on-demand outBuf for ws_path=${skill.ws_path}`);
-    buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_activeRenderer, b, fmt, isReplay, receivedAt));
+    buf?.attach((b, fmt, isReplay) => _deliverFrame(_activeRenderer, b, fmt, isReplay));
   } else if (hasIn && topicIn?.topic) {
     // No out buffer and no ws_path — wire directly to in_topic stream
     const inWsUrl = _wsUrlFor('/ws/bus' + topicIn.topic);
     const buf = _ensureBuffer(skill.id, inWsUrl, hint, 'in');
     console.log(`[attach] wired to in_topic=${topicIn.topic}`);
-    buf?.attach((b, fmt, isReplay, receivedAt) => _deliverFrame(_activeRenderer, b, fmt, isReplay, receivedAt));
+    buf?.attach((b, fmt, isReplay) => _deliverFrame(_activeRenderer, b, fmt, isReplay));
   } else {
     console.log('[preview] no ws_path for skill', skill.id);
   }
   _attachedSkillId = skill.id;
 }
 
-function _deliverFrame(renderer, buffer, format, isReplay, receivedAt) {
-  if (renderer?.name === 'odom') {
-    const receive = isReplay ? renderer.onDataSilent : renderer.onData;
-    receive?.call(renderer, buffer, format, { receivedAt });
-  } else if (isReplay) renderer?.onDataSilent?.(buffer);
+/** 回放的历史帧静默喂给渲染器，实时帧带上真实 format。 */
+function _deliverFrame(renderer, buffer, format, isReplay) {
+  if (isReplay) renderer?.onDataSilent?.(buffer);
   else renderer?.onData?.(buffer, format);
 }
 

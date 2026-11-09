@@ -197,8 +197,6 @@ class RtabmapNode(Node):
                 input_contract=input_contract, on_frame=self._queue_frame)
             self._map_pub = self.create_publisher(UInt8MultiArray, self._map_topic, _QOS)
             self._status_pub = self.create_publisher(String, self._status_topic, _QOS)
-            self._pose_pub = self.create_publisher(String, self._map_topic + '/pose', _QOS)
-            self._correction_pub = self.create_publisher(String, self._map_topic + '/map_to_odom', _QOS)
             self.create_subscription(String, odom_topic, self._odom, _QOS)
             self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
             if input_contract:
@@ -439,10 +437,8 @@ class RtabmapNode(Node):
                 return
             index = max(indices, key=lambda i: msg.poses_id[i])
             pose = _native_pose(msg.poses[index])
-            correction = msg.map_to_odom
-            transform = _native_pose(SimpleNamespace(position=correction.translation, orientation=correction.rotation))
             with self._result_lock:
-                segment['graph'] = (self._stamp(msg), msg.header.frame_id, pose, transform)
+                segment['graph'] = (self._stamp(msg), msg.header.frame_id, pose)
             self._publish_snapshot(segment)
         except (AttributeError, TypeError, ValueError, OverflowError) as error:
             log.warning('Invalid native RTAB-Map graph: %s', error)
@@ -462,7 +458,7 @@ class RtabmapNode(Node):
             graph, cloud = segment['graph'], segment['cloud']
             if graph is None or cloud is None or graph[:2] != cloud[:2]:
                 return
-            stamp, frame, pose, correction = graph
+            _, frame, pose = graph
             if not isinstance(frame, str) or not frame.strip():
                 return
             packet = encode_mapping(cloud[2], pose, max_points=self._settings['preview_max_points'])
@@ -475,12 +471,6 @@ class RtabmapNode(Node):
             segment['last_preview'] = now
             message = UInt8MultiArray(); message.data = packet
             self._map_pub.publish(message)
-            common = dict(backend='rtabmap', state='map_snapshot', segment_id=segment['segment_id'],
-                          frame_id=frame, stamp_ns=str(stamp))
-            message = String(); message.data = json.dumps(dict(common, pose=pose.tolist()), allow_nan=False)
-            self._pose_pub.publish(message)
-            message = String(); message.data = json.dumps(dict(common, transform=correction.tolist()), allow_nan=False)
-            self._correction_pub.publish(message)
 
     def _native_info(self, msg, segment):
         if type(msg.ref_id) is not int or msg.ref_id <= 0:
@@ -521,9 +511,7 @@ class RtabmapNode(Node):
 
     def outputs(self):
         return [{'topic': self._map_topic, 'format': 'sensor/mapping', 'desc': 'Map snapshot; marker is last mapped pose'},
-                {'topic': self._status_topic, 'format': 'data/json'},
-                {'topic': self._map_topic + '/pose', 'format': 'data/json'},
-                {'topic': self._map_topic + '/map_to_odom', 'format': 'data/json'}]
+                {'topic': self._status_topic, 'format': 'data/json'}]
 
     def close(self):
         self.freeze_capture()
