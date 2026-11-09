@@ -94,13 +94,20 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 | | |
 |---|---|
 | MCP HTTP | `http://<host>:15730/mcp` |
-| SSE（ACP 完成事件） | `http://<host>:15730/mcp/sse` |
+| SSE（保留的事件端点；统一导航不再通过它报告完成） | `http://<host>:15730/mcp/sse` |
 | 容器 | `embodied-actucore` |
 | 镜像 | `<registry>/<namespace>/actucore:<tag>` |
 | 注册类别 | `actucore` |
 | `serverInfo.name` | `actucore-bundle` |
 
 端口只有一个：ActuCore 没有 Perception 那种音频流场景，所以不开 WebSocket（15731 预留）。
+
+`controlled_semantic_spatial` 的导航终态沿用 `navi` 的 ACP 回调：后台线程向
+`${AGENT_CORE_URL:-https://localhost:15678}/api/acp/complete` POST 同一个 `action_id`。
+到达映射为 `completed`，停止/取消映射为 `cancelled`，失败/超时映射为 `failed`；
+原始导航状态与原因保留在 `result`。不重复发送 SSE 完成事件，不修改 Core 屏障。
+回调采用现有 `navi` 的自签名 TLS 兼容方式（不校验证书），应仅用于可信本机 Core；
+请求超时为 10 秒，失败会记录警告，当前不自动重试。
 
 ## `navi` 卡片
 

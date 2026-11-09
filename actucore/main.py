@@ -132,11 +132,12 @@ class ActuCoreBundle:
                     "built-in navigation runtime currently requires namespace=ubuntu"
                 )
             from plugins.controlled_semantic_spatial import ControlledSemanticSpatialPlugin
+            from plugins.controlled_semantic_spatial.acp import complete_navigation
             plugin = ControlledSemanticSpatialPlugin(
                 navigation_cfg,
                 namespace,
                 executor,
-                completion_callback=sse_push,
+                completion_callback=complete_navigation,
             )
             self._plugins.append(plugin)
             log.info(

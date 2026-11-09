@@ -12,6 +12,8 @@ ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 sys.path.insert(0, str(ACTUCORE_ROOT.parent / "perception" / "utils"))
 
+from plugins.controlled_semantic_spatial.acp import complete_navigation
+
 
 class InvalidHandle(Exception):
     pass
@@ -56,7 +58,7 @@ class BundleConfigurationTest(unittest.TestCase):
         with mock.patch("plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin") as plugin:
             bundle = module.ActuCoreBundle(cfg, executor)
         plugin.assert_called_once_with(
-            card_cfg, "ubuntu", executor, completion_callback=module.sse_push
+            card_cfg, "ubuntu", executor, completion_callback=complete_navigation
         )
         self.assertEqual(bundle._plugins, [plugin.return_value])
 
@@ -114,7 +116,7 @@ class BundleConfigurationTest(unittest.TestCase):
                 "plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin"
             ) as plugin:
                 module.ActuCoreBundle({"plugins": {key: settings}}, None)
-                plugin.assert_called_once_with(settings, "ubuntu", None, completion_callback=module.sse_push)
+                plugin.assert_called_once_with(settings, "ubuntu", None, completion_callback=complete_navigation)
 
 
 class BundleDispatchTest(unittest.TestCase):
