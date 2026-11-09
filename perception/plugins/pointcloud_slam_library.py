@@ -252,7 +252,9 @@ def save_rtabmap_revision(root, artifacts, settings, name, bound_id, request_id)
                 saved_segments.append(saved_segment)
             data = {'schema': 'motus.rtabmap-map/1', 'segments': saved_segments,
                     'statistics': artifacts['statistics'], 'resolved': {key: deepcopy(settings.get(key))
-                        for key in ('resolved_inputs', 'extrinsic_mode', 'map_plane')}}
+                        for key in ('resolved_inputs', 'extrinsic_mode', 'map_plane',
+                            'cloud_frame', 'child_frame', 'clock_id',
+                            'child_from_cloud', 'input_provenance')}}
             entry['saves'].append({'request_id': request_id, 'revision': revision, 'source': source_id,
                                    'segments': len(saved_segments), 'backend': 'rtabmap'})
             entry.update(revision=revision, backend='rtabmap')

@@ -8,8 +8,7 @@ import shutil
 import threading
 import uuid
 
-import yaml
-
+from .pointcloud_slam_config import discover_runtime_geometry, reconcile_explicit_extrinsic
 from .pointcloud_slam_input import resolve_inputs
 from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_ros import RtabmapNode, discover_input_bindings
@@ -19,17 +18,16 @@ from .pointcloud_slam_view import SavedMapView
 from utils.ros_lifecycle import dispose_node
 
 _ARCHIVE_DIR = '/models/pointcloud_slam'
-_DEFAULTS = {'robot': '其他', 'max_gap_ms': 200, 'max_age_s': 2,
+_DEFAULTS = {'max_gap_ms': 200, 'max_age_s': 2,
              'max_measurement_age_ms': 1500, 'max_future_skew_ms': 100,
              'max_pending': 10, 'max_cloud_points': 1000000,
              'voxel_size_m': .08, 'max_working_nodes': 3000, 'max_update_ms': 3000,
              'max_disk_bytes': 2147483648, 'reserve_bytes': 1073741824,
              'preview_interval_s': 1, 'preview_max_points': 40000}
-_RETIRED = {'input_policy', 'clock_relation_verified', 'extrinsic_calibrated',
+_RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calibrated',
             'preview_enabled', 'preview_backend', 'preview_geometry', 'preview_relocalization',
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
             'max_frames', 'max_points', 'persistent_history'}
-_SENSOR_KEYS = {'cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud'}
 _ACTIONS = {
     'start_mapping': ('Start mapping', ['map_name']),
     'stop_mapping': ('Stop mapping and save', []),
@@ -38,29 +36,11 @@ _ACTIONS = {
     'delete_map': ('Delete saved map', ['map_id'])}
 
 
-def _robot_config(config):
-    robot = config.get('robot', '其他')
-    if robot not in ('Bumi', 'G1', 'Tianyi', '其他'):
-        raise ValueError('unknown robot selection')
-    if robot == '其他':
-        return config
-    config = {k: v for k, v in config.items() if k not in _SENSOR_KEYS}
-    if robot == 'Bumi':
-        path = Path(__file__).parent.parent / 'configs' / 'pointcloud_slam_bumi.yaml'
-        with path.open() as source:
-            config.update(yaml.safe_load(source))
-    # G1/Tianyi stay without a sensor preset until their odometry/clock evidence exists:
-    # nothing is invented here, and start fails clearly while frames remain unset.
-    return config
-
-
 def _config_properties():
-    """The canvas surface: the one transform the inputs cannot supply.
+    """Only the optional manual mount is configurable on the canvas.
 
-    Robot presets, frames, clock and every resource/RTAB-Map/preview parameter
-    are deployment-config (or internal-default) behaviour; they are not canvas
-    fields. ``robot`` is therefore not a property here: a saved canvas value
-    for it is stale input and must not move the active preset.
+    Frames and clock come from the connected native publishers, not a robot
+    selector. Algorithm budgets are deployment config; old robot rows are stale.
     """
     return {
         'child_from_cloud': {'type': 'string', 'scope': 'instance',
@@ -81,13 +61,14 @@ class PointCloudSlamPlugin:
         deployment = {k: v for k, v in (config or {}).items()
                       if k not in _RETIRED and k != 'map_plane'}
         self._deployment_config = deepcopy(deployment)
-        self._config = _robot_config({**_DEFAULTS, **deployment})
+        self._config = {**_DEFAULTS, **deployment}
         self._executor = executor
         self._node = self._pending = self._view = None
         self._view_id = self._session_dir = self._map_name = self._save_request = None
         self._project_inputs = None
         self._topics = {}
         self._resolved_inputs = None
+        self._runtime_inputs = self._runtime_provenance = None
         self._input_diagnostics = []
         self._legacy_core = True
         self._session_settings = {}
@@ -157,7 +138,7 @@ class PointCloudSlamPlugin:
         self._dispose(view)
 
     def _settings(self):
-        return {**self._config, **(self._resolved_inputs or {}).get('settings', {})}
+        return {**self._config, **(self._runtime_inputs or {}), **(self._resolved_inputs or {}).get('settings', {})}
 
     def _validate(self, cfg):
         """Validate the internal settings that are present; never require facts.
@@ -184,29 +165,16 @@ class PointCloudSlamPlugin:
                     not math.isfinite(value) or value < 0 or (value == 0 and key != 'max_future_skew_ms')):
                 raise ValueError(key + ' has an invalid value')
 
-    @staticmethod
-    def _require_preset_available(cfg):
-        """G1/Tianyi have no compatible odometry preset yet; say so before a session starts.
-
-        The preset comes from the deployment configuration (``pointcloud_slam.robot``),
-        never from the canvas.
-        """
-        robot = cfg.get('robot')
-        if robot in ('G1', 'Tianyi') and not all(cfg.get(k) for k in ('cloud_frame', 'child_frame', 'clock_id')):
-            raise ValueError(robot + ' preset awaits compatible state/odom and verified sensor configuration; '
-                             'set the deployment config pointcloud_slam.robot to 其他 for manually configured inputs')
-
     def _require_mapping_inputs(self, cfg):
         """The mapping session needs concrete frames and an extrinsic; fail clearly at start."""
-        self._require_preset_available(cfg)
         for key in ('cloud_frame', 'child_frame', 'clock_id'):
             value = cfg.get(key)
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(key + ' is required before mapping starts: set the deployment robot preset '
-                                 'or let the connected inputs declare it')
+                raise ValueError(key + ' is required before mapping starts: connect capture-timed '
+                                 'PointCloud2 and tracking motus.odom/1 or supply explicit metadata')
         if cfg.get('extrinsic_mode', 'static') != 'dynamic' and cfg.get('child_from_cloud') is None:
-            raise ValueError('child_from_cloud is required before mapping starts: set it on the card, '
-                             'set the deployment robot preset, or let the connected inputs declare it')
+            raise ValueError('child_from_cloud is required before mapping starts: supply the '
+                             'measured card transform or a calibrated upstream mount')
 
     def dispatch(self, name, args):
         try:
@@ -297,6 +265,7 @@ class PointCloudSlamPlugin:
                                 'native_ros_publishers' if self._legacy_core else 'input_bindings',
                             'producer_metadata_provided': self._resolved_inputs is not None},
                         'input_diagnostics': deepcopy(self._input_diagnostics),
+                        'input_provenance': deepcopy(self._runtime_provenance),
                         'topic_in': [{'topic': t, 'format': f} for t, f in self._topics.items()],
                         'topic_out': self._outputs(),
                         'input_status': self._node.status() if self._node else {'odometry': 'waiting'}}
@@ -310,7 +279,7 @@ class PointCloudSlamPlugin:
                 # can never switch it.
                 props = _config_properties()
                 updates = {k: v for k, v in args.items() if k in props and v is not None and v != ''}
-                merged = _robot_config({**_DEFAULTS, **self._deployment_config, **updates})
+                merged = {**_DEFAULTS, **self._deployment_config, **updates}
                 if isinstance(merged.get('child_from_cloud'), str):
                     merged['child_from_cloud'] = json.loads(merged['child_from_cloud'])
                 if merged.get('child_from_cloud') is not None:
@@ -321,6 +290,7 @@ class PointCloudSlamPlugin:
                         raise ValueError('stop mapping before changing configuration')
                     return {'state': 'configured', 'config': dict(self._config)}
                 self._config = merged
+                self._runtime_inputs = self._runtime_provenance = None
                 return {'state': 'configured', 'config': dict(self._config)}
             if action == 'start':
                 return self._prepare(args)
@@ -350,12 +320,15 @@ class PointCloudSlamPlugin:
                     capability.get('profile') != 'motus_slam/1'):
                 raise ValueError('odometry source lacks declared SLAM pose capability')
         self._resolved_inputs = None
+        self._runtime_inputs = self._runtime_provenance = None
         self._input_diagnostics = []
         if 'input_metadata' in args:
             try:
                 # Strict producer-declaration semantics: the card itself has no
                 # experimental/strict policy any more.
                 self._resolved_inputs = resolve_inputs(args['input_metadata'], bindings)
+                reconcile_explicit_extrinsic(self._config.get('child_from_cloud'),
+                    self._resolved_inputs['settings'].get('child_from_cloud'))
             except ValueError as error:
                 self._input_diagnostics = deepcopy(getattr(error, 'diagnostics', []))
                 raise
@@ -376,6 +349,17 @@ class PointCloudSlamPlugin:
             raise ValueError('finish the pending map save first')
         if not self._project_inputs or self._capture_stop.is_set():
             raise ValueError('start the project before mapping')
+        # Core main passes only topic names. Learn the missing geometry from
+        # fresh ROS pointcloud and tracking odometry, never from robot presets.
+        if self._resolved_inputs is None and any(
+                self._config.get(key) is None for key in
+                ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')):
+            odom_topic = next(t for t, f in self._topics.items() if f == 'state/odom')
+            cloud_topic = next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2')
+            self._runtime_inputs, self._runtime_provenance = discover_runtime_geometry(
+                self._executor, odom_topic, cloud_topic,
+                manual=self._config.get('child_from_cloud'),
+                max_gap_ms=self._config['max_gap_ms'])
         self._require_mapping_inputs(self._settings())
         self._validate(self._settings())
         name = validate_map_name(args.get('map_name'))
@@ -389,6 +373,7 @@ class PointCloudSlamPlugin:
         session.mkdir(parents=True, exist_ok=False)
         settings = deepcopy(self._settings())
         settings['resolved_inputs'] = deepcopy((self._resolved_inputs or {}).get('inputs', {}))
+        settings['input_provenance'] = deepcopy(self._runtime_provenance)
         node = None
         try:
             node = RtabmapNode(next(t for t, f in self._topics.items() if f == 'state/odom'),

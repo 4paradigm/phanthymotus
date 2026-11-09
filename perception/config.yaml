@@ -274,11 +274,13 @@ plugins:
     min_depth_m: 0.1
     max_depth_m: 10.0
 
-  # RTAB-Map mapping from native PointCloud2 and existing odometry.
-  # The canvas exposes only `child_from_cloud`. This deployment block selects the
-  # robot preset: `robot: Bumi|G1|Tianyi|其他` (deployment-only, never a canvas
-  # field; Bumi supplies frames/clock/extrinsic/limits). Frames/clock/resource/
-  # RTAB-Map/preview parameters are internal defaults that this block may override.
+  # RTAB-Map mapping from native PointCloud2 and existing tracking odometry.
+  # Core main supplies connected ROS topics. Perception resolves sensor frame,
+  # odometry child frame and clock from the live messages when no explicit
+  # motus.slam_input/1 declaration is passed; it does not guess robot presets.
+  # Calibrated producer extrinsics may be used automatically. For an assumed or
+  # missing mount, enter child_from_cloud (rigid 4x4) in the card instance config.
+  # The following deployment settings are generic RTAB-Map/resource overrides.
   pointcloud_slam:
     enabled: true
 

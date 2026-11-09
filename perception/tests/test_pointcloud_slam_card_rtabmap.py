@@ -126,32 +126,25 @@ def test_missing_native_runtime_prevents_false_ready(card, monkeypatch):
 
 
 def test_budget_defaults_are_generic_and_not_robot_preset_values(tmp_path):
-    # The Bumi preset keeps only the installation contract; the memory budgets
-    # stay generic card defaults. They are deployment-config overrides, never
-    # canvas fields, and the preset does not reset them.
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(module, '_ARCHIVE_DIR', str(tmp_path))
-    monkeypatch.setattr(module, 'RtabmapNode', Session, raising=False)
-    monkeypatch.setattr(module, 'require_runtime', lambda: None, raising=False)
-    plain = module.PointCloudSlamPlugin({'robot': 'Bumi'}, _FakeExecutor())
+    # Legacy deployment keys must never replace the connected sensor frame.
+    plugin = module.PointCloudSlamPlugin({'robot': 'Bumi'}, _FakeExecutor())
     try:
-        props = plain.get_tools()[0]['configSchema']['properties']
-        assert set(props) == {'child_from_cloud'}
-        assert plain._settings()['max_working_nodes'] == 3000
-        assert plain._settings()['max_update_ms'] == 3000
-        assert plain._settings()['cloud_frame'] == 'ubuntu_rgb_optical'
+        assert 'robot' not in plugin._settings()
+        assert plugin._settings()['max_working_nodes'] == 3000
+        assert plugin._settings()['max_update_ms'] == 3000
+        assert 'cloud_frame' not in plugin._settings()
+        assert list(plugin.get_tools()[0]['configSchema']['properties']) == ['child_from_cloud']
     finally:
-        plain.shutdown()
-    overridden = module.PointCloudSlamPlugin(
-        {'robot': 'Bumi', 'max_working_nodes': 1500, 'max_update_ms': 2000}, _FakeExecutor())
+        plugin.shutdown()
+    tuned = module.PointCloudSlamPlugin(
+        {'robot': 'Bumi', 'max_working_nodes': 1500, 'max_update_ms': 2000},
+        _FakeExecutor())
     try:
-        assert overridden._settings()['max_working_nodes'] == 1500
-        assert overridden._settings()['max_update_ms'] == 2000
-        assert overridden._settings()['cloud_frame'] == 'ubuntu_rgb_optical'
+        assert tuned._settings()['max_working_nodes'] == 1500
+        assert tuned._settings()['max_update_ms'] == 2000
+        assert 'cloud_frame' not in tuned._settings()
     finally:
-        overridden.shutdown()
-    monkeypatch.undo()
-
+        tuned.shutdown()
 
 def test_native_database_save_is_idempotent_and_old_geometry_config_is_not_exposed(card):
     node = capture(card)
@@ -284,7 +277,7 @@ def test_stale_canvas_configuration_replay_is_noop_through_mapping_and_save(card
         assert result['state'] == 'configured'
         assert result['config'] == original
         assert card._config is original
-        assert card._config['robot'] == '其他'
+        assert 'robot' not in card._config
         assert (card._node or card._pending) is node
     finally:
         release.set()
@@ -325,7 +318,7 @@ def test_stale_canvas_robot_is_ignored_even_while_mapping(card, pending):
         node.failure = None
     assert call(card, 'config', robot='Bumi', input_policy='experimental',
                 clock_relation_verified=True)['state'] == 'configured'
-    assert card._config == original and card._config['robot'] == '其他'
+    assert card._config == original and 'robot' not in card._config
     assert call(card, 'stop_mapping', request_id='stale')['state'] == 'saved'
     assert call(card, 'start_mapping', map_name='Still valid')['state'] == 'running'
 
@@ -357,80 +350,75 @@ def test_saving_displayed_defaults_preserves_loaded_resource_budgets():
         plugin.shutdown()
 
 
-def test_bumi_deployment_preset_wins_over_stale_canvas_fields(card):
+def test_legacy_robot_name_cannot_override_explicit_installation_geometry(card):
     plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
     try:
-        stale = {'child_from_cloud': 'invalid', 'robot': '其他', 'input_policy': 'experimental'}
-        result = call(plugin, 'config', **stale)
-        assert result['state'] == 'configured'
-        assert result['config']['robot'] == 'Bumi'
-        assert result['config']['cloud_frame'] == 'ubuntu_rgb_optical'
-        assert result['config']['child_frame'] == '{segment_id}_base'
-        assert result['config']['clock_id'] == 'ros'
-        expected = [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]
-        assert result['config']['child_from_cloud'] == expected
-        capture(plugin)
-        saved = call(plugin, 'stop_mapping', request_id='bumi-profile')
-        path = Path(module._ARCHIVE_DIR) / 'maps' / saved['map_id'] / '1.json'
-        resolved = json.loads(path.read_text())['resolved']
-        assert resolved['resolved_inputs'] == {} and 'input_validation' not in resolved
-    finally:
-        plugin.shutdown()
-
-
-def test_stale_canvas_robot_cannot_change_deployment_preset(card):
-    plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
-    try:
-        result = call(plugin, 'config', robot='其他')
-        assert result['state'] == 'configured'
-        assert plugin._config['robot'] == 'Bumi'
-        assert plugin._settings()['cloud_frame'] == 'ubuntu_rgb_optical'
-        assert plugin._settings()['child_frame'] == '{segment_id}_base'
-        assert plugin._settings()['clock_id'] == 'ros'
-        assert plugin._settings()['child_from_cloud'] == [[0, 0, 1, 0], [-1, 0, 0, 0],
-                                                        [0, -1, 0, 0], [0, 0, 0, 1]]
+        assert 'robot' not in plugin._config
+        assert plugin._settings()['cloud_frame'] == 'sensor'
+        assert plugin._settings()['child_from_cloud'] == settings()['child_from_cloud']
+        assert call(plugin, 'config', child_from_cloud='invalid', robot='Bumi')['state'] == 'error'
+        assert call(plugin, 'config', robot='Tianyi')['state'] == 'configured'
+        assert plugin._settings()['child_from_cloud'] == settings()['child_from_cloud']
         ready(plugin)
     finally:
         plugin.shutdown()
 
-
-@pytest.mark.parametrize('robot', ['G1', 'Tianyi'])
-def test_g1_tianyi_deployment_presets_prepare_then_fail_clearly(card, robot):
-    plugin = module.PointCloudSlamPlugin({'robot': robot}, _FakeExecutor())
+def test_stale_robot_canvas_value_has_no_effect_on_geometry(card):
+    plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
     try:
-        assert plugin.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
-        result = call(plugin, 'start_mapping', map_name='Hall')
-        assert result['state'] == 'error'
-        assert robot in result['message'] and 'odom' in result['message']
-        assert plugin._node is None
-        # A stale canvas robot cannot switch the deployment preset.
-        assert call(plugin, 'config', robot='Bumi')['state'] == 'configured'
-        assert plugin._config['robot'] == robot
-        assert call(plugin, 'start_mapping', map_name='Hall')['state'] == 'error'
+        result = call(plugin, 'config', robot='其他')
+        assert result['state'] == 'configured'
+        assert 'robot' not in plugin._config
+        assert plugin._settings()['cloud_frame'] == 'sensor'
+        assert plugin._settings()['child_frame'] == '{segment_id}_base'
+        assert plugin._settings()['clock_id'] == 'ros'
+        assert plugin._settings()['child_from_cloud'] == settings()['child_from_cloud']
+        ready(plugin)
     finally:
         plugin.shutdown()
 
+@pytest.mark.parametrize('robot', ['G1', 'Tianyi'])
+def test_g1_tianyi_deployment_presets_prepare_then_fail_clearly(card, robot, monkeypatch):
+    plugin = module.PointCloudSlamPlugin({'robot': robot}, _FakeExecutor())
+    def no_live_inputs(*args, **kwargs):
+        raise ValueError('tracking odometry and capture-timed PointCloud2 unavailable')
+    monkeypatch.setattr(module, 'discover_runtime_geometry', no_live_inputs)
+    try:
+        assert plugin.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+        assert 'robot' not in plugin._config
+        result = call(plugin, 'start_mapping', map_name='Hall')
+        assert result['state'] == 'error'
+        assert 'tracking odometry' in result['message']
+        assert plugin._node is None
+        assert call(plugin, 'config', robot='Bumi')['state'] == 'configured'
+        assert 'robot' not in plugin._config
+    finally:
+        plugin.shutdown()
 
 def test_unknown_deployment_robot_is_rejected():
-    with pytest.raises(ValueError, match='robot'):
-        module.PointCloudSlamPlugin({'robot': 'unknown'}, _FakeExecutor())
-
+    # Deprecated robot model selectors are ignored rather than required.
+    plugin = module.PointCloudSlamPlugin({'robot': 'unknown'}, _FakeExecutor())
+    try:
+        assert 'robot' not in plugin._settings()
+        assert plugin.get_tools()[0]['topic_out'][0]['format'] == 'sensor/mapping'
+    finally:
+        plugin.shutdown()
 
 def test_stale_canvas_robot_cannot_move_a_ready_deployment_preset(card):
     plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
     try:
         ready(plugin)
         assert call(plugin, 'config', robot='G1')['state'] == 'configured'
-        assert plugin._config['robot'] == 'Bumi'
+        assert 'robot' not in plugin._config
+        assert plugin._settings()['cloud_frame'] == 'sensor'
         assert call(plugin, 'start_mapping', map_name='Hall')['state'] == 'running'
     finally:
         plugin.shutdown()
 
-
 def test_stale_canvas_robot_cannot_change_the_其他_deployment(card):
     result = call(card, 'config', robot='Bumi')
     assert result['state'] == 'configured'
-    assert result['config']['robot'] == '其他'
+    assert 'robot' not in result['config']
     assert result['config']['cloud_frame'] == 'sensor'
     assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
 
@@ -661,7 +649,7 @@ def test_retired_and_stale_canvas_config_keys_are_ignored_not_fatal(card):
                   preview_enabled=True, cloud_frame='old')
     assert result['state'] == 'configured'
     assert result['config'] == original
-    assert result['config']['robot'] == '其他'
+    assert 'robot' not in result['config']
     for key in ('input_policy', 'clock_relation_verified', 'extrinsic_calibrated', 'preview_enabled'):
         assert key not in card._config
 
@@ -679,7 +667,7 @@ def test_deployment_resource_overrides_survive_stale_canvas_robot(card):
         assert plugin._settings()['max_gap_ms'] == 123
         # A stale canvas robot is ignored; the deployment preset keeps the values.
         assert call(plugin, 'config', robot='Bumi')['state'] == 'configured'
-        assert plugin._config['robot'] == '其他'
+        assert 'robot' not in plugin._config
         assert plugin._settings()['max_gap_ms'] == 123
         assert plugin._settings()['voxel_size_m'] == .05
         assert plugin._settings()['preview_max_points'] == 20000
@@ -691,25 +679,30 @@ def test_missing_frames_and_extrinsic_fail_at_mapping_start_only(tmp_path, monke
     monkeypatch.setattr(module, '_ARCHIVE_DIR', str(tmp_path))
     monkeypatch.setattr(module, 'RtabmapNode', Session, raising=False)
     monkeypatch.setattr(module, 'require_runtime', lambda: None, raising=False)
+    def no_samples(*args, **kwargs):
+        raise ValueError('cloud_frame cannot be inferred without valid live data')
+    monkeypatch.setattr(module, 'discover_runtime_geometry', no_samples)
     card = module.PointCloudSlamPlugin({}, _FakeExecutor())
     try:
-        assert call(card, 'config', child_from_cloud=json.dumps([[1, 0, 0, 0], [0, 1, 0, 0],
-                                                                [0, 0, 1, 0], [0, 0, 0, 1]]))['state'] == 'configured'
+        assert call(card, 'config', child_from_cloud=json.dumps(settings()['child_from_cloud']))['state'] == 'configured'
         assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
         result = call(card, 'start_mapping', map_name='Hall')
         assert result['state'] == 'error' and 'cloud_frame' in result['message']
         assert card._node is None
     finally:
         card.shutdown()
-    framed = module.PointCloudSlamPlugin({'cloud_frame': 'sensor', 'child_frame': '{segment_id}_base',
-                                          'clock_id': 'ros'}, _FakeExecutor())
+    def no_mount(*args, **kwargs):
+        raise ValueError('child_from_cloud requires measured sensor mounting')
+    monkeypatch.setattr(module, 'discover_runtime_geometry', no_mount)
+    framed = module.PointCloudSlamPlugin(
+        {'cloud_frame': 'sensor', 'child_frame': '{segment_id}_base', 'clock_id': 'ros'},
+        _FakeExecutor())
     try:
         assert framed.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
         result = call(framed, 'start_mapping', map_name='Hall')
         assert result['state'] == 'error' and 'child_from_cloud' in result['message']
     finally:
         framed.shutdown()
-
 
 def test_input_metadata_route_still_prepares_and_starts(card):
     from test_pointcloud_slam_input import declarations
@@ -731,42 +724,35 @@ def test_input_metadata_route_still_prepares_and_starts(card):
 
 
 def test_bumi_deployment_preset_starts_in_legacy_core_mode_without_any_flags(card, monkeypatch):
+    # Old deployment robot names are ignored; explicit geometry stays valid.
     plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
     try:
         monkeypatch.setattr(module, 'discover_input_bindings', lambda topics:
                             {'/cloud': 'sensor/pointcloud2', '/pose': 'state/odom'})
-        result = call(plugin, 'start', input_topics=['/cloud', '/pose'], input_topic='/cloud')
-        assert result['state'] == 'ready'
+        assert call(plugin, 'start', input_topics=['/cloud', '/pose'])['state'] == 'ready'
         assert plugin._legacy_core is True
         assert call(plugin, 'info')['input_compatibility']['mode'] == 'legacy_core'
-        assert call(plugin, 'start_mapping', map_name='Legacy Bumi')['state'] == 'running'
-        session_settings = plugin._session_settings
-        assert session_settings['cloud_frame'] == 'ubuntu_rgb_optical'
-        assert session_settings['child_frame'] == '{segment_id}_base'
-        assert session_settings['clock_id'] == 'ros'
-        assert session_settings['child_from_cloud'] == [[0, 0, 1, 0], [-1, 0, 0, 0],
-                                                        [0, -1, 0, 0], [0, 0, 0, 1]]
-        for key in ('input_policy', 'clock_relation_verified', 'extrinsic_calibrated', 'input_validation'):
-            assert key not in session_settings
+        assert call(plugin, 'start_mapping', map_name='Legacy')['state'] == 'running'
+        session = plugin._session_settings
+        assert session['cloud_frame'] == 'sensor'
+        assert session['child_frame'] == '{segment_id}_base'
+        assert session['clock_id'] == 'ros'
+        assert session['child_from_cloud'] == settings()['child_from_cloud']
+        assert 'robot' not in session
     finally:
         plugin.shutdown()
-
 
 def test_deployment_bumi_preset_survives_stale_canvas_replay(card):
     plugin = module.PointCloudSlamPlugin({'robot': 'Bumi'}, _FakeExecutor())
     try:
         props = plugin.get_tools()[0]['configSchema']['properties']
         assert set(props) == {'child_from_cloud'}
-        # The resolved preset matrix is still injected for display.
-        assert json.loads(props['child_from_cloud']['default']) == [
-            [0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]
-        # An old saved row full of retired fields (and a stale canvas robot)
-        # replays harmlessly: the deployment preset stays active.
-        result = call(plugin, 'config', robot='G1', input_policy='experimental', max_frames=5,
-                      clock_relation_verified=False)
+        assert 'default' not in props['child_from_cloud']
+        result = call(plugin, 'config', robot='G1', input_policy='experimental',
+                      max_frames=5, clock_relation_verified=False)
         assert result['state'] == 'configured'
-        assert result['config']['robot'] == 'Bumi'
-        assert result['config']['cloud_frame'] == 'ubuntu_rgb_optical'
+        assert 'robot' not in result['config']
+        assert 'cloud_frame' not in result['config']
         assert 'input_policy' not in result['config']
     finally:
         plugin.shutdown()
@@ -808,3 +794,26 @@ def test_reselect_saved_map_is_idempotent_and_renames_without_ports(card):
     assert renamed['topic_out'] == selected['topic_out']
     assert view.outputs()[0]['metadata']['map_view']['name'] == 'Lobby'
     assert 'closed_topics' not in renamed
+
+
+def test_core_main_topics_can_resolve_generic_geometry_without_robot_name(card, monkeypatch):
+    from copy import deepcopy
+    inferred = {key: deepcopy(settings()[key]) for key in
+                ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')}
+    def discover(executor, odom_topic, cloud_topic, **kwargs):
+        assert (odom_topic, cloud_topic) == ('/pose', '/cloud')
+        assert kwargs['manual'] is None
+        return inferred, {'resolution': 'observed_ros_messages',
+                          'extrinsic_source': 'producer_calibrated'}
+    monkeypatch.setattr(module, 'discover_runtime_geometry', discover)
+    plugin = module.PointCloudSlamPlugin({'reserve_bytes': 0}, _FakeExecutor())
+    try:
+        assert plugin.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+        result = call(plugin, 'start_mapping', map_name='Generic')
+        assert result['state'] == 'running'
+        assert plugin._session_settings['cloud_frame'] == 'sensor'
+        assert plugin._session_settings['child_frame'] == '{segment_id}_base'
+        assert call(plugin, 'info')['input_provenance']['resolution'] == 'observed_ros_messages'
+        assert len(plugin.get_tools()[0]['topic_out']) == 1
+    finally:
+        plugin.shutdown()
