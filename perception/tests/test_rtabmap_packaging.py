@@ -23,12 +23,20 @@ def smoke():
     return module
 
 
+def native_params_from_command(command):
+    """Read the same ROS params file that the native process receives."""
+    assert command.count('--params-file') == 1
+    assert '-p' not in command  # RTAB-Map names with '/' cannot use CLI overrides.
+    path = Path(command[command.index('--params-file') + 1])
+    assert path.is_file()
+    return json.loads(path.read_text())['/**']['ros__parameters']
+
+
 def test_native_command_selects_external_odom_cloud_and_pcl_toro(tmp_path):
     command = smoke().native_command('/native/rtabmap', tmp_path / 'map.db', 'build_smoke',
         {'max_pending': 7, 'voxel_size_m': .12, 'max_working_nodes': 100, 'max_update_ms': 250})
     assert command[0] == '/native/rtabmap'
-    params = {value.split(':=', 1)[0]: json.loads(value.split(':=', 1)[1])
-              for flag, value in zip(command, command[1:]) if flag == '-p'}
+    params = native_params_from_command(command)
     remaps = {value for flag, value in zip(command, command[1:]) if flag == '-r'}
     assert {'__ns:=/build_smoke', 'odom:=odom', 'scan_cloud:=cloud'} <= remaps
     assert params['database_path'] == str(tmp_path / 'map.db')
@@ -49,8 +57,7 @@ def test_smoke_forwards_shared_production_parameters_without_overrides(tmp_path,
                 'Icp/Iterations': '3', 'frame_id': 'production-frame'}
     monkeypatch.setattr(module, 'mapping_parameters', lambda *args: expected, raising=False)
     command = module.native_command('/native/rtabmap', tmp_path / 'native.db', '/smoke', {})
-    params = {value.split(':=', 1)[0]: json.loads(value.split(':=', 1)[1])
-              for flag, value in zip(command, command[1:]) if flag == '-p'}
+    params = native_params_from_command(command)
     assert params == expected
 
 
@@ -109,18 +116,42 @@ def test_mapping_summary_rejects_empty_corrupt_or_nonfinite_packets(packet):
         smoke().mapping_packet_summary(packet)
 
 
-def test_gateway_waits_for_pose_matching_the_selected_packet_and_native_frame():
-    module = smoke()
-    packet = struct.pack('<fffBIffffff', 2., 0., 0., 3, 2, 1., 2., 0., 3., 4., 1.5)
-    previous = {'frame_id': 'native/map', 'stamp_ns': '1000000000', 'pose':
-        [[1, 0, 0, 1], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}
-    current = {'frame_id': 'native/map', 'stamp_ns': '2000000000', 'pose':
-        [[1, 0, 0, 2], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}
-    assert module.matching_mapping_pose(packet, [previous], 'native/map') is None
-    match = module.matching_mapping_pose(packet, [previous, current], 'native/map')
-    assert match['stamp_ns'] == '2000000000'
-    assert module.matching_mapping_pose(packet, [current], 'another/map') is None
+def test_gateway_snapshot_waits_for_matching_native_stamp_and_frame():
+    """Exercise the production snapshot gate rather than a deleted smoke helper."""
+    from threading import RLock
 
+    import numpy as np
+    from plugins.pointcloud_slam_ros import RtabmapNode
+
+    pose = np.eye(4)
+    pose[0, 3] = 2.
+    points = np.array([[1., 2., 0.], [3., 4., 1.5]])
+    segment = {'graph': (2_000_000_000, 'native/map', pose),
+               'cloud': (1_000_000_000, 'native/map', points),
+               'snapshot': None, 'frame_id': '', 'last_preview': 0.}
+    packets = []
+    gateway = NS(_result_lock=RLock(),
+                 _settings={'preview_max_points': 10, 'preview_interval_s': .1},
+                 _active=segment, _closed=False,
+                 _map_pub=NS(publish=lambda msg: packets.append(bytes(msg.data))))
+
+    # A stale cloud cannot be paired with the newer native optimized pose.
+    RtabmapNode._publish_snapshot(gateway, segment)
+    assert segment['snapshot'] is None and not packets
+
+    # Equal capture stamps are insufficient if the native map frames differ.
+    segment['cloud'] = (2_000_000_000, 'other/map', points)
+    RtabmapNode._publish_snapshot(gateway, segment)
+    assert segment['snapshot'] is None and not packets
+
+    # The matching pair emits the actual optimized graph pose into the packet.
+    segment['cloud'] = (2_000_000_000, 'native/map', points)
+    RtabmapNode._publish_snapshot(gateway, segment)
+    assert len(packets) == 1
+    assert segment['frame_id'] == 'native/map'
+    assert segment['snapshot'] == packets[0]
+    assert smoke().mapping_packet_summary(packets[0]) == {
+        'pose': (2., 0., 0.), 'point_count': 2, 'z_range_m': (0., 1.5)}
 
 def test_synthetic_cloud_is_three_dimensional_and_tracks_known_external_motion():
     module = smoke()
