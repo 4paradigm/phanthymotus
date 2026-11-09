@@ -822,11 +822,12 @@ EXPOSE 15721
 # while jp6.1's base sets 3.10. A base that started setting it, or set it
 # differently, would drop this .pth into a directory nothing imports from — and
 # the failure would surface at runtime as a missing rclpy, not at build time.
+# Source-built ROS packages can use either site-packages or dist-packages.
+# Collect both layouts for every workspace, with the RTAB-Map overlay first.
 RUN . /etc/jetpack.env; \
     PTH="/usr/local/lib/python${PY_ABI}/dist-packages/ros_ws.pth"; \
-    find /opt/rtabmap_ros -type d \( -name "site-packages" -o -name "dist-packages" \) > "${PTH}" && \
-    find /ros_ws/install -name "site-packages" -type d >> "${PTH}" && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> "${PTH}" && \
+    find /opt/rtabmap_ros /ros_ws/install /opt/ros/humble/install \
+      -type d \( -name "site-packages" -o -name "dist-packages" \) > "${PTH}" && \
     echo "[build] ${PTH}:" && cat "${PTH}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
