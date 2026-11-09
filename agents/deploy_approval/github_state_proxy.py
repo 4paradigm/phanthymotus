@@ -699,7 +699,9 @@ def _validate_hidden_state(data: dict) -> dict:
             val = attempt.get(key, "")
             if not isinstance(val, str) or not val:
                 raise MalformedHiddenStateError(f"approve_attempt.{key} must be a non-empty string")
-        if attempt.get("outcome") not in {"blocked_occupied", "approval_revoked", "deployed", "failed", "uncertain"}:
+        if attempt.get("outcome") not in {
+                "blocked_occupied", "approval_revoked", "preflight_unavailable",
+                "deployed", "failed", "uncertain"}:
             raise MalformedHiddenStateError("approve_attempt.outcome invalid")
         preflight = attempt.get("preflight", [])
         health = attempt.get("health", [])
