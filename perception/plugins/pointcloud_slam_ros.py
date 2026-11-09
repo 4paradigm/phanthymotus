@@ -19,6 +19,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 
 from .pointcloud_slam_rtabmap import RtabmapProcess
+from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 
@@ -536,8 +537,15 @@ class RtabmapNode(Node):
         if not self._closed:
             raise RuntimeError('Close RTAB-Map before reading finalized map artifacts')
         with self._result_lock:
-            segments = [{'segment_id': segment['segment_id'], 'frame_id': segment['frame_id'],
-                'database': str(segment['process'].database_path), 'snapshot': segment['snapshot']}
-                for segment in self._segments if segment['forwarded'] and
-                    getattr(segment['process'], 'mapped_nodes', None) != 0]
+            pending = [(segment['segment_id'], segment['frame_id'],
+                        segment['process'].database_path, segment['snapshot'])
+                       for segment in self._segments if segment['forwarded'] and
+                       getattr(segment['process'], 'mapped_nodes', None) != 0]
+        segments = []
+        for segment_id, frame_id, database, snapshot in pending:
+            if snapshot is not None:
+                snapshot = rebuild_snapshot(database, max_points=self._settings['preview_max_points'],
+                                            fallback=snapshot)
+            segments.append({'segment_id': segment_id, 'frame_id': frame_id,
+                             'database': str(database), 'snapshot': snapshot})
         return {'segments': segments, 'statistics': self.status()}
