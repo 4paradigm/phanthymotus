@@ -236,20 +236,27 @@ def update_runtime_image_checks(
     return "\n\n".join(part for part in (prefix, block, suffix) if part)
 
 
-def _build_table(builds: list[BuildInfo]) -> str:
+def _build_table(builds: list[BuildInfo], components: list[dict] | None = None) -> str:
     """Render the build results table for deploy-ready comment."""
+    image_refs = {
+        (item.get("target", ""), item.get("driver_path", ""), item.get("variant", "")):
+            item.get("image_ref", "")
+        for item in components or [] if isinstance(item, dict)
+    }
     lines = [
-        "| target | variant/path | build | deploy approval |",
-        "|--------|--------------|-------|-----------------|",
+        "| target | variant/path | image | build | deploy approval |",
+        "|--------|--------------|-------|-------|-----------------|",
     ]
     for b in builds:
         variant = _escape(b.variant or b.driver_path or chr(0x2014))
+        image_ref = image_refs.get((b.target, b.driver_path, b.variant)) or b.image_tag
         build_status = "success" if b.success else "failed"
         eligibility = "deployable" if b.success and b.deployable else "unsupported"
         if not b.success:
             eligibility = "not deployable"
         lines.append(
-            f"| {_escape(b.target)} | {variant} | {build_status} | {eligibility} |"
+            f"| {_escape(b.target)} | {variant} | `{_escape(image_ref)}` | "
+            f"{build_status} | {eligibility} |"
         )
     return "\n".join(lines)
 
@@ -374,21 +381,21 @@ def _workflow_lines(
     deployments_complete: bool | None = None,
     record_test_complete: bool = False,
 ) -> str:
-    """Keep the workflow to one sentence about the current stage."""
+    """Keep the progress note short and separate from the next action."""
     if status == "review-required":
-        return "等待开发者发起代码审查。"
+        return "当前 HEAD 尚无可信代码审查结果。"
     if status == "reviewing":
-        return "代码审查进行中。"
+        return "Review Agent 正在检查当前 HEAD。"
     if status == "deploy-ready":
-        return "构建审核已完成，可以部署。"
+        return "当前 HEAD 的构建和审核已通过。"
     if status == "deploy-requested":
-        return "已申请部署，正在等待机器负责人审批。"
+        return "本轮部署申请已收到。"
     if status == "deploying":
-        return "正在部署，请等待结果。"
+        return "部署命令已提交，结果正在确认。"
     if status == "testing":
-        return "部署完成，现在可以测试。"
+        return "本轮部署已完成，可开始测试。"
     if status == "succeeded":
-        return "本轮部署已验收通过。"
+        return "本轮验收已通过。"
     if status == "failed":
         return "本轮流程失败，请查看具体部署或验收记录。"
     return "等待更新。"
@@ -424,7 +431,7 @@ def _testing_next_action(
     evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
     lines = []
     if evidence_complete:
-        lines.append("测试证据已上传。如需补充视频或图片，可继续上传：")
+        lines.append("测试证据已上传。如需补充视频或图片：")
         if evidence_url:
             lines.append(f"[继续上传测试视频/图片](<{evidence_url}>)")
         else:
@@ -433,7 +440,7 @@ def _testing_next_action(
                 "若入口暂不可用，请查看下方附件区的状态说明。",
             ])
     else:
-        lines.extend(["部署完成，现在可以测试。测试视频或图片请上传到当前轮附件页：", ""])
+        lines.extend(["请上传本轮测试视频或图片：", ""])
         if evidence_url:
             lines.append(f"[上传测试视频/图片](<{evidence_url}>)")
         else:
@@ -517,9 +524,7 @@ def reviewing(
         "",
         "### Next action",
         "",
-        "**Waiting for Review Agent**",
-        "",
-        "No action required.",
+        "等待 Review Agent 返回当前 HEAD 的审查与构建结果。",
     ])
 
 
@@ -582,7 +587,7 @@ def deploy_ready(
         "",
         "### Next action",
         "",
-        "构建审核已完成，可以部署。请使用对应机器的完整命令：",
+        "机器负责人请按下方适配机器的真实 IP 命令审批：",
         "",
         *(commands or ["当前没有可用机器 IP，暂时无法生成直接部署命令。"]),
     ]
@@ -613,7 +618,7 @@ def deploy_ready(
         "",
         "### Components",
         "",
-        _build_table(builds),
+        _build_table(builds, components),
     ])
     return _lifecycle_body(lines)
 
@@ -736,7 +741,7 @@ def deploy_requested(
         "### Next action",
         "",
         ("正在部署，请等待结果。" if display_status == "deploying"
-         else "正在等待机器负责人审批。请对应机器负责人执行下方本机的真实 IP 命令："),
+         else "等待机器负责人按下方对应机器的真实 IP 命令审批："),
         "",
         *([] if display_status == "deploying" else
           [f"- `{_escape(alias)}`（`{_escape(ip)}`）：`{command}`"
@@ -817,7 +822,7 @@ def testing(
         "",
         "### Workflow",
         "",
-        ("测试完成，正在等待验收人确认。" if acceptance_pending else
+        ("已收到本轮验收申请。" if acceptance_pending else
          _workflow_lines("testing", evidence_complete=evidence_complete,
                          deployments_complete=deployments_complete,
                          record_test_complete=record_test_complete)),
@@ -865,7 +870,7 @@ def succeeded_comment(
         "",
         "### Next action",
         "",
-        "**None. Deployment lifecycle is complete.**",
+        "无需进一步操作。",
         "",
     ]
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
@@ -896,9 +901,7 @@ def failed_comment(
         "",
         "### Next action",
         "",
-        "**None. Deployment lifecycle has failed.**",
-        "",
-        "The deployment is not accepted.",
+        "请查看下方失败原因和部署记录。",
     ]
     if error:
         lines.append(f"**Error:** {_escape(error)}")

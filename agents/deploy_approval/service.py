@@ -2264,26 +2264,78 @@ class DeployController:
         if comment_id <= state.get("last_processed_comment_id", 0):
             return state, state, False, False, True
         if not machine_selector:
-            commands = self._runtime_drift_command_lines(state)
-            current_checks = [check for check in state.get("runtime_checks", [])
-                              if isinstance(check, dict)]
-            current_statuses = {check.get("status") for check in current_checks}
-            if current_statuses and current_statuses <= {"match"}:
-                message = "运行镜像已与审批目标一致，无需重新部署；ZERO deploy POST。"
-                topic = "runtime-redeploy-no-machine-already-matches"
-            elif current_statuses.intersection({"unavailable", "identity_changed"}):
-                message = "无法确认机器状态或当前策略绑定。请检查机器连接和本仓库策略，等待下次只读检查；ZERO deploy POST。"
-                topic = "runtime-redeploy-no-machine-unavailable"
-            else:
-                message = "镜像漂移重新审批需要机器真实 IP。请直接执行以下命令；`/request_deploy` 不是前提：\n" + (
-                    "\n".join(f"`{line}`" for line in commands)
-                    if commands else "当前没有已确认漂移的机器，不能重新部署。"
+            drift_checks = self._confirmed_runtime_drift(state)
+            drift_component_ids = {
+                check.get("component_id") for check in drift_checks
+                if isinstance(check.get("component_id"), str)
+            }
+            component_map = {
+                component.get("component_id"): component
+                for component in state.get("components", [])
+                if isinstance(component, dict)
+            }
+            drift_components = [component_map[component_id]
+                                for component_id in drift_component_ids
+                                if component_id in component_map]
+            try:
+                policy_status = self.policy.repo_policy_status(repo)
+                if (not isinstance(policy_status, dict)
+                        or policy_status.get("machines_configured") is not True):
+                    await self._post_command_reply(
+                        repo, pr_number, comment_id,
+                        f"当前仓库 `{repo}` 没有已验证的机器策略，无法重新审批。请管理员检查该仓库 main 上的机器配置；当前不会发送部署请求。",
+                        topic="runtime-redeploy-policy-unconfigured",
+                    )
+                    return state, state, False, False, True
+                groups = self._get_machine_groups_for_components(
+                    drift_components, repo,
+                ) if drift_components else []
+            except Exception as exc:
+                logger.warning("runtime redeploy machine selection unavailable repo=%s reason=%s",
+                               repo, type(exc).__name__)
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "当前仓库机器策略无法验证，不能安全选择重新部署机器。请检查本仓库策略后，使用 Summary 中显示的完整 IP 命令；ZERO deploy POST。",
+                    topic="runtime-redeploy-machine-selection-unavailable",
                 )
-                topic = "runtime-redeploy-requires-machine-ip"
-            await self._post_command_reply(
-                repo, pr_number, comment_id, message, topic=topic,
-            )
-            return state, state, False, False, True
+                return state, state, False, False, True
+            drift_machine_bindings = {
+                (check.get("machine"), check.get("ip")) for check in drift_checks
+            }
+            full_groups = [
+                group for group in groups
+                if (group.get("alias"), group.get("ip")) in drift_machine_bindings
+                and drift_component_ids
+                and drift_component_ids.issubset(set(group.get("component_ids", [])))
+            ]
+            if len(full_groups) == 1:
+                machine_selector = str(full_groups[0].get("ip", "") or "")
+            else:
+                commands = self._runtime_drift_command_lines(state)
+                if len(full_groups) > 1:
+                    message = (
+                        "多台机器完整适配已确认漂移的组件，必须明确指定机器真实 IP：\n"
+                        + ("\n".join(f"`{line}`" for line in commands)
+                           if commands else "当前没有可用的完整 IP 命令。")
+                    )
+                    topic = "runtime-redeploy-multiple-compatible-machines"
+                elif commands:
+                    message = (
+                        "漂移组件没有唯一的完整适配机器，请明确指定机器真实 IP。"
+                        "只有一台机器完整适配时才可省略 machine 参数：\n"
+                        + "\n".join(f"`{line}`" for line in commands)
+                    )
+                    topic = "runtime-redeploy-requires-machine-ip"
+                else:
+                    message = (
+                        "当前没有已确认的镜像漂移机器。请等待下一次只读检查；"
+                        "确认漂移后按 Summary 中的完整 IP 命令审批。ZERO deploy POST。"
+                    )
+                    topic = "runtime-redeploy-no-confirmed-machine"
+                await self._post_command_reply(
+                    repo, pr_number, comment_id, message, topic=topic,
+                )
+                return state, state, False, False, True
         try:
             policy_status = self.policy.repo_policy_status(repo)
             if (not isinstance(policy_status, dict)
@@ -2350,26 +2402,6 @@ class DeployController:
                 topic="runtime-redeploy-wrong-machine",
             )
             return state, state, False, False, True
-        if not drift_for_machine and not allowed_ids:
-            current_machine_checks = [check for check in state.get("runtime_checks", [])
-                                      if isinstance(check, dict)
-                                      and check.get("machine") == machine.alias
-                                      and check.get("ip") == machine_ip]
-            statuses = {check.get("status") for check in current_machine_checks}
-            if statuses and statuses <= {"match"}:
-                message = "重新检查确认运行镜像已与审批目标一致，无需重新部署；ZERO deploy POST。"
-                topic = "runtime-redeploy-machine-already-matches"
-            elif statuses.intersection({"unavailable", "identity_changed"}):
-                message = "无法确认该机器当前运行状态或绑定。请检查机器连接及本仓库策略，等待下次只读检查；ZERO deploy POST。"
-                topic = "runtime-redeploy-machine-unavailable"
-            else:
-                message = "该机器没有已确认的镜像漂移记录。请使用 Lifecycle Summary 中对应机器的 IP 命令；不会发送部署 POST。"
-                topic = "runtime-redeploy-no-confirmed-drift"
-            await self._post_command_reply(
-                repo, pr_number, comment_id, message, topic=topic,
-            )
-            return state, state, False, False, True
-
         await self._reconcile_runtime_image_checks(
             repo, pr_number, state, pr_data, force=True,
             machine_filter=(machine.alias, machine_ip),
@@ -9635,7 +9667,7 @@ class DeployController:
                 new_state.get("components", []),
                 lifecycle_status=new_state.get("status", ""),
             )
-            transitions: dict[tuple[str, str], list[dict]] = {}
+            transitions: dict[tuple[str, str, str, str], list[tuple[dict, str]]] = {}
             history_events = []
             for key, check in selected_results.items():
                 old = old_by_key.get(key)
@@ -9645,13 +9677,21 @@ class DeployController:
                         and old_status not in {"mismatch", "not_running"}
                         or status_value == "match"
                         and old_status in {"mismatch", "not_running"}):
+                    previous_status = (
+                        old_status if isinstance(old_status, str) and old_status
+                        else "unobserved"
+                    )
+                    previous_checked_at = (
+                        old.get("checked_at", "") if isinstance(old, dict) else ""
+                    )
                     transitions.setdefault(
-                        (check["machine"], status_value), [],
-                    ).append(check)
+                        (check["machine"], check["ip"], previous_status, status_value), [],
+                    ).append((check, previous_checked_at))
                     history_events.append({
                         "event": "Runtime image status changed",
                         "machine": check["machine"], "ip": check["ip"],
                         "component": check["component_id"],
+                        "previous_result": previous_status,
                         "result": status_value,
                         "timestamp": comments_mod.beijing_now_str(),
                     })
@@ -9664,13 +9704,13 @@ class DeployController:
                 return state
             round_id = round_id_for_state(new_state)
             anchor_comment_id = int(round_id.rsplit("-", 1)[1])
-            for (machine_alias, status_value), checks in transitions.items():
+            for (machine_alias, ip_value, previous_status, status_value), items in transitions.items():
+                checks = [check for check, _ in items]
                 details = "\n".join(
                     f"- `{check['component_id']}`: target `{check['target_image']}`, "
                     f"observed `{check.get('observed_image') or 'unavailable'}`"
                     for check in checks
                 )
-                ip_value = checks[0]["ip"]
                 if status_value == "match":
                     message = (
                         f"机器 `{machine_alias}`（`{ip_value}`）现在运行的镜像已与审批目标一致：\n"
@@ -9687,7 +9727,18 @@ class DeployController:
                         f"{details}\n请机器负责人执行 `/approve_deploy machine={ip_value}`。"
                         "审批前会再次只读确认当前镜像；若已一致或无法连接，不会发送部署请求。"
                     )
-                topic = f"runtime-image:{machine_alias}:{status_value}"
+                transition_identity = repr(sorted(
+                    (check.get("component_id", ""), previous_checked_at,
+                     check.get("checked_at", ""))
+                    for check, previous_checked_at in items
+                ))
+                transition_fingerprint = hashlib.sha256(
+                    transition_identity.encode("utf-8"),
+                ).hexdigest()[:20]
+                topic = (
+                    f"runtime-image:{machine_alias}:{ip_value}:"
+                    f"{previous_status}-to-{status_value}:{transition_fingerprint}"
+                )
                 try:
                     await self._post_bound_notice(
                         repo, pr_number, head_sha=new_state["head_sha"],

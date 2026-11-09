@@ -1364,6 +1364,53 @@ class GitHubCommandWatcher:
         return (isinstance(processed_at, (int, float))
                 and self._monotonic() - processed_at < PR_RECONCILE_CACHE_SECONDS)
 
+    def _terminal_runtime_scan_due(
+        self, repo: str, pr_number: int, pr: dict, status_labels: set[str],
+    ) -> bool:
+        """Schedule terminal open PRs until hidden state confirms deployment presence."""
+        terminal_labels = status_labels.intersection({
+            "status: succeeded", "status: failed",
+        })
+        if not terminal_labels:
+            return False
+
+        expected_label = next(iter(terminal_labels)) if len(terminal_labels) == 1 else None
+        expected_status = (
+            expected_label.removeprefix("status: ").strip()
+            if expected_label is not None else None
+        )
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        cached = self._pr_reconcile_cache.get((repo, pr_number))
+        cache_matches_pr = (
+            isinstance(cached, dict)
+            and cached.get("updated_at") == pr.get("updated_at")
+            and cached.get("head_sha") == head_sha
+        )
+        if not cache_matches_pr:
+            return True
+
+        cached_status = cached.get("status")
+        if (expected_status is not None
+                and cached_status in {"succeeded", "failed"}
+                and cached_status != expected_status):
+            return True
+        has_deployed_components = cached.get("has_deployed_components")
+        if has_deployed_components is True:
+            return True
+        if (has_deployed_components is False
+                and expected_label is not None
+                and cached_status == expected_status
+                and cached.get("projected_label") == expected_label):
+            return False
+
+        # Unknown or unreadable hidden state is retried with the existing
+        # bounded PR reconcile interval instead of occupying a slot each cycle.
+        processed_at = cached.get("processed_at")
+        if not isinstance(processed_at, (int, float)):
+            return True
+        return self._monotonic() - processed_at >= PR_RECONCILE_CACHE_SECONDS
+
     async def _remember_pr_schedule(self, repo: str, pr_number: int, pr: dict) -> None:
         updated_at = pr.get("updated_at")
         head = pr.get("head")
@@ -1382,14 +1429,14 @@ class GitHubCommandWatcher:
         args = command.get("args") if isinstance(command, dict) else None
         pending_ids = args.get("pending_component_ids") if isinstance(args, dict) else None
         deployments = state.get("deployments", []) if isinstance(state, dict) else []
+        same_head = isinstance(state, dict) and state.get("head_sha") == head_sha
         has_deployed_components = (
             isinstance(deployments, list)
             and any(isinstance(item, dict) and item.get("phase") == "deployed"
                     and isinstance(item.get("component_ids"), list)
                     and bool(item.get("component_ids")) for item in deployments)
-        )
+        ) if same_head and isinstance(deployments, list) else None
         projected_label = None
-        same_head = isinstance(state, dict) and state.get("head_sha") == head_sha
         if same_head:
             status = state.get("status")
             if isinstance(status, str):
@@ -1903,11 +1950,8 @@ class GitHubCommandWatcher:
                         continue
                     self._draft_label_retry_after.pop((repo, number), None)
                     self._draft_label_attempts.pop((repo, number), None)
-                    cached_schedule = self._pr_reconcile_cache.get((repo, number), {})
-                    terminal_runtime_due = (
-                        bool(status_labels.intersection({"status: succeeded", "status: failed"}))
-                        and isinstance(cached_schedule, dict)
-                        and cached_schedule.get("has_deployed_components") is True
+                    terminal_runtime_due = self._terminal_runtime_scan_due(
+                        repo, number, pr, status_labels,
                     )
                     if (not status_labels
                             or status_labels.intersection(ACTIVE_PROJECTION_STATUS_LABELS)
