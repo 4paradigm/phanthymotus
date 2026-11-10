@@ -19,7 +19,7 @@ def contract(*, dynamic=False, independent=False):
         metadata['/o']['source_id'] = 'pose_device'
         for port in metadata.values():
             port['clock'] = dict(mapping='verified_relation', verified=True, relation_id='sync/1')
-    return resolve_inputs(metadata, BINDINGS, experimental=True)
+    return resolve_inputs(metadata, BINDINGS)
 
 
 def tf_packet(ms=1000, x=0):
@@ -128,7 +128,7 @@ def test_independent_declarations_require_both_verified_relation_proofs(port):
         value['clock'] = dict(mapping='sync', verified=True, relation_id='sync/1')
     metadata[port]['clock']['verified'] = False
     with pytest.raises(ValueError, match='relation|verified'):
-        resolve_inputs(metadata, BINDINGS, experimental=True)
+        resolve_inputs(metadata, BINDINGS)
 
 
 def test_cloud_restart_requires_new_pose_segment_and_recovers_lower_stamps():
