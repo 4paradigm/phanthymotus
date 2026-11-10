@@ -131,6 +131,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"visual_depth\", \"type\": \"processor\"},
                     {\"name\": \"ocr\", \"type\": \"processor\"},
                     {\"name\": \"face_recognition\", \"type\": \"processor\"},
+                    {\"name\": \"privacy_view\", \"type\": \"processor\"},
                     {\"name\": \"soundevent\", \"type\": \"processor\"},
                     {\"name\": \"barcode\", \"type\": \"actuator\"},
                     {\"name\": \"phanthy_music\", \"type\": \"actuator\"},

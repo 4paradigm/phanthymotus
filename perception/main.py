@@ -270,6 +270,14 @@ class PerceptionBundle:
             from plugins.soundevent import SoundEventPlugin
             self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
             log.info("SoundEventPlugin loaded")
+        if plugins_cfg.get("privacy_view", {}).get("enabled", False):
+            from plugins.privacy_view import PrivacyViewPlugin
+            try:
+                self._plugins.append(PrivacyViewPlugin(plugins_cfg["privacy_view"], executor))
+                log.info("PrivacyViewPlugin loaded")
+            except Exception:
+                log.error("PrivacyViewPlugin failed to load; continuing without it", exc_info=True)
+
         if plugins_cfg.get("face_recognition", {}).get("enabled", False):
             from plugins.face import FaceRecognitionPlugin
             # Guarded like TTSPlugin: this plugin needs the standalone
