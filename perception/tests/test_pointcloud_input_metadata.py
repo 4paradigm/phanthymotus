@@ -34,6 +34,16 @@ def _camera(topic='/depth'):
                        'timestamp_semantics': 'source_capture_mapped'}}
 
 
+def test_input_metadata_is_not_a_manual_pointcloud_card_parameter():
+    # Canvas forwards upstream declarations internally; users should not see
+    # or edit the input_metadata field in the pointcloud card form.
+    tool = PointCloudPerceptionPlugin({'metric_cloud': True}, 'testns', _FakeExecutor()).get_tools()[0]
+    schema = tool['inputSchema']
+    assert 'input_metadata' not in schema['properties']
+    assert all('input_metadata' not in item['params']
+               for item in schema['x-action-params'].values())
+
+
 def test_metric_rejects_conflicting_camera_and_input_transport_declarations():
     executor = _FakeExecutor()
     plugin = PointCloudPerceptionPlugin({'metric_cloud': True}, 'testns', executor)
