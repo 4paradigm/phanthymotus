@@ -73,6 +73,31 @@ def _escape(text: str) -> str:
     return value
 
 
+def _safe_display_text(value) -> str:
+    text = str(value if value is not None else "")
+    try:
+        from .evidence_builder import _redact_secrets
+
+        text = _redact_secrets(text)
+    except ImportError:
+        pass
+    text = re.sub(
+        r"(?i)\b(?:[\w.-]*token|[\w.-]*password|[\w.-]*secret|capability|authorization)\b\s*[:=]\s*[^\s,;&]+",
+        "[凭据已隐藏]", text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:token|password|secret|capability)\s+[A-Za-z0-9._~+/=-]{8,}",
+        "[凭据已隐藏]", text,
+    )
+    text = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer [凭据已隐藏]", text,
+    )
+    text = re.sub(
+        r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[凭据已隐藏]@", text,
+    )
+    return text
+
+
 def _lifecycle_body(lines: list[str]) -> str:
     # The service owns the visible event block; this sentinel does not create a
     # second visible-history block when that writer preserves existing events.
@@ -102,17 +127,19 @@ def _deployment_table(deployments=None, components=None, machine_groups=None) ->
         machine = dep.get("machine", dep.get("alias", "?"))
         ip = dep.get("ip") or machines.get(machine) or "—"
         phase = dep.get("phase") or dep.get("result") or dep.get("status") or "unknown"
-        result = str(phase)
+        result = _safe_display_text(phase)
         if dep.get("error"):
-            result += ": " + str(dep["error"])
+            result += ": " + _safe_display_text(dep["error"])
         if dep.get("updated_at") or dep.get("timestamp"):
             result += " · " + str(dep.get("updated_at") or dep.get("timestamp"))
         ids = dep.get("component_ids") or ([dep["component_id"]] if dep.get("component_id") else snapshot_ids or ["unknown"])
         for cid in ids:
             c = local.get(cid, dep if dep.get("component_id") == cid else {})
-            values = (machine, ip, c.get("target") or cid,
-                      c.get("variant") or c.get("driver_path") or "—",
-                      c.get("image_ref") or dep.get("image_ref") or "—", result)
+            values = tuple(_safe_display_text(value) for value in (
+                machine, ip, c.get("target") or cid,
+                c.get("variant") or c.get("driver_path") or "—",
+                c.get("image_ref") or dep.get("image_ref") or "—", result,
+            ))
             lines.append("| " + " | ".join(_escape(v) for v in values) + " |")
             count += 1
     if count:
@@ -135,6 +162,8 @@ def _runtime_component_label(component: dict) -> str:
 
 def runtime_image_checks_block(
     runtime_checks, components, *, lifecycle_status: str = "",
+    machine_groups=None, machine_inventory=None, machine_diagnostics=None,
+    machine_context=None, test_only: bool | None = None,
 ) -> str:
     """Render bounded, verified runtime image observations for the Lifecycle Summary."""
     if not isinstance(runtime_checks, list) or not runtime_checks:
@@ -144,46 +173,155 @@ def runtime_image_checks_block(
         if isinstance(item, dict) and isinstance(item.get("component_id"), str)
     }
     rows = []
+    context = machine_context if isinstance(machine_context, dict) else {}
+    groups = _record_rows(machine_groups)
+    inventory = _machine_inventory_records(machine_inventory)
+    diagnostics = _machine_diagnostic_rows(machine_diagnostics)
+    group_by_alias = {_machine_alias(row).casefold(): row for row in groups
+                      if _machine_alias(row)}
+    inventory_by_alias = {_machine_alias(row).casefold(): row for row in inventory
+                          if _machine_alias(row)}
+    diagnostic_by_alias = {_machine_alias(row).casefold(): row for row in diagnostics
+                           if _machine_alias(row)}
+    physical_ip_counts = {}
+    physical_alias_counts = {}
+    for row in inventory:
+        primary_ip = _canonical_ip(_machine_ip(row))
+        alias = _machine_alias(row).casefold()
+        if primary_ip:
+            physical_ip_counts[primary_ip] = physical_ip_counts.get(primary_ip, 0) + 1
+        if alias:
+            physical_alias_counts[alias] = physical_alias_counts.get(alias, 0) + 1
+    policy_aliases_by_ip = {}
+    for row in groups:
+        alias = _machine_alias(row)
+        node_host = _canonical_ip(_record_value(row, "node_host"))
+        if alias and node_host:
+            policy_aliases_by_ip.setdefault(node_host, set()).add(alias.casefold())
     status_text = {
-        "match": "运行镜像与审批镜像一致",
-        "mismatch": "运行镜像不是当前审批版本，需要重新部署",
-        "not_running": "机器组件当前未运行，需要重新确认",
-        "unavailable": "无法确认机器状态",
-        "identity_changed": "无法确认机器状态（机器绑定已变化）",
+        "match": "MATCH：运行镜像与审批目标一致",
+        "mismatch": "MISMATCH：运行镜像与当前审批目标不一致",
+        "not_running": "UNAVAILABLE：组件当前未运行，无法比较镜像",
+        "unavailable": "UNAVAILABLE：机器连接或状态不可用",
+        "identity_changed": "IDENTITY_CHANGED：机器身份绑定已变化，等待重新确认",
     }
     for check in runtime_checks:
         if not isinstance(check, dict):
             continue
         component = component_map.get(check.get("component_id"), {})
         machine = str(check.get("machine", "") or "")
-        ip_value = str(check.get("ip", "") or "")
-        target_image = str(check.get("target_image", "") or "")
-        observed_image = str(check.get("observed_image", "") or "")
-        if component.get("target") == "core" and observed_image:
-            observed_image = f"current_tag: {observed_image}"
-        checked_at = str(check.get("checked_at", "") or "")
-        status = check.get("status", "unavailable")
+        key = machine.casefold()
+        group = group_by_alias.get(key, {})
+        physical = inventory_by_alias.get(key, {})
+        diagnostic = diagnostic_by_alias.get(key, {})
+        supplied_context = context.get(key, {})
+        if not isinstance(supplied_context, dict):
+            supplied_context = {}
+        ip_value = (
+            _canonical_ip(_record_value(check, "primary_ip"))
+            or _canonical_ip(_record_value(check, "main_ip"))
+            or _canonical_ip(_machine_ip(physical))
+            or _canonical_ip(_record_value(supplied_context, "primary_ip"))
+            or _canonical_ip(_record_value(supplied_context, "main_ip"))
+            or _canonical_ip(_record_value(check, "ip"))
+            or "未记录"
+        )
+        owners = _owner_names(check, diagnostic, physical, group)
+        owner = _owner_label(
+            owners, test_only=test_only is True, mention=test_only is False,
+        )
+        # An explicit empty value means the current controller has revoked the
+        # selector. Only use a live machine group when the check omitted it;
+        # never revive a command parsed from Lifecycle Markdown history.
+        raw_selector = (
+            check.get("command_selector") if "command_selector" in check
+            else _record_value(group, "command_selector", default="")
+        )
+        command_selector = str(raw_selector or "").strip()
+        selected_ip = _canonical_ip(command_selector)
+        selected_as_alias = bool(
+            command_selector == machine and machine
+            and not _canonical_ip(command_selector)
+        )
+        identity_values = [value for value in (
+            _field_flag(record, "identity_confirmed", "machine_identity_confirmed")
+            for record in (check, diagnostic, group)
+        ) if value is not None]
+        identity_confirmed = (
+            False if False in identity_values else
+            True if True in identity_values else None
+        )
+        group_node_host = next((value for value in (
+            _canonical_ip(_record_value(group, "node_host")),
+            _canonical_ip(_record_value(group, "policy_node_host")),
+            _canonical_ip(_record_value(diagnostic, "node_host")),
+            _canonical_ip(_record_value(diagnostic, "policy_node_host")),
+            _canonical_ip(_record_value(check, "node_host")),
+            _canonical_ip(_record_value(check, "policy_node_host")),
+            _canonical_ip(_record_value(group, "primary_ip")),
+        ) if value), "")
+        duplicate_ip = bool(
+            physical_ip_counts.get(ip_value, 0) > 1
+            or _field_flag(check, "duplicate_ip") is True
+            or _field_flag(diagnostic, "duplicate_ip") is True
+            or _field_flag(group, "duplicate_ip") is True
+            or "PRIMARY_IP_AMBIGUOUS" in _display_values(
+                _record_value(group, "blocking_reasons", default=[])
+            )
+            or len(policy_aliases_by_ip.get(group_node_host, set())) > 1
+        )
+        repo_authorization = next((value for value in (
+            _field_flag(record, "repository_authorized", "repo_authorized")
+            for record in (check, diagnostic, group)
+        ) if value is not None), None)
+        binding_matches = bool(ip_value and group_node_host and ip_value == group_node_host)
+        selector_is_safe = bool(
+            selected_ip == ip_value and not duplicate_ip
+            and (not group_node_host or binding_matches)
+        )
+        if selected_as_alias:
+            selector_is_safe = bool(
+                duplicate_ip and identity_confirmed is True and binding_matches
+                and physical_alias_counts.get(key, 0) == 1
+                and _machine_alias(physical).casefold() == key
+            )
+        if (not selector_is_safe
+                or _field_flag(group, "approval_available") is False
+                or repo_authorization is False
+                or (group and group_node_host and group_node_host != ip_value)
+                or identity_confirmed is False):
+            command_selector = ""
+        target_image = _runtime_digest(check.get("target_image", ""))
+        observed_image = _runtime_digest(check.get("observed_image", ""))
+        checked_at = str(check.get("checked_at", "") or "未扫描")
+        status = str(check.get("status", "unavailable") or "unavailable").casefold()
+        if status not in status_text:
+            status = "unavailable"
         next_step = "等待下次状态检查"
         if lifecycle_status == "deploying":
-            status_label = status_text.get(status, "无法确认机器状态")
+            status_label = status_text[status]
             status_text_value = f"部署进行中；上次只读检查：{status_label}"
             next_step = "正在部署，请等待结果；不要重复审批"
-        elif status in {"mismatch", "not_running"}:
-            try:
-                address = ipaddress.ip_address(ip_value)
-            except ValueError:
-                address = None
-            if address is not None and address.version == 4:
-                next_step = f"`/approve_deploy machine={address}`"
-            else:
-                next_step = "先检查当前仓库的机器配置"
         elif status == "match":
-            next_step = "无需重新部署"
+            next_step = "MATCH：无需重新部署。"
+        elif status == "mismatch":
+            if command_selector:
+                next_step = (
+                    f"MISMATCH：直接重新审批：`/approve_deploy machine={_escape(command_selector)}`。"
+                    "`/request_deploy` 可选。"
+                )
+            else:
+                next_step = "MISMATCH：当前身份或仓库授权未确认，暂不生成审批命令。"
+        elif status == "unavailable":
+            next_step = "UNAVAILABLE：机器连接或状态不可用，不能确认是否需要重新部署。"
         elif status == "identity_changed":
-            next_step = "检查当前仓库的机器白名单与绑定"
+            next_step = "身份绑定变化，等待重新确认；当前不生成审批命令。"
+        elif status == "not_running":
+            next_step = "组件未运行，无法比较镜像；先确认机器状态，不生成重新部署命令。"
         rows.append("| " + " | ".join((
             f"`{_escape(machine)}`",
             f"`{_escape(ip_value)}`",
+            owner,
             _escape(_runtime_component_label(component)),
             f"`{_escape(target_image)}`",
             f"`{_escape(observed_image)}`" if observed_image else "未取得",
@@ -198,17 +336,19 @@ def runtime_image_checks_block(
         _RUNTIME_CHECKS_START,
         "### 已部署组件镜像检查",
         "",
-        "| 机器 | IP | 组件 | 审批目标镜像 | 当前镜像 | 最后检查 | 状态 | 下一步 |",
-        "|---|---|---|---|---|---|---|---|",
+        "| 机器 | 主 IP | Owner | 组件 | 审批目标 digest | 当前运行 digest | 状态 | 最后检查 | 下一步 |",
+        "|---|---|---|---|---|---|---|---|---|",
         *rows,
         "",
-        "`/request_deploy` 是可选操作，可直接按上方实际 IP 命令审批。",
+        "MISMATCH 行给出的直接审批命令可以单独使用；`/request_deploy` 可选。",
         _RUNTIME_CHECKS_END,
     ])
 
 
 def update_runtime_image_checks(
     markdown: str, runtime_checks, components, *, lifecycle_status: str = "",
+    machine_groups=None, machine_inventory=None, machine_diagnostics=None,
+    test_only: bool | None = None,
 ) -> str:
     """Replace only the runtime-check section, keeping the rest of the summary intact."""
     if not isinstance(markdown, str):
@@ -222,8 +362,14 @@ def update_runtime_image_checks(
         start = updated.index(_RUNTIME_CHECKS_START)
         end = updated.index(_RUNTIME_CHECKS_END, start) + len(_RUNTIME_CHECKS_END)
         updated = updated[:start].rstrip() + updated[end:]
+    if test_only is None and "[test only]" in updated.casefold():
+        test_only = True
+    machine_context = _lifecycle_machine_display_context(updated)
     block = runtime_image_checks_block(
         runtime_checks, components, lifecycle_status=lifecycle_status,
+        machine_groups=machine_groups, machine_inventory=machine_inventory,
+        machine_diagnostics=machine_diagnostics, machine_context=machine_context,
+        test_only=test_only,
     )
     if not block:
         return updated.rstrip()
@@ -535,6 +681,21 @@ def deploy_ready(
     machine_groups: list[dict] | None = None,
     components: list[dict] | None = None,
 ) -> str:
+    build_rows = builds if isinstance(builds, list) else []
+    builds_passed = bool(build_rows) and all(
+        _field_flag(build, "success") is True
+        and _field_flag(build, "deployable") is True
+        for build in build_rows
+    )
+    evidence = review_evidence if isinstance(review_evidence, dict) else {}
+    review_passed = (
+        type(evidence.get("build_comment_id")) is int
+        and evidence.get("build_comment_id", 0) > 0
+        and type(evidence.get("code_review_comment_id")) is int
+        and evidence.get("code_review_comment_id", 0) > 0
+        and evidence.get("resolved_head_sha") == head_sha
+    )
+    approval_evidence_ready = builds_passed and review_passed
     deployable_ids = {
         component.get("component_id") for component in components or []
         if isinstance(component, dict) and isinstance(component.get("component_id"), str)
@@ -542,35 +703,111 @@ def deploy_ready(
     }
     if not deployable_ids:
         deployable_ids = {
-            build.component_id for build in builds
-            if build.success and build.deployable and isinstance(build.component_id, str) and build.component_id
+            _record_value(build, "component_id") for build in build_rows
+            if _field_flag(build, "success") is True
+            and _field_flag(build, "deployable") is True
+            and isinstance(_record_value(build, "component_id"), str)
+            and _record_value(build, "component_id")
         }
     commands = []
-    full_machine_ips = set()
-    seen_ips = set()
-    for group in machine_groups or []:
-        if not isinstance(group, dict):
-            continue
-        compatible = group.get("component_ids")
-        if not isinstance(compatible, list):
-            continue
-        compatible_ids = {component for component in compatible if isinstance(component, str)}
-        if not deployable_ids or not deployable_ids.intersection(compatible_ids):
-            continue
+    full_machine_aliases = set()
+    group_rows = [group for group in (machine_groups or [])
+                  if isinstance(group, dict)]
+    alias_counts = {}
+    primary_ip_counts = {}
+    aliases_by_node_host = {}
+
+    def ipv4(value):
+        if not isinstance(value, str) or not value.strip():
+            return ""
         try:
-            ip = ipaddress.ip_address(group.get("ip"))
-        except (TypeError, ValueError):
-            continue
-        if ip.version != 4:
-            continue
-        if deployable_ids.issubset(compatible_ids):
-            full_machine_ips.add(str(ip))
-        if str(ip) in seen_ips:
-            continue
-        seen_ips.add(str(ip))
+            address = ipaddress.ip_address(value.strip())
+        except ValueError:
+            return ""
+        return str(address) if address.version == 4 else ""
+
+    for group in group_rows:
         alias = group.get("alias")
-        label = f"{_escape(alias)}（`{ip}`）" if isinstance(alias, str) and alias else f"`{ip}`"
-        commands.append(f"- {label}：`/approve_deploy machine={ip}`")
+        if isinstance(alias, str) and alias.strip():
+            key = alias.strip().casefold()
+            alias_counts[key] = alias_counts.get(key, 0) + 1
+        primary_ip = ipv4(group.get("primary_ip"))
+        node_host = ipv4(group.get("node_host"))
+        if primary_ip:
+            primary_ip_counts[primary_ip] = primary_ip_counts.get(primary_ip, 0) + 1
+        if isinstance(alias, str) and alias and node_host:
+            aliases_by_node_host.setdefault(node_host, set()).add(alias.casefold())
+
+    if approval_evidence_ready:
+        seen_commands = set()
+        for group in group_rows:
+            compatible = group.get("component_ids")
+            if not isinstance(compatible, list):
+                continue
+            compatible_ids = {
+                component_id for component_id in compatible
+                if isinstance(component_id, str) and component_id
+            }
+            if not deployable_ids or not deployable_ids.intersection(compatible_ids):
+                continue
+            alias = group.get("alias")
+            if (not isinstance(alias, str)
+                    or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias) is None
+                    or alias_counts.get(alias.casefold(), 0) != 1
+                    or group.get("approval_available") is not True
+                    or group.get("repo_authorized") is not True
+                    or group.get("identity_confirmed") is not True):
+                continue
+            node_id = group.get("node_id")
+            primary_ip = ipv4(group.get("primary_ip"))
+            node_host = ipv4(group.get("node_host"))
+            if (not isinstance(node_id, str) or not node_id.strip()
+                    or not primary_ip or primary_ip != node_host):
+                continue
+
+            reasons = set(_display_values(group.get("blocking_reasons")))
+            ambiguous_ip = bool(
+                group.get("duplicate_ip") is True
+                or "PRIMARY_IP_AMBIGUOUS" in reasons
+                or primary_ip_counts.get(primary_ip, 0) > 1
+                or len(aliases_by_node_host.get(node_host, set())) > 1
+            )
+            # A present selector is authoritative, including an empty value.
+            # Only legacy groups with no selector field may use a verified IP.
+            if "command_selector" in group:
+                raw_selector = group.get("command_selector")
+            else:
+                raw_selector = (
+                    group.get("ip") if group.get("ip_command_safe") is True
+                    else ""
+                )
+            selector = raw_selector.strip() if isinstance(raw_selector, str) else ""
+            if not selector:
+                continue
+
+            selector_ip = ipv4(selector)
+            if selector_ip:
+                if (selector_ip != primary_ip or selector_ip != node_host
+                        or group.get("ip_command_safe") is not True
+                        or ambiguous_ip):
+                    continue
+                command_selector = selector_ip
+            else:
+                if (selector != alias or not ambiguous_ip
+                        or group.get("ip_command_safe") is not False
+                        or (not aliases_by_node_host.get(node_host)
+                            or alias.casefold() not in aliases_by_node_host[node_host])):
+                    continue
+                command_selector = alias
+
+            command = f"/approve_deploy machine={command_selector}"
+            if command in seen_commands:
+                continue
+            seen_commands.add(command)
+            label = f"{_escape(alias)}（主 IP：`{primary_ip}`）"
+            commands.append(f"- {label}：`{command}`")
+            if deployable_ids.issubset(compatible_ids):
+                full_machine_aliases.add(alias.casefold())
 
     lines = [
         BOT_MARKER,
@@ -587,25 +824,27 @@ def deploy_ready(
         "",
         "### Next action",
         "",
-        "机器负责人请按下方适配机器的真实 IP 命令审批：",
+        "机器负责人请按下方已验证的机器命令审批：",
         "",
-        *(commands or ["当前没有可用机器 IP，暂时无法生成直接部署命令。"]),
     ]
-    if len(full_machine_ips) == 1:
+    if commands:
+        lines.extend(commands)
+    elif approval_evidence_ready:
+        lines.append("当前没有通过仓库授权、机器身份和组件兼容校验的可执行审批命令。")
+    else:
+        lines.append("Review/Build 证据尚未确认通过，暂不显示可执行部署审批方式。")
+    if approval_evidence_ready and len(full_machine_aliases) == 1:
         lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写：", "", "`/approve_deploy`"])
-    lines.extend([
-        "",
-        "也可以选择用 `/request_deploy` 申请部署。",
-        "",
-        "### Review evidence",
-        "",
-        f"- **Build Result:** {'success' if builds and all(b.success for b in builds) else 'failed'}",
-    ])
-    evidence = review_evidence or {}
-    if evidence.get("test_comment_id", 0) == 0:
-        lines.append("- **Tests:** not run")
-    elif evidence.get("test_skipped", False):
+    if approval_evidence_ready:
+        lines.extend(["", "也可以选择用 `/request_deploy` 申请部署。"])
+    lines.extend(["", "### Review evidence", ""])
+    lines.append(
+        f"- **Build Result:** {'success' if builds_passed else 'failed'}"
+    )
+    if evidence.get("test_skipped", False):
         lines.append("- **Tests:** skipped")
+    elif evidence.get("test_comment_id", 0) == 0:
+        lines.append("- **Tests:** not run")
     else:
         lines.append(
             f"- **Tests:** {int(evidence.get('test_passed', 0))} passed / "
@@ -623,6 +862,384 @@ def deploy_ready(
     return _lifecycle_body(lines)
 
 
+_V44_CANDIDATE_REVIEWERS = ("Haohao-end", "shiguangchuan", "kentcyq")
+_OWNER_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}\Z")
+
+
+def _record_value(record, *names, default=None):
+    for name in names:
+        if isinstance(record, dict) and name in record:
+            return record[name]
+        if record is not None and hasattr(record, name):
+            return getattr(record, name)
+    return default
+
+
+def _record_rows(value, container_names=()):
+    if value is None:
+        return []
+    for name in container_names:
+        nested = _record_value(value, name)
+        if isinstance(nested, (list, tuple)):
+            return list(nested)
+    if isinstance(value, dict):
+        if any(name in value for name in ("alias", "machine_alias", "machine_name", "machine", "name")):
+            return [value]
+        rows = []
+        display_fields = (
+            "index", "number", "brand", "manufacturer", "model", "model_name",
+            "alias", "name", "machine_name", "main_ip", "primary_ip", "ip",
+            "node_host", "auxiliary_ip", "auxiliary_ips", "aux_ips", "secondary_ips",
+            "owner", "owners", "owner_login", "owner_logins", "platform", "platform_name",
+            "platforms",
+            "authorized", "repository_authorized", "identity_confirmed",
+            "agent_core_credentials_available", "agent_core_status",
+            "platform_confirmed", "component_compatible",
+            "components_compatible", "component_ids", "safe_to_approve", "status",
+            "reason", "reasons", "compatibility_status", "duplicate_ip",
+            "ip_conflicts",
+        )
+        for key, row in value.items():
+            key_text = str(key)
+            try:
+                ip_key = str(ipaddress.ip_address(key_text))
+            except ValueError:
+                ip_key = ""
+            if isinstance(row, dict):
+                normalized = dict(row)
+                if ip_key:
+                    normalized.setdefault("ip", ip_key)
+                else:
+                    normalized.setdefault("alias", key_text)
+                rows.append(normalized)
+            elif row is not None:
+                normalized = {name: getattr(row, name) for name in display_fields
+                             if hasattr(row, name)}
+                if ip_key:
+                    normalized.setdefault("ip", ip_key)
+                else:
+                    normalized.setdefault("alias", key_text)
+                rows.append(normalized)
+        return rows
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        return list(value)
+    except TypeError:
+        return []
+
+
+def _machine_inventory_records(value):
+    records = _record_rows(value, ("machines", "inventory", "items"))
+    if records:
+        return records
+    try:
+        from . import machine_inventory as inventory_module
+    except ImportError:
+        return []
+    for name in ("MACHINE_INVENTORY", "PHYSICAL_MACHINES", "INVENTORY", "_INVENTORY"):
+        value = getattr(inventory_module, name, None)
+        if value is not None:
+            records = _record_rows(value, ("machines", "inventory", "items"))
+            if records:
+                return records
+    return []
+
+
+def _display_values(value):
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = []
+    return [str(item).strip() for item in values
+            if isinstance(item, str) and item.strip()]
+
+
+def _field_flag(record, *names):
+    value = _record_value(record, *names)
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold().replace("_", "-")
+        if normalized in {"true", "yes", "authorized", "available", "confirmed",
+                          "compatible", "safe", "ready", "reachable", "configured",
+                          "present", "exists"}:
+            return True
+        if normalized in {"false", "no", "unauthorized", "unavailable", "unknown",
+                          "unconfirmed", "incompatible", "unsafe", "offline", "missing",
+                          "absent", "not-configured", "not-found"}:
+            return False
+    return None
+
+
+def _machine_alias(record):
+    value = _record_value(record, "alias", "machine_alias", "machine", "machine_name", "name")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _machine_ip(record):
+    # ``ip`` is intentionally empty for some ambiguous repository bindings.
+    # Keep looking for the physical primary address or the policy node_host.
+    for name in ("main_ip", "primary_ip", "primary_ip_address", "ip", "node_host"):
+        value = _record_value(record, name)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            return str(ipaddress.ip_address(value.strip()))
+        except ValueError:
+            return value.strip()
+    return ""
+
+
+def _canonical_ip(value):
+    if not isinstance(value, str):
+        return ""
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return ""
+
+
+def _test_only_status(*records):
+    for record in records:
+        if isinstance(record, (list, tuple)):
+            if _test_only_status(*record):
+                return True
+            continue
+        value = _field_flag(record, "test_only", "is_test_only")
+        if value is True:
+            return True
+        title = _record_value(record, "title", "pr_title")
+        if isinstance(title, str) and "[test only]" in title.casefold():
+            return True
+    return False
+
+
+def _owner_names(*records):
+    def clean(values):
+        normalized = [value[1:] if value.startswith("@") else value
+                      for value in _display_values(values)]
+        ignored = {"负责人待配置", "未知", "unknown", "pending", "none"}
+        return list(dict.fromkeys(
+            value for value in normalized if value.casefold() not in ignored
+        ))
+
+    # Repository policy is current for the PR's repository and always takes
+    # priority over the shared physical-inventory owner snapshot.
+    for record in records:
+        owners = clean(_record_value(record, "policy_owners"))
+        if owners:
+            return owners
+    # Some current machine-group records expose policy owners as ``owners``.
+    for record in records:
+        if _field_flag(record, "repo_authorized") is True:
+            owners = clean(_record_value(
+                record, "owners", "owner", "owner_login", "owner_logins",
+            ))
+            if owners:
+                return owners
+    # Prefer explicit physical owners, then older inventory-compatible fields.
+    for record in records:
+        owners = clean(_record_value(record, "physical_owners"))
+        if owners:
+            return owners
+    for record in records:
+        owners = clean(_record_value(record, "owners", "owner", "owner_login", "owner_logins"))
+        if owners:
+            return owners
+    return []
+
+
+def _owner_label(owners, *, test_only=False, mention=True):
+    labels = []
+    for owner in owners:
+        if _OWNER_LOGIN_RE.fullmatch(owner):
+            labels.append(f"@{owner}" if mention and not test_only else owner)
+        else:
+            labels.append(owner.replace("@", "＠"))
+    return " ".join(_escape(owner) for owner in labels) if labels else "负责人待配置"
+
+
+def _machine_diagnostic_rows(value):
+    return _record_rows(
+        value, ("machines", "machine_diagnostics", "items", "rows"),
+    )
+
+
+def _repo_policy_display_status(repo, status, diagnostics):
+    if not isinstance(status, dict):
+        status = {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    app_authorized = _field_flag(
+        status, "github_app_authorized", "app_authorized", "authorized",
+    )
+    if app_authorized is None:
+        app_state = _record_value(
+            status, "github_app_status", "app_status", "installation_status",
+            "status", default="",
+        )
+        app_authorized = isinstance(app_state, str) and app_state.strip().casefold() in {
+            "authorized", "installed", "active", "available",
+        }
+    machines_configured = _field_flag(status, "machines_configured", "machines_yaml_exists")
+    reviewers_configured = _field_flag(status, "reviewers_configured", "test_reviewers_yaml_exists")
+    missing_files = set(_display_values(status.get("missing_files")))
+    machines_yaml_state = status.get("machines_yaml_status")
+    reviewers_yaml_state = status.get("test_reviewers_yaml_status")
+    if machines_configured is None:
+        machines_configured = (
+            False if "machines.yaml" in missing_files
+            or isinstance(machines_yaml_state, str)
+            and machines_yaml_state.casefold() in {"missing", "absent", "not-found"} else
+            True if isinstance(machines_yaml_state, str)
+            and machines_yaml_state.casefold() in {"configured", "present", "valid", "exists"} else
+            None
+        )
+    if reviewers_configured is None:
+        reviewers_configured = (
+            False if "test_reviewers.yaml" in missing_files
+            or isinstance(reviewers_yaml_state, str)
+            and reviewers_yaml_state.casefold() in {"missing", "absent", "not-found"} else
+            True if isinstance(reviewers_yaml_state, str)
+            and reviewers_yaml_state.casefold() in {"configured", "present", "valid", "exists"} else
+            None
+        )
+    if not app_authorized:
+        app_status = "未授权或无法确认"
+    else:
+        app_status = "已授权"
+    machines_status = (
+        "已配置" if machines_configured is True else
+        "main 缺少" if machines_configured is False or "machines.yaml" in missing_files else
+        "配置无效" if isinstance(machines_yaml_state, str)
+        and machines_yaml_state.casefold() in {"invalid", "corrupt", "malformed"} else
+        "未配置或无法确认"
+    )
+    reviewers_status = (
+        "已配置" if reviewers_configured is True else
+        "main 缺少" if reviewers_configured is False or "test_reviewers.yaml" in missing_files else
+        "配置无效" if isinstance(reviewers_yaml_state, str)
+        and reviewers_yaml_state.casefold() in {"invalid", "corrupt", "malformed"} else
+        "未配置或无法确认"
+    )
+    authorized_machines = _record_value(
+        status, "authorized_machines", "machines",
+        default=_record_value(diagnostics, "authorized_machines", "authorized"),
+    )
+    if isinstance(authorized_machines, dict):
+        authorized_aliases = {
+            str(alias).strip().casefold() for alias, machine in authorized_machines.items()
+            if machine is not False
+        }
+        authorized_count = len(authorized_aliases)
+    elif isinstance(authorized_machines, (list, tuple, set)):
+        authorized_aliases = {
+            str(_record_value(item, "alias", "name", default=item)).strip().casefold()
+            for item in authorized_machines
+        }
+        authorized_count = len(authorized_aliases)
+    else:
+        authorized_aliases = set()
+        explicit_count = _record_value(
+            status, "authorized_machine_count",
+            default=_record_value(diagnostics, "authorized_machine_count"),
+        )
+        authorized_count = (explicit_count if type(explicit_count) is int and explicit_count >= 0
+                            else 0 if machines_configured is False else None)
+    if machines_configured is False:
+        authorized_aliases = set()
+        authorized_count = 0
+    reviewers = _display_values(_record_value(
+        status, "reviewers", "test_reviewers", "acceptance_reviewers",
+        default=_record_value(diagnostics, "reviewers", "test_reviewers",
+                              "acceptance_reviewers"),
+    ))
+    candidate_reviewers = _display_values(_record_value(
+        status, "candidate_reviewers",
+        default=_record_value(diagnostics, "candidate_reviewers"),
+    ))
+    candidate_reviewers = list(dict.fromkeys(
+        [*candidate_reviewers, *_V44_CANDIDATE_REVIEWERS]
+    ))
+    reviewer_display = (
+        "验收人：" + "、".join(_escape(name) for name in reviewers)
+        if reviewers else
+        "验收人：未配置或名单未提供"
+    )
+    count_display = str(authorized_count) if authorized_count is not None else "未提供"
+    return {
+        "repo": repo,
+        "app_authorized": app_authorized,
+        "app_status": app_status,
+        "machines_configured": machines_configured is True,
+        "machines_configured_known": machines_configured is not None,
+        "machines_status": machines_status,
+        "reviewers_configured": reviewers_configured is True,
+        "reviewers_status": reviewers_status,
+        "authorized_aliases": authorized_aliases,
+        "authorized_count": authorized_count,
+        "reviewers": reviewers,
+        "reviewer_display": reviewer_display,
+        "candidate_reviewers": candidate_reviewers,
+        "count_display": count_display,
+    }
+
+
+def _runtime_digest(value):
+    if not isinstance(value, str) or not value:
+        return "未取得"
+    match = re.search(r"(?:@)?sha256:([0-9a-fA-F]{64})", value)
+    return f"sha256:{match.group(1).lower()}" if match else "未取得"
+
+
+def _lifecycle_machine_display_context(markdown):
+    """Read already-rendered safe machine identities for runtime-only refreshes."""
+    result = {}
+    if not isinstance(markdown, str):
+        return result
+
+    def cells(line):
+        values = line.strip().strip("|").split("|")
+        return [html.unescape(value.strip()).strip().strip("`").strip()
+                for value in values]
+
+    section = ""
+    for line in markdown.splitlines():
+        if line.startswith("### "):
+            heading = line.casefold()
+            section = (
+                "inventory" if "machine inventory" in heading
+                else "compatible" if "compatible machines" in heading
+                else ""
+            )
+            continue
+        if not line.startswith("|") or line.lstrip().startswith("|---"):
+            continue
+        row = cells(line)
+        if section == "inventory" and len(row) >= 7:
+            alias = row[3]
+            if alias and alias.casefold() not in {"别名", "alias"}:
+                entry = result.setdefault(alias.casefold(), {})
+                entry["alias"] = alias
+                entry["primary_ip"] = row[4] if row[4] not in {"—", "未提供"} else ""
+                if row[6] and row[6] not in {"—", "负责人待配置"}:
+                    entry["owner"] = row[6]
+        elif section == "compatible" and len(row) >= 4:
+            alias = row[0]
+            if not alias or alias.casefold() in {"机器名称", "machine"}:
+                continue
+            entry = result.setdefault(alias.casefold(), {})
+            entry["alias"] = alias
+            if row[1] not in {"—", "未提供"}:
+                entry["primary_ip"] = row[1]
+            if row[2] and row[2] not in {"—", "负责人待配置"}:
+                entry["owner"] = row[2]
+    return result
+
+
 def deploy_requested(
     repo: str, pr_number: int, head_sha: str,
     components: list[dict],
@@ -634,105 +1251,613 @@ def deploy_requested(
     component_snapshot: list[dict] | None = None,
     attempt: dict | None = None,
     display_status: str = "deploy-requested",
+    machine_inventory=None,
+    machine_diagnostics=None,
+    repository_policy_status=None,
+    runtime_checks=None,
 ) -> str:
-    """status: deploy-requested with IP table, workflow, deployment, history."""
+    """Render a repository-scoped lifecycle with physical and authorized machines."""
     if (not isinstance(display_status, str)
             or display_status not in {"deploy-requested", "deploying"}):
         raise ValueError("display_status must be deploy-requested or deploying")
-    # Build component labels
-    comp_lines = []
-    for c in components:
-        if isinstance(c, dict):
-            target = c.get("target", "")
-            variant = c.get("variant", "") or ""
-            driver_path = c.get("driver_path", "") or ""
-            image_ref = c.get("image_ref", "") or ""
-            label = target
-            if target == "driver" and driver_path:
-                label = f"driver {driver_path}"
-            elif variant:
-                label = f"{target} {variant}"
-            elif driver_path:
-                label = f"{target} {driver_path}"
-            display = _compact_image_ref(image_ref)
-            extra = f" \u2014 `{display}`" if display else ""
-            comp_lines.append(f"- {_escape(label)}{extra}")
+    inventory_rows = _machine_inventory_records(machine_inventory)
+    diagnostic_rows = _machine_diagnostic_rows(machine_diagnostics)
+    group_rows = _record_rows(machine_groups)
+    policy = _repo_policy_display_status(repo, repository_policy_status, machine_diagnostics)
+    test_only = _test_only_status(
+        repository_policy_status, machine_diagnostics, group_rows, components,
+    ) or any(
+        isinstance(note, str) and "[test only]" in note.casefold()
+        for note in [last_lifecycle_event, *(gate_note or [])]
+    )
 
-    # Build machine table with IP
-    table_lines = [
-        "| Machine | IP | Components |",
-        "|---|---|---|",
-    ]
-    for mg in machine_groups:
-        if not isinstance(mg, dict):
-            continue
-        alias = mg.get("alias", "?")
-        ip = mg.get("ip", "")
-        remaining_ids = {c.get("component_id") for c in components if isinstance(c, dict)}
-        cids = [cid for cid in mg.get("component_ids", []) if cid in remaining_ids]
-        if not cids:
-            continue
-        comp_labels = []
-        for cid in cids:
-            for c in components if isinstance(components, list) else []:
-                if isinstance(c, dict) and c.get("component_id") == cid:
-                    target = c.get("target", "")
-                    variant = c.get("variant", "") or ""
-                    driver_path = c.get("driver_path", "") or ""
-                    lbl = target
-                    if target == "driver" and driver_path:
-                        lbl = f"driver {driver_path}"
-                    elif variant:
-                        lbl = f"{target} {variant}"
-                    comp_labels.append(lbl)
-                    break
-            if not any(
-                isinstance(c, dict) and c.get("component_id") == cid
-                for c in (components or [])
-            ):
-                comp_labels.append(cid)
-        ip_str = f"`{_escape(ip)}`" if ip else "`\u2014`"
-        comps_str = (
-            ", ".join(f"`{_escape(l)}`" for l in comp_labels) if comp_labels else "`none`"
-        )
-        table_lines.append(f"| `{_escape(alias)}` | {ip_str} | {comps_str} |")
+    def alias_key(record):
+        return _machine_alias(record).casefold()
 
-    remaining_ids = {
+    diagnostic_by_alias = {alias_key(row): row for row in diagnostic_rows if alias_key(row)}
+    inventory_by_alias = {alias_key(row): row for row in inventory_rows if alias_key(row)}
+    group_by_alias = {alias_key(row): row for row in group_rows if alias_key(row)}
+    diagnostics_by_ip = {
+        _canonical_ip(_machine_ip(row)): row for row in diagnostic_rows
+        if _canonical_ip(_machine_ip(row))
+    }
+    inventory_by_ip = {
+        _canonical_ip(_machine_ip(row)): row for row in inventory_rows
+        if _canonical_ip(_machine_ip(row))
+    }
+    components = components if isinstance(components, list) else []
+    component_ids = {
         item.get("component_id") for item in components
         if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+        and item.get("component_id")
     }
-    machine_commands = []
-    seen_commands = set()
-    for group in machine_groups or []:
-        if not isinstance(group, dict):
-            continue
-        component_ids = group.get("component_ids")
-        if (not isinstance(component_ids, list)
-                or not any(component_id in remaining_ids for component_id in component_ids)):
-            continue
-        raw_ip = group.get("ip")
+    known_aliases_by_ip = {}
+    inventory_ip_counts = {}
+    inventory_alias_counts = {}
+    policy_aliases_by_ip = {}
+    policy_alias_counts = {}
+    for row in inventory_rows:
+        ip_value = _canonical_ip(_machine_ip(row))
+        alias = _machine_alias(row)
+        if alias:
+            alias_key_value = alias.casefold()
+            inventory_alias_counts[alias_key_value] = (
+                inventory_alias_counts.get(alias_key_value, 0) + 1
+            )
+        if ip_value:
+            inventory_ip_counts[ip_value] = inventory_ip_counts.get(ip_value, 0) + 1
+            known_aliases_by_ip.setdefault(ip_value, []).append(alias or "别名未提供")
+    for row in group_rows:
+        alias = _machine_alias(row)
+        alias_key_value = alias.casefold()
+        node_host = next((value for value in (
+            _canonical_ip(_record_value(row, "node_host")),
+            _canonical_ip(_record_value(row, "policy_node_host")),
+            _canonical_ip(_record_value(row, "primary_ip")),
+        ) if value), "")
+        if alias:
+            policy_alias_counts[alias_key_value] = policy_alias_counts.get(alias_key_value, 0) + 1
+        if node_host:
+            policy_aliases_by_ip.setdefault(node_host, []).append(alias or "别名未提供")
+        ip_value = _canonical_ip(_machine_ip(row))
+        if ip_value and alias and not inventory_ip_counts.get(ip_value):
+            aliases = known_aliases_by_ip.setdefault(ip_value, [])
+            if alias not in aliases:
+                aliases.append(alias)
+
+    def machine_parts(machine):
+        alias = _machine_alias(machine)
+        key = alias.casefold()
+        ip_value = _canonical_ip(_machine_ip(machine))
+        diagnostic = diagnostic_by_alias.get(key)
+        physical = inventory_by_alias.get(key)
+        if ip_value and inventory_ip_counts.get(ip_value, 0) == 1:
+            diagnostic = diagnostic or diagnostics_by_ip.get(ip_value, {})
+            physical = physical or inventory_by_ip.get(ip_value)
+        physical = physical or machine
+        group = group_by_alias.get(key) or {}
+        if not group and diagnostic:
+            group = diagnostic
+        return alias, ip_value, diagnostic, physical, group
+
+    def machine_flags(machine):
+        alias, ip_value, diagnostic, physical, group = machine_parts(machine)
+        records = (diagnostic, group, physical)
+        duplicate_aliases = known_aliases_by_ip.get(ip_value, [])
+        physical_ip = _canonical_ip(_record_value(
+            physical, "primary_ip", "main_ip", "primary_ip_address", "ip",
+        )) or ip_value
+        policy_node_host = next((value for value in (
+            _canonical_ip(_record_value(group, "node_host")),
+            _canonical_ip(_record_value(group, "policy_node_host")),
+            _canonical_ip(_record_value(diagnostic, "node_host")),
+            _canonical_ip(_record_value(diagnostic, "policy_node_host")),
+            _canonical_ip(_record_value(group, "primary_ip")),
+            _canonical_ip(_record_value(diagnostic, "primary_ip")),
+        ) if value), "")
+        group_primary_ip = next((value for value in (
+            _canonical_ip(_record_value(group, "primary_ip")),
+            _canonical_ip(_record_value(group, "main_ip")),
+            _canonical_ip(_record_value(group, "primary_ip_address")),
+        ) if value), "")
+        duplicate_ip = bool(
+            inventory_ip_counts.get(physical_ip, 0) > 1
+            or len({name.casefold() for name in duplicate_aliases}) > 1
+            or _field_flag(diagnostic, "duplicate_ip") is True
+            or "PRIMARY_IP_AMBIGUOUS" in _display_values(
+                _record_value(group, "blocking_reasons", default=[])
+            )
+            or len({name.casefold() for name in policy_aliases_by_ip.get(
+                policy_node_host, [],
+            )}) > 1
+        )
+        authorized = _field_flag(
+            diagnostic, "repository_authorized", "authorized", "machine_authorized",
+        )
+        if authorized is None:
+            authorized = alias.casefold() in policy["authorized_aliases"]
+        authorized = bool(
+            policy["app_authorized"] and policy["machines_configured"] and authorized
+        )
+        identity_flags = [value for value in (
+            _field_flag(record, "identity_confirmed", "machine_identity_confirmed")
+            for record in records
+        ) if value is not None]
+        identity_flag = (
+            False if False in identity_flags else
+            True if True in identity_flags else None
+        )
+        identity_confirmed = identity_flag is True
+        configured_flags = [value for value in (
+            _field_flag(record, "agent_core_credentials_configured")
+            for record in records
+        ) if value is not None]
+        if False in configured_flags:
+            credentials_configured = False
+        elif True in configured_flags:
+            credentials_configured = True
+        else:
+            legacy_configured_flags = [value for value in (
+                _field_flag(record, "agent_core_credentials_available")
+                for record in records
+            ) if value is not None]
+            credentials_configured = (
+                False if False in legacy_configured_flags else
+                True if True in legacy_configured_flags else None
+            )
+
+        core_status_values = [
+            str(value).strip().casefold().replace("_", "-")
+            for value in (_record_value(record, "agent_core_status") for record in records)
+            if isinstance(value, str) and value.strip()
+        ]
+        denied_core_statuses = {
+            "credential-missing", "credentials-missing", "missing-credentials",
+            "unavailable", "offline", "unreachable",
+        }
+        if any(value in denied_core_statuses for value in core_status_values):
+            agent_core_status = next(
+                value for value in core_status_values if value in denied_core_statuses
+            )
+        elif any(value in {"available", "healthy", "reachable", "ok"}
+                 for value in core_status_values):
+            agent_core_status = "available"
+        elif core_status_values:
+            agent_core_status = "unknown"
+        else:
+            legacy_health_flags = [value for value in (
+                _field_flag(record, "agent_core_available", "agent_core_reachable")
+                for record in records
+            ) if value is not None]
+            agent_core_status = (
+                "unavailable" if False in legacy_health_flags else
+                "available" if True in legacy_health_flags else "unknown"
+            )
+
+        explicit_core_failure = agent_core_status in denied_core_statuses
+        credentials_available = bool(
+            not explicit_core_failure
+            and credentials_configured is not False
+            and (
+                agent_core_status == "available"
+                or agent_core_status == "unknown" and credentials_configured is True
+            )
+        )
+        credentials_flag = (
+            False if explicit_core_failure or credentials_configured is False else
+            True if credentials_available else None
+        )
+        platform_flag = next((value for value in (
+            _field_flag(record, "platform_confirmed", "platform_known")
+            for record in records
+        ) if value is not None), None)
+        platform_confirmed = platform_flag is True
+        if platform_flag is None:
+            platform_value = _record_value(
+                diagnostic, "platform", "platform_name", "platforms",
+                default=_record_value(physical, "platform", "platform_name", "platforms"),
+            )
+            platform_values = _display_values(platform_value)
+            platform_confirmed = bool(platform_values) and all(
+                value.casefold() not in {"unknown", "unconfirmed", "未确认", "未知"}
+                for value in platform_values
+            )
+        group_component_ids = _record_value(group, "component_ids", default=[])
+        if not isinstance(group_component_ids, (list, tuple, set)):
+            group_component_ids = []
+        diagnostic_component_ids = _record_value(diagnostic, "component_ids", default=[])
+        if not isinstance(diagnostic_component_ids, (list, tuple, set)):
+            diagnostic_component_ids = []
+        machine_component_ids = {
+            component_id for component_id in group_component_ids
+            if isinstance(component_id, str) and component_id
+        }
+        diagnosed_component_ids = {
+            component_id for component_id in diagnostic_component_ids
+            if isinstance(component_id, str) and component_id
+        }
+        component_flags = [value for value in (
+            _field_flag(record, "component_compatible", "components_compatible")
+            for record in (diagnostic, group)
+        ) if value is not None]
+        component_flag = (
+            False if False in component_flags else
+            True if True in component_flags else None
+        )
+        component_coverage_confirmed = bool(
+            machine_component_ids
+            and diagnosed_component_ids
+            and machine_component_ids.issubset(diagnosed_component_ids)
+        )
+        if component_flag is False:
+            component_compatible = False
+        else:
+            component_compatible = component_coverage_confirmed
+        ip_identity_matches = bool(
+            physical_ip and policy_node_host and physical_ip == policy_node_host
+            and (not group_primary_ip or group_primary_ip == physical_ip)
+        )
+        alias_identity_matches = bool(
+            alias
+            and _machine_alias(physical).casefold() == alias.casefold()
+            and _machine_alias(group).casefold() == alias.casefold()
+            and inventory_alias_counts.get(alias.casefold(), 0) == 1
+            and policy_alias_counts.get(alias.casefold(), 0) == 1
+        )
+        identity_confirmed = bool(
+            identity_flag is True and alias_identity_matches and ip_identity_matches
+        )
+        identity_mismatch = False
         try:
-            address = ipaddress.ip_address(raw_ip)
-        except (TypeError, ValueError):
-            continue
-        if address.version != 4:
-            continue
-        command = f"/approve_deploy machine={address}"
-        if command in seen_commands:
-            continue
-        seen_commands.add(command)
-        machine_commands.append((str(group.get("alias") or ""), str(address), command))
+            identity_mismatch = bool(
+                physical_ip and policy_node_host and physical_ip != policy_node_host
+            )
+        except ValueError:
+            pass
+        safe_flag = _field_flag(diagnostic, "safe_to_approve", "approval_safe")
+        provided_selector = str(
+            _record_value(group, "command_selector", default="")
+            or _record_value(diagnostic, "command_selector", default="")
+            or ""
+        ).strip()
+        group_approval_flag = _field_flag(group, "approval_available")
+        physical_ip_unique = bool(
+            physical_ip
+            and inventory_ip_counts.get(physical_ip, 0) == 1
+            and len({name.casefold() for name in policy_aliases_by_ip.get(
+                policy_node_host, [],
+            )}) == 1
+            and not duplicate_ip
+        )
+        if identity_confirmed and authorized and group_approval_flag is not False:
+            if physical_ip_unique and provided_selector in {"", physical_ip}:
+                command_selector = physical_ip
+            elif (duplicate_ip and alias_identity_matches
+                  and provided_selector in {"", alias}):
+                command_selector = alias
+            else:
+                command_selector = ""
+        else:
+            command_selector = ""
+        group_approval_available = (
+            group_approval_flag is True
+        )
+        safe_flag_allows = safe_flag is not False or bool(
+            duplicate_ip and command_selector == alias and group_approval_available
+            and component_coverage_confirmed
+        )
+        safe = bool(
+            authorized and identity_confirmed and credentials_available
+            and platform_confirmed and component_compatible and command_selector
+            and safe_flag_allows
+        )
+        reasons = []
+        supplied_reasons = _record_value(diagnostic, "reasons", "reason", "diagnostic")
+        reasons.extend(_safe_display_text(reason) for reason in _display_values(supplied_reasons))
+        if not policy["app_authorized"]:
+            reasons.append("GitHub App 对该仓库的授权未确认。")
+        elif not policy["machines_configured"]:
+            reasons.append(
+                "当前仓库 main 缺少有效的 machines.yaml。"
+                if policy["machines_status"] == "main 缺少"
+                else "当前仓库机器授权状态未确认。"
+            )
+        elif not authorized:
+            reasons.append("当前仓库 main 缺少机器授权。")
+        if duplicate_ip:
+            conflicting_aliases = _display_values(_record_value(
+                diagnostic, "ip_conflicts", "conflicting_aliases",
+            ))
+            if inventory_ip_counts.get(ip_value, 0) > 1:
+                conflicting_aliases.extend(duplicate_aliases)
+            conflict_labels = sorted(
+                set(conflicting_aliases), key=str.casefold,
+            )
+            reasons.append(
+                "主 IP 存在冲突，涉及别名："
+                + ("、".join(conflict_labels) or "冲突别名待确认") + "。"
+            )
+        if identity_mismatch:
+            reasons.append("物理主 IP 与当前仓库 node_host 不一致，禁止审批命令。")
+        elif not identity_confirmed:
+            reasons.append("机器别名、node_id 与主 IP 的身份绑定未确认。")
+        if credentials_flag is False:
+            reasons.append("Agent Core 凭据或连接不可用。")
+        elif not credentials_available:
+            reasons.append("Agent Core 凭据或连接状态未确认。")
+        if platform_flag is False:
+            reasons.append("机器平台状态未确认。")
+        elif not platform_confirmed:
+            reasons.append("机器平台尚未确认。")
+        if not component_compatible:
+            reasons.append(
+                "当前 PR 所需组件与该机器不兼容。"
+                if component_flag is False else "当前 PR 组件匹配结果尚未确认。"
+            )
+        if safe_flag is False and not (
+                duplicate_ip and command_selector == alias and group_approval_available):
+            reasons.append("机器诊断未允许安全审批。")
+        return {
+            "alias": alias,
+            "ip": physical_ip or ip_value or _machine_ip(machine),
+            "command_selector": command_selector,
+            "diagnostic": diagnostic,
+            "physical": physical,
+            "group": group,
+            "owners": _owner_names(diagnostic, physical, group),
+            "authorized": authorized,
+            "identity_flag": identity_flag,
+            "identity_confirmed": identity_confirmed,
+            "credentials_flag": credentials_flag,
+            "credentials_available": credentials_available,
+            "platform_flag": platform_flag,
+            "platform_confirmed": platform_confirmed,
+            "component_flag": component_flag,
+            "component_compatible": component_compatible,
+            "duplicate_ip": duplicate_ip,
+            "safe": safe,
+            "reasons": list(dict.fromkeys(reasons)),
+        }
+
+    machine_states = [machine_flags(row) for row in inventory_rows]
+    safe_machines = {
+        item["alias"].casefold(): item for item in machine_states
+        if item["safe"] and item["alias"]
+    }
+    machine_state_by_alias = {
+        item["alias"].casefold(): item for item in machine_states if item["alias"]
+    }
+    physical_machine_count = len(inventory_rows)
+    inventory_lines = [
+        "### Machine Inventory · 机器完整清单", "",
+        "| 编号 | 品牌 | 型号 | 别名 | 主 IP | 辅助 IP | Owner | 仓库授权 | Agent Core | 平台 | 当前 PR 组件兼容性 | 原因 |",
+        "|---:|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for ordinal, (machine, state) in enumerate(zip(inventory_rows, machine_states), 1):
+        index = _record_value(machine, "index", "number", "id", default=ordinal)
+        brand = _record_value(machine, "brand", "manufacturer", default="未提供")
+        model = _record_value(machine, "model", "model_name", default="未提供")
+        alias = state["alias"] or "未提供"
+        main_ip = _machine_ip(machine) or "未提供"
+        auxiliary_ips = _display_values(_record_value(
+            machine, "auxiliary_ip", "auxiliary_ips", "aux_ips", "secondary_ips",
+        ))
+        owner_text = _owner_label(state["owners"], test_only=test_only, mention=not test_only)
+        auth_text = "已授权" if state["authorized"] else "未授权或未确认"
+        agent_text = (
+            "凭据可用" if state["credentials_available"] else
+            "不可用" if state["credentials_flag"] is False else "未确认"
+        )
+        platform_value = _record_value(
+            state["diagnostic"], "platform", "platform_name", "platforms",
+            default=_record_value(machine, "platform", "platform_name", "platforms"),
+        )
+        platform_text = "、".join(_display_values(platform_value)) or "未确认"
+        compatibility = (
+            "兼容" if state["component_compatible"] else
+            "不兼容" if state["component_flag"] is False else
+            "部分兼容" if component_ids.intersection(
+                set(_record_value(state["group"], "component_ids", default=[]) or [])
+                | set(_record_value(state["diagnostic"], "component_ids", default=[]) or [])
+            ) else "未确认"
+        )
+        reasons = "；".join(state["reasons"]) or "所有审批条件已确认。"
+        inventory_lines.append("| " + " | ".join(_escape(value) for value in (
+            index, brand, model, alias, main_ip,
+            "、".join(auxiliary_ips) if auxiliary_ips else "—",
+            owner_text, auth_text, agent_text, platform_text, compatibility, reasons,
+        )) + " |")
+    if not inventory_rows:
+        inventory_lines.extend([
+            "| — | — | — | 未提供 | — | — | — | 未确认 | 未确认 | 未确认 | 未确认 | 未收到物理机器清单，不能据此推断机器不存在。 |",
+        ])
+
+    compatible_lines = [
+        "### Compatible Machines · 本轮适配机器", "",
+    ]
+    compatible_states = [item for item in machine_states if item["safe"]]
+    if display_status == "deploying":
+        compatible_lines.append("当前部署正在执行，请等待结果；此阶段不重复审批。")
+    elif compatible_states:
+        compatible_lines.extend([
+            "| 机器名称 | 主 IP | Owner | 审批命令 |",
+            "|---|---|---|---|",
+        ])
+        for state in compatible_states:
+            owner = _owner_label(state["owners"], test_only=test_only, mention=not test_only)
+            command = f"/approve_deploy machine={state['command_selector']}"
+            compatible_lines.append("| " + " | ".join(_escape(value) for value in (
+                state["alias"], state["ip"], owner, command,
+            )) + " |")
+    else:
+        compatible_lines.append("尚无通过仓库授权、身份、Agent Core、平台、组件及安全审批检查的机器。")
+
+    pending_lines = [
+        "### Pending / Incompatible Machines · 待确认机器", "",
+    ]
+    pending_states = [item for item in machine_states if not item["safe"]]
+    known_no_authorization = (
+        policy["machines_status"] == "main 缺少"
+        or policy["authorized_count"] == 0
+    )
+    authorization_unknown = (
+        not policy["app_authorized"] or not policy["machines_configured"]
+        or policy["authorized_count"] is None
+    )
+    if (known_no_authorization or authorization_unknown) and inventory_rows:
+        if known_no_authorization and physical_machine_count == 21:
+            pending_lines.extend([
+                "物理机器已登记，但当前仓库尚未授权。",
+                "所有21台仍正常展示。没有授权的机器不生成可执行审批命令。",
+                "",
+            ])
+        elif known_no_authorization:
+            pending_lines.extend([
+                f"物理机器已登记，但当前仓库尚未授权；清单中的 {physical_machine_count} 台设备仍正常展示。",
+                "没有授权的机器不生成可执行审批命令。",
+                "",
+            ])
+        else:
+            pending_lines.extend([
+                "物理机器已登记，但当前仓库授权状态未确认。",
+                "所有物理机器仍正常展示；未确认授权的机器不生成可执行审批命令。",
+                "",
+            ])
+    if pending_states:
+        for state in pending_states:
+            reasons = "；".join(state["reasons"]) or "兼容性或安全审批条件未确认。"
+            pending_lines.extend([
+                f"- 机器 `{_escape(state['alias'] or '未提供')}`",
+                f"  - Owner: {_owner_label(state['owners'], test_only=test_only, mention=not test_only)}",
+                f"  - 主 IP：`{_escape(state['ip'] or '未提供')}`",
+                f"  - 状态：{_escape('重复 IP' if state['duplicate_ip'] else '待确认 / 不兼容')}",
+                f"  - 原因：{_escape(reasons)}",
+            ])
+    elif inventory_rows:
+        pending_lines.append("所有已登记机器均通过当前审批条件。")
+
+    policy_lines = [
+        "### Repository Authorization · 仓库授权", "",
+        f"- 仓库：`{_escape(repo)}`",
+        f"- GitHub App 授权：{policy['app_status']}",
+        f"- machines.yaml：{policy['machines_status']}",
+        f"- test_reviewers.yaml：{policy['reviewers_status']}",
+        f"- 已授权机器数量：{policy['count_display']}",
+        f"- {policy['reviewer_display']}",
+        "- 验收人候选账号（实际授权以当前仓库 test_reviewers.yaml 为准）："
+        + "、".join(_escape(name) for name in policy["candidate_reviewers"]),
+    ]
+    if inventory_rows and (
+            policy["machines_status"] == "main 缺少"
+            or policy["authorized_count"] == 0):
+        policy_lines.extend([
+            "",
+            "物理机器已登记，但当前仓库尚未授权。所有物理机器仍展示；未授权机器不会出现可执行审批命令。",
+        ])
+    elif inventory_rows and (
+            not policy["app_authorized"] or not policy["machines_configured"]
+            or policy["authorized_count"] is None):
+        policy_lines.extend([
+            "",
+            "当前仓库授权状态未确认。所有物理机器仍展示；未确认授权的机器不会出现可执行审批命令。",
+        ])
+
+    runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
+    runtime_lines = ["### Runtime Image Status · 运行镜像状态", ""]
+    if runtime_rows:
+        runtime_lines.extend([
+            "| 机器 | 主 IP | Owner | 审批目标 digest | 当前运行 digest | 比较状态 | 最后扫描时间 | 下一步 |",
+            "|---|---|---|---|---|---|---|---|",
+        ])
+        runtime_status_labels = {
+            "match": "MATCH：运行镜像与审批目标一致",
+            "mismatch": "MISMATCH：运行镜像与审批目标不一致",
+            "not_running": "UNAVAILABLE：组件未运行，无法比较镜像",
+            "unavailable": "UNAVAILABLE：机器连接或状态不可用",
+            "identity_changed": "IDENTITY_CHANGED：机器身份绑定已变化，等待重新确认",
+        }
+        for check in runtime_rows:
+            alias = _machine_alias(check)
+            alias_key_value = alias.casefold()
+            machine_state = machine_state_by_alias.get(alias_key_value, {})
+            diagnostic = (
+                diagnostic_by_alias.get(alias_key_value)
+                or machine_state.get("diagnostic")
+                or diagnostics_by_ip.get(_canonical_ip(_machine_ip(check)), {})
+            )
+            physical = (
+                inventory_by_alias.get(alias_key_value)
+                or machine_state.get("physical")
+                or inventory_by_ip.get(_canonical_ip(_machine_ip(check)), {})
+            )
+            group = machine_state.get("group", {})
+            owners = _owner_names(check, diagnostic, physical, group)
+            ip_value = (
+                _canonical_ip(_record_value(check, "primary_ip"))
+                or _canonical_ip(_record_value(check, "main_ip"))
+                or _canonical_ip(_machine_ip(physical))
+                or _canonical_ip(machine_state.get("ip"))
+                or _canonical_ip(_machine_ip(check))
+            )
+            status = str(_record_value(check, "status", default="unavailable")).casefold()
+            if status not in runtime_status_labels:
+                status = "unavailable"
+            if display_status == "deploying":
+                next_step = "正在部署，请等待结果；不要重复审批。"
+            elif status == "match":
+                next_step = "MATCH：无需重新部署。"
+            elif status == "unavailable":
+                next_step = "UNAVAILABLE：等待机器恢复连接；当前不能判断是否需要重新部署。"
+            elif status == "identity_changed":
+                next_step = "身份绑定变化，等待重新确认；当前不生成审批命令。"
+            elif status == "not_running":
+                next_step = "UNAVAILABLE：组件未运行，先确认机器状态；不生成重新部署命令。"
+            else:
+                safe_state = safe_machines.get(alias_key_value)
+                selector = safe_state.get("command_selector", "") if safe_state else ""
+                if selector:
+                    next_step = (
+                        f"MISMATCH：直接重新审批：`/approve_deploy machine={selector}`；"
+                        "`/request_deploy` 可选。"
+                    )
+                else:
+                    next_step = "MISMATCH：当前身份或仓库授权未确认，暂不生成审批命令。"
+            target_digest = _runtime_digest(_record_value(check, "target_image", "target_digest"))
+            observed_digest = _runtime_digest(_record_value(check, "observed_image", "observed_digest"))
+            checked_at = (
+                _record_value(check, "checked_at", "last_scanned_at", default="未扫描")
+                or "未扫描"
+            )
+            owner = _owner_label(owners, test_only=test_only, mention=not test_only)
+            status_label = runtime_status_labels[status]
+            if display_status == "deploying":
+                status_label = f"部署进行中；上次只读检查：{status_label}"
+            runtime_lines.append("| " + " | ".join(_escape(value) for value in (
+                alias or _record_value(check, "machine", default="未提供"),
+                ip_value or "未提供", owner, target_digest, observed_digest,
+                status_label, checked_at, next_step,
+            )) + " |")
+    else:
+        runtime_lines.append("尚无可展示的机器镜像检查结果。")
 
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
-        "### Deploy Approval \u2014 Lifecycle",
+        "### Deploy Approval — Lifecycle",
         "",
         f"**Status:** `{display_status}`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
-        f"**Repository:** `{repo}`",
-    ]
-    lines.extend([
+        f"**Repository:** `{_escape(repo)}`",
+        "",
+        *policy_lines,
+        "",
+        *inventory_lines,
+        "",
+        *compatible_lines,
+        "",
+        *pending_lines,
+        "",
+        *runtime_lines,
         "",
         "### Workflow",
         "",
@@ -740,35 +1865,27 @@ def deploy_requested(
         "",
         "### Next action",
         "",
-        ("正在部署，请等待结果。" if display_status == "deploying"
-         else "等待机器负责人按下方对应机器的真实 IP 命令审批："),
-        "",
-        *([] if display_status == "deploying" else
-          [f"- `{_escape(alias)}`（`{_escape(ip)}`）：`{command}`"
-           for alias, ip, command in machine_commands]
-          if machine_commands else
-          ["当前没有可用的机器 IP，暂时无法生成审批命令，请检查机器配置。"]),
-        "",
-        "### Compatible machines for remaining components",
-        "",
-    ])
-
-    if len(table_lines) > 2:
-        lines.extend(table_lines)
+    ]
+    if display_status == "deploying":
+        lines.append("正在部署，请等待结果；请勿重复审批。")
+    elif compatible_states:
+        lines.extend([
+            "等待对应机器负责人使用 Compatible Machines 中列出的命令审批。",
+            "`/request_deploy` 可选，不是直接审批的前提。",
+        ])
     else:
-        lines.extend(["No compatible machines found.", ""])
+        lines.append("暂时没有通过完整安全检查的可执行审批命令；先解决 Pending / Incompatible Machines 中列出的原因。")
 
     if gate_note:
-        lines.extend(["", *gate_note])
-
-    # Current Deployment section
+        lines.extend(["", *[_safe_display_text(note) for note in gate_note
+                             if isinstance(note, str)]])
     lines.extend(["", "### Current Deployment", ""])
     lines.append(_deployment_table(
-        deployments, all_components or component_snapshot or components, machine_groups,
+        deployments, all_components or component_snapshot or components, group_rows,
     ))
     lines.extend(_attempt_lines(attempt))
-
-    return _lifecycle_body(lines)
+    body = _lifecycle_body(lines)
+    return body.replace("@", "＠") if test_only else body
 
 
 def testing(
@@ -1122,7 +2239,7 @@ def _attempt_lines(attempt: dict | None) -> list[str]:
         "Components": attempt.get("component_ids") or attempt.get("components") or attempt.get("args", {}).get("pending_component_ids") or "unknown",
         "Phase": attempt.get("phase") or "unknown",
         "Time": attempt.get("timestamp") or attempt.get("updated_at") or attempt.get("started_at") or "unknown",
-        "Error": attempt.get("error") or "—",
+        "Error": _safe_display_text(attempt.get("error") or "—"),
     }
     return ["", "### Deployment attempt", "", *[
         f"- **{label}:** {_escape(value)}" for label, value in values.items()
