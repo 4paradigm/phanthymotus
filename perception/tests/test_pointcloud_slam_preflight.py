@@ -119,3 +119,13 @@ def test_declared_mount_conflict_is_not_an_initialization_delay():
     result = evaluate_preflight(args)
     assert result['state'] == 'not_ready'
     assert any(d['field'] == 'extrinsic' for d in result['diagnostics'])
+
+
+def test_unknown_initializing_source_id_does_not_invent_independent_clock():
+    args = inputs()
+    args['input_metadata']['/o']['source_id'] = 'unknown'
+    result = evaluate_preflight(args)
+    assert result['state'] == 'waiting_for_inputs'
+    assert not result['diagnostics']
+    assert {issue['field'] for issue in result['pending']} >= {
+        'source_id', 'clock.relation_id'}
