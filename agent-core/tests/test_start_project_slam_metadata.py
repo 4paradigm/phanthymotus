@@ -37,6 +37,7 @@ def rig(monkeypatch):
         'cloud': [{'topic': '/lidar/display', 'format': 'sensor/pointcloud'},
                   {'topic': '/lidar/native', 'format': 'sensor/pointcloud2'}],
         'other': [{'topic': '/other/cloud', 'format': 'sensor/pointcloud2'}],
+        'depth': [{'topic': '/bumi/depth', 'format': 'image/depth-zlib'}],
     }
     extra = {
         'odom': {'odom_interface': {'schema': 'motus.odom/1',
@@ -50,6 +51,10 @@ def rig(monkeypatch):
              'format': 'sensor/pointcloud', 'source_id': 'display-only'}]},
         'other': {'input_metadata': [{'schema': 'motus.slam_input/1',
                    'topic': '/other/cloud', 'format': 'sensor/pointcloud2'}]},
+        'depth': {'input_metadata': [{'topic': '/bumi/depth',
+                                     'format': 'image/depth-zlib',
+                                     'source_id': 'measured-depth',
+                                     'clock': {'verified': False}}]},
     }
 
     async def call(mcp_id, req, timeout_s=None):
@@ -156,3 +161,34 @@ def test_multiple_odometry_outputs_cannot_reuse_one_unkeyed_interface():
                     'odom_interface': {'schema': 'motus.odom/1'}}}
     out = collect_slam_inputs(conns, info, lambda c: c['fromTopic'])
     assert out['odom_interfaces'] == {}
+
+
+def test_pointcloud_receives_only_connected_depth_provenance(rig):
+    layout = {'cards': [_card('other', 'other'), _card('depth', 'depth'),
+                        _card('cloud', 'pointcloud')],
+              'connections': [_wire('depth', 0, 'cloud', '/bumi/depth',
+                                    'image/depth-zlib')]}
+    assert run(layout) is not False
+    assert rig.starts['cloud']['input_metadata'] == {
+        '/bumi/depth': {'topic': '/bumi/depth', 'format': 'image/depth-zlib',
+                        'source_id': 'measured-depth',
+                        'clock': {'verified': False}}}
+    assert 'input_bindings' not in rig.starts['cloud']
+    assert rig.infos.count('depth') == 1
+
+
+def test_unconnected_or_stale_source_declarations_cannot_be_forwarded(rig):
+    from api.slam_metadata import collect_connected_metadata
+    conns = [_wire('depth', 0, 'cloud', '/bumi/depth', 'image/depth-zlib')]
+    # A second declaration for another robot lives in the same info() but was
+    # never connected to this consumer.
+    info = {'depth': {'topic_out': rig.ports['depth'],
+                      'input_metadata': [
+                          rig.extra['depth']['input_metadata'][0],
+                          {'topic': '/elsewhere/depth', 'format': 'image/depth-zlib'}]}}
+    metadata = collect_connected_metadata(conns, info, lambda c: c['fromTopic'])
+    assert list(metadata) == ['/bumi/depth']
+    # A saved canvas topic is not evidence that the live producer still emits
+    # it after a restart.
+    info['depth']['topic_out'][0] = {'topic': '/new/topic', 'format': 'image/depth-zlib'}
+    assert collect_connected_metadata(conns, info, lambda c: c['fromTopic']) == {}
