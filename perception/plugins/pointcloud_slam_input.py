@@ -118,6 +118,11 @@ def resolve_inputs(metadata, bindings):
         return ('{segment_id}' + value[len(segment):]
                 if isinstance(segment, str) and segment and
                    isinstance(value, str) and value.startswith(segment + '_') else value)
+    # Only the resolver's private copy gains a frame-name template. Keep the
+    # producer's actual declaration untouched; its segment ID is an explicit
+    # source fact, not a substring guessed from an arbitrary frame name.
+    if isinstance(pose.get('frame_id'), str):
+        inputs[odom_topic]['frame_id_template'] = template(pose['frame_id'])
     return dict(inputs=inputs, frame_metadata_topic=sidecar,
                 extrinsic=deepcopy(extrinsic),
                 clock_relation_mode='verified_relation' if independent else 'shared_source',
