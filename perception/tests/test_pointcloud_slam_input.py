@@ -285,3 +285,26 @@ def test_missing_evidence_after_present_evidence_is_not_downgraded():
     s.odom(odom(1100), now=1.1)
     assert s.status(now=1.1)['odometry'] != 'tracking'
     assert 'evidence lost' in s.last_error
+
+
+def test_new_bumi_segment_reuses_measured_mount_with_new_frame_names():
+    from plugins.pointcloud_slam_input import resolve_inputs
+    metadata = declarations()
+    metadata['/o'].update(segment_id='s', frame_id='s_odom',
+                          child_frame_id='s_base')
+    metadata['/c']['extrinsic']['parent_frame'] = 's_base'
+    contract = resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
+    assert contract['settings']['child_frame'] == '{segment_id}_base'
+    assert contract['inputs']['/o']['frame_id_template'] == '{segment_id}_odom'
+    assert contract['inputs']['/o']['frame_id'] == 's_odom'
+    s = stream(input_contract=contract, child_frame='{segment_id}_base')
+    for stamp_ms, segment in [(1000, 's'), (1100, 't')]:
+        sample = odom(stamp_ms, segment=segment)
+        sample['pose']['frame_id'] = segment + '_odom'
+        sample['pose']['child_frame_id'] = segment + '_base'
+        s.odom(sample, now=stamp_ms / 1000)
+        s.cloud(stamp_ms * 1_000_000, 'camera', [[1, 2, 3]],
+                now=stamp_ms / 1000, data_sha256=packet()['data_sha256'])
+        s.cloud_metadata(packet(stamp_ms), now=stamp_ms / 1000)
+    assert [frame.pose.segment_id for frame in s.accepted] == ['s', 't']
+    assert s.status(now=1.1)['odometry'] == 'tracking'
