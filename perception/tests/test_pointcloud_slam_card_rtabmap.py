@@ -298,10 +298,33 @@ def test_rejected_configuration_does_not_poison_the_previous_valid_extrinsic(car
     assert card._node is not None
 
 
-@pytest.mark.parametrize('interfaces', [['invalid'], {'/pose': 'invalid'}, {'/pose': {'slam_pose': 'invalid'}}])
+@pytest.mark.parametrize('interfaces', [
+    ['invalid'],
+    {'/pose': 'invalid'},
+    {'/pose': {'slam_pose': 'invalid'}},
+    {'/pose': {'schema': 'motus.odom/1',
+               'slam_pose': {'available': False, 'profile': 'motus_slam/1'}}},
+    {'/pose': {'schema': 'motus.odom/1',
+               'slam_pose': {'available': True, 'profile': 'pose_drift/1'}}},
+])
 def test_malformed_explicit_capability_returns_error_without_starting(card, interfaces):
     result = card.dispatch('pointcloud_slam', {**arguments(), 'odom_interfaces': interfaces})
     assert result['state'] == 'error'
+    assert result['message']
+    assert not card._executor.nodes
+
+
+@pytest.mark.parametrize('interfaces_present', [False, True])
+def test_missing_odom_capability_is_pending_not_malformed(card, interfaces_present):
+    args = arguments()
+    if interfaces_present:
+        args['odom_interfaces'] = {}
+    else:
+        args.pop('odom_interfaces')
+    result = card.dispatch('pointcloud_slam', args)
+    assert result['state'] == 'ready'
+    diagnostic = call(card, 'info')['input_diagnostics']
+    assert any(item['field'] == 'odom_interface' for item in diagnostic)
     assert not card._executor.nodes
 
 

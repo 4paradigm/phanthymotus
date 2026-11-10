@@ -163,6 +163,37 @@ def test_multiple_odometry_outputs_cannot_reuse_one_unkeyed_interface():
     assert out['odom_interfaces'] == {}
 
 
+def test_malformed_explicit_odom_interface_values_are_not_dropped():
+    conns = [_wire('src', 0, 'slam', '/odom', 'state/odom')]
+    ports = [{'topic': '/odom', 'format': 'state/odom'}]
+
+    keyed = collect_slam_inputs(conns, {
+        'src': {'topic_out': ports, 'odom_interfaces': {'/odom': 'invalid'}}
+    }, lambda c: c['fromTopic'])
+    assert keyed['odom_interfaces']['/odom'] == 'invalid'
+
+    legacy = collect_slam_inputs(conns, {
+        'src': {'topic_out': ports, 'odom_interface': 'invalid'}
+    }, lambda c: c['fromTopic'])
+    assert legacy['odom_interfaces']['/odom'] == 'invalid'
+
+
+def test_malformed_odom_interfaces_container_is_rejected():
+    conns = [_wire('src', 0, 'slam', '/odom', 'state/odom')]
+    info = {'src': {'topic_out': [{'topic': '/odom', 'format': 'state/odom'}],
+                    'odom_interfaces': ['invalid']}}
+    with pytest.raises(SlamRoutingError, match='odom_interfaces'):
+        collect_slam_inputs(conns, info, lambda c: c['fromTopic'])
+
+
+def test_missing_topic_keyed_odom_interface_remains_pending():
+    conns = [_wire('src', 0, 'slam', '/odom', 'state/odom')]
+    info = {'src': {'topic_out': [{'topic': '/odom', 'format': 'state/odom'}],
+                    'odom_interfaces': {}}}
+    result = collect_slam_inputs(conns, info, lambda c: c['fromTopic'])
+    assert result['odom_interfaces'] == {}
+
+
 def test_pointcloud_receives_only_connected_depth_provenance(rig):
     layout = {'cards': [_card('other', 'other'), _card('depth', 'depth'),
                         _card('cloud', 'pointcloud')],

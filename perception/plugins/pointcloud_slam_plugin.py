@@ -10,6 +10,7 @@ import threading
 import uuid
 
 from .pointcloud_slam_config import discover_runtime_geometry, reconcile_explicit_extrinsic
+from .pointcloud_slam_contract import SpatialSlamError, validate_slam_capability
 from .pointcloud_slam_input import InputContractError, resolve_inputs
 from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_ros import RtabmapNode, discover_input_bindings
@@ -347,20 +348,25 @@ class PointCloudSlamPlugin:
         self._runtime_inputs = self._runtime_provenance = None
         self._input_diagnostics = []
 
-        interfaces = args.get('odom_interfaces')
-        interface = interfaces.get(odom) if isinstance(interfaces, dict) else None
-        capability = interface.get('slam_pose') if isinstance(interface, dict) else None
-        if not (isinstance(interface, dict) and
-                interface.get('schema') == 'motus.odom/1' and
-                isinstance(capability, dict) and
-                capability.get('available') is True and
-                capability.get('profile') == 'motus_slam/1'):
-            # The project may start while a sensor initializes or reports
-            # unknown tracking. Runtime odometry decoding still admits only
-            # real motus_slam/1 tracking measurements.
+        if 'odom_interfaces' not in args:
+            # No declaration is recoverable while an upstream producer starts.
+            # Actual mapping still requires valid motus_slam/1 tracking samples.
             self._input_diagnostics.append({
                 'topic': odom, 'field': 'odom_interface',
-                'reason': 'SLAM capability not yet established; waiting for valid tracking samples'})
+                'reason': 'SLAM capability declaration is missing; waiting for upstream info()'})
+        else:
+            interfaces = args['odom_interfaces']
+            if not isinstance(interfaces, dict):
+                raise ValueError('odom_interfaces must be a topic-keyed object')
+            if odom not in interfaces:
+                self._input_diagnostics.append({
+                    'topic': odom, 'field': 'odom_interface',
+                    'reason': 'SLAM capability declaration is missing for the connected odometry topic'})
+            else:
+                try:
+                    validate_slam_capability(interfaces[odom])
+                except SpatialSlamError as error:
+                    raise ValueError(f'{odom}: invalid SLAM odometry capability: {error}') from error
 
         if 'input_metadata' in args:
             provided = args.get('input_metadata')

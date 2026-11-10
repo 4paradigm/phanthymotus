@@ -106,8 +106,7 @@ def resolve_inputs(metadata, bindings):
         except SpatialSlamError as error:
             raise InputContractError([dict(topic=topic, field='contract', reason=str(error))]) from error
     try:
-        validate_mount(extrinsic, parent_frame=child, child_frame=frame,
-                       require_calibrated=False)
+        validate_mount(extrinsic, parent_frame=child, child_frame=frame)
     except SpatialSlamError as error:
         raise InputContractError([dict(topic=cloud_topic, field='extrinsic',
                                        reason=str(error))]) from error

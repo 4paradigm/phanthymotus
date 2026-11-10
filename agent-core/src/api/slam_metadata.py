@@ -43,8 +43,8 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
 
     connections are only the target consumer's inbound edges. A saved connection
     format is never evidence of current type: a live info() port takes precedence.
-    Without live info, only the wiring hint is forwarded; missing producer
-    metadata will be rejected by the strict SLAM consumer.
+    Missing capability declarations remain pending at the consumer. Explicit
+    malformed declarations are preserved or rejected, never silently dropped.
     """
     bindings, interfaces, metadata = {}, {}, {}
     for conn in connections:
@@ -78,16 +78,23 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
             metadata[topic] = deepcopy(claim)
 
         if fmt == POSE:
-            by_topic = info.get('odom_interfaces')
-            interface = by_topic.get(topic) if isinstance(by_topic, dict) else None
-            if interface is None:
-                ports = info.get('topic_out') or []
-                count = sum(isinstance(p, dict) and p.get('format') == POSE
-                            for p in ports)
-                if count == 1:
-                    interface = info.get('odom_interface')
-            if isinstance(interface, dict):
-                interfaces[topic] = deepcopy(interface)
+            if 'odom_interfaces' in info:
+                by_topic = info['odom_interfaces']
+                if not isinstance(by_topic, dict):
+                    raise SlamRoutingError(
+                        f'{src_id}: odom_interfaces must be a topic-keyed object')
+                if topic in by_topic:
+                    # Preserve malformed explicit values so Perception rejects
+                    # them; never silently turn a bad declaration into "missing".
+                    interfaces[topic] = deepcopy(by_topic[topic])
+                    continue
+            ports = info.get('topic_out') or []
+            count = sum(isinstance(p, dict) and p.get('format') == POSE
+                        for p in ports)
+            if count == 1 and 'odom_interface' in info:
+                # Legacy single-output declaration. Preserve its raw value for
+                # the same consumer-side validation as the topic-keyed form.
+                interfaces[topic] = deepcopy(info['odom_interface'])
     return {'input_bindings': bindings, 'odom_interfaces': interfaces,
             'input_metadata': metadata}
 
