@@ -1,8 +1,10 @@
 """Bounded admission of raw clouds paired with validated external odometry.
 
-The caller must establish the declared clock relation and calibrate the
-extrinsic. ``now`` is monotonic receipt time, used only to detect stale input;
+The caller establishes comparable timestamp and frame coordinates before
+admission. ``now`` is monotonic receipt time, used only to detect stale input;
 it is never substituted for a measurement timestamp. Calls must be serialized.
+Optional frame evidence is hash-checked when present; a producer's clock is
+never promoted to verified merely because timestamps look plausible.
 """
 from collections import deque, OrderedDict
 from copy import deepcopy
@@ -20,7 +22,7 @@ class SlamStream:
                  max_future_skew_ms=None, input_contract=None, extrinsic_mode='static'):
         if any(not isinstance(s, str) or not s.strip() for s in
                (cloud_frame, child_frame, clock_id)):
-            raise ValueError('cloud frame, child frame and verified clock required')
+            raise ValueError('cloud frame, child frame and clock identity required')
         if (child_frame.count('{segment_id}') > 1 or
                 '{' in child_frame.replace('{segment_id}', '') or
                 '}' in child_frame.replace('{segment_id}', '')):
@@ -71,6 +73,10 @@ class SlamStream:
         self._required_new_segment = None
         self._cloud_metadata = OrderedDict()
         self._unmatched_clouds = OrderedDict()
+        # Wait briefly for optional ROS sidecars; do not allow any known digest
+        # mismatch to fall back to time-based alignment.
+        self._metadata_grace_s = min(0.2, max_age_s / 4)
+        self._metadata_fallbacks = 0
         self.last_error = ''
         self._odom_state = 'waiting'
         self._dropped_pending = 0
@@ -119,7 +125,9 @@ class SlamStream:
         return {'odometry': odom_state, 'cloud': cloud_state, 'pending_clouds': len(self._pending),
                 'integration': integration, 'dropped_pending': self._dropped_pending,
                 'segments': len(self._segments), 'admitted_frames': self._admitted,
-                'unmatched_clouds': len(self._unmatched_clouds), 'last_error': last_error}
+                'unmatched_clouds': len(self._unmatched_clouds),
+                'frames_without_sidecar': self._metadata_fallbacks,
+                'last_error': last_error}
 
     def _check_measurement_time(self, stamp_ns, measurement_now_ns):
         if self.max_measurement_age_ms is None:
