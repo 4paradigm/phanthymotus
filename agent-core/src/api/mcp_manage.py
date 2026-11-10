@@ -1323,7 +1323,8 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 source = await mcp_call_tool(
                     card.get('mcpId', ''), MCPCallRequest(
                         tool=card.get('toolName', ''),
-                        arguments={'action': 'info', 'instance_id': card.get('id', '')}),
+                        arguments={'action': 'info', 'instance_id': card.get('id', ''),
+                                   'read_only': True}),
                     timeout_s=4.0)
                 if source.get('code') != 200:
                     raise ValueError('upstream info() unavailable: ' +
