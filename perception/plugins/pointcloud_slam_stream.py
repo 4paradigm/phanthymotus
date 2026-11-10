@@ -146,7 +146,8 @@ class SlamStream:
                 from .pointcloud_slam_input import frame_identity
                 quality = sample['vendor']['motus_slam']
                 declared = next(d for d in self.input_contract['inputs'].values() if d['kind'] == 'pose')
-                if declared.get('frame_id') and pose.frame_id != declared['frame_id'].replace('{segment_id}', pose.segment_id):
+                expected_frame = declared.get('frame_id_template', declared.get('frame_id'))
+                if expected_frame and pose.frame_id != expected_frame.replace('{segment_id}', pose.segment_id):
                     raise ValueError('pose frame differs from input declaration; restart inputs')
                 mount = declared.get('extrinsic')
                 if isinstance(mount, dict):
