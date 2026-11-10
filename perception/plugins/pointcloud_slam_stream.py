@@ -263,7 +263,6 @@ class SlamStream:
         from .pointcloud_slam_input import frame_identity
         try:
             identity = frame_identity(packet, clock_id=self.clock_id, payload=True,
-                experimental=self.input_contract['experimental'],
                 relation_id=self.input_contract.get('relation_id'))
             if packet['frame_id'] != self.cloud_frame:
                 raise ValueError('cloud metadata frame mismatch')
@@ -271,11 +270,27 @@ class SlamStream:
             context = self._capture_context(packet)
             independent = self.input_contract.get('clock_relation_mode') == 'verified_relation'
             if not independent:
-                if identity != self._input_identity:
-                    raise ValueError('cloud epoch/generation does not match current pose')
-                if (packet['mapping'] != self._pose_measurement['mapping'] or
-                        packet['source_clock'] != self._pose_measurement['source_clock']):
-                    raise ValueError('cloud and pose clock mapping evidence differs')
+                if self._input_identity is not None:
+                    if identity != self._input_identity:
+                        raise ValueError('cloud epoch/generation does not match current pose')
+                    if (packet['mapping'] != self._pose_measurement['mapping'] or
+                            packet['source_clock'] != self._pose_measurement['source_clock']):
+                        raise ValueError('cloud and pose clock mapping evidence differs')
+                else:
+                    # Same camera source: VO has segment and capture timestamp
+                    # but does not need to mint a second motus.slam_frame packet.
+                    # Cloud evidence, when available, still cannot change
+                    # mapping or generation inside one pose segment.
+                    if self._cloud_identity is not None and self._cloud_segment == self._input_segment:
+                        if (identity != self._cloud_identity or
+                            packet['mapping'] != self._cloud_measurement['mapping'] or
+                            packet['source_clock'] != self._cloud_measurement['source_clock']):
+                            self._required_new_segment = self._input_segment
+                            self._lose()
+                            raise ValueError('cloud clock mapping changed within segment')
+                    self._cloud_identity = identity
+                    self._cloud_measurement = deepcopy(packet)
+                    self._cloud_segment = self._input_segment
             else:
                 if identity in self._retired_cloud_identities:
                     raise ValueError('retired cloud epoch/generation dropped')
@@ -314,8 +329,16 @@ class SlamStream:
 
     def _pair_cloud(self, key, *, now, measurement_now_ns):
         if key not in self._cloud_metadata or key not in self._unmatched_clouds:
-            if any(k[:2] == key[:2] and k[2] != key[2]
-                   for k in (self._cloud_metadata if key in self._unmatched_clouds else self._unmatched_clouds)):
+            # A sidecar for this timestamp/frame is negative evidence for
+            # any cloud with a different digest. It must NOT later bypass
+            # the mismatch via the missing-sidecar fallback.
+            mismatch = [other for other in self._unmatched_clouds
+                        if other[:2] == key[:2] and
+                        any(m[:2] == other[:2] and m[2] != other[2]
+                            for m in self._cloud_metadata)]
+            for other in mismatch:
+                self._unmatched_clouds.pop(other, None)
+                self._dropped_pending += 1
                 self.last_error = 'cloud payload does not match measurement metadata'
             return
         cloud, received = self._unmatched_clouds.pop(key)
@@ -325,6 +348,29 @@ class SlamStream:
             return
         self._accept_cloud(key[0], key[1], cloud, now=now, received=received,
                            measurement_now_ns=measurement_now_ns, capture_context=context)
+
+    def _release_without_metadata(self, now, measurement_now_ns):
+        """Use ordinary timestamp pairing when optional sidecar is missing.
+
+        A known mismatch is never accepted. Dynamic camera frames require
+        per-frame transforms and never take this static-only fallback.
+        """
+        if not self.input_contract or self.extrinsic_mode != 'static':
+            return
+        for key, (cloud, received) in list(self._unmatched_clouds.items()):
+            if now - received < self._metadata_grace_s:
+                continue
+            self._unmatched_clouds.pop(key, None)
+            if any(m[:2] == key[:2] for m in self._cloud_metadata):
+                self._dropped_pending += 1
+                self.last_error = 'cloud payload does not match measurement metadata'
+                continue
+            try:
+                self._accept_cloud(key[0], key[1], cloud, now=now,
+                                   measurement_now_ns=measurement_now_ns, received=received)
+                self._metadata_fallbacks += 1
+            except ValueError as error:
+                self.last_error = str(error)
 
     def cloud(self, stamp_ns, frame, cloud, *, now, point_count=None, measurement_now_ns=None,
               data_sha256=None, capture_context=None):
