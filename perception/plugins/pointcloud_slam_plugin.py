@@ -10,7 +10,7 @@ import threading
 import uuid
 
 from .pointcloud_slam_config import discover_runtime_geometry, reconcile_explicit_extrinsic
-from .pointcloud_slam_input import resolve_inputs
+from .pointcloud_slam_input import InputContractError, resolve_inputs
 from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_ros import RtabmapNode, discover_input_bindings
 from .pointcloud_slam_rtabmap import require_runtime
@@ -364,26 +364,52 @@ class PointCloudSlamPlugin:
                 set(bindings.values()) != {'state/odom', 'sensor/pointcloud2'}):
             raise ValueError('one format-resolved odometry and one PointCloud2 input required')
         odom = next(t for t, f in bindings.items() if f == 'state/odom')
-        if not legacy or 'odom_interfaces' in args:
-            interfaces = args.get('odom_interfaces')
-            interface = interfaces.get(odom) if isinstance(interfaces, dict) else None
-            capability = interface.get('slam_pose') if isinstance(interface, dict) else None
-            if (not isinstance(interface, dict) or not isinstance(capability, dict) or
-                    interface.get('schema') != 'motus.odom/1' or capability.get('available') is not True or
-                    capability.get('profile') != 'motus_slam/1'):
-                raise ValueError('odometry source lacks declared SLAM pose capability')
         self._resolved_inputs = None
         self._runtime_inputs = self._runtime_provenance = None
         self._input_diagnostics = []
+
+        interfaces = args.get('odom_interfaces')
+        interface = interfaces.get(odom) if isinstance(interfaces, dict) else None
+        capability = interface.get('slam_pose') if isinstance(interface, dict) else None
+        if not (isinstance(interface, dict) and
+                interface.get('schema') == 'motus.odom/1' and
+                isinstance(capability, dict) and
+                capability.get('available') is True and
+                capability.get('profile') == 'motus_slam/1'):
+            # The project may start while a sensor initializes or reports
+            # unknown tracking. Runtime odometry decoding still admits only
+            # real motus_slam/1 tracking measurements.
+            self._input_diagnostics.append({
+                'topic': odom, 'field': 'odom_interface',
+                'reason': 'SLAM capability not yet established; waiting for valid tracking samples'})
+
         if 'input_metadata' in args:
             try:
-                # Strict producer-declaration semantics: the card itself has no
-                # experimental/strict policy any more.
                 self._resolved_inputs = resolve_inputs(args['input_metadata'], bindings)
                 reconcile_explicit_extrinsic(self._config.get('child_from_cloud'),
                     self._resolved_inputs['settings'].get('child_from_cloud'))
-            except ValueError as error:
-                self._input_diagnostics = deepcopy(getattr(error, 'diagnostics', []))
+            except InputContractError as error:
+                # A producer info() snapshot taken before camera/VO first frame
+                # may have an unknown clock stamp, frame or mount. Keep the
+                # project alive and discover actual geometry when mapping starts.
+                # But a positive contradictory claim (wrong connected source,
+                # conflicting mounts, incompatible format) is not "pending".
+                self._input_diagnostics.extend(deepcopy(error.diagnostics))
+                fatal_fields = {'schema', 'topic/format', 'kind',
+                    'cloud_semantics', 'timing_model', 'observation_model',
+                    'extrinsic.mode', 'extrinsic.pose_reference'}
+                fatal = any(
+                    d.get('field') in fatal_fields or
+                    'conflicting' in d.get('reason', '') or
+                    d.get('field') == 'clock.relation_id' or
+                    (d.get('field') == 'clock_id' and
+                     d.get('reason') == 'differs from pose clock')
+                    for d in error.diagnostics)
+                if fatal:
+                    raise
+            except ValueError:
+                # An explicit manual transform that conflicts with a complete
+                # measured producer mount must never be silently overridden.
                 raise
         self._validate(self._settings())
         require_runtime()
