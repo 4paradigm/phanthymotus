@@ -184,10 +184,13 @@ def test_perception_frame_identity_delegates_to_shared_contract():
         'ros', 'epoch-1', 'generation-1')
     unverified = deepcopy(data)
     unverified['mapping']['verified'] = False
-    with pytest.raises(ValueError, match='verified'):
-        frame_identity(unverified, clock_id='ros')
-    assert frame_identity(unverified, clock_id='ros', experimental=True) == (
+    # There is one normal admission path: an unverified flag is provenance,
+    # not a separate strict/experimental mode. Explicit cross-source relation
+    # proof remains mandatory when a relation_id is requested.
+    assert frame_identity(unverified, clock_id='ros') == (
         'ros', 'epoch-1', 'generation-1')
+    with pytest.raises(ValueError, match='relation'):
+        frame_identity(unverified, clock_id='ros', relation_id='calibrated_pair')
 
 
 def test_perception_pose_decoder_checks_shared_profile():
