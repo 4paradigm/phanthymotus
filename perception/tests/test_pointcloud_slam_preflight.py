@@ -40,12 +40,16 @@ def test_valid_claims_only_establish_static_readiness():
     assert result['live_frame_pairing_checked'] is False
 
 
-def test_unverified_clock_is_diagnosed_and_not_promoted():
+def test_unverified_clock_is_a_note_not_a_strict_startup_gate():
     args = inputs()
     args['input_metadata']['/c']['clock']['verified'] = False
+    args['input_metadata']['/c']['extrinsic']['calibrated'] = False
     result = evaluate_preflight(args)
-    assert result['state'] == 'not_ready'
-    assert any('clock' in issue['field'] for issue in result['diagnostics'])
+    assert result['state'] == 'static_ready'
+    assert not result['diagnostics']
+    assert any('not independently verified' in note for note in result['notes'])
+    assert any('not marked calibrated' in note for note in result['notes'])
+    assert result['live_frame_pairing_checked'] is False
 
 
 def test_missing_slam_pose_capability_and_bad_topic_type():
@@ -76,3 +80,42 @@ def test_preflight_action_does_not_launch_mapping_or_mutate_state():
     tool_schema = card.get_tools()[0]['inputSchema']
     assert tool_schema['x-slam-input-contract'] == 'motus.slam_input/1'
     assert 'preflight' in tool_schema['properties']['action']['enum']
+
+
+def test_missing_declarations_report_waiting_not_strict_rejection():
+    args = inputs()
+    args['input_metadata'] = {}
+    args['odom_interfaces'] = {}
+    result = evaluate_preflight(args)
+    assert result['state'] == 'waiting_for_inputs'
+    assert not result['diagnostics']
+    assert {d['field'] for d in result['pending']} == {
+        'input_metadata', 'odom_interface'}
+    assert result['live_frame_pairing_checked'] is False
+
+
+def test_incomplete_frame_at_start_is_pending_not_fabricated():
+    args = inputs()
+    args['input_metadata']['/c']['frame_id'] = None
+    result = evaluate_preflight(args)
+    assert result['state'] == 'waiting_for_inputs'
+    assert any(d['field'] == 'frame_id' for d in result['pending'])
+    assert not result['diagnostics']
+
+
+def test_declared_incompatible_clock_stays_not_ready():
+    args = inputs()
+    args['input_metadata']['/c']['clock_id'] = 'another_clock'
+    result = evaluate_preflight(args)
+    assert result['state'] == 'not_ready'
+    assert any(d['field'] == 'clock_id' for d in result['diagnostics'])
+
+
+def test_declared_mount_conflict_is_not_an_initialization_delay():
+    args = inputs()
+    args['input_metadata']['/o']['extrinsic'] = deepcopy(
+        args['input_metadata']['/c']['extrinsic'])
+    args['input_metadata']['/o']['extrinsic']['matrix'][0][3] = 0.15
+    result = evaluate_preflight(args)
+    assert result['state'] == 'not_ready'
+    assert any(d['field'] == 'extrinsic' for d in result['diagnostics'])
