@@ -21,7 +21,7 @@ from std_msgs.msg import String
 from utils.latest_frame import LatestFrame
 from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 from plugins.image_input import BadInput, load_image_bytes
 from plugins.ocr_runtime import (
@@ -449,8 +449,10 @@ class OCRPlugin:
         # All fields below are guarded by _state_lock. The lock is only ever
         # held for dict/flag updates — never while downloading, building
         # engines, or joining workers — so info/start/stop stay responsive.
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._nodes: dict[str, _OCRNode] = {}
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._state_lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
         self._instance_configs: dict[str, dict] = {}
         self._pending_starts: dict[str, str] = {}   # node_key -> input_topic
         self._adapter: RapidOCRAdapter | None = None
@@ -509,67 +511,23 @@ class OCRPlugin:
             _close_quietly(stale)
             return
 
-        # Bring up every instance that is still pending. Nodes are created
-        # outside the lock; each one is committed only if its start was not
-        # cancelled in the meantime.
         while True:
             with self._state_lock:
                 if generation != self._load_generation or not self._pending_starts:
                     return
                 node_key, input_topic = next(iter(self._pending_starts.items()))
-            # README lifecycle rule: register under the lock *before*
-            # starting, so a concurrent stop (or a failure at any later
-            # point) can always locate the node — a started-but-unregistered
-            # worker would be unreachable and leak.
-            try:
-                node = self._create_node(node_key, input_topic, adapter)
-            except Exception as error:  # noqa: BLE001 - keep serving others
-                log.error("[ocr] failed to build instance %r on %r: %s",
-                          node_key, input_topic, escape_log_text(error))
-                with self._state_lock:
-                    if self._pending_starts.get(node_key) == input_topic:
-                        del self._pending_starts[node_key]
-                continue
-            registered = False
+                request = self._lifecycle.current(node_key)
+            self._activate_node(node_key, input_topic, adapter, request)
             with self._state_lock:
-                still_wanted = (
-                    generation == self._load_generation
-                    and self._pending_starts.get(node_key) == input_topic
-                )
-                if still_wanted:
-                    try:
-                        self._executor.add_node(node)
-                    except Exception as error:  # noqa: BLE001
-                        log.error("[ocr] failed to register instance %r: %s",
-                                  node_key, escape_log_text(error))
-                        del self._pending_starts[node_key]
-                    else:
-                        self._nodes[node_key] = node
-                        del self._pending_starts[node_key]
-                        registered = True
-            if not registered:
-                try:
-                    node.destroy_node()   # never started, never registered
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            try:
-                node.start()
-            except Exception as error:  # noqa: BLE001
-                log.error("[ocr] failed to start instance %r: %s",
-                          node_key, escape_log_text(error))
-                with self._state_lock:
-                    if self._nodes.get(node_key) is node:
-                        del self._nodes[node_key]
-                self._dispose(node_key, node)
-                continue
-            with self._state_lock:
-                still_ours = self._nodes.get(node_key) is node
-            if not still_ours:
-                # A concurrent stop retired the node while start() ran;
-                # its dispose already handled teardown — just make sure the
-                # worker this start spawned is gone too.
-                node.stop()
+                if (generation == self._load_generation
+                        and self._lifecycle.current(node_key) is request
+                        and self._pending_starts.get(node_key) == input_topic):
+                    self._pending_starts.pop(node_key, None)
+
+    def _activate_node(self, key, topic, adapter, request):
+        return self._lifecycle.start(
+            key, request, lambda: self._create_node(key, topic, adapter),
+            self._lifecycle.retire_node)
 
     def _create_node(self, node_key: str, input_topic: str, adapter) -> "_OCRNode":
         cfg = merge_rate_cfg(
@@ -583,16 +541,8 @@ class OCRPlugin:
             min_interval=ocr_interval(cfg),
         )
 
-    def _dispose(self, node_key: str, node: "_OCRNode") -> None:
-        """Stop and fully destroy one node (worker, executor entry, handle)."""
-        try:
-            # retire (not plain stop): marks the node dead under its lock so
-            # an in-flight start that lost the race reports idle instead of
-            # creating a subscription/worker on the destroyed handle.
-            node.retire()
-        finally:
-            dispose_node(self._executor, node, label=f"ocr/{node_key}")
-        log.info(f"[ocr] node disposed: {node_key}")
+    def _dispose(self, node_key: str, node: _OCRNode) -> dict:
+        return self._lifecycle.retire(node_key, node, node.retire)
 
     # ── per-instance status (lock held) ───────────────────────────────────
 
@@ -606,7 +556,19 @@ class OCRPlugin:
 
     # ── MCP dispatch ──────────────────────────────────────────────────────
 
-    def dispatch(self, name: str, args: dict) -> dict | None:
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
+
+    def _dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "ocr" else name
         instance_id = args.get("instance_id", "")
 
@@ -745,119 +707,27 @@ class OCRPlugin:
 
     def _do_start(self, instance_id: str, args: dict) -> dict:
         input_topic = args.get("input_topic")
-        # No topic is a supported mode, as in plugins/tts.py: the card comes
-        # up on-demand and answers recognize_by_photo / recognize_by_url. It
-        # simply has nothing to subscribe to.
-        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
-
-        retired = None
+        key = instance_id or input_topic or _DEFAULT_INSTANCE
+        request, blocked = self._lifecycle.begin(key, input_topic)
+        if blocked:
+            return blocked
         with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None and existing._input_topic != input_topic:
-                # Topics are fixed at node construction; rebind the key.
-                retired = self._nodes.pop(node_key)
-                existing = None
-        if retired is not None:
-            self._dispose(node_key, retired)
-
-        start_node = None
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None:
-                start_node = existing        # idempotent re-start
-            elif self._adapter_state == "ready":
-                # Claim the key before leaving the lock: a concurrent stop
-                # must always find the instance in _pending_starts or _nodes,
-                # never in an invisible in-between state (the orphan-node
-                # window PR #113 documents for the ASR plugin).
-                self._pending_starts[node_key] = input_topic
-            else:
-                self._pending_starts[node_key] = input_topic
+            if self._adapter_state != "ready":
+                self._pending_starts[key] = input_topic
                 if self._adapter_state in ("idle", "error"):
                     self._spawn_loader_locked()
-                return {
-                    "state": "loading",
-                    "input": input_topic or "",
-                    "output": _ocr_output_topic(input_topic),
-                }
-            adapter = self._adapter
-            generation = self._load_generation
-
-        if start_node is not None:
-            return start_node.start()
-
-        node = self._create_node(node_key, input_topic, adapter)
-        # README lifecycle rule: register before start, so a concurrent stop
-        # (or an add_node/start failure) can always locate the node instead of
-        # leaking a started worker that nothing tracks.
-        with self._state_lock:
-            claimed = self._pending_starts.get(node_key) == input_topic
-            current = self._nodes.get(node_key)
-            fresh = generation == self._load_generation
-            registered = False
-            if claimed and current is None and fresh:
-                try:
-                    self._executor.add_node(node)
-                except Exception as error:  # noqa: BLE001
-                    log.error("[ocr] failed to register instance %r: %s",
-                              node_key, escape_log_text(error))
-                    del self._pending_starts[node_key]
-                else:
-                    self._nodes[node_key] = node
-                    del self._pending_starts[node_key]
-                    registered = True
-            elif claimed and not fresh:
-                # A config change invalidated the adapter mid-start. Keep the
-                # pending claim: the loader spawned by config brings this
-                # instance up on the new adapter.
-                pass
-            elif claimed:
-                del self._pending_starts[node_key]
-        if not registered:
-            try:
-                node.destroy_node()   # never started, never registered
-            except Exception:  # noqa: BLE001
-                pass
-            if current is not None:
-                return current.start()
-            if claimed and not fresh:
                 return {"state": "loading", "input": input_topic or "",
                         "output": _ocr_output_topic(input_topic)}
-            return {"state": "idle", "input": input_topic or "",
-                    "output": _ocr_output_topic(input_topic)}
-        try:
-            result = node.start()
-        except Exception:
-            with self._state_lock:
-                if self._nodes.get(node_key) is node:
-                    del self._nodes[node_key]
-            self._dispose(node_key, node)
-            raise
-        with self._state_lock:
-            still_ours = self._nodes.get(node_key) is node
-        if not still_ours:
-            # A concurrent stop retired the node while start() ran; its
-            # dispose handled teardown — stop the worker this start spawned.
-            node.stop()
-            return {"state": "idle", "input": input_topic or "",
-                    "output": _ocr_output_topic(input_topic)}
-        return result
+            adapter = self._adapter
+        return self._activate_node(key, input_topic, adapter, request)
 
     def _do_stop(self, instance_id: str) -> dict:
-        to_dispose: list[tuple[str, _OCRNode]] = []
         with self._state_lock:
             if instance_id:
                 self._pending_starts.pop(instance_id, None)
-                node = self._nodes.pop(instance_id, None)
-                if node is not None:
-                    to_dispose.append((instance_id, node))
             else:
                 self._pending_starts.clear()
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
-        for node_key, node in to_dispose:
-            self._dispose(node_key, node)
-        return {"state": "idle"}
+        return self._lifecycle.stop(instance_id or None)
 
     def _do_config(self, instance_id: str, args: dict) -> dict:
         cfg = {
@@ -875,12 +745,21 @@ class OCRPlugin:
             with self._state_lock:
                 previous = self._instance_configs.get(instance_id, {})
                 self._instance_configs[instance_id] = {**previous, **cfg}
-                retired = self._nodes.pop(instance_id, None)
+                retired = self._nodes.get(instance_id)
             if retired is not None:
                 # The instance goes back to idle; the next start picks up the
                 # merged per-instance configuration.
-                self._dispose(instance_id, retired)
+                stopped = self._lifecycle.stop(instance_id)
+                if stopped["state"] != "idle":
+                    return stopped
             return {"status": "configured", "instance_id": instance_id}
+
+        with self._state_lock:
+            rebuild = _adapter_signature({**self._plugin_cfg, **cfg}) != _adapter_signature(self._plugin_cfg)
+        if rebuild:
+            stopped = self._lifecycle.stop()
+            if stopped["state"] != "idle":
+                return stopped
 
         with self._state_lock:
             updated_cfg = {**self._plugin_cfg, **cfg}
@@ -903,20 +782,22 @@ class OCRPlugin:
             # cached adapter and retire nodes built on it. Pending starts stay
             # pending and are served by a fresh loader for the new config.
             self._load_generation += 1
+            for key, topic in self._pending_starts.items():
+                self._lifecycle.begin(key, topic, configuring=True)
             stale_adapter = self._adapter
             self._adapter = None
-            disposed = list(self._nodes.items())
-            self._nodes = {}
             if self._pending_starts:
                 self._spawn_loader_locked()
             else:
                 self._adapter_state = "idle"
                 self._load_error = None
-        for node_key, node in disposed:
-            self._dispose(node_key, node)
         if stale_adapter is not None:
             _close_quietly(stale_adapter)
         return {"status": "configured", "adapter_loaded": False, "reused": False}
+
+    def shutdown(self) -> dict:
+        """Cancel pending creation and retain failed cleanup for explicit retry."""
+        return self._lifecycle.shutdown()
 
 
 def _close_quietly(adapter) -> None:

@@ -38,6 +38,8 @@ import os
 import queue
 import threading
 import time
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -48,11 +50,13 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeDisposal, dispose_node
 
 from plugins.image_input import BadInput, load_image_bytes
 
 log = logging.getLogger(__name__)
+
+
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -76,6 +80,28 @@ DEFAULT_OUTPUT_TOPIC = "/perception/vop"
 _DEFAULT_INSTANCE = "_default"
 
 DEFAULT_MODEL = "yoloe-26s-seg"
+
+@dataclass
+class _StartRequest:
+    generation: int
+    input_topic: str
+    config: dict
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class _VOPInstance:
+    operation_lock: object = field(default_factory=threading.RLock)
+    generation: int = 0
+    request: Optional[_StartRequest] = None
+    state: str = "idle"
+    error: Optional[str] = None
+    input_topic: str = ""
+    cleanup_task: Optional[threading.Thread] = None
+    cleanup_wake: threading.Event = field(default_factory=threading.Event)
+    cleanup_task_error: Optional[str] = None
+
+
 
 # Names that already exist in deployed canvas cards and yaml. A card saved when
 # this plugin ran YOLOv8-World must keep loading after an upgrade: the engine it
@@ -401,9 +427,15 @@ class _VOPNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        self._frame_lock = threading.Lock()
         self._last_inference_time = 0.0
         self._detect_count = 0
         self._running = False
+        self._state = "idle"
+        self._error: Optional[str] = None
+        self._retired = threading.Event()
+        self._disposal = NodeDisposal()
+        self._retirement_stop_started = False
         # Serializes start/stop on this node. The plugin calls both from HTTP
         # handler threads, and the canvas routinely does config→start→stop→start
         # within seconds; without this two starts can both pass the running
@@ -419,30 +451,79 @@ class _VOPNode(Node):
         """
         self._stop_event.set()
 
+    def request_retire(self) -> None:
+        """Irreversible cancellation; safe while start holds lifecycle locks."""
+        self._retired.set()
+        self.request_stop()
+
+    def destroy_node(self):
+        self.request_retire()
+        with self._lifecycle_lock:
+            return super().destroy_node()
+
     def _status(self) -> dict:
-        return {
-            "state": "running" if self._running else "idle",
-            "input": self._input_topic,
-            "output": self._output_topic,
-            "mode": "stream" if self._input_topic else "on_demand",
-        }
+        with self._frame_lock:
+            return {
+                "state": self._state,
+                "error": self._error,
+                "retired": self._retired.is_set(),
+                "cleanup_removed": self._disposal.removed,
+                "cleanup_destroyed": self._disposal.destroyed,
+                "cleanup_error": self._disposal.error,
+                "input": self._input_topic,
+                "output": self._output_topic,
+                "mode": "stream" if self._input_topic else "on_demand",
+            }
 
     def start(self) -> dict:
         with self._lifecycle_lock:
+            if self._retired.is_set():
+                return self._status()
             if self._running:
                 return self._status()
-            self._stop_event.clear()
-            if self._input_topic and self._sub is None:
-                self._sub = self.create_subscription(
-                    CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
-                )
-                self._worker = threading.Thread(target=self._inference_worker, daemon=True,
-                                                name=f"vop_worker_{self._input_topic}")
-                self._worker.start()
+            # A worker still finishing an old inference keeps its own stop
+            # event and queue. Restarting must never revive that worker or let
+            # it take frames belonging to the new stream.
+            with self._frame_lock:
+                self._stop_event = threading.Event()
+                self._frame_queue = queue.Queue(maxsize=1)
+                self._last_inference_time = 0.0
+                self._state = "starting"
+                self._error = None
+                self._running = not self._retired.is_set()
+            if self._retired.is_set():
+                self._stop_event.set()
+                with self._frame_lock:
+                    self._state = "idle"
+                return self._status()
+            try:
+                if self._input_topic:
+                    if self._sub is None:
+                        self._sub = self.create_subscription(
+                            CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
+                        )
+                    self._worker = threading.Thread(
+                        target=self._inference_worker, daemon=True,
+                        args=(self._stop_event, self._frame_queue),
+                        name=f"vop_worker_{self._input_topic}")
+                    self._worker.start()
+            except Exception as error:
+                self._stop_event.set()
+                with self._frame_lock:
+                    self._running = False
+                    self._state = "failed"
+                    self._error = str(error)
+                raise
+            with self._frame_lock:
+                if self._retired.is_set() or self._stop_event.is_set():
+                    self._running = False
+                    self._state = "stopping"
+                    self._stop_event.set()
+                else:
+                    self._state = "running"
             # Without a topic there is nothing to subscribe to and no frames to
             # consume, so no worker is spawned; the node exists to own the
             # publisher that one-shot results go out on.
-            self._running = True
             log.info(f"[vop] started: {self._input_topic or '(no topic, on-demand)'} "
                      f"→ {self._output_topic}")
             return self._status()
@@ -462,38 +543,49 @@ class _VOPNode(Node):
         # as soon as it releases, instead of this call queueing behind it.
         self._stop_event.set()
         with self._lifecycle_lock:
+            # A concurrent start may have replaced the event while stop was
+            # waiting for this lock. Cancel that generation as well.
+            self._stop_event.set()
+            with self._frame_lock:
+                self._running = False
+                self._state = "stopping"
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
-            self._worker = None
-            self._running = False
+            with self._frame_lock:
+                if not self._worker or not self._worker.is_alive():
+                    self._worker = None
+                    self._state = "idle"
             log.info(f"[vop] stopped: {self._input_topic or '(no topic)'}")
             return self._status()
 
     def _image_cb(self, msg: CompressedImage):
-        now = time.monotonic()
-        if now - self._last_inference_time < self._frame_interval:
-            return
-        self._last_inference_time = now
-        # Drop old frame if queue full (no backpressure)
-        try:
-            self._frame_queue.put_nowait(msg.data)
-        except queue.Full:
-            try:
-                self._frame_queue.get_nowait()
-            except queue.Empty:
-                pass
+        with self._frame_lock:
+            if not self._running or self._stop_event.is_set() or self._retired.is_set():
+                return
+            now = time.monotonic()
+            if now - self._last_inference_time < self._frame_interval:
+                return
+            self._last_inference_time = now
+            # Drop old frame if queue full (no backpressure)
             try:
                 self._frame_queue.put_nowait(msg.data)
             except queue.Full:
-                pass
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._frame_queue.put_nowait(msg.data)
+                except queue.Full:
+                    pass
 
-    def _inference_worker(self):
+    def _inference_worker(self, stop_event, frame_queue):
         import cv2
         from plugins.vision_runtime import decode_detections
 
-        while not self._stop_event.is_set():
+        while not stop_event.is_set() and not self._retired.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                jpeg_bytes = frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             started = time.time()
@@ -560,25 +652,28 @@ class _VOPNode(Node):
         self._publish_objects(objects, started)
 
     def _publish_objects(self, objects: list, started: Optional[float] = None):
-        self._detect_count += 1
-        # `count` and `latency_ms` follow plugins/face.py: a consumer should not
-        # have to len() the list to know whether anything was seen, and latency
-        # is the number an operator actually watches. `timestamp` keeps its name
-        # rather than becoming face's `ts` — renaming it would break every
-        # existing reader of {topic}/objects for no gain.
-        payload = {
-            "timestamp": time.time(),
-            "count": len(objects),
-            "objects": objects,
-        }
-        if started is not None:
-            # Measured from the start of processing this frame, not from its
-            # arrival: queue wait is a function of the fps cap, not of how long
-            # detection takes, and mixing them makes the number unreadable.
-            payload["latency_ms"] = int((time.time() - started) * 1000)
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self._pub.publish(msg)
+        with self._frame_lock:
+            if not self._running or self._stop_event.is_set() or self._retired.is_set():
+                return False
+            self._detect_count += 1
+            # `count` and `latency_ms` follow plugins/face.py: a consumer should not
+            # have to len() the list to know whether anything was seen, and latency
+            # is the number an operator actually watches. `timestamp` keeps its name
+            # rather than becoming face's `ts` — renaming it would break every
+            # existing reader of {topic}/objects for no gain.
+            payload = {
+                "timestamp": time.time(),
+                "count": len(objects),
+                "objects": objects,
+            }
+            if started is not None:
+                # Measured from the start of processing this frame, not from its
+                # arrival: queue wait is a function of the fps cap, not of how long
+                # detection takes, and mixing them makes the number unreadable.
+                payload["latency_ms"] = int((time.time() - started) * 1000)
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(msg)
 
 
 # ── Plugin class ──────────────────────────────────────────────────────────────
@@ -620,6 +715,13 @@ class VideoObjectPerceptionPlugin:
         # perception/README.md § "Plugin Concurrency". Never held across
         # node.start()/stop() or a model load.
         self._nodes_lock = threading.RLock()
+        self._instances: dict[str, _VOPInstance] = {}
+        self._loader_thread: Optional[threading.Thread] = None
+        # In-flight inference cannot be forcibly interrupted. Retiring nodes
+        # remain owned here until a tracked task observes worker exit and
+        # completes executor removal and ROS handle disposal.
+        self._draining_nodes: dict[str, list[_VOPNode]] = {}
+        self._cleanup_threads: set[threading.Thread] = set()
         # A configured `classes` list cannot be honoured any more (the engine's
         # vocabulary is frozen). Remember that it was asked for, so info() and
         # the next dispatch can say so instead of pretending it took effect.
@@ -906,32 +1008,282 @@ class VideoObjectPerceptionPlugin:
             return self._vocabulary[cls_id]
         return str(cls_id)
 
-    def _start_node(self, node_key: str, input_topic: str):
-        """Create and start a VOPNode for the given topic.
+    def _current_request(self, node_key: str, request: _StartRequest) -> bool:
+        """Called under _nodes_lock; no ROS operations or blocking work here."""
+        instance = self._instances.get(node_key)
+        return (instance is not None and instance.request is request
+                and instance.generation == request.generation
+                and not request.cancelled.is_set())
 
-        Registers the node before starting it so a concurrent stop can always
-        find and cancel it; the lock covers only the registration, never the
-        start itself, so a stop is not queued behind a start it is trying to
-        abort (perception/README.md § "Plugin Concurrency").
-        """
+    def _settle_stop(self, node_key: str) -> None:
         with self._nodes_lock:
-            if node_key in self._nodes:
-                return
-            icfg = self._instance_configs.get(node_key, {})
-            confidence = float(icfg.get("confidence", self._confidence))
-            fps = int(icfg.get("fps", self._fps))
-            publish_bbox = bool(icfg.get("publish_bbox", self._publish_bbox))
-            publish_color = (_color_level(icfg["publish_color"])
-                             if "publish_color" in icfg else self._publish_color)
-            suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
-            input_for_node = input_topic or None
-            node = _VOPNode(input_for_node, self._model, confidence, fps,
-                            node_suffix=suffix, vocabulary=self._vocabulary,
-                            publish_bbox=publish_bbox, publish_color=publish_color)
-            self._executor.add_node(node)
-            self._nodes[node_key] = node
-        node.start()
-        log.info(f"[vop] node started (background): {input_topic}")
+            instance = self._instances.get(node_key)
+            if (instance is not None and instance.request is None
+                    and node_key not in self._nodes):
+                resources = self._draining_nodes.get(node_key, [])
+                errors = [node._disposal.error for node in resources if node._disposal.error]
+                if instance.cleanup_task_error:
+                    errors.append(instance.cleanup_task_error)
+                instance.state = "failed" if errors else "stopping" if resources else "idle"
+                instance.error = "; ".join(errors) or None
+
+    def _dispose_retired_node(self, node_key: str, node, *, registered=True,
+                              schedule=True) -> dict:
+        """Transfer ownership before teardown; retain failed resources for retry."""
+        node.request_retire()
+        if not registered:
+            # add_node may raise after inserting the node (e.g. guard wake).
+            # Use the real executor's membership API before declaring it absent.
+            get_nodes = getattr(self._executor, "get_nodes", None)
+            if get_nodes is None:
+                # False means add_node was never attempted. None means it
+                # was attempted but did not confirm success: it may already
+                # own the node, so disposal must attempt removal first.
+                if registered is False:
+                    node._disposal.removed = True
+            else:
+                try:
+                    node._disposal.removed = node not in get_nodes()
+                except Exception:
+                    pass  # dispose_node will report the unverifiable membership
+        with self._nodes_lock:
+            resources = self._draining_nodes.setdefault(node_key, [])
+            if node not in resources:
+                resources.append(node)
+            if self._nodes.get(node_key) is node:
+                del self._nodes[node_key]
+        try:
+            if (node._retirement_stop_started
+                    and (node._worker is None or not node._worker.is_alive())):
+                result = {"state": "idle"}
+            else:
+                result = node.stop()
+                node._retirement_stop_started = True
+            if result["state"] == "stopping":
+                if schedule:
+                    self._schedule_cleanup(node_key)
+                self._settle_stop(node_key)
+                return result
+            dispose_node(self._executor, node, label=f"vop/{node_key}",
+                         progress=node._disposal)
+        except Exception as error:
+            node._disposal.error = f"stop: {error}"
+        if node._disposal.complete:
+            with node._frame_lock:
+                node._worker = None
+                node._state, node._error = "idle", None
+            with self._nodes_lock:
+                self._draining_nodes[node_key].remove(node)
+                if not self._draining_nodes[node_key]:
+                    del self._draining_nodes[node_key]
+        else:
+            with node._frame_lock:
+                node._state = "failed"
+                node._error = node._disposal.error
+        self._settle_stop(node_key)
+        return node._status()
+
+    def _schedule_cleanup(self, node_key: str) -> bool:
+        """One waiter/reaper per instance, shared by every stop request."""
+        with self._nodes_lock:
+            instance = self._instances[node_key]
+            instance.cleanup_wake.set()
+            if instance.cleanup_task is not None:
+                return True
+            instance.cleanup_task_error = None
+            thread = None
+            try:
+                thread = threading.Thread(target=self._cleanup_worker, args=(node_key,),
+                                          daemon=True, name=f"vop_cleanup_{node_key}")
+                instance.cleanup_task = thread
+                self._cleanup_threads.add(thread)
+                thread.start()
+            except Exception as error:
+                instance.cleanup_task = None
+                self._cleanup_threads.discard(thread)
+                instance.cleanup_task_error = f"cleanup thread: {error}"
+                instance.state = "failed"
+                instance.error = instance.cleanup_task_error
+                return False
+            return True
+
+    def _cleanup_worker(self, node_key: str) -> None:
+        instance = self._instances[node_key]
+        current = threading.current_thread()
+        try:
+            while True:
+                with self._nodes_lock:
+                    instance.cleanup_wake.clear()
+                with instance.operation_lock:
+                    self._finish_stop(node_key, instance, schedule=False)
+                with self._nodes_lock:
+                    alive = any(node._worker is not None and node._worker.is_alive()
+                                for node in self._draining_nodes.get(node_key, []))
+                    if not alive and not instance.cleanup_wake.is_set():
+                        # Release the slot atomically with the final work check.
+                        instance.cleanup_task = None
+                        self._cleanup_threads.discard(current)
+                        return
+                instance.cleanup_wake.wait(timeout=0.1)
+        except Exception as error:
+            with self._nodes_lock:
+                instance.cleanup_task_error = f"cleanup worker: {error}"
+                if instance.request is None:
+                    instance.state = "failed"
+                    instance.error = instance.cleanup_task_error
+        finally:
+            with self._nodes_lock:
+                if instance.cleanup_task is current:
+                    instance.cleanup_task = None
+                self._cleanup_threads.discard(current)
+
+    def _start_node(self, node_key: str, request: _StartRequest) -> dict:
+        instance = self._instances[node_key]
+        with instance.operation_lock:
+            with self._nodes_lock:
+                if not self._current_request(node_key, request):
+                    self._settle_stop(node_key)
+                    return {"state": "idle", "cancelled": True}
+                old = self._nodes.get(node_key)
+            if old is not None:
+                self._dispose_retired_node(node_key, old)
+            node = None
+            registered = False
+            keep = False
+            try:
+                with self._nodes_lock:
+                    if not self._current_request(node_key, request):
+                        return {"state": "idle", "cancelled": True}
+                cfg = request.config
+                suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
+                node = _VOPNode(
+                    request.input_topic or None, self._model, cfg["confidence"], cfg["fps"],
+                    node_suffix=f"{suffix}_{request.generation}", vocabulary=self._vocabulary,
+                    publish_bbox=cfg["publish_bbox"], publish_color=cfg["publish_color"])
+                node._request_generation = request.generation
+                with self._nodes_lock:
+                    if not self._current_request(node_key, request):
+                        return {"state": "idle", "cancelled": True}
+                # Registration can mutate executor membership before raising
+                # (e.g. while waking the guard). Do not treat that as absence.
+                registered = None
+                if self._executor.add_node(node) is False:
+                    raise RuntimeError("ROS executor refused VOP node registration")
+                registered = True
+                with self._nodes_lock:
+                    if not self._current_request(node_key, request):
+                        return {"state": "idle", "cancelled": True}
+                    self._nodes[node_key] = node
+                # stop can retire the registered node while this call is about
+                # to run. The node's terminal latch closes that final window.
+                result = node.start()
+                with self._nodes_lock:
+                    if not self._current_request(node_key, request):
+                        return {"state": "idle", "cancelled": True}
+                    if node._retired.is_set() or result["state"] != "running":
+                        raise RuntimeError(result.get("error") or "VOP startup was cancelled")
+                    instance.state = "running"
+                    instance.error = None
+                    keep = True
+                return {**result, "generation": request.generation}
+            except Exception as error:
+                with self._nodes_lock:
+                    if self._current_request(node_key, request):
+                        instance.state = "failed"
+                        instance.error = str(error)
+                        log.error("[vop] instance %s failed: %s", node_key, error)
+                        return {"state": "failed", "error": str(error),
+                                "generation": request.generation}
+                return {"state": "idle", "cancelled": True}
+            finally:
+                if node is not None and not keep:
+                    self._dispose_retired_node(node_key, node, registered=registered)
+                self._settle_stop(node_key)
+
+    def _load_pending(self) -> None:
+        try:
+            self._ensure_model()
+        except Exception as error:
+            with self._nodes_lock:
+                self._model_loading = False
+                self._model_load_error = str(error)
+                for instance in self._instances.values():
+                    if instance.request is not None and instance.state == "starting":
+                        instance.state = "failed"
+                        instance.error = str(error)
+            return
+        with self._nodes_lock:
+            self._model_loading = False
+            self._model_load_error = None
+            self._model_load_status = None
+            pending = [(key, instance.request) for key, instance in self._instances.items()
+                       if instance.state == "starting" and instance.request is not None]
+        for key, request in pending:
+            self._start_node(key, request)
+
+    def _request_start(self, node_key: str, input_topic: str, args: dict) -> dict:
+        from plugins.camera_info import for_topic
+
+        launch_loader = False
+        with self._nodes_lock:
+            instance = self._instances.setdefault(node_key, _VOPInstance())
+            overrides = self._instance_configs.get(node_key, {})
+            cfg = {
+                "confidence": float(overrides.get("confidence", self._confidence)),
+                "fps": int(overrides.get("fps", self._fps)),
+                "publish_bbox": bool(overrides.get("publish_bbox", self._publish_bbox)),
+                "publish_color": _color_level(overrides.get("publish_color", self._publish_color)),
+            }
+            request = instance.request
+            if (request is not None and not request.cancelled.is_set()
+                    and instance.state in ("starting", "running")
+                    and request.input_topic == input_topic and request.config == cfg):
+                node = self._nodes.get(node_key)
+                if instance.state == "running" and node is not None:
+                    # Do not call start() on a cached node reference.
+                    return {**node._status(), "generation": request.generation}
+                return {"state": "loading" if self._model_loading else "starting",
+                        "input": input_topic, "output": output_topic_for(input_topic),
+                        "generation": request.generation}
+            if request is not None:
+                request.cancelled.set()
+            old = self._nodes.get(node_key)
+            if old is not None:
+                old.request_retire()
+            instance.generation += 1
+            request = _StartRequest(instance.generation, input_topic, cfg)
+            instance.request = request
+            instance.state = "starting"
+            instance.error = None
+            instance.input_topic = input_topic
+            self._upstream_camera[node_key] = deepcopy(for_topic(args.get("camera_info"), input_topic))
+            if self._model is None and not self._model_loading:
+                self._model_loading = True
+                self._model_load_error = None
+                launch_loader = True
+            model_ready = self._model is not None
+            if launch_loader:
+                self._loader_thread = threading.Thread(
+                    target=self._load_pending, daemon=True, name="vop_model_load")
+                loader = self._loader_thread
+        if model_ready:
+            return self._start_node(node_key, request)
+        if launch_loader:
+            try:
+                loader.start()
+            except Exception as error:
+                with self._nodes_lock:
+                    self._model_loading = False
+                    self._model_load_error = str(error)
+                    for pending in self._instances.values():
+                        if pending.state == "starting" and pending.request is not None:
+                            pending.state = "failed"
+                            pending.error = str(error)
+                return {"state": "failed", "error": str(error),
+                        "generation": request.generation}
+        return {"state": "loading", "input": input_topic,
+                "output": output_topic_for(input_topic), "generation": request.generation,
+                "message": self._model_load_status or "Model loading in background"}
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
         """`{"camera_info": [...]}` for an `info()` answered while loading.
@@ -948,6 +1300,8 @@ class VideoObjectPerceptionPlugin:
             topic = topics[0] if topics else ""
         key = instance_id or topic or _DEFAULT_INSTANCE
         with self._nodes_lock:
+            if not topic and key in self._instances:
+                topic = self._instances[key].input_topic
             upstream = self._upstream_camera.get(key) or {}
         declared = inherit(upstream, topic=output_topic_for(topic),
                            fmt="data/json", stage="perception/vop")
@@ -956,22 +1310,55 @@ class VideoObjectPerceptionPlugin:
     def _retire_node(self, node_key: str) -> Optional[dict]:
         """Stop, unregister and destroy one node. Returns its stop() result."""
         with self._nodes_lock:
-            node = self._nodes.pop(node_key, None)
+            instance = self._instances.get(node_key)
+            node = self._nodes.get(node_key)
+            if instance is not None:
+                instance.generation += 1
+                if instance.request is not None:
+                    instance.request.cancelled.set()
+                instance.request = None
+                instance.state = "stopping"
+                instance.error = None
+                instance.cleanup_task_error = None
+            if node is not None:
+                node.request_retire()
             # Goes with the node: a re-wired card answering info() with the
             # optics of a camera it is no longer fed by is worse than answering
             # with nothing, because downstream cannot tell the difference.
             self._upstream_camera.pop(node_key, None)
-        if node is None:
+        if instance is None:
             return None
-        node.request_stop()
-        result = node.stop()
-        # remove-then-destroy, via the shared helper: the node has to leave the
-        # executor before any of its handles are destroyed, or the spin thread
-        # dies on InvalidHandle. It must also be destroyed and not merely
-        # removed, or the publisher and the ROS node name leak and the next
-        # start on the same topic trips "Publisher already registered".
-        dispose_node(self._executor, node, label=f"vop/{node_key}")
-        return result
+        if not instance.operation_lock.acquire(blocking=False):
+            scheduled = self._schedule_cleanup(node_key)
+            return {"state": "stopping" if scheduled else "failed",
+                    "error": instance.cleanup_task_error}
+        try:
+            return self._finish_stop(node_key, instance)
+        finally:
+            instance.operation_lock.release()
+
+    def _finish_stop(self, node_key: str, instance: _VOPInstance, *, schedule=True) -> dict:
+        with self._nodes_lock:
+            # A newer start owns its cleanup. Never let an older stop operation
+            # remove a replacement node after it acquires the per-instance lock.
+            superseded = instance.request is not None
+            node = None if superseded else self._nodes.get(node_key)
+            resources = list(self._draining_nodes.get(node_key, []))
+        if node is not None:
+            self._dispose_retired_node(node_key, node, schedule=schedule)
+        for retired in resources:
+            if retired is not node and (retired._worker is None or not retired._worker.is_alive()):
+                self._dispose_retired_node(node_key, retired, schedule=False)
+        if schedule:
+            with self._nodes_lock:
+                alive = any(retired._worker is not None and retired._worker.is_alive()
+                            for retired in self._draining_nodes.get(node_key, []))
+            if alive:
+                self._schedule_cleanup(node_key)
+        self._settle_stop(node_key)
+        with self._nodes_lock:
+            return {"state": instance.state, "error": instance.error,
+                    **({"superseded": True} if superseded else {})}
 
     def get_tools(self) -> list:
         """TOOLS, with the frozen vocabulary folded into the description.
@@ -999,47 +1386,79 @@ class VideoObjectPerceptionPlugin:
         )
         return tools
 
+    def _info_snapshot(self) -> dict:
+        """Read node locks outside the registry, then validate the whole binding.
+
+        A completed replacement may invalidate a status read in progress. Retry
+        that snapshot rather than joining an old stream to current optics.
+        """
+        while True:
+            with self._nodes_lock:
+                nodes = dict(self._nodes)
+                records = {key: {
+                    "state": record.state, "error": record.error,
+                    "generation": record.generation, "input": record.input_topic,
+                    "config": dict(record.request.config) if record.request else {},
+                    "cleanup_task_error": record.cleanup_task_error,
+                    "cleanup_pending": record.cleanup_task is not None,
+                } for key, record in self._instances.items()}
+                retired = {key: tuple(values) for key, values in self._draining_nodes.items()}
+                cameras = deepcopy(self._upstream_camera)
+                model_loading = self._model_loading
+                model_error = self._model_load_error
+            statuses = {key: node._status() for key, node in nodes.items()}
+            draining = {key: [node._status() for node in values]
+                        for key, values in retired.items()}
+            with self._nodes_lock:
+                if (nodes != self._nodes or records.keys() != self._instances.keys()
+                        or any(record["generation"] != self._instances[key].generation
+                               or record["state"] != self._instances[key].state
+                               or record["error"] != self._instances[key].error
+                               for key, record in records.items())
+                        or retired != {key: tuple(values) for key, values in self._draining_nodes.items()}):
+                    continue
+            return dict(nodes=nodes, records=records, statuses=statuses, draining=draining,
+                        cameras=cameras, model_loading=model_loading, model_error=model_error)
+
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            # Report loading/error state
-            if self._model_loading:
-                return {
-                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
-                    "state": "loading",
-                    "desc": "Loading YOLO model...",
-                    # **The declaration does not wait for the engine.**
-                    #
-                    # This reply used to drop it, and agent-core records
-                    # whatever `info()` returns — so a consumer that started
-                    # while this card was still loading got no camera
-                    # declaration at all, and nothing said so. On r1_sz that
-                    # cost navi its box path and the corridor's real geometry,
-                    # and it only ever reproduced on a *cold* container, because
-                    # a warm one starts immediately and never passes through
-                    # here.
-                    **self._loading_camera_info(args, instance_id),
-                }
-            if self._model_load_error:
-                return {
-                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
-                    "state": "error",
-                    "desc": f"Model load failed: {self._model_load_error}",
-                }
-            with self._nodes_lock:
-                nodes = dict(self._nodes)
+            snapshot = self._info_snapshot()
+            nodes, records = snapshot["nodes"], snapshot["records"]
+            draining = snapshot["draining"]
+            model_loading, model_error = snapshot["model_loading"], snapshot["model_error"]
             instances = {}
-            for key, node in nodes.items():
+            for key in dict.fromkeys([*records, *nodes]):
+                node = nodes.get(key)
+                record = records.get(key, {})
+                if (node is not None and record
+                        and getattr(node, "_request_generation", None) != record["generation"]):
+                    node = None  # never mix the new binding with an old stream's status
+                cfg = record.get("config", {})
+                topic = record.get("input", node._input_topic if node else "")
+                status = snapshot["statuses"][key] if node else {}
+                actual_state = record.get("state", status.get("state", "idle"))
+                if actual_state == "running" and status:
+                    actual_state = status["state"]
                 instances[key] = {
-                    "input": node._input_topic,
-                    "output": node._output_topic,
-                    "confidence": node._confidence,
-                    "fps": node._fps,
-                    "publish_bbox": node._publish_bbox,
-                    "publish_color": node._publish_color,
-                    "detect_count": node._detect_count,
+                    "input": topic,
+                    "output": output_topic_for(topic),
+                    "confidence": node._confidence if node else cfg.get("confidence", self._confidence),
+                    "fps": node._fps if node else cfg.get("fps", self._fps),
+                    "publish_bbox": node._publish_bbox if node else cfg.get("publish_bbox", self._publish_bbox),
+                    "publish_color": node._publish_color if node else cfg.get("publish_color", self._publish_color),
+                    "detect_count": node._detect_count if node else 0,
+                    "state": actual_state,
+                    "error": record.get("error") or status.get("error"),
+                    "generation": record.get("generation", 0),
+                    "draining_streams": draining.get(key, []),
+                    "cleanup_pending": record.get("cleanup_pending", False),
+                    "cleanup_errors": ([record["cleanup_task_error"]]
+                                       if record.get("cleanup_task_error") else []) + [
+                        item["cleanup_error"] for item in draining.get(key, [])
+                        if item.get("cleanup_error")],
                 }
             # Determine topic info: from running instance, args, or empty
             input_topic = args.get("input_topic", "")
@@ -1047,19 +1466,32 @@ class VideoObjectPerceptionPlugin:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
                     input_topic = topics_list[0]
-            # If instance_id specified and running, use its topics
-            if instance_id and instance_id in nodes:
-                input_topic = nodes[instance_id]._input_topic
-            # If no explicit topic but there are running instances, use first one
-            elif not input_topic and nodes:
-                input_topic = next(iter(nodes.values()))._input_topic
+            if instance_id and instance_id in instances:
+                input_topic = instances[instance_id]["input"]
+            elif not input_topic and instances:
+                active = next((item for item in instances.values()
+                               if item["state"] in ("running", "starting")),
+                              next(iter(instances.values())))
+                input_topic = active["input"]
             topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
             topics_out = ([{"topic": output_topic_for(input_topic), "format": "data/json"}]
-                          if (input_topic or nodes) else [])
-            state = "running" if instances else "idle"
+                          if (input_topic or instances) else [])
+            states = {item["state"] for item in instances.values()}
+            state = next((value for value in ("running", "starting", "stopping", "failed")
+                          if value in states), "idle")
+            if instance_id:
+                state = instances.get(instance_id, {}).get("state", "idle")
+            if model_loading and (state == "starting" or not records):
+                state = "loading"  # preserve the legacy model-loading state
+            elif model_error and not records:
+                state = "error"
             info = {
                 "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                 "state": state,
+                "model_state": ("loading" if model_loading else "ready" if self._model is not None
+                                else "failed" if model_error else "idle"),
+                "model_error": model_error,
+
                 "vocabulary_frozen": True,
                 # `None` rather than 0 while the list is still unknown: a card
                 # that says "0 classes" reads as "detects nothing", which is
@@ -1073,6 +1505,11 @@ class VideoObjectPerceptionPlugin:
                 "topic_out": topics_out,
                 "desc": "YOLOE-26 open-vocabulary object detection (TensorRT, fixed class list)",
             }
+            if state in ("failed", "error"):
+                failed = (instances.get(instance_id, {}) if instance_id else
+                          next((item for item in instances.values()
+                                if item["state"] == "failed"), {}))
+                info["error"] = failed.get("error") or model_error or "VOP instance failed"
             # Surface a `classes` that yaml asked for and this build cannot
             # honour. Without this the card looks perfectly healthy while
             # silently detecting a different set than its config states.
@@ -1094,11 +1531,10 @@ class VideoObjectPerceptionPlugin:
                 from plugins.camera_info import inherit
                 # Same key derivation `start` uses, so info() looks up the entry
                 # that start recorded.
-                key = instance_id if instance_id in nodes else (
-                    next(iter(nodes), None) if nodes
-                    else (instance_id or input_topic or _DEFAULT_INSTANCE))
-                with self._nodes_lock:
-                    upstream = self._upstream_camera.get(key) or {}
+                key = instance_id if instance_id in instances else next(
+                    (key for key, item in instances.items() if item["input"] == input_topic),
+                    instance_id or input_topic or _DEFAULT_INSTANCE)
+                upstream = snapshot["cameras"].get(key) or {}
                 declared = inherit(upstream, topic=topics_out[0]["topic"],
                                    fmt="data/json", stage="perception/vop")
                 if declared:
@@ -1114,66 +1550,29 @@ class VideoObjectPerceptionPlugin:
         elif action == "start":
             input_topic = args.get("input_topic")
             if not input_topic:
-                topics_list = args.get("input_topics") or []
-                if topics_list:
-                    input_topic = topics_list[0]
-            # No topic is a supported mode, as in plugins/tts.py: the card comes
-            # up on-demand, loads the engine and owns a publisher, and answers
-            # recognize_by_photo / recognize_by_url. It just has nothing to
-            # subscribe to, so it consumes no frames.
+                topics = args.get("input_topics") or []
+                input_topic = topics[0] if topics else ""
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
-            # Recorded before the node starts, and recorded even when empty, so a
-            # restart that no longer carries a declaration replaces the old entry
-            # rather than leaving one that claims a camera no longer wired.
-            if input_topic:
-                from plugins.camera_info import for_topic as _camera_for_topic
-                with self._nodes_lock:
-                    self._upstream_camera[node_key] = _camera_for_topic(
-                        args.get("camera_info"), input_topic)
-            with self._nodes_lock:
-                running = self._nodes.get(node_key)
-            if running is None:
-                if self._model is None:
-                    if self._model_loading:
-                        return {"state": "loading",
-                                "message": (self._model_load_status
-                                            or "Model is still loading, please wait...")}
-                    if self._model_load_error:
-                        return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
-                    # Model not loaded yet — start loading in background
-                    def _bg_start():
-                        self._model_loading = True
-                        self._model_load_error = None
-                        self._model_load_status = None
-                        try:
-                            self._ensure_model()
-                            self._model_loading = False
-                            self._model_load_status = None
-                            self._start_node(node_key, input_topic)
-                        except Exception as e:
-                            self._model_loading = False
-                            self._model_load_error = str(e)
-                            log.error(f"[vop] model load failed: {e}", exc_info=True)
-                    threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
-                    return {"state": "loading", "input": input_topic or "",
-                            "output": output_topic_for(input_topic),
-                            "message": "Model loading in background, will start automatically"}
-                self._start_node(node_key, input_topic)
-                with self._nodes_lock:
-                    running = self._nodes.get(node_key)
-                if running is None:
-                    # A concurrent stop retired it between start and lookup.
-                    return {"state": "idle", "input": input_topic}
-            return running.start()
+            return self._request_start(node_key, input_topic, args)
 
         elif action == "stop":
             if instance_id:
                 result = self._retire_node(instance_id)
                 return result if result is not None else {"state": "idle"}
             with self._nodes_lock:
-                keys = list(self._nodes.keys())
-            results = [key for key in keys if self._retire_node(key) is not None]
-            return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
+                keys = [key for key, instance in self._instances.items()
+                        if instance.state != "idle" or instance.request is not None
+                        or key in self._nodes or self._draining_nodes.get(key)]
+            results = {key: self._retire_node(key) for key in keys}
+            pending = any(result and result["state"] == "stopping" for result in results.values())
+            failed = {key: result.get("error") or "VOP cleanup failed"
+                      for key, result in results.items()
+                      if result and result["state"] == "failed"}
+            return {"state": "failed" if failed else "stopping" if pending else "idle",
+                    "stopped_instances": list(results),
+                    **({"failed_instances": list(failed),
+                        "error": "; ".join(f"{key}: {error}" for key, error in failed.items())}
+                       if failed else {})} if results else {"state": "idle"}
 
         elif action == "recognize_by_photo":
             return self._recognize_image(args, url_action="recognize_by_url")
@@ -1224,7 +1623,9 @@ class VideoObjectPerceptionPlugin:
             if instance_id:
                 with self._nodes_lock:
                     self._instance_configs[instance_id] = cfg
-                    running = instance_id in self._nodes
+                    instance = self._instances.get(instance_id)
+                    running = (instance_id in self._nodes
+                               or (instance is not None and instance.request is not None))
                 # If instance is running, retire it; the next start picks up
                 # the new config.
                 if running:
@@ -1232,14 +1633,15 @@ class VideoObjectPerceptionPlugin:
                 return {"status": "configured", "instance_id": instance_id, "config": cfg}
             else:
                 # Update global defaults
-                if "confidence" in cfg:
-                    self._confidence = float(cfg["confidence"])
-                if "fps" in cfg:
-                    self._fps = int(cfg["fps"])
-                if "publish_bbox" in cfg:
-                    self._publish_bbox = bool(cfg["publish_bbox"])
-                if "publish_color" in cfg:
-                    self._publish_color = _color_level(cfg["publish_color"])
+                with self._nodes_lock:
+                    if "confidence" in cfg:
+                        self._confidence = float(cfg["confidence"])
+                    if "fps" in cfg:
+                        self._fps = int(cfg["fps"])
+                    if "publish_bbox" in cfg:
+                        self._publish_bbox = bool(cfg["publish_bbox"])
+                    if "publish_color" in cfg:
+                        self._publish_color = _color_level(cfg["publish_color"])
                 return {"status": "configured", "config": cfg}
 
         return None

@@ -253,7 +253,7 @@ def test_unbound_on_demand_start_discards_stopped_camera(monkeypatch):
     p._model = object()
     p._upstream_camera['a'] = camera()
     starts = []
-    monkeypatch.setattr(p, '_start_node', lambda key, topic: starts.append((key, topic)))
+    monkeypatch.setattr(p, '_start_node', lambda key, topic, request=None: starts.append((key, topic)))
     p.dispatch('visual_depth', dict(action='start', instance_id='a'))
     assert starts == [('a', None)]
     assert 'a' not in p._upstream_camera
