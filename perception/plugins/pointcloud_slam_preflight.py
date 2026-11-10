@@ -97,14 +97,30 @@ def evaluate_preflight(args, *, manual_extrinsic=None, topic_types=None):
             if not resolved['extrinsic'].get('calibrated'):
                 notes.append('mount not marked calibrated; verify the actual transform')
         except InputContractError as error:
+            pose_meta = metadata.get(odom_topic) or {}
+            cloud_topic = next(t for t, fmt in bindings.items() if fmt == CLOUD_FORMAT)
+            cloud_meta = metadata.get(cloud_topic) or {}
+            known_frames = (isinstance(pose_meta.get('child_frame_id'), str) and
+                            bool(pose_meta['child_frame_id'].strip()) and
+                            isinstance(cloud_meta.get('frame_id'), str) and
+                            bool(cloud_meta['frame_id'].strip()))
+            known_clocks = (isinstance(pose_meta.get('clock_id'), str) and
+                            bool(pose_meta['clock_id'].strip()) and
+                            isinstance(cloud_meta.get('clock_id'), str) and
+                            bool(cloud_meta['clock_id'].strip()))
             for issue in error.diagnostics:
                 field, reason = issue.get('field', ''), issue.get('reason', '')
-                # Missing startup evidence is pending; contradictory present
-                # claims remain blocking. Never silently accept a mismatch.
-                if (field in _FATAL_FIELDS or 'conflicting' in reason or
+                # A missing frame/clock can produce derivative mismatches with
+                # otherwise valid mounts. Do not classify those as contradictory
+                # until both ends have advertised their real identities.
+                derived_pending = (
+                    (field == 'extrinsic' and 'must explicitly map' in reason and not known_frames) or
+                    (field == 'clock_id' and 'differs' in reason and not known_clocks))
+                hard = (field in _FATAL_FIELDS or 'conflicting' in reason or
                         (field == 'clock_id' and 'differs' in reason) or
                         (field == 'extrinsic' and 'must explicitly map' in reason) or
-                        (field not in _PENDING_FIELDS)):
+                        field not in _PENDING_FIELDS)
+                if hard and not derived_pending:
                     diagnostics.append(issue)
                 else:
                     pending.append(issue)
