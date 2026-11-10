@@ -585,7 +585,6 @@ FROM perception-app AS rtabmap-builder
 WORKDIR /work
 
 # Native dependencies are cached independently of application changes.
-WORKDIR /work
 # Native RTAB-Map 0.22.1 + its Humble wrapper, built against each image's ROS,
 # OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
 RUN set -e; \
@@ -788,7 +787,6 @@ COPY --from=rtabmap-builder /opt/rtabmap-runtime/system-libs/ /opt/rtabmap_runti
 COPY --from=rtabmap-builder /opt/rtabmap_ros/ /opt/rtabmap_ros/
 
 # ── Application code ───────────────────────────────────────────────
-COPY perception/main.py# ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
@@ -898,6 +896,16 @@ RUN . /etc/jetpack.env; \
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/opt/rtabmap_runtime/lib:/opt/rtabmap_ros/lib:/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/opt/rtabmap_ros:/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+
+# Validate the copied runtime closure in the final stage, not just in the builder.
+RUN set -e; \
+    rtabmap_executable=/opt/rtabmap_ros/lib/rtabmap_slam/rtabmap; \
+    test -x "${rtabmap_executable}"; \
+    ldd "${rtabmap_executable}" > /tmp/rtabmap-runtime-ldd; \
+    if grep -q 'not found' /tmp/rtabmap-runtime-ldd; then \
+      cat /tmp/rtabmap-runtime-ldd; exit 1; \
+    fi; \
+    rm -f /tmp/rtabmap-runtime-ldd
 
 # Runs directly, outside pytest and its ROS stubs, without GPU/camera access.
 # Also checks generated Python typesupport through the runtime .pth/ENV paths.
