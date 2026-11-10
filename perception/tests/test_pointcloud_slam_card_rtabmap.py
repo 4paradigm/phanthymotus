@@ -766,6 +766,32 @@ def test_input_metadata_route_still_prepares_and_starts(card):
     assert 'input_validation' not in call(card, 'info')
 
 
+
+def test_initializing_source_declarations_do_not_block_project_start(card):
+    args = arguments()
+    args['input_metadata'] = {}
+    args['odom_interfaces'] = {}
+    result = card.dispatch('pointcloud_slam', args)
+    assert result['state'] == 'ready'
+    assert card._resolved_inputs is None
+    diagnostics = call(card, 'info')['input_diagnostics']
+    assert {d['field'] for d in diagnostics} >= {'odom_interface', 'input_metadata'}
+    # Session geometry was provided through the unchanged deployment config.
+    assert call(card, 'start_mapping', map_name='Initializing')['state'] == 'running'
+
+
+def test_contradictory_connected_clock_declarations_fail_project_start(card):
+    from test_pointcloud_slam_input import declarations
+    declared = declarations()
+    pose = {**declared['/o'], 'topic': '/pose'}
+    cloud = {**declared['/c'], 'topic': '/cloud', 'clock_id': 'different_clock'}
+    result = card.dispatch('pointcloud_slam', {
+        **arguments(), 'input_metadata': {'/pose': pose, '/cloud': cloud}})
+    assert result['state'] == 'error'
+    assert 'clock_id' in result['message']
+    assert card._node is None
+
+
 def test_bumi_deployment_preset_starts_in_legacy_core_mode_without_any_flags(card, monkeypatch):
     # Old deployment robot names are ignored; explicit geometry stays valid.
     plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
