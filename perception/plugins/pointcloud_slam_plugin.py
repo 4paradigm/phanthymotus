@@ -417,12 +417,17 @@ class PointCloudSlamPlugin:
                                     bool(odom_decl['child_frame_id'].strip()) and
                                     isinstance(cloud_decl.get('frame_id'), str) and
                                     bool(cloud_decl['frame_id'].strip()))
+                    sources_known = all(isinstance(d.get('source_id'), str) and
+                                        bool(d['source_id'].strip()) and
+                                        d['source_id'] != 'unknown'
+                                        for d in (odom_decl, cloud_decl))
                     fatal_fields = {'schema', 'topic/format', 'kind',
                         'cloud_semantics', 'timing_model', 'observation_model',
-                        'extrinsic.mode', 'extrinsic.pose_reference', 'clock.relation_id'}
+                        'extrinsic.mode', 'extrinsic.pose_reference'}
                     fatal = any(
                         d.get('field') in fatal_fields or
                         'conflicting' in d.get('reason', '') or
+                        (d.get('field') == 'clock.relation_id' and sources_known) or
                         (d.get('field') == 'clock_id' and
                          'differs' in d.get('reason', '') and clock_known) or
                         (d.get('field') == 'extrinsic' and
