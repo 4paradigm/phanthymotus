@@ -43,8 +43,7 @@ def measured_odom(ms=1000, segment='a', epoch='e1', generation='g1'):
 
 def resolved():
     from plugins.pointcloud_slam_input import resolve_inputs
-    return resolve_inputs(declarations(), {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
-                          )
+    return resolve_inputs(declarations(), {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
 
 
 def test_resolver_uses_producer_frames_and_preserves_unverified_evidence():
@@ -84,7 +83,7 @@ def test_default_resolution_uses_unverified_clock_and_keeps_provenance():
     assert result['settings']['child_from_cloud'] == np.eye(4).tolist()
 
 
-def test_strict_stream_waits_for_exact_stamp_metadata_and_bounds_unmatched_clouds():
+def test_sidecar_pairing_waits_for_exact_digest_and_bounds_unmatched_clouds():
     s = stream(input_contract=resolved())
     s.odom(measured_odom(), now=1.)
     s.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1.,
