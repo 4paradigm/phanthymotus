@@ -384,33 +384,56 @@ class PointCloudSlamPlugin:
                 'reason': 'SLAM capability not yet established; waiting for valid tracking samples'})
 
         if 'input_metadata' in args:
-            try:
-                self._resolved_inputs = resolve_inputs(args['input_metadata'], bindings)
-                reconcile_explicit_extrinsic(self._config.get('child_from_cloud'),
-                    self._resolved_inputs['settings'].get('child_from_cloud'))
-            except InputContractError as error:
-                # A producer info() snapshot taken before camera/VO first frame
-                # may have an unknown clock stamp, frame or mount. Keep the
-                # project alive and discover actual geometry when mapping starts.
-                # But a positive contradictory claim (wrong connected source,
-                # conflicting mounts, incompatible format) is not "pending".
-                self._input_diagnostics.extend(deepcopy(error.diagnostics))
-                fatal_fields = {'schema', 'topic/format', 'kind',
-                    'cloud_semantics', 'timing_model', 'observation_model',
-                    'extrinsic.mode', 'extrinsic.pose_reference'}
-                fatal = any(
-                    d.get('field') in fatal_fields or
-                    'conflicting' in d.get('reason', '') or
-                    d.get('field') == 'clock.relation_id' or
-                    (d.get('field') == 'clock_id' and
-                     d.get('reason') == 'differs from pose clock')
-                    for d in error.diagnostics)
-                if fatal:
+            provided = args.get('input_metadata')
+            # Core calls info() while starting an upstream camera/VO. A missing
+            # producer declaration is not a contradictory claim. In particular,
+            # collect_slam_inputs() may legitimately supply an empty dict when
+            # both ROS topics exist but the first tracking sample does not.
+            if (not isinstance(provided, dict) or
+                    any(not isinstance(provided.get(topic), dict) for topic in bindings)):
+                missing = [topic for topic in bindings if not isinstance(
+                    provided.get(topic) if isinstance(provided, dict) else None, dict)]
+                self._input_diagnostics.append({
+                    'topic': ', '.join(missing), 'field': 'input_metadata',
+                    'reason': 'waiting for producer descriptions; runtime geometry will be probed'})
+            else:
+                try:
+                    self._resolved_inputs = resolve_inputs(provided, bindings)
+                    reconcile_explicit_extrinsic(self._config.get('child_from_cloud'),
+                        self._resolved_inputs['settings'].get('child_from_cloud'))
+                except InputContractError as error:
+                    self._input_diagnostics.extend(deepcopy(error.diagnostics))
+                    # Missing startup information is recoverable; a producer
+                    # explicitly declaring a wrong format, clock or incompatible
+                    # mount is not. Avoid treating a *derived* mismatch as
+                    # evidence when the source has not reported its frame yet.
+                    odom_decl = provided.get(odom) or {}
+                    cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
+                    cloud_decl = provided.get(cloud_topic) or {}
+                    clock_known = all(isinstance(d.get('clock_id'), str) and
+                                      d['clock_id'] and d['clock_id'] != 'unknown'
+                                      for d in (odom_decl, cloud_decl))
+                    frames_known = (isinstance(odom_decl.get('child_frame_id'), str) and
+                                    bool(odom_decl['child_frame_id'].strip()) and
+                                    isinstance(cloud_decl.get('frame_id'), str) and
+                                    bool(cloud_decl['frame_id'].strip()))
+                    fatal_fields = {'schema', 'topic/format', 'kind',
+                        'cloud_semantics', 'timing_model', 'observation_model',
+                        'extrinsic.mode', 'extrinsic.pose_reference', 'clock.relation_id'}
+                    fatal = any(
+                        d.get('field') in fatal_fields or
+                        'conflicting' in d.get('reason', '') or
+                        (d.get('field') == 'clock_id' and
+                         'differs' in d.get('reason', '') and clock_known) or
+                        (d.get('field') == 'extrinsic' and
+                         'must explicitly map' in d.get('reason', '') and frames_known)
+                        for d in error.diagnostics)
+                    if fatal:
+                        raise
+                except ValueError:
+                    # A manual transform conflicting with upstream geometry is
+                    # a real configuration conflict, never silently overridden.
                     raise
-            except ValueError:
-                # An explicit manual transform that conflicts with a complete
-                # measured producer mount must never be silently overridden.
-                raise
         self._validate(self._settings())
         require_runtime()
         with self._operation_lock:
