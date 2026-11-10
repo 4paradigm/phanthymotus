@@ -80,8 +80,12 @@ def evaluate_preflight(args, *, manual_extrinsic=None, topic_types=None):
             fail(odom_topic, 'odom_interface', str(error))
 
     metadata = args.get('input_metadata')
-    if not isinstance(metadata, dict) or not metadata:
-        wait('', 'input_metadata', 'source declarations are not available yet')
+    if (not isinstance(metadata, dict) or
+            any(not isinstance(metadata.get(topic), dict) for topic in bindings)):
+        missing = [topic for topic in bindings if not isinstance(
+            metadata.get(topic) if isinstance(metadata, dict) else None, dict)]
+        wait(', '.join(missing), 'input_metadata',
+             'source declarations are not available yet')
     else:
         try:
             resolved = resolve_inputs(metadata, bindings)
