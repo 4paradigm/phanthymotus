@@ -88,3 +88,34 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
                 interfaces[topic] = deepcopy(interface)
     return {'input_bindings': bindings, 'odom_interfaces': interfaces,
             'input_metadata': metadata}
+
+
+def collect_connected_metadata(connections, resolved_info, topic_of_connection):
+    """Select producer source declarations for generic metadata-aware cards.
+
+    Unlike the SLAM route, older display consumers are allowed to have no
+    declaration. Never use a persisted canvas snapshot as physical evidence.
+    """
+    out = {}
+    for conn in connections:
+        src_id = conn.get('fromCardId')
+        info = resolved_info.get(src_id) or {}
+        try:
+            index = int(conn.get('fromPortIdx', 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if index < 0:
+            continue
+        port = _port(info, index)
+        topic = topic_of_connection(conn)
+        if not topic or port.get('topic') != topic or not port.get('format'):
+            continue
+        claim = _declaration(info, topic)
+        if claim is None:
+            continue
+        if claim.get('topic') != topic or claim.get('format') != port.get('format'):
+            raise SlamRoutingError(f'{topic}: producer metadata does not match connected port')
+        if topic in out:
+            raise SlamRoutingError(f'{topic}: duplicate connected source metadata')
+        out[topic] = deepcopy(claim)
+    return out
