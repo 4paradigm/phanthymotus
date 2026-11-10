@@ -108,10 +108,14 @@ def evaluate_preflight(args, *, manual_extrinsic=None, topic_types=None):
                             bool(pose_meta['child_frame_id'].strip()) and
                             isinstance(cloud_meta.get('frame_id'), str) and
                             bool(cloud_meta['frame_id'].strip()))
-            known_clocks = (isinstance(pose_meta.get('clock_id'), str) and
-                            bool(pose_meta['clock_id'].strip()) and
-                            isinstance(cloud_meta.get('clock_id'), str) and
-                            bool(cloud_meta['clock_id'].strip()))
+            known_clocks = all(isinstance(d.get('clock_id'), str) and
+                               bool(d['clock_id'].strip()) and
+                               d['clock_id'] != 'unknown'
+                               for d in (pose_meta, cloud_meta))
+            known_sources = all(isinstance(d.get('source_id'), str) and
+                                bool(d['source_id'].strip()) and
+                                d['source_id'] != 'unknown'
+                                for d in (pose_meta, cloud_meta))
             for issue in error.diagnostics:
                 field, reason = issue.get('field', ''), issue.get('reason', '')
                 # A missing frame/clock can produce derivative mismatches with
@@ -119,7 +123,8 @@ def evaluate_preflight(args, *, manual_extrinsic=None, topic_types=None):
                 # until both ends have advertised their real identities.
                 derived_pending = (
                     (field == 'extrinsic' and 'must explicitly map' in reason and not known_frames) or
-                    (field == 'clock_id' and 'differs' in reason and not known_clocks))
+                    (field == 'clock_id' and 'differs' in reason and not known_clocks) or
+                    (field == 'clock.relation_id' and not known_sources))
                 hard = (field in _FATAL_FIELDS or 'conflicting' in reason or
                         (field == 'clock_id' and 'differs' in reason) or
                         (field == 'extrinsic' and 'must explicitly map' in reason) or
