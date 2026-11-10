@@ -149,20 +149,28 @@ class SlamStream:
                 if declared.get('frame_id') and pose.frame_id != declared['frame_id'].replace('{segment_id}', pose.segment_id):
                     raise ValueError('pose frame differs from input declaration; restart inputs')
                 mount = declared.get('extrinsic')
-                if isinstance(mount, dict) and quality.get('extrinsic_version') != mount['version']:
-                    raise ValueError('pose extrinsic_version changed or unknown; restart inputs')
-                if declared.get('pose_reference') and quality.get('pose_reference') != declared['pose_reference']:
+                if isinstance(mount, dict):
+                    observed_mount = quality.get('extrinsic')
+                    observed_version = (quality.get('extrinsic_version') or
+                        (observed_mount.get('version') if isinstance(observed_mount, dict) else None))
+                    if observed_version != mount['version']:
+                        raise ValueError('pose extrinsic_version changed or unknown; restart inputs')
+                observed_reference = quality.get('pose_reference') or sample['vendor'].get('pose_reference')
+                if declared.get('pose_reference') and observed_reference != declared['pose_reference']:
                     raise ValueError('pose_reference changed or unknown; restart inputs')
                 measurement = quality.get('measurement')
-                identity = frame_identity(measurement, clock_id=self.clock_id,
-                    experimental=self.input_contract['experimental'],
-                    relation_id=self.input_contract.get('relation_id'))
-                if measurement['stamp_ns'] // 1_000_000 != pose.stamp_ms:
-                    raise ValueError('pose measurement timestamp mismatch')
-                if identity in self._retired_identities:
-                    self.last_error = 'retired input epoch/generation dropped'
-                    return
-
+                identity = None
+                if measurement is not None:
+                    # Malformed claimed evidence cannot silently be ignored.
+                    identity = frame_identity(measurement, clock_id=self.clock_id,
+                        relation_id=self.input_contract.get('relation_id'))
+                    if measurement['stamp_ns'] // 1_000_000 != pose.stamp_ms:
+                        raise ValueError('pose measurement timestamp mismatch')
+                    if identity in self._retired_identities:
+                        self.last_error = 'retired input epoch/generation dropped'
+                        return
+                elif self._input_identity is not None and pose.segment_id == self._input_segment:
+                    raise ValueError('pose measurement evidence lost within active segment')
 
         except ValueError as error:
             self.last_error = str(error)
@@ -188,7 +196,8 @@ class SlamStream:
             if self.input_contract:
                 same_segment = pose.segment_id == self._input_segment
                 changed = self._input_identity is not None and identity != self._input_identity
-                mapping_changed = (identity == self._input_identity and self._pose_measurement is not None and
+                mapping_changed = (measurement is not None and identity == self._input_identity and
+                    self._pose_measurement is not None and
                     (measurement['mapping'] != self._pose_measurement['mapping'] or
                      measurement['source_clock'] != self._pose_measurement['source_clock']))
                 if self._required_new_segment == pose.segment_id or (same_segment and (changed or mapping_changed)):
@@ -227,6 +236,7 @@ class SlamStream:
         self._last_received = now
         self._odom_state = 'tracking'
         self._drain(now, measurement_now_ns)
+        self._release_without_metadata(now, measurement_now_ns)
 
     def _capture_context(self, packet):
         declaration = self.input_contract.get('extrinsic', {})
