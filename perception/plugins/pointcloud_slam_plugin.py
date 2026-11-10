@@ -31,7 +31,6 @@ _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calib
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
             'max_frames', 'max_points', 'persistent_history'}
 _ACTIONS = {
-    'preflight': ('Check SLAM input readiness (read-only)', []),
     'start_mapping': ('Start mapping', ['map_name']),
     'stop_mapping': ('Stop mapping and save', []),
     'abandon_pending': ('Release failed save (keep recovery files)', []),
@@ -43,8 +42,8 @@ _ACTIONS = {
 def _config_properties():
     """Only the optional manual mount is configurable on the canvas.
 
-    Frames and clock come from the connected native publishers, not a robot
-    selector. Algorithm budgets are deployment config; old robot rows are stale.
+    Frames and clocks come from connected publishers, not a model selector.
+    Algorithm budgets are deployment configuration, not hardware-model presets.
     """
     return {
         'child_from_cloud': {'type': 'string', 'scope': 'instance',
@@ -61,7 +60,7 @@ class PointCloudSlamPlugin:
         # Retired/unknown deployment keys are ignored, never fatal: old config
         # rows and old canvas documents must not block a project start. The
         # filtered deployment config is kept separately so config-action
-        # updates re-base on it instead of on a possibly preset-derived state.
+        # updates re-base on it instead of on stale canvas fields.
         deployment = {k: v for k, v in (config or {}).items()
                       if k not in _RETIRED and k != 'map_plane'}
         self._deployment_config = deepcopy(deployment)
@@ -151,7 +150,7 @@ class PointCloudSlamPlugin:
         """Validate the internal settings that are present; never require facts.
 
         Canvas configuration may be partial: frames/clock/extrinsic arrive from
-        the robot preset, deployment config or input declarations, and their
+        live connected inputs, deployment config or producer declarations; their
         absence is reported when mapping starts instead of while saving config.
         """
         if cfg.get('extrinsic_mode', 'static') not in ('static', 'dynamic'):
@@ -251,28 +250,7 @@ class PointCloudSlamPlugin:
         if not isinstance(request, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request):
             raise ValueError('invalid map request id')
 
-    def _preflight_ros_topics(self):
-        """Read existing ROS graph only; do not launch a node or mapping process."""
-        nodes_fn = getattr(self._executor, 'get_nodes', None)
-        if callable(nodes_fn):
-            try:
-                for node in nodes_fn():
-                    list_fn = getattr(node, 'get_topic_names_and_types', None)
-                    if callable(list_fn):
-                        return dict(list_fn())
-            except (RuntimeError, AttributeError, TypeError):
-                pass
-        return None
-
     def _dispatch(self, action, args):
-        if action == 'preflight':
-            from .pointcloud_slam_preflight import evaluate_preflight
-            # Core's project start has already supplied the connected ports.
-            # An explicit preflight request can override them for offline checks.
-            data = args if 'input_topics' in args else self._project_inputs or args
-            return evaluate_preflight(
-                data, manual_extrinsic=self._config.get('child_from_cloud'),
-                topic_types=self._preflight_ros_topics())
         if action == 'stop':
             return self._stop_project()
         if action == 'start':
@@ -312,9 +290,8 @@ class PointCloudSlamPlugin:
                 mapping = self._node is not None or self._pending is not None
                 # Only the one canvas field is configurable; every other key
                 # (stale canvas rows, including a saved `robot`, and old config
-                # rows) is ignored rather than fatal. The active robot preset is
-                # read from the deployment config only, so a stale canvas value
-                # can never switch it.
+                # rows) is ignored rather than fatal. A legacy robot selector is ignored rather than used to choose
+                # any robot-specific SLAM behavior.
                 props = _config_properties()
                 updates = {k: v for k, v in args.items() if k in props and v is not None and v != ''}
                 merged = {**_DEFAULTS, **self._deployment_config, **updates}
@@ -457,7 +434,7 @@ class PointCloudSlamPlugin:
         if not self._project_inputs or self._capture_stop.is_set():
             raise ValueError('start the project before mapping')
         # Core main passes only topic names. Learn the missing geometry from
-        # fresh ROS pointcloud and tracking odometry, never from robot presets.
+        # fresh ROS pointcloud and tracking odometry, never a model preset.
         if self._resolved_inputs is None and any(
                 self._config.get(key) is None for key in
                 ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')):

@@ -1,6 +1,6 @@
 """Publish one archived map segment on the stable SLAM preview topic.
 
-Like Tianyi, selecting a saved map changes the contents of one mapping output.
+Selecting a saved map changes the contents of the same mapping output.
 Different RTAB-Map odometry segments have independent map coordinates; do not
 silently combine or replay them sequentially as if they were one map.
 """

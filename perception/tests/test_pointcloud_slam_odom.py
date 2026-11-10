@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from plugins.pointcloud_slam_odom import decode_bumi_odom
+from plugins.pointcloud_slam_odom import decode_legacy_odom
 
 
 def sample():
@@ -17,7 +17,7 @@ def sample():
 
 
 def test_pose_frames_come_from_pose_not_twist():
-    result = decode_bumi_odom(sample())
+    result = decode_legacy_odom(sample())
     assert result.frame_id == "segment_odom"
     assert result.child_frame_id == "segment_base"
     assert result.stamp_ms == 1234
@@ -43,7 +43,7 @@ def test_rejects_unusable_samples(change):
     data = copy.deepcopy(sample())
     change(data)
     with pytest.raises(ValueError):
-        decode_bumi_odom(data)
+        decode_legacy_odom(data)
 
 
 def standard_sample():

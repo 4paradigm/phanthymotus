@@ -314,7 +314,7 @@ def test_stale_canvas_configuration_replay_is_noop_through_mapping_and_save(card
         assert entered.wait(1)
     try:
         # A stale saved-canvas robot (and removed keys) is ignored and cannot
-        # move the deployment preset while a map session is live.
+        # alter active deployment settings while a map session is live.
         result = call(card, 'config', robot='Bumi', input_policy='experimental',
                       preview_enabled=True, instance_id='existing-slam-card')
         assert result['state'] == 'configured'
@@ -387,7 +387,7 @@ def test_saving_displayed_defaults_preserves_loaded_resource_budgets():
         assert result['state'] == 'configured'
         assert result['config']['max_cloud_points'] == 20000
         assert result['config']['preview_interval_s'] == 2
-        # Frames come from deployment config/preset, never from the canvas fields.
+        # Frame values come from deployment config or live inputs, not stale canvas fields.
         assert result['config']['cloud_frame'] == 'sensor'
     finally:
         plugin.shutdown()
@@ -421,7 +421,7 @@ def test_stale_robot_canvas_value_has_no_effect_on_geometry(card):
         plugin.shutdown()
 
 @pytest.mark.parametrize('robot', ['G1', 'Tianyi'])
-def test_g1_tianyi_deployment_presets_prepare_then_fail_clearly(card, robot, monkeypatch):
+def test_retired_robot_selector_does_not_supply_missing_runtime_inputs(card, robot, monkeypatch):
     plugin = module.PointCloudSlamPlugin({'robot': robot}, _FakeExecutor())
     def no_live_inputs(*args, **kwargs):
         raise ValueError('tracking odometry and capture-timed PointCloud2 unavailable')
@@ -438,7 +438,7 @@ def test_g1_tianyi_deployment_presets_prepare_then_fail_clearly(card, robot, mon
     finally:
         plugin.shutdown()
 
-def test_unknown_deployment_robot_is_rejected():
+def test_unknown_deployment_robot_is_ignored():
     # Deprecated robot model selectors are ignored rather than required.
     plugin = module.PointCloudSlamPlugin({'robot': 'unknown'}, _FakeExecutor())
     try:
@@ -708,7 +708,7 @@ def test_deployment_resource_overrides_survive_stale_canvas_robot(card):
         assert plugin._settings()['max_gap_ms'] == 123
         assert call(plugin, 'config', **displayed)['state'] == 'configured'
         assert plugin._settings()['max_gap_ms'] == 123
-        # A stale canvas robot is ignored; the deployment preset keeps the values.
+        # A stale robot-model field is ignored; deployment overrides remain authoritative.
         assert call(plugin, 'config', robot='Bumi')['state'] == 'configured'
         assert 'robot' not in plugin._config
         assert plugin._settings()['max_gap_ms'] == 123
@@ -792,7 +792,7 @@ def test_contradictory_connected_clock_declarations_fail_project_start(card):
     assert card._node is None
 
 
-def test_bumi_deployment_preset_starts_in_legacy_core_mode_without_any_flags(card, monkeypatch):
+def test_retired_robot_selector_does_not_affect_legacy_core(card, monkeypatch):
     # Old deployment robot names are ignored; explicit geometry stays valid.
     plugin = module.PointCloudSlamPlugin({**settings(), 'robot': 'Bumi'}, _FakeExecutor())
     try:
@@ -811,7 +811,7 @@ def test_bumi_deployment_preset_starts_in_legacy_core_mode_without_any_flags(car
     finally:
         plugin.shutdown()
 
-def test_deployment_bumi_preset_survives_stale_canvas_replay(card):
+def test_retired_robot_selector_is_ignored_on_replay(card):
     plugin = module.PointCloudSlamPlugin({'robot': 'Bumi'}, _FakeExecutor())
     try:
         props = plugin.get_tools()[0]['configSchema']['properties']
@@ -826,7 +826,7 @@ def test_deployment_bumi_preset_survives_stale_canvas_replay(card):
     finally:
         plugin.shutdown()
 
-def test_stable_single_mapping_output_and_tianyi_style_switch(card):
+def test_stable_mapping_output_for_live_and_saved_views(card):
     from plugins.pointcloud_slam_preview import PREVIEW_TOPIC
     expected = card.get_tools()[0]['topic_out']
     assert expected == [{'topic': PREVIEW_TOPIC, 'format': 'sensor/mapping',

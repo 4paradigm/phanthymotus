@@ -1,4 +1,4 @@
-"""Decode the Bumi visual-odometry pose without depending on ROS.
+"""Decode tracking odometry poses without depending on ROS.
 
 Freshness, ordering and segment transitions require stream state and are the
 consumer's responsibility. This parser does not turn lost samples into poses.
@@ -31,8 +31,8 @@ def _vector(value, length):
     return tuple(float(v) for v in value)
 
 
-def decode_bumi_odom(sample):
-    """Decode one tracking sample from Bumi's motus.odom/1 visual stream."""
+def decode_legacy_odom(sample):
+    """Decode one tracking sample from the legacy motus.odom/1 visual profile."""
     if not isinstance(sample, dict) or sample.get("schema") != "motus.odom/1":
         raise ValueError("unsupported odometry schema")
     stamp = sample.get("stamp_ms")

@@ -6,7 +6,7 @@ import numpy as np
 
 from .pointcloud_slam_transforms import rigid
 
-# One stable canvas output for live and archived maps (Tianyi-style).
+# One stable canvas output for both live and archived maps.
 PREVIEW_TOPIC = '/pointcloud_slam/map'
 
 
@@ -24,7 +24,7 @@ def encode_mapping(points, pose, *, max_points):
         raise ValueError('preview points exceed float32 range')
     xyz = np.asarray(points, dtype='<f4')
     # The stock Core mapping renderer negates the packet's yaw. Match the
-    # existing Tianyi/G1 display convention without changing RTAB-Map poses.
+    # existing shared mapping renderer convention without changing RTAB-Map poses.
     ros_yaw = math.atan2(matrix[1, 0], matrix[0, 0])
     display_yaw = -ros_yaw if ros_yaw != 0.0 else 0.0  # avoid negative-zero bytes
     return struct.pack('<fffBI', matrix[0, 3], matrix[1, 3], display_yaw, 3, len(xyz)) + xyz.tobytes()

@@ -1309,44 +1309,6 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
     if not url or target.get('transport', 'http') != 'http':
         raise fastapi.HTTPException(status_code=400, detail='MCP not reachable via HTTP')
 
-    if (req.tool == 'pointcloud_slam' and req.arguments.get('action') == 'preflight'
-            and 'input_topics' not in req.arguments):
-        # A SLAM start can fail before the card saves _project_inputs. The
-        # read-only preflight must still see the two canvas connections.
-        # Re-read only the currently connected producer info() descriptions,
-        # without starting any device or trusting stale saved topic metadata.
-        try:
-            from api.config import payload_of
-            from api.slam_preflight import resolve_canvas_preflight
-
-            async def source_info(card):
-                source = await mcp_call_tool(
-                    card.get('mcpId', ''), MCPCallRequest(
-                        tool=card.get('toolName', ''),
-                        arguments={'action': 'info', 'instance_id': card.get('id', ''),
-                                   'read_only': True}),
-                    timeout_s=4.0)
-                if source.get('code') != 200:
-                    raise ValueError('upstream info() unavailable: ' +
-                                     str(card.get('toolName', 'unknown')))
-                data = payload_of(source)
-                if not data or data.get('state') == 'error' or data.get('error'):
-                    raise ValueError('upstream info() invalid: ' +
-                                     str(card.get('toolName', 'unknown')))
-                return data
-
-            routed = await resolve_canvas_preflight(
-                config.main.get('canvas_layout'), mcp_id, req.tool,
-                req.arguments.get('instance_id'), source_info)
-            req = MCPCallRequest(tool=req.tool, arguments={**req.arguments, **routed})
-        except (ValueError, TypeError, KeyError) as error:
-            return {'code': 200, 'data': {
-                'state': 'not_ready',
-                'diagnostics': [{'topic': '', 'field': 'canvas_input',
-                                 'reason': str(error)}],
-                'runtime_validation': 'not_checked',
-                'live_frame_pairing_checked': False}}
-
     headers = {'Content-Type': 'application/json'}
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
@@ -1364,7 +1326,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             # Auto-config: start 前自动 apply 已保存的 config
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
-            _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config', 'preflight'}
+            _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
             if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)

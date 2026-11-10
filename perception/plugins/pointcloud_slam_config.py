@@ -33,7 +33,7 @@ def reconcile_explicit_extrinsic(manual, producer):
 
 def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
                    max_gap_ms=200):
-    """Build a session geometry from actual messages, not Bumi/G1/Tianyi presets.
+    """Build session geometry from actual messages, never robot-model presets.
 
     This legacy-Core route verifies frame names and a contemporaneous timestamp
     pair. It does NOT claim a verified relationship between independent clocks;
