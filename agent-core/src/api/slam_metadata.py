@@ -23,6 +23,8 @@ def _port(info, index):
 
 
 def _declaration(info, topic):
+    if not isinstance(info, dict):
+        return None
     declarations = info.get('input_metadata')
     if isinstance(declarations, dict):
         item = declarations.get(topic)
