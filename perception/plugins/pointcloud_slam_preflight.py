@@ -31,9 +31,14 @@ def evaluate_preflight(args, *, manual_extrinsic=None, topic_types=None):
     if not isinstance(topics, list) or len(topics) != 2 or any(
             not isinstance(t, str) or not t for t in topics) or len(set(topics)) != 2:
         fail('', 'input_topics', 'two distinct connected source topics are required')
-    if (not isinstance(bindings, dict) or
-            set(bindings.values()) != {POSE_FORMAT, CLOUD_FORMAT} or
-            not isinstance(topics, list) or set(bindings) != set(topics)):
+    valid_bindings = (isinstance(bindings, dict)
+                      and all(isinstance(k, str) and isinstance(v, str)
+                              for k, v in bindings.items())
+                      and len(bindings) == 2
+                      and set(bindings.values()) == {POSE_FORMAT, CLOUD_FORMAT})
+    if (not valid_bindings or not isinstance(topics, list) or
+            not all(isinstance(t, str) for t in topics) or
+            set(bindings) != set(topics)):
         fail('', 'input_bindings', 'must bind exactly one state/odom and one sensor/pointcloud2')
     if diagnostics:
         return {'state': 'not_ready', 'diagnostics': diagnostics,
