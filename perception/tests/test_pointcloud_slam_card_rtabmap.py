@@ -233,6 +233,49 @@ def test_failed_save_retains_staging_database_for_retry(card):
     assert len(call(card, 'list_maps')['maps']) == 1
 
 
+def test_new_project_start_saves_stale_mapping_before_repreparing(card):
+    # Intelligent control may stop without calling this card's stop action.
+    old_session = capture(card)
+    result = card.dispatch('pointcloud_slam', arguments())
+    assert result['state'] == 'ready'
+    assert old_session.closed and old_session.destroyed
+    assert call(card, 'list_maps')['maps'][0]['name'] == 'Hall'
+    assert call(card, 'info')['state'] == 'ready'
+    assert call(card, 'start_mapping', map_name='Second')['state'] == 'running'
+
+
+def test_new_project_start_retries_prior_failed_save(card):
+    session = capture(card)
+    session.failure = 'transient close error'
+    assert call(card, 'stop_mapping', request_id='previous')['state'] == 'error'
+    assert session.database.exists()
+    session.failure = None
+    result = card.dispatch('pointcloud_slam', arguments())
+    assert result['state'] == 'ready'
+    assert session.closed
+    assert call(card, 'list_maps')['maps'][0]['name'] == 'Hall'
+
+
+def test_abandon_failed_pending_retains_recovery_files_and_allows_restart(card):
+    session = capture(card)
+    assert call(card, 'abandon_pending')['state'] == 'error'  # cannot discard a live map
+    session.failure = 'native database cannot finalize'
+    assert call(card, 'stop_mapping', request_id='broken')['state'] == 'error'
+    directory = session.directory
+    assert directory.exists() and session.database.exists()
+    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'error'
+    result = call(card, 'abandon_pending')
+    assert result['state'] == 'recovery_required'
+    assert result['recovery']['path'] == str(directory)
+    assert result['recovery']['map_name'] == 'Hall'
+    assert session.destroyed and card._pending is None
+    assert directory.exists() and session.database.exists()
+    info = call(card, 'info')
+    assert info['last_recovery']['path'] == str(directory)
+    assert call(card, 'operation_status', request_id='broken')['state'] == 'error'
+    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+
+
 def test_rejected_configuration_does_not_poison_the_previous_valid_extrinsic(card):
     ready(card)
     assert call(card, 'config', child_from_cloud='invalid')['state'] == 'error'

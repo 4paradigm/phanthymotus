@@ -309,16 +309,42 @@ def _wait_cloud_and_summary(node):
 
 # ── review issue 2：auto 按消息类型分派，不嗅探话题名 ─────────────────────────
 
-def test_auto_mode_subscribes_to_both_image_and_compressed():
+@pytest.mark.parametrize(('publisher_type', 'callback'), [
+    ('sensor_msgs/msg/Image', '_auto_image_cb'),
+    ('sensor_msgs/msg/CompressedImage', '_auto_comp_cb'),
+])
+def test_undeclared_auto_waits_for_late_publisher_and_binds_one_type(publisher_type, callback):
     plugin, executor = _plugin()
-    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/image_raw"})
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'input_topic': '/cam/image_raw'})
+    assert result['state'] == 'running'
     node = executor.nodes[0]
-    kinds = [type(s.msg_type).__name__ if hasattr(s, "msg_type") else None
-             for s in node.subscriptions]
-    # fake subscription 没存 msg_type，按回调区分即可
-    cbs = {s.callback.__name__ for s in node.subscriptions}
-    assert cbs == {"_auto_image_cb", "_auto_comp_cb"}
-    assert len(node.subscriptions) == 2
+    assert node.subscriptions == []
+    timer = node._input_discovery_timer
+    assert timer is not None
+    node._topic_types['/cam/image_raw'] = [publisher_type]
+    timer.callback()
+    assert [sub.callback.__name__ for sub in node.subscriptions] == [callback]
+    assert node._input_discovery_timer is None
+    assert timer.cancelled
+    assert node._worker is not None and node._worker.is_alive()
+    plugin.shutdown()
+
+
+def test_undeclared_auto_rejects_conflicting_publisher_types(monkeypatch):
+    plugin, executor = _plugin()
+    original = pc._PointCloudNode._input_ros_type
+
+    def both_types(self):
+        self._topic_types['/cam/image_raw'] = [
+            'sensor_msgs/msg/Image', 'sensor_msgs/msg/CompressedImage']
+        return original(self)
+
+    monkeypatch.setattr(pc._PointCloudNode, '_input_ros_type', both_types)
+    result = plugin.dispatch('pointcloud', {'action': 'start', 'input_topic': '/cam/image_raw'})
+    assert result['state'] == 'error'
+    assert 'conflicting ROS publisher types' in result['message']
+    assert not executor.nodes
+    plugin.shutdown()
 
 
 def test_auto_mode_depth_image_on_rgb_named_topic_publishes():
@@ -328,7 +354,8 @@ def test_auto_mode_depth_image_on_rgb_named_topic_publishes():
     Image 帧静默丢弃、一帧云都不出——review issue 2 的原始复现。
     """
     plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/camera/image_raw"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/camera/image_raw",
+                                   "camera_info": {"/camera/image_raw": {"format": "image/depth-z16"}}})
     node = executor.nodes[0]
 
     depth_mm = np.full((4, 4), 1500, dtype="<u2")
@@ -345,7 +372,8 @@ def test_auto_mode_depth_image_on_rgb_named_topic_publishes():
 
 def test_auto_mode_depth_zlib_compressed_image_publishes():
     plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/whatever"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/whatever",
+                                   "camera_info": {"/cam/whatever": {"format": "image/depth-zlib"}}})
     node = executor.nodes[0]
 
     raw = np.full((480, 640), 2500, dtype="<u2").tobytes()
@@ -366,7 +394,8 @@ def test_auto_mode_recognizes_visual_depth_producer_format():
     引擎下载、JPEG 解码失败、一帧云都不出。小写归一化后必须出云。
     """
     plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/depth_raw"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/depth_raw",
+                                   "camera_info": {"/cam/depth_raw": {"format": "image/depth-zlib"}}})
     node = executor.nodes[0]
 
     raw = np.full((480, 640), 3000, dtype="<u2").tobytes()
@@ -397,7 +426,8 @@ def test_auto_mode_jpeg_frame_routes_to_mono(legacy_config):
                 LetterboxMeta(1.0, 0, 0, frame.shape[1], frame.shape[0])
 
     plugin, executor = _plugin(cfg={"fps": 1000, **legacy_config})
-    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb",
+                                   "camera_info": {"/cam/rgb": {"format": "image/jpeg"}}})
     node = executor.nodes[0]
     model = _FakeModel()
     plugin._model = model  # start 已过，经 _plugin_model 钩子被 worker 取到
@@ -427,7 +457,8 @@ def test_auto_mode_cold_start_jpeg_triggers_lazy_load_and_publishes():
                 LetterboxMeta(1.0, 0, 0, frame.shape[1], frame.shape[0])
 
     plugin, executor = _plugin(cfg={"fps": 1000})
-    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb",
+                                   "camera_info": {"/cam/rgb": {"format": "image/jpeg"}}})
     node = executor.nodes[0]
 
     load_started = threading.Event()
@@ -727,13 +758,18 @@ def test_legacy_raw_blob_without_R_falls_back_to_identity():
         fake.restore()
 
 
-def test_explicit_depth_mode_still_subscribes_image_and_compressed():
+@pytest.mark.parametrize(('format_name', 'expected'), [
+    ('image/depth-z16', '_depth_image_cb'),
+    ('image/depth-zlib', '_depth_comp_cb'),
+])
+def test_explicit_depth_mode_subscribes_only_to_declared_type(format_name, expected):
     plugin, executor = _plugin()
-    plugin.dispatch("pointcloud",
-                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
-    node = executor.nodes[0]
-    cbs = {s.callback.__name__ for s in node.subscriptions}
-    assert cbs == {"_depth_image_cb", "_depth_comp_cb"}
+    result = plugin.dispatch('pointcloud', {'action': 'start',
+        'input_topic': '/cam/depth', 'mode': 'depth',
+        'camera_info': {'/cam/depth': {'format': format_name}}})
+    assert result['state'] == 'running'
+    assert [sub.callback.__name__ for sub in executor.nodes[0].subscriptions] == [expected]
+    plugin.shutdown()
 
 
 def test_explicit_mono_mode_subscribes_compressed_only():

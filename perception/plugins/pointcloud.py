@@ -117,7 +117,7 @@ TOOLS = [
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "depth", "mono", "stereo"],
-                    "description": "输入模式。auto（默认）：2 路输入 → 双目 stereo；1 路输入同时订阅 Image/CompressedImage 并按首帧消息类型自动选 depth（z16/zlib 深度图）或 mono（jpeg）",
+                    "description": "输入模式。auto（默认）：2 路输入 → 双目 stereo；1 路输入按声明或 ROS 发布者类型选择订阅，首帧确定 depth（z16/zlib 深度图）或 mono（jpeg）",
                 },
             },
             "required": ["action"],
@@ -267,6 +267,8 @@ class _PointCloudNode(Node):
         self._metric_last_skip = None
 
         self._subs: list = []
+        self._input_discovery_timer = None
+        self._input_discovery_errors = 0
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stereo_queue: queue.Queue = queue.Queue(maxsize=1)
         # 双目左右帧按拍摄时刻（header.stamp，缺省退回到达时刻）配对：
@@ -286,6 +288,64 @@ class _PointCloudNode(Node):
     def request_stop(self) -> None:
         self._stop_event.set()
 
+    def _input_ros_type(self):
+        """Select one ROS transport type, never two subscriptions on one topic.
+
+        Camera declarations take priority. For older producers that supply no
+        format, discover actual publisher endpoint types rather than guessing
+        from the topic name or creating incompatible DDS subscriptions.
+        """
+        declared = {
+            "image/depth-z16": "sensor_msgs/msg/Image",
+            "image/depth-zlib": "sensor_msgs/msg/CompressedImage",
+            "image/jpeg": "sensor_msgs/msg/CompressedImage",
+        }
+        if self._input_format:
+            if self._input_format not in declared:
+                raise ValueError(f"unsupported pointcloud input format: {self._input_format}")
+            return declared[self._input_format]
+        endpoints = self.get_publishers_info_by_topic(self._input_topic)
+        types = {entry.topic_type for entry in endpoints}
+        supported = set(declared.values())
+        if types - supported:
+            raise ValueError(f"unsupported pointcloud publisher types on {self._input_topic}: {sorted(types)}")
+        if len(types) > 1:
+            raise ValueError(f"conflicting ROS publisher types on {self._input_topic}: {sorted(types)}")
+        return next(iter(types)) if types else None
+
+    def _attach_input_subscription(self):
+        msg_type = self._input_ros_type()
+        if msg_type is None:
+            return False  # Publisher may appear after canvas startup.
+        raw = msg_type == "sensor_msgs/msg/Image"
+        if self._mode == "depth":
+            callback = self._depth_image_cb if raw else self._depth_comp_cb
+        else:
+            callback = self._auto_image_cb if raw else self._auto_comp_cb
+        self._subs.append(self.create_subscription(
+            Image if raw else CompressedImage, self._input_topic, callback, _LOW_LAT_QOS))
+        log.info("[pointcloud] bound %s to %s", self._input_topic, msg_type)
+        return True
+
+    def _poll_input_subscription(self):
+        # Legacy untyped publishers may come online after the card starts.
+        with self._lifecycle_lock:
+            if self._stop_event.is_set():
+                return
+            try:
+                attached = self._attach_input_subscription()
+            except Exception as error:
+                self._input_discovery_errors += 1
+                if self._input_discovery_errors == 1 or self._input_discovery_errors % 120 == 0:
+                    log.error("[pointcloud] input binding failed: %s", error,
+                              exc_info=self._input_discovery_errors == 1)
+                return
+            if attached:
+                self._input_discovery_errors = 0
+                timer, self._input_discovery_timer = self._input_discovery_timer, None
+                if timer is not None:
+                    self.destroy_timer(timer)
+
     def start(self) -> dict:
         with self._lifecycle_lock:
             if self._running:
@@ -298,32 +358,19 @@ class _PointCloudNode(Node):
                     self._subs.append(self.create_subscription(
                         CompressedImage, self._input_topic_right, self._right_cb, _LOW_LAT_QOS))
             elif self._input_topic:
-                if self._mode == "depth":
-                    # Prefer the declared ROS type; some RMWs reject two types
-                    # on one topic. Preserve the legacy fallback if unknown.
-                    if self._input_format not in ("image/depth-zlib", "image/jpeg"):
-                        self._subs.append(self.create_subscription(
-                            Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
-                    if (self._input_format == "image/depth-zlib" or
-                            (not self._metric_cloud_enabled and self._input_format != "image/depth-z16")):
-                        self._subs.append(self.create_subscription(
-                            CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
-                elif self._mode == "auto":
-                    # Use upstream type declarations when present; unknown
-                    # sources retain legacy message-based detection.
-                    if self._input_format not in ("image/depth-zlib", "image/jpeg"):
-                        self._subs.append(self.create_subscription(
-                            Image, self._input_topic, self._auto_image_cb, _LOW_LAT_QOS))
-                    if self._input_format != "image/depth-z16":
-                        self._subs.append(self.create_subscription(
-                            CompressedImage, self._input_topic, self._auto_comp_cb, _LOW_LAT_QOS))
+                if self._mode in ("depth", "auto"):
+                    if not self._attach_input_subscription():
+                        # Don't install a guessed fallback subscription; bind
+                        # when a publisher advertises its real ROS type.
+                        self._input_discovery_timer = self.create_timer(
+                            0.5, self._poll_input_subscription)
                 else:  # mono
                     self._subs.append(self.create_subscription(
                         CompressedImage, self._input_topic, self._jpeg_cb, _LOW_LAT_QOS))
             if self._metric_metadata_source_topic:
                 self._subs.append(self.create_subscription(
                     String, self._metric_metadata_source_topic, self._metric_metadata_cb, _PUB_QOS))
-            if self._subs:
+            if self._subs or self._input_discovery_timer is not None:
                 self._worker = threading.Thread(target=self._worker_loop, daemon=True,
                                                 name=f"pointcloud_worker_{self._input_topic}")
                 self._worker.start()
@@ -339,6 +386,9 @@ class _PointCloudNode(Node):
         # node leaves the executor (InvalidHandle race otherwise; see vop).
         self._stop_event.set()
         with self._lifecycle_lock:
+            timer, self._input_discovery_timer = self._input_discovery_timer, None
+            if timer is not None:
+                self.destroy_timer(timer)
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
                 if self._worker.is_alive():
@@ -1562,7 +1612,12 @@ class PointCloudPerceptionPlugin:
                                      name="pointcloud_model_load").start()
                     return {"state": "loading", "mode": mode, "input": input_topic,
                             "message": "Engine loading in background, will start automatically"}
-                self._start_node(node_key, mode, input_topic, right_topic, calibration)
+                try:
+                    self._start_node(node_key, mode, input_topic, right_topic, calibration)
+                except Exception as error:
+                    log.error("[pointcloud] unable to bind ROS input topic %s: %s",
+                              input_topic, error, exc_info=True)
+                    return {'state': 'error', 'message': str(error)}
                 with self._nodes_lock:
                     running = self._nodes.get(node_key)
                 if running is None:

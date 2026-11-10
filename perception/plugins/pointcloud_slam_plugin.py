@@ -1,5 +1,6 @@
 """Point-cloud mapping card backed by the native RTAB-Map process."""
 from copy import deepcopy
+import logging
 import json
 import math
 from pathlib import Path
@@ -17,6 +18,7 @@ from .pointcloud_slam_transforms import rigid
 from .pointcloud_slam_view import SavedMapView
 from utils.ros_lifecycle import dispose_node
 
+log = logging.getLogger(__name__)
 _ARCHIVE_DIR = '/models/pointcloud_slam'
 _DEFAULTS = {'max_gap_ms': 200, 'max_age_s': 2,
              'max_measurement_age_ms': 1500, 'max_future_skew_ms': 100,
@@ -31,6 +33,7 @@ _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calib
 _ACTIONS = {
     'start_mapping': ('Start mapping', ['map_name']),
     'stop_mapping': ('Stop mapping and save', []),
+    'abandon_pending': ('Release failed save (keep recovery files)', []),
     'list_maps': ('List maps', []), 'select_map': ('View saved map', ['map_id']),
     'rename_map': ('Rename saved map', ['map_id', 'map_name']),
     'delete_map': ('Delete saved map', ['map_id'])}
@@ -73,6 +76,7 @@ class PointCloudSlamPlugin:
         self._legacy_core = True
         self._session_settings = {}
         self._last_stop = None
+        self._last_recovery = None
         self._save_status = {'state': 'idle'}
         self._capture_stop = threading.Event()
         self._project_stopping = False
@@ -94,6 +98,7 @@ class PointCloudSlamPlugin:
         actions = {key: {'requires_project': key == 'start_mapping'} for key in _ACTIONS}
         actions['operation_status'] = {'internal': True}
         actions['delete_map']['confirm'] = '删除地图及其全部版本？'
+        actions['abandon_pending']['confirm'] = '保存已经失败。解除阻塞并保留原始会话文件供人工恢复？该地图不会列入已保存地图。'
         for key in ('stop_mapping', 'select_map'):
             actions[key].update(background=True, status_action='operation_status',
                 pending_states=['working'], error_states=['error'], poll_interval_ms=500)
@@ -189,6 +194,9 @@ class PointCloudSlamPlugin:
                 for operation in (self._operation, self._save_status):
                     if request and operation.get('request_id') == request:
                         return dict(operation, state='working' if operation['state'] == 'saving' else operation['state'])
+            if request and self._last_recovery and self._last_recovery.get('request_id') == request:
+                return {'state': 'error', 'request_id': request,
+                        'message': 'Map save failed; session retained at ' + self._last_recovery['path']}
             from .pointcloud_slam_library import map_entries
             for entry in map_entries(_ARCHIVE_DIR):
                 for saved in entry['saves']:
@@ -244,6 +252,10 @@ class PointCloudSlamPlugin:
     def _dispatch(self, action, args):
         if action == 'stop':
             return self._stop_project()
+        if action == 'start':
+            return self._prepare_after_prior_mapping(args)
+        if action == 'abandon_pending':
+            return self._abandon_pending()
         if action == 'stop_mapping':
             return self._stop_mapping(args.get('request_id'))
         if action == 'info':
@@ -252,7 +264,9 @@ class PointCloudSlamPlugin:
                 stopping = self._project_stopping or self._blocking_stops
             if stopping:
                 return {'state': 'idle', 'capture_stopped': True, 'backend': 'rtabmap',
-                        'save_state': save['state'], 'save_result': save, 'topic_in': [], 'topic_out': self._outputs()}
+                        'save_state': save['state'], 'save_result': save,
+                        'last_recovery': deepcopy(self._last_recovery),
+                        'topic_in': [], 'topic_out': self._outputs()}
             with self._lock:
                 return {'state': 'idle' if self._capture_stop.is_set() else
                         'running' if self._node else 'save_pending' if self._pending else
@@ -260,6 +274,7 @@ class PointCloudSlamPlugin:
                         'capture_stopped': self._capture_stop.is_set(), 'map_name': self._map_name,
                         'selected_map_id': self._view_id, 'last_stop': deepcopy(self._last_stop),
                         'save_state': save['state'], 'save_result': save,
+                        'last_recovery': deepcopy(self._last_recovery),
                         'input_compatibility': {'mode': 'legacy_core' if self._legacy_core else 'explicit',
                             'role_source': 'not_resolved' if not self._topics else
                                 'native_ros_publishers' if self._legacy_core else 'input_bindings',
@@ -292,11 +307,26 @@ class PointCloudSlamPlugin:
                 self._config = merged
                 self._runtime_inputs = self._runtime_provenance = None
                 return {'state': 'configured', 'config': dict(self._config)}
-            if action == 'start':
-                return self._prepare(args)
             if action == 'start_mapping':
                 return self._start_mapping(args)
             return self._map_action(action, args)
+
+    def _prepare_after_prior_mapping(self, args):
+        # Intelligent control can restart without issuing the previous card's
+        # stop action. A new project start must finalize that previous session,
+        # not leave the canvas permanently blocked on the old node/pending map.
+        with self._lock:
+            previous = self._node or self._pending
+        if previous is not None:
+            log.warning('[pointcloud_slam] new project start finalizing previous map session')
+            try:
+                self._stop_mapping()  # commits native DB; never discards it
+            except Exception as error:
+                raise RuntimeError('previous map save failed: ' + str(error) +
+                                   '; retry stop_mapping or use abandon_pending '
+                                   'to preserve recovery files and release the card') from error
+        with self._lock:
+            return self._prepare(args)
 
     def _prepare(self, args):
         if self._node or self._pending:
@@ -451,6 +481,39 @@ class PointCloudSlamPlugin:
             with self._operation_lock:
                 self._save_status = dict(result, state='saved' if result['state'] == 'saved' else 'idle')
             return result
+
+    def _abandon_pending(self):
+        """Release an unrecoverable failed save, preserving its raw session.
+
+        Explicit confirmation is required: this intentionally does not claim
+        the map is saved and never deletes a native database.
+        """
+        with self._save_lock:
+            with self._operation_lock:
+                if (self._save_status.get('state') != 'error' or
+                        self._project_stopping or self._blocking_stops or
+                        self._operation.get('state') == 'working'):
+                    raise ValueError('abandon_pending requires a failed, completed map save')
+            with self._lock:
+                pending = self._pending
+                if pending is None or self._node is not None:
+                    raise ValueError('no failed pending map to release')
+                for segment in getattr(pending, '_segments', []):
+                    process = segment.get('process')
+                    if process is not None and process.poll() is None:
+                        raise ValueError('native mapping process is still alive; retry stop_mapping first')
+                pending.freeze_capture()
+                recovery = {'path': str(self._session_dir), 'map_name': self._map_name,
+                            'request_id': self._save_request,
+                            'error': self._save_status.get('message')}
+                self._last_recovery = recovery
+                self._pending = self._session_dir = self._map_name = self._save_request = None
+            dispose_node(self._executor, pending, label=self.PREFIX)
+            with self._operation_lock:
+                self._save_status = {'state': 'idle'}
+        log.warning('[pointcloud_slam] failed map retained for recovery at %s', recovery['path'])
+        return {'state': 'recovery_required', 'recovery': recovery,
+                'message': 'Failed map save was released; raw files are preserved for recovery'}
 
     def _stop_ack(self):
         return {'state': 'idle', 'capture_stopped': True,

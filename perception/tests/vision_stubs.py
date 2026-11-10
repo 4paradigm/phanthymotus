@@ -61,6 +61,7 @@ class _FakeNode:
         self._name = name
         self.publishers = []
         self.subscriptions = []
+        self._topic_types = {}
         self.destroyed = False
         _FakeNode.instances.append(self)
 
@@ -76,6 +77,10 @@ class _FakeNode:
         subscription = _FakeSubscription(topic, callback, qos)
         self.subscriptions.append(subscription)
         return subscription
+
+    def get_publishers_info_by_topic(self, topic):
+        return [types.SimpleNamespace(topic_type=kind)
+                for kind in self._topic_types.get(topic, [])]
 
     def destroy_subscription(self, subscription):
         # Plugins drop the subscription on stop() and recreate it on the next
