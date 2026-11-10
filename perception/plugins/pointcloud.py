@@ -114,10 +114,6 @@ TOOLS = [
                     "type": "array", "items": {"type": "string"},
                     "description": "双目模式的左右话题列表：第一路=左目，第二路=右目。单输入时忽略此参数",
                 },
-                "input_metadata": {
-                    "type": "object",
-                    "description": "Producer measurement declarations keyed by connected input topic",
-                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "depth", "mono", "stereo"],
