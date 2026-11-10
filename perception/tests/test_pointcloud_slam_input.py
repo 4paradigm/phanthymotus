@@ -44,7 +44,7 @@ def measured_odom(ms=1000, segment='a', epoch='e1', generation='g1'):
 def resolved():
     from plugins.pointcloud_slam_input import resolve_inputs
     return resolve_inputs(declarations(), {'/o': 'state/odom', '/c': 'sensor/pointcloud2'},
-                          experimental=True)
+                          )
 
 
 def test_resolver_uses_producer_frames_and_preserves_unverified_evidence():
@@ -72,13 +72,16 @@ def test_resolver_rejects_unsupported_cloud_facts(field, value, reason):
     metadata = declarations()
     metadata['/c'][field] = value
     with pytest.raises(ValueError, match=reason):
-        resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'}, experimental=True)
+        resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
 
 
-def test_default_resolution_requires_real_clock_and_transform_evidence():
+def test_default_resolution_uses_unverified_clock_and_keeps_provenance():
     from plugins.pointcloud_slam_input import resolve_inputs
-    with pytest.raises(ValueError, match='verified'):
-        resolve_inputs(declarations(), {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
+    result = resolve_inputs(declarations(), {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
+    assert result['clock_relation_mode'] == 'shared_source'
+    assert result['inputs']['/c']['clock']['verified'] is False
+    assert result['extrinsic']['calibrated'] is False
+    assert result['settings']['child_from_cloud'] == np.eye(4).tolist()
 
 
 def test_strict_stream_waits_for_exact_stamp_metadata_and_bounds_unmatched_clouds():
@@ -149,7 +152,7 @@ def test_axis_convention_transform_cannot_target_a_different_pose_reference():
     metadata['/c']['extrinsic']['pose_reference'] = 'body_axes'
     metadata['/o']['pose_reference'] = 'body'
     with pytest.raises(ValueError, match='pose_reference'):
-        resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'}, experimental=True)
+        resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
 
 
 def test_pose_producer_can_supply_actual_sensor_mount_without_depth_assumptions():
@@ -159,7 +162,7 @@ def test_pose_producer_can_supply_actual_sensor_mount_without_depth_assumptions(
     mount.update(source='calibration', calibrated=True, version='measured-mount/2')
     mount['matrix'][0][3] = .24
     metadata['/o']['extrinsic'] = mount
-    result = resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'}, experimental=True)
+    result = resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
     assert result['settings']['child_from_cloud'][0][3] == .24
     # The evidence stays on the declaration; it is not repackaged as a card flag.
     assert 'extrinsic_calibrated' not in result['settings']
@@ -172,7 +175,7 @@ def test_conflicting_transform_declarations_are_rejected():
     metadata['/o']['extrinsic'] = deepcopy(metadata['/c']['extrinsic'])
     metadata['/o']['extrinsic']['matrix'][0][3] = .24
     with pytest.raises(ValueError, match='extrinsic'):
-        resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'}, experimental=True)
+        resolve_inputs(metadata, {'/o': 'state/odom', '/c': 'sensor/pointcloud2'})
 
 
 def test_lower_stamp_in_new_epoch_cannot_continue_same_segment():
@@ -198,7 +201,7 @@ def test_mapping_must_reproduce_mapped_acquisition_stamp():
     bad = packet()
     bad['mapping']['offset_ns'] = 10
     with pytest.raises(ValueError, match='mapping'):
-        frame_identity(bad, clock_id='clock', experimental=True)
+        frame_identity(bad, clock_id='clock')
 
 
 def test_changed_pose_mount_version_requires_input_renegotiation():
@@ -206,7 +209,7 @@ def test_changed_pose_mount_version_requires_input_renegotiation():
     metadata = declarations()
     metadata['/o']['extrinsic'] = metadata['/c'].pop('extrinsic')
     metadata['/o']['pose_reference'] = 'body_axes'
-    contract = resolve_inputs(metadata, {'/o':'state/odom','/c':'sensor/pointcloud2'}, experimental=True)
+    contract = resolve_inputs(metadata, {'/o':'state/odom','/c':'sensor/pointcloud2'})
     s = stream(input_contract=contract)
     first = measured_odom()
     first['vendor']['motus_slam'].update(extrinsic_version='test/1', pose_reference='body_axes')
@@ -226,3 +229,59 @@ def test_runtime_pose_frame_must_match_its_declaration():
     s.odom(measured_odom(), now=1.)
     assert s.status(now=1.)['odometry'] != 'tracking'
     assert 'pose frame' in s.last_error
+
+
+def test_no_per_pose_measurement_needed_for_same_source_tracking():
+    s = stream(input_contract=resolved())
+    sample = odom(1000)
+    s.odom(sample, now=1.)
+    assert s.status(now=1.)['odometry'] == 'tracking'
+    s.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1.,
+            data_sha256=packet()['data_sha256'])
+    # The source sends a sidecar but the odometry doesn't need to invent one.
+    s.cloud_metadata(packet(), now=1.05)
+    assert [f.pose.segment_id for f in s.accepted] == ['a']
+
+
+def test_missing_sidecar_falls_back_to_bounded_odom_pairing():
+    s = stream(input_contract=resolved())
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1.01,
+            data_sha256=packet()['data_sha256'])
+    assert not s.accepted
+    # An incoming tracking pose is sufficient to drain the sidecar grace.
+    s.odom(odom(1200, x=0.2), now=1.30)
+    assert len(s.accepted) == 1
+    assert s.status(now=1.30)['frames_without_sidecar'] == 1
+
+
+def test_known_payload_digest_mismatch_never_uses_fallback():
+    s = stream(input_contract=resolved())
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1.01,
+            data_sha256='f' * 64)
+    s.cloud_metadata(packet(), now=1.02)
+    s.odom(odom(1200), now=1.30)
+    assert not s.accepted
+    assert s.status(now=1.30)['frames_without_sidecar'] == 0
+    assert 'payload' in s.last_error
+
+
+def test_invalid_tracking_sample_blocks_cloud_without_evidence():
+    s = stream(input_contract=resolved())
+    s.odom(odom(1000), now=1.)
+    lost = odom(1100, status='lost')
+    s.odom(lost, now=1.1)
+    assert s.status(now=1.1)['odometry'] != 'tracking'
+    with pytest.raises(ValueError, match='odometry'):
+        s.cloud(1_150_000_000, 'camera', [[1, 2, 3]], now=1.15,
+                data_sha256=packet()['data_sha256'])
+    assert not s.accepted
+
+
+def test_missing_evidence_after_present_evidence_is_not_downgraded():
+    s = stream(input_contract=resolved())
+    s.odom(measured_odom(), now=1.)
+    s.odom(odom(1100), now=1.1)
+    assert s.status(now=1.1)['odometry'] != 'tracking'
+    assert 'evidence lost' in s.last_error
