@@ -114,6 +114,10 @@ TOOLS = [
                     "type": "array", "items": {"type": "string"},
                     "description": "双目模式的左右话题列表：第一路=左目，第二路=右目。单输入时忽略此参数",
                 },
+                "input_metadata": {
+                    "type": "object",
+                    "description": "Core-provided capture provenance for connected input topics",
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "depth", "mono", "stereo"],
@@ -121,6 +125,7 @@ TOOLS = [
                 },
             },
             "required": ["action"],
+            "x-input-metadata-consumer": True,
             "x-action-params": {
                 "start": {
                     "params": ["input_topic", "input_topics", "mode"],
