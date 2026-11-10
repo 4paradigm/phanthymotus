@@ -661,7 +661,8 @@ async def _do_start_project_impl():
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
                                  control_interface: dict = None,
-                                 camera_info: dict = None):
+                                 camera_info: dict = None,
+                                 slam_inputs: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -713,6 +714,12 @@ async def _do_start_project_impl():
             # frame, and reports in `info().degraded` what it had to assume when
             # a source declared nothing.
             args['camera_info'] = camera_info
+
+        if slam_inputs is not None:
+            # Strict consumers get exactly the metadata for their connected
+            # ports. An empty input_metadata is still meaningful: it disables
+            # Perception's legacy ROS inference instead of inventing evidence.
+            args.update(slam_inputs)
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -960,6 +967,27 @@ async def _do_start_project_impl():
                     out[topic] = entry
         return out
 
+    def _requires_slam_metadata(card: dict) -> bool:
+        """Opt-in from the consumer schema; retain support for older SLAM tools."""
+        mcp_id, tool_name = card.get('mcpId'), card.get('toolName')
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != mcp_id:
+                continue
+            for tool in mcp.get('tools') or []:
+                if (isinstance(tool, dict) and tool.get('name') == tool_name
+                        and (tool.get('inputSchema') or {}).get('x-slam-input-contract')
+                        == 'motus.slam_input/1'):
+                    return True
+        # A saved canvas can outlive its cached tool schema. This name is the
+        # generic consumer, not a robot preset, and must never silently fall
+        # back to unaudited runtime guesses.
+        return tool_name == 'pointcloud_slam'
+
+    def _upstream_slam_inputs(card_id: str) -> dict:
+        from api.slam_metadata import collect_slam_inputs
+        inbound = [c for c in connections if c.get('toCardId') == card_id]
+        return collect_slam_inputs(inbound, resolved_info, _topic_of_connection)
+
     async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
         """The action space of whatever this card's `control/*` output feeds.
 
@@ -1085,9 +1113,25 @@ async def _do_start_project_impl():
             errors.append(tool_name)
             continue
 
+        slam_inputs = None
+        if _requires_slam_metadata(card):
+            try:
+                slam_inputs = _upstream_slam_inputs(card.get('id', ''))
+            except ValueError as error:
+                tool_name = card.get('toolName', '')
+                message = f'SLAM 输入路由失败: {error}'
+                print(f'[start-project] {tool_name}: {message}')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                    'status': 'error', 'message': message,
+                }})
+                errors.append(tool_name)
+                continue
+
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
-                                 camera_info=_upstream_camera_info(card.get('id', '')))
+                                 camera_info=_upstream_camera_info(card.get('id', '')),
+                                 slam_inputs=slam_inputs)
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
