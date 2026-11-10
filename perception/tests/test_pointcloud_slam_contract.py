@@ -140,6 +140,10 @@ def test_rigid_mount_and_calibration_are_distinct():
     skew['matrix'][0][1] = .1
     with pytest.raises(SpatialSlamError, match='orthonormal'):
         validate_mount(skew)
+    invalid_calibration_flag = deepcopy(value)
+    invalid_calibration_flag['calibrated'] = 'false'
+    with pytest.raises(SpatialSlamError, match='boolean'):
+        validate_mount(invalid_calibration_flag)
     dynamic = {k: value[k] for k in ('parent_frame', 'child_frame', 'version')}
     dynamic.update(mode='dynamic', source='tf', calibrated=True)
     assert validate_mount(dynamic) is dynamic

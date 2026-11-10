@@ -2,8 +2,8 @@
 
 The canvas on Core main passes input_topics, not spatial metadata. Observe a
 fresh tracking motus.odom/1 pose and a native PointCloud2 header to resolve
-frame/clock names without guessing a robot model. A supplied mount is trusted
-automatically only when its producer explicitly marks it calibrated.
+frame/clock names without guessing a robot model. A structurally valid mount
+may be used without calibration; the calibration flag is retained as provenance.
 """
 from collections import deque
 import json
@@ -13,6 +13,7 @@ import uuid
 
 import numpy as np
 
+from .pointcloud_slam_contract import SpatialSlamError, validate_mount
 from .pointcloud_slam_odom import decode_slam_odom
 from .pointcloud_slam_transforms import rigid
 
@@ -53,14 +54,13 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
     mount = quality.get('extrinsic')
     proposed = None
     if mount is not None:
-        if (not isinstance(mount, dict)
-                or mount.get('parent_frame') != pose.child_frame_id
-                or mount.get('child_frame') != cloud_frame):
-            raise ValueError('odometry extrinsic frame does not match connected cloud')
+        try:
+            validate_mount(mount, parent_frame=pose.child_frame_id,
+                           child_frame=cloud_frame)
+        except SpatialSlamError as error:
+            raise ValueError('odometry extrinsic frame/geometry invalid: ' + str(error)) from error
         if mount.get('mode', 'static') != 'static':
             raise ValueError('dynamic mount requires the verified per-frame input contract')
-        if not mount.get('source') or not mount.get('version'):
-            raise ValueError('odometry extrinsic lacks source/version')
         proposed = _matrix(mount.get('matrix'))
 
     manual_matrix = _matrix(manual) if manual is not None else None
@@ -76,7 +76,10 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
     elif manual_matrix is not None:
         chosen = manual_matrix
         provenance = 'manual_card'
-    elif cloud_frame == pose.child_frame_id and mount is None:
+    elif mount is not None:
+        chosen = proposed
+        provenance = 'producer_declared_uncalibrated'
+    elif cloud_frame == pose.child_frame_id:
         # Identical frames imply an identity mapping, not an assumed mount.
         chosen = np.eye(4)
         provenance = 'identical_frame'

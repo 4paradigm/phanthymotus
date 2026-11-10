@@ -26,17 +26,22 @@ def sample(calibrated=False, with_mount=True):
     return value
 
 
-def test_assumed_sensor_mount_requires_operator_matrix():
-    with pytest.raises(ValueError, match='child_from_cloud'):
-        infer_geometry(sample(), 'sensor_optical', 1_000_000_000)
-    settings, provenance = infer_geometry(sample(), 'sensor_optical', 1_000_000_000,
-                                          manual=MOUNT)
+def test_uncalibrated_sensor_mount_is_accepted_and_provenance_is_preserved():
+    settings, provenance = infer_geometry(sample(), 'sensor_optical', 1_000_000_000)
     assert settings['cloud_frame'] == 'sensor_optical'
     assert settings['child_frame'] == '{segment_id}_base'
     assert settings['clock_id'] == 'ros'
     np.testing.assert_allclose(settings['child_from_cloud'], MOUNT)
-    assert provenance['extrinsic_source'] == 'manual_card'
+    assert provenance['extrinsic_source'] == 'producer_declared_uncalibrated'
     assert 'not_independent_clock_proof' in provenance['clock_relation']
+
+    manual_settings, manual_provenance = infer_geometry(
+        sample(), 'sensor_optical', 1_000_000_000, manual=MOUNT)
+    np.testing.assert_allclose(manual_settings['child_from_cloud'], MOUNT)
+    assert manual_provenance['extrinsic_source'] == 'manual_card'
+
+    with pytest.raises(ValueError, match='child_from_cloud'):
+        infer_geometry(sample(with_mount=False), 'sensor_optical', 1_000_000_000)
 
 
 def test_calibrated_upstream_mount_is_accepted_and_conflicts_fail_closed():
