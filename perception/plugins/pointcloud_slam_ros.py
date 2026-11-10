@@ -183,6 +183,8 @@ class RtabmapNode(Node):
         self._runtime_error = ''
         self._stop_reason = ''
         self._forwarded = self._dropped = 0
+        self._native_rejections = {'graph': 0, 'cloud': 0}
+        self._native_rejection_streaks = {'graph': 0, 'cloud': 0}
         self._disk_bytes = 0
         self._session_dir = Path(session_dir).resolve()
         self._namespace = '/pointcloud_slam/session_' + uuid.uuid4().hex
@@ -426,6 +428,24 @@ class RtabmapNode(Node):
     def _stamp(msg):
         return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
 
+    def _native_rejected(self, kind, error):
+        """Report the first rejection, then every 100 additional consecutive errors."""
+        with self._result_lock:
+            self._native_rejections[kind] += 1
+            self._native_rejection_streaks[kind] += 1
+            total = self._native_rejections[kind]
+            streak = self._native_rejection_streaks[kind]
+        if (streak - 1) % 100 == 0:
+            # Native input may be externally sourced; never log unbounded or multiline details.
+            detail = ''.join(char if char.isprintable() else ' '
+                             for char in str(error)[:200])
+            log.warning('Invalid native RTAB-Map %s (streak=%d, total=%d): %s',
+                        kind, streak, total, detail)
+
+    def _native_accepted(self, kind):
+        with self._result_lock:
+            self._native_rejection_streaks[kind] = 0
+
     def _native_graph(self, msg, segment):
         try:
             if not msg.poses_id or len(msg.poses_id) != len(msg.poses):
@@ -438,8 +458,9 @@ class RtabmapNode(Node):
             with self._result_lock:
                 segment['graph'] = (self._stamp(msg), msg.header.frame_id, pose)
             self._publish_snapshot(segment)
+            self._native_accepted('graph')
         except (AttributeError, TypeError, ValueError, OverflowError) as error:
-            log.warning('Invalid native RTAB-Map graph: %s', error)
+            self._native_rejected('graph', error)
 
     def _native_cloud(self, msg, segment):
         try:
@@ -447,8 +468,9 @@ class RtabmapNode(Node):
             with self._result_lock:
                 segment['cloud'] = (stamp, frame, points)
             self._publish_snapshot(segment)
+            self._native_accepted('cloud')
         except ValueError as error:
-            log.warning('Invalid native RTAB-Map cloud: %s', error)
+            self._native_rejected('cloud', error)
 
     def _publish_snapshot(self, segment):
         from .pointcloud_slam_preview import encode_mapping
@@ -498,12 +520,18 @@ class RtabmapNode(Node):
             active = self._active
             frame = active['frame_id'] if active else None
             segment = active['segment_id'] if active else None
+            rejections = dict(self._native_rejections)
+            streaks = dict(self._native_rejection_streaks)
         return dict(health, backend='rtabmap', state='error' if self._runtime_error else
             'storage_limit' if self._stop_reason else 'stopped' if stopped else health['odometry'],
             capture_stopped=stopped, stop_reason=self._stop_reason,
             accepted_clouds=health['admitted_frames'], forwarded_clouds=forwarded,
             runtime_queue=queued, dropped_runtime_queue=dropped, segment_id=segment,
             frame_id=frame, disk_bytes=self._disk_bytes, **counts,
+            native_graph_rejections=rejections['graph'],
+            native_cloud_rejections=rejections['cloud'],
+            native_graph_rejection_streak=streaks['graph'],
+            native_cloud_rejection_streak=streaks['cloud'],
             accepted_loops=counts['native_loop_closures'] + counts['native_proximity_detections'],
             last_error=self._runtime_error or self._stop_reason or health['last_error'])
 
