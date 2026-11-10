@@ -647,6 +647,8 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
     rm -rf /tmp/rtabmap-ws /tmp/rtabmap-core-build
 
 ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
+# Older JP5.11 Humble bases can lack VelocityStamped; only build a pinned
+# geometry_msgs 4.2.4 overlay when it is missing. Compatible JP6.1 is unchanged.
 # A wrapper/dependency download failure must not discard the compiled core.
 # Cache all required sources and the package selection before running colcon.
 RUN set -e; . /opt/ros/humble/install/setup.bash; \
@@ -672,6 +674,15 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
     fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da; \
     fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e; \
     rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
+    if ! find /opt/ros/humble/install/include -type f \
+        -path '*/geometry_msgs/msg/velocity_stamped.hpp' -print -quit | grep -q .; then \
+      echo '[rtabmap-build] geometry_msgs lacks VelocityStamped; adding pinned 4.2.4 overlay'; \
+      fetch_rtabmap_source common_interfaces ros2/common_interfaces 53761cba9a000902602e7e695cb40de78eadee7f; \
+      test -f /tmp/rtabmap-ws/src/common_interfaces/geometry_msgs/msg/VelocityStamped.msg; \
+      mv /tmp/rtabmap-ws/src/common_interfaces/geometry_msgs /tmp/rtabmap-ws/src/geometry_msgs; \
+      rm -rf /tmp/rtabmap-ws/src/common_interfaces; \
+      rtabmap_packages="geometry_msgs ${rtabmap_packages}"; \
+    fi; \
     add_missing_rtabmap_dependencies() { \
       dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; shift 3; \
       missing_packages=''; \

@@ -75,6 +75,9 @@ def shell_fixture(tmp_path):
     """Use real shells/files/tar; replace only unavailable network/ROS/build tools."""
     ros = tmp_path / 'ros'
     (ros / 'lib').mkdir(parents=True)
+    header = ros / 'include/geometry_msgs/geometry_msgs/msg/velocity_stamped.hpp'
+    header.parent.mkdir(parents=True)
+    header.write_text('// JP6.1 compatible underlay fixture\n')
     (tmp_path / 'lib').mkdir()
     (tmp_path / 'work').mkdir()
     for path in (ros / 'lib/librcutils.so',
@@ -91,6 +94,10 @@ ros2() {
         entry = tarfile.TarInfo('pinned-source/CMakeLists.txt')
         entry.size = len(content)
         archive.addfile(entry, io.BytesIO(content))
+        message = tarfile.TarInfo('pinned-source/geometry_msgs/msg/VelocityStamped.msg')
+        message_data = b'Twist velocity\n'
+        message.size = len(message_data)
+        archive.addfile(message, io.BytesIO(message_data))
     return r'''
 curl() {
     printf '%s\n' "$*" >> "$TEST_ROOT/downloads"
@@ -143,6 +150,7 @@ def test_ros_package_selection_survives_a_fresh_build_shell(tmp_path, missing):
     assert fetched.returncode == 0, fetched.stdout + fetched.stderr
     assert not (tmp_path / 'colcon-args').exists()
     download_log = (tmp_path / 'downloads').read_bytes()
+    assert b'common_interfaces' not in download_log
     for name in ('rtabmap_ros', 'message_filters', 'geometry2'):
         assert (tmp_path / 'workspace/src' / name / 'CMakeLists.txt').is_file()
     result = run_layer(build, tmp_path, prelude)
@@ -158,6 +166,26 @@ def test_ros_package_selection_survives_a_fresh_build_shell(tmp_path, missing):
         str(tmp_path / 'local/lib') + ':/fixture/underlay')
     assert (tmp_path / 'downloads').read_bytes() == download_log
     assert not (tmp_path / 'workspace').exists()
+
+
+def test_old_geometry_msgs_gets_only_the_missing_message_overlay(tmp_path):
+    """JP5.11 must build VelocityStamped; compatible JP6.1 stays unchanged."""
+    _, _, fetch, build = layers()
+    prelude = shell_fixture(tmp_path)
+    (tmp_path / 'ros/include/geometry_msgs/geometry_msgs/msg/velocity_stamped.hpp').unlink()
+
+    result = run_layer(fetch, tmp_path, prelude)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / 'workspace/src/geometry_msgs/msg/VelocityStamped.msg').is_file()
+    assert not (tmp_path / 'workspace/src/common_interfaces').exists()
+    downloads = (tmp_path / 'downloads').read_text()
+    assert 'ros2/common_interfaces/tar.gz/53761cba9a000902602e7e695cb40de78eadee7f' in downloads
+
+    built = run_layer(build, tmp_path, prelude)
+    assert built.returncode == 0, built.stdout + built.stderr
+    args = (tmp_path / 'colcon-args').read_text().splitlines()
+    selected = args[args.index('--packages-select') + 1:args.index('--cmake-args')]
+    assert selected == ['geometry_msgs'] + BASE_PACKAGES
 
 
 def test_ros_build_without_saved_package_selection_fails_before_colcon(tmp_path):
