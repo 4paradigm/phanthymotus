@@ -217,5 +217,5 @@ def test_perception_explicit_input_is_compatible_with_common_declaration():
     assert result['frame_metadata_topic'] == '/cloud/meta'
     assert {'/odom': pose, '/cloud': cloud} == original
     cloud['extrinsic']['calibrated'] = False
-    with pytest.raises(ValueError, match='calibrated'):
+    with pytest.raises(ValueError, match='calibration'):
         resolve_inputs({'/odom': pose, '/cloud': cloud}, bindings)
