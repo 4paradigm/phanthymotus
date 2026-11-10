@@ -108,6 +108,19 @@ def test_card_starts_mapping_with_cloud_and_existing_odom_without_rgbd(card):
     assert len(card.get_tools()[0]['topic_out']) == 1
 
 
+def test_action_identifiers_match_canvas_display_names(card):
+    tool = card.get_tools()[0]
+    action = tool['inputSchema']['properties']['action']
+    options = action['oneOf']
+
+    assert [item['const'] for item in options] == action['enum']
+    assert all(item['title'] == item['const'] for item in options)
+
+    params = tool['inputSchema']['x-action-params']
+    assert set(params) == set(module._ACTIONS)
+    assert {name: item['params'] for name, item in params.items()} == module._ACTIONS
+
+
 def test_legacy_core_roles_use_native_publisher_discovery(card, monkeypatch):
     monkeypatch.setattr(module, 'discover_input_bindings', lambda topics:
         {'/cloud': 'sensor/pointcloud2', '/pose': 'state/odom'})

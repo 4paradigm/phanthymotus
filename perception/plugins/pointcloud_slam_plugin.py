@@ -31,12 +31,14 @@ _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calib
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
             'max_frames', 'max_points', 'persistent_history'}
 _ACTIONS = {
-    'start_mapping': ('Start mapping', ['map_name']),
-    'stop_mapping': ('Stop mapping and save', []),
-    'abandon_pending': ('Release failed save (keep recovery files)', []),
-    'list_maps': ('List maps', []), 'select_map': ('View saved map', ['map_id']),
-    'rename_map': ('Rename saved map', ['map_id', 'map_name']),
-    'delete_map': ('Delete saved map', ['map_id'])}
+    'start_mapping': ['map_name'],
+    'stop_mapping': [],
+    'abandon_pending': [],
+    'list_maps': [],
+    'select_map': ['map_id'],
+    'rename_map': ['map_id', 'map_name'],
+    'delete_map': ['map_id'],
+}
 
 
 def _config_properties():
@@ -104,13 +106,13 @@ class PointCloudSlamPlugin:
                 pending_states=['working'], error_states=['error'], poll_interval_ms=500)
         schema = {'type': 'object', 'properties': {
             'action': {'type': 'string', 'enum': verbs,
-                       'oneOf': [{'const': k, 'title': _ACTIONS[k][0] if k in _ACTIONS else k} for k in verbs]},
+                       'oneOf': [{'const': k, 'title': k} for k in verbs]},
             'input_topics': {'type': 'array', 'items': {'type': 'string'}},
             'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
             'input_metadata': {'type': 'object'},
             **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id')},
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
-            'x-action-params': {k: {'params': v[1]} for k, v in _ACTIONS.items()},
+            'x-action-params': {k: {'params': params} for k, params in _ACTIONS.items()},
             'x-slam-input-contract': 'motus.slam_input/1',
             'x-map-manager': {'schema': 'motus.map-manager/1', 'actions': {
                 k: k for k in ('list_maps', 'select_map', 'rename_map', 'delete_map')}},
