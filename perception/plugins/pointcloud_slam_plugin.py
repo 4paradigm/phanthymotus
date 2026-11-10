@@ -31,6 +31,7 @@ _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calib
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
             'max_frames', 'max_points', 'persistent_history'}
 _ACTIONS = {
+    'preflight': ('Check SLAM input readiness (read-only)', []),
     'start_mapping': ('Start mapping', ['map_name']),
     'stop_mapping': ('Stop mapping and save', []),
     'abandon_pending': ('Release failed save (keep recovery files)', []),
@@ -111,6 +112,7 @@ class PointCloudSlamPlugin:
             **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id')},
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': v[1]} for k, v in _ACTIONS.items()},
+            'x-slam-input-contract': 'motus.slam_input/1',
             'x-map-manager': {'schema': 'motus.map-manager/1', 'actions': {
                 k: k for k in ('list_maps', 'select_map', 'rename_map', 'delete_map')}},
             'x-action-lifecycle': {'schema': 'motus.action-lifecycle/1', 'config_actions': ['start'], 'actions': actions}}
@@ -249,7 +251,28 @@ class PointCloudSlamPlugin:
         if not isinstance(request, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request):
             raise ValueError('invalid map request id')
 
+    def _preflight_ros_topics(self):
+        """Read existing ROS graph only; do not launch a node or mapping process."""
+        nodes_fn = getattr(self._executor, 'get_nodes', None)
+        if callable(nodes_fn):
+            try:
+                for node in nodes_fn():
+                    list_fn = getattr(node, 'get_topic_names_and_types', None)
+                    if callable(list_fn):
+                        return dict(list_fn())
+            except (RuntimeError, AttributeError, TypeError):
+                pass
+        return None
+
     def _dispatch(self, action, args):
+        if action == 'preflight':
+            from .pointcloud_slam_preflight import evaluate_preflight
+            # Core's project start has already supplied the connected ports.
+            # An explicit preflight request can override them for offline checks.
+            data = args if 'input_topics' in args else self._project_inputs or args
+            return evaluate_preflight(
+                data, manual_extrinsic=self._config.get('child_from_cloud'),
+                topic_types=self._preflight_ros_topics())
         if action == 'stop':
             return self._stop_project()
         if action == 'start':
