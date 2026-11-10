@@ -169,8 +169,8 @@ class SlamStream:
                     if identity in self._retired_identities:
                         self.last_error = 'retired input epoch/generation dropped'
                         return
-                elif self._input_identity is not None and pose.segment_id == self._input_segment:
-                    raise ValueError('pose measurement evidence lost within active segment')
+                elif self._input_identity is not None:
+                    raise ValueError('pose measurement evidence lost after prior verified segment')
 
         except ValueError as error:
             self.last_error = str(error)
