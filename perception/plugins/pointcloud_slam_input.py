@@ -14,7 +14,7 @@ class InputContractError(ValueError):
         super().__init__('; '.join(f"{d['topic']}: {d['field']} {d['reason']}" for d in diagnostics))
 
 
-def resolve_inputs(metadata, bindings, *, experimental=False):
+def resolve_inputs(metadata, bindings):
     """Resolve only the connected pose/cloud pair; never invent missing facts."""
     diagnostics = []
     inputs = {}
@@ -96,9 +96,6 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
             matrix = _rigid(extrinsic.get('matrix')).tolist()
         except (TypeError, ValueError):
             require(False, cloud_topic, 'extrinsic.matrix', 'must be a rigid 4x4 transform')
-    if not experimental:
-        require(verified, cloud_topic, 'clock', 'must be verified for strict policy')
-        require(extrinsic.get('calibrated') is True, cloud_topic, 'extrinsic', 'must be verified by calibration for strict policy')
     if diagnostics:
         raise InputContractError(diagnostics)
     # Keep wire-level validation shared with driver authors, while preserving
@@ -110,27 +107,34 @@ def resolve_inputs(metadata, bindings, *, experimental=False):
             raise InputContractError([dict(topic=topic, field='contract', reason=str(error))]) from error
     try:
         validate_mount(extrinsic, parent_frame=child, child_frame=frame,
-                       require_calibrated=not experimental)
+                       require_calibrated=False)
     except SpatialSlamError as error:
         raise InputContractError([dict(topic=cloud_topic, field='extrinsic',
                                        reason=str(error))]) from error
-    return dict(inputs=inputs, frame_metadata_topic=sidecar, experimental=experimental,
+    # This describes input geometry, not a strict/experimental admission policy.
+    # Unknown clock accuracy is diagnostic; timestamp alignment remains mandatory.
+    segment = pose.get('segment_id')
+    def template(value):
+        return ('{segment_id}' + value[len(segment):]
+                if isinstance(segment, str) and segment and
+                   isinstance(value, str) and value.startswith(segment + '_') else value)
+    return dict(inputs=inputs, frame_metadata_topic=sidecar,
                 extrinsic=deepcopy(extrinsic),
                 clock_relation_mode='verified_relation' if independent else 'shared_source',
                 relation_id=relation_id,
                 # No operator-assertion flags travel with the resolved settings:
                 # they were a card policy, not producer evidence.
-                settings=dict(cloud_frame=frame, child_frame=child, clock_id=cloud['clock_id'],
+                settings=dict(cloud_frame=frame, child_frame=template(child), clock_id=cloud['clock_id'],
                               child_from_cloud=matrix, extrinsic_mode=mode))
 
 
-def frame_identity(packet, *, clock_id, experimental=False, payload=False, relation_id=None):
-    """The shared motus.slam_frame/1 contract used for exact frame pairing.
+def frame_identity(packet, *, clock_id, payload=False, relation_id=None):
+    """Check available frame evidence without inventing clock verification.
 
-    Preserve the historical experimental argument for ROS-free tests and the
-    strict Perception caller; only a verified producer may assert sync.
+    Exact digest, frame, timestamp and mapping arithmetic remain mandatory
+    whenever evidence is supplied; unverified mapping is not an admission mode.
     """
     return validate_frame_identity(packet, clock_id=clock_id,
-                                   strict=not experimental,
+                                   strict=False,
                                    require_digest=payload,
                                    relation_id=relation_id)
