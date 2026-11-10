@@ -1,6 +1,7 @@
 """ROS adapter contract tests; these do not claim native engine acceptance."""
 from copy import deepcopy
 import json
+import logging
 import sqlite3
 import struct
 import threading
@@ -201,6 +202,68 @@ def test_nonfinite_native_output_never_publishes_a_mapping_packet(node):
     sub = next(s for s in node.subscriptions if s.topic.endswith('/cloud_map'))
     sub.callback(cloud(frame='native_map', points=[(float('inf'), 0., 0.)]))
     assert not published(node, '/pointcloud_slam/map')[0].messages
+
+
+
+def test_native_rejection_warnings_are_rate_limited_per_input_and_preview_recovers(node, caplog):
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    graph = next(s.callback for s in node.subscriptions if s.topic.endswith('/mapGraph'))
+    output = next(s.callback for s in node.subscriptions if s.topic.endswith('/cloud_map'))
+    invalid_graph = NS(poses_id=[1], poses=[NS(position=None)])
+    invalid_cloud = cloud(frame='native_map')
+    invalid_cloud.width = -1
+
+    with caplog.at_level(logging.WARNING, logger='plugins.pointcloud_slam_ros'):
+        for _ in range(250):
+            graph(invalid_graph)
+            output(invalid_cloud)
+
+        def warnings(kind):
+            return [record.getMessage() for record in caplog.records
+                    if record.name == 'plugins.pointcloud_slam_ros'
+                    and record.getMessage().startswith('Invalid native RTAB-Map ' + kind)]
+
+        assert len(warnings('graph')) == len(warnings('cloud')) == 3
+        assert node.status()['native_graph_rejections'] == 250
+        assert node.status()['native_cloud_rejections'] == 250
+        assert node.status()['native_graph_rejection_streak'] == 250
+        assert node.status()['native_cloud_rejection_streak'] == 250
+
+        graph(NS(header=NS(frame_id='native_map', stamp=NS(sec=1, nanosec=0)),
+            poses_id=[1], poses=[NS(position=NS(x=1., y=2., z=0.),
+                orientation=NS(x=0., y=0., z=0., w=1.))]))
+        output(cloud(frame='native_map'))
+        assert published(node, '/pointcloud_slam/map')[0].messages
+        assert node.status()['native_graph_rejection_streak'] == 0
+        assert node.status()['native_cloud_rejection_streak'] == 0
+        assert node.status()['native_graph_rejections'] == 250
+        assert node.status()['native_cloud_rejections'] == 250
+
+        graph(invalid_graph)
+        output(invalid_cloud)
+        assert len(warnings('graph')) == len(warnings('cloud')) == 4
+        assert node.status()['native_graph_rejections'] == 251
+        assert node.status()['native_cloud_rejections'] == 251
+
+
+def test_native_rejection_warning_sanitizes_and_bounds_detail(node, caplog, monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    output = next(s.callback for s in node.subscriptions if s.topic.endswith('/cloud_map'))
+
+    def invalid_cloud(*args, **kwargs):
+        raise ValueError('bad\n' + 'x' * 300 + '\x1b[31m')
+
+    monkeypatch.setattr(ros, 'decode_cloud', invalid_cloud)
+    with caplog.at_level(logging.WARNING, logger='plugins.pointcloud_slam_ros'):
+        output(cloud(frame='native_map'))
+    warning = next(record.getMessage() for record in caplog.records
+                   if record.getMessage().startswith('Invalid native RTAB-Map cloud'))
+    detail = warning.split(': ', 1)[1]
+    assert len(detail) == 200
+    assert '\n' not in warning and '\x1b' not in warning
 
 
 def test_freeze_during_slow_native_start_is_immediate_and_cannot_resume(tmp_path, monkeypatch):
