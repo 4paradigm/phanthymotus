@@ -12,9 +12,20 @@ def test_mapping_packet_preserves_pose_coordinates_and_bounds_points():
     pose = np.array([[0, -1, 0, -2.5], [1, 0, 0, 4.25],
                      [0, 0, 1, -.75], [0, 0, 0, 1]])
     packet = preview.encode_mapping(np.arange(30).reshape(-1, 3), pose, max_points=3)
-    expected = struct.pack('<fffBI9f', -2.5, 4.25, math.pi / 2, 3, 3,
+    expected = struct.pack('<fffBI9f', -2.5, 4.25, -math.pi / 2, 3, 3,
                            0, 1, 2, 12, 13, 14, 27, 28, 29)
     assert packet == expected
+
+
+@pytest.mark.parametrize('ros_yaw', [math.pi / 2, -math.pi / 2, math.pi / 4, -math.pi / 4])
+def test_mapping_display_yaw_matches_other_robot_cards(ros_yaw):
+    pose = np.eye(4)
+    c, s = math.cos(ros_yaw), math.sin(ros_yaw)
+    pose[:2, :2] = [[c, -s], [s, c]]
+    packet = preview.encode_mapping([[1., 2., 3.]], pose, max_points=1)
+    x, y, display_yaw, flags, count = struct.unpack('<fffBI', packet[:17])
+    assert (x, y, flags, count) == (0., 0., 3, 1)
+    assert display_yaw == pytest.approx(-ros_yaw)
 
 
 @pytest.mark.parametrize('points,limit', [([[float('nan'), 0, 0]], 1),

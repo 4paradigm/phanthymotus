@@ -64,6 +64,16 @@ def test_rebuild_uses_linked_graph_nodes_and_keeps_marker(tmp_path):
     assert np.max(np.linalg.norm(points - np.array([3, 0, 5]), axis=1)) > 1
 
 
+def test_saved_snapshot_does_not_flip_display_yaw_again(tmp_path):
+    database = _database(tmp_path / 'native.db', [
+        (1, _pose_blob(1, 2), _cloud_blob([[0, 0, 0]]), None, None, None),
+    ], links=[(1, 1)])
+    for display_yaw in (0.25, -0.25, 1.1, -1.1):
+        fallback = _fallback(yaw=display_yaw)
+        packet = module.rebuild(database, max_points=20, fallback=fallback)
+        assert np.isclose(_decode(packet)[2], display_yaw, atol=1e-6)
+
+
 def test_rebuild_falls_back_for_corrupt_or_empty_database(tmp_path):
     fallback = _fallback()
     missing = module.rebuild(str(tmp_path / 'missing.db'), max_points=100, fallback=fallback)

@@ -71,9 +71,12 @@ def _transform(points, matrix):
 
 def _marker(packet):
     """Keep the marker (last mapped pose) of the preview snapshot replaced."""
-    x, y, yaw, _, _ = struct.unpack('<fffBI', packet[:17])
-    if not np.isfinite([x, y, yaw]).all():
+    x, y, display_yaw, _, _ = struct.unpack('<fffBI', packet[:17])
+    if not np.isfinite([x, y, display_yaw]).all():
         raise ValueError('invalid snapshot marker')
+    # A preview packet stores -ROS yaw. Undo that only while constructing
+    # the pose matrix; encode_mapping will apply the display convention again.
+    yaw = -display_yaw
     c, s = math.cos(yaw), math.sin(yaw)
     matrix = np.eye(4)
     matrix[:3, :3] = [[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]

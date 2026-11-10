@@ -245,11 +245,10 @@ export const MappingRenderer = {
     // Update robot position and orientation
     // Coordinate mapping: robot at (robotX, 0.2, -robotY)
     // Yaw: in original frame yaw=0 is +X, yaw=pi/2 is +Y
-    // In Three.js: a positive Y rotation turns +X toward -Z (ROS +Y).
-    // The ROS→Three.js axis transform already handles the sign: use +yaw.
+    // In Three.js: +X stays +X, +Y maps to -Z → rotation around Y axis = -yaw
     if (this._robotMesh) {
       this._robotMesh.position.set(robotX, 0.2, -robotY);
-      this._robotMesh.rotation.set(0, robotYaw, 0);
+      this._robotMesh.rotation.set(0, -robotYaw, 0);
       this._robotPos.set(robotX, 0.2, -robotY);
     }
   },

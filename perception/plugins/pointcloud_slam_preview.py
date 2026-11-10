@@ -23,5 +23,8 @@ def encode_mapping(points, pose, *, max_points):
             np.any(np.abs(matrix[:2, 3]) > np.finfo(np.float32).max)):
         raise ValueError('preview points exceed float32 range')
     xyz = np.asarray(points, dtype='<f4')
-    yaw = math.atan2(matrix[1, 0], matrix[0, 0])
-    return struct.pack('<fffBI', matrix[0, 3], matrix[1, 3], yaw, 3, len(xyz)) + xyz.tobytes()
+    # The stock Core mapping renderer negates the packet's yaw. Match the
+    # existing Tianyi/G1 display convention without changing RTAB-Map poses.
+    ros_yaw = math.atan2(matrix[1, 0], matrix[0, 0])
+    display_yaw = -ros_yaw if ros_yaw != 0.0 else 0.0  # avoid negative-zero bytes
+    return struct.pack('<fffBI', matrix[0, 3], matrix[1, 3], display_yaw, 3, len(xyz)) + xyz.tobytes()
