@@ -221,3 +221,83 @@ def test_core_build_runs_from_prepared_sources_in_a_fresh_shell(tmp_path, build_
     assert result.returncode == build_status, result.stdout + result.stderr
     assert not (tmp_path / 'downloads').exists()
     assert source.exists() == bool(build_status)
+
+
+def test_jp511_ros_groups_have_independent_cache_layers():
+    recipe = DOCKERFILE.read_text().replace(chr(92) + chr(10), ' ')
+    commands = [value for op, value in re.findall(r'^(RUN|ARG|COPY) (.*)$',
+                                                 recipe, re.M) if op == 'RUN']
+    groups = ('foundations', 'support', 'slam')
+    positions = []
+    for group in groups:
+        matches = [(i, cmd) for i, cmd in enumerate(commands)
+                   if 'bash /tmp/build_rtabmap_ros_group.sh ' + group in cmd]
+        assert len(matches) == 1, group
+        index, run = matches[0]
+        positions.append(index)
+        assert run.startswith(
+            '--mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},'
+            'target=/var/cache/rtabmap-ccache ')
+        assert 'if [ "${JP_VERSION}" = "511" ]' in run
+    assert positions == sorted(positions)
+    old_path = next(command for command in commands
+                    if 'MAKEFLAGS=-j2 colcon build' in command)
+    assert 'if [ "${JP_VERSION:-61}" != "511" ]' in old_path
+    assert 'rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh' in old_path
+
+
+def test_jp511_group_helper_is_valid_and_preserves_exit_status():
+    helper = Path(__file__).parents[1] / 'tools/build_rtabmap_ros_group.sh'
+    data = helper.read_text()
+    assert subprocess.run(['bash', '-n', str(helper)], check=False).returncode == 0
+    assert 'time.sleep(60)' in data
+    assert 'trap cleanup_heartbeat EXIT' in data
+    assert 'MAKEFLAGS=-j2 colcon build --event-handlers console_direct+' in data
+    assert '--packages-select "${selected[@]}" --cmake-args' in data
+    assert '. /opt/rtabmap_ros/setup.bash' in data
+    assert 'export CCACHE_COMPILERCHECK=content' in data
+
+
+@pytest.mark.parametrize('group,expected', [
+    ('foundations', ['geometry_msgs', 'tf2', 'tf2_ros', 'tf2_py',
+                     'tf2_ros_py', 'tf2_eigen', 'tf2_geometry_msgs',
+                     'message_filters']),
+    ('support', ['rtabmap_msgs', 'rtabmap_conversions',
+                 'rtabmap_sync', 'rtabmap_util', 'pcl_ros']),
+    ('slam', ['rtabmap_slam']),
+])
+def test_jp511_group_selection_and_colcon_failure_propagation(tmp_path, group, expected):
+    prelude = shell_fixture(tmp_path)
+    helper = (Path(__file__).parents[1] /
+              'tools/build_rtabmap_ros_group.sh').read_text()
+    for old, new in (
+        ('/opt/ros/humble/install', tmp_path / 'ros'),
+        ('/opt/rtabmap_ros', tmp_path / 'install'),
+        ('/usr/lib/aarch64-linux-gnu', tmp_path / 'lib'),
+        ('/usr/local/lib', tmp_path / 'local/lib'),
+        ('/var/cache/rtabmap-ccache', tmp_path / 'ccache'),
+        ('/tmp/rtabmap-ws', tmp_path / 'workspace'),
+    ):
+        helper = helper.replace(old, str(new))
+    helper_path = tmp_path / 'group.sh'
+    helper_path.write_text(helper)
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    packages = ['geometry_msgs'] + BASE_PACKAGES + ['pcl_ros']
+    (workspace / 'packages.list').write_text(' '.join(packages) + '\n')
+    env = dict(os.environ, TEST_ROOT=str(tmp_path), MISSING_PACKAGES='',
+               BUILD_STATUS='0', LD_LIBRARY_PATH='/fixture/underlay')
+    invocation = prelude + '\n. "' + str(helper_path) + '" ' + group + '\n'
+    result = subprocess.run(['bash', '-c', invocation], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (tmp_path / 'colcon-args').read_text().splitlines()
+    actual = args[args.index('--packages-select') + 1:args.index('--cmake-args')]
+    assert actual == expected
+    assert '--event-handlers' in args and 'console_direct+' in args
+    assert (tmp_path / 'build-library-path').read_text().strip().startswith(
+        str(tmp_path / 'local/lib') + ':')
+    env['BUILD_STATUS'] = '37'
+    failure = subprocess.run(['bash', '-c', invocation], env=env,
+                             capture_output=True, text=True, timeout=15)
+    assert failure.returncode == 37, failure.stdout + failure.stderr

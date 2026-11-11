@@ -51,12 +51,15 @@ echo "[rtabmap-build] JP5.11 $group packages: ${selected[*]}"
 # Review builds are terminated after 600 seconds without output. Large C++
 # translation units can remain silent; emit a heartbeat every 60 seconds.
 # A failed colcon command still returns its real error code.
-heartbeat() {
-    while sleep 60; do
-        echo "[rtabmap-build] JP5.11 $group still compiling..."
-    done
-}
-heartbeat &
+# Use a single Python process instead of a shell loop that could leave an
+# orphaned "sleep" holding CI log pipes open after the build exits.
+python3 -u -c '
+import sys
+import time
+while True:
+    time.sleep(60)
+    print("[rtabmap-build] JP5.11 " + sys.argv[1] + " still compiling...", flush=True)
+' "$group" &
 heartbeat_pid=$!
 cleanup_heartbeat() {
     kill "$heartbeat_pid" 2>/dev/null || true
