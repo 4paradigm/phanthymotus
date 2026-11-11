@@ -253,6 +253,11 @@ class PerceptionBundle:
                 log.error("PointCloudPerceptionPlugin failed to load; continuing without pointcloud",
                           exc_info=True)
 
+        if plugins_cfg.get("rgbd_odometry", {}).get("enabled", False):
+            from plugins.rgbd_odometry import RgbdOdometryPlugin
+            self._plugins.append(RgbdOdometryPlugin(plugins_cfg["rgbd_odometry"], executor))
+            log.info("RgbdOdometryPlugin loaded")
+
         slam_cfg = plugins_cfg.get("pointcloud_slam") or {}
         if slam_cfg.get("enabled", False):
             try:

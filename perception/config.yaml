@@ -281,6 +281,9 @@ plugins:
   # Calibrated producer extrinsics may be used automatically. For an assumed or
   # missing mount, enter child_from_cloud (rigid 4x4) in the card instance config.
   # The following deployment settings are generic RTAB-Map/resource overrides.
+  rgbd_odometry:
+    enabled: true
+
   pointcloud_slam:
     enabled: true
 

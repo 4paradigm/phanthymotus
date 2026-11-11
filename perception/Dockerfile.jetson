@@ -678,7 +678,7 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
     fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}"; \
     fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da; \
     fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e; \
-    rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_slam'; \
+    rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_odom rtabmap_slam'; \
     if ! find /opt/ros/humble/install/include -type f \
         -path '*/geometry_msgs/msg/velocity_stamped.hpp' -print -quit | grep -q .; then \
       echo '[rtabmap-build] geometry_msgs lacks VelocityStamped; adding pinned 4.2.4 overlay'; \
@@ -871,7 +871,8 @@ ENV AMENT_PREFIX_PATH="/opt/rtabmap_ros:/ros_ws/install/audio_msgs:/opt/ros/humb
 
 # Runs directly, outside pytest and its ROS stubs, without GPU/camera access.
 # Also checks generated Python typesupport through the runtime .pth/ENV paths.
-RUN ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=127 python3 /work/tools/rtabmap_pointcloud_smoke.py
+RUN test -x /opt/rtabmap_ros/lib/rtabmap_odom/rgbd_odometry && \
+    ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=127 python3 /work/tools/rtabmap_pointcloud_smoke.py
 
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.

@@ -15,7 +15,7 @@ case "$group" in
         candidates='rtabmap_msgs pcl_conversions pcl_ros diagnostic_updater cv_bridge image_geometry image_transport laser_geometry rtabmap_conversions rtabmap_sync rtabmap_util'
         ;;
     slam)
-        candidates='rtabmap_slam'
+        candidates='rtabmap_odom rtabmap_slam'
         ;;
     *)
         echo "[rtabmap-build] unknown JP5.11 group: $group" >&2
