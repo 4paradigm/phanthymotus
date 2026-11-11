@@ -147,6 +147,13 @@ def test_core_sparse_fetch_preserves_pinned_sources_and_recovers_interrupted_che
     result, source, commit, files = run_core_fetch(tmp_path, interrupt_checkout=interrupt_checkout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == commit
+    cache = tmp_path / 'source-cache'
+    assert subprocess.check_output([
+        'git', '-C', str(cache), 'config', '--get', 'extensions.partialClone'],
+        text=True).strip() == 'origin'
+    assert subprocess.check_output([
+        'git', '-C', str(cache), 'config', '--get', 'remote.origin.promisor'],
+        text=True).strip() == 'true'
     for name, contents in files.items():
         if name.startswith('data/'):
             assert not (source / name).exists()

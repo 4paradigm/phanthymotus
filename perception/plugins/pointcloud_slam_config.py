@@ -54,13 +54,15 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
     mount = quality.get('extrinsic')
     proposed = None
     if mount is not None:
+        # The legacy route cannot consume a per-capture TF mount. Reject it
+        # with the stable public error before static-matrix validation.
+        if isinstance(mount, dict) and mount.get('mode', 'static') == 'dynamic':
+            raise ValueError('dynamic mount requires the verified per-frame input contract')
         try:
             validate_mount(mount, parent_frame=pose.child_frame_id,
                            child_frame=cloud_frame)
         except SpatialSlamError as error:
             raise ValueError('odometry extrinsic frame/geometry invalid: ' + str(error)) from error
-        if mount.get('mode', 'static') != 'static':
-            raise ValueError('dynamic mount requires the verified per-frame input contract')
         proposed = _matrix(mount.get('matrix'))
 
     manual_matrix = _matrix(manual) if manual is not None else None

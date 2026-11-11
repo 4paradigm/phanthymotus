@@ -55,6 +55,9 @@ def resolve_inputs(metadata, bindings):
     clock = clock if isinstance(clock, dict) else {}
     require(isinstance(clock.get('mapping'), str) and bool(clock['mapping'].strip()), cloud_topic, 'clock.mapping')
     pose_clock = pose.get('clock') if isinstance(pose.get('clock'), dict) else {}
+    # A shared producer already names one clock domain. Separate producers
+    # must prove the relation; unverified same-source evidence is retained,
+    # never silently promoted to verified.
     independent = pose.get('source_id') != cloud.get('source_id')
     relation_id = clock.get('relation_id') if independent else None
     verified = clock.get('verified') is True and pose_clock.get('verified') is True
@@ -106,6 +109,8 @@ def resolve_inputs(metadata, bindings):
         except SpatialSlamError as error:
             raise InputContractError([dict(topic=topic, field='contract', reason=str(error))]) from error
     try:
+        # Calibration is provenance, not an admission gate. Rigid transforms,
+        # source/version, frame names and per-capture TF remain mandatory.
         validate_mount(extrinsic, parent_frame=child, child_frame=frame)
     except SpatialSlamError as error:
         raise InputContractError([dict(topic=cloud_topic, field='extrinsic',

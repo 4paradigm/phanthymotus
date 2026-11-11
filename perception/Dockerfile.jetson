@@ -609,6 +609,11 @@ RUN --mount=type=cache,id=perception-rtabmap-source-${RTABMAP_CORE_COMMIT},targe
     mkdir -p "${rtabmap_source}"; \
     git -C "${rtabmap_source}" init -q; \
     git -C "${rtabmap_source}" config remote.origin.url https://github.com/introlab/rtabmap.git; \
+    # git init + fetch --filter needs partial-clone extension on older Git (JP5.11). \
+    git -C "${rtabmap_source}" config core.repositoryformatversion 1; \
+    git -C "${rtabmap_source}" config extensions.partialClone origin; \
+    git -C "${rtabmap_source}" config remote.origin.promisor true; \
+    git -C "${rtabmap_source}" config remote.origin.partialclonefilter blob:none; \
     git -C "${rtabmap_source}" config http.version HTTP/1.1; \
     git -C "${rtabmap_source}" config http.lowSpeedLimit 1024; \
     git -C "${rtabmap_source}" config http.lowSpeedTime 30; \

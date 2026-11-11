@@ -209,16 +209,37 @@ def test_dynamic_without_contract_cannot_fuse_without_capture_context():
         s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
 
 
-@pytest.mark.parametrize('missing', ['pose_clock', 'calibration'])
-def test_strict_policy_checks_both_clock_proofs_and_dynamic_calibration(missing):
+@pytest.mark.parametrize('unverified', ['pose_clock', 'calibration'])
+def test_same_source_dynamic_mount_accepts_unverified_evidence_without_claiming_proof(unverified):
+    # Same-source measurements share a clock identity and do not require an
+    # independently verified relation. An uncalibrated TF mount is allowed
+    # only with capture-time transform evidence (validated by the stream).
     metadata = declarations()
     metadata['/c']['extrinsic'].update(mode='dynamic', source='tf', calibrated=True)
     metadata['/c']['extrinsic'].pop('matrix')
     for value in metadata.values():
         value['clock'] = dict(mapping='shared', verified=True)
-    if missing == 'pose_clock':
+    if unverified == 'pose_clock':
         metadata['/o']['clock']['verified'] = False
     else:
         metadata['/c']['extrinsic']['calibrated'] = False
-    with pytest.raises(ValueError, match='verified|calibration'):
+    resolved = resolve_inputs(metadata, BINDINGS)
+    assert resolved['clock_relation_mode'] == 'shared_source'
+    assert resolved['settings']['extrinsic_mode'] == 'dynamic'
+    assert resolved['settings']['child_from_cloud'] is None
+    if unverified == 'pose_clock':
+        assert resolved['inputs']['/o']['clock']['verified'] is False
+    else:
+        assert resolved['extrinsic']['calibrated'] is False
+
+
+def test_independent_dynamic_mount_still_requires_verified_relation():
+    metadata = declarations()
+    metadata['/c']['extrinsic'].update(mode='dynamic', source='tf', calibrated=False)
+    metadata['/c']['extrinsic'].pop('matrix')
+    metadata['/o']['source_id'] = 'independent_pose_sensor'
+    for value in metadata.values():
+        value['clock'] = dict(mapping='independent', verified=True, relation_id='sync/1')
+    metadata['/o']['clock']['verified'] = False
+    with pytest.raises(ValueError, match='relation'):
         resolve_inputs(metadata, BINDINGS)
