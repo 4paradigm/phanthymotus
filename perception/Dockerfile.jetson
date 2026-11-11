@@ -14,7 +14,7 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
 ARG ENABLE_VITS2_TRT=1
 
-FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch AS perception-app
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 
 # ── Everything that differs per JetPack line, resolved once ──────────────────
@@ -579,17 +579,11 @@ assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
 print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
-# Compile RTAB-Map in a disposable stage. The final image starts again from
-# perception-app and receives only the runtime closure of the native build.
-FROM perception-app AS rtabmap-builder
-WORKDIR /work
-
 # Native dependencies are cached independently of application changes.
+WORKDIR /work
 # Native RTAB-Map 0.22.1 + its Humble wrapper, built against each image's ROS,
 # OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
-RUN set -e; \
-    dpkg-query -W -f='${Package}\n' | sort -u > /tmp/rtabmap-packages.before; \
-    . /etc/jetpack.env; \
+RUN set -e; . /etc/jetpack.env; \
     case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
     mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
@@ -740,52 +734,6 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
       -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
     cd /work; rm -rf /tmp/rtabmap-ws
 
-# Package only the runtime closure of the native build. Compilers, headers,
-# development packages, source trees and ccache remain in rtabmap-builder.
-RUN set -e; \
-    runtime=/opt/rtabmap-runtime; \
-    mkdir -p "${runtime}/usr-local-lib" "${runtime}/system-libs"; \
-    find /usr/local/lib \( -type f -o -type l \) \
-      \( -name 'libRTABMap*.so*' -o -name 'libutilite*.so*' \) \
-      -exec cp -a {} "${runtime}/usr-local-lib/" \;; \
-    test -n "$(find "${runtime}/usr-local-lib" -name 'libRTABMapCore.so*' -print -quit)"; \
-    rm -rf /opt/rtabmap_ros/include; \
-    find /opt/rtabmap_ros -type f \( -name '*.a' -o -name '*.la' \) -delete; \
-    find /opt/rtabmap_ros -type d -name cmake -prune -exec rm -rf {} +; \
-    dpkg-query -W -f='${Package}\n' | sort -u > /tmp/rtabmap-packages.after; \
-    comm -13 /tmp/rtabmap-packages.before /tmp/rtabmap-packages.after > /tmp/rtabmap-packages.new; \
-    export LD_LIBRARY_PATH="/usr/local/lib:/opt/rtabmap_ros/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"; \
-    find /opt/rtabmap_ros/lib \( -type f -o -type l \) \
-      \( -name '*.so' -o -name '*.so.*' -o -perm -111 \) > /tmp/rtabmap-runtime-files; \
-    find /usr/local/lib \( -type f -o -type l \) \
-      \( -name 'libRTABMap*.so*' -o -name 'libutilite*.so*' \) >> /tmp/rtabmap-runtime-files; \
-    : > /tmp/rtabmap-runtime-deps.tsv; \
-    while IFS= read -r binary; do \
-      if ldd "${binary}" > /tmp/rtabmap-ldd 2>&1; then \
-        if grep -q 'not found' /tmp/rtabmap-ldd; then cat /tmp/rtabmap-ldd; exit 1; fi; \
-        awk '$2 == "=>" && $3 ~ /^\// {print $1 "\t" $3}' /tmp/rtabmap-ldd >> /tmp/rtabmap-runtime-deps.tsv; \
-      elif grep -Eq 'not a dynamic executable|statically linked' /tmp/rtabmap-ldd; then \
-        :; \
-      else cat /tmp/rtabmap-ldd; exit 1; fi; \
-    done < /tmp/rtabmap-runtime-files; \
-    sort -u /tmp/rtabmap-runtime-deps.tsv > /tmp/rtabmap-runtime-deps.sorted; \
-    while IFS="$(printf '\t')" read -r soname library; do \
-      case "${library}" in /usr/lib/*|/lib/*) ;; *) continue ;; esac; \
-      case "${soname}" in libc.so.*|libm.so.*|libpthread.so.*|librt.so.*|libdl.so.*|libgcc_s.so.*|libstdc++.so.*|ld-linux*.so.*|libnss_*.so.*|libresolv.so.*) continue ;; esac; \
-      owner="$(dpkg-query -S "${library}" 2>/dev/null | sed -n '1s/:.*//p')"; \
-      if [ -n "${owner}" ] && grep -Fxq "${owner}" /tmp/rtabmap-packages.new; then \
-        cp -L "${library}" "${runtime}/system-libs/${soname}"; \
-      fi; \
-    done < /tmp/rtabmap-runtime-deps.sorted; \
-    echo '[rtabmap-build] runtime payload:'; \
-    du -sh "${runtime}/usr-local-lib" "${runtime}/system-libs" /opt/rtabmap_ros
-
-FROM perception-app AS perception-runtime
-WORKDIR /work
-COPY --from=rtabmap-builder /opt/rtabmap-runtime/usr-local-lib/ /usr/local/lib/
-COPY --from=rtabmap-builder /opt/rtabmap-runtime/system-libs/ /opt/rtabmap_runtime/lib/
-COPY --from=rtabmap-builder /opt/rtabmap_ros/ /opt/rtabmap_ros/
-
 # ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
@@ -894,18 +842,8 @@ RUN . /etc/jetpack.env; \
     echo "[build] ${PTH}:" && cat "${PTH}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/opt/rtabmap_runtime/lib:/opt/rtabmap_ros/lib:/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/opt/rtabmap_ros/lib:/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/opt/rtabmap_ros:/ros_ws/install/audio_msgs:/opt/ros/humble/install"
-
-# Validate the copied runtime closure in the final stage, not just in the builder.
-RUN set -e; \
-    rtabmap_executable=/opt/rtabmap_ros/lib/rtabmap_slam/rtabmap; \
-    test -x "${rtabmap_executable}"; \
-    ldd "${rtabmap_executable}" > /tmp/rtabmap-runtime-ldd; \
-    if grep -q 'not found' /tmp/rtabmap-runtime-ldd; then \
-      cat /tmp/rtabmap-runtime-ldd; exit 1; \
-    fi; \
-    rm -f /tmp/rtabmap-runtime-ldd
 
 # Runs directly, outside pytest and its ROS stubs, without GPU/camera access.
 # Also checks generated Python typesupport through the runtime .pth/ENV paths.
