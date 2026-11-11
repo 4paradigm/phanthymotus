@@ -369,7 +369,10 @@ class RtabmapNode(Node):
             now_ns = self._measurement_now()
             self.stream._check_measurement_time(stamp, now_ns)
             health = self.stream.status(now=self._receipt_clock(), measurement_now_ns=now_ns)
-            if (health['odometry'] != 'tracking' or health['integration'] != 'admitting' or
+            # Newer clouds waiting for their sidecars do not invalidate this
+            # already admitted pair. Tracking and segment barriers still apply.
+            if (health['odometry'] != 'tracking' or health['integration'] not in
+                    ('admitting', 'waiting_for_cloud_metadata') or
                     not self.stream._poses or self.stream._poses[-1].segment_id != pose.segment_id):
                 return
             segment['tf_pub'].publish(tf)

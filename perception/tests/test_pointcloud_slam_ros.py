@@ -347,6 +347,44 @@ def test_sidecar_digest_must_match_before_native_forwarding(tmp_path, monkeypatc
         n.close()
 
 
+@pytest.mark.parametrize('with_sidecars', [False, True])
+def test_admitted_clouds_forward_while_newer_clouds_wait_for_metadata(
+        tmp_path, monkeypatch, with_sidecars):
+    import plugins.pointcloud_slam_ros as ros
+    from test_pointcloud_slam_input import measured_odom, packet, resolved
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    n = ros.RtabmapNode('/o', '/c', settings(max_pending=10),
+        session_dir=tmp_path, input_contract=resolved())
+    now = [1.]
+    n._receipt_clock = lambda: now[0]
+    n._measurement_clock_ns = lambda: int(now[0]*1_000_000_000)
+    try:
+        # Run the worker synchronously so a newer pending cloud is always
+        # present when an already admitted frame reaches the native publisher.
+        for i in range(30):
+            ms = 1000 + i*33
+            now[0] = ms/1000
+            n._odom(NS(data=json.dumps(measured_odom(ms))))
+            n._cloud(cloud(ms*1_000_000))
+            if with_sidecars and i:
+                n._cloud_metadata(NS(data=json.dumps(packet(ms-33))))
+            while n._queue:
+                item = n._queue.popleft()
+                segment = n._active or n._activate(item[2])
+                n._publish_pair(segment, item)
+        status = n.status()
+        assert status['unmatched_clouds'] > 0
+        assert status['accepted_clouds'] > 0
+        assert status['forwarded_clouds'] == status['accepted_clouds']
+        forwarded = published(n, '/scan_cloud')[0].raw_messages
+        assert len(forwarded) == status['forwarded_clouds']
+        assert forwarded[0].header.stamp.sec == 1
+        assert forwarded[0].header.stamp.nanosec == 0
+    finally:
+        n.close()
+        n.destroy_node()
+
+
 def test_decode_padded_organized_big_endian_cloud_preserves_input_bytes():
     from plugins.pointcloud_slam_ros import decode_cloud
     msg = cloud(points=[(1., 2., 3.), (4., 5., 6.)])
