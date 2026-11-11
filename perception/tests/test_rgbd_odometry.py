@@ -73,7 +73,7 @@ def test_card_exposes_common_odom_and_isolates_instances(monkeypatch):
     monkeypatch.setattr(module,'require_runtime',lambda:None)
     Session.created=[];card=RgbdOdometryPlugin({},object())
     tool=card.get_tools()[0]
-    assert [p['format'] for p in tool['topic_in']]==['image/jpeg','image/depth-zlib']
+    assert [p['format'] for p in tool['topic_in']]==['image/jpeg','image/depth-zlib','sensor/imu']
     assert tool['odom_interface']['slam_pose']['profile']=='motus_slam/1'
     a=start(card,'one');b=start(card,'two');assert a['topic_out']!=b['topic_out']
     assert start(card,'one')['topic_out']==a['topic_out']
@@ -125,7 +125,7 @@ def test_unpaired_lost_diagnostic_ends_segment_before_next_good_pair():
     from plugins.rgbd_odometry_runtime import RgbdSession
     session=object.__new__(RgbdSession)
     session.lock=threading.RLock();session.stop_event=threading.Event()
-    session.gate=tracking_gate();session.results={'pose':OrderedDict(),'info':OrderedDict()}
+    session.imu=None;session.gate=tracking_gate();session.results={'pose':OrderedDict(),'info':OrderedDict()}
     session.counts={'estimates':0};published=[];session._publish=published.append
     msg,info=messages(1_300_000_000);info.lost=True
     session._result('info',info)
@@ -161,3 +161,32 @@ def test_shutdown_attempts_other_instances_when_one_cleanup_fails():
     card.instances={'first':(NS(close=fail),'a'),'second':(other,'b')}
     with pytest.raises(RuntimeError):card.shutdown()
     assert other.stopped and 'second' not in card.instances
+
+
+def test_imu_toggle_is_per_instance_and_requires_third_binding(monkeypatch):
+    from plugins import rgbd_odometry as module
+    class RecordingSession(Session):
+        def __init__(self, calibration, executor, topic):
+            super().__init__(calibration,executor,topic);self.calibration=calibration
+    monkeypatch.setattr(module,'RgbdSession',RecordingSession)
+    monkeypatch.setattr(module,'require_runtime',lambda:None)
+    card=RgbdOdometryPlugin({},object())
+    field=card.get_tools()[0]['configSchema']['properties']['imu_assisted']
+    assert field['default'] is False and field['scope']=='instance'
+    result=card.dispatch('rgbd_odometry',{'action':'config','instance_id':'one','imu_assisted':True})
+    assert result['config']['imu_assisted'] is True
+    assert start(card,'one')['state']=='error'
+    assisted=card.dispatch('rgbd_odometry',dict(action='start',instance_id='one',
+        input_topics=['/rgb','/depth','/motion'],camera_info=declarations()))
+    assert assisted['state']=='running'
+    assert card.instances['one'][0].calibration['imu_topic']=='/motion'
+    assert {p['topic'] for p in assisted['topic_in']}=={'/rgb','/depth','/motion'}
+    assert start(card,'two')['state']=='running'
+    assert 'imu_topic' not in card.instances['two'][0].calibration
+    assert card.dispatch('rgbd_odometry',{'action':'config','instance_id':'one','imu_assisted':False})['state']=='error'
+    card.shutdown()
+
+
+def test_invalid_boolean_toggle_does_not_silently_enable_imu():
+    card=RgbdOdometryPlugin({},object())
+    assert card.dispatch('rgbd_odometry',{'action':'config','imu_assisted':'false'})['state']=='error'

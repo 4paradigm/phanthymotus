@@ -82,3 +82,19 @@ def make_sample(status, stamp_ns, segment, clock, pose=None, *, reason=None):
     if valid:
         validate_tracking_pose(sample)
     return sample
+
+
+def validate_start_inputs(declarations, topics, imu_assisted=False):
+    """The optional third input is a self-describing JSON camera IMU stream."""
+    if type(imu_assisted) is not bool or not isinstance(topics, list):
+        raise ValueError('imu_assisted must be boolean and input_topics must be a list')
+    expected = 3 if imu_assisted else 2
+    if len(topics) != expected or any(not isinstance(t, str) or not t for t in topics) or len(set(topics)) != expected:
+        raise ValueError('connect two RGB-D topics and exactly one IMU topic when assistance is enabled')
+    declarations = declarations if isinstance(declarations, dict) else {}
+    rgbd = [t for t in topics if isinstance(declarations.get(t), dict) and
+            declarations[t].get('format') in ('image/jpeg', 'image/depth-zlib')]
+    calibration = validate_inputs(declarations, rgbd)
+    if imu_assisted:
+        calibration['imu_topic'] = next(t for t in topics if t not in rgbd)
+    return calibration
