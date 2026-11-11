@@ -45,7 +45,7 @@ existing JSON `std_msgs/String` transport; `motus.imu/1` packets carry raw SI
 vectors, capture timestamps, shared RGB-D clock identity and actual factory/TF
 rotations into the camera axes. No Core metadata routing change is needed.
 
-The consumer initializes tilt from plausible gravity, integrates source-timed
+In the default attitude-only mode, the consumer initializes tilt from plausible gravity, integrates source-timed
 gyro rotations and corrects tilt while acceleration is plausible. Heading is
 relative, covariance/accuracy are not certified, and acceleration is never
 integrated into translation. It forwards private native `sensor_msgs/Imu` to
@@ -69,6 +69,76 @@ For current Core's topic-only SLAM path, map provenance explicitly records
 unverified timestamp overlap. The stricter SLAM declaration path still requires
 independent timing/mount evidence. Validate real tracking and map save/reopen
 on each deployment; offline tests do not establish physical accuracy.
+
+### Optional short-term ESKF and depth assistance
+
+Set all three instance flags in the same `config` or `start` action:
+
+```json
+{"action":"config","instance_id":"card-one","imu_assisted":true,
+ "short_term_compensation":true,"depth_geometry":true}
+```
+
+Then start that instance with the two calibrated RGB-D topics, their
+`camera_info`, and the source's third `sensor/imu` topic. Stop before changing
+modes. Both new flags default to false. Geometry requires short-term
+compensation, which requires IMU assistance. No new Python/native packages or
+GPU inference runtime are added; depth registration is bounded NumPy ICP.
+
+In this mode the native visual estimator receives no IMU prior: the ESKF owns
+raw inertial information once. Its 15 error states cover position, velocity,
+attitude, gyro bias and accelerometer bias. Position is integrated at the
+accelerometer origin and transformed back to the camera origin using the
+actual installation offset. Packets must include finite calibrated
+`camera_from_gyro_translation`, `camera_from_accel_translation` (metres,
+sensor origins in camera coordinates), and `translation_source`. Older
+rotation-only sources continue to support attitude-only mode, but cannot
+start translational compensation. Tianyi obtains full capture-time TF;
+G1/Bumi obtain RealSense SDK factory extrinsics without another camera owner.
+Missing motion hardware/calibration is reported, never replaced by zero.
+
+Initialization waits for at least 0.5 s of visually observed near-stationary
+position **and orientation**, low angular speed and stable gravity magnitude.
+Keep the camera still for startup; failure to initialize within 15 s requires
+a restart. Initial velocity is estimated from visual motion rather than
+assumed zero. Visual observations use inlier counts, finite PSD covariance,
+image contrast/sharpness and valid measured-depth fraction. Independent
+capture clocks need bracketing IMU coverage, not identical sensor rates.
+Native pose/diagnostic results are joined at exact image capture times;
+results arriving after their 250 ms observation deadline are discarded.
+
+If vision becomes unavailable, `vendor.motus_slam.status` changes to
+`coasting`, followed by `recovering` until three consistent visual
+observations pass innovation checks. During both states `pose` is null;
+`vendor.fusion.prediction` contains the optional camera pose and covariance,
+with its own `prediction_stamp_ns`, aid and quality diagnostics. Predictions
+are for inspection/recovery, not validated navigation feedback. SLAM pauses
+cloud admission and clears pending interpolation pairs; it resumes in the
+same segment only after bounded verified tracking recovery. True `lost`,
+coordinate changes and source resets still retire the segment.
+
+The short-outage offline validation target is 0.5 s. A hard 1 s visual
+correction timeout or modeled position standard deviation above 0.10 m ends
+the segment; rejection/geometry cannot extend that timeout. Noise and
+covariance are conservative engineering priors, **not measured accuracy
+bounds**. Deep integration cannot compensate arbitrary-duration blindness.
+
+Depth assistance aligns current axial depth to the last visually trusted
+reference using the inertial pose as a local initial estimate. It requires
+six-axis geometric observability, adequate overlap, low residual and bounded
+motion; a flat wall, missing depth or stale reference is rejected. A bounded
+multi-start check also rejects competing geometric alignments; it cannot
+prove global uniqueness outside its tested local neighborhood. Geometry
+is used only when that frame lacks accepted visual tracking, avoiding
+same-frame duplicate corrections. Correlation-aware covariance intersection
+keeps repeated use of a shared depth reference conservative. Pose composition
+propagates rotational uncertainty into position uncertainty at the offset.
+Mapping remains paused throughout coasting.
+
+All three source adapters and the fusion/SLAM boundaries have offline tests.
+Synthetic trajectories and rendered rooms validate code signs, units and
+policy, not actual robot precision or native camera tracking. Hardware tests,
+driver updates and deployment remain deferred until explicitly requested.
 
 ## Audio Requirements for ASR
 

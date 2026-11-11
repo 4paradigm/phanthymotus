@@ -283,6 +283,8 @@ plugins:
   # The following deployment settings are generic RTAB-Map/resource overrides.
   rgbd_odometry:
     enabled: true
+    # Per-instance opt-in: imu_assisted + short_term_compensation + depth_geometry.
+    # Default remains visual-only; compensation requires calibrated IMU translations.
 
   pointcloud_slam:
     enabled: true
