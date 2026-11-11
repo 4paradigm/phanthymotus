@@ -603,13 +603,13 @@ ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
 # The full archive includes GUI assets and datasets. Fetch only the pinned
 # headless sources; keep completed Git objects when a transfer is interrupted.
 # 固定提交的源码跨构建重试保留；与编译目录分开，避免配置过程改写缓存。
+# Older JP5.11 Git needs the partial-clone extension before a filtered fetch.
 RUN --mount=type=cache,id=perception-rtabmap-source-${RTABMAP_CORE_COMMIT},target=/var/cache/rtabmap-source,sharing=locked \
     set -e; \
     rtabmap_source=/var/cache/rtabmap-source; \
     mkdir -p "${rtabmap_source}"; \
     git -C "${rtabmap_source}" init -q; \
     git -C "${rtabmap_source}" config remote.origin.url https://github.com/introlab/rtabmap.git; \
-    # git init + fetch --filter needs partial-clone extension on older Git (JP5.11). \
     git -C "${rtabmap_source}" config core.repositoryformatversion 1; \
     git -C "${rtabmap_source}" config extensions.partialClone origin; \
     git -C "${rtabmap_source}" config remote.origin.promisor true; \
