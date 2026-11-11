@@ -2075,6 +2075,48 @@ html, body {
   text-transform: uppercase;
   letter-spacing: .4px;
 }
+/* Body-level parameter help uses the existing dashboard theme. */
+.canvas-field-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 14px;
+  cursor: help;
+  vertical-align: middle;
+}
+.canvas-field-help:hover { color: var(--accent); background: var(--accent-dim); }
+.canvas-field-help:focus-visible, .canvas-field-tip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.canvas-field-tip {
+  position: fixed;
+  z-index: 400;
+  width: max-content;
+  max-width: min(360px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs);
+  background: var(--bg-card);
+  color: var(--text);
+  box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.canvas-field-tip[hidden] { display: none; }
 .canvas-field-input {
   font-size: 11.5px;
   font-family: var(--font-mono);
