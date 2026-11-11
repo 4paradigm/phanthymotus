@@ -21,6 +21,34 @@ consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
 The implementation must not infer calibrated mounting or verified
 cross-sensor clocks from a robot model or nearby timestamps.
 
+## Generic RGB-D visual odometry
+
+Enable `plugins.rgbd_odometry.enabled` to expose the `rgbd_odometry` processor
+card. Connect a driver's `camera_rgbd` color (`image/jpeg`) and measured depth
+(`image/depth-zlib`) ports. Both must declare the same rectified optical plane,
+640×480 intrinsics, capture clock and camera ID through `motus.camera/1`.
+Depth is little-endian uint16 millimetres. Display-only or estimated depth,
+receipt-timed video and unregistered lenses are rejected.
+
+The card supervises the image's pinned RTAB-Map `rgbd_odometry` runtime. Its
+`state/odom` output carries `motus.odom/1` with `vendor.motus_slam` and can be
+connected to `pointcloud_slam` alongside native `sensor/pointcloud2`. The pose
+reference is the camera optical frame; no body mount or calibrated clock
+relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
+driver repository. G1 requires SDK global capture time; Bumi also exposes its
+existing fixed hardware-clock offset explicitly as unverified provenance.
+
+Actions are `start`, `stop` and `info`, with optional `instance_id`. Source
+startup must return its calibration before the downstream card starts. Tracking
+requires matching valid pose/diagnostic measurements. A lost diagnostic, stale
+input or expired estimate ends the segment; stop and start again to create a
+new estimator/segment. A held pose is never republished as fresh tracking.
+
+For current Core's topic-only SLAM path, map provenance explicitly records
+unverified timestamp overlap. The stricter SLAM declaration path still requires
+independent timing/mount evidence. Validate real tracking and map save/reopen
+on each deployment; offline tests do not establish physical accuracy.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

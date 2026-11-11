@@ -39,8 +39,10 @@ class EstimateGate:
         self.last_input = self.last_stamp = 0
         self.good = 0
 
-    def input(self, stamp):
-        self.last_input = stamp
+    def input(self, stamp, *, now_ns=None):
+        self.status(stamp if now_ns is None else now_ns)
+        if self.state != 'lost':
+            self.last_input = stamp
 
     def fault(self, reason):
         self.state, self.reason = 'lost', self.reason or str(reason)
@@ -53,7 +55,7 @@ class EstimateGate:
         return self.state
 
     def accept(self, msg, info, now):
-        if self.state == 'lost' or stamp_ns(msg) != stamp_ns(info):
+        if self.status(now) == 'lost' or stamp_ns(msg) != stamp_ns(info):
             return None
         stamp = stamp_ns(msg)
         try:
@@ -141,14 +143,14 @@ class RgbdSession:
         if self.stop_event.is_set():
             return
         with self.lock:
-            if self.gate.state == 'lost':
+            if self.gate.status(time.time_ns()) == 'lost':
                 return
             try:
                 if msg.header.frame_id != self.calibration['frame_id']:
                     raise ValueError('image optical frame differs from calibration')
                 pair = self.pairs.push(kind, stamp_ns(msg), msg, time.time_ns())
                 if pair:
-                    self.gate.input(pair[1][0])
+                    self.gate.input(pair[1][0], now_ns=time.time_ns())
                     if self.pending.full():
                         self.pending.get_nowait()
                         self.counts['dropped_pairs'] += 1
@@ -214,6 +216,10 @@ class RgbdSession:
         with self.lock:
             if self.stop_event.is_set():
                 return
+            if kind == 'info' and msg.lost and self.gate.state == 'tracking':
+                self.gate.fault('visual estimator reported lost tracking')
+            if self.gate.state == 'lost':
+                return
             stamp = stamp_ns(msg)
             self.results[kind][stamp] = msg
             while len(self.results[kind]) > 20:
@@ -255,7 +261,11 @@ class RgbdSession:
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
                 if self.process.poll() is not None:
                     break
-                os.killpg(self.process.pid, sig)
+                try:
+                    os.killpg(self.process.pid, sig)
+                except ProcessLookupError:
+                    self.process.wait(timeout=1)
+                    break
                 try:
                     self.process.wait(timeout=3)
                 except subprocess.TimeoutExpired:

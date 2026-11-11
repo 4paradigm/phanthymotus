@@ -103,3 +103,61 @@ def test_canvas_card_ids_produce_valid_distinct_ros_topics(monkeypatch):
     assert '-' not in a['topic_out'][0]['topic']
     assert card.get_tools()[0]['multiInstance'] is True
     card.shutdown()
+
+
+def test_resume_between_watchdog_ticks_cannot_bypass_stale_segment():
+    gate=tracking_gate()
+    assert gate.status(2_600_000_000)=='tracking'
+    gate.input(2_750_000_000,now_ns=2_760_000_000)
+    assert gate.accept(*messages(2_750_000_000),2_760_000_000) is None
+    assert gate.state=='lost'
+
+
+def test_fresh_estimate_cannot_overwrite_an_expired_previous_estimate():
+    gate=tracking_gate()
+    assert gate.accept(*messages(2_750_000_000),2_760_000_000) is None
+    assert gate.state=='lost'
+
+
+def test_unpaired_lost_diagnostic_ends_segment_before_next_good_pair():
+    import threading
+    from collections import OrderedDict
+    from plugins.rgbd_odometry_runtime import RgbdSession
+    session=object.__new__(RgbdSession)
+    session.lock=threading.RLock();session.stop_event=threading.Event()
+    session.gate=tracking_gate();session.results={'pose':OrderedDict(),'info':OrderedDict()}
+    session.counts={'estimates':0};published=[];session._publish=published.append
+    msg,info=messages(1_300_000_000);info.lost=True
+    session._result('info',info)
+    assert session.gate.state=='lost'
+    msg,info=messages(1_400_000_000)
+    session._result('pose',msg);session._result('info',info)
+    assert not published
+
+
+def test_process_exit_during_stop_still_releases_node_and_tempfiles(monkeypatch):
+    import os,subprocess,sys,tempfile,threading
+    from pathlib import Path
+    from plugins.rgbd_odometry_runtime import RgbdSession
+    session=object.__new__(RgbdSession)
+    session.stop_event=threading.Event();session.worker=None;session.log=None
+    session.directory=tempfile.TemporaryDirectory();path=Path(session.directory.name)
+    session.segment='test';events=[]
+    session.node=NS(destroy_node=lambda:events.append('destroy'))
+    session.executor=NS(remove_node=lambda n:events.append('remove'))
+    session.process=subprocess.Popen([sys.executable,'-c','import time; time.sleep(.1)'],start_new_session=True)
+    killpg=os.killpg
+    def race(pid,sig):
+        session.process.wait(timeout=2)
+        killpg(pid,sig)
+    monkeypatch.setattr(os,'killpg',race)
+    session.close()
+    assert events==['remove','destroy'] and not path.exists()
+
+
+def test_shutdown_attempts_other_instances_when_one_cleanup_fails():
+    card=RgbdOdometryPlugin({},object());other=Session({},None,'/two')
+    def fail():raise RuntimeError('cannot stop first estimator')
+    card.instances={'first':(NS(close=fail),'a'),'second':(other,'b')}
+    with pytest.raises(RuntimeError):card.shutdown()
+    assert other.stopped and 'second' not in card.instances

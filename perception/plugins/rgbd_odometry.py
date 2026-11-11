@@ -65,6 +65,12 @@ class RgbdOdometryPlugin:
 
     def shutdown(self):
         with self.lock:
+            failures = []
             for instance in list(self.instances):
-                self.instances[instance][0].close()
-                del self.instances[instance]
+                try:
+                    self.instances[instance][0].close()
+                    del self.instances[instance]
+                except Exception as error:
+                    failures.append(f'{instance}: {error}')
+            if failures:
+                raise RuntimeError('RGB-D shutdown incomplete: ' + '; '.join(failures))
