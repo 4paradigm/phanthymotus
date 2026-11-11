@@ -708,12 +708,30 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
       d53b925d25b4b5657261a44f4479365965cc2363 laser_geometry; \
     printf '%s\n' "${rtabmap_packages}" > /tmp/rtabmap-ws/packages.list
 
+# JP5.11: cache ROS foundations, RTAB-Map support and rtabmap_slam
+# independently; the JP6.1 single-build path below remains unchanged.
+COPY perception/tools/build_rtabmap_ros_group.sh /tmp/build_rtabmap_ros_group.sh
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; if [ "${JP_VERSION}" = "511" ]; then \
+      bash /tmp/build_rtabmap_ros_group.sh foundations; \
+    fi
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; if [ "${JP_VERSION}" = "511" ]; then \
+      bash /tmp/build_rtabmap_ros_group.sh support; \
+    fi
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; if [ "${JP_VERSION}" = "511" ]; then \
+      bash /tmp/build_rtabmap_ros_group.sh slam; \
+    fi
+
 # RUN starts a fresh shell: reload both the ROS environment and the selection
 # made against this image's underlay, including only its missing dependencies.
 RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
-    set -e; . /opt/ros/humble/install/setup.bash; \
-    export CCACHE_DIR=/var/cache/rtabmap-ccache CCACHE_COMPILERCHECK=content; \
-    rtabmap_python="$(command -v python3)"; \
+    set -e; \
+    if [ "${JP_VERSION:-61}" != "511" ]; then \
+      . /opt/ros/humble/install/setup.bash; \
+      export CCACHE_DIR=/var/cache/rtabmap-ccache CCACHE_COMPILERCHECK=content; \
+      rtabmap_python="$(command -v python3)"; \
     export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
     test -s /tmp/rtabmap-ws/packages.list; \
     rtabmap_packages="$(cat /tmp/rtabmap-ws/packages.list)"; \
@@ -732,7 +750,8 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
       -Dcrypto_LIB:FILEPATH="${rtabmap_crypto}" \
       '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
       -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
-    cd /work; rm -rf /tmp/rtabmap-ws
+    fi; \
+    cd /work; rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh
 
 # ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
