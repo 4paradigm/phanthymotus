@@ -38,6 +38,8 @@ class DepthRegistration:
     T_reference_current maps current optical coordinates to the reference.
     Covariance uses a left tangent at the reference: xyz metres then radians.
     Single planes and any poorly observed six-axis solution fail closed.
+    A bounded coarse multi-start check rejects competing pose basins; it is
+    not a proof of global uniqueness for arbitrary repeated geometry.
     """
 
     def __init__(self, calibration):
@@ -74,6 +76,58 @@ class DepthRegistration:
         jacobian = np.concatenate((normal, np.cross(moved, normal)), axis=1)
         return jacobian, residual
 
+    def _fit(self, points, target, normals, transform, iterations):
+        for _ in range(iterations):
+            jacobian, residual = self._correspondences(points, target, normals, transform)
+            if len(residual) < 100 or len(residual)/len(points) < .35:
+                return None
+            # Huber weighting suppresses mismatched surfaces without declaring
+            # those pixels independent precision measurements.
+            weights = np.minimum(1., .01/np.maximum(np.abs(residual), 1e-10))
+            hessian = jacobian.T @ (weights[:, None]*jacobian)
+            eigenvalues = np.linalg.eigvalsh(hessian)
+            if eigenvalues[0] <= eigenvalues[-1]*1e-4:
+                return None
+            delta = np.linalg.solve(hessian, -jacobian.T @ (weights*residual))
+            transform = _increment(delta) @ transform
+            if not _bounded_transform(transform):
+                return None
+            if np.linalg.norm(delta[:3]) < 1e-5 and np.linalg.norm(delta[3:]) < 1e-5:
+                break
+        return transform
+
+    def _ambiguous(self, points, target, normals, transform, inliers, rmse):
+        # At most 19 starts, five iterations each, roughly 600 source points.
+        # Multiple metric scales avoid assuming a known repetition period.
+        starts = [np.eye(4)]
+        for axis in range(3):
+            for distance in (-.1, -.04, .04, .1):
+                seed = transform.copy()
+                seed[axis, 3] += distance
+                starts.append(seed)
+            for angle in (-np.deg2rad(5.), np.deg2rad(5.)):
+                delta = np.zeros(6)
+                delta[3+axis] = angle
+                starts.append(_increment(delta) @ transform)
+        coarse = points[::max(1, int(np.ceil(len(points)/600)))]
+        for seed in starts:
+            if not _bounded_transform(seed):
+                continue
+            alternative = self._fit(coarse, target, normals, seed, 5)
+            if alternative is None:
+                continue
+            translation = np.linalg.norm(alternative[:3, 3]-transform[:3, 3])
+            rotation = alternative[:3, :3] @ transform[:3, :3].T
+            if translation < .02 and np.trace(rotation) > 1+2*np.cos(np.deg2rad(2.)):
+                continue
+            # Recheck contenders on all samples, so a coarse-grid alias cannot
+            # manufacture evidence for an alternative. Require similar support.
+            _, residual = self._correspondences(points, target, normals, alternative)
+            if (len(residual) >= max(100, .85*inliers)
+                    and np.sqrt(np.mean(residual**2)) <= max(.0015, 1.25*rmse)):
+                return True
+        return False
+
     def register(self, current_depth, reference_depth, initial_transform):
         current, reference = np.asarray(current_depth), np.asarray(reference_depth)
         try:
@@ -106,23 +160,9 @@ class DepthRegistration:
         points = points[valid_current[::stride, ::stride]]
         if len(points) < 100:
             return None
-        for _ in range(15):
-            jacobian, residual = self._correspondences(points, target, normals, transform)
-            if len(residual) < 100 or len(residual)/len(points) < .35:
-                return None
-            # Huber weighting suppresses mismatched surfaces without declaring
-            # those pixels independent precision measurements.
-            weights = np.minimum(1., .01/np.maximum(np.abs(residual), 1e-10))
-            hessian = jacobian.T @ (weights[:, None]*jacobian)
-            eigenvalues = np.linalg.eigvalsh(hessian)
-            if eigenvalues[0] <= eigenvalues[-1]*1e-4:
-                return None
-            delta = np.linalg.solve(hessian, -jacobian.T @ (weights*residual))
-            transform = _increment(delta) @ transform
-            if not _bounded_transform(transform):
-                return None
-            if np.linalg.norm(delta[:3]) < 1e-5 and np.linalg.norm(delta[3:]) < 1e-5:
-                break
+        transform = self._fit(points, target, normals, transform, 15)
+        if transform is None:
+            return None
         jacobian, residual = self._correspondences(points, target, normals, transform)
         if len(residual) < 100 or len(residual)/len(points) < .35:
             return None
@@ -130,6 +170,8 @@ class DepthRegistration:
         hessian = jacobian.T @ jacobian
         eigenvalues = np.linalg.eigvalsh(hessian)
         if rmse >= .02 or eigenvalues[0] <= eigenvalues[-1]*1e-4:
+            return None
+        if self._ambiguous(points, target, normals, transform, len(residual), rmse):
             return None
         # Do not let thousands of correlated depth pixels imply submillimetre
         # pose certainty. Retain inverse-Hessian shape plus explicit floors.

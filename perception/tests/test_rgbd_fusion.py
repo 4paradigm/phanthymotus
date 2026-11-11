@@ -55,9 +55,11 @@ def images():
 
 
 def source(t, **changes):
-    return packet(t, camera_from_accel_translation=[.03, 0, 0],
+    values = dict(camera_from_accel_translation=[.03, 0, 0],
                   camera_from_gyro_translation=[.03, 0, 0],
-                  translation_source='sdk_factory_extrinsics', **changes)
+                  translation_source='sdk_factory_extrinsics')
+    values.update(changes)
+    return packet(t, **values)
 
 
 def warmed():
@@ -199,3 +201,48 @@ def test_accelerometer_bias_is_estimated_while_vision_is_available():
     # Position/gravity/bias observability is coupled; do not demand the
     # unobservable static bias/tilt split equals the injected bias exactly.
     assert f.ba[0] > .005
+
+
+def test_independently_sampled_camera_uses_bracketing_imu_to_initialize():
+    c = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    for i in range(401):
+        t = 1_000_000_000+i*5_000_000
+        c.observe_imu(source(t), t)
+        if i%20 == 1:
+            frame_stamp = t-4_000_000  # camera is1ms after the previous gyro sample
+            sample = c.observe_frame(frame_stamp, *images(), pose(), t)
+    assert c.filter is not None and sample['pose'] is not None
+
+
+@pytest.mark.parametrize('change', [{'translation_source': 'tf'},
+                                  {'clock_mapping': {'method': 'fixed_arrival_offset', 'offset_ns': 1000000}}])
+def test_calibration_source_and_time_mapping_changes_retire_segment(change):
+    c, stamp = warmed()
+    with pytest.raises(ValueError):
+        c.observe_imu(source(stamp+5_000_000, **change), stamp+5_000_000)
+    assert c.state == 'lost'
+
+
+def test_correlated_geometry_updates_do_not_average_away_shared_reference_error():
+    f = InertialFilter(1_000_000_000, pose(), [0, 0, 0], [0, 0, G], [0, 0, 0], [0, 0, 0])
+    f.P[:3, :3] = np.eye(3)*.01
+    for _ in range(20):
+        assert f.correct(pose(), np.eye(6)*.0002, correlated=True)
+    covariance = np.array(f.camera_pose()['covariance']).reshape(6, 6)
+    assert np.linalg.eigvalsh(covariance[:3, :3]).min() >= .0001
+
+
+def test_geometry_covariance_includes_rotation_induced_position_uncertainty():
+    from plugins.rgbd_fusion import geometry_observation
+    reference = pose()
+    reference['covariance'] = [0.]*36
+    transform = np.eye(4); transform[0, 3] = .1
+    result = dict(transform=transform, covariance=np.diag([.0001]*3+[.04]*3))
+    measured, covariance = geometry_observation(reference, result)
+    assert measured['position'] == pytest.approx([.1, 0, 0])
+    # A left-tangent z-rotation moves the translated camera in +y.
+    # Add1deg reference orientation floor and5mm reference position floor.
+    assert covariance[1, 1] == pytest.approx(.0005280461741978671)
+    assert covariance[1, 5] == pytest.approx(.004030461741978671)
+    assert covariance[2, 4] == pytest.approx(-.004030461741978671)
+    assert np.linalg.eigvalsh(covariance).min() > 0

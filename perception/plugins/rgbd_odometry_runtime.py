@@ -107,15 +107,17 @@ class CaptureObservations:
         self.last_added = 0
 
     def add_frame(self, stamp, color, depth, now):
+        outputs = self.drain(now)
         if stamp <= self.last_added or len(self.frames) >= 8:
             self.fusion.fault('fusion capture queue repeated, reset or overflowed')
-            return
+            return outputs
         self.last_added = stamp
         self.frames[stamp] = dict(color=color, depth=depth, deadline=now+250_000_000)
+        return outputs
 
     def result(self, kind, msg, now):
         stamp = stamp_ns(msg)
-        if stamp in self.frames:
+        if stamp in self.frames and now <= self.frames[stamp]['deadline']:
             self.frames[stamp][kind] = msg
         return self.drain(now)
 
@@ -193,7 +195,7 @@ class RgbdSession:
                 if self.fusion is None:
                     self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
                 self.node.create_subscription(String, calibration['imu_topic'], self._imu, qos_profile_sensor_data)
-            self.node.create_timer(.2, self._watchdog)
+            self.node.create_timer(.05 if self.fusion else .2, self._watchdog)
             self.executor.add_node(self.node)
             params = estimator_parameters(calibration, self.segment)
             path = Path(self.directory.name) / 'parameters.json'
@@ -319,7 +321,9 @@ class RgbdSession:
                              self._imu_frame_ready(stamp_ns(depth), time.time_ns()))
                     if ready and not self.stop_event.is_set():
                         if self.observations is not None:
-                            self.observations.add_frame(stamp_ns(depth), image, z16, time.time_ns())
+                            for sample in self.observations.add_frame(stamp_ns(depth), image, z16, time.time_ns()):
+                                self._publish(sample)
+                                self.counts['estimates'] += 1
                         self.rgbd.publish(out)
                         self.counts['pairs'] += 1
             except Exception as error:
@@ -393,7 +397,7 @@ class RgbdSession:
         with self.lock:
             return {'state': 'running', 'status': (self.fusion.status(time.time_ns()) if self.fusion else
                                                   self.gate.status(time.time_ns())),
-                    'reason': self.gate.reason, 'segment_id': self.segment,
+                    'reason': self.fusion.reason if self.fusion else self.gate.reason, 'segment_id': self.segment,
                     'pose_reference': 'camera_optical', **self.counts,
                     'last_measurement_ns': self.gate.last_stamp,
                     'imu_assistance': self.imu.info(time.time_ns()) if self.imu else {'enabled': False},

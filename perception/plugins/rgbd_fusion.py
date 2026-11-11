@@ -61,6 +61,23 @@ def observation_covariance(pose):
     return c + np.diag([.005**2]*3 + [np.deg2rad(1.)**2]*3)
 
 
+def geometry_observation(reference, result):
+    """Compose camera pose and left-SE(3) registration uncertainty in world axes."""
+    ref_p, ref_r = pose_values(reference)
+    transform = result['transform']
+    translation = transform[:3, 3]
+    measured = dict(position=(ref_p+ref_r@translation).tolist(),
+                    quaternion=quaternion(ref_r@transform[:3, :3]))
+    relative = np.zeros((6, 6))
+    relative[:3, :3], relative[3:, 3:] = ref_r, ref_r
+    relative[:3, 3:] = -ref_r@skew(translation)
+    anchor = np.eye(6)
+    anchor[:3, 3:] = -skew(ref_r@translation)
+    covariance = (relative@result['covariance']@relative.T +
+                  anchor@observation_covariance(reference)@anchor.T)
+    return measured, (covariance+covariance.T)/2.
+
+
 class InertialFilter:
     """Right attitude-error ESKF; position/velocity refer to accel sensor origin."""
     def __init__(self, stamp, pose, velocity, force, gyro, lever):
@@ -104,7 +121,7 @@ class InertialFilter:
         h[:3, :3], h[:3, 6:9], h[3:, 6:9] = np.eye(3), self.R@skew(self.lever), np.eye(3)
         return h
 
-    def correct(self, pose, covariance):
+    def correct(self, pose, covariance, *, correlated=False):
         position, rotation = pose_values(pose)
         residual = np.r_[position-(self.p-self.R@self.lever), log_rotation(self.R.T@rotation)]
         # Absolute gates are independent of possibly over-large model covariance.
@@ -118,7 +135,12 @@ class InertialFilter:
         innovation = h@self.P@h.T+covariance
         if residual@np.linalg.solve(innovation, residual) > 22.46:
             return False
-        gain = np.linalg.solve(innovation, h@self.P).T
+        # Covariance intersection for depth corrections sharing a reference:
+        # do not repeatedly average down a common reference/calibration error.
+        prior = self.P/.9 if correlated else self.P
+        covariance = covariance/.1 if correlated else covariance
+        innovation = h@prior@h.T+covariance
+        gain = np.linalg.solve(innovation, h@prior).T
         delta = gain@residual
         self.p += delta[:3]
         self.v += delta[3:6]
@@ -126,7 +148,7 @@ class InertialFilter:
         self.bg += delta[9:12]
         self.ba += delta[12:15]
         identity = np.eye(15)-gain@h
-        self.P = identity@self.P@identity.T+gain@covariance@gain.T
+        self.P = identity@prior@identity.T+gain@covariance@gain.T
         reset = np.eye(15)
         reset[6:9, 6:9] -= .5*skew(delta[6:9])
         self.P = reset@self.P@reset.T
@@ -152,7 +174,7 @@ class ShortTermFusion:
         self.samples = deque(maxlen=1024)
         self.warmup = deque(maxlen=30)
         self.filter = None
-        self.lever = self.translations = None
+        self.lever = self.translations = self.source_provenance = None
         self.geometry = DepthRegistration(K) if depth_geometry else None
         self.reference = None
         self.state, self.reason = 'initializing', 'waiting for 0.5 s low-motion visual/IMU warmup'
@@ -174,7 +196,11 @@ class ShortTermFusion:
                                   _vector(packet.get('camera_from_accel_translation'))]
             if self.translations is not None and not np.allclose(translations, self.translations, atol=1e-7, rtol=0):
                 raise ValueError('IMU translation changed; restart segment')
+            provenance = (packet['translation_source'], deepcopy(packet.get('clock_mapping')))
+            if self.source_provenance is not None and provenance != self.source_provenance:
+                raise ValueError('IMU calibration source or clock mapping changed; restart segment')
             sample = self.imu.observe(packet, now_ns)
+            self.source_provenance = provenance
             self.translations = translations
             self.lever = translations[3:].copy()
             if sample is not None:
@@ -207,9 +233,18 @@ class ShortTermFusion:
         if len(self.warmup) < 3 or stamp-self.warmup[0][0] < 500_000_000:
             return False
         first_stamp, first_pose = self.warmup[0]
-        entries = [s for s in self.samples if first_stamp <= s[0] <= stamp]
-        if len(entries) < 20 or entries[-1][0] < stamp or entries[0][0] > first_stamp:
+        if not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp:
             return False
+        entries = [s for s in self.samples if first_stamp <= s[0] <= stamp]
+        if len(entries) < 20:
+            return False
+        # Interpolate the independently sampled IMU at both visual boundaries.
+        times = np.array([s[0]-first_stamp for s in self.samples], dtype=float)
+        values = np.array([np.r_[s[1], s[2]] for s in self.samples])
+        boundaries = [np.array([np.interp(t-first_stamp, times, values[:, j]) for j in range(6)])
+                      for t in (first_stamp, stamp)]
+        entries = [(first_stamp, boundaries[0][:3], boundaries[0][3:])] + entries + [
+                   (stamp, boundaries[1][:3], boundaries[1][3:])]
         positions = np.array([p['position'] for _, p in self.warmup])
         gyro, accel = np.array([s[1] for s in entries]), np.array([s[2] for s in entries])
         first_rotation = pose_values(first_pose)[1]
@@ -294,14 +329,8 @@ class ShortTermFusion:
                     initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
                     result = self.geometry.register(depth, ref_depth, initial)
                     if result is not None:
-                        transform = result['transform']
-                        measured = dict(position=(ref_p+ref_r@transform[:3, 3]).tolist(),
-                                        quaternion=quaternion(ref_r@transform[:3, :3]))
-                        basis = np.zeros((6, 6)); basis[:3, :3] = basis[3:, 3:] = ref_r
-                        # Include reference pose uncertainty; this is a correlated
-                        # fallback, never fused beside a same-frame visual update.
-                        geom_cov = basis@result['covariance']@basis.T + observation_covariance(ref_pose)
-                        if self.filter.correct(measured, geom_cov):
+                        measured, geom_cov = geometry_observation(ref_pose, result)
+                        if self.filter.correct(measured, geom_cov, correlated=True):
                             self.aid = 'depth_geometry'
                             self.quality['geometry'] = dict(inliers=result['inliers'], rmse=result['rmse'])
             self.status(stamp)

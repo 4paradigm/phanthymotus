@@ -82,6 +82,33 @@ def test_rejects_single_plane_despite_perfect_residual():
     assert DepthRegistration(K).register(plane, plane, np.eye(4)) is None
 
 
+def render_repeated_surface(period, angle=0.):
+    """Intersect rays with a sinusoidal height field, independently of ICP.
+
+    Fixed-point ray intersection converges for this amplitude and field of
+    view. The two wave directions may be rotated relative to pixel axes.
+    """
+    y, x = np.indices((240, 320))
+    ray_x = (x-K[0, 2])/K[0, 0]
+    ray_y = (y-K[1, 2])/K[1, 1]
+    depth = np.ones(ray_x.shape)
+    for _ in range(150):
+        a = (np.cos(angle)*ray_x+np.sin(angle)*ray_y)*depth
+        b = (-np.sin(angle)*ray_x+np.cos(angle)*ray_y)*depth
+        depth = 1+period*.1*(np.sin(2*np.pi*a/period)+np.cos(2*np.pi*b/period))
+    return np.rint(depth*1000).astype(np.uint16)
+
+
+@pytest.mark.parametrize('period, angle', [(.03, 0.), (.05, 0.), (.085, .4), (.13, 0.)])
+@pytest.mark.parametrize('alias_prior', [False, True])
+def test_rejects_repetitive_full_rank_geometry_even_from_correct_prior(period, angle, alias_prior):
+    depth = render_repeated_surface(period, angle)
+    prior = np.eye(4)
+    if alias_prior:
+        prior[:2, 3] = period*.98*np.array([np.cos(angle), np.sin(angle)])
+    assert DepthRegistration(K).register(depth, depth, prior) is None
+
+
 @pytest.mark.parametrize('case', ['empty', 'almost_empty', 'outliers', 'no_overlap', 'float_depth'])
 def test_rejects_unusable_depth(case):
     reference = render_room(np.eye(4))
