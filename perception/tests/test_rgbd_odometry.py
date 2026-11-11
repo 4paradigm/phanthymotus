@@ -38,7 +38,8 @@ def test_lost_diagnostic_latches_until_new_estimator_segment():
 
 def test_stale_input_invalid_covariance_and_wrong_frames_stop_tracking():
     gate=tracking_gate()
-    assert gate.status(2_300_000_001)=='lost'
+    assert gate.status(2_400_000_000)=='tracking'
+    assert gate.status(2_700_000_001)=='lost'
     for change in [lambda m:setattr(m.header,'frame_id','wrong'),
                    lambda m:m.pose.covariance.__setitem__(0,9999.),
                    lambda m:setattr(m.pose.pose.orientation,'w',0.)]:
@@ -89,3 +90,16 @@ def test_invalid_geometry_never_launches_estimator(monkeypatch):
     Session.created=[];card=RgbdOdometryPlugin({},object())
     result=card.dispatch('rgbd_odometry',{'action':'start','input_topics':['/rgb','/depth']})
     assert result['state']=='error' and not Session.created
+
+
+def test_canvas_card_ids_produce_valid_distinct_ros_topics(monkeypatch):
+    from plugins import rgbd_odometry as module
+    monkeypatch.setattr(module,'RgbdSession',Session)
+    monkeypatch.setattr(module,'require_runtime',lambda:None)
+    card=RgbdOdometryPlugin({},object())
+    a=start(card,'card-m123');b=start(card,'card_m123')
+    assert a['state']=='running' and b['state']=='running'
+    assert a['topic_out']!=b['topic_out']
+    assert '-' not in a['topic_out'][0]['topic']
+    assert card.get_tools()[0]['multiInstance'] is True
+    card.shutdown()

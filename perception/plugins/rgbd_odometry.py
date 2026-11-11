@@ -11,13 +11,15 @@ _INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profil
 
 
 class RgbdOdometryPlugin:
+    PREFIX = 'rgbd_odometry'
+
     def __init__(self, config, executor):
         self.executor = executor
         self.instances = {}
         self.lock = threading.RLock()
 
     def get_tools(self):
-        return [{'name': 'rgbd_odometry', 'type': 'sensor',
+        return [{'name': 'rgbd_odometry', 'type': 'processor', 'multiInstance': True,
                  'description': 'RGB-D 视觉里程计：从配准彩色和实测深度估计相机位姿',
                  'inputSchema': {'type': 'object', 'properties': {
                      'action': {'type': 'string', 'enum': ['start', 'stop', 'info']},
@@ -28,13 +30,13 @@ class RgbdOdometryPlugin:
 
     @staticmethod
     def _outputs(instance):
-        return [{'topic': '/rgbd_odometry/' + instance + '/state/odom', 'format': 'state/odom'}]
+        return [{'topic': '/rgbd_odometry/i_' + instance.encode('utf-8').hex() + '/state/odom', 'format': 'state/odom'}]
 
     def dispatch(self, name, args):
         if name != 'rgbd_odometry':
             return None
         instance = args.get('instance_id') or 'default'
-        if not isinstance(instance, str) or not re.fullmatch(r'[A-Za-z0-9_]+', instance):
+        if not isinstance(instance, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', instance):
             return {'state': 'error', 'message': 'invalid RGB-D instance ID'}
         action = args.get('action', 'info')
         with self.lock:

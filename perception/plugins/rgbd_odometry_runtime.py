@@ -46,7 +46,7 @@ class EstimateGate:
         self.state, self.reason = 'lost', self.reason or str(reason)
 
     def status(self, now):
-        if self.last_input and now - self.last_input > 1_000_000_000:
+        if self.last_input and now - self.last_input > 1_500_000_000:
             self.fault('RGB-D input stale; restart to begin a new segment')
         if self.last_stamp and now - self.last_stamp > 1_500_000_000:
             self.fault('visual estimate stale; restart to begin a new segment')
@@ -128,7 +128,7 @@ class RgbdSession:
             cmd = [str(require_runtime()), '--ros-args', '--params-file', str(path),
                    '-r', '__ns:=/' + self.segment, '-r', '__node:=rgbd_odometry',
                    '-r', 'odom:=/' + self.segment + '/visual',
-                   '-r', 'odom_info:=/' + self.segment + '/diagnostic']
+                   '-r', 'odom_info_lite:=/' + self.segment + '/diagnostic']
             self.process = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT,
                 start_new_session=True, env=dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1'))
             self.worker = threading.Thread(target=self._work, name=self.segment, daemon=True)
@@ -157,7 +157,7 @@ class RgbdSession:
                 self.gate.fault(error)
 
     def _work(self):
-        from sensor_msgs.msg import Image, CameraInfo
+        from sensor_msgs.msg import CompressedImage, CameraInfo
         from rtabmap_msgs.msg import RGBDImage
         import cv2
         while not self.stop_event.is_set():
@@ -178,14 +178,17 @@ class RgbdSession:
                     raise ValueError('RGB-D depth has insufficient measured pixels')
                 out = RGBDImage()
                 out.header = deepcopy(depth.header)
-                for field, source, encoding, data, step in (
-                    ('rgb', color, 'bgr8', image.tobytes(), 640 * 3),
-                    ('depth', depth, '16UC1', raw, 640 * 2)):
-                    frame = Image()
-                    frame.header = deepcopy(source.header)
-                    frame.width, frame.height, frame.encoding = 640, 480, encoding
-                    frame.is_bigendian, frame.step, frame.data = False, step, data
-                    setattr(out, field, frame)
+                # RTAB-Map supports lossless PNG depth in RGBDImage. Keep the
+                # native inter-process message bounded instead of fragmenting
+                # 1.5 MB of raw RGB/depth over best-effort DDS on every frame.
+                ok, png = cv2.imencode('.png', z16, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                if not ok:
+                    raise ValueError('RGB-D lossless depth encoding failed')
+                out.rgb_compressed = deepcopy(color)
+                out.depth_compressed = CompressedImage()
+                out.depth_compressed.header = deepcopy(depth.header)
+                out.depth_compressed.format = 'png'
+                out.depth_compressed.data = png.tobytes()
                 k = self.calibration['K'].ravel().tolist()
                 for field in ('rgb_camera_info', 'depth_camera_info'):
                     info = CameraInfo()

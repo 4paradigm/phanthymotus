@@ -12,7 +12,7 @@ import pytest
 DOCKERFILE = Path(__file__).parents[1] / 'Dockerfile.jetson'
 BASE_PACKAGES = ('tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs '
                  'message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync '
-                 'rtabmap_util rtabmap_slam').split()
+                 'rtabmap_util rtabmap_odom rtabmap_slam').split()
 OPTIONAL_PACKAGES = ('pcl_conversions pcl_ros diagnostic_updater cv_bridge '
                      'image_geometry image_transport laser_geometry').split()
 
@@ -264,7 +264,7 @@ def test_jp511_group_helper_is_valid_and_preserves_exit_status():
                      'message_filters']),
     ('support', ['rtabmap_msgs', 'rtabmap_conversions',
                  'rtabmap_sync', 'rtabmap_util', 'pcl_ros']),
-    ('slam', ['rtabmap_slam']),
+    ('slam', ['rtabmap_odom', 'rtabmap_slam']),
 ])
 def test_jp511_group_selection_and_colcon_failure_propagation(tmp_path, group, expected):
     prelude = shell_fixture(tmp_path)
