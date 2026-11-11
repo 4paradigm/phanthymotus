@@ -17,6 +17,7 @@ import numpy as np
 
 from .rgbd_odometry_contract import PairBuffer, make_sample
 from .rgbd_imu import ImuAttitude
+from .rgbd_fusion import ShortTermFusion, observation_covariance, pose_values
 from utils.ros_lifecycle import dispose_node
 
 
@@ -93,9 +94,61 @@ def estimator_parameters(calibration, segment):
               'publish_tf': False, 'subscribe_rgbd': True, 'qos': 2,
               'topic_queue_size': 2, 'sync_queue_size': 2,
               'Odom/ResetCountdown': '0', 'Vis/MaxFeatures': '1000'}
-    if calibration.get('imu_topic'):
+    if calibration.get('imu_topic') and not calibration.get('short_term_compensation'):
         params.update(wait_imu_to_init=True, **{'Odom/GuessSmoothingDelay': '0'})
     return params
+
+
+class CaptureObservations:
+    """Bounded exact-stamp joins with capture-order delivery and late-result discard."""
+    def __init__(self, fusion):
+        self.fusion = fusion
+        self.frames = OrderedDict()
+        self.last_added = 0
+
+    def add_frame(self, stamp, color, depth, now):
+        if stamp <= self.last_added or len(self.frames) >= 8:
+            self.fusion.fault('fusion capture queue repeated, reset or overflowed')
+            return
+        self.last_added = stamp
+        self.frames[stamp] = dict(color=color, depth=depth, deadline=now+250_000_000)
+
+    def result(self, kind, msg, now):
+        stamp = stamp_ns(msg)
+        if stamp in self.frames:
+            self.frames[stamp][kind] = msg
+        return self.drain(now)
+
+    def _visual(self, stamp, entry):
+        msg, info = entry.get('pose'), entry.get('info')
+        if msg is None or info is None or info.lost or info.inliers < 10:
+            return None, 'visual pose missing, lost or insufficient inliers'
+        try:
+            if msg.header.frame_id != self.fusion.segment+'_odom' or msg.child_frame_id != self.fusion.frame:
+                self.fusion.fault('native visual frame/segment changed; restart required')
+                return None, 'visual frame changed'
+            p, q = msg.pose.pose.position, msg.pose.pose.orientation
+            pose = dict(position=[p.x, p.y, p.z], quaternion=[q.x, q.y, q.z, q.w],
+                        frame_id=msg.header.frame_id, child_frame_id=msg.child_frame_id,
+                        covariance=list(msg.pose.covariance), quality_weight=max(1., 50./info.inliers))
+            pose_values(pose)
+            observation_covariance(pose)
+            return pose, None
+        except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError):
+            return None, 'invalid visual pose or covariance'
+
+    def drain(self, now):
+        outputs = []
+        while self.frames:
+            stamp, entry = next(iter(self.frames.items()))
+            ready = ('pose' in entry and 'info' in entry) or getattr(entry.get('info'), 'lost', False)
+            coverage = bool(self.fusion.samples) and self.fusion.samples[-1][0] >= stamp
+            if (not ready or not coverage) and now < entry['deadline']:
+                break
+            self.frames.pop(stamp)
+            visual, reason = self._visual(stamp, entry)
+            outputs.append(self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now, reason=reason))
+        return outputs
 
 
 class RgbdSession:
@@ -109,7 +162,12 @@ class RgbdSession:
         self.calibration, self.executor, self.topic = calibration, executor, topic
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
         self.gate = EstimateGate(self.segment, calibration['frame_id'], calibration['clock_id'])
-        self.imu = ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None
+        self.fusion = (ShortTermFusion(self.segment, calibration['frame_id'], calibration['clock_id'],
+                       calibration['K'], calibration.get('depth_geometry', False))
+                       if calibration.get('short_term_compensation') else None)
+        self.observations = CaptureObservations(self.fusion) if self.fusion else None
+        self.imu = (self.fusion.imu if self.fusion else
+                    ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None)
         self.lock = threading.RLock()
         self.pairs, self.pending = PairBuffer(), queue.Queue(maxsize=1)
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
@@ -132,7 +190,8 @@ class RgbdSession:
                                           lambda m: self._result('info', m), qos_profile_sensor_data)
             if self.imu is not None:
                 from sensor_msgs.msg import Imu
-                self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
+                if self.fusion is None:
+                    self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
                 self.node.create_subscription(String, calibration['imu_topic'], self._imu, qos_profile_sensor_data)
             self.node.create_timer(.2, self._watchdog)
             self.executor.add_node(self.node)
@@ -144,7 +203,7 @@ class RgbdSession:
                    '-r', '__ns:=/' + self.segment, '-r', '__node:=rgbd_odometry',
                    '-r', 'odom:=/' + self.segment + '/visual',
                    '-r', 'odom_info_lite:=/' + self.segment + '/diagnostic']
-            if self.imu is not None:
+            if self.imu is not None and self.fusion is None:
                 cmd.extend(['-r', 'imu:=/' + self.segment + '/imu'])
             self.process = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT,
                 start_new_session=True, env=dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1'))
@@ -179,6 +238,9 @@ class RgbdSession:
             if self.stop_event.is_set() or self.gate.state == 'lost':
                 return
             try:
+                if getattr(self, 'fusion', None) is not None:
+                    self.fusion.observe_imu(json.loads(msg.data), time.time_ns())
+                    return
                 sample = self.imu.observe(json.loads(msg.data), time.time_ns())
                 if sample is None:
                     return
@@ -192,6 +254,8 @@ class RgbdSession:
                 self.imu_pub.publish(out)
             except (ValueError, TypeError, AttributeError, RuntimeError) as error:
                 self.imu.fault(error)
+                if getattr(self, 'fusion', None) is not None:
+                    self.fusion.fault(error)
                 self.gate.fault('IMU assistance: ' + str(error))
 
     def _imu_frame_ready(self, stamp, now):
@@ -216,7 +280,7 @@ class RgbdSession:
             try:
                 (_, color), (_, depth) = pair
                 with self.lock:
-                    if not self._imu_frame_ready(stamp_ns(depth), time.time_ns()):
+                    if self.fusion is None and not self._imu_frame_ready(stamp_ns(depth), time.time_ns()):
                         self.counts['dropped_pairs'] += 1
                         continue
                 image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
@@ -226,7 +290,7 @@ class RgbdSession:
                         not decoder.eof or decoder.unused_data or decoder.unconsumed_tail):
                     raise ValueError('RGB-D payload does not match declared 640x480 geometry')
                 z16 = np.frombuffer(raw, '<u2').reshape(480, 640)
-                if np.count_nonzero(z16) < 100:
+                if self.fusion is None and np.count_nonzero(z16) < 100:
                     raise ValueError('RGB-D depth has insufficient measured pixels')
                 out = RGBDImage()
                 out.header = deepcopy(depth.header)
@@ -251,7 +315,11 @@ class RgbdSession:
                     info.p = [k[0], 0., k[2], 0., 0., k[4], k[5], 0., 0., 0., 1., 0.]
                     setattr(out, field, info)
                 with self.lock:
-                    if self._imu_frame_ready(stamp_ns(depth), time.time_ns()) and not self.stop_event.is_set():
+                    ready = (self.gate.state != 'lost' if self.fusion is not None else
+                             self._imu_frame_ready(stamp_ns(depth), time.time_ns()))
+                    if ready and not self.stop_event.is_set():
+                        if self.observations is not None:
+                            self.observations.add_frame(stamp_ns(depth), image, z16, time.time_ns())
                         self.rgbd.publish(out)
                         self.counts['pairs'] += 1
             except Exception as error:
@@ -266,6 +334,12 @@ class RgbdSession:
     def _result(self, kind, msg):
         with self.lock:
             if self.stop_event.is_set():
+                return
+            if getattr(self, 'fusion', None) is not None:
+                if self.gate.state != 'lost':
+                    for sample in self.observations.result(kind, msg, time.time_ns()):
+                        self._publish(sample)
+                        self.counts['estimates'] += 1
                 return
             if kind == 'info' and msg.lost and self.gate.state == 'tracking':
                 self.gate.fault('visual estimator reported lost tracking')
@@ -291,6 +365,21 @@ class RgbdSession:
                 self.gate.fault('RGB-D estimator exited')
             if not self.gate.last_input and time.monotonic() - self.started > 10:
                 self.gate.fault('waiting for calibrated RGB-D inputs timed out')
+            if getattr(self, 'fusion', None) is not None:
+                now = time.time_ns()
+                for sample in self.observations.drain(now):
+                    self._publish(sample)
+                    self.counts['estimates'] += 1
+                if self.gate.state == 'lost':
+                    self.fusion.fault(self.gate.reason)
+                if self.fusion.status(now) == 'lost':
+                    self.gate.fault(self.fusion.reason)
+                elif self.fusion.filter is None and time.monotonic()-self.started > 15:
+                    self.fusion.fault('low-motion fusion initialization timed out; restart required')
+                    self.gate.fault(self.fusion.reason)
+                if self.fusion.state != 'tracking':
+                    self._publish(self.fusion.output(self.fusion.last_frame or now))
+                return
             if self.imu is not None:
                 if self.imu.status(time.time_ns()) == 'lost':
                     self.gate.fault('IMU assistance: ' + str(self.imu.reason))
@@ -302,11 +391,13 @@ class RgbdSession:
 
     def info(self):
         with self.lock:
-            return {'state': 'running', 'status': self.gate.status(time.time_ns()),
+            return {'state': 'running', 'status': (self.fusion.status(time.time_ns()) if self.fusion else
+                                                  self.gate.status(time.time_ns())),
                     'reason': self.gate.reason, 'segment_id': self.segment,
                     'pose_reference': 'camera_optical', **self.counts,
                     'last_measurement_ns': self.gate.last_stamp,
                     'imu_assistance': self.imu.info(time.time_ns()) if self.imu else {'enabled': False},
+                    'fusion': self.fusion.info(time.time_ns()) if self.fusion else {'enabled': False},
                     'estimator_log': str(Path(self.directory.name) / 'estimator.log')}
 
     def close(self):

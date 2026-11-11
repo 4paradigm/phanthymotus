@@ -79,6 +79,7 @@ class SlamStream:
         self._metadata_fallbacks = 0
         self.last_error = ''
         self._odom_state = 'waiting'
+        self._fusion_pause = None
         self._dropped_pending = 0
 
     @property
@@ -86,6 +87,7 @@ class SlamStream:
         return len(self._pending)
 
     def _lose(self):
+        self._fusion_pause = None
         self._requires_new_segment = bool(self._segments)
         self._poses.clear()
         self._pending.clear()
@@ -139,7 +141,44 @@ class SlamStream:
                 age_ns < -self.max_future_skew_ms * 1_000_000):
             raise ValueError('measurement timestamp stale or in the future')
 
+    def _pause_fusion(self, sample, now, measurement_now_ns):
+        """Pause admission within one bounded fusion segment; retain no clouds."""
+        vendor = sample.get('vendor', {}) if isinstance(sample, dict) else {}
+        quality, fusion = vendor.get('motus_slam', {}), vendor.get('fusion', {})
+        if not isinstance(quality, dict) or quality.get('status') not in ('coasting', 'recovering'):
+            return False
+        anchor = self._fusion_pause[0] if self._fusion_pause else self._poses[-1] if self._poses else None
+        stamp = sample.get('stamp_ms')
+        valid = (anchor is not None and not self._requires_new_segment and self._required_new_segment is None
+                 and sample.get('schema') == 'motus.odom/1' and sample.get('pose') is None
+                 and isinstance(fusion, dict) and fusion.get('enabled') is True
+                 and fusion.get('mapping_allowed') is False and fusion.get('status') == quality['status']
+                 and quality.get('segment_id') == anchor.segment_id and quality.get('clock_id') == self.clock_id
+                 and type(stamp) is int and anchor.stamp_ms <= stamp <= anchor.stamp_ms+1000
+                 and (self._fusion_pause is None or now-self._fusion_pause[1] <= 1.))
+        if not valid:
+            self._lose()
+            self.last_error = 'invalid or expired fusion pause; new segment required'
+            return True
+        try:
+            self._check_measurement_time(stamp*1_000_000, measurement_now_ns)
+        except ValueError as error:
+            self._lose()
+            self.last_error = str(error)
+            return True
+        self._fusion_pause = (anchor, self._fusion_pause[1] if self._fusion_pause else now)
+        self._poses.clear()
+        self._pending.clear()
+        self._last_received = None
+        self._cloud_metadata.clear()
+        self._unmatched_clouds.clear()
+        self._odom_state = quality['status']
+        self.last_error = 'map integration paused during short-term fusion'
+        return True
+
     def odom(self, sample, *, now, measurement_now_ns=None):
+        if self._pause_fusion(sample, now, measurement_now_ns):
+            return
         try:
             pose = decode_slam_odom(sample)
             if self.input_contract:
@@ -231,6 +270,14 @@ class SlamStream:
             self.last_error = str(error)
             self._lose()
             return
+        if self._fusion_pause is not None:
+            anchor, started = self._fusion_pause
+            if (pose.segment_id == anchor.segment_id and
+                    (now-started > 1. or not anchor.stamp_ms < pose.stamp_ms <= anchor.stamp_ms+1000
+                     or pose.frame_id != anchor.frame_id or pose.child_frame_id != anchor.child_frame_id)):
+                self._lose()
+            else:
+                self._fusion_pause = None
         if self._last_received is not None and now - self._last_received > self.max_age_s:
             self._lose()
         self._poses.append(pose)
@@ -378,6 +425,10 @@ class SlamStream:
         """Retain the opaque native message; XYZ validation belongs to the ROS adapter."""
         if type(stamp_ns) is not int or stamp_ns <= 0 or frame != self.cloud_frame:
             raise ValueError('invalid cloud frame or timestamp')
+        if self._fusion_pause is not None:
+            if now-self._fusion_pause[1] > 1.:
+                self._lose()
+            raise ValueError('cloud integration paused during short-term fusion')
         if self._last_received is None or now - self._last_received > self.max_age_s:
             self._lose()
             raise ValueError('odometry stale or unavailable')
@@ -399,6 +450,10 @@ class SlamStream:
 
     def _accept_cloud(self, stamp_ns, frame, cloud, *, now, measurement_now_ns=None, received=None,
                       capture_context=None):
+        if self._fusion_pause is not None:
+            if now-self._fusion_pause[1] > 1.:
+                self._lose()
+            raise ValueError('cloud integration paused during short-term fusion')
         if self._last_received is None or now - self._last_received > self.max_age_s:
             self._lose()
             raise ValueError('odometry stale or unavailable')

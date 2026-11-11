@@ -126,3 +126,37 @@ def test_cloud_frame_and_capacity_checks(wrong):
     args.update(wrong)
     with pytest.raises(ValueError):
         s.cloud(**args)
+
+
+def paused(ms, status='coasting', segment='a'):
+    sample = odom(ms, segment=segment, status=status)
+    sample['pose'] = None
+    sample['vendor']['fusion'] = dict(enabled=True, status=status, mapping_allowed=False,
+                                      last_visual_ns=1_000_000_000)
+    return sample
+
+
+def test_explicit_short_fusion_pause_blocks_clouds_then_resumes_same_segment():
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
+    s.odom(paused(1100), now=1.1)
+    with pytest.raises(ValueError):
+        s.cloud(1_100_000_000, 'camera', [[1, 0, 0]], now=1.1)
+    s.odom(paused(1200, 'recovering'), now=1.2)
+    s.odom(odom(1300), now=1.3)
+    s.cloud(1_300_000_000, 'camera', [[1, 0, 0]], now=1.3)
+    assert len(s.accepted) == 2
+    assert s.status(now=1.3)['integration'] == 'admitting'
+
+
+@pytest.mark.parametrize('sample, resume_ms', [(paused(1100, segment='other'), 1300),
+                                              (paused(2100), 2200), (paused(1100), 2101)])
+def test_fusion_pause_cannot_bypass_segment_identity_or_one_second_limit(sample, resume_ms):
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
+    s.odom(sample, now=sample['stamp_ms']/1000)
+    s.odom(odom(resume_ms), now=resume_ms/1000)
+    s.cloud(resume_ms*1_000_000, 'camera', [[1, 0, 0]], now=resume_ms/1000)
+    assert len(s.accepted) == 1

@@ -16,7 +16,8 @@ class RgbdOdometryPlugin:
     def __init__(self, config, executor):
         self.executor = executor
         self.instances = {}
-        self.imu_default = (config or {}).get('imu_assisted', False)
+        self.defaults = {k: (config or {}).get(k, False) for k in
+                         ('imu_assisted', 'short_term_compensation', 'depth_geometry')}
         self.settings = {}
         self.lock = threading.RLock()
 
@@ -26,10 +27,15 @@ class RgbdOdometryPlugin:
                  'inputSchema': {'type': 'object', 'properties': {
                      'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config']},
                      'instance_id': {'type': 'string'}, 'input_topics': {'type': 'array', 'items': {'type': 'string'}},
-                     'camera_info': {'type': 'object'}, 'imu_assisted': {'type': 'boolean'}}},
+                     'camera_info': {'type': 'object'}, 'imu_assisted': {'type': 'boolean'},
+                     'short_term_compensation': {'type': 'boolean'}, 'depth_geometry': {'type': 'boolean'}}},
                  'configSchema': {'type': 'object', 'properties': {
                      'imu_assisted': {'type': 'boolean', 'default': False, 'scope': 'instance',
-                                      'description': '启用可选相机 IMU 姿态辅助（需要第三路 IMU 输入）'}}},
+                                      'description': '启用可选相机 IMU 辅助（需要第三路 IMU 输入）'},
+                     'short_term_compensation': {'type': 'boolean', 'default': False, 'scope': 'instance',
+                         'description': '启用 ESKF 短时补偿，需要 IMU 完整标定及低运动初始化'},
+                     'depth_geometry': {'type': 'boolean', 'default': False, 'scope': 'instance',
+                         'description': '启用深度几何配准辅助，需要先启用短时补偿'}}},
                  'topic_in': [{'format': 'image/jpeg'}, {'format': 'image/depth-zlib'},
                               {'format': 'sensor/imu', 'optional': True}],
                  'topic_out': self._outputs('default'), 'odom_interface': _INTERFACE}]
@@ -48,17 +54,24 @@ class RgbdOdometryPlugin:
         with self.lock:
             current = self.instances.get(instance)
             try:
-                enabled = args.get('imu_assisted', self.settings.get(instance, self.imu_default))
-                if type(enabled) is not bool:
-                    raise ValueError('imu_assisted must be a boolean')
+                settings = {k: args.get(k, self.settings.get(instance, self.defaults).get(k, False))
+                            for k in self.defaults}
+                if any(type(v) is not bool for v in settings.values()):
+                    raise ValueError('IMU, compensation and geometry flags must be boolean')
+                enabled = settings['imu_assisted']
+                if settings['short_term_compensation'] and not enabled:
+                    raise ValueError('short-term compensation requires imu_assisted')
+                if settings['depth_geometry'] and not settings['short_term_compensation']:
+                    raise ValueError('depth geometry requires short-term compensation')
                 if action == 'config':
-                    if current and enabled != self.settings[instance]:
-                        raise ValueError('stop RGB-D odometry before changing IMU mode')
-                    self.settings[instance] = enabled
-                    return {'state': 'configured', 'config': {'imu_assisted': enabled}}
+                    if current and settings != self.settings[instance]:
+                        raise ValueError('stop RGB-D odometry before changing assistance modes')
+                    self.settings[instance] = settings
+                    return {'state': 'configured', 'config': settings.copy()}
                 if action == 'start':
                     calibration = validate_start_inputs(args.get('camera_info'), args.get('input_topics'), enabled)
-                    signature = json.dumps([args['input_topics'], args['camera_info'], enabled], sort_keys=True)
+                    calibration.update(settings)
+                    signature = json.dumps([args['input_topics'], args['camera_info'], settings], sort_keys=True)
                     if current and current[1] != signature:
                         raise ValueError('stop RGB-D odometry before changing its input geometry')
                     if not current:
@@ -69,7 +82,7 @@ class RgbdOdometryPlugin:
                             bindings.append({'topic': calibration['imu_topic'], 'format': 'sensor/imu'})
                         current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic']), signature, bindings)
                         self.instances[instance] = current
-                        self.settings[instance] = enabled
+                        self.settings[instance] = settings
                 elif action == 'stop':
                     if current:
                         current[0].close()
@@ -80,7 +93,7 @@ class RgbdOdometryPlugin:
                 return {**(current[0].info() if current else {'state': 'idle'}),
                         'topic_out': self._outputs(instance), 'odom_interface': _INTERFACE,
                         'topic_in': current[2] if current else [],
-                        'config': {'imu_assisted': self.settings.get(instance, self.imu_default)}}
+                        'config': self.settings.get(instance, self.defaults).copy()}
             except (ValueError, RuntimeError, ImportError, LookupError) as error:
                 return {'state': 'error', 'message': str(error)}
 
