@@ -1,5 +1,3 @@
-from copy import deepcopy
-
 import numpy as np
 import pytest
 
@@ -184,3 +182,17 @@ def test_gravity_correction_removes_tilt_without_integrating_translation():
     after=rotation_from_quaternion(a.quaternion) @ [0,0,1]
     assert abs(after[1])<.002
     assert a.info(t)['translation_integrated'] is False
+
+
+def test_nontracking_output_keeps_selected_imu_mode_and_health(monkeypatch):
+    from plugins.rgbd_odometry_contract import make_sample
+    import sys
+    obj,_,runtime,NS,json=session(monkeypatch)
+    messages=[];obj.publisher=NS(publish=messages.append)
+    monkeypatch.setattr(sys.modules['std_msgs.msg'],'String',lambda **kw:NS(**kw),raising=False)
+    monkeypatch.setattr(runtime.time,'time_ns',lambda:1_010_000_000)
+    del obj._publish
+    obj.imu.fault('source reset')
+    obj._publish(make_sample('lost',1_010_000_000,'run','capture-clock',reason='IMU source reset'))
+    state=json.loads(messages[0].data)['vendor']['imu_assistance']
+    assert state['enabled'] is True and state['status']=='lost'

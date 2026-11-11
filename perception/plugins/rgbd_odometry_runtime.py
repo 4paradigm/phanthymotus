@@ -260,6 +260,7 @@ class RgbdSession:
 
     def _publish(self, sample):
         from std_msgs.msg import String
+        sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
         self.publisher.publish(String(data=json.dumps(sample, allow_nan=False)))
 
     def _result(self, kind, msg):
@@ -279,7 +280,6 @@ class RgbdSession:
                 now = time.time_ns()
                 sample = self.gate.accept(pose, info, now) if self._imu_frame_ready(stamp, now) else None
                 if sample:
-                    sample['vendor']['imu_assistance'] = self.imu.info(now) if self.imu else {'enabled': False}
                     self._publish(sample)
                     self.counts['estimates'] += 1
 
