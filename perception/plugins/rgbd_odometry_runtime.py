@@ -18,6 +18,7 @@ import numpy as np
 from .rgbd_odometry_contract import PairBuffer, make_sample
 from .rgbd_imu import ImuAttitude
 from .rgbd_fusion import ShortTermFusion, observation_covariance, pose_values
+from .rgbd_body_mount import CaptureMounts
 from utils.ros_lifecycle import dispose_node
 
 
@@ -168,6 +169,8 @@ class RgbdSession:
                        calibration['K'], calibration.get('depth_geometry', False))
                        if calibration.get('short_term_compensation') else None)
         self.observations = CaptureObservations(self.fusion) if self.fusion else None
+        self.mounts = (CaptureMounts(calibration['body_mount'], calibration['frame_id'], calibration['clock_id'])
+                       if calibration.get('body_mount') else None)
         self.imu = (self.fusion.imu if self.fusion else
                     ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None)
         self.lock = threading.RLock()
@@ -195,6 +198,8 @@ class RgbdSession:
                 if self.fusion is None:
                     self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
                 self.node.create_subscription(String, calibration['imu_topic'], self._imu, qos_profile_sensor_data)
+            if self.mounts is not None:
+                self.node.create_subscription(String, self.mounts.declaration['topic'], self._mount, qos_profile_sensor_data)
             self.node.create_timer(.05 if self.fusion else .2, self._watchdog)
             self.executor.add_node(self.node)
             params = estimator_parameters(calibration, self.segment)
@@ -233,6 +238,16 @@ class RgbdSession:
                     self.pending.put_nowait(pair)
             except (ValueError, queue.Full) as error:
                 self.gate.fault(error)
+
+    def _mount(self, msg):
+        with self.lock:
+            if self.stop_event.is_set():
+                return
+            try:
+                self.mounts.observe(json.loads(msg.data), time.time_ns())
+            except (ValueError, TypeError, AttributeError) as error:
+                # Body-reference evidence is optional: camera VO remains valid.
+                self.mounts.fault(error)
 
     def _imu(self, msg):
         from sensor_msgs.msg import Imu
@@ -332,6 +347,8 @@ class RgbdSession:
 
     def _publish(self, sample):
         from std_msgs.msg import String
+        if getattr(self, 'mounts', None) is not None:
+            sample = self.mounts.attach(sample, time.time_ns())
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
         self.publisher.publish(String(data=json.dumps(sample, allow_nan=False)))
 
@@ -402,6 +419,7 @@ class RgbdSession:
                     'last_measurement_ns': self.gate.last_stamp,
                     'imu_assistance': self.imu.info(time.time_ns()) if self.imu else {'enabled': False},
                     'fusion': self.fusion.info(time.time_ns()) if self.fusion else {'enabled': False},
+                    'body_mount': self.mounts.info(time.time_ns()) if self.mounts else {'status': 'undeclared'},
                     'estimator_log': str(Path(self.directory.name) / 'estimator.log')}
 
     def close(self):

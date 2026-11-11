@@ -38,9 +38,18 @@ def validate_inputs(declarations, topics):
     if (depth['vendor'].get('depth_source') != 'measured' or
             depth['vendor'].get('depth_unit') != 'mm'):
         raise ValueError('RGB-D requires measured millimetre depth')
-    return dict(color_topic=color['topic'], depth_topic=depth['topic'],
+    mount = color['vendor'].get('body_mount')
+    if mount != depth['vendor'].get('body_mount'):
+        raise ValueError('RGB-D body_mount declarations conflict')
+    if mount is not None:
+        from .rgbd_body_mount import validate_mount_declaration
+        mount = validate_mount_declaration(mount, color['vendor']['frame_id'], topics)
+    result = dict(color_topic=color['topic'], depth_topic=depth['topic'],
                 K=np.asarray(color['K'], dtype=float).reshape(3, 3),
                 frame_id=color['vendor']['frame_id'], clock_id=color['vendor']['clock_id'])
+    if mount is not None:
+        result['body_mount'] = mount
+    return result
 
 
 class PairBuffer:
@@ -78,7 +87,7 @@ def make_sample(status, stamp_ns, segment, clock, pose=None, *, reason=None):
               'vendor': {'source': 'rtabmap_rgbd_odometry', 'pose_reference': 'camera_optical',
                          'accuracy_validated': False, 'reason': reason,
                          'motus_slam': {'status': status, 'stamp_source': 'measurement' if valid else 'unknown',
-                                        'segment_id': segment, 'clock_id': clock}}}
+                                        'segment_id': segment, 'clock_id': clock, 'stamp_ns': stamp_ns}}}
     if valid:
         validate_tracking_pose(sample)
     return sample

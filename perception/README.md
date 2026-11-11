@@ -38,6 +38,32 @@ relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
 driver repository. G1 requires SDK global capture time; Bumi also exposes its
 existing fixed hardware-clock offset explicitly as unverified provenance.
 
+### Automatic body-camera mount
+
+Tianyi, G1 and Bumi drivers can declare a `vendor.body_mount` sidecar in both
+RGB-D `camera_info` entries. The card discovers and subscribes to that topic
+automatically; no card matrix or additional canvas connection is needed. The
+driver queries the actual ROS TF tree at each image capture timestamp. Default
+body frames are Tianyi `base_link`, G1 `pelvis` and Bumi `base_link`; driver-side
+`CAMERA_BODY_FRAME` changes only the requested frame name. A calibrated TF path
+to the actual rectified optical frame must exist in the driver's TF domain.
+Camera SDK IMU calibration and visualization models do not supply this path.
+
+The `motus.camera_mount/1` JSON packet contains `T_body_camera` in metres:
+`p_body = R * p_camera + t`, exact `stamp_ns`, capture clock, source epoch and
+frame identities. Dynamic head/waist joints are queried per capture, never
+frozen at startup or replaced with latest TF. Only an exact nanosecond match
+can produce `vendor.body_pose`, using
+`T_world_body = T_world_camera * inverse(T_body_camera)`. Main `pose` and SLAM
+remain camera-referenced. Body covariance is null and accuracy is unverified,
+because the TF source supplies no extrinsic uncertainty.
+
+`info().body_mount` and `vendor.camera_mount` expose missing, stale or invalid
+TF. These conditions leave camera VO running and make `vendor.body_pose` null.
+A changed mount identity/epoch or invalid packet retires body evidence until
+the card is restarted; it does not reset the visual/IMU estimator. Hardware
+acceptance must verify the installed TF tree, domain, timestamps and calibration.
+
 Optional camera IMU assistance is selected per card with `imu_assisted=true`
 in its instance configuration (`config` action). Connect the source's third
 `sensor/imu` port as well as the two RGB-D ports. The third port remains the

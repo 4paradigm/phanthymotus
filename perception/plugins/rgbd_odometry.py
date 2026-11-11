@@ -2,6 +2,7 @@
 import json
 import re
 import threading
+from copy import deepcopy
 
 from .rgbd_odometry_contract import validate_start_inputs
 from .rgbd_odometry_runtime import RgbdSession, require_runtime
@@ -71,7 +72,13 @@ class RgbdOdometryPlugin:
                 if action == 'start':
                     calibration = validate_start_inputs(args.get('camera_info'), args.get('input_topics'), enabled)
                     calibration.update(settings)
-                    signature = json.dumps([args['input_topics'], args['camera_info'], settings], sort_keys=True)
+                    geometry = deepcopy(args['camera_info'])
+                    for declaration in geometry.values():
+                        mount = (declaration.get('vendor') or {}).get('body_mount')
+                        if isinstance(mount, dict):
+                            mount.pop('status', None)
+                            mount.pop('reason', None)
+                    signature = json.dumps([args['input_topics'], geometry, settings], sort_keys=True)
                     if current and current[1] != signature:
                         raise ValueError('stop RGB-D odometry before changing its input geometry')
                     if not current:
