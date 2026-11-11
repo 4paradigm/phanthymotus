@@ -431,6 +431,74 @@ def test_ocr_payload_empty_and_error():
     assert payload["error"] == "boom"
 
 
+def test_ocr_layout_keeps_numbered_rows_in_visual_order():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for number, title, y in [("03", "应用层", 40), ("02", "连接层", 130), ("01", "算力层", 220)]:
+        items += [
+            {"text": number, "bbox": [270, y, 292, y + 16], "score": .99},
+            {"text": title, "bbox": [350, y, 530, y + 16], "score": .99},
+        ]
+    text = build_ocr_summary(items, (1000, 400))
+    for number, title in [("03", "应用层"), ("02", "连接层"), ("01", "算力层")]:
+        assert f'原编号“{number}”，右侧邻近文字为“{title}”' in text
+    assert text.index("“03”") < text.index("“02”") < text.index("“01”")
+
+
+def test_ocr_layout_keeps_comparison_labels_and_values_on_their_rows():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [
+        {"text": "方案甲", "bbox": [430, 120, 585, 136], "score": .99},
+        {"text": "10", "bbox": [610, 120, 640, 136], "score": .99},
+        {"text": "方案乙", "bbox": [430, 210, 570, 226], "score": .99},
+        {"text": "1000+", "bbox": [850, 210, 915, 226], "score": .99},
+    ]
+    text = build_ocr_summary(items, (1000, 400))
+    assert "“方案甲”；同排右侧数值为“10”" in text
+    assert "“方案乙”；同排右侧数值为“1000+”" in text
+
+
+def test_ocr_layout_repeated_numbers_preserve_vertical_order():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [140, y, 180, y + 12], "score": .99}
+             for text, y in [("10", 30), ("20", 150), ("10", 270)]]
+    text = build_ocr_summary(items, (300, 330))
+    assert text.count("“10”") == 2
+    assert text.find("“10”") < text.find("“20”") < text.rfind("“10”")
+
+
+def test_ocr_layout_date_columns_keep_their_nearby_text():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for index, date in enumerate(["2020/01", "2021/02", "2022/03", "2023/04"]):
+        x = index * 150
+        items += [
+            {"text": date, "bbox": [x, 100, x + 60, 120], "score": .99},
+            {"text": f"说明{index}", "bbox": [x, 125, x + 90, 145], "score": .99},
+        ]
+    text = build_ocr_summary(items, (600, 300))
+    for index, date in enumerate(["2020/01", "2021/02", "2022/03", "2023/04"]):
+        assert any(f'“{date}”' in line and f'“说明{index}”' in line for line in text.splitlines())
+
+
+def test_ocr_layout_aligned_columns_keep_each_title_with_its_body():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for label, x in [("甲", 20), ("乙", 220), ("丙", 420)]:
+        items += [
+            {"text": label + "标题", "bbox": [x, 40, x + 100, 60], "score": .99},
+            {"text": label + "说明", "bbox": [x, 75, x + 100, 95], "score": .99},
+        ]
+    text = build_ocr_summary(items, (600, 300))
+    assert "从左到右" in text
+    assert all(f'“{label}标题”、“{label}说明”' in text for label in ["甲", "乙", "丙"])
+
+
 # ── config surface (培育→配置) ───────────────────────────────────────────────
 
 def test_ocr_config_schema_exposes_only_operator_fields():
