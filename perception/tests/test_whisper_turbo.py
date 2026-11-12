@@ -24,6 +24,16 @@ def metadata(data, **extra):
     return {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), **extra}
 
 
+def wav_bytes():
+    audio = io.BytesIO()
+    with wave.open(audio, "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16000)
+        stream.writeframes(b"\0\0" * 1600)
+    return audio.getvalue()
+
+
 class Chunks(io.BytesIO):
     def read(self, size=-1):
         return super().read(min(size, 2) if size >= 0 else size)
@@ -286,20 +296,102 @@ def test_worker_protocol_reuses_one_process_and_returns_language(tmp_path, monke
     (tmp_path / "model.bin").write_bytes(b"protocol fixture")
     monkeypatch.setenv("WHISPER_TURBO_WORKER", str(worker))
     monkeypatch.setattr("ctypes.util.find_library", lambda _: None)
-    audio = io.BytesIO()
-    with wave.open(audio, "wb") as stream:
-        stream.setnchannels(1)
-        stream.setsampwidth(2)
-        stream.setframerate(16000)
-        stream.writeframes(b"\0\0" * 1600)
     adapter = WhisperTurboAdapter(str(tmp_path))
     assert adapter._process is None
     try:
         adapter.prepare()
         pid = adapter._process.pid
         for _ in range(2):
-            assert adapter.transcribe_rich(audio.getvalue()) == ("hello", {"lang": "ja"})
+            assert adapter.transcribe_rich(wav_bytes()) == ("hello", {"lang": "ja"})
             assert adapter._process.pid == pid
     finally:
         adapter.close()
     assert adapter._process is None
+
+
+def test_close_interrupts_busy_worker_and_queued_calls_cannot_restart_it(tmp_path, monkeypatch):
+    import subprocess
+    marker, worker = tmp_path / "received", tmp_path / "worker"
+    worker.write_text("#!/usr/bin/env python3\nimport json,sys,time,pathlib\n"
+                     "print(json.dumps({'ready':True,'gpu':True}),flush=True)\n"
+                     "for line in sys.stdin:\n"
+                     f" pathlib.Path({str(marker)!r}).write_text('received')\n"
+                     " time.sleep(30)\n")
+    worker.chmod(0o755)
+    (tmp_path / "model.bin").write_bytes(b"protocol fixture")
+    monkeypatch.setenv("WHISPER_TURBO_WORKER", str(worker))
+    monkeypatch.setattr("ctypes.util.find_library", lambda _: None)
+    processes, errors = [], []
+    original = subprocess.Popen
+    def spawn(*args, **kwargs):
+        process = original(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    adapter, closed, queued = WhisperTurboAdapter(str(tmp_path)), threading.Event(), threading.Event()
+    def recognize():
+        queued.set()
+        try:
+            adapter.transcribe(wav_bytes())
+        except RuntimeError as error:
+            errors.append(error)
+    def close():
+        try:
+            adapter.close()
+        finally:
+            closed.set()
+    first, second = threading.Thread(target=recognize), threading.Thread(target=recognize)
+    closer = threading.Thread(target=close)
+    try:
+        adapter.prepare()
+        first.start()
+        deadline = time.monotonic() + 3
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        queued.clear()
+        second.start()
+        assert queued.wait(2)
+        closer.start()
+        assert closed.wait(3)
+        for thread in (first, second):
+            thread.join(3)
+        assert len(processes) == 1 and processes[0].poll() is not None
+        assert not first.is_alive() and not second.is_alive() and len(errors) == 2
+        assert adapter._process is None
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for thread in (first, second, closer):
+            if thread.ident is not None:
+                thread.join(3)
+        adapter.close()
+
+
+def test_transient_worker_failure_recovers_but_explicit_close_is_terminal(tmp_path, monkeypatch):
+    marker, worker = tmp_path / "booted", tmp_path / "worker"
+    worker.write_text("#!/usr/bin/env python3\nimport json,sys,pathlib\n"
+                     f"marker=pathlib.Path({str(marker)!r})\n"
+                     "first=not marker.exists()\nmarker.touch()\n"
+                     "print(json.dumps({'ready':True,'gpu':True}),flush=True)\n"
+                     "for line in sys.stdin:\n"
+                     " print(json.dumps({'error':'temporary'} if first else "
+                     "{'raw_text':'recovered','predicted_language':'en'}),flush=True)\n")
+    worker.chmod(0o755)
+    (tmp_path / "model.bin").write_bytes(b"protocol fixture")
+    monkeypatch.setenv("WHISPER_TURBO_WORKER", str(worker))
+    monkeypatch.setattr("ctypes.util.find_library", lambda _: None)
+    adapter = WhisperTurboAdapter(str(tmp_path))
+    try:
+        adapter.prepare()
+        with pytest.raises(RuntimeError, match="temporary"):
+            adapter.transcribe(wav_bytes())
+        assert adapter._process is None
+        assert adapter.transcribe(wav_bytes()) == "recovered"
+        adapter.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            adapter.transcribe(wav_bytes())
+        assert adapter._process is None
+    finally:
+        adapter.close()

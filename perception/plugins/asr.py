@@ -2605,11 +2605,11 @@ class ASRPlugin:
             # in-flight start() so _dispose_node does not sit behind it.
             for _, node in nodes:
                 node.request_stop()
+            if unused is not None:
+                unused.close()
             result = {"state": "idle"}
             for key, node in nodes:
                 result = self._dispose_node(node, key)
-            if unused is not None:
-                unused.close()
             if instance_id:
                 return result
             if keys:

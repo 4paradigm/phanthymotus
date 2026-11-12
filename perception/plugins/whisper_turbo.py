@@ -36,6 +36,7 @@ class WhisperTurboAdapter:
             self._root / "runtime" / ("jp" + self._jetpack) / "bin" / "whisper_turbo_worker")
         self._lock = threading.RLock()
         self._process = None
+        self._closed = False
         self._stderr = None
         self._numeric = None
         self.last_language = None
@@ -44,6 +45,8 @@ class WhisperTurboAdapter:
     def prepare(self, on_status=None):
         """Download and initialize only after a valid start request."""
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Whisper Turbo backend is closed")
             if self._process is not None and self._process.poll() is None:
                 return
             if not self._override:
@@ -59,6 +62,8 @@ class WhisperTurboAdapter:
             self._start()
 
     def _start(self):
+        if self._closed:
+            raise RuntimeError("Whisper Turbo backend is closed")
         if self._process is not None and self._process.poll() is None:
             return
         if not self._worker.is_file() or not self._model.is_file():
@@ -78,12 +83,14 @@ class WhisperTurboAdapter:
             self._process = subprocess.Popen(
                 [str(self._worker), str(self._model)], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=self._stderr, text=True, bufsize=1, env=env)
+            if self._closed:
+                raise RuntimeError("Whisper Turbo backend is closed")
             atexit.register(self.close)
             ready = self._read(60.0)
             if not ready.get("ready") or not ready.get("gpu"):
                 raise RuntimeError("Whisper Turbo failed CUDA initialization")
         except Exception:
-            self.close()
+            self._close_worker()
             raise
         log.info("[asr] Whisper Turbo ready: load=%.2fs", ready.get("load_s", 0.0))
 
@@ -137,7 +144,7 @@ class WhisperTurboAdapter:
             except Exception:
                 # A timed-out response must never become the next utterance's
                 # transcript; restart this worker rather than reuse its pipe.
-                self.close()
+                self._close_worker()
                 raise
             finally:
                 os.unlink(path)
@@ -162,7 +169,21 @@ class WhisperTurboAdapter:
         return text, tags, None
 
     def close(self):
-        with self._lock:
+        self._closed = True
+        self._close_worker()
+
+    def _close_worker(self):
+        # A blocked recognition owns the request lock. Interrupt its child
+        # first so stop cannot wait for the full recognition timeout.
+        if not self._lock.acquire(blocking=False):
+            process = self._process
+            if process is not None and process.poll() is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+            self._lock.acquire()
+        try:
             process, self._process = self._process, None
             atexit.unregister(self.close)
             if process is not None:
@@ -183,3 +204,5 @@ class WhisperTurboAdapter:
             if self._stderr is not None:
                 self._stderr.close()
                 self._stderr = None
+        finally:
+            self._lock.release()
