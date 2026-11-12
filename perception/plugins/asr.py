@@ -1850,32 +1850,10 @@ class _ASRNode(Node):
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
-        converted = getattr(self, '_audio_container_decoded', False)
-        timing_pcm_length = len(pcm)
-        # Silero consumes 512-sample windows. Preserve that granularity for a
-        # recovered file and drain with backpressure, rather than dropping the
-        # second half when a minute of audio fills the live-input queue.
-        if converted:
-            silence_ms = max(0, int(getattr(self, '_vad_silence_ms', 400)))
-            # Preserve the established untrusted timing anchor of decoded
-            # speech; extra synthetic silence must not shift the speech earlier.
-            timing_pcm_length += (silence_ms + 100) * SAMPLE_RATE // 1000 * 2
-            flush_ms = silence_ms + 100
-            pcm += b'\0' * (flush_ms * SAMPLE_RATE // 1000 * 2)
-        step = 1024 if converted else len(pcm)
-        for offset in range(0, len(pcm), step):
-            chunk = pcm[offset:offset + step]
-            chunk_ts = ts - (timing_pcm_length - offset - len(chunk)) / (SAMPLE_RATE * 2) if converted else ts
-            trusted = msg.header.stamp.sec >= 1_000_000_000 and not converted
-            try:
-                if converted:
-                    self._pcm_queue.put((chunk, chunk_ts, trusted), timeout=1)
-                else:
-                    self._pcm_queue.put_nowait((chunk, chunk_ts, trusted))
-            except Exception:
-                if converted:
-                    self._warn_audio_contract('container-queue', 'VAD queue stalled while decoding MPEG-4 audio')
-                    break
+        try:
+            self._pcm_queue.put_nowait((pcm, ts, msg.header.stamp.sec >= 1_000_000_000))
+        except Exception:
+            pass  # drop if severely behind
 
     def _warn_audio_contract(self, key: str, detail: str) -> None:
         """Warn on the first violation of a kind, then every 500th one.
@@ -1892,28 +1870,13 @@ class _ASRNode(Node):
     def _check_audio_contract(self, fmt: str, pcm: bytes) -> bytes:
         """Validate the documented AudioChunk contract, return usable PCM.
 
-        Self-describing MPEG-4 files are decoded before PCM alignment. Plain
-        PCM retains its existing handling: a chunk with an odd byte count
+        Only the 16-bit alignment is corrected: a chunk with an odd byte count
         makes the VAD worker's struct.unpack() raise, killing the subprocess and
         taking ASR to the error state. Format and chunk size are reported but
         left alone — undersized chunks are the most common cause of "ASR hears
         audio but never emits text", and dropping them here would change the
         behaviour of producers that work today.
         """
-        from plugins.audio_container import Mpeg4AudioInput
-
-        self._audio_container_decoded = False
-        if not hasattr(self, '_container_audio_input'):
-            self._container_audio_input = Mpeg4AudioInput()
-        try:
-            pcm, self._audio_container_decoded = self._container_audio_input.feed(pcm)
-        except Exception as error:
-            self._warn_audio_contract('container', 'MPEG-4 audio decode failed: ' + str(error))
-            return b''
-        if self._audio_container_decoded:
-            self._warn_audio_contract('container', 'decoded MPEG-4 audio received on the PCM topic; capture timing unavailable')
-        if not pcm:
-            return b''
         if fmt not in _AUDIO_FORMAT_ALIASES:
             self._warn_audio_contract(
                 'format', f"format={fmt!r}, expected {AUDIO_FORMAT!r}")
