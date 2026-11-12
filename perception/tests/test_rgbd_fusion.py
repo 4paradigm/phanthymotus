@@ -170,7 +170,9 @@ def test_visual_rotation_during_warmup_is_not_estimated_as_gyro_bias():
 
 def test_missing_camera_frames_stop_claiming_tracking_before_hard_loss():
     c, t = warmed()
-    for i in range(1, 61):
+    # Wall-clock silence is judged after the 250 ms join deadline plus one
+    # >=4 Hz frame interval, so ordinary native latency is not a loss of frames.
+    for i in range(1, 121):
         stamp = t+i*5_000_000
         c.observe_imu(source(stamp), stamp)
     assert c.status(stamp) == 'coasting'

@@ -89,6 +89,7 @@ class InertialFilter:
         self.bg = _vector(gyro)
         self.ba = force + self.R.T@self.g
         self.stamp = stamp
+        self.rejection = None
         self.P = np.diag([.005**2]*3 + [.03**2]*3 + [.02**2]*3 + [.01**2]*3 + [.1**2]*3)
 
     def propagate(self, dt, gyro, force):
@@ -126,6 +127,7 @@ class InertialFilter:
         residual = np.r_[position-(self.p-self.R@self.lever), log_rotation(self.R.T@rotation)]
         # Absolute gates are independent of possibly over-large model covariance.
         if np.linalg.norm(residual[:3]) > .15 or np.linalg.norm(residual[3:]) > np.deg2rad(15.):
+            self.rejection = 'absolute_residual_gate'
             return False
         h = self.measurement_matrix()
         # Incoming rotation covariance is in world axes; residual uses local axes.
@@ -134,7 +136,9 @@ class InertialFilter:
         covariance = basis@covariance@basis.T
         innovation = h@self.P@h.T+covariance
         if residual@np.linalg.solve(innovation, residual) > 22.46:
+            self.rejection = 'innovation_gate'
             return False
+        self.rejection = None
         # Covariance intersection for depth corrections sharing a reference:
         # do not repeatedly average down a common reference/calibration error.
         prior = self.P/.9 if correlated else self.P
@@ -165,8 +169,21 @@ class InertialFilter:
                     covariance=covariance.ravel().tolist())
 
 
+SIGMA_LIMIT_M = .10
+INERTIAL_LIMIT_NS = 1_000_000_000
+# Wall-clock polls lag capture time by native latency. Frames resolve within the
+# 250 ms join deadline, so 500 ms without any processed frame (>= 4 Hz) means
+# frames stopped, not that the pipeline is merely latent.
+FRAME_SILENCE_NS = 500_000_000
+
+
 class ShortTermFusion:
-    """Frame-time fusion. Caller serializes exact-stamp visual results before use."""
+    """Frame-time fusion. Caller serializes exact-stamp visual results before use.
+
+    Per frame: hard time/frame/data errors end the segment; otherwise IMU
+    prediction is followed by an attempted legal visual correction, and only
+    then are predicted (no correction) or corrected uncertainties judged.
+    """
     def __init__(self, segment, frame, clock, K, depth_geometry=False):
         from .rgbd_geometry import DepthRegistration
         self.segment, self.frame, self.clock = segment, frame, clock
@@ -178,10 +195,13 @@ class ShortTermFusion:
         self.geometry = DepthRegistration(K) if depth_geometry else None
         self.reference = None
         self.state, self.reason = 'initializing', 'waiting for 0.5 s low-motion visual/IMU warmup'
-        self.last_frame = self.last_visual = 0
+        self.last_frame = self.last_visual = self.last_confident = 0
+        self.last_processed_ns = self.last_visual_wall = 0
         self.good = 0
         self.aid = 'none'
         self.quality = {}
+        self.frames = deque(maxlen=16)
+        self.last_tracking = None
 
     def fault(self, reason):
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
@@ -211,16 +231,27 @@ class ShortTermFusion:
             raise ValueError(str(error)) from error
 
     def status(self, now_ns):
+        """Wall-clock health for watchdog/info; never judges covariance or
+        resets recovery evidence, which belong to capture-time frame processing."""
         if self.state != 'lost' and self.imu.status(now_ns) == 'lost':
             self.fault('IMU stale or invalid: '+str(self.imu.reason))
         if self.filter is not None and self.state != 'lost':
-            if now_ns-self.last_visual > 1_000_000_000:
+            if self.last_visual_wall and now_ns-self.last_visual_wall > INERTIAL_LIMIT_NS:
                 self.fault('visual correction absent for more than 1 s')
-            elif self.position_sigma() > .10:
-                self.fault('modeled position uncertainty exceeds 0.10 m')
-            elif self.state == 'tracking' and now_ns-self.last_visual > 250_000_000:
-                self.state, self.reason, self.good = 'coasting', 'visual correction delayed', 0
+            elif (self.state == 'tracking' and self.last_processed_ns and
+                    now_ns-self.last_processed_ns > FRAME_SILENCE_NS):
+                self.state, self.reason = 'coasting', 'camera frames delayed'
         return self.state
+
+    def _expire(self, stamp):
+        """Capture-time bounds, checked before this frame can refresh them."""
+        if self.state != 'lost' and self.imu.status(stamp) == 'lost':
+            self.fault('IMU stale or invalid: '+str(self.imu.reason))
+        if self.filter is not None and self.state != 'lost':
+            if stamp-self.last_visual > INERTIAL_LIMIT_NS:
+                self.fault('visual correction absent for more than 1 s')
+            elif stamp-self.last_visual > 250_000_000:
+                self.state, self.reason, self.good = 'coasting', 'visual correction delayed', 0
 
     def position_sigma(self):
         covariance = np.array(self.filter.camera_pose()['covariance']).reshape(6, 6)
@@ -279,16 +310,19 @@ class ShortTermFusion:
         if self.filter.stamp != stamp:
             raise ValueError('IMU history has a propagation gap')
 
-    def observe_frame(self, stamp, color, depth, visual_pose, now_ns, reason=None):
+    def observe_frame(self, stamp, color, depth, visual_pose, now_ns, reason=None, *, arrival_ns=None):
         from .rgbd_geometry import observation_quality
-        # Check capture-time expiry before a new visual observation can refresh it.
-        self.status(stamp)
+        diagnostic = dict(capture_ns=stamp, arrival_ns=arrival_ns, processed_ns=now_ns,
+                          latency_ms=round((now_ns-stamp)/1e6, 1), predicted_sigma_m=None,
+                          corrected_sigma_m=None, visual='missing' if visual_pose is None else 'offered',
+                          visual_reject_reason=reason if visual_pose is None else None)
+        self._expire(stamp)
         if self.state == 'lost':
-            return self.output(stamp)
+            return self._finish(stamp, diagnostic)
         try:
             if stamp <= self.last_frame or not -50_000_000 <= now_ns-stamp <= 1_000_000_000:
                 raise ValueError('fusion frame time is stale, repeated or reset')
-            self.last_frame = stamp
+            self.last_frame, self.last_processed_ns = stamp, now_ns
             self.quality = observation_quality(color, depth)
             covariance = None
             if visual_pose is not None:
@@ -298,54 +332,94 @@ class ShortTermFusion:
                 covariance = observation_covariance(visual_pose)*self.quality['weight']*visual_pose.get('quality_weight', 1.)
                 if not self.quality['visual_usable']:
                     visual_pose = None
+                    diagnostic.update(visual='rejected', visual_reject_reason='image_' + self.quality['reason'])
             if self.filter is None:
                 if visual_pose is not None and self._initialize(stamp, visual_pose):
-                    self.last_visual = stamp
+                    self.last_visual = self.last_confident = stamp
+                    self.last_visual_wall = now_ns
                     self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
-                return self.output(stamp)
+                return self._finish(stamp, diagnostic)
             self._propagate(stamp)
-            self.status(stamp)
-            if self.state == 'lost':
-                return self.output(stamp)
+            diagnostic['predicted_sigma_m'] = self.position_sigma()
+            # A legal visual correction is attempted before predicted
+            # covariance can end the segment; gates and time bounds still apply.
             accepted = visual_pose is not None and self.filter.correct(visual_pose, covariance)
+            if visual_pose is not None and not accepted:
+                diagnostic.update(visual='rejected', visual_reject_reason=self.filter.rejection)
             self.aid = 'visual' if accepted else 'inertial'
             if accepted:
-                self.last_visual = stamp
-                self.good += 1
-                if self.state == 'tracking' or self.good >= 3:
-                    self.state, self.reason = 'tracking', None
-                    self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
+                diagnostic['visual'] = 'accepted'
+                self.last_visual, self.last_visual_wall = stamp, now_ns
+                corrected = diagnostic['corrected_sigma_m'] = self.position_sigma()
+                if corrected > SIGMA_LIMIT_M:
+                    self.good = 0
+                    self.state, self.reason = 'recovering', 'corrected position uncertainty exceeds 0.10 m'
+                    if stamp-self.last_confident > INERTIAL_LIMIT_NS:
+                        self.fault('corrected position uncertainty exceeded 0.10 m for more than 1 s')
                 else:
-                    self.state, self.reason = 'recovering', 'waiting for three consistent visual observations'
+                    self.last_confident = stamp
+                    self.good += 1
+                    if self.state == 'tracking' or self.good >= 3:
+                        self.state, self.reason = 'tracking', None
+                        self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
+                        self.last_tracking = (stamp, self.filter.camera_pose(), deepcopy(visual_pose))
+                    else:
+                        self.state, self.reason = 'recovering', 'waiting for three consistent visual observations'
             else:
                 self.good = 0
                 self.state, self.reason = 'coasting', reason or 'visual observation rejected'
-                if self.geometry and self.reference and stamp-self.reference[0] <= 1_000_000_000:
-                    ref_stamp, ref_depth, ref_pose = self.reference
-                    ref_p, ref_r = pose_values(ref_pose)
-                    predicted = self.filter.camera_pose()
-                    p, r = pose_values(predicted)
-                    initial = np.eye(4)
-                    initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
-                    # Geometry only corrects a bounded prediction; it never
-                    # promotes coasting to tracking or authorizes map integration.
-                    self.quality['geometry'] = dict(
-                        attempted=True, accepted=False, reason='registration_rejected')
-                    result = self.geometry.register(depth, ref_depth, initial)
-                    if result is not None:
-                        self.quality['geometry'].update(
-                            inliers=result['inliers'], rmse=result['rmse'],
-                            overlap=result['overlap'], condition=result['condition'])
-                        measured, geom_cov = geometry_observation(ref_pose, result)
-                        if self.filter.correct(measured, geom_cov, correlated=True):
-                            self.aid = 'depth_geometry'
-                            self.quality['geometry'].update(accepted=True, reason=None)
-                        else:
-                            self.quality['geometry']['reason'] = 'fusion_gate_rejected'
-            self.status(stamp)
+                self._assist_with_geometry(stamp, depth)
+                diagnostic['corrected_sigma_m'] = self.position_sigma() if self.aid == 'depth_geometry' else None
+                if self.position_sigma() > SIGMA_LIMIT_M:
+                    self.fault('predicted position uncertainty exceeds 0.10 m without an accepted visual correction')
         except (ValueError, TypeError, KeyError, np.linalg.LinAlgError) as error:
             self.fault(error)
+        return self._finish(stamp, diagnostic)
+
+    def _assist_with_geometry(self, stamp, depth):
+        if not (self.geometry and self.reference and stamp-self.reference[0] <= 1_000_000_000):
+            return
+        ref_stamp, ref_depth, ref_pose = self.reference
+        ref_p, ref_r = pose_values(ref_pose)
+        p, r = pose_values(self.filter.camera_pose())
+        initial = np.eye(4)
+        initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
+        # Geometry only corrects a bounded prediction; it never
+        # promotes coasting to tracking or authorizes map integration.
+        self.quality['geometry'] = dict(attempted=True, accepted=False, reason='registration_rejected')
+        try:
+            result = self.geometry.register(depth, ref_depth, initial)
+        except (ValueError, TypeError, ArithmeticError, np.linalg.LinAlgError) as error:
+            # An assistance failure skips assistance; it is not a fusion fault.
+            self.quality['geometry']['reason'] = 'registration_error: ' + str(error)[:80]
+            return
+        self._apply_geometry(ref_pose, result)
+
+    def _apply_geometry(self, ref_pose, result):
+        if result is None:
+            return
+        self.quality['geometry'].update(
+            inliers=result['inliers'], rmse=result['rmse'],
+            overlap=result['overlap'], condition=result['condition'])
+        measured, geom_cov = geometry_observation(ref_pose, result)
+        if self.filter.correct(measured, geom_cov, correlated=True):
+            self.aid = 'depth_geometry'
+            self.quality['geometry'].update(accepted=True, reason=None)
+        else:
+            self.quality['geometry']['reason'] = 'fusion_gate_rejected'
+
+    def _finish(self, stamp, diagnostic):
+        diagnostic.update(state=self.state, aid=self.aid)
+        self.frames.append(diagnostic)
         return self.output(stamp)
+
+    def tracking_offset(self):
+        """Fused-vs-visual offset at the last tracking capture, or None."""
+        if self.last_tracking is None:
+            return None
+        _, fused, visual = self.last_tracking
+        (fp, fr), (vp, vr) = pose_values(fused), pose_values(visual)
+        return float(np.linalg.norm(fp-vp)), float(np.linalg.norm(log_rotation(fr.T@vr)))
 
     def output(self, stamp):
         pose = self.filter.camera_pose() if self.filter is not None and self.state != 'lost' else None
@@ -358,12 +432,17 @@ class ShortTermFusion:
         sample['vendor']['fusion']['prediction'] = pose if self.state in ('coasting', 'recovering') else None
         return sample
 
-    def info(self, now_ns):
-        return dict(enabled=True, status=self.status(now_ns), reason=self.reason,
-                    aid=self.aid, quality=deepcopy(self.quality), last_visual_ns=self.last_visual,
-                    last_measurement_ns=self.last_frame, depth_geometry=self.geometry is not None,
-                    prediction_stamp_ns=self.filter.stamp if self.filter is not None else None,
-                    position_sigma_m=self.position_sigma() if self.filter is not None else None,
-                    uncertainty_model='engineering_prior_unvalidated',
-                    translation_integrated=True, mapping_allowed=self.state == 'tracking',
-                    imu=self.imu.info(now_ns))
+    def info(self, now_ns, *, history=False):
+        value = dict(enabled=True, status=self.status(now_ns), reason=self.reason,
+                     aid=self.aid, quality=deepcopy(self.quality), last_visual_ns=self.last_visual,
+                     last_measurement_ns=self.last_frame, depth_geometry=self.geometry is not None,
+                     prediction_stamp_ns=self.filter.stamp if self.filter is not None else None,
+                     position_sigma_m=self.position_sigma() if self.filter is not None else None,
+                     sigma_limit_m=SIGMA_LIMIT_M,
+                     uncertainty_model='engineering_prior_unvalidated',
+                     translation_integrated=True, mapping_allowed=self.state == 'tracking',
+                     imu=self.imu.info(now_ns),
+                     last_frame=deepcopy(self.frames[-1]) if self.frames else None)
+        if history:
+            value['frames'] = deepcopy(list(self.frames))
+        return value
