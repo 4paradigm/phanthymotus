@@ -520,6 +520,40 @@ def test_ocr_layout_repeated_numbers_preserve_vertical_order():
     assert text.find("“10”") < text.find("“20”") < text.rfind("“10”")
 
 
+@pytest.mark.parametrize("boxes,image_size,positions", [
+    ([[50, 80, 130, 96], [750, 80, 830, 96]], (1000, 600), ["画面偏左", "画面偏右"]),
+    ([[450, 30, 530, 46], [450, 500, 530, 516]], (1000, 600), ["位于画面上部", "位于画面下部"]),
+    ([[450, 80, 530, 96], [450, 108, 530, 124]], (1000, 600), []),
+    ([[50, 80, 130, 96], [750, 80, 830, 96]], None, []),
+], ids=["left-right", "top-bottom", "nearby-lines", "unknown-size"])
+def test_ocr_layout_repeated_labels_preserve_distinct_observations(boxes, image_size, positions):
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [{"text": "入口", "bbox": list(box), "score": .99} for box in boxes]
+    before = [{**item, "bbox": list(item["bbox"])} for item in items]
+    payload = build_ocr_payload(items, 0.0, "zh", image_size=image_size)
+    text = payload["text"]
+    assert text.count("“入口”") == 2
+    assert all(position in text for position in positions)
+    if image_size is None:
+        assert "画面" not in text
+    assert items == before
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == before
+
+
+def test_ocr_layout_repeated_labels_do_not_move_past_intervening_text():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [450, y, 530, y + 16], "score": .99}
+             for text, y in [("入口", 30), ("出口", 260), ("入口", 500)]]
+    text = build_ocr_summary(items, (1000, 600))
+    assert text.count("“入口”") == 2
+    assert text.find("“入口”") < text.find("“出口”") < text.rfind("“入口”")
+    assert "位于画面上部" in text and "位于画面下部" in text
+    assert build_ocr_summary(list(reversed(items)), (1000, 600)) == text
+
+
 def test_ocr_layout_date_columns_keep_their_nearby_text():
     from plugins.ocr_summary import build_ocr_summary
 

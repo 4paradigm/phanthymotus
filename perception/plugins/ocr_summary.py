@@ -53,15 +53,17 @@ def _font_size(item):
     return min(max(1, y2 - y1), max(1, x2 - x1) / max(1, units))
 
 def _unique_items(items):
+    """Collapse identical nonnumeric detections only at the same coordinates."""
     unique = {}
     numeric = []
     for item in sorted(items, key=_reading_order):
         if any((char.isdigit() for char in item['text'])):
             numeric.append(item)
             continue
-        previous = unique.get(item['text'])
+        key = (item['text'], tuple(item['bbox']))
+        previous = unique.get(key)
         if previous is None or _font_size(item) > _font_size(previous):
-            unique[item['text']] = item
+            unique[key] = item
     return sorted([*unique.values(), *numeric], key=_reading_order)
 
 def _quotes(items):
@@ -318,28 +320,13 @@ def _describe_group(members):
     return '，'.join(clauses)
 
 def _describe_zone(regions, image_height):
-    repeated = {}
-    for (_position, _y, _x, members) in regions:
-        key = tuple((item['text'] for item in _unique_items(members)))
-        repeated.setdefault(key, []).append(members)
     clauses = []
-    emitted = set()
     for (_position, y, _x, members) in regions:
-        key = tuple((item['text'] for item in _unique_items(members)))
-        occurrences = repeated[key]
-        contains_numbers = any((char.isdigit() for item in members for char in item['text']))
-        if len(occurrences) > 1 and (not contains_numbers):
-            if key in emitted:
-                continue
-            emitted.add(key)
-            representative = [item for group in occurrences for item in group]
-            clauses.append(f'{len(occurrences)}处重复出现' + _quotes(representative))
-        else:
-            clause = _describe_group(members)
-            if _bounds(members)[3] - _bounds(members)[1] < image_height / 3:
-                if y < 1 / 3 or y > 2 / 3:
-                    clause += '（位于画面' + ('上部' if y < 1 / 3 else '下部') + '）'
-            clauses.append(clause)
+        clause = _describe_group(members)
+        if _bounds(members)[3] - _bounds(members)[1] < image_height / 3:
+            if y < 1 / 3 or y > 2 / 3:
+                clause += '（位于画面' + ('上部' if y < 1 / 3 else '下部') + '）'
+        clauses.append(clause)
     prefix = '按从上到下的顺序，' if len(clauses) > 1 else ''
     return prefix + '；另一个文字组中，'.join(clauses)
 
