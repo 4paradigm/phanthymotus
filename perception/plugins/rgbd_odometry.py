@@ -1,11 +1,14 @@
 """Generic RGB-D camera-motion card; robot geometry belongs to the producer."""
 import json
+import logging
 import re
 import threading
+import time
 from copy import deepcopy
 
 from .rgbd_odometry_contract import validate_start_inputs
 from .rgbd_odometry_runtime import RgbdSession, require_runtime
+from utils.ros_lifecycle import dispose_node
 
 
 _INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profile': 'motus_slam/1'}}
@@ -23,6 +26,80 @@ class RgbdOdometryPlugin:
         self.defaults['max_features'] = (config or {}).get('max_features', 1000)
         self.settings = {}
         self.lock = threading.RLock()
+        self.recovery = {}
+        self.retiring = {}
+        self.recovery_node = self.recovery_timer = None
+        self.closed = False
+
+    def _ensure_supervisor(self):
+        if self.recovery_node is None:
+            from rclpy.node import Node
+            self.recovery_node = Node('rgbd_odometry_recovery')
+            self.recovery_timer = self.recovery_node.create_timer(.2, self._recover)
+            self.executor.add_node(self.recovery_node)
+
+    def _recover(self):
+        # This node belongs to the bundle executor, never the session's IMU
+        # executor: closing a retired session must not join its own callback.
+        with self.lock:
+            if self.closed:
+                return
+            now = time.monotonic()
+            for instance, current in list(self.instances.items()):
+                if instance in self.retiring:
+                    continue  # explicit stop must finish incomplete worker cleanup
+                session, signature, bindings = current
+                state = self.recovery[instance]
+                candidate = None
+                try:
+                    info = session.info()
+                    if info['status'] != 'lost':
+                        state['lost_since'] = None
+                        continue
+                    if state['lost_since'] is None:
+                        state['lost_since'] = now
+                    if (now-state['lost_since'] < .8 or
+                            (state['last_attempt'] is not None and now-state['last_attempt'] < 1.5) or
+                            not session.has_fresh_inputs(time.time_ns())):
+                        continue
+                    state['last_attempt'] = now
+                    state['attempts'] += 1
+                    candidate = RgbdSession(session.calibration, self.executor,
+                                            self._outputs(instance)[0]['topic'], publish_output=False)
+                    session.close(report_idle=False)
+                    with candidate.lock:
+                        self.instances[instance] = candidate, signature, bindings
+                        candidate.publish_output = True
+                    state.update(restarts=state['restarts']+1, previous_segment=info['segment_id'],
+                                 reason=info['reason'], error=None, lost_since=None)
+                except Exception as error:
+                    reason = str(error)
+                    if candidate is not None:
+                        try:
+                            candidate.close(report_idle=False)
+                        except Exception as cleanup_error:
+                            self.retiring[instance] = candidate
+                            reason += '; candidate cleanup: ' + str(cleanup_error)
+                    state['error'] = reason
+                    logging.getLogger(__name__).warning('RGB-D recovery %s: %s', instance, reason)
+
+    def _stop_instance(self, instance):
+        failures = []
+        if instance in self.retiring:
+            try:
+                self.retiring[instance].close(report_idle=False)
+                del self.retiring[instance]
+            except Exception as error:
+                failures.append('candidate cleanup: ' + str(error))
+        if instance in self.instances:
+            try:
+                self.instances[instance][0].close()
+                del self.instances[instance]
+            except Exception as error:
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError('; '.join(failures))
+        self.recovery.pop(instance, None)
 
     def get_tools(self):
         return [{'name': 'rgbd_odometry', 'type': 'processor', 'multiInstance': True,
@@ -85,6 +162,10 @@ class RgbdOdometryPlugin:
                     self.settings[instance] = settings
                     return {'state': 'configured', 'config': settings.copy()}
                 if action == 'start':
+                    if self.closed:
+                        raise RuntimeError('RGB-D plugin is shutting down')
+                    if instance in self.retiring:
+                        raise RuntimeError('finish failed RGB-D cleanup with stop before restarting')
                     calibration = validate_start_inputs(args.get('camera_info'), args.get('input_topics'), enabled)
                     calibration.update(settings)
                     geometry = deepcopy(args['camera_info'])
@@ -98,6 +179,7 @@ class RgbdOdometryPlugin:
                         raise ValueError('stop RGB-D odometry before changing its input geometry')
                     if not current:
                         require_runtime()
+                        self._ensure_supervisor()
                         bindings = [{'topic': calibration[k + '_topic'], 'format': f}
                                     for k, f in (('color', 'image/jpeg'), ('depth', 'image/depth-zlib'))]
                         if enabled:
@@ -105,27 +187,33 @@ class RgbdOdometryPlugin:
                         current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic']), signature, bindings)
                         self.instances[instance] = current
                         self.settings[instance] = settings
+                        self.recovery[instance] = dict(lost_since=None, last_attempt=None,
+                            attempts=0, restarts=0, previous_segment=None, reason=None, error=None)
                 elif action == 'stop':
-                    if current:
-                        current[0].close()
-                        del self.instances[instance]
+                    self._stop_instance(instance)
                     current = None
                 elif action != 'info':
                     raise ValueError('unknown RGB-D odometry action')
                 return {**(current[0].info() if current else {'state': 'idle'}),
                         'topic_out': self._outputs(instance), 'odom_interface': _INTERFACE,
                         'topic_in': current[2] if current else [],
+                        'recovery': {k: v for k, v in self.recovery.get(instance, {}).items()
+                                     if k not in ('lost_since', 'last_attempt')},
                         'config': self.settings.get(instance, self.defaults).copy()}
             except (ValueError, RuntimeError, ImportError, LookupError) as error:
                 return {'state': 'error', 'message': str(error)}
 
     def shutdown(self):
         with self.lock:
+            self.closed = True
+            if self.recovery_node is not None:
+                self.recovery_node.destroy_timer(self.recovery_timer)
+                dispose_node(self.executor, self.recovery_node, label='RGB-D recovery')
+                self.recovery_node = self.recovery_timer = None
             failures = []
-            for instance in list(self.instances):
+            for instance in set(self.instances) | set(self.retiring):
                 try:
-                    self.instances[instance][0].close()
-                    del self.instances[instance]
+                    self._stop_instance(instance)
                 except Exception as error:
                     failures.append(f'{instance}: {error}')
             if failures:

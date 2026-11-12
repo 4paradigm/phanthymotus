@@ -207,7 +207,7 @@ class CaptureObservations:
 
 
 class RgbdSession:
-    def __init__(self, calibration, executor, topic):
+    def __init__(self, calibration, executor, topic, *, publish_output=True):
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
@@ -215,6 +215,7 @@ class RgbdSession:
         from nav_msgs.msg import Odometry
         from rtabmap_msgs.msg import RGBDImage, OdomInfo
         self.calibration, self.executor, self.topic = calibration, executor, topic
+        self.publish_output = publish_output
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
         self.gate = EstimateGate(self.segment, calibration['frame_id'], calibration['clock_id'])
         self.fusion = (ShortTermFusion(self.segment, calibration['frame_id'], calibration['clock_id'],
@@ -229,6 +230,7 @@ class RgbdSession:
         self.imu_queue_lock = threading.Lock()
         self.imu_pending, self.imu_overflow = deque(), False
         self.pairs, self.pending = PairBuffer(), queue.Queue(maxsize=1)
+        self.latest_inputs = {}
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
         self.registration_by_stamp = OrderedDict()
         self.last_registration = None
@@ -288,13 +290,15 @@ class RgbdSession:
                 cmd.extend(['-r', 'imu:=/' + self.segment + '/imu'])
             self.process = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT,
                 start_new_session=True, env=dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1'))
-            self.worker = threading.Thread(target=self._work, name=self.segment, daemon=True)
-            self.worker.start()
+            worker = threading.Thread(target=self._work, name=self.segment, daemon=True)
+            worker.start()
+            self.worker = worker
             if self.owns_executor:
-                self.spin_worker = threading.Thread(target=self._spin, name=self.segment+'_ros', daemon=True)
-                self.spin_worker.start()
+                spin_worker = threading.Thread(target=self._spin, name=self.segment+'_ros', daemon=True)
+                spin_worker.start()
+                self.spin_worker = spin_worker
         except Exception:
-            self.close()
+            self.close(report_idle=False)
             raise
 
     def _spin(self):
@@ -313,11 +317,14 @@ class RgbdSession:
             return
         with self.lock:
             self._drain_imu()
-            if self.gate.status(time.time_ns()) == 'lost':
-                return
             try:
                 if msg.header.frame_id != self.calibration['frame_id']:
                     raise ValueError('image optical frame differs from calibration')
+                now, stamp = time.time_ns(), stamp_ns(msg)
+                if stamp > self.latest_inputs.get(kind, 0) and -50_000_000 <= now-stamp <= 1_500_000_000:
+                    self.latest_inputs[kind] = stamp
+                if self.gate.status(now) == 'lost':
+                    return
                 pair = self.pairs.push(kind, stamp_ns(msg), msg, time.time_ns())
                 if pair:
                     self.gate.input(pair[1][0], now_ns=time.time_ns())
@@ -327,6 +334,12 @@ class RgbdSession:
                     self.pending.put_nowait(pair)
             except (ValueError, queue.Full) as error:
                 self.gate.fault(error)
+
+    def has_fresh_inputs(self, now_ns):
+        with self.lock:
+            return all(kind in self.latest_inputs and
+                       -50_000_000 <= now_ns-self.latest_inputs[kind] <= 1_500_000_000
+                       for kind in ('color', 'depth'))
 
     def _mount(self, msg):
         with self.lock:
@@ -467,6 +480,8 @@ class RgbdSession:
                     self.gate.fault(error)
 
     def _publish(self, sample):
+        if not self.publish_output:
+            return  # a replacement cannot advertise tracking before old cleanup succeeds
         from std_msgs.msg import String
         self._drain_imu()
         now = time.time_ns()
@@ -614,7 +629,7 @@ class RgbdSession:
                     'body_mount': self.mounts.info(time.time_ns()) if self.mounts else {'status': 'undeclared'},
                     'estimator_log': str(Path(self.directory.name) / 'estimator.log')}
 
-    def close(self):
+    def close(self, *, report_idle=True):
         self.stop_event.set()
         if self.spin_worker is not None:
             self.spin_worker.join(timeout=5)
@@ -639,7 +654,7 @@ class RgbdSession:
                     continue
             self.process.wait(timeout=1)
         try:
-            if self.status_publisher is not None:
+            if report_idle and self.status_publisher is not None:
                 self._publish_status(make_sample('idle', time.time_ns(), self.segment,
                     self.calibration['clock_id'], reason='RGB-D odometry stopped'), time.time_ns())
         finally:

@@ -1,3 +1,4 @@
+from vision_stubs import _FakeExecutor
 from types import SimpleNamespace as NS
 
 import pytest
@@ -71,7 +72,7 @@ def test_card_exposes_common_odom_and_isolates_instances(monkeypatch):
     from plugins import rgbd_odometry as module
     monkeypatch.setattr(module,'RgbdSession',Session)
     monkeypatch.setattr(module,'require_runtime',lambda:None)
-    Session.created=[];card=RgbdOdometryPlugin({},object())
+    Session.created=[];card=RgbdOdometryPlugin({},_FakeExecutor())
     tool=card.get_tools()[0]
     assert [p['format'] for p in tool['topic_in']]==['image/jpeg','image/depth-zlib','sensor/imu']
     assert tool['odom_interface']['slam_pose']['profile']=='motus_slam/1'
@@ -87,7 +88,7 @@ def test_card_exposes_common_odom_and_isolates_instances(monkeypatch):
 def test_invalid_geometry_never_launches_estimator(monkeypatch):
     from plugins import rgbd_odometry as module
     monkeypatch.setattr(module,'RgbdSession',Session)
-    Session.created=[];card=RgbdOdometryPlugin({},object())
+    Session.created=[];card=RgbdOdometryPlugin({},_FakeExecutor())
     result=card.dispatch('rgbd_odometry',{'action':'start','input_topics':['/rgb','/depth']})
     assert result['state']=='error' and not Session.created
 
@@ -96,7 +97,7 @@ def test_canvas_card_ids_produce_valid_distinct_ros_topics(monkeypatch):
     from plugins import rgbd_odometry as module
     monkeypatch.setattr(module,'RgbdSession',Session)
     monkeypatch.setattr(module,'require_runtime',lambda:None)
-    card=RgbdOdometryPlugin({},object())
+    card=RgbdOdometryPlugin({},_FakeExecutor())
     a=start(card,'card-m123');b=start(card,'card_m123')
     assert a['state']=='running' and b['state']=='running'
     assert a['topic_out']!=b['topic_out']
@@ -158,7 +159,7 @@ def test_process_exit_during_stop_still_releases_node_and_tempfiles(monkeypatch)
 
 
 def test_shutdown_attempts_other_instances_when_one_cleanup_fails():
-    card=RgbdOdometryPlugin({},object());other=Session({},None,'/two')
+    card=RgbdOdometryPlugin({},_FakeExecutor());other=Session({},None,'/two')
     def fail():raise RuntimeError('cannot stop first estimator')
     card.instances={'first':(NS(close=fail),'a'),'second':(other,'b')}
     with pytest.raises(RuntimeError):card.shutdown()
@@ -172,7 +173,7 @@ def test_imu_toggle_is_per_instance_and_requires_third_binding(monkeypatch):
             super().__init__(calibration,executor,topic);self.calibration=calibration
     monkeypatch.setattr(module,'RgbdSession',RecordingSession)
     monkeypatch.setattr(module,'require_runtime',lambda:None)
-    card=RgbdOdometryPlugin({},object())
+    card=RgbdOdometryPlugin({},_FakeExecutor())
     field=card.get_tools()[0]['configSchema']['properties']['imu_assisted']
     assert field['default'] is False and field['scope']=='instance'
     result=card.dispatch('rgbd_odometry',{'action':'config','instance_id':'one','imu_assisted':True})
@@ -190,7 +191,7 @@ def test_imu_toggle_is_per_instance_and_requires_third_binding(monkeypatch):
 
 
 def test_invalid_boolean_toggle_does_not_silently_enable_imu():
-    card=RgbdOdometryPlugin({},object())
+    card=RgbdOdometryPlugin({},_FakeExecutor())
     assert card.dispatch('rgbd_odometry',{'action':'config','imu_assisted':'false'})['state']=='error'
 
 
@@ -205,7 +206,7 @@ def test_visual_frontend_settings_are_instance_scoped_and_require_restart(monkey
     monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
     monkeypatch.setattr(module, 'require_runtime', lambda: None)
     Session.created = []
-    card = RgbdOdometryPlugin({}, object())
+    card = RgbdOdometryPlugin({}, _FakeExecutor())
     schema = card.get_tools()[0]['configSchema']['properties']
     assert schema['visual_frontend']['enum'] == ['f2m_feature', 'f2f_optical_flow']
     assert schema['visual_frontend']['default'] == 'f2m_feature'
@@ -254,7 +255,7 @@ def test_invalid_frontend_settings_never_launch_estimator(monkeypatch, options):
     from plugins import rgbd_odometry as module
     monkeypatch.setattr(module, 'RgbdSession', Session)
     Session.created = []
-    card = RgbdOdometryPlugin({}, object())
+    card = RgbdOdometryPlugin({}, _FakeExecutor())
     result = card.dispatch('rgbd_odometry', dict(
         action='start', input_topics=['/rgb', '/depth'],
         camera_info=declarations(), **options))

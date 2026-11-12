@@ -145,8 +145,15 @@ RGB-D output available; use `imu_assisted=false` when no usable IMU exists.
 Actions are `start`, `stop`, `info` and `config`, with optional `instance_id`. Source
 startup must return its calibration before the downstream card starts. Tracking
 requires matching valid pose/diagnostic measurements. A lost diagnostic, stale
-input or expired estimate ends the segment; stop and start again to create a
-new estimator/segment. A held pose is never republished as fresh tracking.
+input or expired estimate ends the segment. With fresh RGB and depth, a separate
+supervisor attempts a new estimator/segment after 0.8 s, at most once every 1.5 s.
+Each successful restart has a new segment, coordinate origin and IMU/fusion
+history; it must pass the normal tracking/warmup gates again. The old position
+is never carried across that boundary or republished as fresh tracking. Recovery
+does not claim a continuous map or corrected motion accuracy. `info().recovery`
+reports attempts, successful restarts, previous segment and errors. Manual stop
+and bundle shutdown cancel recovery. Automatic replacement does not emit idle;
+explicit stop still does. Input/settings changes continue to require stop/start.
 
 For current Core's topic-only SLAM path, map provenance explicitly records
 unverified timestamp overlap. The stricter SLAM declaration path still requires
@@ -182,8 +189,8 @@ Missing motion hardware/calibration is reported, never replaced by zero.
 
 Initialization waits for at least 0.5 s of visually observed near-stationary
 position **and orientation**, low angular speed and stable gravity magnitude.
-Keep the camera still for startup; failure to initialize within 15 s requires
-a restart. Initial velocity is estimated from visual motion rather than
+Keep the camera still for startup; failure to initialize within 15 s retires
+the segment and permits the supervised retry above. Initial velocity is estimated from visual motion rather than
 assumed zero. Visual observations use inlier counts, finite PSD covariance,
 image contrast/sharpness and valid measured-depth fraction. Independent
 capture clocks need bracketing IMU coverage, not identical sensor rates.

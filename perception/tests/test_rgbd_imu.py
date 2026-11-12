@@ -225,6 +225,7 @@ def session(monkeypatch):
             self.orientation_covariance=[0.]*9
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'],'Imu',Imu,raising=False)
     obj=object.__new__(runtime.RgbdSession)
+    obj.publish_output=True
     obj.lock=threading.RLock();obj.stop_event=threading.Event();obj.imu=aid()
     obj.calibration={'frame_id':'optical','clock_id':'capture-clock'}
     obj.fusion=None;obj.registration_by_stamp=OrderedDict()

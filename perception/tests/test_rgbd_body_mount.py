@@ -1,3 +1,4 @@
+from vision_stubs import _FakeExecutor
 """Exact capture-time body mount propagation; main camera reference is preserved."""
 from collections import OrderedDict
 from copy import deepcopy
@@ -168,6 +169,7 @@ def test_runtime_automatically_attaches_mount_without_altering_main_odom(monkeyp
     from plugins import rgbd_odometry_runtime as runtime
     monkeypatch.setattr(sys.modules['std_msgs.msg'], 'String', lambda **kw: NS(**kw))
     obj = object.__new__(runtime.RgbdSession)
+    obj.publish_output = True
     obj.mounts = mounts(); obj.imu = None
     obj.calibration = {}; obj.fusion = None
     obj.gate = runtime.EstimateGate('run', 'camera_optical', 'camera-clock')
@@ -199,7 +201,7 @@ def test_card_repeated_start_ignores_only_mount_liveness_snapshot(monkeypatch):
     values = declarations()
     for entry in values.values():
         entry['vendor']['body_mount'] = declaration(child_frame=entry['vendor']['frame_id'])
-    card = module.RgbdOdometryPlugin({}, object())
+    card = module.RgbdOdometryPlugin({}, _FakeExecutor())
     args = dict(action='start', camera_info=values, input_topics=['/rgb', '/depth'])
     assert card.dispatch('rgbd_odometry', args)['state'] == 'running'
     for entry in values.values():

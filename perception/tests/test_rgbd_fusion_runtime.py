@@ -1,3 +1,4 @@
+from vision_stubs import _FakeExecutor
 from collections import OrderedDict
 from types import SimpleNamespace as NS
 
@@ -84,7 +85,7 @@ def test_fusion_mode_owns_imu_and_geometry_requires_compensation(monkeypatch):
             super().__init__(calibration, executor, topic); self.calibration = calibration
     monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
     monkeypatch.setattr(module, 'require_runtime', lambda: None)
-    card = RgbdOdometryPlugin({}, object())
+    card = RgbdOdometryPlugin({}, _FakeExecutor())
     props = card.get_tools()[0]['configSchema']['properties']
     assert props['short_term_compensation']['default'] is False
     assert props['depth_geometry']['default'] is False
