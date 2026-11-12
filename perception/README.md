@@ -38,6 +38,26 @@ relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
 driver repository. G1 requires SDK global capture time; Bumi also exposes its
 existing fixed hardware-clock offset explicitly as unverified provenance.
 
+Algorithm settings are available only through the card's instance configuration
+(gear button), without duplicate form fields. The platform still supplies the
+instance ID, input topics and camera calibration automatically. Saved `config`
+replay and direct dispatch arguments remain supported.
+
+The original first `state/odom` port and its topic are unchanged. A second
+`data/json` port publishes `/rgbd_odometry/i_<hex-instance-id>/status` for display,
+using Bumi's summary fields: `status`, `turn_angle_deg`, `displacement_m`,
+`position_m`, `pose_reference`, `age_ms`, `reason`. Position refers to the camera;
+displacement is straight-line distance from the first valid pose of this
+estimator segment, not path length. `turn_angle_deg` stays null because the
+generic camera contract does not define body yaw. Position/displacement are null
+outside tracking, and age is null without a measurement timestamp; ESKF
+predictions never become a valid summary pose. Same-state summaries are limited
+to 5 Hz, with immediate state/reason changes. Stopping publishes `idle` before
+releasing the session. Connect the existing `state/odom` port to SLAM and use
+`data/json` for the status display. Status transport failures are logged without
+retiring valid odometry or blocking session cleanup/restart. This applies to Tianyi, G1
+and Bumi without changing their drivers.
+
 ### Optional visual registration frontend (PR #371)
 
 Each `rgbd_odometry` instance supports `visual_frontend` in `config`:

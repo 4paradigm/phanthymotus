@@ -28,12 +28,7 @@ class RgbdOdometryPlugin:
         return [{'name': 'rgbd_odometry', 'type': 'processor', 'multiInstance': True,
                  'description': 'RGB-D 视觉里程计：从配准彩色和实测深度估计相机位姿',
                  'inputSchema': {'type': 'object', 'properties': {
-                     'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config']},
-                     'instance_id': {'type': 'string'}, 'input_topics': {'type': 'array', 'items': {'type': 'string'}},
-                     'camera_info': {'type': 'object'}, 'imu_assisted': {'type': 'boolean'},
-                     'short_term_compensation': {'type': 'boolean'}, 'depth_geometry': {'type': 'boolean'},
-                     'visual_frontend': {'type': 'string', 'enum': ['f2m_feature', 'f2f_optical_flow']},
-                     'max_features': {'type': 'integer', 'minimum': 100, 'maximum': 5000}}},
+                     'action': {'type': 'string', 'enum': ['start', 'stop', 'info']}}},
                  'configSchema': {'type': 'object', 'properties': {
                      'imu_assisted': {'type': 'boolean', 'default': False, 'scope': 'instance',
                                       'description': '启用可选相机 IMU 辅助（需要第三路 IMU 输入）'},
@@ -55,7 +50,9 @@ class RgbdOdometryPlugin:
 
     @staticmethod
     def _outputs(instance):
-        return [{'topic': '/rgbd_odometry/i_' + instance.encode('utf-8').hex() + '/state/odom', 'format': 'state/odom'}]
+        root = '/rgbd_odometry/i_' + instance.encode('utf-8').hex()
+        return [{'topic': root + '/state/odom', 'format': 'state/odom'},
+                {'topic': root + '/status', 'format': 'data/json'}]
 
     def dispatch(self, name, args):
         if name != 'rgbd_odometry':

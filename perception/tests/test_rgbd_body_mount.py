@@ -175,6 +175,9 @@ def test_runtime_automatically_attaches_mount_without_altering_main_odom(monkeyp
     obj.lock = threading.RLock(); obj.stop_event = threading.Event()
     published = []
     obj.publisher = NS(publish=lambda msg: published.append(json.loads(msg.data)))
+    obj.status_publisher = NS(publish=lambda msg: None)
+    obj.summary_origin = None
+    obj.last_summary_ns = obj.last_summary_state = None
     monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_010_000_123)
     transform = np.eye(4); transform[0, 3] = .2
     obj._mount(NS(data=json.dumps(packet(matrix=transform))))

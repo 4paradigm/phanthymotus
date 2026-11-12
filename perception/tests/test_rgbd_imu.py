@@ -122,6 +122,7 @@ def test_session_buffers_imu_bursts_without_expanding_image_queues(monkeypatch, 
     from types import SimpleNamespace as NS
     from plugins import rgbd_odometry_runtime as runtime
     from vision_stubs import _FakeExecutor, _FakeNode
+    monkeypatch.setattr(sys.modules['std_msgs.msg'], 'String', lambda **kw: NS(**kw))
     owned = []
     def single_executor(*, context):
         executor = _FakeExecutor(); executor.context = context; executor.closed = False
@@ -180,6 +181,7 @@ def test_private_callback_worker_stops_before_node_and_executor_cleanup():
     obj.lock = threading.RLock(); obj.stop_event = threading.Event()
     obj.gate = runtime.EstimateGate('run', 'optical', 'capture-clock'); obj.fusion = None
     obj.worker = obj.process = obj.log = None; obj.owns_executor = True
+    obj.status_publisher = None
     obj.directory = tempfile.TemporaryDirectory(); obj.segment = 'run'
     entered = threading.Event(); events = []
     def spin_once(timeout_sec): entered.set(); obj.stop_event.wait(.01)
@@ -226,6 +228,8 @@ def session(monkeypatch):
     obj.lock=threading.RLock();obj.stop_event=threading.Event();obj.imu=aid()
     obj.calibration={'frame_id':'optical','clock_id':'capture-clock'}
     obj.fusion=None;obj.registration_by_stamp=OrderedDict()
+    obj.status_publisher=NS(publish=lambda msg:None)
+    obj.summary_origin=None;obj.last_summary_ns=obj.last_summary_state=None
     obj.segment='run';obj.gate=runtime.EstimateGate('run','optical','capture-clock')
     obj.process=None;obj.started=runtime.time.monotonic()
     published=[];obj.imu_pub=NS(publish=published.append);obj._publish=lambda sample:None

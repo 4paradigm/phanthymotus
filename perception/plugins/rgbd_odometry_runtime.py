@@ -3,6 +3,8 @@ from collections import OrderedDict, deque
 from array import array
 from copy import deepcopy
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import queue
@@ -230,6 +232,9 @@ class RgbdSession:
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
         self.registration_by_stamp = OrderedDict()
         self.last_registration = None
+        self.status_publisher = None
+        self.summary_origin = None
+        self.last_summary_ns = self.last_summary_state = None
         self.native_reports = 0
         self.stop_event = threading.Event()
         self.process = self.worker = None
@@ -246,6 +251,8 @@ class RgbdSession:
                 self.executor = SingleThreadedExecutor(context=self.node.context)
                 self.owns_executor = True
             self.publisher = self.node.create_publisher(String, topic, qos_profile_sensor_data)
+            self.status_publisher = self.node.create_publisher(
+                String, topic.removesuffix('/state/odom') + '/status', qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
             for kind in ('color', 'depth'):
                 self.node.create_subscription(CompressedImage, calibration[kind + '_topic'],
@@ -482,6 +489,34 @@ class RgbdSession:
         sample['vendor']['registration'] = report
         self.last_registration = deepcopy(report)
         self.publisher.publish(String(data=json.dumps(sample, allow_nan=False)))
+        self._publish_status(sample, now)
+
+    def _publish_status(self, sample, now):
+        """Bumi-shaped display summary; never promote a fusion prediction to pose."""
+        from std_msgs.msg import String
+        vendor = sample['vendor']
+        slam = vendor['motus_slam']
+        state = (slam['status'], vendor['reason'])
+        tick = time.monotonic_ns()
+        if (self.last_summary_ns is not None and tick-self.last_summary_ns < 200_000_000
+                and state == self.last_summary_state):
+            return
+        position = sample['pose']['position'] if sample['pose'] is not None else None
+        if position is not None and self.summary_origin is None:
+            self.summary_origin = list(position)
+        summary = dict(status=slam['status'], turn_angle_deg=None,
+                       displacement_m=round(math.dist(position, self.summary_origin), 3)
+                       if position is not None else None,
+                       position_m=[round(v, 3) for v in position] if position is not None else None,
+                       pose_reference=vendor['pose_reference'],
+                       age_ms=round((now-slam['stamp_ns'])/1e6, 1)
+                       if slam['stamp_source'] == 'measurement' else None,
+                       reason=vendor['reason'])
+        try:
+            self.status_publisher.publish(String(data=json.dumps(summary, allow_nan=False)))
+        except Exception as error:
+            logging.getLogger(__name__).warning('RGB-D status unavailable: %s', error)
+        self.last_summary_ns, self.last_summary_state = tick, state
 
     def _remember_native(self, msg):
         """Store only capture-time-matched diagnostics, with bounded memory."""
@@ -603,9 +638,14 @@ class RgbdSession:
                 except subprocess.TimeoutExpired:
                     continue
             self.process.wait(timeout=1)
-        dispose_node(self.executor, self.node, label=self.segment)
-        if self.owns_executor:
-            self.executor.shutdown(timeout_sec=5)
-        if self.log is not None:
-            self.log.close()
-        self.directory.cleanup()
+        try:
+            if self.status_publisher is not None:
+                self._publish_status(make_sample('idle', time.time_ns(), self.segment,
+                    self.calibration['clock_id'], reason='RGB-D odometry stopped'), time.time_ns())
+        finally:
+            dispose_node(self.executor, self.node, label=self.segment)
+            if self.owns_executor:
+                self.executor.shutdown(timeout_sec=5)
+            if self.log is not None:
+                self.log.close()
+            self.directory.cleanup()
