@@ -310,9 +310,9 @@ class ShortTermFusion:
             accepted = visual_pose is not None and self.filter.correct(visual_pose, covariance)
             self.aid = 'visual' if accepted else 'inertial'
             if accepted:
+                self.last_visual = stamp
                 self.good += 1
                 if self.state == 'tracking' or self.good >= 3:
-                    self.last_visual = stamp
                     self.state, self.reason = 'tracking', None
                     self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
                 else:

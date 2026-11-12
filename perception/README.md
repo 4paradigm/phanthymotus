@@ -180,6 +180,14 @@ cloud admission and clears pending interpolation pairs; it resumes in the
 same segment only after bounded verified tracking recovery. True `lost`,
 coordinate changes and source resets still retire the segment.
 
+IMU ingress uses a separate callback group and a bounded 100-packet FIFO so
+visual processing does not discard capture intervals. Filter updates remain
+serialized, processing one snapshot per pass. The 500 ms freshness check runs
+when each packet is consumed;
+queue overflow retires the segment. Each accepted visual correction refreshes
+the correction timeout during recovery, while mapping still requires three
+consistent visual observations.
+
 The short-outage offline validation target is 0.5 s. A hard 1 s visual
 correction timeout or modeled position standard deviation above 0.10 m ends
 the segment; rejection/geometry cannot extend that timeout. Noise and
@@ -200,8 +208,9 @@ Mapping remains paused throughout coasting.
 
 All three source adapters and the fusion/SLAM boundaries have offline tests.
 Synthetic trajectories and rendered rooms validate code signs, units and
-policy, not actual robot precision or native camera tracking. Hardware tests,
-driver updates and deployment remain deferred until explicitly requested.
+policy, not actual robot precision or native camera tracking. Tianyi raw IMU
+clock and attitude checks have begun; sustained ESKF/depth operation has not
+passed hardware acceptance. G1/Bumi hardware tests remain pending.
 
 ## Audio Requirements for ASR
 

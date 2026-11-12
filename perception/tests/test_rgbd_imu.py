@@ -116,6 +116,40 @@ def test_native_estimator_parameters_only_enable_imu_when_requested():
     assert assisted['frame_id']=='optical'
 
 
+def test_session_buffers_imu_bursts_without_expanding_image_queues(monkeypatch):
+    import sys
+    from types import SimpleNamespace as NS
+    from plugins import rgbd_odometry_runtime as runtime
+    from vision_stubs import _FakeExecutor, _FakeNode
+    sensor_qos = object()
+    monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', sensor_qos, raising=False)
+    monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'Imu', object, raising=False)
+    monkeypatch.setitem(sys.modules, 'rtabmap_msgs.msg', NS(RGBDImage=object, OdomInfo=object))
+    monkeypatch.setitem(sys.modules, 'nav_msgs.msg', NS(Odometry=object))
+    monkeypatch.setitem(sys.modules, 'rclpy.callback_groups', NS(MutuallyExclusiveCallbackGroup=object))
+    original = _FakeNode.create_subscription
+    def subscribe(node, kind, topic, callback, qos, *, callback_group=None):
+        sub = original(node, kind, topic, callback, qos)
+        sub.callback_group = callback_group
+        return sub
+    monkeypatch.setattr(_FakeNode, 'create_subscription', subscribe)
+    monkeypatch.setattr(runtime, 'require_runtime', lambda: '/offline/estimator')
+    monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *a, **kw: NS(poll=lambda: 0, wait=lambda **kw: 0))
+    monkeypatch.setattr(runtime.threading, 'Thread', lambda **kw: NS(start=lambda: None, join=lambda **kw: None, is_alive=lambda: False))
+    calibration = dict(frame_id='optical', clock_id='capture-clock', K=np.eye(3),
+                       color_topic='/rgb', depth_topic='/depth', imu_topic='/motion')
+    obj = runtime.RgbdSession(calibration, _FakeExecutor(), '/out')
+    try:
+        qos = {s.topic: s.qos for s in obj.node.subscriptions}
+        assert qos['/motion'].depth == 100
+        assert qos['/motion'].reliability == 'best_effort'
+        assert qos['/rgb'] is sensor_qos and qos['/depth'] is sensor_qos
+        groups = {s.topic: s.callback_group for s in obj.node.subscriptions}
+        assert groups['/motion'] is not None and groups['/rgb'] is None
+    finally:
+        obj.close()
+
+
 def session(monkeypatch):
     import json,threading
     from types import SimpleNamespace as NS
@@ -137,6 +171,82 @@ def session(monkeypatch):
     obj.process=None;obj.started=runtime.time.monotonic()
     published=[];obj.imu_pub=NS(publish=published.append);obj._publish=lambda sample:None
     return obj,published,runtime,NS,json
+
+
+@pytest.mark.parametrize('delay_ns,active', [(101_000_000, True), (601_000_000, False)])
+def test_imu_ingress_keeps_intervals_but_rejects_stale_backlog(monkeypatch, delay_ns, active):
+    import threading
+    from collections import deque
+    obj, published, runtime, NS, json = session(monkeypatch)
+    obj.imu_pending = deque();obj.imu_queue_lock = threading.Lock();obj.imu_overflow = False
+    monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_000_000_000+delay_ns)
+    def receive():
+        for i in range(20):
+            obj._enqueue_imu(NS(data=json.dumps(packet(1_000_000_000+i*5_000_000))))
+    with obj.lock:
+        receiver = threading.Thread(target=receive)
+        receiver.start();receiver.join(timeout=1)
+        assert not receiver.is_alive()  # ingress must not wait for visual processing
+        assert len(obj.imu_pending) == 20 and not published
+    with obj.lock:
+        obj._drain_imu()
+    if active:
+        assert len(published) == 20 and obj.imu.state == 'active'
+        assert list(obj.imu.history) == [1_000_000_000+i*5_000_000 for i in range(20)]
+    else:
+        assert not published and obj.imu.state == 'lost'
+
+
+def test_imu_ingress_overflow_retires_segment_instead_of_hiding_dropped_captures(monkeypatch):
+    import threading
+    from collections import deque
+    obj, published, runtime, NS, json = session(monkeypatch)
+    obj.imu_pending = deque([NS(data=json.dumps(packet()))]*100)
+    obj.imu_queue_lock = threading.Lock();obj.imu_overflow = False
+    with obj.lock:
+        receiver = threading.Thread(target=lambda: obj._enqueue_imu(NS(data=json.dumps(packet()))))
+        receiver.start();receiver.join(timeout=1)
+        assert not receiver.is_alive()
+        obj._drain_imu()
+    assert not published and obj.gate.state == obj.imu.state == 'lost'
+    assert 'overflow' in obj.imu.reason
+
+
+def test_imu_ingress_only_queues_and_draining_does_not_chase_new_arrivals(monkeypatch):
+    import threading
+    from collections import deque
+    obj, published, runtime, NS, json = session(monkeypatch)
+    obj.imu_pending = deque();obj.imu_queue_lock = threading.Lock();obj.imu_overflow = False
+    obj._enqueue_imu(NS(data=json.dumps(packet())))
+    assert len(obj.imu_pending) == 1 and not published
+    consumed = []
+    def consume(msg):
+        consumed.append(msg)
+        if len(consumed) == 1:
+            obj._enqueue_imu(NS(data='next batch'))
+    obj._imu = consume
+    with obj.lock:
+        obj._drain_imu()
+    assert len(consumed) == 1 and len(obj.imu_pending) == 1
+
+
+def test_imu_fault_during_publication_cannot_emit_a_prebuilt_tracking_pose(monkeypatch):
+    import sys, threading
+    from collections import deque
+    obj, _, runtime, NS, json = session(monkeypatch)
+    obj.imu_pending = deque();obj.imu_queue_lock = threading.Lock();obj.imu_overflow = True
+    monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_001_000_000)
+    monkeypatch.setattr(sys.modules['std_msgs.msg'], 'String', lambda **kw: NS(**kw))
+    output = []
+    obj.publisher = NS(publish=lambda msg: output.append(json.loads(msg.data)))
+    pose = dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.],
+                covariance=(np.eye(6)*.0001).ravel().tolist(),
+                frame_id='run_odom', child_frame_id='optical')
+    sample = runtime.make_sample('tracking', 1_000_000_000, 'run', 'capture-clock', pose)
+    runtime.RgbdSession._publish(obj, sample)
+    assert obj.gate.state == 'lost'
+    assert output[0]['vendor']['motus_slam']['status'] == 'lost'
+    assert output[0]['pose'] is None
 
 
 def test_private_imu_retains_source_stamp_and_outputs_camera_attitude(monkeypatch):

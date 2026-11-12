@@ -1,5 +1,5 @@
 """One supervised RTAB-Map estimator per calibrated RGB-D card instance."""
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from copy import deepcopy
 import json
 import os
@@ -206,7 +206,7 @@ class CaptureObservations:
 class RgbdSession:
     def __init__(self, calibration, executor, topic):
         from rclpy.node import Node
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
         from nav_msgs.msg import Odometry
@@ -223,6 +223,8 @@ class RgbdSession:
         self.imu = (self.fusion.imu if self.fusion else
                     ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None)
         self.lock = threading.RLock()
+        self.imu_queue_lock = threading.Lock()
+        self.imu_pending, self.imu_overflow = deque(), False
         self.pairs, self.pending = PairBuffer(), queue.Queue(maxsize=1)
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
         self.registration_by_stamp = OrderedDict()
@@ -247,9 +249,15 @@ class RgbdSession:
                                           lambda m: self._result('info', m), qos_profile_sensor_data)
             if self.imu is not None:
                 from sensor_msgs.msg import Imu
+                from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
                 if self.fusion is None:
                     self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
-                self.node.create_subscription(String, calibration['imu_topic'], self._imu, qos_profile_sensor_data)
+                # Preserve capture intervals while a visual correction occupies
+                # the callback group; admission still rejects samples over 500 ms old.
+                imu_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
+                self.imu_callback_group = MutuallyExclusiveCallbackGroup()
+                self.node.create_subscription(String, calibration['imu_topic'], self._enqueue_imu, imu_qos,
+                                              callback_group=self.imu_callback_group)
             if self.mounts is not None:
                 self.node.create_subscription(String, self.mounts.declaration['topic'], self._mount, qos_profile_sensor_data)
             self.node.create_timer(.05 if self.fusion else .2, self._watchdog)
@@ -276,6 +284,7 @@ class RgbdSession:
         if self.stop_event.is_set():
             return
         with self.lock:
+            self._drain_imu()
             if self.gate.status(time.time_ns()) == 'lost':
                 return
             try:
@@ -300,6 +309,34 @@ class RgbdSession:
             except (ValueError, TypeError, AttributeError) as error:
                 # Body-reference evidence is optional: camera VO remains valid.
                 self.mounts.fault(error)
+
+    def _enqueue_imu(self, msg):
+        if self.stop_event.is_set():
+            return
+        with self.imu_queue_lock:
+            if len(self.imu_pending) >= 100:
+                self.imu_overflow = True
+            else:
+                self.imu_pending.append(msg)
+
+    def _drain_imu(self):
+        # Caller owns the estimator lock; ingress only touches its own queue.
+        if not hasattr(self, 'imu_pending'):
+            return
+        with self.imu_queue_lock:
+            pending = list(self.imu_pending)
+            self.imu_pending.clear()
+            overflow = self.imu_overflow
+        if overflow:
+            self.imu.fault('IMU ingress overflow; restart required')
+            self.gate.fault(self.imu.reason)
+            if self.fusion is not None:
+                self.fusion.fault(self.imu.reason)
+            return
+        for msg in pending:
+            if self.stop_event.is_set():
+                return
+            self._imu(msg)
 
     def _imu(self, msg):
         from sensor_msgs.msg import Imu
@@ -349,6 +386,7 @@ class RgbdSession:
             try:
                 (_, color), (_, depth) = pair
                 with self.lock:
+                    self._drain_imu()
                     if self.fusion is None and not self._imu_frame_ready(stamp_ns(depth), time.time_ns()):
                         self.counts['dropped_pairs'] += 1
                         continue
@@ -384,6 +422,7 @@ class RgbdSession:
                     info.p = [k[0], 0., k[2], 0., 0., k[4], k[5], 0., 0., 0., 1., 0.]
                     setattr(out, field, info)
                 with self.lock:
+                    self._drain_imu()
                     ready = (self.gate.state != 'lost' if self.fusion is not None else
                              self._imu_frame_ready(stamp_ns(depth), time.time_ns()))
                     if ready and not self.stop_event.is_set():
@@ -391,6 +430,8 @@ class RgbdSession:
                             for sample in self.observations.add_frame(stamp_ns(depth), image, z16, time.time_ns()):
                                 self._publish(sample)
                                 self.counts['estimates'] += 1
+                        if self.gate.state == 'lost':
+                            continue
                         self.rgbd.publish(out)
                         self.counts['pairs'] += 1
             except Exception as error:
@@ -399,6 +440,16 @@ class RgbdSession:
 
     def _publish(self, sample):
         from std_msgs.msg import String
+        self._drain_imu()
+        now = time.time_ns()
+        if self.imu and self.imu.status(now) == 'lost':
+            self.gate.fault('IMU assistance: ' + str(self.imu.reason))
+            if self.fusion is not None:
+                self.fusion.fault(self.gate.reason)
+        if self.gate.state == 'lost' or (self.fusion is not None and self.fusion.state == 'lost'):
+            stamp = sample['vendor']['motus_slam']['stamp_ns']
+            reason = self.fusion.reason if self.fusion is not None else self.gate.reason
+            sample = make_sample('lost', stamp, self.segment, self.calibration['clock_id'], reason=reason)
         if getattr(self, 'mounts', None) is not None:
             sample = self.mounts.attach(sample, time.time_ns())
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
@@ -434,6 +485,7 @@ class RgbdSession:
         with self.lock:
             if self.stop_event.is_set():
                 return
+            self._drain_imu()
             if kind == 'info' and hasattr(self, 'registration_by_stamp'):
                 self._remember_native(msg)
             if getattr(self, 'fusion', None) is not None:
@@ -462,6 +514,7 @@ class RgbdSession:
         with self.lock:
             if self.stop_event.is_set():
                 return
+            self._drain_imu()
             if self.process is not None and self.process.poll() is not None:
                 self.gate.fault('RGB-D estimator exited')
             if not self.gate.last_input and time.monotonic() - self.started > 10:
@@ -492,6 +545,7 @@ class RgbdSession:
 
     def info(self):
         with self.lock:
+            self._drain_imu()
             return {'state': 'running', 'status': (self.fusion.status(time.time_ns()) if self.fusion else
                                                   self.gate.status(time.time_ns())),
                     'reason': self.fusion.reason if self.fusion else self.gate.reason, 'segment_id': self.segment,

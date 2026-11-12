@@ -170,6 +170,7 @@ def test_runtime_automatically_attaches_mount_without_altering_main_odom(monkeyp
     obj = object.__new__(runtime.RgbdSession)
     obj.mounts = mounts(); obj.imu = None
     obj.calibration = {}; obj.fusion = None
+    obj.gate = runtime.EstimateGate('run', 'camera_optical', 'camera-clock')
     obj.registration_by_stamp = OrderedDict()
     obj.lock = threading.RLock(); obj.stop_event = threading.Event()
     published = []

@@ -144,6 +144,19 @@ def test_rejected_visual_recovery_does_not_refresh_outage_clock():
     assert sample['pose'] is None and c.status(t+1_000_000) == 'lost'
 
 
+def test_accepted_recovery_correction_refreshes_timeout_before_tracking_promotion():
+    c, t = warmed()
+    for i in range(1, 221):
+        stamp = t+i*5_000_000
+        c.observe_imu(source(stamp), stamp)
+    frame, now = t+300_000_000, t+1_100_000_000
+    sample = c.observe_frame(frame, *images(), pose(), now)
+    assert sample['vendor']['fusion']['aid'] == 'visual'
+    assert sample['pose'] is None  # one correction does not establish tracking
+    assert c.status(now) == 'recovering'
+    assert c.last_visual == frame
+
+
 def test_visual_rotation_during_warmup_is_not_estimated_as_gyro_bias():
     c = ShortTermFusion('run', 'optical', 'capture-clock', K)
     for i in range(141):
