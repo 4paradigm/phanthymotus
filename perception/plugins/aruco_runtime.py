@@ -19,6 +19,11 @@ class Calibration:
     matrix: np.ndarray
     distortion: np.ndarray | None
 
+    def matches(self, other):
+        return (self.width == other.width and self.height == other.height
+                and np.array_equal(self.matrix, other.matrix)
+                and np.array_equal(self.distortion, other.distortion))
+
     @classmethod
     def from_declaration(cls, value):
         if not isinstance(value, dict):

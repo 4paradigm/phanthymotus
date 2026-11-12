@@ -263,3 +263,43 @@ def test_worker_reports_processing_error_recovers_and_restarts(detector, caplog,
         assert node.destroyed and replacement is not node and replacement.worker.is_alive()
     finally:
         plugin.shutdown()
+
+
+def test_same_topic_restart_applies_marker_size_and_calibration_changes(detector):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({"rate_hz": 30}, executor)
+    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC,
+            "camera_info": {TOPIC: CAMERA}}
+    image = render_marker(np.array([np.pi, 0, 0]), np.array([0.0, 0.0, 0.4]))
+
+    def depth(node, sec):
+        node.subscriptions[0].callback(_frame(image, sec))
+        assert _wait_until(lambda: bool(node.publishers[0].messages))
+        [marker] = json.loads(node.publishers[0].messages[0])["markers"]
+        return marker["translation_m"][2]
+
+    try:
+        assert plugin.dispatch("aruco", args)["state"] == "running"
+        [first] = executor.nodes
+        assert depth(first, 1) == pytest.approx(0.4, abs=0.006)
+        bad_camera = {**CAMERA, "K": []}
+        assert plugin.dispatch("aruco", {**args, "camera_info": {TOPIC: bad_camera}})["state"] == "error"
+        assert executor.nodes == [first] and first.worker.is_alive()
+
+        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "marker_size_m": 0.2})
+        assert plugin.dispatch("aruco", args)["state"] == "running"
+        [second] = executor.nodes
+        assert first.destroyed and not first.worker.is_alive()
+        assert second.outputs == first.outputs
+        assert depth(second, 2) == pytest.approx(0.8, abs=0.012)
+
+        changed = {**CAMERA, "K": [400.0, 0, 320.0, 0, 400.0, 240.0, 0, 0, 1]}
+        restart = {**args, "camera_info": {TOPIC: changed}}
+        assert plugin.dispatch("aruco", restart)["state"] == "running"
+        [third] = executor.nodes
+        assert second.destroyed and not second.worker.is_alive()
+        assert depth(third, 3) == pytest.approx(0.4, abs=0.006)
+        assert plugin.dispatch("aruco", restart)["state"] == "running"
+        assert executor.nodes == [third]
+    finally:
+        plugin.shutdown()

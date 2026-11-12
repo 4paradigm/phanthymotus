@@ -46,8 +46,13 @@ TOOLS = [{
         "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "config"]},
                        "input_topic": {"type": "string", "description": "Camera JPEG topic"}},
         "required": ["action"],
-        "x-action-params": {"start": {"params": ["input_topic"]}, "stop": {"params": []},
-                            "info": {"params": []}, "config": {"params": []}},
+        # Core injects camera_info independently of the canvas's editable fields.
+        "x-action-params": {
+            "start": {"params": ["input_topic"],
+                      "description": "Start with the wired camera's motus.camera/1 declaration. "
+                                     "Direct callers can supply camera_info keyed by topic or as a list."},
+            "stop": {"params": []}, "info": {"params": []}, "config": {"params": []},
+        },
     },
     "configSchema": {"type": "object", "properties": CONFIG},
     "topic_in": [{"format": "image/jpeg", "desc": "Calibrated camera JPEG"}],
@@ -71,8 +76,8 @@ def _validate(options):
 
 
 class _ArucoNode(Node):
-    def __init__(self, topic, key, options, declaration, detector, camera_id):
-        self.calibration = Calibration.from_declaration(declaration)
+    def __init__(self, topic, key, options, calibration, detector, camera_id):
+        self.calibration = calibration
         suffix = hashlib.sha256(key.encode()).hexdigest()[:16]
         super().__init__(f"aruco_{suffix}")
         self.input_topic = topic
@@ -253,8 +258,6 @@ class ArucoPlugin:
             return {"state": "error", "error": "Connect a camera or provide an absolute camera JPEG topic."}
         key = instance or topic
         previous = self._nodes.get(key)
-        if previous is not None and previous.input_topic == topic and previous.worker.is_alive():
-            return self._info(previous)
         options = {**self._defaults, **self._overrides.get(instance, {})}
         node = None
         try:
@@ -267,19 +270,25 @@ class ArucoPlugin:
             declaration = options.get("calibration") or upstream
             if not declaration:
                 raise ValueError("No calibration for this JPEG topic. Configure camera calibration or a card override.")
+            calibration = Calibration.from_declaration(declaration)
             camera_id = upstream.get("id")
             camera_id = camera_id if isinstance(camera_id, str) else ""
+            if (previous is not None and previous.input_topic == topic and previous.worker.is_alive()
+                    and previous.camera_id == camera_id and previous.calibration.matches(calibration)
+                    and all(previous.options[name] == options[name] for name in DEFAULTS)):
+                return self._info(previous)
             detector = MarkerDetector(options["dictionary"])
-            node = _ArucoNode(topic, key, options, declaration, detector, camera_id)
+            node = _ArucoNode(topic, key, options, calibration, detector, camera_id)
             if self._executor.add_node(node) is False:
                 raise RuntimeError("Could not register the ArUco node in the ROS executor.")
+            if previous is not None:
+                self._nodes.pop(key)
+                self._dispose(previous)
             node.worker.start()
         except Exception as exc:
             if node is not None:
                 self._dispose(node)
             return {"state": "error", "error": str(exc)}
-        if previous is not None:
-            self._dispose(previous)
         self._nodes[key] = node
         return self._info(node)
 
