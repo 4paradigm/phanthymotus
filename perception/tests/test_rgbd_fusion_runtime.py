@@ -17,8 +17,9 @@ class Fusion:
         self.samples = [(10_000_000_000, None, None)]
     def fault(self, reason):
         self.reason = reason
-    def observe_frame(self, stamp, color, depth, visual, now, reason=None):
+    def observe_frame(self, stamp, color, depth, visual, now, reason=None, arrival_ns=None):
         self.frames.append((stamp, visual, reason))
+        self.arrivals = getattr(self, 'arrivals', []) + [arrival_ns]
         return {'stamp': stamp}
 
 
@@ -34,6 +35,7 @@ def test_capture_results_are_processed_in_order_at_original_time():
     out = frames.result('pose', m, 1_140_000_000)
     assert [s['stamp'] for s in out] == [1_000_000_000, 1_100_000_000]
     assert [f[0] for f in fusion.frames] == [1_000_000_000, 1_100_000_000]
+    assert fusion.arrivals == [1_010_000_000, 1_110_000_000]  # enqueue time, for latency diagnostics
 
 
 def test_missing_pose_timeout_and_late_results_do_not_rewrite_history():

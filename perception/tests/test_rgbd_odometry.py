@@ -28,12 +28,18 @@ def tracking_gate():
     return gate
 
 
-def test_lost_diagnostic_latches_until_new_estimator_segment():
+def test_lost_diagnostic_pauses_tracking_until_three_continuous_estimates():
     gate=tracking_gate();msg,info=messages(1_300_000_000);info.lost=True
     assert gate.accept(msg,info,1_310_000_000) is None
-    assert gate.status(1_310_000_000)=='lost'
+    assert gate.status(1_310_000_000)=='recovering'
     assert gate.accept(*messages(1_400_000_000),1_410_000_000) is None
-    assert gate.status(1_410_000_000)=='lost'
+    assert gate.accept(*messages(1_500_000_000),1_510_000_000) is None
+    assert gate.accept(*messages(1_600_000_000),1_610_000_000)['pose'] is not None
+    assert gate.state=='tracking'
+    # Persistent loss still ends the segment.
+    gate=tracking_gate();msg,info=messages(1_300_000_000);info.lost=True
+    gate.accept(msg,info,1_310_000_000)
+    assert gate.status(2_811_000_000)=='lost'
     assert tracking_gate().state=='tracking'
 
 
@@ -41,12 +47,12 @@ def test_stale_input_invalid_covariance_and_wrong_frames_stop_tracking():
     gate=tracking_gate()
     assert gate.status(2_400_000_000)=='tracking'
     assert gate.status(2_700_000_001)=='lost'
-    for change in [lambda m:setattr(m.header,'frame_id','wrong'),
-                   lambda m:m.pose.covariance.__setitem__(0,9999.),
-                   lambda m:setattr(m.pose.pose.orientation,'w',0.)]:
+    for change,state in [(lambda m:setattr(m.header,'frame_id','wrong'),'lost'),
+                         (lambda m:m.pose.covariance.__setitem__(0,9999.),'recovering'),
+                         (lambda m:setattr(m.pose.pose.orientation,'w',0.),'recovering')]:
         gate=tracking_gate();msg,info=messages(1_300_000_000);change(msg)
         assert gate.accept(msg,info,1_310_000_000) is None
-        assert gate.state=='lost'
+        assert gate.state==state
 
 
 def test_diagnostics_must_match_actual_pose_capture_time():
@@ -120,7 +126,7 @@ def test_fresh_estimate_cannot_overwrite_an_expired_previous_estimate():
     assert gate.state=='lost'
 
 
-def test_unpaired_lost_diagnostic_ends_segment_before_next_good_pair():
+def test_unpaired_lost_diagnostic_pauses_output_before_next_good_pair():
     import threading
     from collections import OrderedDict
     from plugins.rgbd_odometry_runtime import RgbdSession
@@ -130,7 +136,7 @@ def test_unpaired_lost_diagnostic_ends_segment_before_next_good_pair():
     session.counts={'estimates':0};published=[];session._publish=published.append
     msg,info=messages(1_300_000_000);info.lost=True
     session._result('info',info)
-    assert session.gate.state=='lost'
+    assert session.gate.state=='recovering'
     msg,info=messages(1_400_000_000)
     session._result('pose',msg);session._result('info',info)
     assert not published
