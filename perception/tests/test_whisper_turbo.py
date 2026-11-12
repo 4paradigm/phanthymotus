@@ -175,6 +175,73 @@ def test_config_switch_does_not_start_native_worker(monkeypatch):
     assert plugin.dispatch("asr", {"action": "info"})["state"] == "idle"
 
 
+def test_config_switch_retires_lazy_demand_before_node_disposal(monkeypatch):
+    closed = []
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            pass
+        def prepare(self, **kwargs):
+            pass
+        def close(self):
+            closed.append(True)
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda cfg, **kw:
+                        Adapter() if cfg["asr_model"] == "whisper-turbo-q5" else object())
+    def start_node(node):
+        node.state = "running"
+        return {"state": "running"}
+    monkeypatch.setattr(asr._ASRNode, "start", start_node)
+    plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"}, _FakeExecutor())
+    assert plugin.dispatch("asr", {
+        "action": "start", "instance_id": "card", "input_topic": "/mic"})["state"] == "running"
+    assert plugin._lazy_start_requests == {"card"}
+    dispose = plugin._dispose_node
+    def check_then_dispose(node, key):
+        assert not plugin._lazy_load_requested and not plugin._lazy_start_requests
+        assert not plugin._pending_starts
+        return dispose(node, key)
+    monkeypatch.setattr(plugin, "_dispose_node", check_then_dispose)
+    plugin.dispatch("asr", {"action": "config", "asr_model": "sensevoice-small", "device": "cpu"})
+    deadline = time.monotonic() + 2
+    while plugin._loading and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not plugin._loading and not plugin._nodes and closed
+
+
+def test_cold_start_config_switch_cancels_old_deferred_request(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    closed, built = [], []
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            pass
+        def prepare(self, **kwargs):
+            entered.set()
+            assert release.wait(3)
+        def close(self):
+            closed.append(True)
+    def build(cfg, **kwargs):
+        built.append(cfg["asr_model"])
+        return Adapter() if cfg["asr_model"] == "whisper-turbo-q5" else object()
+    monkeypatch.setattr(asr, "_build_asr_adapter", build)
+    monkeypatch.setattr(asr, "MODEL_LOAD_GRACE_S", 0)
+    plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"}, None)
+    try:
+        assert plugin.dispatch("asr", {
+            "action": "start", "instance_id": "card", "input_topic": "/mic"})["state"] == "loading"
+        assert entered.wait(2)
+        old_start = plugin._pending_starts["card"]
+        plugin.dispatch("asr", {"action": "config", "asr_model": "sensevoice-small", "device": "cpu"})
+        assert not plugin._lazy_start_requests and not plugin._pending_starts
+    finally:
+        release.set()
+    deadline = time.monotonic() + 2
+    while plugin._loading and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not plugin._loading and closed and built == ["whisper-turbo-q5", "sensevoice-small"]
+    assert plugin.dispatch("asr", old_start) == {"state": "idle"}
+    info = plugin.dispatch("asr", {"action": "info", "instance_id": "card", "input_topic": "/mic"})
+    assert info["state"] == "idle" and not plugin._nodes
+
+
 def test_deferred_prepare_failure_is_terminal_for_instance_polling(monkeypatch):
     entered, release = threading.Event(), threading.Event()
     adapters = []

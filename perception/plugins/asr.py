@@ -2490,7 +2490,16 @@ class ASRPlugin:
             }
 
         elif action == "start":
-            lazy_start = None
+            lazy_start = args.get("_lazy_start_generation")
+            if lazy_start is not None:
+                # A deferred Whisper start can outlive a switch to a non-lazy
+                # model too. It still belongs to the cancelled generation.
+                input_topic, _ = _resolve_asr_inputs(args)
+                lazy_key = instance_id or input_topic
+                with self._nodes_lock:
+                    if lazy_start != (self._lazy_stop_generation,
+                                      self._lazy_instance_stops.get(lazy_key, 0)):
+                        return {"state": "idle"}
             if ASR_MODELS.get(self._asr_model, {}).get("lazy"):
                 input_topic, _ = _resolve_asr_inputs(args)
                 if not input_topic:
@@ -2735,6 +2744,10 @@ class ASRPlugin:
                 with self._nodes_lock:
                     self._lazy_stop_generation += 1
                     self._pending_starts.clear()
+                    # Retire the old demand before slow node disposal gives
+                    # the loader another chance to prepare a cancelled model.
+                    self._lazy_load_requested = False
+                    self._lazy_start_requests.clear()
                     nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
                 for _, node in nodes:
                     node.request_stop()
@@ -2744,8 +2757,6 @@ class ASRPlugin:
                     self._adapter.close()
                 if isinstance(self._adapter, WhisperTurboAdapter) or ASR_MODELS[new_model].get("lazy"):
                     self._adapter = None
-                self._lazy_load_requested = False
-                self._lazy_start_requests.clear()
                 self._asr_model = new_model
                 self._device = new_device
                 self._plugin_cfg['device'] = new_device
