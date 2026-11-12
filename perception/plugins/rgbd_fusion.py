@@ -198,6 +198,7 @@ class ShortTermFusion:
         self.geometry = DepthRegistration(K) if depth_geometry else None
         self.reference = None
         self.state, self.reason = 'initializing', 'waiting for 0.5 s low-motion visual/IMU warmup'
+        self.loss_kind = None
         self.last_frame = self.last_visual = self.last_confident = 0
         self.last_processed_ns = self.last_visual_wall = 0
         self.good = 0
@@ -209,7 +210,9 @@ class ShortTermFusion:
         self.geometry_runner = self.geometry_job = None
         self.revision = 0
 
-    def fault(self, reason):
+    def fault(self, reason, kind='fusion'):
+        if self.state != 'lost':
+            self.loss_kind = kind
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
 
     def observe_imu(self, packet, now_ns):
@@ -330,13 +333,15 @@ class ShortTermFusion:
             return self._finish(stamp, diagnostic)
         try:
             if stamp <= self.last_frame or not -50_000_000 <= now_ns-stamp <= 1_000_000_000:
-                raise ValueError('fusion frame time is stale, repeated or reset')
+                self.fault('fusion frame time is stale, repeated or reset', 'clock')
+                return self._finish(stamp, diagnostic)
             self.last_frame, self.last_processed_ns = stamp, now_ns
             self.quality = observation_quality(color, depth)
             covariance = None
             if visual_pose is not None:
                 if visual_pose.get('frame_id') != self.segment+'_odom' or visual_pose.get('child_frame_id') != self.frame:
-                    raise ValueError('visual frame or segment changed')
+                    self.fault('visual frame or segment changed', 'frame')
+                    return self._finish(stamp, diagnostic)
                 pose_values(visual_pose)
                 covariance = observation_covariance(visual_pose)*self.quality['weight']*visual_pose.get('quality_weight', 1.)
                 if not self.quality['visual_usable']:
@@ -430,7 +435,9 @@ class ShortTermFusion:
             return
         self.geometry_job = None
         geometry = self.quality.setdefault('geometry', dict(attempted=True, accepted=False))
-        if status != 'done':
+        if now_ns > job['deadline']:
+            outcome = 'timeout_discarded'
+        elif status != 'done':
             outcome = 'stale_result_discarded' if force else 'timeout_discarded'
         elif self.state == 'lost' or self.filter is None or self.revision != job['revision']:
             outcome = 'stale_result_discarded'

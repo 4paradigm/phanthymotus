@@ -15,7 +15,7 @@ class Fusion:
         self.segment, self.frame = 'run', 'camera_optical'
         self.frames, self.reason = [], None
         self.samples = [(10_000_000_000, None, None)]
-    def fault(self, reason):
+    def fault(self, reason, kind='fusion'):
         self.reason = reason
     def observe_frame(self, stamp, color, depth, visual, now, reason=None, arrival_ns=None):
         self.frames.append((stamp, visual, reason))

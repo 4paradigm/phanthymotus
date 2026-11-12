@@ -96,6 +96,9 @@ Each `rgbd_odometry` instance supports `visual_frontend` in `config`:
   Frontends are not ranked by raw inlier counts. `info().frontend` reports
   mode, active frontend, switch count/reason, the last decision and cooldown.
   These limits are engineering choices, not hardware-tuned values.
+  Explicit native visual rejection also starts the bounded recovery timer
+  before the first tracking pose, so an uninitializable frontend can recover
+  or switch rather than remain initializing indefinitely.
 
 `visual_frontend` and `max_features` are instance-scoped. Stop an active
 instance before changing either. Restart creates a new odometry segment;
@@ -196,6 +199,8 @@ does not claim a continuous map or corrected motion accuracy. `info().recovery`
 reports attempts, successful restarts, previous segment and errors. Manual stop
 and bundle shutdown cancel recovery. Automatic replacement does not emit idle;
 explicit stop still does. Input/settings changes continue to require stop/start.
+Watchdog pause messages reuse the latest admitted native capture timestamp;
+receipt time is never substituted for capture evidence during a pause.
 
 For current Core's topic-only SLAM path, map provenance explicitly records
 unverified timestamp overlap. The stricter SLAM declaration path still requires
@@ -266,6 +271,8 @@ for supervised new-segment recovery. Fallback poses obey the same
 three-estimate, continuity, pause-declaration and 1 s/0.8 s rules. The ESKF is not
 restarted inside that segment; a later new segment retries it. Predictions
 are never published as tracking and a stale IMU is never fused again.
+Camera frame/segment, capture-clock and capture-queue faults end the segment
+instead of entering visual-only fallback.
 
 If vision becomes unavailable, `vendor.motus_slam.status` changes to
 `coasting`, followed by `recovering` until three consistent visual

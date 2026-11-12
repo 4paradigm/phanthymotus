@@ -64,7 +64,7 @@ class EstimateGate:
     def __init__(self, segment, frame, clock):
         self.segment, self.frame, self.clock = segment, frame, clock
         self.state, self.reason = 'initializing', None
-        self.last_input = self.last_stamp = 0
+        self.last_input = self.last_stamp = self.last_result_stamp = 0
         self.good = 0
         self.recover_by = None
         self.last_pose = None
@@ -81,13 +81,15 @@ class EstimateGate:
             self.loss_kind = kind
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
 
-    def degrade(self, reason, now):
+    def degrade(self, reason, now, *, stamp=None):
         """Reject one estimate. Tracking pauses; evidence must be rebuilt."""
         self.rejection = str(reason)
         if self.state == 'lost':
             return
+        if stamp is not None:
+            self.last_result_stamp = stamp
         self.good = 0
-        if self.state in ('tracking', 'recovering'):
+        if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
                 self.recover_by = now + RECOVERY_NS
             self.state, self.reason = 'recovering', 'visual estimate rejected: ' + str(reason)
@@ -120,9 +122,10 @@ class EstimateGate:
         if now - stamp < -50_000_000:
             self.fault('visual estimate capture time is in the future', 'clock')
             return None
-        if stamp <= self.last_stamp or now - stamp > 1_500_000_000:
+        if stamp <= max(self.last_stamp, self.last_result_stamp) or now - stamp > 1_500_000_000:
             self.rejection = 'stale or out-of-order visual estimate'  # never counted as evidence
             return None
+        self.last_result_stamp = stamp
         try:
             if info.lost or info.inliers < 10:
                 raise ValueError('visual tracking lost or insufficient inliers')
@@ -227,7 +230,7 @@ class CaptureObservations:
     def add_frame(self, stamp, color, depth, now):
         outputs = self.drain(now)
         if stamp <= self.last_added or len(self.frames) >= 8:
-            self.fusion.fault('fusion capture queue repeated, reset or overflowed')
+            self.fusion.fault('fusion capture queue repeated, reset or overflowed', 'input')
             return outputs
         self.last_added = stamp
         self.frames[stamp] = dict(color=color, depth=depth, added=now, deadline=now+250_000_000)
@@ -245,7 +248,7 @@ class CaptureObservations:
             return None, 'visual pose missing, lost or insufficient inliers'
         try:
             if msg.header.frame_id != self.fusion.segment+'_odom' or msg.child_frame_id != self.fusion.frame:
-                self.fusion.fault('native visual frame/segment changed; restart required')
+                self.fusion.fault('native visual frame/segment changed; restart required', 'frame')
                 return None, 'visual frame changed'
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
             pose = dict(position=[p.x, p.y, p.z], quaternion=[q.x, q.y, q.z, q.w],
@@ -571,7 +574,10 @@ class RgbdSession:
     def _check_fusion(self, now):
         if (getattr(self, 'fusion', None) is not None and getattr(self, 'fallback', None) is None and
                 self.fusion.state == 'lost' and self.gate.state != 'lost'):
-            self._enter_fallback(now)
+            if self.fusion.loss_kind in ('frame', 'clock', 'input'):
+                self.gate.fault(self.fusion.reason, self.fusion.loss_kind)
+            else:
+                self._enter_fallback(now)
 
     def _enter_fallback(self, now):
         """ESKF stopped: continue with the independent native visual estimate.
@@ -698,6 +704,14 @@ class RgbdSession:
             if self.stop_event.is_set():
                 return
             self._drain_imu()
+            # Frame identity is a session boundary even when an IMU failure
+            # has already stopped fusion and pending captures will be cleared.
+            if kind == 'pose' and (msg.header.frame_id != self.gate.segment+'_odom' or
+                                   msg.child_frame_id != self.gate.frame):
+                self.gate.fault('native visual frame or segment changed; restart required', 'frame')
+                if getattr(self, 'fusion', None) is not None:
+                    self.fusion.fault(self.gate.reason, 'frame')
+                return
             if kind == 'info' and hasattr(self, 'registration_by_stamp'):
                 self._remember_native(msg)
             if self._fusing():
@@ -707,9 +721,12 @@ class RgbdSession:
                         self.counts['estimates'] += 1
                     self._check_fusion(time.time_ns())
                 return
-            if kind == 'info' and msg.lost and stamp_ns(msg) > self.gate.last_stamp:
+            stamp, now = stamp_ns(msg), time.time_ns()
+            if (kind == 'info' and msg.lost and
+                    stamp > max(self.gate.last_stamp, self.gate.last_result_stamp) and
+                    -50_000_000 <= now-stamp <= 1_500_000_000):
                 # Pause before the matching pose arrives; the same estimator keeps running.
-                self.gate.degrade('visual estimator reported lost tracking', time.time_ns())
+                self.gate.degrade('visual estimator reported lost tracking', now, stamp=stamp)
             if self.gate.state == 'lost':
                 return
             stamp = stamp_ns(msg)
@@ -760,7 +777,10 @@ class RgbdSession:
                 elif self.imu.state == 'initializing' and time.monotonic() - self.started > 10:
                     self.gate.fault('waiting for usable camera IMU attitude timed out', 'imu')
             if self.gate.status(time.time_ns()) != 'tracking':
-                self._publish(make_sample(self.gate.state, time.time_ns(), self.segment,
+                # A pause carries native capture evidence, not the watchdog's
+                # receipt time; transport latency must not expire SLAM's segment.
+                stamp = self.gate.last_result_stamp or self.gate.last_stamp or time.time_ns()
+                self._publish(make_sample(self.gate.state, stamp, self.segment,
                                           self.calibration['clock_id'], reason=self.gate.reason))
 
     def info(self):

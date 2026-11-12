@@ -7,6 +7,7 @@ import pytest
 from plugins import rgbd_odometry as module
 from plugins.rgbd_odometry_runtime import estimator_parameters
 from test_rgbd_odometry_contract import declarations
+from test_rgbd_degradation import feed
 from test_rgbd_odometry_recovery import images
 from test_rgbd_odometry_status import sessions  # noqa: F401
 from vision_stubs import _FakeExecutor
@@ -132,3 +133,26 @@ def test_changing_to_or_from_auto_still_requires_stop(auto):
     start(card, args, 'auto')
     assert card.dispatch('rgbd_odometry', dict(action='config', instance_id='one',
                                                visual_frontend='f2m_feature'))['state'] == 'error'
+
+
+def test_frontend_that_only_reports_lost_can_switch_before_first_tracking(auto):
+    card, args, now, seconds = auto
+    start(card, args, 'auto')
+    old = card.instances['one'][0]
+    initial = now[0]
+    for i in range(35):
+        seconds[0] += .1
+        stamp = initial+i*100_000_000
+        now[0] = stamp+20_000_000
+        images(old, stamp)
+        feed(old, now, stamp, lost=True)
+        old._watchdog()
+        if old.gate.state == 'lost':
+            old.process.returncode = 0  # stubbed process exits before replacement cleanup
+        card._recover()
+        if card.instances['one'][0] is not old:
+            break
+    new = card.instances['one'][0]
+    assert new is not old and new.segment != old.segment
+    assert new.calibration['visual_frontend'] == 'f2f_optical_flow'
+    assert frontend(card)['switches'] == 1

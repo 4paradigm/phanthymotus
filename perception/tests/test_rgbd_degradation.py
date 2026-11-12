@@ -283,3 +283,62 @@ def test_resume_beyond_consumer_pause_bound_starts_a_new_segment(sessions):
     for k in (7, 8, 9):  # valid again, but 0.7-0.9 s after the last published capture
         feed(s, now, stamp + k*100*MS)
     assert s.gate.state == 'lost' and 'pause' in s.gate.reason
+
+
+def test_watchdog_pause_uses_capture_time_with_delayed_native_results(sessions):
+    create, now, _ = sessions
+    s = create()
+    stream, accepted = slam_stream()
+    anchor = track(s, now)
+
+    def deliver_at(start, receipt):
+        for raw in s.publisher.messages[start:]:
+            stream.odom(json.loads(raw), now=receipt)
+        return len(s.publisher.messages)
+
+    seen = deliver_at(0, 1.5)
+    stream.cloud(anchor, 'camera_optical', [[1, 0, 0]], now=1.5)
+    for stamp, lost in [(1_300_000_000, True), (1_600_000_000, False), (1_800_000_000, False)]:
+        now[0] = stamp+300*MS
+        msg, info = native(s, stamp, lost=lost)
+        s._result('pose', msg); s._result('info', info)
+        seen = deliver_at(seen, now[0]/1e9)
+    now[0] = 2_210_000_000
+    s._watchdog()
+    seen = deliver_at(seen, 2.21)
+    stamp = anchor+800*MS
+    now[0] = stamp+300*MS
+    msg, info = native(s, stamp)
+    s._result('pose', msg); s._result('info', info)
+    deliver_at(seen, now[0]/1e9)
+    stream.cloud(stamp, 'camera_optical', [[1, 0, 0]], now=now[0]/1e9)
+    assert s.gate.state == 'tracking'
+    assert stream.status(now=now[0]/1e9)['integration'] == 'admitting'
+    assert len(accepted) == 2
+
+
+@pytest.mark.parametrize('field', ['frame_id', 'child_frame_id'])
+@pytest.mark.parametrize('prior_imu_fault', [False, True])
+def test_fusion_native_frame_change_requires_a_new_segment(fused, field, prior_imu_fault):
+    make, now, _ = fused
+    s = make()
+    value = dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.], covariance=[0.]*36)
+    s.fusion.last_tracking = (1_500_000_000, value, value)
+    s.fusion.last_visual = 1_500_000_000
+    stamp = 1_600_000_000
+    s.fusion.samples.append((stamp, None, None))
+    s.observations.add_frame(stamp, None, None, stamp)
+    if prior_imu_fault:
+        s.fusion.fault('IMU ingress overflow; restart required')
+    now[0] = stamp+20*MS
+    msg, info = native(s, stamp)
+    if field == 'frame_id':
+        msg.header.frame_id = 'different_odom'
+    else:
+        msg.child_frame_id = 'different_optical'
+    s._result('pose', msg); s._result('info', info)
+    for k in range(3):
+        feed(s, now, stamp+(k+1)*100*MS)
+    assert s.gate.state == 'lost' and s.gate.loss_kind == 'frame'
+    assert s.fallback is None
+    assert all(json.loads(raw)['pose'] is None for raw in s.publisher.messages)

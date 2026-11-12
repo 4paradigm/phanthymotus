@@ -126,20 +126,22 @@ def test_fresh_estimate_cannot_overwrite_an_expired_previous_estimate():
     assert gate.state=='lost'
 
 
-def test_unpaired_lost_diagnostic_pauses_output_before_next_good_pair():
+def test_unpaired_lost_diagnostic_pauses_output_before_next_good_pair(monkeypatch):
     import threading
     from collections import OrderedDict
     from plugins.rgbd_odometry_runtime import RgbdSession
+    monkeypatch.setattr('plugins.rgbd_odometry_runtime.time.time_ns', lambda: 1_420_000_000)
     session=object.__new__(RgbdSession)
     session.lock=threading.RLock();session.stop_event=threading.Event()
     session.imu=None;session.gate=tracking_gate();session.results={'pose':OrderedDict(),'info':OrderedDict()}
+    session.segment='run';session.calibration={'clock_id':session.gate.clock}
     session.counts={'estimates':0};published=[];session._publish=published.append
     msg,info=messages(1_300_000_000);info.lost=True
     session._result('info',info)
     assert session.gate.state=='recovering'
     msg,info=messages(1_400_000_000)
     session._result('pose',msg);session._result('info',info)
-    assert not published
+    assert published and all(sample['pose'] is None for sample in published)
 
 
 def test_process_exit_during_stop_still_releases_node_and_tempfiles(monkeypatch):

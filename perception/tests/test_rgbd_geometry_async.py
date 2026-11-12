@@ -129,6 +129,32 @@ def test_pending_registration_cannot_defer_inertial_bounds_forever():
         registration.release.set(); assert worker.close(2)
 
 
+@pytest.mark.parametrize('force', [False, True])
+def test_finished_registration_is_discarded_after_its_deadline(force):
+    result, current = real_result()
+    registration = BlockingRegistration(result)
+    c, worker, stamp, color = coasting(registration)
+    try:
+        c.observe_frame(stamp, color, current, None, stamp, reason='visual missing')
+        registration.release.set()
+        deadline = time.monotonic()+2
+        while time.monotonic() < deadline:
+            with worker.condition:
+                if worker.finished is not None:
+                    break
+            time.sleep(.001)
+        with worker.condition:
+            assert worker.finished is not None
+        covariance = c.filter.P.copy()
+        c.poll_geometry(stamp+300_000_000, force=force)
+        assert c.aid == 'inertial'
+        assert c.quality['geometry']['reason'] == 'timeout_discarded'
+        assert c.frames[-1]['geometry'] == 'timeout_discarded'
+        np.testing.assert_array_equal(c.filter.P, covariance)
+    finally:
+        registration.release.set(); assert worker.close(2)
+
+
 def test_worker_is_bounded_and_close_prevents_late_delivery():
     registration = BlockingRegistration(result={'late': True})
     worker = GeometryWorker(registration)
