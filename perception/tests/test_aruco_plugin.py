@@ -1,7 +1,8 @@
 """Real OpenCV geometry and JPEGs, with ROS message/executor stubs."""
 
-from types import SimpleNamespace
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -13,6 +14,7 @@ from vision_stubs import _FakeCompressedImage, _FakeExecutor, _wait_until
 
 
 TOPIC = "/camera/color"
+JETPACK_IMAGE = Path("/etc/jetpack.env")
 WIDTH, HEIGHT = 640, 480
 K = [800.0, 0.0, 320.0, 0.0, 800.0, 240.0, 0.0, 0.0, 1.0]
 CAMERA = {"schema": "motus.camera/1", "topic": TOPIC, "id": "calibrated-camera",
@@ -26,6 +28,12 @@ def detector():
     try:
         return MarkerDetector("DICT_4X4_50")
     except RuntimeError as exc:
+        if JETPACK_IMAGE.is_file():
+            # The cloud runner uses the built image's OpenCV. A skipped
+            # detection here would let an unusable JetPack image pass CI.
+            version = getattr(cv2, "__version__", "unavailable")
+            pytest.fail(f"JetPack OpenCV {version} cannot run ArUco: {exc} ({exc.__cause__})",
+                        pytrace=False)
         pytest.skip(str(exc))
 
 
