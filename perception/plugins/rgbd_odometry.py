@@ -6,7 +6,7 @@ import threading
 import time
 from copy import deepcopy
 
-from .rgbd_odometry_contract import validate_start_inputs
+from .rgbd_odometry_contract import start_topics, validate_start_inputs
 from .rgbd_odometry_runtime import RgbdSession, require_runtime
 from utils.ros_lifecycle import dispose_node
 
@@ -166,7 +166,12 @@ class RgbdOdometryPlugin:
                         raise RuntimeError('RGB-D plugin is shutting down')
                     if instance in self.retiring:
                         raise RuntimeError('finish failed RGB-D cleanup with stop before restarting')
-                    calibration = validate_start_inputs(args.get('camera_info'), args.get('input_topics'), enabled)
+                    topics = start_topics(args)
+                    try:
+                        calibration = validate_start_inputs(args.get('camera_info'), topics, enabled)
+                    except ValueError as error:
+                        logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
+                        raise
                     calibration.update(settings)
                     geometry = deepcopy(args['camera_info'])
                     for declaration in geometry.values():
@@ -174,7 +179,7 @@ class RgbdOdometryPlugin:
                         if isinstance(mount, dict):
                             mount.pop('status', None)
                             mount.pop('reason', None)
-                    signature = json.dumps([args['input_topics'], geometry, settings], sort_keys=True)
+                    signature = json.dumps([topics, geometry, settings], sort_keys=True)
                     if current and current[1] != signature:
                         raise ValueError('stop RGB-D odometry before changing its input geometry')
                     if not current:

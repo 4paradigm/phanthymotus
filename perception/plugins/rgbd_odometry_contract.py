@@ -93,16 +93,65 @@ def make_sample(status, stamp_ns, segment, clock, pose=None, *, reason=None):
     return sample
 
 
+def start_topics(args):
+    """Core sends a lone resolved input only as singular `input_topic`."""
+    topics = args.get('input_topics')
+    if topics is None and isinstance(args.get('input_topic'), str) and args['input_topic']:
+        return [args['input_topic']]
+    return topics
+
+
+def _short(topic):
+    text = str(topic)
+    return text if len(text) <= 64 else text[:20] + '...' + text[-41:]
+
+
+def _describe_inputs(declarations, topics):
+    """Bounded per-input evidence for start failures; never infers calibration."""
+    rows = []
+    for topic in topics[:4]:
+        entry = declarations.get(topic)
+        rows.append(f'{_short(topic)}: ' + (
+            'no camera_info declaration' if not isinstance(entry, dict) else
+            'declared ' + str(entry.get('format') or 'without format')[:32]))
+    # Problems first: Core keeps only the first 200 characters of the message.
+    rows.sort(key=lambda row: 'declared image/' in row)
+    if len(topics) > 4:
+        rows.append(f'+{len(topics)-4} more input(s)')
+    unused = sorted(str(t) for t in declarations if t not in topics)
+    if unused:
+        rows.append('declared but not connected: ' + ', '.join(_short(t) for t in unused[:2]) +
+                    (f' +{len(unused)-2} more' if len(unused) > 2 else ''))
+    return '; '.join(rows)
+
+
 def validate_start_inputs(declarations, topics, imu_assisted=False):
-    """The optional third input is a self-describing JSON camera IMU stream."""
-    if type(imu_assisted) is not bool or not isinstance(topics, list):
-        raise ValueError('imu_assisted must be boolean and input_topics must be a list')
-    expected = 3 if imu_assisted else 2
-    if len(topics) != expected or any(not isinstance(t, str) or not t for t in topics) or len(set(topics)) != expected:
-        raise ValueError('connect two RGB-D topics and exactly one IMU topic when assistance is enabled')
+    """The optional third input is a self-describing JSON camera IMU stream.
+
+    Failures name which input lacks a declaration or has the wrong format.
+    """
+    if type(imu_assisted) is not bool:
+        raise ValueError('imu_assisted must be boolean')
+    if not isinstance(topics, list) or any(not isinstance(t, str) or not t for t in topics):
+        raise ValueError('input_topics must be a list of topic names; no RGB-D input topic received')
     declarations = declarations if isinstance(declarations, dict) else {}
+    detail = _describe_inputs(declarations, topics)
+    duplicates = sorted({t for t in topics if topics.count(t) > 1})
+    if duplicates:
+        raise ValueError('connect distinct RGB-D/IMU input topics: duplicate ' +
+                         ', '.join(_short(t) for t in duplicates[:2]))
+    expected = 3 if imu_assisted else 2
+    if len(topics) != expected:
+        raise ValueError('connect two RGB-D topics and exactly one IMU topic when assistance is enabled: '
+                         f'imu_assisted={str(imu_assisted).lower()}, {len(topics)} input(s) connected; {detail}')
     rgbd = [t for t in topics if isinstance(declarations.get(t), dict) and
             declarations[t].get('format') in ('image/jpeg', 'image/depth-zlib')]
+    formats = [declarations[t]['format'] for t in rgbd]
+    missing = [f for f in ('image/jpeg', 'image/depth-zlib') if f not in formats]
+    if len(rgbd) != 2 or missing:
+        raise ValueError('connect one calibrated color and one measured depth input: ' +
+                         (f'missing {" and ".join(missing)}; ' if missing else
+                          'more than one declaration per role; ') + detail)
     calibration = validate_inputs(declarations, rgbd)
     if imu_assisted:
         calibration['imu_topic'] = next(t for t in topics if t not in rgbd)
