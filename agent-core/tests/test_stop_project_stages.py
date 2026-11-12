@@ -78,6 +78,12 @@ class Recorder:
 @pytest.fixture
 def rig(monkeypatch):
     rec = Recorder()
+    # Tests may run against a local Core database; preserve its Canvas,
+    # runtime state and MCP catalog instead of clearing a user's project.
+    previous = {
+        key: (key in config_mod.main, config_mod.main.get(key))
+        for key in ('canvas_layout', 'core', 'services')
+    }
     config_mod.main['canvas_layout'] = {'cards': list(CARDS)}
     config_mod.main['core'] = {'project_running': True}
 
@@ -92,8 +98,16 @@ def rig(monkeypatch):
     rec.install = _install
     monkeypatch.setattr(api_config, 'STOP_CARD_TIMEOUT_S', 0.2)
     monkeypatch.setattr(api_config, '_stop_teardown_task', None, raising=False)
-    yield rec
-    config_mod.main['canvas_layout'] = {}
+    try:
+        yield rec
+    finally:
+        for key, (existed, value) in previous.items():
+            if existed:
+                config_mod.main[key] = value
+            else:
+                with config_mod._get_conn() as conn:
+                    conn.execute('DELETE FROM config WHERE key=?', (key,))
+                    conn.commit()
 
 
 def run(coro):

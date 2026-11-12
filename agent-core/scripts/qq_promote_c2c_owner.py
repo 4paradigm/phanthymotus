@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from pathlib import Path
 import sys
 
-sys.path.insert(0, "/work/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 def update_owner(*, revoke: bool = False) -> dict:
@@ -38,13 +39,24 @@ def update_owner(*, revoke: bool = False) -> dict:
     if user["role"] == "blocked":
         raise ValueError("Refusing to promote a blocked account")
     new_role = "viewer" if revoke else "owner"
+    # Separate explicit local approval from the role. Never put a general
+    # owner override in the default QQ config or accept this via a QQ message.
+    # Revoke the grant before demoting; grant only after owner upsert succeeds.
+    if revoke:
+        config.main["qq_c2c_owner_grant"] = {"enabled": False}
     updated = acl.upsert_user(
         "qq", user["user_id"], display_name=user.get("display_name", ""),
         role=new_role,
         tool_filter="*",
     )
+    if not revoke:
+        config.main["qq_c2c_owner_grant"] = {
+            "enabled": True,
+            "principal": user["user_id"],
+        }
     return {
         "role": updated["role"],
+        "privileged_tools_enabled": not revoke,
         "principal_hash": hashlib.sha256(user["user_id"].encode()).hexdigest()[:12],
         "is_private_chat": True,
         "other_qq_users_unchanged": True,

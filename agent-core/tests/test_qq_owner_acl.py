@@ -6,6 +6,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from channel.tool_policy import _qq_owner_dm_identity, allowed_for_principals
+# Load the production policy dependency before patching config.main in tests.
+import event.llm  # noqa: F401
 
 _OWNER = "official:1900000000:A1234567890BCDEF1234567890ABCDEF"
 _GROUP = "official:1900000000:group:GroupOpenID12345:MemberOpenID12345"
@@ -16,10 +18,20 @@ _TOOLS = (
 
 
 class QQOwnerACLTests(unittest.TestCase):
-    def check(self, user_id, role, tool, filter_="*"):
-        with mock.patch("channel.acl.get_user", return_value={
-                "role": role, "tool_filter": filter_}):
+    def check(self, user_id, role, tool, filter_="*", grant=None):
+        if grant is None:
+            grant = {"enabled": True, "principal": _OWNER}
+        with (mock.patch("channel.acl.get_user", return_value={
+                "role": role, "tool_filter": filter_}),
+              mock.patch("config.main", {"qq_c2c_owner_grant": grant})):
             return allowed_for_principals([("qq", user_id)], tool)
+
+    def test_default_denies_privileged_owner_without_local_grant(self):
+        for grant in ({}, {"enabled": False, "principal": _OWNER},
+                      {"enabled": True, "principal": "official:1900000000:OtherOwner123456789"}):
+            with self.subTest(grant=grant):
+                self.assertFalse(self.check(_OWNER, "owner", "Bash", grant=grant))
+                self.assertTrue(self.check(_OWNER, "owner", "mcp__channel__channel_reply", grant=grant))
 
     def test_owner_c2c_can_call_all_tools(self):
         self.assertTrue(_qq_owner_dm_identity(_OWNER))

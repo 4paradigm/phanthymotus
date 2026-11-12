@@ -18,7 +18,14 @@ def _qq_safe(name: str, *, role: str = '', user_id: str = '') -> bool:
     an operator mistakenly expands their role or tool filter.
     """
     if role == 'owner' and _qq_owner_dm_identity(user_id):
-        return True
+        # A DB owner role alone must NEVER grant remote shell/device access.
+        # A separate, locally provisioned exact-principal grant is required.
+        import config
+        grant = config.main.get('qq_c2c_owner_grant', {})
+        if (isinstance(grant, dict)
+                and grant.get('enabled') is True
+                and grant.get('principal') == user_id):
+            return True
     return name in ('finish', 'mcp__channel__channel_reply')
 
 

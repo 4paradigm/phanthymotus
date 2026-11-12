@@ -226,6 +226,31 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         await cb.on_message_event("C2C_MESSAGE_CREATE", raw)
         self.assertEqual(len(self.inbound), 1)
 
+    async def test_group_diagnostics_are_sampled_not_logged_per_message(self):
+        import contextlib
+        import io
+        self.adapter.config.update({
+            "enabled_scopes": ["c2c", "group"],
+            "private_only": False,
+        })
+        await self.adapter.start()
+        cb = MockWs.instances[-1].callbacks
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            for i in range(201):
+                event = dict(
+                    chat_scope="group", chat_id="GroupOpenID12345",
+                    user_id="MemberOpenID12345",
+                    message_id=f"group-sampled-{i:04d}",
+                    content="测试", user_name="tester",
+                    attachments=[], msg_elements=[],
+                )
+                await cb.on_message_event("GROUP_AT_MESSAGE_CREATE", event)
+        logs = stream.getvalue()
+        self.assertEqual(self.adapter._group_event_count, 201)
+        self.assertEqual(logs.count("gateway_event_received type=at"), 3)
+        self.assertEqual(logs.count("[qq-group] sdk_parsed="), 3)
+
     async def test_group_image_callback_dispatches_downloaded_metadata(self):
         self.adapter.config.update({
             "enabled_scopes": ["c2c", "group"],

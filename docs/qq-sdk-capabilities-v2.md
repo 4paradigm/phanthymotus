@@ -30,11 +30,12 @@ Existing production Core version 80600c3 remains text-only C2C.
 - SDK support does not grant QQ platform entitlements. Enterprise and personal
   developer registrations have different Group/Guild and C2C permissions.
 - QQ is passive-message first. We do not expose unbounded proactive push.
-- QQ users default to server-side reply-only tool policy. An **explicitly provisioned
-  owner role on a verified C2C principal** (three-part `official:<appid>:<openid>`)
-  can access the full set of tools bound on the Canvas. QQ group/Guild principals
-  and ordinary users remain reply-only, even if misconfigured with owner role.
-  Runtime owner grants are stored in the ACL database, not checked into Git.
+- QQ users default to server-side reply-only tool policy. Elevated C2C tools
+  require **both** a verified `owner` ACL role **and** a separate locally
+  provisioned, enabled `qq_c2c_owner_grant` for the exact
+  `official:<appid>:<openid>` principal. Without either condition, even an
+  `owner` C2C account remains reply-only. Group/Guild and ordinary users
+  remain reply-only regardless of their role.
 - Interaction approval records **one-time intent only**, with exact actor and
   group validation. It does not automatically elevate an ACL role or run a
   physical action. Even the SDK's "always" button is narrowed to one-time.
@@ -60,15 +61,18 @@ Existing production Core version 80600c3 remains text-only C2C.
 - The script refuses to select an account unless exactly one registered C2C
   principal exists for the active official QQ AppID. No real OpenIDs, account
   secrets, or personal QQ numbers are committed.
-- An `owner` C2C principal with `tool_filter="*"` may call **all tools actually
-  bound on the Agent Core Canvas**, including Bash, file writes and robot tools.
+- An `owner` C2C principal with `tool_filter="*"` and an enabled exact-ID
+  grant in the Core runtime configuration may call **all tools actually bound
+  on the Agent Core Canvas**, including Bash, file writes and robot tools.
+  The grant is **off by default**; a bare `owner` role cannot bypass it.
   This is equivalent to privileged remote access and must be deliberately
   enabled and audited by a trusted system administrator.
 - Group, Guild and regular QQ users remain reply-only, including users with
   incorrectly configured elevated roles. Privilege is re-checked at dispatch.
-- Runtime ACL roles are persisted in the Core database; a Git commit does not
-  transfer the owner's runtime user record between separate Core installations.
-  To revoke this privilege, use `--revoke` in the same local admin environment.
+- Runtime ACL role and the opt-in `qq_c2c_owner_grant` are persisted
+  separately in the Core database. No QQ principal, approval token, or role
+  assignment is shipped in Git; another installation is default-deny.
+  To revoke, use `--revoke` in the same local admin environment.
 - QQ AppID, Gateway entitlement, credentials and robot deployment approvals
   remain separate from the owner role.
 

@@ -163,6 +163,7 @@ class QQOfficialAdapter(ChannelAdapter):
         self._http = None
         self._attempted_replies = OrderedDict()
         self._reply_lock = asyncio.Lock()
+        self._group_event_count = 0
 
     async def start(self) -> None:
         validate_qq_official_config(self.config)
@@ -207,24 +208,30 @@ class QQOfficialAdapter(ChannelAdapter):
             try:
                 is_group_event = event_type in (
                     "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE")
+                if is_group_event:
+                    self._group_event_count += 1
+                log_group = (is_group_event and
+                             (self._group_event_count == 1 or
+                              self._group_event_count % 100 == 0))
                 if event_type == "GROUP_MESSAGE_CREATE":
                     if "group" not in self.config.get("enabled_scopes", ["c2c"]):
                         return
                     if not _full_group_mentions_bot(
                             raw, self.config.get("bot_group_openid", "")):
-                        print("[qq-group] full_event_ignored_not_at_bot",
-                              flush=True)
+                        if log_group:
+                            print("[qq-group] full_event_ignored_not_at_bot",
+                                  flush=True)
                         return
                     # Same payload schema as GROUP_AT; normalize for SDK 1.2.2.
                     parsed_event_type = "GROUP_AT_MESSAGE_CREATE"
                 else:
                     parsed_event_type = event_type
-                if event_type == "GROUP_AT_MESSAGE_CREATE":
+                if event_type == "GROUP_AT_MESSAGE_CREATE" and log_group:
                     print("[qq-group] gateway_event_received type=at",
                           flush=True)
                 event = self._parser.parse(parsed_event_type, raw)
                 msg = self._parse_message(event)
-                if is_group_event:
+                if is_group_event and log_group:
                     print(
                         f"[qq-group] sdk_parsed={event is not None} "
                         f"adapter_accepted={msg is not None}",
