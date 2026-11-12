@@ -194,3 +194,72 @@ def test_instances_on_same_camera_have_distinct_topics_and_override(detector):
     finally:
         plugin.shutdown()
     assert not executor.nodes
+
+
+@pytest.mark.parametrize(("camera_info", "expected_id"), [
+    ({TOPIC: CAMERA}, CAMERA["id"]),
+    ([CAMERA], CAMERA["id"]),
+    ({TOPIC: {**CAMERA, "schema": "other.camera/1"}}, ""),
+    ({TOPIC: {**CAMERA, "topic": "/another/color"}}, ""),
+    ({TOPIC: {**CAMERA, "format": "image/depth-zlib"}}, ""),
+])
+def test_calibration_override_uses_only_matching_camera_identity(detector, camera_info, expected_id):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC,
+            "camera_info": camera_info}
+    try:
+        if not expected_id:
+            assert plugin.dispatch("aruco", args)["state"] == "error"
+            assert not executor.nodes
+        plugin.dispatch("aruco", {"action": "config", "instance_id": "a",
+                                  "calibration": {**CAMERA, "id": "calibration-file-id"}})
+        assert plugin.dispatch("aruco", args)["state"] == "running"
+        [node] = executor.nodes
+        node.subscriptions[0].callback(_frame(np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8), 1))
+        assert _wait_until(lambda: bool(node.publishers[0].messages))
+        assert json.loads(node.publishers[0].messages[0])["camera_id"] == expected_id
+    finally:
+        plugin.shutdown()
+
+
+def test_worker_reports_processing_error_recovers_and_restarts(detector, caplog, monkeypatch):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({"rate_hz": 30}, executor)
+    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC,
+            "camera_info": {TOPIC: CAMERA}}
+    info_args = {"action": "info", "instance_id": "a"}
+    image = np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
+    try:
+        assert plugin.dispatch("aruco", args)["state"] == "running"
+        [node] = executor.nodes
+        deliver = node.subscriptions[0].callback
+        pose_pub = node.publishers[0]
+
+        def broken_detector(*_args):
+            raise RuntimeError("detector unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(node.detector, "estimate", broken_detector)
+            for index in (1, 2):
+                deliver(_frame(image, index))
+                assert _wait_until(lambda: len(pose_pub.messages) == index)
+                failed = json.loads(pose_pub.messages[-1])
+                assert failed["markers"] == []
+                assert "detector unavailable" in failed["error"]
+                assert failed["stamp"]["sec"] == index
+            info = plugin.dispatch("aruco", info_args)
+            assert info["state"] == "error" and "detector unavailable" in info["error"]
+            assert sum("detector unavailable" in record.message for record in caplog.records) == 1
+
+        deliver(_frame(image, 3))
+        assert _wait_until(lambda: plugin.dispatch("aruco", info_args)["state"] == "running")
+        assert "error" not in json.loads(pose_pub.messages[-1])
+
+        node.close()
+        assert "worker stopped" in plugin.dispatch("aruco", info_args)["error"]
+        assert plugin.dispatch("aruco", args)["state"] == "running"
+        [replacement] = executor.nodes
+        assert node.destroyed and replacement is not node and replacement.worker.is_alive()
+    finally:
+        plugin.shutdown()

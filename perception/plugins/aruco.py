@@ -13,8 +13,9 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from plugins.aruco_runtime import Calibration, DEFAULT_DICTIONARY, DICTIONARIES, MarkerDetector
-from plugins.camera_info import for_topic
+from plugins.camera_info import SCHEMA, for_topic
 from utils.latest_frame import LatestFrame
+from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
@@ -70,18 +71,20 @@ def _validate(options):
 
 
 class _ArucoNode(Node):
-    def __init__(self, topic, key, options, declaration, detector):
+    def __init__(self, topic, key, options, declaration, detector, camera_id):
         self.calibration = Calibration.from_declaration(declaration)
         suffix = hashlib.sha256(key.encode()).hexdigest()[:16]
         super().__init__(f"aruco_{suffix}")
         self.input_topic = topic
         self.options = options
-        self.camera_id = declaration.get("id") or ""
+        self.camera_id = camera_id
         self.detector = detector
         self.frames = LatestFrame()
         self._closed = threading.Event()
         self._publish_lock = threading.Lock()
+        self._error_log = SampledLogGate()
         self.last_error = ""
+        self.worker_error = ""
         base = f"{topic}/aruco/i_{suffix}"
         self.outputs = [{"topic": f"{base}/poses", **TOOLS[0]["topic_out"][0]},
                         {"topic": f"{base}/overlay", **TOOLS[0]["topic_out"][1]}]
@@ -111,18 +114,41 @@ class _ArucoNode(Node):
             start = time.monotonic()
             try:
                 self._process(frame)
-            except Exception:
-                log.exception("ArUco could not process a camera frame")
+            except Exception as exc:
+                self._worker_error(frame, exc)
+            else:
+                self._error_log.check("processed")
             # Pop after waiting so the next iteration sees the newest frame.
             self._closed.wait(max(0, interval - (time.monotonic() - start)))
 
+    def _frame_result(self, frame):
+        stamp = frame.header.stamp
+        return {"camera_id": self.camera_id, "frame_id": frame.header.frame_id,
+                "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec},
+                "coordinate_frame": "camera_optical", "dictionary": self.options["dictionary"],
+                "marker_size_m": self.options["marker_size_m"], "markers": []}
+
+    def _worker_error(self, frame, error):
+        detail = escape_log_text(error)
+        message = f"ArUco could not process camera frame: {detail}"
+        with self._publish_lock:
+            if self._closed.is_set():
+                return
+            self.last_error = self.worker_error = message
+        should_log, transition, _ = self._error_log.check("failed")
+        if should_log:
+            log.error("ArUco could not process camera frame: %s", detail, exc_info=transition)
+        try:
+            result = self._frame_result(frame)
+            result["error"] = message
+            self._publish(result, worker_error=message)
+        except Exception as publish_error:
+            if should_log:
+                log.warning("Could not publish ArUco frame error: %s", escape_log_text(publish_error))
+
     def _process(self, frame):
         cv = self.detector.cv
-        stamp = frame.header.stamp
-        result = {"camera_id": self.camera_id, "frame_id": frame.header.frame_id,
-                  "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec},
-                  "coordinate_frame": "camera_optical", "dictionary": self.options["dictionary"],
-                  "marker_size_m": self.options["marker_size_m"], "markers": []}
+        result = self._frame_result(frame)
         image, overlay = None, None
         try:
             if not 0 < len(frame.data) <= MAX_JPEG_BYTES:
@@ -135,20 +161,25 @@ class _ArucoNode(Node):
             result["error"] = str(exc)
         if image is not None:
             ok, encoded = cv.imencode(".jpg", image)
-            if ok:
-                overlay = CompressedImage()
-                overlay.header = frame.header
-                overlay.format = "jpeg"
-                overlay.data = encoded.tobytes()
+            if not ok:
+                raise RuntimeError("Could not encode the ArUco overlay JPEG.")
+            overlay = CompressedImage()
+            overlay.header = frame.header
+            overlay.format = "jpeg"
+            overlay.data = encoded.tobytes()
+        self._publish(result, overlay)
+
+    def _publish(self, result, overlay=None, *, worker_error=""):
         message = String()
         message.data = json.dumps(result, allow_nan=False)
         with self._publish_lock:
             if self._closed.is_set():
                 return
-            self.last_error = result.get("error", "")
             self._poses.publish(message)
             if overlay is not None:
                 self._overlay.publish(overlay)
+            self.last_error = result.get("error", "")
+            self.worker_error = worker_error
 
 
 class ArucoPlugin:
@@ -187,8 +218,13 @@ class ArucoPlugin:
 
     def _info(self, node):
         if node is not None:
-            return {"state": "running", "topic_in": [{"topic": node.input_topic, "format": "image/jpeg"}],
+            info = {"state": "running", "topic_in": [{"topic": node.input_topic, "format": "image/jpeg"}],
                     "topic_out": node.outputs, "last_frame_error": node.last_error}
+            if not node.worker.is_alive():
+                info.update(state="error", error="ArUco frame worker stopped. Restart the card.")
+            elif node.worker_error:
+                info.update(state="error", error=node.worker_error)
+            return info
         try:
             MarkerDetector(DEFAULT_DICTIONARY)
         except RuntimeError as exc:
@@ -217,7 +253,7 @@ class ArucoPlugin:
             return {"state": "error", "error": "Connect a camera or provide an absolute camera JPEG topic."}
         key = instance or topic
         previous = self._nodes.get(key)
-        if previous is not None and previous.input_topic == topic:
+        if previous is not None and previous.input_topic == topic and previous.worker.is_alive():
             return self._info(previous)
         options = {**self._defaults, **self._overrides.get(instance, {})}
         node = None
@@ -225,13 +261,16 @@ class ArucoPlugin:
             _validate(options)
             declarations = camera_info if isinstance(camera_info, (dict, list, tuple)) else None
             upstream = for_topic(declarations, topic)
+            if (upstream.get("schema") != SCHEMA or upstream.get("topic") != topic
+                    or upstream.get("format") not in (None, "", "image/jpeg")):
+                upstream = {}
             declaration = options.get("calibration") or upstream
             if not declaration:
                 raise ValueError("No calibration for this JPEG topic. Configure camera calibration or a card override.")
-            if options.get("calibration") and upstream.get("id"):
-                declaration = {"id": upstream["id"], **declaration}
+            camera_id = upstream.get("id")
+            camera_id = camera_id if isinstance(camera_id, str) else ""
             detector = MarkerDetector(options["dictionary"])
-            node = _ArucoNode(topic, key, options, declaration, detector)
+            node = _ArucoNode(topic, key, options, declaration, detector, camera_id)
             if self._executor.add_node(node) is False:
                 raise RuntimeError("Could not register the ArUco node in the ROS executor.")
             node.worker.start()
