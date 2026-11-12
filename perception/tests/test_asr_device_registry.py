@@ -38,7 +38,7 @@ sys.modules.setdefault("sherpa_onnx", types.ModuleType("sherpa_onnx"))
 from plugins import asr  # noqa: E402
 from utils import model_downloader  # noqa: E402
 
-VALID_DTYPES = {"int8", "fp32", "fp16"}
+VALID_DTYPES = {"int8", "fp32", "fp16", "q5_0"}
 
 
 def _device_specs():
@@ -48,8 +48,12 @@ def _device_specs():
 
 
 def test_every_model_has_a_cpu_entry():
-    """cpu is the fallback for an unsupported device request, so it must exist."""
+    """ONNX backends retain CPU fallback; the native CUDA backend is explicit."""
     for model, info in asr.ASR_MODELS.items():
+        if info.get("lazy"):
+            assert model == "whisper-turbo-q5"
+            assert set(info["devices"]) == {"gpu"}
+            continue
         assert "cpu" in info["devices"], f"{model} has no cpu weights"
 
 
@@ -87,6 +91,12 @@ def test_cpu_entries_are_never_fp16():
 def test_download_keys_resolve():
     """A gpu entry must name a pinned bundle; a cpu entry a legacy archive."""
     for model, device, spec in _device_specs():
+        if spec.get("runtime") == "whisper.cpp":
+            from utils.install_whisper_turbo import MODEL_DIR, REVISION, MANIFEST_SHA256
+            assert model == "whisper-turbo-q5" and device == "gpu"
+            assert spec["dir"] == MODEL_DIR and REVISION in MODEL_DIR
+            assert len(MANIFEST_SHA256) == 64
+            continue
         key = spec["download"]
         if device == "gpu":
             assert key in model_downloader.SHERPA_GPU_BUNDLES, \
@@ -132,7 +142,9 @@ def test_asr_models_supporting():
     assert "parakeet-en" in asr.asr_models_supporting("gpu")
     # Measured 0.80x on CUDA — deliberately absent.
     assert "x-asr-zh-en" not in asr.asr_models_supporting("gpu")
-    assert asr.asr_models_supporting("cpu") == sorted(asr.ASR_MODELS)
+    assert asr.asr_models_supporting("cpu") == sorted(
+        model for model, info in asr.ASR_MODELS.items() if "cpu" in info["devices"])
+    assert "whisper-turbo-q5" in asr.asr_models_supporting("gpu")
 
 
 @pytest.mark.parametrize("cfg, expected_dir", [

@@ -30,6 +30,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from plugins.vad_preroll import PcmHistory
+from plugins.whisper_turbo import WhisperTurboAdapter
+from utils.install_whisper_turbo import MODEL_DIR as WHISPER_TURBO_MODEL_DIR
 
 log = logging.getLogger(__name__)
 
@@ -658,7 +660,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model. Whisper Turbo Q5 uses automatic language detection, requires GPU, and downloads resources on first start", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -670,12 +672,10 @@ TOOLS = [
                 # degrades a carried-over device to cpu instead of rejecting it,
                 # and only rejects a device the request actually changed.
                 "device":        {"type": "string", "enum": ["cpu", "gpu"],
-                                  "description": "Inference device. gpu loads non-quantised weights "
-                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
-                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
-                                                 "never gives back — check headroom before enabling",
+                                  "description": "Inference device. Supported precision and memory "
+                                                 "depend on the model; Whisper Turbo Q5 requires GPU",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small", "whisper-turbo-q5"]}},
                 # `kws` (a second sherpa KeywordSpotter on the raw audio) was
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
                 "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
@@ -697,7 +697,7 @@ TOOLS = [
                 # 压掉，所以普通一句话只多出一个 lang 字段。
                 # 只对 sensevoice-small 有意义：别的模型的结果里没有这些字段，
                 # 开着也只是调一个返回空 dict 的默认实现。
-                "emit_audio_tags": {"type": "boolean", "description": "把 SenseVoice 顺带给出的语音情绪（HAPPY/SAD/ANGRY…）、音频事件（Laughter/Cry/Applause/BGM…）和语种一起发到 <topic>/asr。零额外模型、零额外内存：这些字段模型本来就算了，以前被丢掉。平淡的普通话只会多一个 lang 字段", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"]}},
+                "emit_audio_tags": {"type": "boolean", "description": "Include detected language in ASR output. SenseVoice also provides audio-event metadata; Whisper Turbo provides language only", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small", "whisper-turbo-q5"]}},
                 # 默认 **关**，而上面那个默认开。不是保守，是实测：Orin 6 上 351
                 # 段真机语音里 340 段是 NEUTRAL/EMO_UNKNOWN，剩下 11 段基本是错的
                 # （「小范小范，你好呀。」→ SAD，出现三次；「我的断网了？」→ HAPPY）。
@@ -1010,6 +1010,13 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 # counts, and emitted nothing but `</s>`. See utils/onnx_provider.py for the
 # measurements and perception/README.md for the admission checklist.
 ASR_MODELS = {
+    "whisper-turbo-q5": {
+        "label": "Whisper Turbo Q5 (automatic multilingual, GPU)",
+        "adapter": WhisperTurboAdapter,
+        "lazy": True,
+        "devices": {"gpu": {"dir": WHISPER_TURBO_MODEL_DIR, "dtype": "q5_0",
+                            "runtime": "whisper.cpp"}},
+    },
     "x-asr-zh-en": {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
@@ -1234,6 +1241,8 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
         model_info = ASR_MODELS[model_name]
 
     device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    if model_info.get("lazy") and device not in model_info["devices"]:
+        raise ValueError("Whisper Turbo Q5 requires device=gpu")
     if device not in model_info["devices"]:
         # Degrade rather than refuse to boot: a baked config.yaml asking for a
         # device this model has no verified weights for should still come up on
@@ -1247,6 +1256,8 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
     spec = model_info["devices"][device]
 
     model_dir = _model_dir_for(cfg, spec)
+    if model_info.get("lazy"):
+        return model_info["adapter"](model_dir, device, int(cfg.get("num_threads", 2)))
     _status(f"正在获取模型 '{model_name}' ({device}) …")
     # Same callback on both paths. The gpu bundles are the largest downloads in
     # the stack — parakeet's fp32 weights are 437 MB and took 81 s on an Orin —
@@ -1839,10 +1850,32 @@ class _ASRNode(Node):
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
-        try:
-            self._pcm_queue.put_nowait((pcm, ts, msg.header.stamp.sec >= 1_000_000_000))
-        except Exception:
-            pass  # drop if severely behind
+        converted = getattr(self, '_audio_container_decoded', False)
+        timing_pcm_length = len(pcm)
+        # Silero consumes 512-sample windows. Preserve that granularity for a
+        # recovered file and drain with backpressure, rather than dropping the
+        # second half when a minute of audio fills the live-input queue.
+        if converted:
+            silence_ms = max(0, int(getattr(self, '_vad_silence_ms', 400)))
+            # Preserve the established untrusted timing anchor of decoded
+            # speech; extra synthetic silence must not shift the speech earlier.
+            timing_pcm_length += (silence_ms + 100) * SAMPLE_RATE // 1000 * 2
+            flush_ms = silence_ms + 100
+            pcm += b'\0' * (flush_ms * SAMPLE_RATE // 1000 * 2)
+        step = 1024 if converted else len(pcm)
+        for offset in range(0, len(pcm), step):
+            chunk = pcm[offset:offset + step]
+            chunk_ts = ts - (timing_pcm_length - offset - len(chunk)) / (SAMPLE_RATE * 2) if converted else ts
+            trusted = msg.header.stamp.sec >= 1_000_000_000 and not converted
+            try:
+                if converted:
+                    self._pcm_queue.put((chunk, chunk_ts, trusted), timeout=1)
+                else:
+                    self._pcm_queue.put_nowait((chunk, chunk_ts, trusted))
+            except Exception:
+                if converted:
+                    self._warn_audio_contract('container-queue', 'VAD queue stalled while decoding MPEG-4 audio')
+                    break
 
     def _warn_audio_contract(self, key: str, detail: str) -> None:
         """Warn on the first violation of a kind, then every 500th one.
@@ -1859,13 +1892,28 @@ class _ASRNode(Node):
     def _check_audio_contract(self, fmt: str, pcm: bytes) -> bytes:
         """Validate the documented AudioChunk contract, return usable PCM.
 
-        Only the 16-bit alignment is corrected: a chunk with an odd byte count
+        Self-describing MPEG-4 files are decoded before PCM alignment. Plain
+        PCM retains its existing handling: a chunk with an odd byte count
         makes the VAD worker's struct.unpack() raise, killing the subprocess and
         taking ASR to the error state. Format and chunk size are reported but
         left alone — undersized chunks are the most common cause of "ASR hears
         audio but never emits text", and dropping them here would change the
         behaviour of producers that work today.
         """
+        from plugins.audio_container import Mpeg4AudioInput
+
+        self._audio_container_decoded = False
+        if not hasattr(self, '_container_audio_input'):
+            self._container_audio_input = Mpeg4AudioInput()
+        try:
+            pcm, self._audio_container_decoded = self._container_audio_input.feed(pcm)
+        except Exception as error:
+            self._warn_audio_contract('container', 'MPEG-4 audio decode failed: ' + str(error))
+            return b''
+        if self._audio_container_decoded:
+            self._warn_audio_contract('container', 'decoded MPEG-4 audio received on the PCM topic; capture timing unavailable')
+        if not pcm:
+            return b''
         if fmt not in _AUDIO_FORMAT_ALIASES:
             self._warn_audio_contract(
                 'format', f"format={fmt!r}, expected {AUDIO_FORMAT!r}")
@@ -2166,7 +2214,7 @@ class ASRPlugin:
         self._device       = normalize_device(plugin_cfg.get('device'),
                                              plugin_cfg.get('hw_provider'))
         if self._device not in ASR_MODELS.get(self._asr_model, {}).get("devices", {}):
-            self._device = "cpu"
+            self._device = ("gpu" if ASR_MODELS.get(self._asr_model, {}).get("lazy") else "cpu")
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
@@ -2183,7 +2231,11 @@ class ASRPlugin:
         # threads — a plain attribute assignment is atomic enough for that and
         # needs no lock.
         self._load_status  = ""
-        self._adapter      = _build_asr_adapter(plugin_cfg)
+        self._lazy_load_requested = False
+        self._lazy_stop_generation = 0
+        self._lazy_instance_stops = {}
+        self._adapter      = (None if ASR_MODELS.get(self._asr_model, {}).get("lazy")
+                              else _build_asr_adapter(plugin_cfg))
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
@@ -2284,21 +2336,32 @@ class ASRPlugin:
             while True:
                 with self._nodes_lock:
                     model, device = self._load_target
+                    lazy = ASR_MODELS.get(model, {}).get("lazy", False)
+                    load = not lazy or self._lazy_load_requested
+                adapter = None
                 try:
-                    log.info(f"[asr] downloading/loading model '{model}' ({device})...")
-                    adapter = _build_asr_adapter(
-                        {**self._plugin_cfg, 'asr_model': model, 'device': device},
-                        on_status=lambda text: setattr(self, "_load_status", text))
+                    if load:
+                        log.info(f"[asr] downloading/loading model '{model}' ({device})...")
+                        adapter = _build_asr_adapter(
+                            {**self._plugin_cfg, 'asr_model': model, 'device': device},
+                            on_status=lambda text: setattr(self, "_load_status", text))
+                        if lazy:
+                            adapter.prepare(on_status=lambda text: setattr(self, "_load_status", text))
                     error = None
                 except Exception as e:
                     log.error(f"[asr] failed to load model '{model}': {e}", exc_info=True)
+                    if isinstance(adapter, WhisperTurboAdapter):
+                        adapter.close()
                     adapter, error = None, str(e)
                 with self._nodes_lock:
-                    if self._load_target != (model, device):
+                    if (self._load_target != (model, device)
+                            or (lazy and load != self._lazy_load_requested)):
                         # Superseded while we were loading — drop this result,
                         # including its error, and load what was asked for last.
                         log.info("[asr] load of '%s' (%s) superseded by '%s' (%s)",
                                  model, device, *self._load_target)
+                        if isinstance(adapter, WhisperTurboAdapter):
+                            adapter.close()
                         continue
                     if adapter is not None:
                         self._adapter = adapter
@@ -2427,6 +2490,18 @@ class ASRPlugin:
             }
 
         elif action == "start":
+            lazy_start = None
+            if ASR_MODELS.get(self._asr_model, {}).get("lazy"):
+                input_topic, _ = _resolve_asr_inputs(args)
+                if not input_topic:
+                    raise ValueError("input_topic is required")
+                with self._nodes_lock:
+                    lazy_key = instance_id or input_topic
+                    lazy_start = (self._lazy_stop_generation,
+                                  self._lazy_instance_stops.get(lazy_key, 0))
+                    self._lazy_load_requested = True
+                    if self._adapter is None:
+                        self._load_model_async(self._asr_model)
             if self._loading:
                 # Short grace wait, then hand back. A warm model is ready within
                 # a second or two, and waiting for it keeps `start` synchronous
@@ -2444,6 +2519,10 @@ class ASRPlugin:
                 while self._loading:
                     if time.monotonic() > deadline:
                         with self._nodes_lock:
+                            if lazy_start is not None and lazy_start != (
+                                    self._lazy_stop_generation,
+                                    self._lazy_instance_stops.get(lazy_key, 0)):
+                                return {"state": "idle"}
                             self._pending_starts[instance_id or
                                                  args.get("input_topic", "")] = dict(args)
                         return {"state": "loading", "asr_model": self._asr_model,
@@ -2463,6 +2542,10 @@ class ASRPlugin:
             # node name; the dict kept only the last, orphaning a live node whose
             # subscription and VAD subprocess nothing could ever stop.
             with self._nodes_lock:
+                if lazy_start is not None and lazy_start != (
+                        self._lazy_stop_generation,
+                        self._lazy_instance_stops.get(lazy_key, 0)):
+                    return {"state": "idle"}
                 node = self._nodes.get(node_key)
                 if node is None:
                     node = _ASRNode(input_topic, self._adapter, self._language,
@@ -2502,6 +2585,11 @@ class ASRPlugin:
 
         elif action == "stop":
             with self._nodes_lock:
+                if instance_id:
+                    self._lazy_instance_stops[instance_id] = (
+                        self._lazy_instance_stops.get(instance_id, 0) + 1)
+                else:
+                    self._lazy_stop_generation += 1
                 # A start deferred behind a model load has to be dropped here
                 # too, or it fires minutes after the operator stopped the card.
                 if instance_id:
@@ -2572,6 +2660,15 @@ class ASRPlugin:
                         "message": f"Unknown asr_model '{new_model}'; "
                                    f"available: {', '.join(sorted(ASR_MODELS))}"}
             if new_device not in ASR_MODELS[new_model]["devices"]:
+                if ASR_MODELS[new_model].get("lazy"):
+                    # A saved CPU device belongs to the previous model. The
+                    # newly selected model has only a CUDA implementation.
+                    if 'device' not in cfg or new_device == self._device:
+                        new_device = "gpu"
+                    else:
+                        return {"status": "error", "asr_model": self._asr_model,
+                                "message": "Whisper Turbo Q5 requires device=gpu"}
+            if new_device not in ASR_MODELS[new_model]["devices"]:
                 # Two different situations reach here, and only one of them is a
                 # user error.
                 #
@@ -2609,14 +2706,22 @@ class ASRPlugin:
             if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
                 with self._nodes_lock:
+                    self._lazy_stop_generation += 1
+                    self._pending_starts.clear()
                     nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
                 for _, node in nodes:
                     node.request_stop()
                 for key, node in nodes:
                     self._dispose_node(node, key)
+                if isinstance(self._adapter, WhisperTurboAdapter):
+                    self._adapter.close()
+                if isinstance(self._adapter, WhisperTurboAdapter) or ASR_MODELS[new_model].get("lazy"):
+                    self._adapter = None
+                self._lazy_load_requested = False
                 self._asr_model = new_model
                 self._device = new_device
                 self._plugin_cfg['device'] = new_device
+                self._plugin_cfg['asr_model'] = new_model
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "device": self._device,
