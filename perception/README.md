@@ -43,6 +43,20 @@ Algorithm settings are available only through the card's instance configuration
 instance ID, input topics and camera calibration automatically. Saved `config`
 replay and direct dispatch arguments remain supported.
 
+Start failures name the offending input instead of only stating the rule, e.g.
+`connect one calibrated color and one measured depth input: missing image/jpeg;
+/ns/camera/head: no camera_info declaration; /ns/camera/rgbd/depth: declared
+image/depth-zlib`. Missing declarations and wrong formats come first because
+Core keeps only 200 characters; topic text is shortened. A single resolved
+input sent by Core as `input_topic` is diagnosed as a count error. No
+intrinsics, registration, depth unit or format is assumed. Offline, the real
+start-project chain reproduces the "connect one calibrated color…" message
+when a source answers without `camera_info` (Tianyi's camera card reports
+`unavailable` with no declaration before its first calibrated capture, which
+Core does not treat as a failure) or when a source `info()` fails and the link
+falls back to a canvas snapshot topic. Which case occurred in the field is not
+established.
+
 The original first `state/odom` port and its topic are unchanged. A second
 `data/json` port publishes `/rgbd_odometry/i_<hex-instance-id>/status` for display,
 using Bumi's summary fields: `status`, `turn_angle_deg`, `displacement_m`,
@@ -71,6 +85,17 @@ Each `rgbd_odometry` instance supports `visual_frontend` in `config`:
   native parameters must always change together.
 - `max_features`: 100..5000 integer, 1000 by default. This is a resource
   bound, not a measured tracking-performance guarantee.
+- `auto` (opt-in; the default remains `f2m_feature`): starts F2M and runs one
+  native frontend at a time. Only a segment loss classified as visual
+  degradation (persistent rejected estimates, stale or discontinuous visual
+  estimates) while both camera inputs are fresh makes the supervisor start the
+  *other* frontend, always as a new segment. Camera-input, IMU, clock, frame,
+  process and ESKF-continuity losses keep the frontend. After a switch, a 20 s
+  cooldown applies; after two switches without any tracking in between,
+  ordinary recovery keeps the current frontend until tracking returns.
+  Frontends are not ranked by raw inlier counts. `info().frontend` reports
+  mode, active frontend, switch count/reason, the last decision and cooldown.
+  These limits are engineering choices, not hardware-tuned values.
 
 `visual_frontend` and `max_features` are instance-scoped. Stop an active
 instance before changing either. Restart creates a new odometry segment;
@@ -134,6 +159,7 @@ relative, covariance/accuracy are not certified, and acceleration is never
 integrated into translation. It forwards private native `sensor_msgs/Imu` to
 RTAB-Map and waits for IMU coverage of each image. Stale/reset timestamps,
 changed source epochs/calibration and invalid geometry end the session segment;
+in this attitude-prior mode the native estimator itself consumes the IMU, so
 there is no automatic fallback to unassisted tracking after enabling IMU.
 `info().imu_assistance` and pose provenance distinguish the selected mode and
 its source/health. The pinned RTAB-Map core ignores orientation quaternions
@@ -144,8 +170,18 @@ RGB-D output available; use `imu_assisted=false` when no usable IMU exists.
 
 Actions are `start`, `stop`, `info` and `config`, with optional `instance_id`. Source
 startup must return its calibration before the downstream card starts. Tracking
-requires matching valid pose/diagnostic measurements. A lost diagnostic, stale
-input or expired estimate ends the segment. With fresh RGB and depth, a separate
+requires matching valid pose/diagnostic measurements. A single rejected
+estimate (native lost diagnostic, covariance above bounds, too few inliers,
+invalid quaternion) changes the state to `recovering`: pose output pauses, but
+the same native estimator keeps receiving frames. Tracking resumes in the same
+segment only after three consecutive valid estimates whose pose is continuous
+with the last published pose (within 5 cm + 1 m/s and 5° + 90°/s of elapsed
+time; an unvalidated engineering bound). Degradation lasting 1.5 s, a
+discontinuous resume, a changed native frame or a future capture time ends the
+segment. Late or repeated camera captures are dropped and counted
+(`info().input_rejections`), never paired; persistent input loss still expires
+the segment. Stale or out-of-order native results are ignored, never counted
+as evidence. With fresh RGB and depth, a separate
 supervisor attempts a new estimator/segment after 0.8 s, at most once every 1.5 s.
 Each successful restart has a new segment, coordinate origin and IMU/fusion
 history; it must pass the normal tracking/warmup gates again. The old position
@@ -197,6 +233,34 @@ capture clocks need bracketing IMU coverage, not identical sensor rates.
 Native pose/diagnostic results are joined at exact image capture times;
 results arriving after their 250 ms observation deadline are discarded.
 
+Each frame is judged in a fixed order. Hard capture-time, frame and data
+errors end the segment first. The IMU prediction is then followed by an
+attempted visual correction (time, residual and innovation gates unchanged).
+Only after that is uncertainty judged: without an accepted correction, a
+predicted position sigma above 0.10 m ends the segment; after an accepted
+correction, a corrected sigma above 0.10 m pauses output (`recovering`) and
+ends the segment if it persists for 1 s. `position_sigma_m` is the square root
+of the largest camera-position covariance eigenvalue under the unvalidated
+engineering priors, not a measured error. Watchdog/`info` polls are wall-clock
+and include native latency, so they never judge covariance or reset recovery
+evidence; they only report `coasting` after 500 ms without any processed frame
+(250 ms join deadline plus a 4 Hz frame interval). `info().fusion.frames`
+holds the last 16 frames' capture/arrival/processing times, latency, predicted
+and corrected sigma, visual outcome and rejection reason; each odometry sample
+carries only `last_frame`.
+
+If the ESKF stops (stale/invalid IMU, uncertainty, initialization timeout),
+the independent native visual estimate — which never consumed IMU in this
+mode — continues as an explicit `visual_only` fallback (`vendor.fallback`,
+`vendor.fusion.status=lost`, tracking `reason` says so, `info().fallback`).
+This stays in the segment only when the fused/visual offset at the last
+published fused capture is within 2 cm / 2° (unvalidated engineering bound),
+or when no fused pose was ever published; otherwise the segment is retired
+for supervised new-segment recovery. Fallback poses obey the same
+three-estimate, continuity and 1.5 s degradation rules. The ESKF is not
+restarted inside that segment; a later new segment retries it. Predictions
+are never published as tracking and a stale IMU is never fused again.
+
 If vision becomes unavailable, `vendor.motus_slam.status` changes to
 `coasting`, followed by `recovering` until three consistent visual
 observations pass innovation checks. During both states `pose` is null;
@@ -224,8 +288,8 @@ the correction timeout during recovery, while mapping still requires three
 consistent visual observations.
 
 The short-outage offline validation target is 0.5 s. A hard 1 s visual
-correction timeout or modeled position standard deviation above 0.10 m ends
-the segment; rejection/geometry cannot extend that timeout. Noise and
+correction timeout ends the segment; rejection/geometry cannot extend it. The
+0.10 m modeled position limit applies as described above. Noise and
 covariance are conservative engineering priors, **not measured accuracy
 bounds**. Deep integration cannot compensate arbitrary-duration blindness.
 
@@ -240,6 +304,19 @@ same-frame duplicate corrections. Correlation-aware covariance intersection
 keeps repeated use of a shared depth reference conservative. Pose composition
 propagates rotational uncertainty into position uncertainty at the offset.
 Mapping remains paused throughout coasting.
+
+Registration runs on one per-session worker thread, never under the session
+lock, so IMU ingress, native result joins, the watchdog and stop are not held
+behind ICP (about 47 ms median per registration on an arm64 development host;
+Jetson timing has not been measured). At most one registration runs and one
+waits; a newer request replaces the waiting one. A result is applied only to
+the exact filter state it was computed for, before the next frame advances the
+filter; otherwise, after its 250 ms deadline, on failure, stop or restart it is
+discarded. A pending registration defers that frame's predicted-uncertainty
+judgement until its result, deadline or the next frame; the 1 s visual bound
+is unaffected. Registration errors skip assistance instead of ending the ESKF.
+If ICP is slower than the frame interval on the target, results will mostly
+be discarded — measure before relying on depth assistance.
 
 All three source adapters and the fusion/SLAM boundaries have offline tests.
 Synthetic trajectories and rendered rooms validate code signs, units and
