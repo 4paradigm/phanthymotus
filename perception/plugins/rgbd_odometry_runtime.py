@@ -22,6 +22,7 @@ from .rgbd_odometry_contract import PairBuffer, make_sample
 from .rgbd_imu import ImuAttitude
 from .rgbd_fusion import ShortTermFusion, log_rotation, observation_covariance, pose_values
 from .rgbd_body_mount import CaptureMounts
+from .rgbd_geometry import GeometryWorker
 from utils.ros_lifecycle import dispose_node
 
 
@@ -297,6 +298,7 @@ class RgbdSession:
         self.stop_event = threading.Event()
         self.process = self.worker = None
         self.spin_worker = None
+        self.geometry_worker = None
         self.owns_executor = False
         self.directory = tempfile.TemporaryDirectory(prefix='motus-rgbd-')
         self.log = None
@@ -306,6 +308,11 @@ class RgbdSession:
         self.started = time.monotonic()
         self.node = Node(self.segment)
         try:
+            if self.fusion is not None and self.fusion.geometry is not None:
+                # ICP never runs under self.lock: IMU ingress, native results
+                # and stop remain responsive while it computes.
+                self.geometry_worker = GeometryWorker(self.fusion.geometry)
+                self.fusion.geometry_runner = self.geometry_worker
             if self.imu is not None:
                 from rclpy.executors import SingleThreadedExecutor
                 self.executor = SingleThreadedExecutor(context=self.node.context)
@@ -715,6 +722,7 @@ class RgbdSession:
                 self.gate.fault('waiting for calibrated RGB-D inputs timed out', 'input')
             if self._fusing():
                 now = time.time_ns()
+                self.fusion.poll_geometry(now)
                 for sample in self.observations.drain(now):
                     self._publish(sample)
                     self.counts['estimates'] += 1
@@ -770,6 +778,8 @@ class RgbdSession:
             self.worker.join(timeout=5)
             if self.worker.is_alive():
                 raise RuntimeError('RGB-D decoding worker did not stop')
+        if getattr(self, 'geometry_worker', None) is not None and not self.geometry_worker.close(5):
+            raise RuntimeError('RGB-D geometry worker did not stop')
         if self.process is not None:
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
                 if self.process.poll() is not None:

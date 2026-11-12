@@ -1,5 +1,7 @@
 """Bounded RGB-D observation assistance using only NumPy."""
 
+import threading
+
 import numpy as np
 
 
@@ -181,6 +183,72 @@ class DepthRegistration:
                 'inliers': len(residual), 'rmse': rmse,
                 'overlap': len(residual)/len(points),
                 'condition': float(eigenvalues[-1]/eigenvalues[0])}
+
+
+class GeometryWorker:
+    """One registration thread: one running, one pending, one finished result.
+
+    Keeps ICP off the caller's estimator lock. A newer submission replaces an
+    unstarted one; results are claimed only by their exact token, so a caller
+    that moved on (or closed) never receives a stale correction.
+    """
+
+    def __init__(self, registration):
+        self.registration = registration
+        self.condition = threading.Condition()
+        self.pending = self.running = self.finished = None
+        self.dropped = 0
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name='rgbd_geometry', daemon=True)
+        self.thread.start()
+
+    def submit(self, token, current, reference, initial):
+        with self.condition:
+            if self.closed:
+                return False
+            if self.pending is not None:
+                self.dropped += 1
+            self.pending = (token, current, reference, initial)
+            self.condition.notify()
+            return True
+
+    def take(self, token):
+        with self.condition:
+            if self.finished is not None and self.finished[0] == token:
+                _, result, error = self.finished
+                self.finished = None
+                return 'done', (result, error)
+            if (self.running == token or
+                    (self.pending is not None and self.pending[0] == token)):
+                return 'pending', None
+            return 'missing', None
+
+    def close(self, timeout=5.):
+        with self.condition:
+            self.closed = True
+            self.pending = self.finished = None
+            self.condition.notify()
+        self.thread.join(timeout=timeout)
+        return not self.thread.is_alive()
+
+    def _run(self):
+        while True:
+            with self.condition:
+                while self.pending is None and not self.closed:
+                    self.condition.wait()
+                if self.closed:
+                    return
+                token, current, reference, initial = self.pending
+                self.pending, self.running = None, token
+            result = error = None
+            try:
+                result = self.registration.register(current, reference, initial)
+            except Exception as failure:  # reported to the filter, never raised in its thread
+                error = f'{type(failure).__name__}: {failure}'
+            with self.condition:
+                self.running = None
+                if not self.closed:
+                    self.finished = (token, result, error)
 
 
 def observation_quality(color, depth):

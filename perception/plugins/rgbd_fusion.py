@@ -175,6 +175,9 @@ INERTIAL_LIMIT_NS = 1_000_000_000
 # 250 ms join deadline, so 500 ms without any processed frame (>= 4 Hz) means
 # frames stopped, not that the pipeline is merely latent.
 FRAME_SILENCE_NS = 500_000_000
+# Off-lock registration must finish within the visual join deadline; later
+# results describe a superseded filter state and are discarded.
+GEOMETRY_DEADLINE_NS = 250_000_000
 
 
 class ShortTermFusion:
@@ -202,6 +205,9 @@ class ShortTermFusion:
         self.quality = {}
         self.frames = deque(maxlen=16)
         self.last_tracking = None
+        # Optional off-lock registration (GeometryWorker); None runs inline.
+        self.geometry_runner = self.geometry_job = None
+        self.revision = 0
 
     def fault(self, reason):
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
@@ -312,6 +318,9 @@ class ShortTermFusion:
 
     def observe_frame(self, stamp, color, depth, visual_pose, now_ns, reason=None, *, arrival_ns=None):
         from .rgbd_geometry import observation_quality
+        # A registration for an earlier state applies only before this frame
+        # advances the filter; otherwise it is discarded, never replayed.
+        self.poll_geometry(now_ns, force=True)
         diagnostic = dict(capture_ns=stamp, arrival_ns=arrival_ns, processed_ns=now_ns,
                           latency_ms=round((now_ns-stamp)/1e6, 1), predicted_sigma_m=None,
                           corrected_sigma_m=None, visual='missing' if visual_pose is None else 'offered',
@@ -340,6 +349,7 @@ class ShortTermFusion:
                     self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
                 return self._finish(stamp, diagnostic)
             self._propagate(stamp)
+            self.revision += 1
             diagnostic['predicted_sigma_m'] = self.position_sigma()
             # A legal visual correction is attempted before predicted
             # covariance can end the segment; gates and time bounds still apply.
@@ -348,6 +358,7 @@ class ShortTermFusion:
                 diagnostic.update(visual='rejected', visual_reject_reason=self.filter.rejection)
             self.aid = 'visual' if accepted else 'inertial'
             if accepted:
+                self.revision += 1
                 diagnostic['visual'] = 'accepted'
                 self.last_visual, self.last_visual_wall = stamp, now_ns
                 corrected = diagnostic['corrected_sigma_m'] = self.position_sigma()
@@ -368,15 +379,17 @@ class ShortTermFusion:
             else:
                 self.good = 0
                 self.state, self.reason = 'coasting', reason or 'visual observation rejected'
-                self._assist_with_geometry(stamp, depth)
+                self._assist_with_geometry(stamp, depth, now_ns, diagnostic)
                 diagnostic['corrected_sigma_m'] = self.position_sigma() if self.aid == 'depth_geometry' else None
-                if self.position_sigma() > SIGMA_LIMIT_M:
+                # A pending registration defers this judgement to its result or
+                # deadline; the next frame re-judges after its own prediction.
+                if self.geometry_job is None and self.position_sigma() > SIGMA_LIMIT_M:
                     self.fault('predicted position uncertainty exceeds 0.10 m without an accepted visual correction')
         except (ValueError, TypeError, KeyError, np.linalg.LinAlgError) as error:
             self.fault(error)
         return self._finish(stamp, diagnostic)
 
-    def _assist_with_geometry(self, stamp, depth):
+    def _assist_with_geometry(self, stamp, depth, now_ns, diagnostic):
         if not (self.geometry and self.reference and stamp-self.reference[0] <= 1_000_000_000):
             return
         ref_stamp, ref_depth, ref_pose = self.reference
@@ -387,6 +400,13 @@ class ShortTermFusion:
         # Geometry only corrects a bounded prediction; it never
         # promotes coasting to tracking or authorizes map integration.
         self.quality['geometry'] = dict(attempted=True, accepted=False, reason='registration_rejected')
+        if self.geometry_runner is not None:
+            token = (self.segment, stamp, self.revision)
+            if self.geometry_runner.submit(token, depth, ref_depth, initial):
+                self.quality['geometry']['reason'] = diagnostic['geometry'] = 'pending'
+                self.geometry_job = dict(token=token, revision=self.revision, ref_pose=ref_pose,
+                                         deadline=now_ns+GEOMETRY_DEADLINE_NS, diagnostic=diagnostic)
+            return
         try:
             result = self.geometry.register(depth, ref_depth, initial)
         except (ValueError, TypeError, ArithmeticError, np.linalg.LinAlgError) as error:
@@ -394,6 +414,42 @@ class ShortTermFusion:
             self.quality['geometry']['reason'] = 'registration_error: ' + str(error)[:80]
             return
         self._apply_geometry(ref_pose, result)
+
+    def poll_geometry(self, now_ns, *, force=False):
+        """Claim an off-lock registration for the exact filter state it used.
+
+        `force` (next frame) resolves the job without judging uncertainty; the
+        frame does that after its own visual attempt. A watchdog poll applies a
+        ready result or expires the job, then applies the deferred limit.
+        """
+        job = self.geometry_job
+        if job is None or self.geometry_runner is None:
+            return
+        status, payload = self.geometry_runner.take(job['token'])
+        if status == 'pending' and not force and now_ns <= job['deadline']:
+            return
+        self.geometry_job = None
+        geometry = self.quality.setdefault('geometry', dict(attempted=True, accepted=False))
+        if status != 'done':
+            outcome = 'stale_result_discarded' if force else 'timeout_discarded'
+        elif self.state == 'lost' or self.filter is None or self.revision != job['revision']:
+            outcome = 'stale_result_discarded'
+        elif payload[1] is not None:
+            outcome = geometry['reason'] = 'registration_error: ' + payload[1][:80]
+        elif payload[0] is None:
+            outcome = geometry['reason'] = 'registration_rejected'
+        else:
+            self._apply_geometry(job['ref_pose'], payload[0])
+            outcome = 'accepted' if geometry.get('accepted') else 'fusion_gate_rejected'
+            if geometry.get('accepted'):
+                self.revision += 1
+                job['diagnostic']['corrected_sigma_m'] = self.position_sigma()
+        if outcome.endswith('discarded'):
+            geometry['reason'] = outcome
+        job['diagnostic']['geometry'] = outcome
+        if (not force and self.state == 'coasting' and self.filter is not None and
+                self.position_sigma() > SIGMA_LIMIT_M):
+            self.fault('predicted position uncertainty exceeds 0.10 m without an accepted visual correction')
 
     def _apply_geometry(self, ref_pose, result):
         if result is None:

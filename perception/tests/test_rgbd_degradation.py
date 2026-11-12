@@ -136,9 +136,9 @@ def fused(sessions, monkeypatch):
     assisted_runtime(monkeypatch)
     made = []
 
-    def make():
+    def make(depth_geometry=False):
         calibration = validate_start_inputs(declarations(), ['/rgb', '/depth', '/imu'], True)
-        calibration.update(imu_assisted=True, short_term_compensation=True, depth_geometry=False,
+        calibration.update(imu_assisted=True, short_term_compensation=True, depth_geometry=depth_geometry,
                            visual_frontend='f2m_feature', max_features=1000)
         session = runtime.RgbdSession(calibration, _FakeExecutor(), '/fused/state/odom')
         made.append(session)
