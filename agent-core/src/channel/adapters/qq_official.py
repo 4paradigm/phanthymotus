@@ -1,4 +1,4 @@
-"""Tencent QQ official C2C text adapter for PhanthyMotus."""
+"""Tencent QQ official Gateway Channel adapter for PhanthyMotus."""
 from __future__ import annotations
 
 import asyncio
@@ -6,18 +6,41 @@ from collections import OrderedDict
 import os
 from pathlib import Path
 import re
+import socket
 import threading
 import time
 
-from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage
+import httpx
+
+from channel.adapter import (
+    Attachment, ChannelAdapter, InboundMessage, OutboundMessage,
+    KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE, PartialSendError,
+)
+from channel.adapters.qq_official_media import (
+    receive_media, send_media, _validate_outbound_file,
+)
+from channel.adapters.qq_official_interactions import QQInteractionRegistry
+from channel.adapters.qq_official_sessions import QQSessionState
+from channel.adapters.qq_official_voice import read_voice_text
 
 _MAX_INBOUND = 2000
 _MAX_OUTBOUND = 1800
-_SEEN_TTL = 600.0
+_SEEN_TTL = 3600.0  # C2C passive context can remain valid for 60 minutes
+_REPLY_TTL = {"c2c": 3600.0, "group": 300.0, "guild": 300.0, "guild_dm": 300.0}
 _SEEN_LIMIT = 1024
+# Bounded retry only for proven pre-connection DNS failures.
+_DNS_RETRY_DELAYS = (0.5, 1.5)
 _APP_ID_RE = re.compile(r"^[0-9]{5,32}$")
 _OPENID_RE = re.compile(r"^[A-Za-z0-9_-]{8,256}$")
 _ENV_RE = re.compile(r"^QQ_OFFICIAL_[A-Z0-9_]{1,64}$")
+_ALLOWED_SCOPES = frozenset(("c2c", "group", "guild", "guild_dm"))
+_EVENT_SCOPE = {
+    "C2C_MESSAGE_CREATE": "c2c",
+    "GROUP_AT_MESSAGE_CREATE": "group",
+    "GUILD_AT_MESSAGE_CREATE": "guild",
+    "GUILD_MESSAGE_CREATE": "guild",
+    "DIRECT_MESSAGE_CREATE": "guild_dm",
+}
 
 
 def validate_qq_official_config(cfg: dict) -> dict:
@@ -25,8 +48,31 @@ def validate_qq_official_config(cfg: dict) -> dict:
         raise ValueError("QQ official protocol required")
     if not _APP_ID_RE.fullmatch(str(cfg.get("app_id", ""))):
         raise ValueError("QQ official app_id must be numeric")
-    if cfg.get("private_only", True) is not True:
-        raise ValueError("QQ official V1 is C2C only")
+    scopes = cfg.get("enabled_scopes", ["c2c"])
+    if (not isinstance(scopes, list) or not scopes
+            or any(not isinstance(s, str) for s in scopes)
+            or len(scopes) != len(set(scopes))
+            or not set(scopes) <= _ALLOWED_SCOPES):
+        raise ValueError("QQ official enabled_scopes must be a nonempty unique subset")
+    if cfg.get("private_only", True) not in (True, False):
+        raise ValueError("QQ official private_only must be boolean")
+    if cfg.get("private_only", True) and set(scopes) != {"c2c"}:
+        raise ValueError("QQ official expanded scopes require private_only=false")
+    if cfg.get("private_only", True) is False and set(scopes) == {"c2c"}:
+        raise ValueError("QQ official nonprivate mode requires expanded scopes")
+    for flag in ("enable_inbound_media", "enable_outbound_media",
+                 "enable_markdown", "enable_typing",
+                 "enable_session_resume", "enable_interactions",
+                 "enable_approvals", "enable_guild_plain_messages",
+                 "enable_voice_transcription"):
+        if flag in cfg and not isinstance(cfg[flag], bool):
+            raise ValueError(f"QQ official {flag} must be boolean")
+    if cfg.get("enable_approvals") and not cfg.get("enable_interactions"):
+        raise ValueError("QQ approvals require interactive events")
+    if cfg.get("enable_guild_plain_messages") and "guild" not in scopes:
+        raise ValueError("QQ plain Guild events require the guild scope")
+    if cfg.get("enable_voice_transcription") and not cfg.get("enable_inbound_media"):
+        raise ValueError("QQ voice transcription requires inbound media")
     sources = ("app_secret", "app_secret_env", "app_secret_file")
     if sum(bool(cfg.get(k)) for k in sources) != 1:
         raise ValueError("QQ official requires exactly one credential source")
@@ -55,8 +101,25 @@ def _load_credential(cfg: dict) -> str:
     return value.strip()
 
 
+def _is_temporary_dns_failure(error: BaseException) -> bool:
+    """Detect EAI_AGAIN through SDK wrapping, never a generic timeout."""
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror) and current.errno == socket.EAI_AGAIN:
+            return True
+        if (isinstance(current, httpx.ConnectError)
+                and "[Errno -3] Temporary failure in name resolution" in str(current)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class QQOfficialAdapter(ChannelAdapter):
-    """Official Gateway adapter; no group, media or proactive tools."""
+    """Official Gateway adapter with scope-gated messages and rich media."""
+
+    SUPPORTED_FILE_KINDS = (KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE)
 
     def __init__(self, channel_id: str, platform: str, config: dict, on_message):
         super().__init__(channel_id, platform, config, on_message)
@@ -69,6 +132,11 @@ class QQOfficialAdapter(ChannelAdapter):
         self._session_id = None
         self._seq = None
         self._seen = OrderedDict()
+        self._source_scopes = OrderedDict()
+        self._source_actors = OrderedDict()
+        self._prompted_sources = set()
+        self._interactions = QQInteractionRegistry()
+        self._session_store = None
         self._http = None
         self._attempted_replies = OrderedDict()
         self._reply_lock = asyncio.Lock()
@@ -87,6 +155,9 @@ class QQOfficialAdapter(ChannelAdapter):
         self._parser = EventParser()
         self._last_error = ""
         credential = _load_credential(self.config)
+        if self.config.get("enable_session_resume", False):
+            self._session_store = QQSessionState(str(self.config["app_id"]))
+            self._session_id, self._seq = self._session_store.read()
         self._http = httpx.AsyncClient(timeout=15)
         self._api = QQApiClient(str(self.config["app_id"]), credential)
         self._api.setup(self._http)
@@ -104,6 +175,8 @@ class QQOfficialAdapter(ChannelAdapter):
         def set_session(session_id, seq):
             with self._session_lock:
                 self._session_id, self._seq = session_id, seq
+                if self._session_store is not None:
+                    self._session_store.save(session_id, seq)
 
         async def on_event(event_type: str, raw: dict):
             if self._connected is None or not self._connected.is_set():
@@ -112,6 +185,26 @@ class QQOfficialAdapter(ChannelAdapter):
                 event = self._parser.parse(event_type, raw)
                 msg = self._parse_message(event)
                 if msg is not None:
+                    if self.config.get("enable_inbound_media", False):
+                        msg.attachments = await receive_media(
+                            self._http, event, "/work/resource/qq_official_media")
+                        if (not msg.attachments
+                                and (getattr(event, "attachments", None) or
+                                     any(getattr(e, "attachments", None) for e in
+                                         (getattr(event, "msg_elements", None) or [])))):
+                            msg.text += " [QQ attachment unavailable]"
+                    if self.config.get("enable_voice_transcription"):
+                        transcript = await read_voice_text(
+                            self._http, event, msg.attachments)
+                        if transcript:
+                            msg.text = (msg.text + " [QQ语音转写] " + transcript)[:_MAX_INBOUND]
+                    if (msg.chat_type == "p2p" and self.config.get("enable_typing")
+                            and self._api is not None):
+                        try:
+                            await self._api.send_typing(msg.chat_id, msg.message_id,
+                                                        input_seconds=5)
+                        except Exception:
+                            pass
                     await self._on_message(msg)
             except asyncio.CancelledError:
                 raise
@@ -122,7 +215,23 @@ class QQOfficialAdapter(ChannelAdapter):
 
         def fatal(_code, _message):
             self._last_error = "QQ official Gateway rejected session"
+            with self._session_lock:
+                self._session_id, self._seq = None, None
+                if self._session_store is not None:
+                    self._session_store.clear()
             signal(False)
+
+        async def on_interaction(event_type: str, raw: dict):
+            if (not self.config.get("enable_interactions")
+                    or self._api is None or self._connected is None
+                    or not self._connected.is_set()):
+                return
+            try:
+                await self._interactions.handle(self._api, event_type, raw)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "QQ official interaction handler failed (details suppressed)")
 
         callbacks = WSCallbacks(
             on_event,                 # inbound
@@ -137,7 +246,12 @@ class QQOfficialAdapter(ChannelAdapter):
             lambda _reason: None,     # pending futures
             self._api.get_gateway_url_sync,
         )
-        self._ws = QQWebSocket(callbacks=callbacks, log_tag="phanthymotus-qq")
+        callbacks.on_interaction_event = on_interaction
+        gateway_class = QQWebSocket
+        if self.config.get("enable_guild_plain_messages", False):
+            from channel.adapters.qq_official_gateway import QQGuildWebSocket
+            gateway_class = QQGuildWebSocket
+        self._ws = gateway_class(callbacks=callbacks, log_tag="phanthymotus-qq")
 
         try:
             await self._api.ensure_token()
@@ -169,54 +283,81 @@ class QQOfficialAdapter(ChannelAdapter):
         self._loop = None
 
     def _parse_message(self, event) -> InboundMessage | None:
-        if (event is None or event.chat_scope != "c2c"
-                or event.event_type != "C2C_MESSAGE_CREATE"):
+        if event is None:
             return None
-        if getattr(event, "attachments", None):
+        scope = _EVENT_SCOPE.get(event.event_type)
+        if (event.event_type == "GUILD_MESSAGE_CREATE"
+                and not self.config.get("enable_guild_plain_messages", False)):
             return None
-        # Tencent may include text-only msg_elements in an ordinary C2C message.
-        # Reject embedded media, but do not discard valid plain-text elements.
+        if scope is None or event.chat_scope != ("dm" if scope == "guild_dm" else scope):
+            return None
+        if scope not in self.config.get("enabled_scopes", ["c2c"]):
+            return None
+        has_media = bool(getattr(event, "attachments", None))
         for element in (getattr(event, "msg_elements", None) or []):
-            if (getattr(element, "attachments", None)
-                    or not isinstance(getattr(element, "content", None), str)
-                    or not element.content.strip()):
+            has_media = has_media or bool(getattr(element, "attachments", None))
+            if (not getattr(element, "attachments", None)
+                    and (not isinstance(getattr(element, "content", None), str)
+                         or not element.content.strip())):
                 return None
+        if has_media and not self.config.get("enable_inbound_media", False):
+            return None
         user, chat, mid = event.user_id, event.chat_id, event.message_id
         content = event.content
+        if not isinstance(content, str):
+            return None
+        content = content.strip() or ("[QQ attachment]" if has_media else "")
         if (not isinstance(user, str) or not _OPENID_RE.fullmatch(user)
-                or not isinstance(chat, str) or chat != user
+                or not isinstance(chat, str) or not _OPENID_RE.fullmatch(chat)
+                or (scope == "c2c" and chat != user)
                 or not isinstance(mid, str) or not 0 < len(mid) <= 128
-                or not isinstance(content, str)
-                or not 0 < len(content.strip()) <= _MAX_INBOUND):
+                or not 0 < len(content) <= _MAX_INBOUND):
             return None
         now = time.monotonic()
-        while self._seen:
-            key, ts = next(iter(self._seen.items()))
-            if now - ts <= _SEEN_TTL:
-                break
-            self._seen.popitem(last=False)
-        dedup_key = f"{self.config['app_id']}:{mid}"
+        for cache in (self._seen, self._source_scopes):
+            while cache:
+                _, item = next(iter(cache.items()))
+                ts = item if cache is self._seen else item[1]
+                if now - ts <= _SEEN_TTL:
+                    break
+                cache.popitem(last=False)
+        dedup_key = (scope, chat, mid)
         if dedup_key in self._seen:
             return None
         self._seen[dedup_key] = now
         if len(self._seen) > _SEEN_LIMIT:
             self._seen.popitem(last=False)
-        # Isolate official OpenIDs from numeric OneBot QQ IDs at ACL level.
-        principal = f"official:{self.config['app_id']}:{user}"
+        self._source_scopes[(chat, mid)] = (scope, now)
+        self._source_actors[(chat, mid)] = user
+        if len(self._source_scopes) > _SEEN_LIMIT:
+            stale, _ = self._source_scopes.popitem(last=False)
+            self._source_actors.pop(stale, None)
+        # Keep each QQ group member's ACL identity separate; each chat
+        # retains its own persistent conversation context in ChannelManager.
+        principal = (f"official:{self.config['app_id']}:{user}" if scope == "c2c"
+                     else f"official:{self.config['app_id']}:{scope}:{chat}:{user}")
         return InboundMessage(
             platform="qq", channel_id=self.channel_id, user_id=principal,
             chat_id=chat, display_name=(event.user_name or "QQ user")[:100],
-            text=content.strip(), message_id=mid,
-            chat_type="p2p", sender_type="user",
+            text=content, message_id=mid,
+            chat_type="p2p" if scope in ("c2c", "guild_dm") else "group",
+            sender_type="user",
         )
 
     async def send_message(self, msg: OutboundMessage) -> None:
         if (not self._running or self._api is None or self._connected is None
                 or not self._connected.is_set()):
             raise ConnectionError("QQ official Gateway is disconnected")
-        if msg.files or msg.image_bytes:
-            raise ValueError("QQ official V1 supports text only")
-        if not isinstance(msg.text, str) or not 0 < len(msg.text) <= _MAX_OUTBOUND:
+        if msg.image_bytes:
+            raise ValueError("QQ official byte images must be saved as a file first")
+        if msg.files and not self.config.get("enable_outbound_media", False):
+            raise ValueError("QQ official media sending is not enabled")
+        if len(msg.files) > 3:
+            raise ValueError("QQ official supports at most 3 media files per trigger")
+        for attachment in msg.files:
+            _validate_outbound_file(attachment)
+        if (not isinstance(msg.text, str) or len(msg.text) > _MAX_OUTBOUND
+                or (not msg.text and not msg.files)):
             raise ValueError("QQ official text length invalid")
         if not isinstance(msg.chat_id, str) or not _OPENID_RE.fullmatch(msg.chat_id):
             raise ValueError("QQ official target OpenID invalid")
@@ -226,6 +367,14 @@ class QQOfficialAdapter(ChannelAdapter):
         # One passive reply per trigger. Mark an attempt *before* HTTP so that
         # concurrent requests or an unconfirmed timeout cannot deliver twice.
         key = (msg.chat_id, mid)
+        source = self._source_scopes.get(key)
+        if source is None:
+            raise ValueError("QQ official unknown or expired reply source")
+        scope = source[0]
+        if time.monotonic() - source[1] > _REPLY_TTL[scope]:
+            raise ValueError("QQ official unknown or expired reply source")
+        if msg.files and scope not in ("c2c", "group"):
+            raise ValueError("QQ SDK media supports only C2C and group")
         async with self._reply_lock:
             now = time.monotonic()
             for seen, ts in list(self._attempted_replies.items()):
@@ -236,15 +385,92 @@ class QQOfficialAdapter(ChannelAdapter):
             self._attempted_replies[key] = now
             if len(self._attempted_replies) > _SEEN_LIMIT:
                 self._attempted_replies.popitem(last=False)
-        try:
-            # SDK 1.2.2: retries=1 means ONE TOTAL ATTEMPT, not one extra retry.
-            # A timeout is NOT proof that sending failed. No blind retries.
-            await self._api.send_text(
-                "c2c", msg.chat_id, msg.text,
-                reply_to=mid, markdown=False, retries=1,
-            )
-        except Exception:
-            raise RuntimeError("QQ official reply failed or delivery unconfirmed") from None
+        sent: list[str] = []
+        for attachment in msg.files:
+            try:
+                await send_media(self._api, self._http, scope, msg.chat_id, mid, attachment)
+                sent.append("media")
+            except Exception:
+                if sent:
+                    raise PartialSendError(sent, ["QQ media delivery unconfirmed"]) from None
+                raise RuntimeError(
+                    "QQ official rich media failed or delivery unconfirmed") from None
+        if not msg.text:
+            return
+        # One passive source can produce up to four actual messages:
+        # <= 3 media files followed by text, below QQ's five-reply budget.
+        # Generic timeouts must never be retried blindly.
+        for attempt in range(len(_DNS_RETRY_DELAYS) + 1):
+            try:
+                if scope == "guild_dm":
+                    # SDK 1.2.2 parses DMs but has no high-level DM send helper.
+                    # Its authenticated generic REST client supports the v2 route.
+                    await self._api.request(
+                        "POST", f"/dms/{msg.chat_id}/messages",
+                        {"content": msg.text, "msg_id": mid},
+                    )
+                else:
+                    await self._api.send_text(
+                        scope, msg.chat_id, msg.text,
+                        reply_to=mid, markdown=self.config.get("enable_markdown", False),
+                        retries=1,
+                    )
+                return
+            except Exception as exc:
+                if not _is_temporary_dns_failure(exc):
+                    if sent:
+                        raise PartialSendError(sent, ["QQ text delivery unconfirmed"]) from None
+                    raise RuntimeError(
+                        "QQ official reply failed or delivery unconfirmed") from None
+                if attempt < len(_DNS_RETRY_DELAYS):
+                    await asyncio.sleep(_DNS_RETRY_DELAYS[attempt])
+                    continue
+                # DNS never resolved, so no HTTP POST was transmitted.
+                if not sent:
+                    async with self._reply_lock:
+                        if self._attempted_replies.get(key) == now:
+                            self._attempted_replies.pop(key, None)
+                    raise RuntimeError(
+                        "QQ official DNS resolution failed before delivery; retry permitted") from None
+                raise PartialSendError(sent, ["QQ text DNS failed before delivery"]) from None
+
+    async def _interactive_source(self, chat_id: str, source_id: str,
+                                  actor_id: str) -> str:
+        if not self.config.get("enable_interactions"):
+            raise ValueError("QQ interactive features are disabled")
+        key = (chat_id, source_id)
+        source = self._source_scopes.get(key)
+        if (source is None or source[0] not in ("c2c", "group")
+                or time.monotonic() - source[1] > _REPLY_TTL[source[0]]
+                or self._source_actors.get(key) != actor_id):
+            raise ValueError("QQ interactive source or actor not verified")
+        async with self._reply_lock:
+            if key in self._prompted_sources:
+                raise ValueError("QQ interactive prompt already attempted")
+            self._prompted_sources.add(key)
+        return source[0]
+
+    async def request_approval(self, chat_id: str, source_id: str, actor_id: str,
+                               title: str, description: str = "") -> str:
+        """Server-side trusted workflow only: queue one-shot approval prompt.
+
+        A received decision never grants Agent Core tool permissions directly.
+        """
+        if not self.config.get("enable_approvals"):
+            raise ValueError("QQ interactive approvals are disabled")
+        scope = await self._interactive_source(chat_id, source_id, actor_id)
+        return await self._interactions.send_approval(
+            self._api, scope, chat_id, actor_id, source_id, title, description)
+
+    async def request_choice(self, chat_id: str, source_id: str, actor_id: str,
+                             label: str, choices: dict[str, str]) -> str:
+        """Server-side trusted workflow only: non-privileged inline buttons."""
+        scope = await self._interactive_source(chat_id, source_id, actor_id)
+        return await self._interactions.send_choices(
+            self._api, scope, chat_id, actor_id, source_id, label, choices)
+
+    def take_interaction_result(self, nonce: str) -> str | None:
+        return self._interactions.take(nonce)
 
     async def health_check(self) -> tuple[bool, str]:
         ok = bool(self._running and self._connected and self._connected.is_set())

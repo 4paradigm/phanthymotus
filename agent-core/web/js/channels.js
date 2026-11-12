@@ -92,6 +92,43 @@ function _renderChannels(channels) {
 
 // ── Add channel form ──────────────────────────────────────────────────────────
 
+
+function _qqCapabilityFields(scopes = ['c2c'], flags = {}) {
+  const enabled = new Set(scopes);
+  const scope = (id, title) => '<label><input data-qq-scope type="checkbox" value="' + id
+    + '"' + (enabled.has(id) ? ' checked' : '') + ' /> ' + title + '</label>';
+  const flag = (id, title) => '<label><input data-qq-flag="' + id + '" type="checkbox"'
+    + (flags[id] ? ' checked' : '') + ' /> ' + title + '</label>';
+  return '<div class="channel-form-row" data-qq-capabilities><label>QQ scopes</label><div>'
+    + scope('c2c', 'Private') + scope('group', 'Group @bot')
+    + scope('guild', 'Guild @bot')
+    + scope('guild_dm', 'Guild direct message')
+    + '<p class="channel-users-hint">Group and guild require QQ platform permissions.</p>'
+    + '</div></div><div class="channel-form-row" data-qq-capabilities><label>Extra</label><div>'
+    + flag('enable_inbound_media', 'Receive media')
+    + flag('enable_outbound_media', 'Send media')
+    + flag('enable_typing', 'Typing indicator')
+    + flag('enable_markdown', 'Markdown (platform approval)')
+    + flag('enable_voice_transcription', 'Voice transcription (requires media and STT backend)')
+    + flag('enable_guild_plain_messages', 'Plain Guild events (requires Gateway permission)')
+    + flag('enable_session_resume', 'Persist Gateway resume session')
+    + flag('enable_interactions', 'Interactive keyboard callbacks')
+    + flag('enable_approvals', 'Trusted approval requests')
+    + '</div></div>';
+}
+
+function _qqCapabilityConfig(form) {
+  const enabled_scopes = Array.from(form.querySelectorAll('[data-qq-scope]:checked'), el => el.value);
+  if (!enabled_scopes.length) throw new Error('Select at least one QQ scope');
+  const data = {enabled_scopes, private_only: enabled_scopes.length === 1 && enabled_scopes[0] === 'c2c'};
+  for (const id of ['enable_inbound_media', 'enable_outbound_media', 'enable_typing',
+                    'enable_markdown', 'enable_voice_transcription', 'enable_guild_plain_messages',
+                    'enable_session_resume', 'enable_interactions', 'enable_approvals']) {
+    data[id] = !!form.querySelector('[data-qq-flag="' + id + '"]')?.checked;
+  }
+  return data;
+}
+
 function _showAddForm({ official = false } = {}) {
   if (document.getElementById('channel-add-form')) return;
   const formHtml = `
@@ -128,9 +165,7 @@ function _showAddForm({ official = false } = {}) {
         <label>Environment variable name</label>
         <input type="text" id="channel-form-qq-env-name" placeholder="QQ_OFFICIAL_APP_SECRET" />
       </div>
-      <div class="channel-form-row hidden" id="channel-form-qq-private-row">
-        <label><input type="checkbox" checked disabled /> Private only (V1)</label>
-      </div>
+      ${_qqCapabilityFields()}
       <div class="channel-form-row" id="channel-form-token-row">
         <label>Bot Token</label>
         <input type="password" id="channel-form-token" placeholder="Bot token" />
@@ -194,7 +229,8 @@ function _showAddForm({ official = false } = {}) {
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
-    document.getElementById('channel-form-qq-private-row').classList.toggle('hidden', !isQQ);
+    form.querySelectorAll('[data-qq-capabilities]').forEach(node =>
+      node.classList.toggle('hidden', !isQQ));
     document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan || isOfficial);
   }
 
@@ -247,7 +283,8 @@ async function _submitAdd(formEl) {
       alert('Environment name must start with QQ_OFFICIAL_'); return;
     }
     config.protocol = 'official';
-    config.private_only = true;
+    try { Object.assign(config, _qqCapabilityConfig(formEl)); }
+    catch (e) { alert(e.message); return; }
     config.app_id = appId;
     if (qqMode === 'env') config.app_secret_env = qqEnvName;
     else config.app_secret_file = '/run/qq-official-app-secret';
@@ -325,6 +362,17 @@ function _showQQEdit(channel, item) {
   form.dataset.qqEditForm = '1';
   form.innerHTML =
     '<div class="channel-form-row"><label>App ID</label><input data-qq-app-id type="text" /></div>' +
+    _qqCapabilityFields(channel.qq_enabled_scopes, {
+      enable_inbound_media: channel.qq_media_in,
+      enable_outbound_media: channel.qq_media_out,
+      enable_typing: channel.qq_typing,
+      enable_markdown: channel.qq_markdown,
+      enable_voice_transcription: channel.qq_voice_transcription,
+      enable_guild_plain_messages: channel.qq_guild_plain,
+      enable_session_resume: channel.qq_session_resume,
+      enable_interactions: channel.qq_interactions,
+      enable_approvals: channel.qq_approvals,
+    }) +
     '<div class="channel-form-row"><label>QQ credential source</label>' +
     '<select data-qq-mode><option value="env">Environment variable</option>' +
     '<option value="file">Mounted file (/run/qq-official-app-secret)</option></select></div>' +
@@ -343,7 +391,10 @@ function _showQQEdit(channel, item) {
   form.querySelector('[data-qq-save]').addEventListener('click', async () => {
     const appId = form.querySelector('[data-qq-app-id]').value.trim();
     if (!appId) { alert('App ID is required'); return; }
-    const config = { protocol: 'official', private_only: true, app_id: appId };
+    let options;
+    try { options = _qqCapabilityConfig(form); }
+    catch (e) { alert(e.message); return; }
+    const config = { protocol: 'official', app_id: appId, ...options };
     if (mode.value === 'env') {
       const envName = form.querySelector('[data-qq-env]').value.trim();
       if (!/^QQ_OFFICIAL_[A-Z0-9_]{1,64}$/.test(envName)) {

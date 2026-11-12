@@ -1,14 +1,17 @@
 """Mocked official QQ adapter tests: no network, credentials or QQ PII."""
 import asyncio
 import os
+import socket
 from pathlib import Path
 import sys
 import types
 import unittest
 from unittest import mock
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from channel.adapter import OutboundMessage
+from channel.adapter import OutboundMessage, Attachment, PartialSendError
 from channel.adapters.qq_official import QQOfficialAdapter, validate_qq_official_config
 
 class MockApi:
@@ -81,6 +84,17 @@ def message(user="OpenID123456789", mid="mid-01", **overrides):
     return types.SimpleNamespace(event_type="C2C_MESSAGE_CREATE", **value)
 
 
+def sdk_dns_failure():
+    """Model qqbot_agent_sdk wrapping httpx.ConnectError from socket.gaierror."""
+    dns = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    http_error = httpx.ConnectError(
+        "[Errno -3] Temporary failure in name resolution")
+    http_error.__cause__ = dns
+    wrapped = RuntimeError("send_text failed after 1 attempts")
+    wrapped.__cause__ = http_error
+    return wrapped
+
+
 class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         MockApi.instances.clear()
@@ -150,6 +164,7 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_has_source_and_never_retries(self):
         await self.adapter.start()
         target = "OpenID123456789"
+        self.adapter._parse_message(message(user=target, mid="mid-01"))
         with self.assertRaises(ValueError):
             await self.adapter.send_message(OutboundMessage(chat_id=target, text="reply"))
         await self.adapter.send_message(OutboundMessage(
@@ -171,18 +186,225 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         original = OutboundMessage(
             chat_id="OpenID123456789", text="answer",
             reply_to_message_id="retry-unsafe-message")
+        self.adapter._parse_message(message(mid="retry-unsafe-message"))
         with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
             await self.adapter.send_message(original)
         with self.assertRaisesRegex(ValueError, "already attempted"):
             await self.adapter.send_message(original)
         api.send_text.assert_awaited_once()
 
+    async def test_temporary_dns_failure_retries_inside_one_reply(self):
+        await self.adapter.start()
+        api = MockApi.instances[-1]
+        api.send_text = mock.AsyncMock(side_effect=[sdk_dns_failure(), None])
+        original = OutboundMessage(
+            chat_id="OpenID123456789", text="answer", reply_to_message_id="dns-1")
+        self.adapter._parse_message(message(mid="dns-1"))
+        with mock.patch("channel.adapters.qq_official._DNS_RETRY_DELAYS", (0, 0)):
+            await self.adapter.send_message(original)
+        self.assertEqual(api.send_text.await_count, 2)
+        for call in api.send_text.await_args_list:
+            self.assertEqual(call.kwargs["retries"], 1)
+        with self.assertRaisesRegex(ValueError, "already attempted"):
+            await self.adapter.send_message(original)
+        self.assertEqual(api.send_text.await_count, 2)
+
+    async def test_dns_exhaustion_allows_later_safe_attempt(self):
+        await self.adapter.start()
+        api = MockApi.instances[-1]
+        api.send_text = mock.AsyncMock(
+            side_effect=[sdk_dns_failure(), sdk_dns_failure(),
+                         sdk_dns_failure(), None])
+        original = OutboundMessage(
+            chat_id="OpenID123456789", text="answer", reply_to_message_id="dns-2")
+        self.adapter._parse_message(message(mid="dns-2"))
+        with mock.patch("channel.adapters.qq_official._DNS_RETRY_DELAYS", (0, 0)):
+            with self.assertRaisesRegex(RuntimeError, "retry permitted"):
+                await self.adapter.send_message(original)
+            self.assertEqual(api.send_text.await_count, 3)
+            await self.adapter.send_message(original)
+        self.assertEqual(api.send_text.await_count, 4)
+
+    async def test_other_connect_error_is_not_retryable(self):
+        await self.adapter.start()
+        api = MockApi.instances[-1]
+        api.send_text = mock.AsyncMock(
+            side_effect=httpx.ConnectError("Connection reset before response"))
+        original = OutboundMessage(
+            chat_id="OpenID123456789", text="answer", reply_to_message_id="other")
+        self.adapter._parse_message(message(mid="other"))
+        with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
+            await self.adapter.send_message(original)
+        with self.assertRaisesRegex(ValueError, "already attempted"):
+            await self.adapter.send_message(original)
+        api.send_text.assert_awaited_once()
+
+    async def test_dns_retry_blocks_concurrent_duplicate(self):
+        await self.adapter.start()
+        api = MockApi.instances[-1]
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def send_once_then_succeed(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await release.wait()
+                raise sdk_dns_failure()
+
+        api.send_text = mock.AsyncMock(side_effect=send_once_then_succeed)
+        original = OutboundMessage(
+            chat_id="OpenID123456789", text="answer", reply_to_message_id="dns-race")
+        self.adapter._parse_message(message(mid="dns-race"))
+        with mock.patch("channel.adapters.qq_official._DNS_RETRY_DELAYS", (0, 0)):
+            first = asyncio.create_task(self.adapter.send_message(original))
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            with self.assertRaisesRegex(ValueError, "already attempted"):
+                await self.adapter.send_message(original)
+            release.set()
+            await first
+        self.assertEqual(calls, 2)
+
+
+    async def test_group_at_reply_uses_group_openid_and_member_scoped_acl(self):
+        self.adapter.config.update(
+            {"enabled_scopes": ["c2c", "group", "guild"], "private_only": False})
+        await self.adapter.start()
+        group = "GroupOpenID12345"
+        member = "MemberOpenID12345"
+        event = types.SimpleNamespace(
+            event_type="GROUP_AT_MESSAGE_CREATE", chat_scope="group",
+            chat_id=group, user_id=member, message_id="group-msg-1",
+            content="hello", attachments=[], msg_elements=[], user_name="member")
+        parsed = self.adapter._parse_message(event)
+        self.assertEqual(parsed.chat_id, group)
+        self.assertEqual(parsed.chat_type, "group")
+        self.assertIn(group, parsed.user_id)
+        self.assertIn(member, parsed.user_id)
+        self.assertIsNone(self.adapter._parse_message(event))
+        await self.adapter.send_message(OutboundMessage(
+            chat_id=group, text="response", reply_to_message_id="group-msg-1"))
+        self.assertEqual(MockApi.instances[-1].messages[-1][0][:2], ("group", group))
+
+    async def test_guild_at_reply_uses_channel_and_does_not_leak_group(self):
+        self.adapter.config.update(
+            {"enabled_scopes": ["c2c", "group", "guild"], "private_only": False})
+        await self.adapter.start()
+        event = types.SimpleNamespace(
+            event_type="GUILD_AT_MESSAGE_CREATE", chat_scope="guild",
+            chat_id="Channel12345", user_id="GuildUser12345",
+            message_id="guild-msg-1", content="test", attachments=[],
+            msg_elements=[], user_name="guild member")
+        parsed = self.adapter._parse_message(event)
+        self.assertEqual(parsed.chat_type, "group")
+        self.assertIn("guild:Channel12345", parsed.user_id)
+        await self.adapter.send_message(OutboundMessage(
+            chat_id="Channel12345", text="reply", reply_to_message_id="guild-msg-1"))
+        self.assertEqual(MockApi.instances[-1].messages[-1][0][:2],
+                         ("guild", "Channel12345"))
+
+
+    async def test_guild_direct_message_uses_official_dm_route(self):
+        self.adapter.config.update({
+            "enabled_scopes": ["c2c", "guild_dm"], "private_only": False})
+        await self.adapter.start()
+        event = types.SimpleNamespace(
+            event_type="DIRECT_MESSAGE_CREATE", chat_scope="dm",
+            chat_id="GuildDm12345", user_id="GuildMember12345",
+            message_id="dm-001", content="DM question", attachments=[],
+            msg_elements=[], user_name=None)
+        parsed = self.adapter._parse_message(event)
+        self.assertEqual(parsed.chat_type, "p2p")
+        self.assertIn("guild_dm:GuildDm12345", parsed.user_id)
+        api = MockApi.instances[-1]
+        api.request = mock.AsyncMock(return_value={"id": "out-001"})
+        await self.adapter.send_message(OutboundMessage(
+            chat_id="GuildDm12345", text="DM answer", reply_to_message_id="dm-001"))
+        api.request.assert_awaited_once_with(
+            "POST", "/dms/GuildDm12345/messages",
+            {"content": "DM answer", "msg_id": "dm-001"})
+
+    async def test_media_then_text_uses_single_source_without_duplicates(self):
+        from channel.adapters.qq_official import QQOfficialAdapter
+        self.adapter.config["enable_outbound_media"] = True
+        await self.adapter.start()
+        self.adapter._parse_message(message(mid="media-then-text"))
+        api = MockApi.instances[-1]
+        files = [Attachment(kind="image", path="/work/resource/qq_outbox/test.png",
+                            name="test.png")]
+        with mock.patch("channel.adapters.qq_official._validate_outbound_file"):
+            with mock.patch("channel.adapters.qq_official.send_media",
+                            new_callable=mock.AsyncMock) as sender:
+                await self.adapter.send_message(OutboundMessage(
+                    chat_id="OpenID123456789", text="caption", files=files,
+                    reply_to_message_id="media-then-text"))
+                sender.assert_awaited_once()
+        self.assertEqual(api.messages[-1][0][:3],
+                         ("c2c", "OpenID123456789", "caption"))
+        with self.assertRaisesRegex(ValueError, "already attempted"):
+            await self.adapter.send_message(OutboundMessage(
+                chat_id="OpenID123456789", text="duplicate",
+                reply_to_message_id="media-then-text"))
+
+    async def test_media_delivered_then_text_timeout_reports_partial_send(self):
+        self.adapter.config["enable_outbound_media"] = True
+        await self.adapter.start()
+        self.adapter._parse_message(message(mid="media-partial"))
+        api = MockApi.instances[-1]
+        api.send_text = mock.AsyncMock(side_effect=TimeoutError())
+        files = [Attachment(kind="image", path="/work/resource/qq_outbox/test.png",
+                            name="test.png")]
+        with mock.patch("channel.adapters.qq_official._validate_outbound_file"):
+            with mock.patch("channel.adapters.qq_official.send_media",
+                            new_callable=mock.AsyncMock) as sender:
+                with self.assertRaises(PartialSendError) as caught:
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", text="caption", files=files,
+                        reply_to_message_id="media-partial"))
+                sender.assert_awaited_once()
+        self.assertIn("media", caught.exception.sent)
+        with self.assertRaisesRegex(ValueError, "already attempted"):
+            await self.adapter.send_message(OutboundMessage(
+                chat_id="OpenID123456789", text="repeat",
+                reply_to_message_id="media-partial"))
+
+    async def test_unapproved_group_disabled_by_default(self):
+        await self.adapter.start()
+        event = types.SimpleNamespace(
+            event_type="GROUP_AT_MESSAGE_CREATE", chat_scope="group",
+            chat_id="GroupOpenID12345", user_id="MemberOpenID12345",
+            message_id="group-disabled", content="hi", attachments=[],
+            msg_elements=[], user_name=None)
+        self.assertIsNone(self.adapter._parse_message(event))
+        with self.assertRaisesRegex(ValueError, "unknown or expired"):
+            await self.adapter.send_message(OutboundMessage(
+                chat_id="GroupOpenID12345", text="reply",
+                reply_to_message_id="group-disabled"))
+
+    async def test_group_reply_cannot_route_to_different_chat(self):
+        self.adapter.config.update(
+            {"enabled_scopes": ["c2c", "group"], "private_only": False})
+        await self.adapter.start()
+        event = types.SimpleNamespace(
+            event_type="GROUP_AT_MESSAGE_CREATE", chat_scope="group",
+            chat_id="GroupOpenID12345", user_id="MemberOpenID12345",
+            message_id="group-locked", content="hi", attachments=[],
+            msg_elements=[], user_name=None)
+        self.assertIsNotNone(self.adapter._parse_message(event))
+        with self.assertRaisesRegex(ValueError, "unknown or expired"):
+            await self.adapter.send_message(OutboundMessage(
+                chat_id="OtherGroup12345", text="reply",
+                reply_to_message_id="group-locked"))
+        self.assertEqual(MockApi.instances[-1].messages, [])
+
     async def test_group_and_proactive_are_not_supported(self):
         await self.adapter.start()
         with self.assertRaisesRegex(ValueError, "source message"):
             await self.adapter.send_message(OutboundMessage(
                 chat_id="OpenID123456789", text="unsolicited"))
-        with self.assertRaisesRegex(ValueError, "text only"):
+        with self.assertRaisesRegex(ValueError, "byte images"):
             await self.adapter.send_message(OutboundMessage(
                 chat_id="OpenID123456789", text="image",
                 reply_to_message_id="m2", image_bytes=b"x"))
@@ -244,6 +466,11 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         cfg["app_secret_env"] = "QQ_OFFICIAL_TEST"
         validate_qq_official_config(cfg)
         for changes in (
+            {"enabled_scopes": ["c2c", "group"]},
+            {"enabled_scopes": ["invalid"]},
+            {"enable_typing": "on"},
+            {"enabled_scopes": ["guild_dm"]},
+            {"enabled_scopes": ["c2c", "c2c"]},
             {"protocol": "onebot"},
             {"app_id": "not-numeric"},
             {"private_only": False},

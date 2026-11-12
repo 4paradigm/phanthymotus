@@ -979,6 +979,31 @@ class ChannelManager:
                                 if ch_cfg['platform'] == 'qq' else ''),
                 'qq_app_id': (ch_cfg.get('config', {}).get('app_id', '')
                               if ch_cfg['platform'] == 'qq' else ''),
+                'qq_enabled_scopes': (ch_cfg.get('config', {}).get('enabled_scopes', ['c2c'])
+                                      if ch_cfg['platform'] == 'qq' else []),
+                'qq_media_in': (ch_cfg.get('config', {}).get('enable_inbound_media', False)
+                                if ch_cfg['platform'] == 'qq' else False),
+                'qq_media_out': (ch_cfg.get('config', {}).get('enable_outbound_media', False)
+                                 if ch_cfg['platform'] == 'qq' else False),
+                'qq_markdown': (ch_cfg.get('config', {}).get('enable_markdown', False)
+                                if ch_cfg['platform'] == 'qq' else False),
+                'qq_typing': (ch_cfg.get('config', {}).get('enable_typing', False)
+                              if ch_cfg['platform'] == 'qq' else False),
+                'qq_voice_transcription': (
+                    ch_cfg.get('config', {}).get('enable_voice_transcription', False)
+                    if ch_cfg['platform'] == 'qq' else False),
+                'qq_guild_plain': (
+                    ch_cfg.get('config', {}).get('enable_guild_plain_messages', False)
+                    if ch_cfg['platform'] == 'qq' else False),
+                'qq_session_resume': (
+                    ch_cfg.get('config', {}).get('enable_session_resume', False)
+                    if ch_cfg['platform'] == 'qq' else False),
+                'qq_interactions': (
+                    ch_cfg.get('config', {}).get('enable_interactions', False)
+                    if ch_cfg['platform'] == 'qq' else False),
+                'qq_approvals': (
+                    ch_cfg.get('config', {}).get('enable_approvals', False)
+                    if ch_cfg['platform'] == 'qq' else False),
                 'active_input': channel_id in self.active_input_channels,
                 'active_output': channel_id in self.active_output_channels,
             })
