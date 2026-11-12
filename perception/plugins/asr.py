@@ -2375,6 +2375,17 @@ class ASRPlugin:
                         log.info("[asr] running the start deferred behind the load "
                                  "of '%s'", model)
                         self.dispatch("asr", start_args)
+                    elif lazy:
+                        with self._nodes_lock:
+                            if self._pending_starts.get(key) is start_args:
+                                input_topic, _ = _resolve_asr_inputs(start_args)
+                                unused = self._retire_lazy_request(
+                                    start_args.get("instance_id") or input_topic,
+                                    start_args.get("_lazy_start_generation"))
+                            else:
+                                unused = None
+                        if unused is not None:
+                            unused.close()
                 except Exception as e:
                     log.error(f"[asr] deferred start failed: {e}", exc_info=True)
                 finally:
@@ -2512,6 +2523,10 @@ class ASRPlugin:
                 while self._loading:
                     if time.monotonic() > deadline:
                         with self._nodes_lock:
+                            # The load can finish between the loop condition
+                            # and acquiring this lock; do not queue too late.
+                            if not self._loading:
+                                break
                             if lazy_start is not None and lazy_start != (
                                     self._lazy_stop_generation,
                                     self._lazy_instance_stops.get(lazy_key, 0)):

@@ -98,7 +98,8 @@ def test_invalid_remote_alias_fails_before_network(tmp_path, monkeypatch, alias)
 @pytest.mark.parametrize("jp", ["511", "61"])
 def test_installer_layout_and_warm_cache(tmp_path, monkeypatch, jp):
     blobs = {name: b"data" for name in [
-        "jp511/bin/whisper_turbo_worker", "jp61/bin/whisper_turbo_worker",
+        "jp511/bin/whisper_turbo_worker", "jp511/bin/whisper_turbo_worker.native",
+        "jp61/bin/whisper_turbo_worker",
         "jp511/lib/libwhisper.so.1.8.3", "jp61/lib/libwhisper.so.1.8.3",
         "model/ggml-large-v3-turbo-q5_0.bin", "lora/ja.wslr", "numeric.json",
         "numeric-itn/lexicon.json", "LICENSE.whisper", "LICENSE.whisper.cpp", "MODEL_CARD.json"]}
@@ -122,6 +123,8 @@ def test_installer_layout_and_warm_cache(tmp_path, monkeypatch, jp):
     worker = install.ensure_release(tmp_path, jp)
     assert worker == tmp_path / "runtime" / ("jp" + jp) / "bin/whisper_turbo_worker"
     assert worker.stat().st_mode & 0o111
+    if jp == "511":
+        assert worker.with_name("whisper_turbo_worker.native").stat().st_mode & 0o111
     assert (tmp_path / "model.bin").read_bytes() == b"data"
     assert not (tmp_path / "model").exists()
     assert (worker.parent.parent / "lib/libwhisper.so").resolve().name == "libwhisper.so.1.8.3"
@@ -170,6 +173,77 @@ def test_config_switch_does_not_start_native_worker(monkeypatch):
     assert result["status"] == "configured"
     assert plugin._adapter is None and plugin._device == "gpu"
     assert plugin.dispatch("asr", {"action": "info"})["state"] == "idle"
+
+
+def test_deferred_prepare_failure_is_terminal_for_instance_polling(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    adapters = []
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            self.closed = False
+            adapters.append(self)
+        def prepare(self, **kwargs):
+            entered.set()
+            assert release.wait(3)
+            raise RuntimeError("CUDA unavailable")
+        def close(self):
+            self.closed = True
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: Adapter())
+    monkeypatch.setattr(asr, "MODEL_LOAD_GRACE_S", 0)
+    plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"}, None)
+    try:
+        assert plugin.dispatch("asr", {
+            "action": "start", "instance_id": "card", "input_topic": "/mic"})["state"] == "loading"
+        assert entered.wait(2)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 2
+    while (plugin._loading or plugin._pending_starts) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    info = plugin.dispatch("asr", {"action": "info", "instance_id": "card", "input_topic": "/mic"})
+    assert info["state"] == "error" and "CUDA unavailable" in info["desc"]
+    assert info["topic_in"][0]["topic"] == "/mic"
+    assert not plugin._pending_starts and not plugin._lazy_start_requests
+    assert not plugin._lazy_load_requested and plugin._adapter is None and adapters[0].closed
+
+
+def test_load_finishing_at_grace_deadline_does_not_leave_a_late_pending_start(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            pass
+        def prepare(self, **kwargs):
+            entered.set()
+            assert release.wait(3)
+            raise RuntimeError("CUDA unavailable")
+        def close(self):
+            pass
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: Adapter())
+    monkeypatch.setattr(asr, "MODEL_LOAD_GRACE_S", 0)
+    plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"}, None)
+    owner, original_clock, calls = threading.current_thread(), time.monotonic, []
+    def clock():
+        if threading.current_thread() is not owner:
+            return original_clock()
+        calls.append(True)
+        if len(calls) == 1:
+            return 0
+        if len(calls) == 2:
+            assert entered.wait(2)
+            release.set()
+            deadline = original_clock() + 2
+            while plugin._loading and original_clock() < deadline:
+                time.sleep(0.005)
+            assert not plugin._loading
+            return 1
+        return original_clock()
+    monkeypatch.setattr(asr.time, "monotonic", clock)
+    try:
+        result = plugin.dispatch("asr", {"action": "start", "instance_id": "card", "input_topic": "/mic"})
+    finally:
+        release.set()
+    assert result["state"] == "error" and "CUDA unavailable" in result["message"]
+    assert not plugin._pending_starts and not plugin._lazy_start_requests
 
 
 @pytest.mark.parametrize("instance", ["", "card"])
