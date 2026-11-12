@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import threading
 import time
 import uuid
+from dataclasses import replace
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
@@ -69,6 +71,19 @@ _DEPTH_TYPE_WAIT_S = 5.0
 # name them even with no chassis wired, instead of leaving the renderer to call
 # them joint1..joint6.
 TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
+
+# These policy fields are shared by the operator's config dialog and the
+# config action. Defaults come from startup configuration, before a particular
+# downstream chassis adopts/clamps the effective policy limits.
+_TUNING_FIELDS = ("stop_distance_m",)
+_BOOL_TUNING_FIELDS = frozenset()
+_RUNTIME_CONFIG_FIELDS = frozenset((*_TUNING_FIELDS, "obstacle_stop_m"))
+# Older saved canvases still send these keys on start. Nominal gains and gain
+# scheduling modes belong to startup YAML, not runtime operator controls;
+# arrival tolerance belongs to one navigate_to action.
+_IGNORED_LEGACY_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw",
+                                    "adaptive_k_fwd", "response_yaw_gain",
+                                    "stop_tolerance_m"))
 
 
 def _sensor_qos():
@@ -124,6 +139,8 @@ class NaviPlugin:
         self._publisher = None
         self._timer = None
         self._running = False
+        self._starting = False
+        self._start_cancelled = False
         self._paused = False
         self._rate_hz = 10.0
         self._ttl_ms = 300
@@ -135,7 +152,8 @@ class NaviPlugin:
 
         self._config = policy_mod.Config(**{
             k: v for k, v in self._cfg.items()
-            if k in policy_mod.Config.__dataclass_fields__
+            if (k in policy_mod.Config.__dataclass_fields__
+                and k != "stop_tolerance_m")
         })
         self._state = policy_mod.State()
 
@@ -170,6 +188,8 @@ class NaviPlugin:
         self._depth_ms = 0
         self._odom = None
         self._odom_ms = 0
+        self._odom_interface = {}
+        self._odom_max_age_ms = int(self._config.max_obs_age_ms)
         self._binding = {}
         self._acp_action_id = ""
         self._limit_notes: list = []
@@ -187,13 +207,34 @@ class NaviPlugin:
     # ── tool ─────────────────────────────────────────────────────────────────
 
     def get_tools(self) -> list:
+        tuning_properties = {
+            "stop_distance_m": {"type": "number", "minimum": 0,
+                                "title": "目标停止距离 stop_distance_m（m）",
+                                "description": "期望停在目标前的距离，按相机到目标"
+                                               "计算；到达距离阈值为此值加停止容差"},
+        }
+        stop_tolerance_spec = {
+            "type": "number", "minimum": 0,
+            "default": policy_mod.Config.__dataclass_fields__["stop_tolerance_m"].default,
+            "title": "本次停止距离容差 stop_tolerance_m（m）",
+            "description": "仅覆盖本次 navigate_to；不写入卡片配置。"
+                           "未填时每次恢复 0.05m，用于容纳相机测距误差。"
+                           "距离不大于停止距离加该容差时满足距离条件，"
+                           "仍需有效观测及原有对正条件。",
+        }
+        for key, spec in tuning_properties.items():
+            spec["default"] = self._cfg.get(
+                key, policy_mod.Config.__dataclass_fields__[key].default)
         return [{
             "name": "navi",
             "type": "processor",
             "multiInstance": False,
             "description": ("视觉导航：朝一个目标走过去。目标不在视野里时会**自行"
                             "原地转身搜索**，所以不需要先手动转动机器人。"
-                            "路上按深度减速避障，到设定距离停下。"),
+                            "路上按深度减速避障，到设定距离停下。"
+                            "底盘速度范围、横移能力、搜索转速和转向响应均从"
+                            "下游 Driver 描述符读取；未声明响应时使用通用默认"
+                            "转向P。info 可查看最终采用的限制和增益。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -205,8 +246,8 @@ class NaviPlugin:
                                "description": "要走过去的东西。用 list_visible_objects "
                                               "返回的 key（如 chair#azure）最准；"
                                               "也接受纯名字，但同名多个时挑哪一个不保证"},
-                    "stop_distance_m": {"type": "number",
-                                        "description": "在目标前多远停下，默认 1.2 m"},
+                    **{key: dict(spec) for key, spec in tuning_properties.items()},
+                    "stop_tolerance_m": dict(stop_tolerance_spec),
                     # Handed over by agent-core from the card wired downstream.
                     # Not operator-editable: it is a reading of another card,
                     # and a hand-typed copy is a copy that goes stale.
@@ -227,7 +268,7 @@ class NaviPlugin:
                                        "存在性检查。",
                     },
                     "navigate_to": {
-                        "params": ["target", "stop_distance_m"],
+                        "params": ["target", "stop_distance_m", "stop_tolerance_m"],
                         "description":
                             "朝目标走过去。**目标不必现在就看得见** —— 看不见时会"
                             "自行原地转身搜索，转满一圈仍未找到才算失败，所以不要"
@@ -249,6 +290,12 @@ class NaviPlugin:
                                         "description": "停止导航，放弃当前目标"},
                     "pause": {"params": [], "description": "暂停，保留目标"},
                     "resume": {"params": [], "description": "继续"},
+                    "config": {
+                        "params": list(_TUNING_FIELDS),
+                        "description": "配置默认停止距离。"
+                                       "只更新填写的参数；配置保留到本进程后续"
+                                       "启动，容器重启后需由画布配置或 YAML 恢复。",
+                    },
                 },
                 # Unlike the vla card, this one finishes: arriving is an answer.
                 "x-completion": {"actions": ["navigate_to"], "timeout": 300},
@@ -257,38 +304,24 @@ class NaviPlugin:
                 "x-is-dangerous": True,
                 "x-resource": ["base"],
             },
-            # **Three knobs, not twenty-two.**
-            #
-            # Everything else lives in `actucore/config.yaml`, where it has the
-            # paragraph of explanation it needs, and stays reachable through the
-            # `config` action for anyone tuning. What it must not be is a form
-            # field: an operator asked to pick `release_frac` or
-            # `bearingless_std_factor` has no way to judge the answer, and the
-            # dialog's length hides the three that actually matter.
-            #
-            # There is a second, sharper reason. **agent-core sends every field
-            # in this schema on every config call, defaults included** — so a
-            # key here silently overrides the same key in config.yaml. On r1_sz
-            # the file said `vx_max: 0.6` and the card reported 0.4, because the
-            # schema default won. Every field removed from here is one fewer
-            # place for the file to be quietly ignored; every field kept has to
-            # carry the same default the file does, which `test_navi_card.py`
-            # now checks.
+            # agent-core submits schema defaults along with dialog values.
+            # Tuning defaults must therefore reflect this card's startup YAML,
+            # rather than overwrite it or copy a previous chassis's limits.
             "configSchema": {
                 "type": "object",
                 "properties": {
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "stop_distance_m": {"type": "number", "default": 0.8,
-                                        "description": "走到目标前多远算到达（米）",
-                                        "scope": "instance"},
-                    "obstacle_stop_m": {"type": "number", "default": 0.6,
+                    "obstacle_stop_m": {"type": "number",
+                                        "default": self._cfg.get("obstacle_stop_m", 0.6),
                                         "description": "正前方障碍近于这个距离就完全"
-                                                       "不前进（米）。必须小于 "
-                                                       "stop_distance_m，否则机器人会"
-                                                       "被它正要走向的目标挡停",
+                                                       "不前进（米）。达到或超过到达"
+                                                       "距离阈值时，目标可能先被当作"
+                                                       "障碍挡停；请结合底盘实际外廓核对",
                                         "scope": "instance"},
+                    **{key: {**spec, "scope": "instance"}
+                       for key, spec in tuning_properties.items()},
                 },
                 "required": [],
             },
@@ -352,6 +385,24 @@ class NaviPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):
+        with self._lock:
+            if self._running or self._starting:
+                return self._error("already running")
+            self._starting = True
+            self._start_cancelled = False
+        try:
+            result = self._start_impl(args)
+            with self._lock:
+                cancelled = self._start_cancelled
+            if cancelled:
+                self._unwind()
+                return {"state": "idle", "message": "启动已取消"}
+            return result
+        finally:
+            with self._lock:
+                self._starting = False
+
+    def _start_impl(self, args: dict):
         # No downstream is **not** a reason to refuse starting.
         #
         # "Don't wire the chassis yet, I just want to see what it computes" is a
@@ -389,9 +440,11 @@ class NaviPlugin:
         # preserve the former chassis's yaw and velocity restrictions.
         self._config = policy_mod.Config(**{
             k: v for k, v in self._cfg.items()
-            if k in policy_mod.Config.__dataclass_fields__
+            if (k in policy_mod.Config.__dataclass_fields__
+                and k != "stop_tolerance_m")
         })
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
+        self._limit_notes.extend(policy_mod.adopt_response(self._config, descriptor))
 
         rate = negotiate.effective_rate(capabilities, descriptor,
                                         self._cfg.get("rate_hz"))
@@ -442,11 +495,71 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
+        # Agent Core carries producer contracts keyed by the actual wired
+        # topic.  Selecting only after role binding prevents a second odometry
+        # producer on the canvas from donating timing to the wrong stream.
+        interfaces = args.get("odom_interfaces") or {}
+        interface = (interfaces.get(binding.get("odom"))
+                     if isinstance(interfaces, dict) else None)
+        # One-release compatibility for callers that used the earlier scalar
+        # hand-off. It is deliberately lower priority than the topic-keyed map.
+        if interface is None:
+            interface = args.get("odom_interface")
+        self._adopt_odom_interface(interface, bound_topic=binding.get("odom"))
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
                 "ttl_ms": self._ttl_ms, "inputs": binding,
                 "degraded": self._degradations()}
+
+    def _adopt_odom_interface(self, interface, *, bound_topic=None):
+        """Adopt timing declared by the state producer, never a robot constant.
+
+        A driver may stamp a sample at measurement time or when the reply was
+        received.  Navi does not guess which.  It uses the declared rate plus
+        delay budget to decide how long a sample remains usable; old drivers
+        that declare neither keep the existing observation-age fallback.
+        """
+        self._odom_interface = dict(interface) if isinstance(interface, dict) else {}
+        fallback = int(self._config.max_obs_age_ms)
+        max_age = fallback
+        try:
+            if not self._odom_interface:
+                if bound_topic:
+                    self._limit_notes.append(
+                        f"state/odom 未声明 timing，已使用通用 {fallback}ms 观测有效期")
+                self._odom_max_age_ms = fallback
+                return
+            if self._odom_interface.get("schema") != "motus.odom/1":
+                raise ValueError("schema must be motus.odom/1")
+            declared_topic = self._odom_interface.get("topic")
+            if declared_topic is not None and declared_topic != bound_topic:
+                raise ValueError("declared topic does not match the bound odom topic")
+            rate = float(self._odom_interface.get("rate_hz") or 0.0)
+            timing = self._odom_interface.get("timing") or {}
+            if not isinstance(timing, dict):
+                raise ValueError("timing must be an object")
+            stamp_source = timing.get("stamp_source")
+            delay_ms = float(timing["max_measurement_delay_ms"])
+            if (stamp_source not in {"robot", "received"}
+                    or not math.isfinite(rate) or rate <= 0
+                    or not math.isfinite(delay_ms) or delay_ms < 0):
+                raise ValueError("invalid rate or timing")
+            # Three source periods tolerate one delayed/missed poll. The
+            # Driver's measurement-delay bound covers a sample stamped before
+            # it became observable on the bus.
+            max_age = int(math.ceil(3000.0 / rate + delay_ms))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            if bound_topic:
+                self._limit_notes.append(
+                    "odom_interface 的 schema/topic/timing 声明无效，"
+                    f"已使用通用 {fallback}ms 观测有效期")
+            # A malformed declaration is the same as no timing contract. Keep
+            # the legacy receipt-time semantics as well as the configured budget;
+            # otherwise `_on_string` would trust an unvalidated producer stamp.
+            self._odom_interface = {}
+            max_age = fallback
+        self._odom_max_age_ms = max(100, max_age)
 
     def _adopt_camera(self, declarations, binding: dict) -> str:
         """Adopt the depth camera's geometry; return a reason to refuse, or "".
@@ -565,11 +678,36 @@ class NaviPlugin:
         if not target:
             return self._error("navigate_to 需要 target —— 一个 vop 认得的名字")
         with self._lock:
+            if self._starting:
+                return self._error("卡片正在启动，请稍后再试")
             if not self._running:
                 return {"state": "idle",
                         "message": "卡片未在运行，请先在画布上启动"}
-            if "stop_distance_m" in args and args["stop_distance_m"] is not None:
-                self._config.stop_distance_m = float(args["stop_distance_m"])
+            # Tolerance is a property of this action, not persistent card
+            # configuration.  Start each target from the strict default so a
+            # generous tolerance used for one approach cannot leak into the
+            # next one.
+            distance_updates = {
+                "stop_tolerance_m":
+                    policy_mod.Config.__dataclass_fields__["stop_tolerance_m"].default,
+            }
+            for key in ("stop_distance_m", "stop_tolerance_m"):
+                if key not in args or args[key] is None:
+                    continue
+                try:
+                    if isinstance(args[key], bool):
+                        raise ValueError("must be a finite nonnegative number")
+                    value = float(args[key])
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError("must be a finite nonnegative number")
+                    distance_updates[key] = value
+                except (TypeError, ValueError, OverflowError) as error:
+                    return self._error(f"配置 {key} 无效：{error}")
+            try:
+                candidate = replace(self._config, **distance_updates)
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"停止距离配置无效：{error}")
+            self._config = candidate
             # A new target discards everything remembered about the old one —
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
@@ -583,6 +721,9 @@ class NaviPlugin:
             # `args` — which is what this did first — finds nothing, so no
             # pending is ever registered and no completion can be matched.
             self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
+            arrival = {"stop_distance_m": self._config.stop_distance_m,
+                       "stop_tolerance_m": self._config.stop_tolerance_m,
+                       "arrival_distance_m": self._config.arrival_distance_m}
         log.info("navi navigate_to: target=%r", target)
         out = {"state": "running", "target": target, "topic": self._topic,
                # agent-core reads this back out to register the pending action.
@@ -590,7 +731,7 @@ class NaviPlugin:
                # as the barrier is concerned, and the completion POST below
                # later refers to an id nobody is waiting on.
                "action_id": self._acp_action_id,
-               "stop_distance_m": self._config.stop_distance_m,
+               **arrival,
                "degraded": self._degradations()}
 
         # Answer "is this target visible right now" immediately.
@@ -633,19 +774,31 @@ class NaviPlugin:
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
+            action_id, self._acp_action_id = self._acp_action_id, ""
+            target = self._state.target
             self._state = policy_mod.State()
+            if action_id:
+                result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
+                threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
+                                 daemon=True, name="navi_acp").start()
         return {"state": "running", "message": "已停止导航，卡片仍在运行"}
 
     def _halt(self, halted: bool):
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
+            # A paused policy does not tick, so it cannot clear its own gain
+            # schedule before resume. Keep the track, but restart gain gently.
+            self._state.adaptive_fwd_scale = 1.0
+            self._state.adaptive_yaw_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
 
-    def _stop(self):
+    def _stop(self, *, cancel_start=True):
         with self._lock:
+            if self._starting and cancel_start:
+                self._start_cancelled = True
             if not self._running:
                 return {"state": "idle"}
             self._running = False
@@ -674,7 +827,7 @@ class NaviPlugin:
 
     def _unwind(self):
         self._stop_view_thread()
-        self._stop()
+        self._stop(cancel_start=False)
 
     def _stop_view_thread(self):
         self._view_stop.set()
@@ -685,20 +838,76 @@ class NaviPlugin:
 
     def _config_action(self, args: dict):
         changed = {}
+        ignored = []
         for key, value in (args or {}).items():
+            if key in _IGNORED_LEGACY_FIELDS:
+                ignored.append(key)
+                continue
             field = policy_mod.Config.__dataclass_fields__.get(key)
-            if field is None or value is None:
+            if field is None:
+                continue
+            if key not in _RUNTIME_CONFIG_FIELDS:
+                ignored.append(key)
+                continue
+            if value is None:
+                if key in _BOOL_TUNING_FIELDS:
+                    return self._error(f"配置 {key} 无效：must be a boolean")
                 continue
             # Coerce to the field's own type. Blanket `float()` turned
             # `use_lateral` into 1.0 — truthy, so it worked, which is exactly
             # how a field ends up holding the wrong type for a year.
             cast = (bool if field.type in ("bool", bool)
                     else int if field.type in ("int", int) else float)
-            setattr(self._config, key, cast(value))
-            changed[key] = getattr(self._config, key)
-            # Preserve user-configured values across subsequent starts.
-            self._cfg[key] = changed[key]
-        return {"status": "configured", "config": changed}
+            try:
+                if key in _BOOL_TUNING_FIELDS and not isinstance(value, bool):
+                    raise ValueError("must be a boolean")
+                if key in _TUNING_FIELDS and key not in _BOOL_TUNING_FIELDS and isinstance(value, bool):
+                    raise ValueError("must be a finite nonnegative number")
+                changed[key] = cast(value)
+                if key in _TUNING_FIELDS and key not in _BOOL_TUNING_FIELDS:
+                    if not math.isfinite(changed[key]) or changed[key] < 0:
+                        raise ValueError("must be a finite nonnegative number")
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"配置 {key} 无效：{error}")
+
+        with self._lock:
+            if self._starting and changed:
+                return self._error("卡片正在启动，暂不能修改参数")
+            # Stage a complete replacement so the policy never observes half
+            # of a config request. Copy effective geometry adopted from the
+            # camera/chassis; rebuilding from YAML would discard that reading.
+            try:
+                candidate = replace(self._config, **changed)
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"配置无效：{error}")
+            notes = self._limit_notes
+            if self._running and changed:
+                # Restore requested ceilings before adoption, including those
+                # unchanged by this request. Otherwise an already-clamped
+                # ceiling loses its explanatory note on the next gain change.
+                for key in ("vx_max", "vy_max", "wz_max", "search_rate"):
+                    setattr(candidate, key, changed.get(
+                        key, self._cfg.get(
+                            key, policy_mod.Config.__dataclass_fields__[key].default)))
+                notes = policy_mod.adopt_limits(candidate, self._descriptor)
+            if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
+                   for key in ("stop_distance_m",
+                               "stop_tolerance_m", "slow_distance_m")):
+                # A successful gain/boundary change starts a fresh schedule;
+                # tracker state and unrelated navigation counters stay intact.
+                self._state.adaptive_fwd_scale = 1.0
+            if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
+                   for key in ("align_full_stop", "wz_max")):
+                self._state.adaptive_yaw_scale = 1.0
+            self._config = candidate
+            self._cfg.update(changed)
+            self._limit_notes = notes
+            result = {"status": "configured", "config": changed,
+                      "effective_config": {key: getattr(candidate, key)
+                                           for key in changed}}
+            if ignored:
+                result["ignored_parameters"] = ignored
+            return result
 
     def _info(self):
         with self._lock:
@@ -726,7 +935,36 @@ class NaviPlugin:
                                "format": "image/jpeg"}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
+                "config": {**{key: getattr(self._config, key)
+                              for key in _TUNING_FIELDS},
+                           "max_obs_age_ms": self._config.max_obs_age_ms,
+                           "stop_tolerance_m": self._config.stop_tolerance_m,
+                           "arrival_distance_m": self._config.arrival_distance_m,
+                           "k_fwd": self._config.k_fwd,
+                           "adaptive_k_fwd": self._config.adaptive_k_fwd,
+                           "k_yaw": self._config.k_yaw,
+                           "response_yaw_gain": self._config.response_yaw_gain,
+                           "adaptive_k_yaw": self._config.adaptive_k_yaw,
+                           "vx_max": self._config.vx_max,
+                           "vy_max": self._config.vy_max,
+                           "wz_max": self._config.wz_max,
+                           "search_rate": self._config.search_rate,
+                           "use_lateral": self._config.use_lateral,
+                           "obstacle_stop_m": self._config.obstacle_stop_m,
+                           "slow_distance_m": self._config.slow_distance_m},
                 "published": self._published,
+                "gains": {
+                    "forward": {"base": self._config.k_fwd,
+                                "effective": getattr(decision, "k_fwd_effective", None)},
+                    "yaw": {"base": (self._config.response_yaw_gain
+                                      if self._config.response_yaw_gain is not None
+                                      else self._config.k_yaw),
+                            "effective": getattr(decision, "k_yaw_effective", None),
+                            "source": ("driver_response"
+                                       if self._config.response_yaw_gain is not None
+                                       else "adaptive_default")}},
+                "odom_timing": {"max_age_ms": self._odom_max_age_ms,
+                                "interface": dict(self._odom_interface)},
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
                 # no declaration arrived and boxes cannot be used — see
                 # `_degradations`.
@@ -744,7 +982,9 @@ class NaviPlugin:
                 "degraded": self._degradations(),
                 "last": ({"status": decision.status, "reason": decision.reason,
                           "distance_m": decision.distance_m,
-                          "bearing": decision.bearing}
+                          "bearing": decision.bearing,
+                          "k_fwd_effective": getattr(decision, "k_fwd_effective", None),
+                          "k_yaw_effective": getattr(decision, "k_yaw_effective", None)}
                          if decision else None),
                 # **Coasting has to be visible here.** A robot walking towards a
                 # prediction and a robot walking towards something it can see
@@ -762,6 +1002,12 @@ class NaviPlugin:
         if not self._running:
             return []
         out = []
+        if self._config.obstacle_stop_m >= self._config.arrival_distance_m:
+            out.append(
+                f"障碍停车距离 obstacle_stop_m={self._config.obstacle_stop_m:g} m "
+                f"达到或超过到达阈值 arrival_distance_m={self._config.arrival_distance_m:g} m；"
+                "目标可能先触发避障停车而无法到达。请结合实际底盘外廓核对距离设置；"
+                "自适应P不会降低避障停车距离")
         if not self._binding.get("depth_map"):
             out.append("只接了深度摘要，没有深度图 —— 距离按目标所在的三分之一"
                        "画面估计，精度明显变差；避障也退回按画面三等分判断，"
@@ -823,7 +1069,7 @@ class NaviPlugin:
         ("/visual_depth", "depth_map"),
 
         # Hardware drivers may publish metric depth directly. Support both
-        # normal camera/depth paths and namespaced head cameras (Tianyi).
+        # normal camera/depth paths and namespaced head cameras.
         ("/camera/head/depth", "depth_map"),
         ("/camera/depth", "depth_map"),
         ("/depth", "depth_map"),
@@ -1105,6 +1351,8 @@ class NaviPlugin:
             payload = json.loads(message.data)
         except Exception:                                     # noqa: BLE001
             return          # one bad frame must not take the stream down
+        if not isinstance(payload, dict):
+            return
         now = int(time.time() * 1000)
         with self._obs_lock:
             if role == "objects":
@@ -1128,7 +1376,22 @@ class NaviPlugin:
                 # rotation assumed to be zero.
                 self._odom = {axis: odom_mod.axis_of(payload, axis)
                               for axis in ("vx", "vy", "wz")}
-                self._odom_ms = now
+                stamp = payload.get("stamp_ms")
+                if self._odom_interface:
+                    # A declared interface makes stamp_ms authoritative. An
+                    # absent/non-finite stamp is not silently upgraded to a
+                    # fresh receipt-time sample, because the declared maximum
+                    # measurement delay would then be meaningless.
+                    if (isinstance(stamp, (int, float))
+                            and not isinstance(stamp, bool)
+                            and math.isfinite(stamp)):
+                        self._odom_ms = int(stamp)
+                    else:
+                        self._odom_ms = 0
+                else:
+                    # Backwards compatibility for old producers whose timing
+                    # contract predates stamp_source.
+                    self._odom_ms = now
 
     def _on_image(self, message):
         """The raw camera frame, kept compressed until something draws it."""
@@ -1190,7 +1453,9 @@ class NaviPlugin:
             fresh_depth = now - self._depth_ms <= max_age
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
                      if fresh_depth else None)
-            odom = self._odom if now - self._odom_ms <= max_age else None
+            odom_age = now - self._odom_ms
+            odom = (self._odom
+                    if 0 <= odom_age <= self._odom_max_age_ms else None)
         return objects, depth, odom
 
     def next_command(self):
@@ -1215,18 +1480,19 @@ class NaviPlugin:
         # threshold comes from the downstream descriptor — it is a property of
         # the robot, and this policy should not know any robot's numbers.
         #
-        # **Which threshold depends on what the command itself asks for.** On a
-        # legged chassis the yaw deadband is a property of the gait, not of the
-        # axis: R1 needs 1.0 rad/s to start turning from a standstill and 0.05
-        # once it is already walking. Applying the standing figure to a command
-        # that also translates inflates a small correction twenty-fold — and
-        # this line would have done exactly that to every command the policy
-        # had just been careful not to quantise.
+        # **Which threshold depends on what the command itself asks for.** Some
+        # legged chassis declare a much smaller moving-yaw floor than their
+        # standstill floor. Applying the standstill figure to a command that
+        # also translates inflates a small correction and creates weaving.
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
 
-        self._seq += 1
         obs_ms = self._objects_ms or int(now * 1000)
+        return self._command_message(values, now, obs_ms)
+
+    def _command_message(self, values, now, obs_ms):
+        """Build one guarded normal-navigation command."""
+        self._seq += 1
         message = build_message(
             seq=self._seq,
             values=values,
@@ -1235,7 +1501,7 @@ class NaviPlugin:
             source=f"mcp__actucore__{self.PREFIX}",
             stamp_ms=int(now * 1000),
             # When the picture this was computed from was taken, not now. A
-            # command generated this instant from a 900 ms old frame is the
+            # command generated this instant from a 1100 ms old frame is the
             # characteristic failure here, and only this number catches it.
             obs_stamp_ms=obs_ms,
             ttl_ms=self._ttl_ms,
@@ -1284,19 +1550,22 @@ class NaviPlugin:
         return list(moving)
 
     def _tick(self):
-        publisher = self._publisher
-        if publisher is None or not self._running or self._paused:
-            # Publishing nothing is how a halt reaches the chassis: the
-            # driver's watchdog stops it within watchdog_ms. Commanding a stop
-            # from here would fight that.
-            return
-        try:
-            message = self.next_command()
-        except Exception as error:                            # noqa: BLE001
-            with self._lock:
+        with self._lock:
+            publisher = self._publisher
+            if publisher is None or not self._running or self._paused:
+                return
+            try:
+                message = self.next_command()
+                if message is not None:
+                    from std_msgs.msg import String
+                    payload = String()
+                    payload.data = json.dumps(message, ensure_ascii=False)
+                    publisher.publish(payload)
+                    self._published += 1
+            except Exception as error:                        # noqa: BLE001
                 self._last_error = f"{type(error).__name__}: {error}"
-            log.warning("navi tick failed: %s", error)
-            return
+                log.warning("navi tick failed: %s", error)
+                return
         # **Before the early return, not after it.** The tick publishes nothing
         # when the decision is to publish nothing — blind, searching, arrived,
         # refused — and those are exactly the moments somebody wants the picture
@@ -1304,17 +1573,6 @@ class NaviPlugin:
         # precisely when the robot stops explaining itself.
         self._publish_view()
 
-        if message is None:
-            self._maybe_complete()
-            return
-
-        from std_msgs.msg import String
-
-        payload = String()
-        payload.data = json.dumps(message, ensure_ascii=False)
-        publisher.publish(payload)
-        with self._lock:
-            self._published += 1
         self._maybe_complete()
 
     def _publish_view(self):
