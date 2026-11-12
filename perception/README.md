@@ -176,9 +176,15 @@ invalid quaternion) changes the state to `recovering`: pose output pauses, but
 the same native estimator keeps receiving frames. Tracking resumes in the same
 segment only after three consecutive valid estimates whose pose is continuous
 with the last published pose (within 5 cm + 1 m/s and 5° + 90°/s of elapsed
-time; an unvalidated engineering bound). Degradation lasting 1.5 s, a
-discontinuous resume, a changed native frame or a future capture time ends the
-segment. Late or repeated camera captures are dropped and counted
+time; an unvalidated engineering bound) and no later than 0.8 s after the
+last published capture. Rejected frames publish pose-less `recovering`
+samples declaring `vendor.pause` (`source=visual_gate`,
+`mapping_allowed=false`); `pointcloud_slam` honours that declaration exactly
+like an ESKF pause (same segment and clock, at most 1 s), so the resumed
+segment stays mappable. The 0.8 s producer bound leaves margin under that 1 s
+consumer limit for latency jitter. Degradation lasting 1 s, a resume after
+0.8 s, a discontinuous resume, a changed native frame or a future capture time
+ends the segment. Late or repeated camera captures are dropped and counted
 (`info().input_rejections`), never paired; persistent input loss still expires
 the segment. Stale or out-of-order native results are ignored, never counted
 as evidence. With fresh RGB and depth, a separate
@@ -257,7 +263,7 @@ This stays in the segment only when the fused/visual offset at the last
 published fused capture is within 2 cm / 2° (unvalidated engineering bound),
 or when no fused pose was ever published; otherwise the segment is retired
 for supervised new-segment recovery. Fallback poses obey the same
-three-estimate, continuity and 1.5 s degradation rules. The ESKF is not
+three-estimate, continuity, pause-declaration and 1 s/0.8 s rules. The ESKF is not
 restarted inside that segment; a later new segment retries it. Predictions
 are never published as tracking and a stale IMU is never fused again.
 

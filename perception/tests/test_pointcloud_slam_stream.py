@@ -160,3 +160,51 @@ def test_fusion_pause_cannot_bypass_segment_identity_or_one_second_limit(sample,
     s.odom(odom(resume_ms), now=resume_ms/1000)
     s.cloud(resume_ms*1_000_000, 'camera', [[1, 0, 0]], now=resume_ms/1000)
     assert len(s.accepted) == 1
+
+
+def gate_paused(ms, status='recovering', segment='a', **pause):
+    sample = odom(ms, segment=segment, status=status)
+    sample['pose'] = None
+    sample['vendor']['pause'] = dict(dict(source='visual_gate', status=status, mapping_allowed=False), **pause)
+    return sample
+
+
+def test_explicit_visual_gate_pause_resumes_same_segment_like_fusion_pause():
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
+    s.odom(gate_paused(1100), now=1.1)
+    with pytest.raises(ValueError):
+        s.cloud(1_100_000_000, 'camera', [[1, 0, 0]], now=1.1)
+    s.odom(odom(1300), now=1.3)
+    s.cloud(1_300_000_000, 'camera', [[1, 0, 0]], now=1.3)
+    assert len(s.accepted) == 2 and s.status(now=1.3)['integration'] == 'admitting'
+
+
+@pytest.mark.parametrize('sample, resume_ms', [
+    (gate_paused(1100, mapping_allowed=True), 1300),
+    (gate_paused(1100, status='recovering', segment='other'), 1300),
+    (dict(gate_paused(1100), vendor=dict(gate_paused(1100)['vendor'],
+          pause=dict(source='visual_gate', status='coasting', mapping_allowed=False))), 1300),
+    (gate_paused(2100), 2200),
+    (gate_paused(1100), 2101),
+])
+def test_visual_gate_pause_has_identical_bounds(sample, resume_ms):
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
+    s.odom(sample, now=sample['stamp_ms']/1000)
+    s.odom(odom(resume_ms), now=resume_ms/1000)
+    s.cloud(resume_ms*1_000_000, 'camera', [[1, 0, 0]], now=resume_ms/1000)
+    assert len(s.accepted) == 1
+
+
+def test_undeclared_pause_still_requires_a_new_segment():
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[1, 0, 0]], now=1.)
+    undeclared = odom(1100, status='recovering'); undeclared['pose'] = None
+    s.odom(undeclared, now=1.1)
+    s.odom(odom(1300), now=1.3)
+    s.cloud(1_300_000_000, 'camera', [[1, 0, 0]], now=1.3)
+    assert len(s.accepted) == 1

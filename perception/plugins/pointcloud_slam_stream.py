@@ -149,10 +149,14 @@ class SlamStream:
             return False
         anchor = self._fusion_pause[0] if self._fusion_pause else self._poses[-1] if self._poses else None
         stamp = sample.get('stamp_ms')
+        # The producer must declare the pause: an ESKF block, or the RGB-D
+        # visual gate's `pause` while its same native estimator recovers.
+        declarations = [d for d in (fusion if isinstance(fusion, dict) and fusion.get('enabled') is True else None,
+                                    vendor.get('pause')) if isinstance(d, dict)]
         valid = (anchor is not None and not self._requires_new_segment and self._required_new_segment is None
                  and sample.get('schema') == 'motus.odom/1' and sample.get('pose') is None
-                 and isinstance(fusion, dict) and fusion.get('enabled') is True
-                 and fusion.get('mapping_allowed') is False and fusion.get('status') == quality['status']
+                 and any(d.get('mapping_allowed') is False and d.get('status') == quality['status']
+                         for d in declarations)
                  and quality.get('segment_id') == anchor.segment_id and quality.get('clock_id') == self.clock_id
                  and type(stamp) is int and anchor.stamp_ms <= stamp <= anchor.stamp_ms+1000
                  and (self._fusion_pause is None or now-self._fusion_pause[1] <= 1.))

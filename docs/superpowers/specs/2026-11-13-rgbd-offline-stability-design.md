@@ -45,8 +45,14 @@ unchanged. Bounded per-frame diagnostics (16 frames).
 
 C. Rejected estimates pause output (`recovering`) while the same estimator
 keeps receiving frames; resume after three consecutive valid estimates
-continuous with the last published pose; retire after 1.5 s, discontinuity,
-frame change or future capture time. Late/repeated captures are dropped.
+continuous with the last published pose and within 0.8 s of its capture;
+retire after 1 s, discontinuity, frame change or future capture time.
+Late/repeated captures are dropped. `pointcloud_slam` already allowed a
+declared <= 1 s in-segment pause only for ESKF samples; an undeclared pause
+made it require a new segment, so an in-segment resume would stall mapping.
+Rejected frames therefore publish pose-less samples declaring
+`vendor.pause` (visual_gate, mapping_allowed=false), which the consumer now
+accepts under the identical bounds.
 
 D. One worker thread per fused session runs ICP off the lock; one running, one
 pending, one result. Results apply only to the exact filter revision before

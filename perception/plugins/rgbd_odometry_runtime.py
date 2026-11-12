@@ -38,7 +38,11 @@ def stamp_ns(msg):
     return msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
 
 
-RECOVERY_NS = 1_500_000_000
+# pointcloud_slam pauses a segment for at most 1 s (wall time and capture
+# stamps after its last pose). Resume in-segment only within 0.8 s of the last
+# published capture, leaving margin for native latency jitter; otherwise the
+# segment ends and supervised recovery starts a new one.
+RECOVERY_NS, PAUSE_RESUME_NS = 1_000_000_000, 800_000_000
 # Fused output differs from the native visual pose by ESKF corrections. A
 # visual-only fallback may stay in the segment only within this (unvalidated)
 # engineering bound at the last published fused capture.
@@ -94,7 +98,7 @@ class EstimateGate:
         if self.last_stamp and now - self.last_stamp > 1_500_000_000:
             self.fault('visual estimate stale; restart to begin a new segment', 'visual')
         if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
-            self.fault('visual degradation persisted beyond 1.5 s; restart to begin a new segment', 'visual')
+            self.fault('visual degradation persisted beyond 1 s; restart to begin a new segment', 'visual')
         return self.state
 
     def _continuous(self, stamp, position, rotation):
@@ -135,6 +139,11 @@ class EstimateGate:
             position, rotation = pose_values(pose)
         except (ValueError, TypeError, AttributeError) as error:
             self.degrade(error, now)
+            return None
+        if (self.state == 'recovering' and self.last_pose is not None and
+                stamp - self.last_pose[0] > PAUSE_RESUME_NS):
+            self.fault('visual recovery exceeded the 0.8 s in-segment pause bound; '
+                       'restart to begin a new segment', 'visual')
             return None
         if self.state != 'tracking' and not self._continuous(stamp, position, rotation):
             self.fault('visual estimate resumed discontinuously; restart to begin a new segment', 'visual')
@@ -621,6 +630,10 @@ class RgbdSession:
                 sample = make_sample(self.gate.state, stamp, self.segment, self.calibration['clock_id'],
                                      reason=self.gate.reason)
             sample = self._label_fallback(sample)
+        if (sample['vendor']['motus_slam']['status'] == 'recovering' and not self._fusing() and
+                self.gate.state == 'recovering' and self.gate.last_pose is not None):
+            # Declared, bounded in-segment pause the SLAM consumer can honour.
+            sample['vendor']['pause'] = dict(source='visual_gate', status='recovering', mapping_allowed=False)
         if getattr(self, 'mounts', None) is not None:
             sample = self.mounts.attach(sample, time.time_ns())
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
@@ -710,6 +723,11 @@ class RgbdSession:
                 if sample:
                     self._publish(sample)
                     self.counts['estimates'] += 1
+                elif (self.gate.state == 'recovering' and self.gate.last_pose is not None and
+                        stamp > self.gate.last_pose[0]):
+                    # Capture-stamped barrier: the map pauses before any later cloud.
+                    self._publish(make_sample('recovering', stamp, self.segment,
+                                              self.calibration['clock_id'], reason=self.gate.reason))
 
     def _watchdog(self):
         with self.lock:

@@ -56,7 +56,10 @@ def test_single_bad_estimate_pauses_output_keeps_feeding_and_recovers_same_segme
     stamp = track(s, now)
     count = len(s.publisher.messages)
     feed(s, now, stamp + 100*MS, **bad)
-    assert s.gate.state == 'recovering' and len(s.publisher.messages) == count
+    assert s.gate.state == 'recovering'
+    barriers = [json.loads(m) for m in s.publisher.messages[count:]]
+    assert barriers and all(b['pose'] is None and b['vendor']['pause']['mapping_allowed'] is False
+                            for b in barriers)
     ticks[0] += 1
     s._watchdog()
     assert status(s)['status'] == 'recovering' and status(s)['position_m'] is None
@@ -96,7 +99,7 @@ def test_discontinuous_resume_is_not_spliced_into_the_segment(sessions):
     count = len(s.publisher.messages)
     feed(s, now, stamp + 200*MS, x=5.)
     assert s.gate.state == 'lost' and 'discontinu' in s.gate.reason
-    assert len(s.publisher.messages) == count
+    assert all(json.loads(m)['pose'] is None for m in s.publisher.messages[count:])
 
 
 def test_changed_native_frame_is_a_hard_error(sessions):
@@ -228,3 +231,55 @@ def test_fallback_does_not_resume_fusion_or_publish_predictions(fused):
     assert all(json.loads(m)['vendor'].get('source') != 'rgbd_eskf' or json.loads(m)['pose'] is None
                for m in s.publisher.messages)
     assert not s.observations.frames
+
+
+# ── SLAM consumer contract: an in-segment resume must remain mappable ───────
+
+def slam_stream():
+    from plugins.pointcloud_slam_stream import SlamStream
+    accepted = []
+    stream = SlamStream(cloud_frame='camera_optical', child_frame='camera_optical', clock_id='camera-global',
+                        child_from_cloud=np.eye(4), max_gap_ms=250, max_age_s=2, max_pending=4,
+                        max_cloud_points=3, on_frame=lambda *a: accepted.append(a))
+    return stream, accepted
+
+
+def deliver(session, stream, start):
+    for raw in session.publisher.messages[start:]:
+        sample = json.loads(raw)
+        stream.odom(sample, now=sample['stamp_ms']/1000 + .02)
+    return len(session.publisher.messages)
+
+
+def test_transient_rejection_pauses_slam_and_resumed_segment_is_admitted(sessions):
+    create, now, _ = sessions
+    s = create()
+    stream, accepted = slam_stream()
+    stamp = track(s, now)
+    seen = deliver(s, stream, 0)
+    stream.cloud(stamp, 'camera_optical', [[1, 0, 0]], now=stamp/1e9 + .02)
+    assert len(accepted) == 1
+    feed(s, now, stamp + 100*MS, lost=True)
+    pause = last(s)
+    assert pause['pose'] is None and pause['vendor']['pause'] == dict(
+        source='visual_gate', status='recovering', mapping_allowed=False)
+    seen = deliver(s, stream, seen)
+    with pytest.raises(ValueError):
+        stream.cloud(stamp + 100*MS, 'camera_optical', [[1, 0, 0]], now=(stamp + 100*MS)/1e9 + .02)
+    for k in (2, 3, 4):
+        feed(s, now, stamp + k*100*MS)
+    deliver(s, stream, seen)
+    resumed = stamp + 400*MS
+    stream.cloud(resumed, 'camera_optical', [[1, 0, 0]], now=resumed/1e9 + .02)
+    assert len(accepted) == 2
+    assert stream.status(now=resumed/1e9 + .02)['integration'] == 'admitting'
+
+
+def test_resume_beyond_consumer_pause_bound_starts_a_new_segment(sessions):
+    create, now, _ = sessions
+    s = create()
+    stamp = track(s, now)
+    feed(s, now, stamp + 100*MS, lost=True)
+    for k in (7, 8, 9):  # valid again, but 0.7-0.9 s after the last published capture
+        feed(s, now, stamp + k*100*MS)
+    assert s.gate.state == 'lost' and 'pause' in s.gate.reason
