@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""
+"""Deploy Approval V153 fresh-lifecycle acceptance; no runtime behavior change.
+
 perception/main.py — Perception Stack bundle 统一入口。
 
 读取 config.yaml，按插件配置加载各感知插件，聚合成一个 MCP HTTP server 对外暴露：
