@@ -23,7 +23,11 @@ LANGUAGES = ("en", "zh", "ja", "fr", "de", "es", "ru", "th")
 
 
 class WhisperTurboAdapter:
-    """One Q5 model; automatic language and resident Japanese/Thai/Russian LoRA."""
+    """One Q5 model with language LoRA; token alignment is unavailable.
+
+    Text wake-word gating remains available. Direction matching follows the
+    node's existing no-alignment rules rather than invented token times.
+    """
 
     def __init__(self, model_dir, device="gpu", num_threads=2):
         if device != "gpu":

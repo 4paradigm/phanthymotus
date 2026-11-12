@@ -660,7 +660,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model. Whisper Turbo Q5 uses automatic language detection, requires GPU, and downloads resources on first start", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model. Whisper Turbo Q5 uses automatic language detection and GPU, downloads on first start, and has no token timing for precise wake direction", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -824,7 +824,7 @@ class ASRAdapter(ABC):
         """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
 
         返回 `(text, extras)`，`extras` 直接合进发布的 payload。默认是空 dict：
-        只有 SenseVoice 的解码结果带这些字段，别的适配器下这些 key 干脆不出现，
+        SenseVoice 提供情绪与音频事件，Whisper 提供语种；不支持的 key 不出现，
         而不是出现一个空值让 LLM 以为「这句话判断过、没有情绪」。
 
         为什么是返回值，而不是适配器上记一个 `self._last_emotion`：
@@ -834,6 +834,11 @@ class ASRAdapter(ABC):
         配到了另一句话上」—— 不会报错，也不会有任何日志。
         """
         return self.transcribe(wav_bytes, language), {}
+
+
+# The native adapter lives in a separate module; virtual registration avoids
+# importing this module back from it while retaining the shared interface.
+ASRAdapter.register(WhisperTurboAdapter)
 
 
 class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
@@ -2730,6 +2735,13 @@ class ASRPlugin:
                 self._device = new_device
                 self._plugin_cfg['device'] = new_device
                 self._plugin_cfg['asr_model'] = new_model
+                if ASR_MODELS[new_model].get("lazy"):
+                    with self._nodes_lock:
+                        self._load_target = (new_model, new_device)
+                        self._load_error = None
+                        self._load_status = ""
+                    return {"status": "configured", "asr_model": new_model,
+                            "device": new_device}
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "device": self._device,

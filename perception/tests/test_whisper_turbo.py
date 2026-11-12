@@ -162,12 +162,14 @@ def test_config_switch_does_not_start_native_worker(monkeypatch):
     builds = []
     monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: builds.append(a) or object())
     plugin = asr.ASRPlugin({"asr_model": "sensevoice-small", "device": "cpu"}, None)
-    plugin.dispatch("asr", {"action": "config", "asr_model": "whisper-turbo-q5"})
+    result = plugin.dispatch("asr", {"action": "config", "asr_model": "whisper-turbo-q5"})
     deadline = time.monotonic() + 2
     while plugin._loading and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not plugin._loading and len(builds) == 1
+    assert result["status"] == "configured"
     assert plugin._adapter is None and plugin._device == "gpu"
+    assert plugin.dispatch("asr", {"action": "info"})["state"] == "idle"
 
 
 @pytest.mark.parametrize("instance", ["", "card"])
@@ -357,6 +359,25 @@ def test_worker_protocol_reuses_one_process_and_returns_language(tmp_path, monke
     finally:
         adapter.close()
     assert adapter._process is None
+
+
+@pytest.mark.parametrize("text,end_pos,expected", [
+    ("小范小范你好", 4, "valid"),
+    ("嗯，小范小范你好", 5, "unknown"),
+])
+def test_whisper_wake_direction_uses_existing_no_alignment_rules(
+    tmp_path, monkeypatch, text, end_pos, expected
+):
+    adapter = WhisperTurboAdapter(str(tmp_path))
+    assert isinstance(adapter, asr.ASRAdapter)
+    monkeypatch.setattr(adapter, "_transcribe", lambda _: (text, "zh"))
+    transcript, tags, alignment = adapter.transcribe_aligned(b"protocol fixture")
+    assert transcript == text and tags == {"lang": "zh"} and alignment is None
+    char_ends = [i + 1 for i, char in enumerate(text) if char != "，"]
+    fields = asr._wake_direction_fields(
+        transcript, char_ends, end_pos, 4, 1700000000.0, 0,
+        [(90, 1700000000000000, 1700000000500000)], True, alignment=alignment)
+    assert fields["speaker_direction_state"] == expected
 
 
 def test_close_interrupts_busy_worker_and_queued_calls_cannot_restart_it(tmp_path, monkeypatch):
