@@ -1,4 +1,5 @@
 """Exact capture-time body mount propagation; main camera reference is preserved."""
+from collections import OrderedDict
 from copy import deepcopy
 
 import numpy as np
@@ -168,6 +169,8 @@ def test_runtime_automatically_attaches_mount_without_altering_main_odom(monkeyp
     monkeypatch.setattr(sys.modules['std_msgs.msg'], 'String', lambda **kw: NS(**kw))
     obj = object.__new__(runtime.RgbdSession)
     obj.mounts = mounts(); obj.imu = None
+    obj.calibration = {}; obj.fusion = None
+    obj.registration_by_stamp = OrderedDict()
     obj.lock = threading.RLock(); obj.stop_event = threading.Event()
     published = []
     obj.publisher = NS(publish=lambda msg: published.append(json.loads(msg.data)))

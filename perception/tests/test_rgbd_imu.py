@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import numpy as np
 import pytest
 
@@ -130,6 +132,7 @@ def session(monkeypatch):
     obj=object.__new__(runtime.RgbdSession)
     obj.lock=threading.RLock();obj.stop_event=threading.Event();obj.imu=aid()
     obj.calibration={'frame_id':'optical','clock_id':'capture-clock'}
+    obj.fusion=None;obj.registration_by_stamp=OrderedDict()
     obj.segment='run';obj.gate=runtime.EstimateGate('run','optical','capture-clock')
     obj.process=None;obj.started=runtime.time.monotonic()
     published=[];obj.imu_pub=NS(publish=published.append);obj._publish=lambda sample:None
