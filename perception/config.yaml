@@ -431,6 +431,12 @@ plugins:
     # 码里的内容是不可信输入，会直接进 LLM 的上下文 —— 这是对那个暴露面的上限
     max_text_chars: 2048
 
+  aruco:
+    enabled: true
+    dictionary: DICT_4X4_50
+    marker_size_m: 0.1
+    rate_hz: 5.0
+
   soundevent:
     enabled: true
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的

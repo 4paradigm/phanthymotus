@@ -133,6 +133,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"face_recognition\", \"type\": \"processor\"},
                     {\"name\": \"soundevent\", \"type\": \"processor\"},
                     {\"name\": \"barcode\", \"type\": \"actuator\"},
+                    {\"name\": \"aruco\", \"type\": \"processor\"},
                     {\"name\": \"phanthy_music\", \"type\": \"actuator\"},
                     {\"name\": \"audio_mixer\", \"type\": \"processor\"}
                 ]

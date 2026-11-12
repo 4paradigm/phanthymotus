@@ -4257,14 +4257,8 @@ That key is what `ZXING_WHEEL_511` names.
 
 ### ArUco / AprilTag are deliberately not here
 
-Their output is a 6-DoF pose, not text, and producing it needs the marker's
-printed size plus camera intrinsics. That is a different card with a different
-config and a different output port; `info` says so in `markers` rather than
-leaving the question open. `cv2.aruco`'s presence in the JetPack base OpenCV is
-also unverified, and the only clean way to add it would be replacing OpenCV —
-`opencv-contrib-python` from pip would shadow the base `cv2` the whole vision
-stack and rapidocr are built against (see the `pip uninstall opencv-python` step
-in `Dockerfile.jetson`).
+ArUco poses use the separate [ArUco Processor](#aruco-定位-aruco). The barcode
+card decodes text and does not estimate ArUco or AprilTag poses.
 
 ### Verifying
 
@@ -4324,6 +4318,36 @@ at the form rather than the schema (`web/js/sidebar.js`):
 * **The config panel is English.** The LLM-facing `inputSchema` is not bound by
   this — it is read by a model, not shown in the form.
 
+
+## ArUco 定位 (`aruco`)
+
+Connect a camera's `image/jpeg` port to the ArUco Processor. Select the
+dictionary used to generate the marker and enter the measured length of the
+outer black square in meters. The default is `DICT_4X4_50` and 0.100 m.
+Print at 100% scale with a white margin, then measure the black square.
+
+The card uses the connected camera's `motus.camera/1` declaration. If it
+doesn't provide usable calibration, set **Camera calibration override** in
+the card. Enter `width`, `height`, row-major `K`, `distortion_model` and `D`
+for the JPEG resolution. Use `pinhole` with an empty or zero `D` for a rectified
+or undistorted image, or provide the measured coefficients for `plumb_bob`
+or `rational_polynomial`. Enter `{}` to clear a previous override. Restart the
+card after changing settings. Start the project to pass calibration from the
+wired camera. A standalone tool call must supply that calibration explicitly
+or use the override.
+
+In **Monitor**, the `poses` output reports the marker ID, XYZ translation
+in meters, Rodrigues rotation vector in radians, and reprojection RMS in
+pixels. The transform maps marker coordinates into the camera optical
+frame (+X right, +Y down, +Z forward). The `overlay` output shows the same
+camera frame with red X, green Y and blue Z axes. An empty `markers` list
+clears the previous detection when the marker leaves the frame. A single
+planar marker's rotation can be ambiguous near a frontal view.
+
+The card uses the Perception image's OpenCV. Verify `cv2.aruco` in the
+actual JetPack image before deployment. If it is missing, the card reports
+the dependency error while other processors continue to load. Keep the
+system OpenCV used by the existing vision processors when preparing the image.
 
 ## Camera Parameters (`camera_info`)
 
