@@ -2195,6 +2195,8 @@ class ASRPlugin:
         # needs no lock.
         self._load_status  = ""
         self._lazy_load_requested = False
+        # Keys cover both pending starts and active nodes; stop/error retires
+        # the key so one instance cannot close a peer's shared backend.
         self._lazy_start_requests = set()
         self._lazy_stop_generation = 0
         self._lazy_instance_stops = {}
@@ -2315,6 +2317,8 @@ class ASRPlugin:
         def _do_load():
             while True:
                 with self._nodes_lock:
+                    # A superseded iteration must resolve the target and its
+                    # lazy preparation policy again, before building anything.
                     model, device = self._load_target
                     lazy = ASR_MODELS.get(model, {}).get("lazy", False)
                     load = not lazy or self._lazy_load_requested

@@ -18,6 +18,7 @@ from plugins.whisper_turbo import WhisperTurboAdapter
 from utils import install_whisper_turbo as install
 from utils import model_downloader as downloads
 from utils.model_progress import fetch_status
+from vision_stubs import _FakeExecutor
 
 
 def metadata(data, **extra):
@@ -251,8 +252,57 @@ def test_cancel_one_start_preserves_peer_and_last_stop_releases_backend(monkeypa
     assert all(not thread.is_alive() for thread in threads)
     assert results == {"a": {"state": "idle"}, "b": {"state": "running"}}
     assert len(adapters) == 1 and not adapters[0].closed
+    assert plugin._lazy_start_requests == {"b"}
     plugin.dispatch("asr", {"action": "stop", "instance_id": "b"})
     assert plugin._adapter is None and adapters[0].closed
+    assert not plugin._lazy_start_requests and not plugin._lazy_load_requested
+
+
+def test_start_during_non_lazy_to_whisper_switch_prepares_latest_target(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    built, adapters, results = [], [], []
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            self.prepared = False
+            adapters.append(self)
+        def prepare(self, **kwargs):
+            self.prepared = True
+        def close(self):
+            pass
+    def build(cfg, **kwargs):
+        model = cfg["asr_model"]
+        built.append(model)
+        if model == "parakeet-en":
+            entered.set()
+            assert release.wait(3)
+        return Adapter() if model == "whisper-turbo-q5" else object()
+    def start_node(node):
+        assert node._adapter.prepared
+        node.state = "running"
+        return {"state": "running"}
+    monkeypatch.setattr(asr, "_build_asr_adapter", build)
+    monkeypatch.setattr(asr._ASRNode, "start", start_node)
+    plugin = asr.ASRPlugin({"asr_model": "sensevoice-small", "device": "cpu"}, _FakeExecutor())
+    plugin.dispatch("asr", {"action": "config", "asr_model": "parakeet-en"})
+    assert entered.wait(2)
+    plugin.dispatch("asr", {"action": "config", "asr_model": "whisper-turbo-q5"})
+    starter = threading.Thread(target=lambda: results.append(plugin.dispatch(
+        "asr", {"action": "start", "instance_id": "card", "input_topic": "/mic"})))
+    starter.start()
+    try:
+        deadline = time.monotonic() + 2
+        while "card" not in plugin._lazy_start_requests and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "card" in plugin._lazy_start_requests
+    finally:
+        release.set()
+        starter.join(3)
+    try:
+        assert not starter.is_alive() and results == [{"state": "running"}]
+        assert built == ["sensevoice-small", "parakeet-en", "whisper-turbo-q5"]
+        assert len(adapters) == 1 and adapters[0].prepared and plugin._adapter is adapters[0]
+    finally:
+        plugin.dispatch("asr", {"action": "stop"})
 
 
 def test_stale_deferred_start_cannot_revive_after_stop(monkeypatch):
