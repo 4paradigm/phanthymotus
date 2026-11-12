@@ -19,6 +19,8 @@ class RgbdOdometryPlugin:
         self.instances = {}
         self.defaults = {k: (config or {}).get(k, False) for k in
                          ('imu_assisted', 'short_term_compensation', 'depth_geometry')}
+        self.defaults['visual_frontend'] = (config or {}).get('visual_frontend', 'f2m_feature')
+        self.defaults['max_features'] = (config or {}).get('max_features', 1000)
         self.settings = {}
         self.lock = threading.RLock()
 
@@ -29,14 +31,24 @@ class RgbdOdometryPlugin:
                      'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'config']},
                      'instance_id': {'type': 'string'}, 'input_topics': {'type': 'array', 'items': {'type': 'string'}},
                      'camera_info': {'type': 'object'}, 'imu_assisted': {'type': 'boolean'},
-                     'short_term_compensation': {'type': 'boolean'}, 'depth_geometry': {'type': 'boolean'}}},
+                     'short_term_compensation': {'type': 'boolean'}, 'depth_geometry': {'type': 'boolean'},
+                     'visual_frontend': {'type': 'string', 'enum': ['f2m_feature', 'f2f_optical_flow']},
+                     'max_features': {'type': 'integer', 'minimum': 100, 'maximum': 5000}}},
                  'configSchema': {'type': 'object', 'properties': {
                      'imu_assisted': {'type': 'boolean', 'default': False, 'scope': 'instance',
                                       'description': '启用可选相机 IMU 辅助（需要第三路 IMU 输入）'},
                      'short_term_compensation': {'type': 'boolean', 'default': False, 'scope': 'instance',
                          'description': '启用 ESKF 短时补偿，需要 IMU 完整标定及低运动初始化'},
                      'depth_geometry': {'type': 'boolean', 'default': False, 'scope': 'instance',
-                         'description': '启用深度几何配准辅助，需要先启用短时补偿'}}},
+                         'description': '启用深度几何配准辅助，需要先启用短时补偿'},
+                     'visual_frontend': {'type': 'string', 'scope': 'instance',
+                                         'default': self.defaults['visual_frontend'],
+                                         'enum': ['f2m_feature', 'f2f_optical_flow'],
+                                         'description': 'F2M 特征匹配（默认）或 F2F 光流；切换需停止实例'},
+                     'max_features': {'type': 'integer', 'scope': 'instance',
+                                      'default': self.defaults['max_features'],
+                                      'minimum': 100, 'maximum': 5000,
+                                      'description': '最大特征数，调整需停止实例'}}},
                  'topic_in': [{'format': 'image/jpeg'}, {'format': 'image/depth-zlib'},
                               {'format': 'sensor/imu', 'optional': True}],
                  'topic_out': self._outputs('default'), 'odom_interface': _INTERFACE}]
@@ -57,8 +69,14 @@ class RgbdOdometryPlugin:
             try:
                 settings = {k: args.get(k, self.settings.get(instance, self.defaults).get(k, False))
                             for k in self.defaults}
-                if any(type(v) is not bool for v in settings.values()):
+                if any(type(settings[k]) is not bool for k in
+                       ('imu_assisted', 'short_term_compensation', 'depth_geometry')):
                     raise ValueError('IMU, compensation and geometry flags must be boolean')
+                if settings['visual_frontend'] not in ('f2m_feature', 'f2f_optical_flow'):
+                    raise ValueError('unsupported visual_frontend: use f2m_feature or f2f_optical_flow')
+                if (type(settings['max_features']) is not int or
+                        not 100 <= settings['max_features'] <= 5000):
+                    raise ValueError('max_features must be an integer in [100, 5000]')
                 enabled = settings['imu_assisted']
                 if settings['short_term_compensation'] and not enabled:
                     raise ValueError('short-term compensation requires imu_assisted')
@@ -66,7 +84,7 @@ class RgbdOdometryPlugin:
                     raise ValueError('depth geometry requires short-term compensation')
                 if action == 'config':
                     if current and settings != self.settings[instance]:
-                        raise ValueError('stop RGB-D odometry before changing assistance modes')
+                        raise ValueError('stop RGB-D odometry before changing frontend or assistance settings')
                     self.settings[instance] = settings
                     return {'state': 'configured', 'config': settings.copy()}
                 if action == 'start':

@@ -190,3 +190,71 @@ def test_imu_toggle_is_per_instance_and_requires_third_binding(monkeypatch):
 def test_invalid_boolean_toggle_does_not_silently_enable_imu():
     card=RgbdOdometryPlugin({},object())
     assert card.dispatch('rgbd_odometry',{'action':'config','imu_assisted':'false'})['state']=='error'
+
+
+def test_visual_frontend_settings_are_instance_scoped_and_require_restart(monkeypatch):
+    from plugins import rgbd_odometry as module
+
+    class RecordingSession(Session):
+        def __init__(self, calibration, executor, topic):
+            super().__init__(calibration, executor, topic)
+            self.calibration = calibration
+
+    monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
+    monkeypatch.setattr(module, 'require_runtime', lambda: None)
+    Session.created = []
+    card = RgbdOdometryPlugin({}, object())
+    schema = card.get_tools()[0]['configSchema']['properties']
+    assert schema['visual_frontend']['enum'] == ['f2m_feature', 'f2f_optical_flow']
+    assert schema['visual_frontend']['default'] == 'f2m_feature'
+    assert schema['max_features']['default'] == 1000
+    assert start(card, 'normal')['state'] == 'running'
+    assert card.instances['normal'][0].calibration['visual_frontend'] == 'f2m_feature'
+
+    configured = card.dispatch('rgbd_odometry', {
+        'action': 'config', 'instance_id': 'flow',
+        'visual_frontend': 'f2f_optical_flow', 'max_features': 1500})
+    assert configured['state'] == 'configured'
+    assert start(card, 'flow')['state'] == 'running'
+    first = card.instances['flow'][0]
+    assert first.calibration['visual_frontend'] == 'f2f_optical_flow'
+    assert first.calibration['max_features'] == 1500
+    assert len(Session.created) == 2
+    assert start(card, 'flow')['state'] == 'running'  # idempotent
+    assert len(Session.created) == 2
+    assert card.dispatch('rgbd_odometry', {
+        'action': 'config', 'instance_id': 'flow',
+        'visual_frontend': 'f2m_feature'})['state'] == 'error'
+    assert not first.stopped
+
+    card.dispatch('rgbd_odometry', {'action': 'stop', 'instance_id': 'flow'})
+    assert first.stopped
+    assert card.dispatch('rgbd_odometry', {
+        'action': 'config', 'instance_id': 'flow',
+        'visual_frontend': 'f2m_feature'})['state'] == 'configured'
+    assert start(card, 'flow')['state'] == 'running'
+    assert card.instances['flow'][0] is not first
+    assert card.instances['flow'][0].calibration['visual_frontend'] == 'f2m_feature'
+    card.shutdown()
+
+
+@pytest.mark.parametrize('options', [
+    {'visual_frontend': 'optical_flow'},
+    {'visual_frontend': 'f2m_optical_flow'},
+    {'visual_frontend': None},
+    {'max_features': 0},
+    {'max_features': 5001},
+    {'max_features': 1000.0},
+    {'max_features': True},
+    {'max_features': '1000'},
+])
+def test_invalid_frontend_settings_never_launch_estimator(monkeypatch, options):
+    from plugins import rgbd_odometry as module
+    monkeypatch.setattr(module, 'RgbdSession', Session)
+    Session.created = []
+    card = RgbdOdometryPlugin({}, object())
+    result = card.dispatch('rgbd_odometry', dict(
+        action='start', input_topics=['/rgb', '/depth'],
+        camera_info=declarations(), **options))
+    assert result['state'] == 'error'
+    assert not Session.created

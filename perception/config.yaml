@@ -283,6 +283,10 @@ plugins:
   # The following deployment settings are generic RTAB-Map/resource overrides.
   rgbd_odometry:
     enabled: true
+    # Pinned RTAB-Map F2M uses feature matching; optical flow requires F2F.
+    # Change visual_frontend only while the card instance is stopped.
+    visual_frontend: f2m_feature     # f2m_feature | f2f_optical_flow
+    max_features: 1000              # integer 100..5000
     # Per-instance opt-in: imu_assisted + short_term_compensation + depth_geometry.
     # Default remains visual-only; compensation requires calibrated IMU translations.
 

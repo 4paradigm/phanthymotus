@@ -122,3 +122,99 @@ def test_camera_captures_expire_missing_native_results_before_queue_overflow():
     assert fusion.reason is None
     assert len(outputs) >= 10
     assert all(visual is None for _, visual, _ in fusion.frames)
+
+
+@pytest.mark.parametrize('frontend,strategy,cor_type', [
+    ('f2m_feature', '0', '0'),
+    ('f2f_optical_flow', '1', '1'),
+])
+def test_pinned_rtabmap_frontend_strategy_is_real(frontend, strategy, cor_type):
+    parameters = estimator_parameters({
+        'frame_id': 'camera_optical', 'visual_frontend': frontend,
+        'max_features': 1500}, 'run')
+    assert parameters['Odom/Strategy'] == strategy
+    assert parameters['Vis/CorType'] == cor_type
+    assert parameters['Vis/MaxFeatures'] == '1500'
+    if frontend == 'f2f_optical_flow':
+        assert parameters['Vis/CorFlowWinSize'] == '16'
+        assert parameters['Vis/CorFlowMaxLevel'] == '3'
+    else:
+        assert 'Vis/CorFlowWinSize' not in parameters
+
+
+def test_default_rtabmap_frontend_preserves_feature_matching():
+    parameters = estimator_parameters({'frame_id': 'camera_optical'}, 'run')
+    assert parameters['Odom/Strategy'] == '0'
+    assert parameters['Vis/CorType'] == '0'
+    assert parameters['Vis/MaxFeatures'] == '1000'
+    assert parameters['Odom/ResetCountdown'] == '0'
+
+
+@pytest.mark.parametrize('option', [
+    {'visual_frontend': 'f2m_optical_flow'},
+    {'visual_frontend': 'other'},
+    {'max_features': True},
+    {'max_features': 10},
+    {'max_features': 10000},
+])
+def test_runtime_also_rejects_invalid_frontend_settings(option):
+    with pytest.raises(ValueError):
+        estimator_parameters({'frame_id': 'camera_optical', **option}, 'run')
+
+
+def test_registration_report_does_not_turn_geometry_prediction_into_tracking():
+    from plugins.rgbd_odometry_runtime import registration_report
+    sample = {'vendor': {
+        'motus_slam': {'status': 'coasting'},
+        'fusion': {'aid': 'depth_geometry', 'quality': {
+            'visual_usable': False, 'depth_fraction': .8, 'contrast': 5.,
+            'sharpness': 2., 'reason': 'low_contrast',
+            'geometry': {'attempted': True, 'accepted': True,
+                         'inliers': 123, 'rmse': .008, 'overlap': .45,
+                         'condition': 1234., 'reason': None}}}}}
+    report = registration_report(
+        sample, 'f2m_feature', {'inliers': 4, 'lost': True, 'latency_ms': 33.},
+        depth_enabled=True)
+    assert report['frontend'] == 'f2m_feature'
+    assert report['status'] == 'coasting'
+    assert report['native_inliers'] == 4
+    assert report['native_lost'] is True
+    assert report['capture_to_diagnostic_ms'] == 33.
+    assert report['image_quality']['depth_fraction'] == .8
+    assert report['depth_icp']['accepted'] is True
+    assert report['depth_icp']['inliers'] == 123
+    # These optional diagnostics cannot manufacture an admitted SLAM pose.
+    assert 'pose' not in sample
+    empty = registration_report({'vendor': {
+        'motus_slam': {'status': 'lost'}}}, 'f2m_feature')
+    assert empty['native_inliers'] is None
+    assert empty['image_quality'] is None
+    assert empty['depth_icp']['attempted'] is False
+
+
+def test_native_registration_diagnostics_are_capture_stamped_and_bounded(monkeypatch):
+    from plugins.rgbd_odometry_runtime import RgbdSession, registration_report
+    from plugins import rgbd_odometry_runtime as runtime
+    import threading
+
+    session = object.__new__(RgbdSession)
+    session.registration_by_stamp = OrderedDict()
+    session.native_reports = 0
+    first_stamp = 1_000_000_000
+    monkeypatch.setattr(runtime.time, 'time_ns', lambda: first_stamp + 35_000_000)
+    msg, info = messages(first_stamp)
+    session._remember_native(info)
+    assert session.native_reports == 1
+    native = session.registration_by_stamp.pop(first_stamp)
+    assert native['inliers'] == 50 and native['lost'] is False
+    assert native['latency_ms'] == 35.
+    missing = registration_report({'vendor': {
+        'motus_slam': {'status': 'coasting'}}},
+        'f2m_feature', session.registration_by_stamp.pop(first_stamp, None))
+    assert missing['native_inliers'] is None
+
+    for index in range(50):
+        stamp = first_stamp + index * 1_000_000
+        _, info = messages(stamp)
+        session._remember_native(info)
+    assert len(session.registration_by_stamp) <= 32

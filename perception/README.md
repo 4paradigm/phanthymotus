@@ -38,6 +38,43 @@ relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
 driver repository. G1 requires SDK global capture time; Bumi also exposes its
 existing fixed hardware-clock offset explicitly as unverified provenance.
 
+### Optional visual registration frontend (PR #371)
+
+Each `rgbd_odometry` instance supports `visual_frontend` in `config`:
+
+- `f2m_feature` (default): RTAB-Map frame-to-map feature matching
+  (`Odom/Strategy=0`, `Vis/CorType=0`), unchanged from the previous default.
+- `f2f_optical_flow`: frame-to-frame Lucas-Kanade optical flow
+  (`Odom/Strategy=1`, `Vis/CorType=1`), an opt-in experimental comparison
+  rather than a proven accuracy improvement. Pinned RTAB-Map F2M **does not**
+  support `Vis/CorType=1`: it silently forces feature matching, so the two
+  native parameters must always change together.
+- `max_features`: 100..5000 integer, 1000 by default. This is a resource
+  bound, not a measured tracking-performance guarantee.
+
+`visual_frontend` and `max_features` are instance-scoped. Stop an active
+instance before changing either. Restart creates a new odometry segment;
+different RTAB-Map frontend states and coordinate origins are never spliced
+into one tracking segment. RGB-D inputs, output port and `motus.odom/1`
+schema remain unchanged.
+
+The optional `depth_geometry` setting is **not** another `visual_frontend`
+value: it is a bounded projective point-to-plane ICP correction for an
+initialized ESKF when the visual observation is rejected. It still requires
+`imu_assisted=true` and `short_term_compensation=true`. Accepted ICP
+corrections may stabilize coasting but **cannot** independently promote the
+state to `tracking`; mapping stays paused during coasting/recovering.
+Long visual outages, poorly constrained planes and bad IMU data still fail
+closed. No geometry-only automatic recovery is claimed.
+
+`info().registration` and optional `vendor.registration` on each odometry
+sample contain the selected frontend, native inliers/loss (only when a native
+OdomInfo matches that capture timestamp), capture-to-diagnostic delay (not
+algorithm-only execution time), and ESKF image/ICP diagnostics when available.
+Missing per-frame measurements are `null`. ICP fields distinguish attempted,
+accepted and rejected corrections. These are monitoring fields, not a new
+SLAM pose or calibration guarantee.
+
 ### Automatic body-camera mount
 
 Tianyi, G1 and Bumi drivers can declare a `vendor.body_mount` sidecar in both

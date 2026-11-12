@@ -91,13 +91,62 @@ class EstimateGate:
 
 
 def estimator_parameters(calibration, segment):
+    frontend = calibration.get('visual_frontend', 'f2m_feature')
+    if frontend not in ('f2m_feature', 'f2f_optical_flow'):
+        raise ValueError('unsupported RGB-D visual frontend')
+    max_features = calibration.get('max_features', 1000)
+    if type(max_features) is not int or not 100 <= max_features <= 5000:
+        raise ValueError('invalid RGB-D max_features')
+    # Pinned RTAB-Map OdometryF2M forcibly replaces Vis/CorType=1 with 0.
+    # Optical flow must use F2F (Odom/Strategy=1), never a fake F2M toggle.
+    optical = frontend == 'f2f_optical_flow'
     params = {'frame_id': calibration['frame_id'], 'odom_frame_id': segment + '_odom',
               'publish_tf': False, 'subscribe_rgbd': True, 'qos': 2,
               'topic_queue_size': 2, 'sync_queue_size': 2,
-              'Odom/ResetCountdown': '0', 'Vis/MaxFeatures': '1000'}
+              'Odom/ResetCountdown': '0', 'Odom/Strategy': '1' if optical else '0',
+              'Vis/CorType': '1' if optical else '0',
+              'Vis/MaxFeatures': str(max_features)}
+    if optical:
+        params.update({'Vis/CorFlowWinSize': '16', 'Vis/CorFlowMaxLevel': '3',
+                       'Vis/CorFlowIterations': '30'})
     if calibration.get('imu_topic') and not calibration.get('short_term_compensation'):
         params.update(wait_imu_to_init=True, **{'Odom/GuessSmoothingDelay': '0'})
     return params
+
+
+def registration_report(sample, frontend, native=None, *, depth_enabled=False):
+    """Optional diagnostics from the *same capture frame*, never a pose claim.
+
+    OdomInfo inliers cover optical-flow or feature correspondences.
+    Depth diagnostics come from this sample's fusion snapshot, never mutable
+    filter state. Missing measurements remain None.
+    """
+    vendor = sample.get('vendor') or {}
+    fusion = vendor.get('fusion') or {}
+    quality = fusion.get('quality') or {}
+    depth = quality.get('geometry') or {}
+    native = native or {}
+    image = ({key: quality.get(key) for key in
+              ('visual_usable', 'depth_fraction', 'contrast', 'sharpness', 'reason')}
+             if 'visual_usable' in quality else None)
+    return {
+        'frontend': frontend,
+        'status': (vendor.get('motus_slam') or {}).get('status'),
+        'native_inliers': native.get('inliers'),
+        'native_lost': native.get('lost'),
+        'capture_to_diagnostic_ms': native.get('latency_ms'),
+        'image_quality': image,
+        'depth_icp': {
+            'enabled': bool(depth_enabled),
+            'attempted': bool(depth.get('attempted', False)),
+            'accepted': bool(depth.get('accepted', False)),
+            'inliers': depth.get('inliers'),
+            'rmse_m': depth.get('rmse'),
+            'overlap': depth.get('overlap'),
+            'condition': depth.get('condition'),
+            'reject_reason': depth.get('reason')
+        }
+    }
 
 
 class CaptureObservations:
@@ -176,6 +225,9 @@ class RgbdSession:
         self.lock = threading.RLock()
         self.pairs, self.pending = PairBuffer(), queue.Queue(maxsize=1)
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
+        self.registration_by_stamp = OrderedDict()
+        self.last_registration = None
+        self.native_reports = 0
         self.stop_event = threading.Event()
         self.process = self.worker = None
         self.directory = tempfile.TemporaryDirectory(prefix='motus-rgbd-')
@@ -350,12 +402,40 @@ class RgbdSession:
         if getattr(self, 'mounts', None) is not None:
             sample = self.mounts.attach(sample, time.time_ns())
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
+        stamp = (sample['vendor'].get('motus_slam') or {}).get('stamp_ns')
+        native = self.registration_by_stamp.pop(stamp, None)
+        report = registration_report(
+            sample, self.calibration.get('visual_frontend', 'f2m_feature'), native,
+            depth_enabled=bool(self.fusion and self.fusion.geometry))
+        sample['vendor']['registration'] = report
+        self.last_registration = deepcopy(report)
         self.publisher.publish(String(data=json.dumps(sample, allow_nan=False)))
+
+    def _remember_native(self, msg):
+        """Store only capture-time-matched diagnostics, with bounded memory."""
+        stamp = stamp_ns(msg)
+        if stamp <= 0:
+            return
+        inliers = getattr(msg, 'inliers', None)
+        inliers = inliers if type(inliers) is int and inliers >= 0 else None
+        lost = getattr(msg, 'lost', None)
+        lost = lost if type(lost) is bool else None
+        latency_ms = (time.time_ns() - stamp) / 1e6
+        if not 0. <= latency_ms <= 1500.:
+            latency_ms = None
+        self.registration_by_stamp[stamp] = {
+            'inliers': inliers, 'lost': lost, 'latency_ms': latency_ms}
+        self.registration_by_stamp.move_to_end(stamp)
+        while len(self.registration_by_stamp) > 32:
+            self.registration_by_stamp.popitem(last=False)
+        self.native_reports += 1
 
     def _result(self, kind, msg):
         with self.lock:
             if self.stop_event.is_set():
                 return
+            if kind == 'info' and hasattr(self, 'registration_by_stamp'):
+                self._remember_native(msg)
             if getattr(self, 'fusion', None) is not None:
                 if self.gate.state != 'lost':
                     for sample in self.observations.result(kind, msg, time.time_ns()):
@@ -419,6 +499,8 @@ class RgbdSession:
                     'last_measurement_ns': self.gate.last_stamp,
                     'imu_assistance': self.imu.info(time.time_ns()) if self.imu else {'enabled': False},
                     'fusion': self.fusion.info(time.time_ns()) if self.fusion else {'enabled': False},
+                    'registration': deepcopy(self.last_registration),
+                    'native_reports': self.native_reports,
                     'body_mount': self.mounts.info(time.time_ns()) if self.mounts else {'status': 'undeclared'},
                     'estimator_log': str(Path(self.directory.name) / 'estimator.log')}
 

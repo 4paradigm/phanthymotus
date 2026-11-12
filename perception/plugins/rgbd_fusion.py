@@ -327,12 +327,21 @@ class ShortTermFusion:
                     p, r = pose_values(predicted)
                     initial = np.eye(4)
                     initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
+                    # Geometry only corrects a bounded prediction; it never
+                    # promotes coasting to tracking or authorizes map integration.
+                    self.quality['geometry'] = dict(
+                        attempted=True, accepted=False, reason='registration_rejected')
                     result = self.geometry.register(depth, ref_depth, initial)
                     if result is not None:
+                        self.quality['geometry'].update(
+                            inliers=result['inliers'], rmse=result['rmse'],
+                            overlap=result['overlap'], condition=result['condition'])
                         measured, geom_cov = geometry_observation(ref_pose, result)
                         if self.filter.correct(measured, geom_cov, correlated=True):
                             self.aid = 'depth_geometry'
-                            self.quality['geometry'] = dict(inliers=result['inliers'], rmse=result['rmse'])
+                            self.quality['geometry'].update(accepted=True, reason=None)
+                        else:
+                            self.quality['geometry']['reason'] = 'fusion_gate_rejected'
             self.status(stamp)
         except (ValueError, TypeError, KeyError, np.linalg.LinAlgError) as error:
             self.fault(error)
