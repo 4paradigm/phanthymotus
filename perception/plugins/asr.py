@@ -2195,6 +2195,7 @@ class ASRPlugin:
         # needs no lock.
         self._load_status  = ""
         self._lazy_load_requested = False
+        self._lazy_start_requests = set()
         self._lazy_stop_generation = 0
         self._lazy_instance_stops = {}
         self._adapter      = (None if ASR_MODELS.get(self._asr_model, {}).get("lazy")
@@ -2240,6 +2241,22 @@ class ASRPlugin:
 
     def get_tools(self) -> list:
         return TOOLS
+
+    def _retire_lazy_request(self, key=None, generation=None):
+        """Detach an unused lazy backend; close it outside the node lock."""
+        with self._nodes_lock:
+            if generation is not None and generation != (
+                    self._lazy_stop_generation, self._lazy_instance_stops.get(key, 0)):
+                return None
+            if key is None:
+                self._lazy_start_requests.clear()
+            else:
+                self._lazy_start_requests.discard(key)
+            self._lazy_load_requested = bool(self._lazy_start_requests)
+            if not self._lazy_load_requested and isinstance(self._adapter, WhisperTurboAdapter):
+                adapter, self._adapter = self._adapter, None
+                return adapter
+        return None
 
     def _dispose_node(self, node: _ASRNode, key: str = "") -> dict:
         """Stop a node and release its ROS endpoints.
@@ -2460,8 +2477,12 @@ class ASRPlugin:
                     raise ValueError("input_topic is required")
                 with self._nodes_lock:
                     lazy_key = instance_id or input_topic
-                    lazy_start = (self._lazy_stop_generation,
-                                  self._lazy_instance_stops.get(lazy_key, 0))
+                    current_generation = (self._lazy_stop_generation,
+                                          self._lazy_instance_stops.get(lazy_key, 0))
+                    lazy_start = args.get("_lazy_start_generation", current_generation)
+                    if lazy_start != current_generation:
+                        return {"state": "idle"}
+                    self._lazy_start_requests.add(lazy_key)
                     self._lazy_load_requested = True
                     if self._adapter is None:
                         self._load_model_async(self._asr_model)
@@ -2486,16 +2507,28 @@ class ASRPlugin:
                                     self._lazy_stop_generation,
                                     self._lazy_instance_stops.get(lazy_key, 0)):
                                 return {"state": "idle"}
+                            deferred_args = dict(args)
+                            if lazy_start is not None:
+                                deferred_args["_lazy_start_generation"] = lazy_start
                             self._pending_starts[instance_id or
-                                                 args.get("input_topic", "")] = dict(args)
+                                                 args.get("input_topic", "")] = deferred_args
                         return {"state": "loading", "asr_model": self._asr_model,
                                 "message": (self._load_status or
                                             f"模型 '{self._asr_model}' 仍在加载")}
                     time.sleep(0.1)
-            if self._load_error:
-                return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
-            if not self._adapter:
-                return {"state": "error", "message": "ASR model not loaded"}
+            with self._nodes_lock:
+                if lazy_start is not None and lazy_start != (
+                        self._lazy_stop_generation,
+                        self._lazy_instance_stops.get(lazy_key, 0)):
+                    return {"state": "idle"}
+            if self._load_error or not self._adapter:
+                message = (f"Model failed to load: {self._load_error}"
+                           if self._load_error else "ASR model not loaded")
+                if lazy_start is not None:
+                    unused = self._retire_lazy_request(lazy_key, lazy_start)
+                    if unused is not None:
+                        unused.close()
+                return {"state": "error", "message": message}
             input_topic, direction_topic = _resolve_asr_inputs(args)
             if not input_topic:
                 raise ValueError("input_topic is required")
@@ -2544,6 +2577,10 @@ class ASRPlugin:
                     if self._nodes.get(node_key) is node:
                         del self._nodes[node_key]
                 self._dispose_node(node, node_key)
+                if lazy_start is not None:
+                    unused = self._retire_lazy_request(lazy_key, lazy_start)
+                    if unused is not None:
+                        unused.close()
             return result
 
         elif action == "stop":
@@ -2563,6 +2600,7 @@ class ASRPlugin:
                     keys = list(self._nodes.keys())
                     self._pending_starts.clear()
                 nodes = [(k, self._nodes.pop(k)) for k in keys]
+                unused = self._retire_lazy_request(instance_id or None)
             # request_stop() before disposing: it is non-blocking and unblocks an
             # in-flight start() so _dispose_node does not sit behind it.
             for _, node in nodes:
@@ -2570,6 +2608,8 @@ class ASRPlugin:
             result = {"state": "idle"}
             for key, node in nodes:
                 result = self._dispose_node(node, key)
+            if unused is not None:
+                unused.close()
             if instance_id:
                 return result
             if keys:
@@ -2681,6 +2721,7 @@ class ASRPlugin:
                 if isinstance(self._adapter, WhisperTurboAdapter) or ASR_MODELS[new_model].get("lazy"):
                     self._adapter = None
                 self._lazy_load_requested = False
+                self._lazy_start_requests.clear()
                 self._asr_model = new_model
                 self._device = new_device
                 self._plugin_cfg['device'] = new_device

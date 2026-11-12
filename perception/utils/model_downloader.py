@@ -535,6 +535,7 @@ _MIN_USEFUL_BPS = 50 * 1024
 
 
 def _source_url(source: str, filename: str) -> str:
+    _check_bundle_relpath(filename)
     quoted = "/".join(quote(part) for part in filename.split("/"))
     if "{file}" in source:
         return source.replace("{file}", quoted)
@@ -646,7 +647,7 @@ def _download_verified_bundle(
                     cause = error.__cause__ if error.__cause__ is not None else error
                     log.warning(
                         f"[model_downloader] {name}: {filename} failed from "
-                        f"{source}: {error} ({type(cause).__name__}: {cause})"
+                        f"{source}: {error} ({type(cause).__name__}): {cause}"
                         + (f"; {remaining} source(s) left" if remaining else "")
                     )
             if last_error is not None:

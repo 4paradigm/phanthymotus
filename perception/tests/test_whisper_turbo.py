@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 import wave
 
@@ -43,6 +44,7 @@ def test_download_progress_fallback_alias_and_verified_cache(tmp_path, monkeypat
     assert (tmp_path / "model.bin").read_bytes() == data
     assert calls[-1] == "https://good.test/model/weights.bin"
     assert "SHA256 mismatch" in caplog.text
+    assert "(ValueError)" in caplog.text
     assert any("10%" in line for line in status) and any("100%" in line for line in status)
     calls.clear()
     status.clear()
@@ -72,6 +74,14 @@ def test_source_probes_use_remote_path_for_a_cache_alias(monkeypatch):
     files = {"model.bin": {"size": 1000000, "source_path": "model/weights.bin"}}
     downloads._order_sources("whisper", ["first", "second"], files)
     assert probes == ["model/weights.bin", "model/weights.bin"]
+
+
+@pytest.mark.parametrize("alias", ["", "../weights.bin", "/weights.bin"])
+def test_invalid_remote_alias_fails_before_network(tmp_path, monkeypatch, alias):
+    monkeypatch.setattr(downloads, "urlopen", lambda *a, **kw: pytest.fail("unexpected network"))
+    with pytest.raises(ValueError, match="Invalid model filename"):
+        downloads.ensure_verified_bundle("whisper-test", str(tmp_path), "https://release.test",
+                                         {"model.bin": metadata(b"x", source_path=alias)})
 
 
 @pytest.mark.parametrize("jp", ["511", "61"])
@@ -152,14 +162,16 @@ def test_config_switch_does_not_start_native_worker(monkeypatch):
 @pytest.mark.parametrize("instance", ["", "card"])
 def test_stop_during_preparation_cancels_start(monkeypatch, instance):
     entered, release = threading.Event(), threading.Event()
+    adapters = []
     class Adapter(WhisperTurboAdapter):
         def __init__(self):
-            pass
+            self.closed = False
+            adapters.append(self)
         def prepare(self, **kwargs):
             entered.set()
             assert release.wait(3)
         def close(self):
-            pass
+            self.closed = True
     monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: Adapter())
     plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"}, None)
     results = []
@@ -174,6 +186,94 @@ def test_stop_during_preparation_cancels_start(monkeypatch, instance):
         thread.join(3)
     assert not thread.is_alive() and results == [{"state": "idle"}]
     assert not plugin._nodes and not plugin._pending_starts
+    assert plugin._adapter is None and adapters[0].closed
+    assert not plugin._lazy_load_requested and not plugin._lazy_start_requests
+
+
+def test_cancel_one_start_preserves_peer_and_last_stop_releases_backend(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    adapters, nodes, results = [], [], {}
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            self.closed = False
+            adapters.append(self)
+        def prepare(self, **kwargs):
+            entered.set()
+            assert release.wait(3)
+        def close(self):
+            self.closed = True
+    class Node:
+        state = "idle"
+        _direction_topic = ""
+        def __init__(self, *args, **kwargs):
+            pass
+        def start(self):
+            self.state = "running"
+            return {"state": "running"}
+        def request_stop(self):
+            pass
+        def stop(self):
+            self.state = "idle"
+            return {"state": "idle"}
+        def destroy_node(self):
+            pass
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: Adapter())
+    monkeypatch.setattr(asr, "_ASRNode", Node)
+    plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"},
+                           SimpleNamespace(add_node=nodes.append, remove_node=nodes.remove))
+    def start(key):
+        results[key] = plugin.dispatch("asr", {
+            "action": "start", "instance_id": key, "input_topic": "/mic/" + key})
+    threads = [threading.Thread(target=start, args=(key,)) for key in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    try:
+        assert entered.wait(2)
+        deadline = time.monotonic() + 2
+        while plugin._lazy_start_requests != {"a", "b"} and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert plugin._lazy_start_requests == {"a", "b"}
+        plugin.dispatch("asr", {"action": "stop", "instance_id": "a"})
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(3)
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == {"a": {"state": "idle"}, "b": {"state": "running"}}
+    assert len(adapters) == 1 and not adapters[0].closed
+    plugin.dispatch("asr", {"action": "stop", "instance_id": "b"})
+    assert plugin._adapter is None and adapters[0].closed
+
+
+def test_stale_deferred_start_cannot_revive_after_stop(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    adapters = []
+    class Adapter(WhisperTurboAdapter):
+        def __init__(self):
+            self.closed = False
+            adapters.append(self)
+        def prepare(self, **kwargs):
+            entered.set()
+            assert release.wait(3)
+        def close(self):
+            self.closed = True
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: Adapter())
+    monkeypatch.setattr(asr, "MODEL_LOAD_GRACE_S", 0)
+    plugin = asr.ASRPlugin({"asr_model": "whisper-turbo-q5", "device": "gpu"}, None)
+    try:
+        assert plugin.dispatch("asr", {
+            "action": "start", "instance_id": "card", "input_topic": "/mic"})["state"] == "loading"
+        assert entered.wait(2)
+        deferred = plugin._pending_starts["card"]
+        plugin.dispatch("asr", {"action": "stop", "instance_id": "card"})
+    finally:
+        release.set()
+    deadline = time.monotonic() + 2
+    while plugin._loading and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not plugin._loading
+    assert plugin.dispatch("asr", deferred) == {"state": "idle"}
+    assert len(adapters) == 1 and adapters[0].closed and plugin._adapter is None
 
 
 def test_worker_protocol_reuses_one_process_and_returns_language(tmp_path, monkeypatch):
