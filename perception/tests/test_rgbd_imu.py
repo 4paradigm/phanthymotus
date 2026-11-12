@@ -116,11 +116,21 @@ def test_native_estimator_parameters_only_enable_imu_when_requested():
     assert assisted['frame_id']=='optical'
 
 
-def test_session_buffers_imu_bursts_without_expanding_image_queues(monkeypatch):
+@pytest.mark.parametrize('spawn_error', [False, True])
+def test_session_buffers_imu_bursts_without_expanding_image_queues(monkeypatch, spawn_error):
     import sys
     from types import SimpleNamespace as NS
     from plugins import rgbd_odometry_runtime as runtime
     from vision_stubs import _FakeExecutor, _FakeNode
+    owned = []
+    def single_executor(*, context):
+        executor = _FakeExecutor(); executor.context = context; executor.closed = False
+        def shutdown(**kw): executor.closed = True
+        executor.shutdown = shutdown
+        owned.append(executor)
+        return executor
+    monkeypatch.setattr(_FakeNode, 'context', object(), raising=False)
+    monkeypatch.setattr(sys.modules['rclpy.executors'], 'SingleThreadedExecutor', single_executor)
     sensor_qos = object()
     monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', sensor_qos, raising=False)
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'Imu', object, raising=False)
@@ -134,12 +144,23 @@ def test_session_buffers_imu_bursts_without_expanding_image_queues(monkeypatch):
         return sub
     monkeypatch.setattr(_FakeNode, 'create_subscription', subscribe)
     monkeypatch.setattr(runtime, 'require_runtime', lambda: '/offline/estimator')
-    monkeypatch.setattr(runtime.subprocess, 'Popen', lambda *a, **kw: NS(poll=lambda: 0, wait=lambda **kw: 0))
+    def process(*a, **kw):
+        if spawn_error: raise RuntimeError('spawn failed')
+        return NS(poll=lambda: 0, wait=lambda **kw: 0)
+    monkeypatch.setattr(runtime.subprocess, 'Popen', process)
     monkeypatch.setattr(runtime.threading, 'Thread', lambda **kw: NS(start=lambda: None, join=lambda **kw: None, is_alive=lambda: False))
     calibration = dict(frame_id='optical', clock_id='capture-clock', K=np.eye(3),
                        color_topic='/rgb', depth_topic='/depth', imu_topic='/motion')
-    obj = runtime.RgbdSession(calibration, _FakeExecutor(), '/out')
+    shared = _FakeExecutor()
+    if spawn_error:
+        with pytest.raises(RuntimeError, match='spawn failed'):
+            runtime.RgbdSession(calibration, shared, '/out')
+        assert len(owned) == 1 and owned[0].closed and not owned[0].nodes and not shared.nodes
+        return
+    obj = runtime.RgbdSession(calibration, shared, '/out')
     try:
+        assert len(owned) == 1 and obj.executor is owned[0]
+        assert obj.executor.context is obj.node.context and not shared.nodes
         qos = {s.topic: s.qos for s in obj.node.subscriptions}
         assert qos['/motion'].depth == 100
         assert qos['/motion'].reliability == 'best_effort'
@@ -148,6 +169,44 @@ def test_session_buffers_imu_bursts_without_expanding_image_queues(monkeypatch):
         assert groups['/motion'] is not None and groups['/rgb'] is None
     finally:
         obj.close()
+    assert owned[0].closed and not owned[0].nodes
+
+
+def test_private_callback_worker_stops_before_node_and_executor_cleanup():
+    import tempfile, threading
+    from types import SimpleNamespace as NS
+    from plugins import rgbd_odometry_runtime as runtime
+    obj = object.__new__(runtime.RgbdSession)
+    obj.lock = threading.RLock(); obj.stop_event = threading.Event()
+    obj.gate = runtime.EstimateGate('run', 'optical', 'capture-clock'); obj.fusion = None
+    obj.worker = obj.process = obj.log = None; obj.owns_executor = True
+    obj.directory = tempfile.TemporaryDirectory(); obj.segment = 'run'
+    entered = threading.Event(); events = []
+    def spin_once(timeout_sec): entered.set(); obj.stop_event.wait(.01)
+    def destroy():
+        assert not obj.spin_worker.is_alive()
+        events.append('destroy')
+    obj.node = NS(destroy_node=destroy)
+    obj.executor = NS(spin_once=spin_once, remove_node=lambda n: events.append('remove'),
+                      shutdown=lambda **kw: events.append('shutdown'))
+    obj.spin_worker = threading.Thread(target=obj._spin)
+    obj.spin_worker.start()
+    assert entered.wait(1)
+    obj.close()
+    assert events == ['remove', 'destroy', 'shutdown']
+
+
+def test_private_callback_failure_retires_estimator():
+    import threading
+    from types import SimpleNamespace as NS
+    from plugins import rgbd_odometry_runtime as runtime
+    obj = object.__new__(runtime.RgbdSession)
+    obj.stop_event = threading.Event(); obj.lock = threading.RLock()
+    obj.gate = runtime.EstimateGate('run', 'optical', 'capture-clock'); obj.fusion = None
+    def fail(**kw): raise RuntimeError('callback failed')
+    obj.executor = NS(spin_once=fail)
+    obj._spin()
+    assert obj.gate.state == 'lost' and 'callback failed' in obj.gate.reason
 
 
 def session(monkeypatch):

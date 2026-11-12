@@ -218,3 +218,60 @@ def test_native_registration_diagnostics_are_capture_stamped_and_bounded(monkeyp
         _, info = messages(stamp)
         session._remember_native(info)
     assert len(session.registration_by_stamp) <= 32
+
+
+def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monkeypatch):
+    from array import array
+    from copy import deepcopy
+    import sys, threading, queue, zlib
+    import numpy as np
+    from plugins import rgbd_odometry_runtime as runtime
+    obj = object.__new__(runtime.RgbdSession)
+    obj.lock = threading.RLock(); obj.stop_event = threading.Event()
+    obj.imu = obj.fusion = obj.observations = None
+    obj.gate = runtime.EstimateGate('run', 'optical', 'capture-clock')
+    obj.calibration = dict(frame_id='optical', clock_id='capture-clock', K=np.eye(3))
+    obj.counts = dict(pairs=0, estimates=0, dropped_pairs=0)
+    header = NS(frame_id='optical', stamp=NS(sec=1, nanosec=123))
+    jpeg, png = b'camera-jpeg', b'encoded-png-depth'
+    encoded = []
+    def encode(format, image, params):
+        encoded.append((format, image.copy(), params))
+        return True, np.frombuffer(png, np.uint8)
+    cv2 = NS(IMREAD_COLOR=1, IMWRITE_PNG_COMPRESSION=16,
+             imdecode=lambda data, mode: np.zeros((480, 640, 3), np.uint8), imencode=encode)
+    monkeypatch.setitem(sys.modules, 'cv2', cv2)
+    depth = np.full((480, 640), 1500, np.uint16)
+    color_msg = NS(header=deepcopy(header), format='jpeg', data=jpeg)
+    depth_msg = NS(header=deepcopy(header), data=zlib.compress(depth.tobytes(), 1))
+    pair = ((1_000_000_123, color_msg), (1_000_000_123, depth_msg))
+    pending = [pair]
+    def get(timeout):
+        if pending: return pending.pop()
+        obj.stop_event.set(); raise queue.Empty
+    obj.pending = NS(get=get)
+    class Image:
+        def __init__(self): self.header = NS()
+        @property
+        def data(self): return self._data
+        @data.setter
+        def data(self, value):
+            # Model Humble's efficient array path, avoiding its per-byte loops.
+            assert isinstance(value, array) and value.typecode == 'B'
+            self._data = value
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(CompressedImage=Image, CameraInfo=NS))
+    monkeypatch.setitem(sys.modules, 'rtabmap_msgs.msg', NS(RGBDImage=NS))
+    monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_001_000_123)
+    published = []
+    def publish(msg): published.append(msg); obj.stop_event.set()
+    obj.rgbd = NS(publish=publish)
+    obj._work()
+    assert obj.gate.state != 'lost', obj.gate.reason
+    assert len(published) == obj.counts['pairs'] == 1
+    out = published[0]
+    assert out.header == header and out.depth_compressed.header == header
+    assert out.rgb_compressed.data == color_msg.data
+    assert out.depth_compressed.format == 'png'
+    assert bytes(out.depth_compressed.data) == png
+    assert encoded[0][0] == '.png' and encoded[0][2] == [cv2.IMWRITE_PNG_COMPRESSION, 1]
+    np.testing.assert_array_equal(encoded[0][1], depth)

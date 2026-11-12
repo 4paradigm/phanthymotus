@@ -180,6 +180,14 @@ cloud admission and clears pending interpolation pairs; it resumes in the
 same segment only after bounded verified tracking recovery. True `lost`,
 coordinate changes and source resets still retire the segment.
 
+IMU-enabled sessions run their ROS node on an owned single-threaded executor
+in the existing node context, avoiding competing Python callbacks while
+estimator state is serialized. Session close stops its callback thread and
+executor without shutting down the shared ROS context. Image-only sessions
+retain the bundle executor. Native depth PNG messages use ROS byte arrays
+to avoid per-byte setter validation; encoding and capture headers are retained.
+These changes add no dependencies.
+
 IMU ingress uses a separate callback group and a bounded 100-packet FIFO so
 visual processing does not discard capture intervals. Filter updates remain
 serialized, processing one snapshot per pass. The 500 ms freshness check runs
@@ -208,9 +216,16 @@ Mapping remains paused throughout coasting.
 
 All three source adapters and the fusion/SLAM boundaries have offline tests.
 Synthetic trajectories and rendered rooms validate code signs, units and
-policy, not actual robot precision or native camera tracking. Tianyi raw IMU
-clock and attitude checks have begun; sustained ESKF/depth operation has not
-passed hardware acceptance. G1/Bumi hardware tests remain pending.
+policy, not actual robot precision or native camera tracking. On 2026-11-12,
+an isolated Tianyi F2F optical-flow session with ESKF and depth assistance
+enabled ran for 600 seconds with active IMU, 59,920 consumed motion samples
+and zero native lost reports. Maximum IMU consumption age was 266 ms against
+the unchanged 500 ms limit. There were 5,075 tracking poses against 5,821
+native reports; intermittent coasting/recovering remained. No depth registration
+was attempted in this static scene, so this does not validate geometric
+recovery, motion accuracy or uninterrupted SLAM. The host camera timestamp
+patch and PR519 input adapter were required; the deployed business images
+were not replaced by this test. G1/Bumi hardware tests remain pending.
 
 ## Audio Requirements for ASR
 

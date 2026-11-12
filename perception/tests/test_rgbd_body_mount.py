@@ -227,8 +227,10 @@ def test_session_discovers_mount_topic_from_camera_metadata(monkeypatch):
     for entry in values.values():
         entry['vendor']['body_mount'] = declaration(child_frame=frame)
     calibration = validate_start_inputs(values, ['/rgb', '/depth'])
-    session = runtime.RgbdSession(calibration, _FakeExecutor(), '/out')
+    shared = _FakeExecutor()
+    session = runtime.RgbdSession(calibration, shared, '/out')
     try:
+        assert session.executor is shared and not session.owns_executor
         subscriptions = {sub.topic: sub for sub in session.node.subscriptions}
         mount = packet(child_frame=frame, clock_id=calibration['clock_id'])
         subscriptions['/camera/rgbd/body_mount'].callback(NS(data=json.dumps(mount)))

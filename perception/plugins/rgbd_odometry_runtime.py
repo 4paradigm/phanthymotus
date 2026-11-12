@@ -1,5 +1,6 @@
 """One supervised RTAB-Map estimator per calibrated RGB-D card instance."""
 from collections import OrderedDict, deque
+from array import array
 from copy import deepcopy
 import json
 import os
@@ -232,12 +233,18 @@ class RgbdSession:
         self.native_reports = 0
         self.stop_event = threading.Event()
         self.process = self.worker = None
+        self.spin_worker = None
+        self.owns_executor = False
         self.directory = tempfile.TemporaryDirectory(prefix='motus-rgbd-')
         self.log = None
         self.counts = dict(pairs=0, estimates=0, dropped_pairs=0)
         self.started = time.monotonic()
         self.node = Node(self.segment)
         try:
+            if self.imu is not None:
+                from rclpy.executors import SingleThreadedExecutor
+                self.executor = SingleThreadedExecutor(context=self.node.context)
+                self.owns_executor = True
             self.publisher = self.node.create_publisher(String, topic, qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
             for kind in ('color', 'depth'):
@@ -276,9 +283,23 @@ class RgbdSession:
                 start_new_session=True, env=dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1'))
             self.worker = threading.Thread(target=self._work, name=self.segment, daemon=True)
             self.worker.start()
+            if self.owns_executor:
+                self.spin_worker = threading.Thread(target=self._spin, name=self.segment+'_ros', daemon=True)
+                self.spin_worker.start()
         except Exception:
             self.close()
             raise
+
+    def _spin(self):
+        try:
+            while not self.stop_event.is_set():
+                self.executor.spin_once(timeout_sec=.05)
+        except Exception as error:
+            if not self.stop_event.is_set():
+                with self.lock:
+                    self.gate.fault('RGB-D callback executor: ' + str(error))
+                    if self.fusion is not None:
+                        self.fusion.fault(self.gate.reason)
 
     def _image(self, kind, msg):
         if self.stop_event.is_set():
@@ -411,7 +432,7 @@ class RgbdSession:
                 out.depth_compressed = CompressedImage()
                 out.depth_compressed.header = deepcopy(depth.header)
                 out.depth_compressed.format = 'png'
-                out.depth_compressed.data = png.tobytes()
+                out.depth_compressed.data = array('B', png.tobytes())
                 k = self.calibration['K'].ravel().tolist()
                 for field in ('rgb_camera_info', 'depth_camera_info'):
                     info = CameraInfo()
@@ -560,6 +581,10 @@ class RgbdSession:
 
     def close(self):
         self.stop_event.set()
+        if self.spin_worker is not None:
+            self.spin_worker.join(timeout=5)
+            if self.spin_worker.is_alive():
+                raise RuntimeError('RGB-D callback worker did not stop')
         if self.worker is not None:
             self.worker.join(timeout=5)
             if self.worker.is_alive():
@@ -579,6 +604,8 @@ class RgbdSession:
                     continue
             self.process.wait(timeout=1)
         dispose_node(self.executor, self.node, label=self.segment)
+        if self.owns_executor:
+            self.executor.shutdown(timeout_sec=5)
         if self.log is not None:
             self.log.close()
         self.directory.cleanup()

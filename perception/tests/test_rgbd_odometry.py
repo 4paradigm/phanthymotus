@@ -141,6 +141,7 @@ def test_process_exit_during_stop_still_releases_node_and_tempfiles(monkeypatch)
     from plugins.rgbd_odometry_runtime import RgbdSession
     session=object.__new__(RgbdSession)
     session.stop_event=threading.Event();session.worker=None;session.log=None
+    session.spin_worker=None;session.owns_executor=False
     session.directory=tempfile.TemporaryDirectory();path=Path(session.directory.name)
     session.segment='test';events=[]
     session.node=NS(destroy_node=lambda:events.append('destroy'))
