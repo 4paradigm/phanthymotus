@@ -28,6 +28,21 @@ class QQRealSDKSendSemantics(unittest.IsolatedAsyncioTestCase):
         adapter._connected = asyncio.Event()
         adapter._connected.set()
         adapter._running = True
+        # A passive reply is permitted only after the original QQ message
+        # has been accepted and bound to this exact C2C destination.
+        from types import SimpleNamespace
+        inbound = SimpleNamespace(
+            event_type="C2C_MESSAGE_CREATE",
+            chat_scope="c2c",
+            chat_id="OfficialOpenIDTest001",
+            user_id="OfficialOpenIDTest001",
+            message_id="sdk-timeout-once",
+            content="synthetic question",
+            user_name="test",
+            attachments=[],
+            msg_elements=[],
+        )
+        self.assertIsNotNone(adapter._parse_message(inbound))
         outbound = OutboundMessage(
             chat_id="OfficialOpenIDTest001",
             text="synthetic reply",

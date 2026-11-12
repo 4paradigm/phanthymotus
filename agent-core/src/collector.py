@@ -508,6 +508,18 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         # to it; ChannelManager maintains the per-chat recap separately.
         '_qq_channel_turn': bool(batch) and all(
             _qq_source_identity(ev) is not None for ev in batch),
+        '_qq_channel_id': next((
+            payload.get('channel_id', '') for payload in _channel_payloads(batch)
+            if payload.get('platform') == 'qq'
+        ), ''),
+        # QQ attachment metadata is owned by ChannelManager; the decision
+        # layer revalidates every path against the private media directory.
+        '_qq_image_files': [
+            file for payload in _channel_payloads(batch)
+            if payload.get('platform') == 'qq'
+            for file in (payload.get('files') or [])[:3]
+            if isinstance(file, dict) and file.get('kind') == 'image'
+        ][:2],
         '_channel_message_ids': channel_message_ids(batch),
         '_channel_principals': list(dict.fromkeys(
             (str(p.get('platform', '')), str(p.get('user_id', '')))

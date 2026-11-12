@@ -716,6 +716,15 @@ class ChannelManager:
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
         files = [a.to_dict() for a in (msg.attachments or [])]
+        # QQ viewers may inspect files they uploaded *in this message* without
+        # gaining access to Desktop Read/Bash or another channel's files.
+        # This reuses Feishu's channel.store path and fails closed on unsafe
+        # file paths or unsupported formats.
+        preview = ''
+        if msg.platform == 'qq' and msg.attachments:
+            from channel.attachment_preview import preview_message_files
+            preview = await asyncio.to_thread(
+                preview_message_files, msg.channel_id, msg.attachments)
         topic = channel_request_topic(msg.channel_id)
         payload = {
             'platform': msg.platform,
@@ -724,7 +733,7 @@ class ChannelManager:
             'user': msg.display_name,
             'user_id': msg.user_id,
             'chat_id': msg.chat_id,
-            'text': msg.text,
+            'text': msg.text + ('\n' + preview if preview else ''),
             'user_role': user['role'],
             'sender_type': msg.sender_type,
             'chat_type': msg.chat_type,

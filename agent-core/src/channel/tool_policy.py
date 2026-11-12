@@ -5,17 +5,35 @@ For batched messages, every human principal must permit the requested tool.
 """
 import asyncio
 import fnmatch
+import re
 
 from channel import acl
 
 
-def _qq_safe(name: str) -> bool:
-    """QQ V1 is text-only; no device execution, audio, or delegated tools.
+def _qq_safe(name: str, *, role: str = '', user_id: str = '') -> bool:
+    """Allow a deliberately provisioned QQ C2C owner full tool access.
 
-    An explicit operator role and tool_filter cannot expand this platform cap.
-    Audio features require a separate reviewed change and real-device tests.
+    A QQ group/Guild identity is different from a C2C principal and is never
+    eligible for this override. Ordinary QQ users remain reply-only even if
+    an operator mistakenly expands their role or tool filter.
     """
+    if role == 'owner' and _qq_owner_dm_identity(user_id):
+        return True
     return name in ('finish', 'mcp__channel__channel_reply')
+
+
+def _qq_owner_dm_identity(user_id: str) -> bool:
+    """The SDK verifies C2C OpenID and constructs exactly 3 principal fields."""
+    if not isinstance(user_id, str):
+        return False
+    segments = user_id.split(':')
+    return (
+        len(segments) == 3
+        and segments[0] == 'official'
+        and segments[1].isdigit()
+        and 5 <= len(segments[1]) <= 20
+        and bool(re.fullmatch(r'[A-Za-z0-9_-]{10,128}', segments[2]))
+    )
 
 
 def _matches_filter(raw: str, name: str) -> bool:
@@ -55,7 +73,7 @@ def allowed_for_principals(principals: list, name: str, snapshot: dict | None = 
             # finish should always be possible to terminate an authorized turn.
             if name != 'finish':
                 return False
-        if platform == 'qq' and not _qq_safe(name):
+        if platform == 'qq' and not _qq_safe(name, role=user['role'], user_id=user_id):
             return False
     return True
 

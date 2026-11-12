@@ -6,7 +6,9 @@ hosts, over HTTPS, without redirects, with a streaming size cap.
 """
 from __future__ import annotations
 
+from collections import Counter
 import mimetypes
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -19,6 +21,17 @@ _MAX_MEDIA_PER_EVENT = 3
 _QQ_CDN_SUFFIXES = (
     "qq.com", "qq.com.cn", "qpic.cn", "gtimg.cn",
 )
+_MEDIA_FAILURES: Counter[str] = Counter()
+
+
+def _note_media_failure(reason: str) -> None:
+    """Feishu-style sampled diagnostics; never log signed CDN URLs."""
+    _MEDIA_FAILURES[reason] += 1
+    count = _MEDIA_FAILURES[reason]
+    if count == 1 or count % 100 == 0:
+        print(f"[qq-media] rejected reason={reason} count={count}", flush=True)
+
+
 _FILE_TYPES = {
     KIND_IMAGE: "MEDIA_TYPE_IMAGE",
     KIND_VIDEO: "MEDIA_TYPE_VIDEO",
@@ -58,8 +71,9 @@ async def receive_media(client, event, cache_root: str) -> list[Attachment]:
     for att in sources[:_MAX_MEDIA_PER_EVENT]:
         url = getattr(att, "url", "")
         if not isinstance(url, str) or not _allowed_qq_url(url):
+            _note_media_failure("untrusted_or_missing_cdn_url")
             continue
-        mime = str(getattr(att, "content_type", "") or "application/octet-stream").lower()
+        mime = str(getattr(att, "content_type", "") or "application/octet-stream").split(";", 1)[0].strip().lower()
         name = str(getattr(att, "filename", "") or "")[:120]
         kind = (KIND_IMAGE if mime.startswith("image/") else
                 KIND_VIDEO if mime.startswith("video/") else
@@ -68,14 +82,19 @@ async def receive_media(client, event, cache_root: str) -> list[Attachment]:
         try:
             async with client.stream("GET", url, follow_redirects=False, timeout=15.0) as response:
                 if response.status_code != 200:
+                    _note_media_failure("cdn_http_not_200")
                     continue
                 length = int(response.headers.get("content-length", "0") or 0)
                 if length > _MAX_INBOUND:
+                    _note_media_failure("attachment_too_large")
                     continue
                 cache.mkdir(mode=0o700, parents=True, exist_ok=True)
                 path = cache / (uuid4().hex + _extension(mime, name))
                 total = 0
-                with path.open("xb") as output:
+                # QQ attachments are private conversations; never create
+                # world-readable copies even under a protected cache directory.
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as output:
                     async for chunk in response.aiter_bytes():
                         total += len(chunk)
                         if total > _MAX_INBOUND:
@@ -86,9 +105,9 @@ async def receive_media(client, event, cache_root: str) -> list[Attachment]:
                         kind=kind, path=str(path), name=name or path.name,
                         mime=mime, size=total))
                     path = None
-        except Exception:
-            # Media errors must never leak signed URLs or credentials into logs.
-            pass
+        except Exception as exc:
+            # Report the error category only, never signed URL/body.
+            _note_media_failure("download_" + type(exc).__name__)
         finally:
             if path is not None:
                 path.unlink(missing_ok=True)

@@ -30,8 +30,11 @@ Existing production Core version 80600c3 remains text-only C2C.
 - SDK support does not grant QQ platform entitlements. Enterprise and personal
   developer registrations have different Group/Guild and C2C permissions.
 - QQ is passive-message first. We do not expose unbounded proactive push.
-- QQ users remain in the server-side reply-only tool policy; group members
-  cannot command Bumi's motors, shell, TTS or private data.
+- QQ users default to server-side reply-only tool policy. An **explicitly provisioned
+  owner role on a verified C2C principal** (three-part `official:<appid>:<openid>`)
+  can access the full set of tools bound on the Canvas. QQ group/Guild principals
+  and ordinary users remain reply-only, even if misconfigured with owner role.
+  Runtime owner grants are stored in the ACL database, not checked into Git.
 - Interaction approval records **one-time intent only**, with exact actor and
   group validation. It does not automatically elevate an ACL role or run a
   physical action. Even the SDK's "always" button is narrowed to one-time.
@@ -48,6 +51,26 @@ Existing production Core version 80600c3 remains text-only C2C.
 - SDK administration methods (token renewal, onboard, upload part completion,
   low-level DTOs) are used indirectly or available through the admin CLI.
   They are not independently exposed as LLM tools.
+
+## Explicit owner access (opt-in; exact C2C identity only)
+
+- The **user's existing private QQ C2C identity** may be promoted to `owner`
+  by a trusted operator **after identity verification**, using the local-only
+  `agent-core/scripts/qq_promote_c2c_owner.py --promote` script.
+- The script refuses to select an account unless exactly one registered C2C
+  principal exists for the active official QQ AppID. No real OpenIDs, account
+  secrets, or personal QQ numbers are committed.
+- An `owner` C2C principal with `tool_filter="*"` may call **all tools actually
+  bound on the Agent Core Canvas**, including Bash, file writes and robot tools.
+  This is equivalent to privileged remote access and must be deliberately
+  enabled and audited by a trusted system administrator.
+- Group, Guild and regular QQ users remain reply-only, including users with
+  incorrectly configured elevated roles. Privilege is re-checked at dispatch.
+- Runtime ACL roles are persisted in the Core database; a Git commit does not
+  transfer the owner's runtime user record between separate Core installations.
+  To revoke this privilege, use `--revoke` in the same local admin environment.
+- QQ AppID, Gateway entitlement, credentials and robot deployment approvals
+  remain separate from the owner role.
 
 ## Explicit gaps before claiming all functions are production-ready
 
@@ -70,9 +93,10 @@ node --check agent-core/web/js/channels.js
 python -m compileall -q agent-core/src/channel/adapters agent-core/scripts/qq_official_onboard.py
 ```
 
-Local result (2026-11-12): 68 passed, 3 skipped; JavaScript syntax and
-Python compile checks passed. Linux SDK integration and physical device
-acceptance are not yet complete.
+Local result (2026-11-13): QQ tests 103 passed and Channel tests 10 passed
+against the installed SDK in the Linux local test container. Core+Flash image
+bridge also passed synthetic image verification; live full media/interaction
+acceptance and company CI for the new commit are still pending.
 
 ## Release rules
 

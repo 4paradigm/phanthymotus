@@ -43,6 +43,25 @@ _EVENT_SCOPE = {
 }
 
 
+def _full_group_mentions_bot(raw: dict, bot_group_openid: str = "") -> bool:
+    """Only deliver full-mode group traffic when it explicitly @s this bot.
+
+    GROUP_MESSAGE_CREATE includes non-@ traffic. Unknown mention identity
+    must fail closed so the LLM cannot reply to an entire busy QQ group.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("mentions"), list):
+        return False
+    for mention in raw["mentions"]:
+        if not isinstance(mention, dict):
+            continue
+        if mention.get("is_you") is True:
+            return True
+        openid = mention.get("openid") or mention.get("id")
+        if bot_group_openid and openid == bot_group_openid:
+            return True
+    return False
+
+
 def validate_qq_official_config(cfg: dict) -> dict:
     if not isinstance(cfg, dict) or cfg.get("protocol") != "official":
         raise ValueError("QQ official protocol required")
@@ -73,6 +92,10 @@ def validate_qq_official_config(cfg: dict) -> dict:
         raise ValueError("QQ plain Guild events require the guild scope")
     if cfg.get("enable_voice_transcription") and not cfg.get("enable_inbound_media"):
         raise ValueError("QQ voice transcription requires inbound media")
+    bot_group_openid = cfg.get("bot_group_openid", "")
+    if (not isinstance(bot_group_openid, str)
+            or (bot_group_openid and not _OPENID_RE.fullmatch(bot_group_openid))):
+        raise ValueError("QQ bot_group_openid must be a valid OpenID")
     sources = ("app_secret", "app_secret_env", "app_secret_file")
     if sum(bool(cfg.get(k)) for k in sources) != 1:
         raise ValueError("QQ official requires exactly one credential source")
@@ -134,7 +157,7 @@ class QQOfficialAdapter(ChannelAdapter):
         self._seen = OrderedDict()
         self._source_scopes = OrderedDict()
         self._source_actors = OrderedDict()
-        self._prompted_sources = set()
+        self._prompted_sources = OrderedDict()
         self._interactions = QQInteractionRegistry()
         self._session_store = None
         self._http = None
@@ -182,12 +205,74 @@ class QQOfficialAdapter(ChannelAdapter):
             if self._connected is None or not self._connected.is_set():
                 return
             try:
-                event = self._parser.parse(event_type, raw)
+                is_group_event = event_type in (
+                    "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE")
+                if event_type == "GROUP_MESSAGE_CREATE":
+                    if "group" not in self.config.get("enabled_scopes", ["c2c"]):
+                        return
+                    if not _full_group_mentions_bot(
+                            raw, self.config.get("bot_group_openid", "")):
+                        print("[qq-group] full_event_ignored_not_at_bot",
+                              flush=True)
+                        return
+                    # Same payload schema as GROUP_AT; normalize for SDK 1.2.2.
+                    parsed_event_type = "GROUP_AT_MESSAGE_CREATE"
+                else:
+                    parsed_event_type = event_type
+                if event_type == "GROUP_AT_MESSAGE_CREATE":
+                    print("[qq-group] gateway_event_received type=at",
+                          flush=True)
+                event = self._parser.parse(parsed_event_type, raw)
                 msg = self._parse_message(event)
+                if is_group_event:
+                    print(
+                        f"[qq-group] sdk_parsed={event is not None} "
+                        f"adapter_accepted={msg is not None}",
+                        flush=True,
+                    )
+                    if event is not None and msg is None:
+                        # Log only validation categories, not user data.
+                        elements = getattr(event, "msg_elements", None) or []
+                        user_id = getattr(event, "user_id", None)
+                        chat_id = getattr(event, "chat_id", None)
+                        message_id = getattr(event, "message_id", None)
+                        body = getattr(event, "content", None)
+                        flags = {
+                            "scope": getattr(event, "chat_scope", None) == "group",
+                            "user_openid": isinstance(user_id, str) and bool(
+                                _OPENID_RE.fullmatch(user_id)),
+                            "group_openid": isinstance(chat_id, str) and bool(
+                                _OPENID_RE.fullmatch(chat_id)),
+                            "message_id": isinstance(message_id, str) and
+                                0 < len(message_id) <= 512,
+                            "content": isinstance(body, str) and
+                                0 < len(body.strip()) <= _MAX_INBOUND,
+                            "elements_valid": all(
+                                isinstance(getattr(e, "content", None), str)
+                                for e in elements),
+                            "media_allowed": (
+                                self.config.get("enable_inbound_media", False)
+                                or not (getattr(event, "attachments", None)
+                                    or any(getattr(e, "attachments", None)
+                                           for e in elements))),
+                        }
+                        failures = [name for name, valid in flags.items()
+                                    if not valid]
+                        print(
+                            "[qq-group] rejected_checks="
+                            + ",".join(failures or ["duplicate_or_other"]),
+                            flush=True,
+                        )
                 if msg is not None:
                     if self.config.get("enable_inbound_media", False):
+                        # Reuse the same persistent channel store as Feishu:
+                        # origin labeling, per-channel isolation and pruning.
+                        from channel import store
+                        cache = store.dir_for(self.channel_id).resolve()
                         msg.attachments = await receive_media(
-                            self._http, event, "/work/resource/qq_official_media")
+                            self._http, event, str(cache))
+                        if msg.attachments:
+                            store.maybe_prune()
                         if (not msg.attachments
                                 and (getattr(event, "attachments", None) or
                                      any(getattr(e, "attachments", None) for e in
@@ -214,7 +299,14 @@ class QQOfficialAdapter(ChannelAdapter):
                     "QQ official inbound failed (details suppressed)")
 
         def fatal(_code, _message):
-            self._last_error = "QQ official Gateway rejected session"
+            if (str(_code) == "4014"
+                    or "disallowed intents" in str(_message).lower()
+                    or "intent not authorized" in str(_message).lower()):
+                self._last_error = (
+                    "QQ Gateway 4014: requested event intents are not authorized; "
+                    "disable unsupported message scopes or interactions")
+            else:
+                self._last_error = "QQ official Gateway rejected session"
             with self._session_lock:
                 self._session_id, self._seq = None, None
                 if self._session_store is not None:
@@ -247,11 +339,14 @@ class QQOfficialAdapter(ChannelAdapter):
             self._api.get_gateway_url_sync,
         )
         callbacks.on_interaction_event = on_interaction
-        gateway_class = QQWebSocket
-        if self.config.get("enable_guild_plain_messages", False):
-            from channel.adapters.qq_official_gateway import QQGuildWebSocket
-            gateway_class = QQGuildWebSocket
-        self._ws = gateway_class(callbacks=callbacks, log_tag="phanthymotus-qq")
+        from channel.adapters.qq_official_gateway import (
+            QQScopedWebSocket, qq_gateway_intents,
+        )
+        self._ws = QQScopedWebSocket(
+            callbacks=callbacks,
+            intents=qq_gateway_intents(self.config),
+            log_tag="phanthymotus-qq",
+        )
 
         try:
             await self._api.ensure_token()
@@ -263,7 +358,8 @@ class QQOfficialAdapter(ChannelAdapter):
             )
             self._running = True
         except Exception:
-            self._last_error = "QQ official authentication/Gateway READY failed"
+            if not self._last_error:
+                self._last_error = "QQ official authentication/Gateway READY failed"
             await self.stop()
             raise RuntimeError(self._last_error) from None
 
@@ -296,21 +392,27 @@ class QQOfficialAdapter(ChannelAdapter):
         has_media = bool(getattr(event, "attachments", None))
         for element in (getattr(event, "msg_elements", None) or []):
             has_media = has_media or bool(getattr(element, "attachments", None))
-            if (not getattr(element, "attachments", None)
-                    and (not isinstance(getattr(element, "content", None), str)
-                         or not element.content.strip())):
-                return None
-        if has_media and not self.config.get("enable_inbound_media", False):
-            return None
+            if not getattr(element, "attachments", None):
+                element_text = getattr(element, "content", None)
+                if not isinstance(element_text, str):
+                    return None
+                # The SDK may emit empty metadata segments for mentions
+                # or media in any chat scope. The final content/media check
+                # below rejects genuinely empty messages instead.
+        media_enabled = self.config.get("enable_inbound_media", False)
         user, chat, mid = event.user_id, event.chat_id, event.message_id
         content = event.content
         if not isinstance(content, str):
             return None
         content = content.strip() or ("[QQ attachment]" if has_media else "")
+        if has_media and not media_enabled:
+            # Keep the safe text/reply path functional when media is disabled.
+            # Never imply that an attachment was downloaded or inspected.
+            content = (content + " [QQ attachment not enabled]")[:_MAX_INBOUND]
         if (not isinstance(user, str) or not _OPENID_RE.fullmatch(user)
                 or not isinstance(chat, str) or not _OPENID_RE.fullmatch(chat)
                 or (scope == "c2c" and chat != user)
-                or not isinstance(mid, str) or not 0 < len(mid) <= 128
+                or not isinstance(mid, str) or not 0 < len(mid) <= 512
                 or not 0 < len(content) <= _MAX_INBOUND):
             return None
         now = time.monotonic()
@@ -320,7 +422,9 @@ class QQOfficialAdapter(ChannelAdapter):
                 ts = item if cache is self._seen else item[1]
                 if now - ts <= _SEEN_TTL:
                     break
-                cache.popitem(last=False)
+                expired, _ = cache.popitem(last=False)
+                if cache is self._source_scopes:
+                    self._source_actors.pop(expired, None)
         dedup_key = (scope, chat, mid)
         if dedup_key in self._seen:
             return None
@@ -362,7 +466,7 @@ class QQOfficialAdapter(ChannelAdapter):
         if not isinstance(msg.chat_id, str) or not _OPENID_RE.fullmatch(msg.chat_id):
             raise ValueError("QQ official target OpenID invalid")
         mid = msg.reply_to_message_id
-        if not isinstance(mid, str) or not 0 < len(mid) <= 128:
+        if not isinstance(mid, str) or not 0 < len(mid) <= 512:
             raise ValueError("QQ official requires a verified source message ID")
         # One passive reply per trigger. Mark an attempt *before* HTTP so that
         # concurrent requests or an unconfirmed timeout cannot deliver twice.
@@ -445,9 +549,17 @@ class QQOfficialAdapter(ChannelAdapter):
                 or self._source_actors.get(key) != actor_id):
             raise ValueError("QQ interactive source or actor not verified")
         async with self._reply_lock:
+            now = time.monotonic()
+            while self._prompted_sources:
+                _, oldest = next(iter(self._prompted_sources.items()))
+                if now - oldest <= _SEEN_TTL:
+                    break
+                self._prompted_sources.popitem(last=False)
             if key in self._prompted_sources:
                 raise ValueError("QQ interactive prompt already attempted")
-            self._prompted_sources.add(key)
+            self._prompted_sources[key] = now
+            if len(self._prompted_sources) > _SEEN_LIMIT:
+                self._prompted_sources.popitem(last=False)
         return source[0]
 
     async def request_approval(self, chat_id: str, source_id: str, actor_id: str,

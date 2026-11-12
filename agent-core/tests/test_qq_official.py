@@ -46,8 +46,9 @@ class MockApi:
 class MockWs:
     instances = []
 
-    def __init__(self, callbacks, log_tag):
+    def __init__(self, callbacks, log_tag="", intents=None):
         self.callbacks = callbacks
+        self.intents = intents
         self.closed = False
         self.__class__.instances.append(self)
 
@@ -118,6 +119,14 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         )})
         sdk.start()
         self.addCleanup(sdk.stop)
+        gateway = mock.patch.dict(sys.modules, {
+            "channel.adapters.qq_official_gateway": types.SimpleNamespace(
+                QQScopedWebSocket=MockWs,
+                qq_gateway_intents=lambda config: 33554432,
+            ),
+        })
+        gateway.start()
+        self.addCleanup(gateway.stop)
 
     async def asyncTearDown(self):
         await self.adapter.stop()
@@ -132,6 +141,15 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         await self.adapter.stop()
         self.assertTrue(MockWs.instances[-1].closed)
 
+    async def test_gateway_4014_error_is_actionable(self):
+        await self.adapter.start()
+        MockWs.instances[-1].callbacks.on_fatal_error(
+            4014, "disallowed intents")
+        await asyncio.sleep(0)
+        self.assertIn("4014", self.adapter._last_error)
+        self.assertIn("intents", self.adapter._last_error)
+        self.assertEqual(self.adapter.status(), "degraded")
+
     async def test_c2c_parser_and_dedup(self):
         a = self.adapter._parse_message(message())
         b = self.adapter._parse_message(message("OpenIDother12345", "mid-02"))
@@ -141,16 +159,63 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(a.user_id.startswith("official:1900000000:"))
         self.assertIsNone(self.adapter._parse_message(message()))
         self.assertIsNone(self.adapter._parse_message(message(mid="a", chat_scope="group")))
-        self.assertIsNone(self.adapter._parse_message(message(mid="b", attachments=[object()])))
+        disabled_media = self.adapter._parse_message(message(mid="b", attachments=[object()]))
+        self.assertIsNotNone(disabled_media)
+        self.assertIn("attachment not enabled", disabled_media.text)
+        self.assertEqual(disabled_media.attachments, [])
         self.assertIsNone(self.adapter._parse_message(message(mid="c", msg_elements=[object()])))
         self.assertIsNotNone(self.adapter._parse_message(message(
             mid="text-element", msg_elements=[types.SimpleNamespace(
                 content="hello", attachments=[])])))
-        self.assertIsNone(self.adapter._parse_message(message(
+        media_segment = self.adapter._parse_message(message(
             mid="media-element", msg_elements=[types.SimpleNamespace(
-                content="hello", attachments=[object()])])))
+                content="hello", attachments=[object()])]))
+        self.assertIsNotNone(media_segment)
+        self.assertIn("attachment not enabled", media_segment.text)
         self.assertIsNone(self.adapter._parse_message(message(mid="d", chat_id="other")))
         self.assertIsNone(self.adapter._parse_message(message(mid="e", content="")))
+
+    async def test_source_actor_is_expired_with_reply_context(self):
+        with mock.patch("channel.adapters.qq_official.time.monotonic",
+                        side_effect=[1.0, 3702.0]):
+            self.assertIsNotNone(self.adapter._parse_message(
+                message(mid="early")))
+            self.assertIsNotNone(self.adapter._parse_message(
+                message(mid="later")))
+        old_key = ("OpenID123456789", "early")
+        self.assertNotIn(old_key, self.adapter._source_scopes)
+        self.assertNotIn(old_key, self.adapter._source_actors)
+
+    async def test_interaction_prompt_registry_stays_bounded(self):
+        from channel.adapters.qq_official import _SEEN_LIMIT
+        self.adapter.config["enable_interactions"] = True
+        chat = "OpenID123456789"
+        for i in range(_SEEN_LIMIT + 2):
+            mid = f"prompt-{i}"
+            self.adapter._source_scopes[(chat, mid)] = ("c2c", 100.0)
+            self.adapter._source_actors[(chat, mid)] = chat
+            with mock.patch("channel.adapters.qq_official.time.monotonic",
+                            return_value=100.0):
+                scope = await self.adapter._interactive_source(
+                    chat, mid, chat)
+                self.assertEqual(scope, "c2c")
+        self.assertEqual(len(self.adapter._prompted_sources), _SEEN_LIMIT)
+        self.assertNotIn((chat, "prompt-0"),
+                         self.adapter._prompted_sources)
+
+    async def test_c2c_image_empty_sdk_segment_keeps_inbound_message(self):
+        image_segment = types.SimpleNamespace(content="", attachments=[])
+        result = self.adapter._parse_message(message(
+            mid="c2c-image-with-empty-segment",
+            attachments=[object()], msg_elements=[image_segment],
+            content="这张图片是什么",
+        ))
+        self.assertIsNotNone(result)
+        self.assertIn("attachment not enabled", result.text)
+        self.assertIsNone(self.adapter._parse_message(message(
+            mid="no-media-empty-event", content="",
+            msg_elements=[image_segment],
+        )))
 
     async def test_callback_only_once(self):
         await self.adapter.start()
@@ -160,6 +225,54 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         await cb.on_message_event("C2C_MESSAGE_CREATE", raw)
         await cb.on_message_event("C2C_MESSAGE_CREATE", raw)
         self.assertEqual(len(self.inbound), 1)
+
+    async def test_group_image_callback_dispatches_downloaded_metadata(self):
+        self.adapter.config.update({
+            "enabled_scopes": ["c2c", "group"],
+            "private_only": False,
+            "enable_inbound_media": True,
+        })
+        await self.adapter.start()
+        cb = MockWs.instances[-1].callbacks
+        downloaded = Attachment(
+            kind="image", path="/work/resource/qq_official_media/test.png",
+            name="test.png", mime="image/png", size=11)
+        incoming = dict(
+            chat_scope="group", chat_id="GroupOpenID12345",
+            user_id="MemberOpenID12345", message_id="media-event-01",
+            content="这张图是什么", user_name="tester",
+            attachments=[types.SimpleNamespace(content_type="image/png")],
+            msg_elements=[types.SimpleNamespace(content="", attachments=[])],
+        )
+        with mock.patch("channel.adapters.qq_official.receive_media",
+                        new_callable=mock.AsyncMock, return_value=[downloaded]) as fetch:
+            await cb.on_message_event("GROUP_AT_MESSAGE_CREATE", incoming)
+        self.assertEqual(len(self.inbound), 1)
+        self.assertEqual(self.inbound[0].chat_type, "group")
+        self.assertEqual(self.inbound[0].attachments, [downloaded])
+        fetch.assert_awaited_once()
+
+    async def test_media_fetch_failure_preserves_text_reply_context(self):
+        self.adapter.config.update({
+            "enabled_scopes": ["c2c", "group"],
+            "private_only": False,
+            "enable_inbound_media": True,
+        })
+        await self.adapter.start()
+        cb = MockWs.instances[-1].callbacks
+        incoming = dict(
+            chat_scope="group", chat_id="GroupOpenID12345",
+            user_id="MemberOpenID12345", message_id="media-event-02",
+            content="请描述图片", user_name="tester",
+            attachments=[types.SimpleNamespace(content_type="image/png")],
+            msg_elements=[],
+        )
+        with mock.patch("channel.adapters.qq_official.receive_media",
+                        new_callable=mock.AsyncMock, return_value=[]):
+            await cb.on_message_event("GROUP_AT_MESSAGE_CREATE", incoming)
+        self.assertEqual(len(self.inbound), 1)
+        self.assertIn("attachment unavailable", self.inbound[0].text)
+        self.assertEqual(self.inbound[0].message_id, "media-event-02")
 
     async def test_reply_has_source_and_never_retries(self):
         await self.adapter.start()
@@ -267,6 +380,43 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertEqual(calls, 2)
 
+
+    async def test_group_at_accepts_empty_mention_segment_and_long_id(self):
+        self.adapter.config.update(
+            {"enabled_scopes": ["c2c", "group"], "private_only": False})
+        event = types.SimpleNamespace(
+            event_type="GROUP_AT_MESSAGE_CREATE", chat_scope="group",
+            chat_id="GroupOpenID12345", user_id="MemberOpenID12345",
+            message_id="g" * 180,
+            content="群聊兼容测试", attachments=[],
+            msg_elements=[types.SimpleNamespace(content="", attachments=[]),
+                          types.SimpleNamespace(content="群聊兼容测试", attachments=[])],
+            user_name="test",
+        )
+        parsed = self.adapter._parse_message(event)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.chat_type, "group")
+        self.assertEqual(parsed.message_id, "g" * 180)
+
+    async def test_group_long_source_id_can_be_passively_replied(self):
+        self.adapter.config.update({
+            "enabled_scopes": ["c2c", "group"], "private_only": False})
+        await self.adapter.start()
+        group_id = "GroupOpenID12345"
+        source_id = "g" * 180
+        event = types.SimpleNamespace(
+            event_type="GROUP_AT_MESSAGE_CREATE", chat_scope="group",
+            chat_id=group_id, user_id="MemberOpenID12345",
+            message_id=source_id, content="hello",
+            attachments=[], msg_elements=[], user_name="member",
+        )
+        self.assertIsNotNone(self.adapter._parse_message(event))
+        await self.adapter.send_message(OutboundMessage(
+            chat_id=group_id, text="测试回复",
+            reply_to_message_id=source_id))
+        sent_args, sent_options = MockApi.instances[-1].messages[-1]
+        self.assertEqual(sent_args[:2], ("group", group_id))
+        self.assertEqual(sent_options["reply_to"], source_id)
 
     async def test_group_at_reply_uses_group_openid_and_member_scoped_acl(self):
         self.adapter.config.update(
@@ -408,6 +558,48 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.send_message(OutboundMessage(
                 chat_id="OpenID123456789", text="image",
                 reply_to_message_id="m2", image_bytes=b"x"))
+
+    async def test_manager_preserves_group_media_metadata_in_topic(self):
+        import json
+        from channel.adapter import InboundMessage
+        from channel.manager import ChannelManager
+        manager = ChannelManager()
+        store = {
+            "canvas_layout": {"cards": [
+                {"id": "in", "mcpId": "channel", "toolName": "channel_request"},
+            ]},
+            "tool_config:channel:channel_request:in": {
+                "channel_id": "official_test"},
+            "channel_configs": [{
+                "id": "official_test", "platform": "qq",
+                "enabled": True, "config": {"protocol": "official"},
+            }],
+        }
+        file = Attachment(kind="image",
+                          path="/work/resource/qq_official_media/a.png",
+                          mime="image/png", name="a.png", size=13)
+        msg = InboundMessage(
+            platform="qq", channel_id="official_test",
+            user_id="official:1900000000:group:GroupOpenID12345:MemberOpenID12345",
+            chat_id="GroupOpenID12345", display_name="member",
+            text="图片是什么", message_id="real-source-01",
+            chat_type="group", attachments=[file],
+        )
+        with (mock.patch("channel.manager.config.main", store),
+              mock.patch("channel.acl.get_user", return_value={
+                  "role": "viewer", "tool_filter": "*"}),
+              mock.patch("channel.acl.check_permission", return_value=(True, "")),
+              mock.patch("api.inspection.publish_to_topic",
+                         new_callable=mock.AsyncMock) as published,
+              mock.patch("api.motus_stream.push_event",
+                         new_callable=mock.AsyncMock)):
+            await manager._on_inbound_message(msg)
+        published.assert_awaited_once()
+        payload = json.loads(published.await_args.args[1])
+        self.assertEqual(payload["chat_type"], "group")
+        self.assertEqual(payload["message_id"], "real-source-01")
+        self.assertEqual(payload["files"][0]["path"], file.path)
+        self.assertEqual(payload["files"][0]["kind"], "image")
 
     async def test_manager_routes_official_reply_to_original_openid(self):
         import json

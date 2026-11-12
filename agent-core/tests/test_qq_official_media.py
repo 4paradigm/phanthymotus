@@ -29,6 +29,23 @@ class QQMediaTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertFalse(_allowed_qq_url(url), url)
 
+    async def test_media_diagnostics_never_print_signed_urls(self):
+        import contextlib
+        import io
+        from channel.adapters.qq_official_media import _MEDIA_FAILURES
+        _MEDIA_FAILURES.clear()
+        signature = "unique_signed_query_value"
+        att = types.SimpleNamespace(
+            url="https://unsafe.example.com/image.png?sig=" + signature,
+            content_type="image/png", filename="private.png")
+        event = types.SimpleNamespace(attachments=[att], msg_elements=[])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = await receive_media(None, event, "/tmp/qq-invalid-url-test")
+        self.assertEqual(result, [])
+        self.assertIn("untrusted_or_missing_cdn_url", output.getvalue())
+        self.assertNotIn(signature, output.getvalue())
+
     async def test_untrusted_attachment_is_not_downloaded(self):
         att = types.SimpleNamespace(
             url="http://127.0.0.1/secret", content_type="image/png",

@@ -2476,6 +2476,9 @@ class Event:
                     message_list  = current_history,
                     trigger_event = trigger_event,
                 )
+                if qq_private_turn:
+                    from channel.qq_vision import add_qq_images
+                    await add_qq_images(messages, trigger_event)
                 # 把 trigger user message 记入 turn_messages，后续轮次能看到
                 trigger_user_msg = messages[-1]  # build() 最后一条是 L4 user
                 turn_messages.append(trigger_user_msg)
@@ -2490,8 +2493,12 @@ class Event:
 
             # 保存请求日志
             pathlib.Path('./resource/log').mkdir(parents=True, exist_ok=True)
+            log_messages = messages
+            if qq_private_turn:
+                from channel.qq_vision import redact_inline_images
+                log_messages = redact_inline_images(messages)
             pathlib.Path('./resource/log/llm.json').write_text(
-                json.dumps(messages, ensure_ascii=False)
+                json.dumps(log_messages, ensure_ascii=False)
             )
             pathlib.Path('./resource/log/llm_tools.json').write_text(
                 json.dumps(all_tool_list, ensure_ascii=False, indent=2)
@@ -2503,6 +2510,8 @@ class Event:
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
             prompt_chars = sum(len(m.get('content') or '') for m in messages)
             last_user = next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
+            if qq_private_turn and isinstance(last_user, list):
+                last_user = '[multimodal image input]'
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
