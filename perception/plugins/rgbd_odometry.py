@@ -12,6 +12,11 @@ from utils.ros_lifecycle import dispose_node
 
 
 _INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profile': 'motus_slam/1'}}
+_FRONTENDS = ('f2m_feature', 'f2f_optical_flow')
+# Optional `auto`: engineering limits, not tuned on hardware. A switch needs a
+# visual-kind loss with fresh inputs, then waits out a cooldown; after two
+# switches without tracking in between, ordinary recovery keeps the frontend.
+_AUTO_COOLDOWN_S, _AUTO_MAX_UNTRACKED_SWITCHES = 20., 2
 
 
 class RgbdOdometryPlugin:
@@ -27,6 +32,7 @@ class RgbdOdometryPlugin:
         self.settings = {}
         self.lock = threading.RLock()
         self.recovery = {}
+        self.frontends = {}
         self.retiring = {}
         self.recovery_node = self.recovery_timer = None
         self.closed = False
@@ -55,6 +61,8 @@ class RgbdOdometryPlugin:
                     info = session.info()
                     if info['status'] != 'lost':
                         state['lost_since'] = None
+                        if info['status'] == 'tracking' and instance in self.frontends:
+                            self.frontends[instance]['untracked'] = 0
                         continue
                     if state['lost_since'] is None:
                         state['lost_since'] = now
@@ -64,7 +72,8 @@ class RgbdOdometryPlugin:
                         continue
                     state['last_attempt'] = now
                     state['attempts'] += 1
-                    candidate = RgbdSession(session.calibration, self.executor,
+                    calibration, switch = self._next_frontend(instance, session, info, now)
+                    candidate = RgbdSession(calibration, self.executor,
                                             self._outputs(instance)[0]['topic'], publish_output=False)
                     session.close(report_idle=False)
                     with candidate.lock:
@@ -72,6 +81,11 @@ class RgbdOdometryPlugin:
                         candidate.publish_output = True
                     state.update(restarts=state['restarts']+1, previous_segment=info['segment_id'],
                                  reason=info['reason'], error=None, lost_since=None)
+                    if switch:
+                        frontend = self.frontends[instance]
+                        frontend.update(active=switch, switches=frontend['switches']+1,
+                                        untracked=frontend['untracked']+1, last_switch_reason=info['reason'],
+                                        cooldown_until=now+_AUTO_COOLDOWN_S)
                 except Exception as error:
                     reason = str(error)
                     if candidate is not None:
@@ -82,6 +96,37 @@ class RgbdOdometryPlugin:
                             reason += '; candidate cleanup: ' + str(cleanup_error)
                     state['error'] = reason
                     logging.getLogger(__name__).warning('RGB-D recovery %s: %s', instance, reason)
+
+    def _next_frontend(self, instance, session, info, now):
+        """Choose the replacement's frontend; never run both, never splice origins."""
+        frontend = self.frontends.get(instance)
+        if not frontend or frontend['mode'] != 'auto':
+            return session.calibration, None
+        active, kind = frontend['active'], info.get('loss_kind')
+        other = _FRONTENDS[1-_FRONTENDS.index(active)]
+        if kind != 'visual':
+            frontend['decision'] = f'kept {active}: loss kind {kind} is not visual degradation'
+        elif frontend['cooldown_until'] is not None and now < frontend['cooldown_until']:
+            frontend['decision'] = f'kept {active}: frontend switch cooldown'
+        elif frontend['untracked'] >= _AUTO_MAX_UNTRACKED_SWITCHES:
+            frontend['decision'] = (f'kept {active}: {_AUTO_MAX_UNTRACKED_SWITCHES} switches '
+                                    'without tracking; switching suspended')
+        else:
+            frontend['decision'] = f'switched to {other}: visual degradation with fresh inputs'
+            return dict(session.calibration, visual_frontend=other), other
+        return session.calibration, None
+
+    def _frontend_info(self, instance):
+        frontend = self.frontends.get(instance)
+        if not frontend:
+            return None
+        remaining = (0. if frontend['cooldown_until'] is None else
+                     max(0., round(frontend['cooldown_until']-time.monotonic(), 1)))
+        return dict(mode=frontend['mode'], active=frontend['active'], switches=frontend['switches'],
+                    last_switch_reason=frontend['last_switch_reason'], decision=frontend['decision'],
+                    cooldown_remaining_s=remaining,
+                    switching_suspended=(frontend['mode'] == 'auto' and
+                                         frontend['untracked'] >= _AUTO_MAX_UNTRACKED_SWITCHES))
 
     def _stop_instance(self, instance):
         failures = []
@@ -100,6 +145,7 @@ class RgbdOdometryPlugin:
         if failures:
             raise RuntimeError('; '.join(failures))
         self.recovery.pop(instance, None)
+        self.frontends.pop(instance, None)
 
     def get_tools(self):
         return [{'name': 'rgbd_odometry', 'type': 'processor', 'multiInstance': True,
@@ -115,8 +161,9 @@ class RgbdOdometryPlugin:
                          'description': '启用深度几何配准辅助，需要先启用短时补偿'},
                      'visual_frontend': {'type': 'string', 'scope': 'instance',
                                          'default': self.defaults['visual_frontend'],
-                                         'enum': ['f2m_feature', 'f2f_optical_flow'],
-                                         'description': 'F2M 特征匹配（默认）或 F2F 光流；切换需停止实例'},
+                                         'enum': [*_FRONTENDS, 'auto'],
+                                         'description': 'F2M 特征匹配（默认）、F2F 光流或 auto（持续视觉退化时'
+                                                        '切换前端并开启新段）；切换需停止实例'},
                      'max_features': {'type': 'integer', 'scope': 'instance',
                                       'default': self.defaults['max_features'],
                                       'minimum': 100, 'maximum': 5000,
@@ -146,8 +193,8 @@ class RgbdOdometryPlugin:
                 if any(type(settings[k]) is not bool for k in
                        ('imu_assisted', 'short_term_compensation', 'depth_geometry')):
                     raise ValueError('IMU, compensation and geometry flags must be boolean')
-                if settings['visual_frontend'] not in ('f2m_feature', 'f2f_optical_flow'):
-                    raise ValueError('unsupported visual_frontend: use f2m_feature or f2f_optical_flow')
+                if settings['visual_frontend'] not in (*_FRONTENDS, 'auto'):
+                    raise ValueError('unsupported visual_frontend: use f2m_feature, f2f_optical_flow or auto')
                 if (type(settings['max_features']) is not int or
                         not 100 <= settings['max_features'] <= 5000):
                     raise ValueError('max_features must be an integer in [100, 5000]')
@@ -173,6 +220,9 @@ class RgbdOdometryPlugin:
                         logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
                         raise
                     calibration.update(settings)
+                    mode = 'auto' if settings['visual_frontend'] == 'auto' else 'manual'
+                    if mode == 'auto':
+                        calibration['visual_frontend'] = _FRONTENDS[0]  # existing default starts
                     geometry = deepcopy(args['camera_info'])
                     for declaration in geometry.values():
                         mount = (declaration.get('vendor') or {}).get('body_mount')
@@ -194,6 +244,9 @@ class RgbdOdometryPlugin:
                         self.settings[instance] = settings
                         self.recovery[instance] = dict(lost_since=None, last_attempt=None,
                             attempts=0, restarts=0, previous_segment=None, reason=None, error=None)
+                        self.frontends[instance] = dict(mode=mode, active=calibration['visual_frontend'],
+                            switches=0, untracked=0, last_switch_reason=None, decision=None,
+                            cooldown_until=None)
                 elif action == 'stop':
                     self._stop_instance(instance)
                     current = None
@@ -204,6 +257,7 @@ class RgbdOdometryPlugin:
                         'topic_in': current[2] if current else [],
                         'recovery': {k: v for k, v in self.recovery.get(instance, {}).items()
                                      if k not in ('lost_since', 'last_attempt')},
+                        'frontend': self._frontend_info(instance),
                         'config': self.settings.get(instance, self.defaults).copy()}
             except (ValueError, RuntimeError, ImportError, LookupError) as error:
                 return {'state': 'error', 'message': str(error)}

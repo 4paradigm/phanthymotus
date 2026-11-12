@@ -214,7 +214,7 @@ def test_visual_frontend_settings_are_instance_scoped_and_require_restart(monkey
     Session.created = []
     card = RgbdOdometryPlugin({}, _FakeExecutor())
     schema = card.get_tools()[0]['configSchema']['properties']
-    assert schema['visual_frontend']['enum'] == ['f2m_feature', 'f2f_optical_flow']
+    assert schema['visual_frontend']['enum'] == ['f2m_feature', 'f2f_optical_flow', 'auto']
     assert schema['visual_frontend']['default'] == 'f2m_feature'
     assert schema['max_features']['default'] == 1000
     assert start(card, 'normal')['state'] == 'running'

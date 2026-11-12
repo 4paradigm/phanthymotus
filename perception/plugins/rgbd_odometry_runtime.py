@@ -758,6 +758,7 @@ class RgbdSession:
                     'pose_reference': 'camera_optical', **self.counts,
                     'last_measurement_ns': self.gate.last_stamp,
                     'visual_rejection': self.gate.rejection,
+                    'loss_kind': self.gate.loss_kind,
                     'input_rejections': {'count': self.counts['rejected_inputs'],
                                          'last_reason': self.input_rejection},
                     'fallback': deepcopy(self.fallback),
