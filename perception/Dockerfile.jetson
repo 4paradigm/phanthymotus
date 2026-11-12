@@ -582,9 +582,15 @@ print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────
-RUN pip3 install --no-cache-dir --no-deps --only-binary=:all: \
-    -i "${PYPI_MIRROR}" "kaldifst==1.7.8" && \
-    python3 -c "import kaldifst; assert hasattr(kaldifst, 'StdVectorFst')"
+COPY perception/plugins/requirements.asr-numeric.txt /tmp/asr-numeric-requirements.txt
+# The default VITS2 frontend already provides this exact dependency. Only
+# minimal images built without that frontend need to install it here.
+RUN if ! python3 -c "import kaldifst; from importlib.metadata import version; assert version('kaldifst') == '1.7.8'; assert hasattr(kaldifst, 'StdVectorFst')"; then \
+      pip3 install --no-cache-dir --no-deps --only-binary=:all: \
+        -i "${PYPI_MIRROR}" -r /tmp/asr-numeric-requirements.txt; \
+    fi && \
+    python3 -c "import kaldifst; assert hasattr(kaldifst, 'StdVectorFst')" && \
+    rm -f /tmp/asr-numeric-requirements.txt
 
 WORKDIR /work
 COPY perception/main.py    /work/main.py

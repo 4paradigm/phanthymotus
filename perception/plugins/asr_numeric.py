@@ -262,7 +262,15 @@ class NumericOutputNormalizer:
             except ValueError:
                 return value
 
-        text = re.sub(r"ร้อยละ\s*(" + atom + r"+(?:\s+" + atom + r"+)*)", lambda m: number(m.group(1)) + "%", text)
+        def percent(match):
+            try:
+                value = number(match.group(1))
+            except ValueError:
+                return match.group()
+            # Invalid fractional expressions can also return their input.
+            return value + "%" if re.fullmatch(r"\d+(?:\.\d+)?", value) else match.group()
+
+        text = re.sub(r"ร้อยละ\s*(" + atom + r"+(?:\s+" + atom + r"+)*)", percent, text)
         return re.sub(atom + r"+(?:\s+" + atom + r"+)*", replace, text)
 
     @staticmethod
