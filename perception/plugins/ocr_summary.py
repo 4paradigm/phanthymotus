@@ -227,7 +227,7 @@ def _local_position(box, bounds):
 
 def _numeric_observation(item):
     text = unicodedata.normalize('NFKC', item['text']).replace(' ', '').strip('()')
-    return bool(_NUMBER_TEXT.fullmatch(text))
+    return any(char.isdecimal() for char in text) and bool(_NUMBER_TEXT.fullmatch(text))
 
 def _local_layout(members):
     bounds = _bounds(members)
@@ -1205,7 +1205,14 @@ def _comparison_bindings(items):
         ranked = sorted(matches.values(), key=lambda value: (value[0], tuple((_reading_order(row[1]) for row in value[1]))))
         if not ranked or (len(ranked) > 1 and ranked[1][0] - ranked[0][0] < 0.5 * scale):
             continue
-        accepted.append(ranked[0][1])
+        rows = ranked[0][1]
+        # A shared gutter wider than the block is tall is weak evidence of
+        # one local comparison. Individual long rows can still stay paired.
+        gutter = min(row[1]['bbox'][0] for row in rows) - max(row[0]['bbox'][2] for row in rows)
+        bounds = _bounds([item for row in rows for item in row])
+        if gutter > max(6 * scale, bounds[3] - bounds[1]):
+            continue
+        accepted.append(rows)
     if len(accepted) != 1:
         return None
     rows = accepted[0]
@@ -1246,15 +1253,19 @@ def _numbered_bindings(items):
         return None
     anchors = candidates[0]
     centers = [_xy(i)[1] for i in anchors]
-    edges = [centers[0] - (centers[1] - centers[0]) / 2]
-    edges += [(a + b) / 2 for (a, b) in zip(centers, centers[1:])]
-    edges.append(centers[-1] + (centers[-1] - centers[-2]) / 2)
+    numbers = [int(unicodedata.normalize('NFKC', i['text']).strip()) for i in anchors]
+    # Leave unobserved index rows unassigned instead of expanding a neighbor
+    # across the skipped number and absorbing its still-visible text.
+    half_steps = [(b - a) / (2 * abs(n - m))
+                  for a, b, m, n in zip(centers, centers[1:], numbers, numbers[1:])]
+    lower = [center - half for center, half in zip(centers, [half_steps[0]] + half_steps)]
+    upper = [center + half for center, half in zip(centers, half_steps + [half_steps[-1]])]
     groups = [[] for _ in anchors]
     for item in items:
         if any((item is anchor for anchor in anchors)):
             continue
         y = _xy(item)[1]
-        possible = [index for (index, anchor) in enumerate(anchors) if edges[index] < y < edges[index + 1] and item['bbox'][0] >= anchor['bbox'][2] - 0.25 * scale]
+        possible = [index for (index, anchor) in enumerate(anchors) if lower[index] < y < upper[index] and item['bbox'][0] >= anchor['bbox'][2] - 0.25 * scale]
         if len(possible) == 1:
             groups[possible[0]].append(item)
     rows = []

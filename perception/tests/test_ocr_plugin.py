@@ -433,6 +433,7 @@ def test_ocr_payload_empty_and_error():
 
 def test_ocr_layout_keeps_numbered_rows_in_visual_order():
     from plugins.ocr_summary import build_ocr_summary
+    from plugins.ocr_runtime import build_ocr_payload
 
     items = []
     for number, title, y in [("03", "应用层", 40), ("02", "连接层", 130), ("01", "算力层", 220)]:
@@ -444,6 +445,10 @@ def test_ocr_layout_keeps_numbered_rows_in_visual_order():
     for number, title in [("03", "应用层"), ("02", "连接层"), ("01", "算力层")]:
         assert f'原编号“{number}”，右侧邻近文字为“{title}”' in text
     assert text.index("“03”") < text.index("“02”") < text.index("“01”")
+    payload = build_ocr_payload(items, 0.0, "zh", image_size=(1000, 400))
+    assert payload["text"] == text
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == items
 
 
 def test_ocr_layout_keeps_comparison_labels_and_values_on_their_rows():
@@ -458,6 +463,51 @@ def test_ocr_layout_keeps_comparison_labels_and_values_on_their_rows():
     text = build_ocr_summary(items, (1000, 400))
     assert "“方案甲”；同排右侧数值为“10”" in text
     assert "“方案乙”；同排右侧数值为“1000+”" in text
+
+
+@pytest.mark.parametrize("missing_number", ["04", "03", "02", "01"])
+def test_ocr_layout_missing_index_leaves_its_visible_text_unassigned(missing_number):
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    titles = {"04": "应用层", "03": "编排层", "02": "连接层", "01": "算力层"}
+    for index, (number, title) in enumerate(titles.items()):
+        y = 40 + index * 90
+        if number != missing_number:
+            items.append({"text": number, "bbox": [270, y, 292, y + 16], "score": .99})
+        items.append({"text": title, "bbox": [350, y - 1, 530, y + 15], "score": .99})
+        items.append({"text": title + "说明", "bbox": [350, y + 22, 580, y + 34], "score": .99})
+    text = build_ocr_summary(items, (1000, 450))
+    orphan = f'“{titles[missing_number]}”'
+    assert orphan in text
+    for number, title in titles.items():
+        if number == missing_number:
+            assert f'“{number}”' not in text
+            continue
+        assert any(f'“{number}”' in line and f'“{title}”' in line for line in text.splitlines())
+        assert not any(f'“{number}”' in line and orphan in line for line in text.splitlines())
+
+
+def test_ocr_layout_alphabetic_sizes_are_not_described_as_numbers():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [x, y, x + width, y + 16], "score": .99}
+             for text, x, y, width in [("规格甲", 50, 80, 100), ("S", 300, 80, 20),
+                                       ("规格乙", 50, 180, 100), ("L", 300, 180, 20)]]
+    text = build_ocr_summary(items, (600, 300))
+    assert "同排右侧数值为" not in text
+    assert all(f'“{item["text"]}”' in text for item in items)
+
+
+def test_ocr_layout_distant_columns_are_not_forced_into_comparison_rows():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [x, y, x + width, y + 16], "score": .99}
+             for text, x, y, width in [("产品介绍", 50, 80, 160), ("1000+", 1100, 80, 65),
+                                       ("服务说明", 50, 180, 160), ("20+", 1100, 180, 50)]]
+    text = build_ocr_summary(items, (1300, 300))
+    assert "同排右侧数值为" not in text
+    assert all(f'“{item["text"]}”' in text for item in items)
 
 
 def test_ocr_layout_repeated_numbers_preserve_vertical_order():
