@@ -1273,34 +1273,54 @@ VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision"
 # the file that was uploaded — the point of the pin is to catch a bad transfer,
 # and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE / KOKORO.)
 #
-# vocab.json is byte-identical across both families; the two bundles carry
-# their own copy anyway so a family is one self-contained download.
-_VOP_VOCAB = {
-    "size": 1969,
-    "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b",
-}
+# vocab.json is byte-identical across both families of one model; the two
+# bundles carry their own copy anyway so a family is one self-contained
+# download.
+#
+# VOP_MODEL_BUNDLES is keyed by model name first, then by JetPack family: each
+# model is a choice on the card (plugins/vop.py's `model`), not a replacement
+# for the one before it. Adding a model is adding a row here — export it with
+# `tools/export_vision_engines.py --vop-weights`, publish to COS, pin.
+# ensure_vop_model() keeps each model in its own subdirectory, because every
+# bundle ships a file called vocab.json and they differ.
+
+
+def _vop_bundles(model: str, vocab: dict, engines: dict) -> dict:
+    """One model's per-family bundles, at `vision/<model>/tensorrt-...-orin-640`."""
+    paths = {"jp61": "tensorrt-jp61-trt10.4-orin-640",
+             "jp511": "tensorrt-jp511-trt8.5-orin-640"}
+    return {
+        family: {
+            "base_url": f"{VISION_MODEL_BASE}/{model}/{paths[family]}",
+            "files": {f"{model}.engine": engine, "vocab.json": vocab},
+        }
+        for family, engine in engines.items()
+    }
+
 
 VOP_MODEL_BUNDLES = {
-    "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
-        "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 24780908,
-                "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
-            },
-            "vocab.json": _VOP_VOCAB,
+    # 144 classes (COCO-80 + ROBOT_EXTRA), NMS-free end-to-end head. Default.
+    "yoloe-26s-seg": _vop_bundles(
+        "yoloe-26s-seg",
+        {"size": 1969,
+         "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b"},
+        {
+            "jp61": {"size": 24780908,
+                     "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099"},
+            "jp511": {"size": 23742701,
+                      "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe"},
         },
-    },
-    "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
-        "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 23742701,
-                "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe",
-            },
-            "vocab.json": _VOP_VOCAB,
+    ),
+    # The same 144-class vocabulary on ultralytics' m-size weights, same
+    # NMS-free head and same decoder — a bigger model, not a different one.
+    "yoloe-26m-seg": _vop_bundles(
+        "yoloe-26m-seg",
+        {"size": 0, "sha256": ""},
+        {
+            "jp61": {"size": 0, "sha256": ""},
+            "jp511": {"size": 0, "sha256": ""},
         },
-    },
+    ),
 }
 
 DEPTH_MODEL_BUNDLES = {
@@ -1567,10 +1587,14 @@ def ensure_depthart_model(model_dir: str = "/models/depthart", family: str | Non
                                  os.path.join(model_dir, key), key, progress_cb)
 
 
-def ensure_vop_model(model_dir: str, family: str | None = None,
-                     progress_cb=None) -> dict[str, str]:
-    """Ensure the vop detection engine + its frozen vocabulary are present."""
-    return _ensure_vision_bundle("vop", VOP_MODEL_BUNDLES, model_dir, family,
+def ensure_vop_model(model_dir: str, model: str = "yoloe-26s-seg",
+                     family: str | None = None, progress_cb=None) -> dict[str, str]:
+    """Ensure one vop model's engine + its frozen vocabulary are present."""
+    if model not in VOP_MODEL_BUNDLES:
+        raise ValueError(f"Unknown vop model {model!r}; available: "
+                         f"{sorted(VOP_MODEL_BUNDLES)}")
+    return _ensure_vision_bundle(f"vop/{model}", VOP_MODEL_BUNDLES[model],
+                                 os.path.join(model_dir, model), family,
                                  progress_cb=progress_cb)
 
 
