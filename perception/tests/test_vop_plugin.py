@@ -62,6 +62,7 @@ def _plugin(cfg=None, model=None):
     ("yolov8s-world", "yoloe-26s-seg"),
     ("yoloe-26s", "yoloe-26s-seg"),
     ("yoloe-26s-seg", "yoloe-26s-seg"),
+    ("yoloe-26m-seg", "yoloe-26m-seg"),
     ("", "yoloe-26s-seg"),
 ])
 def test_legacy_model_names_still_resolve(configured, expected):
@@ -72,6 +73,104 @@ def test_legacy_model_names_still_resolve(configured, expected):
 def test_unknown_model_name_is_left_alone():
     """An explicit engine path is a dev-box escape hatch, not an alias miss."""
     assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom"
+
+
+# ── model registry and switching ─────────────────────────────────────────────
+
+def test_every_bundled_model_is_offered_on_the_card():
+    """The card's choice and the downloader's rows are one list."""
+    from utils.model_downloader import VOP_MODEL_BUNDLES
+
+    schema = vop_plugin.TOOLS[0]["configSchema"]["properties"]["model"]
+    assert schema["enum"] == list(VOP_MODEL_BUNDLES)
+    assert {"yoloe-26s-seg", "yoloe-26m-seg"} <= set(schema["enum"])
+    assert schema["default"] == vop_plugin.DEFAULT_MODEL == "yoloe-26s-seg"
+    assert schema["scope"] == "shared"
+
+
+def test_each_model_downloads_into_its_own_directory(monkeypatch):
+    """Every bundle ships a vocab.json; sharing a directory would make two
+    models overwrite each other's on every switch."""
+    import utils.model_downloader as md
+
+    seen = []
+    monkeypatch.setattr(md, "ensure_verified_bundle",
+                        lambda name, model_dir, base_url, files, progress_cb=None:
+                        seen.append((model_dir, base_url, sorted(files))) or {})
+    monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
+    for model in md.VOP_MODEL_BUNDLES:
+        for family in ("jp61", "jp511"):
+            md.ensure_vop_model("/models/vop", model=model, family=family)
+    assert len(seen) == 2 * len(md.VOP_MODEL_BUNDLES)
+    for model_dir, base_url, files in seen:
+        model = model_dir.rsplit("/", 1)[1]
+        assert model_dir == f"/models/vop/{model}"
+        assert base_url.startswith(md.VISION_MODEL_BASE + f"/{model}/")
+        assert files == sorted([f"{model}.engine", "vocab.json"])
+
+
+def test_an_unknown_model_is_refused_by_the_downloader():
+    import utils.model_downloader as md
+
+    with pytest.raises(ValueError, match="Unknown vop model"):
+        md.ensure_vop_model("/models/vop", model="yoloe-26x-seg")
+
+
+def test_config_switches_the_model_and_stops_running_instances():
+    plugin, executor = _plugin(model=_FakeModel())
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert len(executor.nodes) == 1
+
+    reply = plugin.dispatch("vop", {"action": "config", "model": "yoloe-26m-seg"})
+
+    assert reply["status"] == "configured"
+    assert reply["model"] == "yoloe-26m-seg"
+    assert reply["stopped_instances"] == ["/cam/rgb"]
+    assert "model" not in reply["config"]
+    assert executor.nodes == [] and plugin._nodes == {}
+    # The old engine is dropped, so the next start loads the new one.
+    assert plugin._model is None
+    assert plugin._model_name == "yoloe-26m-seg"
+    assert plugin._vocabulary == []
+
+
+def test_config_with_an_instance_id_still_switches_the_shared_model():
+    plugin, _ = _plugin(model=_FakeModel())
+    reply = plugin.dispatch("vop", {"action": "config", "instance_id": "cam",
+                                    "model": "yoloe-26m-seg", "fps": 3})
+    assert plugin._model_name == "yoloe-26m-seg"
+    assert plugin._instance_configs["cam"] == {"fps": 3}
+    assert reply["model"] == "yoloe-26m-seg"
+
+
+def test_config_to_the_current_model_keeps_the_engine():
+    model = _FakeModel()
+    plugin, executor = _plugin(model=model)
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("vop", {"action": "config", "model": "yoloe-26s-seg"})
+    assert plugin._model is model
+    assert len(executor.nodes) == 1
+    plugin.dispatch("vop", {"action": "stop"})
+
+
+def test_an_unknown_model_in_config_changes_nothing():
+    model = _FakeModel()
+    plugin, _ = _plugin(model=model)
+    reply = plugin.dispatch("vop", {"action": "config", "model": "yoloe-26x-seg",
+                                    "fps": 2})
+    assert reply["status"] == "error"
+    assert "yoloe-26m-seg" in reply["message"]
+    assert plugin._model is model
+    assert plugin._model_name == "yoloe-26s-seg"
+    assert plugin._fps != 2
+
+
+def test_a_switch_during_a_load_is_refused():
+    plugin, _ = _plugin()
+    plugin._model_loading = True
+    reply = plugin.dispatch("vop", {"action": "config", "model": "yoloe-26m-seg"})
+    assert reply["status"] == "error"
+    assert plugin._model_name == "yoloe-26s-seg"
 
 
 # ── frozen vocabulary ────────────────────────────────────────────────────────

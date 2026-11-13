@@ -50,9 +50,11 @@ deserializes fine and is then rejected on load.
 
     python3 tools/export_vision_engines.py --out /tmp/engines
     python3 tools/export_vision_engines.py --model vop --imgsz 640
+    python3 tools/export_vision_engines.py --model vop --vop-weights yoloe-26m-seg.pt
 
 Outputs, per model:
-    yoloe-26s-seg.engine + vocab.json     (vop)
+    yoloe-26s-seg.engine + vocab.json     (vop; --vop-weights to pick another
+                                           size, and add a VOP_MODEL_BUNDLES row)
     yolo26n-depth.engine                  (visual_depth)
     yolo26s-pose.engine                   (pose; --pose-weights to pick another
                                            size, and update the bundle table)
@@ -117,11 +119,19 @@ def sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def export_vop(out_dir: str, imgsz: int, workspace: float | None) -> list[str]:
+# Which vop weights to export. Each size is its own row in VOP_MODEL_BUNDLES and
+# its own choice on the card, so exporting another one adds a model rather than
+# replacing the default.
+DEFAULT_VOP_WEIGHTS = "yoloe-26s-seg.pt"
+
+
+def export_vop(out_dir: str, imgsz: int, workspace: float | None,
+               weights: str = DEFAULT_VOP_WEIGHTS) -> list[str]:
     from ultralytics import YOLOE
 
+    name = weights[:-3] if weights.endswith(".pt") else weights
     vocab = vocabulary()
-    model = YOLOE("yoloe-26s-seg.pt")
+    model = YOLOE(weights)
     try:
         model.set_classes(vocab)
     except TypeError:
@@ -135,7 +145,7 @@ def export_vop(out_dir: str, imgsz: int, workspace: float | None) -> list[str]:
     # and the decoder refuses it rather than misreading it.
     engine = model.export(format="engine", imgsz=imgsz, half=True,
                           workspace=workspace, nms=False)
-    target = os.path.join(out_dir, "yoloe-26s-seg.engine")
+    target = os.path.join(out_dir, f"{name}.engine")
     shutil.move(str(engine), target)
 
     # Shipped beside the engine so the plugin can name what it detects without
@@ -143,7 +153,7 @@ def export_vop(out_dir: str, imgsz: int, workspace: float | None) -> list[str]:
     vocab_path = os.path.join(out_dir, "vocab.json")
     with open(vocab_path, "w", encoding="utf-8") as handle:
         json.dump(
-            {"model": "yoloe-26s-seg", "imgsz": imgsz, "classes": vocab},
+            {"model": name, "imgsz": imgsz, "classes": vocab},
             handle, ensure_ascii=False, indent=1,
         )
     return [target, vocab_path]
@@ -397,6 +407,9 @@ def main() -> int:
                         help="pose weights to export (default %(default)s). "
                              "Changing this also means updating "
                              "POSE_MODEL_BUNDLES, whose COS paths name the model")
+    parser.add_argument("--vop-weights", default=DEFAULT_VOP_WEIGHTS,
+                        help="vop weights to export (default %(default)s). "
+                             "Each size is its own VOP_MODEL_BUNDLES row")
     parser.add_argument("--workspace", type=float, default=2.0,
                         help="TensorRT builder workspace in GB (0 = unbounded)")
     args = parser.parse_args()
@@ -414,7 +427,8 @@ def main() -> int:
 
     produced: list[str] = []
     if args.model in ("both", "vop"):
-        produced += export_vop(args.out, args.imgsz, workspace)
+        produced += export_vop(args.out, args.imgsz, workspace,
+                               weights=args.vop_weights)
     if args.model in ("both", "depth"):
         produced += export_depth(args.out, args.imgsz, workspace)
     if args.model in ("both", "pose"):

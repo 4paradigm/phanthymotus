@@ -3209,6 +3209,33 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
+### Choosing a vop model
+
+The card's `model` (shared across instances) picks one row of
+`VOP_MODEL_BUNDLES` in `utils/model_downloader.py`; the enum on the card is
+that table's keys, so there is no second list to keep in step.
+
+| `model` | Weights | Classes | Notes |
+|---|---|---|---|
+| `yoloe-26s-seg` | ultralytics YOLOE-26 s | 144 | default |
+| `yoloe-26m-seg` | ultralytics YOLOE-26 m | 144 | same vocabulary and decoder, larger and slower |
+
+Every row is an NMS-free end-to-end export (`nms=False`) and decodes through
+the same `decode_detections`. A model whose engine needs NMS on the robot does
+not get a row: the reason vop runs TensorRT directly is that post-processing
+is nearly free, and a per-frame Python NMS would give that back.
+
+Each model downloads into its own `/models/vop/<model>/`, because every bundle
+ships a `vocab.json`. Switching the model with `config` stops every running
+instance — they all share the one engine — and the next `start` loads the new
+one.
+
+To add a size: `tools/export_vision_engines.py --model vop --vop-weights
+yoloe-26<size>-seg.pt` in a throwaway container of **each** perception image
+(jp5.11 and jp6.1), upload both to
+`vision/<model>/tensorrt-{jp511-trt8.5,jp61-trt10.4}-orin-640/` on COS, and pin
+the size and SHA256 of the copies downloaded back.
+
 ### vop's streamed payload: `publish_bbox` and `publish_color`
 
 Two knobs govern what one detected object costs on the topic. **They affect the

@@ -48,6 +48,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.model_downloader import VOP_MODEL_BUNDLES
 from utils.ros_lifecycle import dispose_node
 
 from plugins.image_input import BadInput, load_image_bytes
@@ -76,6 +77,12 @@ DEFAULT_OUTPUT_TOPIC = "/perception/vop"
 _DEFAULT_INSTANCE = "_default"
 
 DEFAULT_MODEL = "yoloe-26s-seg"
+
+# The models this build can run — one row each in
+# utils.model_downloader.VOP_MODEL_BUNDLES, which is the single list:
+#   yoloe-26s-seg  144 classes, NMS-free head (default)
+#   yoloe-26m-seg  same 144 classes on the m-size weights
+VOP_MODELS = tuple(VOP_MODEL_BUNDLES)
 
 # Names that already exist in deployed canvas cards and yaml. A card saved when
 # this plugin ran YOLOv8-World must keep loading after an upgrade: the engine it
@@ -291,7 +298,12 @@ def output_topic_for(input_topic: Optional[str]) -> str:
 
 
 def canonical_model_name(name: str) -> str:
-    """Map a configured model name onto the one model this build ships."""
+    """Map a configured model name onto a model this build ships, or itself.
+
+    An unknown name is returned unchanged rather than defaulted, so it fails
+    loudly at load — a card asking for a model and silently getting another is
+    the failure the aliases exist to avoid, not to cause.
+    """
     base = (name or "").strip()
     if base.endswith(".pt") or base.endswith(".engine"):
         base = base.rsplit(".", 1)[0]
@@ -338,7 +350,7 @@ TOOLS = [
                 "start":  {"params": ["input_topic"], "description": "启动。给 input_topic 则持续检测该摄像头话题；不给则以按需模式启动，只服务单张图片的识别"},
                 "stop":   {"params": [], "description": "Stop detection"},
                 "info":   {"params": ["input_topic"], "description": "Report state, topics and the frozen class list"},
-                "config": {"params": [], "description": "Update confidence / fps"},
+                "config": {"params": [], "description": "Update model / confidence / fps"},
                 "recognize_by_photo": {
                     "params": ["image_path", "confidence"],
                     "description": "认出一张图片里的物体 — 一次性识别，不需要摄像头也不需要先 start。返回每个物体的名称、画面中的相对位置与置信度",
@@ -356,6 +368,9 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
+                # One engine serves every instance, so the model is shared; a
+                # switch stops the running instances and the next start loads it.
+                "model": {"type": "string", "enum": list(VOP_MODELS), "description": "检测模型。yoloe-26s-seg = s 尺寸，最快（默认）；yoloe-26m-seg = m 尺寸，同样 144 类，更准也更慢。切换会停掉正在运行的实例", "default": DEFAULT_MODEL, "scope": "shared"},
                 "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "instance"},
                 "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "instance"},
                 # Both govern the *streamed* payload only. The one-shot photo
@@ -648,23 +663,27 @@ class VideoObjectPerceptionPlugin:
         """
         try:
             from utils.model_downloader import (
-                VOP_MODEL_BUNDLES, ensure_verified_bundle, require_models_subpath,
+                ensure_verified_bundle, require_models_subpath,
                 select_bundle_family,
             )
 
-            model_dir = require_models_subpath(
-                os.environ.get("VOP_MODEL_DIR", "/models/vop")
-            )
-            key = select_bundle_family(VOP_MODEL_BUNDLES)
-            entry = VOP_MODEL_BUNDLES[key]
+            model_dir = require_models_subpath(os.path.join(
+                os.environ.get("VOP_MODEL_DIR", "/models/vop"), self._model_name))
+            model = self._model_name
+            bundles = VOP_MODEL_BUNDLES.get(model)
+            if bundles is None:
+                return
+            key = select_bundle_family(bundles)
+            entry = bundles[key]
             vocab_only = {n: m for n, m in entry["files"].items() if n == "vocab.json"}
             if not vocab_only:
                 return
             paths = ensure_verified_bundle(
-                f"vop/{key}/vocab", model_dir, entry["base_url"], vocab_only
+                f"vop/{model}/{key}/vocab", model_dir, entry["base_url"], vocab_only
             )
             vocab = self._read_vocab(paths.get("vocab.json"))
-            if vocab and not self._vocabulary:
+            # The model may have been switched while this was downloading.
+            if vocab and not self._vocabulary and model == self._model_name:
                 self._vocabulary = vocab
                 log.info(f"[vop] vocabulary available before load: {len(vocab)} classes")
         except Exception as exc:
@@ -690,6 +709,41 @@ class VideoObjectPerceptionPlugin:
             f"To detect something outside that list, rebuild the engine with "
             f"tools/export_vision_engines.py and republish the bundle."
         )
+
+    def _switch_model(self, requested) -> dict:
+        """Point the plugin at another model; the next start loads it.
+
+        Every running instance is stopped first: they all share the one engine
+        being dropped, and a node left running would keep publishing the old
+        model's detections under the new model's name.
+        """
+        name = canonical_model_name(str(requested))
+        if name not in VOP_MODELS:
+            return {"status": "error", "model": self._model_name,
+                    "message": f"Unknown vop model {requested!r}; "
+                               f"available: {', '.join(VOP_MODELS)}"}
+        if name == self._model_name:
+            return {"model": name}
+        if self._model_loading:
+            return {"status": "error", "model": self._model_name,
+                    "message": f"model {self._model_name!r} is still loading; "
+                               "retry the switch once it has finished"}
+        with self._nodes_lock:
+            keys = list(self._nodes)
+        for key in keys:
+            self._retire_node(key)
+        # The old engine is dropped, not closed: a one-shot recognize on another
+        # thread may still hold it mid-infer, and it is freed with that last
+        # reference.
+        with self._model_lock:
+            self._model = None
+            self._model_name = name
+            self._model_load_error = None
+            self._vocabulary = []
+        log.info(f"[vop] model switched to {name}; stopped {len(keys)} instance(s)")
+        threading.Thread(target=self._prefetch_vocabulary, daemon=True,
+                         name="vop_vocab_prefetch").start()
+        return {"model": name, "stopped_instances": keys}
 
     def _ensure_model(self):
         if self._model is not None:
@@ -764,8 +818,8 @@ class VideoObjectPerceptionPlugin:
 
         model_dir = os.environ.get("VOP_MODEL_DIR", "/models/vop")
         progress_cb, _ = fetch_status(
-            lambda text: setattr(self, "_model_load_status", text), "yoloe-26s-seg")
-        paths = ensure_vop_model(model_dir, progress_cb=progress_cb)
+            lambda text: setattr(self, "_model_load_status", text), configured)
+        paths = ensure_vop_model(model_dir, model=configured, progress_cb=progress_cb)
         engine = next(p for name, p in paths.items() if name.endswith(".engine"))
         return engine, self._read_vocab(paths.get("vocab.json"))
 
@@ -1221,6 +1275,13 @@ class VideoObjectPerceptionPlugin:
             if cfg.get("classes"):
                 self._rejected_classes = list(cfg["classes"])
                 raise ValueError(self._frozen_vocab_error(cfg["classes"]))
+            # `model` is shared across instances, so it is applied to the plugin
+            # whichever form of config carries it, and never stored per instance.
+            switched = None
+            if "model" in cfg:
+                switched = self._switch_model(cfg.pop("model"))
+                if switched.get("status") == "error":
+                    return switched
             if instance_id:
                 with self._nodes_lock:
                     self._instance_configs[instance_id] = cfg
@@ -1229,7 +1290,8 @@ class VideoObjectPerceptionPlugin:
                 # the new config.
                 if running:
                     self._retire_node(instance_id)
-                return {"status": "configured", "instance_id": instance_id, "config": cfg}
+                return {"status": "configured", "instance_id": instance_id,
+                        "config": cfg, **(switched or {})}
             else:
                 # Update global defaults
                 if "confidence" in cfg:
@@ -1240,6 +1302,6 @@ class VideoObjectPerceptionPlugin:
                     self._publish_bbox = bool(cfg["publish_bbox"])
                 if "publish_color" in cfg:
                     self._publish_color = _color_level(cfg["publish_color"])
-                return {"status": "configured", "config": cfg}
+                return {"status": "configured", "config": cfg, **(switched or {})}
 
         return None
