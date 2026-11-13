@@ -126,6 +126,9 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
             supplied = updates['config']
             if not isinstance(supplied, dict):
                 raise fastapi.HTTPException(400, 'QQ configuration must be an object')
+            for key in ('app_secret', 'app_secret_env', 'app_secret_file'):
+                if key in supplied and not isinstance(supplied[key], str):
+                    raise fastapi.HTTPException(400, f'QQ official {key} must be a string')
             if 'app_secret' in supplied:
                 raise fastapi.HTTPException(
                     400, 'Inline QQ AppSecret is no longer accepted; '

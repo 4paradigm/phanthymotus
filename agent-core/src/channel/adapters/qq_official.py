@@ -97,6 +97,9 @@ def validate_qq_official_config(cfg: dict) -> dict:
             or (bot_group_openid and not _OPENID_RE.fullmatch(bot_group_openid))):
         raise ValueError("QQ bot_group_openid must be a valid OpenID")
     sources = ("app_secret", "app_secret_env", "app_secret_file")
+    for key in sources:
+        if key in cfg and not isinstance(cfg[key], str):
+            raise ValueError(f"QQ official {key} must be a string")
     if sum(bool(cfg.get(k)) for k in sources) != 1:
         raise ValueError("QQ official requires exactly one credential source")
     if cfg.get("app_secret_env") and not _ENV_RE.fullmatch(cfg["app_secret_env"]):
