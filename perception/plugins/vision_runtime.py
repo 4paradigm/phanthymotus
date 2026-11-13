@@ -23,6 +23,7 @@ The decoding here assumes engines exported with `nms=False`, i.e. YOLO26's
 NMS-free end-to-end head, whose output is already final boxes. That is what
 `tools/export_vision_engines.py` produces; an engine exported the other way
 has a different output layout and is rejected rather than silently misread.
+B6 opts into dense single-label decoding with explicit detection_layout metadata.
 """
 
 from __future__ import annotations
@@ -164,7 +165,49 @@ def _find_detection_rows(outputs) -> Optional[np.ndarray]:
     return None
 
 
-def decode_detections(outputs, meta: LetterboxMeta, conf: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def decode_dense_detections(outputs, meta, conf, *, num_classes=220,
+                            nms_iou=0.7, max_det=300):
+    """Decode explicitly declared single-label YOLO dense xywh/class output.
+
+    NMS runs before clipping to the original image, matching training replay.
+    This path is opt-in via engine metadata; other vision plugins keep their
+    existing end-to-end decoder. No torch dependency is needed on the device.
+    """
+    arrays = _as_candidates(outputs)
+    if len(arrays) != 1 or arrays[0].shape != (1, 4 + num_classes, 8400):
+        raise VisionDecodeError("Unexpected yolo_dense_v1 output shape")
+    dense = arrays[0][0].astype(np.float32)
+    if not np.isfinite(dense).all():
+        raise VisionDecodeError("Nonfinite dense detections")
+    ids = dense[4:].argmax(axis=0)
+    scores = dense[4:][ids, np.arange(dense.shape[1])]
+    candidates = np.flatnonzero(scores >= max(0.01, conf))
+    xywh = dense[:4, candidates].T
+    boxes = np.concatenate((xywh[:, :2] - xywh[:, 2:] / 2,
+                            xywh[:, :2] + xywh[:, 2:] / 2), axis=1)
+    scores, ids = scores[candidates], ids[candidates]
+    order = np.argsort(-scores, kind="stable")
+    areas = (np.maximum(boxes[:, 2] - boxes[:, 0], 0)
+             * np.maximum(boxes[:, 3] - boxes[:, 1], 0))
+    keep = []
+    while order.size and len(keep) < max_det:
+        i = int(order[0])
+        keep.append(i)
+        rest = order[1:]
+        wh = np.maximum(np.minimum(boxes[i, 2:], boxes[rest, 2:]) -
+                        np.maximum(boxes[i, :2], boxes[rest, :2]), 0)
+        intersection = wh[:, 0] * wh[:, 1]
+        union = areas[i] + areas[rest] - intersection
+        overlap = np.divide(intersection, union,
+                            out=np.zeros_like(union), where=union > 0)
+        order = rest[~((ids[rest] == ids[i]) & (overlap > nms_iou))]
+    keep = np.asarray(keep, dtype=np.int64)
+    return (undo_letterbox(boxes[keep], meta), scores[keep],
+            ids[keep].astype(np.int32))
+
+
+def decode_detections(outputs, meta: LetterboxMeta, conf: float, *,
+                      metadata=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Decode an NMS-free end-to-end head into (boxes_xyxy, scores, class_ids).
 
     Takes the engine's full output list and finds the right tensor itself.
@@ -176,6 +219,13 @@ def decode_detections(outputs, meta: LetterboxMeta, conf: float) -> tuple[np.nda
     because every wrong reading of these numbers still produces
     plausible-looking boxes.
     """
+    layout = (metadata or {}).get("detection_layout")
+    if layout == "yolo_dense_v1":
+        return decode_dense_detections(
+            outputs, meta, conf, num_classes=int(metadata["num_classes"]),
+            nms_iou=float(metadata["nms_iou"]), max_det=int(metadata["max_det"]))
+    if layout is not None:
+        raise VisionDecodeError(f"Unsupported detection_layout: {layout}")
     rows = _find_detection_rows(outputs)
     if rows is None:
         shapes = [tuple(a.shape) for a in _as_candidates(outputs)]

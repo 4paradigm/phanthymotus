@@ -3125,6 +3125,17 @@ So the sequence after a model change is: recalibrate with `calibrate`, then put
 the returned `cal_a`/`cal_b` into the card's config. Until you do, `info()`
 reports `model-default` and distances are the engine's own fit.
 
+### Current VOP model: B6, 220 classes
+
+VOP defaults to the frozen B6 `yoloe-26m-det` model: 220 classes, 640 x 640 FP16,
+confidence 0.35, and separate hash-pinned Orin engines for JP5.1.1 and JP6.1.
+Its metadata selects the one-to-many dense decoder with class-aware NMS at
+IoU 0.7. Photo recognition and ROS2 streaming use the same model and decoding.
+See [B6 deployment and validation](benchmarks/vop220/B6.md) for public model
+artifacts, their hashes, reported results, and validation limits.
+
+The timing measurements below describe the earlier 144-class model.
+
 ### Why TensorRT *directly*, and not through ultralytics
 
 End-to-end per frame, batch 1 at 640, **Orin 5 with its containers stopped** so
@@ -3168,7 +3179,7 @@ with its own letterbox and decode, exactly as `plugins/ocr_runtime.py` does.
 ultralytics is a **build-time** dependency now — it exports the engine and
 nothing else.
 
-The decoders assume engines exported with `nms=False`, i.e. YOLO26's NMS-free
+The legacy decoders handle engines exported with `nms=False`, i.e. YOLO26's NMS-free
 end-to-end head whose output is already final boxes. `yoloe-26s-seg` emits two
 tensors: `(1, 300, 38)` — 4 box + score + class + 32 mask coefficients, the
 last 32 ignored — and `(1, 32, 160, 160)` mask prototypes.
@@ -3197,16 +3208,18 @@ weights when it exports; on an exported model `set_classes()` raises. So:
 This is deliberate. A card that silently detects a different set than its
 config states is much worse than one that refuses.
 
-To change what vop detects: edit `ROBOT_EXTRA` in
-`tools/export_vision_engines.py`, rebuild on a host of each JetPack line,
-republish, re-pin.
+To change what vop detects, prepare matching model weights and an ordered
+vocabulary, export and build on each target JetPack runtime, then republish
+and update the bundle pins. `tools/export_vision_engines.py` describes the
+earlier NMS-free model export; B6 uses its declared dense output layout.
 
 The plugin never restates the vocabulary. It reads it from the **engine's own
 metadata** — written by the same export that baked the classes into the
 weights, so it cannot drift out of order or out of date — and falls back to the
 `vocab.json` shipped in the bundle only for an engine built without names.
 
-Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
+Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`,
+`yoloe-26s-seg`, `yoloe-26m`, `yoloe-26m-seg`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
 ### vop's streamed payload: `publish_bbox` and `publish_color`
