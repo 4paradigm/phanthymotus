@@ -1649,12 +1649,12 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     #
     # The accumulator is floored at zero so an opposing turn cannot bank
     # negative credit that a later real sweep has to pay off.
-    measured = (odom or {}).get("wz")
+    measured = _measured_yaw_rate(odom)
     sweep_measured = measured is not None
     if sweep_measured:
         direction = 1.0 if wz >= 0 else -1.0
         state.searched_rad = max(0.0, state.searched_rad
-                                 + float(measured) * direction * dt)
+                                 + measured * direction * dt)
     else:
         # No odometry, or a robot that does not measure yaw rate — `None`, never
         # 0.0, which is the whole reason the format forbids reporting zero for an

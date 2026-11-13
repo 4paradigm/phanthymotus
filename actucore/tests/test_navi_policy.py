@@ -620,6 +620,26 @@ def test_the_sweep_counts_radians_actually_turned_when_odometry_says_so():
     assert state.searched_rad == pytest.approx(0.6, abs=0.01)
 
 
+@pytest.mark.parametrize("measured", [
+    None, True, False, "-0.5", "bad", float("nan"), float("inf"),
+    -float("inf"), [], {}, pytest.param(10 ** 400, id="overflow_int"),
+])
+def test_invalid_search_yaw_falls_back_to_commanded_sweep(measured):
+    config = _cfg(search_rate=1.0, search_sweep_rad=0.25, search_timeout_s=30)
+    state = _state(missing_frames=20, searched_rad=0.1)
+    for expected in (0.2, 0.3):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         odom={"vx": 0.0, "vy": 0.0, "wz": measured},
+                         config=config, state=state, dt=0.1)
+        assert math.isfinite(state.searched_rad)
+        assert state.searched_rad == pytest.approx(expected)
+        if expected == 0.2:
+            assert decision.status == P.SEARCHING and decision.publishes
+            assert decision.values[5] == -1.0
+    assert decision.status == P.FAILED and not decision.publishes
+    assert "commanded, no odometry" in decision.reason
+
+
 def test_a_robot_that_does_not_turn_never_completes_a_sweep():
     """The failure this is for: the sweep ending without the robot moving."""
     config = _cfg(search_sweep_rad=1.0, search_rate=1.0, search_timeout_s=1e6)
