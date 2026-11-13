@@ -2459,8 +2459,17 @@ function _showStartupModal(items) {
   const dots = [];
   const statuses = [];
   const nameEls = [];
-  const topicNames = card => (card.topicOut || [])
-    .map(t => (t.topic || '').split('/').filter(Boolean).pop()).filter(Boolean);
+  const topicNames = card => {
+    const names = [...new Set((card.topicOut || [])
+      .map(t => (t.topic || '').split('/').filter(Boolean).pop()).filter(Boolean))];
+    // Prefer the instance part shared by its channels, e.g. left_rgb/left_depth.
+    let prefix = names.length > 1 ? names[0] : '';
+    for (const name of names.slice(1)) {
+      while (!name.startsWith(prefix)) prefix = prefix.slice(0, -1);
+    }
+    prefix = prefix.replace(/[^_.-]*$/, '').replace(/[_.-]+$/, '');
+    return prefix ? [prefix, ...names] : names;
+  };
   function refreshNames() {
     const cards = items.map(({ card }) => _cards.find(c => c.id === card.id) || card);
     const names = cards.map(card => {

@@ -97,7 +97,7 @@ test('same-tool rows derive distinct names from output topics without device con
       topic: `/robot/wrist_camera/card_${side}/${side}_${channel}`, format: 'image/jpeg',
     })),
   }));
-  assert.deepEqual(modalNames(input), ['wrist_camera · left_rgb', 'wrist_camera · right_rgb']);
+  assert.deepEqual(modalNames(input), ['wrist_camera · left', 'wrist_camera · right']);
 });
 
 test('topic-based naming works for other tools and skips shared outputs', () => {
@@ -175,15 +175,28 @@ for (const status of ['error', 'cancelled']) {
 
 test('an open modal follows live topic swaps without resetting instance status', () => {
   const input = ['a', 'b'].map((id, i) => ({ id, toolName: 'sensor',
-    topicOut: [{ topic: i ? '/s/right_rgb' : '/s/left_rgb' }] }));
+    topicOut: ['rgb', 'depth'].map(channel => ({ topic: `/s/${i ? 'right' : 'left'}_${channel}` })) }));
   const modal = startupModal(input);
   modal.updateItem(0, 'error', 'device unavailable');
   [input[0].topicOut, input[1].topicOut] = [input[1].topicOut, input[0].topicOut];
   modal.document.dispatchEvent(new Event('canvas-topics-updated'));
-  assert.deepEqual(modal.names(), ['sensor · right_rgb', 'sensor · left_rgb']);
+  assert.deepEqual(modal.names(), ['sensor · right', 'sensor · left']);
   assert.equal(modal.rows[0].querySelector('.startup-status').textContent, 'device unavailable');
   modal.close();
   input[0].topicOut = [{ topic: '/s/changed' }];
   modal.document.dispatchEvent(new Event('canvas-topics-updated'));
-  assert.equal(modal.names()[0], 'sensor · right_rgb', 'closed modals release their listener');
+  assert.equal(modal.names()[0], 'sensor · right', 'closed modals release their listener');
+});
+
+test('multi-output instance prefixes are generic and do not require camera channel names', () => {
+  assert.deepEqual(modalNames([
+    { id: 'a', toolName: 'processor', topicOut: [{ topic: '/s/desk-text' }, { topic: '/s/desk-status' }] },
+    { id: 'b', toolName: 'processor', topicOut: [{ topic: '/s/room-text' }, { topic: '/s/room-status' }] },
+  ]), ['processor · desk', 'processor · room']);
+});
+
+test('a shared multi-output prefix is insufficient to distinguish instances', () => {
+  assert.deepEqual(modalNames(['a', 'b'].map(id => ({ id, toolName: 'sensor',
+    topicOut: [{ topic: `/s/${id}/image_rgb` }, { topic: `/s/${id}/image_depth` }] }))),
+    ['sensor · a', 'sensor · b']);
 });
