@@ -128,7 +128,7 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 前进P默认 0.9，转向P默认 0.6，搜索转速默认 0.6rad/s。这些不再放到
 画布配置表单中。`navi` 启动时从下游 `control_interface` 读取速度上限、
 横移能力、死区和可选的 `response.wz`，再得到实际有效值。因此机器人差异属于
-Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协商后的只读值。
+Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协商后的实际值。
 
 设置默认停止距离：
 
@@ -142,7 +142,11 @@ Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协
 }
 ```
 
-`config` 只更新默认停止距离；容器重启后保留设置需保存到画布或部署 YAML。
+画布/LLM 的 `config` 表单只提供默认停止距离。显式 dispatch/API 调用还支持
+`obstacle_stop_m`、`slow_distance_m`、`align_full_stop`、`vx_max`、`vy_max`、
+`wz_max`、`search_rate` 和 `use_lateral`；速度、搜索转速及横移能力仍受下游
+Driver 声明约束，显式 `use_lateral: false` 不会被硬件能力声明重新开启。
+容器重启后保留设置需保存到画布或部署 YAML。
 
 `stop_tolerance_m` 也可在 `navigate_to` 动作中单次指定。到达的距离条件为
 `距离 <= stop_distance_m + stop_tolerance_m`：例如停止距离 1.2 m、容差 0.1 m，
@@ -168,20 +172,31 @@ Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协
 
 若下游 Driver 在 `control_interface.response.wz` 声明 `source`、`gain`、
 `delay_s` 和 `settling_s`，navi 会据此派生有效转向 P。`source` 只接受
-`measured`、`vendor-spec` 或 `estimate`；声明缺失或无效时回到通用 0.6。
+`measured`、`vendor-spec` 或 `estimate`；声明缺失或无效时回到启动配置的
+`k_yaw`（默认 0.6）及所选调度模式。
 速度范围、横移能力、搜索转速上限和死区同样来自 Driver 描述符。
-`info.gains.yaw.source` 为 `driver_response` 或 `adaptive_default`，
-并在 `info.config` 中显示最终采用的只读值。
+`info.gains.yaw.source` 为 `driver_response` 或 `adaptive_default`；显式关闭
+自适应且没有有效 Driver 响应时为 `configured_default`。
+Driver 响应派生的转向 P 同样用于避障绕行，绕行不使用目标偏移调度。
+搜索转速按静止偏航死区和双向上限协商，确保无里程计时的扫角累计与实际输出一致；
+双向上限不足以越过死区时明确失败，显式零搜索转速仍禁用搜索。
+`info.config` 显示最终采用的实际值。
 
 接入 `state/odom` 时，Agent Core 会把上游 `odom_interface` 按实际话题传给 navi。
 navi 校验 `motus.odom/1` 契约（`timing.stamp_source` 只接受 `robot` 或
-`received`），并按 `rate_hz`、`timing.stamp_source` 和
-`timing.max_measurement_delay_ms` 计算里程计有效期：
-`max(100ms, 3 × 周期 + 最大测量延迟)`。旧 Driver 未声明或声明无效时使用
-通用 `max_obs_age_ms`（默认 1000ms），并在
-`degraded` 中说明；缺失声明不会阻断项目启动。
-检测和深度观测也使用 `max_obs_age_ms`：1000ms 仍有效，超过 1000ms 时停止发布
-运动指令，交给下游 watchdog 停车；有效的 odom timing 不随此配置放宽。
+`received`），并按生产者声明计算里程计有效期：
+
+- 声明有效 `max_measurement_delay_ms` 时：`max(100ms, 3 × 周期 + 最大测量延迟)`。
+- 合法省略测量延迟时：`max(100ms, 3 × 周期, 协商后的 max_obs_age_ms)`，
+  保留有效生产者时间戳，并在 `degraded` 中提示未声明测量延迟。
+- 旧 Driver 缺失声明或声明无效时：回退到协商后的 `max_obs_age_ms` 和本地接收时间，
+  并提示降级；不会阻断项目启动。
+
+检测和深度观测的 `max_obs_age_ms` 默认 **500ms**；下游声明
+`control_interface.rate.max_obs_age_ms` 时取自身配置与下游上限的较小值。
+默认配置下 500ms 仍有效，超过 500ms 时停止发布运动指令，交给下游 watchdog 停车。
+例如显式配置 1000ms、下游上限 600ms 时，实际采用 600ms；默认 500ms 则仍采用
+500ms。已声明有效测量延迟的 odom timing 独立计算，不随视觉有效期放宽。
 `info.config.max_obs_age_ms` 返回实际观测有效期，便于部署后核对。
 `info.config` 同时返回实际 `obstacle_stop_m`、`slow_distance_m` 和
 `arrival_distance_m`。若障碍停车距离达到或超过到达阈值，`degraded` 会提示目标可能
