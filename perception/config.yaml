@@ -536,6 +536,19 @@ plugins:
     # 画布上这张卡的作用是对它下命令（命名、查名单、听样本、删人）。start 会预加载
     # 模型（否则第一句话要多等 1-2 秒），stop 会停止给语音附加身份、也停止建新声纹。
 
+  # Generic camera processor; models load on start, inside the shared ORT child.
+  privacy_view:
+    enabled: true
+    mode: opaque
+    device: cpu
+    detect_fps: 10.0
+    confidence_threshold: 0.5
+    bbox_padding: 0.25
+    pixelate_strength: 16
+    gaussian_strength: 51
+    inference_timeout_s: 2.0
+    max_frame_age_s: 2.0
+
   face_recognition:
     enabled: true
     # Which detector+recogniser pair to run. The registry is

@@ -77,6 +77,11 @@ class _FakeNode:
         self.subscriptions.append(subscription)
         return subscription
 
+    def create_timer(self, period, callback):
+        # Unit tests drive timer callbacks explicitly; real timer scheduling
+        # and reclamation belong to the separate DDS integration suite.
+        return types.SimpleNamespace(timer_period_sec=period, callback=callback)
+
     def destroy_subscription(self, subscription):
         # Plugins drop the subscription on stop() and recreate it on the next
         # start(); the tests assert on what is left registered here.
