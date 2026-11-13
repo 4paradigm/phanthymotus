@@ -99,15 +99,14 @@ def test_each_model_downloads_into_its_own_directory(monkeypatch):
                         seen.append((model_dir, base_url, sorted(files))) or {})
     monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
     for model in md.VOP_MODEL_BUNDLES:
-        md.ensure_vop_model("/models/vop", model=model, family="jp61") \
-            if all(f["sha256"] for f in md.VOP_MODEL_BUNDLES[model]["jp61"]["files"].values()) \
-            else None
+        for family in ("jp61", "jp511"):
+            md.ensure_vop_model("/models/vop", model=model, family=family)
+    assert len(seen) == 2 * len(md.VOP_MODEL_BUNDLES)
     for model_dir, base_url, files in seen:
         model = model_dir.rsplit("/", 1)[1]
         assert model_dir == f"/models/vop/{model}"
         assert base_url.startswith(md.VISION_MODEL_BASE + f"/{model}/")
         assert files == sorted([f"{model}.engine", "vocab.json"])
-    assert seen
 
 
 def test_an_unknown_model_is_refused_by_the_downloader():

@@ -1315,10 +1315,13 @@ VOP_MODEL_BUNDLES = {
     # NMS-free head and same decoder — a bigger model, not a different one.
     "yoloe-26m-seg": _vop_bundles(
         "yoloe-26m-seg",
-        {"size": 0, "sha256": ""},
+        {"size": 1969,
+         "sha256": "05fa1b5aacf69d7bc47e07ff787980984ba56b6a08778431137ccb9a2f47b5ff"},
         {
-            "jp61": {"size": 0, "sha256": ""},
-            "jp511": {"size": 0, "sha256": ""},
+            "jp61": {"size": 51475372,
+                     "sha256": "c7accc12499f77119fb3b8b1068a173f9a6fa93ccff71a4314ef6f65d46c6528"},
+            "jp511": {"size": 50562344,
+                      "sha256": "6ab05e8dbe375519209165986f26e03b95d3ecab78b3116a4d1003bf2055218b"},
         },
     ),
 }
