@@ -661,8 +661,7 @@ async def _do_start_project_impl():
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
                                  control_interface: dict = None,
-                                 camera_info: dict = None,
-                                 odom_interfaces: dict = None):
+                                 camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -714,13 +713,6 @@ async def _do_start_project_impl():
             # frame, and reports in `info().degraded` what it had to assume when
             # a source declared nothing.
             args['camera_info'] = camera_info
-
-        if odom_interfaces:
-            # Timing belongs to the producer of each concrete state stream.
-            # Keep it keyed by the resolved topic for the same reason camera
-            # declarations are: a multi-input consumer binds roles by content,
-            # not by source-card name or connection order.
-            args['odom_interfaces'] = odom_interfaces
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -968,28 +960,6 @@ async def _do_start_project_impl():
                     out[topic] = entry
         return out
 
-    def _upstream_odom_interfaces(card_id: str) -> dict:
-        """Driver-owned odometry contracts keyed by the actual wired topic.
-
-        This reuses upstream ``info()`` replies already collected in dependency
-        order. Missing or malformed declarations are optional and never block
-        project startup; the consumer keeps its backwards-compatible freshness
-        fallback and reports the degradation itself.
-        """
-        out: dict = {}
-        for conn in [c for c in connections if c.get('toCardId') == card_id]:
-            topic = _topic_of_connection(conn)
-            source = resolved_info.get(conn.get('fromCardId')) or {}
-            fmt = next((port.get('format') for port in source.get('topic_out') or []
-                        if isinstance(port, dict) and port.get('topic') == topic
-                        and port.get('format')), conn.get('format'))
-            if fmt != 'state/odom':
-                continue
-            interface = source.get('odom_interface')
-            if topic and isinstance(interface, dict) and interface and topic not in out:
-                out[topic] = dict(interface)
-        return out
-
     async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
         """The action space of whatever this card's `control/*` output feeds.
 
@@ -1117,8 +1087,7 @@ async def _do_start_project_impl():
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
-                                 camera_info=_upstream_camera_info(card.get('id', '')),
-                                 odom_interfaces=_upstream_odom_interfaces(card.get('id', '')))
+                                 camera_info=_upstream_camera_info(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:

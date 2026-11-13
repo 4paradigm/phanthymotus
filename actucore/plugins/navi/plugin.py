@@ -500,7 +500,7 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
-        # Agent Core carries producer contracts keyed by the actual wired
+        # Callers may supply producer contracts keyed by the actual wired
         # topic.  Selecting only after role binding prevents a second odometry
         # producer on the canvas from donating timing to the wrong stream.
         interfaces = args.get("odom_interfaces") or {}

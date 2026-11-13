@@ -34,13 +34,11 @@ import config  # noqa: E402
 
 
 CAM, CAM2 = 'card-cam', 'card-cam2'
-DEPTH, VOP, NAVI, MIC, ODOM = ('card-depth', 'card-vop', 'card-navi',
-                              'card-mic', 'card-odom')
+DEPTH, VOP, NAVI, MIC = 'card-depth', 'card-vop', 'card-navi', 'card-mic'
 
 CAM_TOPIC, CAM2_TOPIC = '/ubuntu/camera/main', '/ubuntu/camera/side'
 DEPTH_TOPIC = '/ubuntu/camera/main/visual_depth'
 OBJECTS_TOPIC = '/ubuntu/camera/main/objects'
-ODOM_TOPIC = '/ubuntu/state/odom'
 
 
 def _decl(topic, **over):
@@ -64,9 +62,9 @@ def _card(cid, tool):
     return {'id': cid, 'toolName': tool, 'mcpId': f'mcp-{tool}'}
 
 
-def _conn(src, dst, topic, fmt='data/json'):
+def _conn(src, dst, topic):
     return {'fromCardId': src, 'toCardId': dst, 'fromPortIdx': '0',
-            'toPortIdx': '0', 'format': fmt, 'fromTopic': topic}
+            'toPortIdx': '0', 'format': 'data/json', 'fromTopic': topic}
 
 
 @pytest.fixture
@@ -81,12 +79,10 @@ def rig(monkeypatch):
         DEPTH: [{'topic': DEPTH_TOPIC, 'format': 'image/depth-zlib'}],
         VOP:   [{'topic': OBJECTS_TOPIC, 'format': 'data/json'}],
         MIC:   [{'topic': '/ubuntu/mic', 'format': 'audio/pcm-16k'}],
-        ODOM:  [{'topic': ODOM_TOPIC, 'format': 'state/odom'}],
     }
     # Set by individual tests. A card absent from here declares nothing, which
     # is the normal case for almost every card in the repository.
     declarations: dict = {}
-    odom_declarations: dict = {}
 
     async def _call(mcp_id, req, timeout_s=None):
         args = dict(req.arguments)
@@ -99,8 +95,6 @@ def rig(monkeypatch):
             data = {'state': 'idle', 'topic_out': topic_outs.get(card_id, [])}
             if card_id in declarations:
                 data['camera_info'] = declarations[card_id]
-            if card_id in odom_declarations:
-                data['odom_interface'] = odom_declarations[card_id]
             return {'code': 200, 'data': data}
         return {'code': 200, 'data': {'state': 'idle'}}
 
@@ -137,8 +131,7 @@ def rig(monkeypatch):
         monkeypatch.setitem(sys.modules, name, mod)
 
     return types.SimpleNamespace(starts=starts, events=events, infos=infos,
-                                 declarations=declarations,
-                                 odom_declarations=odom_declarations)
+                                 declarations=declarations)
 
 
 def _run(layout) -> bool:
@@ -285,51 +278,3 @@ def test_no_extra_round_trip_is_taken_for_it(rig):
 
     assert rig.infos, 'info() 一次都没被调用 —— 这条测试在空转'
     assert rig.infos.count(CAM) == 1, f'camera 被 info() 了 {rig.infos.count(CAM)} 次'
-
-
-# ── odometry timing follows the same upstream-info path ─────────────────────
-
-@pytest.mark.parametrize('persisted_format', ['state/odom', None, 'data/json'])
-def test_odom_interface_reaches_navi_keyed_by_resolved_topic(rig, persisted_format):
-    interface = {
-        'schema': 'motus.odom/1',
-        'rate_hz': 10,
-        'timing': {'max_measurement_delay_ms': 120,
-                   'stamp_source': 'received'},
-    }
-    rig.odom_declarations[ODOM] = interface
-    connection = _conn(ODOM, NAVI, '/stale/odom', persisted_format)
-    if persisted_format is None:
-        del connection['format']
-    layout = {
-        'cards': [_card(ODOM, 'loco_state'), _card(NAVI, 'navi')],
-        # The canvas snapshot may be stale; the key must follow the source's
-        # live resolved topic, exactly like the input_topic sent to navi.
-        'connections': [connection],
-    }
-    _run(layout)
-
-    assert rig.starts[NAVI]['odom_interfaces'] == {ODOM_TOPIC: interface}
-    assert rig.infos.count(ODOM) == 1
-
-
-def test_missing_odom_interface_is_optional(rig):
-    layout = {
-        'cards': [_card(ODOM, 'loco_state'), _card(NAVI, 'navi')],
-        'connections': [_conn(ODOM, NAVI, ODOM_TOPIC, 'state/odom')],
-    }
-    assert _run(layout) is not False
-    assert 'odom_interfaces' not in rig.starts[NAVI]
-
-
-@pytest.mark.parametrize('persisted_format', ['data/json', 'state/odom'])
-def test_non_odom_connection_does_not_donate_odom_interface(rig, persisted_format):
-    rig.odom_declarations[CAM] = {'schema': 'motus.odom/1', 'rate_hz': 10,
-                                  'timing': {'stamp_source': 'received'}}
-    layout = {
-        'cards': [_card(CAM, 'camera'), _card(NAVI, 'navi')],
-        'connections': [_conn(CAM, NAVI, CAM_TOPIC, persisted_format)],
-    }
-    _run(layout)
-
-    assert 'odom_interfaces' not in rig.starts[NAVI]

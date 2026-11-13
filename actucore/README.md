@@ -183,8 +183,13 @@ Driver 响应派生的固定转向 P 同样用于避障绕行。
 双向上限不足以越过死区时明确失败，显式零搜索转速仍禁用搜索。
 `info.config` 显示最终采用的实际值。
 
-接入 `state/odom` 时，Agent Core 会把上游 `odom_interface` 按实际话题传给 navi。
-navi 校验 `motus.odom/1` 契约（`timing.stamp_source` 只接受 `robot` 或
+接入 `state/odom` 后，navi 仍订阅并使用里程计数据。本 PR 不包含 Agent Core 的
+`odom_interface` 自动转发改动；启动调用方未传入时序声明时，navi 使用本地接收时间
+和协商后的 `max_obs_age_ms`（默认 500ms），并在 `degraded` 中提示降级。
+这不会校验样本在生产者端已经经过的时间，消息积压时可能把旧里程计当作新数据。
+
+若启动调用方显式通过按话题索引的 `odom_interfaces` 传入声明，
+navi 会校验 `motus.odom/1` 契约（`timing.stamp_source` 只接受 `robot` 或
 `received`），并按生产者声明计算里程计有效期：
 
 - 声明有效 `max_measurement_delay_ms` 时：`max(100ms, 3 × 周期 + 最大测量延迟)`。
