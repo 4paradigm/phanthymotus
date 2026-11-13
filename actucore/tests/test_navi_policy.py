@@ -1220,9 +1220,9 @@ def test_the_sign_survives():
 
 
 def test_the_default_search_rate_clears_a_typical_deadband():
-    """The generic search request clears the typical standing yaw floor."""
+    """The shared deadband lifts the default search request when necessary."""
     rate = P.Config().search_rate
-    assert rate == 1.0
+    assert rate == 0.6
     assert P.apply_deadband([0, 0, 0, 0, 0, -rate], _R1)[5] != 0.0
 
 
@@ -2079,12 +2079,12 @@ def test_fixed_forward_rejects_invalid_baseline_gain(gain):
 
 # ── bounded bearing-P yaw schedule ────────────────────────────────────────
 
-def test_default_gains_preserve_fixed_generic_controllers():
+def test_default_gains_use_adaptive_yaw_and_fixed_forward_point_nine():
     config = _cfg()
-    assert config.k_fwd == 0.6
+    assert config.k_fwd == 0.9
     assert config.adaptive_k_fwd is False
-    assert config.k_yaw == 1.2
-    assert config.adaptive_k_yaw is False
+    assert config.k_yaw == 0.6
+    assert config.adaptive_k_yaw is True
 
 
 def test_yaw_schedule_has_a_lower_gain_near_centre_and_never_exceeds_nominal():
@@ -2306,7 +2306,7 @@ def test_driver_response_target_gain_is_fixed_independent_of_bearing_schedule(ad
                               (-0.1, False, 0.1), (0.2, True, 5.0)):
         assert P._yaw_gain(config, state, bearing, live, dt) == 0.7
         assert state.adaptive_yaw_scale == 1.0
-    assert config.k_yaw == 1.2  # Nominal gap-turn gain was not overwritten.
+    assert config.k_yaw == 0.6  # Nominal gap-turn gain was not overwritten.
 
 
 @pytest.mark.parametrize("bearing", [-0.2, 0.2])
@@ -2409,7 +2409,7 @@ def test_absent_driver_response_keeps_the_configured_gain():
     config = _cfg()
     assert P.adopt_response(config, {}) == []
     assert config.response_yaw_gain is None
-    assert config.k_yaw == 1.2
+    assert config.k_yaw == 0.6
 
 
 @pytest.mark.parametrize("response", [
@@ -2432,4 +2432,4 @@ def test_invalid_driver_response_falls_back_to_generic_yaw(response):
     config = _cfg()
     notes = P.adopt_response(config, {"response": response})
     assert config.response_yaw_gain is None
-    assert len(notes) == 1 and "1.2" in notes[0]
+    assert len(notes) == 1 and "0.6" in notes[0]

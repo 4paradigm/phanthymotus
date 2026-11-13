@@ -709,13 +709,13 @@ def test_driver_owned_controls_are_not_public_parameters():
 
 def test_generic_defaults_are_visible_only_in_info():
     info = _card()._info()
-    assert info["config"]["k_yaw"] == 1.2
-    assert info["config"]["k_fwd"] == 0.6
-    assert info["config"]["search_rate"] == 1.0
+    assert info["config"]["k_yaw"] == 0.6
+    assert info["config"]["k_fwd"] == 0.9
+    assert info["config"]["search_rate"] == 0.6
     assert info["config"]["max_obs_age_ms"] == 500
     assert info["config"]["stop_tolerance_m"] == 0.05
     assert info["config"]["arrival_distance_m"] == pytest.approx(0.85)
-    assert info["gains"]["yaw"]["source"] == "configured_default"
+    assert info["gains"]["yaw"]["source"] == "adaptive_default"
 
 
 def _running_generic_card(**cfg):
@@ -778,9 +778,9 @@ def test_absent_or_invalid_driver_response_keeps_configured_gain(response):
     notes = navi_plugin.policy_mod.adopt_response(
         card._config, _descriptor(response=response))
     assert card._config.response_yaw_gain is None
-    assert card._info()["gains"]["yaw"]["base"] == 1.2
+    assert card._info()["gains"]["yaw"]["base"] == 0.6
     if response:
-        assert len(notes) == 1 and "1.2" in notes[0]
+        assert len(notes) == 1 and "0.6" in notes[0]
     else:
         assert notes == []
 

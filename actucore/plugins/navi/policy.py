@@ -155,10 +155,10 @@ class Config:
     # above 0 keeps the robot moving through the correction, which is what makes
     # the path an arc instead of a sequence of stops.
     align_min_scale: float = 0.45
-    k_yaw: float = 1.2
-    k_fwd: float = 0.6
+    k_yaw: float = 0.6
+    k_fwd: float = 0.9
     adaptive_k_fwd: bool = False
-    adaptive_k_yaw: bool = False
+    adaptive_k_yaw: bool = True
     # Optional effective P derived from the downstream Driver's declared yaw
     # response.  Navi never measures or persists a robot-specific plant model;
     # the component that owns the hardware owns that declaration.
@@ -209,7 +209,7 @@ class Config:
     # turn that has only just started.
     min_dwell_s: float = 0.25
     # Driver limits fit this rate to the executable bidirectional yaw envelope.
-    search_rate: float = 1.0
+    search_rate: float = 0.6
     # Backstop only. The sweep below is what normally ends a search, because it
     # is behavioural — "I have turned all the way round and it is not here" —
     # whereas a clock says nothing about what the robot did with the time.
