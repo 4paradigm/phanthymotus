@@ -50,7 +50,7 @@ def rpc(url, method, params=None, *, timeout=4):
     return result["result"]
 
 
-def handler(plugin):
+def handler(plugin, evidence_dir=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -85,7 +85,7 @@ def handler(plugin):
                 self.send({"error": "not found"}, 404)
 
         def do_POST(self):
-            if self.path != "/mcp":
+            if self.path not in ("/mcp", "/evidence"):
                 self.send({"error": "not found"}, 404)
                 return
             rid = None
@@ -106,6 +106,38 @@ def handler(plugin):
                 length = int(self.headers.get("Content-Length", "0"))
                 need(0 < length <= 1024 * 1024, "REQUEST_TOO_LARGE")
                 request = loads(self.rfile.read(length))
+                if self.path == "/evidence":
+                    from .evidence import save_session
+
+                    need(evidence_dir is not None, "EVIDENCE_DIRECTORY_NOT_CONFIGURED")
+                    need(isinstance(request, dict), "INVALID_ARGUMENTS")
+                    exported = plugin.dispatch(
+                        NAME,
+                        {
+                            "action": "export_session",
+                            "session_id": request.get("session_id"),
+                            "session_token": request.get("session_token"),
+                        },
+                    )
+                    need(
+                        exported.get("state") != "error",
+                        exported.get("code", "EXPORT_FAILED"),
+                    )
+                    browser_logs = request.get("browser_logs", "")
+                    need(
+                        isinstance(browser_logs, str) and len(browser_logs) <= 16000,
+                        "INVALID_BROWSER_LOGS",
+                    )
+                    exported["browser_logs"] = browser_logs
+                    self.send(
+                        save_session(
+                            exported,
+                            evidence_dir,
+                            request.get("expected"),
+                            request.get("notes", ""),
+                        )
+                    )
+                    return
                 need(isinstance(request, dict), "INVALID_RPC")
                 rid = request.get("id")
                 need(request.get("jsonrpc") == "2.0", "INVALID_RPC")
@@ -174,11 +206,16 @@ def main():
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--host", default="127.0.0.1", choices=["127.0.0.1"])
     p.add_argument("--port", type=int, default=18084)
+    p.add_argument(
+        "--evidence-dir", type=Path, help="Existing personal evidence directory"
+    )
     args = p.parse_args()
     from .plugin import TabletopROIGoalVerifierPlugin
 
     plugin = TabletopROIGoalVerifierPlugin(loads(args.config.read_text()))
-    server = ThreadingHTTPServer((args.host, args.port), handler(plugin))
+    server = ThreadingHTTPServer(
+        (args.host, args.port), handler(plugin, args.evidence_dir)
+    )
 
     def stop(*_):
         threading.Thread(target=server.shutdown, daemon=True).start()

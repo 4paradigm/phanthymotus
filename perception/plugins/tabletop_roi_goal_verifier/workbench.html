@@ -16,6 +16,9 @@ body{font:14px system-ui;background:#162230;color:#e7edf5;padding:18px;margin:0}
 <label>任务标识 <input id="task" value="tabletop-roi-test"></label>
 <button id="session">1. 创建会话</button><button id="before">2. 记录操作前状态</button>
 <button id="mark">3. 标记操作完成</button><button id="after">4. 获取新观测并验证</button>
+<label>现场测试预期 <select id="expected"><option>FAIL</option><option>PASS</option><option>INCONCLUSIVE</option></select></label>
+<label>现场备注 <input id="notes" placeholder="人工放入瓶子/移开手/遮挡等"></label>
+<button id="save-field">保存现场证据到服务目录</button>
 <button id="reset">重置会话</button><button id="export">导出证据 JSON</button><button id="stop">关闭订阅及会话</button>
 </section><section><div id="result">尚未验证</div><canvas id="view" width="640" height="480"></canvas>
 <p id="measurement" class="note"></p><div id="roi-evidence" hidden><label>操作前 ROI</label><img id="roi-before" alt="操作前 ROI"><label>操作后 ROI</label><img id="roi-after" alt="操作后 ROI"></div>
@@ -49,10 +52,11 @@ bind('mark',async()=>{marker=show(await call({action:'mark_operation_complete',r
 bind('after',async()=>{if(!marker)throw Error('先标记操作完成');const r=show(await call({action:'verify_after',request_id:rid(),...identity(),marker_id:marker.marker_id}));evidence(r);});
 bind('reset',async()=>{session=show(await call({action:'reset_session',request_id:rid(),...identity()}));marker=null;clearResult();});
 bind('export',async()=>{const r=show(await call({action:'export_session',...identity()}));el('export-data').value=JSON.stringify({...r,browser_logs:el('logs').textContent},null,2);el('export-panel').open=true;el('export-data').select();});
+bind('save-field',async()=>{if(window!==window.top)throw Error('请在独立服务页面保存现场证据，或导出 JSON');const response=await fetch('/evidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...identity(),expected:v('expected'),notes:v('notes'),browser_logs:el('logs').textContent})});const r=await response.json();if(r.error)throw Error(r.error.message);show(r);});
 bind('stop',async()=>{live=false;show(await call({action:'stop'}));session=marker=null;clearResult();});
 for(const id of ['roi-region','roi-threshold','roi-area','roi-frames','task'])el(id).onchange=invalidate;
 el('source').onchange=()=>{invalidate();lastObservation=bitmap=null;el('roi-region').value='';draw();};
-async function init(){if(initialized)return;initialized=true;try{const info=show(await call({action:'info'}));el('binding').textContent=info.verifier_id+' · '+info.api_version;for(const s of info.sources){const o=document.createElement('option');o.value=s.source_id;o.textContent=s.source_id+' / '+s.camera_id+' / '+s.provenance;el('source').append(o);}}catch(e){log(e.message);el('state').textContent=e.message;}}
+async function init(){el('save-field').hidden=window!==window.top;if(initialized)return;initialized=true;try{const info=show(await call({action:'info'}));el('binding').textContent=info.verifier_id+' · '+info.api_version;for(const s of info.sources){const o=document.createElement('option');o.value=s.source_id;o.textContent=s.source_id+' / '+s.camera_id+' / '+s.provenance;el('source').append(o);}}catch(e){log(e.message);el('state').textContent=e.message;}}
 window.addEventListener('message',e=>{if(e.source!==parent||e.data?.protocol!=='motus.workbench/1'||!e.ports[0]||port)return;port=e.ports[0];port.onmessage=ev=>{const r=ev.data,w=waiting.get(r.id);if(w){waiting.delete(r.id);clearTimeout(w.timeout);r.error?w.reject(Error(r.error)):w.resolve(r.result);}};port.start();init();});
 if(window===window.top)init();
 })();

@@ -18,6 +18,11 @@ def validate(config):
         text(key)
         need(b["source_id"] == key, "SOURCE_BINDING_MISMATCH")
         for field in ("camera_id", "frame_id", "view_id", "fixed_view_record"):
+            need(
+                isinstance(b.get(field), str) and bool(b[field].strip()),
+                "CAMERA_BINDING_REQUIRED",
+                f"请填写已核实的 sources.{key}.{field}",
+            )
             text(b[field])
         need(b.get("view_mode") == "fixed", "VIEW_EVIDENCE_REQUIRED")
         need(b["distortion"] in ("raw", "rectified"), "DISTORTION_REQUIRED")
@@ -40,6 +45,12 @@ def validate(config):
             )
         else:
             need(b.get("stamp_semantics") == "capture", "CAPTURE_TIME_UNPROVEN")
+            need(
+                isinstance(b.get("capture_time_record"), str)
+                and bool(b["capture_time_record"].strip()),
+                "CAPTURE_TIME_UNPROVEN",
+                f"请填写 sources.{key}.capture_time_record 的真实核实记录",
+            )
             text(b["capture_time_record"])
             text(b["topic"])
             need(b["topic"].startswith("/"), "INVALID_TOPIC")

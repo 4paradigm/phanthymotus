@@ -42,7 +42,10 @@ def main():
                 if exc.code != "SOURCE_CLOSED":
                     raise
 
-    class Host(handler(card)):
+    evidence_root = args.output / "evidence"
+    evidence_root.mkdir(exist_ok=True)
+
+    class Host(handler(card, evidence_root)):
         def do_GET(self):
             if self.path == "/core-test":
                 data = b"""<script type="module">
@@ -170,6 +173,15 @@ def main():
                     (args.output / f"{host}-{expected}.json").write_text(
                         json.dumps(evidence, indent=2)
                     )
+                    if host == "standalone":
+                        frame.locator("#expected").select_option(expected)
+                        frame.locator("#notes").fill("SYNTHETIC browser test only")
+                        frame.locator("#save-field").click()
+                        frame.locator("#state").filter(
+                            has_text='"state": "saved"'
+                        ).wait_for()
+                        saved = json.loads(frame.locator("#state").inner_text())
+                        assert Path(saved["directory"], "session.json").exists()
                     page.screenshot(
                         path=str(args.output / f"{host}-{expected}.png"), full_page=True
                     )

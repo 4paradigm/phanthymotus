@@ -170,16 +170,25 @@ def test_compressed_ros_image_callback_to_roi_without_detector():
             card, "mark_operation_complete", request_id=uuid4().hex, **identity
         )
         send(picture(True))
-        timer = threading.Timer(0.03, lambda: send(picture(True)))
-        timer.start()
-        result = invoke(
-            card,
-            "verify_after",
-            request_id=uuid4().hex,
-            marker_id=marker["marker_id"],
-            **identity,
-        )
-        timer.join()
+        halt = threading.Event()
+
+        def stream():
+            while not halt.wait(0.03):
+                send(picture(True))
+
+        producer = threading.Thread(target=stream)
+        producer.start()
+        try:
+            result = invoke(
+                card,
+                "verify_after",
+                request_id=uuid4().hex,
+                marker_id=marker["marker_id"],
+                **identity,
+            )
+        finally:
+            halt.set()
+            producer.join(1)
         assert result["result"] == "PASS" and result["provenance"] == "synthetic"
     finally:
         card.stop()

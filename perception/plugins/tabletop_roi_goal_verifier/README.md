@@ -59,3 +59,17 @@ python3 perception/tools/tabletop_roi_browser.py --output /tmp/roi-browser --chr
 不依赖 `plugins/goal_verifier`，可先于 #374 合并。Object Card 检查被选择物体的目标位置；本 Card 判断区域前后视觉状态变化。它不做单帧物体在场检测，也不包装 VOP。当前上游代码搜索没有发现 `region_presence` 标识；如未来加入相似能力，应按输入证据与跨操作会话语义比较。
 
 若将来决定整合到 Object Card，可以迁移 `roi.py` 与独立 Sources/Engine 的 ROI 调用；本次不执行备用整合，也不承诺两个接口可直接互换。
+
+## D435 现场 kit
+
+一键安装、启动/停止、只读 Doctor、Windows SSH 转发和三态采集步骤见 [deploy/field/ONSITE.md](deploy/field/ONSITE.md)。现场模板的序列号/topic 是历史期望；相机身份、固定视角和采集语义必须现场核实，记录字段留空时拒绝启动。
+
+kit 包含 CPython 3.10 的 x86_64/aarch64 离线 wheel 和 pip bootstrap，无需系统 pip、ensurepip、sudo 或公共服务。默认新目录、端口 18084，冲突时选择后续空闲端口。独立页面可将本次结果、ROI 图、参数、时间、session 和页面日志保存到个人 evidence/，去除 session token。只会停止本目录记录且进程身份匹配的服务。
+
+从预先下载的 wheel 目录重建交付：
+
+```bash
+python3 perception/tools/package_tabletop_roi_field.py --wheels-dir /path/to/wheel-input --output /path/to/new-artifacts/d435-field
+```
+
+当前为现场工具 Ready，未完成真实 D435 验收；aarch64 只准备了匹配 wheel，尚无该架构运行记录。
