@@ -34,5 +34,11 @@ def _register_builtin_adapters():
     except ImportError as e:
         print(f'[channel] lan adapter unavailable ({e})')
 
+    try:
+        from channel.adapters.qq_onebot import QQOneBotAdapter
+        register_adapter('qq', QQOneBotAdapter)
+    except ImportError:
+        print('[channel] QQ adapter unavailable (missing aiohttp)')
+
 
 _register_builtin_adapters()
