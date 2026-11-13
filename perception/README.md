@@ -12,6 +12,16 @@ the local TTS engines run on TensorRT.
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
 
+### Whisper Turbo Q5
+
+Select `asr_model: whisper-turbo-q5` with `device: gpu` to use the optional
+whisper.cpp CUDA backend. The first valid `start` downloads any missing pinned
+runtime/model files and initializes the worker; `info` and `config` do not
+preload it. During recognition, one base model and the published Japanese,
+Thai and Russian adapters stay loaded, and automatic language identification
+selects the matching adapter for each segment. Other supported languages use
+the base model.
+
 ### ROS2 Message Type
 
 ```
@@ -94,6 +104,13 @@ token is unavailable. If timing is unavailable, a wake word at the utterance
 start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
 and wake triggering continue normally. Check token timing accuracy on the
 robot; the timestamps do not establish the physical alignment error by themselves.
+
+Whisper Turbo Q5 does not provide word or token timestamps. Text wake-word
+matching still works. Wake direction follows the no-timing rule above: a wake
+word at the utterance start can use the VAD onset, while a spoken prefix before
+the wake word returns `unknown`. Use a timestamp-capable backend when wake
+direction must be matched after other speech.
+
 Direction history keeps up to 60 seconds / 1201 events, covering a 30-second
 VAD segment plus queueing margin at Bumi's maximum 20 Hz publication rate.
 The worker snapshots history before transcription, so later direction events
