@@ -146,7 +146,10 @@ def test_rejected_visual_recovery_does_not_refresh_outage_clock():
 
 def test_accepted_recovery_correction_refreshes_timeout_before_tracking_promotion():
     c, t = warmed()
-    for i in range(1, 221):
+    # An actual missing correction starts recovery; a normal 300 ms capture
+    # interval alone no longer does so.
+    advance(c, t, .05)
+    for i in range(11, 221):
         stamp = t+i*5_000_000
         c.observe_imu(source(stamp), stamp)
     frame, now = t+300_000_000, t+1_100_000_000

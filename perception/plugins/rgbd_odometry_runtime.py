@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 import zlib
 
 import numpy as np
@@ -170,6 +171,32 @@ class EstimateGate:
         self.state, self.reason, self.recover_by = 'tracking', None, None
         self.last_pose = (stamp, position, rotation)
         return sample
+
+
+def estimator_environment(directory):
+    """Give only the native child room for fragmented RGBDImage UDP bursts."""
+    env = dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
+    profile = env.get('FASTRTPS_DEFAULT_PROFILES_FILE')
+    if not profile:
+        return env
+    tree = ET.parse(profile)
+    changed = False
+    for transport in tree.findall('.//{*}transport_descriptor'):
+        kind = transport.find('{*}type')
+        if kind is None or kind.text != 'UDPv4':
+            continue
+        size = transport.find('{*}receiveBufferSize')
+        if size is None:
+            prefix = transport.tag.rpartition('}')[0] + '}' if '}' in transport.tag else ''
+            size = ET.SubElement(transport, prefix+'receiveBufferSize')
+        size.text = str(max(1048576, int(size.text or '0')))
+        changed = True
+    if changed:
+        path = Path(directory)/'native-dds.xml'
+        ET.register_namespace('', 'http://www.eprosima.com')
+        tree.write(path, encoding='unicode')
+        env['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(path)
+    return env
 
 
 def estimator_parameters(calibration, segment):
@@ -398,7 +425,7 @@ class RgbdSession:
             if self.imu is not None and self.fusion is None:
                 cmd.extend(['-r', 'imu:=/' + self.segment + '/imu'])
             self.process = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT,
-                start_new_session=True, env=dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1'))
+                start_new_session=True, env=estimator_environment(self.directory.name))
             worker = threading.Thread(target=self._work, name=self.segment, daemon=True)
             worker.start()
             self.worker = worker

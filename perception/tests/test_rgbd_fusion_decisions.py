@@ -17,6 +17,50 @@ def imu_until(c, start, seconds):
     return stamp
 
 
+@pytest.mark.parametrize('interval', [.265, .3])
+def test_accepted_normal_camera_cadence_does_not_demote_tracking(interval):
+    c, stamp = warmed()
+    for _ in range(6):
+        stamp = imu_until(c, stamp, interval)
+        sample = c.observe_frame(stamp, *images(), pose(), stamp+1_000_000)
+        assert sample['vendor']['fusion']['last_frame']['visual'] == 'accepted'
+        assert sample['pose'] is not None and c.state == 'tracking'
+
+
+def test_three_accepted_low_rate_corrections_recover_after_a_rejection():
+    c, stamp = warmed()
+    stamp = imu_until(c, stamp, .05)
+    assert c.observe_frame(stamp, *images(), None, stamp+1_000_000)['pose'] is None
+    for count in range(3):
+        stamp = imu_until(c, stamp, .265)
+        sample = c.observe_frame(stamp, *images(), pose(), stamp+1_000_000)
+        assert (sample['pose'] is not None) == (count == 2)
+    assert c.state == 'tracking'
+
+
+@pytest.mark.parametrize('visual', [None, pose(3.)])
+def test_bad_observation_still_restarts_low_rate_recovery_evidence(visual):
+    c, stamp = warmed()
+    for interval, value in ((.05, None), (.265, pose()), (.265, pose()), (.05, visual)):
+        stamp = imu_until(c, stamp, interval)
+        assert c.observe_frame(stamp, *images(), value, stamp+1_000_000)['pose'] is None
+    for count in range(3):
+        stamp = imu_until(c, stamp, .1)
+        sample = c.observe_frame(stamp, *images(), pose(), stamp+1_000_000)
+        assert (sample['pose'] is not None) == (count == 2)
+
+
+def test_recovery_corrections_cannot_resume_an_expired_mapping_pause():
+    c, stamp = warmed()
+    stamp = imu_until(c, stamp, .5)
+    c.observe_frame(stamp, *images(), None, stamp+1_000_000)
+    for _ in range(3):
+        stamp = imu_until(c, stamp, .265)
+        sample = c.observe_frame(stamp, *images(), pose(), stamp+1_000_000)
+        assert sample['pose'] is None
+    assert c.state == 'lost' and 'pause' in c.reason
+
+
 def noisy(x=0., variance=.04):
     value = pose(x)
     value['covariance'] = (np.eye(6)*variance).ravel().tolist()
@@ -52,7 +96,7 @@ def test_corrected_sigma_between_old_and_new_limits_can_recover_tracking():
     assert diagnostic['visual'] == 'accepted'
     assert c.reason == 'waiting for three consistent visual observations'
     for _ in range(2):
-        stamp = imu_until(c, stamp, .1)
+        stamp = imu_until(c, stamp, .05)  # complete recovery within the 1 s map pause
         sample = c.observe_frame(stamp, *images(), noisy(), stamp+1_000_000)
     assert c.state == 'tracking' and sample['pose'] is not None
 
@@ -129,9 +173,9 @@ def test_frame_silence_stops_claiming_tracking_without_resetting_evidence():
     # Frames were only delayed: a contiguous capture resumes tracking...
     stamp = t+200_000_000
     assert c.observe_frame(stamp, *images(), pose(), t+610_000_000)['pose'] is not None
-    # ...but a capture gap over 250 ms needs three corrections again.
+    # A normal 300 ms camera interval does not discard accepted evidence.
     stamp += 300_000_000
-    assert c.observe_frame(stamp, *images(), pose(), t+620_000_000)['pose'] is None
+    assert c.observe_frame(stamp, *images(), pose(), t+620_000_000)['pose'] is not None
 
 
 def test_per_frame_diagnostics_are_bounded_and_not_copied_into_each_sample():

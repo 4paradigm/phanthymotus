@@ -217,6 +217,15 @@ its ROS wrapper doubles the diagonal for `Odometry.pose.covariance`. It is
 not a calibrated accumulated trajectory-error estimate. The 0.04 m² check
 remains an engineering admission bound, independent of the ESKF sigma limit.
 
+All three modes (pure RGB-D, IMU attitude assistance and ESKF) give the native
+child a private copy of the configured `FASTRTPS_DEFAULT_PROFILES_FILE` with
+at least 1 MiB UDPv4 receive buffers. Larger configured buffers are retained.
+The loopback whitelist, participant settings, public profile and parent
+environment stay unchanged; the copy is removed with the session. Profiles
+without explicit UDPv4 transports are left unchanged. This addresses observed
+kernel receive-buffer drops before RTAB-Map processing, not visual matching
+failures; effective socket capacity still depends on host limits.
+
 For current Core's topic-only SLAM path, map provenance explicitly records
 unverified timestamp overlap. The stricter SLAM declaration path still requires
 independent timing/mount evidence. Validate real tracking and map save/reopen
@@ -258,6 +267,13 @@ image contrast/sharpness and valid measured-depth fraction. Independent
 capture clocks need bracketing IMU coverage, not identical sensor rates.
 Native pose/diagnostic results are joined at exact image capture times;
 results arriving after their 250 ms observation deadline are discarded.
+Accepted corrections at normal camera cadence (including 265–300 ms
+intervals) retain recovery evidence. Only a capture gap beyond the existing
+500 ms frame-silence bound, a missing/rejected correction, or excessive
+corrected uncertainty resets that evidence. Three good corrections are still
+required after degradation. A resumed fused pose cannot cross the 1 s mapping
+pause from the last published fused capture; that segment must restart.
+The 250 ms result-join deadline and 1 s no-visual-correction limit are unchanged.
 `info().native_join` reports session-local queued/completed/pending captures,
 deadline expirations, IMU-uncovered completions, and pose/info callbacks
 received, joined, after-deadline or unqueued. Absent counter keys mean zero;

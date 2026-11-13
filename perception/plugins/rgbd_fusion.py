@@ -259,7 +259,10 @@ class ShortTermFusion:
         if self.filter is not None and self.state != 'lost':
             if stamp-self.last_visual > INERTIAL_LIMIT_NS:
                 self.fault('visual correction absent for more than 1 s')
-            elif stamp-self.last_visual > 250_000_000:
+            elif self.last_frame and stamp-self.last_frame > FRAME_SILENCE_NS:
+                # A normal 4 Hz capture (plus jitter) is not a failed visual
+                # correction. Only actual frame silence resets evidence here;
+                # missing/rejected corrections reset it in observe_frame.
                 self.state, self.reason, self.good = 'coasting', 'visual correction delayed', 0
 
     def position_sigma(self):
@@ -376,9 +379,13 @@ class ShortTermFusion:
                     self.last_confident = stamp
                     self.good += 1
                     if self.state == 'tracking' or self.good >= 3:
-                        self.state, self.reason = 'tracking', None
-                        self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
-                        self.last_tracking = (stamp, self.filter.camera_pose(), deepcopy(visual_pose))
+                        if (self.state != 'tracking' and self.last_tracking is not None and
+                                stamp-self.last_tracking[0] > INERTIAL_LIMIT_NS):
+                            self.fault('fusion recovery exceeded the 1 s mapping pause; restart required')
+                        else:
+                            self.state, self.reason = 'tracking', None
+                            self.reference = (stamp, depth.copy(), deepcopy(visual_pose))
+                            self.last_tracking = (stamp, self.filter.camera_pose(), deepcopy(visual_pose))
                     else:
                         self.state, self.reason = 'recovering', 'waiting for three consistent visual observations'
             else:
