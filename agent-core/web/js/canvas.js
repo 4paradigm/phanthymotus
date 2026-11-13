@@ -14,7 +14,7 @@
 import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired, getToolConfigs } from './sidebar.js';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
@@ -2144,7 +2144,8 @@ async function _startProject() {
     const p = event.payload || {};
     if (event.type === 'project_start_begin') {
       const cards = p.cards || [];
-      const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
+      const items = cards.map(c => ({ card: _cards.find(card => card.id === c.card_id)
+        || { id: c.card_id, toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
       cards.forEach((c, i) => { itemIndex[c.card_id] = i; });
     } else if (event.type === 'project_start_item') {
@@ -2458,7 +2459,12 @@ function _showStartupModal(items) {
   items.forEach(({ card }) => {
     const li = document.createElement('li');
     li.className = 'startup-modal-item';
-    li.innerHTML = `<span class="startup-dot"></span><span class="startup-name">${card.toolName}</span><span class="startup-status">等待启动</span>`;
+    li.innerHTML = '<span class="startup-dot"></span><span class="startup-name"></span><span class="startup-status">等待启动</span>';
+    const repeated = items.filter(i => i.card.toolName === card.toolName).length > 1;
+    const cfg = getToolConfigs()[`${card.mcpId}:${card.toolName}:${card.id}`] || {};
+    const side = { left: '左侧', right: '右侧' }[cfg.side];
+    li.querySelector('.startup-name').textContent = repeated
+      ? [card.toolName, side, card.id].filter(Boolean).join(' · ') : card.toolName;
     list.appendChild(li);
     dots.push(li.querySelector('.startup-dot'));
     statuses.push(li.querySelector('.startup-status'));

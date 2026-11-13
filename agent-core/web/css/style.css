@@ -6433,7 +6433,7 @@ html, body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
 }
-.startup-name { font-weight: 600; min-width: 80px; }
+.startup-name { font-weight: 600; min-width: 80px; overflow-wrap: anywhere; }
 .startup-status {
   color: var(--text-muted);
   font-size: 12px;

@@ -731,7 +731,7 @@ async def _do_start_project_impl():
                     await push_event({'type': 'project_start_item', 'payload': {
                         'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error', 'message': tool_message,
                     }})
-                    errors.append(tool_name)
+                    errors.append(f'{tool_name} ({card_id})')
                     # Kept for a failed card too, as before: the project is about
                     # to roll back, but changing that here would be an unrelated
                     # behaviour change riding along with this fix.
@@ -777,7 +777,7 @@ async def _do_start_project_impl():
                             'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error',
                             'message': message,
                         }})
-                        errors.append(tool_name)
+                        errors.append(f'{tool_name} ({card_id})')
                     elif dropped:
                         kept = [t for t in wanted if t not in dropped]
                         message = (f'{tool_name} 只消费了 {", ".join(kept)}，'
@@ -788,7 +788,7 @@ async def _do_start_project_impl():
                             'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error',
                             'message': message,
                         }})
-                        errors.append(tool_name)
+                        errors.append(f'{tool_name} ({card_id})')
                     else:
                         print(f'[start-project] started {tool_name} ({mcp_id})')
                         await push_event({'type': 'project_start_item', 'payload': {
@@ -806,13 +806,13 @@ async def _do_start_project_impl():
                 await push_event({'type': 'project_start_item', 'payload': {
                     'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error', 'message': msg,
                 }})
-                errors.append(tool_name)
+                errors.append(f'{tool_name} ({card_id})')
         except Exception as e:
             print(f'[start-project] failed {tool_name}: {e}')
             await push_event({'type': 'project_start_item', 'payload': {
                 'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error', 'message': str(e)[:100],
             }})
-            errors.append(tool_name)
+            errors.append(f'{tool_name} ({card_id})')
 
     def _port_topic(out_list: list, port_idx: int) -> str:
         """The topic a source publishes on `port_idx`.
@@ -1072,7 +1072,7 @@ async def _do_start_project_impl():
                 'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                 'status': 'error', 'message': message,
             }})
-            errors.append(tool_name)
+            errors.append(f'{tool_name} ({card.get("id", "")})')
             continue
 
         descriptor, descriptor_error = await _downstream_descriptor(card.get('id', ''))
@@ -1083,7 +1083,7 @@ async def _do_start_project_impl():
                 'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                 'status': 'error', 'message': descriptor_error,
             }})
-            errors.append(tool_name)
+            errors.append(f'{tool_name} ({card.get("id", "")})')
             continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,

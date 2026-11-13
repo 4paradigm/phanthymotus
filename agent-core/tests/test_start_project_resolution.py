@@ -506,6 +506,18 @@ def test_start_failure_progress_identifies_the_failed_instance(driver, reply):
                    'connections': []}) is False
     failed, = _errors(driver.events)
     assert failed.get('card_id') == 'left'
+    done = next(e['payload'] for e in driver.events if e['type'] == 'project_start_done')
+    assert done['errors'] == ['wrist_camera (left)']
+
+
+def test_failure_summary_distinguishes_two_instances_of_one_tool(driver, capsys):
+    for cid in ('left', 'right'):
+        driver.start_results[cid] = {'code': 503, 'message': 'driver offline'}
+    assert _start({'cards': [_card('left', 'wrist_camera'), _card('right', 'wrist_camera')],
+                   'connections': []}) is False
+    done = next(e['payload'] for e in driver.events if e['type'] == 'project_start_done')
+    assert done['errors'] == ['wrist_camera (left)', 'wrist_camera (right)']
+    assert '2 cards failed (wrist_camera (left), wrist_camera (right))' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('terminal', ['running', 'error', 'idle', 'timeout'])
