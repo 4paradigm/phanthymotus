@@ -446,6 +446,7 @@ export async function initCanvas(initialMcps) {
   _setupControlButtons();
   _setupPortDrag();
   _setupPortTooltip();
+  _setupFieldTooltip();
   _syncGeometryObservers();
 
   // Load persisted layout
@@ -1124,12 +1125,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
-          const desc = def.description || '';
-          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(key)}">`;
         }
         return `
           <div class="canvas-field">
-            <label class="canvas-field-label" title="${_esc(def.description || '')}">${_esc(label)}</label>
+            ${_fieldLabel(label, def.description)}
             ${inputHtml}
           </div>`;
       }).join('');
@@ -1299,12 +1299,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
-        const desc = def.description || '';
-        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(key)}">`;
       }
       return `
         <div class="canvas-field">
-          <label class="canvas-field-label" title="${_esc(def.description || '')}">${_esc(label)}</label>
+          ${_fieldLabel(label, def.description)}
           ${inputHtml}
         </div>`;
     }).join('');
@@ -1485,6 +1484,101 @@ function _fmtColorClass(fmt) {
   if (fmt.startsWith('data/json') || fmt.startsWith('text')) return 'fmt-json';
   if (fmt.startsWith('image') || fmt.startsWith('video')) return 'fmt-visual';
   return 'fmt-default';
+}
+
+// Body portal, like port help: descriptions must not be clipped or zoomed.
+function _fieldLabel(label, description) {
+  const desc = typeof description === 'string' ? description.trim() : '';
+  return `<div class="canvas-field-label">${_esc(label)}${desc
+    ? ` <button type="button" class="canvas-field-help" aria-label="${_esc(label).replace(/"/g, '&quot;')}: 参数说明" data-description="${_esc(desc).replace(/"/g, '&quot;')}">ⓘ</button>`
+    : ''}</div>`;
+}
+
+let _fieldHelpReady = false;
+function _setupFieldTooltip() {
+  if (_fieldHelpReady) return;
+  _fieldHelpReady = true;
+  let tip, anchor, timer, frame, pinned = false;
+  function hide() {
+    clearTimeout(timer);
+    cancelAnimationFrame(frame);
+    if (anchor) anchor.removeAttribute('aria-describedby');
+    anchor = null;
+    pinned = false;
+    if (tip) tip.hidden = true;
+  }
+  function place() {
+    if (!anchor?.isConnected || !anchor.getClientRects().length) { hide(); return; }
+    const r = anchor.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) { hide(); return; }
+    const above = Math.max(0, r.top - 14);
+    const below = Math.max(0, innerHeight - r.bottom - 14);
+    tip.style.maxHeight = `${Math.max(above, below)}px`;
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = `${Math.max(8, Math.min(r.left, innerWidth - w - 8))}px`;
+    const y = h <= below ? r.bottom + 6 : r.top - h - 6;
+    tip.style.top = `${Math.max(8, Math.min(y, innerHeight - h - 8))}px`;
+    frame = requestAnimationFrame(place);
+  }
+  function show(button) {
+    clearTimeout(timer);
+    if (anchor === button) return;
+    hide();
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.id = 'canvas-field-description';
+      tip.className = 'canvas-field-tip';
+      tip.setAttribute('role', 'tooltip');
+      tip.tabIndex = 0; // Keyboard users can scroll very long descriptions.
+      tip.hidden = true;
+      document.body.appendChild(tip);
+      tip.addEventListener('pointerenter', () => clearTimeout(timer));
+      tip.addEventListener('pointerleave', leave);
+      tip.addEventListener('focusout', leave);
+    }
+    anchor = button;
+    tip.textContent = button.dataset.description;
+    tip.hidden = false;
+    button.setAttribute('aria-describedby', tip.id);
+    place();
+  }
+  function leave() {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!pinned && document.activeElement !== anchor && document.activeElement !== tip
+          && !anchor?.matches(':hover') && !tip?.matches(':hover')) hide();
+    }, 180);
+  }
+  document.addEventListener('pointerover', e => {
+    const button = e.target.closest?.('.canvas-field-help');
+    if (button) show(button);
+  });
+  document.addEventListener('pointerout', e => {
+    if (e.target.closest?.('.canvas-field-help')) leave();
+  });
+  document.addEventListener('focusin', e => {
+    const button = e.target.closest?.('.canvas-field-help');
+    if (button) show(button);
+    else if (e.target !== tip) hide();
+  });
+  document.addEventListener('click', e => {
+    const button = e.target.closest?.('.canvas-field-help');
+    if (button) {
+      if (anchor === button && pinned) hide();
+      else { show(button); pinned = true; }
+    } else if (!tip?.contains(e.target)) hide();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown' && anchor && e.target === anchor) {
+      e.preventDefault();
+      tip.focus();
+    }
+    if (e.key === 'Escape') {
+      if (document.activeElement === tip && anchor) anchor.focus();
+      hide();
+    }
+  });
+  document.addEventListener('change', hide);
 }
 
 // ── Port hover tooltip ────────────────────────────────────────────────────────
