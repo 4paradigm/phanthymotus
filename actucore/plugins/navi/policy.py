@@ -154,7 +154,7 @@ class Config:
     # the path an arc instead of a sequence of stops.
     align_min_scale: float = 0.45
     k_yaw: float = 0.6
-    k_fwd: float = 0.9
+    k_fwd: float = 0.6
     adaptive_k_fwd: bool = False
     # Optional effective P derived from the downstream Driver's declared yaw
     # response.  Navi never measures or persists a robot-specific plant model;

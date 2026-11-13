@@ -125,7 +125,7 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 | `stop_distance_m` | 期望停止距离，相机到目标的距离，m | 0.8 |
 | `stop_tolerance_m` | **仅限单次 `navigate_to`** 的到达容差，不是卡片 `config`，m | 0.05 |
 
-前进P默认 0.9，转向P默认 0.6，搜索转速默认 0.6rad/s。这些不再放到
+前进P默认 0.6，转向P默认 0.6，搜索转速默认 0.6rad/s。这些不再放到
 画布配置表单中。`navi` 启动时从下游 `control_interface` 读取速度上限、
 横移能力、死区和可选的 `response.wz`，再得到实际有效值。因此机器人差异属于
 Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协商后的实际值。
@@ -158,7 +158,7 @@ Driver 声明约束，显式 `use_lateral: false` 不会被硬件能力声明重
 
 ### 默认前进P与高级启动兼容
 
-默认启动配置为 `k_fwd: 0.9`、`adaptive_k_fwd: false`，因此前进增益固定为 0.9。
+默认启动配置为 `k_fwd: 0.6`、`adaptive_k_fwd: false`，因此前进增益固定为 0.6。
 `info.last.k_fwd_effective` 显示这一拍实际使用的前进增益；未使用时返回 null。
 速度上限、底盘限制、避障和到达条件仍决定最终指令。
 

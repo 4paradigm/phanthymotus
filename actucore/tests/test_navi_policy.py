@@ -2099,7 +2099,7 @@ def test_fixed_forward_rejects_invalid_baseline_gain(gain):
 
 def test_default_gains_keep_fixed_forward_and_yaw():
     config = _cfg()
-    assert config.k_fwd == 0.9
+    assert config.k_fwd == 0.6
     assert config.adaptive_k_fwd is False
     assert config.k_yaw == 0.6
 

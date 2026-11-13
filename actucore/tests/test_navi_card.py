@@ -710,7 +710,7 @@ def test_driver_owned_controls_are_not_public_parameters():
 def test_generic_defaults_are_visible_only_in_info():
     info = _card()._info()
     assert info["config"]["k_yaw"] == 0.6
-    assert info["config"]["k_fwd"] == 0.9
+    assert info["config"]["k_fwd"] == 0.6
     assert info["config"]["search_rate"] == 0.6
     assert info["config"]["max_obs_age_ms"] == 500
     assert info["config"]["stop_tolerance_m"] == 0.05
