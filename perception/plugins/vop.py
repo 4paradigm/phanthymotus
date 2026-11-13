@@ -75,7 +75,7 @@ DEFAULT_OUTPUT_TOPIC = "/perception/vop"
 # Instance key for the topic-less card, mirroring tts's `_default`.
 _DEFAULT_INSTANCE = "_default"
 
-DEFAULT_MODEL = "yoloe-26s-seg"
+DEFAULT_MODEL = "yoloe-26m-det"
 
 # Names that already exist in deployed canvas cards and yaml. A card saved when
 # this plugin ran YOLOv8-World must keep loading after an upgrade: the engine it
@@ -85,6 +85,9 @@ _MODEL_ALIASES = {
     "yolov8s-worldv2": DEFAULT_MODEL,
     "yolov8s-world": DEFAULT_MODEL,
     "yoloe-26s": DEFAULT_MODEL,
+    "yoloe-26s-seg": DEFAULT_MODEL,
+    "yoloe-26m": DEFAULT_MODEL,
+    "yoloe-26m-seg": DEFAULT_MODEL,
 }
 
 
@@ -505,7 +508,8 @@ class _VOPNode(Node):
                     continue
                 outputs, meta = self._model.infer(frame)
                 boxes, scores, classes = decode_detections(
-                    outputs, meta, self._confidence
+                    outputs, meta, self._confidence,
+                    metadata=getattr(self._model, 'metadata', None)
                 )
                 objects = self._extract_objects(boxes, scores, classes, frame)
                 self._publish_objects(objects, started)
@@ -764,7 +768,7 @@ class VideoObjectPerceptionPlugin:
 
         model_dir = os.environ.get("VOP_MODEL_DIR", "/models/vop")
         progress_cb, _ = fetch_status(
-            lambda text: setattr(self, "_model_load_status", text), "yoloe-26s-seg")
+            lambda text: setattr(self, "_model_load_status", text), self._model_name or DEFAULT_MODEL)
         paths = ensure_vop_model(model_dir, progress_cb=progress_cb)
         engine = next(p for name, p in paths.items() if name.endswith(".engine"))
         return engine, self._read_vocab(paths.get("vocab.json"))
@@ -835,7 +839,8 @@ class VideoObjectPerceptionPlugin:
         from plugins.vision_runtime import decode_detections
 
         outputs, meta = model.infer(frame)
-        boxes, scores, classes = decode_detections(outputs, meta, confidence)
+        boxes, scores, classes = decode_detections(outputs, meta, confidence,
+            metadata=getattr(model, 'metadata', None))
 
         # Same shape the stream publishes, so a consumer written against
         # {topic}/objects needs no second parser — plus the pixel box, which a

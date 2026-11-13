@@ -158,8 +158,8 @@ plugins:
     namespace: ""       # auto-detect from hostname if empty
     # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
     # cards saved before the switch, but the engine it loads is this one.
-    model: "yoloe-26s-seg"
-    confidence: 0.3
+    model: "yoloe-26m-det"
+    confidence: 0.35
     fps: 5
     # ── How much the streamed payload carries ────────────────────────────
     # Governs the stream on the topic only. The one-shot photo actions
