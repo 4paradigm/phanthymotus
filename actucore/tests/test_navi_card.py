@@ -213,8 +213,8 @@ def test_unknown_config_keys_are_ignored_rather_than_crashing():
 
 def test_the_config_action_updates_a_live_card():
     card = _card()
-    card.dispatch("navi", {"action": "config", "vx_max": 0.15})
-    assert card._config.vx_max == 0.15
+    card.dispatch("navi", {"action": "config", "stop_distance_m": 1.15})
+    assert card._config.stop_distance_m == 1.15
 
 
 # ── input binding ────────────────────────────────────────────────────────────
@@ -684,51 +684,260 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
     assert "类别并不稳定" in text
 
 
-# ── the config dialog is three knobs, and its defaults are load-bearing ──────
+# ── generic configuration and Driver-owned capabilities ───────────────────
 
-def test_the_dialog_offers_only_what_an_operator_can_judge():
-    """Twenty-two fields, most of them things like `release_frac` and
-    `bearingless_std_factor`, gave an operator no way to judge an answer and
-    buried the three that matter. The rest live in config.yaml with the
-    paragraph of explanation they need, and stay reachable via the `config`
-    action."""
+def test_the_dialog_exposes_only_generic_card_configuration():
     keys = set(_tool()["configSchema"]["properties"])
     assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m"}
 
 
-def test_every_schema_default_matches_the_file_default():
-    """**agent-core sends every schema field on every config call, defaults
-    included**, so a key here silently overrides the same key in config.yaml.
-    On r1_sz the file said `vx_max: 0.6` and the card reported 0.4 — the schema
-    default won, and the only trace was a degraded note that read like the file
-    had never been edited.
-
-    A field may live in the schema or in the file; if it lives in both, the two
-    defaults have to agree or the file is decoration."""
-    import os
-    import yaml
-
-    root = os.path.join(os.path.dirname(__file__), "..")
-    with open(os.path.join(root, "config.yaml")) as handle:
-        navi_cfg = yaml.safe_load(handle)["plugins"]["navi"]
-
-    for key, spec in _tool()["configSchema"]["properties"].items():
-        if key in navi_cfg:
-            assert navi_cfg[key] == spec["default"], (
-                f"{key}: config.yaml 是 {navi_cfg[key]}，schema 默认是 "
-                f"{spec['default']} —— 画布会用后者覆盖前者")
+def test_only_default_stop_distance_is_available_to_the_config_action():
+    tool = _tool()
+    assert tool["inputSchema"]["x-action-params"]["config"]["params"] == [
+        "stop_distance_m"]
+    assert tool["inputSchema"]["x-action-params"]["navigate_to"]["params"] == [
+        "target", "stop_distance_m", "stop_tolerance_m"]
 
 
-def test_a_chassis_that_swallows_commands_is_reported_as_degraded():
-    """A policy whose commands are being dropped looks exactly like one that is
-    working: same verdicts, same counters, same silence. On r1_sz a deploy reset
-    the driver to its image defaults (`dry_run: true`) and the robot stood still
-    while every layer reported success."""
+def test_driver_owned_controls_are_not_public_parameters():
+    tool = _tool()
+    hidden = {"k_yaw", "k_fwd", "adaptive_k_yaw", "adaptive_k_fwd",
+              "search_rate", "vx_max", "vy_max", "wz_max", "use_lateral"}
+    assert hidden.isdisjoint(tool["inputSchema"]["properties"])
+    assert hidden.isdisjoint(tool["configSchema"]["properties"])
+
+
+def test_generic_defaults_are_visible_only_in_info():
+    info = _card()._info()
+    assert info["config"]["k_yaw"] == 0.6
+    assert info["config"]["k_fwd"] == 0.9
+    assert info["config"]["search_rate"] == 0.6
+    assert info["config"]["max_obs_age_ms"] == 1000
+    assert info["config"]["stop_tolerance_m"] == 0.05
+    assert info["config"]["arrival_distance_m"] == pytest.approx(0.85)
+    assert info["gains"]["yaw"]["source"] == "adaptive_default"
+
+
+def _running_generic_card(**cfg):
+    card = _card(**cfg)
+    card._open_publisher = lambda: setattr(card, "_node", _FakeNode({
+        "/camera/depth": ["sensor_msgs/msg/CompressedImage"],
+    }))
+    result = card._start({
+        "control_interface": _descriptor(limits={
+            "lower": [-0.3, 0, 0, 0, 0, -1.0],
+            "upper": [0.3, 0, 0, 0, 0, 1.0],
+            "min_magnitude": [0, 0, 0, 0, 0, 0],
+        }, footprint={"half_width": 0.22, "source": "measured"}),
+        "input_topics": ["/cam/objects", "/camera/depth"],
+    })
+    assert result["state"] == "running", result
+    return card
+
+
+def test_driver_limits_derive_lateral_capability_and_clamp_search_only_for_safety():
+    card = _running_generic_card(search_rate=0.6)
+    assert card._config.vx_max == 0.3
+    assert card._config.vy_max == 0.0
+    assert card._config.use_lateral is False
+    assert card._config.wz_max == 1.0
+    assert card._config.search_rate == 0.6
+    card._stop()
+
+    limited = _card(search_rate=0.6)
+    config = navi_plugin.policy_mod.Config(search_rate=0.6)
+    navi_plugin.policy_mod.adopt_limits(config, _descriptor(limits={
+        "lower": [-0.3, 0, 0, 0, 0, -0.4],
+        "upper": [0.3, 0, 0, 0, 0, 0.4],
+    }))
+    assert config.search_rate == 0.4
+    assert limited._config.search_rate == 0.6
+
+
+def test_driver_response_is_adopted_and_reported_as_read_only():
     card = _card()
-    card._running = True
-    card._binding = {"objects": "o", "depth_map": "d", "odom": "s"}
-    card._descriptor = {"mode": "twist", "dry_run": True}
-    assert any("dry_run" in note for note in card._degradations())
+    descriptor = _descriptor(response={
+        "wz": {"source": "measured", "gain": 0.75,
+               "delay_s": 0.2, "settling_s": 0.4},
+    })
+    card._config = navi_plugin.policy_mod.Config()
+    notes = navi_plugin.policy_mod.adopt_response(card._config, descriptor)
+    info = card._info()
+    assert card._config.response_yaw_gain is not None
+    assert info["gains"]["yaw"]["source"] == "driver_response"
+    assert len(notes) == 1 and "response.wz" in notes[0]
+
+
+@pytest.mark.parametrize("response", [
+    {},
+    {"wz": {"source": "unknown", "gain": 0.75}},
+    {"wz": {"source": "measured", "gain": 0}},
+])
+def test_absent_or_invalid_driver_response_keeps_generic_point_six(response):
+    card = _card()
+    notes = navi_plugin.policy_mod.adopt_response(
+        card._config, _descriptor(response=response))
+    assert card._config.response_yaw_gain is None
+    assert card._info()["gains"]["yaw"]["base"] == 0.6
+    if response:
+        assert len(notes) == 1 and "0.6" in notes[0]
+    else:
+        assert notes == []
+
+
+def test_stop_tolerance_is_per_navigation_and_resets_to_five_centimetres():
+    card = _running_generic_card(stop_distance_m=0.8)
+    first = card._navigate_to({"target": "person", "stop_distance_m": 1.2,
+                               "stop_tolerance_m": 0.1})
+    assert first["arrival_distance_m"] == pytest.approx(1.3)
+    second = card._navigate_to({"target": "chair"})
+    assert second["stop_tolerance_m"] == 0.05
+    assert second["arrival_distance_m"] == pytest.approx(1.25)
+    assert card._config.stop_tolerance_m == 0.05
+    card._stop()
+
+
+@pytest.mark.parametrize("key", ["stop_distance_m", "stop_tolerance_m"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, True, "bad"])
+def test_invalid_navigation_distance_is_atomic(key, value):
+    card = _running_generic_card()
+    card._navigate_to({"target": "person", "stop_distance_m": 1.2,
+                       "stop_tolerance_m": 0.1})
+    state, config, action_id = card._state, card._config, card._acp_action_id
+    args = {"target": "chair", "stop_distance_m": 2.0,
+            "stop_tolerance_m": 0.2, key: value}
+    result = card._navigate_to(args)
+    assert result["state"] == "error" and key in result["message"]
+    assert card._state is state and state.target == "person"
+    assert card._config is config and card._acp_action_id == action_id
+    card._stop()
+
+
+def test_odom_timing_selects_the_bound_topic_and_computes_freshness():
+    card = _card()
+    card._binding = {"odom": "/robot/state/odom"}
+    card._adopt_odom_interface({
+        "schema": "motus.odom/1", "topic": "/robot/state/odom",
+        "rate_hz": 10,
+        "timing": {"stamp_source": "received",
+                   "max_measurement_delay_ms": 120},
+    }, bound_topic="/robot/state/odom")
+    assert card._odom_max_age_ms == 420
+
+
+@pytest.mark.parametrize("age_ms", [420, 421])
+def test_declared_odom_timing_is_independent_of_visual_freshness(monkeypatch, age_ms):
+    card = _card()
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._adopt_odom_interface({
+        "schema": "motus.odom/1", "rate_hz": 10,
+        "timing": {"stamp_source": "received",
+                   "max_measurement_delay_ms": 120},
+    }, bound_topic="/robot/state/odom")
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+    card._objects_ms = card._depth_ms = now_ms - 900
+    card._odom = {"vx": 0.1, "vy": 0.0, "wz": 0.0}
+    card._odom_ms = now_ms - age_ms
+
+    objects, depth, odom = card.observation()
+    assert objects is card._objects
+    assert depth is not None
+    assert odom == (card._odom if age_ms == 420 else None)
+
+
+@pytest.mark.parametrize("interface", [
+    {},
+    {"schema": "wrong", "rate_hz": 10,
+     "timing": {"stamp_source": "received", "max_measurement_delay_ms": 20}},
+    {"schema": "motus.odom/1", "topic": "/other", "rate_hz": 10,
+     "timing": {"stamp_source": "received", "max_measurement_delay_ms": 20}},
+    {"schema": "motus.odom/1", "rate_hz": 10,
+     "timing": {"stamp_source": "host", "max_measurement_delay_ms": 20}},
+    {"schema": "motus.odom/1", "rate_hz": 10,
+     "timing": {"stamp_source": "received"}},
+])
+def test_missing_or_invalid_odom_timing_falls_back_without_blocking(interface):
+    card = _card()
+    card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
+    assert card._odom_max_age_ms == 1000
+    assert card._limit_notes
+
+
+@pytest.mark.parametrize("age_ms", [900, 1000, 1001])
+@pytest.mark.parametrize("role", ["objects", "depth"])
+def test_visual_observation_freshness_boundary(monkeypatch, age_ms, role):
+    card = _card()
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._objects = {"objects": []}
+    card._depth_bands = {"center": 2.0}
+
+    card._objects_ms = card._depth_ms = now_ms
+    setattr(card, f"_{role}_ms", now_ms - age_ms)
+    objects, depth, _ = card.observation()
+    if role == "objects" and age_ms > 1000:
+        assert objects is None
+    else:
+        assert objects is card._objects
+    if role == "depth" and age_ms > 1000:
+        assert depth is None
+    else:
+        assert depth == {"map": None, "bands": {"center": 2.0}}
+
+
+@pytest.mark.parametrize("age_ms", [900, 1000, 1001])
+def test_visual_age_controls_publication_without_rewriting_stamp(monkeypatch, age_ms):
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card = _card()
+    assert _first_command(card) is not None
+    card._config.max_obs_age_ms = 1000
+    card._objects_ms = card._depth_ms = now_ms - age_ms
+
+    message = card.next_command()
+    if age_ms > 1000:
+        assert message is None
+        assert card._last_decision.status == navi_plugin.policy_mod.BLIND
+    else:
+        assert message is not None
+        assert message["stamp_ms"] == now_ms
+        assert message["obs_stamp_ms"] == now_ms - age_ms
+        assert message["ttl_ms"] == card._ttl_ms == 300
+
+
+def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
+    card = _card()
+    card._adopt_odom_interface({
+        "schema": "motus.odom/1", "rate_hz": 10,
+        "timing": {"stamp_source": "host", "max_measurement_delay_ms": 20},
+    }, bound_topic="/robot/state/odom")
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.456)
+
+    class _Message:
+        data = json.dumps({"schema": "motus.odom/1", "stamp_ms": 1,
+                           "twist": [0.1, 0, 0, 0, 0, 0.2]})
+
+    card._on_string("odom", _Message())
+    assert card._odom_interface == {}
+    assert card._odom_ms == 123456
+
+
+def test_valid_odom_contract_uses_the_producer_stamp(monkeypatch):
+    card = _card()
+    card._adopt_odom_interface({
+        "schema": "motus.odom/1", "rate_hz": 10,
+        "timing": {"stamp_source": "robot", "max_measurement_delay_ms": 20},
+    }, bound_topic="/robot/state/odom")
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.456)
+
+    class _Message:
+        data = json.dumps({"schema": "motus.odom/1", "stamp_ms": 7,
+                           "twist": [0.1, 0, 0, 0, 0, 0.2]})
+
+    card._on_string("odom", _Message())
+    assert card._odom_ms == 7
 
 
 # ── 相机几何沿连线传下来（motus.camera/1）──────────────────────────────────────
@@ -1066,12 +1275,12 @@ def test_start_stop_start_destroys_old_node_and_does_not_duplicate_depth_subscri
 
 
 @pytest.mark.parametrize("first_yaw_limit,expected_first", [
-    (0.83, 0.83),  # Bumi -> R1
-    (0.0, 0.0),    # No yaw -> R1
+    (0.83, 0.6),
+    (0.0, 0.0),
 ])
 def test_search_rate_recovers_after_switching_chassis(
         monkeypatch, first_yaw_limit, expected_first):
-    card = _card(search_rate=1.0)
+    card = _card(search_rate=0.6)
 
     class Executor:
         def remove_node(self, node):
@@ -1112,27 +1321,12 @@ def test_search_rate_recovers_after_switching_chassis(
         "input_topics": ["/cam/objects", "/camera/depth"],
     })
     assert second["state"] == "running", second
-    assert card._config.search_rate == pytest.approx(1.0)
+    assert card._config.search_rate == pytest.approx(0.6)
     card._stop()
 
 
-def test_user_search_rate_setting_survives_next_start():
-    card = _card(search_rate=1.0)
-    result = card._config_action({"search_rate": 0.7})
-
-    assert result["config"]["search_rate"] == pytest.approx(0.7)
-    assert card._cfg["search_rate"] == pytest.approx(0.7)
-
-    # Same reconstruction that happens before each start.
-    restored = navi_plugin.policy_mod.Config(**{
-        k: v for k, v in card._cfg.items()
-        if k in navi_plugin.policy_mod.Config.__dataclass_fields__
-    })
-    assert restored.search_rate == pytest.approx(0.7)
-
-
-def test_tianyi_head_depth_topic_binds_as_metric_depth():
-    """Tianyi publishes metric depth as camera/head/depth."""
+def test_head_depth_topic_binds_as_metric_depth():
+    """A driver may publish metric depth as camera/head/depth."""
     bound, problem = _bind([
         "/nvidia_desktop/camera/head/objects",
         "/nvidia_desktop/camera/head/depth",

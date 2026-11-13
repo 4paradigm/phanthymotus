@@ -77,3 +77,4 @@ def test_cancelled_counts_as_a_non_success():
                  'result': {'reason': 'superseded by new navigate'}})
 
     assert out['result']['reason'] == 'superseded by new navigate'
+
