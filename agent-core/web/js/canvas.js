@@ -14,7 +14,7 @@
 import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired, getToolConfigs } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
@@ -2456,15 +2456,21 @@ function _showStartupModal(items) {
   const list = modal.querySelector('.startup-modal-list');
   const dots = [];
   const statuses = [];
-  items.forEach(({ card }) => {
+  const topicNames = card => (card.topicOut || [])
+    .map(t => (t.topic || '').split('/').filter(Boolean).pop()).filter(Boolean);
+  const names = items.map(({ card }) => {
+    const peers = items.filter(i => i.card.toolName === card.toolName && i.card.id !== card.id);
+    if (!peers.length) return card.toolName;
+    const taken = new Set(peers.flatMap(i => topicNames(i.card)));
+    const topic = topicNames(card).find(name => !taken.has(name));
+    return [card.toolName, topic || card.id].filter(Boolean).join(' · ');
+  });
+  items.forEach(({ card }, i) => {
     const li = document.createElement('li');
     li.className = 'startup-modal-item';
     li.innerHTML = '<span class="startup-dot"></span><span class="startup-name"></span><span class="startup-status">等待启动</span>';
-    const repeated = items.filter(i => i.card.toolName === card.toolName).length > 1;
-    const cfg = getToolConfigs()[`${card.mcpId}:${card.toolName}:${card.id}`] || {};
-    const side = { left: '左侧', right: '右侧' }[cfg.side];
-    li.querySelector('.startup-name').textContent = repeated
-      ? [card.toolName, side, card.id].filter(Boolean).join(' · ') : card.toolName;
+    li.querySelector('.startup-name').textContent = names.filter(name => name === names[i]).length > 1
+      ? `${names[i]} · ${card.id}` : names[i];
     list.appendChild(li);
     dots.push(li.querySelector('.startup-dot'));
     statuses.push(li.querySelector('.startup-status'));

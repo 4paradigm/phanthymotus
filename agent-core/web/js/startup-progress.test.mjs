@@ -72,39 +72,60 @@ class Element {
   addEventListener() {}
 }
 
-function modalNames(inputCards, configs = {}) {
+function modalNames(inputCards) {
   const at = canvas.indexOf('function _showStartupModal(');
   const end = canvas.indexOf('\n}\n', at) + 3;
   const show = runInNewContext(canvas.slice(at, end) + '\n_showStartupModal;', {
     document: { createElement: () => new Element(), body: new Element() },
-    getToolConfigs: () => configs,
   });
   const result = show(inputCards.map(card => ({ card })));
   return result.modal.querySelector('.startup-modal-list').children.map(row =>
     row.querySelector('.startup-name').textContent);
 }
 
-test('same-tool rows show configured wrist side and unique instance ID', () => {
-  const input = [
-    { id: 'card-a', toolName: 'wrist_camera', mcpId: 'tianyi' },
-    { id: 'card-b', toolName: 'wrist_camera', mcpId: 'tianyi' },
-  ];
-  assert.deepEqual(modalNames(input, {
-    'tianyi:wrist_camera:card-a': { side: 'left' },
-    'tianyi:wrist_camera:card-b': { side: 'right' },
-  }), ['wrist_camera · 左侧 · card-a', 'wrist_camera · 右侧 · card-b']);
+test('same-tool rows derive distinct names from output topics without device configuration', () => {
+  const input = ['left', 'right'].map(side => ({
+    id: `card-${side}`, toolName: 'wrist_camera', mcpId: 'tianyi',
+    topicOut: ['rgb', 'depth'].map(channel => ({
+      topic: `/robot/wrist_camera/card_${side}/${side}_${channel}`, format: 'image/jpeg',
+    })),
+  }));
+  assert.deepEqual(modalNames(input), ['wrist_camera · left_rgb', 'wrist_camera · right_rgb']);
 });
 
-test('same-side or unlabelled instances remain distinguishable by ID', () => {
-  const input = ['a', 'b'].map(id => ({ id, toolName: 'sensor', mcpId: 'robot' }));
-  assert.deepEqual(modalNames(input), ['sensor · a', 'sensor · b']);
-  assert.deepEqual(modalNames(input, {
-    'robot:sensor:a': { side: 'left' }, 'robot:sensor:b': { side: 'left' },
-  }), ['sensor · 左侧 · a', 'sensor · 左侧 · b']);
+test('topic-based naming works for other tools and skips shared outputs', () => {
+  assert.deepEqual(modalNames([
+    { id: 'a', toolName: 'ext_mic', topicOut: [{ topic: '/audio/shared' }, { topic: '/audio/desk' }] },
+    { id: 'b', toolName: 'ext_mic', topicOut: [{ topic: '/audio/shared' }, { topic: '/audio/room' }] },
+  ]), ['ext_mic · desk', 'ext_mic · room']);
+});
+
+test('missing or indistinguishable output names fall back to card IDs', () => {
+  assert.deepEqual(modalNames([
+    { id: 'a', toolName: 'sensor', topicOut: [{ topic: '/a/rgb' }, { topic: '/a/depth' }] },
+    { id: 'b', toolName: 'sensor', topicOut: [{ topic: '/b/rgb' }, { topic: '/b/depth' }] },
+    { id: 'c', toolName: 'sensor', topicOut: [{ format: 'image/jpeg' }] },
+    { id: 'd', toolName: 'sensor' },
+  ]), ['sensor · a', 'sensor · b', 'sensor · c', 'sensor · d']);
+});
+
+test('topic-derived names cannot collide with another instance ID', () => {
+  assert.deepEqual(modalNames([
+    { id: 'a', toolName: 'sensor', topicOut: [{ topic: '/s/b' }] },
+    { id: 'b', toolName: 'sensor' },
+  ]), ['sensor · b · a', 'sensor · b · b']);
+});
+
+test('topic names are text rather than HTML', () => {
+  assert.deepEqual(modalNames([
+    { id: 'a', toolName: 'sensor', topicOut: [{ topic: '/s/<b>' }] },
+    { id: 'b', toolName: 'sensor', topicOut: [{ topic: '/s/other' }] },
+  ]), ['sensor · <b>', 'sensor · other']);
 });
 
 test('single-instance cards keep the existing tool name', () => {
-  assert.deepEqual(modalNames([{ id: 'head', toolName: 'camera_head', mcpId: 'robot' }]),
+  assert.deepEqual(modalNames([{ id: 'head', toolName: 'camera_head', mcpId: 'robot',
+    topicOut: [{ topic: '/robot/camera/head' }] }]),
     ['camera_head']);
 });
 
