@@ -1,0 +1,6 @@
+# Standalone Python >=3.10 only, in a NEW environment. Jetson uses its bundled ABI-compatible NumPy/cv2.
+# The official image build does not install this file. Installing it grows the standalone environment, especially OpenCV.
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+jsonschema>=4.18,<5
+PyYAML>=6,<7

@@ -391,6 +391,26 @@ function _buildConsoleEntry(mcp, tool) {
   return entry;
 }
 
+// Read-only processors may be inspected without starting the whole project.
+// This is an entry point, not a permission grant; the existing workbench host
+// still enforces its advertised capabilities. No card is started here.
+function _readOnlyWorkbenchButton(container, mcp, tool) {
+  if (tool.type !== 'processor' || tool.inputSchema?.['x-workbench']?.readOnly !== true ||
+      tool.inputSchema?.['x-workbench']?.protocol !== 'motus.workbench/1') return;
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'tool-readonly-workbench-btn';
+  button.title = '打开只读工作台'; button.textContent = '打开工作台';
+  button.addEventListener('pointerdown', e => e.stopPropagation());
+  button.addEventListener('click', async e => {
+    e.stopPropagation(); e.preventDefault();
+    try {
+      const { openToolConsole } = await import('./workbench.js');
+      await openToolConsole(mcp.id, tool);
+    } catch (error) { alert(`无法打开工作台：${error.message}`); }
+  });
+  container.appendChild(button);
+}
+
 function _buildChip(mcp, tool) {
   const chip = document.createElement('div');
   const toolType = tool.type || '';
@@ -416,6 +436,7 @@ function _buildChip(mcp, tool) {
     ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
     : '';
   chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
+  _readOnlyWorkbenchButton(chip, mcp, tool);
 
   // Mobile add-to-canvas button
   chip.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
@@ -562,6 +583,7 @@ function _buildToolCard(mcp, tool) {
   `;
 
   // Detail button
+  _readOnlyWorkbenchButton(card.querySelector('.tool-card-actions'), mcp, tool);
   card.querySelector('.tool-card-info-btn').addEventListener('click', (e) => {
     e.stopPropagation();
     _showDetail(mcp, tool);
