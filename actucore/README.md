@@ -142,7 +142,8 @@ Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协
 }
 ```
 
-画布/LLM 的 `config` 表单只提供默认停止距离。显式 dispatch/API 调用还支持
+画布配置表单提供 `rate_hz`、`obstacle_stop_m` 和 `stop_distance_m`；LLM 的
+`config` 动作参数只提供默认停止距离。显式 dispatch/API 调用还支持
 `obstacle_stop_m`、`slow_distance_m`、`align_full_stop`、`vx_max`、`vy_max`、
 `wz_max`、`search_rate` 和 `use_lateral`；速度、搜索转速及横移能力仍受下游
 Driver 声明约束，显式 `use_lateral: false` 不会被硬件能力声明重新开启。

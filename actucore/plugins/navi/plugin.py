@@ -196,6 +196,8 @@ class NaviPlugin:
         self._binding = {}
         self._acp_action_id = ""
         self._limit_notes: list = []
+        self._response_notes: list = []
+        self._odom_notes: list = []
         # What `_adopt_camera` had to change or assume. Separate from
         # `_limit_notes` only because they are populated at different points in
         # `_start`; both end up in `degraded`.
@@ -447,7 +449,7 @@ class NaviPlugin:
                 and k != "stop_tolerance_m")
         })
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
-        self._limit_notes.extend(policy_mod.adopt_response(self._config, descriptor))
+        self._response_notes = policy_mod.adopt_response(self._config, descriptor)
 
         rate = negotiate.effective_rate(capabilities, descriptor,
                                         self._cfg.get("rate_hz"))
@@ -524,12 +526,13 @@ class NaviPlugin:
         that declare neither keep the existing observation-age fallback.
         """
         self._odom_interface = dict(interface) if isinstance(interface, dict) else {}
+        self._odom_notes = []
         fallback = int(self._config.max_obs_age_ms)
         max_age = fallback
         try:
             if not self._odom_interface:
                 if bound_topic:
-                    self._limit_notes.append(
+                    self._odom_notes.append(
                         f"state/odom 未声明 timing，已使用通用 {fallback}ms 观测有效期")
                 self._odom_max_age_ms = fallback
                 return
@@ -538,7 +541,10 @@ class NaviPlugin:
             declared_topic = self._odom_interface.get("topic")
             if declared_topic is not None and declared_topic != bound_topic:
                 raise ValueError("declared topic does not match the bound odom topic")
-            rate = float(self._odom_interface.get("rate_hz") or 0.0)
+            rate = self._odom_interface.get("rate_hz")
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+                raise ValueError("rate_hz must be a number")
+            rate = float(rate)
             timing = self._odom_interface.get("timing") or {}
             if not isinstance(timing, dict):
                 raise ValueError("timing must be an object")
@@ -558,11 +564,11 @@ class NaviPlugin:
             max_age = int(math.ceil(3000.0 / rate + delay_ms))
             if delay is None:
                 max_age = max(max_age, fallback)
-                self._limit_notes.append(
+                self._odom_notes.append(
                     f"state/odom 未声明测量延迟，已使用 {max_age}ms 里程计有效期")
         except (KeyError, TypeError, ValueError, OverflowError):
             if bound_topic:
-                self._limit_notes.append(
+                self._odom_notes.append(
                     "odom_interface 的 schema/topic/timing 声明无效，"
                     f"已使用通用 {fallback}ms 观测有效期")
             # A malformed declaration is the same as no timing contract. Keep
@@ -1045,6 +1051,8 @@ class NaviPlugin:
             out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")
         out.extend(self._limit_notes)
+        out.extend(self._response_notes)
+        out.extend(self._odom_notes)
         out.extend(self._camera_notes)
         if not all(self._objects_frame):
             # **Not a cosmetic loss.** Without the frame size vop's pixel boxes

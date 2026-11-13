@@ -978,11 +978,14 @@ async def _do_start_project_impl():
         """
         out: dict = {}
         for conn in [c for c in connections if c.get('toCardId') == card_id]:
-            if conn.get('format') != 'state/odom':
-                continue
             topic = _topic_of_connection(conn)
-            interface = ((resolved_info.get(conn.get('fromCardId')) or {})
-                         .get('odom_interface'))
+            source = resolved_info.get(conn.get('fromCardId')) or {}
+            fmt = next((port.get('format') for port in source.get('topic_out') or []
+                        if isinstance(port, dict) and port.get('topic') == topic
+                        and port.get('format')), conn.get('format'))
+            if fmt != 'state/odom':
+                continue
+            interface = source.get('odom_interface')
             if topic and isinstance(interface, dict) and interface and topic not in out:
                 out[topic] = dict(interface)
         return out

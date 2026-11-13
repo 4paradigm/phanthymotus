@@ -200,7 +200,8 @@ plugins:
   # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。
 
   navi:
-    # 卡片 config 只暴露默认停止距离。速度上限、横移能力、搜索转速
+    # 画布表单提供 rate_hz、obstacle_stop_m 和默认停止距离；LLM config 动作只提供
+    # 默认停止距离。速度上限、横移能力、搜索转速
     # 和转向响应均由下游 Driver descriptor 协商，不在画布表单里手填。
     # 到达容差是 navigate_to 的单次参数，不持久到这份启动配置。
     #

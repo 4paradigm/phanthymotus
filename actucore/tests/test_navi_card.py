@@ -860,7 +860,7 @@ def test_missing_or_invalid_odom_timing_falls_back_without_blocking(interface):
     card = _card()
     card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
     assert card._odom_max_age_ms == 500
-    assert card._limit_notes
+    assert card._odom_notes
 
 
 @pytest.mark.parametrize("timing", [[1], "received", True, 1])
@@ -871,7 +871,7 @@ def test_non_object_odom_timing_falls_back_without_blocking(timing):
     }, bound_topic="/robot/state/odom")
     assert card._odom_interface == {}
     assert card._odom_max_age_ms == 500
-    assert card._limit_notes
+    assert card._odom_notes
 
 
 @pytest.mark.parametrize("age_ms", [900, 1000, 1001])

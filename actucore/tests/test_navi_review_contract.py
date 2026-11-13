@@ -31,8 +31,8 @@ def test_odom_optional_delay_preserves_producer_stamp_and_rate_budget(monkeypatc
     }, bound_topic="/robot/state/odom")
     assert card._odom_interface["timing"]["stamp_source"] == "received"
     assert card._odom_max_age_ms == expected
-    assert any("未声明测量延迟" in note for note in card._limit_notes)
-    assert not any("无效" in note for note in card._limit_notes)
+    assert any("未声明测量延迟" in note for note in card._odom_notes)
+    assert not any("无效" in note for note in card._odom_notes)
     monkeypatch.setattr(time, "time", lambda: 123.456)
     card._on_string("odom", SimpleNamespace(data=json.dumps({
         "schema": "motus.odom/1", "stamp_ms": 123000,
@@ -50,6 +50,48 @@ def test_present_invalid_odom_delay_does_not_become_an_unknown_delay(delay):
     }, bound_topic="/robot/state/odom")
     assert card._odom_interface == {}
     assert card._odom_max_age_ms == 500
+
+
+@pytest.mark.parametrize("rate", [True, False, "2", "20", None, [], {}, 0, -1,
+                                 float("nan"), float("inf")])
+def test_invalid_odom_rate_keeps_receipt_time_fallback(monkeypatch, rate):
+    card = _card()
+    card._adopt_odom_interface({
+        "schema": "motus.odom/1", "rate_hz": rate,
+        "timing": {"stamp_source": "received"},
+    }, bound_topic="/robot/state/odom")
+    assert card._odom_interface == {}
+    assert card._odom_max_age_ms == 500
+    monkeypatch.setattr(time, "time", lambda: 123.456)
+    card._on_string("odom", SimpleNamespace(data=json.dumps({
+        "schema": "motus.odom/1", "stamp_ms": 123000,
+        "twist": [0.1, 0, None, None, None, 0.2],
+    })))
+    assert card._odom_ms == 123456
+
+
+@pytest.mark.parametrize("interface,notice", [
+    ({"schema": "motus.odom/1", "rate_hz": 20,
+      "timing": {"stamp_source": "received"}}, "未声明测量延迟"),
+    ({"schema": "wrong"}, "声明无效"),
+])
+@pytest.mark.parametrize("response", [None, {"wz": "invalid"}])
+def test_runtime_config_preserves_odom_and_response_notices(interface, notice, response):
+    card = _card()
+    try:
+        start_card(card, response=response)
+        card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
+        before = card._info()["degraded"]
+        assert any(notice in note for note in before)
+        for distance in (1.0, 1.2):
+            assert card._config_action({"stop_distance_m": distance})["status"] == "configured"
+            after = card._info()["degraded"]
+            assert any(notice in note for note in after)
+            if response:
+                assert any("response.wz 声明无效" in note for note in after)
+            assert len(after) == len(set(after))
+    finally:
+        card._stop()
 
 
 @pytest.mark.parametrize("configured,declared,age,fresh", [

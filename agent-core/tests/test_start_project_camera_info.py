@@ -289,7 +289,8 @@ def test_no_extra_round_trip_is_taken_for_it(rig):
 
 # ── odometry timing follows the same upstream-info path ─────────────────────
 
-def test_odom_interface_reaches_navi_keyed_by_resolved_topic(rig):
+@pytest.mark.parametrize('persisted_format', ['state/odom', None, 'data/json'])
+def test_odom_interface_reaches_navi_keyed_by_resolved_topic(rig, persisted_format):
     interface = {
         'schema': 'motus.odom/1',
         'rate_hz': 10,
@@ -297,11 +298,14 @@ def test_odom_interface_reaches_navi_keyed_by_resolved_topic(rig):
                    'stamp_source': 'received'},
     }
     rig.odom_declarations[ODOM] = interface
+    connection = _conn(ODOM, NAVI, '/stale/odom', persisted_format)
+    if persisted_format is None:
+        del connection['format']
     layout = {
         'cards': [_card(ODOM, 'loco_state'), _card(NAVI, 'navi')],
         # The canvas snapshot may be stale; the key must follow the source's
         # live resolved topic, exactly like the input_topic sent to navi.
-        'connections': [_conn(ODOM, NAVI, '/stale/odom', 'state/odom')],
+        'connections': [connection],
     }
     _run(layout)
 
@@ -318,11 +322,13 @@ def test_missing_odom_interface_is_optional(rig):
     assert 'odom_interfaces' not in rig.starts[NAVI]
 
 
-def test_non_odom_connection_does_not_donate_odom_interface(rig):
-    rig.odom_declarations[ODOM] = {'rate_hz': 10, 'timing': {'delay_ms': 80}}
+@pytest.mark.parametrize('persisted_format', ['data/json', 'state/odom'])
+def test_non_odom_connection_does_not_donate_odom_interface(rig, persisted_format):
+    rig.odom_declarations[CAM] = {'schema': 'motus.odom/1', 'rate_hz': 10,
+                                  'timing': {'stamp_source': 'received'}}
     layout = {
-        'cards': [_card(ODOM, 'loco_state'), _card(NAVI, 'navi')],
-        'connections': [_conn(ODOM, NAVI, ODOM_TOPIC, 'data/json')],
+        'cards': [_card(CAM, 'camera'), _card(NAVI, 'navi')],
+        'connections': [_conn(CAM, NAVI, CAM_TOPIC, persisted_format)],
     }
     _run(layout)
 
