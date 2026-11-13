@@ -129,6 +129,24 @@ def test_pending_registration_cannot_defer_inertial_bounds_forever():
         registration.release.set(); assert worker.close(2)
 
 
+@pytest.mark.parametrize('sigma,status', [(.15, 'coasting'), (.201, 'lost')])
+def test_geometry_timeout_applies_twenty_cm_position_limit(sigma, status):
+    registration = BlockingRegistration()
+    c, worker, stamp, color = coasting(registration)
+    try:
+        c._propagate(stamp)
+        c.filter.P = np.zeros((15, 15))
+        c.filter.P[:3, :3] = np.eye(3)*sigma**2
+        c.observe_frame(stamp, color, c.reference[1], None, stamp, reason='visual missing')
+        assert c.geometry_job is not None
+        c.poll_geometry(stamp+300_000_000)
+        assert c.state == status
+        if status == 'lost':
+            assert 'exceeds 0.20 m' in c.reason
+    finally:
+        registration.release.set(); assert worker.close(2)
+
+
 @pytest.mark.parametrize('force', [False, True])
 def test_finished_registration_is_discarded_after_its_deadline(force):
     result, current = real_result()

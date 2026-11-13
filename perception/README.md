@@ -248,8 +248,8 @@ Each frame is judged in a fixed order. Hard capture-time, frame and data
 errors end the segment first. The IMU prediction is then followed by an
 attempted visual correction (time, residual and innovation gates unchanged).
 Only after that is uncertainty judged: without an accepted correction, a
-predicted position sigma above 0.10 m ends the segment; after an accepted
-correction, a corrected sigma above 0.10 m pauses output (`recovering`) and
+predicted position sigma above 0.20 m ends the segment; after an accepted
+correction, a corrected sigma above 0.20 m pauses output (`recovering`) and
 ends the segment if it persists for 1 s. `position_sigma_m` is the square root
 of the largest camera-position covariance eigenvalue under the unvalidated
 engineering priors, not a measured error. Watchdog/`info` polls are wall-clock
@@ -305,7 +305,9 @@ unchanged; driver-side freshness limits are independent.
 
 The short-outage offline validation target is 0.5 s. A hard 1 s visual
 correction timeout ends the segment; rejection/geometry cannot extend it. The
-0.10 m modeled position limit applies as described above. Noise and
+0.20 m modeled position limit applies as described above. This is raised from
+0.10 m to permit more short-term compensation; it accepts greater modeled
+uncertainty and does not establish improved position accuracy. Noise and
 covariance are conservative engineering priors, **not measured accuracy
 bounds**. Deep integration cannot compensate arbitrary-duration blindness.
 

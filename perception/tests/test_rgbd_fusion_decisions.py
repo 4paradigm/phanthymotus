@@ -23,14 +23,49 @@ def noisy(x=0., variance=.04):
     return value
 
 
+@pytest.mark.parametrize('sigma,status', [(.15, 'coasting'), (.20, 'coasting'), (.201, 'lost')])
+def test_default_position_sigma_limit_allows_up_to_twenty_cm_without_tracking_prediction(sigma, status):
+    c, t = warmed()
+    stamp = imu_until(c, t, .1)
+    c._propagate(stamp)
+    # Isolate the decision boundary from the engineering propagation priors.
+    c.filter.P = np.zeros((15, 15))
+    c.filter.P[:3, :3] = np.eye(3)*sigma**2
+    sample = c.observe_frame(stamp, *images(), None, stamp+1_000_000, reason='visual missing')
+    fusion = sample['vendor']['fusion']
+    assert fusion['sigma_limit_m'] == .20
+    assert fusion['last_frame']['predicted_sigma_m'] == pytest.approx(sigma)
+    assert c.state == status
+    assert sample['pose'] is None
+    if status == 'lost':
+        assert 'exceeds 0.20 m' in c.reason
+    else:
+        assert fusion['prediction'] is not None
+
+
+def test_corrected_sigma_between_old_and_new_limits_can_recover_tracking():
+    c, t = warmed()
+    stamp = imu_until(c, t, .9)
+    sample = c.observe_frame(stamp, *images(), noisy(), stamp+1_000_000)
+    diagnostic = sample['vendor']['fusion']['last_frame']
+    assert .10 < diagnostic['corrected_sigma_m'] <= .20
+    assert diagnostic['visual'] == 'accepted'
+    assert c.reason == 'waiting for three consistent visual observations'
+    for _ in range(2):
+        stamp = imu_until(c, stamp, .1)
+        sample = c.observe_frame(stamp, *images(), noisy(), stamp+1_000_000)
+    assert c.state == 'tracking' and sample['pose'] is not None
+
+
 def test_predicted_sigma_over_limit_is_corrected_by_a_legal_visual_first():
     c, t = warmed()
-    stamp = imu_until(c, t, .8)  # predicted sigma ~0.108 m with these engineering priors
+    c.filter.P[:3, :3] = np.eye(3)*.25**2
+    stamp = imu_until(c, t, .8)
     sample = c.observe_frame(stamp, *images(), pose(), stamp+1_000_000)
     fusion = sample['vendor']['fusion']
     assert c.state != 'lost', c.reason
-    assert fusion['last_frame']['predicted_sigma_m'] > .10
-    assert fusion['last_frame']['corrected_sigma_m'] <= .10
+    assert fusion['last_frame']['predicted_sigma_m'] > .20
+    assert fusion['last_frame']['corrected_sigma_m'] <= .20
     assert fusion['last_frame']['visual'] == 'accepted'
     # A gap demotes tracking: one correction cannot re-establish tracking.
     assert sample['pose'] is None and c.state == 'recovering'
@@ -43,25 +78,31 @@ def test_predicted_sigma_over_limit_is_corrected_by_a_legal_visual_first():
 @pytest.mark.parametrize('visual,why', [(None, 'visual missing'), (pose(3.), 'absolute_residual_gate')])
 def test_missing_or_bad_visual_cannot_extend_inertial_bound(visual, why):
     c, t = warmed()
+    c.filter.P[:3, :3] = np.eye(3)*.25**2
     stamp = imu_until(c, t, .8)
     sample = c.observe_frame(stamp, *images(), visual, stamp+1_000_000, reason='visual missing')
     assert sample['pose'] is None and c.state == 'lost'
-    assert 'predicted position uncertainty exceeds 0.10 m' in c.reason
+    assert 'predicted position uncertainty exceeds 0.20 m' in c.reason
     assert why in str(sample['vendor']['fusion']['last_frame'])
 
 
 def test_corrected_uncertainty_over_limit_pauses_output_then_is_bounded():
     c, t = warmed()
+    c.filter.P[:3, :3] = np.eye(3)*.5**2
+    color, depth = images()
+    color = np.where(color > 0, 16, 0).astype(np.uint8)
+    weak = noisy()
+    weak['quality_weight'] = 3.
     stamp = imu_until(c, t, .9)
-    sample = c.observe_frame(stamp, *images(), noisy(), stamp+1_000_000)
+    sample = c.observe_frame(stamp, color, depth, weak, stamp+1_000_000)
     assert sample['vendor']['fusion']['last_frame']['visual'] == 'accepted'
-    assert sample['vendor']['fusion']['last_frame']['corrected_sigma_m'] > .10
+    assert sample['vendor']['fusion']['last_frame']['corrected_sigma_m'] > .20
     assert sample['pose'] is None and c.state == 'recovering'
     assert 'corrected position uncertainty' in c.reason
     # Accepted but over-uncertain corrections cannot keep the segment alive.
     for _ in range(12):
         stamp = imu_until(c, stamp, .1)
-        sample = c.observe_frame(stamp, *images(), noisy(), stamp+1_000_000)
+        sample = c.observe_frame(stamp, color, depth, weak, stamp+1_000_000)
         assert sample['pose'] is None
         if c.state == 'lost':
             break

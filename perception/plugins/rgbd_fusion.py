@@ -169,7 +169,7 @@ class InertialFilter:
                     covariance=covariance.ravel().tolist())
 
 
-SIGMA_LIMIT_M = .10
+SIGMA_LIMIT_M = .20
 INERTIAL_LIMIT_NS = 1_000_000_000
 # Wall-clock polls lag capture time by native latency. Frames resolve within the
 # 250 ms join deadline, so 500 ms without any processed frame (>= 4 Hz) means
@@ -369,9 +369,9 @@ class ShortTermFusion:
                 corrected = diagnostic['corrected_sigma_m'] = self.position_sigma()
                 if corrected > SIGMA_LIMIT_M:
                     self.good = 0
-                    self.state, self.reason = 'recovering', 'corrected position uncertainty exceeds 0.10 m'
+                    self.state, self.reason = 'recovering', f'corrected position uncertainty exceeds {SIGMA_LIMIT_M:.2f} m'
                     if stamp-self.last_confident > INERTIAL_LIMIT_NS:
-                        self.fault('corrected position uncertainty exceeded 0.10 m for more than 1 s')
+                        self.fault(f'corrected position uncertainty exceeded {SIGMA_LIMIT_M:.2f} m for more than 1 s')
                 else:
                     self.last_confident = stamp
                     self.good += 1
@@ -389,7 +389,7 @@ class ShortTermFusion:
                 # A pending registration defers this judgement to its result or
                 # deadline; the next frame re-judges after its own prediction.
                 if self.geometry_job is None and self.position_sigma() > SIGMA_LIMIT_M:
-                    self.fault('predicted position uncertainty exceeds 0.10 m without an accepted visual correction')
+                    self.fault(f'predicted position uncertainty exceeds {SIGMA_LIMIT_M:.2f} m without an accepted visual correction')
         except (ValueError, TypeError, KeyError, np.linalg.LinAlgError) as error:
             self.fault(error)
         return self._finish(stamp, diagnostic)
@@ -456,7 +456,7 @@ class ShortTermFusion:
         job['diagnostic']['geometry'] = outcome
         if (not force and self.state == 'coasting' and self.filter is not None and
                 self.position_sigma() > SIGMA_LIMIT_M):
-            self.fault('predicted position uncertainty exceeds 0.10 m without an accepted visual correction')
+            self.fault(f'predicted position uncertainty exceeds {SIGMA_LIMIT_M:.2f} m without an accepted visual correction')
 
     def _apply_geometry(self, ref_pose, result):
         if result is None:
