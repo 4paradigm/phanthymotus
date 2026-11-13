@@ -202,6 +202,21 @@ explicit stop still does. Input/settings changes continue to require stop/start.
 Watchdog pause messages reuse the latest admitted native capture timestamp;
 receipt time is never substituted for capture evidence during a pause.
 
+Before the segment has published its first pose, finite valid estimates with
+at least 10 inliers but translation covariance above 0.04 m² remain
+`initializing`. They reset the three-good-estimate count and publish no pose
+or mapping-pause declaration, while the same native estimator keeps its map.
+Fresh weak results prove only estimator liveness; stale results/input and
+invalid observations still expire. Once a pose has been published, the
+existing 0.8 s/1 s recovery boundaries apply unchanged. This avoids repeatedly
+resetting a new frontend solely because its quality has not settled; it does
+not establish motion accuracy or accept high-covariance poses.
+
+The pinned RTAB-Map PnP covariance is a registration residual statistic;
+its ROS wrapper doubles the diagonal for `Odometry.pose.covariance`. It is
+not a calibrated accumulated trajectory-error estimate. The 0.04 m² check
+remains an engineering admission bound, independent of the ESKF sigma limit.
+
 For current Core's topic-only SLAM path, map provenance explicitly records
 unverified timestamp overlap. The stricter SLAM declaration path still requires
 independent timing/mount evidence. Validate real tracking and map save/reopen
@@ -243,6 +258,16 @@ image contrast/sharpness and valid measured-depth fraction. Independent
 capture clocks need bracketing IMU coverage, not identical sensor rates.
 Native pose/diagnostic results are joined at exact image capture times;
 results arriving after their 250 ms observation deadline are discarded.
+`info().native_join` reports session-local queued/completed/pending captures,
+deadline expirations, IMU-uncovered completions, and pose/info callbacks
+received, joined, after-deadline or unqueued. Absent counter keys mean zero;
+callback counts can include duplicates. Unqueued means the capture is no
+longer pending or was never queued here, not proof of a DDS/native drop.
+Fallback retains these counters and counts its cancelled pending captures.
+Frame rejection reasons distinguish missing pose, missing diagnostic, both
+missing, native lost, insufficient inliers and invalid pose/covariance.
+These counters do not prove native receipt: the pinned wrapper can drop
+inputs while busy, and best-effort delivery can also lose messages.
 
 Each frame is judged in a fixed order. Hard capture-time, frame and data
 errors end the segment first. The IMU prediction is then followed by an

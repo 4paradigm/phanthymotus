@@ -4,6 +4,7 @@ Real RgbdSession/EstimateGate with ROS and native process boundaries stubbed.
 These are logic tests; they do not establish physical tracking behaviour.
 """
 import json
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -45,6 +46,66 @@ def track(session, now, start=1_000_000_000, x=0.):
 
 def last(session):
     return json.loads(session.publisher.messages[-1])
+
+
+def test_recorded_weak_start_does_not_restart_before_first_tracking_pose():
+    trace = json.loads((Path(__file__).parent/'fixtures/rgbd_motion_weak_start.json').read_text())
+    gate = runtime.EstimateGate('run', 'camera_optical', 'camera-clock')
+    for row in trace['frames']:
+        msg, info = messages(row['stamp_ns'])  # synthetic identity, not recorded trajectory
+        msg.pose.covariance = np.diag(row['covariance_diagonal']).ravel().tolist()
+        info.inliers, info.lost = row['inliers'], row['lost']
+        gate.input(row['stamp_ns'], now_ns=row['now_ns'])
+        assert gate.accept(msg, info, row['now_ns']) is None
+    assert gate.state == 'initializing'
+    assert gate.last_pose is None and gate.good == 0
+    # A continuation is synthetic: it proves warmup, not actual motion accuracy.
+    for k in range(1, 4):
+        stamp = row['stamp_ns'] + k*200*MS
+        gate.input(stamp)
+        sample = gate.accept(*messages(stamp), stamp+20*MS)
+        assert (sample is not None) == (k == 3)
+    assert gate.state == 'tracking'
+
+
+def test_weak_warmup_after_two_good_frames_uses_result_liveness(sessions):
+    create, now, ticks = sessions
+    s = create()
+    for k in range(30):
+        stamp = 1_000_000_000+k*100*MS
+        now[0] = stamp
+        images(s, stamp)
+        feed(s, now, stamp, cov=.001 if k < 2 else .25)
+        ticks[0] += .1
+        s._watchdog()
+        assert s.gate.state == 'initializing'
+    assert all(json.loads(m)['pose'] is None and 'pause' not in json.loads(m)['vendor']
+               for m in s.publisher.messages)
+    assert s.gate.good == 0
+    # Input stays fresh, but a silent native estimator must still expire.
+    now[0] += 1_500_000_001
+    s.gate.last_input = now[0]
+    s._watchdog()
+    assert s.gate.state == 'lost' and s.gate.loss_kind == 'visual'
+
+
+@pytest.mark.parametrize('bad', ['lost', 'inliers', 'nan', 'asymmetric', 'negative', 'indefinite', 'quaternion'])
+def test_invalid_warmup_is_not_treated_as_weak_but_usable_native_output(bad):
+    gate = runtime.EstimateGate('run', 'camera_optical', 'camera-clock')
+    for k in range(14):
+        stamp = 1_000_000_000+k*100*MS
+        msg, info = messages(stamp)
+        msg.pose.covariance = np.diag([.25]*3+[.001]*3).ravel().tolist()
+        if bad == 'lost': info.lost = True
+        if bad == 'inliers': info.inliers = 9
+        if bad == 'nan': msg.pose.covariance[0] = float('nan')
+        if bad == 'asymmetric': msg.pose.covariance[1] = .1
+        if bad == 'negative': msg.pose.covariance[0] = -.1
+        if bad == 'indefinite': msg.pose.covariance[1] = msg.pose.covariance[6] = .5
+        if bad == 'quaternion': msg.pose.pose.orientation.w = 0.
+        gate.input(stamp)
+        assert gate.accept(msg, info, stamp+20*MS) is None
+    assert gate.state == 'lost'
 
 
 # ── C: pure RGB-D ────────────────────────────────────────────────────────────

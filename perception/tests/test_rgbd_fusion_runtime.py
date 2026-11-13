@@ -58,6 +58,54 @@ def test_lost_diagnostic_can_trigger_coast_without_matching_pose():
     assert fusion.frames[0][1] is None
 
 
+@pytest.mark.parametrize('kinds,lost,inliers,reason', [
+    ((), False, 50, 'visual pose and diagnostic missing'),
+    (('pose',), False, 50, 'visual diagnostic missing'),
+    (('info',), False, 50, 'visual pose missing'),
+    (('info',), True, 50, 'native visual tracking lost'),
+    (('pose', 'info'), False, 9, 'visual inliers below 10'),
+])
+def test_join_distinguishes_transport_absence_from_native_quality(kinds, lost, inliers, reason):
+    fusion = Fusion(); frames = CaptureObservations(fusion)
+    frames.add_frame(1_000_000_000, None, None, 1_010_000_000)
+    msg, info = messages(1_000_000_000)
+    info.lost, info.inliers = lost, inliers
+    for kind in kinds:
+        frames.result(kind, msg if kind == 'pose' else info, 1_020_000_000)
+    frames.drain(1_260_000_000)
+    assert fusion.frames == [(1_000_000_000, None, reason)]
+
+
+def test_join_accounts_for_late_and_unqueued_results_without_rewriting_history():
+    fusion = Fusion(); frames = CaptureObservations(fusion)
+    frames.add_frame(1_000_000_000, None, None, 1_010_000_000)
+    msg, info = messages(1_000_000_000)
+    frames.result('pose', msg, 1_200_000_000)
+    frames.result('info', info, 1_260_000_001)  # expired while still pending
+    frames.result('info', info, 1_270_000_000)  # already consumed
+    assert len(fusion.frames) == 1 and fusion.frames[0][1] is None
+    assert frames.counts['queued'] == frames.counts['completed'] == 1
+    assert frames.counts['deadline_expired'] == 1
+    assert frames.counts['pose_received'] == frames.counts['pose_joined'] == 1
+    assert frames.counts['info_received'] == 2
+    assert frames.counts['info_joined'] == 0
+    assert frames.counts['info_after_deadline'] == 1
+    assert frames.counts['info_unqueued'] == 1
+
+
+def test_join_reports_imu_coverage_timeout_separately_from_missing_visual():
+    fusion = Fusion(); fusion.samples = []
+    frames = CaptureObservations(fusion)
+    frames.add_frame(1_000_000_000, None, None, 1_010_000_000)
+    msg, info = messages(1_000_000_000)
+    frames.result('pose', msg, 1_020_000_000)
+    frames.result('info', info, 1_020_000_000)
+    assert not fusion.frames
+    frames.drain(1_260_000_000)
+    assert fusion.frames[0][1] is not None
+    assert frames.counts['imu_uncovered'] == frames.counts['deadline_expired'] == 1
+
+
 def test_capture_backlog_and_repeated_frame_fail_closed():
     for stamps in ([1_000_000_000]*2, [1_000_000_000+i*10_000_000 for i in range(9)]):
         fusion = Fusion(); frames = CaptureObservations(fusion)

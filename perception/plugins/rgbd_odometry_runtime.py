@@ -1,5 +1,5 @@
 """One supervised RTAB-Map estimator per calibrated RGB-D card instance."""
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from array import array
 from copy import deepcopy
 import json
@@ -97,7 +97,10 @@ class EstimateGate:
     def status(self, now):
         if self.last_input and now - self.last_input > 1_500_000_000:
             self.fault('RGB-D input stale; restart to begin a new segment', 'input')
-        if self.last_stamp and now - self.last_stamp > 1_500_000_000:
+        # Before any published anchor, fresh weak results prove liveness only.
+        # An anchored segment still expires against its accepted visual stamps.
+        visual_stamp = self.last_stamp if self.last_pose is not None else self.last_result_stamp
+        if visual_stamp and now - visual_stamp > 1_500_000_000:
             self.fault('visual estimate stale; restart to begin a new segment', 'visual')
         if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
             self.fault('visual degradation persisted beyond 1 s; restart to begin a new segment', 'visual')
@@ -132,7 +135,7 @@ class EstimateGate:
             covariance = np.asarray(msg.pose.covariance, dtype=float).reshape(6, 6)
             if (not np.isfinite(covariance).all() or
                     not np.allclose(covariance, covariance.T, atol=1e-8) or
-                    np.any(np.diag(covariance) < 0) or np.any(np.diag(covariance)[:3] > .04)):
+                    np.any(np.diag(covariance) < 0)):
                 raise ValueError('visual covariance exceeds tracking bounds')
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
             pose = dict(position=[p.x, p.y, p.z], quaternion=[q.x, q.y, q.z, q.w],
@@ -142,6 +145,14 @@ class EstimateGate:
             position, rotation = pose_values(pose)
         except (ValueError, TypeError, AttributeError) as error:
             self.degrade(error, now)
+            return None
+        if np.any(np.diag(covariance)[:3] > .04):
+            self.degrade('visual covariance exceeds tracking bounds', now)
+            if self.last_pose is None and np.linalg.eigvalsh(covariance).min() >= -1e-10:
+                # No map/pose has been published in this segment. Keep the
+                # native map alive while quality settles, without allowing a
+                # weak pose onto the output or extending an old SLAM pause.
+                self.state, self.recover_by = 'initializing', None
             return None
         if (self.state == 'recovering' and self.last_pose is not None and
                 stamp - self.last_pose[0] > PAUSE_RESUME_NS):
@@ -226,6 +237,7 @@ class CaptureObservations:
         self.fusion = fusion
         self.frames = OrderedDict()
         self.last_added = 0
+        self.counts = Counter()
 
     def add_frame(self, stamp, color, depth, now):
         outputs = self.drain(now)
@@ -234,18 +246,33 @@ class CaptureObservations:
             return outputs
         self.last_added = stamp
         self.frames[stamp] = dict(color=color, depth=depth, added=now, deadline=now+250_000_000)
+        self.counts['queued'] += 1
         return outputs
 
     def result(self, kind, msg, now):
         stamp = stamp_ns(msg)
-        if stamp in self.frames and now <= self.frames[stamp]['deadline']:
+        self.counts[kind+'_received'] += 1
+        if stamp not in self.frames:
+            # Includes drained captures and results never queued by this
+            # consumer; it is not evidence of a native/DDS dropped frame.
+            self.counts[kind+'_unqueued'] += 1
+        elif now > self.frames[stamp]['deadline']:
+            self.counts[kind+'_after_deadline'] += 1
+        else:
             self.frames[stamp][kind] = msg
+            self.counts[kind+'_joined'] += 1
         return self.drain(now)
 
     def _visual(self, stamp, entry):
         msg, info = entry.get('pose'), entry.get('info')
-        if msg is None or info is None or info.lost or info.inliers < 10:
-            return None, 'visual pose missing, lost or insufficient inliers'
+        if info is not None and info.lost:
+            return None, 'native visual tracking lost'
+        if info is None:
+            return None, 'visual diagnostic missing' if msg is not None else 'visual pose and diagnostic missing'
+        if info.inliers < 10:
+            return None, 'visual inliers below 10'
+        if msg is None:
+            return None, 'visual pose missing'
         try:
             if msg.header.frame_id != self.fusion.segment+'_odom' or msg.child_frame_id != self.fusion.frame:
                 self.fusion.fault('native visual frame/segment changed; restart required', 'frame')
@@ -269,6 +296,11 @@ class CaptureObservations:
             if (not ready or not coverage) and now < entry['deadline']:
                 break
             self.frames.pop(stamp)
+            self.counts['completed'] += 1
+            if not ready or not coverage:
+                self.counts['deadline_expired'] += 1
+            if not coverage:
+                self.counts['imu_uncovered'] += 1
             visual, reason = self._visual(stamp, entry)
             outputs.append(self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
                                                      reason=reason, arrival_ns=entry['added']))
@@ -597,6 +629,7 @@ class RgbdSession:
         self.fallback = dict(mode='visual_only', reason=reason, since_ns=now,
                              fused_visual_offset_m=None if offset is None else round(offset[0], 4),
                              fused_visual_offset_deg=None if offset is None else round(float(np.rad2deg(offset[1])), 2))
+        self.observations.counts['cancelled_on_fallback'] += len(self.observations.frames)
         self.observations.frames.clear()
         gate = self.gate
         gate.good = 0
@@ -804,6 +837,8 @@ class RgbdSession:
                     'fusion': self.fusion.info(time.time_ns(), history=True) if self.fusion else {'enabled': False},
                     'registration': deepcopy(self.last_registration),
                     'native_reports': self.native_reports,
+                    'native_join': dict(self.observations.counts, pending=len(self.observations.frames))
+                                   if self.observations is not None else None,
                     'body_mount': self.mounts.info(time.time_ns()) if self.mounts else {'status': 'undeclared'},
                     'estimator_log': str(Path(self.directory.name) / 'estimator.log')}
 
