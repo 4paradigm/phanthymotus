@@ -26,7 +26,14 @@ class Engine:
 
     def _now(self):
         now = number(self.wall())
-        need(self.last_wall is None or now >= self.last_wall, "CLOCK_ROLLBACK")
+        if self.last_wall is not None and now < self.last_wall:
+            for session in self.sessions.values():
+                session["clock_invalid"] = True
+                session["result"] = None
+            self.roi_images.clear()
+            self.requests.clear()
+            self.last_wall = now
+            need(False, "CLOCK_ROLLBACK")
         self.last_wall = now
         return now
 
@@ -35,6 +42,7 @@ class Engine:
         need(s is not None, "UNKNOWN_SESSION")
         need(args.get("session_token") == s["session_token"], "RETIRED_SESSION")
         need(now < s["expires_at"], "SESSION_EXPIRED")
+        need(not s.get("clock_invalid"), "SESSION_CLOCK_INVALID")
         return s
 
     @staticmethod
@@ -229,6 +237,8 @@ class Engine:
             if self._key(args) in self.requests:
                 # An invalid conflicting retry must not overwrite the original receipt or result.
                 return self.replay("verify_after", args)
+            # A new failed observation must not display a previous attempt's after crop.
+            s.get("roi_evidence", {}).pop("after_target_jpeg_base64", None)
             out = self._result(s, getattr(exc, "code", "INPUT_ERROR"), self._now())
             out.update(
                 message=str(exc),
@@ -259,13 +269,15 @@ class Engine:
             need(s["before"] is None, "BASELINE_ALREADY_SET")
             meta, image = prepare(observed, binding, now, self.max_age)
             patch, _ = crop(image, s["target_roi"])
-            s["before"] = meta
-            s["observations"] = [deepcopy(meta)]
-            self.roi_images[s["session_id"]] = image
-            s["roi_evidence"] = {
+            evidence = {
                 "before_target_jpeg_base64": jpeg(patch),
                 "before_statistics": statistics(image, s["target_roi"]),
             }
+            # Commit only once all baseline evidence has been generated.
+            s["before"] = meta
+            s["observations"] = [deepcopy(meta)]
+            self.roi_images[s["session_id"]] = image
+            s["roi_evidence"] = evidence
             return dict(
                 state="before_captured",
                 **self._public(s),

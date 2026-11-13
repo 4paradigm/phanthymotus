@@ -25,6 +25,8 @@ class Sources:
         self.sequence = {}
         self.nodes = []
         self.closed = False
+        self.cancelled = threading.Event()
+        self.source_epochs = {key: uuid4().hex for key in config["sources"]}
         self.errors = {}
         self.ros = None
         self.thread = None
@@ -34,6 +36,8 @@ class Sources:
         with self.condition:
             if not self.closed:
                 self.errors[source_id] = str(exc)
+                self.frames.pop(source_id, None)
+                self.source_epochs[source_id] = uuid4().hex
                 self.condition.notify_all()
 
     def image(self, source_id, msg):
@@ -93,7 +97,7 @@ class Sources:
     def feed_image(self, source_id, pixels, captured_at, *, provenance):
         """Also supports labelled recorded-data tests; no reception-time retiming."""
         with self.condition:
-            need(not self.closed, "SOURCE_CLOSED")
+            need(not self.closed and not self.cancelled.is_set(), "SOURCE_CLOSED")
             b = self.config["sources"][source_id]
             need(provenance == b.get("provenance", "real"), "PROVENANCE_MISMATCH")
             need(
@@ -133,6 +137,11 @@ class Sources:
                 previous is None or captured_at > previous[1]["captured_at"],
                 "IMAGE_REPLAY",
             )
+            if (
+                previous
+                and captured_at - previous[1]["captured_at"] > self.engine.max_age
+            ):
+                self.source_epochs[source_id] = uuid4().hex
             sequence = self.sequence.get(source_id, 0) + 1
             self.sequence[source_id] = sequence
             snapshot = pixels.copy()
@@ -140,7 +149,7 @@ class Sources:
                 "schema": OBSERVATION,
                 "observation_id": uuid4().hex,
                 "source_id": source_id,
-                "source_epoch": self.epoch,
+                "source_epoch": self.source_epochs[source_id],
                 "sequence": sequence,
                 "camera_id": b["camera_id"],
                 "frame_id": b["frame_id"],
@@ -175,7 +184,7 @@ class Sources:
                 "ROI_IMAGE_SOURCE_REQUIRED",
             )
             while True:
-                need(not self.closed, "SOURCE_CLOSED")
+                need(not self.closed and not self.cancelled.is_set(), "SOURCE_CLOSED")
                 need(
                     not self.errors.get(source_id),
                     "SOURCE_INPUT_ERROR",
@@ -264,9 +273,18 @@ class Sources:
             self.thread = threading.Thread(target=executor.spin, daemon=True)
             self.thread.start()
 
+    def interrupt(self):
+        """Wake acquisition waiters without waiting for the plugin lifecycle lock."""
+        self.cancelled.set()
+        with self.condition:
+            self.condition.notify_all()
+
     def close(self):
         with self.condition:
+            if self.closed:
+                return
             self.closed = True
+            self.cancelled.set()
             self.epoch = uuid4().hex
             self.frames.clear()
             self.previews.clear()

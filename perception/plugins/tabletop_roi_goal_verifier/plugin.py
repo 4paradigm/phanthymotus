@@ -24,6 +24,8 @@ class TabletopROIGoalVerifierPlugin:
         self.sources = Sources(self.config, self.engine)
         self.validator = Draft202012Validator(input_schema())
         self.started = False
+        self._stop_generation = 0
+        self._signal_lock = threading.Lock()
 
     def get_tools(self):
         return [
@@ -45,18 +47,29 @@ class TabletopROIGoalVerifierPlugin:
     def start(self):
         """Bundle startup only advertises this Card; subscription is explicit."""
 
+    def _signal_stop(self):
+        with self._signal_lock:
+            self._stop_generation += 1
+            self.sources.interrupt()
+
     def stop(self):
+        self._signal_stop()
         with self.lock:
             self.sources.close()
             self.engine.stop()
             self.started = False
 
     def dispatch(self, name, args):
-        # Serialize replay checks, acquisitions and commits, including concurrent retries.
+        # Signal stop before the lock: an acquisition may be waiting for a frame.
+        if name == NAME and isinstance(args, dict) and args.get("action") == "stop":
+            self._signal_stop()
+        generation = self._stop_generation
+        # Serialize receipts and session commits, including concurrent retries.
         with self.lock:
             action = None
             try:
                 need(name == NAME, "WRONG_TOOL")
+                need(generation == self._stop_generation, "OPERATION_CANCELLED")
                 args = deepcopy(args or {})
                 need(isinstance(args, dict), "INVALID_ARGUMENTS")
                 if "_tool_name" in args:
@@ -73,10 +86,11 @@ class TabletopROIGoalVerifierPlugin:
                 allowed = (
                     set(ACTION_FIELDS[action])
                     | set(OPTIONAL.get(action, ()))
-                    | {"instance_id"}
+                    | {"instance_id", "_trace_id"}
                 )
                 need(not args.keys() - allowed, "ACTION_ARGUMENT_MISMATCH")
                 args.pop("instance_id", None)
+                args.pop("_trace_id", None)
                 if action == "ui":
                     return {
                         "protocol": "motus.workbench/1",
@@ -128,11 +142,12 @@ class TabletopROIGoalVerifierPlugin:
                                     declaration.get("height"),
                                 ]
                     if not self.started:
-                        if self.sources.closed:
+                        if self.sources.closed or self.sources.cancelled.is_set():
                             self.sources = Sources(self.config, self.engine)
                         self.engine.running = True
                         try:
                             self.sources.start_ros(self.executor)
+                            need(generation == self._stop_generation, "START_CANCELLED")
                         except Exception:
                             self.sources.close()
                             self.engine.stop()
@@ -172,7 +187,9 @@ class TabletopROIGoalVerifierPlugin:
                             packet = self.sources.read_image(source, after=after)
                             observed.append(packet)
                             after = packet["frame"]["captured_at"]
-                return self.engine.call(action, args, observed=observed)
+                result = self.engine.call(action, args, observed=observed)
+                need(generation == self._stop_generation, "OPERATION_CANCELLED")
+                return result
             except Exception as exc:  # noqa: BLE001 — return transport/source diagnostics
                 if action == "verify_after" and isinstance(args, dict):
                     try:

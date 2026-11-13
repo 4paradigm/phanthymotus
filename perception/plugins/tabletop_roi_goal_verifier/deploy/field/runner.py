@@ -207,6 +207,44 @@ def start(root, requested, offline=False):
     )
 
 
+def _pidfd_call(number, *arguments):
+    # Some portable Python 3.10 builds omit the pidfd bindings. The Linux
+    # syscall numbers are identical on our supported x86_64/aarch64 targets.
+    import ctypes
+    import platform
+
+    if sys.platform != "linux" or platform.machine() not in ("x86_64", "aarch64"):
+        raise RuntimeError("Safe stop requires Linux pidfd support on x86_64/aarch64")
+    libc = ctypes.CDLL(None, use_errno=True)
+    value = libc.syscall(ctypes.c_long(number), *arguments)
+    if value < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return value
+
+
+def _open_pid_handle(pid):
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    import ctypes
+
+    return _pidfd_call(434, ctypes.c_int(pid), ctypes.c_uint(0))
+
+
+def _signal_pid_handle(fd, signum):
+    if hasattr(signal, "pidfd_send_signal"):
+        return signal.pidfd_send_signal(fd, signum)
+    import ctypes
+
+    return _pidfd_call(
+        424,
+        ctypes.c_int(fd),
+        ctypes.c_int(signum),
+        ctypes.c_void_p(0),
+        ctypes.c_uint(0),
+    )
+
+
 def stop(root):
     statefile = root / "service.json"
     if not statefile.exists():
@@ -216,7 +254,21 @@ def stop(root):
         return {"state": "already_stopped"}
     if not owned(state, root):
         raise RuntimeError("PID identity changed; refusing to signal it")
-    os.kill(state["pid"], signal.SIGTERM)
+    # Pin the kernel process object before the final identity check: a numeric
+    # PID could be reused between /proc validation and os.kill.
+    try:
+        process_fd = _open_pid_handle(state["pid"])
+    except ProcessLookupError:
+        return {"state": "already_stopped"}
+    try:
+        if not owned(state, root):
+            raise RuntimeError("PID identity changed; refusing to signal it")
+        try:
+            _signal_pid_handle(process_fd, signal.SIGTERM)
+        except ProcessLookupError:
+            return {"state": "already_stopped"}
+    finally:
+        os.close(process_fd)
     for _ in range(80):
         current = identity(state["pid"])
         if current is None or current["process_state"] == "Z":

@@ -37,9 +37,11 @@ def input_schema():
             "observation_id",
         )
     }
+    props["session_token"].update(format="password", **{"x-sensitive": True})
     props.update(
         action={"type": "string", "enum": list(ACTION_FIELDS), "default": "ui"},
         instance_id={"type": "string", "maxLength": 256},
+        _trace_id={"type": "string", "minLength": 1, "maxLength": 256},
         target_roi={
             "type": "array",
             "minItems": 4,

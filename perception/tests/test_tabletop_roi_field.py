@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -150,3 +151,27 @@ def test_evidence_endpoint_refuses_unverified_session():
             server.server_close()
             thread.join(2)
             card.stop()
+
+
+def test_stop_uses_a_pinned_process_handle_instead_of_a_reusable_pid(
+    tmp_path, monkeypatch
+):
+    runner = module("runner")
+    state = {"pid": 12345, "start_ticks": "test"}
+    (tmp_path / "service.json").write_text(json.dumps(state))
+    states = iter([{"process_state": "S"}, None])
+    monkeypatch.setattr(runner, "identity", lambda pid: next(states))
+    monkeypatch.setattr(runner, "owned", lambda *args: True)
+    opened = []
+    sent = []
+    closed = []
+    monkeypatch.setattr(
+        runner, "_open_pid_handle", lambda pid: opened.append(pid) or 77
+    )
+    monkeypatch.setattr(os, "close", closed.append)
+    monkeypatch.setattr(
+        os, "kill", lambda *args: pytest.fail("numeric PID must not be signalled")
+    )
+    monkeypatch.setattr(runner, "_signal_pid_handle", lambda fd, sig: sent.append(fd))
+    assert runner.stop(tmp_path)["state"] == "stopped"
+    assert opened == [12345] and sent == [77] and closed == [77]

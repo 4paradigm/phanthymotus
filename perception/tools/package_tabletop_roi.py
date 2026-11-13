@@ -31,6 +31,7 @@ def main():
             "perception/tests/test_tabletop_roi_goal_verifier.py",
             "perception/tests/test_tabletop_roi_transport.py",
             "perception/tests/test_tabletop_roi_field.py",
+            "perception/tests/test_tabletop_roi_review.py",
             "perception/tools/package_tabletop_roi.py",
             "perception/tools/package_tabletop_roi_field.py",
             "perception/tools/tabletop_roi_browser.py",

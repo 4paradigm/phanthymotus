@@ -58,6 +58,11 @@ def prepare(packet, binding, now, max_age):
         and meta["image_size"] == [image.shape[1], image.shape[0]],
         "INVALID_IMAGE",
     )
+    need(
+        1 <= image.shape[0] <= 8192 and 1 <= image.shape[1] <= 8192,
+        "INVALID_IMAGE_SIZE",
+    )
+    need(2 < float(image.mean()) < 253, "IMAGE_SATURATED_OR_EMPTY")
     scale = min(1.0, 640 / image.shape[1], 480 / image.shape[0])
     image = cv2.resize(
         image,
@@ -145,6 +150,13 @@ def compare(before, afters, region, options):
             else 0.0
         )
         need(fraction < 0.8, "ROI_OCCLUDED_OR_REPLACED")
+        if fraction >= options["min_change_fraction"]:
+            # Neutral local illumination/shadow/reflection can imitate an object.
+            # Refuse achromatic-only changes; color change is still not identity proof.
+            delta = patch1.astype(np.int16) - patch0.astype(np.int16)
+            neutral = np.ptp(delta, axis=2)[mask.astype(bool)] <= 4
+            need(float(neutral.mean()) < 0.98, "ROI_PHOTOMETRIC_AMBIGUITY")
+
         sharp0 = float(
             cv2.Laplacian(cv2.cvtColor(patch0, cv2.COLOR_BGR2GRAY), cv2.CV_32F).var()
         )

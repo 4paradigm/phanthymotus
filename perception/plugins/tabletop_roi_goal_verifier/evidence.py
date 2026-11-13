@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import tempfile
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,26 +38,46 @@ def save_session(exported, root, label, notes=""):
         + uuid4().hex[:8]
     )
     directory = root / name
-    directory.mkdir(mode=0o700)
-    (directory / "session.json").write_text(
-        json.dumps(exported, ensure_ascii=False, indent=2)
-    )
-    (directory / "result.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2)
-    )
     images = exported.get("roi_evidence", {})
-    for key, filename in [
-        ("before_target_jpeg_base64", "before-roi.jpg"),
-        ("after_target_jpeg_base64", "after-roi.jpg"),
-    ]:
-        if images.get(key):
-            (directory / filename).write_bytes(
-                base64.b64decode(images[key], validate=True)
-            )
-    sums = []
-    for file in sorted(directory.iterdir()):
-        sums.append(hashlib.sha256(file.read_bytes()).hexdigest() + "  " + file.name)
-    (directory / "SHA256SUMS").write_text("\n".join(sums) + "\n")
+    complete = all(
+        images.get(k) for k in ("before_target_jpeg_base64", "after_target_jpeg_base64")
+    )
+    need(
+        result.get("result") not in ("PASS", "FAIL") or bool(complete),
+        "EVIDENCE_INCOMPLETE",
+    )
+    exported["test_record"]["evidence_complete"] = bool(complete)
+    # Build privately, then publish one complete directory atomically. Any
+    # decode/write/checksum error removes the temporary partial run.
+    with tempfile.TemporaryDirectory(prefix=".incomplete-", dir=root) as temporary:
+        staging = Path(temporary)
+        (staging / "session.json").write_text(
+            json.dumps(exported, ensure_ascii=False, indent=2)
+        )
+        (staging / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2)
+        )
+        for key, filename in [
+            ("before_target_jpeg_base64", "before-roi.jpg"),
+            ("after_target_jpeg_base64", "after-roi.jpg"),
+        ]:
+            if images.get(key):
+                data = base64.b64decode(images[key], validate=True)
+                import cv2
+                import numpy as np
+
+                need(
+                    cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                    is not None,
+                    "EVIDENCE_IMAGE_INVALID",
+                )
+                (staging / filename).write_bytes(data)
+        sums = [
+            hashlib.sha256(file.read_bytes()).hexdigest() + "  " + file.name
+            for file in sorted(staging.iterdir())
+        ]
+        (staging / "SHA256SUMS").write_text("\n".join(sums) + "\n")
+        staging.rename(directory)
     return {
         "state": "saved",
         "directory": str(directory),
