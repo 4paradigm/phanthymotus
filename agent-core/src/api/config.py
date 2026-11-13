@@ -542,7 +542,7 @@ async def _do_start_project_impl():
                 if message and message != last_message:
                     last_message = message
                     await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
+                        'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'loading',
                         'message': message,
                     }})
                 continue
@@ -553,7 +553,7 @@ async def _do_start_project_impl():
                 # also releases the frontend's wait on this item.
                 print(f'[start-project] {tool_name} ({mcp_id}) load abandoned (idle)')
                 await push_event({'type': 'project_start_item', 'payload': {
-                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'cancelled',
+                    'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'cancelled',
                     'message': '启动已取消',
                 }})
                 return
@@ -565,12 +565,12 @@ async def _do_start_project_impl():
                 except Exception as error:
                     print(f'[start-project] {tool_name} topic re-register failed: {error}')
             await push_event({'type': 'project_start_item', 'payload': {
-                'tool': tool_name, 'mcp_id': mcp_id, 'status': status,
+                'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': status,
                 'message': message if status == 'error' else '',
             }})
             return
         await push_event({'type': 'project_start_item', 'payload': {
-            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+            'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error',
             'message': f'模型加载超过 {LOADING_TIMEOUT_S // 60} 分钟仍未就绪',
         }})
 
@@ -594,7 +594,8 @@ async def _do_start_project_impl():
 
     # 广播启动开始
     await push_event({'type': 'project_start_begin', 'payload': {
-        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', '')} for c in all_ordered],
+        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', ''),
+                   'card_id': c.get('id', '')} for c in all_ordered],
     }})
 
     errors = []
@@ -670,7 +671,7 @@ async def _do_start_project_impl():
             return
 
         await push_event({'type': 'project_start_item', 'payload': {
-            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'starting',
+            'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'starting',
         }})
 
         args = {'action': 'start', 'instance_id': card_id}
@@ -728,7 +729,7 @@ async def _do_start_project_impl():
                 if tool_state == 'error':
                     print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
                     await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
+                        'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error', 'message': tool_message,
                     }})
                     errors.append(tool_name)
                     # Kept for a failed card too, as before: the project is about
@@ -746,7 +747,7 @@ async def _do_start_project_impl():
                     message = tool_message or '模型加载中，就绪后自动开始'
                     print(f'[start-project] {tool_name} ({mcp_id}) loading: {message}')
                     await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
+                        'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'loading',
                         'message': message,
                     }})
                     _asyncio.create_task(
@@ -773,7 +774,7 @@ async def _do_start_project_impl():
                         print(f'[start-project] {tool_name} ({mcp_id}) topic clash with '
                               f'{other_id}: {shared}')
                         await push_event({'type': 'project_start_item', 'payload': {
-                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+                            'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error',
                             'message': message,
                         }})
                         errors.append(tool_name)
@@ -784,14 +785,14 @@ async def _do_start_project_impl():
                                    f'请把多余的连线拆到另一张卡片上')
                         print(f'[start-project] {tool_name} ({mcp_id}) dropped inputs: {dropped}')
                         await push_event({'type': 'project_start_item', 'payload': {
-                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+                            'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error',
                             'message': message,
                         }})
                         errors.append(tool_name)
                     else:
                         print(f'[start-project] started {tool_name} ({mcp_id})')
                         await push_event({'type': 'project_start_item', 'payload': {
-                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+                            'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'ready',
                         }})
             else:
                 # `message` is where mcp_call_tool puts the human-readable
@@ -803,13 +804,13 @@ async def _do_start_project_impl():
                           or f'启动失败 (code={result.get("code")})')[:200]
                 print(f'[start-project] {tool_name} error: {result}')
                 await push_event({'type': 'project_start_item', 'payload': {
-                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': msg,
+                    'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error', 'message': msg,
                 }})
                 errors.append(tool_name)
         except Exception as e:
             print(f'[start-project] failed {tool_name}: {e}')
             await push_event({'type': 'project_start_item', 'payload': {
-                'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': str(e)[:100],
+                'tool': tool_name, 'mcp_id': mcp_id, 'card_id': card_id, 'status': 'error', 'message': str(e)[:100],
             }})
             errors.append(tool_name)
 
@@ -1068,7 +1069,7 @@ async def _do_start_project_impl():
             tool_name = card.get('toolName', '')
             print(f'[start-project] {tool_name}: {message}')
             await push_event({'type': 'project_start_item', 'payload': {
-                'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                 'status': 'error', 'message': message,
             }})
             errors.append(tool_name)
@@ -1079,7 +1080,7 @@ async def _do_start_project_impl():
             tool_name = card.get('toolName', '')
             print(f'[start-project] {tool_name}: {descriptor_error}')
             await push_event({'type': 'project_start_item', 'payload': {
-                'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                 'status': 'error', 'message': descriptor_error,
             }})
             errors.append(tool_name)
