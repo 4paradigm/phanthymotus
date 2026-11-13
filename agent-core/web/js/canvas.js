@@ -554,6 +554,8 @@ export async function initCanvas(initialMcps) {
       }
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
+    } else if (event.type === 'tool_config_updated') {
+      _refreshConfiguredTopics(event.payload || {});
     } else if (event.type === 'canvas_layout') {
       // Ignore the echo of our own autosave; readers reload to follow the editor.
       if ((event.payload?.editor || '') !== _sessionId) _scheduleReload();
@@ -2456,25 +2458,34 @@ function _showStartupModal(items) {
   const list = modal.querySelector('.startup-modal-list');
   const dots = [];
   const statuses = [];
+  const nameEls = [];
   const topicNames = card => (card.topicOut || [])
     .map(t => (t.topic || '').split('/').filter(Boolean).pop()).filter(Boolean);
-  const names = items.map(({ card }) => {
-    const peers = items.filter(i => i.card.toolName === card.toolName && i.card.id !== card.id);
-    if (!peers.length) return card.toolName;
-    const taken = new Set(peers.flatMap(i => topicNames(i.card)));
-    const topic = topicNames(card).find(name => !taken.has(name));
-    return [card.toolName, topic || card.id].filter(Boolean).join(' · ');
-  });
-  items.forEach(({ card }, i) => {
+  function refreshNames() {
+    const cards = items.map(({ card }) => _cards.find(c => c.id === card.id) || card);
+    const names = cards.map(card => {
+      const peers = cards.filter(c => c.toolName === card.toolName && c.id !== card.id);
+      if (!peers.length) return card.toolName;
+      const taken = new Set(peers.flatMap(topicNames));
+      const topic = topicNames(card).find(name => !taken.has(name));
+      return [card.toolName, topic || card.id].filter(Boolean).join(' · ');
+    });
+    names.forEach((name, i) => {
+      nameEls[i].textContent = names.filter(n => n === name).length > 1
+        ? `${name} · ${cards[i].id}` : name;
+    });
+  }
+  items.forEach(() => {
     const li = document.createElement('li');
     li.className = 'startup-modal-item';
     li.innerHTML = '<span class="startup-dot"></span><span class="startup-name"></span><span class="startup-status">等待启动</span>';
-    li.querySelector('.startup-name').textContent = names.filter(name => name === names[i]).length > 1
-      ? `${names[i]} · ${card.id}` : names[i];
+    nameEls.push(li.querySelector('.startup-name'));
     list.appendChild(li);
     dots.push(li.querySelector('.startup-dot'));
     statuses.push(li.querySelector('.startup-status'));
   });
+  refreshNames();
+  document.addEventListener('canvas-topics-updated', refreshNames);
   document.body.appendChild(overlay);
 
   const STATUS_TEXT = {
@@ -2487,6 +2498,7 @@ function _showStartupModal(items) {
   }
   function close() {
     if (_countdownTimer) clearInterval(_countdownTimer);
+    document.removeEventListener('canvas-topics-updated', refreshNames);
     overlay.remove();
   }
 
@@ -2554,12 +2566,21 @@ function _parseMcpCallResult(json) {
  * different answer after the same links were redrawn in another order, and a
  * different answer from the one api/config.py derives at start.
  */
-async function _fetchTopicsFromDriver(card, inputTopics) {
+async function _refreshConfiguredTopics({ mcp_id, tool }) {
+  // Instance config may also change shared settings or another device binding.
+  const cards = _cards.filter(c => c.mcpId === mcp_id && c.toolName === tool);
+  await Promise.all(cards.map(card =>
+    _fetchTopicsFromDriver(card, _inputTopicsFor(card), { force: true })));
+}
+
+async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {}) {
   const topics = Array.isArray(inputTopics) ? inputTopics
                 : (inputTopics ? [inputTopics] : []);
   const want = inputKey(topics);
-  if (card._topicFetchFor === want) return;   // identical request already in flight
+  if (!force && card._topicFetchFor === want) return;   // identical request already in flight
   card._topicFetchFor = want;
+  const token = {};
+  card._topicFetchToken = token;
   try {
     const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
       method: 'POST',
@@ -2569,7 +2590,9 @@ async function _fetchTopicsFromDriver(card, inputTopics) {
                                           ...inputArgs(topics) } }),
     });
     const data = await resp.json();
+    if (card._topicFetchToken !== token) return; // superseded by a newer config/query
     const parsed = _parseMcpCallResult(data);
+    if (!parsed) { card._topicFetchFor = null; return; }
     const topicOut = parsed?.topic_out;
     // Remember which input produced this answer. A derived topic is only valid
     // for the input it was derived from, and without this the cache could never
@@ -2606,7 +2629,9 @@ async function _fetchTopicsFromDriver(card, inputTopics) {
       _scheduleRedraw();
       _debouncedSave();
     }
+    document.dispatchEvent(new Event('canvas-topics-updated'));
   } catch (e) {
+    if (card._topicFetchToken !== token) return;
     card._topicFetchFor = null;   // let a later resolve retry after a failure
     console.warn('[canvas] info fetch failed:', e);
   }

@@ -70,18 +70,25 @@ class Element {
     return this.nodes[selector];
   }
   addEventListener() {}
+  remove() {}
 }
 
-function modalNames(inputCards) {
+function startupModal(inputCards) {
   const at = canvas.indexOf('function _showStartupModal(');
   const end = canvas.indexOf('\n}\n', at) + 3;
+  const document = new EventTarget();
+  document.createElement = () => new Element();
+  document.body = new Element();
   const show = runInNewContext(canvas.slice(at, end) + '\n_showStartupModal;', {
-    document: { createElement: () => new Element(), body: new Element() },
+    document, _cards: inputCards, Event,
   });
   const result = show(inputCards.map(card => ({ card })));
-  return result.modal.querySelector('.startup-modal-list').children.map(row =>
-    row.querySelector('.startup-name').textContent);
+  const rows = result.modal.querySelector('.startup-modal-list').children;
+  return { ...result, document, rows,
+    names: () => rows.map(row => row.querySelector('.startup-name').textContent) };
 }
+
+function modalNames(inputCards) { return startupModal(inputCards).names(); }
 
 test('same-tool rows derive distinct names from output topics without device configuration', () => {
   const input = ['left', 'right'].map(side => ({
@@ -165,3 +172,18 @@ for (const status of ['error', 'cancelled']) {
     assert.equal(p.rows[0].message, 'left camera outcome');
   });
 }
+
+test('an open modal follows live topic swaps without resetting instance status', () => {
+  const input = ['a', 'b'].map((id, i) => ({ id, toolName: 'sensor',
+    topicOut: [{ topic: i ? '/s/right_rgb' : '/s/left_rgb' }] }));
+  const modal = startupModal(input);
+  modal.updateItem(0, 'error', 'device unavailable');
+  [input[0].topicOut, input[1].topicOut] = [input[1].topicOut, input[0].topicOut];
+  modal.document.dispatchEvent(new Event('canvas-topics-updated'));
+  assert.deepEqual(modal.names(), ['sensor · right_rgb', 'sensor · left_rgb']);
+  assert.equal(modal.rows[0].querySelector('.startup-status').textContent, 'device unavailable');
+  modal.close();
+  input[0].topicOut = [{ topic: '/s/changed' }];
+  modal.document.dispatchEvent(new Event('canvas-topics-updated'));
+  assert.equal(modal.names()[0], 'sensor · right_rgb', 'closed modals release their listener');
+});
