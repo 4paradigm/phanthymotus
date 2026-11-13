@@ -1,0 +1,59 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>桌面 ROI Goal Verifier</title>
+<style>
+body{font:14px system-ui;background:#162230;color:#e7edf5;padding:18px;margin:0}h2{margin:0 0 8px}main{display:grid;grid-template-columns:330px 1fr;gap:18px}label{display:block;margin:10px 0}input,select,button,textarea{font:inherit;background:#263b50;color:inherit;border:1px solid #647d96;border-radius:4px;padding:7px}input{width:240px}button{cursor:pointer;margin:4px}canvas{max-width:100%;background:#0e1721;border:1px solid #50667b;touch-action:none}pre{white-space:pre-wrap;overflow:auto;max-height:280px}.PASS{color:#70e8a0}.FAIL{color:#ffa39a}.INCONCLUSIVE{color:#ffda80}.note{color:#b8c9d9;font-size:12px}#result{font-size:24px}img{max-width:240px}textarea{width:95%;height:140px}@media(max-width:760px){main{display:block}}
+</style>
+<h2>桌面 ROI 目标区域验证</h2><p>PASS 仅表示目标区域出现明显且稳定的视觉变化；不证明物体身份、机器人运动或毫米精度。</p>
+<main><section>
+<div id="binding" class="note"></div><label>图像来源 <select id="source"></select></label>
+<button id="start">启动图像订阅</button><button id="live">开始实时预览</button><button id="observe">刷新一帧</button>
+<p class="note">固定相机，在右侧拖框选择目标区域。基准应为空；放入物体后移开手并等待画面稳定。</p>
+<label>目标 ROI（归一化 x1,y1,x2,y2）<input id="roi-region" placeholder="在图像上拖框"></label>
+<label>预设 <select id="roi-preset"><option value="standard">标准</option><option value="loose">宽松</option><option value="strict">严格</option></select></label>
+<label>变化阈值 <input id="roi-threshold" type="number" value="25" min="8" max="80"></label>
+<label>最小变化比例 <input id="roi-area" type="number" value="0.04" min="0.005" max="0.5" step="0.005"></label>
+<label>稳定帧数 <input id="roi-frames" type="number" value="2" min="2" max="5"></label>
+<label>任务标识 <input id="task" value="tabletop-roi-test"></label>
+<button id="session">1. 创建会话</button><button id="before">2. 记录操作前状态</button>
+<button id="mark">3. 标记操作完成</button><button id="after">4. 获取新观测并验证</button>
+<button id="reset">重置会话</button><button id="export">导出证据 JSON</button><button id="stop">关闭订阅及会话</button>
+</section><section><div id="result">尚未验证</div><canvas id="view" width="640" height="480"></canvas>
+<p id="measurement" class="note"></p><div id="roi-evidence" hidden><label>操作前 ROI</label><img id="roi-before" alt="操作前 ROI"><label>操作后 ROI</label><img id="roi-after" alt="操作后 ROI"></div>
+<pre id="state"></pre><details id="export-panel"><summary>会话证据 JSON（保存含图像、参数、时间和结果）</summary><textarea id="export-data" readonly></textarea></details>
+<details><summary>页面日志</summary><pre id="logs"></pre></details></section></main>
+<script>
+(()=>{'use strict';let port,n=0,session=null,marker=null,lastObservation=null,bitmap=null,dragStart=null,live=false,pending=false,initialized=false,controlBusy=false;
+const waiting=new Map(),el=id=>document.getElementById(id),v=id=>el(id).value,rid=()=>crypto.randomUUID();
+function log(x){el('logs').textContent=(new Date().toISOString()+' '+x+'\n'+el('logs').textContent).slice(0,12000);}
+async function call(args){let out;if(port){out=await new Promise((resolve,reject)=>{const id=String(++n);const timeout=setTimeout(()=>{waiting.delete(id);reject(Error('调用超时'));},20000);waiting.set(id,{resolve,reject,timeout});port.postMessage({id,method:'call',args});});}else{const r=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:++n,method:'tools/call',params:{name:'tabletop_roi_goal_verifier',arguments:args}})});const raw=await r.json();if(raw.error)throw Error(raw.error.message);out=JSON.parse(raw.result.content[0].text);}if(out.state==='error')throw Error(out.code+': '+out.message);return out;}
+function identity(){if(!session)throw Error('先创建会话');return {session_id:session.session_id,session_token:session.session_token};}
+function show(r){el('state').textContent=JSON.stringify(r,null,2);if(r.result){el('result').textContent=r.result+' · '+r.code;el('result').className=r.result;}log(r.code||r.state||'ok');return r;}
+function clearResult(){el('result').textContent='尚未验证';el('result').className='';el('roi-evidence').hidden=true;el('roi-before').removeAttribute('src');el('roi-after').removeAttribute('src');}
+function region(required=true){const a=v('roi-region').split(',').map(Number);if(a.length===4&&a.every(Number.isFinite)&&0<=a[0]&&a[0]<a[2]&&a[2]<=1&&0<=a[1]&&a[1]<a[3]&&a[3]<=1)return a;if(required)throw Error('请先框选有效 ROI');return null;}
+function draw(){const c=el('view'),ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);if(bitmap)ctx.drawImage(bitmap,0,0,c.width,c.height);const r=dragStart?region(false):(session?.target_roi||region(false));if(r){ctx.strokeStyle='#71e4a0';ctx.lineWidth=2;ctx.strokeRect(r[0]*c.width,r[1]*c.height,(r[2]-r[0])*c.width,(r[3]-r[1])*c.height);}}
+async function observe(){if(pending)return;pending=true;try{const r=await call({action:'observe',source_id:v('source')});const o=r.observation;const p=await call({action:'get_preview',source_id:o.source_id,observation_id:o.observation_id});if(!p.preview)throw Error('缺少关联帧');const img=new Image();await new Promise((res,rej)=>{img.onload=res;img.onerror=()=>rej(Error('JPEG 解码失败'));img.src='data:image/jpeg;base64,'+p.preview.jpeg_base64;});lastObservation=o;bitmap=img;const c=el('view');c.width=img.width;c.height=img.height;draw();el('measurement').textContent=o.provenance+' · '+o.image_size.join('×')+' · '+o.frame_id+' · 采集 '+o.captured_at+' · 延迟 '+(Date.now()/1000-o.captured_at).toFixed(3)+'s';}finally{pending=false;}}
+function evidence(r){if(!r.roi_evidence)return;el('roi-evidence').hidden=false;for(const [key,id] of [['before_target_jpeg_base64','roi-before'],['after_target_jpeg_base64','roi-after']]){if(r.roi_evidence[key])el(id).src='data:image/jpeg;base64,'+r.roi_evidence[key];else el(id).removeAttribute('src');}}
+function invalidate(){if(session){const old=identity();session=marker=null;call({action:'close_session',request_id:rid(),...old}).catch(e=>log(e.message));clearResult();el('state').textContent='参数变化，请重建会话及基准';}draw();}
+const point=e=>{const r=el('view').getBoundingClientRect();return [Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(e.clientY-r.top)/r.height))];};
+el('view').onpointerdown=e=>{if(!lastObservation)return;dragStart=point(e);el('view').setPointerCapture(e.pointerId);};
+el('view').onpointermove=e=>{if(!dragStart)return;const end=point(e);el('roi-region').value=[Math.min(dragStart[0],end[0]),Math.min(dragStart[1],end[1]),Math.max(dragStart[0],end[0]),Math.max(dragStart[1],end[1])].map(x=>x.toFixed(4)).join(',');draw();};
+el('view').onpointerup=e=>{if(!dragStart)return;el('view').onpointermove(e);dragStart=null;invalidate();};el('view').onpointercancel=()=>{dragStart=null;draw();};
+el('roi-preset').onchange=()=>{const p={loose:[15,.02,2],standard:[25,.04,2],strict:[40,.08,3]}[v('roi-preset')];['roi-threshold','roi-area','roi-frames'].forEach((id,i)=>el(id).value=p[i]);invalidate();};
+function bind(id,fn){el(id).onclick=async()=>{if(controlBusy)return;controlBusy=true;el(id).disabled=true;try{while(pending)await new Promise(r=>setTimeout(r,10));await fn();}catch(e){el('state').textContent='错误：'+e.message;el('result').textContent='INCONCLUSIVE · '+e.message;el('result').className='INCONCLUSIVE';log(e.message);}finally{el(id).disabled=false;controlBusy=false;}};}
+bind('start',async()=>show(await call({action:'start'})));
+bind('observe',observe);bind('live',async()=>{live=!live;el('live').textContent=live?'暂停实时预览':'开始实时预览';if(live)await observe();});
+setInterval(()=>{if(live&&initialized&&!pending&&!controlBusy)observe().catch(e=>{log(e.message);el('measurement').textContent='预览失败：'+e.message;});},250);
+bind('session',async()=>{const target_roi=region();if(session)await call({action:'close_session',request_id:rid(),...identity()});session=null;marker=null;clearResult();session=show(await call({action:'start_session',request_id:rid(),task_id:v('task'),source_id:v('source'),target_roi,roi_options:{change_threshold:Number(v('roi-threshold')),min_change_fraction:Number(v('roi-area')),stable_frames:Number(v('roi-frames'))}}));draw();});
+bind('before',async()=>{const r=show(await call({action:'capture_before',request_id:rid(),...identity()}));evidence(r);});
+bind('mark',async()=>{marker=show(await call({action:'mark_operation_complete',request_id:rid(),...identity()}));clearResult();});
+bind('after',async()=>{if(!marker)throw Error('先标记操作完成');const r=show(await call({action:'verify_after',request_id:rid(),...identity(),marker_id:marker.marker_id}));evidence(r);});
+bind('reset',async()=>{session=show(await call({action:'reset_session',request_id:rid(),...identity()}));marker=null;clearResult();});
+bind('export',async()=>{const r=show(await call({action:'export_session',...identity()}));el('export-data').value=JSON.stringify({...r,browser_logs:el('logs').textContent},null,2);el('export-panel').open=true;el('export-data').select();});
+bind('stop',async()=>{live=false;show(await call({action:'stop'}));session=marker=null;clearResult();});
+for(const id of ['roi-region','roi-threshold','roi-area','roi-frames','task'])el(id).onchange=invalidate;
+el('source').onchange=()=>{invalidate();lastObservation=bitmap=null;el('roi-region').value='';draw();};
+async function init(){if(initialized)return;initialized=true;try{const info=show(await call({action:'info'}));el('binding').textContent=info.verifier_id+' · '+info.api_version;for(const s of info.sources){const o=document.createElement('option');o.value=s.source_id;o.textContent=s.source_id+' / '+s.camera_id+' / '+s.provenance;el('source').append(o);}}catch(e){log(e.message);el('state').textContent=e.message;}}
+window.addEventListener('message',e=>{if(e.source!==parent||e.data?.protocol!=='motus.workbench/1'||!e.ports[0]||port)return;port=e.ports[0];port.onmessage=ev=>{const r=ev.data,w=waiting.get(r.id);if(w){waiting.delete(r.id);clearTimeout(w.timeout);r.error?w.reject(Error(r.error)):w.resolve(r.result);}};port.start();init();});
+if(window===window.top)init();
+})();
+</script></html>

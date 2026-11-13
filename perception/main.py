@@ -257,6 +257,15 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("tabletop_roi_goal_verifier", {}).get("enabled", False):
+            try:
+                from plugins.tabletop_roi_goal_verifier import TabletopROIGoalVerifierPlugin
+                self._plugins.append(TabletopROIGoalVerifierPlugin(
+                    plugins_cfg["tabletop_roi_goal_verifier"], executor))
+                log.info("TabletopROIGoalVerifierPlugin loaded")
+            except Exception:
+                log.error("TabletopROIGoalVerifierPlugin failed to load", exc_info=True)
+
         if plugins_cfg.get("barcode", {}).get("enabled", False):
             from plugins.barcode import BarcodeScanPlugin
             # No try/except and no model: zxing-cpp is imported lazily by
