@@ -628,7 +628,7 @@ export function updateCanvasMcps(mcps) {
   if (topicsChanged) {
     // Rebuild cards that have new port counts
     for (const card of _cards) {
-      const newEl = _buildCardEl({ id: card.id, mcpId: card.mcpId, toolName: card.toolName, driverName: card.driverName, x: card.x, y: card.y, topicIn: card.topicIn, topicOut: card.topicOut });
+      const newEl = _buildCardEl({ id: card.id, mcpId: card.mcpId, toolName: card.toolName, driverName: card.driverName, x: card.x, y: card.y, topicIn: card.topicIn, topicOut: card.topicOut, topicOutFrom: card.topicOutFrom });
       card.el.replaceWith(newEl);
       card.el = newEl;
       _makeDraggable(newEl, card);
@@ -928,7 +928,7 @@ function _findNonOverlappingPos(x, y) {
 // ── Card management ───────────────────────────────────────────────────────────
 
 function _addCard(data, save = true) {
-  const { id, mcpId, toolName, x, y } = data;
+  const { id, mcpId, toolName, x, y, topicOutFrom } = data;
   let { driverName } = data;
 
   if (!driverName) {
@@ -936,7 +936,7 @@ function _addCard(data, save = true) {
     driverName = mcp ? (mcp.server_name || mcp.name || mcp.id) : mcpId;
   }
 
-  const el = _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: data.topicIn, topicOut: data.topicOut });
+  const el = _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: data.topicIn, topicOut: data.topicOut, topicOutFrom });
   _viewport.appendChild(el);
 
   // Restore or initialize persisted topic data
@@ -949,11 +949,11 @@ function _addCard(data, save = true) {
     const _toolObj = _tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
     if (typeof _toolObj === 'object') {
       if (!topicInData.length  && _toolObj.topic_in)  topicInData  = _toolObj.topic_in;
-      if (!topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
+      if (topicOutFrom === undefined && !topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
     }
   }
 
-  const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData };
+  const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData, topicOutFrom };
   _cards.push(cardData);
   _makeDraggable(el, cardData);
   _syncGeometryObservers();
@@ -1008,7 +1008,7 @@ async function _removeCard(id) {
 
 // ── Card rendering ────────────────────────────────────────────────────────────
 
-function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTopicIn, topicOut: savedTopicOut }) {
+function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTopicIn, topicOut: savedTopicOut, topicOutFrom }) {
   const el = document.createElement('div');
   el.dataset.cardId = id;
   el.style.left = x + 'px';
@@ -1033,7 +1033,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const savedInHasReal = savedTopicIn?.some(t => t.topic);
   const staticInHasReal = toolTopicIn?.some(t => t.topic);
   const topicIn  = (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : null) || (toolTopicIn?.length  ? toolTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
-  const topicOut = (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
+  const topicOut = topicOutFrom !== undefined ? (savedTopicOut || []) : (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 
   el.className = `canvas-card${effectiveType ? ' ' + effectiveType : ''}`;
@@ -2605,40 +2605,33 @@ async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {})
     const parsed = _parseMcpCallResult(data);
     if (!parsed) { card._topicFetchFor = null; return; }
     const topicOut = parsed?.topic_out;
-    if (!Array.isArray(topicOut)) return; // state-only info does not revoke outputs
+    if (!Array.isArray(topicOut)) {
+      card._topicFetchFor = null; // unverified output must allow a same-input retry
+      return;
+    }
     // Remember which input produced this answer. A derived topic is only valid
     // for the input it was derived from, and without this the cache could never
     // be told apart from a still-correct one — see _revalidateDerivedTopics.
     card.topicOutFrom = want;
-    if (topicOut?.some(t => t.topic)) {
-      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      const shapeChanged = outPorts.length !== topicOut.length || topicOut.some((t, i) =>
-        outPorts[i]?.dataset.format !== (t.format || ''));
-      card.topicOut = topicOut;
-      if (shapeChanged) {
-        const newEl = _buildCardEl({ id: card.id, mcpId: card.mcpId, toolName: card.toolName,
-          driverName: card.driverName, x: card.x, y: card.y,
-          topicIn: card.topicIn, topicOut });
-        card.el.replaceWith(newEl);
-        card.el = newEl;
-        _makeDraggable(newEl, card);
-        _syncGeometryObservers();
-      } else {
-        topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
-      }
-      // A resolved topic is some downstream card's input, so the graph below this
-      // one has to be re-walked — otherwise a chain (mic → asr → tts) only ever
-      // resolves its first hop.
-      _resolveAllTopics();
-      _scheduleRedraw();
-      _debouncedSave();
+    const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+    const shapeChanged = outPorts.length !== topicOut.length || topicOut.some((t, i) =>
+      outPorts[i]?.dataset.format !== (t.format || ''));
+    card.topicOut = topicOut;
+    if (shapeChanged) {
+      const newEl = _buildCardEl({ id: card.id, mcpId: card.mcpId, toolName: card.toolName,
+        driverName: card.driverName, x: card.x, y: card.y,
+        topicIn: card.topicIn, topicOut, topicOutFrom: card.topicOutFrom });
+      card.el.replaceWith(newEl);
+      card.el = newEl;
+      _makeDraggable(newEl, card);
+      _syncGeometryObservers();
     } else {
-      // Explicit empty/unresolved outputs revoke previously inferred bindings.
-      card.topicOut = topicOut;
-      _resolveAllTopics();
-      _scheduleRedraw();
-      _debouncedSave();
+      topicOut.forEach((t, i) => { if (outPorts[i]) outPorts[i].dataset.topic = t.topic || ''; });
     }
+    // Propagate the declaration, including removed/unresolved outputs, downstream.
+    _resolveAllTopics();
+    _scheduleRedraw();
+    _debouncedSave();
     document.dispatchEvent(new Event('canvas-topics-updated'));
   } catch (e) {
     if (card._topicFetchToken !== token) return;
@@ -2777,7 +2770,7 @@ function _revalidateDerivedTopics() {
     // its inbound connection, so want was '' with hasReal true, and the guard
     // below skipped it — the card kept '/remote_control/message/tts' while the
     // driver published on '/perception/tts', and the panel stayed empty.
-    if (known === undefined) {
+    if (known === undefined || card._topicFetchFor == null) {
       // Nothing has verified this card's topics in this page's lifetime, and
       // the saved layout is not evidence. `want` is '' both when nothing
       // feeds this card (ask now, the driver answers with its default) and
@@ -3103,6 +3096,7 @@ async function _saveLayout() {
     y:          c.y,
     topicIn:    c.topicIn  || [],
     topicOut:   c.topicOut || [],
+    topicOutFrom: c.topicOutFrom,
   }));
   try {
     const resp = await fetch('/api/canvas/layout', {
