@@ -709,13 +709,13 @@ def test_driver_owned_controls_are_not_public_parameters():
 
 def test_generic_defaults_are_visible_only_in_info():
     info = _card()._info()
-    assert info["config"]["k_yaw"] == 0.6
-    assert info["config"]["k_fwd"] == 0.9
-    assert info["config"]["search_rate"] == 0.6
-    assert info["config"]["max_obs_age_ms"] == 1000
+    assert info["config"]["k_yaw"] == 1.2
+    assert info["config"]["k_fwd"] == 0.6
+    assert info["config"]["search_rate"] == 1.0
+    assert info["config"]["max_obs_age_ms"] == 500
     assert info["config"]["stop_tolerance_m"] == 0.05
     assert info["config"]["arrival_distance_m"] == pytest.approx(0.85)
-    assert info["gains"]["yaw"]["source"] == "adaptive_default"
+    assert info["gains"]["yaw"]["source"] == "configured_default"
 
 
 def _running_generic_card(**cfg):
@@ -773,14 +773,14 @@ def test_driver_response_is_adopted_and_reported_as_read_only():
     {"wz": {"source": "unknown", "gain": 0.75}},
     {"wz": {"source": "measured", "gain": 0}},
 ])
-def test_absent_or_invalid_driver_response_keeps_generic_point_six(response):
+def test_absent_or_invalid_driver_response_keeps_configured_gain(response):
     card = _card()
     notes = navi_plugin.policy_mod.adopt_response(
         card._config, _descriptor(response=response))
     assert card._config.response_yaw_gain is None
-    assert card._info()["gains"]["yaw"]["base"] == 0.6
+    assert card._info()["gains"]["yaw"]["base"] == 1.2
     if response:
-        assert len(notes) == 1 and "0.6" in notes[0]
+        assert len(notes) == 1 and "1.2" in notes[0]
     else:
         assert notes == []
 
@@ -827,7 +827,7 @@ def test_odom_timing_selects_the_bound_topic_and_computes_freshness():
 
 @pytest.mark.parametrize("age_ms", [420, 421])
 def test_declared_odom_timing_is_independent_of_visual_freshness(monkeypatch, age_ms):
-    card = _card()
+    card = _card(max_obs_age_ms=1000)
     now_ms = 123_456
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
     card._adopt_odom_interface({
@@ -855,13 +855,11 @@ def test_declared_odom_timing_is_independent_of_visual_freshness(monkeypatch, ag
      "timing": {"stamp_source": "received", "max_measurement_delay_ms": 20}},
     {"schema": "motus.odom/1", "rate_hz": 10,
      "timing": {"stamp_source": "host", "max_measurement_delay_ms": 20}},
-    {"schema": "motus.odom/1", "rate_hz": 10,
-     "timing": {"stamp_source": "received"}},
 ])
 def test_missing_or_invalid_odom_timing_falls_back_without_blocking(interface):
     card = _card()
     card._adopt_odom_interface(interface, bound_topic="/robot/state/odom")
-    assert card._odom_max_age_ms == 1000
+    assert card._odom_max_age_ms == 500
     assert card._limit_notes
 
 
@@ -872,14 +870,14 @@ def test_non_object_odom_timing_falls_back_without_blocking(timing):
         "schema": "motus.odom/1", "rate_hz": 10, "timing": timing,
     }, bound_topic="/robot/state/odom")
     assert card._odom_interface == {}
-    assert card._odom_max_age_ms == 1000
+    assert card._odom_max_age_ms == 500
     assert card._limit_notes
 
 
 @pytest.mark.parametrize("age_ms", [900, 1000, 1001])
 @pytest.mark.parametrize("role", ["objects", "depth"])
 def test_visual_observation_freshness_boundary(monkeypatch, age_ms, role):
-    card = _card()
+    card = _card(max_obs_age_ms=1000)
     now_ms = 123_456
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
     card._objects = {"objects": []}

@@ -1220,9 +1220,9 @@ def test_the_sign_survives():
 
 
 def test_the_default_search_rate_clears_a_typical_deadband():
-    """The generic 0.6 request is lifted by the shared sink when necessary."""
+    """The generic search request clears the typical standing yaw floor."""
     rate = P.Config().search_rate
-    assert rate == 0.6
+    assert rate == 1.0
     assert P.apply_deadband([0, 0, 0, 0, 0, -rate], _R1)[5] != 0.0
 
 
@@ -2079,16 +2079,16 @@ def test_fixed_forward_rejects_invalid_baseline_gain(gain):
 
 # ── bounded bearing-P yaw schedule ────────────────────────────────────────
 
-def test_default_gains_use_adaptive_yaw_and_fixed_forward_point_nine():
+def test_default_gains_preserve_fixed_generic_controllers():
     config = _cfg()
-    assert config.k_fwd == 0.9
+    assert config.k_fwd == 0.6
     assert config.adaptive_k_fwd is False
-    assert config.k_yaw == 0.6
-    assert config.adaptive_k_yaw is True
+    assert config.k_yaw == 1.2
+    assert config.adaptive_k_yaw is False
 
 
 def test_yaw_schedule_has_a_lower_gain_near_centre_and_never_exceeds_nominal():
-    config = _cfg()
+    config = _cfg(adaptive_k_yaw=True)
     settled = []
     for bearing in (0.0, 0.1, 0.3, config.align_full_stop, 0.9):
         state = _state()
@@ -2105,7 +2105,7 @@ def test_yaw_schedule_has_a_lower_gain_near_centre_and_never_exceeds_nominal():
 
 
 def test_yaw_gain_changes_at_a_bounded_rate_in_both_directions():
-    config = _cfg()
+    config = _cfg(adaptive_k_yaw=True)
     state = _state()
     P._yaw_gain(config, state, 0.0, True, 0.1)
     assert state.adaptive_yaw_scale == pytest.approx(0.8)
@@ -2119,7 +2119,7 @@ def test_yaw_gain_changes_at_a_bounded_rate_in_both_directions():
 
 
 def test_yaw_schedule_does_not_jump_after_a_long_gap_or_nonpositive_tick():
-    config = _cfg()
+    config = _cfg(adaptive_k_yaw=True)
     state = _state()
     P._yaw_gain(config, state, 0.0, True, 30.0)
     assert state.adaptive_yaw_scale == pytest.approx(0.6)
@@ -2131,7 +2131,7 @@ def test_yaw_schedule_does_not_jump_after_a_long_gap_or_nonpositive_tick():
 
 @pytest.mark.parametrize("bearing", [-0.2, 0.2])
 def test_adaptive_target_yaw_keeps_its_sign_and_can_turn_while_advancing(bearing, monkeypatch):
-    config = _cfg(use_lateral=False, floor_wz=0.0, wz_max=0.1)
+    config = _cfg(adaptive_k_yaw=True, use_lateral=False, floor_wz=0.0, wz_max=0.1)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
     state = _adaptive_ready(config, distance=2.0, bearing=bearing)
     decision = _adaptive_frame(config, state, distance=2.0, bearing=bearing)
@@ -2153,7 +2153,7 @@ def test_fixed_yaw_mode_preserves_the_original_tracking_p_law(monkeypatch):
 
 
 def test_turning_in_place_retains_the_scheduled_yaw_gain():
-    config = _cfg(align_min_scale=0.0, floor_wz=0.0)
+    config = _cfg(adaptive_k_yaw=True, align_min_scale=0.0, floor_wz=0.0)
     state = _adaptive_ready(config, distance=2.0, bearing=0.9)
     state.adaptive_yaw_scale = 0.5
     decision = _adaptive_frame(config, state, distance=2.0, bearing=0.9)
@@ -2164,7 +2164,7 @@ def test_turning_in_place_retains_the_scheduled_yaw_gain():
 
 
 def test_one_missed_frame_freezes_yaw_gain_and_reobservation_resumes_smoothly():
-    config = _cfg(use_lateral=False)
+    config = _cfg(adaptive_k_yaw=True, use_lateral=False)
     state = _adaptive_ready(config, distance=2.0, bearing=0.02)
     for _ in range(6):
         _adaptive_frame(config, state, distance=2.0, bearing=0.02)
@@ -2181,7 +2181,7 @@ def test_one_missed_frame_freezes_yaw_gain_and_reobservation_resumes_smoothly():
 
 
 def test_an_in_range_prediction_also_freezes_gain_until_the_target_is_live(monkeypatch):
-    config = _cfg(use_lateral=False)
+    config = _cfg(adaptive_k_yaw=True, use_lateral=False)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
     state = _adaptive_ready(config, distance=1.0, bearing=0.02)
     state.adaptive_yaw_scale = 0.6
@@ -2197,7 +2197,7 @@ def test_an_in_range_prediction_also_freezes_gain_until_the_target_is_live(monke
 
 @pytest.mark.parametrize("kind", ["blind", "arrived", "idle", "failed", "lost"])
 def test_yaw_schedule_resets_for_a_stopped_or_lost_target_session(kind):
-    config = _cfg(use_lateral=False)
+    config = _cfg(adaptive_k_yaw=True, use_lateral=False)
     state = _adaptive_ready(config, distance=2.0, bearing=0.02)
     state.adaptive_yaw_scale = 0.6
     if kind == "blind":
@@ -2306,7 +2306,7 @@ def test_driver_response_target_gain_is_fixed_independent_of_bearing_schedule(ad
                               (-0.1, False, 0.1), (0.2, True, 5.0)):
         assert P._yaw_gain(config, state, bearing, live, dt) == 0.7
         assert state.adaptive_yaw_scale == 1.0
-    assert config.k_yaw == 0.6  # Nominal gap-turn gain was not overwritten.
+    assert config.k_yaw == 1.2  # Nominal gap-turn gain was not overwritten.
 
 
 @pytest.mark.parametrize("bearing", [-0.2, 0.2])
@@ -2353,13 +2353,13 @@ def test_driver_response_profile_leaves_search_rate_unchanged():
     assert decision.k_yaw_effective is None
 
 
-def test_driver_response_profile_does_not_change_obstacle_gap_turns(monkeypatch):
+def test_driver_response_profile_controls_obstacle_gap_turns(monkeypatch):
     config = _cfg(response_yaw_gain=0.3, use_lateral=False,
                   stop_distance_m=0.3, floor_wz=0.0)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs:
                         (5.0, 1.0) if kwargs.get("lateral_offset_m") else (0.4, 1.0))
     decision = _profiled_frame(config, distance=1.2, bearing=0.02, odom={"wz": 0.2})
-    expected = min(config.wz_max, config.k_yaw * math.atan2(P._keepout_m(config), 0.4))
+    expected = min(config.wz_max, config.response_yaw_gain * math.atan2(P._keepout_m(config), 0.4))
     assert decision.status == P.AVOIDING
     assert decision.values[0] == 0.0
     assert abs(decision.values[5]) == pytest.approx(expected)
@@ -2395,7 +2395,7 @@ def test_driver_response_tracking_gain_rejects_invalid_values(value):
 
 
 def test_driver_response_declaration_is_adopted_without_calibration():
-    config = _cfg()
+    config = _cfg(k_yaw=0.6)
     notes = P.adopt_response(config, {
         "response": {"wz": {"source": "measured", "gain": 0.75,
                               "delay_s": 0.2, "settling_s": 0.4}},
@@ -2405,11 +2405,11 @@ def test_driver_response_declaration_is_adopted_without_calibration():
     assert len(notes) == 1 and "response.wz" in notes[0]
 
 
-def test_absent_driver_response_keeps_the_generic_point_six_gain():
+def test_absent_driver_response_keeps_the_configured_gain():
     config = _cfg()
     assert P.adopt_response(config, {}) == []
     assert config.response_yaw_gain is None
-    assert config.k_yaw == 0.6
+    assert config.k_yaw == 1.2
 
 
 @pytest.mark.parametrize("response", [
@@ -2432,4 +2432,4 @@ def test_invalid_driver_response_falls_back_to_generic_yaw(response):
     config = _cfg()
     notes = P.adopt_response(config, {"response": response})
     assert config.response_yaw_gain is None
-    assert len(notes) == 1 and "0.6" in notes[0]
+    assert len(notes) == 1 and "1.2" in notes[0]

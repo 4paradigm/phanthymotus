@@ -155,10 +155,10 @@ class Config:
     # above 0 keeps the robot moving through the correction, which is what makes
     # the path an arc instead of a sequence of stops.
     align_min_scale: float = 0.45
-    k_yaw: float = 0.6
-    k_fwd: float = 0.9
+    k_yaw: float = 1.2
+    k_fwd: float = 0.6
     adaptive_k_fwd: bool = False
-    adaptive_k_yaw: bool = True
+    adaptive_k_yaw: bool = False
     # Optional effective P derived from the downstream Driver's declared yaw
     # response.  Navi never measures or persists a robot-specific plant model;
     # the component that owns the hardware owns that declaration.
@@ -208,10 +208,8 @@ class Config:
     # ...and stays engaged at least this long, so one noisy frame cannot end a
     # turn that has only just started.
     min_dwell_s: float = 0.25
-    # Generic search rate. Driver limits safety-clamp it at start and the shared
-    # command path applies the declared yaw deadband, so this policy does not
-    # carry a robot-specific search speed.
-    search_rate: float = 0.6
+    # Driver limits fit this rate to the executable bidirectional yaw envelope.
+    search_rate: float = 1.0
     # Backstop only. The sweep below is what normally ends a search, because it
     # is behavioural — "I have turned all the way round and it is not here" —
     # whereas a clock says nothing about what the robot did with the time.
@@ -227,7 +225,7 @@ class Config:
     idle_timeout_s: float = 10.0
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
-    max_obs_age_ms: int = 1000
+    max_obs_age_ms: int = 500
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
     # Confidence needed to **start** following something. Below this a
@@ -644,16 +642,21 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """
     notes: list[str] = []
     notes.extend(_adopt_footprint(config, descriptor))
+    max_age = ((descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+    if (isinstance(max_age, (int, float)) and not isinstance(max_age, bool)
+            and math.isfinite(max_age) and max_age > 0
+            and max_age < config.max_obs_age_ms):
+        config.max_obs_age_ms = max_age
+        notes.append(f"观测有效期已按下游准入上限收紧到 {max_age:g}ms")
     limits = (descriptor or {}).get("limits") or {}
     floors = list(limits.get("min_magnitude") or [])
     lower = list(limits.get("lower") or [])
     upper = list(limits.get("upper") or [])
 
-    # Whether lateral motion exists is a hardware fact. Hidden UI defaults
-    # must not be able to turn a pinned vy axis back on (or disable one that the
-    # downstream explicitly exposes).
+    # Hardware can disable lateral motion; it cannot override an explicit
+    # operator choice to avoid strafing.
     try:
-        config.use_lateral = not (
+        config.use_lateral = config.use_lateral and not (
             float(lower[1]) == 0.0 and float(upper[1]) == 0.0)
     except (IndexError, TypeError, ValueError):
         pass
@@ -736,10 +739,11 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
                 search_cap = max(0.0, -yaw_lower)
             else:
                 search_cap = None
-            # Search uses the generic 0.6 rad/s default and is safety-clamped
-            # by the Driver's executable bidirectional yaw envelope. Deadband
-            # lifting happens later, per command, in the shared control path.
+            # Negotiate the actual executable rate here, so sweep accounting
+            # agrees with the command after deadband lifting. Zero stays off.
             candidate = config.search_rate
+            if candidate > 0:
+                candidate = max(candidate, floor)
             if search_cap is not None:
                 candidate = min(candidate, search_cap)
             if (floor and search_cap is not None
@@ -750,7 +754,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
                         f"可执行量 {floor:g}，已停用搜索转身")
                 config.search_rate = 0.0
             elif candidate != config.search_rate:
-                notes.append(f"search_rate 超过下游双向允许的 {candidate:g}，已压回")
+                notes.append(f"search_rate 已按下游死区和双向上限调整为 {candidate:g}")
                 config.search_rate = candidate
 
     return notes
@@ -762,7 +766,7 @@ def adopt_response(config: Config, descriptor: dict) -> list[str]:
     ``response.wz`` describes the plant behind the velocity interface.  Navi
     uses it to choose an effective proportional gain, but does not calibrate,
     persist, or identify that plant itself. Missing data keeps the generic
-    0.6 P controller and its target-offset schedule.
+    configured P controller and its optional target-offset schedule.
     """
     response = (descriptor or {}).get("response") or {}
     yaw = response.get("wz") if isinstance(response, dict) else None
@@ -770,22 +774,22 @@ def adopt_response(config: Config, descriptor: dict) -> list[str]:
     if yaw is None:
         return []
     if not isinstance(yaw, dict):
-        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+        return [f"下游 response.wz 声明无效，已使用配置 k_yaw={config.k_yaw:g}"]
     try:
         source = yaw["source"]
         numeric = (yaw["gain"], yaw["delay_s"], yaw["settling_s"])
     except (KeyError, TypeError, ValueError, OverflowError):
-        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+        return [f"下游 response.wz 声明无效，已使用配置 k_yaw={config.k_yaw:g}"]
     if (not isinstance(source, str)
             or any(isinstance(value, bool)
                    or not isinstance(value, (int, float)) for value in numeric)):
-        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+        return [f"下游 response.wz 声明无效，已使用配置 k_yaw={config.k_yaw:g}"]
     source = source.strip().lower()
     gain, delay_s, settling_s = map(float, numeric)
     if (source not in {"measured", "vendor-spec", "estimate"}
             or not all(math.isfinite(value) for value in (gain, delay_s, settling_s))
             or gain <= 0 or delay_s < 0 or settling_s < 0):
-        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+        return [f"下游 response.wz 声明无效，已使用配置 k_yaw={config.k_yaw:g}"]
 
     effective_gain = max(0.5, min(2.5, gain))
     penalty = 1.0 + 0.2 * delay_s + 0.1 * settling_s
@@ -1509,7 +1513,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
         # the main loop uses applied to the angle that actually has to be closed
         # — bounded, derived, and about a third of what wz_max was commanding.
         gap_angle = math.atan2(keep, max(ahead, 0.1))
-        wz = _clamp(-sign * config.k_yaw * gap_angle, config.wz_max)
+        yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
+                    else config.k_yaw)
+        wz = _clamp(-sign * yaw_gain * gap_angle, config.wz_max)
         if state is not None:
             state.avoidance_yaw_override = True
         # `sign` indexes the **offset corridor** (+1 = the one displaced to the

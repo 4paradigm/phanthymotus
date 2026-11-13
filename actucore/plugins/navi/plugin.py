@@ -76,8 +76,11 @@ TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 # config action. Defaults come from startup configuration, before a particular
 # downstream chassis adopts/clamps the effective policy limits.
 _TUNING_FIELDS = ("stop_distance_m",)
-_BOOL_TUNING_FIELDS = frozenset()
-_RUNTIME_CONFIG_FIELDS = frozenset((*_TUNING_FIELDS, "obstacle_stop_m"))
+_BOOL_TUNING_FIELDS = frozenset(("use_lateral",))
+_RUNTIME_CONFIG_FIELDS = frozenset((*_TUNING_FIELDS, "obstacle_stop_m",
+                                    "slow_distance_m", "align_full_stop",
+                                    "vx_max", "vy_max", "wz_max",
+                                    "search_rate", "use_lateral"))
 # Older saved canvases still send these keys on start. Nominal gains and gain
 # scheduling modes belong to startup YAML, not runtime operator controls;
 # arrival tolerance belongs to one navigate_to action.
@@ -540,7 +543,11 @@ class NaviPlugin:
             if not isinstance(timing, dict):
                 raise ValueError("timing must be an object")
             stamp_source = timing.get("stamp_source")
-            delay_ms = float(timing["max_measurement_delay_ms"])
+            delay = timing.get("max_measurement_delay_ms")
+            if "max_measurement_delay_ms" in timing and (
+                    delay is None or isinstance(delay, bool)):
+                raise ValueError("invalid measurement delay")
+            delay_ms = float(delay) if delay is not None else 0.0
             if (stamp_source not in {"robot", "received"}
                     or not math.isfinite(rate) or rate <= 0
                     or not math.isfinite(delay_ms) or delay_ms < 0):
@@ -549,6 +556,10 @@ class NaviPlugin:
             # Driver's measurement-delay bound covers a sample stamped before
             # it became observable on the bus.
             max_age = int(math.ceil(3000.0 / rate + delay_ms))
+            if delay is None:
+                max_age = max(max_age, fallback)
+                self._limit_notes.append(
+                    f"state/odom 未声明测量延迟，已使用 {max_age}ms 里程计有效期")
         except (KeyError, TypeError, ValueError, OverflowError):
             if bound_topic:
                 self._limit_notes.append(
@@ -861,10 +872,10 @@ class NaviPlugin:
             try:
                 if key in _BOOL_TUNING_FIELDS and not isinstance(value, bool):
                     raise ValueError("must be a boolean")
-                if key in _TUNING_FIELDS and key not in _BOOL_TUNING_FIELDS and isinstance(value, bool):
+                if key not in _BOOL_TUNING_FIELDS and isinstance(value, bool):
                     raise ValueError("must be a finite nonnegative number")
                 changed[key] = cast(value)
-                if key in _TUNING_FIELDS and key not in _BOOL_TUNING_FIELDS:
+                if key not in _BOOL_TUNING_FIELDS:
                     if not math.isfinite(changed[key]) or changed[key] < 0:
                         raise ValueError("must be a finite nonnegative number")
             except (TypeError, ValueError, OverflowError) as error:
@@ -962,7 +973,8 @@ class NaviPlugin:
                             "effective": getattr(decision, "k_yaw_effective", None),
                             "source": ("driver_response"
                                        if self._config.response_yaw_gain is not None
-                                       else "adaptive_default")}},
+                                       else "adaptive_default" if self._config.adaptive_k_yaw
+                                       else "configured_default")}},
                 "odom_timing": {"max_age_ms": self._odom_max_age_ms,
                                 "interface": dict(self._odom_interface)},
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
