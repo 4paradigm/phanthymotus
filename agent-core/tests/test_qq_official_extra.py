@@ -107,6 +107,52 @@ class QQExtraTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, [("GROUP_MESSAGE_CREATE", event)])
         gateway._is_duplicate.assert_called_once_with("group-full-message-001")
 
+
+    async def test_full_group_websocket_does_not_log_every_message(self):
+        """Busy group traffic must not bypass adapter-side sampled logging."""
+        # Load the real custom gateway class against a minimal SDK stub so
+        # this log-volume regression also runs on SDK-less developer hosts.
+        import importlib.util
+
+        class FakeGateway:
+            def __init__(self, callbacks, log_tag=""):
+                self._cb = callbacks
+
+        fake_sdk = types.SimpleNamespace(
+            QQWebSocket=FakeGateway,
+            OPCode=types.SimpleNamespace(IDENTIFY=2),
+            Intent=types.SimpleNamespace(GROUP_MESSAGES=1))
+        spec = importlib.util.spec_from_file_location(
+            "_qq_gateway_log_test",
+            root / "src" / "channel" / "adapters" / "qq_official_gateway.py")
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {"qqbot_agent_sdk": fake_sdk}):
+            spec.loader.exec_module(module)
+
+        received = []
+        callback = types.SimpleNamespace(
+            on_message_event=lambda name, raw: (name, raw))
+        gateway = module.QQScopedWebSocket(
+            callback, intents=1, log_tag="test")
+        gateway._is_duplicate = mock.Mock(
+            side_effect=lambda message_id: message_id == "duplicate")
+        gateway._dispatch_to_main = received.append
+
+        # Includes non-@ messages: only the adapter may decide whether
+        # to accept and sample their diagnostics.
+        with mock.patch("builtins.print") as log:
+            for index in range(201):
+                gateway._handle_dispatch(
+                    "GROUP_MESSAGE_CREATE", {"id": f"group-{index}",
+                    "mentions": []})
+            gateway._handle_dispatch(
+                "GROUP_MESSAGE_CREATE", {"id": "duplicate", "mentions": []})
+
+        self.assertEqual(len(received), 201)
+        self.assertTrue(all(name == "GROUP_MESSAGE_CREATE"
+                            for name, _ in received))
+        log.assert_not_called()
+
     async def test_full_group_mention_filter_fails_closed(self):
         from channel.adapters.qq_official import _full_group_mentions_bot
         self.assertFalse(_full_group_mentions_bot({"mentions": []}))

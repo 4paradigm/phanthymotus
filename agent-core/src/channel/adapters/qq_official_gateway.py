@@ -47,7 +47,7 @@ class QQScopedWebSocket(QQWebSocket):
             msg_id = str(data.get("id", "")) if isinstance(data, dict) else ""
             if msg_id and self._is_duplicate(msg_id):
                 return
-            print("[qq-group] gateway_event_received type=full", flush=True)
+            # Group event diagnostics are sampled by QQOfficialAdapter, not here.
             self._dispatch_to_main(
                 self._cb.on_message_event(event_type, data))
             return

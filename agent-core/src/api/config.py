@@ -1171,12 +1171,11 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
                                            or '设备停止未确认')
                     if not is_pending(payload, state, rules):
                         return
-                    # Never resend stop while a device is still releasing.
-                    # Query info immediately after the initial stop reply:
-                    # a short per-card deadline must still allow confirmation.
-                    # Only throttle *subsequent* info polls, not the first.
-                    if action == 'info':
-                        await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
+                    # Never resend stop while a device is still releasing. Read
+                    # its actual state within the existing per-card deadline --
+                    # and never spend the whole budget on one sleep, or a short
+                    # deadline gets no read at all.
+                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
                     action = 'info'
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
