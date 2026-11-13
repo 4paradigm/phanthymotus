@@ -346,7 +346,7 @@ class RgbdSession:
                 if self.fusion is None:
                     self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
                 # Preserve capture intervals while a visual correction occupies
-                # the callback group; admission still rejects samples over 500 ms old.
+                # the callback group; admission still rejects samples over 750 ms old.
                 imu_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
                 self.imu_callback_group = MutuallyExclusiveCallbackGroup()
                 self.node.create_subscription(String, calibration['imu_topic'], self._enqueue_imu, imu_qos,

@@ -294,11 +294,14 @@ These changes add no dependencies.
 
 IMU ingress uses a separate callback group and a bounded 100-packet FIFO so
 visual processing does not discard capture intervals. Filter updates remain
-serialized, processing one snapshot per pass. The 500 ms freshness check runs
+serialized, processing one snapshot per pass. The 750 ms consumer freshness check runs
 when each packet is consumed;
 queue overflow retires the segment. Each accepted visual correction refreshes
 the correction timeout during recovery, while mapping still requires three
 consistent visual observations.
+This permits transport delay without replacing capture timestamps. The 100 ms
+inter-sample gap, 20 ms gyro/accel skew, future-clock and identity checks remain
+unchanged; driver-side freshness limits are independent.
 
 The short-outage offline validation target is 0.5 s. A hard 1 s visual
 correction timeout ends the segment; rejection/geometry cannot extend it. The

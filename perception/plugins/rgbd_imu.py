@@ -5,6 +5,9 @@ from copy import deepcopy
 import numpy as np
 
 
+MAX_CAPTURE_AGE_NS = 750_000_000
+
+
 def _rotation(value):
     r = np.asarray(value, dtype=float)
     if (r.shape != (3, 3) or not np.isfinite(r).all() or
@@ -53,7 +56,7 @@ class ImuAttitude:
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
 
     def status(self, now_ns):
-        if self.last_stamp and now_ns - self.last_stamp > 500_000_000:
+        if self.last_stamp and now_ns - self.last_stamp > MAX_CAPTURE_AGE_NS:
             self.fault('IMU capture stale; restart for a new segment')
         return self.state
 
@@ -82,7 +85,7 @@ class ImuAttitude:
             if (type(stamp) is not int or type(accel_stamp) is not int or
                     stamp <= self.last_stamp or accel_stamp <= 0 or accel_stamp < self.last_accel or
                     abs(stamp - accel_stamp) > 20_000_000 or
-                    any(not -50_000_000 <= now_ns - t <= 500_000_000 for t in (stamp, accel_stamp)) or
+                    any(not -50_000_000 <= now_ns - t <= MAX_CAPTURE_AGE_NS for t in (stamp, accel_stamp)) or
                     (self.last_stamp and stamp - self.last_stamp > 100_000_000)):
                 raise ValueError('IMU capture is stale, repeated, reset or unsynchronized')
             angular = rotations[0] @ _vector(packet.get('angular_velocity'))

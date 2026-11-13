@@ -166,7 +166,7 @@ def test_stale_imu_degrades_to_visual_only_with_explicit_provenance(fused):
     s = make()
     now[0] = 1_000_000_000
     imu(s, 999_000_000)
-    now[0] = 1_700_000_000  # IMU now >500 ms old: ESKF must stop
+    now[0] = 1_800_000_000  # IMU now >750 ms old: ESKF must stop
     s._watchdog()
     assert s.fusion.state == 'lost' and 'IMU' in s.fusion.reason
     assert s.gate.state != 'lost', s.gate.reason

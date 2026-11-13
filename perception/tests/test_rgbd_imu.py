@@ -70,8 +70,31 @@ def test_stale_gap_repeated_stamp_and_expired_source_are_latched():
         with pytest.raises(ValueError):a.observe(packet(stamp),now)
         assert a.state=='lost'
     a=aid();a.observe(packet(),1_010_000_000)
-    assert a.status(1_600_000_000)=='lost'
-    with pytest.raises(ValueError):a.observe(packet(1_605_000_000),1_610_000_000)
+    assert a.status(1_800_000_000)=='lost'
+    with pytest.raises(ValueError):a.observe(packet(1_805_000_000),1_810_000_000)
+
+
+@pytest.mark.parametrize('age_ns', [501_000_000, 600_000_000, 750_000_000])
+def test_delayed_imu_within_750_ms_keeps_original_capture_time(age_ns):
+    a=aid()
+    out=a.observe(packet(),1_000_000_000+age_ns)
+    assert out['stamp_ns']==1_000_000_000
+    assert a.covers(1_000_000_000,1_000_000_000+age_ns)
+
+
+@pytest.mark.parametrize('gyro_offset_ns,accel_offset_ns', [(0, 10_000_000), (10_000_000, 0)])
+def test_either_imu_capture_older_than_750_ms_is_rejected(gyro_offset_ns, accel_offset_ns):
+    a=aid()
+    with pytest.raises(ValueError):
+        a.observe(packet(1_000_000_000+gyro_offset_ns,
+                         accel_stamp_ns=1_000_000_000+accel_offset_ns),1_750_000_001)
+    assert a.state=='lost' and a.last_stamp==0
+
+
+def test_imu_silence_expires_at_750_ms_without_extending_capture_time():
+    a=aid();a.observe(packet(),1_001_000_000)
+    assert a.status(1_750_000_000)=='active'
+    assert a.status(1_750_000_001)=='lost'
 
 
 def test_frame_requires_bracketing_imu_coverage_with_bounded_history():
@@ -237,7 +260,7 @@ def session(monkeypatch):
     return obj,published,runtime,NS,json
 
 
-@pytest.mark.parametrize('delay_ns,active', [(101_000_000, True), (601_000_000, False)])
+@pytest.mark.parametrize('delay_ns,active', [(101_000_000, True), (601_000_000, True), (751_000_000, False)])
 def test_imu_ingress_keeps_intervals_but_rejects_stale_backlog(monkeypatch, delay_ns, active):
     import threading
     from collections import deque
@@ -334,7 +357,7 @@ def test_enabled_imu_cannot_be_silently_bypassed_by_images_or_watchdog(monkeypat
     obj.imu.observe(packet(1_020_000_000),1_021_000_000)
     assert obj._imu_frame_ready(1_010_000_000,1_021_000_000)
     obj.gate.input(1_020_000_000)
-    monkeypatch.setattr(runtime.time,'time_ns',lambda:1_600_000_000)
+    monkeypatch.setattr(runtime.time,'time_ns',lambda:1_800_000_000)
     obj._watchdog()
     assert obj.gate.state=='lost'
     assert not obj._imu_frame_ready(1_610_000_000,1_611_000_000)
