@@ -177,6 +177,9 @@ def test_runtime_bounds_remain_configurable_and_driver_clamped():
             "vx_max": 0.2, "vy_max": 0.3, "wz_max": 1.0,
             "search_rate": 0.4, "slow_distance_m": 2.0,
             "align_full_stop": 0.7, "use_lateral": False}
+        assert card._config.vx_max == 0.2
+        assert card._config.wz_max == 1.0
+        assert card._config.use_lateral is False
         card._config_action({"stop_distance_m": 1.0})
         assert card._config.vx_max == 0.2
         assert card._config.use_lateral is False
@@ -196,8 +199,8 @@ def test_invalid_runtime_bounds_leave_configuration_unchanged(args):
     assert card._config is config
 
 
-def test_gap_turn_uses_driver_response_without_target_gain_schedule(monkeypatch):
-    config = P.Config(k_yaw=1.2, response_yaw_gain=0.4, adaptive_k_yaw=True,
+def test_gap_turn_uses_driver_response(monkeypatch):
+    config = P.Config(k_yaw=1.2, response_yaw_gain=0.4,
                       use_lateral=False, floor_wz=0)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs:
                         (5.0, 1.0) if kwargs.get("lateral_offset_m") else (0.4, 1.0))

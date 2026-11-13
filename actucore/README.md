@@ -167,18 +167,18 @@ Driver 声明约束，显式 `use_lateral: false` 不会被硬件能力声明重
 
 ### 转向 P 与 Driver 响应
 
-目标跟随默认使用 `k_yaw=0.6`，并按目标在画面中的偏移在 0.5–1 倍之间有界调度；
-靠近中心时减小增益以抑制反复纠偏。控制保持纯 P，不在 navi 中做在线辨识、
+目标跟随默认使用固定 `k_yaw=0.6`，不再按目标偏移或跟随时长调度增益。
+控制保持纯 P，不在 navi 中做在线辨识、
 机型特判或主动转向标定。
 
 若下游 Driver 在 `control_interface.response.wz` 声明 `source`、`gain`、
 `delay_s` 和 `settling_s`，navi 会据此派生有效转向 P。`source` 只接受
 `measured`、`vendor-spec` 或 `estimate`；声明缺失或无效时回到启动配置的
-`k_yaw`（默认 0.6）及所选调度模式。
+固定 `k_yaw`（默认 0.6）。
 速度范围、横移能力、搜索转速上限和死区同样来自 Driver 描述符。
-`info.gains.yaw.source` 为 `driver_response` 或 `adaptive_default`；显式关闭
-自适应且没有有效 Driver 响应时为 `configured_default`。
-Driver 响应派生的转向 P 同样用于避障绕行，绕行不使用目标偏移调度。
+`info.gains.yaw.source` 为 `driver_response` 或 `configured_default`。
+Driver 响应派生的固定转向 P 同样用于避障绕行。
+旧画布或启动配置中的 `adaptive_k_yaw` 会被忽略，不再提供自适应转向开关。
 搜索转速按静止偏航死区和双向上限协商，确保无里程计时的扫角累计与实际输出一致；
 双向上限不足以越过死区时明确失败，显式零搜索转速仍禁用搜索。
 `info.config` 显示最终采用的实际值。

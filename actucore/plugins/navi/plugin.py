@@ -807,7 +807,6 @@ class NaviPlugin:
             # A paused policy does not tick, so it cannot clear its own gain
             # schedule before resume. Keep the track, but restart gain gently.
             self._state.adaptive_fwd_scale = 1.0
-            self._state.adaptive_yaw_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
@@ -913,9 +912,6 @@ class NaviPlugin:
                 # A successful gain/boundary change starts a fresh schedule;
                 # tracker state and unrelated navigation counters stay intact.
                 self._state.adaptive_fwd_scale = 1.0
-            if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
-                   for key in ("align_full_stop", "wz_max")):
-                self._state.adaptive_yaw_scale = 1.0
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
@@ -961,7 +957,6 @@ class NaviPlugin:
                            "adaptive_k_fwd": self._config.adaptive_k_fwd,
                            "k_yaw": self._config.k_yaw,
                            "response_yaw_gain": self._config.response_yaw_gain,
-                           "adaptive_k_yaw": self._config.adaptive_k_yaw,
                            "vx_max": self._config.vx_max,
                            "vy_max": self._config.vy_max,
                            "wz_max": self._config.wz_max,
@@ -979,7 +974,6 @@ class NaviPlugin:
                             "effective": getattr(decision, "k_yaw_effective", None),
                             "source": ("driver_response"
                                        if self._config.response_yaw_gain is not None
-                                       else "adaptive_default" if self._config.adaptive_k_yaw
                                        else "configured_default")}},
                 "odom_timing": {"max_age_ms": self._odom_max_age_ms,
                                 "interface": dict(self._odom_interface)},

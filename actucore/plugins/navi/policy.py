@@ -87,8 +87,6 @@ IDLE = "idle"
 ADAPTIVE_FWD_MAX_SCALE = 3.0
 ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
 ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
-ADAPTIVE_YAW_MIN_SCALE = 0.5
-ADAPTIVE_YAW_MAX_SCALE = 1.0
 
 
 @dataclass
@@ -158,7 +156,6 @@ class Config:
     k_yaw: float = 0.6
     k_fwd: float = 0.9
     adaptive_k_fwd: bool = False
-    adaptive_k_yaw: bool = True
     # Optional effective P derived from the downstream Driver's declared yaw
     # response.  Navi never measures or persists a robot-specific plant model;
     # the component that owns the hardware owns that declaration.
@@ -347,11 +344,11 @@ class Config:
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{key} must be a finite nonnegative number")
             setattr(self, key, value)
-        for flag in ("adaptive_k_fwd", "adaptive_k_yaw"):
+        for flag in ("adaptive_k_fwd",):
             if type(getattr(self, flag)) is not bool:
                 raise ValueError(f"{flag} must be a boolean")
         for key, adaptive, maximum in (("k_fwd", self.adaptive_k_fwd, ADAPTIVE_FWD_MAX_SCALE),
-                                       ("k_yaw", self.adaptive_k_yaw, ADAPTIVE_YAW_MAX_SCALE)):
+                                       ("k_yaw", False, 1.0)):
             if isinstance(getattr(self, key), bool):
                 raise ValueError(f"{key} must be finite and nonnegative")
             try:
@@ -443,7 +440,6 @@ class State:
     searched_rad: float = 0.0
     commanded_vx: float = 0.0
     adaptive_fwd_scale: float = 1.0
-    adaptive_yaw_scale: float = 1.0
     avoidance_yaw_override: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
@@ -766,7 +762,7 @@ def adopt_response(config: Config, descriptor: dict) -> list[str]:
     ``response.wz`` describes the plant behind the velocity interface.  Navi
     uses it to choose an effective proportional gain, but does not calibrate,
     persist, or identify that plant itself. Missing data keeps the generic
-    configured P controller and its optional target-offset schedule.
+    configured fixed P controller.
     """
     response = (descriptor or {}).get("response") or {}
     yaw = response.get("wz") if isinstance(response, dict) else None
@@ -876,9 +872,6 @@ def step(*, detections, depth, odom, config: Config, state: State,
         # Do not carry an increased approach gain through a hold, search or
         # blocked corridor and release it as a jump on the next approach.
         state.adaptive_fwd_scale = 1.0
-    if (decision.values is None
-            or decision.status in (ARRIVED, FAILED, IDLE, BLIND)):
-        state.adaptive_yaw_scale = 1.0
     # Remember what we asked for, so the tracker can compensate for our own
     # motion on the next tick even with no odometry wired.
     if decision.values is not None:
@@ -912,36 +905,6 @@ def _forward_gain(config: Config, state: State, distance, live: bool,
     change = ADAPTIVE_FWD_SCALE_RATE * elapsed
     state.adaptive_fwd_scale = max(previous - change, min(previous + change, target))
     return config.k_fwd * state.adaptive_fwd_scale
-
-
-def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
-              dt: float) -> float:
-    """Schedule only the gain applied to the current target's bearing.
-
-    Large offsets retain the nominal response. Near the image centre, reducing
-    gain limits repeated over-corrections. This uses no turn history or latency
-    compensation; search speed and obstacle-gap turns remain separate laws.
-    """
-    if config.response_yaw_gain is not None:
-        state.adaptive_yaw_scale = 1.0
-        return config.response_yaw_gain
-    if not config.adaptive_k_yaw:
-        state.adaptive_yaw_scale = 1.0
-        return config.k_yaw
-    previous = max(ADAPTIVE_YAW_MIN_SCALE,
-                   min(ADAPTIVE_YAW_MAX_SCALE, state.adaptive_yaw_scale))
-    if not live:
-        # Brief coasting still emits a predicted turn. Keep its last gain,
-        # rather than jumping back to nominal on a single missed observation.
-        # A true loss of track resets the schedule in `_search`.
-        state.adaptive_yaw_scale = previous
-        return config.k_yaw * previous
-    fraction = min(1.0, max(0.0, abs(bearing) / max(1e-6, config.align_full_stop)))
-    target = ADAPTIVE_YAW_MIN_SCALE + (ADAPTIVE_YAW_MAX_SCALE - ADAPTIVE_YAW_MIN_SCALE) * fraction
-    elapsed = min(ADAPTIVE_FWD_MAX_DT, max(0.0, dt)) if math.isfinite(dt) else 0.0
-    change = ADAPTIVE_FWD_SCALE_RATE * elapsed
-    state.adaptive_yaw_scale = max(previous - change, min(previous + change, target))
-    return config.k_yaw * state.adaptive_yaw_scale
 
 
 def _measured_yaw_rate(odom):
@@ -1056,7 +1019,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # up translating — so the decision is deferred to `_finalise_yaw` once vx is
     # settled. See `floor_wz_moving`.
     live = track.observed
-    yaw_gain = _yaw_gain(config, state, bearing, live, dt)
+    yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
+                else config.k_yaw)
     # Pure proportional steering. odom.wz remains an observation for
     # ego-motion tracking, but is never fed back into the command as a hidden
     # D-like term.
@@ -1604,7 +1568,6 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     every extra second of spin sweeps the shoulders through space no corridor
     has checked.
     """
-    state.adaptive_yaw_scale = 1.0
     state.missing_frames += 1
     if state.missing_frames < config.lost_frames:
         # Briefly occluded — a person walking past. Emitting nothing for a few

@@ -715,7 +715,7 @@ def test_generic_defaults_are_visible_only_in_info():
     assert info["config"]["max_obs_age_ms"] == 500
     assert info["config"]["stop_tolerance_m"] == 0.05
     assert info["config"]["arrival_distance_m"] == pytest.approx(0.85)
-    assert info["gains"]["yaw"]["source"] == "adaptive_default"
+    assert info["gains"]["yaw"]["source"] == "configured_default"
 
 
 def _running_generic_card(**cfg):

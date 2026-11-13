@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from test_navi_card import _card
+from test_navi_card import _card, _running_generic_card
 from test_navi_policy import _detections, _obj, _solid_depth
 
 
@@ -58,11 +58,15 @@ def test_adaptive_mode_does_not_hide_the_reported_depth_bias_or_override_obstacl
     assert any("0.6" in note and "0.45" in note for note in info["degraded"])
 
 
-def test_default_gains_and_retired_canvas_values_reach_the_actual_command():
-    card = _card(use_lateral=False, vx_max=0.3, wz_max=0.5)
+@pytest.mark.parametrize("legacy_adaptive_yaw", [None, False, True])
+def test_default_gains_and_retired_canvas_values_reach_the_actual_command(legacy_adaptive_yaw):
+    cfg = {"use_lateral": False, "vx_max": 0.3, "wz_max": 0.5}
+    if legacy_adaptive_yaw is not None:
+        cfg["adaptive_k_yaw"] = legacy_adaptive_yaw
+    card = _card(**cfg)
     result = card.dispatch("navi", {
         "action": "config", "k_fwd": 0.1, "k_yaw": 10.0,
-        "adaptive_k_fwd": True,
+        "adaptive_k_fwd": True, "adaptive_k_yaw": True,
     })
     assert result["status"] == "configured"
     card._running = True
@@ -73,12 +77,24 @@ def test_default_gains_and_retired_canvas_values_reach_the_actual_command():
     assert info["config"]["k_fwd"] == 0.9
     assert info["config"]["adaptive_k_fwd"] is False
     assert info["last"]["k_fwd_effective"] == 0.9
-    assert info["config"]["adaptive_k_yaw"] is True
     assert command is not None and command["values"][0] > 0
     assert -0.5 <= command["values"][5] < 0
     gain = info["last"]["k_yaw_effective"]
-    assert 0.3 <= gain < 0.6
+    assert gain == 0.6
     assert command["values"][5] == pytest.approx(-gain * info["last"]["bearing"])
+
+
+def test_saved_legacy_yaw_flag_cannot_restore_scheduling_on_start():
+    card = _running_generic_card(adaptive_k_yaw=True)
+    try:
+        card._state.target = "chair"
+        for _ in range(15):
+            command = feed(card, 2.0, bearing=0.1)
+        assert command is not None
+        assert card._last_decision.k_yaw_effective == 0.6
+        assert command["values"][5] == pytest.approx(-0.6 * card._last_decision.bearing)
+    finally:
+        card._stop()
 
 
 def test_default_forward_gain_stops_at_the_configured_arrival_threshold():
