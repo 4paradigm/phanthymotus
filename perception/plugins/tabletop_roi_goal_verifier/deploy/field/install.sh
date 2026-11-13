@@ -3,7 +3,7 @@
 set -euo pipefail
 umask 077
 KIT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-DEST=${1:-/home/agilex/goal-verifier-roi-20261113}
+DEST=${1:-/home/agilex/goal-verifier-roi-20261113-r2}
 PYTHON=${ROI_PYTHON:-python3}
 METHOD=${ROI_INSTALL_METHOD:-auto}
 fail(){ echo "安装失败：$*" >&2; exit 1; }

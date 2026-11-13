@@ -20,4 +20,7 @@
 
 典型错误：SOURCE_TIMEOUT、SOURCE_INPUT_ERROR、STALE_OR_FUTURE、PRE_OPERATION_OBSERVATION、REPLAYED_AFTER_OBSERVATION、SOURCE_GEOMETRY_CHANGED、ROI_NOT_STABLE、ROI_CAMERA_MOVED、ROI_OCCLUDED_OR_REPLACED、REQUEST_ID_CONFLICT、SESSION_EXPIRED。错误不映射成任务 FAIL，可靠数据中的 ROI_NO_CHANGE 才是 FAIL。
 
-会话 token 用于隔离本进程会话；服务仅供同用户 loopback / SSH 隧道使用。Bundle 的现有通用调试日志可能包含请求字段；现场应使用独立服务（其 HTTP handler 不记录请求正文），避免把 Bundle 日志当作可公开证据。
+会话 token 用于隔离本进程会话；服务仅供同用户 loopback / SSH 隧道使用。Bundle 请求/结果日志会递归隐去 session_token；独立服务不记录请求正文。图像、会话和诊断仍按个人证据管理。
+
+
+审查新增拒绝码：OPERATION_CANCELLED、START_CANCELLED、SESSION_CLOCK_INVALID、IMAGE_SATURATED_OR_EMPTY、ROI_PHOTOMETRIC_AMBIGUITY、EVIDENCE_INCOMPLETE、EVIDENCE_IMAGE_INVALID。来源恢复后 source_epoch 变化会触发 SOURCE_GEOMETRY_CHANGED。`_trace_id` 接受 1–256 字符串，仅作诊断，重试时改变它不会改变逻辑请求身份。证据缺失或写入失败不表示验证成功；失败的新后观测不导出上一轮 after 图。

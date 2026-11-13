@@ -2,7 +2,7 @@
 
 本包为真实相机测试做准备，当前尚未连接 D435 或实验室设备。目标环境：Ubuntu 22.04、系统 Python 3.10、ROS2 Humble。包含 x86_64 和 aarch64 的离线 wheel；aarch64 仅完成 wheel 准备，未在该架构运行。
 
-旧目录 `/home/agilex/goal-verifier-own-20261111-s`、旧端口 `18083` 均不使用。新目录默认 `/home/agilex/goal-verifier-roi-20261113`，默认 loopback 端口 `18084`；占用时自动选择其后的空闲端口，不停止占用者。启动后以 `service.json` 的 port/url 为准。
+旧目录 `/home/agilex/goal-verifier-own-20261111-s`、旧端口 `18083` 均不使用。新目录默认 `/home/agilex/goal-verifier-roi-20261113-r2`，默认 loopback 端口 `18084`；占用时自动选择其后的空闲端口，不停止占用者。启动后以 `service.json` 的 port/url 为准。
 
 ## 1. 安装到全新个人目录
 
@@ -10,18 +10,18 @@
 
 ```bash
 sha256sum --check FIELD-SHA256SUMS
-KIT=/home/agilex/roi-kit-20261113
+KIT=/home/agilex/roi-kit-20261113-r2
 [ ! -e "$KIT" ] && [ ! -L "$KIT" ] || { echo 'kit 目录已存在，请选择新目录'; exit 1; }
 mkdir "$KIT"
 tar -xzf tabletop-roi-d435-field.tar.gz -C "$KIT"
 cd "$KIT"
-bash install.sh /home/agilex/goal-verifier-roi-20261113
+bash install.sh /home/agilex/goal-verifier-roi-20261113-r2
 ```
 
 安装前检查全部 SHA256，不覆盖已存在的部署目录，无 sudo，无网络安装。优先 `venv --without-pip`，从经过校验的 pip wheel 安装依赖，不要求 ensurepip。缺少 venv 时自动使用 `pip --target`。依赖、临时文件、缓存和日志都写入新部署目录。可显式选择：
 
 ```bash
-ROI_INSTALL_METHOD=target ROI_PYTHON=/usr/bin/python3.10 bash install.sh /home/agilex/goal-verifier-roi-20261113-target
+ROI_INSTALL_METHOD=target ROI_PYTHON=/usr/bin/python3.10 bash install.sh /home/agilex/goal-verifier-roi-20261113-r2-target
 ```
 
 安装失败不要覆盖旧目录重试；查看新目录 `logs/install.log` / `logs/venv.log`，选择另一个新目录。离线 wheel 只覆盖 Ubuntu 常见的 x86_64/aarch64 + CPython 3.10；不兼容的平台应另行准备，不修改系统 Python。
@@ -33,7 +33,7 @@ ROI_INSTALL_METHOD=target ROI_PYTHON=/usr/bin/python3.10 bash install.sh /home/a
 先运行 Doctor（此时服务未启动、配置记录留空会显示相应失败，ROS 图像检查仍会执行）：
 
 ```bash
-ROOT=/home/agilex/goal-verifier-roi-20261113
+ROOT=/home/agilex/goal-verifier-roi-20261113-r2
 bash "$ROOT/bin/doctor.sh" > "$ROOT/evidence/doctor-before.json"
 ```
 
@@ -122,3 +122,10 @@ evidence/
 `session.json` 是完整导出（去除 session token），包括历史与前后图像。复制保留 `logs/server.log`、Doctor 输出和人工相机/视角记录。图像 hash 是采集 BGR 像素的 SHA256，缩略图是重新编码的 JPEG，二者不应直接互算相等。JSON 中的 provenance 必须是 real，时间真实递增且晚于完成标记。
 
 正式验收仍需人工核实相机身份、固定视角、三组真实结果及证据完整性。现场准备 Ready 与正式验收 Ready 是不同状态；当前交付只达到前者。
+
+
+## 本版补充
+
+断开/重连、长采集间断、时钟回退或 source epoch 变化后，新建会话重新记录基准。中性阴影/反光及纯灰度变化可能返回 ROI_PHOTOMETRIC_AMBIGUITY；选择有明显色彩/结构的目标做标准 PASS 场景，不为达标放宽阈值。证据失败不会发布半个测试目录；缺少可靠后帧的 INCONCLUSIVE 会明确标为证据不完整，不能冒充带前后图的 PASS。保留实际失败和日志。
+
+stop.sh 使用 PID 固定句柄，仅发信号给本目录核实的进程；Linux x86_64/aarch64 的 Python 3.10 绑定缺失时使用同等内核接口，不退回可复用数字 PID。内核不支持或权限不足时给出诊断，不停止其他服务。

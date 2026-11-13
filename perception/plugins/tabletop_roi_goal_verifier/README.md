@@ -73,3 +73,11 @@ python3 perception/tools/package_tabletop_roi_field.py --wheels-dir /path/to/whe
 ```
 
 当前为现场工具 Ready，未完成真实 D435 验收；aarch64 只准备了匹配 wheel，尚无该架构运行记录。
+
+## 2026-11-13 审查收尾
+
+专项审查与当前测试结论见 REVIEW.md / TESTING.md；旧交付数字不代表本次结果。相机错误恢复、采集间断或壁钟回退后需新建会话，停止可抢占等待图像的请求。图片编码失败不会留下半个基准，失败的后观测不会借用旧截图；证据写入使用临时目录和原子发布。
+
+新增 `ROI_PHOTOMETRIC_AMBIGUITY`：纯局部阴影、反光等中性亮度变化保守返回 INCONCLUSIVE。纯灰度物体也可能触发此规则；不要放宽阈值来强求 PASS。已识别的变化不等于物体身份或机器人成功。Core 的 `_trace_id` 仅用于诊断，不参与幂等身份；session token 不写入 Bundle 请求/结果日志。
+
+新一版现场安装建议使用 `/home/agilex/goal-verifier-roi-20261113-r2`。旧目录和旧服务不覆盖。当前 Code Ready / Draft PR Ready；Regular PR 和真实 D435 验收尚未完成。
