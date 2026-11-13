@@ -604,7 +604,7 @@ export function updateCanvasMcps(mcps) {
         // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
         if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
       }
-      if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
+      if (card.topicOutFrom === undefined && liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
         if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
       }
     }
@@ -2031,13 +2031,15 @@ function _resolveAllTopics() {
     const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
     const cardHasRealTopic = card.topicOut?.some(t => t.topic);
     const staticHasRealTopic = toolTopicOut?.some(t => t.topic);
-    const topicOut = (cardHasRealTopic ? card.topicOut : null)
+    // An explicit info result, including no outputs, outranks static metadata.
+    const topicOut = card.topicOutFrom !== undefined ? card.topicOut : (cardHasRealTopic ? card.topicOut : null)
       || (staticHasRealTopic ? toolTopicOut : null)
       || (card.topicOut?.length ? card.topicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
 
     const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
     for (let i = 0; i < outPorts.length; i++) {
-      const staticTopic = topicOut[i]?.topic || outPorts[i].dataset.staticTopic || '';
+      const staticTopic = topicOut[i]?.topic
+        || (card.topicOutFrom === undefined ? outPorts[i].dataset.staticTopic || '' : '');
       outPorts[i].dataset.topic = staticTopic;
     }
     for (const port of card.el.querySelectorAll('.canvas-port.in')) {
@@ -2603,6 +2605,7 @@ async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {})
     const parsed = _parseMcpCallResult(data);
     if (!parsed) { card._topicFetchFor = null; return; }
     const topicOut = parsed?.topic_out;
+    if (!Array.isArray(topicOut)) return; // state-only info does not revoke outputs
     // Remember which input produced this answer. A derived topic is only valid
     // for the input it was derived from, and without this the cache could never
     // be told apart from a still-correct one — see _revalidateDerivedTopics.
@@ -2629,11 +2632,9 @@ async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {})
       _resolveAllTopics();
       _scheduleRedraw();
       _debouncedSave();
-    } else if (card.topicOut?.some(t => t.topic)) {
-      // The driver cannot infer an output for this input, so whatever we are
-      // holding was derived from a different one and is now wrong. Dropping it is
-      // what stops a deleted connection's topic from outliving the connection.
-      card.topicOut = [];
+    } else {
+      // Explicit empty/unresolved outputs revoke previously inferred bindings.
+      card.topicOut = topicOut;
       _resolveAllTopics();
       _scheduleRedraw();
       _debouncedSave();
