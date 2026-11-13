@@ -51,7 +51,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 from plugins.image_input import BadInput, load_image_bytes
 from plugins.pose_action import (
@@ -498,6 +498,10 @@ class _PoseNode(Node):
                      f"→ {self._output_topic}")
             return self._status()
 
+    @property
+    def worker_alive(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
     def stop(self) -> dict:
         """Stop this node's worker. Does NOT touch the subscription.
 
@@ -513,6 +517,9 @@ class _PoseNode(Node):
         with self._lifecycle_lock:
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
+            if self._worker and self._worker.is_alive():
+                self._running = False
+                return {"state": "stopping", "reason": "worker_pending"}
             self._worker = None
             self._running = False
             self._tracker.reset()
@@ -1109,6 +1116,8 @@ class PosePerceptionPlugin:
         # perception/README.md § "Plugin Concurrency". Never held across
         # node.start()/stop() or a model load.
         self._nodes_lock = threading.RLock()
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._nodes_lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
 
     # ── config → objects ─────────────────────────────────────────────────
 
@@ -1599,20 +1608,12 @@ class PosePerceptionPlugin:
 
     # ── node lifecycle ───────────────────────────────────────────────────
 
-    def _start_node(self, node_key: str, input_topic: str):
-        """Create and start a _PoseNode for the given topic.
-
-        Registers the node before starting it so a concurrent stop can always
-        find and cancel it; the lock covers only the registration, never the
-        start, so a stop is not queued behind the start it is trying to abort
-        (perception/README.md § "Plugin Concurrency").
-        """
-        with self._nodes_lock:
-            if node_key in self._nodes:
-                return
+    def _start_node(self, node_key, input_topic, request=None):
+        request = request or self._lifecycle.current(node_key)
+        def create():
             merged = self._merged_config(node_key)
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
-            node = _PoseNode(
+            return _PoseNode(
                 input_topic or None, self._model, merged["confidence"],
                 merged["fps"], node_suffix=suffix,
                 classifier=self._classifier_for(merged),
@@ -1629,30 +1630,13 @@ class PosePerceptionPlugin:
                 publish_hand_keypoints=merged["publish_hand_keypoints"],
                 hand_gestures=merged["gesture_whitelist"],
             )
-            self._executor.add_node(node)
-            self._nodes[node_key] = node
-        node.start()
-        log.info(f"[pose] node started (background): {input_topic}")
+        return self._lifecycle.start(node_key, request, create, self._lifecycle.retire_node)
 
-    def _retire_node(self, node_key: str) -> Optional[dict]:
-        """Stop, unregister and destroy one node. Returns its stop() result."""
-        with self._nodes_lock:
-            node = self._nodes.pop(node_key, None)
-            # Goes with the node: a re-wired card answering info() with the
-            # optics of a camera it is no longer fed by is worse than answering
-            # with nothing, because downstream cannot tell the difference.
-            self._upstream_camera.pop(node_key, None)
-        if node is None:
-            return None
-        node.request_stop()
-        result = node.stop()
-        # remove-then-destroy via the shared helper: the node must leave the
-        # executor before any handle is destroyed, or the spin thread dies on
-        # InvalidHandle and takes every subscription in the process with it. It
-        # must be destroyed and not merely removed, or the publishers and the
-        # ROS node name leak and the next start trips "Publisher already
-        # registered".
-        dispose_node(self._executor, node, label=f"pose/{node_key}")
+    def _retire_node(self, node_key: str) -> dict:
+        result = self._lifecycle.stop(node_key)
+        if result["state"] == "idle":
+            with self._nodes_lock:
+                self._upstream_camera.pop(node_key, None)
         return result
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
@@ -1682,7 +1666,19 @@ class PosePerceptionPlugin:
     def get_tools(self) -> list:
         return TOOLS
 
-    def dispatch(self, name: str, args: dict) -> dict | None:
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
+
+    def _dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)
         instance_id = args.get("instance_id", "")
 
@@ -1696,11 +1692,11 @@ class PosePerceptionPlugin:
             if instance_id:
                 result = self._retire_node(instance_id)
                 return result if result is not None else {"state": "idle"}
-            with self._nodes_lock:
-                keys = list(self._nodes.keys())
-            stopped = [key for key in keys if self._retire_node(key) is not None]
-            return ({"state": "idle", "stopped_instances": stopped} if stopped
-                    else {"state": "idle"})
+            result = self._lifecycle.stop()
+            if result["state"] == "idle":
+                with self._nodes_lock:
+                    self._upstream_camera.clear()
+            return result
 
         elif action in ("recognize_by_photo", "recognize_by_url"):
             return self._recognize_image(args, url_action="recognize_by_url")
@@ -1992,6 +1988,9 @@ class PosePerceptionPlugin:
         # on-demand, loads the engine, owns its publishers and answers
         # recognize_by_photo. It simply has nothing to subscribe to.
         node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+        request, blocked = self._lifecycle.begin(node_key, input_topic)
+        if blocked:
+            return blocked
         # Recorded before the node starts, and recorded even when empty, so a
         # restart that no longer carries a declaration replaces the old entry
         # rather than leaving one claiming a camera that is no longer wired.
@@ -2004,7 +2003,7 @@ class PosePerceptionPlugin:
         with self._nodes_lock:
             running = self._nodes.get(node_key)
         if running is not None:
-            return running.start()
+            return self._start_node(node_key, input_topic, request)
 
         if self._model is None:
             if self._model_loading:
@@ -2023,7 +2022,8 @@ class PosePerceptionPlugin:
                     self._ensure_model()
                     self._model_loading = False
                     self._model_load_status = None
-                    self._start_node(node_key, input_topic)
+                    for pending_key, pending_request in self._lifecycle.pending():
+                        self._start_node(pending_key, pending_request.topic, pending_request)
                 except Exception as error:  # noqa: BLE001
                     self._model_loading = False
                     self._model_load_error = str(error)
@@ -2035,13 +2035,13 @@ class PosePerceptionPlugin:
                     "output": output_topic_for(input_topic),
                     "message": "Engine loading in background, will start automatically"}
 
-        self._start_node(node_key, input_topic)
+        result = self._start_node(node_key, input_topic, request)
         with self._nodes_lock:
             running = self._nodes.get(node_key)
         if running is None:
             # A concurrent stop retired it between start and lookup.
             return {"state": "idle", "input": input_topic}
-        return running.start()
+        return result
 
     def _config(self, args: dict, instance_id: str) -> dict:
         cfg = {k: v for k, v in args.items()
@@ -2120,3 +2120,7 @@ class PosePerceptionPlugin:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]
         return {"status": "configured", "config": cfg}
+
+    def shutdown(self) -> dict:
+        """Cancel pending creation and retain failed cleanup for explicit retry."""
+        return self._lifecycle.shutdown()
