@@ -217,14 +217,18 @@ its ROS wrapper doubles the diagonal for `Odometry.pose.covariance`. It is
 not a calibrated accumulated trajectory-error estimate. The 0.04 m² check
 remains an engineering admission bound, independent of the ESKF sigma limit.
 
-All three modes (pure RGB-D, IMU attitude assistance and ESKF) give the native
-child a private copy of the configured `FASTRTPS_DEFAULT_PROFILES_FILE` with
-at least 1 MiB UDPv4 receive buffers. Larger configured buffers are retained.
-The loopback whitelist, participant settings, public profile and parent
-environment stay unchanged; the copy is removed with the session. Profiles
-without explicit UDPv4 transports are left unchanged. This addresses observed
-kernel receive-buffer drops before RTAB-Map processing, not visual matching
-failures; effective socket capacity still depends on host limits.
+Perception initializes ROS with a process-private copy of the configured
+`FASTRTPS_DEFAULT_PROFILES_FILE`, setting explicit UDPv4 receive buffers to at
+least 1 MiB. This protects the shared input participant from fragmented RGB-D
+bursts; the copy remains alive through ROS shutdown and the environment is then
+restored. All three odometry modes also give each native child its own copy,
+removed with the session. Larger buffers, loopback whitelists and participant
+settings are retained; the public profile is never modified. Profiles without
+explicit UDPv4 transports are left unchanged, and malformed configured XML
+fails before ROS starts. The main-process change takes effect on the next
+application start; it does not reconfigure a running participant. It addresses
+kernel receive-buffer drops, not visual matching failures or native busy-frame
+drops; effective socket capacity still depends on host limits.
 
 For current Core's topic-only SLAM path, map provenance explicitly records
 unverified timestamp overlap. The stricter SLAM declaration path still requires

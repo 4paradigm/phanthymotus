@@ -14,10 +14,11 @@ import tempfile
 import threading
 import time
 import uuid
-import xml.etree.ElementTree as ET
 import zlib
 
 import numpy as np
+
+from utils.dds_transport import receive_environment
 
 from .rgbd_odometry_contract import PairBuffer, make_sample
 from .rgbd_imu import ImuAttitude
@@ -175,28 +176,7 @@ class EstimateGate:
 
 def estimator_environment(directory):
     """Give only the native child room for fragmented RGBDImage UDP bursts."""
-    env = dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
-    profile = env.get('FASTRTPS_DEFAULT_PROFILES_FILE')
-    if not profile:
-        return env
-    tree = ET.parse(profile)
-    changed = False
-    for transport in tree.findall('.//{*}transport_descriptor'):
-        kind = transport.find('{*}type')
-        if kind is None or kind.text != 'UDPv4':
-            continue
-        size = transport.find('{*}receiveBufferSize')
-        if size is None:
-            prefix = transport.tag.rpartition('}')[0] + '}' if '}' in transport.tag else ''
-            size = ET.SubElement(transport, prefix+'receiveBufferSize')
-        size.text = str(max(1048576, int(size.text or '0')))
-        changed = True
-    if changed:
-        path = Path(directory)/'native-dds.xml'
-        ET.register_namespace('', 'http://www.eprosima.com')
-        tree.write(path, encoding='unicode')
-        env['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(path)
-    return env
+    return dict(receive_environment(directory), OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
 
 
 def estimator_parameters(calibration, segment):

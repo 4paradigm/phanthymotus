@@ -54,6 +54,8 @@ import yaml
 import rclpy
 import rclpy.executors
 
+from utils.dds_transport import receive_buffer_profile
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
@@ -749,6 +751,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+@receive_buffer_profile()
 def main():
     global _bundle
 
