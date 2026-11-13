@@ -20,6 +20,7 @@ import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } f
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
+import { renderCanvasFieldHelp } from './canvas-field-help.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
@@ -1006,6 +1007,19 @@ async function _removeCard(id) {
 
 // ── Card rendering ────────────────────────────────────────────────────────────
 
+function _canvasTextField(cardId, index, key, def, label) {
+  const inputId = `canvas-input-${encodeURIComponent(cardId)}-${index}`;
+  const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
+  const fieldKey = _esc(key).replace(/"/g, '&quot;');
+  const { inputAttributes, helpMarkup } = renderCanvasFieldHelp(def.description, inputId);
+  return `
+    <div class="canvas-field">
+      <label class="canvas-field-label" for="${inputId}">${_esc(label)}</label>
+      <input class="canvas-field-input" id="${inputId}" type="${type}" data-key="${fieldKey}"${inputAttributes}>
+      ${helpMarkup}
+    </div>`;
+}
+
 function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTopicIn, topicOut: savedTopicOut }) {
   const el = document.createElement('div');
   el.dataset.cardId = id;
@@ -1103,7 +1117,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     let sensorFieldsHtml = '';
     if (hasSensorActions) {
-      sensorFieldsHtml = Object.entries(sensorProps).map(([key, def]) => {
+      sensorFieldsHtml = Object.entries(sensorProps).map(([key, def], index) => {
         const isReq = sensorRequired.includes(key);
         const label = key + (isReq ? ' *' : '');
         let inputHtml;
@@ -1123,9 +1137,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           const uploadTo = def.uploadTo || '';
           inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
-          const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
-          const desc = def.description || '';
-          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+          return _canvasTextField(id, index, key, def, label);
         }
         return `
           <div class="canvas-field">
@@ -1272,7 +1284,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     const _SYSTEM_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const _TOPIC_KEY_RE = /input.*topic|topic.*in|output.*topic|topic.*out/i;
-    const fieldsHtml = Object.entries(props).map(([key, def]) => {
+    const fieldsHtml = Object.entries(props).map(([key, def], index) => {
       // Hide auto-populated topic fields for processor cards
       if ((effectiveType === 'processor' || effectiveType === 'actuator') && _TOPIC_KEY_RE.test(key)) return '';
       const isReq = required.includes(key);
@@ -1298,9 +1310,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const uploadTo = def.uploadTo || '';
         inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
-        const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
-        const desc = def.description || '';
-        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+        return _canvasTextField(id, index, key, def, label);
       }
       return `
         <div class="canvas-field">

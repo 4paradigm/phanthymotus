@@ -2090,6 +2090,14 @@ html, body {
 .canvas-field-input:focus {
   border-color: var(--accent);
 }
+.canvas-field-help {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+  user-select: text;
+}
 
 .canvas-card-footer {
   padding: 0 10px 10px;
