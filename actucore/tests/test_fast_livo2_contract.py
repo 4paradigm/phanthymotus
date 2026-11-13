@@ -1,0 +1,399 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sys
+import unittest
+from pathlib import Path
+
+import yaml
+
+
+ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ACTUCORE_ROOT))
+
+from plugins.controlled_semantic_spatial.contract import (  # noqa: E402
+    CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
+)
+from plugins.controlled_semantic_spatial.mapping.contract import (  # noqa: E402
+    FAST_LIVO2_ACTIONS,
+    FAST_LIVO2_LIFECYCLE_ACTIONS,
+    fast_livo2_tool_definition,
+)
+
+
+class FastLivo2ContractTest(unittest.TestCase):
+    def test_identity_actions_and_frozen_sensor_contract(self) -> None:
+        tool = fast_livo2_tool_definition("ubuntu")
+
+        self.assertEqual(tool["name"], "fast_livo2")
+        self.assertEqual(tool["displayName"], "FAST-LIVO2")
+        self.assertEqual(tool["type"], "processor")
+        actions = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertEqual(actions[:4], list(FAST_LIVO2_LIFECYCLE_ACTIONS))
+        self.assertEqual(actions[4:], list(FAST_LIVO2_ACTIONS))
+        self.assertEqual(
+            actions[4:],
+            ["start_mapping", "stop_mapping", "load_map", "relocalize"],
+        )
+
+        inputs = {item["port"]: item for item in tool["topic_in"]}
+        self.assertEqual(set(inputs), {"lidar", "imu"})
+        self.assertEqual(inputs["lidar"]["topic"], "/ubuntu/navigation/lidar")
+        self.assertEqual(inputs["lidar"]["ros_type"], "sensor_msgs/msg/PointCloud2")
+        self.assertEqual(
+            inputs["lidar"]["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE"
+        )
+        self.assertEqual(inputs["imu"]["topic"], "/ubuntu/navigation/imu")
+        self.assertEqual(
+            inputs["imu"]["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE"
+        )
+        self.assertIn("sensor_frame", inputs["lidar"]["frame_id"])
+        self.assertIn("sensor_frame", inputs["imu"]["frame_id"])
+        self.assertNotIn("livox_frame", str(tool))
+
+        outputs = {item["port"]: item for item in tool["topic_out"]}
+        self.assertEqual(
+            set(outputs),
+            {
+                "livo_odom",
+                "registered_cloud",
+                "obstacle_map",
+                "static_map",
+                "map_view",
+                "status",
+            },
+        )
+        self.assertEqual(outputs["livo_odom"]["frame_id"], "map -> base_link")
+        self.assertEqual(outputs["registered_cloud"]["frame_id"], "map")
+        self.assertEqual(
+            outputs["obstacle_map"]["topic"], "/ubuntu/navigation/obstacle_map"
+        )
+        self.assertEqual(outputs["obstacle_map"]["frame_id"], "map")
+        self.assertEqual(outputs["static_map"]["topic"], "/ubuntu/navigation/static_map")
+        self.assertEqual(outputs["static_map"]["ros_type"], "nav_msgs/msg/OccupancyGrid")
+        self.assertEqual(
+            outputs["static_map"]["qos"],
+            "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
+        )
+        self.assertEqual(outputs["static_map"]["frame_id"], "map")
+        self.assertEqual(outputs["map_view"]["schema"], "phanthy.navigation.map_view.v1")
+        config = tool["configSchema"]["properties"]
+        self.assertEqual(config["obstacle_min_height_m"]["default"], -0.80)
+        self.assertEqual(config["obstacle_max_height_m"]["default"], 0.10)
+        self.assertTrue(config["map_view_enabled"]["default"])
+        self.assertNotIn("fault_capture_enabled", config)
+        self.assertNotIn("collection_enabled", config)
+        self.assertNotIn("collection_directory", config)
+        self.assertNotIn("start_recording", actions)
+        self.assertNotIn("stop_recording", actions)
+
+
+    def test_runtime_is_locked_in_navigation_base_and_actucore_image(self) -> None:
+        runtime = ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "runtime"
+        source_lock = (runtime / "fast_livo2-source.lock").read_text(
+            encoding="utf-8"
+        )
+        base_dockerfile = (
+            ACTUCORE_ROOT.parent / "deploy" / "prepare_navigation_base.sh"
+        ).read_text(encoding="utf-8")
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
+            encoding="utf-8"
+        )
+        adapter = (
+            runtime / "fast_livo2" / "fast_livo2" / "adapter_node.py"
+        ).read_text(encoding="utf-8")
+        service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text(
+            encoding="utf-8"
+        )
+        main = (ACTUCORE_ROOT / "main.py").read_text(encoding="utf-8")
+        runtime_patch = runtime / "patches" / "fast-livo2-runtime.patch"
+        pcd_patch = runtime / "patches" / "fast-livo2-pcd-save.patch"
+        flush_patch = runtime / "patches" / "fast-livo2-pcd-flush.patch"
+        livox_messages = runtime / "livox_ros_driver2_msgs"
+
+        nav2_lock = (runtime / "nav2-source.lock").read_text(encoding="utf-8")
+        for key, patch, lock in (
+            ("FAST_LIVO2_RUNTIME_PATCH_SHA256", runtime_patch, source_lock),
+            ("FAST_LIVO2_PCD_SAVE_PATCH_SHA256", pcd_patch, source_lock),
+            ("FAST_LIVO2_PCD_FLUSH_PATCH_SHA256", flush_patch, source_lock),
+            (
+                "NAVIGATION2_RUNTIME_PATCH_SHA256",
+                runtime / "patches" / "nav2-without-velocity-smoother.patch",
+                nav2_lock,
+            ),
+        ):
+            with self.subTest(patch=patch.name):
+                declared = re.findall(
+                    rf"^{key}=([0-9a-f]{{64}})$", lock, re.MULTILINE
+                )
+                self.assertEqual(len(declared), 1)
+                self.assertEqual(
+                    hashlib.sha256(patch.read_bytes()).hexdigest(), declared[0]
+                )
+                self.assertIn(f"ARG {key}\n", base_dockerfile)
+                self.assertRegex(
+                    base_dockerfile,
+                    rf'"\$\{{{key}\}}"\s*\\\s*/tmp/{re.escape(patch.name)} \| sha256sum -c -',
+                )
+        self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
+        self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
+        runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
+        self.assertIn(
+            'get_parameter_or("lidar_qos_depth", point_cloud_queue_depth, 100)',
+            runtime_patch_text,
+        )
+        self.assertIn(
+            'get_parameter_or("imu_qos_depth", imu_queue_depth, 2000)',
+            runtime_patch_text,
+        )
+        self.assertNotIn('declare_parameter<int>("lidar_qos_depth"', runtime_patch_text)
+        self.assertNotIn('declare_parameter<int>("imu_qos_depth"', runtime_patch_text)
+        self.assertNotIn(
+            'declare_parameter<std::string>(\n+    "runtime_diagnostics_topic"',
+            runtime_patch_text,
+        )
+        self.assertIn(
+            '"runtime_diagnostics_topic", runtime_diagnostics_topic,',
+            runtime_patch_text,
+        )
+        self.assertIn(
+            "timeout --signal=INT --kill-after=2s 2s",
+            base_dockerfile,
+        )
+        self.assertIn("--params-file /tmp/navigation_lio.yaml", base_dockerfile)
+        self.assertIn("-p lidar_qos_depth:=100", base_dockerfile)
+        self.assertIn("-p imu_qos_depth:=2000", base_dockerfile)
+        self.assertIn("rclcpp::KeepLast", runtime_patch_text)
+        self.assertIn("point_cloud_qos.reliable().durability_volatile()", runtime_patch_text)
+        self.assertIn("imu_qos.reliable().durability_volatile()", runtime_patch_text)
+        runtime_cpp_patch = runtime_patch_text.split(
+            "diff --git a/src/LIVMapper.cpp", 1
+        )[1]
+        self.assertNotIn("@@ -13,", runtime_cpp_patch)
+        self.assertIn("publishRuntimeDiagnostics", runtime_patch_text)
+        self.assertIn("payload << std::setprecision(17)", runtime_patch_text)
+        self.assertIn("input_contract_ready", runtime_patch_text)
+        # Published state time must describe the integrated state, not the
+        # publish instant; speed/freshness checks read these stamps.
+        self.assertIn("stateStampSec", runtime_patch_text)
+        self.assertIn(
+            "odomAftMapped.header.stamp = sec2Stamp(state_sec);", runtime_patch_text
+        )
+        self.assertNotIn(
+            "+  odomAftMapped.header.stamp = this->node->get_clock()->now();",
+            runtime_patch_text,
+        )
+        self.assertIn("state_stamp_sec", runtime_patch_text)
+        self.assertIn("publish_latency_ms", runtime_patch_text)
+        self.assertIn("self._on_mapper_runtime", adapter)
+        self.assertIn("mapper_publish_latency_ms", adapter)
+        self.assertIn("mapper_state_stamp_sec", adapter)
+        self.assertNotIn("self._on_lidar_contract", adapter)
+        self.assertNotIn("self._on_imu_contract", adapter)
+        self.assertIn("+#include <stdexcept>", pcd_patch.read_text(encoding="utf-8"))
+        self.assertIn("import numpy, rosbag2_py", dockerfile)
+        self.assertIn("ros2 bag record --help | grep -F -- '--no-discovery'", dockerfile)
+        self.assertIn(
+            "from fast_livo2.camera_rgb_frame import decode as decode_rgb",
+            dockerfile,
+        )
+        self.assertNotIn("fast_livo2.camera_depth_frame", dockerfile)
+        self.assertIn("assert RGB_MAGIC == b'PSE1'", dockerfile)
+        self.assertTrue((runtime / "navigation_lio.yaml").is_file())
+        self.assertIn("/config/navigation_lio.yaml", dockerfile)
+        self.assertNotIn("base_to_sensor_x", adapter)
+        self.assertNotIn("base_to_sensor_pitch", adapter)
+        # 基础镜像 digest 由构建脚本按 --jp-version 选择，不放在源码锁中。
+        self.assertNotIn("ROS_BASE_IMAGE=", source_lock)
+        self.assertNotIn("APT_ROS_MIRROR=", source_lock)
+        for variable in (
+            "FAST_LIVO2_REPO",
+            "FAST_LIVO2_COMMIT",
+            "RPG_VIKIT_REPO",
+            "RPG_VIKIT_COMMIT",
+            "SOPHUS_REPO",
+            "SOPHUS_COMMIT",
+        ):
+            self.assertIn(f"{variable}=", source_lock)
+            self.assertIn(f"${{{variable}}}", base_dockerfile)
+        for removed in (
+            "LIVOX_ROS_DRIVER2_REPO",
+            "LIVOX_ROS_DRIVER2_COMMIT",
+            "LIVOX_SDK2_REPO",
+            "LIVOX_SDK2_COMMIT",
+        ):
+            self.assertNotIn(removed, source_lock)
+            self.assertNotIn(removed, base_dockerfile)
+        self.assertTrue((livox_messages / "msg" / "CustomMsg.msg").is_file())
+        self.assertTrue((livox_messages / "msg" / "CustomPoint.msg").is_file())
+        self.assertIn(
+            "COPY actucore/plugins/controlled_semantic_spatial/runtime/livox_ros_driver2_msgs/",
+            base_dockerfile,
+        )
+        self.assertIn(
+            'test -z "$(ros2 pkg executables livox_ros_driver2)"',
+            base_dockerfile,
+        )
+        # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以只移除
+        # ROS 源；Ubuntu/NVIDIA 签名源仍需保留并认证系统依赖。
+        self.assertIn("packages\\.ros\\.org/ros2/ubuntu", base_dockerfile)
+        self.assertNotIn("rm -f /etc/apt/sources.list.d/*.list", base_dockerfile)
+        self.assertNotIn("AllowInsecureRepositories", base_dockerfile)
+        self.assertNotIn("--allow-unauthenticated", base_dockerfile)
+        self.assertIn(
+            "ROS APT source remains; humble has no Focal binaries",
+            base_dockerfile,
+        )
+        self.assertNotIn("ros-humble-navigation2", base_dockerfile)
+        self.assertNotIn("ros-humble-nav2-bringup", base_dockerfile)
+        self.assertIn("GPL-2.0-only AND GPL-3.0-only", base_dockerfile)
+        self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
+        self.assertNotIn("FAST_LIVO2_BASE_IMAGE", base_dockerfile)
+        self.assertIn("git fetch --depth 1 origin", base_dockerfile)
+        for patch_name in ("runtime", "pcd-save", "pcd-flush"):
+            patch_path = f"/tmp/fast-livo2-{patch_name}.patch"
+            for dry_run in ("--dry-run ", ""):
+                self.assertIn(
+                    f"patch {dry_run}--batch --fuzz=0 --ignore-whitespace -p1 "
+                    f"\\\n      -i {patch_path}",
+                    base_dockerfile,
+                )
+        self.assertIn(
+            "--packages-select livox_ros_driver2 vikit_common vikit_ros",
+            base_dockerfile,
+        )
+        self.assertNotIn("/tmp/livox-sdk2", base_dockerfile)
+        self.assertIn("--packages-select fast_livo", base_dockerfile)
+        self.assertIn("PCD finalization completed", base_dockerfile)
+        self.assertIn("fast_livo2", dockerfile)
+        self.assertIn("nav2", dockerfile)
+        self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
+        self.assertNotIn("NAVIGATION2_REPO", dockerfile)
+        self.assertNotIn("container_name: embodied-perception-fast-livo2", service)
+        self.assertNotIn("container_name: embodied-perception-nav2", service)
+        self.assertEqual(service.count("container_name:"), 1)
+        self.assertIn(
+            "/opt/phanthy-motus/data/navigation/fast_livo2/maps:"
+            "/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw", service
+        )
+        # 镜像必须留下可核对的 ROS 包清单。
+        self.assertIn(
+            "> /opt/actucore-ros-package-lock.txt", base_dockerfile
+        )
+        self.assertIn(
+            "grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt",
+            base_dockerfile,
+        )
+        self.assertEqual(
+            CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME, "controlled_semantic_spatial"
+        )
+        self.assertIn('plugins_cfg.get("controlled_semantic_spatial"', main)
+
+    def test_contract_exposes_bounded_relocalization_not_navigation(self) -> None:
+        tool = fast_livo2_tool_definition("ubuntu")
+        actions = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("load_map", actions)
+        self.assertIn("relocalize", actions)
+        self.assertNotIn("unload_map", actions)
+        self.assertNotIn("global_localization", actions)
+        self.assertNotIn("navigate_to_tag", actions)
+        self.assertEqual(
+            tool["inputSchema"]["x-action-params"]["relocalize"]["params"][:3],
+            ["initial_x", "initial_y", "initial_yaw"],
+        )
+        self.assertNotIn("initial_z", tool["inputSchema"]["properties"])
+
+        runtime_package = (
+            ACTUCORE_ROOT
+            / "plugins"
+            / "controlled_semantic_spatial"
+            / "runtime"
+            / "fast_livo2"
+            / "fast_livo2"
+        )
+        supervisor = (runtime_package / "runtime_supervisor.py").read_text(
+            encoding="utf-8"
+        )
+        adapter = (runtime_package / "adapter_node.py").read_text(encoding="utf-8")
+        self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
+        self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
+        self.assertNotIn("lidar_fast_livo", supervisor)
+        self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
+        self.assertIn("self._runtime_lifecycle_lock = threading.Lock()", supervisor)
+        self.assertNotIn("self._collection_lifecycle_lock", supervisor)
+        self.assertIn('"rollback_status"', supervisor)
+        self.assertNotIn("finalize_collection_session(", supervisor)
+        self.assertIn("self._reference_points = static_loaded.points", adapter)
+        self.assertIn("reference = self._reference_points", adapter)
+        self.assertIn('"obstacle_min_height_m", -0.80', adapter)
+        self.assertIn('"obstacle_max_height_m", 0.10', adapter)
+        self.assertIn('action == "configure_obstacle_filter"', adapter)
+        self.assertIn('action == "validate_map"', adapter)
+        self.assertIn("self._static_save_result", adapter)
+        self.assertNotIn("and self._static_save_result is not None", adapter)
+        self.assertIn('"map_load_max_points", 200000', adapter)
+        self.assertIn('"static_map_load_max_points", 200000', adapter)
+        self.assertNotIn("static_confirmation_frames", adapter)
+        self.assertNotIn("static_dynamic_filter_enabled", adapter)
+        self.assertIn("latest_sensor_qos = QoSProfile(", adapter)
+        self.assertIn("self._static_map.observe_scan(", adapter)
+        self.assertIn("self._mapping_worker_main", adapter)
+        self.assertIn("MultiThreadedExecutor(num_threads=4)", adapter)
+        publish_fast_path = adapter.split("    def _drain_pending_cloud", 1)[1].split(
+            "    def _on_reset", 1
+        )[0]
+        self.assertLess(
+            publish_fast_path.index("self._cloud_pub.publish(navigation_cloud)"),
+            publish_fast_path.index("self._queue_mapping_scan("),
+        )
+        self.assertNotIn("self._static_map.observe_scan(", publish_fast_path)
+        self.assertNotIn("candidate_points", adapter)
+        self.assertIn('map_view_context.add(work["out_of_band_points"])', adapter)
+        self.assertIn("encode_map_view_points(", adapter)
+        self.assertIn("self._static_map.map_view_points", adapter)
+        self.assertNotIn("self._static_map.as_voxel_map()", adapter)
+        self.assertIn("max_points=_MAP_VIEW_MAX_POINTS", adapter)
+        self.assertIn("_MAP_VIEW_MAX_POINTS = 40_000", adapter)
+        self.assertIn("_MAP_VIEW_POSE_REFRESH_HZ = 1.0", adapter)
+        self.assertNotIn("1.0 / _MAP_VIEW_POSE_REFRESH_HZ", adapter)
+        self.assertIn("MutuallyExclusiveCallbackGroup", adapter)
+        self.assertIn("self._display_callbacks = MutuallyExclusiveCallbackGroup()", adapter)
+        self.assertIn("map_view_qos = QoSProfile(", adapter)
+        self.assertIn("callback_group=self._display_callbacks", adapter)
+        self.assertIn("_RELOCALIZATION_MIN_MATCH_RATIO = 0.35", adapter)
+        self.assertIn("self._static_map.prepare_confirmed(static_loaded.points)", adapter)
+        self.assertIn("self._static_map.apply_prepared_confirmed(prepared)", adapter)
+        self.assertIn('action == "configure_obstacle_filter"', supervisor)
+        self.assertIn("self._map_artifacts_from_manifest(map_name)", supervisor)
+        self.assertIn('self._adapter_execute("validate_map", validation_args)', supervisor)
+        self.assertIn("self._snapshot_session_pcd_files(", supervisor)
+        self.assertIn("_MAX_MAP_ARTIFACT_FILES = 64", supervisor)
+        self.assertIn("_MAX_MAP_ARTIFACT_BYTES = 1_073_741_824", supervisor)
+        self.assertIn("_MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912", supervisor)
+        self.assertIn("_MAX_MAP_MANIFEST_BYTES = 65_536", supervisor)
+        self.assertIn('"manifest_write_failed"', supervisor)
+        self.assertIn("self._pending_mapping_finalize = pending", supervisor)
+        self.assertIn('"mapping_finalize_pending"', supervisor)
+        self.assertIn('"static_map_format_version": 2', supervisor)
+        self.assertIn('"retryable": True', supervisor)
+        self.assertIn("acquire(blocking=False)", supervisor)
+        self.assertNotIn("time.sleep(0.10)", supervisor)
+        self.assertIn('"static_map_pcd"', supervisor)
+        self.assertIn('args["obstacle_height_range_m"]', supervisor)
+        self.assertIn("normalize_obstacle_height_range(", supervisor)
+        self.assertIn("obstacle_height_ranges_match(", adapter)
+        self.assertIn(
+            "saved static map obstacle height range does not match",
+            adapter,
+        )
+        frame_adapter = (runtime_package / "frame_adapter_core.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("_MAX_PCD_HEADER_BYTES = 65_536", frame_adapter)
+        self.assertIn("_MAX_PCD_ASCII_RECORD_BYTES = 65_536", frame_adapter)
+        self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
+
+if __name__ == "__main__":
+    unittest.main()
