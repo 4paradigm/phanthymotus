@@ -30,6 +30,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from plugins.vad_preroll import PcmHistory
+from plugins.whisper_turbo import WhisperTurboAdapter
+from utils.install_whisper_turbo import MODEL_DIR as WHISPER_TURBO_MODEL_DIR
 
 log = logging.getLogger(__name__)
 
@@ -658,7 +660,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model. Whisper Turbo Q5 uses automatic language detection and GPU, downloads on first start, and has no token timing for precise wake direction", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -670,12 +672,10 @@ TOOLS = [
                 # degrades a carried-over device to cpu instead of rejecting it,
                 # and only rejects a device the request actually changed.
                 "device":        {"type": "string", "enum": ["cpu", "gpu"],
-                                  "description": "Inference device. gpu loads non-quantised weights "
-                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
-                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
-                                                 "never gives back — check headroom before enabling",
+                                  "description": "Inference device. Supported precision and memory "
+                                                 "depend on the model; Whisper Turbo Q5 requires GPU",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small", "whisper-turbo-q5"]}},
                 # `kws` (a second sherpa KeywordSpotter on the raw audio) was
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
                 "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
@@ -697,7 +697,7 @@ TOOLS = [
                 # 压掉，所以普通一句话只多出一个 lang 字段。
                 # 只对 sensevoice-small 有意义：别的模型的结果里没有这些字段，
                 # 开着也只是调一个返回空 dict 的默认实现。
-                "emit_audio_tags": {"type": "boolean", "description": "把 SenseVoice 顺带给出的语音情绪（HAPPY/SAD/ANGRY…）、音频事件（Laughter/Cry/Applause/BGM…）和语种一起发到 <topic>/asr。零额外模型、零额外内存：这些字段模型本来就算了，以前被丢掉。平淡的普通话只会多一个 lang 字段", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"]}},
+                "emit_audio_tags": {"type": "boolean", "description": "Include detected language in ASR output. SenseVoice also provides audio-event metadata; Whisper Turbo provides language only", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small", "whisper-turbo-q5"]}},
                 # 默认 **关**，而上面那个默认开。不是保守，是实测：Orin 6 上 351
                 # 段真机语音里 340 段是 NEUTRAL/EMO_UNKNOWN，剩下 11 段基本是错的
                 # （「小范小范，你好呀。」→ SAD，出现三次；「我的断网了？」→ HAPPY）。
@@ -824,7 +824,7 @@ class ASRAdapter(ABC):
         """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
 
         返回 `(text, extras)`，`extras` 直接合进发布的 payload。默认是空 dict：
-        只有 SenseVoice 的解码结果带这些字段，别的适配器下这些 key 干脆不出现，
+        SenseVoice 提供情绪与音频事件，Whisper 提供语种；不支持的 key 不出现，
         而不是出现一个空值让 LLM 以为「这句话判断过、没有情绪」。
 
         为什么是返回值，而不是适配器上记一个 `self._last_emotion`：
@@ -834,6 +834,11 @@ class ASRAdapter(ABC):
         配到了另一句话上」—— 不会报错，也不会有任何日志。
         """
         return self.transcribe(wav_bytes, language), {}
+
+
+# The native adapter lives in a separate module; virtual registration avoids
+# importing this module back from it while retaining the shared interface.
+ASRAdapter.register(WhisperTurboAdapter)
 
 
 class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
@@ -1010,6 +1015,13 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 # counts, and emitted nothing but `</s>`. See utils/onnx_provider.py for the
 # measurements and perception/README.md for the admission checklist.
 ASR_MODELS = {
+    "whisper-turbo-q5": {
+        "label": "Whisper Turbo Q5 (automatic multilingual, GPU)",
+        "adapter": WhisperTurboAdapter,
+        "lazy": True,
+        "devices": {"gpu": {"dir": WHISPER_TURBO_MODEL_DIR, "dtype": "q5_0",
+                            "runtime": "whisper.cpp"}},
+    },
     "x-asr-zh-en": {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
@@ -1234,6 +1246,8 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
         model_info = ASR_MODELS[model_name]
 
     device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    if model_info.get("lazy") and device not in model_info["devices"]:
+        raise ValueError("Whisper Turbo Q5 requires device=gpu")
     if device not in model_info["devices"]:
         # Degrade rather than refuse to boot: a baked config.yaml asking for a
         # device this model has no verified weights for should still come up on
@@ -1247,6 +1261,8 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
     spec = model_info["devices"][device]
 
     model_dir = _model_dir_for(cfg, spec)
+    if model_info.get("lazy"):
+        return model_info["adapter"](model_dir, device, int(cfg.get("num_threads", 2)))
     _status(f"正在获取模型 '{model_name}' ({device}) …")
     # Same callback on both paths. The gpu bundles are the largest downloads in
     # the stack — parakeet's fp32 weights are 437 MB and took 81 s on an Orin —
@@ -2166,7 +2182,7 @@ class ASRPlugin:
         self._device       = normalize_device(plugin_cfg.get('device'),
                                              plugin_cfg.get('hw_provider'))
         if self._device not in ASR_MODELS.get(self._asr_model, {}).get("devices", {}):
-            self._device = "cpu"
+            self._device = ("gpu" if ASR_MODELS.get(self._asr_model, {}).get("lazy") else "cpu")
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
@@ -2183,7 +2199,14 @@ class ASRPlugin:
         # threads — a plain attribute assignment is atomic enough for that and
         # needs no lock.
         self._load_status  = ""
-        self._adapter      = _build_asr_adapter(plugin_cfg)
+        self._lazy_load_requested = False
+        # Keys cover both pending starts and active nodes; stop/error retires
+        # the key so one instance cannot close a peer's shared backend.
+        self._lazy_start_requests = set()
+        self._lazy_stop_generation = 0
+        self._lazy_instance_stops = {}
+        self._adapter      = (None if ASR_MODELS.get(self._asr_model, {}).get("lazy")
+                              else _build_asr_adapter(plugin_cfg))
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
@@ -2225,6 +2248,22 @@ class ASRPlugin:
 
     def get_tools(self) -> list:
         return TOOLS
+
+    def _retire_lazy_request(self, key=None, generation=None):
+        """Detach an unused lazy backend; close it outside the node lock."""
+        with self._nodes_lock:
+            if generation is not None and generation != (
+                    self._lazy_stop_generation, self._lazy_instance_stops.get(key, 0)):
+                return None
+            if key is None:
+                self._lazy_start_requests.clear()
+            else:
+                self._lazy_start_requests.discard(key)
+            self._lazy_load_requested = bool(self._lazy_start_requests)
+            if not self._lazy_load_requested and isinstance(self._adapter, WhisperTurboAdapter):
+                adapter, self._adapter = self._adapter, None
+                return adapter
+        return None
 
     def _dispose_node(self, node: _ASRNode, key: str = "") -> dict:
         """Stop a node and release its ROS endpoints.
@@ -2283,22 +2322,35 @@ class ASRPlugin:
         def _do_load():
             while True:
                 with self._nodes_lock:
+                    # A superseded iteration must resolve the target and its
+                    # lazy preparation policy again, before building anything.
                     model, device = self._load_target
+                    lazy = ASR_MODELS.get(model, {}).get("lazy", False)
+                    load = not lazy or self._lazy_load_requested
+                adapter = None
                 try:
-                    log.info(f"[asr] downloading/loading model '{model}' ({device})...")
-                    adapter = _build_asr_adapter(
-                        {**self._plugin_cfg, 'asr_model': model, 'device': device},
-                        on_status=lambda text: setattr(self, "_load_status", text))
+                    if load:
+                        log.info(f"[asr] downloading/loading model '{model}' ({device})...")
+                        adapter = _build_asr_adapter(
+                            {**self._plugin_cfg, 'asr_model': model, 'device': device},
+                            on_status=lambda text: setattr(self, "_load_status", text))
+                        if lazy:
+                            adapter.prepare(on_status=lambda text: setattr(self, "_load_status", text))
                     error = None
                 except Exception as e:
                     log.error(f"[asr] failed to load model '{model}': {e}", exc_info=True)
+                    if isinstance(adapter, WhisperTurboAdapter):
+                        adapter.close()
                     adapter, error = None, str(e)
                 with self._nodes_lock:
-                    if self._load_target != (model, device):
+                    if (self._load_target != (model, device)
+                            or (lazy and load != self._lazy_load_requested)):
                         # Superseded while we were loading — drop this result,
                         # including its error, and load what was asked for last.
                         log.info("[asr] load of '%s' (%s) superseded by '%s' (%s)",
                                  model, device, *self._load_target)
+                        if isinstance(adapter, WhisperTurboAdapter):
+                            adapter.close()
                         continue
                     if adapter is not None:
                         self._adapter = adapter
@@ -2323,6 +2375,17 @@ class ASRPlugin:
                         log.info("[asr] running the start deferred behind the load "
                                  "of '%s'", model)
                         self.dispatch("asr", start_args)
+                    elif lazy:
+                        with self._nodes_lock:
+                            if self._pending_starts.get(key) is start_args:
+                                input_topic, _ = _resolve_asr_inputs(start_args)
+                                unused = self._retire_lazy_request(
+                                    start_args.get("instance_id") or input_topic,
+                                    start_args.get("_lazy_start_generation"))
+                            else:
+                                unused = None
+                        if unused is not None:
+                            unused.close()
                 except Exception as e:
                     log.error(f"[asr] deferred start failed: {e}", exc_info=True)
                 finally:
@@ -2427,6 +2490,31 @@ class ASRPlugin:
             }
 
         elif action == "start":
+            lazy_start = args.get("_lazy_start_generation")
+            if lazy_start is not None:
+                # A deferred Whisper start can outlive a switch to a non-lazy
+                # model too. It still belongs to the cancelled generation.
+                input_topic, _ = _resolve_asr_inputs(args)
+                lazy_key = instance_id or input_topic
+                with self._nodes_lock:
+                    if lazy_start != (self._lazy_stop_generation,
+                                      self._lazy_instance_stops.get(lazy_key, 0)):
+                        return {"state": "idle"}
+            if ASR_MODELS.get(self._asr_model, {}).get("lazy"):
+                input_topic, _ = _resolve_asr_inputs(args)
+                if not input_topic:
+                    raise ValueError("input_topic is required")
+                with self._nodes_lock:
+                    lazy_key = instance_id or input_topic
+                    current_generation = (self._lazy_stop_generation,
+                                          self._lazy_instance_stops.get(lazy_key, 0))
+                    lazy_start = args.get("_lazy_start_generation", current_generation)
+                    if lazy_start != current_generation:
+                        return {"state": "idle"}
+                    self._lazy_start_requests.add(lazy_key)
+                    self._lazy_load_requested = True
+                    if self._adapter is None:
+                        self._load_model_async(self._asr_model)
             if self._loading:
                 # Short grace wait, then hand back. A warm model is ready within
                 # a second or two, and waiting for it keeps `start` synchronous
@@ -2444,16 +2532,36 @@ class ASRPlugin:
                 while self._loading:
                     if time.monotonic() > deadline:
                         with self._nodes_lock:
+                            # The load can finish between the loop condition
+                            # and acquiring this lock; do not queue too late.
+                            if not self._loading:
+                                break
+                            if lazy_start is not None and lazy_start != (
+                                    self._lazy_stop_generation,
+                                    self._lazy_instance_stops.get(lazy_key, 0)):
+                                return {"state": "idle"}
+                            deferred_args = dict(args)
+                            if lazy_start is not None:
+                                deferred_args["_lazy_start_generation"] = lazy_start
                             self._pending_starts[instance_id or
-                                                 args.get("input_topic", "")] = dict(args)
+                                                 args.get("input_topic", "")] = deferred_args
                         return {"state": "loading", "asr_model": self._asr_model,
                                 "message": (self._load_status or
                                             f"模型 '{self._asr_model}' 仍在加载")}
                     time.sleep(0.1)
-            if self._load_error:
-                return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
-            if not self._adapter:
-                return {"state": "error", "message": "ASR model not loaded"}
+            with self._nodes_lock:
+                if lazy_start is not None and lazy_start != (
+                        self._lazy_stop_generation,
+                        self._lazy_instance_stops.get(lazy_key, 0)):
+                    return {"state": "idle"}
+            if self._load_error or not self._adapter:
+                message = (f"Model failed to load: {self._load_error}"
+                           if self._load_error else "ASR model not loaded")
+                if lazy_start is not None:
+                    unused = self._retire_lazy_request(lazy_key, lazy_start)
+                    if unused is not None:
+                        unused.close()
+                return {"state": "error", "message": message}
             input_topic, direction_topic = _resolve_asr_inputs(args)
             if not input_topic:
                 raise ValueError("input_topic is required")
@@ -2463,6 +2571,10 @@ class ASRPlugin:
             # node name; the dict kept only the last, orphaning a live node whose
             # subscription and VAD subprocess nothing could ever stop.
             with self._nodes_lock:
+                if lazy_start is not None and lazy_start != (
+                        self._lazy_stop_generation,
+                        self._lazy_instance_stops.get(lazy_key, 0)):
+                    return {"state": "idle"}
                 node = self._nodes.get(node_key)
                 if node is None:
                     node = _ASRNode(input_topic, self._adapter, self._language,
@@ -2498,10 +2610,19 @@ class ASRPlugin:
                     if self._nodes.get(node_key) is node:
                         del self._nodes[node_key]
                 self._dispose_node(node, node_key)
+                if lazy_start is not None:
+                    unused = self._retire_lazy_request(lazy_key, lazy_start)
+                    if unused is not None:
+                        unused.close()
             return result
 
         elif action == "stop":
             with self._nodes_lock:
+                if instance_id:
+                    self._lazy_instance_stops[instance_id] = (
+                        self._lazy_instance_stops.get(instance_id, 0) + 1)
+                else:
+                    self._lazy_stop_generation += 1
                 # A start deferred behind a model load has to be dropped here
                 # too, or it fires minutes after the operator stopped the card.
                 if instance_id:
@@ -2512,10 +2633,13 @@ class ASRPlugin:
                     keys = list(self._nodes.keys())
                     self._pending_starts.clear()
                 nodes = [(k, self._nodes.pop(k)) for k in keys]
+                unused = self._retire_lazy_request(instance_id or None)
             # request_stop() before disposing: it is non-blocking and unblocks an
             # in-flight start() so _dispose_node does not sit behind it.
             for _, node in nodes:
                 node.request_stop()
+            if unused is not None:
+                unused.close()
             result = {"state": "idle"}
             for key, node in nodes:
                 result = self._dispose_node(node, key)
@@ -2572,6 +2696,15 @@ class ASRPlugin:
                         "message": f"Unknown asr_model '{new_model}'; "
                                    f"available: {', '.join(sorted(ASR_MODELS))}"}
             if new_device not in ASR_MODELS[new_model]["devices"]:
+                if ASR_MODELS[new_model].get("lazy"):
+                    # A saved CPU device belongs to the previous model. The
+                    # newly selected model has only a CUDA implementation.
+                    if 'device' not in cfg or new_device == self._device:
+                        new_device = "gpu"
+                    else:
+                        return {"status": "error", "asr_model": self._asr_model,
+                                "message": "Whisper Turbo Q5 requires device=gpu"}
+            if new_device not in ASR_MODELS[new_model]["devices"]:
                 # Two different situations reach here, and only one of them is a
                 # user error.
                 #
@@ -2609,14 +2742,32 @@ class ASRPlugin:
             if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
                 with self._nodes_lock:
+                    self._lazy_stop_generation += 1
+                    self._pending_starts.clear()
+                    # Retire the old demand before slow node disposal gives
+                    # the loader another chance to prepare a cancelled model.
+                    self._lazy_load_requested = False
+                    self._lazy_start_requests.clear()
                     nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
                 for _, node in nodes:
                     node.request_stop()
                 for key, node in nodes:
                     self._dispose_node(node, key)
+                if isinstance(self._adapter, WhisperTurboAdapter):
+                    self._adapter.close()
+                if isinstance(self._adapter, WhisperTurboAdapter) or ASR_MODELS[new_model].get("lazy"):
+                    self._adapter = None
                 self._asr_model = new_model
                 self._device = new_device
                 self._plugin_cfg['device'] = new_device
+                self._plugin_cfg['asr_model'] = new_model
+                if ASR_MODELS[new_model].get("lazy"):
+                    with self._nodes_lock:
+                        self._load_target = (new_model, new_device)
+                        self._load_error = None
+                        self._load_status = ""
+                    return {"status": "configured", "asr_model": new_model,
+                            "device": new_device}
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "device": self._device,

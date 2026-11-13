@@ -369,7 +369,7 @@ def test_schema_declares_the_switch_only_for_sensevoice():
     field = schema["emit_audio_tags"]
     assert field["default"] is True
     assert field["scope"] == "shared"
-    assert field["x-show-when"] == {"asr_model": ["sensevoice-small"]}
+    assert field["x-show-when"] == {"asr_model": ["sensevoice-small", "whisper-turbo-q5"]}
 
 
 def test_schema_defaults_emotion_off():

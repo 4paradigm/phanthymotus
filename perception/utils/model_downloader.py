@@ -357,6 +357,9 @@ def ensure_verified_bundle(
     a base URL or a template containing `{file}`. They are probed once per
     bundle and tried fastest-first, falling through on failure; the pinned
     size and SHA256 are what make that safe.
+
+    A file's optional ``source_path`` maps its cache name to a different
+    relative path at the source; existing callers use the cache name for both.
     """
     paths = {
         filename: os.path.join(model_dir, filename) for filename in files
@@ -374,10 +377,12 @@ def ensure_verified_bundle(
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            if _bundle_matches(model_dir, files):
+            pending = {filename: metadata for filename, metadata in files.items()
+                       if not _file_matches(os.path.join(model_dir, filename), metadata)}
+            if not pending:
                 log.info(f"[model_downloader] {name}: verified by another instance")
                 return paths
-            _download_verified_bundle(name, base_url, model_dir, files,
+            _download_verified_bundle(name, base_url, model_dir, pending,
                                       progress_cb=progress_cb)
         finally:
             if fcntl is not None:
@@ -530,6 +535,7 @@ _MIN_USEFUL_BPS = 50 * 1024
 
 
 def _source_url(source: str, filename: str) -> str:
+    _check_bundle_relpath(filename)
     quoted = "/".join(quote(part) for part in filename.split("/"))
     if "{file}" in source:
         return source.replace("{file}", quoted)
@@ -582,7 +588,8 @@ def _order_sources(name: str, sources: list, files: dict) -> list:
         # Nothing here is big enough to measure with. Whichever source we pick,
         # the transfer is over before the choice could have mattered.
         return list(sources)
-    scored = [(_probe_source(source, biggest), source) for source in sources]
+    probe_file = files[biggest].get("source_path", biggest)
+    scored = [(_probe_source(source, probe_file), source) for source in sources]
     usable = [source for rate, source in sorted(scored, reverse=True) if rate > 0]
     if not usable:
         # Every probe failed. Rather than give up here, hand back the original
@@ -623,7 +630,7 @@ def _download_verified_bundle(
             last_error = None
             for index, source in enumerate(sources):
                 try:
-                    _fetch_pinned_file(name, _source_url(source, filename),
+                    _fetch_pinned_file(name, _source_url(source, metadata.get("source_path", filename)),
                                        destination, metadata, label=filename,
                                        progress_cb=progress_cb,
                                        done_bytes=done_bytes,
@@ -640,7 +647,7 @@ def _download_verified_bundle(
                     cause = error.__cause__ if error.__cause__ is not None else error
                     log.warning(
                         f"[model_downloader] {name}: {filename} failed from "
-                        f"{source}: {error} ({type(cause).__name__})"
+                        f"{source}: {error} ({type(cause).__name__}): {cause}"
                         + (f"; {remaining} source(s) left" if remaining else "")
                     )
             if last_error is not None:

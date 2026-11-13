@@ -17,6 +17,7 @@ ARG ENABLE_VITS2_TRT=1
 
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
+ENV WHISPER_TURBO_JP_VERSION=${JP_VERSION}
 
 # ── Everything that differs per JetPack line, resolved once ──────────────────
 # These facts used to be restated at each point of use — the numpy pin appeared
@@ -581,6 +582,16 @@ print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────
+COPY perception/plugins/requirements.asr-numeric.txt /tmp/asr-numeric-requirements.txt
+# The default VITS2 frontend already provides this exact dependency. Only
+# minimal images built without that frontend need to install it here.
+RUN if ! python3 -c "import kaldifst; from importlib.metadata import version; assert version('kaldifst') == '1.7.8'; assert hasattr(kaldifst, 'StdVectorFst')"; then \
+      pip3 install --no-cache-dir --no-deps --only-binary=:all: \
+        -i "${PYPI_MIRROR}" -r /tmp/asr-numeric-requirements.txt; \
+    fi && \
+    python3 -c "import kaldifst; assert hasattr(kaldifst, 'StdVectorFst')" && \
+    rm -f /tmp/asr-numeric-requirements.txt
+
 WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
