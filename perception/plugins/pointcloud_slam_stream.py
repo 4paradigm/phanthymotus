@@ -395,6 +395,8 @@ class SlamStream:
             return
         cloud, received = self._unmatched_clouds.pop(key)
         context = self._cloud_metadata.pop(key)
+        if context is not None:
+            context['data_sha256'] = key[2]
         if now - received > self.max_age_s:
             self.last_error = 'pointcloud receipt stale while waiting for metadata'
             return

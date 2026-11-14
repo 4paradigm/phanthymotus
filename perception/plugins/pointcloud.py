@@ -378,12 +378,12 @@ class _PointCloudNode(Node):
     def _depth_comp_cb(self, msg: CompressedImage, context=None):
         if self._throttled():
             return
-        self._drop_stale(self._frame_queue, ("depth_zlib", msg))
+        self._drop_stale(self._frame_queue, ("depth_zlib", msg) if context is None else ("depth_zlib", msg, context))
 
     def _depth_image_cb(self, msg: Image, context=None):
         if self._throttled():
             return
-        self._drop_stale(self._frame_queue, ("depth_z16", msg))
+        self._drop_stale(self._frame_queue, ("depth_z16", msg) if context is None else ("depth_z16", msg, context))
 
 
     # ── worker：按模式出云 ─────────────────────────────────────────────────
@@ -391,10 +391,15 @@ class _PointCloudNode(Node):
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
-                _, payload = self._frame_queue.get(timeout=1.0)
+                item = self._frame_queue.get(timeout=1.0)
+                _, payload = item[:2]
+                context = item[2] if len(item) == 3 else None
                 if self._stop_event.is_set():
                     break
-                self._emit_depth(payload)
+                if context is None:
+                    self._emit_depth(payload)
+                else:
+                    self._emit_depth(payload, context)
             except queue.Empty:
                 continue
             except Exception as error:  # noqa: BLE001 — keep the worker alive
@@ -414,7 +419,7 @@ class _PointCloudNode(Node):
                     log.info("[pointcloud] worker recovered; error stream cleared")
 
     # A: 深度图 → 反投影
-    def _emit_depth(self, msg):
+    def _emit_depth(self, msg, context=None):
         depth_m, enc = _decode_depth_message(msg)
         if depth_m is None:
             if self._metric_cloud_enabled:
@@ -428,7 +433,7 @@ class _PointCloudNode(Node):
         self._publish(xyz)
         if self._metric_cloud_enabled and ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
                 (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
-            self._publish_metric(xyz, msg, w, h)
+            self._publish_metric(xyz, msg, w, h, context)
         elif self._metric_cloud_enabled:
             self._metric_skip('unsupported_encoding')
 
@@ -445,7 +450,7 @@ class _PointCloudNode(Node):
             return {'published': self._metric_published, 'skipped': dict(self._metric_skipped),
                     'last_skip_reason': self._metric_last_skip}
 
-    def _publish_metric(self, xyz, source, width, height):
+    def _publish_metric(self, xyz, source, width, height, context=None):
         if self._stop_event.is_set():
             return
         # An opt-in asserts that this source's stamp is capture time. A header
@@ -465,6 +470,10 @@ class _PointCloudNode(Node):
             self._metric_skip('missing_frame')
             return
         sec, nanosec = getattr(stamp, 'sec', None), getattr(stamp, 'nanosec', None)
+        if context is not None:
+            header = copy.deepcopy(header)
+            sec, nanosec = divmod(context.observation_stamp_ns, 1_000_000_000)
+            header.stamp.sec, header.stamp.nanosec = sec, nanosec
         if type(sec) is not int or sec <= 0 or type(nanosec) is not int or not 0 <= nanosec < 1_000_000_000:
             self._metric_skip('invalid_capture_stamp')
             return
@@ -485,8 +494,16 @@ class _PointCloudNode(Node):
         cloud.point_step, cloud.row_step = 12, 12 * len(xyz)
         cloud.is_dense = True
         cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
+        if context is not None and self._input_registry is not None:
+            derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context, 'depth_projection')
+            if self._metric_metadata_pub is not None and not self._metric_metadata_source_topic:
+                packet = dict(schema='motus.slam_frame/2', observation=derived.to_dict(),
+                              stamp_ns=derived.observation_stamp_ns, clock_id=derived.normalized_clock_id,
+                              frame_id=header.frame_id, data_sha256=hashlib.sha256(cloud.data).hexdigest(),
+                              source_data_sha256=hashlib.sha256(source.data).hexdigest())
+                self._metric_metadata_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
         self._metric_cloud_pub.publish(cloud)
-        if self._metric_metadata_pub is not None:
+        if self._metric_metadata_pub is not None and self._metric_metadata_source_topic:
             key = (sec * 1_000_000_000 + nanosec, header.frame_id,
                    hashlib.sha256(bytes(source.data)).hexdigest())
             self._pair_metric_metadata(key, cloud_digest=hashlib.sha256(cloud.data).hexdigest())
@@ -671,6 +688,8 @@ class PointCloudPerceptionPlugin:
                 node._metric_metadata_source_topic = metadata_topic
                 node._metric_metadata_pub = node.create_publisher(
                     String, node._metric_metadata_topic, _PUB_QOS)
+            if node._metric_cloud_enabled and self._input_registry is not None and node._metric_metadata_pub is None:
+                node._metric_metadata_pub = node.create_publisher(String, node._metric_metadata_topic, _PUB_QOS)
             K = upstream.get("K")
             if isinstance(K, (list, tuple)) and len(K) == 9:
                 try:
@@ -923,12 +942,11 @@ class PointCloudPerceptionPlugin:
                     supported_K = False
                 if not (declared.get("schema") == "motus.camera/1"
                         and fmt in ("image/depth-z16", "image/depth-zlib")
-                        and declared.get("source") == "derived-from-K"
                         and declared.get("distortion_model") == "pinhole"
                         and isinstance(vendor, dict)
                         and vendor.get("depth_unit") == "mm"
-                        and vendor.get("depth_source") == "measured"
-                        and vendor.get("timestamp_semantics") == "source_capture_mapped"
+                        and vendor.get('depth_semantics', 'optical_z' if vendor.get('depth_source') == 'measured' else None) == 'optical_z'
+                        and (vendor.get("timestamp_semantics") == "source_capture_mapped" or self._input_registry is not None)
                         and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K
                         and (fmt != "image/depth-zlib" or
                              (declared.get("width") == 640 and declared.get("height") == 480))):

@@ -66,44 +66,7 @@ def discover_input_bindings(input_topics):
         node.destroy_node()
 
 
-def decode_cloud(msg, *, max_points, sample=False):
-    """Read finite XYZ float32 points, including padded and organized clouds."""
-    try:
-        stamp = msg.header.stamp
-        sec, nsec = stamp.sec, stamp.nanosec
-        frame = msg.header.frame_id
-        width, height, step, row = msg.width, msg.height, msg.point_step, msg.row_step
-        if (type(sec) is not int or type(nsec) is not int or sec < 0 or
-                not 0 <= nsec < 1_000_000_000 or sec * 1_000_000_000 + nsec <= 0 or
-                not isinstance(frame, str) or not frame.strip()):
-            raise ValueError('cloud needs capture timestamp and frame')
-        if (any(type(v) is not int or v <= 0 for v in (width, height, step, row)) or
-                (not sample and width * height > max_points) or row < width * step or len(msg.data) < row * height):
-            raise ValueError('invalid cloud dimensions or capacity')
-        fields = {}
-        for field in msg.fields:
-            if field.name in ('x', 'y', 'z'):
-                if (field.name in fields or field.datatype != PointField.FLOAT32 or
-                        field.count != 1 or type(field.offset) is not int or
-                        field.offset < 0 or field.offset + 4 > step):
-                    raise ValueError('unsupported XYZ fields')
-                fields[field.name] = field.offset
-        offsets = sorted(fields.values())
-        if (set(fields) != {'x', 'y', 'z'} or
-                any(b - a < 4 for a, b in zip(offsets, offsets[1:]))):
-            raise ValueError('missing or overlapping XYZ fields')
-        raw = memoryview(msg.data)
-        dtype = '>f4' if msg.is_bigendian else '<f4'
-        indices = np.linspace(0, width * height - 1, min(max_points, width * height), dtype=int)
-        points = np.stack([np.ndarray((height, width), dtype=dtype, buffer=raw,
-                                     offset=fields[key], strides=(row, step))[indices // width, indices % width]
-                           for key in ('x', 'y', 'z')], axis=1)
-        points = points[np.isfinite(points).all(axis=1)]
-        if not len(points):
-            raise ValueError('cloud has no finite points')
-        return sec * 1_000_000_000 + nsec, frame, points
-    except (AttributeError, TypeError, BufferError) as error:
-        raise ValueError('invalid PointCloud2') from error
+from .pointcloud_normalization import decode_cloud, normalize_cloud
 
 
 _MAP_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
@@ -278,13 +241,6 @@ class RtabmapNode(Node):
             return
         try:
             stamp, frame, _ = decode_cloud(msg, max_points=self.stream.max_cloud_points)
-            # The pinned native converter reads float pointers and tightly packed rows.
-            if msg.is_bigendian:
-                raise ValueError('RTAB-Map input requires little-endian PointCloud2')
-            if msg.row_step != msg.width * msg.point_step:
-                raise ValueError('RTAB-Map input cannot contain PointCloud2 row padding')
-            if len(msg.data) != msg.row_step * msg.height:
-                raise ValueError('RTAB-Map input data size must exactly match row_step * height')
             digest = hashlib.sha256(bytes(msg.data)).hexdigest() if self.stream.input_contract else None
             with self._lock:
                 if not self._stopped():
@@ -300,6 +256,9 @@ class RtabmapNode(Node):
         self._wake.set()
 
     def _queue_frame(self, stamp, cloud, pose, matrix, context):
+        normalized = normalize_cloud(cloud, None, (context or {}).get('data_sha256'),
+                                     max_points=self.stream.max_cloud_points)
+        cloud = normalized.message
         if len(self._queue) >= self.stream.max_pending:
             self._queue.popleft()
             self._dropped += 1

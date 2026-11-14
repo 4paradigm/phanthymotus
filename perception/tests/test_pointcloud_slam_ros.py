@@ -108,7 +108,7 @@ def test_native_pair_preserves_all_point_fields_bytes_and_exact_nanosecond_stamp
     ('big_endian', 'little-endian'),
     ('row_padding', 'row padding'),
 ])
-def test_native_pointcloud_rejects_big_endian_and_padded_rows_before_publish(
+def test_native_pointcloud_normalizes_big_endian_and_padded_rows_before_publish(
         node, malformed, expected_error):
     # decode_cloud can inspect more layouts than the native RTAB-Map converter
     # supports. Invalid memory layouts must never reach the native publisher.
@@ -122,12 +122,6 @@ def test_native_pointcloud_rejects_big_endian_and_padded_rows_before_publish(
         bad.data += bytes(8)
 
     node._cloud(bad)
-    assert expected_error in node.stream.last_error
-    assert node.status()['forwarded_clouds'] == 0
-    assert not NativeProcess.instances
-
-    # A malformed scan must not poison the next conforming measurement.
-    node._cloud(cloud())
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
     assert len(NativeProcess.instances) == 1
     forwarded = published(node, '/scan_cloud')[0].raw_messages[-1]
@@ -497,9 +491,7 @@ def test_freeze_is_not_blocked_by_session_directory_creation(tmp_path, monkeypat
     assert n.status()['capture_stopped'] is True and not n.artifacts()['segments']
 
 
-@pytest.mark.parametrize('layout,reason', [('row_padding', 'row padding'),
-                                         ('big_endian', 'little-endian'),
-                                         ('trailing_bytes', 'exactly match')])
+@pytest.mark.parametrize('layout,reason', [('trailing_bytes', 'invalid cloud dimensions')])
 def test_native_unsupported_layout_is_rejected_before_process_start(node, layout, reason):
     """The pinned native converter cannot safely consume these valid ROS layouts."""
     msg = cloud()
