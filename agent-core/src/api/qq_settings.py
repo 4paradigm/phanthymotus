@@ -70,7 +70,9 @@ class QQSettingsChange(BaseModel):
 
 class QQCredentialRecovery(BaseModel):
     app_secret: str
-    restore_basic: bool = True
+    # Credential recovery must not silently disable existing group permissions.
+    # Explicit restore_basic=True is reserved for opt-in C2C fallback.
+    restore_basic: bool = False
     persist: bool = True
 
 
@@ -188,10 +190,10 @@ async def promote_verified_credential(channel_id: str, current_cfg: dict,
 
 @router.post('/{channel_id}/credential')
 async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
-    """Replace a broken credential with process-memory-only secret.
+    """Restore QQ credentials without downgrading previously configured scopes.
 
-    Default to the smallest known-good C2C event subscription; the Owner may
-    enable platform-approved group events independently after reconnection.
+    An explicit restore_basic keeps QQ C2C and group @ enabled by default;
+    extra Guild subscriptions and interaction intents can be reset separately.
     """
     _channel(channel_id)
     lock = _locks.setdefault(channel_id, asyncio.Lock())
@@ -209,8 +211,11 @@ async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
             cfg.pop(key, None)
         cfg['app_secret_runtime'] = ref
         if req.restore_basic:
-            cfg['enabled_scopes'] = ['c2c']
-            cfg['private_only'] = True
+            # The basic preset still supports all Tencent-authorized QQ groups.
+            group_opted_out = bool(cfg.get('qq_group_scope_opt_out', False))
+            cfg['enabled_scopes'] = (['c2c'] if group_opted_out
+                                     else ['c2c', 'group'])
+            cfg['private_only'] = group_opted_out
             cfg['enable_guild_plain_messages'] = False
             cfg['enable_interactions'] = False
             cfg['enable_approvals'] = False
@@ -259,8 +264,13 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
         cfg = dict(old)
         cfg['qq_config_mode'] = req.mode
         if req.mode == 'standard':
-            # Existing platform-scoped events are preserved; no unsupported
-            # Guild/group permission is silently added during setup.
+            # All Tencent-authorized QQ groups are enabled by default. A
+            # deliberate group-wide opt-out survives future restarts/updates.
+            # Do not silently add Guild or interaction subscriptions.
+            if not cfg.get('qq_group_scope_opt_out', False):
+                scopes = list(cfg.get('enabled_scopes', ['c2c']))
+                if 'group' not in scopes:
+                    cfg['enabled_scopes'] = [*scopes, 'group']
             for flag in STANDARD_FLAGS:
                 cfg[flag] = True
         else:
@@ -270,6 +280,7 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
                 if any(scope not in SCOPES for scope in req.enabled_scopes):
                     raise fastapi.HTTPException(400, 'Unsupported QQ event scope')
                 cfg['enabled_scopes'] = req.enabled_scopes
+                cfg['qq_group_scope_opt_out'] = 'group' not in req.enabled_scopes
             if any(key not in FLAGS or not isinstance(value, bool)
                    for key, value in req.flags.items()):
                 raise fastapi.HTTPException(400, 'Unsupported QQ capability setting')
@@ -279,6 +290,7 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
             if req.group_enabled:
                 scopes.append('group')
             cfg['enabled_scopes'] = scopes
+            cfg['qq_group_scope_opt_out'] = not req.group_enabled
         scopes = cfg.get('enabled_scopes', ['c2c'])
         cfg['private_only'] = scopes == ['c2c']
         try:
@@ -316,3 +328,4 @@ def update_owner(channel_id: str, req: QQOwnerChange):
                               role='owner', tool_filter=filt)
     return {'role': 'owner', 'user_suffix': uid[-6:],
             'tool_filter': updated['tool_filter'], 'preset': req.preset}
+

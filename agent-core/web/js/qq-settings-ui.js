@@ -143,13 +143,13 @@ export function initQQSettingsUI() {
   recoveryField.type = 'password';
   recoveryField.autocomplete = 'new-password';
   recoveryField.placeholder = '请输入机器人连接密钥';
-  const recoverButton = txt('button', '恢复私聊连接', 'btn-ghost btn-sm');
+  const recoverButton = txt('button', '恢复 QQ 连接', 'btn-ghost btn-sm');
   recoverButton.type = 'button';
   const persistOption = elCheckbox('persist', '保存并自动重连（推荐）', true);
   recovery.append(txt('strong', '修复 QQ 连接'),
     txt('p', '重新输入 AppSecret 即可恢复，默认安全保存以供重启自动连接。', 'channel-users-hint'),
     recoveryField, persistOption, recoverButton,
-    txt('p', '恢复时先使用私聊模式；群聊按平台授权重新开启。', 'channel-users-hint'));
+    txt('p', '恢复凭证会保留已启用的私聊、群聊和媒体能力，无需再次授权群聊。', 'channel-users-hint'));
   panel.append(overview, state, message, recovery, owner);
   const coreSlot = host.querySelector('[data-qq-core-settings-slot]');
   if (coreSlot) coreSlot.appendChild(panel);
@@ -257,9 +257,9 @@ export function initQQSettingsUI() {
     if (!credential) { say('请先输入 QQ AppSecret。'); return; }
     return save(recoverButton, () => jsonRequest(
       API + '/' + encodeURIComponent(channelId) + '/credential',
-      {method:'POST', body:{app_secret:credential,restore_basic:true,
+      {method:'POST', body:{app_secret:credential,restore_basic:false,
                             persist:persistOption.querySelector('input').checked}},
-    ), 'QQ 私聊连接已恢复。现在可按平台授权启用群聊。');
+    ), 'QQ 连接已恢复，原有群聊设置保持不变。');
   });
 
   document.addEventListener('qq-management-refresh', event => {
@@ -303,3 +303,4 @@ export function interceptLegacyQQConfigure() {
     }));
   }, true);
 }
+

@@ -43,7 +43,7 @@ export function initQQManagement() {
     '<div class="qq-console-list-head"><span>用户</span><span>权限</span><span>操作</span></div>',
     '<div data-manage-users></div></div>',
     '<div class="qq-console-list-section"><div class="qq-management-head"><strong>已接入群聊</strong><span class="channel-users-hint">首次 @机器人后自动接入</span></div>',
-    '<div class="qq-console-list-head"><span>群聊</span><span>权限</span><span>操作</span></div>',
+    '<div class="qq-console-list-head"><span>群聊</span><span>权限</span></div>',
     '<div data-manage-groups></div></div>',
     '<div data-qq-advanced-slot></div>',
     '<details class="qq-management-advanced" data-qq-rebind><summary>换绑管理员</summary>',
@@ -144,20 +144,8 @@ export function initQQManagement() {
       const row = element('div', '', 'qq-management-row');
       row.appendChild(element('span', '群 · ' + item.group_id.slice(-6), 'qq-row-identity'));
       row.appendChild(element('span', item.status === 'approved' ? '仅聊天' : '已停用', 'qq-row-permission'));
-      const action = button(item.status === 'approved' ? '停用' : '恢复', () =>
-        run(async () => {
-          const enabling = item.status !== 'approved';
-          if (!enabling && !window.confirm('确定停用这个 QQ 群？')) return;
-          await request('/qq/groups/permission', 'PUT', {
-            channel_id:channel(), group_id:item.group_id,
-            default_permission:'chat',
-            mention_only:true, enabled:enabling,
-          });
-          say(enabling ? '群聊已恢复（成员仅聊天）' : '群聊已停用');
-          await loadGroups();
-        }));
-      action.classList.add('qq-row-action');
-      row.appendChild(action);
+      // Group @ access is automatic. There is no extra permission workflow
+      // or per-group approval/disable action in the default product UI.
       target.appendChild(row);
     }
   }
@@ -193,3 +181,4 @@ export function initQQManagement() {
     setQQDetailsMode(false);
   });
 }
+

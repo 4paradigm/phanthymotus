@@ -19,7 +19,7 @@ BASE = {
 CONFIG = {'id': CHANNEL, 'platform': 'qq', 'enabled': True, 'config': BASE}
 
 
-def test_standard_enables_safe_sdk_flags_without_upgrading_platform_scope():
+def test_standard_enables_group_scope_and_safe_sdk_flags():
     writes = []
 
     def update(channel_id, **kwargs):
@@ -40,8 +40,8 @@ def test_standard_enables_safe_sdk_flags_without_upgrading_platform_scope():
     assert result['saved'] and result['connected']
     saved = writes[0]
     assert saved[CREDENTIAL_KEY] == BASE[CREDENTIAL_KEY]
-    assert saved['enabled_scopes'] == ['c2c']
-    assert saved['private_only'] is True
+    assert saved['enabled_scopes'] == ['c2c', 'group']
+    assert saved['private_only'] is False
     assert all(saved[flag] for flag in qq_settings.STANDARD_FLAGS)
 
 
@@ -139,12 +139,13 @@ def test_recover_credential_preserves_identity_and_restores_safe_c2c():
                      return_value={'saved':True,'changed':True,'connected':True}) as apply,
           mock.patch('api.qq_settings.qq_runtime_credentials.revoke') as revoke):
         result = asyncio.run(qq_settings.recover_qq_credential(
-            CHANNEL, qq_settings.QQCredentialRecovery(app_secret=secret, persist=False)))
+            CHANNEL, qq_settings.QQCredentialRecovery(app_secret=secret, persist=False,
+                                                    restore_basic=True)))
     new_cfg = apply.call_args.args[2]
     assert apply.call_args.args[1] == original
     assert new_cfg['app_id'] == APP
-    assert new_cfg['enabled_scopes'] == ['c2c']
-    assert new_cfg['private_only'] is True
+    assert new_cfg['enabled_scopes'] == ['c2c', 'group']
+    assert new_cfg['private_only'] is False
     assert not new_cfg['enable_interactions']
     assert new_cfg['app_secret_runtime'] == 'R' * 43
     assert 'app_secret_file' not in new_cfg
@@ -152,6 +153,30 @@ def test_recover_credential_preserves_identity_and_restores_safe_c2c():
     assert result['connected'] and result['credential_mode'] == 'runtime'
     assert result['restart_requires_reentry']
     revoke.assert_called_once_with(BASE[CREDENTIAL_KEY])
+
+
+def test_credential_recovery_preserves_group_scope_by_default():
+    # Rotating/restoring the secret is independent from the selected
+    # SDK event scopes and must not silently disable working group chat.
+    original = dict(BASE, enabled_scopes=['c2c', 'group'],
+                    private_only=False, enable_interactions=True,
+                    qq_config_mode='advanced')
+    channel = dict(CONFIG, config=original)
+    with (mock.patch('api.qq_settings._channel', return_value=channel),
+          mock.patch('api.qq_settings.qq_runtime_credentials.put', return_value='T' * 43),
+          mock.patch('api.qq_settings._save_config', new_callable=mock.AsyncMock,
+                     return_value={'saved': True, 'changed': True, 'connected': True}) as apply,
+          mock.patch('api.qq_settings.qq_runtime_credentials.revoke')):
+        assert qq_settings.QQCredentialRecovery(app_secret='q' * 32).restore_basic is False
+        result = asyncio.run(qq_settings.recover_qq_credential(
+            CHANNEL, qq_settings.QQCredentialRecovery(
+                app_secret='q' * 32, persist=False)))
+    cfg = apply.call_args.args[2]
+    assert cfg['enabled_scopes'] == ['c2c', 'group']
+    assert cfg['private_only'] is False
+    assert cfg['enable_interactions'] is True
+    assert cfg['qq_config_mode'] == 'advanced'
+    assert result['connected'] is True
 
 
 def test_recover_credential_failure_cleans_new_memory_reference():
@@ -195,3 +220,4 @@ def test_group_subscription_reverts_on_unauthorized_gateway_intents():
     assert error.value.status_code == 409
     assert changes[0]['enabled_scopes'] == ['c2c', 'group']
     assert changes[-1] == BASE
+

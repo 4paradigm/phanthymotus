@@ -21,8 +21,15 @@ an existing device, including a device with robot Cards already on its Canvas.
 - QQ inbound conversation state persistence runs outside the Gateway event
   loop. Group full-message events respect the saved per-group mention-only
   choice; undiscovered groups still require a bot mention.
-- QQ scopes and media feature flags remain under administrator control. The
-  code does not silently grant motion or system permissions to ordinary users.
+- QQ group @ messaging is enabled by default for new channels. Existing
+  pre-default QQ channel configurations receive an idempotent, QQ-only group
+  scope migration on Core startup unless explicitly opted out. No per-group
+  pairing, allowlist or approval is required: the first authenticated group @
+  event automatically registers that group with chat-only permissions.
+  Restoring AppSecret in either UI preserves group/other transport scopes.
+- Advanced Tencent event scopes and media feature flags remain under
+  administrator control. The code does not silently grant motion or system
+  permissions to ordinary group members, nor bypass platform event permissions.
 
 ## Local checks
 - Focused cross-device / QQ-related regression suites: 72 passed, 1 skipped.
@@ -56,3 +63,4 @@ an existing device, including a device with robot Cards already on its Canvas.
 
 Do not call an image build, a container launch or a unit test a successful
 end-to-end QQ acceptance until the mobile QQ exchange succeeds on Bumi.
+

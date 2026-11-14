@@ -601,8 +601,16 @@ class ChannelManager:
         for ch_cfg in _get_channel_configs():
             if ch_cfg.get('enabled'):
                 if ch_cfg.get('platform') == 'qq':
-                    # Upgrade only the QQ portion of an existing Canvas. The
-                    # robot's existing cards and connections must be preserved.
+                    # QQ group @ is enabled on new installations and migrated
+                    # for old QQ config on start. No individual group approval.
+                    from channel.qq_groups import ensure_default_group_scope
+                    try:
+                        ch_cfg = await asyncio.to_thread(
+                            ensure_default_group_scope, ch_cfg)
+                    except Exception as exc:
+                        print('[qq-group] default scope upgrade unavailable: '
+                              + type(exc).__name__, flush=True)
+                    # Preserve existing robot Cards and Canvas connections.
                     from channel.qq_default_flow import ensure_default_flow
                     try:
                         await asyncio.to_thread(ensure_default_flow, ch_cfg['id'])

@@ -101,19 +101,42 @@ async function connect() {
   busy(button, true);
   warn('');
   try {
-    const result = refreshMode
-      ? await api('/qq/manage/' + encodeURIComponent(channelId) + '/credential', {
-          method: 'POST',
-          body: JSON.stringify({ app_secret:password.value, restore_basic:true,
-                                 persist:source === 'persistent' }),
-        })
-      : await post('/qq/guided-setup', {
+    // Reuse the entered secret if the robot already exists. Rotating a
+    // credential must not silently downgrade group/media scopes.
+    const recoverExisting = id => api(
+      '/qq/manage/' + encodeURIComponent(id) + '/credential', {
+        method: 'POST',
+        body: JSON.stringify({ app_secret:password.value, restore_basic:false,
+                               persist:source === 'persistent' }),
+      });
+    let result;
+    if (refreshMode) {
+      result = await recoverExisting(channelId);
+    } else {
+      try {
+        result = await post('/qq/guided-setup', {
           app_id:appId, source,
           app_secret:password.value,
           receive_images:true,
         });
+      } catch (err) {
+        if (err.status !== 409 || !err.details?.channel_id) throw err;
+        channelId = err.details.channel_id;
+        refreshMode = true;
+        result = await recoverExisting(channelId);
+      }
+    }
     channelId = result.channel_id || channelId;
-    ownerAlreadyBound = !!knownQQChannels.get(appId)?.owner_bound;
+    let existingStatus = knownQQChannels.get(appId);
+    try {
+      const latest = await api('/qq/setup/status');
+      existingStatus = (latest.channels || []).find(
+        ch => ch.channel_id === channelId) || existingStatus;
+      if (existingStatus) knownQQChannels.set(appId, existingStatus);
+    } catch (_) {
+      // Status refresh does not invalidate an already verified connection.
+    }
+    ownerAlreadyBound = !!existingStatus?.owner_bound;
     const nextButton = get('[data-qq-to-pair]');
     nextButton.textContent = ownerAlreadyBound
       ? '下一步：默认权限（管理员已绑定）' : '下一步：绑定管理员';
@@ -121,7 +144,7 @@ async function connect() {
     showStatus('[data-qq-connection-result]', result.connected
       ? 'QQ Gateway 已连接。'
       : '已记录渠道，但尚未连通。请核对凭证、腾讯平台授权与网络连接。');
-    showStatus('[data-qq-flow-result]', result.default_flow?.ready
+    showStatus('[data-qq-flow-result]', (result.default_flow?.ready || existingStatus?.flow_ready)
       ? '基础 QQ 消息工作流已配置。'
       : '已保留现有 Canvas；如未配置消息卡片，请在画布中绑定 QQ Request 和 Reply。');
     if (!result.connected) {
@@ -323,3 +346,4 @@ export function openQQWizard({ onConnected, onOtherPlatform } = {}) {
   };
   initialStatus();
 }
+

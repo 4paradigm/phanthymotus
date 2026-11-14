@@ -60,6 +60,8 @@ def test_guided_setup_does_not_write_secret_to_disk_or_config():
         stored.update(cfg)
     assert result['connected']
     assert result['default_flow']['ready']
+    assert cfg['enabled_scopes'] == ['c2c', 'group']
+    assert cfg['private_only'] is False
     assert 'app_secret' not in cfg
     assert 'app_secret_file' not in cfg
     assert 'app_secret_runtime' in cfg
@@ -411,3 +413,4 @@ def test_deprecated_qq_approval_routes_are_removed():
     assert '/channel/qq/groups/pair/confirm' not in paths
     assert '/channel/users/pending' not in paths
     assert '/channel/users/pending/resolve' not in paths
+

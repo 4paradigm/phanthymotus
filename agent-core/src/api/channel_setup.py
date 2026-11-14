@@ -134,7 +134,7 @@ async def guided_setup(req: QQSetup):
             })
     channel_id = 'qq_official_' + app_id
     cfg = {'protocol': 'official', 'app_id': app_id,
-           'enabled_scopes': ['c2c'], 'private_only': True,
+           'enabled_scopes': ['c2c', 'group'], 'private_only': False,
            'enable_inbound_media': req.receive_images,
            'access_policy': {'default_permission': 'chat',
                              'default_permission': 'chat'}}
@@ -324,7 +324,8 @@ async def set_group_scope(req: QQGroupScope):
     if not scopes:
         raise fastapi.HTTPException(400, 'At least one QQ event scope is required')
     cfg = dict(old_cfg, enabled_scopes=scopes,
-               private_only=set(scopes) == {'c2c'})
+               private_only=set(scopes) == {'c2c'},
+               qq_group_scope_opt_out=not req.enabled)
     try:
         validate_qq_official_config(cfg)
     except ValueError as exc:
@@ -383,3 +384,4 @@ def user_preset(req: Preset):
         return {'user': result}
     except ValueError as exc:
         raise fastapi.HTTPException(400, str(exc)) from None
+
