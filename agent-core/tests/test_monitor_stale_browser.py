@@ -4,12 +4,17 @@ Uses real WebSocket binary JPEG messages, no robot or Agent Core backend.
 import base64, hashlib, io, json, socket, struct, sys, threading, time
 from pathlib import Path
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from PIL import Image, ImageDraw
 WEB = Path(__file__).resolve().parents[1] / 'web'
 state = {'a': True, 'b': True}
-img = Image.new('RGB', (480, 270), '#285b69')
-ImageDraw.Draw(img).text((30, 100), 'LOCAL SIMULATED CAMERA - NO HARDWARE', fill='white')
-buf=io.BytesIO(); img.save(buf,format='JPEG'); FRAME=buf.getvalue()
+FRAME = None
+
+def initialize_frame():
+ global FRAME
+ from PIL import Image, ImageDraw
+ img = Image.new('RGB', (480, 270), '#285b69')
+ ImageDraw.Draw(img).text((30, 100), 'LOCAL SIMULATED CAMERA - NO HARDWARE', fill='white')
+ buf=io.BytesIO(); img.save(buf,format='JPEG'); FRAME=buf.getvalue()
+
 BOOT = """
 export function fixture() {
  _grid=document.getElementById('monitor-dashboard-grid');
@@ -98,6 +103,7 @@ def browser_test():
 if __name__=='__main__' and '--test' in sys.argv:
  browser_test();raise SystemExit
 if __name__=='__main__':
+ initialize_frame()
  server=ThreadingHTTPServer(('127.0.0.1',15681),Handler)
  print('http://127.0.0.1:15681/',flush=True)
  server.serve_forever()
