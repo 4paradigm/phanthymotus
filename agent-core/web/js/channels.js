@@ -81,7 +81,7 @@ function _renderChannels(channels) {
           <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
             Trusted Bots: ${(ch.trusted_bots || []).length}
           </button>` : ''}
-        ${ch.platform === 'qq' ? `<button class="btn-ghost btn-sm" data-channel-action="qq-edit">Configure</button>` : ''}
+        ${ch.platform === 'qq' ? `<button class="btn-ghost btn-sm" data-channel-action="qq-edit">高级 SDK 设置</button>` : ''}
         <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
         <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" data-channel-action="delete">Delete</button>
@@ -347,7 +347,9 @@ function _handleChannelAction(e) {
   switch (btn.dataset.channelAction) {
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
     case 'trusted-bots': _showTrustedBots(channel, item); break;
-    case 'qq-edit': _showQQEdit(channel, item); break;
+    case 'qq-edit': document.dispatchEvent(new CustomEvent('qq-channel-manage', {
+      detail: { channelId: channel.id, tab: 'advanced' },
+    })); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
     case 'delete':     _channelDelete(channel.id); break;

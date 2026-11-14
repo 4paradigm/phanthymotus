@@ -1,172 +1,160 @@
-# Tencent QQ Official private-text Channel
+# Tencent QQ Official Channel — setup, security and Bumi acceptance
 
-This is an **Agent Core Channel adapter** using the Tencent QQ official Bot
-Gateway/SDK, not a standalone Driver, Card, NapCat gateway, or OneBot service.
-It is designed to work on any supported Agent Core host, including Bumi, subject
-to the host's Core image and normal deployment approvals.
+This Channel runs inside the **existing PhanthyMotus Agent Core** using Tencent's
+official QQ Bot Gateway. It needs **no NapCat, OneBot, Windows relay, new Driver,
+or separate Core container**. The official Bot's actual events and media rights
+are controlled by Tencent; toggling a scope locally is not evidence of platform
+authorization.
 
-## Architecture
+## System architecture
 
 ```text
-Mobile QQ private chat
-  -> Tencent official Gateway -> QQOfficialAdapter
-  -> ChannelManager (identity, ACL, deduplication, per-chat context)
-  -> channel_request (Canvas sensor Card) -> decision_core (LLM)
-  -> channel_reply (Canvas executable tool) -> Tencent API -> QQ
+Mobile QQ (private / group / guild, where Tencent permits)
+  -> Tencent QQ Gateway and official SDK
+  -> QQOfficialAdapter (scope parsing, dedup, bounded media download)
+  -> ChannelManager (identity, permission isolation, per-chat state)
+  -> Canvas channel_request -> decision_core -> channel_reply
+  -> Tencent reply API -> originating QQ conversation
 ```
 
-The application runs inside the **existing Agent Core container**. Do not
-start a second production Core or a separate NapCat container for this adapter.
+The same Core also hosts other Channels; QQ setup changes must not alter Feishu
+or device Drivers. The QQ AppID is an application identifier, not a login session.
 
-## Supported behavior and security boundary (V1)
+## Runtime image dependencies
 
-- **Supported:** QQ C2C private-text inbound messages and passive text replies
-  associated with the exact triggering message ID.
-- Gateway health/reconnect, inbound duplicate suppression, and per-private-chat
-  conversation isolation are implemented.
-- New QQ identities default to the `viewer` role, regardless of the global
-  default-role setting.
-- The server additionally limits **all** QQ roles, including `operator` and
-  `owner`, to `mcp__channel__channel_reply` and `finish`. Elevating the QQ
-  user's role **does not** grant robot motion, TTS, music or shell access.
-- **Not supported:** QQ group messages, proactive sending, images/files/audio,
-  robot actuation, delegated tools, or a separate QQ hardware Driver.
-- The LLM's natural-language response is not proof of its actual tool
-  permissions. Verify exposed tools using the Core MCP registry/Canvas.
+- `qqbot-agent-sdk==1.2.2` in `agent-core/pyproject.toml`: official Gateway
+  client and C2C/group media APIs.
+- `pypdf>=5.0`: bounded, text-only previews of PDF attachments; scanned and
+  encrypted PDFs are **not** OCRed. DOCX/XLSX/text preview uses existing parsers.
+- `ffmpeg`: converts GIF uploads into at most two JPEG frames for the configured
+  multimodal LLM. The existing Core Dockerfile installs `ffmpeg`.
+- A model that **actually accepts image input**, and `event.llm.vision_input`
+  enabled in the deployed Core. Merely enabling inbound QQ media is insufficient.
+- A usable speech-to-text backend is required if QQ voice transcription is
+  expected; enabling that event flag alone is insufficient.
 
-## Requirements
+**Dependency-lockfile policy:** the company `agent-core/Dockerfile` copies
+`pyproject.toml` and executes `uv lock && uv sync --no-dev --no-install-project`
+inside the Core image before copying source code. The tracked `agent-core/uv.lock`
+is already larger than the repository's changed-file review limit. This PR
+deliberately does **not** include the locally regenerated ~856 KB lockfile.
+The Docker build regenerates it. This means a separate `uv sync --frozen`
+workflow with the unchanged tracked lockfile is **not** guaranteed to be in
+sync; treat this as a known repo-wide dependency-policy limitation rather than
+proof of a frozen or reproducible offline build. Verify installed packages and
+image behavior in the new company **ARM64 Core image**.
 
-1. A Tencent **official QQ Bot** with its AppID and AppSecret, and an eligible
-   QQ user who can send the bot a private message.
-2. An Agent Core release that includes `qqbot-agent-sdk==1.2.2`. The normal
-   company Core build resolves dependencies from `agent-core/pyproject.toml`.
-3. An available LLM service configured in the running Agent Core.
-4. A Canvas project containing `channel_request`, `decision_core`, and
-   `channel_reply`, with the project started.
+## Configure and onboard
 
-Do not commit, screenshot, or print AppSecrets, API keys, QQ user identifiers,
-chat logs, session files, or any unredacted channel configuration.
+1. Build/review the new Core image; an authorized Machine Owner later upgrades
+   Bumi through its existing Dashboard Core upgrade procedure. Keep previous
+   image tags and persistent resource/config volumes for rollback.
+2. Open **Dashboard -> Channels -> Add QQ Official** and follow the onboarding
+   page. Enter the Tencent official Bot AppID and select a managed, persistent
+   credential source. The guided flow can persist the AppSecret into a private
+   credential file with `0600` permissions outside source code; it never
+   belongs in Git, Canvas, a screenshot, logs or PR comments. An ephemeral
+   credential source must not be treated as reboot-persistent.
+3. Bind the Owner from the exact Tencent QQ private-chat identity by completing
+   the local verification workflow. Owner replacement/revocation is available
+   under advanced administration.
+4. Ensure a Canvas project has `channel_request`, `decision_core` and
+   `channel_reply` appropriately linked and started. Verify connected status,
+   readiness of the chosen LLM, and replies in the originating QQ chat.
+5. For testing accounts, configure the bot's allowed users through the
+   Tencent QQ developer console. Group users become chat-enabled when Tencent
+   emits authorized group events; **no separate membership approval** is needed.
+6. To transfer the Bot from a local test Core to Bumi, **stop the local QQ
+   Channel first**, then connect it in Bumi. Do not run competing Tencent
+   Gateway sessions against the same Bot AppID indefinitely.
 
-## Configure the QQ Channel
+The managed credential directory is derived from the Core database location.
+Preserve the installation's database/config parent directory across upgrades.
+The published image contains no developer AppSecret, live login, QQ conversations,
+or machine-local Canvas configuration.
 
-### Option A: Dashboard (environment variable reference)
+## Authorization model — security-critical
 
-1. In an approved Core deployment, make the environment variable `QQ_OFFICIAL_APP_SECRET`
-   available **inside the running Agent Core container**, not only on Windows.
-   Do not put its value in the Dashboard, PR, source code or logs.
-2. In Dashboard -> Channels, choose QQ Official and enter a unique Channel ID
-   and Tencent Bot AppID.
-3. Select Existing Core environment variable; enter its **name**, not its
-   value. Alternatively, select Mounted credential file only if a managed
-   secret is already mounted at `/run/qq-official-app-secret`.
-4. Enable the Channel and confirm connected status with no health error.
-5. In Canvas, set the same Channel ID on the `channel_request` sensor Card and
-   the `channel_reply` executable Card. Wire `channel_request` to `decision_core`, and
-   add the executor connection from `decision_core` to `channel_reply`.
-6. Start Canvas and verify a real QQ private-text round trip.
+- An ordinary QQ private user has **chat-only** access. QQ group participants,
+  including the Owner speaking in a group, also have **chat-only** access.
+- A QQ C2C Owner receives full `Agent Core` tool permission *only* when all
+  server-side requirements hold: the exact verified private principal, enabled
+  owner grant, ACL `role=owner` and `tool_filter=*`. Group principal formats
+  cannot inherit this grant. Permission is rechecked at tool dispatch.
+- This Owner may be allowed to invoke **Bash, file operations and motion tools**
+  if those tools are already registered and available in the running Core.
+  It is a deliberately privileged remote-access surface and requires explicit
+  maintainer security review. It does **not** install missing robot tools, grant
+  missing ROS2 connectivity, or create new Canvas cards.
+- Separate QQ users and chats must not share one another's private turn
+  context or memory. A short-lived same-sender/same-chat attachment reference
+  can support immediate "can you see the picture?" follow-ups.
+- User-controlled QQ text is never printed verbatim into the diagnostic LLM
+  request summary. Signed QQ CDN URLs and credentials must not enter logs.
+- The deployment's existing actuator confirmation and owner authorization
+  processes still apply; do **not** use motion to test permissions.
 
-The QQ Dashboard sends **only credential references**, never the credential
-value. If the Core service cannot access the configured environment variable
-or file, correct the deployment configuration before enabling the Channel.
+## Feature coverage and explicit limits
 
-### Option B: approved configuration API
-
-The authorized Channel API accepts `protocol` set to official,
-`private_only` set to true, the Bot AppID and **exactly one** credential
-reference:
-
-| Configuration field | Accepted value |
+| Capability | Status / verification required |
 | --- | --- |
-| `app_secret_env` | Environment variable starting with `QQ_OFFICIAL_`, available in the Core container |
-| `app_secret_file` | Exactly `/run/qq-official-app-secret`, readable by the Core process |
+| C2C text, passive reply, Gateway reconnect | Local real-message path demonstrated; retest with deployed image |
+| QQ group @ replies and auto-join | Local path demonstrated; retest on Bumi and with ordinary participants |
+| Images, attachment upload/download | Code + focused tests; revalidate Tencent real CDN payloads |
+| GIF | Frame sampling only, not full temporal comprehension |
+| PDF, DOCX, XLSX/text | Bounded preview; PDF is text-only and reads at most 10 pages |
+| Owner tools | ACL unit tests pass; actual tools depend on Bumi Core registry/Canvas |
+| Conversation/memory isolation | Automated regressions; multi-user concurrency remains an acceptance case |
+| Guild events, guild DMs, ordinary guild messages, interaction buttons | Gateway subscription alone is not end-to-end proof; verify Tencent entitlement |
+| Voice transcription | Requires actual usable STT backend or Tencent ASR text |
+| Markdown | Requires Tencent capability authorization; not enabled by default |
 
-New QQ Channel POST/PUT requests with inline `app_secret` are rejected.
-Previously saved inline credentials remain *readable* for existing runtimes,
-so upgrades do not immediately disconnect a working Bot. Existing legacy
-Channels can be enabled, disabled or restarted without rewriting config;
-to edit them, first choose an environment or file reference in Configure.
+## Checks and acceptance
 
-When a legacy Channel is migrated, the new config no longer includes the
-old inline field. Old data backups still require secure handling, and the
-Bot credential should be rotated following a successful migration if the
-previous value was stored in plaintext. Do not delete runtime data volumes.
-
-Official QQ uses an outbound Gateway connection and does not require
-OneBot, NapCat, public webhook or NAT tunnel.
-
-## Review and installation
-
-The pull-request review bot builds an **Agent Core image**. Unlike a Driver
-image, Core **does not** ship a `deploy/service.yml` fragment and should not
-be started with `run-pr-image.sh`. Follow the build-result comment and use
-the existing **Dashboard deployment/upgrade flow**, which replaces the
-existing Core through its restart helper. Obtain normal review and deployment
-approvals before updating a shared robot.
-
-**Preserve** runtime data volumes, channel settings, LLM configuration and
-Canvas layout across the upgrade. The published image does **not** contain
-the developer's local QQ credentials, account login, LLM key or saved Canvas.
-
-Before activating a new Core against the same official Bot AppID, stop the
-QQ Channel on the old test Core to avoid competing Gateway consumers. Keep the
-previous image tag available for rollback.
-
-A merge, a successful CI image build, and a successful runtime deployment are
-three distinct milestones. A real Bumi deployment additionally requires
-Machine Owner authorization and acceptance evidence.
-
-## Verification and acceptance
-
-Local unit/integration checks from the repository root:
+Before submitting this PR:
 
 ```bash
-python -m pytest agent-core/tests/test_qq_official.py agent-core/tests/test_qq_official_canvas.py agent-core/tests/test_qq_official_sdk_contract.py agent-core/tests/test_qq_api_security.py agent-core/tests/test_qq_channel_integration.py agent-core/tests/test_qq_security_isolation.py agent-core/tests/test_qq_policy_async.py agent-core/tests/test_qq_credential_migration.py agent-core/tests/test_qq_real_sdk_delivery.py -q
+python -m pytest -q agent-core/tests/test_qq_log_safety.py agent-core/tests/test_qq_owner_acl.py agent-core/tests/test_qq_group_auto_join.py agent-core/tests/test_qq_memory_isolation.py agent-core/tests/test_qq_vision.py agent-core/tests/test_qq_attachment_preview.py
 python -m compileall -q agent-core/src
-node --check agent-core/web/js/channels.js
-node --check agent-core/web/js/sidebar.js
+node --check agent-core/web/js/qq-settings-ui.js
 git diff --check
 ```
 
-Tests that require the real official SDK may skip in a Python environment
-without that package. Verify their contract in the final Linux Core image;
-a passing unit suite is not proof of Gateway connectivity.
+After the **company-built image** is available, verify in the shipped image
+`import qqbot_agent_sdk, pypdf`, `ffmpeg -version`, the web/JS assets,
+and Gateway readiness on the platform it ships for (typically linux/arm64).
+Running the image test suite and obtaining a successful build are prerequisites
+for Bumi deployment, **not a replacement for physical-device acceptance**.
 
-Minimal real-message acceptance after the approved image is deployed:
+**Bumi deployment acceptance** (authorized deployment only):
 
-1. **Connected:** Channel and project are active, LLM readiness is confirmed.
-2. **Round trip:** Mobile QQ private text reaches Agent Core and the response
-   returns to the same sender without accidental duplicates.
-3. **Authorization:** New QQ users remain viewer; no QQ user can invoke
-   unsupported robot/privileged tools through this V1 Channel.
-4. **Isolation:** Independent user conversations do not leak into one another.
-5. **Recovery:** Confirm Gateway reconnect after a permitted service restart.
-6. **Independence (for Bumi):** With the development computer offline, the
-   authorized robot Core continues to reply over QQ.
+1. Upgrade via the existing Core Dashboard; preserve saved QQ credentials,
+   memory DB, other Channel settings and Canvas. Check Core and Dashboard health.
+2. Stop the developer PC QQ Channel. On Bumi check Gateway connected and
+   reconnect after restart or network outage, without re-entering a secret.
+3. With mobile QQ, validate ordinary private text and group @ replies.
+4. From the verified Owner's QQ **private** chat, invoke a harmless read-only
+   available Core tool; from ordinary users/groups, verify privileged tools are
+   rejected. Do not use robot motion as a permission smoke test.
+5. Validate real static image, GIF and selectable-text PDF; ask a follow-up in
+   a separate message. Do not claim scanned-PDF OCR or full GIF motion analysis.
+6. Verify two concurrent users and separate private/group histories; run reboot
+   and disconnect/recovery tests. Turn off the Windows PC and confirm QQ replies
+   still originate from Bumi independently.
+7. Record image tag/commit SHA, sanitized test outcomes and rollback version.
+   A failing item remains unaccepted. Advanced guild/STT/Markdown features need
+   their own Tencent platform authorization and end-to-end evidence.
 
-Record sanitized evidence for reviewers and machine owners. Do not perform
-physical robot movement as part of a private-text Channel acceptance test.
+## Review, upgrade and rollback
 
-## Troubleshooting
+This PR builds an **Agent Core image**, not a Driver. The bot review procedure
+on the PR is `/request_bot_review core`. The company build result supplies an
+image tag; the authorized Dashboard upgrade/restart helper installs it onto the
+approved Core machine. Do **not** use the Driver deployment path or run a second
+Core next to the production one. The PR must not merge or trigger Bumi deployment
+without appropriate approval.
 
-| Symptom | Checks |
-| --- | --- |
-| Channel status disconnected | Verify official AppID, selected credential source and outbound network; check sanitized Core health logs |
-| Connected, but no LLM reply | Confirm Canvas project running, matching input/output channel IDs, decision_core readiness and executor connection to channel_reply |
-| Reply fails or duplicates | Check original message ID correlation, SDK errors and whether a second Core instance uses the same Bot AppID |
-| New QQ user is viewer | Expected security default; operator/owner still cannot bypass V1 QQ tool restrictions |
-| Works in developer image but not official image | Check official image tag/architecture, `qqbot-agent-sdk` installation and fresh runtime configuration |
-| Behaves differently after restart | Check persisted configuration volumes, enabled Channel and startup order |
-
-## Rollback
-
-1. Disable the QQ Channel or stop the approved Core project before switching
-   images, so there is only one active Gateway consumer for that AppID.
-2. Use the supported Dashboard Core upgrade/rollback mechanism and the
-   recorded **previous Core image tag**. Do not start two production Core
-   containers concurrently.
-3. Restore previous runtime configuration from the authorized backup if
-   necessary, then verify baseline Agent Core health and existing Channels.
-4. Re-enable only the intended QQ instance and repeat a private-text roundtrip.
-
-Rollback details depend on the host's approved deployment mechanism; never
-delete persistent data volumes to recover from an adapter issue.
+A successful PR build/test, a successful Dashboard upgrade, and real Bumi QQ
+acceptance are three separate milestones. If upgrade causes regressions, use
+the official Core rollback procedure and known previous image tag, preserve
+persistent data, then recheck the original Channels and QQ Gateway.
