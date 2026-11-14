@@ -659,7 +659,7 @@ ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
 RUN set -e; . /opt/ros/humble/install/setup.bash; \
     mkdir -p /tmp/rtabmap-ws/src; \
     fetch_rtabmap_source() { \
-      source_name="$1"; source_repo="$2"; source_commit="$3"; \
+      source_name="$1"; source_repo="$2"; source_commit="$3"; source_sha256="$4"; \
       for source_attempt in 1 2; do \
         echo "[rtabmap-build] fetching ${source_name}, attempt ${source_attempt}/2"; \
         if curl -fL --http1.1 --proto '=https' --tlsv1.2 \
@@ -671,25 +671,26 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
         if [ "${source_attempt}" -eq 2 ]; then return 1; fi; \
         sleep 3; \
       done; \
+      printf '%s  %s\n' "${source_sha256}" "/tmp/${source_name}.tar.gz" | sha256sum -c -; \
       mkdir -p "/tmp/rtabmap-ws/src/${source_name}"; \
       tar -xzf "/tmp/${source_name}.tar.gz" --strip-components=1 -C "/tmp/rtabmap-ws/src/${source_name}"; \
       rm "/tmp/${source_name}.tar.gz"; \
     }; \
-    fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}"; \
-    fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da; \
-    fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e; \
+    fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}" e4c5973693888bb5f3924832624e84dd3f9db12d17f82e149a2cc5512da4240d; \
+    fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da 21103f7cbf39eb08d17dc9eb11d993fc4600dc21c341da503a23226b021c62a1; \
+    fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e 80c1070f46141199cb8940edf250ade15a11e3aa41542758f8ed864e37eb1071; \
     rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_odom rtabmap_slam'; \
     if ! find /opt/ros/humble/install/include -type f \
         -path '*/geometry_msgs/msg/velocity_stamped.hpp' -print -quit | grep -q .; then \
       echo '[rtabmap-build] geometry_msgs lacks VelocityStamped; adding pinned 4.2.4 overlay'; \
-      fetch_rtabmap_source common_interfaces ros2/common_interfaces 53761cba9a000902602e7e695cb40de78eadee7f; \
+      fetch_rtabmap_source common_interfaces ros2/common_interfaces 53761cba9a000902602e7e695cb40de78eadee7f e55ac6172b820db2079b982bbd21deff49500e7098a12cc8b922c47f95303c81; \
       test -f /tmp/rtabmap-ws/src/common_interfaces/geometry_msgs/msg/VelocityStamped.msg; \
       mv /tmp/rtabmap-ws/src/common_interfaces/geometry_msgs /tmp/rtabmap-ws/src/geometry_msgs; \
       rm -rf /tmp/rtabmap-ws/src/common_interfaces; \
       rtabmap_packages="geometry_msgs ${rtabmap_packages}"; \
     fi; \
     add_missing_rtabmap_dependencies() { \
-      dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; shift 3; \
+      dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; dependency_sha256="$4"; shift 4; \
       missing_packages=''; \
       for dependency_package in "$@"; do \
         if ! ros2 pkg prefix "${dependency_package}" >/dev/null 2>&1; then \
@@ -697,20 +698,20 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
         fi; \
       done; \
       if [ -n "${missing_packages}" ]; then \
-        fetch_rtabmap_source "${dependency_name}" "${dependency_repo}" "${dependency_commit}"; \
+        fetch_rtabmap_source "${dependency_name}" "${dependency_repo}" "${dependency_commit}" "${dependency_sha256}"; \
         rtabmap_packages="${rtabmap_packages}${missing_packages}"; \
       fi; \
     }; \
     add_missing_rtabmap_dependencies perception_pcl ros-perception/perception_pcl \
-      ca66aa21f28b7e2848870f08faace81554e78437 pcl_conversions pcl_ros; \
+      ca66aa21f28b7e2848870f08faace81554e78437 c66ecf29ec7626771f8e3783adab8c0867f3e815052875444fe6a6cebae16188 pcl_conversions pcl_ros; \
     add_missing_rtabmap_dependencies diagnostics ros/diagnostics \
-      a1b95037eeab10592a8268be2a67cadaad6673da diagnostic_updater; \
+      a1b95037eeab10592a8268be2a67cadaad6673da 74da212f1ed675179d2a97eaed93ff14267a0e3bbdfb803c5e8efa5b0576c753 diagnostic_updater; \
     add_missing_rtabmap_dependencies vision_opencv ros-perception/vision_opencv \
-      066793a23e5d06d76c78ca3d69824a501c3554fd cv_bridge image_geometry; \
+      066793a23e5d06d76c78ca3d69824a501c3554fd 97f9f95788078dd722ed55e2d8a6da7b81cddf8c497b62f83cb46f022328c813 cv_bridge image_geometry; \
     add_missing_rtabmap_dependencies image_common ros-perception/image_common \
-      69b50c6db906b2044502b00c1b35dc97ec8a40ce image_transport; \
+      69b50c6db906b2044502b00c1b35dc97ec8a40ce 78fad3ad43b17f162801afed107df77c101795341669e2df335df0d7676d5373 image_transport; \
     add_missing_rtabmap_dependencies laser_geometry ros-perception/laser_geometry \
-      d53b925d25b4b5657261a44f4479365965cc2363 laser_geometry; \
+      d53b925d25b4b5657261a44f4479365965cc2363 681ab6f7fd7559ec681f27272154372968ecbd76c26dac3454457db020a2f8f2 laser_geometry; \
     printf '%s\n' "${rtabmap_packages}" > /tmp/rtabmap-ws/packages.list
 
 # JP5.11: cache ROS foundations, RTAB-Map support and rtabmap_slam

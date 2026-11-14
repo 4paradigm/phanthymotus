@@ -1,5 +1,6 @@
 """Execute the Docker source fetcher without network access or extraction."""
 import os
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -12,7 +13,7 @@ DOCKERFILE = Path(__file__).parents[1] / 'Dockerfile.jetson'
 PAYLOAD = b'complete pinned source archive\n'
 
 
-def run_fetch(tmp_path, *, failures, tar_status=0):
+def run_fetch(tmp_path, *, failures, tar_status=0, corrupt=False):
     dockerfile = DOCKERFILE.read_text()
     function = re.search(r'    fetch_rtabmap_source\(\) \{.*?\n    \};',
                          dockerfile, re.S).group()
@@ -33,13 +34,16 @@ curl() {
     printf 'complete pinned source archive\n' > "$2"
 }
 sleep() { echo "$*" >> "$TEST_ROOT/sleeps"; }
-sha256sum() { return 97; }
+sha256sum() {
+    python3 -c 'import hashlib,sys,pathlib; expected,path=sys.stdin.read().strip().split(None,1); sys.exit(0 if hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==expected else 1)'
+}
 tar() {
     if [ "$TAR_STATUS" -ne 0 ]; then return "$TAR_STATUS"; fi
     cat "$2" > "$TEST_ROOT/extracted"
 }
 '''
-    script += function + '\nfetch_rtabmap_source fixture owner/repo pinned-commit\n'
+    expected = hashlib.sha256(b'other archive' if corrupt else PAYLOAD).hexdigest()
+    script += function + '\nfetch_rtabmap_source fixture owner/repo pinned-commit ' + expected + '\n'
     env = dict(os.environ, TEST_ROOT=str(tmp_path), FAILURES=str(failures),
                TAR_STATUS=str(tar_status))
     return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True,
@@ -75,6 +79,12 @@ def test_tar_failure_propagates_without_retrying_download(tmp_path):
     assert (tmp_path / 'attempts').read_text().strip() == '1'
     assert not (tmp_path / 'extracted').exists()
     assert not (tmp_path / 'sleeps').exists()
+
+
+def test_corrupt_source_is_rejected_before_extraction(tmp_path):
+    result = run_fetch(tmp_path, failures=0, corrupt=True)
+    assert result.returncode != 0
+    assert not (tmp_path / 'extracted').exists()
 
 
 def run_core_fetch(tmp_path, *, interrupt_checkout=False, fail_checkout=False, retry_offline=False):

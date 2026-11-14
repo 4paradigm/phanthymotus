@@ -44,6 +44,23 @@ def sessions(monkeypatch):
         if not session.node.destroyed: session.close()
 
 
+@pytest.mark.parametrize('topic,expected', [
+    ('/rgbd_odometry/i_6f6e65/state/odom', '/rgbd_odometry/i_6f6e65/status'),
+    ('/diagnostic/odom', '/diagnostic/odom/status'),
+    ('/state/odom/extra/state/odom', '/state/odom/extra/status'),
+])
+def test_status_topic_uses_python38_string_operations(sessions, topic, expected):
+    class Python38String(str):
+        def __getattribute__(self, name):
+            if name in ('removesuffix', 'removeprefix'):
+                raise AttributeError("'str' object has no attribute " + repr(name))
+            return super().__getattribute__(name)
+
+    create, _, _ = sessions
+    session = create(Python38String(topic))
+    assert session.status_publisher.topic == expected
+
+
 def pose(position):
     return dict(position=position, quaternion=[0., 0., 0., 1.], frame_id='run_odom',
                 child_frame_id='camera_optical', covariance=[.001 if i%7==0 else 0. for i in range(36)])

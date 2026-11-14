@@ -1143,10 +1143,10 @@ async def _do_start_project_impl():
                 message = f'SLAM 输入路由失败: {error}'
                 print(f'[start-project] {tool_name}: {message}')
                 await push_event({'type': 'project_start_item', 'payload': {
-                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                     'status': 'error', 'message': message,
                 }})
-                errors.append(tool_name)
+                errors.append(f'{tool_name} ({card.get("id", "")})')
                 continue
 
         source_metadata = None
@@ -1157,10 +1157,10 @@ async def _do_start_project_impl():
                 tool_name = card.get('toolName', '')
                 message = f'上游采集元数据冲突: {error}'
                 await push_event({'type': 'project_start_item', 'payload': {
-                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                     'status': 'error', 'message': message,
                 }})
-                errors.append(tool_name)
+                errors.append(f'{tool_name} ({card.get("id", "")})')
                 continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,

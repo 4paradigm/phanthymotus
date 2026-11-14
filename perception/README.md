@@ -21,6 +21,41 @@ consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
 The implementation must not infer calibrated mounting or verified
 cross-sensor clocks from a robot model or nearby timestamps.
 
+## Native Jetson packaging and measured size
+
+RGB-D odometry and point-cloud SLAM require the pinned RTAB-Map executables,
+linked against each image's existing ROS, OpenCV/PCL and Python ABI (JP5.11:
+Python 3.8; JP6.1: Python 3.10). The Dockerfile therefore builds native sources;
+this is an intentional deployment dependency, not a Python fallback. ROS source
+archives have pinned SHA-256 checks before extraction. Updating a source commit
+also requires reviewing and updating its archive hash. These hashes detect changed
+bytes; they are not upstream signatures. The core uses Git's pinned object graph.
+
+Registry manifest/config measurements on 2026-11-14 for the images built from
+73627d1 show the following compressed layer bytes. “Before/after native” sums
+layers immediately before/after the RTAB-Map dependency/source/build block in
+the same image; it is not a comparison with a separately rebuilt main image.
+
+| Image tag | Before native | After native | Native block added | Whole image |
+|---|---:|---:|---:|---:|
+| release.261113.def9614-jetson-jp5.11 | 6,744,706,780 | 6,794,902,526 | 50,195,746 | 6,796,695,094 |
+| release.261113.a87c881-jetson-jp6.1 | 8,105,238,860 | 8,127,018,472 | 21,779,612 | 8,128,988,407 |
+
+The dependency-install layers add 1,095,185 and 1,248,405 compressed bytes
+respectively: most listed development dependencies already exist in the earlier
+image layers. Installed libraries/headers and native overlays remain in the final
+image; deleting them in a later layer would not reclaim their download size.
+Source/build layers also remain in image history despite later workspace cleanup.
+The build already disables unused GUI, camera SDK and optimization backends.
+
+A multi-stage build could omit additional source/build intermediates, but copying
+only executables is insufficient: the ROS overlay, Python bindings, shared
+libraries and their ABI-matched runtime dependencies must remain. Removing tools
+inherited from the common base requires a separate base/runtime split. This PR
+retains the existing cached build layout with the measured growth above; it does
+not claim zero image growth or a measured cold-build time. These manifest sizes
+are compressed transfer sizes, not unpacked disk usage or newly rebuilt images.
+
 ## Generic RGB-D visual odometry
 
 Enable `plugins.rgbd_odometry.enabled` to expose the `rgbd_odometry` processor
@@ -155,6 +190,11 @@ in its instance configuration (`config` action). Connect the source's third
 existing JSON `std_msgs/String` transport; `motus.imu/1` packets carry raw SI
 vectors, capture timestamps, shared RGB-D clock identity and actual factory/TF
 rotations into the camera axes. No Core metadata routing change is needed.
+`camera_info` declares only the two image inputs; the IMU schema, frames, units,
+clock and calibration are validated on every packet before it can contribute.
+Starting a session therefore does not certify an arbitrary third topic as a valid
+IMU source: assistance remains uninitialized until valid packets arrive. Requiring
+an IMU camera declaration would reject the existing driver contract.
 
 In the default attitude-only mode, the consumer initializes tilt from plausible gravity, integrates source-timed
 gyro rotations and corrects tilt while acceleration is plausible. Heading is

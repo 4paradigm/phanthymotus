@@ -223,3 +223,25 @@ def test_unconnected_or_stale_source_declarations_cannot_be_forwarded(rig):
     # it after a restart.
     info['depth']['topic_out'][0] = {'topic': '/new/topic', 'format': 'image/depth-zlib'}
     assert collect_connected_metadata(conns, info, lambda c: c['fromTopic']) == {}
+
+
+@pytest.mark.parametrize('source,tool,port,topic,fmt', [
+    ('cloud', 'pointcloud_slam', 1, '/lidar/native', 'sensor/pointcloud2'),
+    ('depth', 'pointcloud', 0, '/bumi/depth', 'image/depth-zlib'),
+])
+def test_metadata_start_failure_identifies_the_card(rig, monkeypatch, source, tool, port, topic, fmt):
+    rig.extra[source]['input_metadata'].append(dict(rig.extra[source]['input_metadata'][0]))
+    rolled_back = []
+    async def stop():
+        rolled_back.append(True)
+    monkeypatch.setattr(config_api, '_do_stop_project', stop)
+    layout = {'cards': [_card(source, source), _card('failed-instance', tool)],
+              'connections': [_wire(source, port, 'failed-instance', topic, fmt)]}
+    assert run(layout) is False
+    errors = [e['payload'] for e in rig.events
+              if e['type'] == 'project_start_item' and e['payload']['status'] == 'error']
+    assert len(errors) == 1
+    assert errors[0]['card_id'] == 'failed-instance'
+    done = next(e['payload'] for e in rig.events if e['type'] == 'project_start_done')
+    assert done['errors'] == [f'{tool} (failed-instance)']
+    assert 'failed-instance' not in rig.starts and rolled_back == [True]

@@ -1,5 +1,6 @@
 """Offline cache-boundary and shell-scope checks, not a native Docker build."""
 import io
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -133,6 +134,9 @@ def run_layer(script, tmp_path, prelude, *, missing=(), build_status=0):
         ('/work;', str(tmp_path / 'work') + ';'),
     ):
         script = script.replace(old, str(new))
+    # Network fixtures use their own archive, but still exercise checksum verification.
+    digest = hashlib.sha256((tmp_path / 'source.tar.gz').read_bytes()).hexdigest()
+    script = re.sub(r'\b[0-9a-f]{64}\b', digest, script)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith('rtabmap_') and key != 'TEST_ROS_READY'}
     env.update(TEST_ROOT=str(tmp_path), MISSING_PACKAGES=' '.join(missing),

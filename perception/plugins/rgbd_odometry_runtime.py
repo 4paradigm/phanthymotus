@@ -370,7 +370,8 @@ class RgbdSession:
                 self.owns_executor = True
             self.publisher = self.node.create_publisher(String, topic, qos_profile_sensor_data)
             self.status_publisher = self.node.create_publisher(
-                String, topic.removesuffix('/state/odom') + '/status', qos_profile_sensor_data)
+                String, (topic[:-11] if topic.endswith('/state/odom') else topic) + '/status',
+                qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
             for kind in ('color', 'depth'):
                 self.node.create_subscription(CompressedImage, calibration[kind + '_topic'],
