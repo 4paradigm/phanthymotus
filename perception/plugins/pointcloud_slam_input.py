@@ -147,7 +147,32 @@ def frame_identity(packet, *, clock_id, payload=False, relation_id=None):
     Exact digest, frame, timestamp and mapping arithmetic remain mandatory
     whenever evidence is supplied; unverified mapping is not an admission mode.
     """
-    return validate_frame_identity(packet, clock_id=clock_id,
-                                   strict=False,
-                                   require_digest=payload,
-                                   relation_id=relation_id)
+    identity = validate_frame_identity(packet, clock_id=clock_id,
+                                       strict=False, require_digest=payload, relation_id=relation_id)
+    mapping = packet['mapping']
+    source, offset, error = packet['source_stamp'], mapping['offset_ns'], mapping.get('uncertainty_ns')
+    if (mapping.get('method') == 'chassis_clock_request_interval_slew' and
+            mapping.get('version') == '2'):
+        if (packet['source_unit'] != 'ms' or type(source) is not int or
+                type(offset) is not int or mapping.get('verified') is not True or
+                type(error) is not int or not 0 <= error <= 50_000_000):
+            raise SpatialSlamError('invalid bounded chassis slew evidence')
+    return identity
+
+
+def continuous_pose_clock(previous, current):
+    """Compare validated pose evidence; only v2 chassis slews may change offset."""
+    if (previous['source_clock'] != current['source_clock'] or
+            previous['source_unit'] != current['source_unit']):
+        return False
+    before, after = previous['mapping'], current['mapping']
+    if before == after:
+        return True
+    if (after.get('method') != 'chassis_clock_request_interval_slew' or
+            after.get('version') != '2' or
+            {k:v for k,v in before.items() if k!='offset_ns'} !=
+            {k:v for k,v in after.items() if k!='offset_ns'}):
+        return False
+    # Compatible late samples reach the stream's existing late-frame drop.
+    elapsed = abs(current['source_stamp']-previous['source_stamp'])*1_000_000
+    return elapsed > 0 and abs(after['offset_ns']-before['offset_ns'])*100 <= elapsed

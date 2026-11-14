@@ -5161,6 +5161,19 @@ unavailable and runs explicit visual mode; a change of timing basis starts a new
 segment. Dynamic body mapping still needs exact capture-associated mount evidence.
 Receipt-only data without that identity cannot use a latest/guessed transform.
 
+Chassis odometry may declare `chassis_clock_request_interval_slew`, version `2`,
+for bounded continuous clock correction. SLAM permits only its per-capture
+`offset_ns` to change within one pose segment: source clock/unit and all other
+mapping fields must stay unchanged, verification must be true, source milliseconds
+and offsets must be integers, and declared uncertainty must stay at or below
+50 ms. Offset changes must not exceed 1% of the elapsed original source time.
+Exact timestamp arithmetic, input epoch/generation, observation identity, frame
+and freshness checks remain in force. Unknown mapping methods retain the existing
+fixed-mapping rule; cloud clock proofs and cross-source relation requirements are
+not relaxed. This supports Driver PR #519's gradual correction without treating
+normal drift as a new trajectory segment. Robot deployment and sustained live
+mapping acceptance are separate from these offline compatibility tests.
+
 Image sharpness/contrast and missing optional quality are diagnostic, not universal
 hard cutoffs. Declared motion limits (`vendor.motion_limits.reference`,
 `max_speed_mps`, `max_angular_rate_radps`) apply only to the actual pose reference.

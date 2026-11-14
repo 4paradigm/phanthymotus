@@ -12,6 +12,7 @@ import math
 
 from .pointcloud_slam_alignment import align_pose
 from .pointcloud_slam_odom import decode_slam_odom
+from .pointcloud_slam_input import continuous_pose_clock
 from .pointcloud_slam_transforms import rigid as _rigid
 
 
@@ -278,8 +279,7 @@ class SlamStream:
                 changed = self._input_identity is not None and identity != self._input_identity
                 mapping_changed = (measurement is not None and identity == self._input_identity and
                     self._pose_measurement is not None and
-                    (measurement['mapping'] != self._pose_measurement['mapping'] or
-                     measurement['source_clock'] != self._pose_measurement['source_clock']))
+                    not continuous_pose_clock(self._pose_measurement, measurement))
                 if self._required_new_segment == pose.segment_id or (same_segment and (changed or mapping_changed)):
                     self._required_new_segment = self._input_segment
                     raise ValueError('input epoch/generation or clock mapping change requires a new segment')

@@ -146,3 +146,39 @@ def test_mixed_capture_receipt_keeps_actual_bases_and_marks_association_approxim
     assert s.accepted[0].capture_context['association_method']=='arrival_time'
     assert s.accepted[0].pose.observation.time_basis=='source_capture'
     assert s.accepted[0].capture_context['observation']['time_basis']=='receipt_estimated'
+
+
+@pytest.mark.parametrize('offset',[-100_000,100_000])
+def test_v2_slew_pose_keeps_identity_and_admits_bracketed_camera_cloud(offset):
+    from dataclasses import replace
+    from test_pointcloud_slam_input import slew_odom
+    from plugins.spatial_time import TimePolicy
+    def pose(ms,delta):
+        value=slew_odom(ms,delta)
+        m=value['vendor']['motus_slam']['measurement']
+        ctx=TimePolicy('ingress').select(dict(stamp_ns=m['stamp_ns'],clock_id='clock',
+            timestamp_semantics='source_capture_mapped',source_id='chassis',source_epoch='e1',
+            source_stamp=ms,source_unit='ms',source_clock='hardware_clock',
+            clock_mapping='chassis_clock_request_interval_slew',mapping_version='2',
+            mapping_offset_ns=delta,clock_mapping_verified=True,
+            clock_mapping_uncertainty_ns=50_000_000,geometry_version='body1'),m['stamp_ns'],m['stamp_ns'])
+        value['vendor']['motus_slam'].update(profile='motus_slam/2',stamp_ns=m['stamp_ns'],observation=ctx.to_dict())
+        return value,ctx
+    first,ctx=pose(1000,0)
+    camera=replace(ctx,source_id='camera',source_epoch='camera1',mapping_source='camera_global',
+                   mapping_version='1',geometry_version='camera1',observation_stamp_ns=1_050_000_000)
+    declarations={'/o':input_declaration('/o','pose','body',ctx),
+                  '/c':input_declaration('/c','cloud','body',camera,metadata_topic='/c/meta')}
+    contract=resolve_inputs(declarations,{'/o':'state/odom','/c':'sensor/pointcloud2'})
+    s=stream(**contract['settings'],input_contract=contract);s.ingress_clock_id='ingress'
+    s.odom(first,now=1.)
+    packet=frame_packet('body',camera,b'raw cloud')
+    s.cloud_metadata(packet,now=1.05)
+    s.cloud(camera.observation_stamp_ns,'body',[[1,2,3]],now=1.05,data_sha256=packet['data_sha256'])
+    assert not s.accepted
+    second,_=pose(1100,offset);s.odom(second,now=1.1)
+    assert len(s.accepted)==1
+    assert s.accepted[0].pose.segment_id=='a'
+    assert s.accepted[0].cloud==[[1,2,3]]
+    assert s.accepted[0].capture_context['observation']['source_epoch']=='camera1'
+    assert s.status(now=1.1)['odometry']=='tracking'
