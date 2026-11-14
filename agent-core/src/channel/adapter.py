@@ -76,6 +76,7 @@ class OutboundMessage:
     # 兼容旧调用方：直接给字节的图片
     image_bytes: bytes | None = None
     image_caption: str = ''
+    reply_to_message_id: str = ''  # Exact trigger for passive replies
 
 
 # 收到消息时的回调签名

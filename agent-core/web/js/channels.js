@@ -19,6 +19,10 @@ export function initChannels() {
   _overlay.addEventListener('click', (e) => { if (e.target === _overlay) _close(); });
   _addBtn.addEventListener('click', _showAddForm);
   _channelList.addEventListener('click', _handleChannelAction);
+  _channelList.addEventListener('click', (event) => {
+    if (!event.target.closest?.('#qq-official-quick-add')) return;
+    _showAddForm({ official: true });
+  });
   _usersList.addEventListener('click', _handleUserAction);
   _usersList.addEventListener('change', _handleUserRoleChange);
   document.getElementById('channel-user-form-add').addEventListener('click', _submitUser);
@@ -53,7 +57,8 @@ function _renderChannels(channels) {
     _channelList.innerHTML = `
       <div class="channel-empty">
         <p>No channels configured</p>
-        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a Telegram, Slack, or Feishu bot to enable remote messaging control</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Connect a Telegram, Slack, Feishu, or QQ Official bot for messaging.</p>
+        <button id="qq-official-quick-add" type="button" class="btn-primary" style="margin-top:12px">创建 QQ 官方机器人</button>
       </div>`;
     return;
   }
@@ -76,6 +81,7 @@ function _renderChannels(channels) {
           <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
             Trusted Bots: ${(ch.trusted_bots || []).length}
           </button>` : ''}
+        ${ch.platform === 'qq' ? `<button class="btn-ghost btn-sm" data-channel-action="qq-edit">高级 SDK 设置</button>` : ''}
         <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
         <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" data-channel-action="delete">Delete</button>
@@ -86,7 +92,45 @@ function _renderChannels(channels) {
 
 // ── Add channel form ──────────────────────────────────────────────────────────
 
-function _showAddForm() {
+
+function _qqCapabilityFields(scopes = ['c2c'], flags = {}) {
+  const enabled = new Set(scopes);
+  const scope = (id, title) => '<label><input data-qq-scope type="checkbox" value="' + id
+    + '"' + (enabled.has(id) ? ' checked' : '') + ' /> ' + title + '</label>';
+  const flag = (id, title) => '<label><input data-qq-flag="' + id + '" type="checkbox"'
+    + (flags[id] ? ' checked' : '') + ' /> ' + title + '</label>';
+  return '<div class="channel-form-row" data-qq-capabilities><label>QQ scopes</label><div>'
+    + scope('c2c', 'Private') + scope('group', 'Group @bot')
+    + scope('guild', 'Guild @bot')
+    + scope('guild_dm', 'Guild direct message')
+    + '<p class="channel-users-hint">Group and guild require QQ platform permissions.</p>'
+    + '</div></div><div class="channel-form-row" data-qq-capabilities><label>Extra</label><div>'
+    + flag('enable_inbound_media', 'Receive media')
+    + flag('enable_outbound_media', 'Send media')
+    + flag('enable_typing', 'Typing indicator')
+    + flag('enable_markdown', 'Markdown (platform approval)')
+    + flag('enable_voice_transcription', 'Voice transcription (requires media and STT backend)')
+    + flag('enable_guild_plain_messages', 'Plain Guild events (requires Gateway permission)')
+    + flag('enable_session_resume', 'Persist Gateway resume session')
+    + flag('enable_interactions', 'Interactive keyboard callbacks')
+    + flag('enable_approvals', 'Trusted approval requests')
+    + '</div></div>';
+}
+
+function _qqCapabilityConfig(form) {
+  const enabled_scopes = Array.from(form.querySelectorAll('[data-qq-scope]:checked'), el => el.value);
+  if (!enabled_scopes.length) throw new Error('Select at least one QQ scope');
+  const data = {enabled_scopes, private_only: enabled_scopes.length === 1 && enabled_scopes[0] === 'c2c'};
+  for (const id of ['enable_inbound_media', 'enable_outbound_media', 'enable_typing',
+                    'enable_markdown', 'enable_voice_transcription', 'enable_guild_plain_messages',
+                    'enable_session_resume', 'enable_interactions', 'enable_approvals']) {
+    data[id] = !!form.querySelector('[data-qq-flag="' + id + '"]')?.checked;
+  }
+  return data;
+}
+
+function _showAddForm({ official = false } = {}) {
+  if (document.getElementById('channel-add-form')) return;
   const formHtml = `
     <div class="channel-add-form" id="channel-add-form">
       <div class="channel-form-row">
@@ -96,12 +140,32 @@ function _showAddForm() {
           <option value="slack">Slack</option>
           <option value="feishu">Feishu (飞书)</option>
           <option value="lan">LAN (机器人之间)</option>
+          <option value="qq">QQ Official</option>
         </select>
       </div>
       <div class="channel-form-row">
         <label>ID</label>
         <input type="text" id="channel-form-id" placeholder="e.g. telegram_main" />
       </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-protocol-row">
+        <label>QQ Protocol</label>
+        <select id="channel-form-qq-protocol">
+          <option value="official">Official QQ Bot</option>
+        </select>
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-credential-row">
+        <label>QQ credential source</label>
+        <select id="channel-form-qq-credential-mode">
+          <option value="env">Existing Core environment variable</option>
+          <option value="file">Mounted credential file</option>
+        </select>
+        <span class="channel-users-hint">The credential must already exist on the Core host; settings store only a reference.</span>
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-env-row">
+        <label>Environment variable name</label>
+        <input type="text" id="channel-form-qq-env-name" placeholder="QQ_OFFICIAL_APP_SECRET" />
+      </div>
+      ${_qqCapabilityFields()}
       <div class="channel-form-row" id="channel-form-token-row">
         <label>Bot Token</label>
         <input type="password" id="channel-form-token" placeholder="Bot token" />
@@ -151,19 +215,43 @@ function _showAddForm() {
     // the hint says where trust actually comes from — an empty form with no
     // explanation reads like something failed to load.
     const isLan = p === 'lan';
+    const isQQ = p === 'qq';
+    const isOfficial = isQQ && document.getElementById('channel-form-qq-protocol').value === 'official';
+    const qqMode = document.getElementById('channel-form-qq-credential-mode').value;
     document.getElementById('channel-form-lan-hint').classList.toggle('hidden', !isLan);
 
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
-    document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-qq-protocol-row').classList.toggle('hidden', !isQQ);
+    document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu && !isOfficial);
     document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-qq-credential-row').classList.toggle('hidden', !isOfficial);
+    document.getElementById('channel-form-qq-env-row').classList.toggle('hidden', !isOfficial || qqMode !== 'env');
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
-    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan);
+    form.querySelectorAll('[data-qq-capabilities]').forEach(node =>
+      node.classList.toggle('hidden', !isQQ));
+    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan || isOfficial);
   }
 
   platformSel.addEventListener('change', updateFormFields);
+  document.getElementById('channel-form-qq-protocol').addEventListener('change', updateFormFields);
+  document.getElementById('channel-form-qq-credential-mode').addEventListener('change', updateFormFields);
   updateFormFields();
+  if (official) {
+    platformSel.value = 'qq';
+    document.getElementById('channel-form-qq-protocol').value = 'official';
+    document.getElementById('channel-form-id').value = 'qq_official_main';
+    updateFormFields();
+    fetch('/api/canvas/tool-configs').then(r => r.json()).then(result => {
+      const entries = Object.entries(result.data || {});
+      const candidate = entries.find(([key, cfg]) =>
+        key.startsWith('channel:channel_request:') &&
+        typeof cfg?.channel_id === 'string' && cfg.channel_id.toLowerCase().includes('qq'));
+      if (candidate && document.getElementById('channel-form-id'))
+        document.getElementById('channel-form-id').value = candidate[1].channel_id;
+    }).catch(() => {});
+  }
 
   document.getElementById('channel-form-submit').addEventListener('click', () => _submitAdd(form));
   document.getElementById('channel-form-cancel').addEventListener('click', () => form.remove());
@@ -178,6 +266,8 @@ async function _submitAdd(formEl) {
   const token = document.getElementById('channel-form-token').value.trim();
   const appToken = document.getElementById('channel-form-app-token')?.value.trim() || '';
   const appId = document.getElementById('channel-form-app-id')?.value.trim() || '';
+  const qqMode = document.getElementById('channel-form-qq-credential-mode').value;
+  const qqEnvName = document.getElementById('channel-form-qq-env-name').value.trim();
   const appSecret = document.getElementById('channel-form-app-secret')?.value.trim() || '';
   const enabled = document.getElementById('channel-form-enabled').checked;
   const botToBotEnabled = platform === 'feishu'
@@ -187,7 +277,18 @@ async function _submitAdd(formEl) {
 
   const config = {};
 
-  if (platform === 'telegram') {
+  if (platform === 'qq') {
+    if (!appId) { alert('QQ App ID is required'); return; }
+    if (qqMode === 'env' && !/^QQ_OFFICIAL_[A-Z0-9_]{1,64}$/.test(qqEnvName)) {
+      alert('Environment name must start with QQ_OFFICIAL_'); return;
+    }
+    config.protocol = 'official';
+    try { Object.assign(config, _qqCapabilityConfig(formEl)); }
+    catch (e) { alert(e.message); return; }
+    config.app_id = appId;
+    if (qqMode === 'env') config.app_secret_env = qqEnvName;
+    else config.app_secret_file = '/run/qq-official-app-secret';
+  } else if (platform === 'telegram') {
     if (!token) { alert('Bot Token is required'); return; }
     config.bot_token = token;
   } else if (platform === 'slack') {
@@ -246,10 +347,82 @@ function _handleChannelAction(e) {
   switch (btn.dataset.channelAction) {
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
     case 'trusted-bots': _showTrustedBots(channel, item); break;
+    case 'qq-edit': document.dispatchEvent(new CustomEvent('qq-channel-manage', {
+      detail: { channelId: channel.id, tab: 'advanced' },
+    })); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
     case 'delete':     _channelDelete(channel.id); break;
   }
+}
+
+function _showQQEdit(channel, item) {
+  const prev = item.querySelector('[data-qq-edit-form]');
+  if (prev) { prev.remove(); return; }
+  const form = document.createElement('div');
+  form.className = 'channel-add-form';
+  form.dataset.qqEditForm = '1';
+  form.innerHTML =
+    '<div class="channel-form-row"><label>App ID</label><input data-qq-app-id type="text" /></div>' +
+    _qqCapabilityFields(channel.qq_enabled_scopes, {
+      enable_inbound_media: channel.qq_media_in,
+      enable_outbound_media: channel.qq_media_out,
+      enable_typing: channel.qq_typing,
+      enable_markdown: channel.qq_markdown,
+      enable_voice_transcription: channel.qq_voice_transcription,
+      enable_guild_plain_messages: channel.qq_guild_plain,
+      enable_session_resume: channel.qq_session_resume,
+      enable_interactions: channel.qq_interactions,
+      enable_approvals: channel.qq_approvals,
+    }) +
+    '<div class="channel-form-row"><label>QQ credential source</label>' +
+    '<select data-qq-mode><option value="env">Environment variable</option>' +
+    '<option value="file">Mounted file (/run/qq-official-app-secret)</option></select></div>' +
+    '<div class="channel-form-row" data-qq-env-row><label>Environment variable name</label>' +
+    '<input data-qq-env type="text" placeholder="QQ_OFFICIAL_APP_SECRET" /></div>' +
+    '<div class="channel-users-hint">Existing legacy credentials remain active until migrated. ' +
+    'Select a preconfigured env/file reference to migrate; use Restart to keep old settings.</div>' +
+    '<div class="channel-form-actions"><button class="btn-primary" data-qq-save>Save & Restart</button>' +
+    '<button class="btn-ghost" data-qq-cancel>Cancel</button></div>';
+  item.appendChild(form);
+  form.querySelector('[data-qq-app-id]').value = channel.qq_app_id || '';
+  const mode = form.querySelector('[data-qq-mode]');
+  mode.addEventListener('change', () =>
+    form.querySelector('[data-qq-env-row]').classList.toggle('hidden', mode.value !== 'env'));
+  form.querySelector('[data-qq-cancel]').addEventListener('click', () => form.remove());
+  form.querySelector('[data-qq-save]').addEventListener('click', async () => {
+    const appId = form.querySelector('[data-qq-app-id]').value.trim();
+    if (!appId) { alert('App ID is required'); return; }
+    let options;
+    try { options = _qqCapabilityConfig(form); }
+    catch (e) { alert(e.message); return; }
+    const config = { protocol: 'official', app_id: appId, ...options };
+    if (mode.value === 'env') {
+      const envName = form.querySelector('[data-qq-env]').value.trim();
+      if (!/^QQ_OFFICIAL_[A-Z0-9_]{1,64}$/.test(envName)) {
+        alert('Environment name must start with QQ_OFFICIAL_'); return;
+      }
+      config.app_secret_env = envName;
+    } else if (mode.value === 'file') {
+      config.app_secret_file = '/run/qq-official-app-secret';
+    }
+    const button = form.querySelector('[data-qq-save]');
+    button.disabled = true;
+    try {
+      const res = await fetch('/api/channel/' + encodeURIComponent(channel.id), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config }),
+      });
+      if (!res.ok) {
+        const response = await res.json().catch(() => ({}));
+        throw new Error(response.detail || 'QQ configuration update failed');
+      }
+      _loadChannels();
+    } catch (e) {
+      alert('QQ configuration failed: ' + e.message);
+      button.disabled = false;
+    }
+  });
 }
 
 async function _channelSetBotToBot(id, enabled, btn) {

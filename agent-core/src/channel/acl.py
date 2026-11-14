@@ -44,10 +44,13 @@ def get_user(platform: str, user_id: str) -> dict | None:
 
 
 def upsert_user(platform: str, user_id: str, display_name: str = '',
-                role: str = 'viewer', tool_filter: str = '*') -> dict:
+                role: str = 'viewer', tool_filter: str | None = None) -> dict:
     """创建或更新用户。"""
     if role not in ROLES:
         raise ValueError(f'Invalid role: {role}. Must be one of {ROLES}')
+    if tool_filter is None:
+        prior = get_user(platform, user_id)
+        tool_filter = prior['tool_filter'] if prior else '*'
     now = time.time()
     with _conn() as conn:
         conn.execute(

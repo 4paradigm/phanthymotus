@@ -59,11 +59,17 @@ def format_ts(epoch: float | None = None, sep: str = 'T') -> str:
 _l1_cache: dict = {'mtime': 0.0, 'content': ''}
 
 
-def _system_definition() -> str:
+def _system_definition(*, include_private_memory: bool = True) -> str:
     """读取 L1 base prompt（含 system prompt + 身份定义 + 长期记忆），带 mtime 缓存。"""
     system_path = pathlib.Path(config.main['event']['llm']['prompt_system'])
     identity_path = pathlib.Path('./resource/memory/identity.md')
     memory_path = pathlib.Path(config.main['event']['llm']['prompt_memory'])
+
+    # QQ prompts must never include the Agent Core's globally shared private memory.
+    if not include_private_memory:
+        system = system_path.read_text(encoding='utf-8')
+        # Global identity.md is not guaranteed to contain only public data.
+        return system
 
     # 检查文件修改时间
     paths = [system_path, memory_path]
@@ -75,9 +81,9 @@ def _system_definition() -> str:
         return _l1_cache['content']
 
     # 重建
-    system = system_path.read_text()
-    identity = identity_path.read_text() if identity_path.exists() else ''
-    memory = memory_path.read_text()
+    system = system_path.read_text(encoding='utf-8')
+    identity = identity_path.read_text(encoding='utf-8') if identity_path.exists() else ''
+    memory = memory_path.read_text(encoding='utf-8')
 
     parts = [system]
     if identity.strip():
@@ -115,12 +121,13 @@ def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
     return (tuple(parts), frozenset(bound_tools) if bound_tools else None, skills_fp)
 
 
-def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
+def _env_static(mcp_registry: dict, bound_tools: set | None = None,
+                include_shared_skills: bool = True) -> str:
     """生成 L2 静态环境信息（设备列表 + 工具 schema + 技能），带缓存。
 
     仅在设备注册/注销/上下线、工具绑定变化时重建。
     """
-    fp = _registry_fingerprint(mcp_registry, bound_tools)
+    fp = (_registry_fingerprint(mcp_registry, bound_tools), include_shared_skills)
     if fp == _l2_static_cache['fingerprint']:
         return _l2_static_cache['content']
 
@@ -164,7 +171,7 @@ def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
     # 技能列表（混合模式：仅展示 UI 激活的技能）
     import sys, event.skills
     skills_mod = sys.modules['event.skills']
-    visible_skills = skills_mod.visible_skills()
+    visible_skills = skills_mod.visible_skills() if include_shared_skills else []
     skills_section = ''
     if visible_skills:
         skill_lines = []
@@ -200,13 +207,17 @@ def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
 
 # ── L2 动态部分（时间/任务/事件统计）─────────────────────────────────────────
 
-def _env_dynamic() -> str:
+def _env_dynamic(*, isolated: bool = False) -> str:
     """生成 L2 动态环境快照（时间、活跃任务）。
 
     每次调用都重新生成，但作为 user message 放在历史之后，
     不影响 system message 的缓存命中。
     """
     now = format_ts(sep=' ')
+    if isolated:
+        # Do not expose shared task goals, active sensors or peer details to
+        # QQ conversations that only own their own session memory.
+        return f'<status time="{now}" />'
 
     # 活跃任务
     import task_store
@@ -393,7 +404,20 @@ def _trigger_message(event: dict) -> str:
 
 # ── 公共入口 ──────────────────────────────────────────────────────────────────
 
-def build_system(mcp_registry: dict, bound_tools: set | None = None) -> dict:
+def _qq_system_definition(scope: tuple[str, str] | None) -> str:
+    base = _system_definition(include_private_memory=False)
+    base += '\n\n本次是 QQ 独立会话，只能使用当前会话记忆。如需记住、读取、遗忘，使用 channel_memory_* 工具；禁止访问全局 Agent 记忆。'
+    if scope:
+        from channel.manager import manager as channel_manager
+        facts = channel_manager.get_chat_memory(*scope)
+        if facts:
+            base += '\n\n---当前 QQ 会话的长期记忆---\n' + '\n'.join('- ' + x for x in facts)
+    return base
+
+
+def build_system(mcp_registry: dict, bound_tools: set | None = None, *,
+                 qq_scope: tuple[str, str] | None = None,
+                 qq_turn: bool = False) -> dict:
     """构建 system message（L1 + L2-static）。
 
     该消息在 turn 内应被冻结复用，不要每轮重建。
@@ -401,7 +425,7 @@ def build_system(mcp_registry: dict, bound_tools: set | None = None) -> dict:
     """
     return {
         'role': 'system',
-        'content': _system_definition() + '\n\n' + _env_static(mcp_registry, bound_tools),
+        'content': (_qq_system_definition(qq_scope) if qq_turn else _system_definition()) + '\n\n' + _env_static(mcp_registry, bound_tools, not qq_turn),
     }
 
 
@@ -419,7 +443,7 @@ def build(
         trigger_event: L4 触发事件（从 collector 取到的 dict）。
     """
     # L2 动态信息 + L4 触发合并为一条 user message，减少消息数
-    dynamic = _env_dynamic()
+    dynamic = _env_dynamic(isolated=bool(trigger_event.get('_qq_channel_turn')))
     trigger = _trigger_message(trigger_event)
 
     return [

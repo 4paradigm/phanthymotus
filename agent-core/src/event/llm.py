@@ -565,6 +565,7 @@ _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 # Bot 身份，是更弱的信任边界。
 _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
     'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
+    'channel_memory_remember', 'channel_memory_read', 'channel_memory_forget',
 })
 
 
@@ -588,6 +589,19 @@ def _bot_channel_restricted(trigger_event: dict) -> bool:
     return bool(trigger_event.get('_bot_channel_event')) and not bool(
         trigger_event.get('_trusted_bot_channel_event')
     )
+
+
+def _shared_history_allowed(trigger_event: dict) -> bool:
+    """QQ private conversations and untrusted bots never see shared Agent turns."""
+    return not (trigger_event.get('_qq_channel_turn') or _bot_channel_restricted(trigger_event))
+
+
+def _isolate_private_turn_steering(events: list[dict], qq_private: bool) -> list[dict]:
+    """Defer unrelated new messages; never mix them into an active QQ turn."""
+    if qq_private and events:
+        collector.defer_priority(events)
+        return []
+    return events
 
 
 def _viewer_channel_restricted(trigger_event: dict) -> bool:
@@ -1611,6 +1625,9 @@ class Event:
         self._sys_tools = _build_system_tools([
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
+            ('channel_memory_remember', event.memory.channel_memory_remember),
+            ('channel_memory_read', event.memory.channel_memory_read),
+            ('channel_memory_forget', event.memory.channel_memory_forget),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
             ('skill_file', event.skills.skill_file),
@@ -1920,7 +1937,7 @@ class Event:
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                if not ev.get('_bot_channel_event'):
+                if not ev.get('_bot_channel_event') and not ev.get('_qq_channel_turn'):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
@@ -1935,11 +1952,12 @@ class Event:
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
-                if not ev.get('_bot_channel_event'):
+                if not ev.get('_bot_channel_event') and not ev.get('_qq_channel_turn'):
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
                 # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
-                if self._current_turn and not ev.get('_bot_channel_event'):
+                if (self._current_turn and not ev.get('_bot_channel_event')
+                        and not ev.get('_qq_channel_turn')):
                     self._save_current_turn(ev)
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
@@ -1949,7 +1967,10 @@ class Event:
         不存在 —— 手动刷新也刷不出来，因为要刷的行还没有。这里按当前 turn 索引 upsert，
         turn 结束时 `_save_current_turn` 再写同一个索引覆盖掉（那一份已 compact）。
         """
-        if not self._current_turn:
+        if not self._current_turn or (
+                trigger_event and trigger_event.get('_qq_channel_turn')):
+            # ChannelManager retains the private per-chat QQ transcript.
+            # Do not persist it in the shared Agent SQLite session.
             return
         import chat_history
         try:
@@ -2238,13 +2259,41 @@ class Event:
 
     async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
                         reconsider_event: asyncio.Event | None = None):
+        from channel.manager import qq_memory_scope
+        channel_id = trigger_event.get('_qq_channel_id')
+        chat_id = trigger_event.get('_qq_chat_id')
+        principals = trigger_event.get('_channel_principals', [])
+        scope = ((channel_id, chat_id) if
+                 trigger_event.get('_qq_channel_turn')
+                 and isinstance(channel_id, str) and bool(channel_id)
+                 and isinstance(chat_id, str) and bool(chat_id)
+                 and isinstance(principals, list) and bool(principals)
+                 and all(isinstance(p, (tuple, list)) and len(p) == 2
+                         and p[0] == 'qq' for p in principals)
+                 else None)
+        token = qq_memory_scope.set(scope)
+        try:
+            return await self._one_turn_impl(trigger_event, cancel_event,
+                                             reconsider_event)
+        finally:
+            qq_memory_scope.reset(token)
+
+    async def _one_turn_impl(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
+                        reconsider_event: asyncio.Event | None = None):
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
         bot_restricted = _bot_channel_restricted(trigger_event)
+        qq_private_turn = bool(trigger_event.get('_qq_channel_turn'))
         viewer_restricted = _viewer_channel_restricted(trigger_event)
         tool_restricted = bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
+        # Principal ACLs must be enforced at dispatch, not by model prompt alone.
+        from channel.tool_policy import (allowed_for_principals, snapshot_principals,
+                                 async_allowed_for_principals)
+        channel_principals = trigger_event.get('_channel_principals', [])
+        channel_acl_snapshot = (await snapshot_principals(channel_principals)
+                                if channel_principals else {})
         replied_message_ids: set[str] = set()
 
         global _reported_turn_msgs
@@ -2312,7 +2361,8 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        if not bot_restricted:
+        if not bot_restricted and not qq_private_turn:
+            # Text-only QQ input must not fire hardware-affecting hooks.
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
@@ -2321,6 +2371,7 @@ class Event:
         # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
         # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
         if (mcp_client.has_blocking_pendings() and not bot_restricted
+                and not qq_private_turn
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
@@ -2350,6 +2401,11 @@ class Event:
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
         system_tools = list(self._sys_tools.values())
+        from channel.tool_policy import QQ_MEMORY_TOOLS
+        from channel.manager import qq_memory_scope
+        if not qq_private_turn or qq_memory_scope.get() is None:
+            system_tools = [tool for tool in system_tools
+                            if tool['schema']['name'] not in QQ_MEMORY_TOOLS]
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
@@ -2362,6 +2418,11 @@ class Event:
                 schema for schema in bound_schemas
                 if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted)
             ]
+        if channel_principals:
+            system_tools = [t for t in system_tools if allowed_for_principals(channel_principals, t['schema']['name'],
+                                            snapshot=channel_acl_snapshot)]
+            bound_schemas = [s for s in bound_schemas if allowed_for_principals(channel_principals, s['name'],
+                                            snapshot=channel_acl_snapshot)]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
             + [{'type': 'function', 'function': s} for s in bound_schemas]
@@ -2370,7 +2431,9 @@ class Event:
         bound_tool_names = {s['name'] for s in bound_schemas}
 
         # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
-        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names,
+                                                 qq_turn=qq_private_turn,
+                                                 qq_scope=qq_memory_scope.get() if qq_private_turn else None)
 
         finish_tool = 'finish'
         llm_cfg = config.main.get('event', {}).get('llm', {})
@@ -2434,7 +2497,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = [] if bot_restricted else self._build_history()
+            history = self._build_history() if _shared_history_allowed(trigger_event) else []
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(_scrub(turn_messages))
 
@@ -2445,6 +2508,9 @@ class Event:
                     message_list  = current_history,
                     trigger_event = trigger_event,
                 )
+                if qq_private_turn:
+                    from channel.qq_vision import add_qq_images
+                    await add_qq_images(messages, trigger_event)
                 # 把 trigger user message 记入 turn_messages，后续轮次能看到
                 trigger_user_msg = messages[-1]  # build() 最后一条是 L4 user
                 turn_messages.append(trigger_user_msg)
@@ -2459,8 +2525,12 @@ class Event:
 
             # 保存请求日志
             pathlib.Path('./resource/log').mkdir(parents=True, exist_ok=True)
+            log_messages = messages
+            if qq_private_turn:
+                from channel.qq_vision import redact_inline_images
+                log_messages = redact_inline_images(messages)
             pathlib.Path('./resource/log/llm.json').write_text(
-                json.dumps(messages, ensure_ascii=False)
+                json.dumps(log_messages, ensure_ascii=False)
             )
             pathlib.Path('./resource/log/llm_tools.json').write_text(
                 json.dumps(all_tool_list, ensure_ascii=False, indent=2)
@@ -2471,7 +2541,9 @@ class Event:
             tool_count = len(all_tool_list)
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
             prompt_chars = sum(len(m.get('content') or '') for m in messages)
-            last_user = next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
+            from channel.qq_log_safety import safe_user_log_preview
+            last_user_content = next((m.get('content', '') for m in reversed(messages) if m.get('role') == 'user'), '')
+            last_user = safe_user_log_preview(last_user_content, qq_turn=qq_private_turn)
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
@@ -2482,7 +2554,8 @@ class Event:
                 # 已经有高优先级 steering 在等——不用真的发一次请求再被打断，
                 # 直接原地重新构建（走下面 except RoundReconsider 同一条处理）。
                 reconsider_event.clear()
-                _steered_pre = await collector.drain_steering()
+                _steered_pre = _isolate_private_turn_steering(
+                    await collector.drain_steering(), qq_private_turn)
                 if _steered_pre:
                     for sev in _steered_pre:
                         turn_messages.append({'role': 'user', 'content':
@@ -2509,7 +2582,8 @@ class Event:
                 # drain 进去，原地重新发起请求。跟 finish 的 barge_in 是两回事：那
                 # 条会中止播放、结束整轮；这里只是换一次更知情的推理，turn 接着走。
                 reconsider_event.clear()
-                _steered_inflight = await collector.drain_steering()
+                _steered_inflight = _isolate_private_turn_steering(
+                    await collector.drain_steering(), qq_private_turn)
                 if _steered_inflight:
                     for sev in _steered_inflight:
                         turn_messages.append({'role': 'user', 'content':
@@ -2524,7 +2598,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2 and not bot_restricted:
+                    if len(self._turns) > 2 and _shared_history_allowed(trigger_event):
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -2534,7 +2608,7 @@ class Event:
                         self._summary = summary
                         self._turns = self._turns[-2:]
                         # 重建 history 并重试（复用冻结的 system）
-                        history = self._build_history()
+                        history = self._build_history() if _shared_history_allowed(trigger_event) else []
                         current_history = history + _sanitize(_scrub(turn_messages))
                         messages = prompt_mod.build(
                             system_msg    = frozen_system,
@@ -2645,6 +2719,12 @@ class Event:
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
                         'mutating, actuator, processor, or delegated execution tools.'
                     )
+                elif (channel_principals and name == 'mcp__channel__channel_reply'
+                      and args.get('source_message_id') not in
+                      trigger_event.get('_channel_message_ids', [])):
+                    result = 'Error: Channel reply must target a message from the current turn.'
+                elif channel_principals and not await async_allowed_for_principals(channel_principals, name):
+                    result = 'Error: Channel ACL/tool_filter denies this tool for a sender in this turn.'
                 elif (bot_restricted and name == 'mcp__channel__channel_reply'
                       and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
                     result = (
@@ -2925,7 +3005,8 @@ class Event:
             if steered:
                 deferred = [
                     sev for sev in steered
-                    if bot_restricted or collector.has_bot_channel_event([sev])
+                    if (qq_private_turn or bot_restricted
+                            or collector.has_bot_channel_event([sev]))
                 ]
                 if deferred:
                     collector.defer_priority(deferred)
@@ -2989,7 +3070,8 @@ class Event:
             await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
-        await self._maybe_compress()
+        if not qq_private_turn:
+            await self._maybe_compress()
 
         # 发布决策到 /decision_core DDS topic
         import ros2_bridge

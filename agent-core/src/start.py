@@ -289,7 +289,7 @@ def _register_core_mcp(silent=False):
                 'name': 'channel_request',
                 'type': 'sensor',
                 'description': (
-                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack): delivers '
+                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack / QQ): delivers '
                     'messages users send from a chat app — including image and file attachments — '
                     'into the decision core. You never call this tool. The events it produces carry '
                     'channel="channel:<platform>"; reply to those with channel_reply.'
@@ -313,7 +313,7 @@ def _register_core_mcp(silent=False):
                 'name': 'channel_reply',
                 'type': 'actuator',
                 'description': (
-                    'Send a reply on a messaging platform (Feishu / Telegram / Slack). '
+                    'Send a reply on a messaging platform (Feishu / Telegram / Slack / QQ). '
                     'This is the ONLY way those users receive anything from you — text left in '
                     '`content` reaches nobody. When the triggering event\'s channel attribute starts '
                     'with "channel:" (for example channel="channel:feishu"), any reply must go through '
@@ -669,6 +669,11 @@ app_api.include_router(api.network.router)
 
 import api.channel
 app_api.include_router(api.channel.router)
+
+import api.channel_setup
+app_api.include_router(api.channel_setup.router)
+import api.qq_settings
+app_api.include_router(api.qq_settings.router)
 
 import api.peer
 # CRITICAL: api.peer.router MUST come after auth_middleware is installed and
