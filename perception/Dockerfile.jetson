@@ -3,11 +3,10 @@
 # JP_VERSION selects the corresponding Jetson base; TensorRT plans are loaded
 # only when the runtime target matches the host TensorRT major version.
 #
-# Build context: repo root (phanthy-motus/) so we can access both
-# src/perception_stack/ and deploy/ros-base/audio_msgs/
+# Build context: repository root, including perception/ and deploy/.
 #
-# Usage:
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
+# Usage (from repo root; Jetson only):
+#   ./deploy/build_perception.sh --jp-version 6.1 --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -92,12 +91,12 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # builds fall back to ld.so's default search path, which already covers the
 # /usr/lib/aarch64-linux-gnu these packages install into.
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+    mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
     chmod +x /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg libvips42 && \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -108,7 +107,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
 RUN cd /ros_ws && \
     . /opt/ros/humble/install/setup.bash && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+    colcon build --event-handlers console_direct+ --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # ── Python deps ────────────────────────────────────────────────────
 # PyYAML goes first, on its own, with --ignore-installed. The jp5.11 base is
@@ -365,12 +364,12 @@ RUN . /etc/jetpack.env; \
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
 # step that actually failed on `--jp-version 6.1`, because layers 1-11 were
 # cached and it was the first apt install to run.
-RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+RUN mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
     chmod +x /usr/sbin/ldconfig && \
     apt-get update && \
     apt-get install -y --no-install-recommends espeak-ng && \
-    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
@@ -405,12 +404,12 @@ COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-require
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ] && \
        ! python3 -c "import os,sysconfig;raise SystemExit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)"; then \
       echo '[build] CPython headers missing — installing python3-dev for the source builds' && \
-      mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+      mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig && \
       printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
       chmod +x /usr/sbin/ldconfig && \
       apt-get update && \
       apt-get install -y --no-install-recommends python3-dev && \
-      mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+      mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig && \
       { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
       rm -rf /var/lib/apt/lists/*; \
     fi
@@ -580,12 +579,192 @@ assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
 print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
-# ── Application code ───────────────────────────────────────────────
+# Native dependencies are cached independently of application changes.
 WORKDIR /work
+# Native RTAB-Map 0.22.1 + its Humble wrapper, built against each image's ROS,
+# OpenCV/PCL and Python ABI. No Python geometry wheels or second ROS install.
+RUN set -e; . /etc/jetpack.env; \
+    case "${JP_VERSION}:${PY_ABI}" in 61:3.10|511:3.8) ;; *) echo 'RTAB-Map JetPack/Python ABI mismatch'; exit 1 ;; esac; \
+    mv /usr/sbin/ldconfig /tmp/ldconfig.perception-orig; \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig; chmod +x /usr/sbin/ldconfig; \
+    apt-get update; apt-get install -y --no-install-recommends --no-upgrade \
+      curl ca-certificates git cmake ccache build-essential python3-dev libpcl-dev \
+      libeigen3-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-python-dev \
+      libsqlite3-dev zlib1g-dev libssl-dev; \
+    mv -f /tmp/ldconfig.perception-orig /usr/sbin/ldconfig; \
+    ldconfig || echo '[build] ldconfig skipped under emulation'; \
+    . /opt/ros/humble/install/setup.bash; \
+    rtabmap_python="$(command -v python3)"; \
+    python3 -c "import cv2,numpy; assert numpy.__version__ == '${NUMPY_VERSION}'; print('[rtabmap-build] OpenCV',cv2.__version__,'Python ${PY_ABI}')"; \
+    apt-get clean; \
+    rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
+
+ARG RTABMAP_CORE_COMMIT=df6300e0ba3e90058f90b09c4d646279366d3516
+# The full archive includes GUI assets and datasets. Fetch only the pinned
+# headless sources; keep completed Git objects when a transfer is interrupted.
+# 固定提交的源码跨构建重试保留；与编译目录分开，避免配置过程改写缓存。
+# Older JP5.11 Git needs the partial-clone extension before a filtered fetch.
+RUN --mount=type=cache,id=perception-rtabmap-source-${RTABMAP_CORE_COMMIT},target=/var/cache/rtabmap-source,sharing=locked \
+    set -e; \
+    rtabmap_source=/var/cache/rtabmap-source; \
+    mkdir -p "${rtabmap_source}"; \
+    git -C "${rtabmap_source}" init -q; \
+    git -C "${rtabmap_source}" config remote.origin.url https://github.com/introlab/rtabmap.git; \
+    git -C "${rtabmap_source}" config core.repositoryformatversion 1; \
+    git -C "${rtabmap_source}" config extensions.partialClone origin; \
+    git -C "${rtabmap_source}" config remote.origin.promisor true; \
+    git -C "${rtabmap_source}" config remote.origin.partialclonefilter blob:none; \
+    git -C "${rtabmap_source}" config http.version HTTP/1.1; \
+    git -C "${rtabmap_source}" config http.lowSpeedLimit 1024; \
+    git -C "${rtabmap_source}" config http.lowSpeedTime 30; \
+    for source_attempt in 1 2; do \
+      echo "[rtabmap-build] fetching pinned core sources, attempt ${source_attempt}/2"; \
+      if { git -C "${rtabmap_source}" cat-file -e "${RTABMAP_CORE_COMMIT}^{commit}" 2>/dev/null || \
+        GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" fetch --depth=1 --filter=blob:none origin "${RTABMAP_CORE_COMMIT}"; } && \
+        git -C "${rtabmap_source}" sparse-checkout init --cone && \
+        git -C "${rtabmap_source}" sparse-checkout set cmake_modules corelib utilite && \
+        GIT_TERMINAL_PROMPT=0 git -C "${rtabmap_source}" checkout --detach "${RTABMAP_CORE_COMMIT}"; then break; fi; \
+      if [ "${source_attempt}" -eq 2 ]; then exit 1; fi; \
+      sleep 3; \
+    done; \
+    test "$(git -C "${rtabmap_source}" rev-parse HEAD)" = "${RTABMAP_CORE_COMMIT}"; \
+    mkdir -p /tmp/rtabmap-ws/src/rtabmap; \
+    cp -a "${rtabmap_source}/." /tmp/rtabmap-ws/src/rtabmap/
+
+# Commit the complete checkout before compiling. A failed build can reuse this
+# source layer; partial object files from the failed RUN are not a Docker cache.
+# Keep successful compiler results even if the review build hits its time limit.
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; . /opt/ros/humble/install/setup.bash; \
+    export CCACHE_DIR=/var/cache/rtabmap-ccache CCACHE_COMPILERCHECK=content; \
+    cmake -S /tmp/rtabmap-ws/src/rtabmap -B /tmp/rtabmap-core-build \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF -DWITH_QT=OFF \
+      -DWITH_GTSAM=OFF -DWITH_OPEN3D=OFF -DWITH_G2O=OFF -DWITH_TORO=ON \
+      -DWITH_CERES=OFF -DWITH_PYTHON=OFF -DWITH_TORCH=OFF -DWITH_POINTMATCHER=OFF \
+      -DWITH_PDAL=OFF -DWITH_OCTOMAP=OFF -DWITH_OPENNI=OFF -DWITH_OPENNI2=OFF \
+      -DWITH_FREENECT=OFF -DWITH_FREENECT2=OFF -DWITH_K4A=OFF \
+      -DWITH_REALSENSE=OFF -DWITH_REALSENSE2=OFF -DWITH_ZED=OFF -DWITH_ZEDOC=OFF \
+      -DWITH_FLYCAPTURE2=OFF -DWITH_DC1394=OFF -DWITH_MYNTEYE=OFF \
+      -DWITH_OPENGV=OFF -DWITH_MRPT=OFF -DWITH_VERTIGO=OFF -DWITH_FASTCV=OFF; \
+    cmake --build /tmp/rtabmap-core-build --target install --parallel 2; \
+    rm -rf /tmp/rtabmap-ws /tmp/rtabmap-core-build
+
+ARG RTABMAP_ROS_COMMIT=2a31e433d2b072795ae90a62abcdd0c00691e04d
+# Older JP5.11 Humble bases can lack VelocityStamped; only build a pinned
+# geometry_msgs 4.2.4 overlay when it is missing. Compatible JP6.1 is unchanged.
+# A wrapper/dependency download failure must not discard the compiled core.
+# Cache all required sources and the package selection before running colcon.
+RUN set -e; . /opt/ros/humble/install/setup.bash; \
+    mkdir -p /tmp/rtabmap-ws/src; \
+    fetch_rtabmap_source() { \
+      source_name="$1"; source_repo="$2"; source_commit="$3"; source_sha256="$4"; \
+      for source_attempt in 1 2; do \
+        echo "[rtabmap-build] fetching ${source_name}, attempt ${source_attempt}/2"; \
+        if curl -fL --http1.1 --proto '=https' --tlsv1.2 \
+          --connect-timeout 20 --max-time 1800 --speed-limit 1024 --speed-time 30 \
+          "https://codeload.github.com/${source_repo}/tar.gz/${source_commit}" -o "/tmp/${source_name}.tar.gz"; then \
+          break; \
+        fi; \
+        rm -f "/tmp/${source_name}.tar.gz"; \
+        if [ "${source_attempt}" -eq 2 ]; then return 1; fi; \
+        sleep 3; \
+      done; \
+      printf '%s  %s\n' "${source_sha256}" "/tmp/${source_name}.tar.gz" | sha256sum -c -; \
+      mkdir -p "/tmp/rtabmap-ws/src/${source_name}"; \
+      tar -xzf "/tmp/${source_name}.tar.gz" --strip-components=1 -C "/tmp/rtabmap-ws/src/${source_name}"; \
+      rm "/tmp/${source_name}.tar.gz"; \
+    }; \
+    fetch_rtabmap_source rtabmap_ros introlab/rtabmap_ros "${RTABMAP_ROS_COMMIT}" e4c5973693888bb5f3924832624e84dd3f9db12d17f82e149a2cc5512da4240d; \
+    fetch_rtabmap_source message_filters ros2/message_filters 31ad79a69e949c5e9ece261aa71fabdd7cbd97da 21103f7cbf39eb08d17dc9eb11d993fc4600dc21c341da503a23226b021c62a1; \
+    fetch_rtabmap_source geometry2 ros2/geometry2 404b7224d623d614f18fa9738dbf1716403d857e 80c1070f46141199cb8940edf250ade15a11e3aa41542758f8ed864e37eb1071; \
+    rtabmap_packages='tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters rtabmap_msgs rtabmap_conversions rtabmap_sync rtabmap_util rtabmap_odom rtabmap_slam'; \
+    if ! find /opt/ros/humble/install/include -type f \
+        -path '*/geometry_msgs/msg/velocity_stamped.hpp' -print -quit | grep -q .; then \
+      echo '[rtabmap-build] geometry_msgs lacks VelocityStamped; adding pinned 4.2.4 overlay'; \
+      fetch_rtabmap_source common_interfaces ros2/common_interfaces 53761cba9a000902602e7e695cb40de78eadee7f e55ac6172b820db2079b982bbd21deff49500e7098a12cc8b922c47f95303c81; \
+      test -f /tmp/rtabmap-ws/src/common_interfaces/geometry_msgs/msg/VelocityStamped.msg; \
+      mv /tmp/rtabmap-ws/src/common_interfaces/geometry_msgs /tmp/rtabmap-ws/src/geometry_msgs; \
+      rm -rf /tmp/rtabmap-ws/src/common_interfaces; \
+      rtabmap_packages="geometry_msgs ${rtabmap_packages}"; \
+    fi; \
+    add_missing_rtabmap_dependencies() { \
+      dependency_name="$1"; dependency_repo="$2"; dependency_commit="$3"; dependency_sha256="$4"; shift 4; \
+      missing_packages=''; \
+      for dependency_package in "$@"; do \
+        if ! ros2 pkg prefix "${dependency_package}" >/dev/null 2>&1; then \
+          missing_packages="${missing_packages} ${dependency_package}"; \
+        fi; \
+      done; \
+      if [ -n "${missing_packages}" ]; then \
+        fetch_rtabmap_source "${dependency_name}" "${dependency_repo}" "${dependency_commit}" "${dependency_sha256}"; \
+        rtabmap_packages="${rtabmap_packages}${missing_packages}"; \
+      fi; \
+    }; \
+    add_missing_rtabmap_dependencies perception_pcl ros-perception/perception_pcl \
+      ca66aa21f28b7e2848870f08faace81554e78437 c66ecf29ec7626771f8e3783adab8c0867f3e815052875444fe6a6cebae16188 pcl_conversions pcl_ros; \
+    add_missing_rtabmap_dependencies diagnostics ros/diagnostics \
+      a1b95037eeab10592a8268be2a67cadaad6673da 74da212f1ed675179d2a97eaed93ff14267a0e3bbdfb803c5e8efa5b0576c753 diagnostic_updater; \
+    add_missing_rtabmap_dependencies vision_opencv ros-perception/vision_opencv \
+      066793a23e5d06d76c78ca3d69824a501c3554fd 97f9f95788078dd722ed55e2d8a6da7b81cddf8c497b62f83cb46f022328c813 cv_bridge image_geometry; \
+    add_missing_rtabmap_dependencies image_common ros-perception/image_common \
+      69b50c6db906b2044502b00c1b35dc97ec8a40ce 78fad3ad43b17f162801afed107df77c101795341669e2df335df0d7676d5373 image_transport; \
+    add_missing_rtabmap_dependencies laser_geometry ros-perception/laser_geometry \
+      d53b925d25b4b5657261a44f4479365965cc2363 681ab6f7fd7559ec681f27272154372968ecbd76c26dac3454457db020a2f8f2 laser_geometry; \
+    printf '%s\n' "${rtabmap_packages}" > /tmp/rtabmap-ws/packages.list
+
+# JP5.11: cache ROS foundations, RTAB-Map support and rtabmap_slam
+# independently; the JP6.1 single-build path below remains unchanged.
+COPY perception/tools/build_rtabmap_ros_group.sh /tmp/build_rtabmap_ros_group.sh
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; if [ "${JP_VERSION}" = "511" ]; then \
+      bash /tmp/build_rtabmap_ros_group.sh foundations; \
+    fi
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; if [ "${JP_VERSION}" = "511" ]; then \
+      bash /tmp/build_rtabmap_ros_group.sh support; \
+    fi
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; if [ "${JP_VERSION}" = "511" ]; then \
+      bash /tmp/build_rtabmap_ros_group.sh slam; \
+    fi
+
+# RUN starts a fresh shell: reload both the ROS environment and the selection
+# made against this image's underlay, including only its missing dependencies.
+RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
+    set -e; \
+    if [ "${JP_VERSION:-61}" != "511" ]; then \
+      . /opt/ros/humble/install/setup.bash; \
+      export CCACHE_DIR=/var/cache/rtabmap-ccache CCACHE_COMPILERCHECK=content; \
+      rtabmap_python="$(command -v python3)"; \
+    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"; \
+    test -s /tmp/rtabmap-ws/packages.list; \
+    rtabmap_packages="$(cat /tmp/rtabmap-ws/packages.list)"; \
+    rtabmap_rcutils="$(readlink -f /opt/ros/humble/install/lib/librcutils.so)"; \
+    rtabmap_builtin="$(readlink -f /opt/ros/humble/install/lib/libbuiltin_interfaces__rosidl_generator_c.so)"; \
+    rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
+    test -f "${rtabmap_rcutils}"; test -f "${rtabmap_builtin}"; test -f "${rtabmap_crypto}"; \
+    cd /tmp/rtabmap-ws; \
+    MAKEFLAGS=-j2 colcon build --event-handlers console_direct+ --merge-install --install-base /opt/rtabmap_ros \
+      --executor sequential --packages-select ${rtabmap_packages} --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DPython3_EXECUTABLE="${rtabmap_python}" -DPYTHON_EXECUTABLE="${rtabmap_python}" \
+      -Drcutils_LIB:FILEPATH="${rtabmap_rcutils}" \
+      -Dbuiltin_interfaces__rosidl_generator_c_LIB:FILEPATH="${rtabmap_builtin}" \
+      -Dcrypto_LIB:FILEPATH="${rtabmap_crypto}" \
+      '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
+      -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
+    fi; \
+    cd /work; rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh
+
+# ── Application code ───────────────────────────────────────────────
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/configs/   /work/configs/
 COPY perception/deploy/    /deploy/
 
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
@@ -666,6 +845,8 @@ print('[build] zxing-cpp:', version('zxing-cpp'), 'ok,', \
       'try_invert' in zxingcpp.read_barcodes.__doc__.splitlines()[0] and 'with try_invert' or 'no try_invert')" \
       || echo "[build] zxing-cpp: NOT INSTALLED — the barcode card will report decoder_unavailable"
 
+COPY perception/tools/rtabmap_pointcloud_smoke.py /work/tools/rtabmap_pointcloud_smoke.py
+
 EXPOSE 15720
 EXPOSE 15721
 
@@ -677,15 +858,22 @@ EXPOSE 15721
 # while jp6.1's base sets 3.10. A base that started setting it, or set it
 # differently, would drop this .pth into a directory nothing imports from — and
 # the failure would surface at runtime as a missing rclpy, not at build time.
+# Source-built ROS packages can use either site-packages or dist-packages.
+# Collect both layouts for every workspace, with the RTAB-Map overlay first.
 RUN . /etc/jetpack.env; \
     PTH="/usr/local/lib/python${PY_ABI}/dist-packages/ros_ws.pth"; \
-    find /ros_ws/install -name "site-packages" -type d > "${PTH}" && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> "${PTH}" && \
+    find /opt/rtabmap_ros /ros_ws/install /opt/ros/humble/install \
+      -type d \( -name "site-packages" -o -name "dist-packages" \) > "${PTH}" && \
     echo "[build] ${PTH}:" && cat "${PTH}"
 
 # ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+ENV LD_LIBRARY_PATH="/opt/rtabmap_ros/lib:/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/opt/rtabmap_ros:/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+
+# Runs directly, outside pytest and its ROS stubs, without GPU/camera access.
+# Also checks generated Python typesupport through the runtime .pth/ENV paths.
+RUN test -x /opt/rtabmap_ros/lib/rtabmap_odom/rgbd_odometry && \
+    ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=127 python3 /work/tools/rtabmap_pointcloud_smoke.py
 
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
@@ -698,5 +886,6 @@ CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
+     source /opt/rtabmap_ros/setup.bash && \
      source /etc/dla-fallback.env && \
      python3 /work/main.py"]

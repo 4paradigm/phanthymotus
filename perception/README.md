@@ -8,6 +8,451 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## Depth-only pointcloud card
+
+`pointcloud` takes exactly one `image/depth-z16` (millimetre Image) or
+`image/depth-zlib` (CompressedImage) input. It backprojects depth into the
+existing display cloud/summary and optional metric PointCloud2 outputs.
+It no longer loads a mono depth model or performs stereo matching; RGB inputs
+and multiple connected depth streams are rejected. To display estimated depth,
+connect the separate `visual_depth` output. Metric output still requires measured
+depth, driver intrinsics and capture-time declarations; estimated depth is not
+promoted to a metric measurement. Saved single-input `auto`/`depth` starts remain
+compatible, while saved `mono`/`stereo` starts require rewiring to a depth source.
+
+## Spatial SLAM Input Contract
+
+The generic `pointcloud_slam` card requires native
+`sensor_msgs/msg/PointCloud2` and tracking `motus.odom/1` with the
+`motus_slam/1` pose profile. The canonical
+[driver-author protocol](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)
+specifies timing, frame, mounting, `motus.slam_input/1` declarations and
+`motus.slam_frame/1` per-frame provenance. This repository keeps a
+pure-Python runtime copy in `plugins/pointcloud_slam_contract.py` and
+consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
+The implementation must not infer calibrated mounting or verified
+cross-sensor clocks from a robot model or nearby timestamps.
+
+## Native Jetson packaging and measured size
+
+RGB-D odometry and point-cloud SLAM require the pinned RTAB-Map executables,
+linked against each image's existing ROS, OpenCV/PCL and Python ABI (JP5.11:
+Python 3.8; JP6.1: Python 3.10). The Dockerfile therefore builds native sources;
+this is an intentional deployment dependency, not a Python fallback. ROS source
+archives have pinned SHA-256 checks before extraction. Updating a source commit
+also requires reviewing and updating its archive hash. These hashes detect changed
+bytes; they are not upstream signatures. The core uses Git's pinned object graph.
+
+Registry manifest/config measurements on 2026-11-14 for the images built from
+73627d1 show the following compressed layer bytes. “Before/after native” sums
+layers immediately before/after the RTAB-Map dependency/source/build block in
+the same image; it is not a comparison with a separately rebuilt main image.
+
+| Image tag | Before native | After native | Native block added | Whole image |
+|---|---:|---:|---:|---:|
+| release.261113.def9614-jetson-jp5.11 | 6,744,706,780 | 6,794,902,526 | 50,195,746 | 6,796,695,094 |
+| release.261113.a87c881-jetson-jp6.1 | 8,105,238,860 | 8,127,018,472 | 21,779,612 | 8,128,988,407 |
+
+The dependency-install layers add 1,095,185 and 1,248,405 compressed bytes
+respectively: most listed development dependencies already exist in the earlier
+image layers. Installed libraries/headers and native overlays remain in the final
+image; deleting them in a later layer would not reclaim their download size.
+Source/build layers also remain in image history despite later workspace cleanup.
+The build already disables unused GUI, camera SDK and optimization backends.
+
+A multi-stage build could omit additional source/build intermediates, but copying
+only executables is insufficient: the ROS overlay, Python bindings, shared
+libraries and their ABI-matched runtime dependencies must remain. Removing tools
+inherited from the common base requires a separate base/runtime split. This PR
+retains the existing cached build layout with the measured growth above; it does
+not claim zero image growth or a measured cold-build time. These manifest sizes
+are compressed transfer sizes, not unpacked disk usage or newly rebuilt images.
+
+## Generic RGB-D visual odometry
+
+Enable `plugins.rgbd_odometry.enabled` to expose the `rgbd_odometry` processor
+card. Connect a driver's `camera_rgbd` color (`image/jpeg`) and measured depth
+(`image/depth-zlib`) ports. Both must declare the same rectified optical plane,
+640×480 intrinsics, capture clock and camera ID through `motus.camera/1`.
+Depth is little-endian uint16 millimetres. Display-only or estimated depth,
+receipt-timed video and unregistered lenses are rejected.
+
+The card supervises the image's pinned RTAB-Map `rgbd_odometry` runtime. Its
+`state/odom` output carries `motus.odom/1` with `vendor.motus_slam` and can be
+connected to `pointcloud_slam` alongside native `sensor/pointcloud2`. The pose
+reference is the camera optical frame; no body mount or calibrated clock
+relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
+driver repository. G1 requires SDK global capture time; Bumi also exposes its
+existing fixed hardware-clock offset explicitly as unverified provenance.
+
+Algorithm settings are available only through the card's instance configuration
+(gear button), without duplicate form fields. The platform still supplies the
+instance ID, input topics and camera calibration automatically. Saved `config`
+replay and direct dispatch arguments remain supported.
+
+Start failures name the offending input instead of only stating the rule, e.g.
+`connect one calibrated color and one measured depth input: missing image/jpeg;
+/ns/camera/head: no camera_info declaration; /ns/camera/rgbd/depth: declared
+image/depth-zlib`. Missing declarations and wrong formats come first because
+Core keeps only 200 characters; topic text is shortened. A single resolved
+input sent by Core as `input_topic` is diagnosed as a count error. No
+intrinsics, registration, depth unit or format is assumed. Offline, the real
+start-project chain reproduces the "connect one calibrated color…" message
+when a source answers without `camera_info` (Tianyi's camera card reports
+`unavailable` with no declaration before its first calibrated capture, which
+Core does not treat as a failure) or when a source `info()` fails and the link
+falls back to a canvas snapshot topic. Which case occurred in the field is not
+established.
+
+The original first `state/odom` port and its topic are unchanged. A second
+`data/json` port publishes `/rgbd_odometry/i_<hex-instance-id>/status` for display,
+using Bumi's summary fields: `status`, `turn_angle_deg`, `displacement_m`,
+`position_m`, `pose_reference`, `age_ms`, `reason`. Position refers to the camera;
+displacement is straight-line distance from the first valid pose of this
+estimator segment, not path length. `turn_angle_deg` stays null because the
+generic camera contract does not define body yaw. Position/displacement are null
+outside tracking, and age is null without a measurement timestamp; ESKF
+predictions never become a valid summary pose. Same-state summaries are limited
+to 5 Hz, with immediate state/reason changes. Stopping publishes `idle` before
+releasing the session. Connect the existing `state/odom` port to SLAM and use
+`data/json` for the status display. Status transport failures are logged without
+retiring valid odometry or blocking session cleanup/restart. This applies to Tianyi, G1
+and Bumi without changing their drivers.
+
+### Optional visual registration frontend (PR #371)
+
+Each `rgbd_odometry` instance supports `visual_frontend` in `config`:
+
+- `f2m_feature` (default): RTAB-Map frame-to-map feature matching
+  (`Odom/Strategy=0`, `Vis/CorType=0`), unchanged from the previous default.
+- `f2f_optical_flow`: frame-to-frame Lucas-Kanade optical flow
+  (`Odom/Strategy=1`, `Vis/CorType=1`), an opt-in experimental comparison
+  rather than a proven accuracy improvement. Pinned RTAB-Map F2M **does not**
+  support `Vis/CorType=1`: it silently forces feature matching, so the two
+  native parameters must always change together.
+- `max_features`: 100..5000 integer, 1000 by default. This is a resource
+  bound, not a measured tracking-performance guarantee.
+- `auto` (opt-in; the default remains `f2m_feature`): starts F2M and runs one
+  native frontend at a time. Only a segment loss classified as visual
+  degradation (persistent rejected estimates, stale or discontinuous visual
+  estimates) while both camera inputs are fresh makes the supervisor start the
+  *other* frontend, always as a new segment. Camera-input, IMU, clock, frame,
+  process and ESKF-continuity losses keep the frontend. After a switch, a 20 s
+  cooldown applies; after two switches without any tracking in between,
+  ordinary recovery keeps the current frontend until tracking returns.
+  Frontends are not ranked by raw inlier counts. `info().frontend` reports
+  mode, active frontend, switch count/reason, the last decision and cooldown.
+  These limits are engineering choices, not hardware-tuned values.
+  Explicit native visual rejection also starts the bounded recovery timer
+  before the first tracking pose, so an uninitializable frontend can recover
+  or switch rather than remain initializing indefinitely.
+
+`visual_frontend` and `max_features` are instance-scoped. Stop an active
+instance before changing either. Restart creates a new odometry segment;
+different RTAB-Map frontend states and coordinate origins are never spliced
+into one tracking segment. RGB-D inputs, output port and `motus.odom/1`
+schema remain unchanged.
+
+The optional `depth_geometry` setting is **not** another `visual_frontend`
+value: it is a bounded projective point-to-plane ICP correction for an
+initialized ESKF when the visual observation is rejected. It still requires
+`imu_assisted=true` and `short_term_compensation=true`. Accepted ICP
+corrections may stabilize coasting but **cannot** independently promote the
+state to `tracking`; mapping stays paused during coasting/recovering.
+Long visual outages, poorly constrained planes and bad IMU data still fail
+closed. No geometry-only automatic recovery is claimed.
+
+`info().registration` and optional `vendor.registration` on each odometry
+sample contain the selected frontend, native inliers/loss (only when a native
+OdomInfo matches that capture timestamp), capture-to-diagnostic delay (not
+algorithm-only execution time), and ESKF image/ICP diagnostics when available.
+Missing per-frame measurements are `null`. ICP fields distinguish attempted,
+accepted and rejected corrections. These are monitoring fields, not a new
+SLAM pose or calibration guarantee.
+
+### Automatic body-camera mount
+
+Tianyi, G1 and Bumi drivers can declare a `vendor.body_mount` sidecar in both
+RGB-D `camera_info` entries. The card discovers and subscribes to that topic
+automatically; no card matrix or additional canvas connection is needed. The
+driver queries the actual ROS TF tree at each image capture timestamp. Default
+body frames are Tianyi `base_link`, G1 `pelvis` and Bumi `base_link`; driver-side
+`CAMERA_BODY_FRAME` changes only the requested frame name. A calibrated TF path
+to the actual rectified optical frame must exist in the driver's TF domain.
+Camera SDK IMU calibration and visualization models do not supply this path.
+
+The `motus.camera_mount/1` JSON packet contains `T_body_camera` in metres:
+`p_body = R * p_camera + t`, exact `stamp_ns`, capture clock, source epoch and
+frame identities. Dynamic head/waist joints are queried per capture, never
+frozen at startup or replaced with latest TF. Only an exact nanosecond match
+can produce `vendor.body_pose`, using
+`T_world_body = T_world_camera * inverse(T_body_camera)`. Main `pose` and SLAM
+remain camera-referenced. Body covariance is null and accuracy is unverified,
+because the TF source supplies no extrinsic uncertainty.
+
+`info().body_mount` and `vendor.camera_mount` expose missing, stale or invalid
+TF. These conditions leave camera VO running and make `vendor.body_pose` null.
+A changed mount identity/epoch or invalid packet retires body evidence until
+the card is restarted; it does not reset the visual/IMU estimator. Hardware
+acceptance must verify the installed TF tree, domain, timestamps and calibration.
+
+Optional camera IMU assistance is selected per card with `imu_assisted=true`
+in its instance configuration (`config` action). Connect the source's third
+`sensor/imu` port as well as the two RGB-D ports. The third port remains the
+existing JSON `std_msgs/String` transport; `motus.imu/1` packets carry raw SI
+vectors, capture timestamps, shared RGB-D clock identity and actual factory/TF
+rotations into the camera axes. No Core metadata routing change is needed.
+`camera_info` declares only the two image inputs; the IMU schema, frames, units,
+clock and calibration are validated on every packet before it can contribute.
+Starting a session therefore does not certify an arbitrary third topic as a valid
+IMU source: assistance remains uninitialized until valid packets arrive. Requiring
+an IMU camera declaration would reject the existing driver contract.
+
+In the default attitude-only mode, the consumer initializes tilt from plausible gravity, integrates source-timed
+gyro rotations and corrects tilt while acceleration is plausible. Heading is
+relative, covariance/accuracy are not certified, and acceleration is never
+integrated into translation. It forwards private native `sensor_msgs/Imu` to
+RTAB-Map and waits for IMU coverage of each image. Stale/reset timestamps,
+changed source epochs/calibration and invalid geometry end the session segment;
+in this attitude-prior mode the native estimator itself consumes the IMU, so
+there is no automatic fallback to unassisted tracking after enabling IMU.
+`info().imu_assistance` and pose provenance distinguish the selected mode and
+its source/health. The pinned RTAB-Map core ignores orientation quaternions
+whose xyz components are exactly zero (including a valid identity quaternion).
+We preserve the true estimate instead of perturbing it to force acceptance;
+physical validation must check the actual mounting and native prior behavior. Unsupported camera motion or missing TF leaves the camera's
+RGB-D output available; use `imu_assisted=false` when no usable IMU exists.
+
+Actions are `start`, `stop`, `info` and `config`, with optional `instance_id`. Source
+startup must return its calibration before the downstream card starts. Tracking
+requires matching valid pose/diagnostic measurements. A single rejected
+estimate (native lost diagnostic, covariance above bounds, too few inliers,
+invalid quaternion) changes the state to `recovering`: pose output pauses, but
+the same native estimator keeps receiving frames. Tracking resumes in the same
+segment only after three consecutive valid estimates whose pose is continuous
+with the last published pose (within 5 cm + 1 m/s and 5° + 90°/s of elapsed
+time; an unvalidated engineering bound) and no later than 0.8 s after the
+last published capture. Rejected frames publish pose-less `recovering`
+samples declaring `vendor.pause` (`source=visual_gate`,
+`mapping_allowed=false`); `pointcloud_slam` honours that declaration exactly
+like an ESKF pause (same segment and clock, at most 1 s), so the resumed
+segment stays mappable. The 0.8 s producer bound leaves margin under that 1 s
+consumer limit for latency jitter. Degradation lasting 1 s, a resume after
+0.8 s, a discontinuous resume, a changed native frame or a future capture time
+ends the segment. Late or repeated camera captures are dropped and counted
+(`info().input_rejections`), never paired; persistent input loss still expires
+the segment. Stale or out-of-order native results are ignored, never counted
+as evidence. With fresh RGB and depth, a separate
+supervisor attempts a new estimator/segment after 0.8 s, at most once every 1.5 s.
+Each successful restart has a new segment, coordinate origin and IMU/fusion
+history; it must pass the normal tracking/warmup gates again. The old position
+is never carried across that boundary or republished as fresh tracking. Recovery
+does not claim a continuous map or corrected motion accuracy. `info().recovery`
+reports attempts, successful restarts, previous segment and errors. Manual stop
+and bundle shutdown cancel recovery. Automatic replacement does not emit idle;
+explicit stop still does. Input/settings changes continue to require stop/start.
+Watchdog pause messages reuse the latest admitted native capture timestamp;
+receipt time is never substituted for capture evidence during a pause.
+
+Before the segment has published its first pose, finite valid estimates with
+at least 10 inliers but translation covariance above 0.04 m² remain
+`initializing`. They reset the three-good-estimate count and publish no pose
+or mapping-pause declaration, while the same native estimator keeps its map.
+Fresh weak results prove only estimator liveness; stale results/input and
+invalid observations still expire. Once a pose has been published, the
+existing 0.8 s/1 s recovery boundaries apply unchanged. This avoids repeatedly
+resetting a new frontend solely because its quality has not settled; it does
+not establish motion accuracy or accept high-covariance poses.
+
+The pinned RTAB-Map PnP covariance is a registration residual statistic;
+its ROS wrapper doubles the diagonal for `Odometry.pose.covariance`. It is
+not a calibrated accumulated trajectory-error estimate. The 0.04 m² check
+remains an engineering admission bound, independent of the ESKF sigma limit.
+
+Perception initializes ROS with a process-private copy of the configured
+`FASTRTPS_DEFAULT_PROFILES_FILE`, setting explicit UDPv4 receive buffers to at
+least 1 MiB. This protects the shared input participant from fragmented RGB-D
+bursts; the copy remains alive through ROS shutdown and the environment is then
+restored. All three odometry modes also give each native child its own copy,
+removed with the session. Larger buffers, loopback whitelists and participant
+settings are retained; the public profile is never modified. Profiles without
+explicit UDPv4 transports are left unchanged, and malformed configured XML
+fails before ROS starts. The main-process change takes effect on the next
+application start; it does not reconfigure a running participant. It addresses
+kernel receive-buffer drops, not visual matching failures or native busy-frame
+drops; effective socket capacity still depends on host limits.
+
+For current Core's topic-only SLAM path, map provenance explicitly records
+unverified timestamp overlap. The stricter SLAM declaration path still requires
+independent timing/mount evidence. Validate real tracking and map save/reopen
+on each deployment; offline tests do not establish physical accuracy.
+
+### Optional short-term ESKF and depth assistance
+
+Set all three instance flags in the same `config` or `start` action:
+
+```json
+{"action":"config","instance_id":"card-one","imu_assisted":true,
+ "short_term_compensation":true,"depth_geometry":true}
+```
+
+Then start that instance with the two calibrated RGB-D topics, their
+`camera_info`, and the source's third `sensor/imu` topic. Stop before changing
+modes. Both new flags default to false. Geometry requires short-term
+compensation, which requires IMU assistance. No new Python/native packages or
+GPU inference runtime are added; depth registration is bounded NumPy ICP.
+
+In this mode the native visual estimator receives no IMU prior: the ESKF owns
+raw inertial information once. Its 15 error states cover position, velocity,
+attitude, gyro bias and accelerometer bias. Position is integrated at the
+accelerometer origin and transformed back to the camera origin using the
+actual installation offset. Packets must include finite calibrated
+`camera_from_gyro_translation`, `camera_from_accel_translation` (metres,
+sensor origins in camera coordinates), and `translation_source`. Older
+rotation-only sources continue to support attitude-only mode, but cannot
+start translational compensation. Tianyi obtains full capture-time TF;
+G1/Bumi obtain RealSense SDK factory extrinsics without another camera owner.
+Missing motion hardware/calibration is reported, never replaced by zero.
+
+Initialization waits for at least 0.5 s of visually observed near-stationary
+position **and orientation**, low angular speed and stable gravity magnitude.
+Keep the camera still for startup; failure to initialize within 15 s retires
+the segment and permits the supervised retry above. Initial velocity is estimated from visual motion rather than
+assumed zero. Visual observations use inlier counts, finite PSD covariance,
+image contrast/sharpness and valid measured-depth fraction. Independent
+capture clocks need bracketing IMU coverage, not identical sensor rates.
+Native pose/diagnostic results are joined at exact image capture times;
+results arriving after their 250 ms observation deadline are discarded.
+Accepted corrections at normal camera cadence (including 265–300 ms
+intervals) retain recovery evidence. Only a capture gap beyond the existing
+500 ms frame-silence bound, a missing/rejected correction, or excessive
+corrected uncertainty resets that evidence. Three good corrections are still
+required after degradation. A resumed fused pose cannot cross the 1 s mapping
+pause from the last published fused capture; that segment must restart.
+The 250 ms result-join deadline and 1 s no-visual-correction limit are unchanged.
+`info().native_join` reports session-local queued/completed/pending captures,
+deadline expirations, IMU-uncovered completions, and pose/info callbacks
+received, joined, after-deadline or unqueued. Absent counter keys mean zero;
+callback counts can include duplicates. Unqueued means the capture is no
+longer pending or was never queued here, not proof of a DDS/native drop.
+Fallback retains these counters and counts its cancelled pending captures.
+Frame rejection reasons distinguish missing pose, missing diagnostic, both
+missing, native lost, insufficient inliers and invalid pose/covariance.
+These counters do not prove native receipt: the pinned wrapper can drop
+inputs while busy, and best-effort delivery can also lose messages.
+
+Each frame is judged in a fixed order. Hard capture-time, frame and data
+errors end the segment first. The IMU prediction is then followed by an
+attempted visual correction (time, residual and innovation gates unchanged).
+Only after that is uncertainty judged: without an accepted correction, a
+predicted position sigma above 0.20 m ends the segment; after an accepted
+correction, a corrected sigma above 0.20 m pauses output (`recovering`) and
+ends the segment if it persists for 1 s. `position_sigma_m` is the square root
+of the largest camera-position covariance eigenvalue under the unvalidated
+engineering priors, not a measured error. Watchdog/`info` polls are wall-clock
+and include native latency, so they never judge covariance or reset recovery
+evidence; they only report `coasting` after 500 ms without any processed frame
+(250 ms join deadline plus a 4 Hz frame interval). `info().fusion.frames`
+holds the last 16 frames' capture/arrival/processing times, latency, predicted
+and corrected sigma, visual outcome and rejection reason; each odometry sample
+carries only `last_frame`.
+
+If the ESKF stops (stale/invalid IMU, uncertainty, initialization timeout),
+the independent native visual estimate — which never consumed IMU in this
+mode — continues as an explicit `visual_only` fallback (`vendor.fallback`,
+`vendor.fusion.status=lost`, tracking `reason` says so, `info().fallback`).
+This stays in the segment only when the fused/visual offset at the last
+published fused capture is within 2 cm / 2° (unvalidated engineering bound),
+or when no fused pose was ever published; otherwise the segment is retired
+for supervised new-segment recovery. Fallback poses obey the same
+three-estimate, continuity, pause-declaration and 1 s/0.8 s rules. The ESKF is not
+restarted inside that segment; a later new segment retries it. Predictions
+are never published as tracking and a stale IMU is never fused again.
+Camera frame/segment, capture-clock and capture-queue faults end the segment
+instead of entering visual-only fallback.
+
+If vision becomes unavailable, `vendor.motus_slam.status` changes to
+`coasting`, followed by `recovering` until three consistent visual
+observations pass innovation checks. During both states `pose` is null;
+`vendor.fusion.prediction` contains the optional camera pose and covariance,
+with its own `prediction_stamp_ns`, aid and quality diagnostics. Predictions
+are for inspection/recovery, not validated navigation feedback. SLAM pauses
+cloud admission and clears pending interpolation pairs; it resumes in the
+same segment only after bounded verified tracking recovery. True `lost`,
+coordinate changes and source resets still retire the segment.
+
+IMU-enabled sessions run their ROS node on an owned single-threaded executor
+in the existing node context, avoiding competing Python callbacks while
+estimator state is serialized. Session close stops its callback thread and
+executor without shutting down the shared ROS context. Image-only sessions
+retain the bundle executor. Native depth PNG messages use ROS byte arrays
+to avoid per-byte setter validation; encoding and capture headers are retained.
+These changes add no dependencies.
+
+IMU ingress uses a separate callback group and a bounded 100-packet FIFO so
+visual processing does not discard capture intervals. Filter updates remain
+serialized, processing one snapshot per pass. The 750 ms consumer freshness check runs
+when each packet is consumed;
+queue overflow retires the segment. Each accepted visual correction refreshes
+the correction timeout during recovery, while mapping still requires three
+consistent visual observations.
+This permits transport delay without replacing capture timestamps. The IMU
+inter-sample gap limit is 150 ms: deployed traces contained 100.096–110.106 ms
+intervals that retired the former 100 ms filter. ESKF propagation subdivides
+accepted gaps into steps no longer than 100 ms, using interpolation between
+actual samples and accumulating process uncertainty. Attitude-assisted image
+processing waits at most 150 ms for actual IMU coverage instead of immediately
+discarding an image that arrives first; its bounded image queue is unchanged.
+The 20 ms gyro/accel skew, future-clock and identity checks remain unchanged;
+driver-side freshness limits are independent. These are engineering tolerances,
+not a physical accuracy guarantee, and do not extend missing IMU coverage.
+
+The short-outage offline validation target is 0.5 s. A hard 1 s visual
+correction timeout ends the segment; rejection/geometry cannot extend it. The
+0.20 m modeled position limit applies as described above. This is raised from
+0.10 m to permit more short-term compensation; it accepts greater modeled
+uncertainty and does not establish improved position accuracy. Noise and
+covariance are conservative engineering priors, **not measured accuracy
+bounds**. Deep integration cannot compensate arbitrary-duration blindness.
+
+Depth assistance aligns current axial depth to the last visually trusted
+reference using the inertial pose as a local initial estimate. It requires
+six-axis geometric observability, adequate overlap, low residual and bounded
+motion; a flat wall, missing depth or stale reference is rejected. A bounded
+multi-start check also rejects competing geometric alignments; it cannot
+prove global uniqueness outside its tested local neighborhood. Geometry
+is used only when that frame lacks accepted visual tracking, avoiding
+same-frame duplicate corrections. Correlation-aware covariance intersection
+keeps repeated use of a shared depth reference conservative. Pose composition
+propagates rotational uncertainty into position uncertainty at the offset.
+Mapping remains paused throughout coasting.
+
+Registration runs on one per-session worker thread, never under the session
+lock, so IMU ingress, native result joins, the watchdog and stop are not held
+behind ICP (about 47 ms median per registration on an arm64 development host;
+Jetson timing has not been measured). At most one registration runs and one
+waits; a newer request replaces the waiting one. A result is applied only to
+the exact filter state it was computed for, before the next frame advances the
+filter; otherwise, after its 250 ms deadline, on failure, stop or restart it is
+discarded. A pending registration defers that frame's predicted-uncertainty
+judgement until its result, deadline or the next frame; the 1 s visual bound
+is unaffected. Registration errors skip assistance instead of ending the ESKF.
+If ICP is slower than the frame interval on the target, results will mostly
+be discarded — measure before relying on depth assistance.
+
+All three source adapters and the fusion/SLAM boundaries have offline tests.
+Synthetic trajectories and rendered rooms validate code signs, units and
+policy, not actual robot precision or native camera tracking. On 2026-11-12,
+an isolated Tianyi F2F optical-flow session with ESKF and depth assistance
+enabled ran for 600 seconds with active IMU, 59,920 consumed motion samples
+and zero native lost reports. Maximum IMU consumption age was 266 ms against
+the unchanged 500 ms limit. There were 5,075 tracking poses against 5,821
+native reports; intermittent coasting/recovering remained. No depth registration
+was attempted in this static scene, so this does not validate geometric
+recovery, motion accuracy or uninterrupted SLAM. The host camera timestamp
+patch and PR519 input adapter were required; the deployed business images
+were not replaced by this test. G1/Bumi hardware tests remain pending.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

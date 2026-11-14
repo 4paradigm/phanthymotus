@@ -257,6 +257,42 @@ plugins:
     # responses, so this does not guess between them.
     lens_barrel_max_fraction: 0.6
 
+  # Unified point cloud. One tool, three inputs:
+  #   A. depth map   (image/depth-z16 Image | image/depth-zlib CompressedImage)
+  #   B. mono RGB    (image/jpeg) — reuses visual_depth's TensorRT engine
+  #   C. stereo pair (image/jpeg × 2)   — SGBM + reprojectImageTo3D
+  # A/B allow approximate visual output (hfov defaults to 90°); metric output
+  # requires real intrinsics. C requires calibration from the upstream camera
+  # declarations or configuration. Engine load (B only) is lazy on first start.
+  pointcloud:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    fps: 2
+    # Rendering ceiling is 40000 per frame (pointcloud.js MAX_POINTS); keep the
+    # default well under it so the browser stays responsive.
+    max_points: 20000
+    min_depth_m: 0.1
+    max_depth_m: 10.0
+
+  # RTAB-Map mapping from native PointCloud2 and existing tracking odometry.
+  # Core main supplies connected ROS topics. Perception resolves sensor frame,
+  # odometry child frame and clock from the live messages when no explicit
+  # motus.slam_input/1 declaration is passed; it does not guess robot presets.
+  # Calibrated producer extrinsics may be used automatically. For an assumed or
+  # missing mount, enter child_from_cloud (rigid 4x4) in the card instance config.
+  # The following deployment settings are generic RTAB-Map/resource overrides.
+  rgbd_odometry:
+    enabled: true
+    # Pinned RTAB-Map F2M uses feature matching; optical flow requires F2F.
+    # Change visual_frontend only while the card instance is stopped.
+    visual_frontend: f2m_feature     # f2m_feature | f2f_optical_flow
+    max_features: 1000              # integer 100..5000
+    # Per-instance opt-in: imu_assisted + short_term_compensation + depth_geometry.
+    # Default remains visual-only; compensation requires calibrated IMU translations.
+
+  pointcloud_slam:
+    enabled: true
+
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities
   # from a skeleton-action model. No second inference runtime: a second ONNX
