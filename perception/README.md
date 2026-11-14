@@ -20,6 +20,15 @@ depth, driver intrinsics and capture-time declarations; estimated depth is not
 promoted to a metric measurement. Saved single-input `auto`/`depth` starts remain
 compatible, while saved `mono`/`stereo` starts require rewiring to a depth source.
 
+The canvas always exposes the display cloud, JSON summary and PointCloud2 ports,
+including before start and with `metric_cloud` disabled. Without a depth input,
+ports declare only their formats; connecting a valid depth input resolves their
+topic paths. The calculation-output switch controls PointCloud2 publishing:
+when disabled, no metric publisher is created, and no metric calibration or
+metadata is advertised.
+Enable it and restart the card to supply a downstream SLAM card with metric data;
+port order and topic paths remain stable when toggling the switch.
+
 ## Spatial SLAM Input Contract
 
 The generic `pointcloud_slam` card requires native

@@ -109,7 +109,7 @@ TOOLS = [
                 "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
                 "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
-                                 "description": "启用计算输出；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
+                                 "description": "启用计算输出（PointCloud2 输出口始终显示）；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
             },
         },
         "topic_in": [
@@ -119,7 +119,7 @@ TOOLS = [
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
             {"format": "data/json", "desc": "点数/范围/三区最近障碍摘要"},
-            {"format": "sensor/pointcloud2", "desc": "可选：带采集时间和物理坐标系的米制计算点云"},
+            {"format": "sensor/pointcloud2", "desc": "米制计算点云（启用计算输出后发布，带采集时间和物理坐标系）"},
         ],
     }
 ]
@@ -798,9 +798,10 @@ class PointCloudPerceptionPlugin:
             if instance_id:
                 nodes = {instance_id: nodes[instance_id]} if instance_id in nodes else {}
             if not nodes:
-                # Canvas info queries precede start. Keep unresolved ports visible,
-                # and derive paths only from this card's validated depth input.
-                topics_out = [{"format": "sensor/pointcloud"}, {"format": "data/json"}]
+                # Ports describe capabilities even when metric publishing is off.
+                # Before start, derive paths only from this card's validated input.
+                topics_out = [{"format": "sensor/pointcloud"}, {"format": "data/json"},
+                              {"format": "sensor/pointcloud2"}]
                 info = {"name": "PointCloudPerception", "manufacture": "Embodied",
                         "model": "depth", "state": "idle", "instances": {},
                         "topic_in": [], "topic_out": topics_out,
@@ -811,11 +812,6 @@ class PointCloudPerceptionPlugin:
                         input_topic = self._resolve_input(args)
                     except ValueError as error:
                         return {**info, "state": "error", "message": str(error)}
-                with self._nodes_lock:
-                    cfg = self._instance_configs.get(instance_id or input_topic or _DEFAULT_INSTANCE, {})
-                    metric = cfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
-                if metric:
-                    topics_out.append({"format": "sensor/pointcloud2"})
                 if input_topic:
                     paths = (*output_topics_for(input_topic), input_topic + "/pointcloud_metric")
                     for port, topic in zip(topics_out, paths):
@@ -841,24 +837,22 @@ class PointCloudPerceptionPlugin:
                 if all(t["topic"] != node._input_topic for t in topics_in):
                     topics_in.append({"topic": node._input_topic,
                                       "format": node._input_format or "image/depth-z16"})
-            # 每实例一对输出话题；多实例时不再用 output_topics_for(None)
+            # 每实例三个输出口；多实例时不再用 output_topics_for(None)
             # 的默认 /perception/... 话题把下游引向不存在的话题。
             if instance_id and instance_id in nodes:
                 node = nodes[instance_id]
                 topics_out = [
                     {"topic": node._cloud_topic, "format": "sensor/pointcloud"},
                     {"topic": node._summary_topic, "format": "data/json"},
+                    {"topic": node._metric_cloud_topic, "format": "sensor/pointcloud2"},
                 ]
-                if node._metric_cloud_enabled:
-                    topics_out.append({"topic": node._metric_cloud_topic, "format": "sensor/pointcloud2"})
             else:
                 seen: set[str] = set()
                 topics_out: list[dict[str, str]] = []
                 for node in nodes.values():
                     outputs = [(node._cloud_topic, "sensor/pointcloud"),
-                               (node._summary_topic, "data/json")]
-                    if node._metric_cloud_enabled:
-                        outputs.append((node._metric_cloud_topic, "sensor/pointcloud2"))
+                               (node._summary_topic, "data/json"),
+                               (node._metric_cloud_topic, "sensor/pointcloud2")]
                     for topic, fmt in outputs:
                         if topic and topic not in seen:
                             seen.add(topic)
