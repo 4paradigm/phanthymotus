@@ -179,3 +179,16 @@ def test_get_all_tools_prefixes_sub_tools_only(bundle_cls):
     assert names == {"face_recognition", "asr", "asr_start"}
     for name in names:
         assert bundle.owns(name), name
+
+
+def test_depth_and_slam_cards_load_without_rgbd(bundle_cls):
+    bundle = bundle_cls({'plugins': {
+        'audio_mixer': {'enabled': False},
+        'echo_cancellation': {'enabled': False},
+        'pointcloud': {'enabled': True, 'namespace': 'test'},
+        'pointcloud_slam': {'enabled': True},
+    }}, None)
+    assert {tool['name'] for tool in bundle.get_all_tools()} == {'pointcloud', 'pointcloud_slam'}
+    assert bundle.owns('rgbd_odometry') is False
+    assert bundle.dispatch('pointcloud', {'action': 'info'}) is not None
+    assert bundle.dispatch('pointcloud_slam', {'action': 'info'}) is not None

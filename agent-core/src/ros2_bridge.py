@@ -208,6 +208,12 @@ def publish(topic: str, data: str) -> None:
 
 def _resolve_msg_type(fmt: str):
     """根据 data format 返回对应的 ROS2 消息类型，未知返回 None。"""
+    if fmt == 'sensor/pointcloud2':
+        # Unlike sensor/pointcloud (UInt8MultiArray), this is a native ROS
+        # sensor_msgs/PointCloud2 consumed directly by Perception. The Core
+        # inspection bridge cannot serialize it as a WebSocket preview, so
+        # NEVER silently fall through to the generic sensor/* String handler.
+        return None
     if fmt.startswith('audio/'):
         try:
             from audio_msgs.msg import AudioChunk

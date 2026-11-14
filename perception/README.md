@@ -8,6 +8,66 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## Depth-only pointcloud card
+
+`pointcloud` takes exactly one `image/depth-z16` (millimetre Image) or
+`image/depth-zlib` (CompressedImage) input. It backprojects depth into the
+existing display cloud/summary and optional metric PointCloud2 outputs.
+It no longer loads a mono depth model or performs stereo matching; RGB inputs
+and multiple connected depth streams are rejected. To display estimated depth,
+connect the separate `visual_depth` output. Metric output still requires measured
+depth, driver intrinsics and capture-time declarations; estimated depth is not
+promoted to a metric measurement. Saved single-input `auto`/`depth` starts remain
+compatible, while saved `mono`/`stereo` starts require rewiring to a depth source.
+
+## Spatial SLAM Input Contract
+
+The generic `pointcloud_slam` card requires native
+`sensor_msgs/msg/PointCloud2` and tracking `motus.odom/1` with the
+`motus_slam/1` pose profile. The canonical
+[driver-author protocol](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)
+specifies timing, frame, mounting, `motus.slam_input/1` declarations and
+`motus.slam_frame/1` per-frame provenance. This repository keeps a
+pure-Python runtime copy in `plugins/pointcloud_slam_contract.py` and
+consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
+The implementation must not infer calibrated mounting or verified
+cross-sensor clocks from a robot model or nearby timestamps.
+
+## Native Jetson packaging and historical size measurements
+
+Point-cloud SLAM requires the pinned RTAB-Map executables,
+linked against each image's existing ROS, OpenCV/PCL and Python ABI (JP5.11:
+Python 3.8; JP6.1: Python 3.10). The Dockerfile therefore builds native sources;
+this is an intentional deployment dependency, not a Python fallback. ROS source
+archives have pinned SHA-256 checks before extraction. Updating a source commit
+also requires reviewing and updating its archive hash. These hashes detect changed
+bytes; they are not upstream signatures. The core uses Git's pinned object graph.
+
+Registry manifest/config measurements on 2026-11-14 for the images built from
+PR371 commit 73627d1 (including its separate RGB-D card) show the following compressed layer bytes. “Before/after native” sums
+layers immediately before/after the RTAB-Map dependency/source/build block in
+the same image; it is not a comparison with a separately rebuilt main image.
+
+| Image tag | Before native | After native | Native block added | Whole image |
+|---|---:|---:|---:|---:|
+| release.261113.def9614-jetson-jp5.11 | 6,744,706,780 | 6,794,902,526 | 50,195,746 | 6,796,695,094 |
+| release.261113.a87c881-jetson-jp6.1 | 8,105,238,860 | 8,127,018,472 | 21,779,612 | 8,128,988,407 |
+
+The dependency-install layers add 1,095,185 and 1,248,405 compressed bytes
+respectively: most listed development dependencies already exist in the earlier
+image layers. Installed libraries/headers and native overlays remain in the final
+image; deleting them in a later layer would not reclaim their download size.
+Source/build layers also remain in image history despite later workspace cleanup.
+The build already disables unused GUI, camera SDK and optimization backends.
+
+A multi-stage build could omit additional source/build intermediates, but copying
+only executables is insufficient: the ROS overlay, Python bindings, shared
+libraries and their ABI-matched runtime dependencies must remain. Removing tools
+inherited from the common base requires a separate base/runtime split. This PR
+retains the existing cached build layout with the measured growth above; it does
+not claim zero image growth or a measured cold-build time. These manifest sizes
+are compressed transfer sizes, not unpacked disk usage or newly rebuilt images.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
