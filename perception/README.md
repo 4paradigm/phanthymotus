@@ -396,9 +396,16 @@ when each packet is consumed;
 queue overflow retires the segment. Each accepted visual correction refreshes
 the correction timeout during recovery, while mapping still requires three
 consistent visual observations.
-This permits transport delay without replacing capture timestamps. The 100 ms
-inter-sample gap, 20 ms gyro/accel skew, future-clock and identity checks remain
-unchanged; driver-side freshness limits are independent.
+This permits transport delay without replacing capture timestamps. The IMU
+inter-sample gap limit is 150 ms: deployed traces contained 100.096–110.106 ms
+intervals that retired the former 100 ms filter. ESKF propagation subdivides
+accepted gaps into steps no longer than 100 ms, using interpolation between
+actual samples and accumulating process uncertainty. Attitude-assisted image
+processing waits at most 150 ms for actual IMU coverage instead of immediately
+discarding an image that arrives first; its bounded image queue is unchanged.
+The 20 ms gyro/accel skew, future-clock and identity checks remain unchanged;
+driver-side freshness limits are independent. These are engineering tolerances,
+not a physical accuracy guarantee, and do not extend missing IMU coverage.
 
 The short-outage offline validation target is 0.5 s. A hard 1 s visual
 correction timeout ends the segment; rejection/geometry cannot extend it. The

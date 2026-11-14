@@ -271,7 +271,8 @@ def test_native_registration_diagnostics_are_capture_stamped_and_bounded(monkeyp
     assert len(session.registration_by_stamp) <= 32
 
 
-def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monkeypatch):
+@pytest.mark.parametrize('imu_arrives_late', [False, True])
+def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monkeypatch, imu_arrives_late):
     from array import array
     from copy import deepcopy
     import sys, threading, queue, zlib
@@ -316,9 +317,22 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     published = []
     def publish(msg): published.append(msg); obj.stop_event.set()
     obj.rgbd = NS(publish=publish)
+    if imu_arrives_late:
+        from test_rgbd_imu import aid, packet
+        obj.imu = aid()
+        obj.imu.observe(packet(990_000_000), 991_000_000)
+        elapsed = [0.]
+        monkeypatch.setattr(runtime.time, 'monotonic', lambda: elapsed[0])
+        def wait(seconds): elapsed[0] += seconds
+        monkeypatch.setattr(obj.stop_event, 'wait', wait)
+        def drain():
+            if elapsed[0] >= .04 and obj.imu.last_stamp == 990_000_000:
+                obj.imu.observe(packet(1_010_000_000), 1_011_000_000)
+        obj._drain_imu = drain
     obj._work()
     assert obj.gate.state != 'lost', obj.gate.reason
     assert len(published) == obj.counts['pairs'] == 1
+    assert obj.counts['dropped_pairs'] == 0
     out = published[0]
     assert out.header == header and out.depth_compressed.header == header
     assert out.rgb_compressed.data == color_msg.data

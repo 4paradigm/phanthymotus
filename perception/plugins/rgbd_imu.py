@@ -6,6 +6,7 @@ import numpy as np
 
 
 MAX_CAPTURE_AGE_NS = 750_000_000
+MAX_CAPTURE_GAP_NS = 150_000_000
 
 
 def _rotation(value):
@@ -86,7 +87,7 @@ class ImuAttitude:
                     stamp <= self.last_stamp or accel_stamp <= 0 or accel_stamp < self.last_accel or
                     abs(stamp - accel_stamp) > 20_000_000 or
                     any(not -50_000_000 <= now_ns - t <= MAX_CAPTURE_AGE_NS for t in (stamp, accel_stamp)) or
-                    (self.last_stamp and stamp - self.last_stamp > 100_000_000)):
+                    (self.last_stamp and stamp - self.last_stamp > MAX_CAPTURE_GAP_NS)):
                 raise ValueError('IMU capture is stale, repeated, reset or unsynchronized')
             angular = rotations[0] @ _vector(packet.get('angular_velocity'))
             acceleration = rotations[1] @ _vector(packet.get('linear_acceleration'))

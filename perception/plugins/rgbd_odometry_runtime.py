@@ -543,6 +543,23 @@ class RgbdSession:
             self.gate.fault('IMU assistance: ' + str(self.imu.reason), 'imu')
         return covered
 
+    def _wait_for_imu(self, stamp):
+        # Images and IMU travel independently. Allow bounded arrival skew,
+        # releasing the estimator lock while waiting for actual IMU coverage.
+        deadline = time.monotonic() + .15
+        while not self.stop_event.is_set():
+            with self.lock:
+                self._drain_imu()
+                if self.fusion is not None or self._imu_frame_ready(stamp, time.time_ns()):
+                    return True
+                if self.gate.state == 'lost':
+                    return False
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                return False
+            self.stop_event.wait(min(.005, remaining))
+        return False
+
     def _work(self):
         from sensor_msgs.msg import CompressedImage, CameraInfo
         from rtabmap_msgs.msg import RGBDImage
@@ -554,11 +571,10 @@ class RgbdSession:
                 continue
             try:
                 (_, color), (_, depth) = pair
-                with self.lock:
-                    self._drain_imu()
-                    if self.fusion is None and not self._imu_frame_ready(stamp_ns(depth), time.time_ns()):
+                if not self._wait_for_imu(stamp_ns(depth)):
+                    with self.lock:
                         self.counts['dropped_pairs'] += 1
-                        continue
+                    continue
                 image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
                 decoder = zlib.decompressobj()
                 raw = decoder.decompress(bytes(depth.data), 640 * 480 * 2 + 1)

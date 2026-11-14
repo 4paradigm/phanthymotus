@@ -313,10 +313,15 @@ class ShortTermFusion:
             start, end = max(self.filter.stamp, left[0]), min(stamp, right[0])
             if end <= start:
                 continue
-            fraction = ((start+end)/2.-left[0])/(right[0]-left[0])
-            gyro = left[1]*(1-fraction)+right[1]*fraction
-            accel = left[2]*(1-fraction)+right[2]*fraction
-            self.filter.propagate((end-start)/1e9, gyro, accel)
+            # Accepted capture gaps can exceed the integrator's 100 ms step.
+            # Interpolate only between real samples; never extend coverage.
+            while start < end:
+                step_end = min(end, start+100_000_000)
+                fraction = (start-left[0]+(step_end-start)/2.)/(right[0]-left[0])
+                gyro = left[1]*(1-fraction)+right[1]*fraction
+                accel = left[2]*(1-fraction)+right[2]*fraction
+                self.filter.propagate((step_end-start)/1e9, gyro, accel)
+                start = step_end
             if self.filter.stamp == stamp:
                 break
         if self.filter.stamp != stamp:

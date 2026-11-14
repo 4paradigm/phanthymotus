@@ -64,7 +64,7 @@ def test_source_restart_or_changed_extrinsic_cannot_reuse_filter_segment(change)
 
 def test_stale_gap_repeated_stamp_and_expired_source_are_latched():
     for stamp,now in [(1_000_000_000,1_010_000_000),
-                      (1_110_000_000,1_120_000_000),
+                      (1_150_000_001,1_160_000_001),
                       (1_700_000_000,1_710_000_000)]:
         a=aid();a.observe(packet(),1_001_000_000)
         with pytest.raises(ValueError):a.observe(packet(stamp),now)
