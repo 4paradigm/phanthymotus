@@ -15,27 +15,15 @@ QQ_GLOBAL_MEMORY_TOOLS = frozenset({'update_memory', 'search_history', 'memory_r
 
 
 def _qq_safe(name: str, *, role: str = '', user_id: str = '') -> bool:
-    """Allow a deliberately provisioned QQ C2C owner full tool access.
+    """Keep QQ V1 limited to a passive reply and turn termination.
 
-    A QQ group/Guild identity is different from a C2C principal and is never
-    eligible for this override. Ordinary QQ users remain reply-only even if
-    an operator mistakenly expands their role or tool filter.
+    The Dashboard owner pairing identifies the principal for administration,
+    but it is not a remote capability grant.  Persisted roles, tool filters and
+    legacy ``qq_c2c_owner_grant`` state must never turn a QQ message into a
+    shell, memory, actuator or arbitrary MCP execution channel.
     """
-    # Ordinary QQ users cannot read the global Agent memory. A verified
-    # Owner remains an administrator and retains explicitly granted tools.
-    if name in QQ_GLOBAL_MEMORY_TOOLS and role != 'owner':
+    if name not in ('finish', 'mcp__channel__channel_reply'):
         return False
-    if name in QQ_MEMORY_TOOLS and _qq_owner_dm_identity(user_id):
-        return True
-    if role == 'owner' and _qq_owner_dm_identity(user_id):
-        # A DB owner role alone must NEVER grant remote shell/device access.
-        # A separate, locally provisioned exact-principal grant is required.
-        import config
-        grant = config.main.get('qq_c2c_owner_grant', {})
-        if (isinstance(grant, dict)
-                and grant.get('enabled') is True
-                and grant.get('principal') == user_id):
-            return True
     parts = user_id.split(':') if isinstance(user_id, str) else []
     if len(parts) == 5 and parts[0] == 'official' and parts[2] == 'group':
         from channel.qq_groups import get_group
@@ -45,17 +33,8 @@ def _qq_safe(name: str, *, role: str = '', user_id: str = '') -> bool:
                    and (ch.get('config') or {}).get('app_id') == parts[1]]
         if len(matches) != 1:
             return False
-        policy = get_group(matches[0]['id'], parts[3])
-        if policy.get('status') != 'approved':
-            return False
-        if name in QQ_MEMORY_TOOLS:
-            return True
-        # Fixed group ceiling: even legacy "daily" policies or stale operator
-        # roles must never grant tools beyond conversation and scoped memory.
-        return name in ('finish', 'mcp__channel__channel_reply')
-    # Private QQ users are chat-only even when legacy ACL roles say operator.
-    # Verified owner C2C full access is checked above using the exact grant.
-    return name in ('finish', 'mcp__channel__channel_reply')
+        return get_group(matches[0]['id'], parts[3]).get('status') == 'approved'
+    return True
 
 
 def _qq_owner_dm_identity(user_id: str) -> bool:

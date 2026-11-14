@@ -51,7 +51,6 @@ class QQBarrierAndMemoryAsyncTests(unittest.IsolatedAsyncioTestCase):
         import config
         owner="official:1900000000:OWNEREXAMPLE123456789"
         principals=[("qq",owner)]
-        grant={"qq_c2c_owner_grant":{"enabled":True,"principal":owner}}
         state={"role":"owner","tool_filter":"*"}
         ready,release=asyncio.Event(),asyncio.Event()
 
@@ -59,11 +58,11 @@ class QQBarrierAndMemoryAsyncTests(unittest.IsolatedAsyncioTestCase):
             ready.set()
             await release.wait()
 
-        with (mock.patch("config.main",grant),
+        with (mock.patch("config.main",{}),
               mock.patch.object(tool_policy.acl,"get_user",
                                 side_effect=lambda *_:dict(state))):
             self.assertTrue(await tool_policy.async_allowed_for_principals(
-                principals,"mcp__robot__loco"))
+                principals,"mcp__channel__channel_reply"))
             wait=asyncio.create_task(simulated_acp_wait())
             await ready.wait()
             self.assertFalse(wait.done())
@@ -71,7 +70,7 @@ class QQBarrierAndMemoryAsyncTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await wait
             self.assertFalse(await tool_policy.async_allowed_for_principals(
-                principals,"mcp__robot__loco"))
+                principals,"mcp__channel__channel_reply"))
         # Verify the dispatch actually rechecks after waiting, not just before.
         source=(Path(__file__).resolve().parents[1]/"src"/"event"/"llm.py").read_text(encoding="utf-8")
         start=source.index("if _bar_needed:",source.index("# ACP barrier: 只等与本次调用资源冲突"))

@@ -60,7 +60,7 @@ class QQOwnerProvisioningTests(unittest.TestCase):
                 update_owner()
             upsert.assert_not_called()
 
-    def test_grant_without_matching_acl_owner_does_not_allow_shell(self):
+    def test_verified_owner_remains_reply_only(self):
         cfg = config_data()
         cfg["qq_c2c_owner_grant"] = {"enabled": True, "principal": UID}
         with (mock.patch("config.main", cfg),
@@ -70,7 +70,10 @@ class QQOwnerProvisioningTests(unittest.TestCase):
         with (mock.patch("config.main", cfg),
               mock.patch("channel.acl.get_user", return_value={
                   "role": "owner", "tool_filter": "*" })):
-            self.assertTrue(allowed_for_principals([("qq", UID)], "Bash"))
+            self.assertFalse(allowed_for_principals([("qq", UID)], "Bash"))
+            self.assertFalse(allowed_for_principals([("qq", UID)], "mcp__robot__loco"))
+            self.assertTrue(allowed_for_principals(
+                [("qq", UID)], "mcp__channel__channel_reply"))
             self.assertFalse(allowed_for_principals([("qq", OTHER)], "Bash"))
 
 

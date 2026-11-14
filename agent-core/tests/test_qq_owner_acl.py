@@ -33,9 +33,12 @@ class QQOwnerACLTests(unittest.TestCase):
                 self.assertFalse(self.check(_OWNER, "owner", "Bash", grant=grant))
                 self.assertTrue(self.check(_OWNER, "owner", "mcp__channel__channel_reply", grant=grant))
 
-    def test_owner_c2c_can_call_all_tools(self):
+    def test_owner_c2c_is_reply_only(self):
         self.assertTrue(_qq_owner_dm_identity(_OWNER))
-        for tool in _TOOLS:
+        for tool in _TOOLS[:5]:
+            with self.subTest(tool=tool):
+                self.assertFalse(self.check(_OWNER, "owner", tool))
+        for tool in _TOOLS[5:]:
             with self.subTest(tool=tool):
                 self.assertTrue(self.check(_OWNER, "owner", tool))
 
@@ -69,7 +72,7 @@ class QQOwnerACLTests(unittest.TestCase):
 
     def test_explicit_tool_filter_still_applies(self):
         self.assertFalse(self.check(_OWNER, "owner", "Bash", "Read"))
-        self.assertTrue(self.check(_OWNER, "owner", "Read", "Read"))
+        self.assertFalse(self.check(_OWNER, "owner", "Read", "Read"))
 
     def test_blocked_owner_and_missing_user_fail_closed(self):
         self.assertFalse(self.check(_OWNER, "blocked", "Read"))

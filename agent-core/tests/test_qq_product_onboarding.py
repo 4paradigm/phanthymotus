@@ -106,12 +106,13 @@ def test_verified_owner_full_access_restored_without_escalating_other_users():
           mock.patch('channel.acl.get_user', return_value=old),
           mock.patch('channel.acl.upsert_user') as update):
         result = qq_onboarding.restore_owner_full_access(CHANNEL)
-        assert result['status'] == 'full_access'
+        assert result['status'] == 'reply_only'
         assert update.call_args.kwargs['role'] == 'owner'
         assert update.call_args.kwargs['tool_filter'] == permissions.OWNER_FILTER
-        assert _qq_safe('Bash', role='owner', user_id=PERSON)
-        assert _matches_filter(permissions.OWNER_FILTER, 'Bash')
-        assert _matches_filter(permissions.OWNER_FILTER, 'mcp__robot__loco')
+        assert not _qq_safe('Bash', role='owner', user_id=PERSON)
+        assert not _qq_safe('mcp__robot__loco', role='owner', user_id=PERSON)
+        assert _qq_safe('mcp__channel__channel_reply', role='owner', user_id=PERSON)
+        assert _qq_safe('finish', role='owner', user_id=PERSON)
         assert not _qq_safe('Bash', role='operator', user_id=PERSON)
         assert not _qq_safe('Bash', role='owner',
                             user_id='official:' + APP + ':OTHER_PERSON_12345')
@@ -171,6 +172,10 @@ def test_default_canvas_is_idempotent_and_does_not_overwrite_existing():
         assert second['status'] == 'existing'
         assert len(state['canvas_layout']['cards']) == 3
         assert len(state['canvas_layout']['connections']) == 1
+        assert len(state['canvas_layout']['execConnections']) == 1
+        executor = state['canvas_layout']['execConnections'][0]
+        assert executor['fromCardId'].endswith('-core')
+        assert executor['toToolName'] == 'channel_reply'
         keys = [k for k in state if k.startswith('tool_config:channel:')]
         assert len(keys) == 2
         assert all(state[k]['channel_id'] == CHANNEL for k in keys)
@@ -179,6 +184,28 @@ def test_default_canvas_is_idempotent_and_does_not_overwrite_existing():
         result = ensure_default_flow(CHANNEL)
         assert result['status'] == 'manual_required'
         assert state['canvas_layout']['cards'][0]['id'] == 'custom'
+
+
+def test_default_canvas_exposes_channel_reply_to_decision_core(monkeypatch):
+    import mcp_client
+    from event.llm import Event
+
+    state = {}
+    schema = {
+        'name': 'mcp__channel__channel_reply',
+        'description': 'send a passive channel reply',
+        'parameters': {'type': 'object', 'properties': {}},
+    }
+    with (mock.patch('config.main', state),
+          mock.patch('channel.manager.get_channel_config', return_value=CONFIG)):
+        ensure_default_flow(CHANNEL)
+        monkeypatch.setitem(mcp_client.registry, 'channel', {
+            'online': True,
+            'schemas': {'mcp__channel__channel_reply': schema},
+            'tool_meta': {},
+        })
+        names = {item['name'] for item in Event()._get_bound_tool_schemas()}
+    assert 'mcp__channel__channel_reply' in names
 
 
 def test_admin_preset_does_not_override_existing_binding():

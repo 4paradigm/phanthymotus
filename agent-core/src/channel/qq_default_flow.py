@@ -42,7 +42,16 @@ def ensure_default_flow(channel_id: str) -> dict:
              'toCardId': controller, 'toPortIdx': '0', 'format': 'data/json',
              'fromTopic': topic},
         ],
-        'execConnections': [],
+        # The decision core must be wired to the reply executor as well as to
+        # the inbound topic.  Without this edge the card is active in the
+        # ChannelManager but its tool schema is never exposed to the LLM.
+        'execConnections': [{
+            'id': f'qq-{stem}-exec-reply',
+            'fromCardId': controller,
+            'toCardId': outbound,
+            'toMcpId': 'channel',
+            'toToolName': 'channel_reply',
+        }],
     }
     config.main[f'tool_config:channel:channel_request:{inbound}'] = {'channel_id': channel_id}
     config.main[f'tool_config:channel:channel_reply:{outbound}'] = {'channel_id': channel_id}

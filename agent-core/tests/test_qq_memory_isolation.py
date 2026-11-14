@@ -155,9 +155,9 @@ def test_qq_tools_cannot_call_global_memory_even_as_owner(scope_store, monkeypat
     scope_store["qq_c2c_owner_grant"] = {"enabled": True, "principal": owner_uid}
     monkeypatch.setattr(acl, "get_user", lambda platform, principal:
                         {"role": "owner", "tool_filter": "*"} if principal == owner_uid else None)
-    assert allowed_for_principals([("qq", owner_uid)], "channel_memory_remember")
+    assert not allowed_for_principals([("qq", owner_uid)], "channel_memory_remember")
     for admin_tool in ("update_memory", "search_history", "memory_recall", "raw_input_info"):
-        assert allowed_for_principals([("qq", owner_uid)], admin_tool), admin_tool
+        assert not allowed_for_principals([("qq", owner_uid)], admin_tool), admin_tool
     assert not _qq_safe("channel_memory_remember", role="viewer", user_id="invalid")
 
 
@@ -173,9 +173,9 @@ def test_viewer_and_verified_group_can_use_only_scoped_memory(scope_store, monke
     monkeypatch.setattr(channel_manager_module, "_get_channel_configs",
                         lambda: [{"id": CHAN, "platform": "qq",
                                   "config": {"app_id": APP}}])
-    assert allowed_for_principals([("qq", user)], "channel_memory_read")
-    assert allowed_for_principals([("qq", user)], "channel_memory_remember")
-    assert allowed_for_principals([("qq", group_user)], "channel_memory_forget")
+    assert not allowed_for_principals([("qq", user)], "channel_memory_read")
+    assert not allowed_for_principals([("qq", user)], "channel_memory_remember")
+    assert not allowed_for_principals([("qq", group_user)], "channel_memory_forget")
     assert not allowed_for_principals([("qq", user)], "update_memory")
     assert not allowed_for_principals([("qq", user)], "Bash")
 
