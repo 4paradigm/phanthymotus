@@ -138,10 +138,47 @@ export const CameraRenderer = {
     this._lastFpsTime = performance.now();
   },
 
-  onData(buffer, hint) {
+  onData(buffer, hint, onFrame) {
     if (!this._img) return;
     const blob = new Blob([buffer], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
+    // Monitor opts into successful-frame notification. Decode into the next
+    // display element once; only swap it in on load, retaining the last good
+    // frame when a corrupt JPEG arrives. Other consumers keep their old path.
+    if (onFrame) {
+      this._cancelPendingFrame?.();
+      const next = this._img.cloneNode(false);
+      next.removeAttribute('src');
+      const cancel = () => {
+        next.onload = next.onerror = null;
+        next.removeAttribute('src');
+        URL.revokeObjectURL(url);
+        if (this._cancelPendingFrame === cancel) this._cancelPendingFrame = null;
+      };
+      this._cancelPendingFrame = cancel;
+      next.onerror = cancel;
+      next.onload = () => {
+        if (!this._img || this._cancelPendingFrame !== cancel || onFrame() === false) {
+          cancel(); return;
+        }
+        next.onload = next.onerror = null;
+        this._cancelPendingFrame = null;
+        const old = this._img;
+        old.replaceWith(next);
+        this._img = next;
+        this._frameCount++;
+        const now = performance.now();
+        if (now - this._lastFpsTime >= 1000) {
+          this._fps = this._frameCount;
+          this._frameCount = 0;
+          this._lastFpsTime = now;
+          if (this._label) this._label.textContent = `${this._fps} fps`;
+        }
+        if (old.src.startsWith('blob:')) URL.revokeObjectURL(old.src);
+      };
+      next.src = url;
+      return;
+    }
     const old = this._img.src;
     this._img.src = url;
     if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
@@ -158,6 +195,7 @@ export const CameraRenderer = {
   },
 
   unmount() {
+    this._cancelPendingFrame?.();
     if (this._img?.src?.startsWith('blob:')) URL.revokeObjectURL(this._img.src);
     this._el?.remove();
     this._el = null;

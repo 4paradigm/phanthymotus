@@ -40,6 +40,7 @@ const EDGE_SPEED = 14;  // px per frame of auto-scroll
 let _topicMcpMap = {};  // topic → mcpId, populated on fetch
 
 let _grid = null;
+let _activation = 0;
 let _cards = new Map(); // topicPath → { el, renderer, ws, format, mode, col, row, colSpan, rowSpan }
 let _totalCols = MAX_COLS;
 
@@ -50,6 +51,7 @@ function _getResponsiveCols() {
 }
 
 export function activate() {
+  deactivate();
   _grid = document.getElementById('monitor-dashboard-grid');
   _grid.innerHTML = '';
   _cards.clear();
@@ -60,7 +62,11 @@ export function activate() {
 }
 
 export function deactivate() {
+  _activation++;
   for (const card of _cards.values()) {
+    clearTimeout(card.staleTimer);
+    clearTimeout(card.retryTimer);
+    card.generation = (card.generation || 0) + 1;
     card.ws?.close();
     card.renderer?.unmount?.();
   }
@@ -164,6 +170,7 @@ function _pointerCell(e) {
 }
 
 async function _fetchAndBuild() {
+  const activation = _activation;
   let mcps = [];
   let topicDetails = {};
   let layout = {};
@@ -194,6 +201,7 @@ async function _fetchAndBuild() {
     return !!(typeof tool === 'object' && tool.multiInstance);
   };
   await resolveDerivedTopics(canvasCards, connections, { isDerived });
+  if (activation !== _activation) return;
   // A connection's fromTopic is read below as a topic to subscribe to, and it is
   // just as stale as the card topic it was copied from — sync it before use.
   syncConnectionTopics(canvasCards, connections);
@@ -345,6 +353,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
         <span class="monitor-card-topic">${_esc(shortName)}</span>
         <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
       </div>
+      ${format === 'image/jpeg' ? '<span class="monitor-video-stale" role="status" hidden>10 秒未收到新画面</span>' : ''}
       ${modeHtml}
       <span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>
     </div>
@@ -405,13 +414,13 @@ function _connectWs(topicPath, format, renderer) {
   function create() {
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
-    ws.onmessage = _wsHandler(topicPath, () => _cards.get(topicPath)?.renderer || renderer, format);
+    ws.onmessage = _wsHandler(topicPath, () => _cards.get(topicPath)?.renderer || renderer, format, ws);
     ws.onerror = () => {};
     ws.onclose = () => {
       // Auto-reconnect after 5s if card still exists
       const card = _cards.get(topicPath);
       if (card && card.ws === ws) {
-        setTimeout(() => {
+        card.retryTimer = setTimeout(() => {
           const c = _cards.get(topicPath);
           if (c && c.ws === ws) {
             c.ws = create();
@@ -453,8 +462,32 @@ function _handleWsMessage(ev, renderer, format) {
  * and so stopped tracking whether the card had ever received anything.
  * `getRenderer` is resolved per frame because a mode switch replaces it.
  */
-function _wsHandler(topicPath, getRenderer, format) {
-  return (ev) => {
+function _wsHandler(topicPath, getRenderer, format, socket) {
+  return async (ev) => {
+    const owner = _cards.get(topicPath);
+    if (!owner || owner.ws !== socket) return;
+    if (format === 'image/jpeg') {
+      // Only bus JPEG previews have observable frames here. video/* URL streams
+      // and depth renderers do not share this protocol.
+      if (!(ev.data instanceof ArrayBuffer) || !ev.data.byteLength) return;
+      const generation = owner.generation || 0;
+      const sequence = owner.sequence = (owner.sequence || 0) + 1;
+      getRenderer().onData(ev.data, format, () => {
+        if (_cards.get(topicPath) !== owner || owner.ws !== socket
+            || (owner.generation || 0) !== generation || sequence < (owner.delivered || 0)) return false;
+        owner.delivered = sequence;
+        owner.gotData = true;
+        owner.el.classList.add('has-data');
+        const status = owner.el.querySelector('.monitor-video-stale');
+        status.hidden = true;
+        clearTimeout(owner.staleTimer);
+        owner.staleTimer = setTimeout(() => {
+          if (_cards.get(topicPath) === owner && (owner.generation || 0) === generation) status.hidden = false;
+        }, 10000);
+        return true;
+      });
+      return;
+    }
     if (!_handleWsMessage(ev, getRenderer(), format)) return;
     const card = _cards.get(topicPath);
     if (card && !card.gotData) {
@@ -467,6 +500,10 @@ function _wsHandler(topicPath, getRenderer, format) {
 function _refreshRenderer(topicPath) {
   const card = _cards.get(topicPath);
   if (!card) return;
+  clearTimeout(card.staleTimer);
+  card.generation = (card.generation || 0) + 1;
+  const stale = card.el.querySelector('.monitor-video-stale');
+  if (stale) { stale.hidden = true; card.gotData = false; card.el.classList.remove('has-data'); }
   const body = card.el.querySelector('.monitor-card-body');
   card.renderer?.unmount?.();
   body.innerHTML = '';
@@ -476,7 +513,7 @@ function _refreshRenderer(topicPath) {
   // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
   // not resolved yet, and a mode switch on such a card must not throw.
   if (card.ws) {
-    card.ws.onmessage = _wsHandler(topicPath, () => _cards.get(topicPath)?.renderer, card.format);
+    card.ws.onmessage = _wsHandler(topicPath, () => _cards.get(topicPath)?.renderer, card.format, card.ws);
   }
 }
 
