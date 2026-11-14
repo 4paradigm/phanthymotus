@@ -7,7 +7,8 @@ consumer's responsibility. This parser does not turn lost samples into poses.
 from dataclasses import dataclass
 import math
 
-from .pointcloud_slam_contract import validate_tracking_pose
+from .spatial_contract import validate_tracking_pose
+from .spatial_time import FrameContext
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class PoseSample:
     covariance: tuple
     clock_id: str = None
     pose_reference: str = None
+    observation: FrameContext = None
 
 
 def _vector(value, length):
@@ -71,7 +73,7 @@ def decode_slam_odom(sample):
     quality = vendor.get("motus_slam") if isinstance(vendor, dict) else None
     if not isinstance(pose, dict) or not isinstance(quality, dict):
         raise ValueError("pose and SLAM metadata are required")
-    if quality.get("status") != "tracking" or quality.get("stamp_source") != "measurement":
+    if quality.get("status") != "tracking" or quality.get("stamp_source") not in ("measurement", "receipt_estimated"):
         raise ValueError("odometry is not a tracking measurement")
     frame, child = pose.get("frame_id"), pose.get("child_frame_id")
     segment, clock = quality.get("segment_id"), quality.get("clock_id")
@@ -90,4 +92,5 @@ def decode_slam_odom(sample):
         raise ValueError('conflicting pose reference declarations')
     if reference not in ('camera_optical', 'body'):
         reference = None  # Neither frame names nor extrinsics declare a pose type.
-    return PoseSample(stamp, frame, child, segment, position, quaternion, covariance, clock, reference)
+    return PoseSample(stamp, frame, child, segment, position, quaternion, covariance, clock, reference,
+                      FrameContext.from_dict(quality['observation']) if quality.get('profile') == 'motus_slam/2' else None)
