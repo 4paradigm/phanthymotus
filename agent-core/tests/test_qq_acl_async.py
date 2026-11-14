@@ -80,3 +80,37 @@ class QQInboundAclAsyncTests(IsolatedAsyncioTestCase):
         self.assertTrue(upsert.call_args.kwargs["preserve_existing"])
         publish.assert_not_awaited()
         self.manager._set_last_context.assert_not_called()
+
+    async def test_preserve_existing_does_not_overwrite_owner_or_blocked_row(self):
+        from channel import acl
+
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.execute(
+            "CREATE TABLE channel_users ("
+            "platform TEXT, platform_user_id TEXT, display_name TEXT, "
+            "role TEXT, tool_filter TEXT, alert_subscriptions TEXT DEFAULT '[]', "
+            "created_at REAL, UNIQUE(platform, platform_user_id))"
+        )
+        try:
+            for role in ("owner", "blocked"):
+                conn.execute(
+                    "DELETE FROM channel_users WHERE platform=? AND platform_user_id=?",
+                    ("qq", "race-user"),
+                )
+                conn.execute(
+                    "INSERT INTO channel_users "
+                    "(platform, platform_user_id, role, tool_filter) VALUES (?, ?, ?, ?)",
+                    ("qq", "race-user", role, "*"),
+                )
+                conn.commit()
+                with mock.patch("channel.acl._conn", return_value=conn):
+                    result = await asyncio.to_thread(
+                        acl.upsert_user,
+                        "qq", "race-user", "new display name",
+                        role="viewer", tool_filter="chat-only",
+                        preserve_existing=True,
+                    )
+                self.assertEqual(result["role"], role)
+                self.assertEqual(result["tool_filter"], "*")
+        finally:
+            conn.close()
