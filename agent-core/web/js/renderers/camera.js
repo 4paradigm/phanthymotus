@@ -138,8 +138,15 @@ export const CameraRenderer = {
     this._lastFpsTime = performance.now();
   },
 
-  onData(buffer, hint) {
+  onData(buffer, hint, onFrame) {
     if (!this._img) return;
+    if (onFrame) {
+      // One in-flight image plus the latest pending bytes. Never cancel an
+      // in-flight decode just because the source publishes faster than loading.
+      this._pendingFrame = { buffer, onFrame };
+      this._loadMonitorFrame();
+      return;
+    }
     const blob = new Blob([buffer], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
     const old = this._img.src;
@@ -157,7 +164,50 @@ export const CameraRenderer = {
     }
   },
 
+  _loadMonitorFrame() {
+    if (!this._img || this._cancelPendingFrame || !this._pendingFrame) return;
+    const { buffer, onFrame } = this._pendingFrame;
+    this._pendingFrame = null;
+    const url = URL.createObjectURL(new Blob([buffer], { type: 'image/jpeg' }));
+    const next = this._img.cloneNode(false);
+    next.removeAttribute('src');
+    const cancel = () => {
+      next.onload = next.onerror = null;
+      next.removeAttribute('src');
+      URL.revokeObjectURL(url);
+      if (this._cancelPendingFrame === cancel) this._cancelPendingFrame = null;
+    };
+    this._cancelPendingFrame = cancel;
+    const finish = (loaded) => {
+      if (this._cancelPendingFrame !== cancel) return;
+      if (loaded && this._img && onFrame() !== false) {
+        next.onload = next.onerror = null;
+        this._cancelPendingFrame = null;
+        const old = this._img;
+        old.replaceWith(next);
+        this._img = next;
+        this._frameCount++;
+        const now = performance.now();
+        if (now - this._lastFpsTime >= 1000) {
+          this._fps = this._frameCount;
+          this._frameCount = 0;
+          this._lastFpsTime = now;
+          if (this._label) this._label.textContent = `${this._fps} fps`;
+        }
+        if (old.src.startsWith('blob:')) URL.revokeObjectURL(old.src);
+      } else {
+        cancel();
+      }
+      this._loadMonitorFrame();
+    };
+    next.onload = () => finish(true);
+    next.onerror = () => finish(false);
+    next.src = url;
+  },
+
   unmount() {
+    this._pendingFrame = null;
+    this._cancelPendingFrame?.();
     if (this._img?.src?.startsWith('blob:')) URL.revokeObjectURL(this._img.src);
     this._el?.remove();
     this._el = null;

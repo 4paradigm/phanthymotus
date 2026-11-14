@@ -9802,3 +9802,7 @@ html, body {
 @media (max-width: 760px) {
   .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
 }
+
+/* Header-only freshness notice; retain the last JPEG in the body. */
+.monitor-video-stale { color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; flex-shrink: 1; }
+.monitor-video-stale[hidden] { display: none; }
