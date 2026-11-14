@@ -28,10 +28,9 @@ def validate_inputs(declarations, topics):
             raise ValueError('RGB-D calibration must be a finite pinhole with zero distortion')
         vendor = d.get('vendor') or {}
         if (vendor.get('registration') != 'registered_rectified' or
-                vendor.get('timestamp_semantics') != 'source_capture_mapped' or
-                not vendor.get('frame_id') or not vendor.get('clock_id')):
+                not vendor.get('frame_id')):
             raise ValueError('RGB-D registration, optical frame and capture clock are required')
-    if (color['id'] != depth['id'] or color['K'] != depth['K'] or
+    if (color['id'] != depth['id'] or not np.allclose(color['K'], depth['K'], rtol=1e-7, atol=1e-7) or
             any(color['vendor'].get(k) != depth['vendor'].get(k)
                 for k in ('frame_id', 'clock_id'))):
         raise ValueError('RGB-D inputs must share registered geometry and capture clock')
@@ -40,11 +39,16 @@ def validate_inputs(declarations, topics):
     for key in ('source_clock', 'mapping_offset_ns', 'clock_mapping',
                 'clock_mapping_verified', 'clock_mapping_uncertainty_ns',
                 'source_id', 'source_epoch'):
-        if color['vendor'].get(key) != depth['vendor'].get(key):
+        if (key in color['vendor'] and key in depth['vendor'] and
+                color['vendor'][key] != depth['vendor'][key]):
             raise ValueError('RGB-D source clock mapping declarations conflict: ' + key)
-    if (depth['vendor'].get('depth_source') != 'measured' or
-            depth['vendor'].get('depth_unit') != 'mm'):
-        raise ValueError('RGB-D requires measured millimetre depth')
+    if (depth['vendor'].get('depth_unit') != 'mm' or
+            depth['vendor'].get('depth_semantics', 'optical_z' if depth['vendor'].get('depth_source') == 'measured' else None) != 'optical_z'):
+        raise ValueError('RGB-D requires millimetre optical Z depth')
+    semantics = [d['vendor'].get('timestamp_semantics') for d in entries]
+    if all(semantics) and semantics[0] != semantics[1]:
+        raise ValueError('RGB-D timestamp semantics conflict')
+    capture = all(v == 'source_capture_mapped' for v in semantics) and bool(color['vendor'].get('clock_id'))
     mount = color['vendor'].get('body_mount')
     if mount != depth['vendor'].get('body_mount'):
         raise ValueError('RGB-D body_mount declarations conflict')
@@ -53,7 +57,9 @@ def validate_inputs(declarations, topics):
         mount = validate_mount_declaration(mount, color['vendor']['frame_id'], topics)
     result = dict(color_topic=color['topic'], depth_topic=depth['topic'],
                 K=np.asarray(color['K'], dtype=float).reshape(3, 3),
-                frame_id=color['vendor']['frame_id'], clock_id=color['vendor']['clock_id'])
+                frame_id=color['vendor']['frame_id'], clock_id=color['vendor'].get('clock_id'),
+                time_basis='source_capture' if capture else 'receipt_estimated',
+                depth_source=depth['vendor'].get('depth_source', 'unknown'))
     if mount is not None:
         result['body_mount'] = mount
     return result

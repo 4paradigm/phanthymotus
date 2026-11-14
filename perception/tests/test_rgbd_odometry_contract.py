@@ -122,3 +122,19 @@ def test_shared_unverified_mapping_is_retained_without_body_extrinsic():
     assert result['frame_id'] == 'camera_optical'
     assert 'body_mount' not in result
     assert all(d['vendor']['clock_mapping_verified'] is False for d in data.values())
+
+
+def test_inherited_valid_intrinsics_and_estimated_metric_depth_are_accepted():
+    data=declarations()
+    data['/depth']['source']='inherited'
+    data['/depth']['K'][0] += 1e-7
+    data['/depth']['vendor'].update(depth_source='estimated', depth_semantics='optical_z')
+    result=validate_inputs(data,['/rgb','/depth'])
+    assert result['depth_source']=='estimated'
+
+
+def test_missing_capture_declaration_uses_explicit_receipt_capability():
+    data=declarations()
+    for d in data.values():
+        d['vendor'].pop('clock_id');d['vendor'].pop('timestamp_semantics')
+    assert validate_inputs(data,['/rgb','/depth'])['time_basis']=='receipt_estimated'

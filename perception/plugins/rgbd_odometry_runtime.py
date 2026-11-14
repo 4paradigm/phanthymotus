@@ -21,6 +21,8 @@ import numpy as np
 from utils.dds_transport import receive_environment
 
 from .rgbd_odometry_contract import PairBuffer, make_sample
+from .rgbd_pairing import RgbdPairer, RgbdPair
+from .spatial_time import TimePolicy
 from .rgbd_imu import ImuAttitude
 from .rgbd_fusion import ShortTermFusion, log_rotation, observation_covariance, pose_values
 from .rgbd_body_mount import CaptureMounts
@@ -343,6 +345,15 @@ class RgbdSession:
         from std_msgs.msg import String
         from nav_msgs.msg import Odometry
         from rtabmap_msgs.msg import RGBDImage, OdomInfo
+        calibration = dict(calibration)
+        self.time_policy = TimePolicy(input_registry.clock_id if input_registry else 'rgbd_ingress/' + uuid.uuid4().hex)
+        self.contexts_by_stamp = OrderedDict()
+        self.assistance_unavailable = None
+        if calibration.get('time_basis') == 'receipt_estimated':
+            calibration['clock_id'] = self.time_policy.clock_id
+            self.assistance_unavailable = 'IMU requires comparable capture timestamps'
+            calibration.pop('imu_topic', None)
+            calibration['short_term_compensation'] = False
         self.calibration, self.executor, self.topic = calibration, executor, topic
         self.publish_output = publish_output
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
@@ -358,7 +369,7 @@ class RgbdSession:
         self.lock = threading.RLock()
         self.imu_queue_lock = threading.Lock()
         self.imu_pending, self.imu_overflow = deque(), False
-        self.pairs, self.pending = PairBuffer(), queue.Queue(maxsize=1)
+        self.pairs, self.pending = RgbdPairer(), queue.Queue(maxsize=1)
         self.latest_inputs = {}
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
         self.registration_by_stamp = OrderedDict()
@@ -465,17 +476,26 @@ class RgbdSession:
                 if msg.header.frame_id != self.calibration['frame_id']:
                     raise ValueError('image optical frame differs from calibration')
                 now, stamp = time.time_ns(), stamp_ns(msg)
+                if isinstance(self.pairs, RgbdPairer):
+                    if context is None:
+                        declaration = self.calibration.get('input_declarations', {}).get(self.calibration[kind + '_topic'], {})
+                        source = dict(declaration.get('vendor') or {}, stamp_ns=stamp)
+                        context = self.time_policy.select(source, now, time.monotonic_ns())
+                    stamp = context.observation_stamp_ns
                 if stamp > self.latest_inputs.get(kind, 0) and -50_000_000 <= now-stamp <= 1_500_000_000:
                     self.latest_inputs[kind] = stamp
                 if self.gate.status(now) == 'lost':
                     return
                 try:
-                    pair = self.pairs.push(kind, stamp_ns(msg), msg, time.time_ns())
+                    pair = (self.pairs.push(kind, msg, context) if isinstance(self.pairs, RgbdPairer) else
+                            self.pairs.push(kind, stamp_ns(msg), msg, time.time_ns()))
                 except ValueError as error:
                     # One late/repeated capture is dropped, never paired or
                     # used; persistent loss of input expires the segment.
                     self.counts['rejected_inputs'] += 1
                     self.input_rejection = f'{kind}: {error}'
+                    if 'context changed' in str(error):
+                        self.gate.fault(error, 'clock')
                     return
                 if pair:
                     self.gate.input(pair[1][0], now_ns=time.time_ns())
@@ -599,7 +619,21 @@ class RgbdSession:
                 continue
             try:
                 (_, color), (_, depth) = pair
+                if isinstance(pair, RgbdPair):
+                    # Only native transport copies gain observation stamps. Source
+                    # headers and both original contexts remain in the association.
+                    color, depth = deepcopy(color), deepcopy(depth)
+                    for message, ctx in ((color, pair.color_context), (depth, pair.depth_context)):
+                        message.header.stamp.sec, message.header.stamp.nanosec = divmod(ctx.observation_stamp_ns, 10**9)
                 capture_stamp = native_capture_stamp(color, depth)
+                if isinstance(pair, RgbdPair):
+                    selected = pair.color_context if capture_stamp == pair.color_context.observation_stamp_ns else pair.depth_context
+                    with self.lock:
+                        if self.gate.last_result_stamp == 0:
+                            self.gate.clock = selected.normalized_clock_id
+                            self.calibration['clock_id'] = selected.normalized_clock_id
+                        self.contexts_by_stamp[capture_stamp] = (selected, pair)
+                        while len(self.contexts_by_stamp) > 32:self.contexts_by_stamp.popitem(last=False)
                 # Prepare images while IMU arrives, retaining the original wait budget.
                 imu_deadline = time.monotonic() + .15
                 image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
@@ -732,8 +766,18 @@ class RgbdSession:
                 self.gate.state == 'recovering' and self.gate.last_pose is not None):
             # Declared, bounded in-segment pause the SLAM consumer can honour.
             sample['vendor']['pause'] = dict(source='visual_gate', status='recovering', mapping_allowed=False)
-        if getattr(self, 'mounts', None) is not None:
+        association = getattr(self, 'contexts_by_stamp', {}).get(stamp)
+        context = association[0] if association else None
+        if getattr(self, 'mounts', None) is not None and (context is None or context.time_basis == 'source_capture'):
             sample = self.mounts.attach(sample, time.time_ns())
+        if context is not None:
+            pair = association[1]
+            slam = sample['vendor']['motus_slam']
+            slam.update(profile='motus_slam/2', observation=context.to_dict(), clock_id=context.normalized_clock_id)
+            if slam['status'] == 'tracking':
+                slam['stamp_source'] = 'measurement' if context.time_basis == 'source_capture' else 'receipt_estimated'
+            sample['vendor']['association'] = dict(id=pair.association_id, method=pair.method, skew_ns=pair.skew_ns,
+                inputs=[pair.color_context.to_dict(), pair.depth_context.to_dict()])
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
         stamp = (sample['vendor'].get('motus_slam') or {}).get('stamp_ns')
         native = self.registration_by_stamp.pop(stamp, None)
@@ -742,7 +786,10 @@ class RgbdSession:
             depth_enabled=bool(self.fusion and self.fusion.geometry))
         sample['vendor']['registration'] = report
         self.last_registration = deepcopy(report)
-        self.publisher.publish(String(data=json.dumps(sample, allow_nan=False)))
+        output = String(data=json.dumps(sample, allow_nan=False))
+        if context is not None and getattr(self, 'input_registry', None) is not None:
+            self.input_registry.register_derived(self.topic, output, context, 'rgbd_odometry')
+        self.publisher.publish(output)
         self._publish_status(sample, now)
 
     def _publish_status(self, sample, now):

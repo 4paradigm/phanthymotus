@@ -12,7 +12,7 @@ def compatible_sources(first, second):
     """Missing optional evidence is unknown; contradictory claims are errors."""
     for key in CLOCK_FIELDS:
         a, b = first.get(key), second.get(key)
-        if a is not None and b is not None and a != b:
+        if key in first and key in second and a != b:
             raise ValueError('source clock declarations conflict: ' + key)
 
 
