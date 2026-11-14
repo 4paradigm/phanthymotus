@@ -44,7 +44,8 @@ def get_user(platform: str, user_id: str) -> dict | None:
 
 
 def upsert_user(platform: str, user_id: str, display_name: str = '',
-                role: str = 'viewer', tool_filter: str | None = None) -> dict:
+                role: str = 'viewer', tool_filter: str | None = None,
+                *, preserve_existing: bool = False) -> dict:
     """创建或更新用户。"""
     if role not in ROLES:
         raise ValueError(f'Invalid role: {role}. Must be one of {ROLES}')
@@ -53,13 +54,25 @@ def upsert_user(platform: str, user_id: str, display_name: str = '',
         tool_filter = prior['tool_filter'] if prior else '*'
     now = time.time()
     with _conn() as conn:
-        conn.execute(
-            'INSERT INTO channel_users (platform, platform_user_id, display_name, role, tool_filter, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?) '
-            'ON CONFLICT(platform, platform_user_id) DO UPDATE SET '
-            'display_name=excluded.display_name, role=excluded.role, tool_filter=excluded.tool_filter',
-            (platform, user_id, display_name, role, tool_filter, now)
-        )
+        if preserve_existing:
+            # Inbound auto-registration races with an administrator granting or
+            # blocking the same user.  Keep the existing ACL decision when the
+            # row appeared between the caller's read and this write.
+            conn.execute(
+                'INSERT INTO channel_users (platform, platform_user_id, display_name, role, tool_filter, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT(platform, platform_user_id) DO UPDATE SET '
+                'display_name=excluded.display_name',
+                (platform, user_id, display_name, role, tool_filter, now)
+            )
+        else:
+            conn.execute(
+                'INSERT INTO channel_users (platform, platform_user_id, display_name, role, tool_filter, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT(platform, platform_user_id) DO UPDATE SET '
+                'display_name=excluded.display_name, role=excluded.role, tool_filter=excluded.tool_filter',
+                (platform, user_id, display_name, role, tool_filter, now)
+            )
         conn.commit()
     return get_user(platform, user_id)
 

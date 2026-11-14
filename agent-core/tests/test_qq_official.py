@@ -13,6 +13,9 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from channel.adapter import OutboundMessage, Attachment, PartialSendError
 from channel.adapters.qq_official import QQOfficialAdapter, validate_qq_official_config
+from channel.adapters.qq_official_media import (
+    QQMediaPostError, QQMediaUploadError,
+)
 
 class MockApi:
     instances = []
@@ -544,6 +547,96 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.send_message(OutboundMessage(
                 chat_id="OpenID123456789", text="repeat",
                 reply_to_message_id="media-partial"))
+
+    async def test_media_upload_failure_releases_reservation_for_retry(self):
+        self.adapter.config["enable_outbound_media"] = True
+        await self.adapter.start()
+        self.adapter._parse_message(message(mid="media-upload-retry"))
+        files = [Attachment(kind="image", path="/work/resource/qq_outbox/test.png",
+                            name="test.png")]
+        with mock.patch("channel.adapters.qq_official._validate_outbound_file"):
+            with mock.patch("channel.adapters.qq_official.send_media",
+                            new_callable=mock.AsyncMock) as sender:
+                sender.side_effect = [QQMediaUploadError("upload failed"), None]
+                with self.assertRaisesRegex(RuntimeError, "retry permitted"):
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", files=files,
+                        reply_to_message_id="media-upload-retry"))
+                await self.adapter.send_message(OutboundMessage(
+                    chat_id="OpenID123456789", files=files,
+                    reply_to_message_id="media-upload-retry"))
+                self.assertEqual(sender.await_count, 2)
+
+    async def test_media_post_failure_keeps_reservation_as_ambiguous(self):
+        self.adapter.config["enable_outbound_media"] = True
+        await self.adapter.start()
+        self.adapter._parse_message(message(mid="media-post-ambiguous"))
+        files = [Attachment(kind="image", path="/work/resource/qq_outbox/test.png",
+                            name="test.png")]
+        with mock.patch("channel.adapters.qq_official._validate_outbound_file"):
+            with mock.patch("channel.adapters.qq_official.send_media",
+                            new_callable=mock.AsyncMock) as sender:
+                sender.side_effect = [QQMediaPostError("timeout")]
+                with self.assertRaisesRegex(RuntimeError, "delivery unconfirmed"):
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", files=files,
+                        reply_to_message_id="media-post-ambiguous"))
+                with self.assertRaisesRegex(ValueError, "already attempted"):
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", files=files,
+                        reply_to_message_id="media-post-ambiguous"))
+
+    async def test_media_upload_reservation_blocks_concurrent_duplicate(self):
+        self.adapter.config["enable_outbound_media"] = True
+        await self.adapter.start()
+        self.adapter._parse_message(message(mid="media-concurrent"))
+        files = [Attachment(kind="image", path="/work/resource/qq_outbox/test.png",
+                            name="test.png")]
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_upload(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+
+        with mock.patch("channel.adapters.qq_official._validate_outbound_file"):
+            with mock.patch("channel.adapters.qq_official.send_media",
+                            side_effect=slow_upload) as sender:
+                first = asyncio.create_task(self.adapter.send_message(OutboundMessage(
+                    chat_id="OpenID123456789", files=files,
+                    reply_to_message_id="media-concurrent")))
+                await asyncio.wait_for(started.wait(), timeout=1)
+                with self.assertRaisesRegex(ValueError, "already attempted"):
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", files=files,
+                        reply_to_message_id="media-concurrent"))
+                release.set()
+                await first
+                sender.assert_awaited_once()
+
+    async def test_second_media_upload_failure_after_delivery_keeps_reservation(self):
+        self.adapter.config["enable_outbound_media"] = True
+        await self.adapter.start()
+        self.adapter._parse_message(message(mid="media-partial-upload"))
+        files = [
+            Attachment(kind="image", path="/work/resource/qq_outbox/one.png",
+                        name="one.png"),
+            Attachment(kind="image", path="/work/resource/qq_outbox/two.png",
+                        name="two.png"),
+        ]
+        with mock.patch("channel.adapters.qq_official._validate_outbound_file"):
+            with mock.patch("channel.adapters.qq_official.send_media",
+                            new_callable=mock.AsyncMock) as sender:
+                sender.side_effect = [None, QQMediaUploadError("upload failed")]
+                with self.assertRaises(PartialSendError) as caught:
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", files=files,
+                        reply_to_message_id="media-partial-upload"))
+                self.assertEqual(caught.exception.sent, ["media"])
+                with self.assertRaisesRegex(ValueError, "already attempted"):
+                    await self.adapter.send_message(OutboundMessage(
+                        chat_id="OpenID123456789", files=files,
+                        reply_to_message_id="media-partial-upload"))
 
     async def test_unapproved_group_disabled_by_default(self):
         await self.adapter.start()

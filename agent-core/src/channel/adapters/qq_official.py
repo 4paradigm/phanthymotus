@@ -18,7 +18,7 @@ from channel.adapter import (
     KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE, PartialSendError,
 )
 from channel.adapters.qq_official_media import (
-    receive_media, send_media, _validate_outbound_file,
+    receive_media, send_media, _validate_outbound_file, QQMediaUploadError,
 )
 from channel.adapters.qq_official_interactions import QQInteractionRegistry
 from channel.adapters.qq_official_sessions import QQSessionState
@@ -488,8 +488,9 @@ class QQOfficialAdapter(ChannelAdapter):
         mid = msg.reply_to_message_id
         if not isinstance(mid, str) or not 0 < len(mid) <= 512:
             raise ValueError("QQ official requires a verified source message ID")
-        # One passive reply per trigger. Mark an attempt *before* HTTP so that
-        # concurrent requests or an unconfirmed timeout cannot deliver twice.
+        # Reserve one passive reply per trigger before HTTP so concurrent
+        # requests cannot deliver twice. The reservation is released only for
+        # a failure proven to occur before QQ's message POST.
         key = (msg.chat_id, mid)
         source = self._source_scopes.get(key)
         if source is None:
@@ -514,6 +515,14 @@ class QQOfficialAdapter(ChannelAdapter):
             try:
                 await send_media(self._api, self._http, scope, msg.chat_id, mid, attachment)
                 sent.append("media")
+            except QQMediaUploadError:
+                if not sent:
+                    async with self._reply_lock:
+                        if self._attempted_replies.get(key) == now:
+                            self._attempted_replies.pop(key, None)
+                    raise RuntimeError(
+                        "QQ official media upload failed before delivery; retry permitted") from None
+                raise PartialSendError(sent, ["QQ media upload failed before delivery"]) from None
             except Exception:
                 if sent:
                     raise PartialSendError(sent, ["QQ media delivery unconfirmed"]) from None

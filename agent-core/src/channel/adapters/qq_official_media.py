@@ -24,6 +24,14 @@ _QQ_CDN_SUFFIXES = (
 _MEDIA_FAILURES: Counter[str] = Counter()
 
 
+class QQMediaUploadError(RuntimeError):
+    """The media upload failed before QQ's message POST was attempted."""
+
+
+class QQMediaPostError(RuntimeError):
+    """The media message POST failed; delivery may be ambiguous."""
+
+
 def _note_media_failure(reason: str) -> None:
     """Feishu-style sampled diagnostics; never log signed CDN URLs."""
     _MEDIA_FAILURES[reason] += 1
@@ -147,17 +155,28 @@ async def send_media(api, http_client, scope: str, chat_id: str, mid: str,
     from qqbot_agent_sdk import constants
 
     uploader = MediaUploader(api_client=api, http_client=http_client)
-    file_info = await uploader.upload(
-        chat_type=scope, chat_id=chat_id, source=attachment.path,
-        file_type=getattr(constants, _FILE_TYPES[attachment.kind]),
-        file_name=attachment.name or Path(attachment.path).name,
-    )
-    outbound = MessageToCreate(
-        content=" ",  # QQ OpenAPI v2 currently requires content for rich media.
-        msg_type=QQMessageType.RICH_MEDIA, msg_id=mid,
-        msg_seq=api.next_msg_seq(), media=MediaInfo(file_info=file_info),
-    )
-    if scope == "c2c":
-        await api.post_c2c_message(chat_id, outbound)
-    else:
-        await api.post_group_message(chat_id, outbound)
+    try:
+        file_info = await uploader.upload(
+            chat_type=scope, chat_id=chat_id, source=attachment.path,
+            file_type=getattr(constants, _FILE_TYPES[attachment.kind]),
+            file_name=attachment.name or Path(attachment.path).name,
+        )
+        # Constructing the DTO and allocating a sequence are local operations;
+        # no QQ message POST has happened yet, so failures remain retryable.
+        outbound = MessageToCreate(
+            content=" ",  # QQ OpenAPI v2 currently requires content for rich media.
+            msg_type=QQMessageType.RICH_MEDIA, msg_id=mid,
+            msg_seq=api.next_msg_seq(), media=MediaInfo(file_info=file_info),
+        )
+    except Exception as exc:
+        raise QQMediaUploadError(
+            "QQ media upload failed before message delivery") from exc
+    try:
+        if scope == "c2c":
+            await api.post_c2c_message(chat_id, outbound)
+        else:
+            await api.post_group_message(chat_id, outbound)
+    except Exception as exc:
+        # The POST may have reached QQ even when the SDK reports an error.
+        raise QQMediaPostError(
+            "QQ media message delivery is unconfirmed") from exc

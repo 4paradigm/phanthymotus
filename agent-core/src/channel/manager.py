@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import time
 from contextvars import ContextVar
 from collections import Counter
@@ -43,6 +44,7 @@ _QQ_MEMORY_LIMIT = 20
 _QQ_MEMORY_ITEM_MAX = 500
 _qq_memory_lock = RLock()
 _qq_group_forward_counts = Counter()
+_qq_acl_error_counts = Counter()
 
 
 def _log_qq_group_forward(channel_id: str) -> None:
@@ -51,6 +53,47 @@ def _log_qq_group_forward(channel_id: str) -> None:
     count = _qq_group_forward_counts[channel_id]
     if count == 1 or count % 100 == 0:
         print(f'[qq-group] auto_enable_passed forwarding_to_canvas count={count}', flush=True)
+
+
+def _log_qq_acl_error(exc: sqlite3.OperationalError) -> None:
+    """Report SQLite contention without turning every inbound event into a log."""
+    key = type(exc).__name__
+    _qq_acl_error_counts[key] += 1
+    count = _qq_acl_error_counts[key]
+    if count == 1 or count % 100 == 0:
+        print(f'[qq-acl] SQLite ACL unavailable ({key}); denying inbound message '
+              f'count={count}', flush=True)
+
+
+async def _qq_inbound_acl(msg: InboundMessage) -> dict | None:
+    """Read/register/check a QQ principal without blocking the event loop."""
+    try:
+        user = await asyncio.to_thread(acl.get_user, msg.platform, msg.user_id)
+        if user is None:
+            # All new ordinary QQ C2C/group users are chat-only.  The verified
+            # C2C owner retains its separate full grant.
+            from channel.permissions import PRESETS
+            default_role, default_filter = PRESETS['chat']
+            # Do not overwrite a role inserted by an owner/administrator
+            # between the read above and this first-message registration.
+            await asyncio.to_thread(
+                acl.upsert_user,
+                msg.platform, msg.user_id, msg.display_name,
+                role=default_role, tool_filter=default_filter,
+                preserve_existing=True,
+            )
+            user = await asyncio.to_thread(acl.get_user, msg.platform, msg.user_id)
+
+        allowed, _reason = await asyncio.to_thread(
+            acl.check_permission, msg.platform, msg.user_id,
+            required_role='viewer',
+        )
+        if not allowed:
+            return None
+        return user
+    except sqlite3.OperationalError as exc:
+        _log_qq_acl_error(exc)
+        return None
 
 
 qq_memory_scope: ContextVar[tuple[str, str] | None] = ContextVar('qq_memory_scope', default=None)
@@ -793,44 +836,38 @@ class ChannelManager:
             # Bot 不写入人员 ACL；只有精确匹配配置的可信 Bot 继承普通输入权限。
             user = {'role': 'operator' if trusted_bot_id else 'viewer'}
         else:
-            # 2. ACL — ensure user exists, otherwise auto-register
-            user = acl.get_user(msg.platform, msg.user_id)
-            if user is None:
-                channel_settings = self._get_channel_settings()
-                if msg.platform == 'qq':
-                    # All new ordinary QQ C2C/group users are chat-only.
-                    # The verified C2C owner retains its separate full grant.
-                    from channel.permissions import PRESETS
-                    default_qq_role, default_qq_filter = PRESETS['chat']
-                default_role = ('viewer' if msg.platform == 'qq' else
-                                channel_settings.get('default_role', 'viewer'))
-                if msg.platform == 'qq':
-                    default_role, default_filter = default_qq_role, default_qq_filter
-                else:
-                    default_filter = None
-                # QQ users are accepted automatically within Tencent's platform scope;
-                # administrators can still block or restrict them through the ACL.
-                auto_approve = (True if msg.platform == 'qq'
-                                else channel_settings.get('auto_approve', True))
-                if auto_approve:
-                    acl.upsert_user(msg.platform, msg.user_id, msg.display_name,
-                                    role=default_role, tool_filter=default_filter)
-                    user = acl.get_user(msg.platform, msg.user_id)
-                else:
-                    adapter = self._adapters.get(msg.channel_id)
-                    if adapter:
-                        await adapter.send_message(OutboundMessage(
-                            chat_id=msg.chat_id,
-                            text='Pending approval. An admin has been notified.',
-                            reply_to_message_id=msg.message_id if msg.platform == 'qq' else '',
-                        ))
-                    return
+            if msg.platform == 'qq':
+                # SQLite ACL access must not stall the Gateway event loop.
+                user = await _qq_inbound_acl(msg)
+                if user is None:
+                    return  # fail closed on blocked/unknown/locked ACL
+            else:
+                # Feishu keeps its existing synchronous path and approval flow.
+                # 2. ACL — ensure user exists, otherwise auto-register
+                user = acl.get_user(msg.platform, msg.user_id)
+                if user is None:
+                    channel_settings = self._get_channel_settings()
+                    default_role = channel_settings.get('default_role', 'viewer')
+                    auto_approve = channel_settings.get('auto_approve', True)
+                    if auto_approve:
+                        acl.upsert_user(msg.platform, msg.user_id, msg.display_name,
+                                        role=default_role, tool_filter=None)
+                        user = acl.get_user(msg.platform, msg.user_id)
+                    else:
+                        adapter = self._adapters.get(msg.channel_id)
+                        if adapter:
+                            await adapter.send_message(OutboundMessage(
+                                chat_id=msg.chat_id,
+                                text='Pending approval. An admin has been notified.',
+                                reply_to_message_id=msg.message_id if msg.platform == 'qq' else '',
+                            ))
+                        return
 
-            # 3. ACL — 检查是否 blocked。用 acl.check_permission 而不是手写 role 比较，
-            #    这样"角色分级"这件事只有一处定义（同一函数后面也会被工具分发层复用）。
-            allowed, _reason = acl.check_permission(msg.platform, msg.user_id, required_role='viewer')
-            if not allowed:
-                return  # 静默丢弃
+                # 3. ACL — 用 acl.check_permission 统一角色分级。
+                allowed, _reason = acl.check_permission(
+                    msg.platform, msg.user_id, required_role='viewer')
+                if not allowed:
+                    return  # 静默丢弃
 
         # 4. Store last conversation context for reply routing (persisted)
         self._set_last_context(
