@@ -1,0 +1,24 @@
+{
+  "verifier_id": "tabletop-roi-personal",
+  "max_age_s": 2,
+  "session_ttl_s": 600,
+  "sources": {
+    "rgb": {
+      "source_id": "rgb",
+      "kind": "ros_image",
+      "camera_id": null,
+      "topic": null,
+      "domain_id": null,
+      "message_type": "compressed",
+      "frame_id": null,
+      "view_id": null,
+      "distortion": "raw",
+      "view_mode": "fixed",
+      "fixed_view_record": null,
+      "stamp_semantics": "capture",
+      "capture_time_record": null,
+      "provenance": "real",
+      "allow_test_data": false
+    }
+  }
+}
