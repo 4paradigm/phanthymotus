@@ -12,6 +12,7 @@ import time
 
 import httpx
 
+from channel.qq_runtime_credentials import get as get_runtime_credential
 from channel.adapter import (
     Attachment, ChannelAdapter, InboundMessage, OutboundMessage,
     KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE, PartialSendError,
@@ -96,7 +97,7 @@ def validate_qq_official_config(cfg: dict) -> dict:
     if (not isinstance(bot_group_openid, str)
             or (bot_group_openid and not _OPENID_RE.fullmatch(bot_group_openid))):
         raise ValueError("QQ bot_group_openid must be a valid OpenID")
-    sources = ("app_secret", "app_secret_env", "app_secret_file")
+    sources = ("app_secret", "app_secret_env", "app_secret_file", "app_secret_runtime")
     for key in sources:
         if key in cfg and not isinstance(cfg[key], str):
             raise ValueError(f"QQ official {key} must be a string")
@@ -105,7 +106,11 @@ def validate_qq_official_config(cfg: dict) -> dict:
     if cfg.get("app_secret_env") and not _ENV_RE.fullmatch(cfg["app_secret_env"]):
         raise ValueError("QQ official environment key invalid")
     if cfg.get("app_secret_file") and cfg["app_secret_file"] != "/run/qq-official-app-secret":
-        raise ValueError("QQ official credential mount invalid")
+        from channel.qq_credential_store import is_managed_reference
+        if not is_managed_reference(str(cfg.get("app_id", "")), cfg["app_secret_file"]):
+            raise ValueError("QQ official credential reference invalid")
+    if cfg.get("app_secret_runtime") and not re.fullmatch(r"[A-Za-z0-9_-]{30,64}", cfg["app_secret_runtime"]):
+        raise ValueError("QQ official runtime credential reference invalid")
     timeout = cfg.get("connect_timeout", 20)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 5 <= timeout <= 60:
         raise ValueError("QQ official connect_timeout out of range")
@@ -117,11 +122,16 @@ def _load_credential(cfg: dict) -> str:
         value = os.environ.get(cfg["app_secret_env"], "")
     elif cfg.get("app_secret_file"):
         try:
-            value = Path("/run/qq-official-app-secret").read_text(encoding="utf-8").strip()
+            from channel.qq_credential_store import is_managed_reference, read
+            path = cfg["app_secret_file"]
+            value = (read(str(cfg["app_id"]), path)
+                     if is_managed_reference(str(cfg["app_id"]), path)
+                     else Path(path).read_text(encoding="utf-8").strip())
         except OSError:
             raise ValueError("QQ official credential mount unreadable") from None
     else:
-        value = cfg.get("app_secret", "")
+        value = (get_runtime_credential(cfg["app_secret_runtime"]) if cfg.get("app_secret_runtime")
+                 else cfg.get("app_secret", ""))
     if not isinstance(value, str) or not value.strip():
         raise ValueError("QQ official credential not configured")
     return value.strip()

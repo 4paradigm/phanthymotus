@@ -44,12 +44,15 @@ class QQOwnerACLTests(unittest.TestCase):
         for tool in ("Bash", "Read", "Write", "mcp__bumi__loco"):
             with self.subTest(tool=tool):
                 self.assertFalse(self.check(_GROUP, "owner", tool))
-        self.assertTrue(self.check(_GROUP, "owner", "mcp__channel__channel_reply"))
+        # New QQ groups require explicit binding; even ordinary replies are
+        # denied before approval, regardless of a fabricated Owner role.
+        self.assertFalse(self.check(_GROUP, "owner", "mcp__channel__channel_reply"))
 
     def test_regular_qq_viewer_and_operator_are_restricted(self):
         for role in ("viewer", "operator"):
             with self.subTest(role=role):
                 self.assertFalse(self.check(_OWNER, role, "Bash"))
+                self.assertFalse(self.check(_OWNER, role, "mcp__perception__tts"))
                 self.assertTrue(self.check(_OWNER, role, "mcp__channel__channel_reply"))
 
     def test_cannot_forge_owner_through_other_principal_syntax(self):

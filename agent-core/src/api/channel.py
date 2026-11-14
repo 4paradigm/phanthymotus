@@ -33,7 +33,7 @@ router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
 def _safe_channel(entry: dict) -> dict:
     result = dict(entry)
     cfg = dict(result.get('config') or {})
-    for key in ('access_token', 'bot_token', 'app_token', 'app_secret', 'token'):
+    for key in ('access_token', 'bot_token', 'app_token', 'app_secret', 'app_secret_runtime', 'token'):
         if key in cfg:
             cfg[key] = '***' if cfg[key] else ''
     result['config'] = cfg
@@ -126,7 +126,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
             supplied = updates['config']
             if not isinstance(supplied, dict):
                 raise fastapi.HTTPException(400, 'QQ configuration must be an object')
-            for key in ('app_secret', 'app_secret_env', 'app_secret_file'):
+            for key in ('app_secret', 'app_secret_env', 'app_secret_file', 'app_secret_runtime'):
                 if key in supplied and not isinstance(supplied[key], str):
                     raise fastapi.HTTPException(400, f'QQ official {key} must be a string')
             if 'app_secret' in supplied:
@@ -138,7 +138,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
             if old_protocol != new_protocol:
                 merged = {}
             credential_keys = (
-                'access_token', 'access_token_env', 'access_token_file',
+                'access_token', 'access_token_env', 'access_token_file', 'app_secret_runtime',
                 'app_secret', 'app_secret_env', 'app_secret_file',
             )
             provided = [key for key in credential_keys if supplied.get(key)]
@@ -177,12 +177,32 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
 
 @router.delete('/{channel_id}')
 async def delete_channel(channel_id: str):
+    existing = await asyncio.to_thread(get_channel_config, channel_id)
     # 先停止 adapter
     if channel_id in manager._adapters:
         await manager._adapters[channel_id].stop()
         del manager._adapters[channel_id]
     if not await asyncio.to_thread(delete_channel_config, channel_id):
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    if existing and existing.get('platform') == 'qq':
+        from channel.qq_runtime_credentials import revoke
+        cfg = existing.get('config') or {}
+        revoke(cfg.get('app_secret_runtime', ''))
+        app_id = cfg.get('app_id', '')
+        grant = config.main.get('qq_c2c_owner_grant', {})
+        if (isinstance(grant, dict) and app_id and
+                str(grant.get('principal', '')).startswith(f'official:{app_id}:')):
+            config.main['qq_c2c_owner_grant'] = {}
+        for key in ('qq_onboarding_pairing', 'qq_group_challenge'):
+            state = config.main.get(key, {})
+            if isinstance(state, dict) and state.get('channel_id') == channel_id:
+                config.main[key] = {}
+        for key in ('qq_group_policies', 'channel_pending_users'):
+            records = config.main.get(key, {})
+            if isinstance(records, dict) and channel_id in records:
+                remaining = dict(records)
+                remaining.pop(channel_id, None)
+                config.main[key] = remaining
     return {'deleted': channel_id}
 
 
@@ -227,7 +247,7 @@ class UpsertUserReq(BaseModel):
     user_id: str
     display_name: str = ''
     role: str = 'viewer'
-    tool_filter: str = '*'
+    tool_filter: str | None = None
 
 
 @router.post('/users')

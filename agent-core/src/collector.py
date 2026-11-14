@@ -426,7 +426,10 @@ def _qq_source_identity(ev: dict) -> tuple[str, str] | None:
     channel_id, chat_id = payload.get('channel_id'), payload.get('chat_id')
     if not isinstance(channel_id, str) or not isinstance(chat_id, str):
         return None
-    return (channel_id, chat_id)
+    kind = payload.get('chat_type') or ('group' if ':group:' in str(payload.get('user_id', '')) else 'p2p')
+    if kind not in ('group', 'p2p'):
+        return None
+    return (channel_id, f'{kind}:{chat_id}')
 
 
 def _security_batch_key(ev: dict) -> tuple:
@@ -466,7 +469,12 @@ def _chat_history_blocks(batch: list[dict]) -> str:
         if not channel_id or not chat_id or (channel_id, chat_id) in seen:
             continue
         seen.add((channel_id, chat_id))
-        history = channel_manager.get_chat_history(channel_id, chat_id)
+        if payload.get('platform') == 'qq':
+            kind = payload.get('chat_type') or ('group' if ':group:' in str(payload.get('user_id', '')) else 'p2p')
+            chat_history_id = f'{kind}:{chat_id}'
+        else:
+            chat_history_id = chat_id
+        history = channel_manager.get_chat_history(channel_id, chat_history_id)
         if not history:
             continue
         lines = []
@@ -508,6 +516,9 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         # to it; ChannelManager maintains the per-chat recap separately.
         '_qq_channel_turn': bool(batch) and all(
             _qq_source_identity(ev) is not None for ev in batch),
+        '_qq_chat_id': (_qq_source_identity(batch[0]) or ('', ''))[1]
+                       if batch and all(_qq_source_identity(ev) is not None for ev in batch)
+                       else '',
         '_qq_channel_id': next((
             payload.get('channel_id', '') for payload in _channel_payloads(batch)
             if payload.get('platform') == 'qq'

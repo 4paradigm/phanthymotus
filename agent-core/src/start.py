@@ -670,6 +670,11 @@ app_api.include_router(api.network.router)
 import api.channel
 app_api.include_router(api.channel.router)
 
+import api.channel_setup
+app_api.include_router(api.channel_setup.router)
+import api.qq_settings
+app_api.include_router(api.qq_settings.router)
+
 import api.peer
 # CRITICAL: api.peer.router MUST come after auth_middleware is installed and
 # before any catch-all. The /api/peer/inbox/* paths are exempt in auth.py so

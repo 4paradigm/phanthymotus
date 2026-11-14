@@ -565,6 +565,7 @@ _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 # Bot 身份，是更弱的信任边界。
 _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
     'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
+    'channel_memory_remember', 'channel_memory_read', 'channel_memory_forget',
 })
 
 
@@ -1624,6 +1625,9 @@ class Event:
         self._sys_tools = _build_system_tools([
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
+            ('channel_memory_remember', event.memory.channel_memory_remember),
+            ('channel_memory_read', event.memory.channel_memory_read),
+            ('channel_memory_forget', event.memory.channel_memory_forget),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
             ('skill_file', event.skills.skill_file),
@@ -2255,6 +2259,27 @@ class Event:
 
     async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
                         reconsider_event: asyncio.Event | None = None):
+        from channel.manager import qq_memory_scope
+        channel_id = trigger_event.get('_qq_channel_id')
+        chat_id = trigger_event.get('_qq_chat_id')
+        principals = trigger_event.get('_channel_principals', [])
+        scope = ((channel_id, chat_id) if
+                 trigger_event.get('_qq_channel_turn')
+                 and isinstance(channel_id, str) and bool(channel_id)
+                 and isinstance(chat_id, str) and bool(chat_id)
+                 and isinstance(principals, list) and bool(principals)
+                 and all(isinstance(p, (tuple, list)) and len(p) == 2
+                         and p[0] == 'qq' for p in principals)
+                 else None)
+        token = qq_memory_scope.set(scope)
+        try:
+            return await self._one_turn_impl(trigger_event, cancel_event,
+                                             reconsider_event)
+        finally:
+            qq_memory_scope.reset(token)
+
+    async def _one_turn_impl(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
+                        reconsider_event: asyncio.Event | None = None):
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
@@ -2376,6 +2401,11 @@ class Event:
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
         system_tools = list(self._sys_tools.values())
+        from channel.tool_policy import QQ_MEMORY_TOOLS
+        from channel.manager import qq_memory_scope
+        if not qq_private_turn or qq_memory_scope.get() is None:
+            system_tools = [tool for tool in system_tools
+                            if tool['schema']['name'] not in QQ_MEMORY_TOOLS]
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
@@ -2401,7 +2431,9 @@ class Event:
         bound_tool_names = {s['name'] for s in bound_schemas}
 
         # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
-        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names,
+                                                 qq_turn=qq_private_turn,
+                                                 qq_scope=qq_memory_scope.get() if qq_private_turn else None)
 
         finish_tool = 'finish'
         llm_cfg = config.main.get('event', {}).get('llm', {})
@@ -2509,9 +2541,9 @@ class Event:
             tool_count = len(all_tool_list)
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
             prompt_chars = sum(len(m.get('content') or '') for m in messages)
-            last_user = next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
-            if qq_private_turn and isinstance(last_user, list):
-                last_user = '[multimodal image input]'
+            from channel.qq_log_safety import safe_user_log_preview
+            last_user_content = next((m.get('content', '') for m in reversed(messages) if m.get('role') == 'user'), '')
+            last_user = safe_user_log_preview(last_user_content, qq_turn=qq_private_turn)
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────

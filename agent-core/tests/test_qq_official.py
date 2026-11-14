@@ -597,7 +597,10 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
                 "channel_id": "official_test"},
             "channel_configs": [{
                 "id": "official_test", "platform": "qq",
-                "enabled": True, "config": {"protocol": "official"},
+                "enabled": True, "config": {
+                    "protocol": "official", "app_id": "1900000000",
+                    "enabled_scopes": ["c2c", "group"], "private_only": False,
+                },
             }],
         }
         file = Attachment(kind="image",

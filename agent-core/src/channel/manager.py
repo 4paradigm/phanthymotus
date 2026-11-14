@@ -14,6 +14,8 @@ import json
 import math
 import re
 import time
+from contextvars import ContextVar
+from threading import RLock
 
 import config
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
@@ -36,6 +38,10 @@ _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 # 历史会把不同人的对话混在一起，可能把 A 的上下文答给 B。
 _CHAT_HISTORY_LIMIT = 12
 _CHAT_HISTORY_TEXT_MAX = 500
+_QQ_MEMORY_LIMIT = 20
+_QQ_MEMORY_ITEM_MAX = 500
+_qq_memory_lock = RLock()
+qq_memory_scope: ContextVar[tuple[str, str] | None] = ContextVar('qq_memory_scope', default=None)
 
 # Bot-to-Bot 主动发起（trusted_bot_id 路径）的粗粒度频率熔断。PR #134 的设计里
 # 明确没有轮次/时间熔断，靠双方"是否还有具体任务"自觉停止——这里加一层兜底，
@@ -232,6 +238,39 @@ class ChannelManager:
         self._inactive_logged: set[str] = set()
         self._trusted_bot_messages: dict[str, dict] = {}
         self._mention_rate: dict[tuple, list[float]] = {}
+        # In-memory visual context for a same-sender, same-chat QQ follow-up.
+        self._recent_qq_attachments: dict[tuple, tuple[float, list[dict]]] = {}
+
+    def _qq_followup_attachments(self, msg: InboundMessage) -> list[dict]:
+        """Carry only this sender's latest QQ image/PDF into immediate follow-ups.
+
+        The downstream vision reader enforces per-channel path validation;
+        paths from a different user, chat or old conversation never cross over.
+        """
+        if msg.platform != 'qq' or msg.sender_type != 'user':
+            return []
+        key = (msg.channel_id, msg.chat_type, msg.chat_id, msg.user_id)
+        now = time.monotonic()
+        # Bound memory and drop stale references even when a chat goes idle.
+        self._recent_qq_attachments = {
+            k: v for k, v in self._recent_qq_attachments.items()
+            if now - v[0] <= 240
+        }
+        current = [a.to_dict() for a in (msg.attachments or [])
+                   if a.kind == 'image' or (a.kind == 'file' and
+                   str(a.name or a.path).lower().endswith('.pdf'))]
+        if current:
+            self._recent_qq_attachments[key] = (now, current[:2])
+            while len(self._recent_qq_attachments) > 128:
+                self._recent_qq_attachments.pop(next(iter(self._recent_qq_attachments)))
+            return []
+        if '[QQ attachment unavailable]' in msg.text:
+            self._recent_qq_attachments.pop(key, None)
+            return []
+        if not re.search(r'图|照片|动图|gif|GIF|这张|刚才|刚发|这个能看|这个看得|PDF|pdf|文档|文件|附件|这份', msg.text or ''):
+            return []
+        prior = self._recent_qq_attachments.get(key)
+        return list(prior[1]) if prior else []
 
     def _trusted_bot_id(self, msg: InboundMessage) -> str:
         """Return the configured alias for an exact Feishu bot/group principal."""
@@ -318,6 +357,58 @@ class ChannelManager:
             return []
         valid = [e for e in entries if isinstance(e, dict) and isinstance(e.get('text'), str)]
         return valid[-limit:]
+
+    # ── QQ per-chat long-term memory (no new schema, keyed like chat history) ──
+
+    def get_chat_memory(self, channel_id: str, chat_id: str) -> list[str]:
+        if not channel_id or not chat_id:
+            return []
+        all_memory = config.main.get('channel_chat_memory', {})
+        if not isinstance(all_memory, dict):
+            return []
+        channel = all_memory.get(channel_id, {})
+        items = channel.get(chat_id, []) if isinstance(channel, dict) else []
+        if not isinstance(items, list):
+            return []
+        return [x for x in items if isinstance(x, str) and x.strip()][-_QQ_MEMORY_LIMIT:]
+
+    def remember_chat_memory(self, channel_id: str, chat_id: str, text: str) -> bool:
+        if not channel_id or not chat_id or not isinstance(text, str):
+            raise ValueError('Missing verified QQ conversation or memory text')
+        item = text.strip()
+        if not item or len(item) > _QQ_MEMORY_ITEM_MAX:
+            raise ValueError('Memory must be 1–500 characters')
+        with _qq_memory_lock:
+            existing = self.get_chat_memory(channel_id, chat_id)
+            if item in existing:
+                return False
+            all_memory = dict(config.main.get('channel_chat_memory', {}) or {})
+            channel = dict(all_memory.get(channel_id, {}) or {})
+            channel[chat_id] = (existing + [item])[-_QQ_MEMORY_LIMIT:]
+            all_memory[channel_id] = channel
+            config.main['channel_chat_memory'] = all_memory
+        return True
+
+    def forget_chat_memory(self, channel_id: str, chat_id: str, text: str = '') -> int:
+        if not channel_id or not chat_id:
+            raise ValueError('Missing verified QQ conversation')
+        with _qq_memory_lock:
+            existing = self.get_chat_memory(channel_id, chat_id)
+            if text.strip():
+                remaining = [x for x in existing if x != text.strip()]
+            else:
+                remaining = []
+            deleted = len(existing) - len(remaining)
+            if deleted:
+                all_memory = dict(config.main.get('channel_chat_memory', {}) or {})
+                channel = dict(all_memory.get(channel_id, {}) or {})
+                if remaining:
+                    channel[chat_id] = remaining
+                else:
+                    channel.pop(chat_id, None)
+                all_memory[channel_id] = channel
+                config.main['channel_chat_memory'] = all_memory
+            return deleted
 
     # ── Persistent conversation context ──────────────────────────────────────
 
@@ -658,6 +749,10 @@ class ChannelManager:
     async def _on_inbound_message(self, msg: InboundMessage):
         """Handle incoming platform message."""
         # Sync active channels from canvas
+        if msg.platform == 'qq':
+            from channel.qq_onboarding import receive as receive_pairing
+            if await asyncio.to_thread(receive_pairing, msg):
+                return
         self.sync_from_canvas()
 
         # 1. Check if this channel is activated on canvas (Input connection)
@@ -670,6 +765,16 @@ class ChannelManager:
             return
         self._inactive_logged.discard(msg.channel_id)
 
+        if (msg.platform == 'qq' and msg.chat_type == 'group'
+                and ':group:' in msg.user_id):
+            from channel.qq_groups import observe as observe_group
+            # The authenticated SDK event proves group reachability. Do not
+            # require a second Dashboard pairing; explicitly disabled stays off.
+            if not observe_group(msg):
+                return
+            # Stage marker for real QQ acceptance; never log group or member IDs.
+            print('[qq-group] auto_enable_passed forwarding_to_canvas', flush=True)
+
         is_bot = msg.sender_type in ('bot', 'app')
         trusted_bot_id = self._trusted_bot_id(msg) if is_bot else ''
         if is_bot:
@@ -680,11 +785,24 @@ class ChannelManager:
             user = acl.get_user(msg.platform, msg.user_id)
             if user is None:
                 channel_settings = self._get_channel_settings()
+                if msg.platform == 'qq':
+                    # All new ordinary QQ C2C/group users are chat-only.
+                    # The verified C2C owner retains its separate full grant.
+                    from channel.permissions import PRESETS
+                    default_qq_role, default_qq_filter = PRESETS['chat']
                 default_role = ('viewer' if msg.platform == 'qq' else
                                 channel_settings.get('default_role', 'viewer'))
-                auto_approve = channel_settings.get('auto_approve', True)
+                if msg.platform == 'qq':
+                    default_role, default_filter = default_qq_role, default_qq_filter
+                else:
+                    default_filter = None
+                # QQ users are accepted automatically within Tencent's platform scope;
+                # administrators can still block or restrict them through the ACL.
+                auto_approve = (True if msg.platform == 'qq'
+                                else channel_settings.get('auto_approve', True))
                 if auto_approve:
-                    acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
+                    acl.upsert_user(msg.platform, msg.user_id, msg.display_name,
+                                    role=default_role, tool_filter=default_filter)
                     user = acl.get_user(msg.platform, msg.user_id)
                 else:
                     adapter = self._adapters.get(msg.channel_id)
@@ -710,21 +828,26 @@ class ChannelManager:
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
         )
-        self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
+        self._record_chat_exchange(msg.channel_id,
+                                   f'{msg.chat_type}:{msg.chat_id}' if msg.platform == 'qq' else msg.chat_id,
+                                   'user', msg.text,
                                    user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
         files = [a.to_dict() for a in (msg.attachments or [])]
+        fallback_files = self._qq_followup_attachments(msg) if msg.platform == 'qq' else []
+        files.extend(fallback_files)
         # QQ viewers may inspect files they uploaded *in this message* without
         # gaining access to Desktop Read/Bash or another channel's files.
         # This reuses Feishu's channel.store path and fails closed on unsafe
         # file paths or unsupported formats.
         preview = ''
-        if msg.platform == 'qq' and msg.attachments:
+        if msg.platform == 'qq' and (msg.attachments or fallback_files):
             from channel.attachment_preview import preview_message_files
             preview = await asyncio.to_thread(
-                preview_message_files, msg.channel_id, msg.attachments)
+                preview_message_files, msg.channel_id,
+                list(msg.attachments or []) + [Attachment(**item) for item in fallback_files])
         topic = channel_request_topic(msg.channel_id)
         payload = {
             'platform': msg.platform,
@@ -914,7 +1037,9 @@ class ChannelManager:
             if not mention_open_id:
                 # Bot-to-bot mentions aren't this chat's own human-facing conversation —
                 # keep the recap scoped to the human/channel side of the exchange.
-                self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
+                scoped_chat = (f'{ctx.get("chat_type", "p2p")}:{chat_id}'
+                               if adapter.platform == 'qq' else chat_id)
+                self._record_chat_exchange(channel_id, scoped_chat, 'assistant', text)
             return result
         except PartialSendError as e:
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍
