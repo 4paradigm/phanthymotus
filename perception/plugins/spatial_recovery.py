@@ -42,5 +42,5 @@ class RecoveryPolicy:
             raise ValueError('invalid recovery timing evidence')
         budget=1_000_000_000
         if self.version == 2 and all(v is not None for v in values):
-            budget=max(budget,min(3_000_000_000,3*input_period_ns+2*processing_p95_ns))
+            budget=max(budget,min(3_000_000_000,3*input_period_ns+processing_p95_ns))
         return PauseContext(now_monotonic_ns,now_monotonic_ns+budget,budget)

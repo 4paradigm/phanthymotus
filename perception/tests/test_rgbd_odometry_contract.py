@@ -149,3 +149,8 @@ def test_registered_color_resize_uses_existing_intrinsics_scaling():
     np.testing.assert_allclose(result['K'],np.array(data['/depth']['K']).reshape(3,3))
     color['K'][2]+=20
     with pytest.raises(ValueError):validate_inputs(data,['/rgb','/depth'])
+
+
+def test_one_missing_clock_declaration_selects_receipt_without_false_capture_claim():
+    data=declarations();data['/depth']['vendor'].pop('clock_id')
+    assert validate_inputs(data,['/rgb','/depth'])['time_basis']=='receipt_estimated'

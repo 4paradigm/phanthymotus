@@ -34,8 +34,9 @@ def validate_inputs(declarations, topics):
             raise ValueError('RGB-D registration, optical frame and capture clock are required')
     color_k = _rescale_K(color['K'], (color['width'],color['height']), (640,480))
     if (color['id'] != depth['id'] or color_k is None or not np.allclose(color_k, depth['K'], rtol=1e-7, atol=1e-7) or
-            any(color['vendor'].get(k) != depth['vendor'].get(k)
-                for k in ('frame_id', 'clock_id'))):
+            color['vendor'].get('frame_id') != depth['vendor'].get('frame_id') or
+            (color['vendor'].get('clock_id') and depth['vendor'].get('clock_id') and
+             color['vendor']['clock_id'] != depth['vendor']['clock_id'])):
         raise ValueError('RGB-D inputs must share registered geometry and capture clock')
     # Optional mapping/source evidence must describe one shared capture timeline.
     # Matching clock names alone cannot conceal contradictory producer claims.
@@ -51,7 +52,7 @@ def validate_inputs(declarations, topics):
     semantics = [d['vendor'].get('timestamp_semantics') for d in entries]
     if all(semantics) and semantics[0] != semantics[1]:
         raise ValueError('RGB-D timestamp semantics conflict')
-    capture = all(v == 'source_capture_mapped' for v in semantics) and bool(color['vendor'].get('clock_id'))
+    capture = all(v == 'source_capture_mapped' for v in semantics) and all(d['vendor'].get('clock_id') for d in entries)
     mount = color['vendor'].get('body_mount')
     if mount != depth['vendor'].get('body_mount'):
         raise ValueError('RGB-D body_mount declarations conflict')

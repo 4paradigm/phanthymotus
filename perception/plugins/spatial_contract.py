@@ -28,7 +28,8 @@ def validate_tracking_pose(sample):
 def input_declaration(topic, kind, frame, context, *, metadata_topic=None):
     value = dict(schema='motus.slam_input/2', topic=topic, kind=kind,
         format='state/odom' if kind=='pose' else 'sensor/pointcloud2', length_unit='m',
-        source_id=context.source_id, source_epoch=context.source_epoch,
+        source_id=context.source_id, source_epoch=context.source_epoch, geometry_version=context.geometry_version,
+        mapping_version=context.mapping_version, mapping_source=context.mapping_source,
         clock_id=context.normalized_clock_id, time_basis=context.time_basis,
         ingress_clock_id=context.ingress_clock_id,
         stamp_source='measurement' if context.time_basis=='source_capture' else 'receipt_estimated',
@@ -81,9 +82,17 @@ def resolve_v2_inputs(metadata, bindings):
             any(not isinstance(v,str) or not v for v in (child,frame,cloud.get('frame_metadata_topic'))) or
             cloud['frame_metadata_topic'] in bindings):
         raise ValueError('input kind, frames and sidecar required')
-    if (pose['clock_id']!=cloud['clock_id'] or pose['time_basis']!=cloud['time_basis'] or
-            pose.get('source_epoch')!=cloud.get('source_epoch')):
-        raise ValueError('input clock/time basis/epoch conflict')
+    if pose['clock_id']!=cloud['clock_id']:
+        raise ValueError('input clock conflict')
+    mixed=pose['time_basis']!=cloud['time_basis']
+    if mixed:
+        capture=pose if pose['time_basis']=='source_capture' else cloud
+        if not capture.get('mapping_source'):
+            raise ValueError('mixed time bases require an explicit capture mapping into the common clock')
+    common_source=(not pose.get('source_id') or not cloud.get('source_id') or pose['source_id']==cloud['source_id'])
+    if (common_source and pose.get('source_epoch') is not None and cloud.get('source_epoch') is not None and
+            pose['source_epoch']!=cloud['source_epoch']):
+        raise ValueError('input source epoch conflict')
     if (pose.get('ingress_clock_id')!=cloud.get('ingress_clock_id') or not pose.get('ingress_clock_id')):
         raise ValueError('common ingress clock evidence required')
     if cloud.get('observation_model') not in ('pinhole','lidar') or cloud.get('timing_model') not in ('instantaneous','deskewed'):
@@ -100,7 +109,8 @@ def resolve_v2_inputs(metadata, bindings):
     mode=mount.get('mode','static')
     matrix=None if mode=='dynamic' else rigid(mount.get('matrix')).tolist()
     return dict(schema='motus.slam_input/2',inputs=inputs,frame_metadata_topic=cloud['frame_metadata_topic'],
-                extrinsic=deepcopy(mount),time_basis=cloud['time_basis'],
+                extrinsic=deepcopy(mount),time_basis='mixed' if mixed else cloud['time_basis'],
+                association_method='arrival_time' if 'receipt_estimated' in (pose['time_basis'],cloud['time_basis']) else 'source_time',
                 ingress_clock_id=cloud['ingress_clock_id'],
                 settings=dict(cloud_frame=frame,child_frame=child,clock_id=cloud['clock_id'],
                               child_from_cloud=matrix,extrinsic_mode=mode))
@@ -118,3 +128,13 @@ def normalize_pose_time(sample, context):
         stamp_ns=context.observation_stamp_ns,clock_id=context.normalized_clock_id,observation=context.to_dict())
     if quality.get('status')=='tracking':validate_tracking_pose(result)
     return result
+
+
+def validate_observation_declaration(context, declaration):
+    for name,attribute in (('clock_id','normalized_clock_id'),('time_basis','time_basis'),
+                           ('ingress_clock_id','ingress_clock_id')):
+        if getattr(context,attribute)!=declaration[name]:
+            raise ValueError('observation differs from input declaration: '+name)
+    for name in ('source_id','source_epoch','geometry_version','mapping_version','mapping_source'):
+        if declaration.get(name) is not None and getattr(context,name)!=declaration[name]:
+            raise ValueError('observation source identity differs from declaration: '+name)

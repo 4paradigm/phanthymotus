@@ -5170,9 +5170,10 @@ separately requires a tracking pose and usable finite points; prediction/lost/
 recovering states do not map. Lidar scans do not inherit image depth-fraction rules.
 
 `motus.pause/2` freezes a waiting budget at degradation: with measured input period
-and processing P95 it is `clamp(3*period + 2*P95, 1s, 3s)`, otherwise 1s. VO and SLAM
+and processing P95 it is `clamp(3*period + P95, 1s, 3s)`, otherwise 1s. VO and SLAM
 share the declared original deadline in the same ingress process. Repeated pause
-messages cannot extend it. Legacy pauses, physical IMU prediction, uncertainty
+messages cannot extend it. The period uses the median of up to 32 intervals,
+only after at least five valid intervals. Legacy pauses, physical IMU prediction, uncertainty
 bounds and the pose interpolation gap retain their previous limits.
 
 PointCloud2 normalization validates original bytes/digest first. Big-endian,

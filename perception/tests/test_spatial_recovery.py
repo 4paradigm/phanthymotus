@@ -3,7 +3,7 @@ from plugins.spatial_recovery import RecoveryPolicy, PauseContext
 
 
 def test_pause_budget_frozen_and_capped():
-    p=RecoveryPolicy();a=p.begin(600_000_000,900_000_000,10_000_000_000)
+    p=RecoveryPolicy();a=p.begin(900_000_000,900_000_000,10_000_000_000)
     assert a.budget_ns==3_000_000_000
     assert a.deadline_monotonic_ns==13_000_000_000
     with pytest.raises(Exception):a.budget_ns=4_000_000_000
@@ -39,3 +39,13 @@ def test_versioned_slam_pause_uses_producer_deadline_without_extending_predictio
     assert s._odom_state=='recovering'
     s.odom(odom(2500),now=2.5)
     assert s._odom_state=='tracking' and not s._requires_new_segment
+
+
+def test_plan_budget_uses_one_p95_and_period_uses_five_interval_median():
+    from plugins.rgbd_odometry_runtime import EstimateGate
+    assert RecoveryPolicy().begin(500_000_000,200_000_000,0).budget_ns==1_700_000_000
+    gate=EstimateGate('run','camera','clock')
+    for i in range(5):gate.input(1_000_000_000+i*100_000_000)
+    assert gate.input_period_ns is None
+    gate.input(2_300_000_000)
+    assert gate.input_period_ns==100_000_000

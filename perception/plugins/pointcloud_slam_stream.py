@@ -217,11 +217,10 @@ class SlamStream:
                 self._lose()
                 raise ValueError('pose observation context changed within segment')
             if self.input_contract and self.input_contract.get('schema')=='motus.slam_input/2':
-                context=pose.observation
-                if (context is None or context.normalized_clock_id!=self.clock_id or
-                        context.time_basis!=self.input_contract['time_basis'] or
-                        context.ingress_clock_id!=self.input_contract['ingress_clock_id']):
-                    raise ValueError('pose observation differs from v2 input declaration')
+                from .spatial_contract import validate_observation_declaration
+                declared=next(d for d in self.input_contract['inputs'].values() if d['kind']=='pose')
+                if pose.observation is None:raise ValueError('pose observation required by v2 declaration')
+                validate_observation_declaration(pose.observation,declared)
             if self.input_contract:
                 from .pointcloud_slam_input import frame_identity
                 quality = sample['vendor']['motus_slam']
@@ -355,14 +354,10 @@ class SlamStream:
     def _v2_cloud_metadata(self, packet, now, measurement_now_ns):
         from .spatial_contract import validate_frame_packet
         context=validate_frame_packet(packet)
-        if (context.normalized_clock_id!=self.clock_id or packet['frame_id']!=self.cloud_frame or
-                context.time_basis!=self.input_contract['time_basis'] or
-                context.ingress_clock_id!=self.input_contract['ingress_clock_id']):
-            raise ValueError('cloud observation differs from v2 input declaration')
-        if self._poses and self._poses[-1].observation is not None:
-            pose_context=self._poses[-1].observation
-            if (context.source_epoch,context.mapping_version)!=(pose_context.source_epoch,pose_context.mapping_version):
-                raise ValueError('cloud source epoch/mapping differs from pose')
+        from .spatial_contract import validate_observation_declaration
+        declared=next(d for d in self.input_contract['inputs'].values() if d['kind']=='cloud')
+        validate_observation_declaration(context,declared)
+        if packet['frame_id']!=self.cloud_frame:raise ValueError('cloud frame differs from declaration')
         if self.extrinsic_mode=='dynamic':
             if context.time_basis=='receipt_estimated':
                 raise ValueError('receipt observation cannot identify dynamic mount capture')
@@ -555,6 +550,28 @@ class SlamStream:
         self._pending.append((stamp_ns, cloud, self._last_cloud_received, deepcopy(capture_context)))
         self._drain(now, measurement_now_ns)
 
+    def _validate_association_context(self, context, pose):
+        if not self.input_contract or self.input_contract.get('schema')!='motus.slam_input/2':return
+        from .spatial_time import FrameContext
+        from .spatial_contract import validate_observation_declaration
+        if not context or not context.get('observation'):raise ValueError('cloud observation required')
+        cloud=FrameContext.from_dict(context['observation'])
+        declared=next(d for d in self.input_contract['inputs'].values() if d['kind']=='cloud')
+        validate_observation_declaration(cloud,declared)
+        parents=(pose.observation,) if pose.observation is not None else pose.observation_parents
+        if not parents:raise ValueError('associated pose observation required')
+        for observed in parents:
+            if observed.normalized_clock_id!=cloud.normalized_clock_id:
+                raise ValueError('associated cloud and pose clock differs')
+            common_source=not observed.source_id or not cloud.source_id or observed.source_id==cloud.source_id
+            if common_source:
+                for field in ('source_epoch','geometry_version','mapping_version'):
+                    a,b=getattr(cloud,field),getattr(observed,field)
+                    if a is not None and b is not None and a!=b:
+                        raise ValueError('cloud/pose association source identity mismatch: '+field)
+        context['association_method']=('arrival_time' if cloud.time_basis=='receipt_estimated' or
+            any(p.time_basis=='receipt_estimated' for p in parents) else 'source_time')
+
     def _drain(self, now, measurement_now_ns):
         remaining = deque()
         while self._pending:
@@ -569,6 +586,7 @@ class SlamStream:
                     remaining.append((stamp, cloud, received, context))
                     continue
                 pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
+                self._validate_association_context(context,pose)
                 frames = (pose.frame_id, pose.child_frame_id, pose.clock_id, pose.pose_reference)
                 if pose.segment_id in self._segments:
                     if pose.segment_id != next(reversed(self._segments)):

@@ -1,5 +1,5 @@
 """Immutable observation evidence; receipt time is not capture time."""
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Optional, Tuple
 import uuid
 
@@ -136,3 +136,16 @@ class TimePolicy:
             mapping_version=source.get('mapping_version'), mapping_offset_ns=offset if capture else None,
             mapping_verified=verified if capture else False, uncertainty_ns=uncertainty if capture else None,
             geometry_version=source.get('geometry_version'))
+
+
+def receipt_association(context):
+    """Derive arrival alignment while retaining the original capture evidence."""
+    if context.time_basis == 'receipt_estimated':
+        return context
+    return replace(context, observation_id=uuid.uuid4().hex,
+        observation_stamp_ns=context.ingress_realtime_ns,
+        normalized_clock_id=context.ingress_clock_id, time_basis='receipt_estimated',
+        mapping_source='perception_ingress', mapping_offset_ns=None,
+        mapping_verified=False, uncertainty_ns=None,
+        parent_observation_ids=(context.observation_id,),
+        transformations=context.transformations+('arrival_alignment',))

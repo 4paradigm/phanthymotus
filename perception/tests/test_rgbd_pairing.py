@@ -32,9 +32,9 @@ def test_arrival_pair_is_approximate_with_separate_source_ids():
 
 
 def test_old_epoch_never_pairs_and_time_basis_cannot_silently_change():
-    for other in (context(epoch='two'),context(receipt=True)):
+    for kind,other in (('depth',context(epoch='two')),('color',context(receipt=True))):
         p=RgbdPairer();p.push('color',msg(),context())
-        with pytest.raises(ValueError,match='context changed'):p.push('depth',msg(),other)
+        with pytest.raises(ValueError,match='context changed'):p.push(kind,msg(),other)
         assert p.pending_count==0
 
 
@@ -58,3 +58,25 @@ def test_source_time_and_geometry_version_conflict():
     assert pair.method=='source_time'
     p=RgbdPairer();p.push('color',msg(),replace(context(),geometry_version='a'))
     with pytest.raises(ValueError):p.push('depth',msg(),replace(context(),geometry_version='b'))
+
+
+def test_optional_epoch_on_one_stream_is_unknown_not_a_reset():
+    p=RgbdPairer();a=replace(context(),source_epoch=None);b=context()
+    p.push('color',msg(),a)
+    pair=p.push('depth',msg(),b)
+    assert pair.color_context.source_epoch is None and pair.depth_context.source_epoch=='one'
+    p.push('color',msg(),replace(a,observation_stamp_ns=a.observation_stamp_ns+1))
+    with pytest.raises(ValueError,match='context changed'):
+        p.push('depth',msg(),context(1_000_000_001,epoch='two'))
+
+
+def test_one_missing_capture_uses_common_ingress_without_erasing_other_source_time():
+    p=RgbdPairer();a=context();b=context(1_001_000_000,receipt=True)
+    p.push('color',msg(),a)
+    pair=p.push('depth',msg(),b)
+    assert pair.method=='arrival_time'
+    assert pair.color_context.time_basis=='source_capture'
+    assert pair.color_time.time_basis=='receipt_estimated'
+    assert pair[0][0]==a.ingress_realtime_ns
+    assert pair.color_time.original_stamp==a.original_stamp
+    assert pair.depth_context.source_capture_id is None

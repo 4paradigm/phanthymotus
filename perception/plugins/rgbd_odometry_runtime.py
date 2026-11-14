@@ -2,6 +2,7 @@
 from collections import Counter, OrderedDict, deque
 from array import array
 from copy import deepcopy
+from dataclasses import replace
 import json
 import logging
 import math
@@ -87,12 +88,14 @@ class EstimateGate:
         self.rejection = None
         self.recovery_policy = self.pause_context = None
         self.input_period_ns = self.processing_p95_ns = None
+        self.input_intervals = deque(maxlen=32)
 
     def input(self, stamp, *, now_ns=None):
         self.status(stamp if now_ns is None else now_ns)
         if self.state != 'lost':
             if self.last_input and stamp > self.last_input:
-                self.input_period_ns = stamp-self.last_input
+                self.input_intervals.append(stamp-self.last_input)
+                self.input_period_ns = int(np.median(self.input_intervals)) if len(self.input_intervals)>=5 else None
             self.last_input = stamp
 
     def fault(self, reason, kind='other'):
@@ -124,7 +127,7 @@ class EstimateGate:
         if visual_stamp and now - visual_stamp > 1_500_000_000:
             self.fault('visual estimate stale; restart to begin a new segment', 'visual')
         if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
-            self.fault('visual degradation persisted beyond 1 s; restart to begin a new segment', 'visual')
+            self.fault(f'visual degradation persisted beyond {(self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)/1e9:g} s; restart to begin a new segment', 'visual')
         return self.state
 
     def _continuous(self, stamp, position, rotation):
@@ -177,7 +180,7 @@ class EstimateGate:
             return None
         if (self.state == 'recovering' and self.last_pose is not None and
                 stamp - self.last_pose[0] > (self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)):
-            self.fault('visual recovery exceeded the 0.8 s in-segment pause bound; '
+            self.fault(f'visual recovery exceeded the {(self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)/1e9:g} s in-segment pause bound; '
                        'restart to begin a new segment', 'visual')
             return None
         if self.state != 'tracking' and not self._continuous(stamp, position, rotation):
@@ -379,6 +382,7 @@ class RgbdSession:
         self.previous_motion = None
         self.quality_by_stamp = OrderedDict()
         self.processing_ages = deque(maxlen=32)
+        self.processing_observations = deque(maxlen=32)
         self.stage_times={k:deque(maxlen=128) for k in ('decode','imu_wait')}
         self.fusion = (ShortTermFusion(self.segment, calibration['frame_id'], calibration['clock_id'],
                        calibration['K'], calibration.get('depth_geometry', False))
@@ -654,11 +658,17 @@ class RgbdSession:
                     # Only native transport copies gain observation stamps. Source
                     # headers and both original contexts remain in the association.
                     color, depth = deepcopy(color), deepcopy(depth)
-                    for message, ctx in ((color, pair.color_context), (depth, pair.depth_context)):
+                    for message, ctx in ((color, pair.color_time), (depth, pair.depth_time)):
                         message.header.stamp.sec, message.header.stamp.nanosec = divmod(ctx.observation_stamp_ns, 10**9)
                 capture_stamp = native_capture_stamp(color, depth)
                 if isinstance(pair, RgbdPair):
-                    selected = pair.color_context if capture_stamp == pair.color_context.observation_stamp_ns else pair.depth_context
+                    selected = pair.color_time if capture_stamp == pair.color_time.observation_stamp_ns else pair.depth_time
+                    other=pair.depth_time if selected is pair.color_time else pair.color_time
+                    selected=replace(selected,observation_id=uuid.uuid4().hex,
+                        parent_observation_ids=(pair.color_context.observation_id,pair.depth_context.observation_id),
+                        transformations=selected.transformations+('rgbd_association',),
+                        **{k:getattr(selected,k) if getattr(selected,k) is not None else getattr(other,k)
+                           for k in ('source_id','source_epoch','geometry_version','mapping_version')})
                     with self.lock:
                         if self.gate.last_result_stamp == 0:
                             self.gate.clock = selected.normalized_clock_id
@@ -831,7 +841,8 @@ class RgbdSession:
                 inputs=[pair.color_context.to_dict(), pair.depth_context.to_dict()])
         quality = getattr(self, 'quality_by_stamp', {}).get(stamp, QualityReport())
         sample['vendor']['observation_quality'] = quality.to_dict()
-        if context is not None:
+        if context is not None and context.observation_id not in self.processing_observations:
+            self.processing_observations.append(context.observation_id)
             self.processing_ages.append(max(0, time.monotonic_ns()-context.ingress_monotonic_ns))
             self.gate.processing_p95_ns = int(np.percentile(self.processing_ages, 95))
             if self.fusion is not None:

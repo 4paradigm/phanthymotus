@@ -220,3 +220,21 @@ def test_failed_final_status_does_not_leave_a_disposed_card_instance(sessions):
     finally:
         original.status_publisher.publish = publish
         card.shutdown()
+
+
+def test_repeated_status_does_not_inflate_observation_processing_latency(sessions):
+    from plugins.spatial_time import TimePolicy
+    create, _, ticks = sessions
+    session=create()
+    context=TimePolicy('shared').select(
+        dict(stamp_ns=1_000_000_000,clock_id='camera-clock',
+             timestamp_semantics='source_capture_mapped'),1_010_000_000,0)
+    pair=NS(association_id='pair',method='source_time',skew_ns=0,
+            color_context=context,depth_context=context)
+    session.contexts_by_stamp[1_000_000_000]=(context,pair)
+    ticks[0]=20_000_000
+    tracking(session,[0.,0.,0.])
+    ticks[0]=900_000_000
+    tracking(session,[0.,0.,0.])
+    assert list(session.processing_ages)==[20_000_000]
+    assert session.gate.processing_p95_ns==20_000_000

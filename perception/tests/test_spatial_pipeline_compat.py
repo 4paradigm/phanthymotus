@@ -102,3 +102,47 @@ def test_context_change_requires_new_segment_and_new_segment_can_map():
     s.cloud(later.observation_stamp_ns,s.cloud_frame,[[1,2,3]],now=1.1)
     assert s.status(now=1.1)['integration']=='admitting'
     assert len(s.accepted)==2
+
+
+@pytest.mark.parametrize('sidecar_first',[True,False])
+@pytest.mark.parametrize('field',['source_epoch','geometry_version','mapping_version'])
+def test_cloud_identity_is_checked_at_final_association_in_either_arrival_order(sidecar_first,field):
+    from dataclasses import replace
+    from plugins.rgbd_odometry_contract import make_sample
+    value,c=sample(receipt=True)
+    current=replace(c,source_epoch='current',geometry_version='current',mapping_version='current')
+    p=make_sample('tracking',current.observation_stamp_ns,'run1',current.normalized_clock_id,value['pose'],context=current)
+    old=replace(current,**{field:'previous'})
+    frame=p['pose']['child_frame_id']
+    metadata={'/o':input_declaration('/o','pose',frame,current),
+              '/c':input_declaration('/c','cloud',frame,current,metadata_topic='/meta')}
+    for declaration in metadata.values():
+        for key in ('source_epoch','geometry_version','mapping_version'):declaration.pop(key,None)
+    resolved=resolve_inputs(metadata,{'/o':'state/odom','/c':'sensor/pointcloud2'})
+    s=stream(**resolved['settings'],input_contract=resolved)
+    packet=frame_packet(frame,old,b'cloud')
+    if sidecar_first:s.cloud_metadata(packet,now=1.)
+    s.odom(p,now=1.)
+    if not sidecar_first:s.cloud_metadata(packet,now=1.)
+    s.cloud(current.observation_stamp_ns,frame,[[1,2,3]],now=1.,data_sha256=packet['data_sha256'])
+    assert not s.accepted
+
+
+def test_mixed_capture_receipt_keeps_actual_bases_and_marks_association_approximate():
+    from dataclasses import replace
+    from plugins.rgbd_odometry_contract import make_sample
+    value,receipt=sample(receipt=True)
+    capture=replace(receipt,time_basis='source_capture',mapping_source='explicit_host_mapping',mapping_version='v1')
+    p=make_sample('tracking',capture.observation_stamp_ns,'run1',capture.normalized_clock_id,value['pose'],context=capture)
+    frame=p['pose']['child_frame_id']
+    metadata={'/o':input_declaration('/o','pose',frame,capture),
+              '/c':input_declaration('/c','cloud',frame,receipt,metadata_topic='/meta')}
+    resolved=resolve_inputs(metadata,{'/o':'state/odom','/c':'sensor/pointcloud2'})
+    s=stream(**resolved['settings'],input_contract=resolved)
+    packet=frame_packet(frame,receipt,b'cloud')
+    s.odom(p,now=1.);s.cloud_metadata(packet,now=1.)
+    s.cloud(receipt.observation_stamp_ns,frame,[[1,2,3]],now=1.,data_sha256=packet['data_sha256'])
+    assert len(s.accepted)==1
+    assert s.accepted[0].capture_context['association_method']=='arrival_time'
+    assert s.accepted[0].pose.observation.time_basis=='source_capture'
+    assert s.accepted[0].capture_context['observation']['time_basis']=='receipt_estimated'

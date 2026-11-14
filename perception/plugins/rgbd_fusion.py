@@ -409,7 +409,7 @@ class ShortTermFusion:
         if self.state == 'tracking' or self.good >= 3:
             if (self.state != 'tracking' and self.last_tracking is not None and
                     stamp-self.last_tracking[0] > (self.pause_context.budget_ns if self.pause_context else INERTIAL_LIMIT_NS)):
-                self.fault('fusion recovery exceeded the 1 s mapping pause; restart required')
+                self.fault(f'fusion recovery exceeded the {(self.pause_context.budget_ns if self.pause_context else INERTIAL_LIMIT_NS)/1e9:g} s mapping pause; restart required')
             else:
                 self.state, self.reason = 'tracking', None
                 if visual_pose is not None:

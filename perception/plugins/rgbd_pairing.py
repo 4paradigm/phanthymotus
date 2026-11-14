@@ -2,6 +2,7 @@
 from collections import deque
 from dataclasses import dataclass
 import uuid
+from .spatial_time import receipt_association
 
 
 @dataclass(frozen=True)
@@ -14,9 +15,12 @@ class RgbdPair:
     method: str
     skew_ns: int
 
+    color_time: object
+    depth_time: object
+
     def __iter__(self):
-        return iter(((self.color_context.observation_stamp_ns, self.color),
-                     (self.depth_context.observation_stamp_ns, self.depth)))
+        return iter(((self.color_time.observation_stamp_ns, self.color),
+                     (self.depth_time.observation_stamp_ns, self.depth)))
 
     def __getitem__(self, index):
         return tuple(self)[index]
@@ -29,7 +33,7 @@ class RgbdPairer:
         self.max_pending, self.max_skew_ns = max_pending, max_skew_ns
         self.max_bytes, self.max_wait_ns = max_bytes, max_wait_ns
         self.previous, self.identities = {}, {}
-        self.signature = None
+        self.signatures = {}
         self.dropped = 0
 
     @property
@@ -46,11 +50,19 @@ class RgbdPairer:
 
     def push(self, kind, message, context):
         signature = (context.time_basis, context.normalized_clock_id,
-                     context.source_epoch, context.geometry_version, context.mapping_version)
-        if self.signature is not None and self.signature != signature:
+                     context.source_epoch, context.geometry_version, context.mapping_version, context.ingress_clock_id)
+        previous=self.signatures.get(kind)
+        other=self.signatures.get('depth' if kind=='color' else 'color')
+        conflict=previous is not None and previous!=signature
+        if other is not None:
+            arrival = 'receipt_estimated' in (signature[0], other[0])
+            clocks_conflict = signature[-1]!=other[-1] if arrival else signature[1]!=other[1]
+            conflict=conflict or clocks_conflict or any(
+                a is not None and b is not None and a!=b for a,b in zip(signature[2:5],other[2:5]))
+        if conflict:
             for q in self.queues.values():q.clear()
             raise ValueError('RGB-D time/source/geometry context changed; new segment required')
-        self.signature = signature
+        self.signatures[kind]=signature
         stamp = context.observation_stamp_ns
         if stamp <= self.previous.get(kind, 0):
             raise ValueError('repeated or backwards RGB-D observation')
@@ -75,12 +87,14 @@ class RgbdPairer:
         color, depth = self.queues['color'], self.queues['depth']
         while color and depth:
             a, b = color[0][1], depth[0][1]
-            skew = a.observation_stamp_ns-b.observation_stamp_ns
+            arrival = 'receipt_estimated' in (a.time_basis, b.time_basis)
+            at, bt = (receipt_association(a), receipt_association(b)) if arrival else (a, b)
+            skew = at.observation_stamp_ns-bt.observation_stamp_ns
             ids = a.source_capture_id, b.source_capture_id
             if abs(skew) <= self.max_skew_ns and (None in ids or ids[0] == ids[1]):
-                method = ('source_identity' if None not in ids else
-                          'source_time' if a.time_basis == 'source_capture' else 'arrival_time')
+                method = ('arrival_time' if arrival else
+                          'source_identity' if None not in ids else 'source_time')
                 cm, _, _ = color.popleft();dm, _, _ = depth.popleft()
-                return RgbdPair(cm, dm, a, b, uuid.uuid4().hex, method, abs(skew))
+                return RgbdPair(cm, dm, a, b, uuid.uuid4().hex, method, abs(skew), at, bt)
             self._drop(color if skew <= 0 else depth)
         return None

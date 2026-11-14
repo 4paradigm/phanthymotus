@@ -24,6 +24,7 @@ class PoseSample:
     pose_reference: str = None
     observation: FrameContext = None
     precise_stamp_ns: int = None
+    observation_parents: tuple = ()
 
     @property
     def stamp_ns(self):
