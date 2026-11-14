@@ -495,6 +495,8 @@ class _PointCloudNode(Node):
         cloud.is_dense = True
         cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
         if context is not None and self._input_registry is not None:
+            self._metric_observation = context
+            self._metric_frame = header.frame_id
             derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context, 'depth_projection')
             if self._metric_metadata_pub is not None and not self._metric_metadata_source_topic:
                 packet = dict(schema='motus.slam_frame/2', observation=derived.to_dict(),
@@ -893,6 +895,12 @@ class PointCloudPerceptionPlugin:
                 with self._nodes_lock:
                     upstream = self._upstream_camera.get(key)
                     declaration = copy.deepcopy(self._upstream_input_metadata.get(key))
+                observation = getattr(metric_node, '_metric_observation', None)
+                if observation is not None and observation.time_basis=='receipt_estimated':
+                    from .spatial_contract import input_declaration
+                    declaration=input_declaration(metric_node._metric_cloud_topic,'cloud',
+                        metric_node._metric_frame,observation,
+                        metadata_topic=metric_node._metric_metadata_topic)
                 if declaration:
                     declaration.update(topic=metric_node._metric_cloud_topic, kind="cloud",
                                        format="sensor/pointcloud2", length_unit="m",

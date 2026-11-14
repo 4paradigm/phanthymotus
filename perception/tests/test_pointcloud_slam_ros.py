@@ -578,3 +578,24 @@ def test_shared_input_leases_are_released_by_gateway_close(tmp_path, monkeypatch
     finally:
         registry.close()
         n.destroy_node()
+
+
+def test_waiting_for_pose_does_not_refresh_original_ingress_age(node):
+    # Stop only this test's worker so we can inspect the actual native queue.
+    node._worker_stop.set();node._wake.set();node._worker.join(timeout=1)
+    tick=[1.]
+    node._receipt_clock=lambda:tick[0]
+    node._odom(NS(data=json.dumps(odom(1000))))
+    node._cloud(cloud(1_100_000_000))
+    tick[0]=1.4
+    node._measurement_clock_ns=lambda:1_200_000_000
+    node._odom(NS(data=json.dumps(odom(1200))))
+    assert len(node._queue)==1
+    assert node._queue[0][-1]==1.
+
+
+def test_unknown_covariance_reports_backend_default(node):
+    send(node)
+    assert _wait_until(lambda:node.status()['forwarded_clouds']==1)
+    assert node.status()['covariance_source']=='backend_default'
+    assert node.status()['upstream_covariance']=='unknown'

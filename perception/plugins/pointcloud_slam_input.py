@@ -16,6 +16,10 @@ class InputContractError(ValueError):
 
 def resolve_inputs(metadata, bindings):
     """Resolve only the connected pose/cloud pair; never invent missing facts."""
+    if isinstance(metadata, dict) and any(isinstance(metadata.get(t),dict) and
+            metadata[t].get('schema')=='motus.slam_input/2' for t in bindings):
+        from .spatial_contract import resolve_v2_inputs
+        return resolve_v2_inputs(metadata,bindings)
     diagnostics = []
     inputs = {}
 

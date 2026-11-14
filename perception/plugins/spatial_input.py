@@ -8,13 +8,16 @@ import threading
 import time
 import uuid
 
-from .spatial_time import TimePolicy, compatible_sources
+from .spatial_time import TimePolicy, FrameContext, compatible_sources
 
 
 def _stamp(message):
     header = getattr(message, 'header', None)
     stamp = getattr(header, 'stamp', None)
-    return stamp.sec * 1_000_000_000 + stamp.nanosec if stamp is not None else None
+    if stamp is None:return None
+    if type(stamp.sec) is not int or type(stamp.nanosec) is not int or stamp.sec<0 or not 0<=stamp.nanosec<1_000_000_000:
+        raise ValueError('invalid ROS timestamp')
+    return stamp.sec * 1_000_000_000 + stamp.nanosec
 
 
 def _payload(message):
@@ -27,6 +30,14 @@ def _identity(topic, message):
             _stamp(message), hashlib.sha256(_payload(message)).hexdigest())
 
 
+def latency_summary(samples):
+    values=sorted(samples)
+    result={'count':len(values)}
+    for name,percentile in (('p50_ms',.5),('p95_ms',.95),('p99_ms',.99)):
+        result[name]=round(values[min(len(values)-1,int((len(values)-1)*percentile))]/1e6,3) if values else None
+    return result
+
+
 class SubscriptionLease:
     def __init__(self, registry, stream, consumer):
         self.registry, self.stream, self.consumer = registry, stream, consumer
@@ -35,6 +46,7 @@ class SubscriptionLease:
         self._bytes = self._dropped = self._errors = 0
         self._closed = False
         self._last_error = None
+        self._queue_times,self._callback_times=deque(maxlen=128),deque(maxlen=128)
         self._worker = threading.Thread(target=self._run, name='spatial-input-consumer', daemon=True)
         self._worker.start()
 
@@ -50,7 +62,7 @@ class SubscriptionLease:
                                      self._bytes + size > self.registry.max_bytes):
                 self._bytes -= self._pending.popleft()[2]
                 self._dropped += 1
-            self._pending.append((message, context, size))
+            self._pending.append((message, context, size, time.monotonic_ns()))
             self._bytes += size
             self._condition.notify()
 
@@ -60,12 +72,14 @@ class SubscriptionLease:
                 self._condition.wait_for(lambda: self._closed or self._pending)
                 if self._closed:
                     return
-                message, context, size = self._pending.popleft()
+                message, context, size, offered = self._pending.popleft()
                 self._bytes -= size
             if time.monotonic_ns() - context.ingress_monotonic_ns > self.registry.max_age_ns:
                 with self._condition:
                     self._dropped += 1
                 continue
+            began=time.monotonic_ns()
+            with self._condition:self._queue_times.append(max(0,began-offered))
             try:
                 # The canonical message is never lent to a mutating consumer.
                 self.consumer(deepcopy(message), context)
@@ -73,11 +87,14 @@ class SubscriptionLease:
                 with self._condition:
                     self._errors += 1
                     self._last_error = str(error)[:300]
+            finally:
+                with self._condition:self._callback_times.append(max(0,time.monotonic_ns()-began))
 
     def status(self):
         with self._condition:
             return dict(pending=len(self._pending), pending_bytes=self._bytes,
-                        dropped=self._dropped, errors=self._errors, last_error=self._last_error)
+                        dropped=self._dropped, errors=self._errors, last_error=self._last_error,
+                        timing=dict(queue_wait=latency_summary(self._queue_times),callback=latency_summary(self._callback_times)))
 
     def close(self):
         with self._condition:
@@ -149,7 +166,7 @@ class InputAdapterRegistry:
     def _check_declarations(first, second):
         a, b = first.get('vendor') or {}, second.get('vendor') or {}
         compatible_sources(a, b)
-        for left, right, names in ((first, second, ('id', 'width', 'height', 'K', 'D', 'format')),
+        for left, right, names in ((first, second, ('id', 'width', 'height', 'K', 'D', 'format', 'clock_id', 'time_basis', 'source_id', 'source_epoch')),
                                   (a, b, ('clock_id', 'frame_id', 'timestamp_semantics', 'registration'))):
             for name in names:
                 if left.get(name) is not None and right.get(name) is not None and left[name] != right[name]:
@@ -157,6 +174,9 @@ class InputAdapterRegistry:
 
     def _source(self, declaration, message):
         source = dict(declaration.get('vendor') or {})
+        if declaration.get('schema') in ('motus.slam_input/1','motus.slam_input/2') and declaration.get('stamp_source')=='measurement':
+            source.update(clock_id=declaration.get('clock_id'),timestamp_semantics='source_capture_mapped',
+                          source_id=declaration.get('source_id'),source_epoch=declaration.get('source_epoch'))
         stamp = _stamp(message)
         if stamp is None and isinstance(getattr(message, 'data', None), str):
             sample = json.loads(message.data)
@@ -182,9 +202,20 @@ class InputAdapterRegistry:
                 if len(_payload(message)) > self.max_bytes:
                     raise ValueError('input payload exceeds byte budget')
                 context = self._derived.get(_identity(stream['key'][1], message))
+                if context is None and isinstance(getattr(message,'data',None),str):
+                    sample=json.loads(message.data)
+                    quality=(sample.get('vendor') or {}).get('motus_slam') or {}
+                    if quality.get('profile')=='motus_slam/2':
+                        from .spatial_contract import validate_tracking_pose
+                        if quality.get('status')=='tracking':validate_tracking_pose(sample)
+                        supplied=FrameContext.from_dict(quality.get('observation'))
+                        if supplied.ingress_clock_id==self.clock_id:
+                            context=supplied
+                        elif supplied.time_basis=='receipt_estimated':
+                            raise ValueError('foreign receipt context has no common ingress clock')
                 if context is None:
                     context = self.time_policy.select(self._source(stream['declaration'], message), realtime, monotonic)
-                elif monotonic-context.ingress_monotonic_ns > self.max_age_ns:
+                if monotonic-context.ingress_monotonic_ns > self.max_age_ns:
                     raise ValueError('derived input exceeds original ingress age')
             except (ValueError, TypeError, AttributeError, OverflowError) as error:
                 stream['rejected'] += 1

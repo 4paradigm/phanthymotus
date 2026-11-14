@@ -257,13 +257,8 @@ plugins:
     # responses, so this does not guess between them.
     lens_barrel_max_fraction: 0.6
 
-  # Unified point cloud. One tool, three inputs:
-  #   A. depth map   (image/depth-z16 Image | image/depth-zlib CompressedImage)
-  #   B. mono RGB    (image/jpeg) — reuses visual_depth's TensorRT engine
-  #   C. stereo pair (image/jpeg × 2)   — SGBM + reprojectImageTo3D
-  # A/B allow approximate visual output (hfov defaults to 90°); metric output
-  # requires real intrinsics. C requires calibration from the upstream camera
-  # declarations or configuration. Engine load (B only) is lazy on first start.
+  # One depth input. Metric output requires declared pinhole intrinsics,
+  # millimetre optical-Z semantics and explicit capture/receipt time context.
   pointcloud:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
@@ -292,6 +287,9 @@ plugins:
 
   pointcloud_slam:
     enabled: true
+    # Empty preserves the pinned backend defaults. Allowed: RGBD/LinearUpdate
+    # (meters), RGBD/AngularUpdate (radians), finite nonnegative values only.
+    native_parameters: {}
 
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities

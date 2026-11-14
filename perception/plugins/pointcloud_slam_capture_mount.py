@@ -76,13 +76,13 @@ class CaptureClouds:
             raise
         self._drain(stream, now, measurement_now_ns)
 
-    def cloud(self, stamp, frame, cloud, count, stream, *, now, measurement_now_ns):
+    def cloud(self, stamp, frame, cloud, count, stream, *, now, measurement_now_ns, received=None):
         if frame != self.mounts.frame:
             raise ValueError('cloud frame differs from capture mount')
         stream._check_measurement_time(stamp, measurement_now_ns)
         if type(stamp) is not int or stamp <= 0:
             raise ValueError('positive cloud capture timestamp required')
-        self.pending.setdefault(stamp, (frame, deepcopy(cloud), count, now))
+        self.pending.setdefault(stamp, (frame, deepcopy(cloud), count, now if received is None else received))
         while len(self.pending) > self.max_pending:
             self.pending.popitem(last=False)
         self._drain(stream, now, measurement_now_ns)

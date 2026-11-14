@@ -26,7 +26,7 @@ _DEFAULTS = {'max_gap_ms': 200, 'max_age_s': 2,
              'max_pending': 10, 'max_cloud_points': 1000000,
              'voxel_size_m': .08, 'max_working_nodes': 3000, 'max_update_ms': 3000,
              'max_disk_bytes': 2147483648, 'reserve_bytes': 1073741824,
-             'preview_interval_s': 1, 'preview_max_points': 40000}
+             'preview_interval_s': 1, 'preview_max_points': 40000, 'native_parameters': {}}
 _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calibrated',
             'preview_enabled', 'preview_backend', 'preview_geometry', 'preview_relocalization',
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
@@ -157,6 +157,8 @@ class PointCloudSlamPlugin:
         live connected inputs, deployment config or producer declarations; their
         absence is reported when mapping starts instead of while saving config.
         """
+        from .pointcloud_slam_rtabmap import native_overrides
+        native_overrides(cfg.get('native_parameters', {}))
         if cfg.get('extrinsic_mode', 'static') not in ('static', 'dynamic'):
             raise ValueError('extrinsic_mode must be static or dynamic')
         if cfg.get('extrinsic_mode', 'static') != 'dynamic' and cfg.get('child_from_cloud') is not None:
@@ -458,7 +460,8 @@ class PointCloudSlamPlugin:
                 self._executor, odom_topic, cloud_topic,
                 manual=self._config.get('child_from_cloud'),
                 max_gap_ms=self._config['max_gap_ms'],
-                **({'camera_info': camera} if camera is not None else {}))
+                **({'camera_info': camera} if camera is not None else {}),
+                **({'input_registry':self._input_registry} if self._input_registry else {}))
         self._require_mapping_inputs(self._settings())
         self._validate(self._settings())
         name = validate_map_name(args.get('map_name'))
@@ -478,7 +481,8 @@ class PointCloudSlamPlugin:
             node = RtabmapNode(next(t for t, f in self._topics.items() if f == 'state/odom'),
                 next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2'), settings,
                 session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop,
-                **({"input_registry": self._input_registry} if self._input_registry else {}))
+                **({"input_registry": self._input_registry,
+                    "input_declarations":self._project_inputs.get("camera_infos",{})} if self._input_registry else {}))
             # A new mapping session replaces the saved view, never competes for
             # the single mapping topic.
             self._close_view()

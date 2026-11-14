@@ -5,6 +5,7 @@ from copy import deepcopy
 import numpy as np
 
 from .spatial_contract import validate_tracking_pose
+from .camera_info import _rescale_K
 
 
 def validate_inputs(declarations, topics):
@@ -17,7 +18,8 @@ def validate_inputs(declarations, topics):
     depth = next(d for d in entries if d['format'] == 'image/depth-zlib')
     for d in entries:
         if (d.get('schema') != 'motus.camera/1' or not d.get('id') or
-                d.get('width') != 640 or d.get('height') != 480 or
+                any(type(d.get(k)) is not int or not 0<d[k]<=4096 for k in ('width','height')) or
+                (d is depth and (d['width']!=640 or d['height']!=480)) or
                 d.get('distortion_model') != 'pinhole'):
             raise ValueError('RGB-D requires declared rectified 640x480 camera geometry')
         k = np.asarray(d.get('K'), dtype=float)
@@ -30,7 +32,8 @@ def validate_inputs(declarations, topics):
         if (vendor.get('registration') != 'registered_rectified' or
                 not vendor.get('frame_id')):
             raise ValueError('RGB-D registration, optical frame and capture clock are required')
-    if (color['id'] != depth['id'] or not np.allclose(color['K'], depth['K'], rtol=1e-7, atol=1e-7) or
+    color_k = _rescale_K(color['K'], (color['width'],color['height']), (640,480))
+    if (color['id'] != depth['id'] or color_k is None or not np.allclose(color_k, depth['K'], rtol=1e-7, atol=1e-7) or
             any(color['vendor'].get(k) != depth['vendor'].get(k)
                 for k in ('frame_id', 'clock_id'))):
         raise ValueError('RGB-D inputs must share registered geometry and capture clock')
@@ -56,7 +59,7 @@ def validate_inputs(declarations, topics):
         from .rgbd_body_mount import validate_mount_declaration
         mount = validate_mount_declaration(mount, color['vendor']['frame_id'], topics)
     result = dict(color_topic=color['topic'], depth_topic=depth['topic'],
-                K=np.asarray(color['K'], dtype=float).reshape(3, 3),
+                K=np.asarray(depth['K'], dtype=float).reshape(3, 3), color_size=(color['width'],color['height']),
                 frame_id=color['vendor']['frame_id'], clock_id=color['vendor'].get('clock_id'),
                 time_basis='source_capture' if capture else 'receipt_estimated',
                 depth_source=depth['vendor'].get('depth_source', 'unknown'),

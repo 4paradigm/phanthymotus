@@ -48,9 +48,9 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
             continue
         if not isinstance(sample, PoseSample):
             raise ValueError('expected validated pose or loss barrier')
-        if last is not None and sample.stamp_ms < last.stamp_ms:
+        if last is not None and sample.stamp_ns < last.stamp_ns:
             raise ValueError('out-of-order pose')
-        if last is not None and sample.stamp_ms == last.stamp_ms:
+        if last is not None and sample.stamp_ns == last.stamp_ns:
             if sample != last or (ordered and ordered[-1] is None):
                 raise ValueError('ambiguous duplicate pose timestamp')
             continue
@@ -61,21 +61,25 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
         if sample is None:
             previous = None
             continue
-        stamp_ns = sample.stamp_ms * 1_000_000
+        stamp_ns = sample.stamp_ns
         if stamp_ns == cloud_stamp_ns:
             return sample
         if stamp_ns > cloud_stamp_ns:
             if previous is None:
                 break
-            left_ns = previous.stamp_ms * 1_000_000
-            if (sample.stamp_ms - previous.stamp_ms > max_gap_ms or
+            left_ns = previous.stamp_ns
+            if (sample.stamp_ns - previous.stamp_ns > max_gap_ms*1_000_000 or
                     (sample.segment_id, sample.frame_id, sample.child_frame_id, sample.clock_id, sample.pose_reference) !=
                     (previous.segment_id, previous.frame_id, previous.child_frame_id, previous.clock_id, previous.pose_reference)):
                 break
+            def identity(p):
+                c=p.observation
+                return (c.time_basis,c.source_epoch,c.mapping_version) if c is not None else None
+            if identity(previous)!=identity(sample):break
             ratio = (cloud_stamp_ns - left_ns) / (stamp_ns - left_ns)
             position = tuple(a + ratio * (b - a) for a, b in zip(previous.position, sample.position))
             return PoseSample(cloud_stamp_ns // 1_000_000, sample.frame_id, sample.child_frame_id,
                               sample.segment_id, position,
-                              _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id, sample.pose_reference)
+                              _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id, sample.pose_reference, None, cloud_stamp_ns)
         previous = sample
     raise ValueError('no compatible pose at cloud timestamp')

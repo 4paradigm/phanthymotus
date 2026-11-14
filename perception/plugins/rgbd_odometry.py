@@ -11,7 +11,9 @@ from .rgbd_odometry_runtime import RgbdSession, require_runtime
 from utils.ros_lifecycle import dispose_node
 
 
-_INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profile': 'motus_slam/1'}}
+_INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profile': 'motus_slam/1',
+    'supported_profiles': ['motus_slam/1', 'motus_slam/2'],
+    'time_bases': ['source_capture', 'receipt_estimated']}}
 _FRONTENDS = ('f2m_feature', 'f2f_optical_flow')
 # Optional `auto`: engineering limits, not tuned on hardware. A switch needs a
 # visual-kind loss with fresh inputs, then waits out a cooldown; after two
@@ -103,8 +105,9 @@ class RgbdOdometryPlugin:
     def _next_frontend(self, instance, session, info, now):
         """Choose the replacement's frontend; never run both, never splice origins."""
         frontend = self.frontends.get(instance)
+        calibration = getattr(session, 'restart_calibration', session.calibration)
         if not frontend or frontend['mode'] != 'auto':
-            return session.calibration, None
+            return calibration, None
         active, kind = frontend['active'], info.get('loss_kind')
         other = _FRONTENDS[1-_FRONTENDS.index(active)]
         if kind != 'visual':
@@ -116,8 +119,8 @@ class RgbdOdometryPlugin:
                                     'without tracking; switching suspended')
         else:
             frontend['decision'] = f'switched to {other}: visual degradation with fresh inputs'
-            return dict(session.calibration, visual_frontend=other), other
-        return session.calibration, None
+            return dict(calibration, visual_frontend=other), other
+        return calibration, None
 
     def _frontend_info(self, instance):
         frontend = self.frontends.get(instance)

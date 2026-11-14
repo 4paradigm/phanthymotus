@@ -98,3 +98,14 @@ def test_derived_cloud_keeps_first_ingress_and_parent_identity():
         assert cloud[0].ingress_monotonic_ns==seen[0].ingress_monotonic_ns
         assert cloud[0].parent_observation_ids==(seen[0].observation_id,)
     finally:a.close();c.close();r.close()
+
+
+def test_consumer_timing_separates_queue_wait_from_callback_work():
+    b=Backend();r=InputAdapterRegistry(subscribe=b.subscribe);seen=[]
+    lease=r.acquire('/depth',object,declaration(),lambda m,c:seen.append(c))
+    try:
+        b.callbacks[0](message());wait_for(lambda:seen and lease.status()['timing']['callback']['count']==1)
+        timing=lease.status()['timing']
+        assert timing['queue_wait']['count']==1
+        assert timing['callback']['p95_ms']>=0
+    finally:lease.close();r.close()

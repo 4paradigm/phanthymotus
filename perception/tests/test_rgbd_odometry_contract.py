@@ -138,3 +138,14 @@ def test_missing_capture_declaration_uses_explicit_receipt_capability():
     for d in data.values():
         d['vendor'].pop('clock_id');d['vendor'].pop('timestamp_semantics')
     assert validate_inputs(data,['/rgb','/depth'])['time_basis']=='receipt_estimated'
+
+
+def test_registered_color_resize_uses_existing_intrinsics_scaling():
+    data=declarations();color=data['/rgb']
+    color['width'],color['height']=1280,960
+    color['K']=[800,0,640,0,800,480,0,0,1]
+    result=validate_inputs(data,['/rgb','/depth'])
+    assert result['color_size']==(1280,960)
+    np.testing.assert_allclose(result['K'],np.array(data['/depth']['K']).reshape(3,3))
+    color['K'][2]+=20
+    with pytest.raises(ValueError):validate_inputs(data,['/rgb','/depth'])

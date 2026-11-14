@@ -58,6 +58,8 @@ class RgbdPairer:
         if identity is not None and identity == self.identities.get(kind):
             raise ValueError('repeated RGB-D capture identity')
         self.previous[kind], self.identities[kind] = stamp, identity
+        if not hasattr(message, 'data'):
+            raise ValueError('RGB-D message payload missing')
         size = len(message.data)
         if size > self.max_bytes:
             raise ValueError('RGB-D message exceeds byte budget')

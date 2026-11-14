@@ -23,6 +23,12 @@ class PoseSample:
     clock_id: str = None
     pose_reference: str = None
     observation: FrameContext = None
+    precise_stamp_ns: int = None
+
+    @property
+    def stamp_ns(self):
+        return (self.observation.observation_stamp_ns if self.observation is not None else
+                self.precise_stamp_ns if self.precise_stamp_ns is not None else self.stamp_ms*1_000_000)
 
 
 def _vector(value, length):
@@ -86,6 +92,9 @@ def decode_slam_odom(sample):
     covariance = pose.get("covariance")
     if covariance is not None:
         covariance = _vector(covariance, 36)
+    precise = quality.get('stamp_ns')
+    if precise is not None and (type(precise) is not int or precise <= 0 or precise//1_000_000 != stamp):
+        raise ValueError('precise pose timestamp conflicts with milliseconds')
     reference = quality.get('pose_reference', vendor.get('pose_reference'))
     if (quality.get('pose_reference') is not None and vendor.get('pose_reference') is not None
             and quality['pose_reference'] != vendor['pose_reference']):
@@ -93,4 +102,5 @@ def decode_slam_odom(sample):
     if reference not in ('camera_optical', 'body'):
         reference = None  # Neither frame names nor extrinsics declare a pose type.
     return PoseSample(stamp, frame, child, segment, position, quaternion, covariance, clock, reference,
-                      FrameContext.from_dict(quality['observation']) if quality.get('profile') == 'motus_slam/2' else None)
+                      FrameContext.from_dict(quality['observation']) if quality.get('profile') == 'motus_slam/2' else None,
+                      quality.get('stamp_ns'))

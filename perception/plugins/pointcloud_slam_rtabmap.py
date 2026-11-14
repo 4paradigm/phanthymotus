@@ -1,5 +1,6 @@
 """Supervise the pinned headless RTAB-Map ROS node and its native SQLite DB."""
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -38,7 +39,7 @@ def mapping_parameters(database_path, namespace, settings):
     parameters retain their native bool/int/float types.
     """
     frame = namespace.rstrip('/').lstrip('/')
-    return {'database_path': str(Path(database_path).resolve()),
+    parameters = {'database_path': str(Path(database_path).resolve()),
         'frame_id': frame + '/base', 'map_frame_id': frame + '/map', 'odom_frame_id': '',
         'publish_tf': False, 'subscribe_odom': True, 'subscribe_scan_cloud': True,
         'subscribe_scan': False, 'subscribe_depth': False, 'subscribe_rgb': False,
@@ -53,6 +54,22 @@ def mapping_parameters(database_path, namespace, settings):
         'Rtabmap/MemoryThr': str(settings['max_working_nodes']),
         'Rtabmap/TimeThr': str(settings['max_update_ms']),
         'DbSqlite3/JournalMode': '0', 'DbSqlite3/Synchronous': '1'}
+    parameters.update(native_overrides(settings.get('native_parameters', {})))
+    return parameters
+
+
+def native_overrides(values):
+    # Verified against pinned df6300e Parameters.h, RGBD section. Empty by
+    # default: preserve native defaults and the scan-only/ICP/TORO pipeline.
+    if not isinstance(values,dict):raise ValueError('native_parameters must be an object')
+    allowed={'RGBD/LinearUpdate','RGBD/AngularUpdate'}
+    result={}
+    for key,value in values.items():
+        if key not in allowed or isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0:
+            raise ValueError('unsupported native parameter/value: '+str(key))
+        result[key]=str(value)
+    return result
+
 
 
 class RtabmapProcess:

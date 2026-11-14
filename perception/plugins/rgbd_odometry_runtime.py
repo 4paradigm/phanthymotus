@@ -29,6 +29,7 @@ from .rgbd_body_mount import CaptureMounts
 from .rgbd_geometry import GeometryWorker, observation_quality
 from .spatial_quality import MotionGate, QualityReport
 from .spatial_recovery import RecoveryPolicy
+from .spatial_input import latency_summary
 from utils.ros_lifecycle import dispose_node
 
 
@@ -345,6 +346,15 @@ class CaptureObservations:
         return outputs
 
 
+def observation_calibration(calibration, ingress_clock_id):
+    result = dict(calibration)
+    if result.get('time_basis') == 'receipt_estimated':
+        result['clock_id'] = ingress_clock_id
+        result.pop('imu_topic', None)
+        result['short_term_compensation'] = False
+    return result
+
+
 class RgbdSession:
     def __init__(self, calibration, executor, topic, *, publish_output=True, input_registry=None):
         self.input_registry, self.input_leases = input_registry, []
@@ -354,15 +364,12 @@ class RgbdSession:
         from std_msgs.msg import String
         from nav_msgs.msg import Odometry
         from rtabmap_msgs.msg import RGBDImage, OdomInfo
-        calibration = dict(calibration)
+        self.requested_calibration = dict(calibration)
         self.time_policy = TimePolicy(input_registry.clock_id if input_registry else 'rgbd_ingress/' + uuid.uuid4().hex)
         self.contexts_by_stamp = OrderedDict()
-        self.assistance_unavailable = None
-        if calibration.get('time_basis') == 'receipt_estimated':
-            calibration['clock_id'] = self.time_policy.clock_id
-            self.assistance_unavailable = 'IMU requires comparable capture timestamps'
-            calibration.pop('imu_topic', None)
-            calibration['short_term_compensation'] = False
+        calibration = observation_calibration(calibration, self.time_policy.clock_id)
+        self.assistance_unavailable = ('IMU requires comparable capture timestamps'
+                                      if calibration.get('time_basis') == 'receipt_estimated' else None)
         self.calibration, self.executor, self.topic = calibration, executor, topic
         self.publish_output = publish_output
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
@@ -372,6 +379,7 @@ class RgbdSession:
         self.previous_motion = None
         self.quality_by_stamp = OrderedDict()
         self.processing_ages = deque(maxlen=32)
+        self.stage_times={k:deque(maxlen=128) for k in ('decode','imu_wait')}
         self.fusion = (ShortTermFusion(self.segment, calibration['frame_id'], calibration['clock_id'],
                        calibration['K'], calibration.get('depth_geometry', False))
                        if calibration.get('short_term_compensation') else None)
@@ -501,6 +509,10 @@ class RgbdSession:
                     stamp = context.observation_stamp_ns
                 if stamp > self.latest_inputs.get(kind, 0) and -50_000_000 <= now-stamp <= 1_500_000_000:
                     self.latest_inputs[kind] = stamp
+                if context is not None and context.time_basis=='receipt_estimated' and self.imu is not None:
+                    self.restart_calibration = dict(self.requested_calibration,time_basis='receipt_estimated',
+                                                    clock_id=context.normalized_clock_id)
+                    self.gate.fault('capture time unavailable; restart in explicit receipt visual mode', 'clock')
                 if self.gate.status(now) == 'lost':
                     return
                 try:
@@ -512,6 +524,8 @@ class RgbdSession:
                     self.counts['rejected_inputs'] += 1
                     self.input_rejection = f'{kind}: {error}'
                     if 'context changed' in str(error):
+                        self.restart_calibration = dict(self.requested_calibration,time_basis=context.time_basis,
+                                                        clock_id=context.normalized_clock_id)
                         self.gate.fault(error, 'clock')
                     return
                 if pair:
@@ -653,12 +667,20 @@ class RgbdSession:
                         while len(self.contexts_by_stamp) > 32:self.contexts_by_stamp.popitem(last=False)
                 # Prepare images while IMU arrives, retaining the original wait budget.
                 imu_deadline = time.monotonic() + .15
+                decode_started=time.monotonic_ns()
                 image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
                 decoder = zlib.decompressobj()
                 raw = decoder.decompress(bytes(depth.data), 640 * 480 * 2 + 1)
-                if (image is None or image.shape != (480, 640, 3) or len(raw) != 640 * 480 * 2 or
+                color_width,color_height=self.calibration.get('color_size',(640,480))
+                if (image is None or image.shape != (color_height, color_width, 3) or len(raw) != 640 * 480 * 2 or
                         not decoder.eof or decoder.unused_data or decoder.unconsumed_tail):
                     raise ValueError('RGB-D payload does not match declared 640x480 geometry')
+                if (color_width,color_height)!=(640,480):
+                    image=cv2.resize(image,(640,480),interpolation=cv2.INTER_AREA)
+                    encoded,buffer=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,95])
+                    if not encoded:raise ValueError('registered RGB resize encoding failed')
+                    color=deepcopy(color)
+                    color.data=array('B',buffer.tobytes())
                 z16 = np.frombuffer(raw, '<u2').reshape(480, 640)
                 if not self._fusing() and np.count_nonzero(z16) < 100:
                     raise ValueError('RGB-D depth has insufficient measured pixels')
@@ -689,7 +711,13 @@ class RgbdSession:
                     info.r = np.eye(3).ravel().tolist()
                     info.p = [k[0], 0., k[2], 0., 0., k[4], k[5], 0., 0., 0., 1., 0.]
                     setattr(out, field, info)
-                if not self._wait_for_imu(capture_stamp, deadline=imu_deadline):
+                if hasattr(self,'stage_times'):
+                    with self.lock:self.stage_times['decode'].append(max(0,time.monotonic_ns()-decode_started))
+                wait_started=time.monotonic_ns()
+                covered=self._wait_for_imu(capture_stamp, deadline=imu_deadline)
+                if hasattr(self,'stage_times'):
+                    with self.lock:self.stage_times['imu_wait'].append(max(0,time.monotonic_ns()-wait_started))
+                if not covered:
                     with self.lock:
                         self.counts['dropped_pairs'] += 1
                     continue
@@ -793,6 +821,7 @@ class RgbdSession:
         if getattr(self, 'mounts', None) is not None and (context is None or context.time_basis == 'source_capture'):
             sample = self.mounts.attach(sample, time.time_ns())
         if context is not None:
+            self.published_context = context
             pair = association[1]
             slam = sample['vendor']['motus_slam']
             slam.update(profile='motus_slam/2', observation=context.to_dict(), clock_id=context.normalized_clock_id)
@@ -819,9 +848,13 @@ class RgbdSession:
             decision = self.motion_gate.evaluate(self.previous_motion, sample, context, quality)
             sample['vendor']['motion_decision'] = dict(action=decision.action, reason=decision.reason)
             if decision.action != 'accept':
-                self.gate.degrade(decision.reason, now, stamp=stamp)
+                if decision.action=='new_segment':
+                    self.gate.fault(decision.reason,'visual')
+                    if self.fusion is not None:self.fusion.fault(decision.reason)
+                else:self.gate.degrade(decision.reason, now, stamp=stamp)
                 sample['pose'] = None
-                sample['vendor']['motus_slam'].update(status='recovering', stamp_source='unknown')
+                sample['vendor']['reason']=decision.reason
+                sample['vendor']['motus_slam'].update(status=self.gate.state, stamp_source='unknown')
                 sample['vendor']['pause'] = dict(status='recovering',mapping_allowed=False)
             else:self.previous_motion = deepcopy(sample)
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
@@ -970,6 +1003,15 @@ class RgbdSession:
                 self._publish(make_sample(self.gate.state, stamp, self.segment,
                                           self.calibration['clock_id'], reason=self.gate.reason))
 
+    def _time_metadata(self):
+        context=getattr(self,'published_context',None)
+        if context is None:return {}
+        result=dict(observation=context.to_dict())
+        if context.time_basis=='receipt_estimated':
+            from .spatial_contract import input_declaration
+            result['input_metadata']=[input_declaration(self.topic,'pose',self.calibration['frame_id'],context)]
+        return result
+
     def info(self):
         with self.lock:
             self._drain_imu()
@@ -981,16 +1023,21 @@ class RgbdSession:
             return {'state': 'running', 'status': self.fusion.state if fusing else self.gate.status(now),
                     'reason': self.fusion.reason if fusing else self.gate.reason, 'segment_id': self.segment,
                     'pose_reference': 'camera_optical', **self.counts,
+                    **self._time_metadata(),
                     'last_measurement_ns': self.gate.last_stamp,
                     'visual_rejection': self.gate.rejection,
                     'loss_kind': self.gate.loss_kind,
                     'input_rejections': {'count': self.counts['rejected_inputs'],
                                          'last_reason': self.input_rejection},
                     'fallback': deepcopy(self.fallback),
+                    'assistance_unavailable': self.assistance_unavailable,
                     'imu_assistance': self.imu.info(time.time_ns()) if self.imu else {'enabled': False},
                     'fusion': self.fusion.info(time.time_ns(), history=True) if self.fusion else {'enabled': False},
                     'registration': deepcopy(self.last_registration),
                     'native_reports': self.native_reports,
+                    'timing': dict(end_to_end=latency_summary(self.processing_ages),
+                                   **{k:latency_summary(v) for k,v in self.stage_times.items()}),
+                    'input_delivery': [lease.status() for lease in self.input_leases],
                     'native_join': dict(self.observations.counts, pending=len(self.observations.frames))
                                    if self.observations is not None else None,
                     'body_mount': self.mounts.info(time.time_ns()) if self.mounts else {'status': 'undeclared'},

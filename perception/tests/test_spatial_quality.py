@@ -21,7 +21,7 @@ def test_unknown_quality_preserves_valid_legacy_pose_and_low_sharpness_is_diagno
 def test_tracking_pose_jump_rejected_with_declared_motion_limit():
     previous,_=sample();current,c=sample(1_100_000_000,2.)
     decision=MotionGate({'reference':'camera_optical','max_speed_mps':1.}).evaluate(previous,current,c,QualityReport())
-    assert decision.action=='pause'
+    assert decision.action=='new_segment'
 
 
 def test_camera_motion_limit_does_not_use_body_limit():

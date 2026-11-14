@@ -5103,3 +5103,97 @@ as well as Perception. For the optional Tianyi estimated source, retain the
 explicit Driver opt-in and capture-certificate service; rebuilding an image does
 not by itself enable `TIANYI_ESTIMATED_BODY_TF=1`. No running service is changed by
 this implementation. Static camera-reference SLAM remains supported unchanged.
+
+## Spatial input timing and stability (PR371)
+
+`rgbd_odometry`, `pointcloud` and `pointcloud_slam` share one input registry in
+Perception. Other cards, AgentCore and Driver are unchanged. There are no robot
+model presets. The registry owns subscriptions by ROS context/topic/type, uses
+reference-counted leases and bounded independent consumer queues, and records
+realtime/monotonic time once at the first controlled callback. Callback timing
+cannot measure delay before Perception (driver, network or DDS receive queues).
+
+Time is explicit:
+
+- Valid declared capture time remains capture time, with integer nanoseconds.
+- Missing capture timing uses `receipt_estimated` in a common Perception ingress
+  clock. This is approximate alignment, not proof of acquisition time or accuracy.
+- Contradictory declarations, invalid known capture times, backwards/repeated
+  observations and changes of epoch/time basis are not hidden by fallback.
+- An observation UUID identifies reception. RGB-D association UUIDs identify
+  pairing. Neither is a fabricated `source_capture_id`.
+- Each derived cloud retains first-ingress age and parent observation identity.
+  Metadata, pose and mount waiting do not reset end-to-end age.
+
+Legacy `motus.camera/1`, `motus.odom/1` and capture-only SLAM v1 inputs remain
+readable. New timing is carried by `motus.observation/1`, `motus_slam/2`,
+`motus.slam_input/2` and `motus.slam_frame/2`. Port names and ROS message types
+are unchanged. Receipt producers and consumers must be upgraded together;
+rollback the complete Perception image, not individual cards. Saved databases
+are never deleted by rollback.
+
+An observation contains `observation_id`, `observation_stamp_ns`,
+`normalized_clock_id`, `time_basis`, first-ingress realtime/monotonic nanoseconds
+and `ingress_clock_id`. Optional source ID/epoch/capture ID, original timestamp,
+unit/clock, mapping provenance/version/offset/verification/uncertainty, geometry
+version, parent observations and transformation names retain unknown values.
+Monotonic timestamps can only be compared inside the named ingress process.
+The v2 pose profile embeds this object as `vendor.motus_slam.observation`;
+its clock and both integer timestamp representations must agree. A v2 cloud
+sidecar carries the same object plus exact frame, stamp and payload SHA-256.
+Missing/corrupt v2 sidecars do not take the optional v1 metadata fallback.
+The `input_declaration` and `frame_packet` helpers in `plugins/spatial_contract.py`
+are the versioned producer API; the mirrored Driver v1 validator is unchanged.
+
+RGB-D still requires registered rectified pinhole geometry and 640×480 uint16
+millimetre optical-Z depth-zlib. `depth_source` and calibration `source` labels
+alone do not reject an input: estimated/unknown depth must explicitly declare
+`vendor.depth_semantics: optical_z`, and all inputs require real valid intrinsics
+and `depth_unit: mm`. A registered color grid with the same camera identity,
+optical frame and equivalent scaled K can be resized to the depth grid using
+the existing intrinsics scaling. Unexplained crops, different optics or distorted
+cross-camera geometry remain unsupported. Native output retains its exact
+chosen RGB/depth timestamp; the two original observations remain separate.
+
+IMU timing/extrinsics and physical prediction limits are unchanged. Receipt-only
+images cannot provide IMU acquisition intervals: the session reports assistance
+unavailable and runs explicit visual mode; a change of timing basis starts a new
+segment. Dynamic body mapping still needs exact capture-associated mount evidence.
+Receipt-only data without that identity cannot use a latest/guessed transform.
+
+Image sharpness/contrast and missing optional quality are diagnostic, not universal
+hard cutoffs. Declared motion limits (`vendor.motion_limits.reference`,
+`max_speed_mps`, `max_angular_rate_radps`) apply only to the actual pose reference.
+Body limits are not camera limits, and receipt jitter alone is not a hard velocity
+failure. A declared-limit discontinuity starts a new segment. Map admission
+separately requires a tracking pose and usable finite points; prediction/lost/
+recovering states do not map. Lidar scans do not inherit image depth-fraction rules.
+
+`motus.pause/2` freezes a waiting budget at degradation: with measured input period
+and processing P95 it is `clamp(3*period + 2*P95, 1s, 3s)`, otherwise 1s. VO and SLAM
+share the declared original deadline in the same ingress process. Repeated pause
+messages cannot extend it. Legacy pauses, physical IMU prediction, uncertainty
+bounds and the pose interpolation gap retain their previous limits.
+
+PointCloud2 normalization validates original bytes/digest first. Big-endian,
+padded or noncanonical XYZ layouts and clouds containing some nonfinite points
+are repacked into finite little-endian XYZ; source and output digests remain
+separate. Already supported finite layouts retain their optional fields.
+
+Native mapping remains scan-only / exact-sync / ICP / TORO. Deployment-only
+`pointcloud_slam.native_parameters` permits `RGBD/LinearUpdate` and
+`RGBD/AngularUpdate` (finite nonnegative values); the default empty object preserves
+native defaults. These names were checked against pinned RTAB-Map `df6300e0`.
+Missing upstream covariance is reported as `backend_default`, not calibrated
+uncertainty. Backend progress uses stamped native activity, never node count alone.
+Without reliable per-frame consumption/skip acknowledgement, silence is reported
+as `suspected_stall`; automatic restart budget is zero. Existing confirmed process
+exit, bounded shutdown and database-validation protections remain active.
+Each segment keeps an independent database. `finalized` means native database
+closure, not completion of the user's map-save action; unknown origins are not merged.
+
+Status exposes bounded queue/callback, decode, IMU-wait and end-to-end latency
+summaries, input drops, time context, mapping decisions, native progress and segment
+lifecycle. CPU tests and synthetic fault replay validate contracts/lifecycle only.
+ROS/Jetson smoke, real turning trajectories, map quality, CPU/GPU/memory under
+robot load and motion accuracy still require target-environment acceptance.

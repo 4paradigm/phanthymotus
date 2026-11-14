@@ -62,6 +62,7 @@ class SlamStream:
         self._last_cloud_received = None
         self._last_cloud_stamp_ns = None
         self.input_contract = input_contract
+        self._observation_signature = self._observation_segment = None
         self._input_identity = None
         self._input_segment = None
         self._retired_identities = set()
@@ -107,7 +108,7 @@ class SlamStream:
             try:
                 if now - self._last_received > self.max_age_s:
                     raise ValueError('odometry receipt stale')
-                self._check_measurement_time(self._poses[-1].stamp_ms * 1_000_000,
+                self._check_measurement_time(self._poses[-1].stamp_ns,
                                              measurement_now_ns)
             except ValueError as error:
                 last_error = str(error)
@@ -202,11 +203,25 @@ class SlamStream:
         self.last_error = 'map integration paused during short-term fusion'
         return True
 
-    def odom(self, sample, *, now, measurement_now_ns=None):
+    def odom(self, sample, *, now, measurement_now_ns=None, received=None):
         if self._pause_fusion(sample, now, measurement_now_ns):
             return
         try:
             pose = decode_slam_odom(sample)
+            if received is not None and now-received>self.max_age_s:
+                raise ValueError('pose exceeded original ingress age')
+            c=pose.observation
+            signature=(c.time_basis,c.normalized_clock_id,c.source_epoch,c.mapping_version,c.geometry_version) if c else None
+            if self._observation_segment==pose.segment_id and self._observation_signature is not None and signature!=self._observation_signature:
+                self._required_new_segment=pose.segment_id
+                self._lose()
+                raise ValueError('pose observation context changed within segment')
+            if self.input_contract and self.input_contract.get('schema')=='motus.slam_input/2':
+                context=pose.observation
+                if (context is None or context.normalized_clock_id!=self.clock_id or
+                        context.time_basis!=self.input_contract['time_basis'] or
+                        context.ingress_clock_id!=self.input_contract['ingress_clock_id']):
+                    raise ValueError('pose observation differs from v2 input declaration')
             if self.input_contract:
                 from .pointcloud_slam_input import frame_identity
                 quality = sample['vendor']['motus_slam']
@@ -255,7 +270,7 @@ class SlamStream:
                 self._lose()
             return
         try:
-            self._check_measurement_time(pose.stamp_ms * 1_000_000, measurement_now_ns)
+            self._check_measurement_time(pose.stamp_ns, measurement_now_ns)
             expected_child = self.child_frame.replace('{segment_id}', pose.segment_id)
             if pose.clock_id != self.clock_id or pose.child_frame_id != expected_child:
                 raise ValueError('pose clock or child frame mismatch')
@@ -270,7 +285,7 @@ class SlamStream:
                     self._required_new_segment = self._input_segment
                     raise ValueError('input epoch/generation or clock mapping change requires a new segment')
             if (self._poses and pose.segment_id == self._poses[-1].segment_id and
-                    pose.stamp_ms < self._poses[-1].stamp_ms):
+                    pose.stamp_ns < self._poses[-1].stamp_ns):
                 self.last_error = 'late odometry sample dropped'
                 return
             if self.input_contract:
@@ -290,7 +305,7 @@ class SlamStream:
                 self._last_cloud_received = None
                 self._cloud_metadata.clear()
                 self._unmatched_clouds.clear()
-            if self._poses and pose.stamp_ms <= self._poses[-1].stamp_ms:
+            if self._poses and pose.stamp_ns <= self._poses[-1].stamp_ns:
                 raise ValueError('pose timestamp did not increase')
         except ValueError as error:
             self.last_error = str(error)
@@ -309,8 +324,11 @@ class SlamStream:
                 self._fusion_pause = self._pause_context = None
         if self._last_received is not None and now - self._last_received > self.max_age_s:
             self._lose()
+        if self._required_new_segment is not None and pose.segment_id!=self._required_new_segment:
+            self._required_new_segment=None
         self._poses.append(pose)
-        self._last_received = now
+        self._observation_signature,self._observation_segment=signature,pose.segment_id
+        self._last_received = now if received is None else received
         self._odom_state = 'tracking'
         self._drain(now, measurement_now_ns)
         self._release_without_metadata(now, measurement_now_ns)
@@ -334,11 +352,43 @@ class SlamStream:
         return deepcopy(dict(child_from_cloud=matrix.tolist(), extrinsic=evidence,
                              measurement=packet))
 
+    def _v2_cloud_metadata(self, packet, now, measurement_now_ns):
+        from .spatial_contract import validate_frame_packet
+        context=validate_frame_packet(packet)
+        if (context.normalized_clock_id!=self.clock_id or packet['frame_id']!=self.cloud_frame or
+                context.time_basis!=self.input_contract['time_basis'] or
+                context.ingress_clock_id!=self.input_contract['ingress_clock_id']):
+            raise ValueError('cloud observation differs from v2 input declaration')
+        if self._poses and self._poses[-1].observation is not None:
+            pose_context=self._poses[-1].observation
+            if (context.source_epoch,context.mapping_version)!=(pose_context.source_epoch,pose_context.mapping_version):
+                raise ValueError('cloud source epoch/mapping differs from pose')
+        if self.extrinsic_mode=='dynamic':
+            if context.time_basis=='receipt_estimated':
+                raise ValueError('receipt observation cannot identify dynamic mount capture')
+            evidence=packet.get('extrinsic')
+            declaration=self.input_contract['extrinsic']
+            if (not isinstance(evidence,dict) or evidence.get('stamp_ns')!=context.observation_stamp_ns or
+                    evidence.get('clock_id')!=context.normalized_clock_id or
+                    evidence.get('source_epoch')!=context.source_epoch or
+                    any(evidence.get(k)!=declaration.get(k) for k in ('parent_frame','child_frame','source','version'))):
+                raise ValueError('dynamic mount capture identity mismatch')
+            matrix=_rigid(evidence.get('matrix'))
+        else:matrix=self.extrinsic
+        key=(packet['stamp_ns'],packet['frame_id'],packet['data_sha256'])
+        self._cloud_metadata[key]=dict(child_from_cloud=matrix.tolist(),observation=context.to_dict(),
+                                        data_sha256=packet['data_sha256'])
+        while len(self._cloud_metadata)>self.max_pending:self._cloud_metadata.popitem(last=False)
+        self._pair_cloud(key,now=now,measurement_now_ns=measurement_now_ns)
+
     def cloud_metadata(self, packet, *, now, measurement_now_ns=None):
         if not self.input_contract:
             return
         from .pointcloud_slam_input import frame_identity
         try:
+            if self.input_contract.get('schema')=='motus.slam_input/2':
+                self._v2_cloud_metadata(packet,now,measurement_now_ns)
+                return
             identity = frame_identity(packet, clock_id=self.clock_id, payload=True,
                 relation_id=self.input_contract.get('relation_id'))
             if packet['frame_id'] != self.cloud_frame:
@@ -436,6 +486,8 @@ class SlamStream:
         """
         if not self.input_contract or self.extrinsic_mode != 'static':
             return
+        if self.input_contract and self.input_contract.get('schema')=='motus.slam_input/2':
+            return
         for key, (cloud, received) in list(self._unmatched_clouds.items()):
             if now - received < self._metadata_grace_s:
                 continue
@@ -513,7 +565,7 @@ class SlamStream:
                 self._check_measurement_time(stamp, measurement_now_ns)
                 if not self._poses:
                     continue
-                if stamp > self._poses[-1].stamp_ms * 1_000_000:
+                if stamp > self._poses[-1].stamp_ns:
                     remaining.append((stamp, cloud, received, context))
                     continue
                 pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)

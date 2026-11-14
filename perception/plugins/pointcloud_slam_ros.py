@@ -5,7 +5,7 @@ import math
 import threading
 import time
 import logging
-from collections import deque
+from collections import deque, OrderedDict
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 
 from .pointcloud_slam_rtabmap import RtabmapProcess
+from .pointcloud_slam_watchdog import BackendProgress
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
 from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_stream import SlamStream
@@ -109,7 +110,7 @@ class RtabmapNode(Node):
     capture lock. freeze_capture therefore remains a quick publication barrier.
     """
     def __init__(self, odom_topic, cloud_topic, settings, *, session_dir,
-                 input_contract=None, capture_stop=None, input_registry=None):
+                 input_contract=None, capture_stop=None, input_registry=None, input_declarations=None):
         self._input_registry, self._input_leases = input_registry, []
         from nav_msgs.msg import Odometry
         from geometry_msgs.msg import TransformStamped
@@ -139,6 +140,9 @@ class RtabmapNode(Node):
         self._project_stop = capture_stop if capture_stop is not None else threading.Event()
         self._worker_stop, self._status_stop, self._wake = threading.Event(), threading.Event(), threading.Event()
         self._queue = deque()
+        self._cloud_ingress = OrderedDict()
+        self._map_decision = None
+        self._covariance_source = None
         self._segments, self._active = [], None
         self._worker = self._status_worker = None
         self._started = self._closed = False
@@ -178,7 +182,11 @@ class RtabmapNode(Node):
                 if input_registry is None:
                     self.create_subscription(kind, topic, callback, _QOS)
                 else:
-                    declaration = (input_contract or {}).get("inputs", {}).get(topic, {})
+                    declaration = (input_contract or {}).get("inputs", {}).get(topic) or (input_declarations or {}).get(topic, {})
+                    if not declaration and topic==cloud_topic and self._settings.get('time_basis','source_capture')=='source_capture':
+                        # Existing configured v1 path already requires capture
+                        # headers in this clock. New receipt paths declare v2.
+                        declaration={'vendor':{'clock_id':self.stream.clock_id,'timestamp_semantics':'source_capture_mapped'}}
                     self._input_leases.append(input_registry.acquire(topic, kind, declaration, callback))
             if input_contract:
                 self.create_subscription(String, input_contract['frame_metadata_topic'], self._cloud_metadata, _QOS)
@@ -196,7 +204,8 @@ class RtabmapNode(Node):
 
     def _odom(self, msg, context=None):
         try:
-            sample = json.loads(msg.data)
+            from .spatial_contract import normalize_pose_time
+            sample = normalize_pose_time(json.loads(msg.data), context)
         except (TypeError, ValueError):
             sample = None
         with self._lock:
@@ -204,7 +213,9 @@ class RtabmapNode(Node):
                 try:
                     if self._capture_clouds is not None:
                         self._capture_clouds.validate_pose(sample, self.stream)
-                    self.stream.odom(sample, now=self._receipt_clock(), measurement_now_ns=self._measurement_now())
+                    self.stream.odom(sample, now=self._receipt_clock(), measurement_now_ns=self._measurement_now(),
+                        received=context.ingress_monotonic_ns/1e9 if context is not None and
+                        context.ingress_clock_id==self.stream.ingress_clock_id else None)
                 except ValueError as error:
                     self.stream.last_error = str(error)
                 if self.stream._odom_state != 'tracking':
@@ -241,29 +252,58 @@ class RtabmapNode(Node):
         if self._stopped():
             return
         try:
+            if context is not None:
+                if context.normalized_clock_id!=self.stream.clock_id:
+                    raise ValueError('cloud observation clock differs from pose clock')
+                if context.time_basis=='receipt_estimated':
+                    msg=deepcopy(msg)
+                    msg.header.stamp.sec,msg.header.stamp.nanosec=divmod(context.observation_stamp_ns,10**9)
             stamp, frame, _ = decode_cloud(msg, max_points=self.stream.max_cloud_points)
+            received = (context.ingress_monotonic_ns/1e9 if context is not None and
+                        context.ingress_clock_id == self.stream.ingress_clock_id else self._receipt_clock())
+            if context is not None and context.time_basis == 'receipt_estimated' and self._capture_clouds is not None:
+                raise ValueError('receipt observation has no exact capture mount identity')
             digest = hashlib.sha256(bytes(msg.data)).hexdigest() if self.stream.input_contract else None
             with self._lock:
                 if not self._stopped():
+                    key = (stamp,frame,hashlib.sha256(msg.data).hexdigest())
+                    self._cloud_ingress[key] = (received,context)
+                    while len(self._cloud_ingress) > self.stream.max_pending*3:self._cloud_ingress.popitem(last=False)
                     if self._capture_clouds is not None:
                         self._capture_clouds.cloud(stamp, frame, msg, msg.width*msg.height, self.stream,
-                            now=self._receipt_clock(), measurement_now_ns=self._measurement_clock_ns())
+                            now=self._receipt_clock(), measurement_now_ns=self._measurement_clock_ns(), received=received)
                     else:
                         self.stream.cloud(stamp, frame, msg, point_count=msg.width*msg.height,
-                            now=self._receipt_clock(), measurement_now_ns=self._measurement_now(), data_sha256=digest)
+                            now=self._receipt_clock(), measurement_now_ns=self._measurement_now(), data_sha256=digest, received=received)
         except ValueError as error:
             with self._lock:
                 self.stream.last_error = str(error)
         self._wake.set()
 
     def _queue_frame(self, stamp, cloud, pose, matrix, context):
-        normalized = normalize_cloud(cloud, None, (context or {}).get('data_sha256'),
+        key = (stamp,cloud.header.frame_id,hashlib.sha256(cloud.data).hexdigest())
+        ingress = self._cloud_ingress.pop(key, None)
+        if ingress is None:
+            raise ValueError('cloud original ingress context expired')
+        received, observation = ingress
+        if self._receipt_clock()-received > self.stream.max_age_s:
+            raise ValueError('cloud exceeded end-to-end ingress budget')
+        from .spatial_quality import MapGate
+        from .rgbd_odometry_contract import make_sample
+        sample = make_sample('tracking', stamp, pose.segment_id, pose.clock_id,
+            dict(frame_id=pose.frame_id, child_frame_id=pose.child_frame_id, position=list(pose.position),
+                 quaternion=list(pose.quaternion), covariance=pose.covariance))
+        _, _, points = decode_cloud(cloud, max_points=self.stream.max_cloud_points)
+        decision = MapGate(dynamic_mount=self.stream.extrinsic_mode=='dynamic').evaluate(sample,points,observation)
+        self._map_decision = dict(action=decision.action,reason=decision.reason)
+        if decision.action != 'accept':raise ValueError(decision.reason)
+        normalized = normalize_cloud(cloud, observation, (context or {}).get('data_sha256'),
                                      max_points=self.stream.max_cloud_points)
         cloud = normalized.message
         if len(self._queue) >= self.stream.max_pending:
             self._queue.popleft()
             self._dropped += 1
-        self._queue.append((stamp, cloud, pose, matrix, self._receipt_clock()))
+        self._queue.append((stamp, cloud, pose, matrix, received))
         self._wake.set()
 
     def start(self):
@@ -316,7 +356,8 @@ class RtabmapNode(Node):
             pose_reference=getattr(pose, 'pose_reference', None),
             process=process, snapshot=None, graph=None, cloud=None, finalized=False, closing=False,
             native_loop_closures=0, native_proximity_detections=0, native_updates=0,
-            last_info=None, subscriptions=[], last_preview=0., forwarded=0)
+            last_info=None, subscriptions=[], last_preview=0., forwarded=0,
+            progress=BackendProgress(timeout_s=max(10.,4*self._settings['max_update_ms']/1000)))
         with self._result_lock:
             self._segments.append(segment)
             self._active = segment
@@ -382,6 +423,8 @@ class RtabmapNode(Node):
             segment['cloud_pub'].publish(cloud)
             self._forwarded += 1
             segment['forwarded'] += 1
+            segment['progress'].forward(stamp,self._receipt_clock())
+            self._covariance_source = 'upstream' if pose.covariance is not None else 'backend_default'
 
     def _run(self):
         while not self._worker_stop.is_set() and not self._stopped():
@@ -506,6 +549,10 @@ class RtabmapNode(Node):
             frame = getattr(getattr(msg, 'header', None), 'frame_id', None)
             if isinstance(frame, str) and frame.strip():
                 segment['frame_id'] = frame
+            try:
+                segment['progress'].activity(self._stamp(msg),self._receipt_clock(),nodes=msg.ref_id)
+            except AttributeError:
+                pass  # No stamped activity evidence in this native message.
             if identity == segment['last_info']:
                 return
             if segment['last_info'] is None or segment['last_info'][0] != msg.ref_id:
@@ -535,7 +582,13 @@ class RtabmapNode(Node):
             'storage_limit' if self._stop_reason else 'stopped' if stopped else health['odometry'],
             capture_stopped=stopped, stop_reason=self._stop_reason,
             accepted_clouds=health['admitted_frames'], forwarded_clouds=forwarded,
-            runtime_queue=queued, dropped_runtime_queue=dropped, segment_id=segment,
+            upstream_covariance='known' if self._covariance_source=='upstream' else 'unknown',
+            covariance_source=self._covariance_source or 'unknown',
+            backend_progress=active['progress'].status(self._receipt_clock()) if active else {'state':'idle'},
+            segment_lifecycle=[dict(segment_id=s['segment_id'],database=str(s['process'].database_path),
+                state='finalized' if s['finalized'] else 'closing' if s['closing'] else 'active',
+                relation_to_previous='unknown_separate_origin') for s in self._segments],
+            map_decision=self._map_decision, runtime_queue=queued, dropped_runtime_queue=dropped, segment_id=segment,
             frame_id=frame, disk_bytes=self._disk_bytes, **counts,
             native_graph_rejections=rejections['graph'],
             native_cloud_rejections=rejections['cloud'],
