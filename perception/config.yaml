@@ -257,6 +257,30 @@ plugins:
     # responses, so this does not guess between them.
     lens_barrel_max_fraction: 0.6
 
+  # One depth input (image/depth-z16 Image or image/depth-zlib CompressedImage).
+  # Display output can use approximate intrinsics; metric output requires
+  # measured depth, real intrinsics and capture-time/frame declarations.
+  pointcloud:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    fps: 2
+    # Rendering ceiling is 40000 per frame (pointcloud.js MAX_POINTS); keep the
+    # default well under it so the browser stays responsive.
+    max_points: 20000
+    min_depth_m: 0.1
+    max_depth_m: 10.0
+
+  # RTAB-Map mapping from native PointCloud2 and existing tracking odometry.
+  # Core supplies connected ROS topics and provenance. When startup geometry
+  # is incomplete, Perception resolves sensor frame,
+  # odometry child frame and clock from live messages; it does not guess robot
+  # presets or promote timestamp overlap to verified clock synchronization.
+  # Calibrated producer extrinsics may be used automatically. For an assumed or
+  # missing mount, enter child_from_cloud (rigid 4x4) in the card instance config.
+  # The following deployment settings are generic RTAB-Map/resource overrides.
+  pointcloud_slam:
+    enabled: true
+
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities
   # from a skeleton-action model. No second inference runtime: a second ONNX
