@@ -58,7 +58,8 @@ def _config_properties():
 class PointCloudSlamPlugin:
     PREFIX = 'pointcloud_slam'
 
-    def __init__(self, config, executor):
+    def __init__(self, config, executor, *, input_registry=None):
+        self._input_registry = input_registry
         # 标点移至后续导航卡片；忽略旧画布中的标注平面，不阻止项目启动。
         # Retired/unknown deployment keys are ignored, never fatal: old config
         # rows and old canvas documents must not block a project start. The
@@ -476,7 +477,8 @@ class PointCloudSlamPlugin:
         try:
             node = RtabmapNode(next(t for t, f in self._topics.items() if f == 'state/odom'),
                 next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2'), settings,
-                session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop)
+                session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop,
+                **({"input_registry": self._input_registry} if self._input_registry else {}))
             # A new mapping session replaces the saved view, never competes for
             # the single mapping topic.
             self._close_view()

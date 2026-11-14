@@ -236,6 +236,8 @@ class PerceptionBundle:
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
 
+        from plugins.spatial_input import InputAdapterRegistry
+        self._spatial_inputs = InputAdapterRegistry(executor)
         pcl_cfg = plugins_cfg.get("pointcloud") or {}
         if pcl_cfg.get("enabled", False):
             import re, socket
@@ -248,7 +250,7 @@ class PerceptionBundle:
             # the rest of the stack down. The card simply does not appear.
             try:
                 self._plugins.append(
-                    PointCloudPerceptionPlugin(pcl_cfg, namespace, executor)
+                    PointCloudPerceptionPlugin(pcl_cfg, namespace, executor, input_registry=self._spatial_inputs)
                 )
                 log.info("PointCloudPerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
@@ -257,14 +259,14 @@ class PerceptionBundle:
 
         if plugins_cfg.get("rgbd_odometry", {}).get("enabled", False):
             from plugins.rgbd_odometry import RgbdOdometryPlugin
-            self._plugins.append(RgbdOdometryPlugin(plugins_cfg["rgbd_odometry"], executor))
+            self._plugins.append(RgbdOdometryPlugin(plugins_cfg["rgbd_odometry"], executor, input_registry=self._spatial_inputs))
             log.info("RgbdOdometryPlugin loaded")
 
         slam_cfg = plugins_cfg.get("pointcloud_slam") or {}
         if slam_cfg.get("enabled", False):
             try:
                 from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
-                self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor))
+                self._plugins.append(PointCloudSlamPlugin(slam_cfg, executor, input_registry=self._spatial_inputs))
                 log.info("PointCloudSlamPlugin loaded (RTAB-Map point-cloud mapping)")
             except Exception:
                 log.error("PointCloudSlamPlugin failed to load; continuing without SLAM", exc_info=True)
@@ -386,6 +388,9 @@ class PerceptionBundle:
                     shutdown()
                 except Exception:
                     log.exception("plugin shutdown failed: %s", plugin.PREFIX)
+        registry = getattr(self, "_spatial_inputs", None)
+        if registry is not None:
+            registry.close()
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────

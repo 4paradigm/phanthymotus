@@ -335,7 +335,8 @@ class CaptureObservations:
 
 
 class RgbdSession:
-    def __init__(self, calibration, executor, topic, *, publish_output=True):
+    def __init__(self, calibration, executor, topic, *, publish_output=True, input_registry=None):
+        self.input_registry, self.input_leases = input_registry, []
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
@@ -394,8 +395,14 @@ class RgbdSession:
                 qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
             for kind in ('color', 'depth'):
-                self.node.create_subscription(CompressedImage, calibration[kind + '_topic'],
-                    lambda m, k=kind: self._image(k, m), qos_profile_sensor_data)
+                input_topic = calibration[kind + '_topic']
+                if input_registry is None:
+                    self.node.create_subscription(CompressedImage, input_topic,
+                        lambda m, k=kind: self._image(k, m), qos_profile_sensor_data)
+                else:
+                    self.input_leases.append(input_registry.acquire(input_topic, CompressedImage,
+                        calibration['input_declarations'].get(input_topic, {}),
+                        lambda m, context, k=kind: self._image(k, m, context)))
             self.node.create_subscription(Odometry, '/' + self.segment + '/visual',
                                           lambda m: self._result('pose', m), qos_profile_sensor_data)
             self.node.create_subscription(OdomInfo, '/' + self.segment + '/diagnostic',
@@ -449,7 +456,7 @@ class RgbdSession:
                     if self.fusion is not None:
                         self.fusion.fault(self.gate.reason)
 
-    def _image(self, kind, msg):
+    def _image(self, kind, msg, context=None):
         if self.stop_event.is_set():
             return
         with self.lock:
@@ -898,6 +905,8 @@ class RgbdSession:
 
     def close(self, *, report_idle=True):
         self.stop_event.set()
+        for lease in getattr(self, "input_leases", ()):
+            lease.close()
         if self.spin_worker is not None:
             self.spin_worker.join(timeout=5)
             if self.spin_worker.is_alive():

@@ -22,7 +22,8 @@ _AUTO_COOLDOWN_S, _AUTO_MAX_UNTRACKED_SWITCHES = 20., 2
 class RgbdOdometryPlugin:
     PREFIX = 'rgbd_odometry'
 
-    def __init__(self, config, executor):
+    def __init__(self, config, executor, *, input_registry=None):
+        self._input_registry = input_registry
         self.executor = executor
         self.instances = {}
         self.defaults = {k: (config or {}).get(k, False) for k in
@@ -75,7 +76,8 @@ class RgbdOdometryPlugin:
                     state['attempts'] += 1
                     calibration, switch = self._next_frontend(instance, session, info, now)
                     candidate = RgbdSession(calibration, self.executor,
-                                            self._outputs(instance)[0]['topic'], publish_output=False)
+                                            self._outputs(instance)[0]['topic'], publish_output=False,
+                                            **({'input_registry': self._input_registry} if self._input_registry else {}))
                     session.close(report_idle=False)
                     with candidate.lock:
                         self.instances[instance] = candidate, signature, bindings
@@ -220,6 +222,7 @@ class RgbdOdometryPlugin:
                         logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
                         raise
                     calibration.update(settings)
+                    calibration['input_declarations'] = deepcopy(args.get('camera_info') or {})
                     # No IMU binding always means pure visual, even with saved ESKF options.
                     calibration['short_term_compensation'] = enabled and settings['short_term_compensation']
                     calibration['depth_geometry'] = enabled and settings['depth_geometry']
@@ -242,7 +245,8 @@ class RgbdOdometryPlugin:
                                     for k, f in (('color', 'image/jpeg'), ('depth', 'image/depth-zlib'))]
                         if enabled:
                             bindings.append({'topic': calibration['imu_topic'], 'format': 'sensor/imu'})
-                        current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic']), signature, bindings)
+                        current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic'],
+                            **({'input_registry': self._input_registry} if self._input_registry else {})), signature, bindings)
                         self.instances[instance] = current
                         self.settings[instance] = settings
                         self.recovery[instance] = dict(lost_since=None, last_attempt=None,

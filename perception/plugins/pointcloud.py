@@ -223,6 +223,9 @@ class _PointCloudNode(Node):
         self._metric_last_skip = None
 
         self._subs: list = []
+        self._input_registry = None
+        self._input_declaration = {}
+        self._input_leases = []
         self._input_discovery_timer = None
         self._input_discovery_errors = 0
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -270,8 +273,13 @@ class _PointCloudNode(Node):
         raw = msg_type == "sensor_msgs/msg/Image"
         self._input_format = "image/depth-z16" if raw else "image/depth-zlib"
         callback = self._depth_image_cb if raw else self._depth_comp_cb
-        self._subs.append(self.create_subscription(
-            Image if raw else CompressedImage, self._input_topic, callback, _LOW_LAT_QOS))
+        if self._input_registry is None:
+            self._subs.append(self.create_subscription(
+                Image if raw else CompressedImage, self._input_topic, callback, _LOW_LAT_QOS))
+        else:
+            self._input_leases.append(self._input_registry.acquire(
+                self._input_topic, Image if raw else CompressedImage,
+                self._input_declaration, callback))
         log.info("[pointcloud] bound %s to %s", self._input_topic, msg_type)
         return True
 
@@ -304,7 +312,7 @@ class _PointCloudNode(Node):
             if self._metric_metadata_source_topic:
                 self._subs.append(self.create_subscription(
                     String, self._metric_metadata_source_topic, self._metric_metadata_cb, _PUB_QOS))
-            if self._subs or self._input_discovery_timer is not None:
+            if self._subs or self._input_leases or self._input_discovery_timer is not None:
                 self._worker = threading.Thread(target=self._worker_loop, daemon=True,
                                                 name=f"pointcloud_worker_{self._input_topic}")
                 self._worker.start()
@@ -318,6 +326,8 @@ class _PointCloudNode(Node):
         # Worker only — subscriptions are destroyed by dispose_node after the
         # node leaves the executor (InvalidHandle race otherwise; see vop).
         self._stop_event.set()
+        for lease in self._input_leases:
+            lease.close()
         with self._lifecycle_lock:
             timer, self._input_discovery_timer = self._input_discovery_timer, None
             if timer is not None:
@@ -365,12 +375,12 @@ class _PointCloudNode(Node):
             except queue.Full:
                 pass
 
-    def _depth_comp_cb(self, msg: CompressedImage):
+    def _depth_comp_cb(self, msg: CompressedImage, context=None):
         if self._throttled():
             return
         self._drop_stale(self._frame_queue, ("depth_zlib", msg))
 
-    def _depth_image_cb(self, msg: Image):
+    def _depth_image_cb(self, msg: Image, context=None):
         if self._throttled():
             return
         self._drop_stale(self._frame_queue, ("depth_z16", msg))
@@ -567,7 +577,8 @@ class PointCloudPerceptionPlugin:
     PREFIX = "pointcloud"
     ALIASES = ()
 
-    def __init__(self, plugin_cfg: dict, namespace: str, executor):
+    def __init__(self, plugin_cfg: dict, namespace: str, executor, *, input_registry=None):
+        self._input_registry = input_registry
         self._namespace = namespace
         self._executor = executor
         self._plugin_cfg = dict(plugin_cfg or {})
@@ -652,6 +663,8 @@ class PointCloudPerceptionPlugin:
             with self._nodes_lock:
                 upstream = self._upstream_camera.get(node_key) or {}
             declaration = self._upstream_input_metadata.get(node_key) or {}
+            node._input_registry = self._input_registry
+            node._input_declaration = upstream
             node._input_format = declaration.get("format") or upstream.get("format")
             metadata_topic = declaration.get("frame_metadata_topic")
             if node._metric_cloud_enabled and isinstance(metadata_topic, str) and metadata_topic:

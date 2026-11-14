@@ -146,7 +146,8 @@ class RtabmapNode(Node):
     capture lock. freeze_capture therefore remains a quick publication barrier.
     """
     def __init__(self, odom_topic, cloud_topic, settings, *, session_dir,
-                 input_contract=None, capture_stop=None):
+                 input_contract=None, capture_stop=None, input_registry=None):
+        self._input_registry, self._input_leases = input_registry, []
         from nav_msgs.msg import Odometry
         from geometry_msgs.msg import TransformStamped
         from tf2_msgs.msg import TFMessage
@@ -208,11 +209,18 @@ class RtabmapNode(Node):
                 self.create_subscription(String, self._settings['capture_mount']['declaration']['topic'],
                                          self._capture_mount, _QOS)
             self._map_pub = self.create_publisher(UInt8MultiArray, self._map_topic, _QOS)
-            self.create_subscription(String, odom_topic, self._odom, _QOS)
-            self.create_subscription(PointCloud2, cloud_topic, self._cloud, _QOS)
+            for topic, kind, callback in ((odom_topic, String, self._odom),
+                                          (cloud_topic, PointCloud2, self._cloud)):
+                if input_registry is None:
+                    self.create_subscription(kind, topic, callback, _QOS)
+                else:
+                    declaration = (input_contract or {}).get("inputs", {}).get(topic, {})
+                    self._input_leases.append(input_registry.acquire(topic, kind, declaration, callback))
             if input_contract:
                 self.create_subscription(String, input_contract['frame_metadata_topic'], self._cloud_metadata, _QOS)
         except Exception:
+            for lease in self._input_leases:
+                lease.close()
             self.destroy_node()
             raise
 
@@ -222,7 +230,7 @@ class RtabmapNode(Node):
     def _measurement_now(self):
         return self._measurement_clock_ns() if self.stream.max_measurement_age_ms is not None else None
 
-    def _odom(self, msg):
+    def _odom(self, msg, context=None):
         try:
             sample = json.loads(msg.data)
         except (TypeError, ValueError):
@@ -265,7 +273,7 @@ class RtabmapNode(Node):
                 self.stream.last_error = str(error)
         self._wake.set()
 
-    def _cloud(self, msg):
+    def _cloud(self, msg, context=None):
         if self._stopped():
             return
         try:
@@ -582,6 +590,8 @@ class RtabmapNode(Node):
 
     def close(self):
         self.freeze_capture()
+        for lease in self._input_leases:
+            lease.close()
         self._worker_stop.set(); self._status_stop.set(); self._wake.set()
         with self._close_lock:
             if self._closed:

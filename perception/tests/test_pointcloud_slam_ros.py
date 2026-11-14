@@ -565,3 +565,24 @@ def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatc
         assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
     finally:
         n.close(); n.destroy_node()
+
+
+def test_shared_input_leases_are_released_by_gateway_close(tmp_path, monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    from perception.plugins.spatial_input import InputAdapterRegistry
+    subscriptions, released = [], []
+    def subscribe(topic, kind, callback):
+        subscriptions.append(topic)
+        return lambda: released.append(topic)
+    registry = InputAdapterRegistry(subscribe=subscribe)
+    n = ros.RtabmapNode('/o', '/c', settings(), session_dir=tmp_path,
+                        input_registry=registry)
+    try:
+        assert subscriptions == ['/o', '/c']
+        n.close()
+        assert sorted(released) == ['/c', '/o']
+        n.close()
+        assert len(released) == 2
+    finally:
+        registry.close()
+        n.destroy_node()
