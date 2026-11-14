@@ -83,3 +83,61 @@ def read(app_id: str, path: str) -> str:
 def delete(app_id: str, path: str) -> None:
     if is_managed_reference(app_id, path):
         Path(path).unlink(missing_ok=True)
+
+
+# Known pre-managed-store mount. This compatibility path is optional and
+# never required when a user configures QQ through the Dashboard.
+_LEGACY_MOUNT = "/run/qq-official-app-secret"
+_LEGACY_INSTALLED_FILE = Path("/opt/phanthy-motus/secrets/qq-official-app-secret")
+
+
+def migrate_legacy(channel: dict) -> dict:
+    """Migrate an already configured, missing legacy mount to durable storage.
+
+    Only the historical installation path is eligible; arbitrary file paths and
+    environment variables are never searched. No secret contents are logged.
+    """
+    from channel.manager import get_channel_config, update_channel_config
+
+    if channel.get("platform") != "qq":
+        return channel
+    current = get_channel_config(channel["id"]) or channel
+    cfg = current.get("config") or {}
+    if cfg.get("app_secret_file") != _LEGACY_MOUNT:
+        return current
+    if Path(_LEGACY_MOUNT).is_file() and os.access(_LEGACY_MOUNT, os.R_OK):
+        return current
+
+    candidate = _LEGACY_INSTALLED_FILE
+    try:
+        info = candidate.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return current
+        # Windows tests use NTFS ACLs rather than POSIX mode bits; the deployed
+        # Linux Core always enforces private 0600 permissions.
+        if os.name != "nt" and (stat.S_IMODE(info.st_mode) & 0o077):
+            return current
+        if hasattr(os, "geteuid") and info.st_uid not in (0, os.geteuid()):
+            return current
+        if not os.access(candidate, os.R_OK):
+            return current
+        value = candidate.read_text(encoding="utf-8").strip()
+        app_id = str(cfg.get("app_id", ""))
+        if not (8 <= len(value) <= 512) or not _APP.fullmatch(app_id):
+            return current
+    except (OSError, UnicodeError):
+        return current
+
+    # The new file is private and persistent before the config pointer changes.
+    # Keep the original host file for rollback.
+    destination = persist(app_id, value)
+    try:
+        updated = update_channel_config(
+            current["id"], config=dict(cfg, app_secret_file=destination))
+        if updated is None:
+            raise RuntimeError("QQ channel disappeared during migration")
+    except Exception:
+        Path(destination).unlink(missing_ok=True)
+        raise
+    return updated
+

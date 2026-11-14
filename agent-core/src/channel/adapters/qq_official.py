@@ -229,12 +229,7 @@ class QQOfficialAdapter(ChannelAdapter):
                 if event_type == "GROUP_MESSAGE_CREATE":
                     if "group" not in self.config.get("enabled_scopes", ["c2c"]):
                         return
-                    if not _full_group_mentions_bot(
-                            raw, self.config.get("bot_group_openid", "")):
-                        if log_group:
-                            print("[qq-group] full_event_ignored_not_at_bot",
-                                  flush=True)
-                        return
+                    # Full SDK group events are validated after parsing.
                     # Same payload schema as GROUP_AT; normalize for SDK 1.2.2.
                     parsed_event_type = "GROUP_AT_MESSAGE_CREATE"
                 else:
@@ -244,6 +239,18 @@ class QQOfficialAdapter(ChannelAdapter):
                           flush=True)
                 event = self._parser.parse(parsed_event_type, raw)
                 msg = self._parse_message(event)
+                if msg is not None and event_type == "GROUP_MESSAGE_CREATE":
+                    from channel.qq_groups import get_group
+                    policy = get_group(self.channel_id, msg.chat_id)
+                    mentioned = _full_group_mentions_bot(
+                        raw, self.config.get("bot_group_openid", ""))
+                    if not mentioned and not (
+                            policy.get("status") == "approved"
+                            and policy.get("mention_only", True) is False):
+                        if log_group:
+                            print("[qq-group] full_event_ignored_by_policy",
+                                  flush=True)
+                        return
                 if is_group_event and log_group:
                     print(
                         f"[qq-group] sdk_parsed={event is not None} "
@@ -621,3 +628,4 @@ class QQOfficialAdapter(ChannelAdapter):
         if self._running and self._connected and self._connected.is_set():
             return "connected"
         return "degraded" if self._running else "disconnected"
+

@@ -43,6 +43,7 @@ _CHAT_HISTORY_TEXT_MAX = 500
 _QQ_MEMORY_LIMIT = 20
 _QQ_MEMORY_ITEM_MAX = 500
 _qq_memory_lock = RLock()
+_qq_context_lock = RLock()
 _qq_group_forward_counts = Counter()
 _qq_acl_error_counts = Counter()
 
@@ -599,6 +600,15 @@ class ChannelManager:
         """启动所有 enabled 的 channel adapters，并拉起 watchdog。"""
         for ch_cfg in _get_channel_configs():
             if ch_cfg.get('enabled'):
+                if ch_cfg.get('platform') == 'qq':
+                    # Upgrade only the QQ portion of an existing Canvas. The
+                    # robot's existing cards and connections must be preserved.
+                    from channel.qq_default_flow import ensure_default_flow
+                    try:
+                        await asyncio.to_thread(ensure_default_flow, ch_cfg['id'])
+                    except Exception as exc:
+                        print('[qq-setup] Canvas integration unavailable: '
+                              + type(exc).__name__, flush=True)
                 await self._start_adapter(ch_cfg)
         if self._watchdog_task is None or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(self._watchdog())
@@ -745,6 +755,16 @@ class ChannelManager:
             await self._push_error(msg)
             return
 
+        if platform == 'qq':
+            # Existing installations may still reference the old one-off
+            # secret mount. Migrate only a trusted known legacy file into the
+            # managed, persistent credential directory before starting.
+            from channel.qq_credential_store import migrate_legacy
+            try:
+                ch_cfg = await asyncio.to_thread(migrate_legacy, ch_cfg)
+            except Exception as exc:
+                print('[qq-setup] Legacy credential migration failed: '
+                      + type(exc).__name__, flush=True)
         adapter_config = dict(ch_cfg.get('config', {}))
         adapter_config['bot_to_bot_enabled'] = ch_cfg.get('bot_to_bot_enabled', False)
         adapter = cls(
@@ -798,6 +818,17 @@ class ChannelManager:
         ch_cfg = get_channel_config(channel_id)
         if ch_cfg and ch_cfg.get('enabled'):
             await self._start_adapter(ch_cfg, retries=retries)
+
+    def _persist_qq_inbound(self, msg: InboundMessage):
+        """Serialize per-process QQ SQLite read/modify/write operations."""
+        with _qq_context_lock:
+            self._set_last_context(
+                msg.channel_id, msg.chat_id, msg.user_id,
+                message_id=msg.message_id, sender_type=msg.sender_type,
+                chat_type=msg.chat_type, expect_reply=msg.expect_reply)
+            self._record_chat_exchange(
+                msg.channel_id, f'{msg.chat_type}:{msg.chat_id}',
+                'user', msg.text, user_label=msg.display_name or msg.user_id)
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -869,18 +900,17 @@ class ChannelManager:
                 if not allowed:
                     return  # 静默丢弃
 
-        # 4. Store last conversation context for reply routing (persisted)
-        self._set_last_context(
-            msg.channel_id, msg.chat_id, msg.user_id,
-            message_id=msg.message_id,
-            sender_type=msg.sender_type,
-            chat_type=msg.chat_type,
-            expect_reply=msg.expect_reply,
-        )
-        self._record_chat_exchange(msg.channel_id,
-                                   f'{msg.chat_type}:{msg.chat_id}' if msg.platform == 'qq' else msg.chat_id,
-                                   'user', msg.text,
-                                   user_label=msg.display_name or msg.user_id)
+        # 4. Persist QQ state off the async Gateway/LLM event loop.
+        if msg.platform == 'qq':
+            await asyncio.to_thread(self._persist_qq_inbound, msg)
+        else:
+            self._set_last_context(
+                msg.channel_id, msg.chat_id, msg.user_id,
+                message_id=msg.message_id, sender_type=msg.sender_type,
+                chat_type=msg.chat_type, expect_reply=msg.expect_reply)
+            self._record_chat_exchange(
+                msg.channel_id, msg.chat_id, 'user', msg.text,
+                user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -1216,3 +1246,4 @@ def _update_status(channel_id: str, status: str):
 # ── 全局单例 ─────────────────────────────────────────────────────────────────
 
 manager = ChannelManager()
+

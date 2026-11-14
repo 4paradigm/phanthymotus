@@ -220,6 +220,38 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
             msg_elements=[image_segment],
         )))
 
+    async def test_full_group_event_respects_saved_mention_policy(self):
+        self.adapter.config.update({
+            "enabled_scopes": ["c2c", "group"], "private_only": False,
+        })
+        await self.adapter.start()
+        cb = MockWs.instances[-1].callbacks
+        group = "GroupOpenID12345"
+        raw = dict(chat_scope="group", chat_id=group,
+                   user_id="MemberOpenID12345",
+                   message_id="full-no-mention-1", content="Hello group",
+                   user_name="tester", mentions=[],
+                   attachments=[], msg_elements=[])
+        policy = {"qq_group_policies": {"official_test": {group: {
+            "status": "approved", "mention_only": False,
+            "default_permission": "chat",
+        }}}}
+        with mock.patch("config.main", policy):
+            await cb.on_message_event("GROUP_MESSAGE_CREATE", raw)
+            self.assertEqual(len(self.inbound), 1)
+            policy["qq_group_policies"]["official_test"][group]["mention_only"] = True
+            await cb.on_message_event("GROUP_MESSAGE_CREATE",
+                                      dict(raw, message_id="full-no-mention-2"))
+            self.assertEqual(len(self.inbound), 1)
+            policy["qq_group_policies"]["official_test"][group]["status"] = "disabled"
+            await cb.on_message_event("GROUP_MESSAGE_CREATE",
+                                      dict(raw, message_id="full-no-mention-3"))
+            self.assertEqual(len(self.inbound), 1)
+            policy["qq_group_policies"]["official_test"].clear()
+            await cb.on_message_event("GROUP_MESSAGE_CREATE",
+                                      dict(raw, message_id="full-no-mention-4"))
+            self.assertEqual(len(self.inbound), 1)
+
     async def test_callback_only_once(self):
         await self.adapter.start()
         raw = vars(message()).copy()
@@ -791,3 +823,4 @@ class QQOfficialTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(ValueError):
                 validate_qq_official_config({**cfg, **changes})
+
