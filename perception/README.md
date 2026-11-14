@@ -4596,3 +4596,64 @@ autoload on, **176 passed** with it off.
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
 ```
+
+## `ros2_node_graph` 卡片
+
+通用 ROS 2 节点图查询卡：把当前 ROS 2 域里的**节点、话题、发布/订阅关系**整理成
+一段文字拓扑，发布到 `data/json` 输出；同时提供一个自包含网页给人调试。
+
+```text
+/perception/ros2_node_graph/state   data/json   节点图文字摘要 + 统计
+网页（默认）                        http://127.0.0.1:15730/
+```
+
+卡片没有输入口，只有输出口：决策中心把它接到 `decision_core` 后，读到的是
+“谁发布什么、谁订阅什么”的摘要，而不是完整节点表。完整图（节点/话题/端点）
+只在网页的 `/api/graph` 里，避免把几 MB 的图灌进 LLM 上下文。
+
+### 端口与隧道
+
+机器人算力板的端口默认不对外开放，所以网页**默认只绑定 `127.0.0.1`**，卡片介绍与
+`info` 会给出：
+
+```text
+网页：http://127.0.0.1:15730/
+隧道：ssh -p 2222 noetix@<robot-ip> -L 15730:127.0.0.1:15730
+```
+
+在本机执行一次隧道命令，再把网页地址复制到浏览器即可。部署环境如果有反向代理、
+已开放的端口或固定网关，把 `public_base_url` 设成浏览器能直接打开的地址
+（如 `https://robot.example/graph/`），卡片会优先使用它，不再需要隧道。
+`bind_host: 0.0.0.0` 也可以局域网直连，但页面没有鉴权，只建议在可信网络使用。
+
+### 动作
+
+- `start`：创建 ROS 节点，周期扫描并发布文字摘要；网页服务在卡片加载时已经启动；
+- `stop`：停止扫描/发布，网页仍可看最后一次快照；
+- `refresh`：立即重新扫描并发布，返回最新摘要；
+- `info`：状态、网页地址、隧道命令、统计、最近错误；
+- `config`：改端口、绑定地址、public URL、SSH 参数、扫描间隔、摘要上限等。
+
+### 配置（`config.yaml`）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `port` | `15730` | 网页端口；0 = 系统随机 |
+| `bind_host` | `127.0.0.1` | 默认 loopback；`0.0.0.0` 局域网直连（无鉴权） |
+| `public_base_url` | 空 | 反代/开放端口地址，设置后优先且不需要隧道 |
+| `ssh_host` | 空 | 隧道中的机器人地址；空 = 自动探测局域网 IP |
+| `ssh_port` / `ssh_user` | `2222` / `noetix` | 生成隧道命令用 |
+| `ssh_local_port` | `0` | 本机映射端口；0 = 同网页端口 |
+| `publish_interval_s` | `5` | 扫描/发布间隔；内容不变只发心跳 |
+| `heartbeat_s` | `30` | 不变时的心跳间隔 |
+| `include_system_topics` | `false` | 是否包含 `/rosout`、`/parameter_events` |
+| `max_nodes` / `max_topics` / `max_flows` | 120 / 200 / 60 | 网页与摘要的显示上限 |
+| `summary_max_chars` | `4000` | `data/json` 摘要字符上限 |
+
+只统计发布/订阅，不含 service/action；网页无鉴权，不要直接暴露到公网。
+
+测试：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_ros2_node_graph.py -q
+```
