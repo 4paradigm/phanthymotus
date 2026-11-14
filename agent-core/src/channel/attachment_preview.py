@@ -23,7 +23,8 @@ _MAX_COLS = 24
 _MAX_FILES = 3
 _TEXT = {".txt", ".csv", ".tsv", ".md", ".json", ".log"}
 _OFFICE = {".xlsx", ".docx"}
-_ALLOWED = _TEXT | _OFFICE
+_ALLOWED = _TEXT | _OFFICE | {".pdf"}
+_MAX_PDF_PAGES = 10
 _XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
@@ -135,6 +136,36 @@ def _docx_preview(path: Path) -> str:
         return "\n".join(paragraphs)
 
 
+def _pdf_preview(path: Path) -> str:
+    """Extract bounded text from a user-uploaded PDF without tool privileges.
+
+    Scanned/image-only PDFs have no usable text in this lightweight path.
+    Never guess at their contents or expand permission boundaries.
+    """
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path), strict=False)
+    if reader.is_encrypted:
+        return "[PDF 已加密，无法直接读取正文]"
+    lines = []
+    max_pages = min(len(reader.pages), _MAX_PDF_PAGES)
+    used = 0
+    for index in range(max_pages):
+        remaining = _MAX_TEXT_CHARS - used
+        if remaining <= 0:
+            break
+        page_text = reader.pages[index].extract_text() or ""
+        page_text = page_text.strip()
+        if page_text:
+            lines.append(f"[PDF 第{index + 1}页]\n{page_text[:remaining]}")
+            used += min(len(page_text), remaining)
+    if len(reader.pages) > max_pages:
+        lines.append(f"[仅预览前 {max_pages} 页，其余页未读取]")
+    if not used:
+        return "[PDF 已收到，但未提取到文字；可能是扫描件或纯图片 PDF]"
+    return "\n\n".join(lines)
+
+
 def preview_message_files(channel_id: str, attachments: list) -> str:
     """Return a bounded preview for this channel's verified current uploads.
 
@@ -148,7 +179,12 @@ def preview_message_files(channel_id: str, attachments: list) -> str:
             continue
         try:
             ext = path.suffix.lower()
-            if ext == ".xlsx":
+            if ext == ".pdf":
+                try:
+                    content = _pdf_preview(path)
+                except Exception:
+                    content = "[PDF 无法解析，可能损坏或包含不支持的结构]"
+            elif ext == ".xlsx":
                 content = _xlsx_preview(path)
             elif ext == ".docx":
                 content = _docx_preview(path)

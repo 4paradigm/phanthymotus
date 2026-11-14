@@ -11,6 +11,7 @@ dependencies = [
     "jsonschema>=4.0",
     "numpy>=1.24",
     "openai>=2.31.0",
+    "pypdf>=5.0",
     "pyyaml>=6.0.2",
     "qqbot-agent-sdk==1.2.2",
     "lark-oapi>=1.4.0",

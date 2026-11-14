@@ -23,6 +23,32 @@ def sample_sheet():
             '</sheetData></worksheet>').encode()
 
 
+def sample_pdf(text=b"HELLO_FROM_PDF"):
+    """Minimal one-page PDF containing a searchable Latin text object."""
+    stream = b"BT /F1 12 Tf 40 100 Td (" + text + b") Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n"
+        + stream + b"\nendstream",
+    ]
+    buf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, body in enumerate(objects, 1):
+        offsets.append(len(buf))
+        buf.extend(f"{index} 0 obj\n".encode() + body + b"\nendobj\n")
+    start = len(buf)
+    buf.extend(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]:
+        buf.extend(f"{offset:010d} 00000 n \n".encode())
+    buf.extend(f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\n"
+               f"startxref\n{start}\n%%EOF\n".encode())
+    return bytes(buf)
+
+
 class QQAttachmentPreviewTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -82,6 +108,22 @@ class QQAttachmentPreviewTests(unittest.IsolatedAsyncioTestCase):
         exe = self.own / "script.py"
         exe.write_text("secret", encoding="utf-8")
         self.assertEqual(preview_message_files("qq_test", [self._att(exe)]), "")
+
+    async def test_pdf_text_is_extracted_with_chat_only_permissions(self):
+        path = self.own / "notes.pdf"
+        path.write_bytes(sample_pdf())
+        content = preview_message_files("qq_test", [self._att(path)])
+        self.assertIn("HELLO_FROM_PDF", content)
+        self.assertIn("PDF 第1页", content)
+        self.assertIn("只读解析结果", content)
+        self.assertEqual(preview_message_files("qq_other", [self._att(path)]), "")
+
+    async def test_corrupt_pdf_reports_failure_without_claiming_content(self):
+        path = self.own / "corrupt.pdf"
+        path.write_bytes(b"%PDF-1.4 not a real PDF")
+        content = preview_message_files("qq_test", [self._att(path)])
+        self.assertIn("无法解析", content)
+        self.assertNotIn("PDF 第1页", content)
 
     async def test_document_word_payload(self):
         path = self.own / "notes.docx"

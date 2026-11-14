@@ -159,6 +159,51 @@ class QQVisionTests(unittest.IsolatedAsyncioTestCase):
             trigger = {"_qq_channel_turn": True, "_qq_image_files": files}
             self.assertEqual(len(_approved_image_paths(trigger, root)), 2)
 
+    async def test_gif_is_transcoded_to_jpeg_frames_before_llm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gif = root / "animation.gif"
+            gif.write_bytes(b"GIF89a" + b"x" * 64)
+            proc = mock.Mock(returncode=0)
+            proc.communicate = mock.AsyncMock(return_value=(
+                b"\xff\xd8one\xff\xd9\xff\xd8two\xff\xd9", b""))
+            with mock.patch("asyncio.create_subprocess_exec",
+                            new_callable=mock.AsyncMock, return_value=proc):
+                messages = [{"role":"user", "content":"这张 GIF 里是什么？"}]
+                self.assertTrue(await add_qq_images(
+                    messages, _trigger(gif), media_root=root, vision_enabled=True))
+            parts = messages[0]["content"]
+            images = [x for x in parts if x["type"] == "image_url"]
+            self.assertEqual(len(images), 2)
+            self.assertTrue(all(x["image_url"]["url"].startswith(
+                "data:image/jpeg;base64,") for x in images))
+            self.assertIn("抽取 2 帧", str(parts))
+
+    async def test_followup_refers_only_to_same_qq_senders_recent_image(self):
+        from channel.manager import ChannelManager
+        from channel.adapter import Attachment
+        from types import SimpleNamespace
+        mgr = ChannelManager()
+        attachment = Attachment(kind="image", path="/work/resource/channel_files/qq_test/a.png",
+                                name="a.png", mime="image/png", size=42)
+        msg = SimpleNamespace(platform="qq", sender_type="user", channel_id="qq_test",
+                              chat_type="p2p", chat_id="chat_A", user_id="user_A",
+                              text="[QQ attachment]", attachments=[attachment])
+        self.assertEqual(mgr._qq_followup_attachments(msg), [])
+        msg.attachments = []
+        msg.text = "这个能看到吗"
+        prior = mgr._qq_followup_attachments(msg)
+        self.assertEqual(len(prior), 1)
+        self.assertEqual(prior[0]["path"], attachment.path)
+        msg.user_id = "user_B"
+        self.assertEqual(mgr._qq_followup_attachments(msg), [])
+        msg.user_id = "user_A"
+        msg.chat_id = "chat_B"
+        self.assertEqual(mgr._qq_followup_attachments(msg), [])
+        msg.chat_id = "chat_A"
+        msg.text = "打开机器人"
+        self.assertEqual(mgr._qq_followup_attachments(msg), [])
+
     def test_request_log_redacts_image_bytes_but_not_live_prompt(self):
         messages = [{"role": "user", "content": [
             {"type": "text", "text": "identify"},

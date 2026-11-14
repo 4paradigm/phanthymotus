@@ -48,7 +48,7 @@ def _approved_image_paths(trigger: dict, media_root: Path = _QQ_MEDIA_ROOT) -> l
         if not isinstance(item, dict) or item.get("kind") != "image":
             continue
         path = item.get("path", "")
-        if not isinstance(path, str) or not path.startswith("/"):
+        if not isinstance(path, str) or not Path(path).is_absolute():
             continue
         candidate = Path(path)
         if candidate.suffix.lower() not in _ALLOWED_IMAGE_EXT:
@@ -83,6 +83,51 @@ def redact_inline_images(messages: list[dict]) -> list[dict]:
     return clean
 
 
+async def _gif_frames(path: Path) -> list[dict]:
+    """Sample up to two bounded JPEG frames from a QQ GIF via existing ffmpeg.
+
+    ChatCompletions vision endpoints are more interoperable with JPEG than
+    animated GIF payloads. This samples frames, not a complete motion analysis.
+    """
+    import asyncio
+    import base64
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+        "-vf", "fps=1,scale='min(640,iw)':-2",
+        "-frames:v", "2", "-q:v", "5",
+        "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        data, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise ValueError("GIF frame decoding timed out") from None
+    if proc.returncode != 0 or not data or len(data) > 3 * 1024 * 1024:
+        raise ValueError("GIF frame decoding failed or exceeded limit")
+    frames = []
+    position = 0
+    while len(frames) < 2:
+        start = data.find(b"\xff\xd8", position)
+        if start < 0:
+            break
+        end = data.find(b"\xff\xd9", start + 2)
+        if end < 0:
+            break
+        blob = data[start:end + 2]
+        if len(blob) > 0:
+            frames.append({"type": "image_url", "image_url": "data:image/jpeg;base64,"
+                           + base64.b64encode(blob).decode("ascii")})
+        position = end + 2
+    if not frames:
+        raise ValueError("No decodable GIF frames")
+    return [{"type": "text", "text":
+             f"[当前 QQ 动图抽取 {len(frames)} 帧供视觉分析，不代表完整动画。]"}, *frames]
+
+
 async def add_qq_images(messages: list[dict], trigger: dict,
                         *, media_root: Path = _QQ_MEDIA_ROOT,
                         reader=None, vision_enabled: bool | None = None) -> bool:
@@ -109,7 +154,9 @@ async def add_qq_images(messages: list[dict], trigger: dict,
     parts = [{"type": "text", "text": text}]
     for path in _approved_image_paths(trigger, media_root):
         try:
-            contents = await (reader or _read_image)(path)
+            contents = await (reader(path) if reader is not None else
+                              _gif_frames(path) if path.suffix.lower() == ".gif"
+                              else _read_image(path))
             if (not isinstance(contents, list)
                     or not any(isinstance(x, dict) and x.get("type") == "image_url"
                                for x in contents)):
