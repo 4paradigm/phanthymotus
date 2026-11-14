@@ -38,9 +38,7 @@ class QQOwnerProvisioningTests(unittest.TestCase):
     def test_local_provision_explicit_exact_user(self):
         response, cfg = self.provision()
         self.assertEqual(response["role"], "owner")
-        self.assertFalse(response["privileged_tools_enabled"])
-        self.assertEqual(response["qq_v1_tools"], [
-            "mcp__channel__channel_reply", "finish"])
+        self.assertTrue(response["privileged_tools_enabled"])
         self.assertEqual(cfg["qq_c2c_owner_grant"], {
             "enabled": True, "principal": UID,
         })
@@ -62,7 +60,7 @@ class QQOwnerProvisioningTests(unittest.TestCase):
                 update_owner()
             upsert.assert_not_called()
 
-    def test_verified_owner_remains_reply_only(self):
+    def test_grant_without_matching_acl_owner_does_not_allow_shell(self):
         cfg = config_data()
         cfg["qq_c2c_owner_grant"] = {"enabled": True, "principal": UID}
         with (mock.patch("config.main", cfg),
@@ -72,10 +70,7 @@ class QQOwnerProvisioningTests(unittest.TestCase):
         with (mock.patch("config.main", cfg),
               mock.patch("channel.acl.get_user", return_value={
                   "role": "owner", "tool_filter": "*" })):
-            self.assertFalse(allowed_for_principals([("qq", UID)], "Bash"))
-            self.assertFalse(allowed_for_principals([("qq", UID)], "mcp__robot__loco"))
-            self.assertTrue(allowed_for_principals(
-                [("qq", UID)], "mcp__channel__channel_reply"))
+            self.assertTrue(allowed_for_principals([("qq", UID)], "Bash"))
             self.assertFalse(allowed_for_principals([("qq", OTHER)], "Bash"))
 
 

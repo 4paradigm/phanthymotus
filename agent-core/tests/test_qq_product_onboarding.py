@@ -106,13 +106,12 @@ def test_verified_owner_full_access_restored_without_escalating_other_users():
           mock.patch('channel.acl.get_user', return_value=old),
           mock.patch('channel.acl.upsert_user') as update):
         result = qq_onboarding.restore_owner_full_access(CHANNEL)
-        assert result['status'] == 'reply_only'
+        assert result['status'] == 'full_access'
         assert update.call_args.kwargs['role'] == 'owner'
         assert update.call_args.kwargs['tool_filter'] == permissions.OWNER_FILTER
-        assert not _qq_safe('Bash', role='owner', user_id=PERSON)
-        assert not _qq_safe('mcp__robot__loco', role='owner', user_id=PERSON)
-        assert _qq_safe('mcp__channel__channel_reply', role='owner', user_id=PERSON)
-        assert _qq_safe('finish', role='owner', user_id=PERSON)
+        assert _qq_safe('Bash', role='owner', user_id=PERSON)
+        assert _matches_filter(permissions.OWNER_FILTER, 'Bash')
+        assert _matches_filter(permissions.OWNER_FILTER, 'mcp__robot__loco')
         assert not _qq_safe('Bash', role='operator', user_id=PERSON)
         assert not _qq_safe('Bash', role='owner',
                             user_id='official:' + APP + ':OTHER_PERSON_12345')

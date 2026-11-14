@@ -111,11 +111,9 @@ def confirm(channel_id: str) -> dict:
 
 @_synchronized
 def restore_owner_full_access(channel_id: str) -> dict:
-    """Normalize an older owner row without widening QQ V1 capabilities.
+    """Upgrade only the Dashboard-confirmed QQ C2C owner from older presets.
 
-    No other user or group can gain privileges through this migration.  The
-    owner role/filter is retained for local administration, while tool_policy
-    still enforces QQ V1's reply-only boundary.
+    No other user or group can gain privileges through this migration.
     """
     from channel.manager import get_channel_config
     from channel.permissions import OWNER_FILTER
@@ -137,7 +135,7 @@ def restore_owner_full_access(channel_id: str) -> dict:
     if user.get('tool_filter') != OWNER_FILTER:
         acl.upsert_user('qq', principal, user.get('display_name', ''),
                         role='owner', tool_filter=OWNER_FILTER)
-    return {'status': 'reply_only', 'user_suffix': principal[-6:]}
+    return {'status': 'full_access', 'user_suffix': principal[-6:]}
 
 
 @_synchronized
