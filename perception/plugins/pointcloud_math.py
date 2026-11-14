@@ -17,12 +17,7 @@ import numpy as np
 MAX_POINTS = 40000
 
 def decimation_stride(w: int, h: int, max_points: int) -> int:
-    """q5 参照：stride = ceil(sqrt(w*h/max_points))，至少 1。
-
-    2-D 图像网格（backproject_depth 抽深度图）用 sqrt 形式；传 w=1 时退
-    化为 1-D：ceil(N/max_points）—— 供已展平的 (N,3) 点云（stereo 反投影
-    路径）按点数抽稀用。2-D 步长抽 1-D 云差 sqrt(N) 倍，密集 640x480 云
-    实际发 ~76800 点（review 第 11 轮）。"""
+    """Bound depth-grid sampling; a single-column input uses a linear stride."""
     n = w * h
     if w == 1:  # 1-D：按点数抽稀，不是 sqrt；ceil(N/max(max_points,1))
         return max(1, -((-n) // max(max_points, 1)))
@@ -47,56 +42,6 @@ def backproject_depth(depth_m: np.ndarray, fx: float, fy: float,
     y = (rows - cy) * z / fy
     xyz = np.stack((x, y, z), axis=-1)
     return np.ascontiguousarray(xyz[valid], dtype=np.float32)
-
-
-def make_Q(fx: float, cx: float, cy: float, Tx: float) -> np.ndarray:
-    """OpenCV stereo-rectify 标准形式，同 Go1 pointcloud_stream.cc 的 make_Q。
-
-    Q = [[1,0,0,-cx],
-         [0,1,0,-cy],
-         [0,0,0, fx],
-         [0,0,-1/Tx,0]]
-
-    Tx 是 stereoCalibrate 的符号化 T[0]（先左后右的标准双目为负）。
-    """
-    Q = np.zeros((4, 4), dtype=np.float64)
-    Q[0, 0] = 1.0
-    Q[1, 1] = 1.0
-    Q[0, 3] = -cx
-    Q[1, 3] = -cy
-    Q[2, 3] = fx
-    Q[3, 2] = -1.0 / Tx
-    return Q
-
-
-def Q_from_baseline(fx: float, cx: float, cy: float, baseline_m: float) -> np.ndarray:
-    """make_Q 的取绝对值版：Tx 只表达基线长度，不问符号。
-
-    本插件自己用 cv2.SGBM 算视差（d ≥ 0），因此 W = Q[3,2]·d 必须为正、
-    即 Q[3,2] = -1/Tx > 0、Tx < 0。无论标定 blob 里 Tx 是 OpenCV 的负值
-    还是 Unitree 出厂标定的正值，统一归一到负号，深度恒为正。
-    """
-    return make_Q(fx, cx, cy, -abs(float(baseline_m)))
-
-
-def filter_cloud(xyz: np.ndarray, min_depth_m: float,
-                 max_depth_m: float) -> np.ndarray:
-    """Go1 参照：剔除非有限值，再按 z（光学系前向）截断。"""
-    if xyz.size == 0:
-        return np.ascontiguousarray(xyz, dtype=np.float32)
-    finite = np.isfinite(xyz).all(axis=-1)
-    xyz = xyz[finite]
-    if xyz.size == 0:
-        return np.ascontiguousarray(xyz, dtype=np.float32)
-    ok = (xyz[:, 2] >= min_depth_m) & (xyz[:, 2] <= max_depth_m)
-    return np.ascontiguousarray(xyz[ok], dtype=np.float32)
-
-
-def decimate_cloud(xyz: np.ndarray, stride: int) -> np.ndarray:
-    """对 (N,3) 均匀抽稀（视差反投影后点数仍可能超限）。"""
-    if stride <= 1 or xyz.shape[0] == 0:
-        return np.ascontiguousarray(xyz, dtype=np.float32)
-    return np.ascontiguousarray(xyz[::stride], dtype=np.float32)
 
 
 def encode_packet(xyz: np.ndarray) -> bytes:
@@ -144,21 +89,6 @@ def intrinsics_from_hfov(w: int, h: int, hfov_deg: float) -> tuple:
     """hfov（度）→ (fx=fy, cx, cy)，画幅 w×h 中心。零配置兜底。"""
     fx = (w / 2.0) / np.tan(np.radians(hfov_deg) / 2.0)
     return float(fx), float(fx), float(w) / 2.0, float(h) / 2.0
-
-
-def calibration_tier(blob: dict) -> str:
-    """标定 blob 分档：
-    raw       —— 带 K1/K2/D1/D2 的完整 stereoCalibrate 结果，运行时先 rectify；
-    rectified —— 只有 {fx, cx, cy, Tx}（左右已校正），直接 Q 反投影；
-    pinhole   —— {fx, fy, cx, cy} / {hfov}，A/B 模式的内参。
-    """
-    if any(k in blob for k in ("K1", "K2", "D1", "D2")):
-        return "raw"
-    if "Tx" in blob:
-        return "rectified"
-    if "hfov" in blob or any(k in blob for k in ("fx", "fy", "cx", "cy")):
-        return "pinhole"
-    return "unknown"
 
 
 def pinhole_of(blob: dict, w: int, h: int) -> tuple:

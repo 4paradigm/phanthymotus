@@ -10,7 +10,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
-  pointcloud       点云（深度图反投影 / 单目深度估计 / 双目立体匹配）
+  pointcloud       点云（一路深度图反投影）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）

@@ -1,15 +1,4 @@
-"""
-tests/test_pointcloud_math.py — 纯数学层的单元测试（只依赖 numpy，主机可跑）。
-
-覆盖 pointcloud_math.py 全部函数，重点是三条 load-bearing 契约：
-
-    1. encode_packet 的二进制协议（pointcloud.js / ros2_bridge 按它解包）；
-    2. Q_from_baseline 的符号约定（SGBM 视差 d ≥ 0 → Tx 必须为负，否则
-       W = Q[3,2]·d ≤ 0，深度全为负数或除零——review issue 1 的根因）；
-    3. 标定 blob 的分档与文件名校验（review issue 3）。
-
-Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
-"""
+"""Depth projection, bounded sampling and pointcloud wire-format tests."""
 
 from __future__ import annotations
 
@@ -80,67 +69,6 @@ def test_backproject_depth_stride_samples_a_quarter():
     assert xyz.shape[0] == 16
     # z 取的是 [::2, ::2] 的值：depth[0,0]=1
     assert xyz[:, 2].min() == pytest.approx(1.0)
-
-
-# ── make_Q / Q_from_baseline ─────────────────────────────────────────────────
-
-def test_make_Q_reference_form():
-    Q = pcm.make_Q(100.0, 320.0, 240.0, -0.02443)
-    assert Q[0, 0] == 1 and Q[1, 1] == 1
-    assert Q[0, 3] == -320.0 and Q[1, 3] == -240.0
-    assert Q[2, 3] == 100.0
-    assert Q[3, 2] == pytest.approx(-1.0 / -0.02443)
-
-
-def test_q_from_baseline_normalizes_sign_both_ways():
-    # OpenCV stereoCalibrate 的 T[0] 是负；Unitree 出厂标定是正。两者都
-    # 必须得到 Q[3,2] > 0（SGBM d ≥ 0 → W > 0 → 正深度）。
-    for baseline in (0.02443, -0.02443):
-        Q = pcm.Q_from_baseline(100.0, 320.0, 240.0, baseline)
-        assert Q[3, 2] > 0
-        assert Q[3, 2] == pytest.approx(1.0 / 0.02443)
-
-
-def test_q_from_baseline_reprojects_disparity_to_positive_depth():
-    # 端到端符号验证：d=10 视差，fx=100，基线 0.02443 → Z = fx·B/d
-    Q = pcm.Q_from_baseline(100.0, 0.0, 0.0, 0.02443)
-    d = 10.0
-    W = Q[3, 2] * d + Q[3, 3]
-    Z = Q[2, 3] / W  # W 分母里的 Q[2,3]=fx
-    assert Z == pytest.approx(100.0 * 0.02443 / d)
-
-
-# ── filter_cloud / decimate_cloud ─────────────────────────────────────────────
-
-def test_filter_cloud_drops_nonfinite_and_out_of_range():
-    xyz = np.array([
-        [0, 0, 1.0],
-        [np.nan, 0, 1.0],
-        [0, 0, 0.05],   # 近于 min
-        [0, 0, 20.0],   # 远于 max
-        [0, 0, 5.0],
-    ], dtype=np.float32)
-    out = pcm.filter_cloud(xyz, 0.1, 10.0)
-    assert out.shape[0] == 2
-    assert 5.0 in out[:, 2] and 1.0 in out[:, 2]
-
-
-def test_filter_cloud_empty_and_all_invalid_pass_through_shape():
-    empty = np.zeros((0, 3), dtype=np.float32)
-    assert pcm.filter_cloud(empty, 0.1, 10.0).shape == (0, 3)
-    bad = np.full((3, 3), np.nan, dtype=np.float32)
-    assert pcm.filter_cloud(bad, 0.1, 10.0).shape == (0, 3)
-
-
-def test_decimate_cloud_takes_every_stride_th_point():
-    xyz = np.arange(30, dtype=np.float32).reshape(10, 3)
-    out = pcm.decimate_cloud(xyz, 3)
-    assert out.shape[0] == 4  # indices 0, 3, 6, 9
-    assert out[0, 0] == 0.0 and out[1, 0] == 9.0
-    # stride ≤ 1 原样返回（仍保证 contiguous float32）
-    same = pcm.decimate_cloud(xyz, 1)
-    assert same.shape == xyz.shape
-    assert np.array_equal(same, xyz)
 
 
 # ── encode_packet ─────────────────────────────────────────────────────────────
@@ -235,12 +163,3 @@ def test_pinhole_of_hfov_fallback():
 def test_pinhole_of_defaults_to_90_degrees():
     fx, fy, cx, cy = pcm.pinhole_of({}, 100, 50)
     assert np.allclose([fx, fy], [50.0, 50.0])  # w/2
-
-
-def test_calibration_tier_classification():
-    assert pcm.calibration_tier({"K1": [], "D1": [], "K2": [], "D2": []}) == "raw"
-    assert pcm.calibration_tier({"fx": 1, "cx": 1, "cy": 1, "Tx": 1}) == "rectified"
-    assert pcm.calibration_tier({"hfov": 90}) == "pinhole"
-    assert pcm.calibration_tier({"fx": 1, "fy": 1}) == "pinhole"
-    assert pcm.calibration_tier({}) == "unknown"
-    assert pcm.calibration_tier({"rms": 0.1}) == "unknown"

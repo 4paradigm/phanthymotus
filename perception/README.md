@@ -8,6 +8,18 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## Depth-only pointcloud card
+
+`pointcloud` takes exactly one `image/depth-z16` (millimetre Image) or
+`image/depth-zlib` (CompressedImage) input. It backprojects depth into the
+existing display cloud/summary and optional metric PointCloud2 outputs.
+It no longer loads a mono depth model or performs stereo matching; RGB inputs
+and multiple connected depth streams are rejected. To display estimated depth,
+connect the separate `visual_depth` output. Metric output still requires measured
+depth, driver intrinsics and capture-time declarations; estimated depth is not
+promoted to a metric measurement. Saved single-input `auto`/`depth` starts remain
+compatible, while saved `mono`/`stereo` starts require rewiring to a depth source.
+
 ## Spatial SLAM Input Contract
 
 The generic `pointcloud_slam` card requires native
