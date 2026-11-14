@@ -162,6 +162,7 @@ class RtabmapNode(Node):
             self.stream = SlamStream(**{key: self._settings[key] for key in keys},
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame)
+            self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
             if self._settings.get('capture_mount'):
                 if input_contract:

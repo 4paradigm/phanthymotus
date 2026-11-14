@@ -80,6 +80,8 @@ class SlamStream:
         self.last_error = ''
         self._odom_state = 'waiting'
         self._fusion_pause = None
+        self._pause_context = None
+        self.ingress_clock_id = None
         self._dropped_pending = 0
 
     @property
@@ -88,6 +90,7 @@ class SlamStream:
 
     def _lose(self):
         self._fusion_pause = None
+        self._pause_context = None
         self._requires_new_segment = bool(self._segments)
         self._poses.clear()
         self._pending.clear()
@@ -153,13 +156,32 @@ class SlamStream:
         # visual gate's `pause` while its same native estimator recovers.
         declarations = [d for d in (fusion if isinstance(fusion, dict) and fusion.get('enabled') is True else None,
                                     vendor.get('pause')) if isinstance(d, dict)]
+        budget = 1_000_000_000
+        wire = vendor.get('pause_context')
+        if wire is not None:
+            from .spatial_recovery import PauseContext
+            try:
+                pause = PauseContext.from_dict(wire)
+                if (wire['ingress_clock_id'] != self.ingress_clock_id or
+                        anchor is None or wire['anchor_stamp_ns']//1_000_000 != anchor.stamp_ms or
+                        pause.expired(round(now*1e9)) or
+                        (self._pause_context is not None and self._pause_context != pause)):
+                    raise ValueError('pause identity/deadline changed or expired')
+                self._pause_context = pause
+                budget = pause.budget_ns
+            except ValueError as error:
+                self._lose();self.last_error = str(error)
+                return True
+        elif self._pause_context is not None:
+            self._lose();self.last_error = 'versioned pause evidence disappeared'
+            return True
         valid = (anchor is not None and not self._requires_new_segment and self._required_new_segment is None
                  and sample.get('schema') == 'motus.odom/1' and sample.get('pose') is None
                  and any(d.get('mapping_allowed') is False and d.get('status') == quality['status']
                          for d in declarations)
                  and quality.get('segment_id') == anchor.segment_id and quality.get('clock_id') == self.clock_id
-                 and type(stamp) is int and anchor.stamp_ms <= stamp <= anchor.stamp_ms+1000
-                 and (self._fusion_pause is None or now-self._fusion_pause[1] <= 1.))
+                 and type(stamp) is int and anchor.stamp_ms <= stamp <= anchor.stamp_ms+budget//1_000_000
+                 and (self._fusion_pause is None or now-self._fusion_pause[1] <= budget/1e9))
         if not valid:
             self._lose()
             self.last_error = 'invalid or expired fusion pause; new segment required'
@@ -276,12 +298,15 @@ class SlamStream:
             return
         if self._fusion_pause is not None:
             anchor, started = self._fusion_pause
+            budget = self._pause_context.budget_ns if self._pause_context else 1_000_000_000
             if (pose.segment_id == anchor.segment_id and
-                    (now-started > 1. or not anchor.stamp_ms < pose.stamp_ms <= anchor.stamp_ms+1000
+                    (now-started > budget/1e9 or
+                     (self._pause_context is not None and self._pause_context.expired(round(now*1e9))) or
+                     not anchor.stamp_ms < pose.stamp_ms <= anchor.stamp_ms+budget//1_000_000
                      or pose.frame_id != anchor.frame_id or pose.child_frame_id != anchor.child_frame_id)):
                 self._lose()
             else:
-                self._fusion_pause = None
+                self._fusion_pause = self._pause_context = None
         if self._last_received is not None and now - self._last_received > self.max_age_s:
             self._lose()
         self._poses.append(pose)
@@ -432,7 +457,7 @@ class SlamStream:
         if type(stamp_ns) is not int or stamp_ns <= 0 or frame != self.cloud_frame:
             raise ValueError('invalid cloud frame or timestamp')
         if self._fusion_pause is not None:
-            if now-self._fusion_pause[1] > 1.:
+            if now-self._fusion_pause[1] > (self._pause_context.budget_ns/1e9 if self._pause_context else 1.):
                 self._lose()
             raise ValueError('cloud integration paused during short-term fusion')
         if self._last_received is None or now - self._last_received > self.max_age_s:
@@ -457,7 +482,7 @@ class SlamStream:
     def _accept_cloud(self, stamp_ns, frame, cloud, *, now, measurement_now_ns=None, received=None,
                       capture_context=None):
         if self._fusion_pause is not None:
-            if now-self._fusion_pause[1] > 1.:
+            if now-self._fusion_pause[1] > (self._pause_context.budget_ns/1e9 if self._pause_context else 1.):
                 self._lose()
             raise ValueError('cloud integration paused during short-term fusion')
         if self._last_received is None or now - self._last_received > self.max_age_s:

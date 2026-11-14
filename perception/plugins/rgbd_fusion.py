@@ -210,6 +210,8 @@ class ShortTermFusion:
         self.quality = {}
         self.frames = deque(maxlen=16)
         self.last_tracking = None
+        self.recovery_policy = self.pause_context = None
+        self.input_period_ns = self.processing_p95_ns = None
         # Optional off-lock registration (GeometryWorker); None runs inline.
         self.geometry_runner = self.geometry_job = None
         self.revision = 0
@@ -406,7 +408,7 @@ class ShortTermFusion:
         self.good += 1
         if self.state == 'tracking' or self.good >= 3:
             if (self.state != 'tracking' and self.last_tracking is not None and
-                    stamp-self.last_tracking[0] > INERTIAL_LIMIT_NS):
+                    stamp-self.last_tracking[0] > (self.pause_context.budget_ns if self.pause_context else INERTIAL_LIMIT_NS)):
                 self.fault('fusion recovery exceeded the 1 s mapping pause; restart required')
             else:
                 self.state, self.reason = 'tracking', None
@@ -498,6 +500,12 @@ class ShortTermFusion:
             self.quality['geometry']['reason'] = 'fusion_gate_rejected'
 
     def _finish(self, stamp, diagnostic):
+        if self.state in ('coasting', 'recovering') and self.last_tracking is not None and self.recovery_policy is not None:
+            if self.pause_context is None:
+                import time
+                self.pause_context = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, time.monotonic_ns())
+        elif self.state == 'tracking':
+            self.pause_context = None
         diagnostic.update(state=self.state, aid=self.aid)
         self.frames.append(diagnostic)
         return self.output(stamp)

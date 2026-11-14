@@ -59,7 +59,8 @@ def validate_inputs(declarations, topics):
                 K=np.asarray(color['K'], dtype=float).reshape(3, 3),
                 frame_id=color['vendor']['frame_id'], clock_id=color['vendor'].get('clock_id'),
                 time_basis='source_capture' if capture else 'receipt_estimated',
-                depth_source=depth['vendor'].get('depth_source', 'unknown'))
+                depth_source=depth['vendor'].get('depth_source', 'unknown'),
+                motion_limits=deepcopy(color['vendor'].get('motion_limits')))
     if mount is not None:
         result['body_mount'] = mount
     return result

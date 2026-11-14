@@ -26,7 +26,9 @@ from .spatial_time import TimePolicy
 from .rgbd_imu import ImuAttitude
 from .rgbd_fusion import ShortTermFusion, log_rotation, observation_covariance, pose_values
 from .rgbd_body_mount import CaptureMounts
-from .rgbd_geometry import GeometryWorker
+from .rgbd_geometry import GeometryWorker, observation_quality
+from .spatial_quality import MotionGate, QualityReport
+from .spatial_recovery import RecoveryPolicy
 from utils.ros_lifecycle import dispose_node
 
 
@@ -82,10 +84,14 @@ class EstimateGate:
         self.last_pose = None
         self.loss_kind = None
         self.rejection = None
+        self.recovery_policy = self.pause_context = None
+        self.input_period_ns = self.processing_p95_ns = None
 
     def input(self, stamp, *, now_ns=None):
         self.status(stamp if now_ns is None else now_ns)
         if self.state != 'lost':
+            if self.last_input and stamp > self.last_input:
+                self.input_period_ns = stamp-self.last_input
             self.last_input = stamp
 
     def fault(self, reason, kind='other'):
@@ -103,7 +109,9 @@ class EstimateGate:
         self.good = 0
         if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
-                self.recover_by = now + RECOVERY_NS
+                if self.recovery_policy is not None:
+                    self.pause_context = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, time.monotonic_ns())
+                self.recover_by = now + (self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)
             self.state, self.reason = 'recovering', 'visual estimate rejected: ' + str(reason)
 
     def status(self, now):
@@ -111,7 +119,7 @@ class EstimateGate:
             self.fault('RGB-D input stale; restart to begin a new segment', 'input')
         # Before any published anchor, fresh weak results prove liveness only.
         # An anchored segment still expires against its accepted visual stamps.
-        visual_stamp = self.last_stamp if self.last_pose is not None else self.last_result_stamp
+        visual_stamp = self.last_stamp if self.last_pose is not None and self.pause_context is None else self.last_result_stamp
         if visual_stamp and now - visual_stamp > 1_500_000_000:
             self.fault('visual estimate stale; restart to begin a new segment', 'visual')
         if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
@@ -167,7 +175,7 @@ class EstimateGate:
                 self.state, self.recover_by = 'initializing', None
             return None
         if (self.state == 'recovering' and self.last_pose is not None and
-                stamp - self.last_pose[0] > PAUSE_RESUME_NS):
+                stamp - self.last_pose[0] > (self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)):
             self.fault('visual recovery exceeded the 0.8 s in-segment pause bound; '
                        'restart to begin a new segment', 'visual')
             return None
@@ -180,6 +188,7 @@ class EstimateGate:
         if self.good < 3:
             return None
         self.state, self.reason, self.recover_by = 'tracking', None, None
+        self.pause_context = None
         self.last_pose = (stamp, position, rotation)
         return sample
 
@@ -358,9 +367,16 @@ class RgbdSession:
         self.publish_output = publish_output
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
         self.gate = EstimateGate(self.segment, calibration['frame_id'], calibration['clock_id'])
+        self.gate.recovery_policy = RecoveryPolicy() if input_registry is not None else None
+        self.motion_gate = MotionGate(calibration.get('motion_limits'))
+        self.previous_motion = None
+        self.quality_by_stamp = OrderedDict()
+        self.processing_ages = deque(maxlen=32)
         self.fusion = (ShortTermFusion(self.segment, calibration['frame_id'], calibration['clock_id'],
                        calibration['K'], calibration.get('depth_geometry', False))
                        if calibration.get('short_term_compensation') else None)
+        if self.fusion is not None:
+            self.fusion.recovery_policy = self.gate.recovery_policy
         self.observations = CaptureObservations(self.fusion) if self.fusion else None
         self.mounts = (CaptureMounts(calibration['body_mount'], calibration['frame_id'], calibration['clock_id'])
                        if calibration.get('body_mount') else None)
@@ -369,7 +385,8 @@ class RgbdSession:
         self.lock = threading.RLock()
         self.imu_queue_lock = threading.Lock()
         self.imu_pending, self.imu_overflow = deque(), False
-        self.pairs, self.pending = RgbdPairer(), queue.Queue(maxsize=1)
+        self.pairs = RgbdPairer() if input_registry is not None or 'input_declarations' in calibration else PairBuffer()
+        self.pending = queue.Queue(maxsize=1)
         self.latest_inputs = {}
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
         self.registration_by_stamp = OrderedDict()
@@ -645,6 +662,11 @@ class RgbdSession:
                 z16 = np.frombuffer(raw, '<u2').reshape(480, 640)
                 if not self._fusing() and np.count_nonzero(z16) < 100:
                     raise ValueError('RGB-D depth has insufficient measured pixels')
+                image_quality = observation_quality(image, z16.astype(float)*.001)
+                with self.lock:
+                    if not hasattr(self, 'quality_by_stamp'):self.quality_by_stamp = OrderedDict()
+                    self.quality_by_stamp[capture_stamp] = QualityReport(**{k:image_quality[k] for k in ('contrast','sharpness','depth_fraction')})
+                    while len(self.quality_by_stamp) > 32:self.quality_by_stamp.popitem(last=False)
                 out = RGBDImage()
                 out.header = deepcopy(depth.header)
                 # RTAB-Map supports lossless PNG depth in RGBDImage. Keep the
@@ -778,6 +800,30 @@ class RgbdSession:
                 slam['stamp_source'] = 'measurement' if context.time_basis == 'source_capture' else 'receipt_estimated'
             sample['vendor']['association'] = dict(id=pair.association_id, method=pair.method, skew_ns=pair.skew_ns,
                 inputs=[pair.color_context.to_dict(), pair.depth_context.to_dict()])
+        quality = getattr(self, 'quality_by_stamp', {}).get(stamp, QualityReport())
+        sample['vendor']['observation_quality'] = quality.to_dict()
+        if context is not None:
+            self.processing_ages.append(max(0, time.monotonic_ns()-context.ingress_monotonic_ns))
+            self.gate.processing_p95_ns = int(np.percentile(self.processing_ages, 95))
+            if self.fusion is not None:
+                self.fusion.input_period_ns = self.gate.input_period_ns
+                self.fusion.processing_p95_ns = self.gate.processing_p95_ns
+        pause_owner = self.fusion if self._fusing() else self.gate
+        pause = getattr(pause_owner, 'pause_context', None)
+        if pause is not None and sample['vendor']['motus_slam']['status'] in ('coasting','recovering'):
+            anchor = (self.fusion.last_tracking[0] if self._fusing() and self.fusion.last_tracking else
+                      self.gate.last_pose[0] if self.gate.last_pose else None)
+            if anchor is not None:
+                sample['vendor']['pause_context'] = pause.to_dict(anchor_stamp_ns=anchor, ingress_clock_id=self.time_policy.clock_id)
+        if sample['vendor']['motus_slam']['status'] == 'tracking' and hasattr(self, 'motion_gate'):
+            decision = self.motion_gate.evaluate(self.previous_motion, sample, context, quality)
+            sample['vendor']['motion_decision'] = dict(action=decision.action, reason=decision.reason)
+            if decision.action != 'accept':
+                self.gate.degrade(decision.reason, now, stamp=stamp)
+                sample['pose'] = None
+                sample['vendor']['motus_slam'].update(status='recovering', stamp_source='unknown')
+                sample['vendor']['pause'] = dict(status='recovering',mapping_allowed=False)
+            else:self.previous_motion = deepcopy(sample)
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
         stamp = (sample['vendor'].get('motus_slam') or {}).get('stamp_ns')
         native = self.registration_by_stamp.pop(stamp, None)
