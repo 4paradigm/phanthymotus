@@ -38,7 +38,9 @@ class QQOwnerProvisioningTests(unittest.TestCase):
     def test_local_provision_explicit_exact_user(self):
         response, cfg = self.provision()
         self.assertEqual(response["role"], "owner")
-        self.assertTrue(response["privileged_tools_enabled"])
+        self.assertFalse(response["privileged_tools_enabled"])
+        self.assertEqual(response["qq_v1_tools"], [
+            "mcp__channel__channel_reply", "finish"])
         self.assertEqual(cfg["qq_c2c_owner_grant"], {
             "enabled": True, "principal": UID,
         })

@@ -39,9 +39,9 @@ def update_owner(*, revoke: bool = False) -> dict:
     if user["role"] == "blocked":
         raise ValueError("Refusing to promote a blocked account")
     new_role = "viewer" if revoke else "owner"
-    # Separate explicit local approval from the role. Never put a general
-    # owner override in the default QQ config or accept this via a QQ message.
-    # Revoke the grant before demoting; grant only after owner upsert succeeds.
+    # Keep the owner role for local Dashboard administration, but QQ V1 remains
+    # reply-only even after this exact-principal pairing. Revoke the binding
+    # before demoting; write it only after the owner upsert succeeds.
     if revoke:
         config.main["qq_c2c_owner_grant"] = {"enabled": False}
     updated = acl.upsert_user(
@@ -56,7 +56,8 @@ def update_owner(*, revoke: bool = False) -> dict:
         }
     return {
         "role": updated["role"],
-        "privileged_tools_enabled": not revoke,
+        "privileged_tools_enabled": False,
+        "qq_v1_tools": ["mcp__channel__channel_reply", "finish"],
         "principal_hash": hashlib.sha256(user["user_id"].encode()).hexdigest()[:12],
         "is_private_chat": True,
         "other_qq_users_unchanged": True,
