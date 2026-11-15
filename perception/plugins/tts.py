@@ -310,6 +310,7 @@ TOOLS = [
 # ── TTS Adapter ──────────────────────────────────────────────────────────────
 
 class TTSAdapter(ABC):
+    reuse_ros_node = False
     # Text _TTSNode.start() synthesizes to prove the model works before declaring
     # `running`. Per-adapter, because a probe is only valid if the adapter's own
     # frontend keeps it: "." is punctuation, and the Thai frontend normalises
@@ -2048,12 +2049,17 @@ class SherpaOnnxTTSPlugin:
                         del self._nodes['_default']
                         self._dispose_node(default_node, '_default')
                 node = self._nodes.get(node_key)
+                if self._adapter.reuse_ros_node:
+                    for key in list(self._nodes):
+                        if key != node_key and self._nodes[key].state == "idle":
+                            self._dispose_node(self._nodes.pop(key), key)
                 if node is None:
                     node = _TTSNode(input_topic or None, self._adapter,
                                     node_suffix=node_key.replace('/', '_').replace('-', '_'))
                     self._executor.add_node(node)
                     self._nodes[node_key] = node
-                elif input_topic and node._input_topic != input_topic:
+                elif node._input_topic != input_topic and (
+                        input_topic or self._adapter.reuse_ros_node and node.state == "idle"):
                     # Input topic changed for existing instance — recreate
                     del self._nodes[node_key]
                     self._dispose_node(node, node_key)
@@ -2065,13 +2071,15 @@ class SherpaOnnxTTSPlugin:
 
         elif action == "stop":
             with self._nodes_lock:
-                if instance_id:
-                    node = self._nodes.pop(instance_id, None)
+                keys = [instance_id] if instance_id else list(self._nodes)
+                for key in keys:
+                    node = self._nodes.get(key)
                     if node is None:
-                        return {"state": "idle"}
-                    return self._dispose_node(node, instance_id)
-                for key in list(self._nodes.keys()):
-                    self._dispose_node(self._nodes.pop(key), key)
+                        continue
+                    if node._adapter.reuse_ros_node and not args.get("_release_nodes"):
+                        node.stop()
+                    else:
+                        self._dispose_node(self._nodes.pop(key), key)
                 return {"state": "idle"}
 
         elif action == "speak":
@@ -2661,7 +2669,7 @@ class TTSPlugin:
 def _dispose_impl(impl) -> None:
     """Stop every node an engine implementation owns before dropping it."""
     try:
-        impl.dispatch("tts", {"action": "stop"})
+        impl.dispatch("tts", {"action": "stop", "_release_nodes": True})
     except Exception:
         log.error("[tts] failed to stop the outgoing engine", exc_info=True)
     # Kokoro's Japanese path may own a worker process. Dropping the impl does not

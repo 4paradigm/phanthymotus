@@ -217,6 +217,7 @@ class KokoroTRT:
 class KokoroMultiTTSAdapter(TTSAdapter):
     LANGUAGES = LANGUAGES
     dry_run_text = "Hi."
+    reuse_ros_node = True
     handles_text_chunking = True
     wait_for_audio_subscriber = True
 
@@ -283,11 +284,29 @@ class KokoroMultiTTSAdapter(TTSAdapter):
             language = (reading_session.resolve(self._frontend, text, preference)
                         if reading_session is not None else
                         self._frontend.detect_language(text) if preference == "auto" else preference)
-            phones = self._frontend.convert(text, language)
-            phones = re.sub(r"\s+", " ", phones).strip()
             speed = np.array([self._speed], dtype=np.float32)
+        samples, count = 0, 0
+        for phones in self._frontend.iter_phonemes(text, language):
+            frontend_done = monotonic()
+            for audio, phone_count in self._synthesize_phones(phones, language, speed, text):
+                inference_done = monotonic()
+                pcm = downsample_24k_to_16k(audio)
+                if count == 0:
+                    now = monotonic()
+                    log.info("[kokoro-multi] first_pcm language=%s seconds=%.3f "
+                             "frontend_s=%.3f inference_s=%.3f resample_s=%.3f phones=%d",
+                             language, now - started, frontend_done - started,
+                             inference_done - frontend_done, now - inference_done, phone_count)
+                samples += audio.size
+                count += 1
+                yield pcm
+        log.info("[kokoro-multi] complete language=%s chunks=%d audio_s=%.3f wall_s=%.3f",
+                 language, count, samples / 24000, monotonic() - started)
+
+    def _synthesize_phones(self, phones, language, speed, source_text):
+        phones = re.sub(r"\s+", " ", phones).strip()
         unknown = set(phones) - self._vocab.keys()
-        decorations = {char for char in unknown if char in text and (
+        decorations = {char for char in unknown if char in source_text and (
             0x1F000 <= ord(char) <= 0x1FAFF or char in "\u200d\ufe0e\ufe0f")}
         if decorations:
             log.info("[kokoro-multi] ignoring unsupported decorations: %s", sorted(decorations))
@@ -296,7 +315,6 @@ class KokoroMultiTTSAdapter(TTSAdapter):
         if unknown:
             raise ValueError(f"Kokoro Multi unsupported phonemes ({language}): {sorted(unknown)}")
         chunks = sentence_phoneme_chunks(phones)
-        samples, count = 0, 0
         while chunks:
             part = chunks.pop(0)
             ids = [self._vocab[c] for c in part]
@@ -319,15 +337,7 @@ class KokoroMultiTTSAdapter(TTSAdapter):
             audio = audio.reshape(-1)
             if audio.size != 600 * int(duration.sum()):
                 raise RuntimeError("Kokoro Multi output length differs from predicted duration")
-            pcm = downsample_24k_to_16k(audio)
-            if count == 0:
-                log.info("[kokoro-multi] first_pcm language=%s seconds=%.3f", language,
-                         monotonic() - started)
-            samples += audio.size
-            count += 1
-            yield pcm
-        log.info("[kokoro-multi] complete language=%s chunks=%d audio_s=%.3f wall_s=%.3f",
-                 language, count, samples / 24000, monotonic() - started)
+            yield audio, len(ids)
 
     def close(self):
         if self._runtime is not None:
@@ -337,9 +347,9 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 WORK = Path(__file__).resolve().parents[1]
 # Filled with the published, immutable release before submission. Missing pins
 # fail explicitly; an unverified or unrelated model is never substituted.
-ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=cb5963115dbc961f88967c5c317fd740a805ebe2&FilePath=kokoro-multi-jp61-fp32-v7.tar.gz"
-ASSET_SHA256 = "80203d6d27dec325613767fcfe2b57fad00d31b4845e40b3238944242dc83d60"
-ASSET_SIZE = 328022693
+ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=33bca270f5677ac77c8dcfc84c5f01c604fc7abf&FilePath=kokoro-multi-jp61-fp32-v8.tar.gz"
+ASSET_SHA256 = "3e70ba779651ebc482e6a5fcf4118ed8c4c2ed8fcd1676f581c624e68252bf9f"
+ASSET_SIZE = 328024817
 
 
 def enabled():
