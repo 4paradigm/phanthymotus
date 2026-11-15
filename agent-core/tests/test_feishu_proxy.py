@@ -108,6 +108,25 @@ class SdkProxyPatchTest(unittest.TestCase):
         feishu._enable_sdk_env_proxy(mod)
         self.assertEqual(mod._ws_connect_kwargs(), {'ping_interval': 30})
 
+    def test_patch_forwards_connection_headers(self):
+        headers = {'User-Agent': 'lark-oapi'}
+        sdk_connect_kwargs = mock.Mock(return_value={
+            'proxy': None, 'additional_headers': headers,
+        })
+        mod = self._stub(_ws_connect_kwargs=sdk_connect_kwargs)
+        feishu._enable_sdk_env_proxy(mod)
+
+        self.assertEqual(mod._ws_connect_kwargs(headers), {'additional_headers': headers})
+        sdk_connect_kwargs.assert_called_once_with(headers)
+
+    def test_patch_forwards_keyword_arguments(self):
+        sdk_connect_kwargs = mock.Mock(return_value={'proxy': None, 'ping_interval': 30})
+        mod = self._stub(_ws_connect_kwargs=sdk_connect_kwargs)
+        feishu._enable_sdk_env_proxy(mod)
+
+        self.assertEqual(mod._ws_connect_kwargs(connection_headers={}), {'ping_interval': 30})
+        sdk_connect_kwargs.assert_called_once_with(connection_headers={})
+
     def test_patch_is_idempotent(self):
         """Applied twice, the second call must be a no-op.
 

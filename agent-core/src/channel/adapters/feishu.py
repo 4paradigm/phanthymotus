@@ -83,8 +83,11 @@ def _enable_sdk_env_proxy(ws_mod) -> None:
     if current is None or getattr(current, '_phanthy_env_proxy', False) is True:
         return
 
-    def connect_kwargs():
-        return {key: value for key, value in current().items() if key != 'proxy'}
+    def connect_kwargs(*args, **kwargs):
+        return {
+            key: value for key, value in current(*args, **kwargs).items()
+            if key != 'proxy'
+        }
 
     connect_kwargs._phanthy_env_proxy = True
     ws_mod._ws_connect_kwargs = connect_kwargs
