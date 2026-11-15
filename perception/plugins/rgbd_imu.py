@@ -51,6 +51,7 @@ class ImuAttitude:
         self.quaternion = None
         self.identity = self.rotations = None
         self.history = deque(maxlen=512)
+        self.orientation_history = deque(maxlen=512)
         self.provenance = {}
 
     def fault(self, reason):
@@ -118,6 +119,7 @@ class ImuAttitude:
                     self.quaternion /= np.linalg.norm(self.quaternion)
             self.state, self.reason = 'active', None
             self.history.append(stamp)
+            self.orientation_history.append((stamp, self.quaternion.copy()))
             return {'stamp_ns': stamp, 'quaternion': self.quaternion.tolist(),
                     'angular_velocity': angular.tolist(), 'linear_acceleration': acceleration.tolist()}
         except (ValueError, TypeError, KeyError, OverflowError) as error:
@@ -127,6 +129,45 @@ class ImuAttitude:
     def covers(self, image_stamp_ns, now_ns):
         return (self.status(now_ns) == 'active' and bool(self.history) and
                 self.history[0] <= image_stamp_ns <= self.history[-1])
+
+    def orientation_at(self, image_stamp_ns, now_ns):
+        """Snapshot an actual capture bracket; never propagate or revive a filter.
+
+        The caller holds its session lock. Absolute nanoseconds stay integers;
+        only the difference between the two measured captures becomes a ratio.
+        Missing coverage is an absent optional hint, never a reason to wait for
+        IMU or suppress an otherwise usable visual frame.
+        """
+        if (self.state != 'active' or not self.orientation_history or
+                type(image_stamp_ns) is not int or type(now_ns) is not int or
+                image_stamp_ns <= 0 or
+                not -50_000_000 <= now_ns-image_stamp_ns <= MAX_CAPTURE_AGE_NS or
+                not -50_000_000 <= now_ns-self.last_stamp <= MAX_CAPTURE_AGE_NS):
+            return None
+        previous = None
+        for stamp, quaternion in self.orientation_history:
+            if stamp == image_stamp_ns:
+                return quaternion.tolist()
+            if stamp > image_stamp_ns:
+                if previous is None:
+                    return None
+                before, a = previous
+                if stamp-before > MAX_CAPTURE_GAP_NS:
+                    return None
+                ratio = (image_stamp_ns-before) / (stamp-before)
+                b = quaternion
+                dot = float(a @ b)
+                if dot < 0.:
+                    b, dot = -b, -dot  # q and -q have the same rotation.
+                dot = min(1., max(0., dot))
+                if dot > .9995:
+                    result = (1.-ratio)*a + ratio*b
+                else:
+                    angle = np.arccos(dot)
+                    result = (np.sin((1.-ratio)*angle)*a + np.sin(ratio*angle)*b) / np.sin(angle)
+                return (result / np.linalg.norm(result)).tolist()
+            previous = stamp, quaternion
+        return None  # No extrapolation beyond the last measured capture.
 
     def info(self, now_ns):
         return {'enabled': True, 'status': self.status(now_ns), 'reason': self.reason,

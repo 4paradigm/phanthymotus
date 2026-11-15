@@ -215,7 +215,7 @@ def test_assisted_recovery_retains_settings_and_reinitializes_imu_history(recove
     card.dispatch('rgbd_odometry', dict(action='stop', instance_id='one'))
     assisted_runtime(monkeypatch)
     settings = dict(imu_assisted=True, short_term_compensation=fusion, depth_geometry=fusion,
-                    visual_frontend='f2f_optical_flow', max_features=500)
+                    inertial_association=False, visual_frontend='f2f_optical_flow', max_features=500)
     assert card.dispatch('rgbd_odometry', dict(args, input_topics=['/rgb', '/depth', '/imu'],
                                              **settings))['state'] == 'running'
     old = card.instances['one'][0]

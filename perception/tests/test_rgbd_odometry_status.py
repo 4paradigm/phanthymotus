@@ -81,7 +81,7 @@ def test_compact_schema_keeps_configuration_and_original_odom_link(sessions):
     assert set(tool['inputSchema']['properties']) == {'action'}
     assert tool['inputSchema']['properties']['action']['enum'] == ['start', 'stop', 'info']
     settings = dict(imu_assisted=False, short_term_compensation=False, depth_geometry=False,
-                    visual_frontend='f2f_optical_flow', max_features=200)
+                    inertial_association=False, visual_frontend='f2f_optical_flow', max_features=200)
     assert set(tool['configSchema']['properties']) == set(settings) - {'imu_assisted'}
     assert all(p['scope'] == 'instance' for p in tool['configSchema']['properties'].values())
     result = card.dispatch('rgbd_odometry', dict(action='config', instance_id='one', **settings))
@@ -109,8 +109,14 @@ def test_bumi_shaped_summary_uses_camera_pose_and_segment_displacement(sessions)
     create, now, ticks = sessions
     session = create()
     tracking(session, [1., 2., 3.])
-    assert status(session) == dict(status='tracking', turn_angle_deg=None, displacement_m=0.,
+    summary = status(session)
+    diagnostics = {key: summary.pop(key) for key in ('mode', 'initialization', 'auxiliary_recovery')}
+    assert summary == dict(status='tracking', turn_angle_deg=None, displacement_m=0.,
         position_m=[1., 2., 3.], pose_reference='camera_optical', age_ms=10., reason=None)
+    assert diagnostics['mode'] == dict(requested='visual_only', effective='visual_only',
+                                     degraded=False, reason=None, transition=None)
+    assert diagnostics['initialization']['phase'] == 'complete'
+    assert diagnostics['auxiliary_recovery']['enabled'] is False
     ticks[0] = 200_000_000
     now[0] = 1_210_000_000
     tracking(session, [4., 6., 3.], 1_200_000_000)
@@ -132,8 +138,13 @@ def test_nontracking_summary_never_exposes_held_pose_or_inertial_prediction(sess
     sample = make_sample(state, 1_000_000_001, session.segment, 'camera-clock', reason='waiting')
     sample['vendor']['fusion'] = dict(prediction=pose([99., 99., 99.]))
     session._publish(sample)
-    assert status(session) == dict(status=state, turn_angle_deg=None, displacement_m=None,
+    summary = status(session)
+    diagnostics = {key: summary.pop(key) for key in ('mode', 'initialization', 'auxiliary_recovery')}
+    assert summary == dict(status=state, turn_angle_deg=None, displacement_m=None,
         position_m=None, pose_reference='camera_optical', age_ms=None, reason='waiting')
+    assert diagnostics['mode']['effective'] == 'visual_only'
+    assert diagnostics['initialization']['phase'] == 'complete'  # original startup already finished
+    assert not diagnostics['auxiliary_recovery']['enabled']
 
 
 def test_status_throttle_does_not_throttle_odometry_or_hide_reason_changes(sessions):

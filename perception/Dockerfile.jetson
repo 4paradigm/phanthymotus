@@ -631,6 +631,13 @@ RUN --mount=type=cache,id=perception-rtabmap-source-${RTABMAP_CORE_COMMIT},targe
     mkdir -p /tmp/rtabmap-ws/src/rtabmap; \
     cp -a "${rtabmap_source}/." /tmp/rtabmap-ws/src/rtabmap/
 
+# Apply only to the copied pinned checkout, never the reusable upstream cache.
+COPY perception/native/rtabmap/rotation_hint_core.patch /tmp/rtabmap-rotation-core.patch
+RUN set -e; \
+    git -C /tmp/rtabmap-ws/src/rtabmap apply --check /tmp/rtabmap-rotation-core.patch; \
+    git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-rotation-core.patch; \
+    rm /tmp/rtabmap-rotation-core.patch
+
 # Commit the complete checkout before compiling. A failed build can reuse this
 # source layer; partial object files from the failed RUN are not a Docker cache.
 # Keep successful compiler results even if the review build hits its time limit.
@@ -714,6 +721,13 @@ RUN set -e; . /opt/ros/humble/install/setup.bash; \
       d53b925d25b4b5657261a44f4479365965cc2363 681ab6f7fd7559ec681f27272154372968ecbd76c26dac3454457db020a2f8f2 laser_geometry; \
     printf '%s\n' "${rtabmap_packages}" > /tmp/rtabmap-ws/packages.list
 
+COPY perception/native/rtabmap/rotation_hint_ros.patch perception/native/rtabmap/RotationHintBuffer.h /tmp/rtabmap-rotation-hint/
+RUN set -e; \
+    git -C /tmp/rtabmap-ws/src/rtabmap_ros apply --check /tmp/rtabmap-rotation-hint/rotation_hint_ros.patch; \
+    git -C /tmp/rtabmap-ws/src/rtabmap_ros apply /tmp/rtabmap-rotation-hint/rotation_hint_ros.patch; \
+    cp /tmp/rtabmap-rotation-hint/RotationHintBuffer.h /tmp/rtabmap-ws/src/rtabmap_ros/rtabmap_odom/include/rtabmap_odom/RotationHintBuffer.h; \
+    rm -rf /tmp/rtabmap-rotation-hint
+
 # JP5.11: cache ROS foundations, RTAB-Map support and rtabmap_slam
 # independently; the JP6.1 single-build path below remains unchanged.
 COPY perception/tools/build_rtabmap_ros_group.sh /tmp/build_rtabmap_ros_group.sh
@@ -757,6 +771,8 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
       '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
       -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
     fi; \
+    mkdir -p /opt/rtabmap_ros/share/rtabmap_odom; \
+    printf '%s\n' 'motus_rotation_hint/1' > /opt/rtabmap_ros/share/rtabmap_odom/motus_rotation_hint_v1; \
     cd /work; rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh
 
 # ── Application code ───────────────────────────────────────────────

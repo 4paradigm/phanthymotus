@@ -8,6 +8,7 @@ from copy import deepcopy
 
 from .rgbd_odometry_contract import start_topics, validate_start_inputs
 from .rgbd_odometry_runtime import RgbdSession, require_runtime
+from .rgbd_recovery import ASSISTANCE_RETRY_S, TRACKING_RESET_S, assistance_mode
 from utils.ros_lifecycle import dispose_node
 
 
@@ -29,7 +30,7 @@ class RgbdOdometryPlugin:
         self.executor = executor
         self.instances = {}
         self.defaults = {k: (config or {}).get(k, False) for k in
-                         ('short_term_compensation', 'depth_geometry')}
+                         ('short_term_compensation', 'depth_geometry', 'inertial_association')}
         self.defaults['imu_assisted'] = False  # Derived from connected inputs, never a setting.
         self.defaults['visual_frontend'] = (config or {}).get('visual_frontend', 'f2m_feature')
         self.defaults['max_features'] = (config or {}).get('max_features', 1000)
@@ -63,29 +64,58 @@ class RgbdOdometryPlugin:
                 candidate = None
                 try:
                     info = session.info()
-                    if info['status'] != 'lost':
-                        state['lost_since'] = None
-                        if info['status'] == 'tracking' and instance in self.frontends:
+                    target = (session.recovery_target(now, time.time_ns())
+                              if hasattr(session, 'recovery_target') else None)
+                    if info['status'] == 'tracking':
+                        if state['healthy_since'] is None:
+                            state['healthy_since'] = now
+                        if now-state['healthy_since'] >= TRACKING_RESET_S:
+                            state.update(failure_streak=0, next_attempt=None, backoff_s=1.5)
+                        if instance in self.frontends:
                             self.frontends[instance]['untracked'] = 0
+                    else:
+                        state['healthy_since'] = None
+                    restoring = target is not None and target['action'] == 'restore_assistance'
+                    if info['status'] != 'lost' and not restoring:
+                        state['lost_since'] = None
                         continue
-                    if state['lost_since'] is None:
+                    if info['status'] == 'lost' and state['lost_since'] is None:
                         state['lost_since'] = now
-                    if (now-state['lost_since'] < .8 or
-                            (state['last_attempt'] is not None and now-state['last_attempt'] < 1.5) or
+                    if ((not restoring and now-state['lost_since'] < .8) or
+                            (state['next_attempt'] is not None and now < state['next_attempt']) or
+                            (restoring and state['mode_retry_after'] is not None and now < state['mode_retry_after']) or
                             not session.has_fresh_inputs(time.time_ns())):
                         continue
                     state['last_attempt'] = now
                     state['attempts'] += 1
-                    calibration, switch = self._next_frontend(instance, session, info, now)
+                    state['failure_streak'] += 1
+                    state['backoff_s'] = min(30., 1.5*2**min(5, state['failure_streak']-1))
+                    state['next_attempt'] = now+state['backoff_s']
+                    if restoring:
+                        state['mode_retry_after'] = now+ASSISTANCE_RETRY_S
+                        state['restoration_attempts'] += 1
+                        calibration, switch = target['calibration'], None
+                    else:
+                        calibration, switch = self._next_frontend(instance, session, info, now,
+                            target['calibration'] if target is not None else None)
+                    transition = dict(action=target['action'] if target else 'restart',
+                        reason=target['reason'] if target else info['reason'], previous_segment=info['segment_id'],
+                        from_mode=info.get('mode', {}).get('effective', assistance_mode(session.calibration)),
+                        to_mode=assistance_mode(calibration))
+                    requested = dict(getattr(session, 'requested_calibration', session.calibration),
+                                     visual_frontend=calibration.get('visual_frontend', 'f2m_feature'))
                     candidate = RgbdSession(calibration, self.executor,
                                             self._outputs(instance)[0]['topic'], publish_output=False,
+                                            requested_calibration=requested, mode_transition=transition,
                                             **({'input_registry': self._input_registry} if self._input_registry else {}))
                     session.close(report_idle=False)
                     with candidate.lock:
                         self.instances[instance] = candidate, signature, bindings
                         candidate.publish_output = True
                     state.update(restarts=state['restarts']+1, previous_segment=info['segment_id'],
-                                 reason=info['reason'], error=None, lost_since=None)
+                                 reason=transition['reason'], error=None, lost_since=None, healthy_since=None)
+                    state['transitions'].append(dict(transition, segment_id=candidate.segment))
+                    del state['transitions'][:-12]
                     if switch:
                         frontend = self.frontends[instance]
                         frontend.update(active=switch, switches=frontend['switches']+1,
@@ -102,10 +132,11 @@ class RgbdOdometryPlugin:
                     state['error'] = reason
                     logging.getLogger(__name__).warning('RGB-D recovery %s: %s', instance, reason)
 
-    def _next_frontend(self, instance, session, info, now):
+    def _next_frontend(self, instance, session, info, now, calibration=None):
         """Choose the replacement's frontend; never run both, never splice origins."""
         frontend = self.frontends.get(instance)
-        calibration = getattr(session, 'restart_calibration', session.calibration)
+        calibration = (getattr(session, 'restart_calibration', session.calibration)
+                       if calibration is None else calibration)
         if not frontend or frontend['mode'] != 'auto':
             return calibration, None
         active, kind = frontend['active'], info.get('loss_kind')
@@ -121,6 +152,16 @@ class RgbdOdometryPlugin:
             frontend['decision'] = f'switched to {other}: visual degradation with fresh inputs'
             return dict(calibration, visual_frontend=other), other
         return calibration, None
+
+    def _recovery_info(self, instance):
+        state = self.recovery.get(instance)
+        if state is None:
+            return {}
+        now = time.monotonic()
+        internal = {'lost_since', 'last_attempt', 'healthy_since', 'next_attempt', 'mode_retry_after'}
+        return dict({k: deepcopy(v) for k, v in state.items() if k not in internal},
+                    retry_in_s=round(max(0., (state['next_attempt'] or now)-now), 2),
+                    restoration_retry_in_s=round(max(0., (state['mode_retry_after'] or now)-now), 2))
 
     def _frontend_info(self, instance):
         frontend = self.frontends.get(instance)
@@ -163,6 +204,9 @@ class RgbdOdometryPlugin:
                          'description': '启用 ESKF 短时补偿，需要 IMU 完整标定及低运动初始化'},
                      'depth_geometry': {'type': 'boolean', 'default': False, 'scope': 'instance',
                          'description': '启用深度几何配准辅助，需要先启用短时补偿'},
+                     'inertial_association': {'type': 'boolean', 'default': False, 'scope': 'instance',
+                         'description': '用惯性旋转引导视觉匹配和求解初值，需要短时补偿及新版原生运行时；'
+                                        '缺少旋转提示时继续视觉处理'},
                      'visual_frontend': {'type': 'string', 'scope': 'instance',
                                          'default': self.defaults['visual_frontend'],
                                          'enum': [*_FRONTENDS, 'auto'],
@@ -198,7 +242,7 @@ class RgbdOdometryPlugin:
                 settings['imu_assisted'] = bool(current and any(
                     p['format'] == 'sensor/imu' for p in current[2]))
                 if any(type(settings[k]) is not bool for k in
-                       ('imu_assisted', 'short_term_compensation', 'depth_geometry')):
+                       ('imu_assisted', 'short_term_compensation', 'depth_geometry', 'inertial_association')):
                     raise ValueError('IMU, compensation and geometry flags must be boolean')
                 if settings['visual_frontend'] not in (*_FRONTENDS, 'auto'):
                     raise ValueError('unsupported visual_frontend: use f2m_feature, f2f_optical_flow or auto')
@@ -207,6 +251,8 @@ class RgbdOdometryPlugin:
                     raise ValueError('max_features must be an integer in [100, 5000]')
                 if settings['depth_geometry'] and not settings['short_term_compensation']:
                     raise ValueError('depth geometry requires short-term compensation')
+                if settings['inertial_association'] and not settings['short_term_compensation']:
+                    raise ValueError('inertial association requires short-term compensation')
                 if action == 'config':
                     if current and settings != self.settings[instance]:
                         raise ValueError('stop RGB-D odometry before changing frontend or assistance settings')
@@ -229,6 +275,7 @@ class RgbdOdometryPlugin:
                     # No IMU binding always means pure visual, even with saved ESKF options.
                     calibration['short_term_compensation'] = enabled and settings['short_term_compensation']
                     calibration['depth_geometry'] = enabled and settings['depth_geometry']
+                    calibration['inertial_association'] = enabled and settings['inertial_association']
                     mode = 'auto' if settings['visual_frontend'] == 'auto' else 'manual'
                     if mode == 'auto':
                         calibration['visual_frontend'] = _FRONTENDS[0]  # existing default starts
@@ -253,7 +300,9 @@ class RgbdOdometryPlugin:
                         self.instances[instance] = current
                         self.settings[instance] = settings
                         self.recovery[instance] = dict(lost_since=None, last_attempt=None,
-                            attempts=0, restarts=0, previous_segment=None, reason=None, error=None)
+                            attempts=0, restarts=0, previous_segment=None, reason=None, error=None,
+                            failure_streak=0, next_attempt=None, backoff_s=1.5, healthy_since=None,
+                            mode_retry_after=None, restoration_attempts=0, transitions=[])
                         self.frontends[instance] = dict(mode=mode, active=calibration['visual_frontend'],
                             switches=0, untracked=0, last_switch_reason=None, decision=None,
                             cooldown_until=None)
@@ -265,8 +314,7 @@ class RgbdOdometryPlugin:
                 return {**(current[0].info() if current else {'state': 'idle'}),
                         'topic_out': self._outputs(instance), 'odom_interface': _INTERFACE,
                         'topic_in': current[2] if current else [],
-                        'recovery': {k: v for k, v in self.recovery.get(instance, {}).items()
-                                     if k not in ('lost_since', 'last_attempt')},
+                        'recovery': self._recovery_info(instance),
                         'frontend': self._frontend_info(instance),
                         'config': self.settings.get(instance, self.defaults).copy()}
             except (ValueError, RuntimeError, ImportError, LookupError) as error:

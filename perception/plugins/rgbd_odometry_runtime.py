@@ -25,6 +25,9 @@ from .rgbd_odometry_contract import PairBuffer, make_sample
 from .rgbd_pairing import RgbdPairer, RgbdPair
 from .spatial_time import TimePolicy
 from .rgbd_imu import ImuAttitude
+from .rgbd_association import RotationHints, association_enabled, require_rotation_hint_runtime
+from .rgbd_recovery import (AuxiliaryHealthProbe, ASSISTANCE_RETRY_S,
+                            VISUAL_INITIALIZATION_S, assistance_mode, visual_calibration)
 from .rgbd_fusion import ShortTermFusion, log_rotation, observation_covariance, pose_values
 from .rgbd_body_mount import CaptureMounts
 from .rgbd_geometry import GeometryWorker, observation_quality
@@ -223,6 +226,10 @@ def estimator_parameters(calibration, segment):
                        'Vis/CorFlowIterations': '30'})
     if calibration.get('imu_topic') and not calibration.get('short_term_compensation'):
         params.update(wait_imu_to_init=True, **{'Odom/GuessSmoothingDelay': '0'})
+    if association_enabled(calibration):
+        params.update(motus_rotation_hint=True, wait_imu_to_init=False, guess_frame_id='',
+                      **{'Odom/GuessMotion': 'true', 'Odom/GuessSmoothingDelay': '0',
+                         'Odom/FilteringStrategy': '0', 'Optimizer/GravitySigma': '0'})
     return params
 
 
@@ -256,6 +263,8 @@ def registration_report(sample, frontend, native=None, *, depth_enabled=False):
             'rmse_m': depth.get('rmse'),
             'overlap': depth.get('overlap'),
             'condition': depth.get('condition'),
+            'rank': depth.get('rank'),
+            'full_pose_supported': depth.get('full_pose_supported'),
             'reject_reason': depth.get('reason')
         }
     }
@@ -353,13 +362,14 @@ def observation_calibration(calibration, ingress_clock_id):
     result = dict(calibration)
     if result.get('time_basis') == 'receipt_estimated':
         result['clock_id'] = ingress_clock_id
-        result.pop('imu_topic', None)
+        result = visual_calibration(result)
         result['short_term_compensation'] = False
     return result
 
 
 class RgbdSession:
-    def __init__(self, calibration, executor, topic, *, publish_output=True, input_registry=None):
+    def __init__(self, calibration, executor, topic, *, publish_output=True, input_registry=None,
+                 requested_calibration=None, mode_transition=None):
         self.input_registry, self.input_leases = input_registry, []
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -367,10 +377,13 @@ class RgbdSession:
         from std_msgs.msg import String
         from nav_msgs.msg import Odometry
         from rtabmap_msgs.msg import RGBDImage, OdomInfo
-        self.requested_calibration = dict(calibration)
+        self.requested_calibration = dict(calibration if requested_calibration is None else requested_calibration)
         self.time_policy = TimePolicy(input_registry.clock_id if input_registry else 'rgbd_ingress/' + uuid.uuid4().hex)
         self.contexts_by_stamp = OrderedDict()
         calibration = observation_calibration(calibration, self.time_policy.clock_id)
+        if association_enabled(calibration):
+            # Reject old images that would silently ignore the new optional parameter.
+            require_rotation_hint_runtime(require_runtime())
         self.assistance_unavailable = ('IMU requires comparable capture timestamps'
                                       if calibration.get('time_basis') == 'receipt_estimated' else None)
         self.calibration, self.executor, self.topic = calibration, executor, topic
@@ -385,7 +398,8 @@ class RgbdSession:
         self.processing_observations = deque(maxlen=32)
         self.stage_times={k:deque(maxlen=128) for k in ('decode','imu_wait')}
         self.fusion = (ShortTermFusion(self.segment, calibration['frame_id'], calibration['clock_id'],
-                       calibration['K'], calibration.get('depth_geometry', False))
+                       calibration['K'], calibration.get('depth_geometry', False),
+                       inertial_association=association_enabled(calibration))
                        if calibration.get('short_term_compensation') else None)
         if self.fusion is not None:
             self.fusion.recovery_policy = self.gate.recovery_policy
@@ -394,6 +408,12 @@ class RgbdSession:
                        if calibration.get('body_mount') else None)
         self.imu = (self.fusion.imu if self.fusion else
                     ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None)
+        self.auxiliary_probe = (AuxiliaryHealthProbe(calibration['frame_id'], calibration['clock_id'],
+            require_translation=bool(self.requested_calibration.get('short_term_compensation')))
+            if self.requested_calibration.get('imu_topic') and calibration.get('time_basis') != 'receipt_estimated'
+            else None)
+        self.imu_topic = (calibration.get('imu_topic') or self.requested_calibration.get('imu_topic')
+                          if self.auxiliary_probe is not None else calibration.get('imu_topic'))
         self.lock = threading.RLock()
         self.imu_queue_lock = threading.Lock()
         self.imu_pending, self.imu_overflow = deque(), False
@@ -411,6 +431,7 @@ class RgbdSession:
         self.process = self.worker = None
         self.spin_worker = None
         self.geometry_worker = None
+        self.rotation_hints = None
         self.owns_executor = False
         self.directory = tempfile.TemporaryDirectory(prefix='motus-rgbd-')
         self.log = None
@@ -418,6 +439,10 @@ class RgbdSession:
         self.input_rejection = None
         self.fallback = None
         self.started = time.monotonic()
+        self.visual_initialization_started = self.mode_changed_at = self.started
+        self.first_tracking_at = None
+        self.initialization_timed_out = False
+        self.mode_transition = deepcopy(mode_transition)
         self.node = Node(self.segment)
         try:
             if self.fusion is not None and self.fusion.geometry is not None:
@@ -425,7 +450,7 @@ class RgbdSession:
                 # and stop remain responsive while it computes.
                 self.geometry_worker = GeometryWorker(self.fusion.geometry)
                 self.fusion.geometry_runner = self.geometry_worker
-            if self.imu is not None:
+            if self.imu_topic is not None:
                 from rclpy.executors import SingleThreadedExecutor
                 self.executor = SingleThreadedExecutor(context=self.node.context)
                 self.owns_executor = True
@@ -434,6 +459,7 @@ class RgbdSession:
                 String, (topic[:-11] if topic.endswith('/state/odom') else topic) + '/status',
                 qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
+            self.rotation_hints = RotationHints(calibration, self.node, self.segment, qos_profile_sensor_data)
             for kind in ('color', 'depth'):
                 input_topic = calibration[kind + '_topic']
                 if input_registry is None:
@@ -447,16 +473,16 @@ class RgbdSession:
                                           lambda m: self._result('pose', m), qos_profile_sensor_data)
             self.node.create_subscription(OdomInfo, '/' + self.segment + '/diagnostic',
                                           lambda m: self._result('info', m), qos_profile_sensor_data)
-            if self.imu is not None:
-                from sensor_msgs.msg import Imu
+            if self.imu_topic is not None:
                 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-                if self.fusion is None:
+                if self.imu is not None and self.fusion is None:
+                    from sensor_msgs.msg import Imu
                     self.imu_pub = self.node.create_publisher(Imu, '/' + self.segment + '/imu', qos_profile_sensor_data)
                 # Preserve capture intervals while a visual correction occupies
                 # the callback group; admission still rejects samples over 750 ms old.
                 imu_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
                 self.imu_callback_group = MutuallyExclusiveCallbackGroup()
-                self.node.create_subscription(String, calibration['imu_topic'], self._enqueue_imu, imu_qos,
+                self.node.create_subscription(String, self.imu_topic, self._enqueue_imu, imu_qos,
                                               callback_group=self.imu_callback_group)
             if self.mounts is not None:
                 self.node.create_subscription(String, self.mounts.declaration['topic'], self._mount, qos_profile_sensor_data)
@@ -472,6 +498,8 @@ class RgbdSession:
                    '-r', 'odom_info_lite:=/' + self.segment + '/diagnostic']
             if self.imu is not None and self.fusion is None:
                 cmd.extend(['-r', 'imu:=/' + self.segment + '/imu'])
+            if self.rotation_hints.enabled:
+                cmd.extend(['-r', 'rotation_hint:=/' + self.segment + '/rotation_hint'])
             self.process = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT,
                 start_new_session=True, env=estimator_environment(self.directory.name))
             worker = threading.Thread(target=self._work, name=self.segment, daemon=True)
@@ -547,6 +575,100 @@ class RgbdSession:
                        -50_000_000 <= now_ns-self.latest_inputs[kind] <= 1_500_000_000
                        for kind in ('color', 'depth'))
 
+    def _probing_auxiliary(self):
+        return (getattr(self, 'auxiliary_probe', None) is not None and
+                (self.imu is None or self.gate.state == 'lost' or
+                 (getattr(self, 'fusion', None) is not None and self.fusion.state == 'lost')))
+
+    def _mode_info(self):
+        requested = assistance_mode(getattr(self, 'requested_calibration', self.calibration))
+        effective = 'visual_only' if getattr(self, 'fallback', None) is not None else assistance_mode(self.calibration)
+        transition = getattr(self, 'mode_transition', None)
+        return dict(requested=requested, effective=effective, degraded=requested != effective,
+                    reason=(self.fallback['reason'] if getattr(self, 'fallback', None) is not None else
+                            getattr(self, 'assistance_unavailable', None) or
+                            (transition['reason'] if transition else None)),
+                    transition=deepcopy(transition))
+
+    def _auxiliary_info(self, now_ns, now_s):
+        probe = getattr(self, 'auxiliary_probe', None)
+        if probe is None:
+            return dict(enabled=False, status='unavailable' if getattr(self, 'assistance_unavailable', None)
+                        else 'disabled', reason=getattr(self, 'assistance_unavailable', None))
+        if not self._probing_auxiliary():
+            return dict(enabled=True, status='inactive', reason='requested assistance is active')
+        return dict(probe.info(now_ns, now_s), restore_cooldown_remaining_s=round(max(
+            0., ASSISTANCE_RETRY_S-(now_s-self.mode_changed_at)), 2))
+
+    def _initialization_info(self, now_s):
+        started = getattr(self, 'visual_initialization_started', getattr(self, 'started', now_s))
+        finished = getattr(self, 'first_tracking_at', None)
+        if finished is not None:
+            phase = 'complete'
+        elif getattr(self, 'initialization_timed_out', False):
+            phase = 'timed_out'
+        elif not self.gate.last_input:
+            phase = 'waiting_rgbd'
+        elif self._fusing():
+            phase = 'waiting_low_motion' if self.fusion.filter is None else 'waiting_consistency'
+        elif self.imu is not None and self.imu.state == 'initializing':
+            phase = 'waiting_imu'
+        else:
+            phase = 'waiting_visual'
+        reason = self.fusion.reason if self._fusing() else self.gate.reason
+        return dict(phase=phase, elapsed_s=round(max(0., (now_s if finished is None else finished)-started), 2),
+                    budget_s=VISUAL_INITIALIZATION_S, reason=reason,
+                    consecutive_visual_estimates=self.fusion.good if self._fusing() else self.gate.good,
+                    required_visual_estimates=3,
+                    fusion_visual_samples=len(self.fusion.warmup) if self._fusing() else None,
+                    imu_samples=len(self.imu.history) if self.imu is not None else 0)
+
+    def _check_initialization(self, now_s):
+        if self.gate.state == 'lost' or getattr(self, 'first_tracking_at', None) is not None:
+            return
+        if self.gate.last_pose is not None or (self.gate.state == 'tracking' and not self._fusing()):
+            return  # a tracking segment has separate bounded visual recovery rules
+        if not self.gate.last_input:
+            return  # the watchdog's separate input timeout identifies missing images
+        if now_s-getattr(self, 'visual_initialization_started', self.started) < VISUAL_INITIALIZATION_S:
+            return
+        if self._fusing():
+            # Constructing an ESKF is not successful initialization. Repeated
+            # short coasts may otherwise keep it below its first tracking pose
+            # forever while each new visual sample refreshes the outage bound.
+            self.fusion.fault(f'fusion initialization timed out after {VISUAL_INITIALIZATION_S:g} s '
+                              'without an admitted tracking pose; visual fallback required')
+            self._check_fusion(time.time_ns())
+        elif self.imu is None or self.fusion is not None or self.imu.state != 'initializing':
+            # An absent attitude source keeps the distinct 10 s IMU timeout.
+            # A healthy attitude source does not extend visual warmup forever.
+            self.initialization_timed_out = True
+            self.gate.fault(f'visual initialization timed out after {VISUAL_INITIALIZATION_S:g} s '
+                            'without three valid estimates; restart required', 'visual')
+
+    def recovery_target(self, now_s, now_ns):
+        """Recommend a new segment; never enable an auxiliary filter in place."""
+        with self.lock:
+            mode = self._mode_info()
+            source = getattr(self, 'restart_calibration', self.calibration)
+            if source.get('time_basis') == 'receipt_estimated':
+                return None
+            health = self._auxiliary_info(now_ns, now_s)
+            if (mode['degraded'] and health.get('status') == 'ready' and
+                    now_s-self.mode_changed_at >= ASSISTANCE_RETRY_S):
+                calibration = dict(source)
+                for key in ('imu_topic', 'imu_assisted', 'short_term_compensation',
+                            'depth_geometry', 'inertial_association'):
+                    if key in self.requested_calibration:
+                        calibration[key] = self.requested_calibration[key]
+                return dict(action='restore_assistance', calibration=calibration,
+                            reason='auxiliary source passed sustained capture health checks')
+            auxiliary_loss = (self.gate.loss_kind in ('imu', 'fusion') and self.imu is not None)
+            if self.gate.state == 'lost' and (auxiliary_loss or getattr(self, 'fallback', None) is not None):
+                return dict(action='degrade_assistance', calibration=visual_calibration(source),
+                            reason=self.gate.reason or mode['reason'])
+            return None
+
     def _mount(self, msg):
         with self.lock:
             if self.stop_event.is_set():
@@ -574,13 +696,19 @@ class RgbdSession:
             pending = list(self.imu_pending)
             self.imu_pending.clear()
             overflow = self.imu_overflow
+            self.imu_overflow = False
         if overflow:
-            self.imu.fault('IMU ingress overflow; restart required')
-            if self.fusion is not None:
+            reason = 'IMU ingress overflow; restart required'
+            probe = getattr(self, 'auxiliary_probe', None)
+            if probe is not None:
+                probe.reset(reason)
+            if self.imu is not None:
+                self.imu.fault(reason)
+            if self.fusion is not None and self.fallback is None:
                 # The native estimator never consumed this IMU: only the ESKF stops.
-                self.fusion.fault(self.imu.reason)
-            else:
-                self.gate.fault(self.imu.reason, 'imu')
+                self.fusion.fault(reason)
+            elif self.imu is not None and self.fusion is None:
+                self.gate.fault(reason, 'imu')
             return
         for msg in pending:
             if self.stop_event.is_set():
@@ -588,18 +716,23 @@ class RgbdSession:
             self._imu(msg)
 
     def _imu(self, msg):
-        from sensor_msgs.msg import Imu
         with self.lock:
-            if self.stop_event.is_set() or self.gate.state == 'lost':
+            if self.stop_event.is_set():
                 return
             try:
+                packet = json.loads(msg.data)
+                if self._probing_auxiliary():
+                    self.auxiliary_probe.observe(packet, time.time_ns(), time.monotonic())
+                if self.gate.state == 'lost' or self.imu is None:
+                    return
                 if getattr(self, 'fusion', None) is not None:
                     if self.fusion.state != 'lost':
-                        self.fusion.observe_imu(json.loads(msg.data), time.time_ns())
+                        self.fusion.observe_imu(packet, time.time_ns())
                     return
-                sample = self.imu.observe(json.loads(msg.data), time.time_ns())
+                sample = self.imu.observe(packet, time.time_ns())
                 if sample is None:
                     return
+                from sensor_msgs.msg import Imu
                 out = Imu()
                 out.header.frame_id = self.calibration['frame_id']
                 out.header.stamp.sec, out.header.stamp.nanosec = divmod(sample['stamp_ns'], 10**9)
@@ -609,6 +742,10 @@ class RgbdSession:
                 (out.linear_acceleration.x, out.linear_acceleration.y, out.linear_acceleration.z) = sample['linear_acceleration']
                 self.imu_pub.publish(out)
             except (ValueError, TypeError, AttributeError, RuntimeError) as error:
+                if self._probing_auxiliary():
+                    self.auxiliary_probe.reset(error)
+                if self.gate.state == 'lost' or self.imu is None:
+                    return
                 self.imu.fault(error)
                 if getattr(self, 'fusion', None) is not None:
                     self.fusion.fault(error)  # visual-only fallback decides continuity
@@ -743,6 +880,9 @@ class RgbdSession:
                             self._check_fusion(time.time_ns())
                         if self.gate.state == 'lost':
                             continue
+                        if getattr(self, 'rotation_hints', None) is not None:
+                            self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns(),
+                                available=self._fusing() and self.fusion.state != 'lost')
                         self.rgbd.publish(out)
                         self.counts['pairs'] += 1
             except Exception as error:
@@ -761,12 +901,13 @@ class RgbdSession:
                 self._enter_fallback(now)
 
     def _enter_fallback(self, now):
-        """ESKF stopped: continue with the independent native visual estimate.
+        """ESKF stopped: continue with the native visual estimate if continuous.
 
-        The native estimator never received IMU in this mode. Its poses share
-        this segment's odom frame, but fused output differed from them by the
-        corrections. Keep the segment only if that offset at the last published
-        fused capture is within the continuity bound; otherwise restart.
+        Optional rotation hints can influence native association, but never
+        reset its pose origin or replace visual measurements. Its poses share
+        this segment's odom frame; fused corrections can introduce an offset.
+        Keep the segment only if the offset at the last published fused capture
+        is within the continuity bound. This proves no statistical independence.
         """
         reason = str(self.fusion.reason)
         offset = self.fusion.tracking_offset()
@@ -782,6 +923,13 @@ class RgbdSession:
         self.fallback = dict(mode='visual_only', reason=reason, since_ns=now,
                              fused_visual_offset_m=None if offset is None else round(offset[0], 4),
                              fused_visual_offset_deg=None if offset is None else round(float(np.rad2deg(offset[1])), 2))
+        self.mode_changed_at = time.monotonic()
+        self.mode_transition = dict(action='degrade_assistance', previous_segment=self.segment,
+                                    from_mode=assistance_mode(self.calibration), to_mode='visual_only', reason=reason)
+        if self.gate.last_pose is None and self.fusion.last_tracking is None:
+            # The visual phase gets one bounded initialization window after
+            # unsuccessful fusion warmup, never one window per weak frame.
+            self.visual_initialization_started = self.mode_changed_at
         self.observations.counts['cancelled_on_fallback'] += len(self.observations.frames)
         self.observations.frames.clear()
         gate = self.gate
@@ -869,6 +1017,14 @@ class RgbdSession:
                 sample['vendor']['pause'] = dict(status='recovering',mapping_allowed=False)
             else:self.previous_motion = deepcopy(sample)
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
+        sample['vendor']['inertial_association'] = (self.rotation_hints.info()
+            if getattr(self, 'rotation_hints', None) is not None else {'enabled': False})
+        if sample['pose'] is not None and sample['vendor']['motus_slam']['status'] == 'tracking':
+            if getattr(self, 'first_tracking_at', None) is None:
+                self.first_tracking_at = time.monotonic()
+        sample['vendor']['mode'] = self._mode_info()
+        sample['vendor']['initialization'] = self._initialization_info(time.monotonic())
+        sample['vendor']['auxiliary_recovery'] = self._auxiliary_info(now, time.monotonic())
         stamp = (sample['vendor'].get('motus_slam') or {}).get('stamp_ns')
         native = self.registration_by_stamp.pop(stamp, None)
         report = registration_report(
@@ -902,7 +1058,11 @@ class RgbdSession:
                        pose_reference=vendor['pose_reference'],
                        age_ms=round((now-slam['stamp_ns'])/1e6, 1)
                        if slam['stamp_source'] == 'measurement' else None,
-                       reason=vendor['reason'])
+                       reason=vendor['reason'],
+                       mode=deepcopy(vendor.get('mode', self._mode_info())),
+                       initialization=deepcopy(vendor.get('initialization', self._initialization_info(time.monotonic()))),
+                       auxiliary_recovery=deepcopy(vendor.get('auxiliary_recovery',
+                           self._auxiliary_info(now, time.monotonic()))))
         try:
             self.status_publisher.publish(String(data=json.dumps(summary, allow_nan=False)))
         except Exception as error:
@@ -984,6 +1144,7 @@ class RgbdSession:
                 self.gate.fault('RGB-D estimator exited', 'process')
             if not self.gate.last_input and time.monotonic() - self.started > 10:
                 self.gate.fault('waiting for calibrated RGB-D inputs timed out', 'input')
+            self._check_initialization(time.monotonic())
             if self._fusing():
                 now = time.time_ns()
                 self.fusion.poll_geometry(now)
@@ -992,9 +1153,7 @@ class RgbdSession:
                     self.counts['estimates'] += 1
                 if self.gate.state == 'lost':
                     self.fusion.fault(self.gate.reason)
-                if (self.fusion.status(now) != 'lost' and self.fusion.filter is None and
-                        time.monotonic()-self.started > 15):
-                    self.fusion.fault('low-motion fusion initialization timed out; restart required')
+                self.fusion.status(now)
                 self._check_fusion(now)
                 if self._fusing():
                     # A bounded pending observation has no final verdict yet.
@@ -1030,6 +1189,7 @@ class RgbdSession:
             if self.fusion:
                 self.fusion.status(now)
                 self._check_fusion(now)
+            self._check_initialization(time.monotonic())
             fusing = self._fusing()
             return {'state': 'running', 'status': self.fusion.state if fusing else self.gate.status(now),
                     'reason': self.fusion.reason if fusing else self.gate.reason, 'segment_id': self.segment,
@@ -1041,8 +1201,12 @@ class RgbdSession:
                     'input_rejections': {'count': self.counts['rejected_inputs'],
                                          'last_reason': self.input_rejection},
                     'fallback': deepcopy(self.fallback),
+                    'mode': self._mode_info(),
+                    'initialization': self._initialization_info(time.monotonic()),
+                    'auxiliary_recovery': self._auxiliary_info(now, time.monotonic()),
                     'assistance_unavailable': self.assistance_unavailable,
                     'imu_assistance': self.imu.info(time.time_ns()) if self.imu else {'enabled': False},
+                    'inertial_association': self.rotation_hints.info() if self.rotation_hints else {'enabled': False},
                     'fusion': self.fusion.info(time.time_ns(), history=True) if self.fusion else {'enabled': False},
                     'registration': deepcopy(self.last_registration),
                     'native_reports': self.native_reports,

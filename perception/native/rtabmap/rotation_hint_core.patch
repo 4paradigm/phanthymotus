@@ -1,0 +1,51 @@
+diff --git a/corelib/include/rtabmap/core/Odometry.h b/corelib/include/rtabmap/core/Odometry.h
+--- a/corelib/include/rtabmap/core/Odometry.h
++++ b/corelib/include/rtabmap/core/Odometry.h
+@@ -67,6 +67,9 @@
+ 	virtual ~Odometry();
+ 	Transform process(SensorData & data, OdometryInfo * info = 0);
+ 	Transform process(SensorData & data, const Transform & guess, OdometryInfo * info = 0);
++	// Optional camera rotation for visual registration search/PnP initialization.
++	// Retains native translation prediction; never an IMU or pose observation.
++	Transform process(SensorData & data, const Transform & guess, OdometryInfo * info, const Transform & rotationSearchHint);
+ 	virtual void reset(const Transform & initialPose = Transform::getIdentity());
+ 	virtual Odometry::Type getType() = 0;
+ 	virtual bool canProcessRawImages() const {return false;}
+diff --git a/corelib/src/Odometry.cpp b/corelib/src/Odometry.cpp
+--- a/corelib/src/Odometry.cpp
++++ b/corelib/src/Odometry.cpp
+@@ -301,6 +301,11 @@
+ }
+ 
+ Transform Odometry::process(SensorData & data, const Transform & guessIn, OdometryInfo * info)
++{
++	return process(data, guessIn, info, Transform());
++}
++
++Transform Odometry::process(SensorData & data, const Transform & guessIn, OdometryInfo * info, const Transform & rotationSearchHint)
+ {
+ 	UASSERT_MSG(data.id() >= 0, uFormat("Input data should have ID greater or equal than 0 (id=%d)!", data.id()).c_str());
+ 
+@@ -648,6 +653,22 @@
+ 		}
+ 	}
+ 
++	// Keep the internally computed visual translation guess. This rotation is
++	// used only to initialize registration; it cannot initialize/reset _pose,
++	// populate the IMU cache, constrain gravity, or replace a failed estimate.
++	if(!rotationSearchHint.isNull() && !data.imageRaw().empty() &&
++		(this->getType() == kTypeF2M || this->getType() == kTypeF2F))
++	{
++		guess = Transform(
++				rotationSearchHint.r11(), rotationSearchHint.r12(), rotationSearchHint.r13(), guess.isNull()?0.0f:guess.x(),
++				rotationSearchHint.r21(), rotationSearchHint.r22(), rotationSearchHint.r23(), guess.isNull()?0.0f:guess.y(),
++				rotationSearchHint.r31(), rotationSearchHint.r32(), rotationSearchHint.r33(), guess.isNull()?0.0f:guess.z());
++		if(_force3DoF)
++		{
++			guess = guess.to3DoF();
++		}
++	}
++
+ 	UTimer time;
+ 
+ 	// Deskewing lidar

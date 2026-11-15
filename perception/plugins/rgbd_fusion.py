@@ -78,6 +78,45 @@ def geometry_observation(reference, result):
     return measured, (covariance+covariance.T)/2.
 
 
+def geometry_projection(reference, result):
+    """Compose a reduced depth factor without filling unmeasured pose axes.
+
+    Returned projection/lift use world camera position/rotation errors. Reference
+    uncertainty is projected with its full cross covariance before fusion's
+    covariance-intersection treatment of the shared anchor.
+    """
+    from .rgbd_geometry import _bounded_transform
+    ref_p, ref_r = pose_values(reference)
+    transform = np.asarray(result['transform'], dtype=float)
+    rank = result['rank']
+    projection = np.asarray(result['projection'], dtype=float)
+    lift = np.asarray(result['observable_lift'], dtype=float)
+    covariance = np.asarray(result['projected_covariance'], dtype=float)
+    if (not isinstance(rank, (int, np.integer)) or not 1 <= rank <= 6
+            or not _bounded_transform(transform) or projection.shape != (rank, 6)
+            or lift.shape != (6, rank) or covariance.shape != (rank, rank)
+            or not np.isfinite(projection).all() or not np.isfinite(lift).all()
+            or not np.isfinite(covariance).all()
+            or not np.allclose(projection@lift, np.eye(rank), atol=1e-7)
+            or not np.allclose(covariance, covariance.T, atol=1e-8)
+            or np.linalg.eigvalsh(covariance).min() <= 0):
+        raise ValueError('invalid projected depth measurement')
+    translation = transform[:3, 3]
+    measured = dict(position=(ref_p+ref_r@translation).tolist(),
+                    quaternion=quaternion(ref_r@transform[:3, :3]))
+    relative = np.zeros((6, 6))
+    relative[:3, :3], relative[3:, 3:] = ref_r, ref_r
+    relative[:3, 3:] = -ref_r@skew(translation)
+    reference_basis = np.zeros((6, 6))
+    reference_basis[:3, :3], reference_basis[3:, 3:] = ref_r.T, ref_r.T
+    inverse = np.eye(6)
+    inverse[:3, 3:] = skew(translation)
+    inverse = inverse@reference_basis
+    anchor_projection = projection@reference_basis
+    covariance = covariance + anchor_projection@observation_covariance(reference)@anchor_projection.T
+    return measured, (covariance+covariance.T)*.5, projection@inverse, relative@lift
+
+
 class InertialFilter:
     """Right attitude-error ESKF; position/velocity refer to accel sensor origin."""
     def __init__(self, stamp, pose, velocity, force, gyro, lever):
@@ -122,20 +161,43 @@ class InertialFilter:
         h[:3, :3], h[:3, 6:9], h[3:, 6:9] = np.eye(3), self.R@skew(self.lever), np.eye(3)
         return h
 
-    def correct(self, pose, covariance, *, correlated=False):
+    def correct(self, pose, covariance, *, correlated=False, projection=None, observable_lift=None):
         position, rotation = pose_values(pose)
         residual = np.r_[position-(self.p-self.R@self.lever), log_rotation(self.R.T@rotation)]
+        h = self.measurement_matrix()
+        if projection is not None:
+            # Projection/lift act on WORLD camera position and attitude errors;
+            # covariance already describes only these k observed coordinates.
+            projection = np.asarray(projection, dtype=float)
+            lift = np.asarray(observable_lift, dtype=float)
+            covariance = np.asarray(covariance, dtype=float)
+            rank = projection.shape[0] if projection.ndim == 2 else 0
+            if (not 1 <= rank <= 6 or projection.shape != (rank, 6) or lift.shape != (6, rank)
+                    or covariance.shape != (rank, rank) or not np.isfinite(projection).all()
+                    or not np.isfinite(lift).all() or not np.isfinite(covariance).all()
+                    or not np.allclose(projection@lift, np.eye(rank), atol=1e-7)
+                    or not np.allclose(covariance, covariance.T, atol=1e-8)
+                    or np.linalg.eigvalsh(covariance).min() <= 0):
+                self.rejection = 'invalid_projected_measurement'
+                return False
+            world = np.eye(6); world[3:, 3:] = self.R
+            local_projection = projection@world
+            residual = local_projection@residual
+            h = local_projection@h
+            absolute = lift@residual
+        else:
+            rank = 6
+            absolute = residual
+            # Incoming rotation covariance is in world axes; residual uses local axes.
+            basis = np.eye(6)
+            basis[3:, 3:] = self.R.T
+            covariance = basis@covariance@basis.T
         # Absolute gates are independent of possibly over-large model covariance.
-        if np.linalg.norm(residual[:3]) > .15 or np.linalg.norm(residual[3:]) > np.deg2rad(15.):
+        if np.linalg.norm(absolute[:3]) > .15 or np.linalg.norm(absolute[3:]) > np.deg2rad(15.):
             self.rejection = 'absolute_residual_gate'
             return False
-        h = self.measurement_matrix()
-        # Incoming rotation covariance is in world axes; residual uses local axes.
-        basis = np.eye(6)
-        basis[3:, 3:] = self.R.T
-        covariance = basis@covariance@basis.T
         innovation = h@self.P@h.T+covariance
-        if residual@np.linalg.solve(innovation, residual) > 22.46:
+        if residual@np.linalg.solve(innovation, residual) > (10.83, 13.82, 16.27, 18.47, 20.52, 22.46)[rank-1]:
             self.rejection = 'innovation_gate'
             return False
         self.rejection = None
@@ -191,7 +253,7 @@ class ShortTermFusion:
     prediction is followed by an attempted legal visual correction, and only
     then are predicted (no correction) or corrected uncertainties judged.
     """
-    def __init__(self, segment, frame, clock, K, depth_geometry=False):
+    def __init__(self, segment, frame, clock, K, depth_geometry=False, *, inertial_association=False):
         from .rgbd_geometry import DepthRegistration
         self.segment, self.frame, self.clock = segment, frame, clock
         self.imu = ImuAttitude(frame, clock)
@@ -200,6 +262,9 @@ class ShortTermFusion:
         self.filter = None
         self.lever = self.translations = self.source_provenance = None
         self.geometry = DepthRegistration(K) if depth_geometry else None
+        # Native association may use the same IMU even when a particular frame
+        # has no hint. Keep its unknown correlation conservative for the segment.
+        self.inertial_association = bool(inertial_association)
         self.reference = None
         self.state, self.reason = 'initializing', 'waiting for 0.5 s low-motion visual/IMU warmup'
         self.loss_kind = None
@@ -372,7 +437,8 @@ class ShortTermFusion:
             diagnostic['predicted_sigma_m'] = self.position_sigma()
             # A legal visual correction is attempted before predicted
             # covariance can end the segment; gates and time bounds still apply.
-            accepted = visual_pose is not None and self.filter.correct(visual_pose, covariance)
+            accepted = visual_pose is not None and self.filter.correct(
+                visual_pose, covariance, correlated=self.inertial_association)
             if visual_pose is not None and not accepted:
                 diagnostic.update(visual='rejected', visual_reject_reason=self.filter.rejection)
             self.aid = 'visual' if accepted else 'inertial'
@@ -488,14 +554,49 @@ class ShortTermFusion:
     def _apply_geometry(self, ref_pose, result):
         if result is None:
             return
-        self.quality['geometry'].update(
-            inliers=result['inliers'], rmse=result['rmse'],
-            overlap=result['overlap'], condition=result['condition'])
-        measured, geom_cov = geometry_observation(ref_pose, result)
-        if self.filter.correct(measured, geom_cov, correlated=True):
+        try:
+            rank = result.get('rank', 6)  # Existing full-rank observations remain valid.
+            if not isinstance(rank, (int, np.integer)) or not 1 <= rank <= 6:
+                raise ValueError('invalid depth measurement rank')
+            self.quality['geometry'].update(
+                inliers=result['inliers'], rmse=result['rmse'],
+                overlap=result['overlap'], condition=result['condition'],
+                rank=rank, full_pose_supported=False)
+            projected = (geometry_projection(ref_pose, result)
+                         if rank < 6 or 'projection' in result else None)
+            if rank < 6:
+                measured, covariance, projection, lift = projected
+                accepted = self.filter.correct(measured, covariance, correlated=True,
+                                               projection=projection, observable_lift=lift)
+            else:
+                from .rgbd_geometry import _bounded_transform
+                relative_covariance = np.asarray(result['covariance'], dtype=float)
+                if (not _bounded_transform(np.asarray(result['transform'], dtype=float))
+                        or relative_covariance.shape != (6, 6) or not np.isfinite(relative_covariance).all()
+                        or not np.allclose(relative_covariance, relative_covariance.T, atol=1e-8)
+                        or np.linalg.eigvalsh(relative_covariance).min() <= 0):
+                    raise ValueError('invalid full depth measurement')
+                if projected is not None:
+                    lift = np.asarray(result['observable_lift'], dtype=float)
+                    reconstructed = lift@np.asarray(result['projected_covariance'], dtype=float)@lift.T
+                    if not np.allclose(reconstructed, relative_covariance, atol=1e-10, rtol=1e-6):
+                        raise ValueError('inconsistent full depth covariance')
+                self.quality['geometry']['full_pose_supported'] = True
+                measured, covariance = geometry_observation(ref_pose, result)
+                accepted = self.filter.correct(measured, covariance, correlated=True)
+        except (ValueError, TypeError, KeyError, ArithmeticError, np.linalg.LinAlgError) as error:
+            self.quality['geometry']['reason'] = 'registration_error: ' + str(error)[:80]
+            return
+        if accepted:
             self.aid = 'depth_geometry'
             self.quality['geometry'].update(accepted=True, reason=None)
-            self._accept_correction(self.filter.stamp)
+            if rank == 6:
+                self._accept_correction(self.filter.stamp)
+            else:
+                # A useful partial correction cannot certify a complete pose,
+                # count toward recovery, or renew the original visual anchor.
+                self.good = 0
+                self.state, self.reason = 'coasting', f'depth geometry constrains {rank} of 6 pose directions'
         else:
             self.quality['geometry']['reason'] = 'fusion_gate_rejected'
 
@@ -534,6 +635,7 @@ class ShortTermFusion:
                      aid=self.aid, quality=deepcopy(self.quality), last_visual_ns=self.last_visual,
                      last_measurement_ns=self.last_frame, depth_geometry=self.geometry is not None,
                      prediction_stamp_ns=self.filter.stamp if self.filter is not None else None,
+                     visual_corrections_correlated=self.inertial_association,
                      position_sigma_m=self.position_sigma() if self.filter is not None else None,
                      sigma_limit_m=SIGMA_LIMIT_M,
                      uncertainty_model='engineering_prior_unvalidated',

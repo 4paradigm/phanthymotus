@@ -77,9 +77,12 @@ def test_full_resolution_registration_uses_calibration_and_a_nonidentity_prior()
     np.testing.assert_allclose(result['transform'], truth, atol=.003)
 
 
-def test_rejects_single_plane_despite_perfect_residual():
+def test_single_plane_reports_only_three_constraints_despite_perfect_residual():
     plane = np.full((240, 320), 2000, dtype=np.uint16)
-    assert DepthRegistration(K).register(plane, plane, np.eye(4)) is None
+    result = DepthRegistration(K).register(plane, plane, np.eye(4))
+    assert result is not None and result['rank'] == 3
+    assert result['projected_covariance'].shape == (3, 3)
+    assert 'covariance' not in result
 
 
 def render_repeated_surface(period, angle=0.):
