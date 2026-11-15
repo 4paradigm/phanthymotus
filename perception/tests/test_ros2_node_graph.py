@@ -17,6 +17,7 @@ from plugins.ros2_node_graph_runtime import (
     build_snapshot,
     compact_payload,
     full_payload,
+    payload_fingerprint,
     url_info,
 )
 
@@ -251,3 +252,93 @@ def test_start_refresh_stop_with_an_injected_source():
     finally:
         plugin.shutdown()
 
+
+def test_bundle_style_dispatch_reads_action_from_args():
+    """PerceptionBundle passes the tool name first and the action in args."""
+    plugin = Ros2NodeGraphPlugin({"port": 0}, executor=None,
+                                 graph_source=FakeSource())
+    try:
+        info = plugin.dispatch("ros2_node_graph", {"action": "info"})
+        assert info["state"] == "idle"
+        assert info["topic_out"][0]["topic"] == "/perception/ros2_node_graph/state"
+        assert info["topic_in"] == []
+        started = plugin.dispatch("ros2_node_graph", {"action": "start"})
+        assert started["state"] == "running"
+        # Calling the tool without an action defaults to info, not None.
+        assert plugin.dispatch("ros2_node_graph", {})["state"] == "running"
+    finally:
+        plugin.shutdown()
+
+
+def test_fingerprint_ignores_scan_time_but_tracks_content():
+    snapshot = build_snapshot(FakeSource(), Config())
+    first = compact_payload(snapshot, Config(), "http://127.0.0.1:15730/", "")
+    second = dict(first)
+    second["generated_at"] = "2099-01-01T00:00:00+00:00"
+    assert payload_fingerprint(first) == payload_fingerprint(second)
+    second["summary"] = second["summary"] + "\n- changed"
+    assert payload_fingerprint(first) != payload_fingerprint(second)
+
+
+def test_unchanged_graph_does_not_republish():
+    import sys
+
+    class String:
+        def __init__(self, data=""):
+            self.data = data
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message.data)
+
+    std_msgs = types.ModuleType("std_msgs")
+    std_msgs_msg = types.ModuleType("std_msgs.msg")
+    std_msgs_msg.String = String
+    saved = {name: sys.modules.get(name)
+             for name in ("std_msgs", "std_msgs.msg")}
+    sys.modules["std_msgs"] = std_msgs
+    sys.modules["std_msgs.msg"] = std_msgs_msg
+    source = FakeSource()
+    plugin = Ros2NodeGraphPlugin({"port": 0}, executor=None,
+                                 graph_source=source)
+    publisher = Publisher()
+    plugin._publisher = publisher
+    plugin._running = True
+    try:
+        plugin._refresh(force_publish=True)
+        assert len(publisher.messages) == 1
+        plugin._refresh(force_publish=False)
+        assert len(publisher.messages) == 1        # same content + no heartbeat
+        import time
+        plugin._last_publish_at = time.monotonic() - 31
+        plugin._refresh(force_publish=False)
+        assert len(publisher.messages) == 2        # heartbeat
+        source.topics.append(("/bumi/new", ["std_msgs/msg/String"]))
+        source.publishers["/bumi/new"] = [_endpoint("state")]
+        source.subscriptions["/bumi/new"] = []
+        plugin._refresh(force_publish=False)
+        assert len(publisher.messages) == 3        # graph changed
+    finally:
+        plugin.shutdown()
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_high_fanout_topic_endpoints_are_capped():
+    source = FakeSource()
+    source.nodes = [(f"p{index}", "/bumi") for index in range(100)]
+    source.topics = [("/many", ["std_msgs/msg/String"])]
+    source.publishers = {"/many": [_endpoint(f"p{index}") for index in range(100)]}
+    source.subscriptions = {"/many": [_endpoint(f"s{index}") for index in range(100)]}
+    snapshot = build_snapshot(source, Config.from_dict({"max_nodes": 10}))
+    topic = snapshot["topics"][0]
+    assert len(topic["publishers"]) <= 10
+    assert len(topic["subscribers"]) <= 10
+    assert topic["endpoints_truncated"] is True
+    assert snapshot["truncated"] is True

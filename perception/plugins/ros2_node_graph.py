@@ -40,6 +40,7 @@ from plugins.ros2_node_graph_runtime import (
     compact_payload,
     full_payload,
     json_dumps,
+    payload_fingerprint,
     url_info,
 )
 
@@ -87,7 +88,7 @@ class Ros2NodeGraphPlugin:
 
         self._snapshot = None
         self._snapshot_at = 0.0
-        self._last_published = ""
+        self._last_fingerprint = ""
         self._last_publish_at = 0.0
         self._last_error = ""
         self._running = False
@@ -105,6 +106,14 @@ class Ros2NodeGraphPlugin:
 
     def _url_info(self) -> dict:
         return url_info(self._config, self._http_port or self._config.port)
+
+    def _topic_out(self) -> list:
+        return [{
+            "topic": self._topic,
+            "format": TOPIC_FORMAT,
+            "desc": ("节点图拓扑文字摘要（summary）+ 统计；完整节点表只在网页里，"
+                     "不进入 LLM 上下文"),
+        }]
 
     def get_tools(self) -> list:
         access = self._url_info()
@@ -154,12 +163,7 @@ class Ros2NodeGraphPlugin:
                                "description": "更新采集、端口或 URL/隧道配置"},
                 },
             },
-            "topic_out": [{
-                "topic": self._topic,
-                "format": TOPIC_FORMAT,
-                "desc": ("节点图拓扑文字摘要（summary）+ 统计；完整节点表只在网页里，"
-                         "不进入 LLM 上下文"),
-            }],
+            "topic_out": self._topic_out(),
             "configSchema": {
                 "type": "object",
                 "properties": {
@@ -190,6 +194,24 @@ class Ros2NodeGraphPlugin:
                     "include_system_topics": {"type": "boolean", "default": False,
                                               "scope": "instance",
                                               "description": "是否包含 /rosout 和 /parameter_events"},
+                    "heartbeat_s": {"type": "number", "default": 30.0,
+                                    "minimum": 5, "maximum": 3600,
+                                    "scope": "instance",
+                                    "description": "内容不变时的心跳间隔"},
+                    "exclude_topics": {"type": "string", "default": "",
+                                       "scope": "instance",
+                                       "description": "逗号分隔的排除话题子串"},
+                    "exclude_namespaces": {"type": "string", "default": "",
+                                           "scope": "instance",
+                                           "description": "逗号分隔的排除命名空间前缀"},
+                    "max_nodes": {"type": "integer", "default": 120,
+                                  "minimum": 10, "maximum": 1000,
+                                  "scope": "instance",
+                                  "description": "网页节点数上限（端点也受此预算约束）"},
+                    "max_topics": {"type": "integer", "default": 200,
+                                   "minimum": 10, "maximum": 2000,
+                                   "scope": "instance",
+                                   "description": "网页话题数上限"},
                     "max_flows": {"type": "integer", "default": 60,
                                   "minimum": 5, "maximum": 500,
                                   "scope": "instance",
@@ -311,11 +333,12 @@ class Ros2NodeGraphPlugin:
             self._last_error = ""
             publisher = self._publisher
             encoded = json_dumps(payload)
+            fingerprint = payload_fingerprint(payload)
             now = time.monotonic()
-            due = (force_publish or encoded != self._last_published
+            due = (force_publish or fingerprint != self._last_fingerprint
                    or now - self._last_publish_at >= self._config.heartbeat_s)
             if due:
-                self._last_published = encoded
+                self._last_fingerprint = fingerprint
                 self._last_publish_at = now
         if due and publisher is not None:
             try:
@@ -328,8 +351,14 @@ class Ros2NodeGraphPlugin:
 
     # ── queries / config ─────────────────────────────────────────────────────
 
-    def dispatch(self, action: str, args: dict):
+    def dispatch(self, name: str, args: dict):
         args = args or {}
+        # PerceptionBundle calls plugin.dispatch(tool_name, args); the action is
+        # inside args.  Tests also call dispatch("start", {}), so fall back to
+        # the first argument when no action was supplied.
+        action = args.get("action") or name
+        if action in (PREFIX, "ros2_node_graph"):
+            action = "info"
         if action == "start":
             return self.start()
         if action == "stop":
@@ -361,6 +390,8 @@ class Ros2NodeGraphPlugin:
             "port": self._http_port or self._config.port,
             "topic": self._topic,
             "protocol": TOPIC_FORMAT,
+            "topic_out": self._topic_out(),
+            "topic_in": [],
             "stats": snapshot["stats"] if snapshot else None,
             "last_scan_age_s": age,
             "config": self._config.as_dict(),

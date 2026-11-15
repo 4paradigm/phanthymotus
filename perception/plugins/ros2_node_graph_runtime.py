@@ -201,6 +201,33 @@ def _namespace_allowed(full_name: str, config: Config) -> bool:
                    for prefix in config.exclude_namespaces)
 
 
+def _bound_endpoints(topics: list, max_nodes: int) -> tuple[list, bool]:
+    """Bound publisher/subscriber names as well as the node list.
+
+    A topic can have thousands of endpoints; capping only ``nodes`` still sent
+    every endpoint to the browser, where the page recreated all of them and the
+    force layout became quadratic.  Each side gets its own budget so a single
+    high-fanout topic still shows both publishers and subscribers.
+    """
+    pub_budget, sub_budget = max_nodes, max_nodes
+    bounded, truncated = [], False
+    for topic in topics:
+        publishers = topic["publishers"][:pub_budget]
+        subscribers = topic["subscribers"][:sub_budget]
+        cut = (len(publishers) < len(topic["publishers"])
+               or len(subscribers) < len(topic["subscribers"]))
+        pub_budget -= len(publishers)
+        sub_budget -= len(subscribers)
+        truncated = truncated or cut
+        bounded.append({
+            **topic,
+            "publishers": publishers,
+            "subscribers": subscribers,
+            "endpoints_truncated": cut,
+        })
+    return bounded, truncated
+
+
 def build_snapshot(source, config: Config, now: str | None = None) -> dict:
     """Turn rclpy's graph API (or a fake source) into one JSON-safe snapshot."""
     node_names = set()
@@ -246,12 +273,16 @@ def build_snapshot(source, config: Config, now: str | None = None) -> dict:
     node_names = sorted(node_names)
     topics = sorted(topics, key=lambda item: item["name"])
     total_nodes, total_topics = len(node_names), len(topics)
+    shown_nodes = node_names[:config.max_nodes]
+    shown_topics, topics_endpoints_truncated = _bound_endpoints(
+        topics[:config.max_topics], config.max_nodes)
+    shown_flows, flows_endpoints_truncated = _bound_endpoints(
+        topics[:config.max_flows], config.max_nodes)
     truncated = (total_nodes > config.max_nodes
                  or total_topics > config.max_topics
-                 or total_topics > config.max_flows)
-    shown_nodes = node_names[:config.max_nodes]
-    shown_topics = topics[:config.max_topics]
-    shown_flows = topics[:config.max_flows]
+                 or total_topics > config.max_flows
+                 or topics_endpoints_truncated
+                 or flows_endpoints_truncated)
     nodes = [{
         "name": name,
         "namespace": name.rsplit("/", 1)[0] or "/",
@@ -386,3 +417,18 @@ def url_info(config: Config, actual_port: int) -> dict:
 
 def json_dumps(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def payload_fingerprint(payload: dict) -> str:
+    """Content identity for publish throttling; deliberately excludes time.
+
+    ``generated_at`` changes on every scan, so comparing the whole payload made
+    an unchanged graph publish every scan instead of only on change/heartbeat.
+    """
+    return json_dumps({
+        "summary": payload.get("summary"),
+        "stats": payload.get("stats"),
+        "truncated": payload.get("truncated"),
+        "url": payload.get("url"),
+        "tunnel": payload.get("tunnel"),
+    })
