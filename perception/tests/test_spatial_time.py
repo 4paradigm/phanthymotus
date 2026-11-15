@@ -2,10 +2,10 @@
 from dataclasses import FrozenInstanceError
 import json
 import pytest
-from perception.plugins.spatial_time import FrameContext, TimePolicy, compatible_sources
-from perception.plugins.rgbd_odometry_contract import make_sample
-from perception.plugins.pointcloud_slam_odom import decode_slam_odom
-from perception.plugins.pointcloud_slam_contract import validate_tracking_pose
+from plugins.spatial_time import FrameContext, TimePolicy, compatible_sources
+from plugins.rgbd_odometry_contract import make_sample
+from plugins.pointcloud_slam_odom import decode_slam_odom
+from plugins.pointcloud_slam_contract import validate_tracking_pose
 
 NOW = 1_794_668_000_123_456_789
 
@@ -78,7 +78,7 @@ def test_observation_cannot_claim_verified_receipt_or_change_header_time():
 
 
 def test_quality_unknown_is_not_an_implicit_rejection():
-    from perception.plugins.spatial_quality import QualityReport, QualityDecision
+    from plugins.spatial_quality import QualityReport, QualityDecision
     q=QualityReport()
     assert q.depth_fraction is None and q.inliers is None
     assert json.loads(json.dumps(q.to_dict()))['depth_fraction'] is None

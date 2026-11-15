@@ -1141,7 +1141,10 @@ async def _do_start_project_impl():
             except ValueError as error:
                 tool_name = card.get('toolName', '')
                 message = f'SLAM 输入路由失败: {error}'
-                print(f'[start-project] {tool_name}: {message}')
+                # Keep producer/canvas-controlled text on one bounded log line.
+                # The event below retains the full diagnostic for the UI.
+                log_detail = repr(f'{tool_name}: {message}'[:1024])
+                print(f'[start-project] {log_detail[:1024]}')
                 await push_event({'type': 'project_start_item', 'payload': {
                     'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
                     'status': 'error', 'message': message,

@@ -561,7 +561,7 @@ def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatc
 
 def test_shared_input_leases_are_released_by_gateway_close(tmp_path, monkeypatch):
     import plugins.pointcloud_slam_ros as ros
-    from perception.plugins.spatial_input import InputAdapterRegistry
+    from plugins.spatial_input import InputAdapterRegistry
     subscriptions, released = [], []
     def subscribe(topic, kind, callback):
         subscriptions.append(topic)

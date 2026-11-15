@@ -2,7 +2,7 @@ import threading
 import time
 from types import SimpleNamespace as NS
 import pytest
-from perception.plugins.spatial_input import InputAdapterRegistry
+from plugins.spatial_input import InputAdapterRegistry
 
 
 class Backend:
