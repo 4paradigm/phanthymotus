@@ -227,3 +227,30 @@ def test_perception_explicit_input_is_compatible_with_common_declaration():
     uncalibrated = resolve_inputs({'/odom': pose, '/cloud': cloud}, bindings)
     assert uncalibrated['extrinsic']['calibrated'] is False
     assert uncalibrated['settings']['child_from_cloud'] == IDENTITY
+
+
+@pytest.mark.parametrize('stamp', [None, True, 0, -1, 1.5, '1000'])
+def test_explicit_pose_stamp_cannot_fall_back_to_twist_time(stamp):
+    value = sample()
+    value['pose']['stamp_ms'] = stamp
+    with pytest.raises(SpatialSlamError, match='stamp_ms'):
+        validate_tracking_pose(value)
+
+
+def test_pose_measurement_evidence_must_match_its_own_stamp():
+    value = sample()
+    value['stamp_ms'] = 2000
+    value['pose']['stamp_ms'] = 1000
+    value['vendor']['motus_slam']['measurement'] = {'stamp_ns': 2_000_000_000}
+    with pytest.raises(SpatialSlamError, match='measurement timestamp'):
+        validate_tracking_pose(value)
+
+
+
+def test_precise_pose_time_cannot_disagree_with_diagnostic_evidence_within_millisecond():
+    value = sample()
+    quality = value['vendor']['motus_slam']
+    quality['stamp_ns'] = 1_000_000_123
+    quality['measurement'] = {'stamp_ns': 1_000_000_000}
+    with pytest.raises(SpatialSlamError, match='measurement timestamp'):
+        validate_tracking_pose(value)

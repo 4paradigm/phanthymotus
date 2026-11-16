@@ -15,7 +15,9 @@ def validate_tracking_pose(sample):
     expected = 'measurement' if context.time_basis == 'source_capture' else 'receipt_estimated'
     if (quality.get('stamp_source') != expected or quality.get('clock_id') != context.normalized_clock_id or
             quality.get('stamp_ns') != context.observation_stamp_ns or
-            sample.get('stamp_ms') != context.observation_stamp_ns // 1_000_000):
+            sample.get('stamp_ms') != context.observation_stamp_ns // 1_000_000 or
+            (isinstance(sample.get('pose'), dict) and
+             sample['pose'].get('stamp_ms', sample.get('stamp_ms')) != context.observation_stamp_ns // 1_000_000)):
         raise ValueError('pose and observation time declarations conflict')
     # Reuse v1 geometry/unit validation on a private copy, after validating v2
     # time above. The wire object remains v2; strict old readers still reject it.

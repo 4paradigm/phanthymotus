@@ -369,3 +369,65 @@ def test_same_source_stamp_cannot_be_rewritten_by_slew():
     s.odom(slew_odom(),now=1.)
     s.odom(slew_odom(1000,1),now=1.01)
     assert s.status(now=1.01)['odometry']!='tracking'
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+def test_twist_receive_time_does_not_change_pose_cloud_association(explicit):
+    s = stream(input_contract=resolved() if explicit else None)
+    value = measured_odom(1000)
+    value['pose']['stamp_ms'] = 1000
+    value['stamp_ms'] = 1200
+    s.odom(value, now=1.2)
+    s.cloud(1_000_000_000, 'camera', [[1, 2, 3]], now=1.2,
+            data_sha256=packet()['data_sha256'])
+    if explicit:
+        s.cloud_metadata(packet(), now=1.2)
+    assert len(s.accepted) == 1
+    assert s.accepted[0].pose.stamp_ms == 1000
+
+
+def test_fresh_twist_cannot_refresh_stale_diagnostic_pose():
+    s = stream(max_measurement_age_ms=100, max_future_skew_ms=50)
+    value = odom(1200)
+    value['pose']['stamp_ms'] = 1000
+    s.odom(value, now=1.2, measurement_now_ns=1_200_000_000)
+    assert s.status(now=1.2, measurement_now_ns=1_200_000_000)['odometry'] != 'tracking'
+    assert 'stale' in s.last_error
+
+
+def test_explicit_pose_time_cannot_override_diagnostic_source_evidence():
+    s = stream(input_contract=resolved())
+    value = measured_odom(1000)
+    value['pose']['stamp_ms'] = 1100
+    s.odom(value, now=1.1)
+    assert s.status(now=1.1)['odometry'] != 'tracking'
+    assert 'measurement timestamp' in s.last_error
+
+
+def test_rest_feedback_with_lost_slam_quality_cannot_map():
+    s = stream()
+    s.odom(odom(1000), now=1.)
+    value = odom(1100, status='lost')
+    value['twist'] = [0.3, 0, None, None, None, -0.4]
+    value['pose'] = None
+    s.odom(value, now=1.1)
+    with pytest.raises(ValueError, match='odometry stale or unavailable'):
+        s.cloud(1_100_000_000, 'camera', [[1, 2, 3]], now=1.1)
+    assert not s.accepted
+    assert s.status(now=1.1)['odometry'] != 'tracking'
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+def test_rest_republication_does_not_refresh_diagnostic_pose_ingress(explicit):
+    s = stream(input_contract=resolved() if explicit else None)
+    value = measured_odom(1000)
+    value['pose']['stamp_ms'] = 1000
+    s.odom(value, now=1.)
+    for now, rest_stamp in [(1.1, 1100), (1.9, 1900)]:
+        value['stamp_ms'] = rest_stamp
+        value['twist'] = [0.3, 0, None, None, None, -0.4]
+        s.odom(value, now=now)
+        assert s.status(now=now)['odometry'] == 'tracking'
+        assert not s.last_error
+    assert s.status(now=2.01)['odometry'] == 'stale'
+    assert s.status(now=2.01)['last_error'] == 'odometry receipt stale'

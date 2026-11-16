@@ -57,15 +57,22 @@ def validate_tracking_pose(sample):
     units = sample.get('units')
     if not isinstance(units, dict) or units.get('length') != 'm':
         raise SpatialSlamError('SLAM pose length unit must be m')
-    stamp = sample.get('stamp_ms')
+    vendor, pose = sample.get('vendor'), sample.get('pose')
+    # motus.odom/1 permits pose time to differ from the twist's sample time.
+    stamp = pose.get('stamp_ms', sample.get('stamp_ms')) if isinstance(pose, dict) else None
     if type(stamp) is not int or stamp <= 0:
         raise SpatialSlamError('SLAM stamp_ms must be positive integer measurement time')
-    vendor, pose = sample.get('vendor'), sample.get('pose')
     quality = vendor.get('motus_slam') if isinstance(vendor, dict) else None
     if not isinstance(quality, dict) or not isinstance(pose, dict):
         raise SpatialSlamError('pose and vendor.motus_slam are required')
     if quality.get('status') != 'tracking' or quality.get('stamp_source') != 'measurement':
         raise SpatialSlamError('SLAM tracking pose requires measurement stamp_source')
+    measurement = quality.get('measurement')
+    if measurement is not None:
+        precise = measurement.get('stamp_ns') if isinstance(measurement, dict) else None
+        if (type(precise) is not int or precise <= 0 or precise // 1_000_000 != stamp or
+                (quality.get('stamp_ns') is not None and quality['stamp_ns'] != precise)):
+            raise SpatialSlamError('pose measurement timestamp mismatch')
     for key in ('segment_id', 'clock_id'):
         if not _text(quality.get(key)):
             raise SpatialSlamError('vendor.motus_slam.' + key + ' is required')

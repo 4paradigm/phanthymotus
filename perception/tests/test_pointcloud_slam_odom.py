@@ -80,3 +80,24 @@ def test_standard_pose_rejects_unusable_or_unproven_inputs(change):
     change(data)
     with pytest.raises(ValueError):
         decode_slam_odom(data)
+
+
+@pytest.mark.parametrize('twist_stamp', [2000, None])
+def test_slam_decoder_uses_independent_pose_measurement_time(twist_stamp):
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    value = standard_sample()
+    value['stamp_ms'] = twist_stamp
+    value['pose']['stamp_ms'] = 1234
+    value['vendor']['motus_slam']['stamp_ns'] = 1_234_000_123
+    result = decode_slam_odom(value)
+    assert result.stamp_ms == 1234
+    assert result.stamp_ns == 1_234_000_123
+    assert value['stamp_ms'] == twist_stamp
+
+
+def test_slam_decoder_keeps_legacy_top_level_pose_time():
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    value = standard_sample()
+    result = decode_slam_odom(value)
+    assert result.stamp_ms == 1234
+    assert result.stamp_ns == 1_234_000_000
