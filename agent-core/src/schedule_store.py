@@ -766,6 +766,27 @@ async def fire_now(sid: str) -> Schedule:
     准入和记账在线程池里（要持锁、读写库），推事件在循环里。用拍下的快照推事件：名字和文字
     来自同一时刻；与删除的先后以拍快照为准。"""
     import asyncio
+    # 准入、推事件、记账作为一个独立 task 跑，外面用 shield 等：HTTP 请求在中途被取消
+    # （客户端断开、服务关闭）时，这一次照样走完——占的名额和“正在触发”标记由
+    # _settle_manual 收好尾，不会留下占着的名额或挡住下一次手动触发的标记。
+    task = asyncio.ensure_future(_fire_now_inner(sid))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            scheduler._settling.add(task)
+            task.add_done_callback(_forget_settling)
+        raise
+
+
+def _forget_settling(task) -> None:
+    scheduler._settling.discard(task)
+    if not task.cancelled():
+        task.exception()          # 取走结果，免得“exception was never retrieved”
+
+
+async def _fire_now_inner(sid: str) -> Schedule:
+    import asyncio
     import event_bus
     s, ticket = await asyncio.to_thread(_snapshot_and_reserve, sid)
     if s is None:

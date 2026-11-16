@@ -1115,5 +1115,68 @@ class TestSixthReview(_Base):
         self.assertEqual(scheduler._pending, [])
 
 
+class TestSeventhReview(_Base):
+    """PR #398 第七轮：立即触发的请求被取消时照样收尾；设置确实写进 SQLite（config.main 是 ConfigDB）。"""
+
+    def _cancel_manual(self, enqueue_ok: bool):
+        import event_bus
+        with _FakeJobs():
+            s = schedule_store.create(name='手动取消' + str(enqueue_ok), text='x', cron=self._far_cron())
+        started = []
+
+        async def slow(source, text, payload=None):
+            started.append(1)
+            await asyncio.sleep(0.2)
+            if not enqueue_ok:
+                raise RuntimeError('down')
+
+        async def go():
+            orig = event_bus.enqueue
+            event_bus.enqueue = slow
+            try:
+                req = asyncio.ensure_future(schedule_store.fire_now(s.id))
+                while not started:
+                    await asyncio.sleep(0.01)
+                req.cancel()                      # 模拟 HTTP 请求被取消
+                with self.assertRaises(asyncio.CancelledError):
+                    await req
+                for _ in range(100):
+                    if not scheduler._settling:
+                        break
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
+            finally:
+                event_bus.enqueue = orig
+        asyncio.run(asyncio.wait_for(go(), 10))
+        self.assertEqual(scheduler._settling, set())
+        return schedule_store.find(s.name)
+
+    def test_cancelled_manual_fire_settles_delivered(self):
+        s = self._cancel_manual(True)
+        self.assertEqual(s.fire_count, 1)
+        self.assertEqual(schedule_store._fires_today(time.time()), 1)
+
+    def test_cancelled_manual_fire_settles_failed(self):
+        s = self._cancel_manual(False)
+        self.assertEqual(s.fire_count, 0)
+        self.assertEqual(schedule_store._fires_today(time.time()), 0, '没发出去：名额退回')
+        self.assertNotIn(s.id, schedule_store._last_fire, '没发出去：不挡下一次手动触发')
+        schedule_store._fire_times.clear()
+        schedule_store.load_all()
+        self.assertEqual(schedule_store._fires_today(time.time()), 0, '库里的名额也删了')
+
+    def test_settings_are_written_to_sqlite(self):
+        self.assertIsInstance(config.main, config.ConfigDB)
+        schedule_store.update_settings(max_fires_per_day=30, model_tools_enabled=True)
+        with sqlite3.connect(str(config.DB_PATH)) as conn:
+            row = conn.execute("SELECT value FROM config WHERE key = 'scheduler_settings'").fetchone()
+        import json
+        saved = json.loads(row[0])
+        self.assertEqual(saved['max_fires_per_day'], 30)
+        self.assertTrue(saved['model_tools_enabled'])
+        self.assertEqual(config.ConfigDB()['scheduler_settings']['max_fires_per_day'], 30,
+                         '新的 ConfigDB 实例（相当于重启后）读到的也是新值')
+
+
 if __name__ == '__main__':
     unittest.main()
