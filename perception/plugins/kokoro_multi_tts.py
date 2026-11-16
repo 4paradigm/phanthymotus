@@ -347,9 +347,9 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 WORK = Path(__file__).resolve().parents[1]
 # Filled with the published, immutable release before submission. Missing pins
 # fail explicitly; an unverified or unrelated model is never substituted.
-ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=33bca270f5677ac77c8dcfc84c5f01c604fc7abf&FilePath=kokoro-multi-jp61-fp32-v8.tar.gz"
-ASSET_SHA256 = "3e70ba779651ebc482e6a5fcf4118ed8c4c2ed8fcd1676f581c624e68252bf9f"
-ASSET_SIZE = 328024817
+ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=ca075cd40fbb2a26e6f22b2b7c2174c95981aa98&FilePath=kokoro-multi-jp61-fp32-v9.tar.gz"
+ASSET_SHA256 = "10ab5d3a7bffd23c403e7278ade70f9d5cb8a9442dbab14a0cb9944a13eea9b2"
+ASSET_SIZE = 324805088
 
 
 def enabled():

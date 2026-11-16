@@ -62,8 +62,8 @@ _IPV4_CUES = {
     "en": r"\b(?:ipv4|ip|address)(?:[ \t]+(?:address|is|at))?",
     "ja": r"(?:IPv4|IP(?:アドレス)?|アドレス)(?:は|が)?",
     "de": r"\b(?:ipv4|ip(?:[- ]adresse)?|adresse)(?:[ \t]+(?:ist|lautet))?",
-    "fr": r"\b(?:ipv4|ip|adresse(?:[ \t]+ip)?)(?:[ \t]+(?:est|vaut))?",
-    "es": r"\b(?:ipv4|ip|dirección(?:[ \t]+ip)?)(?:[ \t]+es)?",
+    "fr": r"\b(?:ipv4|ip|adresse(?:[ \t]+ip)?)(?:[ \t]+(?:d['’]exemple|de[ \t]+(?:test|documentation))){0,2}(?:[ \t]+(?:est|vaut))?",
+    "es": r"\b(?:ipv4|ip|dirección(?:[ \t]+ip)?)(?:[ \t]+de[ \t]+(?:prueba|ejemplo|documentación)){0,2}(?:[ \t]+es)?",
     "ru": r"\b(?:ipv4|ip(?:[- ]адрес)?|адрес)(?:[ \t]+(?:сервера|хоста|равен))?",
     "th": r"(?:IPv4|IP|ไอพี|ที่อยู่(?:ไอพี)?)(?:คือ|เป็น)?",
 }
@@ -104,35 +104,6 @@ _IDENTIFIER_CUES = {
     "es": r"código de verificación(?: ficticio)?|número de pedido",
     "th": r"รหัสยืนยัน(?:สมมติ)?(?:ของคุณ)?|หมายเลขคำสั่งซื้อ",
 }
-
-# V4's reviewed word/letter components, rendered by Kokoro's own English G2P.
-# Keep ARPAbet and ordinary case-sensitive words out of this table.
-_BUSINESS_READINGS = {
-    "OpenAI": "open A I", "OpenMLDB": "open M L D B",
-    "FeatInsight": "feat insight", "ModelScope": "model scope",
-    "HuggingFace": "hugging face", "AGI": "A G I", "AIGC": "A I G C",
-    "AIOS": "A I O S", "AIGS": "A I G S", "AIStudio": "A I studio",
-    "AIPlatform": "A I platform", "AIAgent": "A I agent",
-    "CompositeAI": "composite A I", "ModelHubXC": "model hub X C",
-    "HyperCycle": "hyper cycle", "AutoTune": "auto tune", "AutoDL": "auto D L",
-    "FeatureStore": "feature store", "DataFrame": "data frame",
-    "KVCache": "K V cache", "VectorDB": "vector D B", "TimeSeries": "time series",
-    "WebSockets": "web sockets", "OpenSDK": "open S D K",
-    "LLMBench": "L L M bench", "TokenFactory": "token factory",
-    "SageOne": "sage one", "SageGPT": "sage G P T",
-    "CSV": "C S V", "JVM": "J V M", "JDK": "J D K",
-    "CDN": "C D N", "HTML": "H T M L",
-    "AgenticAI": "agentic A I", "HyperCircle": "hyper circle",
-    "ONNXRuntime": "onyx runtime", "RISEvGPU": "rise V G P U",
-    "PhancyCloud": "fancy cloud", "PhanthyMovie": "fancy movie",
-    "PhanthyCode": "fancy code", "PhanthyWork": "fancy work",
-}
-_FOLD_TECH_TERMS = {
-    "4Paradigm", "ModelHub", "ModelHub XC", "ModelSphere", "GPU", "CPU", "NPU",
-    "API", "ASR", "TTS", "XML", "YAML", "HTTP", "HTTPS",
-    "SDK", "LLM", "vGPU", "Phanthy", "Phancy", "PhanthyCloud", "RISE vGPU",
-}
-
 
 _lexicon_path = None
 
@@ -939,8 +910,8 @@ _ABBREVIATIONS = {
 }
 
 
-def first_sentence_parts(text, protected=()):
-    """Return the complete opening sentence and intact tail, without repacking."""
+def first_sentence_parts(text, protected=(), *, clause=False):
+    """Return a natural opening boundary and its intact tail, without repacking."""
     opens = {"(": ")", "[": "]", "{": "}", "（": "）", "【": "】",
              "《": "》", "「": "」", "『": "』", "“": "”"}
     stack = []
@@ -951,8 +922,19 @@ def first_sentence_parts(text, protected=()):
         if char in opens:
             stack.append(opens[char])
             continue
-        if stack or char not in "。！？!?." or any(a <= index < b for a, b in protected):
+        clause_stop = clause and char in ",，、;；:："
+        if stack or (char not in "。！？!?." and not clause_stop) or any(a <= index < b for a, b in protected):
             continue
+        if clause_stop:
+            head = text[:index]
+            native_letters = re.findall(r"[\u3040-\u30ff\u4e00-\u9fff\u0e00-\u0e7f]", head)
+            words = re.findall(r"[^\W\d_][\w'’'-]*", head)
+            # Keep a greeting such as "Hello," attached to its following clause.
+            if len(native_letters) < 4 and len(words) < 4:
+                continue
+            # The comma before an English calendar year belongs to the date.
+            if char == "," and re.match(r"\s*(?:\d{4}\b|two thousand\b|nineteen\b|twenty\b)", text[index+1:]):
+                continue
         left, right = text[index - 1:index], text[index + 1:index + 2]
         if char == ".":
             if left == "." or right == "." or (left.isalnum() and right.isalnum()):
@@ -1170,10 +1152,9 @@ class Frontend:
             self._literal_symbol_words.setdefault(symbol, {}).update(words)
         configure_lexicon(self._lexicon_path)
         self._english = EnglishWithHints(british=False, fallback=espeak.EspeakFallback(british=False))
+        self._english.lexicon.golds.update(lexicon.get("english_overrides", {}))
         for word, overrides in lexicon.get("pos_overrides", {}).items():
             self._english.lexicon.golds[word].update(overrides)
-        # V4 reviews the company component Phanthy as the English word Fancy.
-        self._english.lexicon.golds["phanthy"] = self._english("fancy")[0]
         self._read_present = self._english.lexicon.golds["read"]["DEFAULT"]
         self._lead_metal = self._english.lexicon.golds["led"]
         self._japanese, self._sandhi = Cutlet(), ToneSandhi()
@@ -1187,32 +1168,9 @@ class Frontend:
         self._thai._tokenizer._dict = self._thai._tokenizer.vocab | set(overrides)
         self._thai._tokenizer._engine = Tokenizer(
             custom_dict=self._thai._tokenizer.vocab, engine="newmm")
-        entries = {e["term"]: dict(e) for e in lexicon["entries"] if e["enabled"]}
-        for term, spoken in (("AI", "A I"), ("Whisper", "whisper"),
-                             ("CosyVoice", "cosy voice"), ("Kokoro", "Kokoro"),
-                             ("XTTS", "X T T S"), ("XTTS-v2", "X T T S V two"),
-                             ("CER", "C E R"), ("VAD", "V A D"),
-                             ("ASML", "A S M L"), ("ASR", "A S R"),
-                             ("TTS", "T T S"), ("XML", "X M L"), ("YAML", "yaml"),
-                             ("large-v3", "large V three"), ("large-v3-turbo", "large V three turbo"),
-                             ("1X Technologies", "one X technologies")):
-            entries.setdefault(term, {"term": term, "spoken_english": spoken,
-                                      "aliases": [], "case_sensitive": True})
-        for term, spoken in _BUSINESS_READINGS.items():
-            entries.setdefault(term, {"term": term, "spoken_english": spoken,
-                                      "aliases": [], "case_sensitive": False})
-        for term, entry in entries.items():
-            if term in _FOLD_TECH_TERMS:
-                entry["case_sensitive"] = False
-        for term, alias in (("AI", "A I"), ("SageAIOS", "Sage A I O S"),
-                            ("4Paradigm", "Fourth Paradigm"), ("4Paradigm", "FourthParadigm"),
-                            ("AgenticAI", "Agentic AI"), ("HyperCircle", "Hyper Circle"),
-                            ("ONNXRuntime", "ONNX Runtime"),
-                            ("ModelHubXC", "Model Hub XC"), ("ModelHubXC", "Model HubXC")):
-            if term in entries:
-                entries[term]["aliases"] = list(dict.fromkeys([*entries[term]["aliases"], alias]))
+        entries = [entry for entry in lexicon["entries"] if entry["enabled"]]
         alternatives, self._entries = [], {}
-        for index, entry in enumerate(entries.values()):
+        for index, entry in enumerate(entries):
             for form in [entry["term"], *entry["aliases"]]:
                 name = f"w{index}_{len(alternatives)}"
                 body = re.escape(form).replace(r"\ ", r"[ \t]+")
@@ -1495,7 +1453,7 @@ class Frontend:
         """Normalize the full request once; defer tail G2P until its turn."""
         source, spoken, language = self._prepare_text(text, language)
         protected = self._literal_spans(spoken) + [m.span() for m in self._terms.finditer(spoken)]
-        for part in first_sentence_parts(spoken, protected):
+        for part in first_sentence_parts(spoken, protected, clause=True):
             yield self._phonemize(part, language, source)
 
     def _phonemize(self, spoken, language, source_text):
