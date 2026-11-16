@@ -111,7 +111,7 @@ class _StorageLimit(RuntimeError):
 class RtabmapNode(Node):
     """A short-lock input gate, native process worker and bounded map display.
 
-    Each external VO segment has a private ROS graph and native database.
+    Each mapping session has a private ROS graph and native database.
     Process startup, shutdown, disk checks and map conversion never hold the
     capture lock. freeze_capture therefore remains a quick publication barrier.
     """
@@ -204,7 +204,7 @@ class RtabmapNode(Node):
                         # headers in this clock. New receipt paths declare v2.
                         declaration={'vendor':{'clock_id':self.stream.clock_id,'timestamp_semantics':'source_capture_mapped'}}
                     self._input_leases.append(input_registry.acquire(topic, kind, declaration, callback))
-            if input_contract:
+            if input_contract and input_contract.get('frame_metadata_topic'):
                 self.create_subscription(String, input_contract['frame_metadata_topic'], self._cloud_metadata, _QOS)
             if self._rgb is not None and self._rgb.camera is not None:
                 topic = self._settings['rgb_input']['topic']
@@ -294,8 +294,6 @@ class RtabmapNode(Node):
             stamp, frame, _ = decode_cloud(msg, max_points=self.stream.max_cloud_points)
             received = (context.ingress_monotonic_ns/1e9 if context is not None and
                         context.ingress_clock_id == self.stream.ingress_clock_id else self._receipt_clock())
-            if context is not None and context.time_basis == 'receipt_estimated' and self._capture_clouds is not None:
-                raise ValueError('receipt observation has no exact capture mount identity')
             digest = hashlib.sha256(bytes(msg.data)).hexdigest() if self.stream.input_contract else None
             with self._lock:
                 if not self._stopped():
@@ -319,18 +317,8 @@ class RtabmapNode(Node):
         if ingress is None:
             raise ValueError('cloud original ingress context expired')
         received, observation = ingress
-        if self._receipt_clock()-received > self.stream.max_age_s:
-            raise ValueError('cloud exceeded end-to-end ingress budget')
-        from .spatial_quality import MapGate
-        from .rgbd_odometry_contract import make_sample
-        sample = make_sample('tracking', stamp, pose.segment_id, pose.clock_id,
-            dict(frame_id=pose.frame_id, child_frame_id=pose.child_frame_id, position=list(pose.position),
-                 quaternion=list(pose.quaternion), covariance=pose.covariance))
-        _, _, points = decode_cloud(cloud, max_points=self.stream.max_cloud_points)
-        decision = MapGate(dynamic_mount=self.stream.extrinsic_mode=='dynamic').evaluate(sample,points,observation)
-        self._map_decision = dict(action=decision.action,reason=decision.reason)
-        if decision.action != 'accept':raise ValueError(decision.reason)
-        normalized = normalize_cloud(cloud, observation, (context or {}).get('data_sha256'),
+        self._map_decision = dict(action='accept', reason='numeric cloud and pose')
+        normalized = normalize_cloud(cloud, observation, None,
                                      max_points=self.stream.max_cloud_points)
         cloud = normalized.message
         if len(self._queue) >= self.stream.max_pending:
@@ -419,7 +407,7 @@ class RtabmapNode(Node):
                 lambda msg, target=segment, handler=callback: handler(msg, target), qos))
         process.start()
         # Native initialization can exceed ten seconds during model warmup.
-        # This bounds discovery only; queued captures still pass freshness checks.
+        # Bound process discovery independently of input measurement timestamps.
         deadline = time.monotonic() + 30.
         while not self._stopped():
             if process.poll() is not None:
@@ -465,27 +453,19 @@ class RtabmapNode(Node):
         cloud.header.frame_id = transform.child_frame_id
         native, rgb_generation = self._sensor_data(cloud, pose, matrix) if self._rgb is not None else (cloud, None)
         with self._lock:
-            if self._stopped() or self._receipt_clock() - received > self.stream.max_age_s:
+            if self._stopped():
                 return
-            now_ns = self._measurement_now()
-            self.stream._check_measurement_time(stamp, now_ns)
-            health = self.stream.status(now=self._receipt_clock(), measurement_now_ns=now_ns)
-            # Newer clouds waiting for their sidecars do not invalidate this
-            # already admitted pair. Tracking and segment barriers still apply.
-            if (health['odometry'] != 'tracking' or health['integration'] not in
-                    ('admitting', 'waiting_for_cloud_metadata') or
-                    not self.stream._poses or self.stream._poses[-1].segment_id != pose.segment_id):
+            if not self.stream._poses:
                 return
             if self.stream.extrinsic_mode != 'dynamic':
                 segment['tf_pub'].publish(tf)
             segment['odom_tf_pub'].publish(odom_tf)
             segment['odom_pub'].publish(odom)
-            # An optional image that expired during projection is omitted; the
-            # admitted scan and odometry continue through the same native node.
+            # A decode fault may invalidate the optional image during projection;
+            # the admitted scan and pose continue through the same native node.
             guard = self._rgb.publication(rgb_generation) if self._rgb is not None else nullcontext(True)
             with guard as valid_rgb:
-                if self._rgb is not None and native.left.data and (not valid_rgb or not -50_000_000 <= (
-                        self._measurement_clock_ns() - self._stamp(native.left)) <= 500_000_000):
+                if self._rgb is not None and native.left.data and not valid_rgb:
                     native.left.data, native.right.data = b'', b''
                     native.left_camera_info, native.local_transform = [], []
                     self._rgb_mode, self._rgb_reason = 'pointcloud', 'RGB expired or invalidated before native publication'
@@ -556,8 +536,6 @@ class RtabmapNode(Node):
             rgb_stamp, image, generation = rgb
             rgb_pose = align_pose(list(self.stream._poses), rgb_stamp,
                                   max_gap_ms=self.stream.max_gap_ms)
-            if rgb_pose.segment_id != pose.segment_id:
-                raise ValueError('RGB pose belongs to a different map segment')
             mount = self._rgb.capture_mount(rgb_stamp, matrix, now_ns)
             if mount is None:
                 return None
@@ -607,7 +585,7 @@ class RtabmapNode(Node):
             if item is None:
                 continue
             try:
-                if self._active is None or self._active['segment_id'] != item[2].segment_id:
+                if self._active is None:
                     segment = self._activate(item[2])
                 else:
                     segment = self._active

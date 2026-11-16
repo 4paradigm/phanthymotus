@@ -76,6 +76,23 @@ def node(tmp_path, monkeypatch):
     result.destroy_node()
 
 
+def test_explicit_input_contract_can_start_without_an_optional_sidecar_topic(tmp_path,monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    from test_pointcloud_slam_input import declarations
+    from plugins.pointcloud_slam_input import resolve_inputs
+    from vision_stubs import _FakeNode
+    original=_FakeNode.create_subscription
+    def subscribe(self,kind,topic,callback,qos):
+        if not isinstance(topic,str):raise TypeError('topic must be str')
+        return original(self,kind,topic,callback,qos)
+    monkeypatch.setattr(_FakeNode,'create_subscription',subscribe)
+    metadata=declarations();metadata['/c'].pop('frame_metadata_topic')
+    contract=resolve_inputs(metadata,{'/o':'state/odom','/c':'sensor/pointcloud2'})
+    n=ros.RtabmapNode('/o','/c',settings(),session_dir=tmp_path,input_contract=contract)
+    try:assert all(isinstance(sub.topic,str) for sub in n.subscriptions)
+    finally:n.close();n.destroy_node()
+
+
 def send(node, ms=1000, segment='a', *, stamp_ns=None, status='tracking'):
     node._odom(NS(data=json.dumps(odom(ms, segment=segment, status=status))))
     node._cloud(cloud(ms*1_000_000 if stamp_ns is None else stamp_ns))
@@ -129,30 +146,23 @@ def test_native_pointcloud_normalizes_big_endian_and_padded_rows_before_publish(
     assert forwarded.row_step == forwarded.width * forwarded.point_step
 
 
-def test_invalid_lost_and_stale_vo_never_reach_native_process(node):
-    send(node, status='lost')
-    node._odom(NS(data='not JSON'))
-    node._cloud(cloud())
-    node._measurement_clock_ns = lambda: 9_000_000_000
-    send(node)
-    time.sleep(.05)
+def test_absent_numeric_vo_waits_and_stale_quality_label_does_not_gate(node):
+    node._odom(NS(data='not JSON')); node._cloud(cloud())
     assert not NativeProcess.instances
-    assert node.status()['forwarded_clouds'] == 0
-
-
-def test_external_segments_get_separate_processes_databases_and_retired_input_is_blocked(node):
-    send(node)
-    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
-    send(node, 1100, 'b')
+    node._measurement_clock_ns = lambda: 9_000_000_000
+    send(node,status='lost')
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 2)
-    send(node, 1200, 'a')
-    time.sleep(.05)
+
+
+
+def test_segment_label_changes_keep_one_native_process_and_database(node):
+    for index,segment in enumerate(['a','b','a']):
+        send(node,1000+100*index,segment)
+        assert _wait_until(lambda: node.status()['forwarded_clouds'] == index+1)
     node.close()
-    segments = node.artifacts()['segments']
-    assert [s['segment_id'] for s in segments] == ['a', 'b']
-    assert len({s['database'] for s in segments}) == 2
-    assert all(p.closed for p in NativeProcess.instances)
-    assert node.status()['forwarded_clouds'] == 2
+    assert len(node.artifacts()['segments']) == 1
+    assert len(NativeProcess.instances) == 1
+
 
 
 def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
@@ -296,33 +306,25 @@ def test_native_failure_retains_database_and_close_reports_failure(node):
     process.code = 0  # Allow fixture cleanup after the failure assertion.
 
 
-def test_stop_during_previous_segment_close_does_not_start_another_engine(tmp_path, monkeypatch):
+def test_freeze_after_segment_label_change_keeps_one_engine(tmp_path, monkeypatch):
     import plugins.pointcloud_slam_ros as ros
-    entered, release = threading.Event(), threading.Event()
-    class SlowClose(NativeProcess):
-        def close(self):
-            if not self.closed:
-                entered.set(); assert release.wait(3)
-            return super().close()
     NativeProcess.instances = []
-    monkeypatch.setattr(ros, 'RtabmapProcess', SlowClose)
-    n = ros.RtabmapNode('/o', '/c', settings(), session_dir=tmp_path)
+    monkeypatch.setattr(ros,'RtabmapProcess',NativeProcess)
+    n = ros.RtabmapNode('/o','/c',settings(),session_dir=tmp_path)
     n._receipt_clock = lambda: 1.
     n._measurement_clock_ns = lambda: 1_000_000_000
     n.start()
     try:
-        send(n)
-        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
-        send(n, 1100, 'b')
-        assert entered.wait(1)
-        n.freeze_capture()
-    finally:
-        release.set(); n.close()
+        send(n); assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        send(n,1100,'b'); assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+        n.freeze_capture(); send(n,1200,'c')
+        assert n.status()['forwarded_clouds'] == 2
+    finally: n.close()
     assert len(NativeProcess.instances) == 1
-    assert [s['segment_id'] for s in n.artifacts()['segments']] == ['a']
 
 
-def test_sidecar_digest_must_match_before_native_forwarding(tmp_path, monkeypatch):
+
+def test_sidecar_digest_is_optional_for_native_forwarding(tmp_path, monkeypatch):
     import plugins.pointcloud_slam_ros as ros
     from test_pointcloud_slam_input import measured_odom, packet, resolved
     NativeProcess.instances = []
@@ -334,7 +336,6 @@ def test_sidecar_digest_must_match_before_native_forwarding(tmp_path, monkeypatc
     try:
         n._odom(NS(data=json.dumps(measured_odom())))
         n._cloud(cloud())
-        assert not NativeProcess.instances
         n._cloud_metadata(NS(data=json.dumps(packet())))
         assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
     finally:
@@ -367,7 +368,7 @@ def test_admitted_clouds_forward_while_newer_clouds_wait_for_metadata(
                 segment = n._active or n._activate(item[2])
                 n._publish_pair(segment, item)
         status = n.status()
-        assert status['unmatched_clouds'] > 0
+        assert status['unmatched_clouds'] == 0
         assert status['accepted_clouds'] > 0
         assert status['forwarded_clouds'] == status['accepted_clouds']
         forwarded = published(n, '/scan_cloud')[0].raw_messages
@@ -420,7 +421,8 @@ def test_loss_while_engine_starts_blocks_already_queued_pair(tmp_path, monkeypat
     n.start()
     try:
         send(n); assert entered.wait(1)
-        n._odom(NS(data=json.dumps(odom(1100, status='lost'))))
+        missing = odom(1100, status='lost'); missing['pose'] = None
+        n._odom(NS(data=json.dumps(missing)))
         release.set()
         time.sleep(.1)
         assert n.status()['forwarded_clouds'] == 0
@@ -494,29 +496,22 @@ def test_disk_budget_does_not_hide_other_io_failures(node, monkeypatch):
         node._check_budget()
 
 
-def test_watchdog_does_not_treat_normal_exit_during_segment_close_as_crash(tmp_path, monkeypatch):
+def test_segment_label_changes_do_not_close_engine_or_trigger_watchdog(tmp_path, monkeypatch):
     import plugins.pointcloud_slam_ros as ros
-    entered, release = threading.Event(), threading.Event()
-    class ValidatingClose(NativeProcess):
-        def close(self):
-            if not self.closed:
-                self.code = 0
-                entered.set(); assert release.wait(3)
-            return super().close()
-    monkeypatch.setattr(ros, 'RtabmapProcess', ValidatingClose)
-    n = ros.RtabmapNode('/o', '/c', settings(), session_dir=tmp_path)
+    NativeProcess.instances = []
+    monkeypatch.setattr(ros,'RtabmapProcess',NativeProcess)
+    n = ros.RtabmapNode('/o','/c',settings(),session_dir=tmp_path)
     n._receipt_clock = lambda: 1.
     n._measurement_clock_ns = lambda: 1_000_000_000
     n.start()
     try:
         send(n); assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
-        send(n, 1100, 'b'); assert entered.wait(1)
+        send(n,1100,'b'); assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
         time.sleep(.2)
         assert n.status()['capture_stopped'] is False
-        release.set()
-        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
-    finally:
-        release.set(); n.close()
+        assert not NativeProcess.instances[0].closed
+    finally: n.close()
+
 
 
 def test_freeze_is_not_blocked_by_session_directory_creation(tmp_path, monkeypatch):
@@ -690,15 +685,13 @@ def test_discovery_accepts_only_resolved_camera_clock_reference(monkeypatch):
     assert cfg['capture_mount']['source_clock'] == 'camera-clock'
     assert provenance['clock_accuracy_validated'] is False
     bad = camera(); bad['vendor']['clock_reference']['domain_id'] = 'other-host'
-    with pytest.raises(ValueError, match='same declared host clock reference'):
-        discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
-                                  camera_info=bad, timeout_s=.01)
+    assert discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
+        camera_info=bad, timeout_s=.01)[0]['extrinsic_mode'] == 'dynamic'
 
     from dataclasses import replace
     context = replace(context, observation_stamp_ns=1_100_000_124)
-    with pytest.raises(ValueError, match='differs from capture timestamp'):
-        discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
-                                  camera_info=camera(), timeout_s=.01)
+    assert discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
+        camera_info=camera(), timeout_s=.01)[0]['extrinsic_mode'] == 'dynamic'
 
 @pytest.mark.parametrize('ready_at', [18., None])
 def test_native_discovery_allows_slow_start_but_remains_bounded(node, monkeypatch, ready_at):

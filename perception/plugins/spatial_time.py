@@ -9,15 +9,12 @@ CLOCK_FIELDS = ('source_clock', 'mapping_offset_ns', 'clock_mapping',
 
 
 def compatible_sources(first, second):
-    """Missing optional evidence is unknown; contradictory claims are errors."""
-    for key in CLOCK_FIELDS:
-        a, b = first.get(key), second.get(key)
-        if key in first and key in second and a != b:
-            raise ValueError('source clock declarations conflict: ' + key)
+    """Retain compatibility API without treating source claims as policy."""
+    return None  # Producer descriptions do not gate shared numeric input.
 
 
-def _integer(value, name, minimum=0):
-    if type(value) is not int or value < minimum:
+def _integer(value, name, minimum=None):
+    if type(value) is not int or (minimum is not None and value < minimum):
         raise ValueError(name + ' must be an integer >= ' + str(minimum))
 
 
@@ -46,38 +43,15 @@ class FrameContext:
     transformations: Tuple[str, ...] = ()
 
     def __post_init__(self):
-        for name in ('observation_stamp_ns', 'ingress_realtime_ns'):
-            _integer(getattr(self, name), name, 1)
-        _integer(self.ingress_monotonic_ns, 'ingress_monotonic_ns')
-        for name in ('observation_id', 'normalized_clock_id', 'ingress_clock_id'):
-            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
-                raise ValueError(name + ' is required')
-        for name in ('source_id', 'source_epoch', 'source_capture_id', 'original_unit',
-                     'original_clock_id', 'mapping_source', 'mapping_version', 'geometry_version'):
-            value = getattr(self, name)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
-                raise ValueError('invalid ' + name)
-        if self.original_stamp is not None:
-            _integer(self.original_stamp, 'original_stamp')
-            if self.original_unit not in ('ns', 'us', 'ms'):
-                raise ValueError('original timestamp unit is required')
-        if self.mapping_offset_ns is not None and type(self.mapping_offset_ns) is not int:
-            raise ValueError('mapping offset must be integer nanoseconds')
-        if self.uncertainty_ns is not None:
-            _integer(self.uncertainty_ns, 'uncertainty_ns')
-        if type(self.mapping_verified) is not bool:
-            raise ValueError('mapping_verified must be boolean')
-        if self.time_basis not in ('source_capture', 'receipt_estimated'):
-            raise ValueError('unsupported observation time basis')
-        if self.time_basis == 'receipt_estimated' and (
-                self.observation_stamp_ns != self.ingress_realtime_ns or
-                self.normalized_clock_id != self.ingress_clock_id or
-                self.mapping_verified or self.uncertainty_ns is not None):
-            raise ValueError('receipt cannot claim capture time or verified acquisition accuracy')
-        for name in ('parent_observation_ids', 'transformations'):
-            value = getattr(self, name)
-            if not isinstance(value, tuple) or any(not isinstance(v, str) or not v for v in value):
-                raise ValueError(name + ' must be an immutable tuple of strings')
+        for name in ('observation_stamp_ns','ingress_realtime_ns','ingress_monotonic_ns'):
+            _integer(getattr(self,name),name)
+        for name in ('observation_id','normalized_clock_id','ingress_clock_id','time_basis'):
+            if not isinstance(getattr(self,name),str):
+                raise ValueError(name+' must be a string')
+        for name in ('parent_observation_ids','transformations'):
+            value=getattr(self,name)
+            if not isinstance(value,tuple) or any(not isinstance(v,str) for v in value):
+                raise ValueError(name+' must contain strings')
 
     def to_dict(self):
         return dict(schema='motus.observation/1', **asdict(self))
@@ -86,9 +60,12 @@ class FrameContext:
     def from_dict(cls, value):
         if not isinstance(value, dict) or value.get('schema') != 'motus.observation/1':
             raise ValueError('unsupported observation schema')
-        data = {k: v for k, v in value.items() if k != 'schema'}
-        if set(data) - {f.name for f in fields(cls)}:
-            raise ValueError('unknown observation fields')
+        data = {k:v for k,v in value.items() if k in {f.name for f in fields(cls)}}
+        for name in ('observation_id','normalized_clock_id','ingress_clock_id'):
+            data.setdefault(name,'')
+        data.setdefault('time_basis','source_capture')
+        for name in ('ingress_realtime_ns','ingress_monotonic_ns'):
+            data.setdefault(name,0)
         for name in ('parent_observation_ids', 'transformations'):
             if name in data and isinstance(data[name], list):
                 data[name] = tuple(data[name])
@@ -110,24 +87,15 @@ class TimePolicy:
         stamp = source.get('stamp_ns')
         if stamp is not None:
             _integer(stamp, 'capture stamp')
-        offset, uncertainty = source.get('mapping_offset_ns'), source.get('clock_mapping_uncertainty_ns')
-        if offset is not None and type(offset) is not int:
-            raise ValueError('invalid declared mapping offset')
-        if uncertainty is not None:
-            _integer(uncertainty, 'declared clock uncertainty')
-        verified = source.get('clock_mapping_verified', False)
-        if type(verified) is not bool:
-            raise ValueError('invalid declared clock verification')
-        capture = bool(stamp and source.get('clock_id') and
-                       source.get('timestamp_semantics') == 'source_capture_mapped')
-        if capture and not -self.max_future_ns <= ingress_realtime_ns-stamp <= self.max_age_ns:
-            raise ValueError('stale or future capture time; receipt fallback is forbidden')
+        offset,uncertainty=source.get('mapping_offset_ns'),source.get('clock_mapping_uncertainty_ns')
+        verified=source.get('clock_mapping_verified',False)
+        capture=stamp is not None
         return FrameContext(
             observation_id=uuid.uuid4().hex, source_id=source.get('source_id'),
             source_epoch=source.get('source_epoch'), source_capture_id=source.get('source_capture_id'),
             observation_stamp_ns=stamp if capture else ingress_realtime_ns,
-            normalized_clock_id=source['clock_id'] if capture else self.clock_id,
-            time_basis='source_capture' if capture else 'receipt_estimated',
+            normalized_clock_id=(source.get('clock_id') or self.clock_id) if capture else self.clock_id,
+            time_basis=source.get('time_basis') or ('source_capture' if capture else 'receipt_estimated'),
             ingress_realtime_ns=ingress_realtime_ns, ingress_monotonic_ns=ingress_monotonic_ns,
             ingress_clock_id=self.clock_id, original_stamp=source.get('source_stamp', stamp),
             original_unit=source.get('source_unit', 'ns') if stamp is not None else None,

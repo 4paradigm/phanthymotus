@@ -1,13 +1,9 @@
-"""Decode tracking odometry poses without depending on ROS.
-
-Freshness, ordering and segment transitions require stream state and are the
-consumer's responsibility. This parser does not turn lost samples into poses.
-"""
+"""Decode numeric odometry poses without depending on ROS."""
 
 from dataclasses import dataclass
 import math
 
-from .spatial_contract import validate_tracking_pose
+from .pointcloud_slam_contract import validate_tracking_pose
 from .spatial_time import FrameContext
 
 
@@ -66,43 +62,30 @@ def decode_legacy_odom(sample):
 
 
 def decode_slam_odom(sample):
-    """Decode the common SLAM profile; stream freshness is checked separately."""
+    """Decode finite pose numbers without certifying producer metadata."""
     validate_tracking_pose(sample)
-    if not isinstance(sample, dict) or sample.get("schema") != "motus.odom/1":
-        raise ValueError("unsupported odometry schema")
-    units = sample.get("units")
-    if not isinstance(units, dict) or units.get("length") != "m":
-        raise ValueError("pose length must be in meters")
-    pose = sample.get("pose")
-    stamp = pose.get("stamp_ms", sample.get("stamp_ms"))
-    if type(stamp) is not int or stamp <= 0:
-        raise ValueError("invalid odometry timestamp")
-    pose, vendor = sample.get("pose"), sample.get("vendor")
-    quality = vendor.get("motus_slam") if isinstance(vendor, dict) else None
-    if not isinstance(pose, dict) or not isinstance(quality, dict):
-        raise ValueError("pose and SLAM metadata are required")
-    if quality.get("status") != "tracking" or quality.get("stamp_source") not in ("measurement", "receipt_estimated"):
-        raise ValueError("odometry is not a tracking measurement")
-    frame, child = pose.get("frame_id"), pose.get("child_frame_id")
-    segment, clock = quality.get("segment_id"), quality.get("clock_id")
-    if any(not isinstance(v, str) or not v.strip() for v in (frame, child, segment, clock)):
-        raise ValueError("pose frames, segment and clock are required")
-    position = _vector(pose.get("position"), 3)
-    quaternion = _vector(pose.get("quaternion"), 4)
-    if abs(sum(v * v for v in quaternion) - 1.0) > 0.002:
-        raise ValueError("quaternion is not normalized")
-    covariance = pose.get("covariance")
+    pose = sample['pose']
+    vendor = sample.get('vendor')
+    vendor = vendor if isinstance(vendor, dict) else {}
+    quality = vendor.get('motus_slam')
+    quality = quality if isinstance(quality, dict) else {}
+    stamp = pose.get('stamp_ms', sample.get('stamp_ms'))
+    position = _vector(pose.get('position'), 3)
+    quaternion = _vector(pose.get('quaternion'), 4)
+    # Scaling first also keeps large finite quaternion components computable.
+    scale = max(abs(v) for v in quaternion)
+    scaled = tuple(v / scale for v in quaternion)
+    norm = math.hypot(*scaled)
+    quaternion = tuple(v / norm for v in scaled)
+    covariance = pose.get('covariance')
     if covariance is not None:
         covariance = _vector(covariance, 36)
     precise = quality.get('stamp_ns')
-    if precise is not None and (type(precise) is not int or precise <= 0 or precise//1_000_000 != stamp):
-        raise ValueError('precise pose timestamp conflicts with milliseconds')
-    reference = quality.get('pose_reference', vendor.get('pose_reference'))
-    if (quality.get('pose_reference') is not None and vendor.get('pose_reference') is not None
-            and quality['pose_reference'] != vendor['pose_reference']):
-        raise ValueError('conflicting pose reference declarations')
-    if reference not in ('camera_optical', 'body'):
-        reference = None  # Neither frame names nor extrinsics declare a pose type.
-    return PoseSample(stamp, frame, child, segment, position, quaternion, covariance, clock, reference,
-                      FrameContext.from_dict(quality['observation']) if quality.get('profile') == 'motus_slam/2' else None,
-                      quality.get('stamp_ns'))
+    if precise is not None and type(precise) is not int:
+        raise ValueError('precise pose timestamp must be integer nanoseconds')
+    observation = quality.get('observation')
+    observation = FrameContext.from_dict(observation) if isinstance(observation, dict) else None
+    return PoseSample(stamp, pose.get('frame_id', ''), pose.get('child_frame_id', ''),
+                      quality.get('segment_id', vendor.get('segment_id', '')), position,
+                      quaternion, covariance, quality.get('clock_id'),
+                      quality.get('pose_reference', vendor.get('pose_reference')), observation, precise)

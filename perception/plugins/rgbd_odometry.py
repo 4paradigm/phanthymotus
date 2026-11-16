@@ -279,13 +279,12 @@ class RgbdOdometryPlugin:
                     mode = 'auto' if settings['visual_frontend'] == 'auto' else 'manual'
                     if mode == 'auto':
                         calibration['visual_frontend'] = _FRONTENDS[0]  # existing default starts
-                    geometry = deepcopy(args['camera_info'])
-                    for declaration in geometry.values():
-                        mount = (declaration.get('vendor') or {}).get('body_mount')
-                        if isinstance(mount, dict):
-                            mount.pop('status', None)
-                            mount.pop('reason', None)
-                    signature = json.dumps([topics, geometry, settings], sort_keys=True)
+                    image_topics = [calibration[k + '_topic'] for k in ('color', 'depth')]
+                    geometry = {topic: {key: args['camera_info'][topic].get(key)
+                                        for key in ('width', 'height', 'K', 'D')}
+                                for topic in image_topics}
+                    signature = json.dumps([image_topics, calibration.get('imu_topic'), geometry, settings],
+                                           sort_keys=True)
                     if current and current[1] != signature:
                         raise ValueError('stop RGB-D odometry before changing its input geometry')
                     if not current:

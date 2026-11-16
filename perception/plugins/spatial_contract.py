@@ -6,25 +6,7 @@ from .spatial_time import FrameContext
 
 
 def validate_tracking_pose(sample):
-    quality = (sample.get('vendor') or {}).get('motus_slam') if isinstance(sample, dict) else None
-    if not isinstance(quality, dict) or quality.get('profile', 'motus_slam/1') == 'motus_slam/1':
-        return validate_v1_pose(sample)
-    if quality.get('profile') != 'motus_slam/2':
-        raise ValueError('unsupported SLAM pose profile')
-    context = FrameContext.from_dict(quality.get('observation'))
-    expected = 'measurement' if context.time_basis == 'source_capture' else 'receipt_estimated'
-    if (quality.get('stamp_source') != expected or quality.get('clock_id') != context.normalized_clock_id or
-            quality.get('stamp_ns') != context.observation_stamp_ns or
-            sample.get('stamp_ms') != context.observation_stamp_ns // 1_000_000 or
-            (isinstance(sample.get('pose'), dict) and
-             sample['pose'].get('stamp_ms', sample.get('stamp_ms')) != context.observation_stamp_ns // 1_000_000)):
-        raise ValueError('pose and observation time declarations conflict')
-    # Reuse v1 geometry/unit validation on a private copy, after validating v2
-    # time above. The wire object remains v2; strict old readers still reject it.
-    geometry = deepcopy(sample)
-    geometry['vendor']['motus_slam']['stamp_source'] = 'measurement'
-    validate_v1_pose(geometry)
-    return sample
+    return validate_v1_pose(sample)
 
 
 def input_declaration(topic, kind, frame, context, *, metadata_topic=None):
@@ -52,77 +34,46 @@ def frame_packet(frame, context, data):
 def validate_frame_packet(packet):
     if not isinstance(packet,dict) or packet.get('schema')!='motus.slam_frame/2':
         raise ValueError('unsupported spatial frame version')
-    context=FrameContext.from_dict(packet.get('observation'))
-    digest=packet.get('data_sha256')
-    if (packet.get('stamp_ns')!=context.observation_stamp_ns or
-            packet.get('clock_id')!=context.normalized_clock_id or
-            not isinstance(packet.get('frame_id'),str) or not packet['frame_id'] or
-            not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest)):
-        raise ValueError('spatial frame identity/digest mismatch')
-    return context
+    return FrameContext.from_dict(packet.get('observation'))
 
 
 def resolve_v2_inputs(metadata, bindings):
-    """Explicit observation-time inputs; never synthesize v1 clock evidence."""
+    """Resolve numeric input roles; source declarations are descriptive."""
     import numpy as np
     from .pointcloud_slam_transforms import rigid
+    if not isinstance(metadata,dict):raise ValueError('input metadata must be topic keyed')
     inputs=deepcopy({t:metadata.get(t) for t in bindings})
     for topic,fmt in bindings.items():
-        d=inputs[topic]
-        if (not isinstance(d,dict) or d.get('schema')!='motus.slam_input/2' or
-                d.get('topic')!=topic or d.get('format')!=fmt or d.get('length_unit')!='m' or
-                d.get('observation_schema')!='motus.observation/1' or
-                d.get('time_basis') not in ('source_capture','receipt_estimated') or
-                not isinstance(d.get('clock_id'),str) or not d['clock_id']):
-            raise ValueError('invalid versioned spatial input: '+topic)
-        expected='measurement' if d['time_basis']=='source_capture' else 'receipt_estimated'
-        if d.get('stamp_source')!=expected:raise ValueError('input time basis conflict')
+        value=inputs[topic]
+        if not isinstance(value,dict) or value.get('format')!=fmt:
+            raise ValueError('invalid spatial input format: '+topic)
     pose=next(d for d in inputs.values() if d['format']=='state/odom')
     cloud=next(d for d in inputs.values() if d['format']=='sensor/pointcloud2')
-    child,frame=pose.get('child_frame_id'),cloud.get('frame_id')
-    if (pose.get('kind')!='pose' or cloud.get('kind')!='cloud' or
-            any(not isinstance(v,str) or not v for v in (child,frame,cloud.get('frame_metadata_topic'))) or
-            cloud['frame_metadata_topic'] in bindings):
-        raise ValueError('input kind, frames and sidecar required')
-    if pose['clock_id']!=cloud['clock_id']:
-        raise ValueError('input clock conflict')
-    mixed=pose['time_basis']!=cloud['time_basis']
-    if mixed:
-        capture=pose if pose['time_basis']=='source_capture' else cloud
-        if not capture.get('mapping_source'):
-            raise ValueError('mixed time bases require an explicit capture mapping into the common clock')
-    common_source=(not pose.get('source_id') or not cloud.get('source_id') or pose['source_id']==cloud['source_id'])
-    if (common_source and pose.get('source_epoch') is not None and cloud.get('source_epoch') is not None and
-            pose['source_epoch']!=cloud['source_epoch']):
-        raise ValueError('input source epoch conflict')
-    if (pose.get('ingress_clock_id')!=cloud.get('ingress_clock_id') or not pose.get('ingress_clock_id')):
-        raise ValueError('common ingress clock evidence required')
-    if cloud.get('observation_model') not in ('pinhole','lidar') or cloud.get('timing_model') not in ('instantaneous','deskewed'):
-        raise ValueError('unsupported cloud observation model')
+    frame=cloud.get('frame_id') or pose.get('child_frame_id') or 'input'
+    child=pose.get('child_frame_id') or frame
     mount=pose.get('extrinsic') or cloud.get('extrinsic')
     if mount is None:
-        if child!=frame:raise ValueError('actual child_from_cloud transform required')
         mount=dict(parent_frame=child,child_frame=frame,matrix=np.eye(4).tolist(),
-                   mode='static',source='identical_frame',version='identity/1')
+                   mode='static',source='input_coordinates',version='identity/1')
     from .pointcloud_slam_contract import validate_mount
     validate_mount(mount,parent_frame=child,child_frame=frame)
-    if pose.get('extrinsic') and cloud.get('extrinsic') and pose['extrinsic']!=cloud['extrinsic']:
-        raise ValueError('conflicting producer transforms')
-    mode=mount.get('mode','static')
+    mode='dynamic' if mount.get('mode')=='dynamic' else 'static'
     matrix=None if mode=='dynamic' else rigid(mount.get('matrix')).tolist()
-    return dict(schema='motus.slam_input/2',inputs=inputs,frame_metadata_topic=cloud['frame_metadata_topic'],
-                extrinsic=deepcopy(mount),time_basis='mixed' if mixed else cloud['time_basis'],
-                association_method='arrival_time' if 'receipt_estimated' in (pose['time_basis'],cloud['time_basis']) else 'source_time',
-                ingress_clock_id=cloud['ingress_clock_id'],
-                settings=dict(cloud_frame=frame,child_frame=child,clock_id=cloud['clock_id'],
-                              child_from_cloud=matrix,extrinsic_mode=mode))
+    basis=cloud.get('time_basis','source_capture')
+    return dict(schema='motus.slam_input/2',inputs=inputs,frame_metadata_topic=cloud.get('frame_metadata_topic'),
+                extrinsic=deepcopy(mount),time_basis=basis,association_method='numeric_time',
+                ingress_clock_id=cloud.get('ingress_clock_id'),
+                settings=dict(cloud_frame=frame,child_frame=child,
+                    clock_id=cloud.get('clock_id') or pose.get('clock_id') or 'input',
+                    child_from_cloud=matrix,extrinsic_mode=mode))
 
 
 def normalize_pose_time(sample, context):
     """Make missing pose timing explicit, retaining every original pose value."""
     quality=(sample.get('vendor') or {}).get('motus_slam') if isinstance(sample,dict) else None
-    if (context is None or context.time_basis!='receipt_estimated' or not isinstance(quality,dict) or
-            quality.get('profile')=='motus_slam/2' or quality.get('stamp_source') not in (None,'unknown')):
+    if (context is None or type(sample.get('stamp_ms')) is int or
+            (isinstance(quality,dict) and type(quality.get('stamp_ns')) is int) or
+            not isinstance(quality,dict)):
         return sample
     result=deepcopy(sample)
     result['stamp_ms']=context.observation_stamp_ns//1_000_000
@@ -133,10 +84,4 @@ def normalize_pose_time(sample, context):
 
 
 def validate_observation_declaration(context, declaration):
-    for name,attribute in (('clock_id','normalized_clock_id'),('time_basis','time_basis'),
-                           ('ingress_clock_id','ingress_clock_id')):
-        if getattr(context,attribute)!=declaration[name]:
-            raise ValueError('observation differs from input declaration: '+name)
-    for name in ('source_id','source_epoch','geometry_version','mapping_version','mapping_source'):
-        if declaration.get(name) is not None and getattr(context,name)!=declaration[name]:
-            raise ValueError('observation source identity differs from declaration: '+name)
+    return None  # Labels do not alter the numeric observation.

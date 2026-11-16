@@ -1,9 +1,4 @@
-"""Match a cloud capture time to tracking poses without crossing a reset.
-
-The caller establishes a common clock and supplies a maximum interpolation
-interval justified for its sensor and motion. None marks an invalid/lost sample;
-it is a barrier, never a pose to interpolate through.
-"""
+"""Interpolate supplied pose numbers at cloud timestamps without metadata policy."""
 import math
 
 from .pointcloud_slam_odom import PoseSample
@@ -27,60 +22,41 @@ def _slerp(a, b, ratio):
 
 
 def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
-    """Interpolate only between consecutive, compatible tracking samples.
+    """Interpolate numeric timestamps; labels and policy gaps do not gate poses.
 
-    ``samples`` must be in acquisition order and each pose must have already
-    passed the relevant producer's quality and geometry validation. Repeated
-    identical poses are allowed; conflicting duplicate timestamps are rejected.
-    Timestamp units are integer nanoseconds for clouds and milliseconds for
-    odometry. No clock mapping or extrapolation is attempted here.
+    None remains an absence barrier. Within each available run, samples can
+    arrive out of order and the last value for a duplicate timestamp is used.
     """
-    if type(cloud_stamp_ns) is not int or cloud_stamp_ns <= 0:
+    if type(cloud_stamp_ns) is not int:
         raise ValueError('invalid cloud timestamp')
-    if (isinstance(max_gap_ms, bool) or not isinstance(max_gap_ms, (int, float))
-            or not math.isfinite(max_gap_ms) or max_gap_ms <= 0):
-        raise ValueError('invalid maximum interpolation gap')
-    ordered = []
-    last = None
+    runs, run = [], []
     for sample in samples:
         if sample is None:
-            ordered.append(None)
-            continue
-        if not isinstance(sample, PoseSample):
+            runs.append(run)
+            run = []
+        elif not isinstance(sample, PoseSample):
             raise ValueError('expected validated pose or loss barrier')
-        if last is not None and sample.stamp_ns < last.stamp_ns:
-            raise ValueError('out-of-order pose')
-        if last is not None and sample.stamp_ns == last.stamp_ns:
-            if sample != last or (ordered and ordered[-1] is None):
-                raise ValueError('ambiguous duplicate pose timestamp')
-            continue
-        ordered.append(sample)
-        last = sample
-    previous = None
-    for sample in ordered:
-        if sample is None:
-            previous = None
-            continue
-        stamp_ns = sample.stamp_ns
-        if stamp_ns == cloud_stamp_ns:
-            return sample
-        if stamp_ns > cloud_stamp_ns:
-            if previous is None:
-                break
-            left_ns = previous.stamp_ns
-            if (sample.stamp_ns - previous.stamp_ns > max_gap_ms*1_000_000 or
-                    (sample.segment_id, sample.frame_id, sample.child_frame_id, sample.clock_id, sample.pose_reference) !=
-                    (previous.segment_id, previous.frame_id, previous.child_frame_id, previous.clock_id, previous.pose_reference)):
-                break
-            def identity(p):
-                c=p.observation
-                return (c.time_basis,c.source_id,c.source_epoch,c.mapping_version,c.geometry_version) if c is not None else None
-            if identity(previous)!=identity(sample):break
-            ratio = (cloud_stamp_ns - left_ns) / (stamp_ns - left_ns)
-            position = tuple(a + ratio * (b - a) for a, b in zip(previous.position, sample.position))
-            return PoseSample(cloud_stamp_ns // 1_000_000, sample.frame_id, sample.child_frame_id,
-                              sample.segment_id, position,
-                              _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id, sample.pose_reference, None, cloud_stamp_ns,
-                              tuple(c for c in (previous.observation,sample.observation) if c is not None))
-        previous = sample
-    raise ValueError('no compatible pose at cloud timestamp')
+        else:
+            run.append(sample)
+    runs.append(run)
+    for run in reversed(runs):
+        ordered = sorted({s.stamp_ns: s for s in run}.values(), key=lambda s: s.stamp_ns)
+        previous = None
+        for sample in ordered:
+            stamp_ns = sample.stamp_ns
+            if stamp_ns == cloud_stamp_ns:
+                return sample
+            if stamp_ns > cloud_stamp_ns:
+                if previous is None:
+                    break
+                ratio = (cloud_stamp_ns - previous.stamp_ns) / (stamp_ns - previous.stamp_ns)
+                position = tuple((1-ratio)*a + ratio*b for a, b in zip(previous.position, sample.position))
+                if not all(math.isfinite(v) for v in position):
+                    raise ValueError('interpolated pose is not finite')
+                return PoseSample(cloud_stamp_ns // 1_000_000, sample.frame_id, sample.child_frame_id,
+                                  sample.segment_id, position,
+                                  _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id,
+                                  sample.pose_reference, None, cloud_stamp_ns,
+                                  tuple(c for c in (previous.observation,sample.observation) if c is not None))
+            previous = sample
+    raise ValueError('no numeric pose at cloud timestamp')

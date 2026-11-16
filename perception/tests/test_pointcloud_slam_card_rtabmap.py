@@ -309,9 +309,11 @@ def test_rejected_configuration_does_not_poison_the_previous_valid_extrinsic(car
 ])
 def test_malformed_explicit_capability_returns_error_without_starting(card, interfaces):
     result = card.dispatch('pointcloud_slam', {**arguments(), 'odom_interfaces': interfaces})
-    assert result['state'] == 'error'
-    assert result['message']
-    assert not card._executor.nodes
+    if not isinstance(interfaces, dict):
+        assert result['state'] == 'error'
+    else:
+        assert result['state'] == 'ready'
+        assert call(card, 'start_mapping', map_name='NumericPose')['state'] == 'running'
 
 
 @pytest.mark.parametrize('interfaces_present', [False, True])
@@ -802,6 +804,24 @@ def test_input_metadata_route_still_prepares_and_starts(card):
     assert 'input_validation' not in call(card, 'info')
 
 
+def test_manual_matrix_priority_survives_live_producer_sidecars(card):
+    from test_pointcloud_slam_input import declarations
+    from test_pointcloud_slam_stream import stream,odom
+    from test_pointcloud_slam_dynamic import tf_packet
+    manual=settings()['child_from_cloud'];manual[0][3]=.6
+    assert call(card,'config',child_from_cloud=manual)['state']=='configured'
+    values=declarations()
+    metadata={'/pose':values['/o'],'/cloud':values['/c']}
+    assert card.dispatch('pointcloud_slam',{**arguments(),'input_metadata':metadata})['state']=='ready'
+    selected=card._settings()
+    s=stream(input_contract=card._resolved_inputs,child_from_cloud=selected['child_from_cloud'],
+             extrinsic_mode=selected['extrinsic_mode'])
+    s.odom(odom(1000),now=1.)
+    s.cloud_metadata(tf_packet(1000,x=2),now=1.)
+    s.cloud(1_000_000_000,'camera',[[1,0,0]],now=1.)
+    assert len(s.accepted)==1 and s.accepted[0].child_from_cloud[0,3]==.6
+
+
 
 def test_initializing_source_declarations_do_not_block_project_start(card):
     args = arguments()
@@ -816,16 +836,15 @@ def test_initializing_source_declarations_do_not_block_project_start(card):
     assert call(card, 'start_mapping', map_name='Initializing')['state'] == 'running'
 
 
-def test_contradictory_connected_clock_declarations_fail_project_start(card):
+def test_different_clock_labels_do_not_gate_project_start(card):
     from test_pointcloud_slam_input import declarations
     declared = declarations()
     pose = {**declared['/o'], 'topic': '/pose'}
     cloud = {**declared['/c'], 'topic': '/cloud', 'clock_id': 'different_clock'}
     result = card.dispatch('pointcloud_slam', {
         **arguments(), 'input_metadata': {'/pose': pose, '/cloud': cloud}})
-    assert result['state'] == 'error'
-    assert 'clock_id' in result['message']
-    assert card._node is None
+    assert result['state'] == 'ready'
+    assert call(card, 'start_mapping', map_name='ProducerAligned')['state'] == 'running'
 
 
 def test_retired_robot_selector_does_not_affect_legacy_core(card, monkeypatch):
@@ -1021,7 +1040,7 @@ def test_connected_rgb_reaches_session_settings_without_changing_spatial_contrac
     assert_rgb_port(card, '/rgb')
 
 
-@pytest.mark.parametrize('broken', ['missing', 'intrinsics', 'clock'])
+@pytest.mark.parametrize('broken', ['missing', 'intrinsics'])
 def test_invalid_connected_rgb_falls_back_without_blocking_mapping(card, broken):
     camera = rgb_camera()
     if broken == 'missing':

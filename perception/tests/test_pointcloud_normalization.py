@@ -32,8 +32,10 @@ def test_row_padding_removed_without_coordinate_change():
     np.testing.assert_array_equal(np.frombuffer(result.message.data,'<f4').reshape(-1,3),[[1,2,3],[4,5,6]])
 
 
-def test_original_digest_checked_before_conversion():
-    with pytest.raises(ValueError,match='digest'):normalize_cloud(cloud(),ctx(),'0'*64)
+def test_original_digest_mismatch_is_diagnostic_without_blocking_conversion():
+    result=normalize_cloud(cloud(),ctx(),'0'*64)
+    assert not result.source_digest_verified
+    assert result.message.width == 1
 
 
 @pytest.mark.parametrize('change',[lambda m:setattr(m,'row_step',1),lambda m:setattr(m,'data',m.data+b'x'),

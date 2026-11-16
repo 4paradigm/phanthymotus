@@ -40,16 +40,15 @@ def test_pose_reference_survives_decode_and_interpolation_without_frame_name_gue
     first = decode_slam_odom(sample)
     second = replace(first, stamp_ms=1200)
     assert align_pose([first, second], 1_100_000_000, max_gap_ms=250).pose_reference == 'camera_optical'
-    with pytest.raises(ValueError):
-        align_pose([first, replace(second, pose_reference='body')], 1_100_000_000, max_gap_ms=250)
+    assert align_pose([first, replace(second, pose_reference='body')],
+        1_100_000_000, max_gap_ms=250).pose_reference == 'body'
     del sample['vendor']['pose_reference']
     sample['pose']['child_frame_id'] = 'base_link'
     assert decode_slam_odom(sample).pose_reference is None
 
 
-def test_conflicting_pose_reference_is_rejected():
+def test_pose_reference_labels_do_not_gate_numeric_pose():
     sample = odom(1000)
     sample['vendor']['pose_reference'] = 'camera_optical'
     sample['vendor']['motus_slam']['pose_reference'] = 'body'
-    with pytest.raises(ValueError, match='conflicting pose reference'):
-        decode_slam_odom(sample)
+    assert decode_slam_odom(sample).pose_reference == 'body'

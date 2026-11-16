@@ -65,21 +65,10 @@ def test_standard_pose_accepts_unknown_covariance_and_preserves_clock():
     assert result.covariance is None
 
 
-@pytest.mark.parametrize('change', [
-    lambda s: s.update(pose=None),
-    lambda s: s['units'].update(length='cm'),
-    lambda s: s.update(units=None),
-    lambda s: s['vendor']['motus_slam'].update(status='lost'),
-    lambda s: s['vendor']['motus_slam'].update(stamp_source='received'),
-    lambda s: s['vendor']['motus_slam'].update(clock_id=''),
-    lambda s: s['vendor']['motus_slam'].update(segment_id=''),
-])
-def test_standard_pose_rejects_unusable_or_unproven_inputs(change):
+def test_standard_pose_requires_actual_numeric_pose():
     from plugins.pointcloud_slam_odom import decode_slam_odom
-    data = standard_sample()
-    change(data)
-    with pytest.raises(ValueError):
-        decode_slam_odom(data)
+    data = standard_sample(); data['pose'] = None
+    with pytest.raises(ValueError): decode_slam_odom(data)
 
 
 @pytest.mark.parametrize('twist_stamp', [2000, None])

@@ -84,7 +84,7 @@ def test_weak_warmup_after_two_good_frames_uses_result_liveness(sessions):
     assert s.gate.good == 0
     # Input stays fresh, but a silent native estimator must still expire.
     now[0] += 1_500_000_001
-    s.gate.last_input = now[0]
+    s.gate.last_input_received = now[0]
     s._watchdog()
     assert s.gate.state == 'lost' and s.gate.loss_kind == 'visual'
 
@@ -181,15 +181,16 @@ def test_out_of_order_estimate_is_ignored_without_counting_as_good(sessions):
     assert last(s)['vendor']['motus_slam']['stamp_ns'] == stamp
 
 
-def test_repeated_or_stale_image_is_dropped_not_fatal(sessions):
+def test_repeated_or_old_source_images_are_admitted(sessions):
     create, now, _ = sessions
     s = create()
     images(s, now[0])
     images(s, now[0])          # repeated capture stamps
     images(s, now[0] - 2_000_000_000)  # older than the pairing window
     assert s.gate.state != 'lost'
-    assert s.counts['rejected_inputs'] == 4
-    assert s.info()['input_rejections']['last_reason']
+    assert s.counts['rejected_inputs'] == 0
+    assert s.pending.qsize() >= 1
+    assert not s.info()['input_rejections']['last_reason']
 
 
 # ── B: ESKF/aid failure degrades to independent visual output ───────────────
@@ -311,8 +312,8 @@ def test_transient_rejection_pauses_slam_and_resumed_segment_is_admitted(session
     assert pause['pose'] is None and pause['vendor']['pause'] == dict(
         source='visual_gate', status='recovering', mapping_allowed=False)
     seen = deliver(s, stream, seen)
-    with pytest.raises(ValueError):
-        stream.cloud(stamp + 100*MS, 'camera_optical', [[1, 0, 0]], now=(stamp + 100*MS)/1e9 + .02)
+    stream.cloud(stamp + 100*MS, 'camera_optical', [[1, 0, 0]], now=(stamp + 100*MS)/1e9 + .02)
+    assert len(accepted) == 1 and stream.pending_count == 1
     for k in (2, 3, 4):
         feed(s, now, stamp + k*100*MS)
     deliver(s, stream, seen)

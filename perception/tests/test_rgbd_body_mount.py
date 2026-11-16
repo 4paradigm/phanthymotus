@@ -77,13 +77,13 @@ def test_dynamic_camera_motion_yields_stationary_body_without_freezing_mount():
     assert body['quaternion'] == pytest.approx([0, 0, 0, 1], abs=1e-10)
 
 
-def test_exact_nanosecond_match_does_not_use_nearest_or_same_millisecond_mount():
+def test_nearest_supplied_numeric_mount_is_usable_without_skew_gate():
     observer = mounts(); observer.observe(packet(), 1_010_000_123)
     assert sample()['vendor']['motus_slam']['stamp_ns'] == 1_000_000_123
     out = observer.attach(sample(1_000_000_124), 1_020_000_123)
     assert out['pose'] is not None
-    assert out['vendor']['body_pose'] is None
-    assert out['vendor']['camera_mount']['status'] == 'unavailable'
+    assert out['vendor']['body_pose'] is not None
+    assert out['vendor']['camera_mount']['status']=='available'
 
 
 def test_missing_unavailable_and_expired_tf_keep_camera_tracking():
@@ -96,7 +96,7 @@ def test_missing_unavailable_and_expired_tf_keep_camera_tracking():
     assert out['vendor']['camera_mount']['reason'] == unavailable['reason']
     assert out['pose'] is not None
     observer.observe(packet(1_100_000_123), 1_110_000_123)
-    assert observer.attach(sample(1_100_000_123), 1_700_000_123)['vendor']['body_pose'] is None
+    assert observer.attach(sample(1_100_000_123),1_700_000_123)['vendor']['body_pose'] is not None
 
 
 @pytest.mark.parametrize('change', [dict(epoch='boot2'), dict(clock_id='other'),
@@ -104,23 +104,24 @@ def test_missing_unavailable_and_expired_tf_keep_camera_tracking():
                                   dict(version='v2'), dict(length_unit='mm'),
                                   dict(transform_direction='camera_from_body'),
                                   dict(matrix=[[1,0,0,0],[0,1,0,0],[0,0,-1,0],[0,0,0,1]])])
-def test_invalid_mount_cannot_be_used_or_silently_recovered(change):
-    observer = mounts()
-    with pytest.raises(ValueError):
-        observer.observe(packet(**change), 1_010_000_123)
-    observer.observe(packet(1_100_000_123), 1_110_000_123)
-    out = observer.attach(sample(1_100_000_123), 1_120_000_123)
-    assert out['pose'] is not None and out['vendor']['body_pose'] is None
-    assert observer.info(1_120_000_123)['status'] == 'lost'
+def test_numeric_mount_is_used_independently_of_metadata(change):
+    observer=mounts();observer.observe(packet(**change),1_010_000_123)
+    assert observer.attach(sample(),1_020_000_123)['vendor']['body_pose'] is not None
+    observer.observe(packet(1_100_000_123),1_110_000_123)
+    assert observer.attach(sample(1_100_000_123),1_120_000_123)['vendor']['body_pose'] is not None
+    assert observer.info(1_120_000_123)['status']=='available'
 
 
 @pytest.mark.parametrize('stamp,now', [(1_000_000_123, 900_000_123),
                                       (True, 1_000_000_000)])
-def test_invalid_packet_time_fails_closed(stamp, now):
-    observer = mounts()
-    with pytest.raises(ValueError):
-        observer.observe(packet(stamp), now)
-    assert observer.attach(sample(), now)['vendor']['body_pose'] is None
+def test_timestamp_type_is_checked_without_future_age_policy(stamp,now):
+    observer=mounts()
+    if type(stamp) is int:
+        observer.observe(packet(stamp),now)
+        assert observer.attach(sample(),now)['vendor']['body_pose'] is not None
+    else:
+        with pytest.raises(ValueError):observer.observe(packet(stamp),now)
+        assert observer.attach(sample(),now)['vendor']['body_pose'] is None
 
 
 def test_nontracking_outputs_never_gain_a_tracking_body_pose():
@@ -130,16 +131,16 @@ def test_nontracking_outputs_never_gain_a_tracking_body_pose():
         assert out['pose'] is None and out['vendor']['body_pose'] is None
 
 
-def test_history_is_bounded_and_retired_capture_not_reused():
+def test_history_is_bounded_and_nearest_retained_numeric_matrix_is_used():
     observer = mounts()
     for i in range(200):
         stamp = 1_000_000_123+i*5_000_000
         observer.observe(packet(stamp), stamp)
     assert observer.info(stamp)['buffered_samples'] <= 128
-    assert observer.attach(sample(), stamp)['vendor']['body_pose'] is None
+    assert observer.attach(sample(),stamp)['vendor']['body_pose'] is not None
 
 
-def test_source_declarations_are_forwarded_and_conflicting_mounts_are_rejected():
+def test_source_declarations_are_forwarded_without_name_conflict_gates():
     values = declarations()
     plain = validate_start_inputs(values, ['/rgb', '/depth'])
     assert 'body_mount' not in plain
@@ -152,14 +153,12 @@ def test_source_declarations_are_forwarded_and_conflicting_mounts_are_rejected()
     result = validate_start_inputs(values, ['/rgb', '/depth'])
     assert result['body_mount']['topic'] == '/camera/rgbd/body_mount'
     values['/depth']['vendor']['body_mount']['parent_frame'] = 'other_base'
-    with pytest.raises(ValueError):
-        validate_start_inputs(values, ['/rgb', '/depth'])
+    assert validate_start_inputs(values,['/rgb','/depth'])['body_mount']['topic']=='/camera/rgbd/body_mount'
 
 
-def test_mount_declaration_cannot_alias_an_image_topic_or_camera_as_body():
+def test_mount_source_and_frame_names_are_descriptive():
     for change in (dict(topic='/rgb'), dict(parent_frame='camera_optical'), dict(source='guess')):
-        with pytest.raises(ValueError):
-            validate_mount_declaration(declaration(**change), 'camera_optical', ['/rgb', '/depth'])
+        assert validate_mount_declaration(declaration(**change),'camera_optical',['/rgb','/depth'])['topic']
 
 
 def test_runtime_automatically_attaches_mount_without_altering_main_odom(monkeypatch):
@@ -209,7 +208,7 @@ def test_card_repeated_start_ignores_only_mount_liveness_snapshot(monkeypatch):
     assert len(Session.created) == 1
     for entry in values.values():
         entry['vendor']['body_mount']['epoch'] = 'new-boot'
-    assert card.dispatch('rgbd_odometry', args)['state'] == 'error'
+    assert card.dispatch('rgbd_odometry',args)['state']=='running'
     card.shutdown()
 
 
@@ -250,19 +249,15 @@ def test_session_discovers_mount_topic_from_camera_metadata(monkeypatch):
     assert session.node.destroyed
 
 
-def test_delayed_mount_is_rejected_but_next_fresh_capture_recovers():
-    observer = mounts()
-    observer.observe(packet(), 1_600_000_123)
-    assert observer.info(1_600_000_123)['status'] == 'unavailable'
-    assert not observer.packets
-    assert observer.attach(sample(), 1_600_000_123)['vendor']['body_pose'] is None
-    observer.observe(packet(1_700_000_123), 1_710_000_123)
-    assert observer.attach(sample(1_700_000_123), 1_720_000_123)['vendor']['body_pose'] is not None
+def test_delayed_mount_and_later_numeric_mount_are_usable():
+    observer=mounts();observer.observe(packet(),1_600_000_123)
+    assert observer.info(1_600_000_123)['status']=='available'
+    assert observer.attach(sample(),1_600_000_123)['vendor']['body_pose'] is not None
+    observer.observe(packet(1_700_000_123),1_710_000_123)
+    assert observer.attach(sample(1_700_000_123),1_720_000_123)['vendor']['body_pose'] is not None
 
 
-def test_repeated_mount_still_requires_restart_after_stale_rejection():
-    observer = mounts()
-    observer.observe(packet(), 1_600_000_123)
-    with pytest.raises(ValueError):
-        observer.observe(packet(), 1_610_000_123)
-    assert observer.state == 'lost'
+def test_repeated_numeric_mount_replaces_the_buffer_entry():
+    observer=mounts();observer.observe(packet(),1_600_000_123)
+    observer.observe(packet(),1_610_000_123)
+    assert observer.state=='available' and len(observer.packets)==1

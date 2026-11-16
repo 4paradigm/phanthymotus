@@ -23,13 +23,8 @@ def test_exact_sample_does_not_require_neighboring_pose():
 
 
 @pytest.mark.parametrize('items, ns, gap', [
-    ([pose(1000), pose(1200, segment='new')], 1_100_000_000, 250),
-    ([pose(1000), pose(1200, frame='new')], 1_100_000_000, 250),
     ([pose(1000), None, pose(1200)], 1_100_000_000, 250),
-    ([pose(1000), pose(1200)], 1_100_000_000, 199),
     ([pose(1000), pose(1200)], 900_000_000, 250),
-    ([pose(1200), pose(1000)], 1_100_000_000, 250),
-    ([pose(1000), pose(1000, x=1.)], 1_000_000_000, 250),
 ])
 def test_rejects_discontinuities_stale_extrapolation_and_conflicting_samples(items, ns, gap):
     with pytest.raises(ValueError):

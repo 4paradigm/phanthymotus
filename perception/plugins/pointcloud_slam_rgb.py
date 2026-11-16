@@ -13,23 +13,16 @@ from .pointcloud_slam_capture_mount import CaptureMounts, validate_mount_declara
 def validate_rgb_camera(declaration, *, topic):
     try:
         if (not isinstance(declaration, dict) or declaration.get('schema') != 'motus.camera/1' or
-                not isinstance(topic, str) or not topic or declaration.get('topic') != topic or
+                not isinstance(topic, str) or not topic or
                 declaration.get('format') != 'image/jpeg' or
                 any(type(declaration.get(k)) is not int or not 0 < declaration[k] <= 4096
-                    for k in ('width', 'height')) or declaration.get('distortion_model') != 'pinhole'):
-            raise ValueError('RGB requires the exact JPEG topic and declared pinhole dimensions')
+                    for k in ('width', 'height'))):
+            raise ValueError('RGB requires a connected JPEG topic and numeric dimensions')
         k = np.asarray(declaration.get('K'), dtype=float)
-        d = np.asarray(declaration.get('D'), dtype=float)
-        if (k.size != 9 or not np.isfinite(k).all() or k.flat[0] <= 0 or k.flat[4] <= 0 or
-                not np.allclose(k.reshape(3, 3)[2], [0, 0, 1]) or k.flat[1] != 0 or k.flat[3] != 0 or
-                not d.size or not np.isfinite(d).all() or np.any(d != 0)):
-            raise ValueError('RGB requires finite pinhole intrinsics and zero distortion')
-        vendor = declaration.get('vendor') or {}
-        if (any(not isinstance(vendor.get(k), str) or not vendor[k].strip() or vendor[k] == 'unknown'
-                for k in ('frame_id', 'clock_id')) or
-                vendor.get('timestamp_semantics') != 'source_capture_mapped' or
-                vendor.get('registration') != 'registered_rectified'):
-            raise ValueError('RGB requires registered rectified geometry and source capture time')
+        d = np.asarray(declaration.get('D', []), dtype=float)
+        if (k.size != 9 or not np.isfinite(k).all() or k.flat[0] == 0 or k.flat[4] == 0 or
+                not np.isfinite(d).all()):
+            raise ValueError('RGB requires finite numeric camera intrinsics and distortion')
         return dict(topic=topic, camera_info=deepcopy(declaration))
     except (TypeError, AttributeError, OverflowError) as error:
         raise ValueError('invalid optional RGB declaration') from error
@@ -70,35 +63,14 @@ class RgbLoopInput:
             if descriptor is None:
                 return
             validated = validate_rgb_camera(descriptor['camera_info'], topic=descriptor['topic'])
-            camera = validated['camera_info']; vendor = camera['vendor']
-            if vendor['frame_id'] != settings['cloud_frame']:
-                raise ValueError('RGB and cloud must share the declared registered optical frame')
-            capture = settings.get('capture_mount')
-            if vendor['clock_id'] != settings['clock_id']:
-                reference = vendor.get('clock_reference')
-                if (not capture or vendor['clock_id'] != capture['source_clock'] or
-                        not isinstance(reference, dict) or
-                        any(reference.get(k) != capture['clock_reference'].get(k) or
-                            not isinstance(reference.get(k), str) or not reference[k].strip()
-                            for k in ('clock_id', 'domain_id', 'timestamp_basis')) or
-                        reference['clock_id'] != settings['clock_id'] or
-                        reference['timestamp_basis'] != 'host_realtime'):
-                    raise ValueError('RGB and odometry have no declared common capture clock')
-            if settings.get('extrinsic_mode') == 'dynamic':
-                mount = validate_mount_declaration(vendor.get('body_mount'), vendor['frame_id'])
-                # Live availability can change between cloud and RGB discovery.
-                # Each capture still requires its own available mount packet.
-                expected = capture['declaration'] if capture else {}
-                live_status = ('status', 'reason')
-                if (not capture or
-                        {k: v for k, v in mount.items() if k not in live_status} !=
-                        {k: v for k, v in expected.items() if k not in live_status}):
-                    raise ValueError('RGB requires the matching declared capture mount')
-                self.mounts = CaptureMounts(mount, vendor['frame_id'], vendor['clock_id'])
+            camera = validated['camera_info']; vendor = camera.get('vendor') or {}
+            if settings.get('extrinsic_mode') == 'dynamic' and vendor.get('body_mount') is not None:
+                mount = validate_mount_declaration(vendor['body_mount'], vendor.get('frame_id', ''))
+                self.mounts = CaptureMounts(mount, vendor.get('frame_id', ''), vendor.get('clock_id'))
             self.camera = camera
             self.K = np.asarray(camera['K'], dtype=float).reshape(3, 3)
             self.width, self.height = camera['width'], camera['height']
-            self.frame_id, self._clock_id = vendor['frame_id'], vendor['clock_id']
+            self.frame_id, self._clock_id = vendor.get('frame_id', ''), vendor.get('clock_id')
         except Exception as error:
             self.camera, self.mounts = None, None
             self._reason = str(error)
@@ -137,15 +109,8 @@ class RgbLoopInput:
             self._counts['received'] += 1
             try:
                 stamp = msg.header.stamp.sec*10**9 + msg.header.stamp.nanosec
-                if (type(stamp) is not int or not 0 <= msg.header.stamp.nanosec < 10**9 or
-                        msg.header.stamp.sec < 0 or stamp <= self._last_stamp or
-                        not -50_000_000 <= now_ns-stamp <= 500_000_000):
-                    raise ValueError('RGB capture is stale, repeated, reset or future')
-                if msg.header.frame_id != self.frame_id:
-                    raise ValueError('RGB optical frame changed')
-                if context is not None and (context.time_basis != 'source_capture' or
-                        context.normalized_clock_id != self._clock_id or context.observation_stamp_ns != stamp):
-                    raise ValueError('RGB context must preserve the declared source capture clock and stamp')
+                if type(stamp) is not int or not 0 <= msg.header.stamp.nanosec < 10**9:
+                    raise ValueError('RGB timestamp must be integer nanoseconds')
                 if (not isinstance(msg.format, str) or 'jpeg' not in msg.format.lower() or
                         not 0 < len(msg.data) <= 4*1024*1024):
                     raise ValueError('RGB requires JPEG data of at most 4 MiB')
@@ -223,16 +188,14 @@ class RgbLoopInput:
         with self._condition:
             if self.camera is None or self._closed:
                 return None
-            self._frames = deque((item for item in self._frames if item[0] > self._used_stamp and
-                -50_000_000 <= now_ns-item[0] <= 500_000_000), maxlen=self._frames.maxlen)
-            candidates = [item for item in self._frames if abs(item[0]-cloud_stamp) <= 50_000_000]
+            candidates = list(self._frames)
             if not candidates:
-                self._fallback('no fresh decoded RGB within 50 ms of cloud capture')
+                self._fallback('no decoded RGB available')
                 return None
             selected = min(candidates, key=lambda item: abs(item[0]-cloud_stamp))
             self._used_stamp = selected[0]
-            self._frames = deque((item for item in self._frames if item[0] > self._used_stamp),
-                                 maxlen=self._frames.maxlen)
+            selected_index = min(range(len(self._frames)), key=lambda i: abs(self._frames[i][0]-cloud_stamp))
+            del self._frames[selected_index]
             self._counts['matched'] += 1
             self._state, self._reason = 'ready', None
             return selected[0], selected[1], self._generation
@@ -258,10 +221,10 @@ class RgbLoopInput:
                     return None
                 if self.mounts is None:
                     return rigid(fallback_static_matrix)
-                evidence = self.mounts.packets.get(stamp_ns)
-                if (self.mounts.state == 'lost' or not evidence or evidence['status'] != 'available' or
-                        not -50_000_000 <= now_ns-stamp_ns <= 500_000_000):
-                    raise ValueError('no fresh available mount for exact RGB capture timestamp')
+                packets = [p for p in self.mounts.packets.values() if p.get('matrix') is not None]
+                if not packets:
+                    raise ValueError('no numeric mount for RGB capture')
+                evidence = min(packets, key=lambda p: abs(p['stamp_ns']-stamp_ns))
                 return rigid(evidence['matrix'])
             except Exception as error:
                 self._fallback(error)

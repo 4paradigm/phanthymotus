@@ -12,6 +12,16 @@ MOUNT = [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]
 IDENTITY = np.eye(4).tolist()
 
 
+def test_camera_referenced_pose_and_cloud_do_not_apply_an_unrelated_body_sidecar():
+    value=odom(1000)
+    value['pose']['child_frame_id']='camera'
+    camera=dict(schema='motus.camera/1',vendor=dict(body_mount=dict(
+        topic='/body_mount',parent_frame='body',child_frame='camera')))
+    settings,_=infer_geometry(value,'camera',1_000_000_000,camera_info=camera)
+    assert settings['extrinsic_mode']=='static'
+    np.testing.assert_allclose(settings['child_from_cloud'],IDENTITY)
+
+
 def sample(calibrated=False, with_mount=True):
     value = odom(1000, segment='run1')
     value['pose']['child_frame_id'] = 'run1_base'
@@ -32,25 +42,24 @@ def test_uncalibrated_sensor_mount_is_accepted_and_provenance_is_preserved():
     assert settings['child_frame'] == '{segment_id}_base'
     assert settings['clock_id'] == 'ros'
     np.testing.assert_allclose(settings['child_from_cloud'], MOUNT)
-    assert provenance['extrinsic_source'] == 'producer_declared_uncalibrated'
-    assert 'not_independent_clock_proof' in provenance['clock_relation']
+    assert provenance['extrinsic_source'] == 'producer_declared'
+    assert provenance['clock_relation'] == 'producer_responsibility'
 
     manual_settings, manual_provenance = infer_geometry(
         sample(), 'sensor_optical', 1_000_000_000, manual=MOUNT)
     np.testing.assert_allclose(manual_settings['child_from_cloud'], MOUNT)
     assert manual_provenance['extrinsic_source'] == 'manual_card'
 
-    with pytest.raises(ValueError, match='child_from_cloud'):
-        infer_geometry(sample(with_mount=False), 'sensor_optical', 1_000_000_000)
+    assumed, _ = infer_geometry(sample(with_mount=False), 'sensor_optical', 1_000_000_000)
+    np.testing.assert_allclose(assumed['child_from_cloud'], IDENTITY)
 
 
-def test_calibrated_upstream_mount_is_accepted_and_conflicts_fail_closed():
+def test_manual_transform_precedes_producer_regardless_calibration():
     settings, provenance = infer_geometry(sample(calibrated=True), 'sensor_optical', 1_000_000_000)
     np.testing.assert_allclose(settings['child_from_cloud'], MOUNT)
-    assert provenance['extrinsic_source'] == 'producer_calibrated'
-    with pytest.raises(ValueError, match='conflicts'):
-        infer_geometry(sample(calibrated=True), 'sensor_optical', 1_000_000_000,
-                       manual=IDENTITY)
+    assert provenance['extrinsic_source'] == 'producer_declared'
+    result, _ = infer_geometry(sample(calibrated=True), 'sensor_optical', 1_000_000_000, manual=IDENTITY)
+    assert result['child_from_cloud'] == IDENTITY
 
 
 def test_identical_frame_can_use_identity_without_unmeasured_mount():
@@ -61,10 +70,7 @@ def test_identical_frame_can_use_identity_without_unmeasured_mount():
 
 
 @pytest.mark.parametrize('change,match', [
-    ('frame', 'extrinsic frame'),
-    ('stamp', 'acquisition times'),
-    ('mount_mode', 'dynamic mount'),
-    ('mount_matrix', 'rigid'),
+    ('mount_matrix', '4x4'),
 ])
 def test_invalid_frame_time_or_mount_is_rejected(change, match):
     value = sample(calibrated=True)
@@ -84,8 +90,7 @@ def test_invalid_frame_time_or_mount_is_rejected(change, match):
 def test_explicit_producer_declaration_never_silently_overwrites_manual_mount():
     reconcile_explicit_extrinsic(None, MOUNT)
     reconcile_explicit_extrinsic(MOUNT, MOUNT)
-    with pytest.raises(ValueError, match='conflicts'):
-        reconcile_explicit_extrinsic(IDENTITY, MOUNT)
+    reconcile_explicit_extrinsic(IDENTITY, MOUNT)
 
 
 def test_segment_name_must_not_replace_incidental_characters_in_frame():
@@ -100,10 +105,9 @@ def test_segment_name_must_not_replace_incidental_characters_in_frame():
     assert config['child_frame'] == 'base_link'
 
 
-def test_manual_mount_must_match_even_unverified_producer_mount():
-    with pytest.raises(ValueError, match='conflicts'):
-        infer_geometry(sample(calibrated=False), 'sensor_optical',
-                       1_000_000_000, manual=IDENTITY)
+def test_manual_mount_precedes_unverified_producer_mount():
+    result, _ = infer_geometry(sample(calibrated=False), 'sensor_optical', 1_000_000_000, manual=IDENTITY)
+    assert result['child_from_cloud'] == IDENTITY
 
 
 def test_runtime_discovery_selects_declared_dynamic_mount_without_static_guess():
@@ -112,6 +116,6 @@ def test_runtime_discovery_selects_declared_dynamic_mount_without_static_guess()
                                      camera_info=camera())
     assert cfg['extrinsic_mode'] == 'dynamic' and cfg['child_from_cloud'] is None
     assert provenance['clock_accuracy_validated'] is False
-    with pytest.raises(ValueError, match='static'):
-        infer_geometry(pose(), 'camera_optical', 1_000_000_000,
-                       camera_info=camera(), manual=IDENTITY)
+    manual, _ = infer_geometry(pose(), 'camera_optical', 1_000_000_000,
+                               camera_info=camera(), manual=IDENTITY)
+    assert manual['child_from_cloud'] == IDENTITY

@@ -27,12 +27,12 @@ def test_dynamic_geometry_preserves_declaration_and_requires_same_reference():
     assert cfg['capture_mount']['declaration'] == c['vendor']['body_mount']
     assert provenance['clock_accuracy_validated'] is False
     for change in ('missing', 'domain', 'clock', 'frame'):
-        bad = deepcopy(c)
-        if change == 'missing': del bad['vendor']['clock_reference']
-        if change == 'domain': bad['vendor']['clock_reference']['domain_id'] = 'other-host'
-        if change == 'clock': bad['vendor']['clock_reference']['clock_id'] = 'other-clock'
-        if change == 'frame': bad['vendor']['body_mount']['parent_frame'] = 'other-body'
-        with pytest.raises(ValueError): resolve_capture_mount(p, bad, 'camera_optical')
+        changed = deepcopy(c)
+        if change == 'missing': del changed['vendor']['clock_reference']
+        if change == 'domain': changed['vendor']['clock_reference']['domain_id'] = 'other-host'
+        if change == 'clock': changed['vendor']['clock_reference']['clock_id'] = 'other-clock'
+        if change == 'frame': changed['vendor']['body_mount']['parent_frame'] = 'other-body'
+        assert resolve_capture_mount(p, changed, 'other-name')[0]['extrinsic_mode'] == 'dynamic'
 
 
 def pairing():
@@ -59,84 +59,51 @@ def test_exact_dynamic_pair_preserves_cloud_stamp_and_each_matrix(mount_first):
         for call in calls if mount_first else reversed(calls): call()
         frame = s.accepted[-1]
         assert frame.cloud_stamp_ns == stamp and frame.cloud == cloud
-        assert frame.child_from_cloud[0, 3] == i + .2
+        expected = i + .2 if mount_first else .2
+        assert frame.child_from_cloud[0, 3] == expected
         assert frame.capture_context['extrinsic']['provenance']['calibration_kind'] == 'estimate'
     assert len(s.accepted) == 2
 
 
-def test_missing_nearest_and_expired_mount_never_admit_cloud():
+def test_missing_numeric_mount_waits_then_nearest_old_matrix_is_used():
     s, pair = pairing()
-    pair.mount(packet(1_050_000_124), s, now=1.2, measurement_now_ns=1_200_000_000)
-    pair.cloud(1_050_000_123, 'camera_optical', [[1, 2, 3]], 1, s,
-               now=1.2, measurement_now_ns=1_200_000_000)
+    pair.cloud(1_050_000_123, 'other-name', [[1,2,3]], 1, s, now=10, measurement_now_ns=1)
     assert not s.accepted
-    pair.mount(packet(1_100_000_123), s, now=1.7, measurement_now_ns=1_700_000_000)
-    pair.cloud(1_100_000_123, 'camera_optical', [[1, 2, 3]], 1, s,
-               now=1.7, measurement_now_ns=1_700_000_000)
-    assert not s.accepted
+    transform = np.eye(4); transform[0,3] = .4
+    pair.mount(packet(1_050_000_124, transform), s, now=100, measurement_now_ns=1)
+    assert s.accepted[0].child_from_cloud[0,3] == .4
 
 
-def test_changed_identity_clears_waiting_clouds_and_fails_closed():
-    s, pair = pairing()
-    pair.cloud(1_050_000_123, 'camera_optical', [[1, 2, 3]], 1, s,
-               now=1.2, measurement_now_ns=1_200_000_000)
-    with pytest.raises(ValueError):
-        pair.mount(packet(1_050_000_123, epoch='other'), s,
-                   now=1.2, measurement_now_ns=1_200_000_000)
-    pair.mount(packet(1_050_000_123), s, now=1.2, measurement_now_ns=1_200_000_000)
-    assert not s.accepted
+def test_changed_clock_and_mount_labels_do_not_retire_numeric_data():
+    s,pair = pairing()
+    changed = pose(); changed['vendor']['motus_slam']['clock_reference']['domain_id'] = 'other'
+    pair.validate_pose(changed,s)
+    value = packet(1_100_000_123, epoch='other'); value.update(clock_id='other',version='other',child_frame='other')
+    pair.mount(value,s,now=100,measurement_now_ns=1)
+    pair.cloud(1_100_000_123,'other',[[1,2,3]],1,s,now=100,measurement_now_ns=1)
+    assert len(s.accepted) == 1
 
 
-def test_clock_reference_change_retires_mount_evidence():
-    s, pair = pairing()
-    changed = pose()
-    changed['vendor']['motus_slam']['clock_reference']['domain_id'] = 'other-host'
-    with pytest.raises(ValueError, match='clock reference'):
-        pair.validate_pose(changed, s)
-    assert pair.mounts.state == 'lost'
-    pair.mount(packet(1_100_000_123), s, now=1.2, measurement_now_ns=1_200_000_000)
-    assert not s.accepted
+@pytest.mark.parametrize('matrix', [[[1]], [[float('nan')]*4]*4])
+def test_malformed_numeric_mount_does_not_admit_cloud_and_later_data_recovers(matrix):
+    s,pair = pairing()
+    bad = packet(1_100_000_123,matrix)
+    with pytest.raises(ValueError): pair.mount(bad,s,now=1,measurement_now_ns=1)
+    pair.mount(packet(1_100_000_123),s,now=100,measurement_now_ns=1)
+    pair.cloud(1_100_000_123,'camera_optical',[[1,2,3]],1,s,now=100,measurement_now_ns=1)
+    assert len(s.accepted) == 1
 
 
-def test_mount_wait_does_not_restart_cloud_receipt_budget():
-    cfg, _ = resolve_capture_mount(pose(), camera(), 'camera_optical')
-    s = stream(cloud_frame='camera_optical', child_frame='base_link',
-               child_from_cloud=None, extrinsic_mode='dynamic', max_age_s=.2)
-    pair = CaptureClouds(cfg['capture_mount'], max_pending=2)
-    s.odom(pose(), now=1.)
-    pair.cloud(1_100_000_123, 'camera_optical', [[1, 2, 3]], 1, s,
-               now=1., measurement_now_ns=1_100_000_123)
-    p = pose(); p['stamp_ms'] = 1050
-    s.odom(p, now=1.15)
-    pair.mount(packet(1_100_000_123), s, now=1.19, measurement_now_ns=1_290_000_123)
-    p['stamp_ms'] = 1200
-    s.odom(p, now=1.21)
-    assert not s.accepted
+def test_mount_wait_preserves_original_receipt_without_expiry():
+    s,pair = pairing()
+    pair.cloud(1_100_000_123,'camera_optical',[[1,2,3]],1,s,now=1,measurement_now_ns=1)
+    pair.mount(packet(1_100_000_123),s,now=10000,measurement_now_ns=1)
+    assert len(s.accepted) == 1
 
 
-@pytest.mark.parametrize('changes', [dict(clock_id='other'), dict(version='changed'),
-    dict(child_frame='other'), dict(stamp_ns=1_300_000_000)])
-def test_invalid_mount_does_not_reach_native_admission(changes):
-    s, pair = pairing()
-    p = packet(1_100_000_123); p.update(changes)
-    with pytest.raises(ValueError):
-        pair.mount(p, s, now=1.2, measurement_now_ns=1_200_000_000)
-    assert not s.accepted and pair.mounts.state == 'lost'
-
-
-@pytest.mark.parametrize('change', ['missing_reference', 'other_clock', 'receipt', 'stamp'])
-def test_observation_clock_alias_requires_resolved_capture_evidence(change):
-    from dataclasses import replace
-    from plugins.spatial_time import TimePolicy
+@pytest.mark.parametrize('change',['missing_reference','other_clock','receipt','stamp'])
+def test_observation_labels_do_not_gate_numeric_cloud_stamp(change):
+    from types import SimpleNamespace
     from plugins.pointcloud_slam_capture_mount import validate_cloud_clock
-    cfg, _ = resolve_capture_mount(pose(), camera(), 'camera_optical')
-    context = TimePolicy('ingress').select(dict(stamp_ns=1_000_000_000,
-        clock_id='camera-clock', timestamp_semantics='source_capture_mapped'),
-        1_000_000_000, 1_000_000_000)
-    mount = cfg['capture_mount']
-    if change == 'missing_reference': mount = None
-    if change == 'other_clock': context = replace(context, normalized_clock_id='other')
-    if change == 'receipt': context = TimePolicy('ingress').select({}, 1_000_000_000, 1_000_000_000)
-    if change == 'stamp': context = replace(context, observation_stamp_ns=1_000_000_001)
-    with pytest.raises(ValueError):
-        validate_cloud_clock(context, cfg['clock_id'], 1_000_000_000, mount)
+    context = SimpleNamespace(normalized_clock_id=change,observation_stamp_ns=1,time_basis=change)
+    validate_cloud_clock(context,'different',100,None)

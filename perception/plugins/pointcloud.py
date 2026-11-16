@@ -2,7 +2,7 @@
 """Depth-only pointcloud card: one Z16/zlib input, display and optional metric output.
 
 Camera parameters come from upstream camera_info. Display output retains its
-approximate field-of-view fallback; metric output requires measured calibration.
+approximate field-of-view fallback; metric output requires finite numeric intrinsics.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ TOOLS = [
                 "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
                 "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
-                                 "description": "启用计算输出（PointCloud2 输出口始终显示）；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
+                                 "description": "启用计算输出（PointCloud2 输出口始终显示）；使用有限数值内参，深度约定为毫米光轴距离"},
             },
         },
         "topic_in": [
@@ -131,21 +131,22 @@ TOOLS = [
 _zlib_fail_count = 0
 
 
-def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
+def _decode_depth_message(msg, dimensions=None) -> tuple[Optional[np.ndarray], str]:
     """z16 Image 或 depth-zlib CompressedImage → (深度图[米], 编码名)。
 
     只接受 16UC1/mono16 的 uint16 毫米深度帧；32FC1 等浮点深度帧（米制）
     点云卡片不支持，直接返回 None 拒绝。返回 (None, 编码名) 表示该帧不可用。
-    zlib 帧解出来是 640x480 uint16 毫米 —— 与 visual_depth 的发布格式一致，
-    解码端共用同一约定。
+    zlib 使用声明的画幅，未声明时沿用 visual_depth 的 640x480 约定。
     """
     global _zlib_fail_count
 
     if isinstance(msg, Image):
         if msg.encoding not in ("16UC1", "mono16"):
             return None, msg.encoding
-        needed = int(msg.height) * int(msg.step)
-        if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
+        if any(type(v) is not int or v <= 0 for v in (msg.width, msg.height, msg.step)):
+            return None, msg.encoding
+        needed = msg.height * msg.step
+        if msg.width > 4096 or msg.height > 4096 or needed > 64*1024*1024 or msg.step < msg.width * 2 or len(msg.data) != needed:
             return None, msg.encoding
         dtype = np.dtype((">" if msg.is_bigendian else "<") + "u2")
         depth = np.ndarray((msg.height, msg.width), dtype=dtype,
@@ -156,35 +157,38 @@ def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
     encoding = str(getattr(msg, "format", "") or "").lower()
     if "depth" not in encoding or "zlib" not in encoding:
         return None, encoding
+    width, height = dimensions if dimensions is not None else (640, 480)
+    if any(type(v) is not int or not 0 < v <= 4096 for v in (width, height)):
+        return None, "depth-zlib"
+    needed = width * height * 2
     data = bytes(msg.data)
     try:
-        raw = zlib_decompress(data)
+        raw = zlib_decompress(data, cap=max(1 << 20, needed + 1))
     except Exception as error:
         _zlib_fail_count += 1
         if _zlib_fail_count == 1 or _zlib_fail_count % 100 == 0:
             log.warning(f"[pointcloud] depth-zlib decompress failed"
                         f"（第 {_zlib_fail_count} 帧）: {str(error)[:200]}")
         return None, getattr(msg, "format", "depth-zlib")
-    if len(raw) != 640 * 480 * 2:
+    if len(raw) != needed:
         return None, "depth-zlib"
     _zlib_fail_count = 0
-    depth = np.frombuffer(raw[:640 * 480 * 2], dtype="<u2").reshape(480, 640).astype(np.float32) * 0.001
+    depth = np.frombuffer(raw, dtype="<u2").reshape(height, width).astype(np.float32) * 0.001
     return depth, "depth-zlib"
 
 
-def zlib_decompress(data: bytes) -> bytes:
-    """有界解压：深度帧是 640x480 uint16 = 614400 B，加余量封顶 1 MiB。
+def zlib_decompress(data: bytes, cap=1 << 20) -> bytes:
+    """有界解压：默认上限 1 MiB，声明画幅的调用方可传入对应字节上限。
 
     review 第 18 轮 Issue 2：zlib.decompress 无上限——几百 KB 的压缩包
     能声明几十 MB 的解压产物，在回调里把 perception 进程直接 OOM。
     decompressobj.max_length 挡住超限，unconsumed_tail 非空即"还有没解
     完的"= 超限，连同超出部分一起拒掉。"""
     import zlib
-    cap = 1 << 20
     d = zlib.decompressobj()
     raw = d.decompress(data, cap)
-    if d.unconsumed_tail or len(raw) > cap or not d.eof:
-        raise ValueError("decompressed output exceeds the 1 MiB depth-frame cap")
+    if d.unconsumed_tail or d.unused_data or len(raw) > cap or not d.eof:
+        raise ValueError("invalid zlib stream or decompressed output exceeds the depth-frame cap")
     return raw
 
 
@@ -420,7 +424,7 @@ class _PointCloudNode(Node):
 
     # A: 深度图 → 反投影
     def _emit_depth(self, msg, context=None):
-        depth_m, enc = _decode_depth_message(msg)
+        depth_m, enc = _decode_depth_message(msg, getattr(self, "_input_dimensions", None))
         if depth_m is None:
             if self._metric_cloud_enabled:
                 self._metric_skip('invalid_depth')
@@ -453,33 +457,27 @@ class _PointCloudNode(Node):
     def _publish_metric(self, xyz, source, width, height, context=None):
         if self._stop_event.is_set():
             return
-        # An opt-in asserts that this source's stamp is capture time. A header
-        # alone cannot distinguish capture time from publication time.
         calibration = self._calibration
         header = getattr(source, "header", None)
         stamp = getattr(header, "stamp", None)
         if not xyz.size:
             self._metric_skip('empty_cloud')
             return
-        if (not isinstance(calibration, dict) or calibration.get('width') != width or
-                calibration.get('height') != height or
+        if (not isinstance(calibration, dict) or
                 not all(k in calibration for k in ('fx', 'fy', 'cx', 'cy'))):
             self._metric_skip('calibration_mismatch')
-            return
-        if not getattr(header, 'frame_id', ''):
-            self._metric_skip('missing_frame')
             return
         sec, nanosec = getattr(stamp, 'sec', None), getattr(stamp, 'nanosec', None)
         if context is not None:
             header = copy.deepcopy(header)
             sec, nanosec = divmod(context.observation_stamp_ns, 1_000_000_000)
             header.stamp.sec, header.stamp.nanosec = sec, nanosec
-        if type(sec) is not int or sec <= 0 or type(nanosec) is not int or not 0 <= nanosec < 1_000_000_000:
+        if type(sec) is not int or type(nanosec) is not int or not 0 <= nanosec < 1_000_000_000:
             self._metric_skip('invalid_capture_stamp')
             return
         try:
-            intrinsics = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
-            if not all(np.isfinite(intrinsics)) or min(intrinsics[:2]) <= 0:
+            intrinsics = self._pinhole_for(width, height)
+            if not all(np.isfinite(intrinsics)) or any(v == 0 for v in intrinsics[:2]):
                 self._metric_skip('invalid_intrinsics')
                 return
         except (TypeError, ValueError):
@@ -556,7 +554,9 @@ class _PointCloudNode(Node):
         横向坐标系统性偏差。K 是像素单位、分辨率变了必须缩放。
         """
         if self._calibration:
-            return pinhole_of(self._calibration, w, h)
+            fx, fy, cx, cy = pinhole_of(self._calibration, w, h)
+            sx, sy = w / self._calibration["width"], h / self._calibration["height"]
+            return fx*sx, fy*sy, cx*sx, cy*sy
         upstream = getattr(self, "_upstream_intrinsics", None)
         if upstream:
             K, src_w, src_h = upstream
@@ -681,10 +681,12 @@ class PointCloudPerceptionPlugin:
                 node._metric_cloud_pub = node.create_publisher(PointCloud2, node._metric_cloud_topic, _PUB_QOS)
             with self._nodes_lock:
                 upstream = self._upstream_camera.get(node_key) or {}
+            if all(type(upstream.get(k)) is int and 0 < upstream[k] <= 4096 for k in ('width', 'height')):
+                node._input_dimensions = (upstream['width'], upstream['height'])
             declaration = self._upstream_input_metadata.get(node_key) or {}
             node._input_registry = self._input_registry
             node._input_declaration = upstream
-            node._input_format = declaration.get("format") or upstream.get("format")
+            node._input_format = upstream.get("format") or declaration.get("format")
             metadata_topic = declaration.get("frame_metadata_topic")
             if node._metric_cloud_enabled and isinstance(metadata_topic, str) and metadata_topic:
                 node._metric_metadata_source_topic = metadata_topic
@@ -697,9 +699,7 @@ class PointCloudPerceptionPlugin:
                 try:
                     matrix = np.asarray(K, dtype=float).reshape(3, 3)
                     dimensions = (upstream.get('width'), upstream.get('height'))
-                    valid = (np.isfinite(matrix).all() and matrix[0, 0] > 0 and matrix[1, 1] > 0
-                             and abs(matrix[0, 1]) < 1e-9 and abs(matrix[1, 0]) < 1e-9
-                             and np.allclose(matrix[2], [0, 0, 1])
+                    valid = (np.isfinite(matrix).all() and matrix[0, 0] != 0 and matrix[1, 1] != 0
                              and all(type(v) is int and v > 0 for v in dimensions))
                     if valid:
                         node._upstream_intrinsics = (matrix.reshape(-1).tolist(), *dimensions)
@@ -926,47 +926,20 @@ class PointCloudPerceptionPlugin:
             icfg = self._instance_configs.get(node_key, {})
             metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
             if metric_enabled:
-                # 沿用现有深度类型：毫米制 Z16 或固定 640x480 的 zlib。
-                # 仅驱动声明的实测针孔内参可开启计算输出，估计深度仍只供显示。
                 from plugins.camera_info import for_topic as _camera_for_topic
                 declared = _camera_for_topic(args.get("camera_info"), input_topic)
-                K = declared.get("K")
-                vendor = declared.get("vendor") or {}
                 fmt = declared.get("format")
                 try:
-                    matrix = np.asarray(K, dtype=float).reshape(3, 3)
-                    distortion = np.asarray(declared.get('D') or [], dtype=float)
-                    supported_K = (np.isfinite(matrix).all() and
-                                   np.allclose(matrix[2], [0., 0., 1.]) and
-                                   abs(matrix[0, 1]) < 1e-9 and abs(matrix[1, 0]) < 1e-9 and
-                                   np.isfinite(distortion).all() and np.all(distortion == 0))
-                except (TypeError, ValueError):
-                    supported_K = False
-                if not (declared.get("schema") == "motus.camera/1"
-                        and fmt in ("image/depth-z16", "image/depth-zlib")
-                        and declared.get("distortion_model") == "pinhole"
-                        and isinstance(vendor, dict)
-                        and vendor.get("depth_source") == "measured"
-                        and vendor.get("depth_unit") == "mm"
-                        and vendor.get('depth_semantics', 'optical_z' if vendor.get('depth_source') == 'measured' else None) == 'optical_z'
-                        and (vendor.get("timestamp_semantics") == "source_capture_mapped" or self._input_registry is not None)
-                        and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K
-                        and (fmt != "image/depth-zlib" or
-                             (declared.get("width") == 640 and declared.get("height") == 480))):
-                    return {"state": "error", "message": "metric_cloud requires measured millimetre depth, driver pinhole intrinsics and capture timestamps"}
-                calibration = dict(fx=K[0], fy=K[4], cx=K[2], cy=K[5],
-                                   width=declared.get("width"), height=declared.get("height"))
-            if metric_enabled:
-                if not isinstance(calibration, dict):
-                    return {"state": "error", "message": "metric_cloud requires depth mode and measured intrinsics"}
-                try:
-                    values = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
-                    dimensions = [calibration[k] for k in ("width", "height")]
-                    if (not all(np.isfinite(values)) or min(values[:2]) <= 0 or
-                            any(type(v) is not int or v <= 0 for v in dimensions)):
+                    matrix = np.asarray(declared.get("K"), dtype=float).reshape(3, 3)
+                    dimensions = [declared.get(k) for k in ("width", "height")]
+                    if (fmt not in ("image/depth-z16", "image/depth-zlib") or
+                            not np.isfinite(matrix).all() or matrix[0, 0] == 0 or matrix[1, 1] == 0 or
+                            any(type(v) is not int or not 0 < v <= 4096 for v in dimensions)):
                         raise ValueError
-                except (KeyError, TypeError, ValueError):
-                    return {"state": "error", "message": "metric_cloud requires finite measured fx/fy/cx/cy and image width/height"}
+                except (TypeError, ValueError):
+                    return {"state": "error", "message": "metric_cloud requires depth encoding, finite intrinsics and positive image dimensions"}
+                calibration = dict(fx=matrix[0, 0], fy=matrix[1, 1], cx=matrix[0, 2], cy=matrix[1, 2],
+                                   width=dimensions[0], height=dimensions[1])
             declarations = args.get("input_metadata")
             if 'input_metadata' in args and (not isinstance(declarations, dict) or
                     (input_topic in declarations and
@@ -974,13 +947,12 @@ class PointCloudPerceptionPlugin:
                 return {'state': 'error', 'message': 'input_metadata must map input topics to nonempty declaration objects'}
             declaration = declarations.get(input_topic) if isinstance(declarations, dict) else None
             declaration = copy.deepcopy(declaration) if isinstance(declaration, dict) else {}
-            if metric_enabled and declaration.get('format') not in (None, fmt):
-                return {'state': 'error', 'message': 'input_metadata format conflicts with driver camera_info'}
             with self._nodes_lock:
                 existing = self._nodes.get(node_key)
                 if existing and (existing._input_topic != (input_topic or '') or
-                                 declaration != self._upstream_input_metadata.get(node_key, {})):
-                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its inputs, mode or metadata'}
+                                 declaration.get('frame_metadata_topic') !=
+                                 self._upstream_input_metadata.get(node_key, {}).get('frame_metadata_topic')):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its input or metadata topic'}
                 self._upstream_input_metadata[node_key] = declaration
             if input_topic:
                 from plugins.camera_info import for_topic as _camera_for_topic

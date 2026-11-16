@@ -271,9 +271,10 @@ def test_native_registration_diagnostics_are_capture_stamped_and_bounded(monkeyp
     assert len(session.registration_by_stamp) <= 32
 
 
+@pytest.mark.parametrize('size', [(640, 480), (3, 2)])
 @pytest.mark.parametrize('mode', ['visual', 'assisted', 'fusion'])
 @pytest.mark.parametrize('color_offset_ns', [-800_000, 0, 800_000])
-def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monkeypatch, mode, color_offset_ns):
+def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monkeypatch, mode, color_offset_ns, size):
     from array import array
     from copy import deepcopy
     import sys, threading, queue, zlib
@@ -283,9 +284,11 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     obj.lock = threading.RLock(); obj.stop_event = threading.Event()
     obj.imu = obj.fusion = obj.observations = None
     obj.gate = runtime.EstimateGate('run', 'optical', 'capture-clock')
-    obj.calibration = dict(frame_id='optical', clock_id='capture-clock', K=np.eye(3))
+    width, height = size
+    obj.calibration = dict(frame_id='optical', clock_id='capture-clock', K=np.eye(3),
+                           color_size=size, depth_size=size)
     obj.counts = dict(pairs=0, estimates=0, dropped_pairs=0)
-    header = NS(frame_id='optical', stamp=NS(sec=1, nanosec=123))
+    header = NS(frame_id='producer-depth', stamp=NS(sec=1, nanosec=123))
     jpeg, png = b'camera-jpeg', b'encoded-png-depth'
     encoded = []
     def encode(format, image, params):
@@ -294,10 +297,11 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
             elapsed[0] += .04  # IMU may arrive while image preparation runs.
         return True, np.frombuffer(png, np.uint8)
     cv2 = NS(IMREAD_COLOR=1, IMWRITE_PNG_COMPRESSION=16,
-             imdecode=lambda data, mode: np.zeros((480, 640, 3), np.uint8), imencode=encode)
+             imdecode=lambda data, mode: np.zeros((height, width, 3), np.uint8), imencode=encode)
     monkeypatch.setitem(sys.modules, 'cv2', cv2)
-    depth = np.full((480, 640), 1500, np.uint16)
+    depth = np.full((height, width), 1500, np.uint16)
     color_msg = NS(header=deepcopy(header), format='jpeg', data=jpeg)
+    color_msg.header.frame_id = 'producer-color'
     color_stamp = 1_000_000_123+color_offset_ns
     color_msg.header.stamp.sec, color_msg.header.stamp.nanosec = divmod(color_stamp, 10**9)
     depth_msg = NS(header=deepcopy(header), data=zlib.compress(depth.tobytes(), 1))
@@ -365,9 +369,16 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
         assert obj.observations.counts['pose_joined'] == 1
         assert obj.observations.counts['info_joined'] == 1
     out = published[0]
-    assert out.header == header and out.depth_compressed.header == header
+    assert out.header.frame_id == out.depth_compressed.header.frame_id == 'optical'
+    assert out.header.stamp == out.depth_compressed.header.stamp == header.stamp
+    assert depth_msg.header.frame_id == 'producer-depth'
+    assert color_msg.header.frame_id == 'producer-color'
+    for info in (out.rgb_camera_info, out.depth_camera_info):
+        assert info.header.frame_id == 'optical'
+        assert (info.width, info.height) == size
     assert out.rgb_compressed.data == color_msg.data
-    assert out.rgb_compressed.header == color_msg.header
+    assert out.rgb_compressed.header.frame_id == 'optical'
+    assert out.rgb_compressed.header.stamp == color_msg.header.stamp
     assert out.depth_compressed.format == 'png'
     assert bytes(out.depth_compressed.data) == png
     assert encoded[0][0] == '.png' and encoded[0][2] == [cv2.IMWRITE_PNG_COMPRESSION, 1]

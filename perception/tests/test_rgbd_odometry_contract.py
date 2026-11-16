@@ -32,10 +32,9 @@ def test_inputs_are_resolved_by_declared_format_not_topic_name():
     ('id', 'other-camera'), ('K', [401,0,320,0,400,240,0,0,1]),
     ('D', [.1,0,0,0,0]), ('width', 1280), ('distortion_model', 'unknown'),
 ])
-def test_equal_frame_names_do_not_hide_invalid_geometry(field, value):
+def test_independent_numeric_geometry_does_not_require_identity_or_labels(field, value):
     data = declarations(); data['/depth'][field] = value
-    with pytest.raises(ValueError):
-        validate_inputs(data, ['/rgb','/depth'])
+    assert validate_inputs(data, ['/rgb','/depth'])['depth_topic'] == '/depth'
 
 
 @pytest.mark.parametrize('field,value', [
@@ -43,29 +42,26 @@ def test_equal_frame_names_do_not_hide_invalid_geometry(field, value):
     ('timestamp_semantics', 'received'), ('clock_id', 'other-clock'),
     ('frame_id', 'other-frame'),
 ])
-def test_inputs_require_measured_registered_depth_and_capture_time(field, value):
+def test_depth_labels_do_not_gate_numeric_images(field, value):
     data=declarations(); data['/depth']['vendor'][field]=value
-    with pytest.raises(ValueError):validate_inputs(data, ['/rgb','/depth'])
+    assert validate_inputs(data, ['/rgb','/depth'])['depth_topic'] == '/depth'
 
 
-def test_pairing_preserves_capture_stamps_and_discards_large_skew():
+def test_pairing_preserves_source_stamps_and_pairs_large_skew_fifo():
     pairs=PairBuffer()
     assert pairs.push('color', 1_000_000_000, 'rgb', 1_010_000_000) is None
-    pair=pairs.push('depth', 1_000_200_000, 'z16', 1_010_000_000)
-    assert pair == ((1_000_000_000, 'rgb'), (1_000_200_000, 'z16'))
-    pairs.push('color',1_100_000_000,'old',1_110_000_000)
-    assert pairs.push('depth',1_140_000_000,'next',1_150_000_000) is None
-    pair=pairs.push('color',1_140_200_000,'new',1_150_000_000)
-    assert pair[0][1]=='new'
+    pair=pairs.push('depth', 2_000_200_000, 'z16', 1_010_000_000)
+    assert pair == ((1_000_000_000, 'rgb'), (2_000_200_000, 'z16'))
 
 
-def test_pairing_bounds_memory_and_rejects_stale_repeated_reset_stamps():
+def test_pairing_bounds_memory_without_rejecting_repeated_or_reset_stamps():
     pairs=PairBuffer()
     for i in range(20):pairs.push('color',1_000_000_000+i*1_000_000,b'x',1_100_000_000)
     assert pairs.pending_count <= 5
     for stamp,now in [(1_019_000_000,1_100_000_000),(1,2_000_000_000),
                       (2_000_000_000,1_000_000_000)]:
-        with pytest.raises(ValueError):pairs.push('color',stamp,b'x',now)
+        assert pairs.push('color',stamp,b'x',now) is None
+    with pytest.raises(ValueError):pairs.push('color', 'invalid', b'x', 0)
 
 
 def pose():
@@ -104,12 +100,11 @@ def test_tracking_output_rejects_bad_estimator_pose():
     ('source_epoch', 'epoch-a', 'epoch-b'),
     ('source_id', 'camera-a', 'camera-b'),
 ])
-def test_shared_clock_name_cannot_hide_conflicting_capture_mapping(field, first, second):
+def test_capture_mapping_labels_do_not_gate_numeric_images(field, first, second):
     data = declarations()
     data['/rgb']['vendor'][field] = first
     data['/depth']['vendor'][field] = second
-    with pytest.raises(ValueError, match='clock|source'):
-        validate_inputs(data, ['/rgb', '/depth'])
+    assert validate_inputs(data, ['/rgb', '/depth'])['depth_topic'] == '/depth'
 
 
 def test_shared_unverified_mapping_is_retained_without_body_extrinsic():
@@ -148,7 +143,7 @@ def test_registered_color_resize_uses_existing_intrinsics_scaling():
     assert result['color_size']==(1280,960)
     np.testing.assert_allclose(result['K'],np.array(data['/depth']['K']).reshape(3,3))
     color['K'][2]+=20
-    with pytest.raises(ValueError):validate_inputs(data,['/rgb','/depth'])
+    assert validate_inputs(data,['/rgb','/depth'])['color_size']==(1280,960)
 
 
 def test_one_missing_clock_declaration_selects_receipt_without_false_capture_claim():
@@ -156,8 +151,7 @@ def test_one_missing_clock_declaration_selects_receipt_without_false_capture_cla
     assert validate_inputs(data,['/rgb','/depth'])['time_basis']=='receipt_estimated'
 
 @pytest.mark.parametrize('source', ['estimated', None])
-def test_optical_z_does_not_authorize_unmeasured_odometry_depth(source):
+def test_depth_source_label_does_not_gate_numeric_depth(source):
     data = declarations()
     data['/depth']['vendor'].update(depth_source=source, depth_semantics='optical_z')
-    with pytest.raises(ValueError, match='measured'):
-        validate_inputs(data, ['/rgb', '/depth'])
+    assert validate_inputs(data, ['/rgb', '/depth'])['depth_source'] == source

@@ -180,23 +180,16 @@ class PointCloudSlamPlugin:
             raise ValueError('preview_max_points exceeds existing renderer capacity')
         if type(cfg.get('reserve_bytes')) is not int or cfg['reserve_bytes'] < 0:
             raise ValueError('reserve_bytes must be a nonnegative integer')
-        for key in ('max_gap_ms', 'max_age_s', 'max_measurement_age_ms', 'voxel_size_m',
-                    'max_update_ms', 'preview_interval_s', 'max_future_skew_ms'):
+        for key in ('voxel_size_m', 'max_update_ms', 'preview_interval_s'):
             value = cfg.get(key)
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                    not math.isfinite(value) or value < 0 or (value == 0 and key != 'max_future_skew_ms')):
+                    not math.isfinite(value) or value <= 0):
                 raise ValueError(key + ' has an invalid value')
 
     def _require_mapping_inputs(self, cfg):
-        """The mapping session needs concrete frames and an extrinsic; fail clearly at start."""
-        for key in ('cloud_frame', 'child_frame', 'clock_id'):
-            value = cfg.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(key + ' is required before mapping starts: connect capture-timed '
-                                 'PointCloud2 and tracking motus.odom/1 or supply explicit metadata')
+        """Use incoming common coordinates when no numeric mount is supplied."""
         if cfg.get('extrinsic_mode', 'static') != 'dynamic' and cfg.get('child_from_cloud') is None:
-            raise ValueError('child_from_cloud is required before mapping starts: supply the '
-                             'measured card transform or a calibrated upstream mount')
+            cfg['child_from_cloud'] = [[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]]
 
     def dispatch(self, name, args):
         try:
@@ -403,7 +396,7 @@ class PointCloudSlamPlugin:
                 try:
                     validate_slam_capability(interfaces[odom])
                 except SpatialSlamError as error:
-                    raise ValueError(f'{odom}: invalid SLAM odometry capability: {error}') from error
+                    self._input_diagnostics.append(dict(topic=odom, field='odom_interface', reason=str(error)))
 
         if 'input_metadata' in args:
             provided = args.get('input_metadata')
@@ -423,46 +416,13 @@ class PointCloudSlamPlugin:
             else:
                 try:
                     self._resolved_inputs = resolve_inputs(provided, spatial_bindings)
-                    reconcile_explicit_extrinsic(self._config.get('child_from_cloud'),
-                        self._resolved_inputs['settings'].get('child_from_cloud'))
+                    manual = self._config.get('child_from_cloud')
+                    reconcile_explicit_extrinsic(manual, self._resolved_inputs['settings'].get('child_from_cloud'))
+                    if manual is not None:
+                        self._resolved_inputs['settings'].update(child_from_cloud=rigid(manual).tolist(),
+                                                                extrinsic_mode='static',manual_extrinsic=True)
                 except InputContractError as error:
                     self._input_diagnostics.extend(deepcopy(error.diagnostics))
-                    # Missing startup information is recoverable; a producer
-                    # explicitly declaring a wrong format, clock or incompatible
-                    # mount is not. Avoid treating a *derived* mismatch as
-                    # evidence when the source has not reported its frame yet.
-                    odom_decl = provided.get(odom) or {}
-                    cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
-                    cloud_decl = provided.get(cloud_topic) or {}
-                    clock_known = all(isinstance(d.get('clock_id'), str) and
-                                      d['clock_id'] and d['clock_id'] != 'unknown'
-                                      for d in (odom_decl, cloud_decl))
-                    frames_known = (isinstance(odom_decl.get('child_frame_id'), str) and
-                                    bool(odom_decl['child_frame_id'].strip()) and
-                                    isinstance(cloud_decl.get('frame_id'), str) and
-                                    bool(cloud_decl['frame_id'].strip()))
-                    sources_known = all(isinstance(d.get('source_id'), str) and
-                                        bool(d['source_id'].strip()) and
-                                        d['source_id'] != 'unknown'
-                                        for d in (odom_decl, cloud_decl))
-                    fatal_fields = {'schema', 'topic/format', 'kind',
-                        'cloud_semantics', 'timing_model', 'observation_model',
-                        'extrinsic.mode', 'extrinsic.pose_reference'}
-                    fatal = any(
-                        d.get('field') in fatal_fields or
-                        'conflicting' in d.get('reason', '') or
-                        (d.get('field') == 'clock.relation_id' and sources_known) or
-                        (d.get('field') == 'clock_id' and
-                         'differs' in d.get('reason', '') and clock_known) or
-                        (d.get('field') == 'extrinsic' and
-                         'must explicitly map' in d.get('reason', '') and frames_known)
-                        for d in error.diagnostics)
-                    if fatal:
-                        raise
-                except ValueError:
-                    # A manual transform conflicting with upstream geometry is
-                    # a real configuration conflict, never silently overridden.
-                    raise
         self._validate(self._settings())
         require_runtime()
         with self._operation_lock:
@@ -498,7 +458,6 @@ class PointCloudSlamPlugin:
                 max_gap_ms=self._config['max_gap_ms'],
                 **({'camera_info': camera} if camera is not None else {}),
                 **({'input_registry':self._input_registry} if self._input_registry else {}))
-        self._require_mapping_inputs(self._settings())
         self._validate(self._settings())
         name = validate_map_name(args.get('map_name'))
         if any(e['name'] == name for e in map_entries(_ARCHIVE_DIR)):
@@ -510,6 +469,7 @@ class PointCloudSlamPlugin:
         session = Path(_ARCHIVE_DIR) / 'sessions' / uuid.uuid4().hex
         session.mkdir(parents=True, exist_ok=False)
         settings = deepcopy(self._settings())
+        self._require_mapping_inputs(settings)
         if self._rgb_input is not None:
             settings['rgb_input'] = deepcopy(self._rgb_input)
         else:

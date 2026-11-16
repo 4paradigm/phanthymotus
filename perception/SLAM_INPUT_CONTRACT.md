@@ -1,84 +1,56 @@
-# Consuming the cross-robot Spatial SLAM Input Contract
+# Consuming spatial SLAM inputs
 
-**Canonical driver specification:** `phanthymotus-driver/docs/spatial_slam_input.md`
-([public source](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)).
-The normative schema identifiers are `motus.odom/1` with
-`vendor.motus_slam`, `motus.slam_input/1` for the two input declarations,
-and `motus.slam_frame/1` for exact per-frame provenance.
+The live consumer follows the [spatial input data standard](docs/spatial-inputs.md):
+only wire structure and the numeric values needed for computation determine
+input acceptance. The Driver's
+[producer specification](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)
+documents physical conventions and provenance. Its stricter producer validators
+are not the live consumer's admission policy. Perception's validator is therefore
+no longer a source-identical copy of `common/spatial_slam.py`.
 
-This Perception image is deployed separately from the robot driver. It embeds
-a **source-identical** pure Python validator in
-`plugins/pointcloud_slam_contract.py` (canonical copy
-`phanthymotus-driver/common/spatial_slam.py`) and tests compatible valid and
-invalid examples in `tests/test_pointcloud_slam_contract.py`.
-The live consumer is `plugins/pointcloud_slam_input.py`, which additionally
-enforces cross-topic frame, calibration, synchronization, epoch and payload
-consistency.
+## Input paths
 
-## Acceptance modes
-
-- **Explicit declaration:** a caller supplies topic-keyed `input_metadata`
-  and optionally `input_bindings` and `odom_interfaces`. The current
-  `resolve_inputs()` path requires verified clock mapping for **both**
-  sources, calibrated static/dynamic extrinsic, and a
-  `frame_metadata_topic` linked by exact timestamp, frame and payload SHA.
-  Independently sourced clocks require matching verified relation IDs.
-  `experimental=True` exists for ROS-free compatibility tests and is **not**
-  an exposed user-policy switch.
-- **Core main / topic-only:** Core forwards the two connected
-  `input_topics`. The SLAM card discovers the actual ROS publisher message
-  types and, on `start_mapping`, briefly subscribes to live tracking
-  `motus.odom/1` and native `PointCloud2` to resolve frame names,
-  measurement times and mount evidence. Default probe timeout is five seconds;
-  `max_gap_ms` defaults to 200. This is an **unverified timestamp-overlap
-  fallback**, not independent-clock synchronization proof.
-- **Manual mount:** the card exposes only `child_from_cloud`, a rigid 4x4
-  `T_odom_child_cloud` with translation in meters. If an upstream mount
-  exists, a conflicting manually entered matrix is rejected. A producer
-  assumption (`calibrated:false`) cannot be adopted automatically.
-  If the cloud and pose child frames are genuinely identical and no
-  different mount is declared, identity is valid.
+- Explicit declarations use topic-keyed `input_metadata`, with optional
+  `input_bindings` and `odom_interfaces`. Declarations identify supported formats;
+  connected topics determine routing. Source/frame/clock names, quality, units,
+  calibration, hashes and timing evidence are diagnostic, not admission gates.
+- Topic-only starts discover the connected ROS message types and probe live
+  numeric pose/cloud inputs. The default probe timeout is five seconds. This
+  discovers usable data; it does not prove physical synchronization.
+- A supplied finite numeric manual `child_from_cloud` 4×4 matrix takes precedence
+  over producer matrices, including later sidecars. Without a matrix, incoming
+  cloud coordinates are assumed already aligned with pose child coordinates.
+  Explicit dynamic mounting waits for its numeric matrix. Exact timestamps are
+  preferred; otherwise the nearest supplied matrix is used without a skew limit.
 
 ## Required ROS topics
 
-| Format | Message | Requirements |
+| Format | Message | Numeric requirements |
 | --- | --- | --- |
-| `state/odom` | `std_msgs/msg/String` | JSON `motus.odom/1`, tracking SLAM pose, stamp, frame and segment |
-| `sensor/pointcloud2` | `sensor_msgs/msg/PointCloud2` | Finite float32 XYZ fields, capture header stamp, frame, metric coordinates |
+| `state/odom` | `std_msgs/msg/String` | `motus.odom/1` JSON, integer timestamp, finite position[3] and nonzero quaternion[4], optional finite covariance[36] |
+| `sensor/pointcloud2` | `sensor_msgs/msg/PointCloud2` | Float32 XYZ fields, valid offsets/strides and payload length, integer header timestamp |
 
-`sensor/pointcloud` is a separate `UInt8MultiArray` visualization wire
-format and is not a substitute for native PointCloud2. A robot laser that
-only publishes `LaserScan` requires conversion upstream. The current
-RTAB-Map process uses `subscribe_scan_cloud=true` and external odometry,
-so adding another odometry estimator inside this card is unnecessary.
+Precise `vendor.motus_slam.stamp_ns` or observation time takes precedence when
+supplied; otherwise the explicit pose time, then legacy top-level time is used.
+Read/receipt times participate in full computation. Neither time-label equality
+nor source freshness is checked. Poses are sorted, duplicate times use the latest
+sample, and clouds wait in bounded buffers for numeric interpolation brackets.
+A status such as `lost` does not veto a usable pose; `pose: null` supplies none.
 
-The card's single fixed `sensor/mapping` output is **preview only**.
-Mapping and localization must use the saved native RTAB-Map database, not
-the preview packet. Maps and revisions retain `input_provenance` and
-the resolved frame/clock/extrinsic settings.
+`sensor/pointcloud` is a separate visualization format, not native PointCloud2.
+LaserScan requires upstream conversion. Native RTAB-Map uses external odometry
+and `subscribe_scan_cloud=true`. The single `sensor/mapping` output is preview
+only; mapping/localization uses the saved native database. Archive path,
+checksum and file-integrity checks remain storage requirements.
 
-## Diagnostics and tests
-
-Before SLAM deployment, verify that the driver publishes exactly one native
-PointCloud2 input and one tracking pose, both in the same ROS 2 DDS domain.
-Inspect `pointcloud_slam.info()` for `input_status` and
-`input_provenance`, and never treat
-`timestamp_overlap_only_not_independent_clock_proof` as calibrated
-time synchronization.
-
-For portable checks run:
+`pointcloud_slam.info()` exposes input status and provenance. These diagnostics
+are not calibration or synchronization certificates. Portable checks:
 
 ```bash
 python -m pytest -q perception/tests/test_pointcloud_slam_contract.py \
   perception/tests/test_pointcloud_slam_input.py \
-  perception/tests/test_pointcloud_slam_config.py
+  perception/tests/test_pointcloud_slam_numeric_input.py
 ```
-
-The source-identical Driver-side validator is
-`common/spatial_slam.py`; update it and the Perception copy in the
-same cross-repository change. The public contract name stays `/1`
-unless a breaking change warrants a new version.
-
 
 ## Jetson native RTAB-Map image dependencies
 
@@ -124,17 +96,14 @@ using latest-time TF. No robot-facing odometry interface or clock budget changes
 
 ## Optional RGB appearance input
 
-The optional `image/jpeg` port is outside the two required pose/cloud spatial
-input declarations. Core routes only the connected live camera declaration.
-Its absence or invalidity never weakens the spatial input contract and never
-blocks an otherwise valid scan. RGB must carry original source-capture time
-and rectified pinhole calibration in the cloud optical frame; RGB/scan skew is
-at most 50 ms. Dynamic camera mounts require exact RGB-capture evidence.
+The optional `image/jpeg` port uses the same format-only policy. JPEG, dimensions,
+intrinsics and the numeric poses/transforms needed for projection must be usable.
+Source/time/frame labels, capture proof and RGB/scan skew do not gate use. The
+provider owns rectification and physical alignment; see the
+[spatial input standard](docs/spatial-inputs.md).
 
-Images are optional per native frame. RGB failure or preparation timeout uses
-the same native map process with measured scan and external odometry only.
-RGB recovery does not reset the map origin. Generated feature depth comes
-only from measured points projected using the two source-time poses; holes
-remain unknown. No RGB or receipt timestamp substitutes for odometry, scan
-or capture-time mounting evidence. See README's optional RGB section for
-input freshness, bounded preparation and runtime status fields.
+Images are optional per native frame. Missing imagery, unusable projection data
+or preparation timeout leaves the same native map process using scan and external
+odometry. RGB recovery does not reset the map origin. Feature depth is projected
+from numeric cloud points; holes remain unknown. No missing pose or transform
+is invented. Bounded queues and preparation budgets still limit resource usage.

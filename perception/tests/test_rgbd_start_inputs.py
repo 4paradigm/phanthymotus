@@ -76,10 +76,11 @@ def test_wrong_or_absent_format_is_named(card, mutate, needle):
     lambda d: d['/depth']['vendor'].update(depth_unit='m'),
     lambda d: d['/depth']['vendor'].pop('depth_unit'),
 ])
-def test_diagnostics_do_not_substitute_intrinsics_registration_or_units(card, mutate):
+def test_numeric_intrinsics_required_but_registration_and_units_are_diagnostic(card, mutate):
     values = declarations(); mutate(values)
-    assert start(card, input_topics=['/rgb', '/depth'], camera_info=values)['state'] == 'error'
-    assert not Session.created
+    expected = 'error' if 'K' not in values['/rgb'] else 'running'
+    assert start(card, input_topics=['/rgb', '/depth'], camera_info=values)['state'] == expected
+    assert bool(Session.created) == (expected == 'running')
 
 
 def test_refreshed_declarations_require_restart_and_are_then_adopted(card):
@@ -101,3 +102,18 @@ def test_saved_imu_toggle_does_not_require_an_absent_link(card):
     assert result['config']['imu_assisted'] is False
     ok = validate_start_inputs(declarations(), ['/imu', '/depth', '/rgb'], True)
     assert ok['imu_topic'] == '/imu'
+
+
+@pytest.mark.parametrize('field,value', [('source_id', 'other'), ('source_epoch', 'new-boot'),
+    ('clock_id', 'other-clock'), ('frame_id', 'other-frame'), ('registration', None)])
+def test_repeated_start_ignores_diagnostic_camera_metadata(card, field, value):
+    values = declarations()
+    assert start(card, input_topics=['/rgb', '/depth'], camera_info=values)['state'] == 'running'
+    original = card.instances['one'][0]
+    for entry in values.values():
+        entry['vendor'][field] = value
+        entry['schema'] = 'producer-label'
+        entry['id'] = 'other-camera'
+    result = start(card, input_topics=['/depth', '/rgb'], camera_info=values)
+    assert result['state'] == 'running'
+    assert card.instances['one'][0] is original

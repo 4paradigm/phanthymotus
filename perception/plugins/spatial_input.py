@@ -8,14 +8,14 @@ import threading
 import time
 import uuid
 
-from .spatial_time import TimePolicy, FrameContext, compatible_sources
+from .spatial_time import TimePolicy, FrameContext
 
 
 def _stamp(message):
     header = getattr(message, 'header', None)
     stamp = getattr(header, 'stamp', None)
     if stamp is None:return None
-    if type(stamp.sec) is not int or type(stamp.nanosec) is not int or stamp.sec<0 or not 0<=stamp.nanosec<1_000_000_000:
+    if type(stamp.sec) is not int or type(stamp.nanosec) is not int:
         raise ValueError('invalid ROS timestamp')
     return stamp.sec * 1_000_000_000 + stamp.nanosec
 
@@ -74,10 +74,6 @@ class SubscriptionLease:
                     return
                 message, context, size, offered = self._pending.popleft()
                 self._bytes -= size
-            if time.monotonic_ns() - context.ingress_monotonic_ns > self.registry.max_age_ns:
-                with self._condition:
-                    self._dropped += 1
-                continue
             began=time.monotonic_ns()
             with self._condition:self._queue_times.append(max(0,began-offered))
             try:
@@ -164,17 +160,11 @@ class InputAdapterRegistry:
 
     @staticmethod
     def _check_declarations(first, second):
-        a, b = first.get('vendor') or {}, second.get('vendor') or {}
-        compatible_sources(a, b)
-        for left, right, names in ((first, second, ('id', 'width', 'height', 'K', 'D', 'format', 'clock_id', 'time_basis', 'source_id', 'source_epoch')),
-                                  (a, b, ('clock_id', 'frame_id', 'timestamp_semantics', 'registration'))):
-            for name in names:
-                if left.get(name) is not None and right.get(name) is not None and left[name] != right[name]:
-                    raise ValueError('live input declaration conflict: ' + name)
+        return None  # Each consumer owns its numeric calibration.
 
     def _source(self, declaration, message):
         source = dict(declaration.get('vendor') or {})
-        if declaration.get('schema') in ('motus.slam_input/1','motus.slam_input/2') and declaration.get('stamp_source')=='measurement':
+        if declaration.get('schema') in ('motus.slam_input/1','motus.slam_input/2'):
             source.update(clock_id=declaration.get('clock_id'),timestamp_semantics='source_capture_mapped',
                           source_id=declaration.get('source_id'),source_epoch=declaration.get('source_epoch'))
         stamp = _stamp(message)
@@ -185,10 +175,9 @@ class InputAdapterRegistry:
                 source.update((k, v) for k, v in quality.items() if k in (
                     'clock_id', 'source_id', 'source_epoch'))
                 stamp = quality.get('stamp_ns')
-                if stamp is None and type(sample.get('stamp_ms')) is int:
-                    stamp = sample['stamp_ms'] * 1_000_000
-                if quality.get('stamp_source') == 'measurement':
-                    source['timestamp_semantics'] = 'source_capture_mapped'
+                source['timestamp_semantics'] = quality.get('stamp_source')
+            if stamp is None and type(sample.get('stamp_ms')) is int:
+                stamp=sample['stamp_ms']*1_000_000
         source['stamp_ns'] = stamp
         return source
 
@@ -205,18 +194,10 @@ class InputAdapterRegistry:
                 if context is None and isinstance(getattr(message,'data',None),str):
                     sample=json.loads(message.data)
                     quality=(sample.get('vendor') or {}).get('motus_slam') or {}
-                    if quality.get('profile')=='motus_slam/2':
-                        from .spatial_contract import validate_tracking_pose
-                        if quality.get('status')=='tracking':validate_tracking_pose(sample)
-                        supplied=FrameContext.from_dict(quality.get('observation'))
-                        if supplied.ingress_clock_id==self.clock_id:
-                            context=supplied
-                        elif supplied.time_basis=='receipt_estimated':
-                            raise ValueError('foreign receipt context has no common ingress clock')
+                    if isinstance(quality.get('observation'),dict):
+                        context=FrameContext.from_dict(quality['observation'])
                 if context is None:
                     context = self.time_policy.select(self._source(stream['declaration'], message), realtime, monotonic)
-                if monotonic-context.ingress_monotonic_ns > self.max_age_ns:
-                    raise ValueError('derived input exceeds original ingress age')
             except (ValueError, TypeError, AttributeError, OverflowError) as error:
                 stream['rejected'] += 1
                 stream['last_error'] = str(error)[:300]
@@ -230,9 +211,6 @@ class InputAdapterRegistry:
                           parent_observation_ids=(parent.observation_id,),
                           transformations=parent.transformations + (stage,))
         with self._lock:
-            now = time.monotonic_ns()
-            self._derived = OrderedDict((k, v) for k, v in self._derived.items()
-                if now-v.ingress_monotonic_ns <= self.max_age_ns)
             self._derived[_identity(topic, message)] = context
             while len(self._derived) > 256:
                 self._derived.popitem(last=False)

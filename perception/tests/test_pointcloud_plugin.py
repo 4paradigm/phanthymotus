@@ -110,7 +110,7 @@ def test_metric_cloud_preserves_header_and_optical_coordinates():
     node.stop()
 
 
-def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
+def test_metric_cloud_accepts_unknown_frame_zero_stamp_and_resized_intrinsics():
     plugin, executor = _plugin({"metric_cloud": True})
     plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     node = executor.nodes[0]
@@ -119,21 +119,21 @@ def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
     pub = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
-    assert not pub.messages
+    assert len(pub.messages) == 1
     msg.header.frame_id = "optical"
     msg.header.stamp = types.SimpleNamespace(sec=0, nanosec=0)
     node._emit_depth(msg)
-    assert not pub.messages
+    assert len(pub.messages) == 2
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     msg.width = 2
     msg.step = 4
     msg.data = np.array([2000, 2000], dtype="<u2").tobytes()
     node._emit_depth(msg)
-    assert not pub.messages
+    assert len(pub.messages) == 3
     node.stop()
 
 
-def test_metric_info_explains_missing_frame_and_rejected_float_depth():
+def test_metric_info_reports_unlabelled_frame_and_rejected_float_depth():
     plugin, executor = _plugin({'metric_cloud': True})
     plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth', 'camera_info': [metric_z16_declaration(1)]})
     node = executor.nodes[0]
@@ -142,8 +142,7 @@ def test_metric_info_explains_missing_frame_and_rejected_float_depth():
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
-    assert info['published'] == 0 and info['last_skip_reason'] == 'missing_frame'
-    assert info['skipped']['missing_frame'] == 1
+    assert info['published'] == 1 and info['last_skip_reason'] is None
     # 32FC1 不再被解码，帧在 _decode_depth_message 就被拒（invalid_depth）。
     bad = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
                      width=1, height=1, step=4)
@@ -153,12 +152,13 @@ def test_metric_info_explains_missing_frame_and_rejected_float_depth():
     node.stop()
 
 
-def test_metric_start_rejects_explicit_non_metric_upstream_format():
+def test_metric_start_accepts_numeric_depth_without_metric_labels():
     plugin, executor = _plugin({'metric_cloud': True})
     declaration = {**_UPSTREAM_DECL, 'topic': '/depth', 'format': 'image/depth-z16'}
     result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
                                              'input_topic': '/depth', 'camera_info': [declaration]})
-    assert result['state'] == 'error' and not executor.nodes
+    assert result['state'] == 'running' and executor.nodes
+    plugin.shutdown()
 
 
 def test_metric_cloud_does_not_start_with_inferred_intrinsics():
@@ -206,29 +206,29 @@ def test_metric_cloud_accepts_calibrated_depth_declaration():
 
 
 @pytest.mark.parametrize('source,model', [('manual', 'pinhole'), ('derived-from-K', 'unknown')])
-def test_metric_cloud_rejects_unverified_or_distorted_declaration(source, model):
+def test_metric_cloud_accepts_unverified_or_distorted_declaration(source, model):
     plugin, executor = _plugin({"metric_cloud": True})
     declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": source, "distortion_model": model,
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
                                             "camera_info": [declaration]})
-    assert result["state"] == "error"
-    assert not executor.nodes
+    assert result["state"] == "running"
+    plugin.shutdown()
 
 
-def test_metric_cloud_rejects_declaration_without_capture_time_semantics():
+def test_metric_cloud_accepts_declaration_without_capture_time_semantics():
     plugin, executor = _plugin({"metric_cloud": True})
     declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
                                             "camera_info": [declaration]})
-    assert result["state"] == "error"
-    assert not executor.nodes
+    assert result["state"] == "running"
+    plugin.shutdown()
 
 
-def test_metric_cloud_rejects_intrinsics_with_unhandled_skew():
+def test_metric_cloud_accepts_finite_intrinsics_with_skew():
     plugin, executor = _plugin({"metric_cloud": True})
     declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
@@ -236,8 +236,8 @@ def test_metric_cloud_rejects_intrinsics_with_unhandled_skew():
                    "vendor": {"depth_unit": "mm", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
                                             "camera_info": [declaration]})
-    assert result["state"] == "error"
-    assert not executor.nodes
+    assert result["state"] == "running"
+    plugin.shutdown()
 
 
 def test_metric_depth_subscribes_only_to_image_type():
@@ -518,7 +518,7 @@ def test_start_rejects_explicit_mode_without_any_input(mode):
     assert executor.nodes == []
 
 
-@pytest.mark.parametrize('index,bad', [(0, 0), (0, float('nan')), (0, 'abc'), (4, float('inf')), (2, float('nan')), (5, float('inf')), (8, 0)])
+@pytest.mark.parametrize('index,bad', [(0, 0), (0, float('nan')), (0, 'abc'), (4, float('inf')), (2, float('nan')), (5, float('inf')), (8, float('inf'))])
 def test_metric_start_rejects_invalid_driver_intrinsics(index, bad):
     decl = metric_z16_declaration()
     decl['K'][index] = bad
@@ -621,12 +621,12 @@ def test_depth_zlib_decompress_is_bounded():
     # 解压炸弹：40 MB 的零压到几 KB，必须在 1 MiB 处被截停
     bomb = zlib.compress(b"\x00" * (40 << 20), 9)
     assert len(bomb) < 100_000  # 压缩端确实很小
-    with pytest.raises(ValueError, match="1 MiB"):
+    with pytest.raises(ValueError, match="cap"):
         zlib_decompress(bomb)
 
     # 略超上限：1.25 MB —— 同样拒收（unconsumed_tail 非空）
     over = zlib.compress(b"\x01" * (1 << 20) + b"\x02" * (1 << 18), 1)
-    with pytest.raises(ValueError, match="1 MiB"):
+    with pytest.raises(ValueError, match="cap"):
         zlib_decompress(over)
 
     # 截断流：解不出来，照旧抛 zlib 的错误（外部有 fail_count 兜底）
@@ -1066,21 +1066,23 @@ def test_saved_manual_settings_do_not_retire_or_override_display_instance(old):
 
 @pytest.mark.parametrize('field,bad', [('depth_source', 'estimated'), ('depth_source', None),
     ('depth_unit', 'm'), ('timestamp_semantics', 'publication')])
-def test_metric_z16_requires_measured_source_units_and_capture_time(field, bad):
+def test_metric_z16_accepts_source_units_and_capture_labels(field, bad):
     declaration = metric_z16_declaration()
     declaration['vendor'][field] = bad
     plugin, executor = _plugin({'metric_cloud': True})
-    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'error'
-    assert not executor.nodes
+    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'running'
+    plugin.shutdown()
 
 
 @pytest.mark.parametrize('field,bad', [('D', [.1, 0, 0, 0]), ('width', 0), ('height', None)])
-def test_metric_rejects_distortion_and_missing_image_dimensions(field, bad):
+def test_metric_ignores_distortion_labels_but_rejects_missing_image_dimensions(field, bad):
     declaration = metric_z16_declaration()
     declaration[field] = bad
     plugin, executor = _plugin({'metric_cloud': True})
-    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'error'
-    assert not executor.nodes
+    expected = 'running' if field == 'D' else 'error'
+    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == expected
+    assert bool(executor.nodes) == (expected == 'running')
+    plugin.shutdown()
 
 
 @pytest.mark.parametrize('endian,big', [('<', 0), ('>', 1)])
@@ -1129,21 +1131,21 @@ def test_metric_zlib_uses_supported_transport_and_preserves_geometry_and_header(
 
 @pytest.mark.parametrize('field,bad', [('depth_unit', 'm'), ('depth_source', 'estimated'),
                                       ('timestamp_semantics', 'publication')])
-def test_metric_zlib_rejects_unproven_source_even_with_explicit_calibration(field, bad):
+def test_metric_zlib_accepts_numeric_depth_independently_of_source_labels(field, bad):
     declaration = metric_zlib_declaration()
     declaration['vendor'][field] = bad
     plugin, executor = _plugin({'metric_cloud': True, 'calibration': {
         'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 640, 'height': 480}})
     result = plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})
-    assert result['state'] == 'error'
-    assert not executor.nodes
+    assert result['state'] == 'running'
+    plugin.shutdown()
 
 
 @pytest.mark.parametrize('fault,reason', [
     ('missing_frame', 'missing_frame'), ('zero_stamp', 'invalid_capture_stamp'),
     ('short', 'invalid_depth'), ('extra', 'invalid_depth'),
 ])
-def test_metric_zlib_rejects_bad_frames_and_recovers(fault, reason):
+def test_metric_zlib_rejects_bad_buffers_but_preserves_unlabelled_headers(fault, reason):
     plugin, executor = _plugin({'metric_cloud': True})
     assert plugin.dispatch('start', {'input_topic': '/depth',
         'camera_info': [metric_zlib_declaration()]})['state'] == 'running'
@@ -1156,13 +1158,18 @@ def test_metric_zlib_rejects_bad_frames_and_recovers(fault, reason):
     pub = next(p for p in node.publishers if p.topic == '/depth/pointcloud_metric')
     try:
         node._emit_depth(msg)
-        assert not pub.raw_messages
-        assert node._metric_status()['skipped'][reason] == 1
+        admitted = fault in ('missing_frame', 'zero_stamp')
+        assert len(pub.raw_messages) == int(admitted)
+        if admitted:
+            assert pub.raw_messages[0].header.frame_id == msg.header.frame_id
+            assert pub.raw_messages[0].header.stamp.sec == msg.header.stamp.sec
+        else:
+            assert node._metric_status()['skipped'][reason] == 1
         msg.data = zlib.compress(pixels)
         msg.header.frame_id = 'optical'
         msg.header.stamp.sec = 124
         node._emit_depth(msg)
-        assert len(pub.raw_messages) == 1
-        assert pub.raw_messages[0].header.stamp.sec == 124
+        assert len(pub.raw_messages) == 1 + int(admitted)
+        assert pub.raw_messages[-1].header.stamp.sec == 124
     finally:
         node.stop()

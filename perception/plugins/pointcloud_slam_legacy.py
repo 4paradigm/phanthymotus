@@ -13,6 +13,16 @@ from .pointcloud_slam_transforms import rigid, pose_matrix
 SCHEMAS = ('motus.experimental-slam-paged/1', 'motus.experimental-slam-paged/2')
 
 
+def _archive_rigid(value):
+    """Retain the saved archive's original rigid-matrix integrity contract."""
+    matrix = rigid(value)
+    if (not np.allclose(matrix[3], [0,0,0,1], atol=1e-6) or
+            not np.allclose(matrix[:3,:3].T@matrix[:3,:3], np.eye(3), atol=1e-6) or
+            not np.isclose(np.linalg.det(matrix[:3,:3]), 1., atol=1e-6)):
+        raise ValueError('invalid archived rigid transform')
+    return matrix
+
+
 def file_digest(path):
     digest = hashlib.sha256()
     with path.open('rb') as source:
@@ -78,7 +88,7 @@ def load_legacy_snapshots(path, data, *, max_points=40000):
             raise ValueError('archive configuration required')
         mode = configuration.get('extrinsic_mode', 'static')
         if mode == 'static':
-            rigid(configuration['child_from_cloud'])
+            _archive_rigid(configuration['child_from_cloud'])
         elif mode != 'dynamic' or configuration.get('child_from_cloud') is not None:
             raise ValueError('invalid archived extrinsic mode')
         segments = {}
@@ -108,7 +118,7 @@ def load_legacy_snapshots(path, data, *, max_points=40000):
                 if (not saved or optimized > len(entries) or
                         stamps != [record['stamp_ns'] for record, _ in entries[:optimized]]):
                     raise ValueError('history capture stamps mismatch')
-                saved = [rigid(pose) for pose in saved]
+                saved = [_archive_rigid(pose) for pose in saved]
                 correction = saved[-1] @ np.linalg.inv(poses[optimized - 1])
                 poses = saved + [correction @ pose for pose in poses[optimized:]]
             total = sum(record['count'] for record, _ in entries)

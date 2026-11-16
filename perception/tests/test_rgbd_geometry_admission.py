@@ -147,7 +147,7 @@ def test_slam_admits_original_cloud_after_delayed_geometry_measurement(setup):
     assert slam.accepted[0].cloud == cloud
 
 
-def test_slam_resumes_on_following_capture_after_three_geometry_recoveries(setup):
+def test_slam_replays_pending_capture_after_three_geometry_recoveries(setup):
     from test_pointcloud_slam_stream import stream
     fusion, runner, queue, stamp, color, depth = setup
     slam = stream(cloud_frame='optical', child_frame='optical', clock_id='capture-clock')
@@ -158,18 +158,16 @@ def test_slam_resumes_on_following_capture_after_three_geometry_recoveries(setup
         next_stamp = stamp+50_000_000
         feed(fusion, stamp, next_stamp)
         assert submit(queue, next_stamp, color, depth) == []
+        slam.cloud(next_stamp, 'optical', [[1., 0., 2.]], now=(next_stamp+5_000_000)/1e9)
         if i < 3:
-            with pytest.raises(ValueError, match='paused'):
-                slam.cloud(next_stamp, 'optical', [[1., 0., 2.]], now=(next_stamp+5_000_000)/1e9)
-        else:
-            slam.cloud(next_stamp, 'optical', [[1., 0., 2.]], now=(next_stamp+5_000_000)/1e9)
+            assert not slam.accepted and slam.pending_count == 1
         runner.ready = True
         out = queue.drain(next_stamp+10_000_000)
         assert len(out) == 1
         slam.odom(out[0], now=(next_stamp+10_000_000)/1e9)
-        assert len(slam.accepted) == (1 if i == 3 else 0)
+        assert len(slam.accepted) == max(0, i-1)
         stamp = next_stamp
-    assert slam.accepted[0].cloud_stamp_ns == stamp
+    assert slam.accepted[-1].cloud_stamp_ns == stamp
 
 
 @pytest.mark.parametrize('offset', [-1, 0, 1])

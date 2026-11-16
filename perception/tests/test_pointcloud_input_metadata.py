@@ -44,13 +44,16 @@ def test_input_metadata_is_not_a_manual_pointcloud_card_parameter():
                for item in schema['x-action-params'].values())
 
 
-def test_metric_rejects_conflicting_camera_and_input_transport_declarations():
+def test_metric_uses_camera_transport_without_admitting_by_metadata_agreement():
     executor = _FakeExecutor()
     plugin = PointCloudPerceptionPlugin({'metric_cloud': True}, 'testns', executor)
     result = plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [_camera()],
         'input_metadata': {'/depth': _declaration(format='image/depth-zlib')}})
-    assert result['state'] == 'error'
-    assert not executor.nodes
+    try:
+        assert result['state'] == 'running'
+        assert [s.callback.__name__ for s in executor.nodes[0].subscriptions if s.topic == '/depth'] == ['_depth_image_cb']
+    finally:
+        plugin.shutdown()
 
 
 def _running(declaration=None, **args):
@@ -268,14 +271,29 @@ def test_missing_sidecar_declaration_keeps_driver_calibrated_metric_start(metada
         plugin.shutdown()
 
 @pytest.mark.parametrize('source', ['estimated', None])
-def test_optical_z_does_not_authorize_unmeasured_metric_depth(source):
+def test_depth_source_labels_do_not_gate_metric_depth(source):
     executor = _FakeExecutor()
     plugin = PointCloudPerceptionPlugin({'metric_cloud': True}, 'testns', executor)
     camera = _camera()
     camera['vendor'].update(depth_source=source, depth_semantics='optical_z')
     result = plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [camera]})
     try:
-        assert result['state'] == 'error'
-        assert not executor.nodes
+        assert result['state'] == 'running'
+        assert executor.nodes
+    finally:
+        plugin.shutdown()
+
+
+def test_repeated_start_accepts_changed_source_labels_without_rebinding():
+    plugin, node = _running()
+    try:
+        changed = _declaration(source_id='other-camera', clock_id='other-clock', frame_id='other-frame')
+        result = plugin.dispatch('pointcloud', {
+            'action': 'start', 'instance_id': 'depth-card', 'input_topic': '/depth', 'camera_info': [_camera()],
+            'input_metadata': {'/depth': changed}})
+        assert result['state'] == 'running'
+        assert plugin._executor.nodes == [node]
+        node._emit_depth(_depth())
+        assert _published(node, '').raw_messages
     finally:
         plugin.shutdown()

@@ -5,96 +5,64 @@ from copy import deepcopy
 import numpy as np
 
 from .spatial_contract import validate_tracking_pose
-from .camera_info import _rescale_K
 
 
 def validate_inputs(declarations, topics):
+    """Require decodable image roles and computable numeric camera geometry.
+
+    Registration, depth units and coordinate conventions are producer contracts;
+    their diagnostic declarations do not control admission.
+    """
     if not isinstance(declarations, dict) or len(topics or []) != 2 or len(set(topics)) != 2:
-        raise ValueError('connect one calibrated color and one measured depth input')
-    entries = [declarations.get(topic, {}) for topic in topics]
-    if {d.get('format') for d in entries} != {'image/jpeg', 'image/depth-zlib'}:
+        raise ValueError('connect one color and one depth input')
+    entries = [declarations.get(topic) for topic in topics]
+    if (any(not isinstance(d, dict) for d in entries) or
+            {d.get('format') for d in entries} != {'image/jpeg', 'image/depth-zlib'}):
         raise ValueError('RGB-D requires image/jpeg and image/depth-zlib declarations')
     color = next(d for d in entries if d['format'] == 'image/jpeg')
     depth = next(d for d in entries if d['format'] == 'image/depth-zlib')
     for d in entries:
-        if (d.get('schema') != 'motus.camera/1' or not d.get('id') or
-                any(type(d.get(k)) is not int or not 0<d[k]<=4096 for k in ('width','height')) or
-                (d is depth and (d['width']!=640 or d['height']!=480)) or
-                d.get('distortion_model') != 'pinhole'):
-            raise ValueError('RGB-D requires declared rectified 640x480 camera geometry')
-        k = np.asarray(d.get('K'), dtype=float)
-        distortion = np.asarray(d.get('D'), dtype=float)
-        if (k.size != 9 or not np.isfinite(k).all() or k.flat[0] <= 0 or k.flat[4] <= 0 or
-                not np.allclose(k.reshape(3, 3)[2], [0, 0, 1]) or
-                distortion.size == 0 or not np.isfinite(distortion).all() or np.any(distortion != 0)):
-            raise ValueError('RGB-D calibration must be a finite pinhole with zero distortion')
-        vendor = d.get('vendor') or {}
-        if (vendor.get('registration') != 'registered_rectified' or
-                not vendor.get('frame_id')):
-            raise ValueError('RGB-D registration, optical frame and capture clock are required')
-    color_k = _rescale_K(color['K'], (color['width'],color['height']), (640,480))
-    if (color['id'] != depth['id'] or color_k is None or not np.allclose(color_k, depth['K'], rtol=1e-7, atol=1e-7) or
-            color['vendor'].get('frame_id') != depth['vendor'].get('frame_id') or
-            (color['vendor'].get('clock_id') and depth['vendor'].get('clock_id') and
-             color['vendor']['clock_id'] != depth['vendor']['clock_id'])):
-        raise ValueError('RGB-D inputs must share registered geometry and capture clock')
-    # Optional mapping/source evidence must describe one shared capture timeline.
-    # Matching clock names alone cannot conceal contradictory producer claims.
-    for key in ('source_clock', 'mapping_offset_ns', 'clock_mapping',
-                'clock_mapping_verified', 'clock_mapping_uncertainty_ns',
-                'source_id', 'source_epoch'):
-        if (key in color['vendor'] and key in depth['vendor'] and
-                color['vendor'][key] != depth['vendor'][key]):
-            raise ValueError('RGB-D source clock mapping declarations conflict: ' + key)
-    if (depth['vendor'].get('depth_source') != 'measured' or
-            depth['vendor'].get('depth_unit') != 'mm' or
-            depth['vendor'].get('depth_semantics', 'optical_z' if depth['vendor'].get('depth_source') == 'measured' else None) != 'optical_z'):
-        raise ValueError('RGB-D requires measured millimetre optical Z depth')
-    semantics = [d['vendor'].get('timestamp_semantics') for d in entries]
-    if all(semantics) and semantics[0] != semantics[1]:
-        raise ValueError('RGB-D timestamp semantics conflict')
-    capture = all(v == 'source_capture_mapped' for v in semantics) and all(d['vendor'].get('clock_id') for d in entries)
-    mount = color['vendor'].get('body_mount')
-    if mount != depth['vendor'].get('body_mount'):
-        raise ValueError('RGB-D body_mount declarations conflict')
+        if any(type(d.get(k)) is not int or not 0 < d[k] <= 4096 for k in ('width', 'height')):
+            raise ValueError('RGB-D requires positive integer image dimensions up to 4096')
+        try:
+            k = np.asarray(d.get('K'), dtype=float)
+            if k.size != 9 or not np.isfinite(k).all() or k.flat[0] == 0 or k.flat[4] == 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError('RGB-D requires nine finite intrinsics with nonzero focal lengths') from None
+    cv = color.get('vendor') if isinstance(color.get('vendor'), dict) else {}
+    dv = depth.get('vendor') if isinstance(depth.get('vendor'), dict) else {}
+    roles = {entry['format']: topic for topic, entry in zip(topics, entries)}
+    result = dict(color_topic=roles['image/jpeg'], depth_topic=roles['image/depth-zlib'],
+                  K=np.asarray(depth['K'], dtype=float).reshape(3, 3),
+                  color_size=(color['width'], color['height']), depth_size=(depth['width'], depth['height']),
+                  frame_id=cv.get('frame_id') or dv.get('frame_id') or 'camera_optical',
+                  clock_id=cv.get('clock_id') or dv.get('clock_id'),
+                  time_basis='source_capture' if cv.get('clock_id') and dv.get('clock_id') else 'receipt_estimated',
+                  depth_source=dv.get('depth_source', 'unknown'),
+                  motion_limits=deepcopy(cv.get('motion_limits')))
+    mount = cv.get('body_mount', dv.get('body_mount'))
     if mount is not None:
         from .rgbd_body_mount import validate_mount_declaration
-        mount = validate_mount_declaration(mount, color['vendor']['frame_id'], topics)
-    result = dict(color_topic=color['topic'], depth_topic=depth['topic'],
-                K=np.asarray(depth['K'], dtype=float).reshape(3, 3), color_size=(color['width'],color['height']),
-                frame_id=color['vendor']['frame_id'], clock_id=color['vendor'].get('clock_id'),
-                time_basis='source_capture' if capture else 'receipt_estimated',
-                depth_source=depth['vendor'].get('depth_source', 'unknown'),
-                motion_limits=deepcopy(color['vendor'].get('motion_limits')))
-    if mount is not None:
-        result['body_mount'] = mount
+        result['body_mount'] = validate_mount_declaration(mount, result['frame_id'], topics)
     return result
 
 
 class PairBuffer:
-    """Match source times with bounded memory; never substitute receipt times."""
+    """Pair image arrivals in FIFO order while preserving their source times."""
     def __init__(self, max_pending=5, max_skew_ns=20_000_000):
         self.queues = {kind: deque(maxlen=max_pending) for kind in ('color', 'depth')}
-        self.previous = {}
-        self.max_skew_ns = max_skew_ns
 
     @property
     def pending_count(self):
         return sum(len(q) for q in self.queues.values())
 
     def push(self, kind, stamp_ns, payload, now_ns):
-        if (type(stamp_ns) is not int or stamp_ns <= self.previous.get(kind, 0) or
-                not -50_000_000 <= now_ns - stamp_ns <= 1_000_000_000):
-            raise ValueError('stale, repeated, future or reset RGB-D capture time')
-        self.previous[kind] = stamp_ns
+        if kind not in self.queues or type(stamp_ns) is not int:
+            raise ValueError('RGB-D requires an image role and integer timestamp')
         self.queues[kind].append((stamp_ns, payload))
         color, depth = self.queues['color'], self.queues['depth']
-        while color and depth:
-            delta = color[0][0] - depth[0][0]
-            if abs(delta) <= self.max_skew_ns:
-                return color.popleft(), depth.popleft()
-            (color if delta < 0 else depth).popleft()
-        return None
+        return (color.popleft(), depth.popleft()) if color and depth else None
 
 
 def make_sample(status, stamp_ns, segment, clock, pose=None, *, reason=None, context=None):

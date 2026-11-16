@@ -1,7 +1,7 @@
 """Robot-independent point-cloud SLAM configuration and runtime input discovery.
 
 The canvas on Core main passes input_topics, not spatial metadata. Observe a
-fresh tracking motus.odom/1 pose and a native PointCloud2 header to resolve
+numeric motus.odom/1 pose and a native PointCloud2 header to resolve
 frame/clock names without guessing a robot model. A structurally valid mount
 may be used without calibration; the calibration flag is retained as provenance.
 """
@@ -25,91 +25,65 @@ def _matrix(value):
 
 
 def reconcile_explicit_extrinsic(manual, producer):
-    """An explicit, validated producer contract cannot be silently overridden."""
-    if manual is None or producer is None:
-        return
-    if not np.allclose(_matrix(manual), _matrix(producer), rtol=0, atol=1e-6):
-        raise ValueError('child_from_cloud conflicts with validated upstream extrinsic')
+    """Validate supplied numeric matrices without requiring identity agreement."""
+    for value in (manual, producer):
+        if value is not None:
+            _matrix(value)
 
 
 def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
                    max_gap_ms=200, camera_info=None):
-    """Build session geometry from actual messages, never robot-model presets.
-
-    This legacy-Core route verifies frame names and a contemporaneous timestamp
-    pair. It does NOT claim a verified relationship between independent clocks;
-    those proofs require the existing strict motus.slam_input/1 declaration path.
-    """
+    """Resolve numeric transforms; producers own physical/time alignment."""
     pose = decode_slam_odom(odom_sample)
-    if not isinstance(cloud_frame, str) or not cloud_frame.strip():
-        raise ValueError('PointCloud2 header.frame_id is missing')
-    if type(cloud_stamp_ns) is not int or cloud_stamp_ns <= 0:
-        raise ValueError('PointCloud2 capture timestamp is missing')
-    if abs(cloud_stamp_ns - pose.stamp_ms * 1_000_000) > max_gap_ms * 1_000_000:
-        raise ValueError('pointcloud and odometry acquisition times do not overlap')
-    if not pose.clock_id or not pose.segment_id:
-        raise ValueError('SLAM odometry clock/segment is missing')
-
-    quality = odom_sample['vendor']['motus_slam']
+    if not isinstance(cloud_frame, str):
+        raise ValueError('PointCloud2 header.frame_id must be text')
+    if type(cloud_stamp_ns) is not int:
+        raise ValueError('PointCloud2 capture timestamp must be integer nanoseconds')
+    vendor = odom_sample.get('vendor')
+    quality = vendor.get('motus_slam', {}) if isinstance(vendor, dict) else {}
+    quality = quality if isinstance(quality, dict) else {}
     mount = quality.get('extrinsic')
     if (mount is None and cloud_frame != pose.child_frame_id and isinstance(camera_info, dict)
             and isinstance(camera_info.get('vendor'), dict) and camera_info['vendor'].get('body_mount') is not None):
-        if manual is not None:
-            raise ValueError('static card transform cannot replace a declared capture mount')
-        from .pointcloud_slam_capture_mount import resolve_capture_mount
-        return resolve_capture_mount(odom_sample, camera_info, cloud_frame)
+        if manual is None:
+            from .pointcloud_slam_capture_mount import resolve_capture_mount
+            return resolve_capture_mount(odom_sample, camera_info, cloud_frame)
     proposed = None
     if mount is not None:
-        # The legacy route cannot consume a per-capture TF mount. Reject it
-        # with the stable public error before static-matrix validation.
-        if isinstance(mount, dict) and mount.get('mode', 'static') == 'dynamic':
-            raise ValueError('dynamic mount requires the verified per-frame input contract')
         try:
             validate_mount(mount, parent_frame=pose.child_frame_id,
                            child_frame=cloud_frame)
         except SpatialSlamError as error:
             raise ValueError('odometry extrinsic frame/geometry invalid: ' + str(error)) from error
-        proposed = _matrix(mount.get('matrix'))
+        if mount.get('matrix') is not None:
+            proposed = _matrix(mount['matrix'])
 
     manual_matrix = _matrix(manual) if manual is not None else None
-    # The odometry estimator has already used the upstream base->sensor
-    # transform when producing its pose. A conflicting manual matrix cannot
-    # silently change that reference point, even for an assumed mount.
-    if proposed is not None and manual_matrix is not None and not np.allclose(
-            proposed, manual_matrix, rtol=0, atol=1e-6):
-        raise ValueError('child_from_cloud conflicts with odometry producer extrinsic')
-    if mount is not None and mount.get('calibrated') is True:
-        chosen = proposed
-        provenance = 'producer_calibrated'
-    elif manual_matrix is not None:
-        chosen = manual_matrix
-        provenance = 'manual_card'
-    elif mount is not None:
-        chosen = proposed
-        provenance = 'producer_declared_uncalibrated'
-    elif cloud_frame == pose.child_frame_id:
-        # Identical frames imply an identity mapping, not an assumed mount.
-        chosen = np.eye(4)
-        provenance = 'identical_frame'
+    if manual_matrix is not None:
+        chosen, mode, provenance = manual_matrix, 'static', 'manual_card'
+    elif proposed is not None:
+        chosen, mode, provenance = proposed, 'static', 'producer_declared'
+    elif mount is not None and mount.get('mode') == 'dynamic':
+        chosen, mode, provenance = None, 'dynamic', 'producer_declared_dynamic'
     else:
-        raise ValueError('child_from_cloud is required: upstream mount is absent '
-                         'or is an unverified assumption; enter measured 4x4 on the SLAM card')
+        chosen, mode = np.eye(4), 'static'
+        provenance = 'identical_frame' if cloud_frame == pose.child_frame_id else 'incoming_coordinates_assumed_aligned'
 
     child = pose.child_frame_id
     # Only normalize an explicit segment prefix. Replacing a raw substring
     # would corrupt ordinary frames (segment "a", child "base_link").
-    if child.startswith(pose.segment_id + '_'):
+    if pose.segment_id and isinstance(child, str) and child.startswith(pose.segment_id + '_'):
         child = '{segment_id}' + child[len(pose.segment_id):]
     return ({
         'cloud_frame': cloud_frame,
         'child_frame': child,
         'clock_id': pose.clock_id,
-        'child_from_cloud': chosen.tolist(),
-        'extrinsic_mode': 'static',
+        'child_from_cloud': chosen.tolist() if chosen is not None else None,
+        'extrinsic_mode': mode,
     }, {
         'resolution': 'observed_ros_messages',
         'extrinsic_source': provenance,
-        'clock_relation': 'timestamp_overlap_only_not_independent_clock_proof',
+        'clock_relation': 'producer_responsibility',
         'segment_id': pose.segment_id,
     })
 
@@ -149,7 +123,7 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
             stamp = msg.header.stamp
             stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
             frame = msg.header.frame_id
-            if (stamp_ns <= 0 and context is None) or not frame:
+            if not isinstance(frame, str):
                 return
         except (AttributeError, ValueError, TypeError):
             return

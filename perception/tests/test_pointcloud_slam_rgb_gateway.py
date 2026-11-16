@@ -49,7 +49,10 @@ def test_bad_rgb_metadata_still_maps_every_scan_in_one_native_process(rgb_node):
 
 def test_fallback_does_not_bypass_required_odometry_loss(rgb_node):
     n = rgb_node
-    send(n, status='lost')
+    from test_pointcloud_slam_stream import odom
+    missing = odom(1000, status='lost'); missing['pose'] = None
+    n._odom(NS(data=json.dumps(missing)))
+    n._cloud(cloud())
     assert not _wait_until(lambda: n.status()['forwarded_clouds'], timeout=.1)
     assert not published(n, '/sensor_data')
 

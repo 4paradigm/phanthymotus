@@ -15,9 +15,9 @@ the local TTS engines run on TensorRT.
 existing display cloud/summary and optional metric PointCloud2 outputs.
 It no longer loads a mono depth model or performs stereo matching; RGB inputs
 and multiple connected depth streams are rejected. To display estimated depth,
-connect the separate `visual_depth` output. Metric output still requires measured
-depth, driver intrinsics and capture-time declarations; estimated depth is not
-promoted to a metric measurement. Saved single-input `auto`/`depth` starts remain
+connect the separate `visual_depth` output. Calculation output requires finite
+numeric intrinsics and decodable depth; source, unit and timing labels do not
+gate use. The provider owns metric scale and physical depth semantics. Saved single-input `auto`/`depth` starts remain
 compatible, while saved `mono`/`stereo` starts require rewiring to a depth source.
 
 The canvas always exposes the display cloud, JSON summary and PointCloud2 ports,
@@ -31,27 +31,14 @@ port order and topic paths remain stable when toggling the switch.
 
 ## Spatial SLAM Input Contract
 
-The generic `pointcloud_slam` card requires native
-`sensor_msgs/msg/PointCloud2` and tracking `motus.odom/1` with the
-`motus_slam/1` pose profile. The canonical
-[driver-author protocol](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)
-specifies timing, frame, mounting, `motus.slam_input/1` declarations and
-`motus.slam_frame/1` per-frame provenance. This repository keeps a
-pure-Python runtime copy in `plugins/pointcloud_slam_contract.py` and
-consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
-On Tianyi's single `state/odom` interface, top-level `stamp_ms` and `twist`
-carry REST speed feedback at receipt time; the diagnostic SLAM pose has its own
-`pose.stamp_ms`. The `motus_slam/1` reader selects that explicit pose time,
-checks `vendor.motus_slam.stamp_ns` and supplied measurement evidence against
-it, and uses top-level time only for legacy packets without `pose.stamp_ms`.
-Repeated REST updates do not refresh identical diagnostic poses or their ingress
-age. Lost SLAM quality still blocks mapping even when measured speed is healthy.
-Deploy this reader with the companion Driver change; older readers reject split
-times through their precise-time mismatch check. The separate `motus_slam/2`
-observation contract retains its existing time-consistency requirements.
-
-The implementation must not infer calibrated mounting or verified
-cross-sensor clocks from a robot model or nearby timestamps.
+The generic `pointcloud_slam` card consumes native
+`sensor_msgs/msg/PointCloud2` and numeric `motus.odom/1` poses. Both topic-only
+and declared inputs follow the [format-only spatial standard](docs/spatial-inputs.md).
+Source/frame/clock names, timing semantics, quality and calibration evidence are
+diagnostic metadata. Read/receipt timestamps are used in full computation.
+See [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md) for input paths and native
+backend requirements. The implementation does not infer physical calibration
+or clock synchronization from accepted metadata.
 
 ## Native Jetson packaging and measured size
 
@@ -92,10 +79,13 @@ are compressed transfer sizes, not unpacked disk usage or newly rebuilt images.
 
 Enable `plugins.rgbd_odometry.enabled` to expose the `rgbd_odometry` processor
 card. Connect a driver's `camera_rgbd` color (`image/jpeg`) and measured depth
-(`image/depth-zlib`) ports. Both must declare the same rectified optical plane,
-640×480 intrinsics, capture clock and camera ID through `motus.camera/1`.
-Depth is little-endian uint16 millimetres. Display-only or estimated depth,
-receipt-timed video and unregistered lenses are rejected.
+(`image/depth-zlib`) ports. Supply numeric dimensions and intrinsics through
+`motus.camera/1`; depth is decoded as little-endian uint16 millimetres. Inputs
+are paired in arrival order within bounded buffers. Source, registration,
+clock, timestamp-meaning and camera-ID declarations do not gate processing;
+read/receipt timestamps participate in the full calculation. Producers own
+physical registration, units and time alignment, as documented in the
+[spatial input standard](docs/spatial-inputs.md).
 
 For each paired color/depth input, fusion and IMU coverage use the same original
 capture header selected by the pinned native estimator: the later image stamp,
@@ -110,8 +100,9 @@ The card supervises the image's pinned RTAB-Map `rgbd_odometry` runtime. Its
 connected to `pointcloud_slam` alongside native `sensor/pointcloud2`. The pose
 reference is the camera optical frame; no body mount or calibrated clock
 relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
-driver repository. G1 requires SDK global capture time; Bumi also exposes its
-existing fixed hardware-clock offset explicitly as unverified provenance.
+driver repository. G1 documents SDK global capture time; Bumi exposes its
+existing fixed hardware-clock offset as provenance. Neither declaration is
+a consumer admission requirement.
 
 Visual-only and short-term fusion sessions initialize the native map basis at
 the camera origin with +X along initial optical forward, +Y along initial optical
@@ -212,29 +203,17 @@ SLAM pose or calibration guarantee.
 
 ### Automatic body-camera mount
 
-Tianyi, G1 and Bumi drivers can declare a `vendor.body_mount` sidecar in both
-RGB-D `camera_info` entries. The card discovers and subscribes to that topic
-automatically; no card matrix or additional canvas connection is needed. The
-driver queries the actual ROS TF tree at each image capture timestamp. Default
-body frames are Tianyi `base_link`, G1 `pelvis` and Bumi `base_link`; driver-side
-`CAMERA_BODY_FRAME` changes only the requested frame name. A calibrated TF path
-to the actual rectified optical frame must exist in the driver's TF domain.
-Camera SDK IMU calibration and visualization models do not supply this path.
-
-The `motus.camera_mount/1` JSON packet contains `T_body_camera` in metres:
-`p_body = R * p_camera + t`, exact `stamp_ns`, capture clock, source epoch and
-frame identities. Dynamic head/waist joints are queried per capture, never
-frozen at startup or replaced with latest TF. Only an exact nanosecond match
-can produce `vendor.body_pose`, using
-`T_world_body = T_world_camera * inverse(T_body_camera)`. Main `pose` and SLAM
-remain camera-referenced. Body covariance is null and accuracy is unverified,
-because the TF source supplies no extrinsic uncertainty.
-
-`info().body_mount` and `vendor.camera_mount` expose missing, stale or invalid
-TF. These conditions leave camera VO running and make `vendor.body_pose` null.
-A changed mount identity/epoch or invalid packet retires body evidence until
-the card is restarted; it does not reset the visual/IMU estimator. Hardware
-acceptance must verify the installed TF tree, domain, timestamps and calibration.
+Drivers can declare a `vendor.body_mount` sidecar in RGB-D camera metadata.
+The card subscribes to its configured topic and consumes numeric 4×4 matrices.
+Source/frame/clock names, capture identities, status, units and calibration flags
+are diagnostic; they do not reject a numeric matrix. Supplied timestamps are
+used to choose an exact or nearest available matrix without an age/skew gate.
+The producer supplies `T_body_camera` in metres with the convention
+`p_body = R * p_camera + t`. Optional body pose is computed as
+`T_world_body = T_world_camera * inverse(T_body_camera)`; the main camera pose
+is retained. Missing numerical transforms leave only that optional body pose
+unavailable. Body covariance remains null without supplied extrinsic uncertainty.
+See the [spatial data standard](docs/spatial-inputs.md) for provider responsibilities.
 
 IMU assistance is selected automatically by wiring: connect the source's
 `sensor/imu` port alongside the two RGB-D ports to enable it; connect only the
@@ -278,13 +257,13 @@ recovery results and one processing P95. It stays within 1–3 s; capture-time
 resumption leaves 200 ms of that budget for jitter. Legacy inputs retain the
 0.8 s capture/1 s waiting limits. Rejected frames publish pose-less `recovering`
 samples declaring `vendor.pause` (`source=visual_gate`,
-`mapping_allowed=false`); `pointcloud_slam` honours that declaration exactly
-like an ESKF pause (same segment and clock, the declared deadline, mapping
-disabled), so the resumed segment stays mappable. Budget expiry, a late or
+`mapping_allowed=false`); without a numeric pose, `pointcloud_slam` waits for
+usable poses and buffers clouds within its configured capacity. Status and
+pause labels do not reject otherwise usable numeric poses. Budget expiry, a late or
 discontinuous resume, a changed native frame or a future capture time
-ends the segment. Late or repeated camera captures are dropped and counted
-(`info().input_rejections`), never paired; persistent input loss still expires
-the segment. Stale or out-of-order native results are ignored, never counted
+ends the segment. Camera inputs are paired in arrival order without timestamp
+age or ordering gates; persistent input loss still expires the segment.
+Stale or out-of-order native results are ignored, never counted
 as evidence. With fresh RGB and depth, a separate
 supervisor attempts a new estimator/segment after 0.8 s, at most once every 1.5 s.
 Each successful restart has a new segment, coordinate origin and IMU/fusion
@@ -325,9 +304,8 @@ application start; it does not reconfigure a running participant. It addresses
 kernel receive-buffer drops, not visual matching failures or native busy-frame
 drops; effective socket capacity still depends on host limits.
 
-For current Core's topic-only SLAM path, map provenance explicitly records
-unverified timestamp overlap. The stricter SLAM declaration path still requires
-independent timing/mount evidence. Validate real tracking and map save/reopen
+Both topic-only and declared SLAM inputs use the same format-only admission
+policy; timing/mount evidence is diagnostic metadata. Validate real tracking and map save/reopen
 on each deployment; offline tests do not establish physical accuracy.
 
 ### Optional short-term ESKF and depth assistance
@@ -417,8 +395,8 @@ three-estimate, continuity and bounded pause-declaration rules. Waiting longer
 for visual evidence does not extend inertial prediction. The ESKF is not
 restarted inside that segment; a later new segment retries it. Predictions
 are never published as tracking. IMU age and source labels are not admission gates.
-Camera frame/segment, capture-clock and capture-queue faults end the segment
-instead of entering visual-only fallback.
+Missing camera input, malformed numeric data and exhausted processing queues can
+still end a segment; descriptive frame/clock labels do not gate input acceptance.
 
 If vision becomes unavailable, `vendor.motus_slam.status` changes to
 `coasting`, followed by `recovering` until three consistent visual or verified
@@ -477,7 +455,7 @@ deadline; a subsequent frame cannot prematurely discard the observation.
 Final outputs are emitted in capture order, never by attaching an old pose
 to a newer timestamp. A rejected/expired observation resets recovery evidence;
 accepted geometry uses the same uncertainty and recovery checks as vision.
-Stop, invalid calibration/time, and the 1 s visual-anchor bound still retire
+Stop, unusable numeric geometry and the 1 s visual-anchor bound still retire
 the segment. Geometry errors skip assistance. Jetson timing remains relevant:
 prior on-device measurements ranged above the deadline under load, so these
 state-machine tests do not establish real turning accuracy or throughput.
@@ -5104,206 +5082,58 @@ older renderers ignore the new flags.
 
 ### Chassis odometry with a moving camera mount
 
-A connected metric cloud's `camera_info.vendor.body_mount` can now supply the
-runtime-discovery path with a dynamic `motus.camera_mount/1` sidecar. Core
-forwards only the connected cloud declaration. The pose and camera producers
-must explicitly declare matching `clock_reference` fields (`clock_id`,
-`domain_id`, `timestamp_basis=host_realtime`); pose clock_id must agree. The
-reference identifies the existing normalized host timeline, not a verified
-physical camera-clock error bound. No timestamps or clock offsets are rewritten.
-This path is reported as `producer_declared_common_reference` with
-`clock_accuracy_validated=false`. An explicit full SLAM input contract retains
-all its existing verified-relation requirements and cannot use this fallback.
+A connected cloud's `camera_info.vendor.body_mount` can supply numerical
+`motus.camera_mount/1` transforms. An explicit dynamic input waits for a numeric
+matrix; exact and nearest supplied timestamps are usable without clock/frame
+name or verification certificates. A manual numeric transform takes precedence
+when configured. In the absence of any transform declaration, the arithmetic
+convention is already-aligned cloud/pose coordinates, not a robot-model mount.
 
-Every cloud waits for its exact nanosecond mount packet. Identity, epoch, source
-clock, frames, proper rigid transform and the existing 500 ms mount freshness
-limit remain mandatory. Pending clouds are bounded; their original receipt time
-continues across both TF and pose waiting. Unavailable packets never provide a
-held transform, and changed identities/clock references require restarting the
-inputs. Each capture's matrix reaches native RTAB-Map via the existing dynamic
-TF path. Estimated installation provenance is retained; no matrix is generated
-from a robot model, and no live pose is replaced by a camera/body approximation.
+## Spatial input data standard (PR371)
 
-Requires the matching Core metadata-routing and Driver clock-declaration updates
-as well as Perception. For the optional Tianyi estimated source, retain the
-explicit Driver opt-in and capture-certificate service; rebuilding an image does
-not by itself enable `TIANYI_ESTIMATED_BODY_TF=1`. No running service is changed by
-this implementation. Static camera-reference SLAM remains supported unchanged.
+RGB-D, metric depth, PointCloud2, odometry, transforms and SLAM inputs follow
+[one numeric-format policy](docs/spatial-inputs.md), matching the
+[IMU data standard](docs/rgbd-imu.md). Parseable layout, numeric dimensions and
+finite values needed for computation are checked. Physical units, axes,
+registration, time alignment, fixed installation and source quality belong to
+the provider and are documented rather than verified by metadata gates.
 
-## Spatial input timing and stability (PR371)
+Source/frame/clock names, epochs, IDs, time/depth/registration labels, calibration
+flags, confidence, live sidecar digests, wall age, skew and interval policy do not
+reject format-complete input or force a metadata-based restart. Source numeric
+timestamps are preserved; missing source timestamps use actual ingress time.
+RGB-D inputs pair in bounded FIFO order. Pose/cloud association sorts numerical
+timestamps and interpolates available brackets without an arbitrary gap limit.
+Missing numeric poses/matrices remain unavailable; they are not fabricated.
 
-`rgbd_odometry`, `pointcloud` and `pointcloud_slam` share one input registry in
-Perception. Other cards, AgentCore and Driver are unchanged. There are no robot
-model presets. The registry owns subscriptions by ROS context/topic/type, uses
-reference-counted leases and bounded independent consumer queues, and records
-realtime/monotonic time once at the first controlled callback. Callback timing
-cannot measure delay before Perception (driver, network or DDS receive queues).
+Resource capacities, native executable capabilities, session lifecycle and
+stored-map path/checksum/archive integrity remain separate runtime concerns.
+The data standards include the exact depth buffer representation, PointCloud2
+layout, camera matrices, pose quaternion/covariance and transform direction.
 
-Time is explicit:
+### Preview axes
 
-- Valid declared capture time remains capture time, with integer nanoseconds.
-- Missing capture timing uses `receipt_estimated` in a common Perception ingress
-  clock. This is approximate alignment, not proof of acquisition time or accuracy.
-- Contradictory declarations, invalid known capture times, backwards/repeated
-  observations and changes of epoch/time basis are not hidden by fallback.
-- An observation UUID identifies reception. RGB-D association UUIDs identify
-  pairing. Neither is a fabricated `source_capture_id`.
-- Each derived cloud retains first-ingress age and parent observation identity.
-  Metadata, pose and mount waiting do not reset end-to-end age.
-
-Legacy `motus.camera/1`, `motus.odom/1` and capture-only SLAM v1 inputs remain
-readable. New timing is carried by `motus.observation/1`, `motus_slam/2`,
-`motus.slam_input/2` and `motus.slam_frame/2`. Port names and ROS message types
-are unchanged. Receipt producers and consumers must be upgraded together;
-rollback the complete Perception image, not individual cards. Saved databases
-are never deleted by rollback.
-
-An observation contains `observation_id`, `observation_stamp_ns`,
-`normalized_clock_id`, `time_basis`, first-ingress realtime/monotonic nanoseconds
-and `ingress_clock_id`. Optional source ID/epoch/capture ID, original timestamp,
-unit/clock, mapping provenance/version/offset/verification/uncertainty, geometry
-version, parent observations and transformation names retain unknown values.
-Monotonic timestamps can only be compared inside the named ingress process.
-The v2 pose profile embeds this object as `vendor.motus_slam.observation`;
-its clock and both integer timestamp representations must agree. A v2 cloud
-sidecar carries the same object plus exact frame, stamp and payload SHA-256.
-Missing/corrupt v2 sidecars do not take the optional v1 metadata fallback.
-The `input_declaration` and `frame_packet` helpers in `plugins/spatial_contract.py`
-are the versioned producer API; the mirrored Driver v1 validator is unchanged.
-
-RGB-D still requires registered rectified pinhole geometry and 640×480 uint16
-millimetre optical-Z depth-zlib. `depth_source` and calibration `source` labels
-alone do not reject an input: estimated/unknown depth must explicitly declare
-`vendor.depth_semantics: optical_z`, and all inputs require real valid intrinsics
-and `depth_unit: mm`. A registered color grid with the same camera identity,
-optical frame and equivalent scaled K can be resized to the depth grid using
-the existing intrinsics scaling. Unexplained crops, different optics or distorted
-cross-camera geometry remain unsupported. Native output retains its exact
-chosen RGB/depth timestamp; the two original observations remain separate.
-
-Receipt-based image timing preserves the selected IMU/fusion mode. The IMU
-consumer accepts the documented numeric format without source-time or clock-name
-admission gates; the provider supplies aligned values. A change of image timing
-basis still starts a new segment for its observation context. Dynamic body mapping still needs exact capture-associated mount evidence.
-Receipt-only data without that identity cannot use a latest/guessed transform.
-
-Chassis odometry may declare `chassis_clock_request_interval_slew`, version `2`,
-for bounded continuous clock correction. SLAM permits only its per-capture
-`offset_ns` to change within one pose segment: source clock/unit and all other
-mapping fields must stay unchanged, verification must be true, source milliseconds
-and offsets must be integers, and declared uncertainty must stay at or below
-50 ms. Offset changes must not exceed 1% of the elapsed original source time.
-Exact timestamp arithmetic, input epoch/generation, observation identity, frame
-and freshness checks remain in force. Unknown mapping methods retain the existing
-fixed-mapping rule; cloud clock proofs and cross-source relation requirements are
-not relaxed. This supports Driver PR #519's gradual correction without treating
-normal drift as a new trajectory segment. Robot deployment and sustained live
-mapping acceptance are separate from these offline compatibility tests.
-
-Image sharpness/contrast and missing optional quality are diagnostic, not universal
-hard cutoffs. Declared motion limits (`vendor.motion_limits.reference`,
-`max_speed_mps`, `max_angular_rate_radps`) apply only to the actual pose reference.
-Body limits are not camera limits, and receipt jitter alone is not a hard velocity
-failure. A declared-limit discontinuity starts a new segment. Map admission
-separately requires a tracking pose and usable finite points; prediction/lost/
-recovering states do not map. Lidar scans do not inherit image depth-fraction rules.
-
-`motus.pause/2` freezes a waiting budget at degradation: with measured input period
-and processing P95 it is `clamp(4*period + P95, 1s, 3s)`, otherwise 1s. Visual
-recovery uses the slower measured camera/native-result period so a fast source
-cannot shorten the three-estimate confirmation window. VO and SLAM
-share the declared original deadline in the same ingress process. Repeated pause
-messages cannot extend it. The period uses the median of up to 32 intervals,
-only after at least five valid intervals. Legacy pauses, physical IMU prediction, uncertainty
-bounds and the pose interpolation gap retain their previous limits.
-
-PointCloud2 normalization validates original bytes/digest first. Big-endian,
-padded or noncanonical XYZ layouts and clouds containing some nonfinite points
-are repacked into finite little-endian XYZ; source and output digests remain
-separate. Already supported finite layouts retain their optional fields.
-
-Native mapping remains scan-only / exact-sync / ICP / TORO. Deployment-only
-`pointcloud_slam.native_parameters` permits `RGBD/LinearUpdate` and
-`RGBD/AngularUpdate` (finite nonnegative values); the default empty object preserves
-native defaults. These names were checked against pinned RTAB-Map `df6300e0`.
-Missing upstream covariance is reported as `backend_default`, not calibrated
-uncertainty. Backend progress uses stamped native activity, never node count alone.
-Without reliable per-frame consumption/skip acknowledgement, silence is reported
-as `suspected_stall`; automatic restart budget is zero. Existing confirmed process
-exit, bounded shutdown and database-validation protections remain active.
-Each segment keeps an independent database. `finalized` means native database
-closure, not completion of the user's map-save action; unknown origins are not merged.
-
-Status exposes bounded queue/callback, decode, IMU-wait and end-to-end latency
-summaries, input drops, time context, mapping decisions, native progress and segment
-lifecycle. CPU tests and synthetic fault replay validate contracts/lifecycle only.
-ROS/Jetson smoke, real turning trajectories, map quality, CPU/GPU/memory under
-robot load and motion accuracy still require target-environment acceptance.
-
-### Preview axes and reviewed input boundaries (2026-11-16)
-
-The display-only depth cloud now uses the same forward/left/up convention and
-initial viewing angle as the mapping renderer. This is a generic camera-start
-basis, not a robot-specific mounting estimate: metric PointCloud2, SLAM map
-coordinates and the map heading remain unchanged. Robot extrinsics still come
-from capture-time TF. Existing browser views need a refresh for the new default
-viewpoint.
-
-Metric depth and RGB-D odometry require an explicit `depth_source: measured`,
-including when `depth_semantics: optical_z` is supplied. Estimated depth remains
-eligible only for display. Each native mapping child receives its own buffered
-DDS profile beside its segment parameters; the parent's environment and transport
-isolation are retained. A missing or directory-mounted DDS profile causes an
-explicit startup configuration error, with no unisolated fallback. This remains
-a fail-closed startup policy, not a speech-only degraded mode. These changes add
-no packages or image build dependencies.
-Native mapping startup allows up to 30 seconds for input discovery during model
-warmup, with immediate stop-event cancellation. This startup allowance does not
-extend the receipt or measurement freshness limits on queued captures.
-
+The display depth cloud and mapping renderer use a common forward/left/up
+camera-start viewing convention. This is a presentation basis, not a physical
+robot mounting estimate. Input optical coordinates and supplied numerical
+extrinsics retain their meanings; existing browser views may need refreshing.
 
 ### Optional RGB loop closure
 
-The SLAM card always exposes three input ports, in order: `state/odom`,
-`sensor/pointcloud2`, and optional `image/jpeg`. Existing saved cards retain their
-first two wire indices and gain the RGB port. RGB is not a visual-odometry input;
-poses still come from the connected odometry source.
+The SLAM card exposes `state/odom`, `sensor/pointcloud2` and optional `image/jpeg`
+ports. RGB enables appearance-based place recognition and candidate transform
+initialization; native ICP still performs its registration computation. Sparse
+feature depth is projected from the numeric cloud with optical Z and zero holes.
+Source/frame/clock labels, age and exact-certificate policy do not gate the
+optional JPEG path. Image decode, numerical intrinsics, pose and any selected
+transform must be available to perform projection.
 
-Without RGB, the existing scan-only native pipeline remains unchanged. With an
-RGB wire, each admitted scan uses an exact-stamped native `SensorData` envelope.
-A valid image enables appearance-based place recognition and visual initialization
-of candidate transforms; native ICP still verifies registration using measured
-scan geometry. Sparse feature depth is projected from measured scan points,
-with nearest optical Z and zero holes, never inferred or hole-filled depth.
-The native process, odometry interface and map segment do not change when RGB
-fails or recovers. Pointcloud proximity matching remains enabled.
+When optional RGB cannot be decoded or projected, the pointcloud path continues.
+`info().input_status.loop_closure_mode` reports `image` or `pointcloud` for the last
+forwarded frame; `rgb_input` reports availability and the computational fallback
+reason. Forwarding an image is not a loop-closure or tracking-accuracy guarantee.
 
-RGB must provide rectified pinhole `motus.camera/1` calibration, its original
-capture clock and the same registered optical frame as the cloud. Images are
-matched within 50 ms and rejected beyond 500 ms old or 50 ms future. A dynamic
-mount requires the exact RGB-capture certificate; cloud-time mounting is not
-substituted. The camera model includes the motion between the RGB and scan
-capture poses without changing the original RGB timestamp. No robot model,
-installation matrix or additional hardware configuration is added.
-
-Missing/unresolved RGB, invalid calibration, stale/future images, decode errors,
-missing pose/mount evidence or failed optional preparation automatically omit
-the images and continue pointcloud registration. JPEG decoding is independent;
-only one optional projection task may be in flight, and the mapping worker
-waits at most 20 ms for its own result before forwarding the scan alone. Faults
-invalidate in-flight imagery before publication. Fresh usable images resume
-image processing automatically. Calibration declarations are adopted at project
-start; fixing a missing/invalid declaration requires a project restart to adopt
-new evidence, while the current map can continue in pointcloud mode.
-
-`info().input_status.loop_closure_mode` reports `image` or `pointcloud` for the
-last forwarded frame; `rgb_input` reports availability and the fallback reason.
-`image` means usable visual evidence was forwarded, not that a loop was accepted.
-Required pointcloud/odometry checks remain strict. Neither tracking nor a detected
-loop establishes physical mapping accuracy.
-
-The standalone synthetic native check is:
+The standalone synthetic native check is
 `ROS_DOMAIN_ID=149 python3 tools/rtabmap_rgb_loop_smoke.py --timeout 90`.
-It uses temporary databases and synthetic inputs only, checks native updates
-through image/fallback/recovery and saved visual evidence, and does not prove
+It uses temporary databases and synthetic inputs and does not establish
 real-route loop closure or moving-robot accuracy.

@@ -25,7 +25,7 @@ def test_legacy_pause_keeps_legacy_limit():
     assert RecoveryPolicy(version=1).begin(1_000_000_000,1_000_000_000,0).budget_ns==1_000_000_000
 
 
-def test_versioned_slam_pause_uses_producer_deadline_without_extending_prediction():
+def test_slam_waits_for_numeric_pose_without_enforcing_pause_metadata():
     from test_pointcloud_slam_stream import stream, odom
     s=stream()
     s.ingress_clock_id='process'
@@ -36,9 +36,11 @@ def test_versioned_slam_pause_uses_producer_deadline_without_extending_predictio
     sample['vendor']['pause']=dict(status='recovering',mapping_allowed=False)
     sample['vendor']['pause_context']=pause.to_dict(anchor_stamp_ns=1_000_000_000,ingress_clock_id='process')
     s.odom(sample,now=1.2)
-    assert s._odom_state=='recovering'
+    assert s._odom_state=='waiting' and len(s.accepted)==1
     s.odom(odom(2500),now=2.5)
-    assert s._odom_state=='tracking' and not s._requires_new_segment
+    assert s._odom_state=='tracking'
+    s.cloud(2_500_000_000,'camera',[[1,2,3]],now=2.5)
+    assert len(s.accepted)==2
 
 
 def test_plan_budget_uses_one_p95_and_period_uses_five_interval_median():

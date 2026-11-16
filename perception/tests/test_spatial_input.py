@@ -75,14 +75,12 @@ def test_source_restart_uses_new_epoch_without_delivering_old_callbacks():
     finally:c.close();r.close()
 
 
-def test_conflicting_live_declarations_do_not_create_second_subscription():
+def test_different_live_declarations_share_one_subscription():
     b=Backend();r=InputAdapterRegistry(subscribe=b.subscribe)
     a=r.acquire('/depth',object,declaration(),lambda *v:None)
-    try:
-        with pytest.raises(ValueError,match='conflict'):
-            r.acquire('/depth',object,declaration('two'),lambda *v:None)
-        assert len(b.callbacks)==1
-    finally:a.close();r.close()
+    second=r.acquire('/depth',object,declaration('two'),lambda *v:None)
+    try:assert len(b.callbacks)==1
+    finally:a.close();second.close();r.close()
 
 
 def test_derived_cloud_keeps_first_ingress_and_parent_identity():

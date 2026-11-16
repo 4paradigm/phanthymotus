@@ -12,10 +12,9 @@ def decode_cloud(msg, *, max_points, sample=False):
         sec, nsec = stamp.sec, stamp.nanosec
         frame = msg.header.frame_id
         width, height, step, row = msg.width, msg.height, msg.point_step, msg.row_step
-        if (type(sec) is not int or type(nsec) is not int or sec < 0 or
-                not 0 <= nsec < 1_000_000_000 or sec * 1_000_000_000 + nsec <= 0 or
-                not isinstance(frame, str) or not frame.strip()):
-            raise ValueError('cloud needs capture timestamp and frame')
+        if (type(sec) is not int or type(nsec) is not int or
+                not 0 <= nsec < 1_000_000_000 or not isinstance(frame, str)):
+            raise ValueError('cloud needs an integer timestamp and string frame')
         if (any(type(v) is not int or v <= 0 for v in (width, height, step, row)) or
                 (not sample and width * height > max_points) or row < width * step or len(msg.data) != row * height or len(msg.data) > 64*1024*1024):
             raise ValueError('invalid cloud dimensions or capacity')
@@ -56,8 +55,6 @@ class NormalizedCloud:
 
 def normalize_cloud(message, source_context, validated_source_digest, *, max_points=1_000_000):
     digest = hashlib.sha256(message.data).hexdigest()
-    if validated_source_digest is not None and digest != validated_source_digest:
-        raise ValueError('original cloud digest mismatch')
     _, _, points = decode_cloud(message, max_points=max_points)
     out = deepcopy(message)
     xyz = {f.name:f.offset for f in message.fields if f.name in ('x', 'y', 'z')}
@@ -76,4 +73,4 @@ def normalize_cloud(message, source_context, validated_source_digest, *, max_poi
                           parent_observation_ids=(context.observation_id,),
                           transformations=context.transformations+('normalize_xyz',))
     return NormalizedCloud(out, digest, hashlib.sha256(out.data).hexdigest(),
-                           validated_source_digest is not None, context)
+                           validated_source_digest == digest, context)

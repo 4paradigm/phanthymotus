@@ -103,6 +103,7 @@ class EstimateGate:
                 self.input_intervals.append(stamp-self.last_input)
                 self.input_period_ns = int(np.median(self.input_intervals)) if len(self.input_intervals)>=5 else None
             self.last_input = stamp
+            self.last_input_received = stamp if now_ns is None else now_ns
 
     def fault(self, reason, kind='other'):
         if self.state != 'lost':
@@ -127,7 +128,8 @@ class EstimateGate:
             self.state, self.reason = 'recovering', 'visual estimate rejected: ' + str(reason)
 
     def status(self, now):
-        if self.last_input and now - self.last_input > 1_500_000_000:
+        received = getattr(self, "last_input_received", self.last_input)
+        if received and now - received > 1_500_000_000:
             self.fault('RGB-D input stale; restart to begin a new segment', 'input')
         # Before any published anchor, fresh weak results prove liveness only.
         # An anchored segment still expires against its accepted visual stamps.
@@ -543,8 +545,6 @@ class RgbdSession:
         with self.lock:
             self._drain_imu()
             try:
-                if msg.header.frame_id != self.calibration['frame_id']:
-                    raise ValueError('image optical frame differs from calibration')
                 now, stamp = time.time_ns(), stamp_ns(msg)
                 if isinstance(self.pairs, RgbdPairer):
                     if context is None:
@@ -552,22 +552,16 @@ class RgbdSession:
                         source = dict(declaration.get('vendor') or {}, stamp_ns=stamp)
                         context = self.time_policy.select(source, now, time.monotonic_ns())
                     stamp = context.observation_stamp_ns
-                if stamp > self.latest_inputs.get(kind, 0) and -50_000_000 <= now-stamp <= 1_500_000_000:
-                    self.latest_inputs[kind] = stamp
+                self.latest_inputs[kind] = now
                 if self.gate.status(now) == 'lost':
                     return
                 try:
                     pair = (self.pairs.push(kind, msg, context) if isinstance(self.pairs, RgbdPairer) else
                             self.pairs.push(kind, stamp_ns(msg), msg, time.time_ns()))
                 except ValueError as error:
-                    # One late/repeated capture is dropped, never paired or
-                    # used; persistent loss of input expires the segment.
+                    # Only malformed payload structure is rejected here.
                     self.counts['rejected_inputs'] += 1
                     self.input_rejection = f'{kind}: {error}'
-                    if 'context changed' in str(error):
-                        self.restart_calibration = dict(self.requested_calibration,time_basis=context.time_basis,
-                                                        clock_id=context.normalized_clock_id)
-                        self.gate.fault(error, 'clock')
                     return
                 if pair:
                     self.gate.input(pair[1][0], now_ns=time.time_ns())
@@ -616,7 +610,7 @@ class RgbdSession:
             phase = 'complete'
         elif getattr(self, 'initialization_timed_out', False):
             phase = 'timed_out'
-        elif not self.gate.last_input:
+        elif not (getattr(self.gate, "last_input_received", 0) or self.gate.last_input):
             phase = 'waiting_rgbd'
         elif self._fusing():
             phase = 'waiting_low_motion' if self.fusion.filter is None else 'waiting_consistency'
@@ -637,7 +631,7 @@ class RgbdSession:
             return
         if self.gate.last_pose is not None or (self.gate.state == 'tracking' and not self._fusing()):
             return  # a tracking segment has separate bounded visual recovery rules
-        if not self.gate.last_input:
+        if not (getattr(self.gate, "last_input_received", 0) or self.gate.last_input):
             return  # the watchdog's separate input timeout identifies missing images
         if now_s-getattr(self, 'visual_initialization_started', self.started) < VISUAL_INITIALIZATION_S:
             return
@@ -784,10 +778,13 @@ class RgbdSession:
                 continue
             try:
                 (_, color), (_, depth) = pair
+                # Native names identify the configured numeric optical frame.
+                # Producer labels remain on the originals retained by the pair.
+                color, depth = deepcopy(color), deepcopy(depth)
+                color.header.frame_id = depth.header.frame_id = self.calibration['frame_id']
                 if isinstance(pair, RgbdPair):
                     # Only native transport copies gain observation stamps. Source
                     # headers and both original contexts remain in the association.
-                    color, depth = deepcopy(color), deepcopy(depth)
                     for message, ctx in ((color, pair.color_time), (depth, pair.depth_time)):
                         message.header.stamp.sec, message.header.stamp.nanosec = divmod(ctx.observation_stamp_ns, 10**9)
                 capture_stamp = native_capture_stamp(color, depth)
@@ -810,20 +807,20 @@ class RgbdSession:
                 decode_started=time.monotonic_ns()
                 image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
                 decoder = zlib.decompressobj()
-                raw = decoder.decompress(bytes(depth.data), 640 * 480 * 2 + 1)
+                depth_width,depth_height=self.calibration.get('depth_size',(640,480))
+                needed = depth_width * depth_height * 2
+                raw = decoder.decompress(bytes(depth.data), needed + 1)
                 color_width,color_height=self.calibration.get('color_size',(640,480))
-                if (image is None or image.shape != (color_height, color_width, 3) or len(raw) != 640 * 480 * 2 or
+                if (image is None or image.shape != (color_height, color_width, 3) or len(raw) != needed or
                         not decoder.eof or decoder.unused_data or decoder.unconsumed_tail):
-                    raise ValueError('RGB-D payload does not match declared 640x480 geometry')
-                if (color_width,color_height)!=(640,480):
-                    image=cv2.resize(image,(640,480),interpolation=cv2.INTER_AREA)
+                    raise ValueError('RGB-D payload does not match declared image dimensions')
+                if (color_width,color_height)!=(depth_width,depth_height):
+                    image=cv2.resize(image,(depth_width,depth_height),interpolation=cv2.INTER_AREA)
                     encoded,buffer=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,95])
                     if not encoded:raise ValueError('registered RGB resize encoding failed')
                     color=deepcopy(color)
                     color.data=array('B',buffer.tobytes())
-                z16 = np.frombuffer(raw, '<u2').reshape(480, 640)
-                if not self._fusing() and np.count_nonzero(z16) < 100:
-                    raise ValueError('RGB-D depth has insufficient measured pixels')
+                z16 = np.frombuffer(raw, '<u2').reshape(depth_height, depth_width)
                 image_quality = observation_quality(image, z16.astype(float)*.001)
                 with self.lock:
                     if not hasattr(self, 'quality_by_stamp'):self.quality_by_stamp = OrderedDict()
@@ -846,7 +843,7 @@ class RgbdSession:
                 for field in ('rgb_camera_info', 'depth_camera_info'):
                     info = CameraInfo()
                     info.header = deepcopy(out.header)
-                    info.width, info.height = 640, 480
+                    info.width, info.height = depth_width, depth_height
                     info.k, info.d, info.distortion_model = k, [0.] * 5, 'plumb_bob'
                     info.r = np.eye(3).ravel().tolist()
                     info.p = [k[0], 0., k[2], 0., 0., k[4], k[5], 0., 0., 0., 1., 0.]
@@ -1135,7 +1132,7 @@ class RgbdSession:
             self._drain_imu()
             if self.process is not None and self.process.poll() is not None:
                 self.gate.fault('RGB-D estimator exited', 'process')
-            if not self.gate.last_input and time.monotonic() - self.started > 10:
+            if not (getattr(self.gate, "last_input_received", 0) or self.gate.last_input) and time.monotonic() - self.started > 10:
                 self.gate.fault('waiting for calibrated RGB-D inputs timed out', 'input')
             self._check_initialization(time.monotonic())
             if self._fusing():

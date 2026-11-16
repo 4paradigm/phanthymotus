@@ -24,15 +24,15 @@ def test_receipt_basis_reaches_slam_with_versioned_inputs_and_exact_sidecar():
     assert s.accepted[0].capture_context['observation']['time_basis']=='receipt_estimated'
 
 
-def test_v2_receipt_clock_conflict_cannot_be_hidden_by_metadata_fallback():
+def test_v2_clock_names_do_not_block_numeric_input_resolution():
     _,ctx=sample(receipt=True)
     declarations={'/o':input_declaration('/o','pose','camera',ctx),
                   '/c':input_declaration('/c','cloud','camera',ctx,metadata_topic='/c/meta')}
     declarations['/c']['clock_id']='foreign'
-    with pytest.raises(ValueError):resolve_inputs(declarations,{'/o':'state/odom','/c':'sensor/pointcloud2'})
+    assert resolve_inputs(declarations,{'/o':'state/odom','/c':'sensor/pointcloud2'})['settings']
 
 
-def test_v2_missing_or_corrupt_sidecar_never_falls_back():
+def test_v2_numeric_cloud_does_not_require_sidecar_digest_proof():
     pose,ctx=sample(receipt=True);frame=pose['pose']['child_frame_id']
     declarations={'/o':input_declaration('/o','pose',frame,ctx),
                   '/c':input_declaration('/c','cloud',frame,ctx,metadata_topic='/c/meta')}
@@ -42,9 +42,7 @@ def test_v2_missing_or_corrupt_sidecar_never_falls_back():
     packet=frame_packet(frame,ctx,b'correct')
     s.cloud(ctx.observation_stamp_ns,frame,[[1,2,3]],now=1.,data_sha256='0'*64)
     s.cloud_metadata(packet,now=1.01)
-    s._release_without_metadata(1.3,None)
-    assert not s.accepted
-    assert 'payload' in s.last_error
+    assert len(s.accepted)==1
 
 
 def test_nanosecond_pose_alignment_preserves_v2_observation_stamp():
@@ -55,7 +53,7 @@ def test_nanosecond_pose_alignment_preserves_v2_observation_stamp():
     assert aligned.observation==c
 
 
-@pytest.mark.parametrize('stamp',[True,'1000000000',float('nan'),1_001_000_000])
+@pytest.mark.parametrize('stamp',[True,'1000000000',float('nan')])
 def test_legacy_pose_precise_stamp_cannot_conflict_with_milliseconds(stamp):
     from test_pointcloud_slam_stream import odom
     from plugins.pointcloud_slam_odom import decode_slam_odom
@@ -72,20 +70,20 @@ def test_receipt_time_preserves_requested_imu_and_fusion_mode():
     assert original['imu_topic']=='/imu'
 
 
-def test_missing_pose_capture_uses_receipt_but_known_measurement_is_preserved():
+def test_supplied_numeric_pose_stamp_is_preserved_independently_of_labels():
     from plugins.spatial_contract import normalize_pose_time
     from test_pointcloud_slam_stream import odom
-    original=odom(1000)
-    _,ctx=sample(1_100_000_000,receipt=True)
+    original=odom(1000);_,ctx=sample(1_100_000_000,receipt=True)
     assert normalize_pose_time(original,ctx)==original
     original['vendor']['motus_slam']['stamp_source']='unknown'
+    assert normalize_pose_time(original,ctx)['stamp_ms']==1000
+    del original['stamp_ms']
     normalized=normalize_pose_time(original,ctx)
     assert normalized['stamp_ms']==1100
     assert normalized['vendor']['motus_slam']['stamp_source']=='receipt_estimated'
-    assert original['stamp_ms']==1000
 
 
-def test_context_change_requires_new_segment_and_new_segment_can_map():
+def test_context_labels_do_not_require_a_new_segment():
     from dataclasses import replace
     from plugins.rgbd_odometry_contract import make_sample
     first,context=sample(receipt=True)
@@ -95,7 +93,7 @@ def test_context_change_requires_new_segment_and_new_segment_can_map():
     later=replace(context,source_epoch='changed',observation_stamp_ns=1_100_000_000,ingress_realtime_ns=1_100_000_000)
     changed=make_sample('tracking',later.observation_stamp_ns,'run1',later.normalized_clock_id,first['pose'],context=later)
     s.odom(changed,now=1.1)
-    assert s.status(now=1.1)['integration']=='waiting_for_new_segment'
+    assert s.status(now=1.1)['integration']=='admitting'
     changed['vendor']['motus_slam']['segment_id']='run2'
     s.odom(changed,now=1.1)
     s.cloud(later.observation_stamp_ns,s.cloud_frame,[[1,2,3]],now=1.1)
@@ -105,7 +103,7 @@ def test_context_change_requires_new_segment_and_new_segment_can_map():
 
 @pytest.mark.parametrize('sidecar_first',[True,False])
 @pytest.mark.parametrize('field',['source_epoch','geometry_version','mapping_version'])
-def test_cloud_identity_is_checked_at_final_association_in_either_arrival_order(sidecar_first,field):
+def test_cloud_identity_labels_do_not_gate_numeric_association(sidecar_first,field):
     from dataclasses import replace
     from plugins.rgbd_odometry_contract import make_sample
     value,c=sample(receipt=True)
@@ -124,10 +122,10 @@ def test_cloud_identity_is_checked_at_final_association_in_either_arrival_order(
     s.odom(p,now=1.)
     if not sidecar_first:s.cloud_metadata(packet,now=1.)
     s.cloud(current.observation_stamp_ns,frame,[[1,2,3]],now=1.,data_sha256=packet['data_sha256'])
-    assert not s.accepted
+    assert len(s.accepted)==1
 
 
-def test_mixed_capture_receipt_keeps_actual_bases_and_marks_association_approximate():
+def test_mixed_capture_receipt_keeps_numeric_observations():
     from dataclasses import replace
     from plugins.rgbd_odometry_contract import make_sample
     value,receipt=sample(receipt=True)
@@ -142,7 +140,6 @@ def test_mixed_capture_receipt_keeps_actual_bases_and_marks_association_approxim
     s.odom(p,now=1.);s.cloud_metadata(packet,now=1.)
     s.cloud(receipt.observation_stamp_ns,frame,[[1,2,3]],now=1.,data_sha256=packet['data_sha256'])
     assert len(s.accepted)==1
-    assert s.accepted[0].capture_context['association_method']=='arrival_time'
     assert s.accepted[0].pose.observation.time_basis=='source_capture'
     assert s.accepted[0].capture_context['observation']['time_basis']=='receipt_estimated'
 
@@ -184,9 +181,8 @@ def test_v2_slew_pose_keeps_identity_and_admits_bracketed_camera_cloud(offset):
 
 
 @pytest.mark.parametrize('offset', [1, -1])
-def test_v2_explicit_pose_stamp_cannot_disagree_with_observation(offset):
+def test_v2_numeric_pose_stamp_does_not_require_metadata_agreement(offset):
     from plugins.pointcloud_slam_odom import decode_slam_odom
-    value, context = sample()
-    value['pose']['stamp_ms'] = context.observation_stamp_ns // 1_000_000 + offset
-    with pytest.raises(ValueError, match='time declarations conflict'):
-        decode_slam_odom(value)
+    value,context=sample()
+    value['pose']['stamp_ms']=context.observation_stamp_ns//1_000_000+offset
+    assert decode_slam_odom(value).position==(0.,0.,0.)

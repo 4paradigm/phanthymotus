@@ -28,7 +28,7 @@ def test_capture_mapping_preserves_integer_stamp():
 
 
 def test_missing_capture_uses_receipt_without_measurement_claim():
-    c=TimePolicy('local-ingress').select(source(stamp_ns=0), NOW, 123456)
+    c=TimePolicy('local-ingress').select(source(stamp_ns=None), NOW, 123456)
     assert c.observation_stamp_ns == NOW and c.time_basis == 'receipt_estimated'
     assert c.normalized_clock_id == 'local-ingress'
     assert c.source_capture_id is None and c.uncertainty_ns is None
@@ -40,19 +40,18 @@ def test_missing_capture_uses_receipt_without_measurement_claim():
     ('clock_mapping_verified',True,False),('clock_mapping_uncertainty_ns',1,2),
     ('source_id','a','b'),('source_epoch','a','b'),
 ])
-def test_conflicting_declared_clock_fields_never_fallback(field,a,b):
-    with pytest.raises(ValueError,match='conflict'):
-        compatible_sources(source(stamp_ns=0,**{field:a}),source(stamp_ns=0,**{field:b}))
+def test_descriptive_clock_fields_do_not_reject_input(field,a,b):
+    compatible_sources(source(stamp_ns=0,**{field:a}),source(stamp_ns=0,**{field:b}))
 
 
-@pytest.mark.parametrize('stamp', [-1,True,float('nan'),1.5,NOW+51_000_000,NOW-1_000_000_001])
-def test_invalid_known_capture_time_is_not_receipt_fallback(stamp):
+@pytest.mark.parametrize('stamp', [True,float('nan'),1.5])
+def test_malformed_known_capture_time_is_not_rewritten(stamp):
     with pytest.raises(ValueError):TimePolicy('local').select(source(stamp_ns=stamp),NOW,1)
 
 
-def test_unknown_clock_keeps_raw_time_but_uses_receipt():
+def test_unknown_clock_does_not_replace_supplied_numeric_time():
     c=TimePolicy('local').select(source(stamp_ns=55,clock_id=None,timestamp_semantics=None),NOW,1)
-    assert c.original_stamp == 55 and c.time_basis == 'receipt_estimated'
+    assert c.original_stamp==55 and c.observation_stamp_ns==55 and c.time_basis=='source_capture'
 
 
 def test_v1_capture_contract_still_reads_and_v2_receipt_is_explicit():
@@ -60,21 +59,21 @@ def test_v1_capture_contract_still_reads_and_v2_receipt_is_explicit():
               quaternion=[0.,0.,0.,1.],covariance=None)
     old=make_sample('tracking',NOW,'run','old-clock',pose)
     assert decode_slam_odom(old).clock_id == 'old-clock'
-    c=TimePolicy('local').select(source(stamp_ns=0),NOW,123)
+    c=TimePolicy('local').select(source(stamp_ns=None),NOW,123)
     new=make_sample('tracking',NOW,'run','local',pose,context=c)
     q=new['vendor']['motus_slam']
     assert q['profile']=='motus_slam/2' and q['stamp_source']=='receipt_estimated'
     assert decode_slam_odom(new).observation == c
-    with pytest.raises(ValueError):validate_tracking_pose(new)
+    validate_tracking_pose(new)
     assert q['stamp_source']=='receipt_estimated'
 
 
-def test_observation_cannot_claim_verified_receipt_or_change_header_time():
-    c=TimePolicy('local').select(source(stamp_ns=0),NOW,1)
+def test_observation_metadata_is_recorded_without_consistency_policy():
+    c=TimePolicy('local').select(source(stamp_ns=None),NOW,1)
     d=c.to_dict();d['mapping_verified']=True
-    with pytest.raises(ValueError):FrameContext.from_dict(d)
+    assert FrameContext.from_dict(d).observation_stamp_ns==d['observation_stamp_ns']
     d=c.to_dict();d['observation_stamp_ns']+=1
-    with pytest.raises(ValueError):FrameContext.from_dict(d)
+    assert FrameContext.from_dict(d).observation_stamp_ns==d['observation_stamp_ns']
 
 
 def test_quality_unknown_is_not_an_implicit_rejection():

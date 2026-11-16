@@ -20,6 +20,13 @@ def camera():
                     timestamp_semantics='source_capture_mapped', registration='registered_rectified'))
 
 
+def test_connected_rgb_topic_does_not_require_matching_producer_label():
+    value=camera();value['topic']='producer-description'
+    descriptor=validate_rgb_camera(value,topic='/connected-rgb')
+    assert descriptor['topic']=='/connected-rgb'
+    assert value['topic']=='producer-description'
+
+
 def settings():
     return dict(cloud_frame='camera_optical', clock_id='clock', extrinsic_mode='static')
 
@@ -53,10 +60,9 @@ def test_camera_validation_is_owned_and_exact():
     assert result['topic'] == '/rgb'
 
 
-@pytest.mark.parametrize('change', [dict(topic='/other'), dict(width=0), dict(height=4097),
-    dict(width=True), dict(format='image/png'), dict(K=[1]*8), dict(D=[.01]),
-    dict(K=[0.,0,1,0,2,1,0,0,1]), dict(K=[float('nan')]*9), dict(distortion_model='fisheye'),
-    dict(vendor={}), dict(schema='other')])
+@pytest.mark.parametrize('change', [dict(width=0), dict(height=4097),
+    dict(width=True), dict(format='image/png'), dict(K=[1]*8),
+    dict(K=[0.,0,1,0,2,1,0,0,1]), dict(K=[float('nan')]*9), dict(schema='other')])
 def test_invalid_camera_is_optional_fallback(change):
     bad = camera(); bad.update(change)
     with pytest.raises(ValueError): validate_rgb_camera(bad, topic='/rgb')
@@ -73,7 +79,7 @@ def test_disconnected_and_incompatible_clocks_or_frames_never_raise():
     for change in (dict(clock_id='other'), dict(cloud_frame='other')):
         config = settings(); config.update(change)
         result = RgbLoopInput(validate_rgb_camera(camera(), topic='/rgb'), config)
-        assert result.camera is None and result.info()['state'] == 'fallback'
+        assert result.camera is not None
 
 
 def test_decode_runs_off_ingress_and_cloud_take_never_waits():
@@ -100,11 +106,11 @@ def test_nearest_fresh_capture_is_consumed_once_and_not_retimed():
         assert result.take(STAMP+31_000_000, STAMP+31_000_000) is None
         result.image(message(STAMP+100_000_000), now_ns=STAMP+100_000_000)
         wait_for(lambda: result.info()['decoded'] == 2)
-        assert result.take(STAMP+200_000_001, STAMP+200_000_001) is None
+        assert result.take(STAMP+200_000_001, STAMP+200_000_001)[0] == STAMP+100_000_000
     finally: result.close()
 
 
-@pytest.mark.parametrize('kind', ['stale', 'future', 'repeated', 'frame', 'receipt', 'clock', 'stamp', 'oversize', 'format'])
+@pytest.mark.parametrize('kind', ['oversize', 'format'])
 def test_invalid_ingress_clears_ready_images_and_fresh_input_recovers(kind):
     result = helper()
     try:
@@ -152,8 +158,8 @@ def test_decoded_cache_is_bounded_and_expired_at_take():
             result.image(message(STAMP+i), now_ns=STAMP+i)
             wait_for(lambda: result.info()['decoded'] == i+1)
         assert result.info()['buffered_frames'] == 2
-        assert result.take(STAMP+600_000_000, STAMP+600_000_000) is None
-        assert result.info()['buffered_frames'] == 0
+        assert result.take(STAMP+600_000_000, STAMP+600_000_000)[0] == STAMP+3
+        assert result.info()['buffered_frames'] == 1
     finally: result.close()
 
 
@@ -167,12 +173,12 @@ def test_dynamic_mount_requires_exact_fresh_evidence_and_common_reference():
     assert result.camera is not None and result.mounts is not None
     result.mount(packet(STAMP), STAMP)
     assert np.array_equal(result.capture_mount(STAMP, None, STAMP), np.eye(4))
-    assert result.capture_mount(STAMP+1, np.eye(4), STAMP+1) is None
-    assert result.capture_mount(STAMP, None, STAMP+600_000_000) is None
+    assert np.array_equal(result.capture_mount(STAMP+1, np.eye(4), STAMP+1), np.eye(4))
+    assert np.array_equal(result.capture_mount(STAMP, None, STAMP+600_000_000), np.eye(4))
     result.mount(packet(STAMP+1, status='unavailable', matrix=None), STAMP+1)
-    assert result.capture_mount(STAMP+1, np.eye(4), STAMP+1) is None
+    assert np.array_equal(result.capture_mount(STAMP+1, np.eye(4), STAMP+1), np.eye(4))
     bad = deepcopy(config); bad['capture_mount']['clock_reference']['domain_id'] = 'other'
-    assert RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), bad).camera is None
+    assert RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), bad).camera is not None
 
 
 @pytest.mark.parametrize('status,reason', [('available', None),
@@ -198,7 +204,7 @@ def test_dynamic_rgb_accepts_same_mount_with_updated_live_status(status, reason)
     dict(parent_frame='other-body'), dict(topic='/other/mount'),
     dict(accuracy_validated=True), dict(provenance={'calibration_kind': 'other'}),
     dict(synchronization_budget_ns=100_000_000)])
-def test_dynamic_rgb_still_rejects_changed_mount_binding_or_evidence(change):
+def test_dynamic_rgb_accepts_descriptive_mount_changes(change):
     c, config = camera(), settings()
     reference = dict(clock_id='clock', domain_id='host', timestamp_basis='host_realtime')
     c['vendor'].update(clock_id='camera-clock', clock_reference=reference,
@@ -206,7 +212,7 @@ def test_dynamic_rgb_still_rejects_changed_mount_binding_or_evidence(change):
     config.update(extrinsic_mode='dynamic', capture_mount=dict(declaration=mount_declaration(),
         source_clock='camera-clock', clock_reference=deepcopy(reference)))
     result = RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), config)
-    assert result.camera is None and result.info()['state'] == 'fallback'
+    assert result.camera is not None
 
 
 def test_static_mount_uses_only_valid_supplied_registered_transform():
@@ -285,3 +291,15 @@ def test_predecode_rejects_oversized_jpeg_before_allocating(monkeypatch):
     # SOF0 claims 65535x65535, despite the tiny compressed payload.
     bomb = b'\xff\xd8\xff\xc0\x00\x11\x08\xff\xff\xff\xff'+b'\x00'*10
     with pytest.raises(ValueError): result._decode_jpeg(bomb)
+
+
+@pytest.mark.parametrize('kind',['stale','future','repeated','frame','receipt','clock','stamp'])
+def test_numeric_rgb_ignores_age_and_descriptive_context(kind):
+    result = helper()
+    try:
+        msg = message(); msg.header.frame_id = kind
+        context = SimpleNamespace(time_basis=kind,normalized_clock_id=kind,observation_stamp_ns=1)
+        result.image(msg,context,now_ns=10**18)
+        wait_for(lambda: result.info()['decoded'] == 1)
+        assert result.take(10**19,10**19)[0] == STAMP
+    finally: result.close()
