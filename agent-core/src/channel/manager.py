@@ -524,6 +524,9 @@ class ChannelManager:
             await self._push_error(msg)
         _update_status(channel_id, 'error')
 
+        if adapter is not None and not adapter.should_auto_reconnect():
+            return
+
         # 指数退避重连（30s → 60s → … → 300s）
         now = time.time()
         if now < self._retry_at.get(channel_id, 0):
@@ -591,7 +594,8 @@ class ChannelManager:
 
         cls = _ADAPTER_CLASSES.get(platform)
         if cls is None:
-            msg = f'[channel] No adapter for platform: {platform}. Supported: telegram, slack, feishu'
+            msg = (f'[channel] No adapter for platform: {platform}. '
+                   'Supported: telegram, slack, feishu, lan, wecom')
             print(msg)
             await self._push_error(msg)
             return
@@ -687,7 +691,8 @@ class ChannelManager:
                     if adapter:
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
-                            text='Pending approval. An admin has been notified.'
+                            text='Pending approval. An admin has been notified.',
+                            source_message_id=msg.message_id,
                         ))
                     return
 
@@ -884,6 +889,9 @@ class ChannelManager:
                 files=attachments,
                 mention_open_id=mention_open_id,
                 expect_reply=expect_reply,
+                # 触发事件的 message_id：长连接型平台（WeCom）据此精确找回
+                # 该次回调的 req_id，而不是靠 chat_id 猜「最近一条」。
+                source_message_id=source_message_id,
             ))
             parts = []
             if text:

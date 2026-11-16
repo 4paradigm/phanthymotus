@@ -76,6 +76,11 @@ class OutboundMessage:
     # 兼容旧调用方：直接给字节的图片
     image_bytes: bytes | None = None
     image_caption: str = ''
+    # 触发事件的 message_id（精确回复用）。必须留在末尾且带默认值：
+    # 现有 4 个适配器与 manager.py 的按位置构造都不受影响。
+    # 长连接型平台（如 WeCom）回复必须回带该消息回调的 req_id，适配器
+    # 据此从 msgid → req_id 映射里精确取值，避免同一会话连发多条时回错消息。
+    source_message_id: str = ''
 
 
 # 收到消息时的回调签名
@@ -151,6 +156,10 @@ class ChannelAdapter(ABC):
     async def health_check(self) -> tuple[bool, str]:
         """返回 (是否连通, 失败原因)。默认只看 _running，子类应重写为真实探测。"""
         return (self._running, '' if self._running else 'adapter not running')
+
+    def should_auto_reconnect(self) -> bool:
+        """是否允许 watchdog 自动重连；需要人工处理的状态可由子类禁止。"""
+        return True
 
     def status(self) -> str:
         """返回当前状态：connected / degraded / disconnected。
