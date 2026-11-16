@@ -64,9 +64,18 @@ class _Base(unittest.TestCase):
         with schedule_store._get_conn() as conn:
             conn.execute('DELETE FROM schedules')
         schedule_store._schedules.clear()
-        schedule_store._fires_by_day.clear()
+        schedule_store._fire_times.clear()
+        with schedule_store._get_conn() as conn:
+            conn.execute('DELETE FROM schedule_fires')
         schedule_store._loaded = True
         config.main['scheduler_settings'] = dict(schedule_store.DEFAULT_SETTINGS)
+
+    @staticmethod
+    def _due_soon(s) -> float:
+        """把一次性定时改到一两秒后（秒级精度），返回 unix 时间，给 scheduler._run_job 的 job['at'] 用。"""
+        t = int(time.time()) + 2
+        schedule_store._schedules[s.id].at = datetime.datetime.fromtimestamp(t, CN).strftime('%Y-%m-%d %H:%M:%S')
+        return float(t)
 
 
 class TestCronAndTimezone(_Base):
@@ -372,7 +381,7 @@ class TestSecondReview(_Base):
         with _FakeJobs():
             a = schedule_store.create(name='一次', text='x', kind='once',
                                       at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
-        job = {'name': 'sched:' + a.id, 'text': 'x', 'at': time.time() + 0.05, 'source': 'scheduler:一次',
+        job = {'name': 'sched:' + a.id, 'text': 'x', 'at': self._due_soon(a), 'source': 'scheduler:一次',
                'on_fire': schedule_store._on_fire(a.id), 'after_fire': schedule_store._after_fire(a.id)}
 
         async def go():
@@ -382,13 +391,15 @@ class TestSecondReview(_Base):
                 await scheduler._run_job(job)
             finally:
                 event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S = orig, delay
-        asyncio.run(asyncio.wait_for(go(), 5))
+        asyncio.run(asyncio.wait_for(go(), 8))
         self.assertEqual(len(calls), 2, '第一次失败后重试一次')
         s = schedule_store.find('一次')
         self.assertFalse(s.enabled)
         self.assertEqual(s.fire_count, 1, '只有成功的那次记账')
+        self.assertEqual(schedule_store._fires_today(time.time()), 1, '失败那次的名额已退回')
 
-    def test_failed_enqueue_keeps_one_shot_enabled(self):
+    def test_one_shot_given_up_is_disabled(self):
+        """重试用完还是发不出去：退回名额并停用落盘，不留“启用着但再也不会触发”的记录。"""
         import event_bus
 
         async def broken(source, text, payload=None):
@@ -397,8 +408,9 @@ class TestSecondReview(_Base):
         with _FakeJobs():
             a = schedule_store.create(name='一次2', text='x', kind='once',
                                       at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
-        job = {'name': 'sched:' + a.id, 'text': 'x', 'at': time.time() + 0.05, 'source': 'scheduler:一次2',
+        job = {'name': 'sched:' + a.id, 'text': 'x', 'at': self._due_soon(a), 'source': 'scheduler:一次2',
                'on_fire': schedule_store._on_fire(a.id), 'after_fire': schedule_store._after_fire(a.id)}
+        tries = []
 
         async def go():
             orig = (event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES)
@@ -407,10 +419,212 @@ class TestSecondReview(_Base):
                 await scheduler._run_job(job)
             finally:
                 event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES = orig
-        asyncio.run(asyncio.wait_for(go(), 5))
+            tries.append(job.get('retries'))
+        asyncio.run(asyncio.wait_for(go(), 8))
+        self.assertEqual(tries, [2])
         s = schedule_store.find('一次2')
-        self.assertTrue(s.enabled, '一直没发出去：保持启用，重启后还会恢复')
+        self.assertFalse(s.enabled)
         self.assertEqual(s.fire_count, 0)
+        self.assertEqual(schedule_store._fires_today(time.time()), 0)
+        schedule_store._schedules.clear()
+        schedule_store.load_all()
+        self.assertFalse(schedule_store.find('一次2').enabled, '停用已落盘')
+
+
+class TestThirdReview(_Base):
+    """PR #398 第三轮审查：每日名额原子占用、收紧设置要重新校验、一次性错过/放弃要停用；
+    以及顺带堵上的：重启不丢当天次数、立即触发也占名额、按天跳的 _next_run 与逐分钟扫一致、
+    精确的最短间隔、两年都不触发的 cron、模型工具不卡事件循环。"""
+
+    def _in_hour(self, name):
+        with _FakeJobs():
+            return schedule_store.create(name=name, text='x', kind='once',
+                                         at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
+
+    def _fill_today(self, n):
+        schedule_store._fire_times.extend([time.time() - 1] * n)
+
+    def test_concurrent_due_respects_cap(self):
+        """差一次到上限时两条同时到点：只放行一条。"""
+        import threading
+        a, b = self._in_hour('a'), self._in_hour('b')
+        self._fill_today(schedule_store.get_settings()['max_fires_per_day'] - 1)
+        barrier, got = threading.Barrier(2), []
+
+        def go(sid):
+            cb = schedule_store._on_fire(sid)
+            barrier.wait()
+            got.append(cb({}))
+        ts = [threading.Thread(target=go, args=(x.id,)) for x in (a, b)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(sorted(got), [False, True])
+        self.assertEqual(schedule_store._fires_today(time.time()), 48)
+
+    def test_concurrent_due_jobs_enqueue_once(self):
+        """走完整的 scheduler._run_job：两条一次性同时到点、只剩一个名额 → 只入队一次；
+        没轮上的那条当场停用，不留“启用但不会再触发”的记录。"""
+        import event_bus
+        a, b = self._in_hour('a'), self._in_hour('b')
+        self._fill_today(47)
+        sent = []
+
+        async def fake(source, text, payload=None):
+            await asyncio.sleep(0.01)
+            sent.append(source)
+
+        def job(s):
+            return {'name': 'sched:' + s.id, 'text': 'x', 'at': self._due_soon(s),
+                    'source': 'scheduler:' + s.name,
+                    'on_fire': schedule_store._on_fire(s.id), 'after_fire': schedule_store._after_fire(s.id)}
+
+        async def go():
+            orig = event_bus.enqueue
+            event_bus.enqueue = fake
+            try:
+                await asyncio.gather(scheduler._run_job(job(a)), scheduler._run_job(job(b)))
+            finally:
+                event_bus.enqueue = orig
+        asyncio.run(asyncio.wait_for(go(), 5))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(schedule_store._fires_today(time.time()), 48)
+        fa, fb = schedule_store.find('a'), schedule_store.find('b')
+        self.assertFalse(fa.enabled or fb.enabled, '发了的和被上限跳过的一次性都停用')
+        self.assertEqual(fa.fire_count + fb.fire_count, 1)
+
+    def test_failed_enqueue_releases_slot(self):
+        a = self._in_hour('a')
+        check, done = schedule_store._on_fire(a.id), schedule_store._after_fire(a.id)
+        job = {}
+        self.assertTrue(check(job))
+        self.assertEqual(schedule_store._fires_today(time.time()), 1)
+        done(job, False, True)
+        self.assertEqual(schedule_store._fires_today(time.time()), 0, '没发出去要退回名额')
+        self.assertTrue(schedule_store.find('a').enabled, '还会重试，保持启用')
+
+    def test_fire_count_survives_restart(self):
+        a = self._in_hour('a')
+        job = {}
+        schedule_store._on_fire(a.id)(job)
+        schedule_store._after_fire(a.id)(job, True, False)
+        schedule_store._fire_times.clear()
+        schedule_store.load_all()
+        self.assertEqual(schedule_store._fires_today(time.time()), 1, '当天已触发的次数写在库里')
+
+    def test_once_skipped_by_cap_is_disabled(self):
+        a = self._in_hour('a')
+        self._fill_today(48)
+        self.assertFalse(schedule_store._on_fire(a.id)({}))
+        self.assertFalse(schedule_store.find('a').enabled)
+        schedule_store._schedules.clear()
+        schedule_store.load_all()
+        self.assertFalse(schedule_store.find('a').enabled, '停用已落盘')
+
+    def test_tightening_settings_rechecks_existing(self):
+        with _FakeJobs():
+            schedule_store.create(name='十分钟', text='x', cron='0,10,20,30,40,50 8 * * *', skill='med')
+            schedule_store.create(name='早上', text='x', cron='0 9 * * *', skill='med')
+        for change, word in (({'min_interval_minutes': 30}, '十分钟'),
+                             ({'max_schedules': 1}, '2 条'),
+                             ({'max_per_skill': 1}, '技能 med'),
+                             ({'max_fires_per_day': 5}, '7 次')):
+            with self.assertRaisesRegex(ValueError, word, msg=str(change)):
+                schedule_store.update_settings(**change)
+        self.assertEqual(schedule_store.get_settings(), schedule_store.DEFAULT_SETTINGS, '被拒时设置不变')
+        schedule_store.update_settings(min_interval_minutes=10, max_fires_per_day=7, model_tools_enabled=True)
+        self.assertEqual(schedule_store.get_settings()['max_fires_per_day'], 7)
+
+    def test_preexisting_violation_does_not_block_unrelated_change(self):
+        with _FakeJobs():
+            s = schedule_store.create(name='a', text='x', cron='0,10,20 8 * * *')
+        schedule_store._schedules[s.id].cron = '*/5 8 * * *'      # 模拟旧版本留下的数据
+        schedule_store.update_settings(model_tools_enabled=True)
+        self.assertTrue(schedule_store.get_settings()['model_tools_enabled'])
+
+    def test_fire_now_takes_a_slot(self):
+        import event_bus
+        sent = []
+
+        async def ok(source, text, payload=None):
+            sent.append(source)
+
+        async def broken(source, text, payload=None):
+            raise RuntimeError('down')
+
+        with _FakeJobs():
+            s = schedule_store.create(name='试', text='x', cron='0 8 * * *')
+        orig = event_bus.enqueue
+        try:
+            event_bus.enqueue = broken
+            with self.assertRaises(RuntimeError):
+                asyncio.run(schedule_store.fire_now(s.id))
+            self.assertEqual(schedule_store._fires_today(time.time()), 0, '没发出去退回名额')
+            event_bus.enqueue = ok
+            asyncio.run(schedule_store.fire_now(s.id))
+            self.assertEqual(schedule_store._fires_today(time.time()), 1)
+            self._fill_today(47)
+            with self.assertRaisesRegex(ValueError, '每日上限'):
+                asyncio.run(schedule_store.fire_now(s.id))
+        finally:
+            event_bus.enqueue = orig
+        self.assertEqual(len(sent), 1)
+
+    def test_next_run_matches_minute_scan(self):
+        """按天跳的 _next_run 和原来的逐分钟扫结果一致。"""
+        def scan(cron, after, tz):
+            tz = scheduler.get_tz(tz) if tz else None
+            mi, ho, md, mo, wd = scheduler.parse_cron(cron)
+            pw = {(w - 1) % 7 for w in wd}
+            dt = datetime.datetime.fromtimestamp(after + 60, tz).replace(second=0, microsecond=0)
+            for _ in range(60 * 24 * 400):
+                if dt.month in mo and dt.day in md and dt.weekday() in pw and dt.hour in ho and dt.minute in mi:
+                    return dt.timestamp()
+                dt += datetime.timedelta(minutes=1)
+        crons = ('0 8 * * *', '*/10 * * * *', '0,10,20,30 0,4,10 * * *', '30 23 * * 0',
+                 '0 8 1 * *', '15 9 13 * 5', '0-30/10 8-10 * * 1-5', '59 23 31 12 *')
+        afters = (_ts('2026-11-16 07:59'), _ts('2026-11-16 08:00') + 30, _ts('2026-12-31 23:58'),
+                  _ts('2027-02-28 23:59'))
+        for c in crons:
+            for a in afters:
+                for tz in ('Asia/Shanghai', 'UTC', None):
+                    self.assertEqual(scheduler._next_run(c, a, tz), scan(c, a, tz), (c, a, tz))
+
+    def test_rare_cron_is_fast(self):
+        t0 = time.time()
+        scheduler._next_run('0 8 29 2 *', time.time(), 'Asia/Shanghai')
+        scheduler.next_runs('0 8 1 1 *', time.time(), 5, 'Asia/Shanghai')
+        self.assertLess(time.time() - t0, 0.5)
+
+    def test_min_gap_is_exact(self):
+        now = _ts('2026-11-16 00:00')
+        self.assertEqual(scheduler.min_gap_minutes('*/10 * * * *', now, 'Asia/Shanghai'), 10)
+        self.assertEqual(scheduler.min_gap_minutes('0 8 * * *', now, 'Asia/Shanghai'), 1440)
+        self.assertEqual(scheduler.min_gap_minutes('0 8 * * 1', now, 'Asia/Shanghai'), 7 * 1440)
+        self.assertEqual(scheduler.min_gap_minutes('0 0,23 30,31 * *', now, 'Asia/Shanghai'), 60,
+                         '月底 30 号 23:00 → 31 号 0:00 只隔 1 小时')
+        config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'min_interval_minutes': 61}
+        with self.assertRaisesRegex(ValueError, '最短只隔 60 分钟'):
+            schedule_store.validate(schedule_store.Schedule(name='月底', text='x', cron='0 0,23 30,31 * *'),
+                                    now=now)
+
+    def test_impossible_cron_is_a_value_error(self):
+        with _FakeJobs():
+            with self.assertRaisesRegex(ValueError, '不会触发'):
+                schedule_store.create(name='二月三十', text='x', cron='0 8 30 2 *')
+
+    def test_monthly_dense_day_beyond_a_week_is_counted(self):
+        """每月 1 号 48 次：就算 1 号不在接下来 7 天里，也要算进每日上限。"""
+        with _FakeJobs():
+            schedule_store.create(name='一号', text='x', cron='*/30 * 1 * *')
+            with self.assertRaisesRegex(ValueError, '-01 这一天'):
+                schedule_store.create(name='一号中午', text='x', cron='15 12 1 * *')
+
+    def test_model_tools_run_store_calls_off_the_loop(self):
+        src = (_SRC / 'event' / 'schedule.py').read_text(encoding='utf-8')
+        self.assertIn('asyncio.to_thread(', src)
+        for call in ('schedule_store.create(', 'schedule_store.update(', 'schedule_store.delete(',
+                     'schedule_store.find('):
+            self.assertNotIn(call, src, call + ' 应走 model_upsert / model_delete，放进线程池')
 
 
 if __name__ == '__main__':

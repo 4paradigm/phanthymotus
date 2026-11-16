@@ -89,6 +89,28 @@ def get_tz(name: str | None):
         raise ValueError(f'未知时区：{name!r}') from e
 
 
+def _tz_arg(tz):
+    if isinstance(tz, str) or tz is None:
+        return get_tz(tz) if tz else None
+    return tz
+
+
+def _compile(cron: str):
+    """cron → (当天的触发分钟（排好序，时*60+分）, 日集合, 月集合, Python 星期集合)。"""
+    minutes, hours, mdays, months, wdays = parse_cron(cron)
+    day_mins = sorted(h * 60 + m for h in hours for m in minutes)
+    py_wdays = {(w - 1) % 7 for w in wdays}   # cron 0=Sunday → Python 0=Monday
+    return day_mins, mdays, months, py_wdays
+
+
+def _date_ok(d: datetime.date, mdays, months, py_wdays) -> bool:
+    return d.month in months and d.day in mdays and d.weekday() in py_wdays
+
+
+def _wall(d: datetime.date, mins: int, tz) -> datetime.datetime:
+    return datetime.datetime(d.year, d.month, d.day, mins // 60, mins % 60, tzinfo=tz)
+
+
 def _next_run(cron: str, after: float, tz=None) -> float:
     """
     计算 cron 表达式在 after 之后的下一个触发时间（unix timestamp）。
@@ -100,24 +122,29 @@ def _next_run(cron: str, after: float, tz=None) -> float:
     支持标准 5 字段 cron：分 时 日(月) 月 周
     字段值：数字、*、*/N、a-b、a-b/N、逗号列表（不支持 L/W/#）
     tz：tzinfo 或时区名；None 按容器本地时区（旧行为）。
+
+    结果与“从 after+60 的整分钟起按挂钟逐分钟找、最多找两年”完全一样，但按天跳：
+    日期不匹配的整天直接跳过，匹配的那天只看列出来的时、分。一年一次的 cron 也只要几百步，
+    不会在事件循环里扫几十万分钟。
     """
-    if isinstance(tz, str) or tz is None:
-        tz = get_tz(tz) if tz else None
-    minutes, hours, mdays, months, wdays = parse_cron(cron)
-    py_wdays = {(w - 1) % 7 for w in wdays}   # cron 0=Sunday → Python 0=Monday
-
-    # 从 after+60 开始逐分钟找，最多两年
-    dt = datetime.datetime.fromtimestamp(after + 60, tz).replace(second=0, microsecond=0)
-    limit = dt + datetime.timedelta(days=366 * 2)
-
-    while dt < limit:
-        if (dt.month in months
-                and dt.day in mdays
-                and dt.weekday() in py_wdays
-                and dt.hour in hours
-                and dt.minute in minutes):
-            return dt.timestamp()
-        dt += datetime.timedelta(minutes=1)
+    tz = _tz_arg(tz)
+    day_mins, mdays, months, py_wdays = _compile(cron)
+    start = datetime.datetime.fromtimestamp(after + 60, tz).replace(second=0, microsecond=0)
+    limit = start + datetime.timedelta(days=366 * 2)
+    start_min = start.hour * 60 + start.minute
+    d = start.date()
+    first = True
+    while d <= limit.date():
+        if _date_ok(d, mdays, months, py_wdays):
+            for mm in day_mins:
+                if first and mm < start_min:
+                    continue
+                cand = _wall(d, mm, tz)
+                if cand >= limit:
+                    break
+                return cand.timestamp()
+        first = False
+        d += datetime.timedelta(days=1)
 
     raise RuntimeError(f'Cannot find next run for cron: {cron!r}')
 
@@ -129,6 +156,68 @@ def next_runs(cron: str, after: float, count: int, tz=None) -> list[float]:
         t = _next_run(cron, t, tz)
         out.append(t)
     return out
+
+
+def fires_between(cron: str, start: float, end: float, tz=None, limit: int | None = None) -> int:
+    """[start, end) 里触发几次（按挂钟时间，与 _next_run 一致）。limit：数到这么多就停。"""
+    if limit is not None and limit <= 0:
+        return 0
+    tz = _tz_arg(tz)
+    day_mins, mdays, months, py_wdays = _compile(cron)
+    d = datetime.datetime.fromtimestamp(start, tz).date()
+    last = datetime.datetime.fromtimestamp(end, tz).date()
+    n = 0
+    while d <= last:
+        if _date_ok(d, mdays, months, py_wdays):
+            for mm in day_mins:
+                t = _wall(d, mm, tz).timestamp()
+                if start <= t < end:
+                    n += 1
+                    if limit is not None and n >= limit:
+                        return n
+        d += datetime.timedelta(days=1)
+    return n
+
+
+def matching_dates(cron: str, after: float, days: int, tz=None) -> list[datetime.date] | None:
+    """接下来 days 天里（cron 的时区）日期会匹配的那些天。
+
+    日、月两个字段都是 * 时返回 None：这种 cron 只按星期重复，看一个星期就够了。"""
+    _, mdays, months, py_wdays = _compile(cron)
+    if mdays == set(range(1, 32)) and months == set(range(1, 13)):
+        return None
+    d = datetime.datetime.fromtimestamp(after, _tz_arg(tz)).date()
+    out = []
+    for _ in range(days):
+        if _date_ok(d, mdays, months, py_wdays):
+            out.append(d)
+        d += datetime.timedelta(days=1)
+    return out
+
+
+def min_gap_minutes(cron: str, after: float, tz=None) -> int | None:
+    """相邻两次触发最短隔几分钟（按挂钟时间，看接下来两年）；两年里不到两次返回 None。
+
+    每个匹配日里的触发分钟都一样，所以一天之内的最短间隔是定值；跨天的间隔只取决于
+    相邻两个匹配日隔几天：隔 k 天 → k*1440 - 当天最后一次 + 当天第一次。
+    比逐次算“接下来 50 次”准：像 '0 0,23 30,31 * *' 这种月底才出现的 1 小时间隔也能算到。"""
+    day_mins, mdays, months, py_wdays = _compile(cron)
+    intra = min((b - a for a, b in zip(day_mins, day_mins[1:])), default=None)
+    d = datetime.datetime.fromtimestamp(after, _tz_arg(tz)).date()
+    prev, span = None, None
+    for _ in range(366 * 2):
+        if _date_ok(d, mdays, months, py_wdays):
+            if prev is not None:
+                k = (d - prev).days
+                span = k if span is None else min(span, k)
+                if span == 1:
+                    break
+            prev = d
+        d += datetime.timedelta(days=1)
+    gaps = [g for g in (intra,) if g is not None]
+    if span is not None:
+        gaps.append(span * 1440 - day_mins[-1] + day_mins[0])
+    return min(gaps) if gaps else None
 
 
 # ── 动态 job 管理 ─────────────────────────────────────────────────────────────
@@ -182,9 +271,13 @@ def add_job(name: str, cron: str, text: str, *, tz=None, at: float | None = None
     """动态添加一个定时 job（如果同名已存在则先移除）。可以从任何线程调用。
 
     cron 和 at 二选一：at 是一次性触发的 unix 时间。
-    on_fire(job) 在推事件前调用，返回 False 就跳过这一次（每日上限、已停用）。
-    after_fire(job) 只在事件成功入队后调用（记账、一次性任务收尾）。两个回调都在线程池里跑
-    （它们会读写 SQLite，不能卡事件循环）。
+    on_fire(job) -> bool：推事件前调用，返回 False 就跳过这一次。schedule_store 在这里
+      持锁检查并**占一个当天名额**（检查和占用是同一步）。
+    after_fire(job, delivered, retrying)：on_fire 放行之后一定会调用一次。delivered=True
+      表示事件已入队（名额转正、记账、一次性任务收尾）；False 表示没发出去（退回名额），
+      retrying 表示 scheduler 还会再试（只有一次性 job 会重试，最多 ONCE_MAX_RETRIES 次）。
+    两个回调都在线程池里跑（它们会读写 SQLite，不能卡事件循环）。job 在推事件途中被取消时
+    占着的名额不退回——算它发过了，宁可少发不多发。
     """
     _on_loop(functools.partial(_add_job_now, name, cron, text, tz, at, source, on_fire, after_fire))
 
@@ -252,7 +345,9 @@ async def _run_job(job: dict) -> None:
             try:
                 fire = (await asyncio.to_thread(on_fire, job)) is not False
             except Exception as e:
+                # 检查本身出错就不发：宁可漏一次，也不越过每日上限
                 print(f'[scheduler] on_fire for {name!r} failed: {e}')
+                fire = False
         delivered = False
         if fire:
             try:
@@ -263,19 +358,19 @@ async def _run_job(job: dict) -> None:
                 delivered = True
             except Exception as e:
                 print(f'[scheduler] enqueue for {name!r} failed: {e}')
-            if delivered and after_fire is not None:
-                try:
-                    await asyncio.to_thread(after_fire, job)
-                except Exception as e:
-                    print(f'[scheduler] after_fire for {name!r} failed: {e}')
+        # 一次性的没发出去：过一会儿再试，直到重试用完
+        retrying = bool(at) and fire and not delivered and job.get('retries', 0) < ONCE_MAX_RETRIES
+        if fire and after_fire is not None:
+            try:
+                await asyncio.to_thread(after_fire, job, delivered, retrying)
+            except Exception as e:
+                print(f'[scheduler] after_fire for {name!r} failed: {e}')
 
         if at:   # 一次性
-            if fire and not delivered:
-                # 没发出去：不算完成，过一会儿再试；状态里仍是启用，重启后也会恢复。
+            if retrying:
                 job['retries'] = job.get('retries', 0) + 1
-                if job['retries'] <= ONCE_MAX_RETRIES:
-                    next_ts = time.time() + ONCE_RETRY_DELAY_S
-                    continue
+                next_ts = time.time() + ONCE_RETRY_DELAY_S
+                continue
             job['next_ts'] = None
             return
         try:

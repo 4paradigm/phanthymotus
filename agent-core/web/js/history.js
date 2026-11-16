@@ -697,7 +697,7 @@ function _renderSchedules(el, data) {
   });
   el.querySelectorAll('.sched-run-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
-      if (!confirm('现在触发一次？机器人会被叫醒跑一轮。')) return;
+      if (!confirm('现在触发一次？机器人会被叫醒跑一轮，算进今天的触发次数。')) return;
       const r = await _scheduleFetch(`/api/schedules/${encodeURIComponent(btn.dataset.id)}/run`, 'POST');
       if (!r.ok) alert(r.error || '触发失败');
       _loadSchedules();

@@ -5,7 +5,8 @@ api/schedules.py — 运行时定时任务 REST API（网页“历史 → 定时
 会在事件循环线程上执行、慢盘或锁库时卡住整个 agent-core。def 路由由 FastAPI 放进线程池；
 scheduler.add_job / remove_job 会自己转回事件循环线程。
 
-增删改立即生效、不用重启；校验（最短间隔、每日上限、条数上限）全在 schedule_store。
+增删改立即生效、不用重启；校验（最短间隔、每日上限、条数上限，以及改设置时对现有定时的
+重新校验）全在 schedule_store。
 出错返回 {'ok': False, 'error': '<中文原因>'}，与 api/tasks.py 的风格一致。
 """
 
@@ -128,9 +129,13 @@ def delete_schedule(sid: str):
 
 @router.post('/{sid}/run')
 async def run_now(sid: str):
-    """立即触发一次，用来试效果。不计入每日上限。"""
+    """立即触发一次，用来试效果。和到点触发一样占当天的触发名额，满了会拒绝。"""
     try:
         s = await schedule_store.fire_now(sid)
     except KeyError:
         return {'ok': False, 'error': f'定时任务 {sid} 不存在'}
+    except ValueError as e:
+        return {'ok': False, 'error': str(e)}
+    except Exception as e:
+        return {'ok': False, 'error': f'事件没发出去：{e}'}
     return {'ok': True, 'schedule': schedule_store.to_dict(s)}

@@ -7,12 +7,16 @@ Tianyi 上模型几乎每次都顺手建一个每 2 分钟的检查，一小时�
   · 管理员在设置里打开 scheduler_settings.model_tools_enabled 才会出现在模型的工具表里
     （event/llm.py 每个 turn 现读配置过滤），关着时即使被调用也直接拒绝；
   · 走和网页完全相同的校验（schedule_store.validate）：最短间隔、每日触发上限、条数上限；
-  · 模型只能改、删自己建的（created_by='model'），人建的只读。
+  · 模型只能改、删自己建的（created_by='model'），人建的只读；查重、权限判断和写入在
+    schedule_store 的同一把锁里（model_upsert / model_delete）。
+
+schedule_store 的函数是同步的、会读写 SQLite，这里一律放进 asyncio.to_thread，不卡事件循环。
 
 下面工具的 docstring 会原样进模型的 prompt，所以只写用法，不写例子 cron（别给它现成的
 高频写法照抄）。
 """
 
+import asyncio
 import typing
 
 import log
@@ -26,16 +30,24 @@ def _enabled() -> bool:
 _OFF = '定时工具没有开启（管理员可在设置的“定时任务”里打开）。需要定时的话，请告诉用户在网页上设置。'
 
 
+def _describe_all() -> str:
+    items = schedule_store.list_all()
+    if not items:
+        return '当前没有定时任务。'
+    return '\n'.join(schedule_store.describe(s) for s in items)
+
+
+def _names() -> str:
+    return '、'.join(x.name for x in schedule_store.list_all()) or '无'
+
+
 class Tools:
     @log.function_(call=True)
     async def schedule_list(self):
         """列出所有定时任务（含人在网页上建的）：名字、触发时间、下次触发、触发时推给你的文字。"""
         if not _enabled():
             return _OFF
-        items = schedule_store.list_all()
-        if not items:
-            return '当前没有定时任务。'
-        return '\n'.join(schedule_store.describe(s) for s in items)
+        return await asyncio.to_thread(_describe_all)
 
     @log.function_(call=True)
     async def schedule_create(self,
@@ -57,21 +69,15 @@ class Tools:
             return '要么写 cron（重复），要么写 at（一次），两个只能写一个。'
         tz = schedule_store.get_settings()['default_tz']
         kind = 'once' if at else 'cron'
-        old = schedule_store.find(name)
         try:
-            if old and old.name == name:
-                if old.created_by != 'model':
-                    return f'「{name}」是人在网页上建的，你不能改。换个名字，或请用户在网页上改。'
-                s = schedule_store.update(old.id, text=text, kind=kind, cron=cron, at=at,
-                                          tz=tz, skill=skill, enabled=True)
-                verb = '已更新'
-            else:
-                s = schedule_store.create(name=name, text=text, kind=kind, cron=cron, at=at,
-                                          tz=tz, skill=skill, created_by='model')
-                verb = '已创建'
+            verb, s = await asyncio.to_thread(
+                schedule_store.model_upsert, name=name, text=text, kind=kind, cron=cron, at=at,
+                tz=tz, skill=skill)
+        except PermissionError:
+            return f'「{name}」是人在网页上建的，你不能改。换个名字，或请用户在网页上改。'
         except ValueError as e:
             return f'没有建成：{e}'
-        return f'{verb}：' + schedule_store.describe(s)
+        return f'{verb}：' + await asyncio.to_thread(schedule_store.describe, s)
 
     @log.function_(call=True)
     async def schedule_delete(self,
@@ -80,11 +86,10 @@ class Tools:
         """删除一个你自己建的定时任务。人在网页上建的不能删。"""
         if not _enabled():
             return _OFF
-        s = schedule_store.find(id)
-        if not s:
-            names = '、'.join(x.name for x in schedule_store.list_all()) or '无'
-            return f'没有找到定时任务 {id}。现有：{names}'
-        if s.created_by != 'model':
-            return f'「{s.name}」是人在网页上建的，你不能删。请用户在网页上处理。'
-        schedule_store.delete(s.id)
+        try:
+            s = await asyncio.to_thread(schedule_store.model_delete, id)
+        except KeyError:
+            return f'没有找到定时任务 {id}。现有：{await asyncio.to_thread(_names)}'
+        except PermissionError as e:
+            return f'「{e.args[0]}」是人在网页上建的，你不能删。请用户在网页上处理。'
         return f'已删除定时任务「{s.name}」。'
