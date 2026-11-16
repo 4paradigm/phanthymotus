@@ -118,3 +118,56 @@ def test_rebuilt_snapshot_preserves_typed_historical_heading(tmp_path):
         packet = module.rebuild(database, max_points=20, fallback=fallback)
         assert packet[:13] == fallback[:13]
         assert len(packet) == 29
+
+
+def _optimized(database, poses, *, ids_blob=None):
+    ids = np.asarray(list(poses), dtype='<i4')
+    matrices = b''.join(poses.values())
+    with sqlite3.connect(database) as connection:
+        connection.execute('CREATE TABLE Admin(opt_ids BLOB, opt_poses BLOB)')
+        connection.execute('INSERT INTO Admin VALUES(?,?)', (
+            ids_blob if ids_blob is not None else zlib.compress(ids.tobytes()) + struct.pack('<iii', 1, len(ids), 4),
+            zlib.compress(matrices) + struct.pack('<iii', 1, len(poses)*12, 5)))
+
+
+def test_saved_loop_geometry_uses_optimized_poses_instead_of_raw_odometry(tmp_path):
+    database = _database(tmp_path/'loop.db', [
+        (1, _pose_blob(0, 0), _cloud_blob([[0, 0, 3]]), None, None, None),
+        (2, _pose_blob(1, 0), _cloud_blob([[0, 0, 3]]), None, None, None),
+    ], links=[(1, 2)])
+    _optimized(database, {1: _pose_blob(0, 0), 2: _pose_blob(.02, 0)})
+    packet = module.rebuild(database, max_points=100, fallback=_fallback())
+    points = _decode(packet)[4]
+    assert len(points) == 2
+    assert np.max(points[:, 0])-np.min(points[:, 0]) < .03
+    assert packet[:13] == _fallback()[:13]
+
+
+def test_incomplete_optimized_graph_never_mixes_raw_and_optimized_coordinates(tmp_path):
+    database = _database(tmp_path/'local.db', [
+        (1, _pose_blob(50, 0), _cloud_blob([[0, 0, 3]]), None, None, None),
+        (2, _pose_blob(60, 0), _cloud_blob([[0, 0, 3]]), None, None, None),
+    ], links=[(1, 2)])
+    _optimized(database, {2: _pose_blob(.1, 0)})
+    points = _decode(module.rebuild(database, max_points=100, fallback=_fallback()))[4]
+    assert len(points) == 1
+    assert np.allclose(points[0], [.1, 0, 3])
+
+
+def test_corrupt_optimized_graph_keeps_last_optimized_preview(tmp_path):
+    database = _database(tmp_path/'bad.db', [
+        (1, _pose_blob(50, 0), _cloud_blob([[0, 0, 3]]), None, None, None),
+    ], links=[(1, 1)])
+    _optimized(database, {1: _pose_blob(0, 0)}, ids_blob=b'corrupt')
+    fallback = _fallback()
+    assert module.rebuild(database, max_points=100, fallback=fallback) == fallback
+
+
+def test_scan_fallback_reads_transform_after_seven_scan_metadata_floats(tmp_path):
+    local = np.eye(4); local[:3, 3] = [1, 2, 3]
+    scan_info = np.asarray([5., 100., 10., 0., 0., 0., 0.] + list(local[:3].ravel()), '<f4').tobytes()
+    database = _database(tmp_path/'scan.db', [
+        (1, _pose_blob(10, 20), None, None, _cloud_blob([[0, 1, 0]]), scan_info),
+    ], links=[(1, 1)])
+    points = _decode(module.rebuild(database, max_points=100, fallback=_fallback()))[4]
+    assert np.allclose(points, [[11, 23, 3]])

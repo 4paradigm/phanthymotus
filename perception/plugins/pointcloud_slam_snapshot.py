@@ -5,8 +5,8 @@ optimized graph* (rtabmap_ros ``getLocalOptimizedPoses()``).  Memory management
 (``Rtabmap/TimeThr`` / ``Rtabmap/MemoryThr`` - this card's ``max_update_ms`` /
 ``max_working_nodes``) can transfer older graph nodes to long-term memory, after
 which the local graph - and therefore the last preview snapshot - no longer
-contains them.  The native database keeps every graph node, its last optimized
-pose (``Node.pose``) and the occupancy-grid cells the native ``cloud_map`` is
+contains them.  The native database keeps raw odometry in ``Node.pose``, the
+saved optimized graph in ``Admin.opt_ids/opt_poses``, and the cells ``cloud_map`` is
 assembled from (``Data.obstacle_cells`` / ``Data.ground_cells``), so a complete
 snapshot can be rebuilt at save time without re-running RTAB-Map.
 
@@ -97,17 +97,52 @@ def _graph_nodes(connection):
     return graph
 
 
+def _optimized_poses(connection):
+    """Pinned DBDriverSqlite3::saveOptimizedPosesQuery, not raw Node.pose."""
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(Admin)')}
+    if not {'opt_ids', 'opt_poses'} <= columns:
+        return None  # Historical database formats without an optimized cache.
+    row = connection.execute('SELECT opt_ids, opt_poses FROM Admin').fetchone()
+    if row is None or not all(row):
+        raise ValueError('optimized graph unavailable')
+    arrays = []
+    for blob, kind in zip(row, (4, 5)):  # CV_32SC1 ids, CV_32FC1 poses
+        rows, cols, actual_kind = struct.unpack('<iii', blob[-12:])
+        if rows != 1 or not 0 < cols <= _MAX_BLOB_POINTS*12 or actual_kind != kind:
+            raise ValueError('invalid optimized graph dimensions')
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(blob[:-12], cols*4+1)
+        if len(raw) != cols*4 or not decoder.eof or decoder.unused_data:
+            raise ValueError('invalid optimized graph payload')
+        arrays.append(np.frombuffer(raw, dtype='<i4' if kind == 4 else '<f4'))
+    ids, values = arrays
+    if len(values) != len(ids)*12 or len(set(ids)) != len(ids):
+        raise ValueError('invalid optimized graph cardinality')
+    poses = {}
+    for node_id, values in zip(ids, values.reshape(-1, 12)):
+        matrix = _matrix(values.tobytes())
+        if matrix is None:
+            raise ValueError('invalid optimized pose')
+        poses[int(node_id)] = matrix
+    return poses
+
+
 def _plan(connection, graph, max_points):
     """Two passes over Data: count points first (bounded memory), then decode."""
     rows = list(connection.execute(
         'SELECT Node.id, Node.pose, Data.obstacle_cells, Data.ground_cells,'
         '       Data.scan, Data.scan_info'
         '  FROM Data JOIN Node ON Node.id = Data.id'))
+    optimized = _optimized_poses(connection)
     sources, total = [], 0
     for node_id, pose, cells, ground, scan, scan_info in rows:
         node_id = int(node_id)
         if node_id not in graph or _matrix(pose) is None:
             continue
+        if optimized is not None:
+            if node_id not in optimized:
+                continue  # Never mix an evicted node's raw pose into optimized space.
+            pose = np.asarray(optimized[node_id][:3], dtype='<f4').tobytes()
         count = _count(cells) + _count(ground)
         if count == 0:
             count = _count(scan) if scan_info else 0
@@ -129,7 +164,8 @@ def _load(sources, stride):
                 local = points if local is None else np.concatenate((local, points))
         if local is None and scan:
             points = _unpack(scan)
-            transform = _matrix(scan_info)
+            # Pinned scan_info: seven float32 metadata values, then 3x4 transform.
+            transform = _matrix(scan_info[28:])
             if points is not None and transform is not None:
                 local = _transform(points, transform)   # sensor frame -> node frame
         if local is None or not len(local):
