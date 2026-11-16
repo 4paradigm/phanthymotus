@@ -174,3 +174,12 @@ def test_v2_slew_pose_keeps_identity_and_admits_bracketed_camera_cloud(offset):
     assert s.accepted[0].cloud==[[1,2,3]]
     assert s.accepted[0].capture_context['observation']['source_epoch']=='camera1'
     assert s.status(now=1.1)['odometry']=='tracking'
+
+
+@pytest.mark.parametrize('offset', [1, -1])
+def test_v2_explicit_pose_stamp_cannot_disagree_with_observation(offset):
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    value, context = sample()
+    value['pose']['stamp_ms'] = context.observation_stamp_ns // 1_000_000 + offset
+    with pytest.raises(ValueError, match='time declarations conflict'):
+        decode_slam_odom(value)

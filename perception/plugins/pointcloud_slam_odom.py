@@ -73,7 +73,8 @@ def decode_slam_odom(sample):
     units = sample.get("units")
     if not isinstance(units, dict) or units.get("length") != "m":
         raise ValueError("pose length must be in meters")
-    stamp = sample.get("stamp_ms")
+    pose = sample.get("pose")
+    stamp = pose.get("stamp_ms", sample.get("stamp_ms"))
     if type(stamp) is not int or stamp <= 0:
         raise ValueError("invalid odometry timestamp")
     pose, vendor = sample.get("pose"), sample.get("vendor")

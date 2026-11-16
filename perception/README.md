@@ -30,6 +30,17 @@ specifies timing, frame, mounting, `motus.slam_input/1` declarations and
 `motus.slam_frame/1` per-frame provenance. This repository keeps a
 pure-Python runtime copy in `plugins/pointcloud_slam_contract.py` and
 consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
+On Tianyi's single `state/odom` interface, top-level `stamp_ms` and `twist`
+carry REST speed feedback at receipt time; the diagnostic SLAM pose has its own
+`pose.stamp_ms`. The `motus_slam/1` reader selects that explicit pose time,
+checks `vendor.motus_slam.stamp_ns` and supplied measurement evidence against
+it, and uses top-level time only for legacy packets without `pose.stamp_ms`.
+Repeated REST updates do not refresh identical diagnostic poses or their ingress
+age. Lost SLAM quality still blocks mapping even when measured speed is healthy.
+Deploy this reader with the companion Driver change; older readers reject split
+times through their precise-time mismatch check. The separate `motus_slam/2`
+observation contract retains its existing time-consistency requirements.
+
 The implementation must not infer calibrated mounting or verified
 cross-sensor clocks from a robot model or nearby timestamps.
 
