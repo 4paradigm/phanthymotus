@@ -1116,3 +1116,25 @@ def test_unresolved_optional_rgb_diagnostic_remains_visible_through_scan_mapping
         release.set()
     card.stop()
     assert diagnostic in call(card, 'info')['input_diagnostics']
+
+
+def test_saved_native_map_can_resume_and_save_as_the_next_revision(card, monkeypatch):
+    node = capture(card)
+    first = call(card, 'stop_mapping')
+    from test_pointcloud_slam_rgb_gateway import rgb_camera
+    card._rgb_input = {'topic': '/rgb', 'camera_info': rgb_camera()}
+    original = module.RtabmapNode
+    restored = []
+    def resume(*args, restored_map=None, **kwargs):
+        restored.append(restored_map)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, 'RtabmapNode', resume)
+    result = call(card, 'start_mapping', map_name='Hall', map_id=first['map_id'])
+    assert result['state'] == 'running'
+    assert restored[0]['segment_id'] == 'run'
+    assert card._session_dir in Path(restored[0]['database']).parents
+    assert call(card, 'rename_map', map_id=first['map_id'], map_name='Renamed Hall')['state']=='renamed'
+    second = call(card, 'stop_mapping')
+    assert second['map_id'] == first['map_id']
+    assert second['revision'] == 2
+    assert second['map_name'] == 'Renamed Hall'

@@ -62,8 +62,11 @@ def mapping_parameters(database_path, namespace, settings):
         # One envelope always contains the scan; optional images may disappear
         # and recover per frame without restarting this native map segment.
         parameters.update(subscribe_sensor_data=True, subscribe_scan_cloud=False,
-                          qos_sensor_data=1)
+                          qos_sensor_data=1, motus_visual_recovery=True)
         parameters.update({'Kp/MaxFeatures': '500', 'Mem/BadSignaturesIgnored': 'false',
+                           'RGBD/NeighborLinkRefining': 'false',
+                           'RGBD/LoopCovLimited': 'true',
+                           'RGBD/ProximityOdomGuess': 'false',
                            'Grid/RangeMax': '0'})
     parameters.update(native_overrides(settings.get('native_parameters', {})))
     return parameters
@@ -90,7 +93,7 @@ class RtabmapProcess:
     A timeout or abnormal exit leaves the session directory intact for retry
     or recovery and can never be mistaken for a saved map.
     """
-    def __init__(self, database_path, namespace, settings, *, executable=None):
+    def __init__(self, database_path, namespace, settings, *, executable=None, restored=False):
         self.database_path = Path(database_path).resolve()
         self.parameter_path = self.database_path.with_suffix('.params.json')
         self.namespace = namespace.rstrip('/')
@@ -102,14 +105,25 @@ class RtabmapProcess:
         self._closed = False
         self.mapped_nodes = None
         self._forced_stop = False
+        self._restored = restored
+
+    def validate_runtime(self):
+        executable = self._executable or resolve_executable()
+        if self._executable is None and self._settings.get('rgb_input') is not None:
+            marker = executable.parents[2] / 'share/rtabmap_slam/motus_visual_recovery_v1'
+            if not marker.is_file() or marker.read_text().strip() != 'motus_visual_recovery/1':
+                raise RuntimeError('RTAB-Map visual recovery runtime unavailable: rebuild the pinned native overlay')
+        return executable
 
     def start(self):
         if self._process is not None:
             raise RuntimeError('RTAB-Map process already started')
-        executable = self._executable or resolve_executable()
+        executable = self.validate_runtime()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.database_path.exists():
+        if self.database_path.exists() and not self._restored:
             raise RuntimeError('Refusing to overwrite native RTAB-Map database')
+        if self._restored and not self.database_path.is_file():
+            raise RuntimeError('Restored native RTAB-Map database is missing')
         params = mapping_parameters(self.database_path, self.namespace, self._settings)
         self.parameter_path.write_text(json.dumps({'/**': {'ros__parameters': params}}))
         self._log = self.database_path.with_suffix('.log').open('ab', buffering=0)

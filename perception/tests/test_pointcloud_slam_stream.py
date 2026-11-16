@@ -101,3 +101,15 @@ def test_absent_numeric_pose_waits_and_resumes_same_segment(status):
     s.odom(odom(1200), now=100)
     s.cloud(1_200_000_000, 'camera', [[1, 0, 0]], now=200)
     assert len(s.accepted) == 1
+
+
+def test_rgb_recovery_receives_unbracketed_clouds_when_external_pose_delivery_stops():
+    unlocalized = []
+    s = stream(on_unlocalized_frame=lambda *args: unlocalized.append(args))
+    s.odom(odom(1000), now=1)
+    for ms in range(1100, 1600, 100):
+        s.cloud(ms*1_000_000, 'camera', [[1,0,3]], now=ms/1000)
+    assert [frame[0] for frame in unlocalized] == [1_100_000_000, 1_200_000_000, 1_300_000_000]
+    assert all(frame[2] is None for frame in unlocalized)
+    assert s.pending_count == 2
+    assert not s.accepted

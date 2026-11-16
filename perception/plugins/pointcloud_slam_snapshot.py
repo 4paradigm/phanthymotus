@@ -151,7 +151,7 @@ def _plan(connection, graph, max_points):
             total += count
     budget = max(4 * int(max_points), 200_000)
     stride = int(math.ceil(total / float(budget))) if total > budget else 1
-    return sources, stride
+    return sources, stride, optimized
 
 
 def _load(sources, stride):
@@ -190,7 +190,11 @@ def rebuild(database_path, *, max_points, fallback=None):
             if connection.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
                 raise ValueError('database integrity check failed')
             graph = _graph_nodes(connection)
-            sources, stride = _plan(connection, graph, max_points)
+            sources, stride, optimized = _plan(connection, graph, max_points)
+            if optimized is not None:
+                located = [node_id for node_id in graph if node_id in optimized]
+                if located:
+                    marker = optimized[max(located)]
             clouds = _load(sources, stride)
         finally:
             connection.close()
@@ -199,9 +203,12 @@ def rebuild(database_path, *, max_points, fallback=None):
         points = np.concatenate(clouds)
         if not len(points) or not np.isfinite(points).all():
             raise ValueError('no finite graph points')
-        packet = encode_mapping(points, marker, max_points=int(max_points))
-        # The marker already has its display axis applied; preserve it exactly.
-        packet = fallback[:13] + packet[13:]
+        flags = fallback[12]
+        reference = 'camera_optical' if flags & 8 else 'body' if flags & 16 else None
+        packet = encode_mapping(points, marker, max_points=int(max_points), pose_reference=reference)
+        # Historical caches without optimized poses retain their original marker.
+        if optimized is None:
+            packet = fallback[:13] + packet[13:]
         log.info('rebuilt saved map snapshot from database: graph_nodes=%d '
                  'points=%d bytes=%d time=%.2fs',
                  len(sources), len(points), len(packet), time.monotonic() - started)

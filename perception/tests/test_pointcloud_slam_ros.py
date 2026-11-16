@@ -47,6 +47,8 @@ class NativeProcess:
         self.database_path, self.namespace = Path(database_path), namespace
         self.started, self.closed, self.code = False, False, None
         self.instances.append(self)
+    def validate_runtime(self):
+        pass
     def start(self):
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.database_path) as db:

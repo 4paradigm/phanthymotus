@@ -13,7 +13,8 @@ class SlamStream:
     def __init__(self, *, cloud_frame, child_frame, clock_id, child_from_cloud,
                  max_gap_ms, max_age_s, max_pending, max_cloud_points,
                  on_frame, max_measurement_age_ms=None,
-                 max_future_skew_ms=None, input_contract=None, extrinsic_mode='static'):
+                 max_future_skew_ms=None, input_contract=None, extrinsic_mode='static',
+                 on_unlocalized_frame=None):
         if any(type(v) is not int or v <= 0 for v in (max_pending, max_cloud_points)):
             raise ValueError('positive bounded capacities required')
         self.max_measurement_age_ms = max_measurement_age_ms
@@ -26,6 +27,7 @@ class SlamStream:
         self.max_gap_ms, self.max_age_s = max_gap_ms, max_age_s
         self.max_pending, self.max_cloud_points = max_pending, max_cloud_points
         self.on_frame = on_frame
+        self.on_unlocalized_frame = on_unlocalized_frame
         self._segments = OrderedDict()
         self._admitted = 0
         self._poses = deque(maxlen=512)
@@ -145,8 +147,13 @@ class SlamStream:
         self._last_cloud_stamp_ns = stamp_ns
         self._last_cloud_received = now if received is None else received
         if len(self._pending) == self.max_pending:
-            self._pending.popleft()
-            self._dropped_pending += 1
+            oldest = self._pending.popleft()
+            if self.on_unlocalized_frame is not None:
+                old_stamp, old_cloud, _, old_context = oldest
+                matrix = _rigid(old_context['child_from_cloud']) if old_context is not None else self.extrinsic
+                self.on_unlocalized_frame(old_stamp, old_cloud, None, matrix.copy(), deepcopy(old_context))
+            else:
+                self._dropped_pending += 1
         self._pending.append((stamp_ns, cloud, self._last_cloud_received, deepcopy(capture_context)))
         self._drain(now, measurement_now_ns)
 
@@ -155,6 +162,10 @@ class SlamStream:
         while self._pending:
             stamp, cloud, received, context = self._pending.popleft()
             try:
+                if not self._poses and self.on_unlocalized_frame is not None:
+                    matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
+                    self.on_unlocalized_frame(stamp, cloud, None, matrix.copy(), deepcopy(context))
+                    continue
                 if not self._poses or stamp > self._poses[-1].stamp_ns or stamp < self._poses[0].stamp_ns:
                     remaining.append((stamp, cloud, received, context))
                     continue

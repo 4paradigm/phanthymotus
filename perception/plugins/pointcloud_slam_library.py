@@ -172,7 +172,7 @@ def _copy_file(source, target):
     return digest.hexdigest()
 
 
-def save_rtabmap_revision(root, artifacts, settings, name, bound_id, request_id):
+def save_rtabmap_revision(root, artifacts, settings, name, bound_id, request_id, *, append_to_bound=False):
     """Commit native databases plus bounded display caches; no legacy solver data."""
     name = validate_map_name(name)
     if not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', request_id):
@@ -185,6 +185,11 @@ def save_rtabmap_revision(root, artifacts, settings, name, bound_id, request_id)
         raise ValueError('distinct native map segment ids required')
     with _maps_locked(root) as maps:
         entries = _entries(maps)
+        if append_to_bound:
+            bound = next((entry for entry in entries if entry['id'] == bound_id), None)
+            if bound is None:
+                raise ValueError('bound map no longer exists')
+            name = bound['name']
         for entry in entries:
             for saved in entry['saves']:
                 if saved['request_id'] == request_id:
@@ -313,6 +318,30 @@ def _verify_saved_revision(directory, revision, source_id):
     for path in (directory / 'revisions' / str(revision), directory / 'revisions',
                  directory, directory.parent):
         _sync_dir(path)
+
+
+def copy_native_map(root, map_id, revision, destination, *,
+                    max_disk_bytes=2147483648, reserve_bytes=1073741824):
+    """Copy one verified native graph into a new, private mapping session."""
+    with _maps_locked(root, False) as maps:
+        entry = _manifest(maps, map_id)
+        revision = entry['revision'] if revision is None else revision
+        _revision(maps, map_id, revision)
+        directory = maps / map_id
+        data = _read_revision(directory / f'{revision}.json')
+        if data['schema'] != 'motus.rtabmap-map/1' or len(data['segments']) != 1:
+            raise ValueError('resume requires one native connected map')
+        segment = data['segments'][0]
+        source = _artifact_path(directory, segment['database'])
+        size = source.stat().st_size
+        if size > max_disk_bytes or shutil.disk_usage(Path(destination).parent).free < size+reserve_bytes:
+            raise OSError('map disk budget or free-space reserve reached')
+        _verify_saved_revision(directory, revision, [segment['segment_id']])
+        _copy_file(source, Path(destination))
+        snapshot = (_artifact_path(directory, segment['snapshot']).read_bytes()
+                    if segment['snapshot'] is not None else None)
+        return dict(segment_id=segment['segment_id'], frame_id=segment['frame_id'],
+                    database=str(destination), snapshot=snapshot, resolved=deepcopy(data.get('resolved') or {}))
 
 
 def load_map_snapshots(root, map_id, revision=None, *, max_points=40000):

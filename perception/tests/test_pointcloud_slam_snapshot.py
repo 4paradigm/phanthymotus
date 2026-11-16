@@ -140,7 +140,8 @@ def test_saved_loop_geometry_uses_optimized_poses_instead_of_raw_odometry(tmp_pa
     points = _decode(packet)[4]
     assert len(points) == 2
     assert np.max(points[:, 0])-np.min(points[:, 0]) < .03
-    assert packet[:13] == _fallback()[:13]
+    assert np.allclose(_decode(packet)[:2], [.02, 0.])
+    assert _decode(packet)[3] & 32  # No axis convention was supplied.
 
 
 def test_incomplete_optimized_graph_never_mixes_raw_and_optimized_coordinates(tmp_path):
@@ -171,3 +172,16 @@ def test_scan_fallback_reads_transform_after_seven_scan_metadata_floats(tmp_path
     ], links=[(1, 1)])
     points = _decode(module.rebuild(database, max_points=100, fallback=_fallback()))[4]
     assert np.allclose(points, [[11, 23, 3]])
+
+
+def test_optimized_snapshot_updates_last_mapped_position_and_typed_heading(tmp_path):
+    database=_database(tmp_path/'marker.db',[
+        (1,_pose_blob(0,0),_cloud_blob([[0,0,3]]),None,None,None),
+        (2,_pose_blob(1,0),_cloud_blob([[0,0,3]]),None,None,None)],links=[(1,2)])
+    pose=np.eye(4);pose[:3,:3]=[[0,-1,0],[1,0,0],[0,0,1]];pose[:2,3]=[.02,.03]
+    _optimized(database,{1:_pose_blob(0,0),2:np.asarray(pose[:3],'<f4').tobytes()})
+    fallback=struct.pack('<fffBI',5.,6.,.25,23,0)  # body heading, last mapped pose
+    x,y,yaw,flags,_=_decode(module.rebuild(database,max_points=100,fallback=fallback))
+    assert np.allclose([x,y],[.02,.03])
+    assert np.isclose(yaw,-np.pi/2)
+    assert flags==23

@@ -108,3 +108,12 @@ session start/stop and the estimation/optimization algorithm. Native execution
 still requires its installed runtime; absent numerical results are not generated
 by format acceptance. No input convention is promoted into a physical accuracy,
 mount calibration or clock-synchronization claim.
+
+For optional SLAM RGB, supplied RGB/cloud poses permit numerical projection at
+their distinct times. During external-pose loss the current adapter can project
+coincident numerical captures using the supplied mount; it cannot infer missing
+inter-capture motion for distinct times. Providers must supply physically aligned,
+rectified images, optical-Z metric geometry, camera intrinsics and mount direction.
+Neither a timestamp name nor a robot name substitutes for these quantities.
+See [SLAM visual recovery](slam-visual-recovery.md): format acceptance is separate
+from appearance retrieval, geometric validation, visual tracking and optimization.

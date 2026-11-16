@@ -49,7 +49,8 @@ def project_depth(points, camera_from_cloud, K, width, height):
 
 
 class RgbLoopInput:
-    def __init__(self, descriptor, settings, *, max_pending=10):
+    def __init__(self, descriptor, settings, *, max_pending=10, on_decoded=None):
+        self._on_decoded = on_decoded
         self.camera, self.mounts = None, None
         self.K, self.width, self.height, self.frame_id = None, None, None, None
         self._condition = threading.Condition()
@@ -57,6 +58,7 @@ class RgbLoopInput:
         self._raw, self._thread, self._closed = None, None, False
         self._generation, self._last_stamp, self._used_stamp = 0, 0, 0
         self._counts = dict(received=0, decoded=0, decode_failures=0, dropped=0, matched=0)
+        self._decoding_stamp = None
         self._state = 'disconnected' if descriptor is None else 'fallback'
         self._reason = 'RGB is disconnected' if descriptor is None else 'waiting for fresh RGB'
         try:
@@ -161,6 +163,7 @@ class RgbLoopInput:
                     return
                 stamp, data, generation = self._raw
                 self._raw = None
+                self._decoding_stamp = stamp
             try:
                 image = self._decode_jpeg(data)
                 if (not isinstance(image, np.ndarray) or image.shape != (self.height, self.width, 3) or
@@ -172,6 +175,11 @@ class RgbLoopInput:
                     self._frames.append((stamp, image))
                     self._counts['decoded'] += 1
                     self._state, self._reason = 'ready', None
+                    self._condition.notify_all()
+                # Never call the owner while holding the decoder condition:
+                # gateway capture/publication takes its lock before ours.
+                if self._on_decoded is not None:
+                    self._on_decoded(stamp)
             except Exception as error:
                 with self._condition:
                     if generation == self._generation and not self._closed:
@@ -183,12 +191,27 @@ class RgbLoopInput:
                             self._raw = (stamp, data, self._generation)
                         self._frames.clear()
                         self._fallback(error)
+            finally:
+                with self._condition:
+                    self._decoding_stamp = None
+                    self._condition.notify_all()
 
-    def take(self, cloud_stamp, now_ns):
+    def take(self, cloud_stamp, now_ns, *, exact=False, wait_s=0.):
         with self._condition:
+            if wait_s > 0:
+                # Only wait for an already received matching JPEG. This is a
+                # scheduling budget, never an input timestamp/skew constraint.
+                self._condition.wait_for(lambda: self._closed or
+                    any(item[0] == cloud_stamp for item in self._frames) or
+                    (self._decoding_stamp != cloud_stamp and
+                     (self._raw is None or self._raw[0] != cloud_stamp)), timeout=wait_s)
             if self.camera is None or self._closed:
                 return None
             candidates = list(self._frames)
+            if exact:
+                candidates = [item for item in candidates if item[0] == cloud_stamp]
+                if not candidates:
+                    return None
             if not candidates:
                 self._fallback('no decoded RGB available')
                 return None

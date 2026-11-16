@@ -55,6 +55,7 @@ class SensorData:
         self.header, self.data = header(), None
         self.laser_scan = PointCloud2()
         self.laser_scan_local_transform = TransformStamped().transform
+        self.imu_local_transform = TransformStamped().transform
         self.left, self.right = Image(), Image()
         self.left_camera_info, self.local_transform = [], []
 

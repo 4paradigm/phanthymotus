@@ -5121,17 +5121,27 @@ extrinsics retain their meanings; existing browser views may need refreshing.
 ### Optional RGB loop closure
 
 The SLAM card exposes `state/odom`, `sensor/pointcloud2` and optional `image/jpeg`
-ports. RGB enables appearance-based place recognition and candidate transform
-initialization; native ICP still performs its registration computation. Sparse
+ports. RGB enables appearance-based place recognition and native visual geometric
+initialization; native ICP and graph validation still check the constraint. Sparse
 feature depth is projected from the numeric cloud with optical Z and zero holes.
 Source/frame/clock labels, age and exact-certificate policy do not gate the
 optional JPEG path. Image decode, numerical intrinsics, pose and any selected
-transform must be available to perform projection.
+transform must be available to perform projection. See
+[visual recovery and offline verification](docs/slam-visual-recovery.md) for the
+complete path, missing-pose behavior, native patch and reproducible checks.
 
 When optional RGB cannot be decoded or projected, the pointcloud path continues.
+With usable external poses this remains scan/odometry mapping. Without a pose,
+the same native process retains the map and searches historical keyframes;
+only geometrically verified localization and subsequent native visual odometry
+permit further global mapping. An image or a `tracking` label alone cannot do so.
 `info().input_status.loop_closure_mode` reports `image` or `pointcloud` for the last
 forwarded frame; `rgb_input` reports availability and the computational fallback
 reason. Forwarding an image is not a loop-closure or tracking-accuracy guarantee.
+`native_recovery` distinguishes `external`, `searching`, `localized` and
+`visual_tracking`. `accepted_loops` includes proximity corrections; it is not a
+visual-loop acceptance metric. Saved geometry uses the native optimized graph,
+including the final connected graph, rather than raw odometry in `Node.pose`.
 
 The standalone synthetic native check is
 `ROS_DOMAIN_ID=149 python3 tools/rtabmap_rgb_loop_smoke.py --timeout 90`.

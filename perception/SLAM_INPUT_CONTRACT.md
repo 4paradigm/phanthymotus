@@ -107,3 +107,31 @@ or preparation timeout leaves the same native map process using scan and externa
 odometry. RGB recovery does not reset the map origin. Feature depth is projected
 from numeric cloud points; holes remain unknown. No missing pose or transform
 is invented. Bounded queues and preparation budgets still limit resource usage.
+
+### Missing external pose and saved-map recovery
+
+`lost` and segment labels do not reject a usable numerical pose. `pose: null`
+means the algorithm must estimate one: with an existing map, the optional RGB
+path delivers observations with explicitly null native odometry to RTAB-Map
+localization. Native visual matching, depth/scan geometry, covariance and graph
+validation remain required. Unlocalized observations do not enter the global
+map. Successful localization is separate from subsequent OdometryF2M tracking;
+failed tracking pauses global additions and retries localization in bounded
+memory, preserving the existing database and map origin.
+
+Without external relative poses, coincident numerical RGB/cloud capture times
+allow projection using the supplied mounting matrix. Different numerical capture
+times require relative motion that is unavailable in this path; projection then
+reports that it cannot be computed. This is missing arithmetic data, not an
+age/skew, clock-name or timestamp-semantics admission rule. Integer capture,
+read and receipt timestamps all retain their numerical meaning and processing.
+
+`start_mapping` with `map_id` (and optional `revision`) uses a private verified
+copy of the saved native database, then estimates the current relation to its
+original map. Selecting a map for preview alone does not start localization.
+Returning external poses are aligned through a valid simultaneous visual
+estimate or verified map localization; a new origin/segment is not concatenated
+to the old map. Numerical external origin jumps are compared with independent
+visual motion using the native uncertainty/error bound when that estimate exists.
+No estimator can identify an arbitrary unknown origin jump from an external pose
+alone; provider labels do not supply the missing transform.

@@ -1,0 +1,138 @@
+--- a/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
++++ b/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
+@@ -29,6 +29,8 @@
+ #define COREWRAPPER_H_
+ 
+ #include <rtabmap_slam/visibility.h>
++#include <memory>
++#include "rtabmap_slam/VisualRecovery.h"
+ #include <rclcpp/rclcpp.hpp>
+ 
+ #include <std_srvs/srv/empty.hpp>
+@@ -301,6 +303,7 @@
+ 
+ private:
+ 	rtabmap::Rtabmap rtabmap_;
++	std::unique_ptr<motus::VisualRecovery> visualRecovery_;
+ 	bool paused_;
+ 
+ 	UMutex lastPoseMutex_;
+--- a/rtabmap_slam/src/CoreWrapper.cpp
++++ b/rtabmap_slam/src/CoreWrapper.cpp
+@@ -625,6 +625,8 @@
+ 
+ 	// Init RTAB-Map
+ 	rtabmap_.init(parameters_, databasePath_);
++	if(this->declare_parameter("motus_visual_recovery", false))
++		visualRecovery_.reset(new motus::VisualRecovery(parameters_));
+ 
+ 	if(rtabmap_.getMemory())
+ 	{
+@@ -994,6 +996,7 @@
+ 		}
+ 	}
+ 
++	motus::VisualRecovery::finalize(rtabmap_);
+ 	rtabmap_.close();
+ 	printf("rtabmap: Saving database/long-term memory...done! (located at %s, %ld MB)\n", databasePath_.c_str(), UFile::length(databasePath_)/(1024*1024));
+ 
+@@ -1132,7 +1135,7 @@
+ 
+ 		UScopeMutex lock(lastPoseMutex_);
+ 
+-		if(!lastPose_.isIdentity() && !odom.isNull() && (odom.isIdentity() || (odomMsg.pose.covariance[0] >= BAD_COVARIANCE && odomMsg.twist.covariance[0] >= BAD_COVARIANCE)))
++		if(!visualRecovery_ && !lastPose_.isIdentity() && !odom.isNull() && (odom.isIdentity() || (odomMsg.pose.covariance[0] >= BAD_COVARIANCE && odomMsg.twist.covariance[0] >= BAD_COVARIANCE)))
+ 		{
+ 			UWARN("Odometry is reset (identity pose or high variance (%f) detected). Increment map id!", MAX(odomMsg.pose.covariance[0], odomMsg.twist.covariance[0]));
+ 			triggerNewMapBeforeNextUpdate_ = true;
+@@ -1222,7 +1225,7 @@
+ 
+ 		UScopeMutex lock(lastPoseMutex_);
+ 
+-		if(!lastPose_.isIdentity() && odom.isIdentity())
++		if(!visualRecovery_ && !lastPose_.isIdentity() && odom.isIdentity())
+ 		{
+ 			UWARN("Odometry is reset (identity pose detected). Increment map id!");
+ 			triggerNewMapBeforeNextUpdate_ = true;
+@@ -1969,13 +1972,14 @@
+ void CoreWrapper::process(
+ 		const rclcpp::Time & stamp,
+ 		SensorData & data,
+-		const Transform & odom,
++		const Transform & externalOdom,
+ 		const std::vector<float> & odomVelocityIn,
+ 		const std::string & odomFrameId,
+ 		const cv::Mat & odomCovariance,
+ 		const OdometryInfo & odomInfo,
+ 		double timeMsgConversion)
+ {
++	Transform odom=externalOdom;
+ 	UTimer timer;
+ 	if(rtabmap_.isIDsGenerated() || data.id() > 0)
+ 	{
+@@ -2290,7 +2294,14 @@
+ 		}
+ 
+ 		timeMsgConversion += timer.ticks();
+-		if(rtabmap_.process(data, odom, covariance, odomVelocity, externalStats))
++		bool processed;
++		if(visualRecovery_)
++		{
++			processed=visualRecovery_->process(rtabmap_,data,externalOdom,covariance,odomVelocity,externalStats);
++			odom=visualRecovery_->odom();
++		}
++		else processed=rtabmap_.process(data,odom,covariance,odomVelocity,externalStats);
++		if(processed)
+ 		{
+ 			timeRtabmap = timer.ticks();
+ 			mapToOdomMutex_.lock();
+@@ -2319,7 +2330,8 @@
+ 							rtabmap_.getStatistics().proximityDetectionId()!=0 ||
+ 							static_cast<int>(uValue(rtabmap_.getStatistics().data(), rtabmap::Statistics::kLoopLandmark_detected(), 0.0f))!=0;
+ 
+-                    if(localized || !pubLocPoseOnlyWhenLocalizing_)
++                    if((localized || !pubLocPoseOnlyWhenLocalizing_) &&
++                        (!visualRecovery_ || visualRecovery_->state()!=motus::VisualRecovery::Searching))
+ 					{
+ 						geometry_msgs::msg::PoseWithCovarianceStamped poseMsg;
+ 					    poseMsg.header.frame_id = mapFrameId_;
+@@ -3162,6 +3174,7 @@
+ {
+ 	RCLCPP_INFO(this->get_logger(), "rtabmap: Reset");
+ 	rtabmap_.resetMemory();
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_));
+ 
+ 	lastPoseMutex_.lock();
+ 	lastPoseCovariance_ = cv::Mat();
+@@ -3351,6 +3364,7 @@
+ 
+ 	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database...");
+ 	rtabmap_.init(parameters_, databasePath_);
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_));
+ 	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database... done!");
+ 
+ 	if(rtabmap_.getMemory())
+@@ -3446,6 +3460,7 @@
+ 
+ 	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory...");
+ 	rtabmap_.init(parameters_, databasePath_);
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_));
+ 	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory... done!");
+ }
+ 
+@@ -4506,6 +4521,15 @@
+ 		msg->header.frame_id = mapFrameId_;
+ 
+ 		rtabmap_conversions::infoToROS(stats, *msg);
++		if(visualRecovery_)
++		{
++			msg->stats_keys.push_back("Motus/RecoveryState/");
++			msg->stats_values.push_back(visualRecovery_->state());
++			msg->stats_keys.push_back("Motus/Relocalizations/");
++			msg->stats_values.push_back(visualRecovery_->relocalizations());
++			msg->stats_keys.push_back("Motus/VisualInliers/");
++			msg->stats_values.push_back(visualRecovery_->visualInliers());
++		}
+ 		infoPub_->publish(std::move(msg));
+ 	}
+ 

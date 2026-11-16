@@ -728,6 +728,13 @@ RUN set -e; \
     cp /tmp/rtabmap-rotation-hint/RotationHintBuffer.h /tmp/rtabmap-ws/src/rtabmap_ros/rtabmap_odom/include/rtabmap_odom/RotationHintBuffer.h; \
     rm -rf /tmp/rtabmap-rotation-hint
 
+COPY perception/native/rtabmap/visual_recovery_ros.patch perception/native/rtabmap/VisualRecovery.h /tmp/rtabmap-visual-recovery/
+RUN set -e; \
+    git -C /tmp/rtabmap-ws/src/rtabmap_ros apply --check /tmp/rtabmap-visual-recovery/visual_recovery_ros.patch; \
+    git -C /tmp/rtabmap-ws/src/rtabmap_ros apply /tmp/rtabmap-visual-recovery/visual_recovery_ros.patch; \
+    cp /tmp/rtabmap-visual-recovery/VisualRecovery.h /tmp/rtabmap-ws/src/rtabmap_ros/rtabmap_slam/include/rtabmap_slam/VisualRecovery.h; \
+    rm -rf /tmp/rtabmap-visual-recovery
+
 # JP5.11: cache ROS foundations, RTAB-Map support and rtabmap_slam
 # independently; the JP6.1 single-build path below remains unchanged.
 COPY perception/tools/build_rtabmap_ros_group.sh /tmp/build_rtabmap_ros_group.sh
@@ -773,6 +780,8 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
     fi; \
     mkdir -p /opt/rtabmap_ros/share/rtabmap_odom; \
     printf '%s\n' 'motus_rotation_hint/1' > /opt/rtabmap_ros/share/rtabmap_odom/motus_rotation_hint_v1; \
+    mkdir -p /opt/rtabmap_ros/share/rtabmap_slam; \
+    printf '%s\n' 'motus_visual_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_visual_recovery_v1; \
     cd /work; rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh
 
 # ── Application code ───────────────────────────────────────────────

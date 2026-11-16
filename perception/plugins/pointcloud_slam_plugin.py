@@ -82,6 +82,7 @@ class PointCloudSlamPlugin:
         self._legacy_core = True
         self._session_settings = {}
         self._last_stop = None
+        self._bound_map_id = None
         self._last_recovery = None
         self._save_status = {'state': 'idle'}
         self._capture_stop = threading.Event()
@@ -442,7 +443,7 @@ class PointCloudSlamPlugin:
             raise ValueError('start the project before mapping')
         # Core main passes only topic names. Learn the missing geometry from
         # fresh ROS pointcloud and tracking odometry, never a model preset.
-        if self._resolved_inputs is None and any(
+        if args.get('map_id') is None and self._resolved_inputs is None and any(
                 self._config.get(key) is None for key in
                 ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')):
             odom_topic = next(t for t, f in self._topics.items() if f == 'state/odom')
@@ -459,8 +460,15 @@ class PointCloudSlamPlugin:
                 **({'camera_info': camera} if camera is not None else {}),
                 **({'input_registry':self._input_registry} if self._input_registry else {}))
         self._validate(self._settings())
-        name = validate_map_name(args.get('map_name'))
-        if any(e['name'] == name for e in map_entries(_ARCHIVE_DIR)):
+        bound = args.get('map_id')
+        if bound is not None and self._rgb_input is None:
+            raise ValueError('RGB is required to estimate the current pose in the saved map')
+        entries = map_entries(_ARCHIVE_DIR)
+        entry = next((e for e in entries if e['id'] == bound), None) if bound is not None else None
+        if bound is not None and entry is None:
+            raise ValueError('unknown map')
+        name = entry['name'] if entry else validate_map_name(args.get('map_name'))
+        if bound is None and any(e['name'] == name for e in entries):
             raise ValueError('map name already in use')
         with self._operation_lock:
             if self._capture_stop.is_set() or self._project_stopping or self._blocking_stops:
@@ -469,18 +477,29 @@ class PointCloudSlamPlugin:
         session = Path(_ARCHIVE_DIR) / 'sessions' / uuid.uuid4().hex
         session.mkdir(parents=True, exist_ok=False)
         settings = deepcopy(self._settings())
-        self._require_mapping_inputs(settings)
         if self._rgb_input is not None:
             settings['rgb_input'] = deepcopy(self._rgb_input)
         else:
             settings.pop('rgb_input', None)
         settings['resolved_inputs'] = deepcopy((self._resolved_inputs or {}).get('inputs', {}))
         settings['input_provenance'] = deepcopy(self._runtime_provenance)
+        restored = None
+        if bound is not None:
+            from .pointcloud_slam_library import copy_native_map
+            restored = copy_native_map(_ARCHIVE_DIR, bound, args.get('revision'), session/'restored.db',
+                max_disk_bytes=settings['max_disk_bytes'], reserve_bytes=settings['reserve_bytes'])
+            for key in ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud', 'extrinsic_mode'):
+                if settings.get(key) is None and restored['resolved'].get(key) is not None:
+                    settings[key] = deepcopy(restored['resolved'][key])
+            for key in ('cloud_frame', 'child_frame', 'clock_id'):
+                settings.setdefault(key, '')
+        self._require_mapping_inputs(settings)
         node = None
         try:
             node = RtabmapNode(next(t for t, f in self._topics.items() if f == 'state/odom'),
                 next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2'), settings,
                 session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop,
+                **({'restored_map': restored} if restored is not None else {}),
                 **({"input_registry": self._input_registry,
                     "input_declarations":self._project_inputs.get("camera_infos",{})} if self._input_registry else {}))
             # A new mapping session replaces the saved view, never competes for
@@ -498,6 +517,7 @@ class PointCloudSlamPlugin:
             raise
         self._session_dir, self._session_settings = session, settings
         self._node, self._map_name = node, name
+        self._bound_map_id = bound
         if self._capture_stop.is_set():
             node.freeze_capture()
             return {'state': 'idle', 'capture_stopped': True}
@@ -537,7 +557,11 @@ class PointCloudSlamPlugin:
                 artifacts = pending.artifacts()
                 if artifacts['segments']:
                     map_id, revision, _ = save_rtabmap_revision(_ARCHIVE_DIR, artifacts,
-                        self._session_settings, self._map_name, None, save_request)
+                        self._session_settings, self._map_name, self._bound_map_id, save_request,
+                        append_to_bound=self._bound_map_id is not None)
+                    if self._bound_map_id is not None:
+                        self._map_name = next(entry['name'] for entry in map_entries(_ARCHIVE_DIR)
+                                              if entry['id'] == self._bound_map_id)
                     result = {'state': 'saved', 'map_id': map_id, 'map_name': self._map_name,
                               'revision': revision, 'request_id': save_request}
                 else:

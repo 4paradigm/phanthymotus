@@ -79,8 +79,10 @@ def test_optional_rgb_uses_one_sensor_data_process_for_image_and_scan_fallback(t
     assert params['subscribe_odom'] is True and params['approx_sync'] is False
     assert all(params[k] is False for k in ('subscribe_rgb', 'subscribe_rgbd', 'subscribe_depth'))
     assert params['Reg/Strategy'] == '1'
-    assert params['RGBD/ProximityOdomGuess'] == 'true'
+    assert params['RGBD/ProximityOdomGuess'] == 'false'
     assert params['RGBD/ProximityPathMaxNeighbors'] == '1'
+    assert params['RGBD/NeighborLinkRefining'] == 'false'
+    assert params['RGBD/LoopCovLimited'] == 'true'
     assert params['Grid/RangeMax'] == '0'
     assert params['Mem/BadSignaturesIgnored'] == 'false'
 
@@ -197,3 +199,36 @@ def test_scan_only_proximity_has_an_odometry_guess(tmp_path):
     assert value['RGBD/ProximityPathMaxNeighbors'] == '1'
     assert value['Reg/Strategy'] == '1'
     assert value['approx_sync'] is False
+
+
+def test_rgb_recovery_fails_before_launch_with_an_unpatched_native_runtime(tmp_path, monkeypatch):
+    module = backend()
+    executable = tmp_path/'runtime/lib/rtabmap_slam/rtabmap'
+    executable.parent.mkdir(parents=True)
+    executable.write_text('#!/bin/sh\nexit 0\n'); executable.chmod(0o755)
+    monkeypatch.setattr(module, 'resolve_executable', lambda: executable)
+    process = module.RtabmapProcess(tmp_path/'session/map.db', '/scope', dict(
+        rgb_input={}, max_pending=2, voxel_size_m=.08, max_working_nodes=100, max_update_ms=100))
+    with pytest.raises(RuntimeError, match='visual recovery'):
+        process.start()
+    assert process._process is None
+
+
+def test_restored_process_preserves_existing_database_nodes(tmp_path):
+    script = native_script(tmp_path)
+    script.write_text(script.read_text().replace('CREATE TABLE Node', 'CREATE TABLE IF NOT EXISTS Node'))
+    path = tmp_path/'restored.db'
+    with sqlite3.connect(path) as db:
+        db.executescript('CREATE TABLE Node(id INTEGER PRIMARY KEY); INSERT INTO Node VALUES(42);')
+    process = backend().RtabmapProcess(path, '/private/resumed', dict(max_pending=2,
+        voxel_size_m=.08,max_working_nodes=300,max_update_ms=100), executable=script, restored=True)
+    process.start()
+    try:
+        deadline = time.monotonic()+5
+        while not path.with_suffix('.ready').exists():
+            assert time.monotonic()<deadline
+            time.sleep(.01)
+    finally:
+        process.close(timeout_s=3)
+    with sqlite3.connect(path) as db:
+        assert db.execute('SELECT id FROM Node ORDER BY id').fetchall() == [(1,), (42,)]

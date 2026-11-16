@@ -284,3 +284,33 @@ def test_typed_heading_survives_save_load_and_point_limit(tmp_path, flags):
     loaded = library.load_map_snapshots(tmp_path, map_id, max_points=1)[0]['packet']
     assert loaded[:13] == typed[:13]
     assert len(loaded) == 29
+
+
+def test_resume_copies_verified_database_without_mutating_the_saved_revision(tmp_path, saved):
+    map_id, _, _ = saved
+    restored = library.copy_native_map(tmp_path, map_id, None, tmp_path/'resume.db')
+    assert restored['segment_id'] == 'a'
+    assert restored['snapshot'] == packet()
+    assert restored['database'] == str(tmp_path/'resume.db')
+    with sqlite3.connect(restored['database']) as db:
+        db.execute('INSERT INTO Node VALUES(2)')
+    archive = json.loads((tmp_path/'maps'/map_id/'1.json').read_text())
+    with sqlite3.connect(tmp_path/'maps'/map_id/archive['segments'][0]['database']) as db:
+        assert db.execute('SELECT COUNT(*) FROM Node').fetchone() == (1,)
+
+
+def test_resume_rejects_modified_native_database(tmp_path, saved):
+    map_id, _, _ = saved
+    archive = json.loads((tmp_path/'maps'/map_id/'1.json').read_text())
+    db = tmp_path/'maps'/map_id/archive['segments'][0]['database']
+    with db.open('ab') as stream: stream.write(b'changed')
+    with pytest.raises(ValueError, match='checksum'):
+        library.copy_native_map(tmp_path, map_id, None, tmp_path/'resume.db')
+    assert not (tmp_path/'resume.db').exists()
+
+
+def test_resume_checks_the_session_disk_budget_before_copying(tmp_path, saved):
+    map_id,_,_=saved
+    with pytest.raises(OSError,match='budget'):
+        library.copy_native_map(tmp_path,map_id,None,tmp_path/'resume.db',max_disk_bytes=1,reserve_bytes=0)
+    assert not (tmp_path/'resume.db').exists()
