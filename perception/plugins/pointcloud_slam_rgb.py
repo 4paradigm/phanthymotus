@@ -86,7 +86,13 @@ class RgbLoopInput:
                     raise ValueError('RGB and odometry have no declared common capture clock')
             if settings.get('extrinsic_mode') == 'dynamic':
                 mount = validate_mount_declaration(vendor.get('body_mount'), vendor['frame_id'])
-                if not capture or mount != capture['declaration']:
+                # Live availability can change between cloud and RGB discovery.
+                # Each capture still requires its own available mount packet.
+                expected = capture['declaration'] if capture else {}
+                live_status = ('status', 'reason')
+                if (not capture or
+                        {k: v for k, v in mount.items() if k not in live_status} !=
+                        {k: v for k, v in expected.items() if k not in live_status}):
                     raise ValueError('RGB requires the matching declared capture mount')
                 self.mounts = CaptureMounts(mount, vendor['frame_id'], vendor['clock_id'])
             self.camera = camera
