@@ -40,3 +40,23 @@ test('body, unavailable, and legacy markers preserve visibility without text', (
   r.onData(packet(3)); assert.equal(r._robotMesh.visible, true);
   r.onData(packet(19)); assert.equal(r._markerLabel.textContent, '');
 });
+
+test('depth display packet and mapping packet share forward-left-up axes', () => {
+  const source = fs.readFileSync(new URL('./renderers/pointcloud.js', import.meta.url), 'utf8')
+    .replace(/^import .*;$/gm, '')
+    .replace('export const PointCloudRenderer', 'globalThis.PointCloudRenderer');
+  const context = vm.createContext({ ArrayBuffer, DataView, Float32Array });
+  vm.runInContext(source, context);
+  const cloud = context.PointCloudRenderer;
+  cloud._buildAxisMap(null);
+  cloud._frames = [];
+  // Optical (right=2, down=-1, forward=3), display packet (-right, forward, down).
+  const raw = new ArrayBuffer(20), view = new DataView(raw);
+  view.setUint32(0, 12, true); view.setUint32(4, 1, true);
+  [-2, 3, -1].forEach((value, i) => view.setFloat32(8 + i * 4, value, true));
+  cloud.onData(raw);
+  const map = renderer(), mapped = packet(3), mappedView = new DataView(mapped);
+  [3, -2, 1].forEach((value, i) => mappedView.setFloat32(17 + i * 4, value, true));
+  map.onData(mapped);
+  assert.deepEqual([...cloud._frames[0].pos], [...map._positions]);
+});

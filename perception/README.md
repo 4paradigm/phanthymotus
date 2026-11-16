@@ -4660,7 +4660,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 ### Standalone SLAM synchronization with PR #371 (2026-11-16)
 
 This branch includes the pointcloud, external-odometry SLAM and shared spatial
-input changes through PR #371 commit `6b99eb4e`. It does not include the RGB-D
+input changes through PR #371 commit `08da8650`. It does not include the RGB-D
 odometry card, image pairing/visual estimation, IMU/ESKF/depth assistance,
 rotation-hint patches or the native `rtabmap_odom` package.
 
@@ -4701,3 +4701,12 @@ Live and saved mapping previews preserve the latest heading/status flags.
 The standalone native build, package selection and existing dependency footprint
 are retained. Source-branch robot tests do not constitute deployment or motion
 accuracy validation of this extracted PR.
+
+The display-only depth cloud shares mapping's forward/left/up preview convention
+and default viewpoint. Metric PointCloud2 and map heading are unchanged; this is
+not a robot-specific mounting declaration. Metric output requires explicit
+measured-depth provenance even with optical-Z semantics. Each native mapping
+child receives a private buffered DDS profile. Missing/directory-mounted DDS
+profiles fail with an actionable configuration error and no unisolated fallback.
+Native input discovery allows up to 30 seconds during startup, while capture
+freshness and stop-event handling remain enforced. No dependencies were added.

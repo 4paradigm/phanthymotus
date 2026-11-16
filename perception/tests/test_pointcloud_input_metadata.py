@@ -266,3 +266,16 @@ def test_missing_sidecar_declaration_keeps_driver_calibrated_metric_start(metada
         assert all(sub.topic != '/capture/evidence' for sub in node.subscriptions)
     finally:
         plugin.shutdown()
+
+@pytest.mark.parametrize('source', ['estimated', None])
+def test_optical_z_does_not_authorize_unmeasured_metric_depth(source):
+    executor = _FakeExecutor()
+    plugin = PointCloudPerceptionPlugin({'metric_cloud': True}, 'testns', executor)
+    camera = _camera()
+    camera['vendor'].update(depth_source=source, depth_semantics='optical_z')
+    result = plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [camera]})
+    try:
+        assert result['state'] == 'error'
+        assert not executor.nodes
+    finally:
+        plugin.shutdown()

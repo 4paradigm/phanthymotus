@@ -12,6 +12,11 @@ def receive_environment(directory):
     profile = env.get('FASTRTPS_DEFAULT_PROFILES_FILE')
     if not profile:
         return env
+    if not Path(profile).is_file():
+        raise RuntimeError(
+            "DDS profile must be a readable regular file: " + str(profile) +
+            "; repair the FASTRTPS_DEFAULT_PROFILES_FILE mount before starting Perception. "
+            "Refusing to start ROS with an unisolated fallback profile.")
     tree = ET.parse(profile)
     changed = False
     for transport in tree.findall('.//{*}transport_descriptor'):

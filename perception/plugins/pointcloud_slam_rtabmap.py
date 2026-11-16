@@ -7,6 +7,8 @@ import signal
 import sqlite3
 import subprocess
 
+from utils.dds_transport import receive_environment
+
 
 def resolve_executable():
     try:
@@ -107,7 +109,11 @@ class RtabmapProcess:
             '-r', '/tf:=' + self.namespace + '/tf',
             '-r', '/tf_static:=' + self.namespace + '/tf_static']
         try:
-            self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+            # Keep each segment profile beside its parameters for the full child lifetime.
+            profile_dir = self.database_path.with_suffix(".dds")
+            profile_dir.mkdir(exist_ok=True)
+            env = receive_environment(profile_dir)
+            self._process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                 stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True)
         except Exception:
             self._log.close()
