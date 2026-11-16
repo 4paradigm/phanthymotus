@@ -39,3 +39,9 @@ def test_versioned_slam_pause_uses_producer_deadline_without_extending_predictio
     assert s._odom_state=='recovering'
     s.odom(odom(2500),now=2.5)
     assert s._odom_state=='tracking' and not s._requires_new_segment
+
+
+def test_pause_budget_covers_four_intervals_and_one_processing_tail():
+    pause=RecoveryPolicy().begin(500_000_000,200_000_000,10_000_000_000)
+    assert pause.budget_ns==2_200_000_000
+    assert pause.deadline_monotonic_ns==12_200_000_000

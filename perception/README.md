@@ -4660,7 +4660,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 ### Standalone SLAM synchronization with PR #371 (2026-11-16)
 
 This branch includes the pointcloud, external-odometry SLAM and shared spatial
-input changes through PR #371 commit `d0389877`. It does not include the RGB-D
+input changes through PR #371 commit `6b99eb4e`. It does not include the RGB-D
 odometry card, image pairing/visual estimation, IMU/ESKF/depth assistance,
 rotation-hint patches or the native `rtabmap_odom` package.
 
@@ -4688,8 +4688,9 @@ validated sample envelopes without estimating poses or asserting camera origin.
 These replace dependencies on the visual-odometry modules in the source branch.
 
 Map admission requires tracking poses and usable finite points. Producer pause
-budgets retain their original deadline and cannot be extended by repeated
-messages. PointCloud2 normalization validates original bytes before converting
+budgets use `clamp(4 * period + processing P95, 1 s, 3 s)` when timing
+evidence is available, otherwise 1 s. They retain their original deadline and
+cannot be extended by repeated messages. PointCloud2 normalization validates original bytes before converting
 noncanonical XYZ layouts, keeping source and output digests distinct. Native
 progress, segment lifecycle and unknown covariance are reported explicitly;
 suspected stalls do not automatically restart the backend or merge unknown map
