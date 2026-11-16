@@ -424,6 +424,18 @@ def main():
         config = Path(directory) / "config.yaml"
         config.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
         os.environ["CONFIG_PATH"] = str(config)
+        # Default Fast DDS announcements can delay a new reader by 3 seconds.
+        # Scope the shorter announcement period to this Kokoro process only.
+        if "FASTRTPS_DEFAULT_PROFILES_FILE" not in os.environ:
+            discovery = Path(directory) / "fastdds.xml"
+            discovery.write_text(
+                '<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">'
+                '<participant profile_name="kokoro_tts_discovery" is_default_profile="true">'
+                '<rtps><builtin><discovery_config><leaseAnnouncement>'
+                '<sec>0</sec><nanosec>100000000</nanosec>'
+                '</leaseAnnouncement></discovery_config></builtin></rtps>'
+                '</participant></profiles>')
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(discovery)
         logging.info("Kokoro Multi JP6: MCP port %s, WS port %s, cache %s",
                      cfg["mcp_port"], cfg["ws_port"], cfg["plugins"]["tts"]["model_dir"])
         runpy.run_path(str(WORK / "main.py"), run_name="__main__")
