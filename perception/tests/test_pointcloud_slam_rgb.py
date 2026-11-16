@@ -175,6 +175,40 @@ def test_dynamic_mount_requires_exact_fresh_evidence_and_common_reference():
     assert RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), bad).camera is None
 
 
+@pytest.mark.parametrize('status,reason', [('available', None),
+    ('unavailable', 'base_link is not present in the current TF tree')])
+def test_dynamic_rgb_accepts_same_mount_with_updated_live_status(status, reason):
+    c, config = camera(), settings()
+    reference = dict(clock_id='clock', domain_id='host', timestamp_basis='host_realtime')
+    c['vendor'].update(clock_id='camera-clock', clock_reference=reference,
+        body_mount=mount_declaration(status=status, reason=reason))
+    config.update(extrinsic_mode='dynamic', capture_mount=dict(declaration=mount_declaration(),
+        source_clock='camera-clock', clock_reference=deepcopy(reference)))
+    result = RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), config)
+    assert result.camera is not None, result.info()
+    unavailable = packet(STAMP, status='unavailable')
+    unavailable.pop('matrix')
+    result.mount(unavailable, STAMP)
+    assert result.capture_mount(STAMP, None, STAMP) is None
+    result.mount(packet(STAMP+1), STAMP+1)
+    assert np.array_equal(result.capture_mount(STAMP+1, None, STAMP+1), np.eye(4))
+
+
+@pytest.mark.parametrize('change', [dict(epoch='new-epoch'), dict(version='other-version'),
+    dict(parent_frame='other-body'), dict(topic='/other/mount'),
+    dict(accuracy_validated=True), dict(provenance={'calibration_kind': 'other'}),
+    dict(synchronization_budget_ns=100_000_000)])
+def test_dynamic_rgb_still_rejects_changed_mount_binding_or_evidence(change):
+    c, config = camera(), settings()
+    reference = dict(clock_id='clock', domain_id='host', timestamp_basis='host_realtime')
+    c['vendor'].update(clock_id='camera-clock', clock_reference=reference,
+        body_mount=mount_declaration(**change))
+    config.update(extrinsic_mode='dynamic', capture_mount=dict(declaration=mount_declaration(),
+        source_clock='camera-clock', clock_reference=deepcopy(reference)))
+    result = RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), config)
+    assert result.camera is None and result.info()['state'] == 'fallback'
+
+
 def test_static_mount_uses_only_valid_supplied_registered_transform():
     result = helper()
     try:
