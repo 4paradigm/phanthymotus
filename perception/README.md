@@ -334,7 +334,7 @@ on each deployment; offline tests do not establish physical accuracy.
 
 ### Optional short-term ESKF and depth assistance
 
-Connect the camera IMU input, then enable the two ESKF/geometry options in the same `config` or `start` action:
+Connect a calibrated IMU input with measurement timestamps, then enable the two ESKF/geometry options in the same `config` or `start` action:
 
 ```json
 {"action":"config","instance_id":"card-one",
@@ -356,8 +356,20 @@ actual installation offset. Packets must include finite calibrated
 sensor origins in camera coordinates), and `translation_source`. Older
 rotation-only sources continue to support attitude-only mode, but cannot
 start translational compensation. Tianyi obtains full capture-time TF;
-G1/Bumi obtain RealSense SDK factory extrinsics without another camera owner.
+G1 obtains RealSense SDK factory extrinsics without another camera owner.
 Missing motion hardware/calibration is reported, never replaced by zero.
+
+Rigidly mounted body IMUs may supply the same generic `motus.imu/1` interface.
+`rotation_source: configured_fixed_mount` requires a nonempty `calibration_id`
+and proper sensor-to-camera rotation matrices. Explicit `read_completion`
+timestamps are accepted for attitude only with an unverified
+`host_wall_read_completion` mapping (`source_clock: ros_wall`, zero offset).
+Source identity, timing semantics and calibration changes retire the attitude
+segment. Diagnostics retain the timestamp semantics and calibration identity;
+these readings do not become hardware capture measurements. Such inputs must
+keep all short-term/inertial translation options disabled. ESKF rejects reading
+timestamps even if translation fields are supplied. This is a source capability
+contract, with no robot-name routing. Bumi uses this body-IMU attitude path.
 
 Initialization waits for at least 0.5 s of visually observed near-stationary
 position **and orientation**, low angular speed and stable gravity magnitude.

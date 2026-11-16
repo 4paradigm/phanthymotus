@@ -290,6 +290,8 @@ class ShortTermFusion:
         if self.state == 'lost':
             return
         try:
+            if packet.get('stamp_source') != 'measurement':
+                raise ValueError('capture measurement time is required for inertial translation compensation')
             if packet.get('translation_source') not in ('tf', 'sdk_factory_extrinsics'):
                 raise ValueError('calibrated IMU translation is required for compensation')
             translations = np.r_[_vector(packet.get('camera_from_gyro_translation')),

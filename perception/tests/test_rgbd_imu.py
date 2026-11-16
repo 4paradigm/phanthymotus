@@ -21,6 +21,46 @@ def packet(stamp=1_000_000_000, **changes):
 def aid():return ImuAttitude('optical','capture-clock')
 
 
+def body_packet(stamp=1_000_000_000, **changes):
+    p=packet(stamp, source_id='controller/body', gyro_frame_id='body', accel_frame_id='body',
+        stamp_source='read_completion', rotation_source='configured_fixed_mount',
+        calibration_id='fixed-v1', clock_mapping=dict(method='host_wall_read_completion',
+            source_clock='ros_wall', offset_ns=0, verified=False))
+    p.update(changes)
+    return p
+
+
+def test_fixed_body_imu_read_time_is_explicitly_accepted_for_attitude_only():
+    a=aid()
+    out=a.observe(body_packet(),1_010_000_000)
+    assert out['stamp_ns']==1_000_000_000
+    assert a.info(1_010_000_000)['stamp_source']=='read_completion'
+    assert a.info(1_010_000_000)['calibration_id']=='fixed-v1'
+    assert a.info(1_010_000_000)['translation_integrated'] is False
+
+
+@pytest.mark.parametrize('change', [dict(calibration_id=''), dict(clock_mapping=None),
+    dict(clock_mapping=dict(method='host_wall_read_completion', source_clock='ros_wall',offset_ns=0,verified=True)),
+    dict(clock_mapping=dict(method='host_wall_read_completion', source_clock='ros_wall',offset_ns=10,verified=False))])
+def test_read_time_source_cannot_claim_verified_capture_or_missing_calibration(change):
+    with pytest.raises(ValueError):aid().observe(body_packet(**change),1_010_000_000)
+
+
+def test_body_fixed_calibration_or_time_semantics_change_retires_attitude_segment():
+    for change in (dict(calibration_id='fixed-v2'), dict(stamp_source='measurement')):
+        a=aid();a.observe(body_packet(),1_010_000_000)
+        with pytest.raises(ValueError):a.observe(body_packet(1_020_000_000,**change),1_030_000_000)
+
+
+def test_read_completion_cannot_enter_inertial_translation_even_with_tf_translation():
+    from plugins.rgbd_fusion import ShortTermFusion
+    f=ShortTermFusion('segment','optical','capture-clock',np.eye(3))
+    p=body_packet(translation_source='tf',camera_from_gyro_translation=[0.,0.,0.],
+                  camera_from_accel_translation=[0.,0.,0.])
+    with pytest.raises(ValueError,match='measurement'):
+        f.observe_imu(p,1_010_000_000)
+
+
 def test_gravity_initialization_maps_camera_specific_force_to_world_up():
     a=aid();out=a.observe(packet(linear_acceleration=[0.,-9.80665,0.]),1_010_000_000)
     np.testing.assert_allclose(rotation_from_quaternion(out['quaternion']) @ [0.,-1.,0.], [0,0,1],atol=1e-9)

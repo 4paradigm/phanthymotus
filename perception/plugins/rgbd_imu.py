@@ -1,4 +1,4 @@
-"""Capture-timed camera IMU attitude prior; no inertial translation integration."""
+"""Calibrated IMU attitude prior; capture and explicit read-time sources."""
 from collections import deque
 from copy import deepcopy
 
@@ -40,7 +40,7 @@ def rotation_from_quaternion(q):
 class ImuAttitude:
     """Relative-heading gyro integration with bounded gravity tilt correction.
 
-    Factory/TF rotations map raw motion axes into the camera optical axes once.
+    Factory/TF/fixed-mount rotations map raw axes into camera optical axes once.
     Acceleration is used only as a plausible gravity direction, never as a
     velocity/position observation. Every discontinuity retires this filter.
     """
@@ -67,7 +67,7 @@ class ImuAttitude:
             if self.status(now_ns) == 'lost':
                 raise ValueError(self.reason)
             if (not isinstance(packet, dict) or packet.get('schema') != 'motus.imu/1' or
-                    packet.get('stamp_source') != 'measurement' or
+                    packet.get('stamp_source') not in ('measurement', 'read_completion') or
                     packet.get('clock_id') != self.clock or packet.get('camera_frame_id') != self.frame):
                 raise ValueError('IMU schema, capture clock or camera frame mismatch')
             if packet.get('units') != {'angular_velocity': 'rad/s', 'linear_acceleration': 'm/s^2'}:
@@ -76,10 +76,18 @@ class ImuAttitude:
             if any(not isinstance(packet.get(k), str) or not packet[k].strip() or
                    packet[k] == 'unknown' for k in names):
                 raise ValueError('IMU source, epoch and physical motion frames are required')
-            if packet.get('rotation_source') not in ('sdk_factory_extrinsics', 'tf'):
+            if packet.get('rotation_source') not in ('sdk_factory_extrinsics', 'tf', 'configured_fixed_mount'):
                 raise ValueError('IMU rotation requires device calibration or source TF')
+            calibration_id = packet.get('calibration_id')
+            if packet.get('rotation_source') == 'configured_fixed_mount' and (
+                    not isinstance(calibration_id, str) or not calibration_id.strip()):
+                raise ValueError('fixed IMU installation requires a calibration identity')
+            if packet['stamp_source'] == 'read_completion' and packet.get('clock_mapping') != dict(
+                    method='host_wall_read_completion', source_clock='ros_wall', offset_ns=0, verified=False):
+                raise ValueError('read-time IMU requires explicit unverified host-wall mapping')
             rotations = (_rotation(packet.get('camera_from_gyro')), _rotation(packet.get('camera_from_accel')))
-            identity = tuple(packet[k] for k in names) + (packet['rotation_source'],)
+            identity = tuple(packet[k] for k in names) + (packet['rotation_source'],
+                                                        calibration_id, packet['stamp_source'])
             if self.identity is not None and (identity != self.identity or any(
                     not np.allclose(old, new, atol=1e-7, rtol=0) for old, new in zip(self.rotations, rotations))):
                 raise ValueError('IMU source epoch or calibration changed; restart for a new segment')
@@ -97,6 +105,7 @@ class ImuAttitude:
             self.last_stamp, self.last_accel = stamp, accel_stamp
             self.provenance = {'source_id': packet['source_id'], 'epoch': packet['epoch'],
                                'rotation_source': packet['rotation_source'],
+                               'calibration_id': calibration_id, 'stamp_source': packet['stamp_source'],
                                'clock_mapping': deepcopy(packet.get('clock_mapping'))}
             magnitude = np.linalg.norm(acceleration)
             gravity_valid = 8. <= magnitude <= 12.
