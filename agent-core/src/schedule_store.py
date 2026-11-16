@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import datetime
 import json
+import functools
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -62,6 +64,16 @@ class Schedule:
 _schedules: dict[str, Schedule] = {}
 _fires_by_day: dict[str, int] = {}     # 'YYYY-MM-DD'（default_tz）→ 当天实际触发数
 _loaded = False
+# API 路由跑在线程池里，可能并发；增删改和内存表的读写都串行。
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with _lock:
+            return fn(*a, **kw)
+    return wrapper
 
 
 # ── 设置 ─────────────────────────────────────────────────────────────────────
@@ -115,6 +127,7 @@ def _delete_row(sid: str) -> None:
         conn.commit()
 
 
+@_locked
 def load_all() -> None:
     global _loaded
     with _get_conn() as conn:
@@ -128,8 +141,9 @@ def load_all() -> None:
 
 
 def _ensure_loaded() -> None:
-    if not _loaded:
-        load_all()
+    with _lock:
+        if not _loaded:
+            load_all()
 
 
 # ── 时间 ─────────────────────────────────────────────────────────────────────
@@ -164,10 +178,10 @@ def next_run_ts(s: Schedule, now: float | None = None) -> float | None:
     return scheduler._next_run(s.cron, now, s.tz)
 
 
-def _daily_estimate(s: Schedule, now: float) -> int:
+def _cron_daily_max(s: Schedule, now: float) -> int:
     """按 cron 估算这个定时任务一天最多触发几次（看接下来 7 天里最多的一天）。"""
-    if s.kind == 'once' or not s.enabled:
-        return 1 if (s.enabled and s.kind == 'once') else 0
+    if s.kind != 'cron' or not s.enabled:
+        return 0
     tz = scheduler.get_tz(s.tz)
     horizon = now + 7 * 86400
     per_day: dict[str, int] = {}
@@ -233,7 +247,16 @@ def validate(s: Schedule, *, now: float | None = None) -> None:
     if s.skill and st['max_per_skill'] and \
             sum(1 for o in others if o.skill == s.skill) + 1 > st['max_per_skill']:
         raise ValueError(f'技能 {s.skill} 的定时任务最多 {st["max_per_skill"]} 条')
-    total = _daily_estimate(s, now) + sum(_daily_estimate(o, now) for o in others)
+    # 重复的按“每天最多几次”算进每一天；一次性的只算进它自己那一天（按默认时区的日期）。
+    cron_total = 0
+    once_by_day: dict[str, int] = {}
+    for x in (s, *others):
+        if x.kind == 'once':
+            day = fmt_ts(parse_at(x.at, x.tz), st['default_tz'])[:10]
+            once_by_day[day] = once_by_day.get(day, 0) + 1
+        else:
+            cron_total += _cron_daily_max(x, now)
+    total = cron_total + max(once_by_day.values(), default=0)
     if total > st['max_fires_per_day']:
         raise ValueError(
             f'加上这条，所有定时任务一天最多会触发 {total} 次，超过上限 {st["max_fires_per_day"]} 次')
@@ -289,21 +312,26 @@ def _register(s: Schedule) -> None:
                           source=f'scheduler:{s.name}', on_fire=_on_fire(s.id))
 
 
+@_locked
 def start_all() -> int:
-    """启动时调用（scheduler.run）：从库里读出来，注册所有启用的定时任务。"""
+    """启动时调用（scheduler.run）：从库里读出来，注册所有启用的定时任务。
+
+    每条单独兜错：库里有一条坏数据（比如 at 写坏了）只跳过它，不能拖垮其他定时。
+    """
     load_all()
     n = 0
     for s in _schedules.values():
-        if s.enabled and s.kind == 'once' and parse_at(s.at, s.tz) <= time.time():
-            s.enabled = False          # 关机期间错过的一次性定时：不补发，标记停用
-            _persist(s)
+        if not s.enabled:
             continue
-        if s.enabled:
-            try:
-                _register(s)
-                n += 1
-            except ValueError as e:
-                print(f'[schedule] skip {s.name!r}: {e}')
+        try:
+            if s.kind == 'once' and parse_at(s.at, s.tz) <= time.time():
+                s.enabled = False      # 关机期间错过的一次性定时：不补发，标记停用
+                _persist(s)
+                continue
+            _register(s)
+            n += 1
+        except Exception as e:
+            print(f'[schedule] skip {s.name!r}: {e}')
     if n:
         print(f'[schedule] started {n} runtime schedule(s)')
     return n
@@ -311,11 +339,13 @@ def start_all() -> int:
 
 # ── 公开接口 ─────────────────────────────────────────────────────────────────
 
+@_locked
 def list_all() -> list[Schedule]:
     _ensure_loaded()
     return sorted(_schedules.values(), key=lambda s: (not s.enabled, s.created_at))
 
 
+@_locked
 def find(key: str) -> Schedule | None:
     """按 id 或名字找。"""
     _ensure_loaded()
@@ -328,6 +358,7 @@ def find(key: str) -> Schedule | None:
     return None
 
 
+@_locked
 def create(*, name: str, text: str, kind: str = 'cron', cron: str = '', at: str = '',
            tz: str = '', skill: str = '', enabled: bool = True, created_by: str = 'web') -> Schedule:
     _ensure_loaded()
@@ -340,6 +371,7 @@ def create(*, name: str, text: str, kind: str = 'cron', cron: str = '', at: str 
     return s
 
 
+@_locked
 def update(sid: str, **changes) -> Schedule:
     _ensure_loaded()
     s = _schedules.get(sid)
@@ -357,6 +389,7 @@ def update(sid: str, **changes) -> Schedule:
     return trial
 
 
+@_locked
 def delete(sid: str) -> bool:
     _ensure_loaded()
     scheduler.remove_job(job_name(sid))
@@ -365,6 +398,7 @@ def delete(sid: str) -> bool:
     return s is not None
 
 
+@_locked
 def clear_all() -> int:
     _ensure_loaded()
     n = len(_schedules)
@@ -378,10 +412,11 @@ def clear_all() -> int:
 
 
 async def fire_now(sid: str) -> Schedule:
-    """立即触发一次（网页“试一下”用），不计入每日上限、不改一次性任务的状态。"""
+    """立即触发一次（网页“试一下”用），不计入每日上限、不改一次性任务的状态。
+    查找走线程池（首次调用可能要读库），推事件在循环里。"""
+    import asyncio
     import event_bus
-    _ensure_loaded()
-    s = _schedules.get(sid)
+    s = await asyncio.to_thread(lambda: _schedules.get(sid) if (_ensure_loaded() or True) else None)
     if not s:
         raise KeyError(sid)
     await event_bus.enqueue(source=f'scheduler:{s.name}', text=event_text(s))

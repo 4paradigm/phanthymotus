@@ -18,6 +18,7 @@ collector 把 scheduler 视为优先来源，会叫醒主模型：
 
 import asyncio
 import datetime
+import functools
 import time
 
 import config
@@ -92,6 +93,10 @@ def _next_run(cron: str, after: float, tz=None) -> float:
     """
     计算 cron 表达式在 after 之后的下一个触发时间（unix timestamp）。
 
+    注意：日(月) 和 周 两个字段**都**限定时按“且”匹配（例如 '0 8 13 * 5' 只在
+    13 号又恰好是周五时触发），与标准 cron 的“或”不同。这是本调度器一直以来的
+    行为，配置里已有的 job 依赖它，所以保持不变（tests/test_runtime_scheduler.py 锁住）。
+
     支持标准 5 字段 cron：分 时 日(月) 月 周
     字段值：数字、*、*/N、a-b、a-b/N、逗号列表（不支持 L/W/#）
     tz：tzinfo 或时区名；None 按容器本地时区（旧行为）。
@@ -130,16 +135,32 @@ def next_runs(cron: str, after: float, count: int, tz=None) -> list[float]:
 
 _dynamic_tasks: dict[str, asyncio.Task] = {}   # name → asyncio.Task
 _job_info: dict[str, dict] = {}                # name → job（含 next_ts），供 API 展示
+_loop: asyncio.AbstractEventLoop | None = None  # run() 记下的事件循环
 
 
-def add_job(name: str, cron: str, text: str, *, tz=None, at: float | None = None,
-            source: str | None = None, on_fire=None) -> None:
-    """动态添加一个定时 job（如果同名已存在则先移除）。
+def _on_loop(fn) -> None:
+    """在事件循环线程里执行 fn。
 
-    cron 和 at 二选一：at 是一次性触发的 unix 时间。
-    on_fire(job) 在推事件前调用，返回 False 就跳过这一次（用于每日上限、一次性任务收尾）。
+    api/schedules.py 的路由是同步的（SQLite 读写不能卡事件循环，FastAPI 把它们放进
+    线程池），但 asyncio 的 task 只能在循环线程里建和取消，所以从别的线程来的调用
+    用 call_soon_threadsafe 转回循环；按 FIFO 执行，先 remove 后 add 的顺序不会乱。
     """
-    remove_job(name)
+    loop = _loop
+    if loop is None or not loop.is_running():
+        fn()                     # 启动前或测试里没有循环：直接执行
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        fn()                     # 已经在循环线程里
+    else:
+        loop.call_soon_threadsafe(fn)
+
+
+def _add_job_now(name, cron, text, tz, at, source, on_fire) -> None:
+    _remove_job_now(name)
     job = {'name': name, 'cron': cron, 'text': text, 'tz': tz, 'at': at,
            'source': source, 'on_fire': on_fire}
     task = asyncio.ensure_future(_run_job(job))
@@ -147,12 +168,26 @@ def add_job(name: str, cron: str, text: str, *, tz=None, at: float | None = None
     _job_info[name] = job
 
 
-def remove_job(name: str) -> None:
-    """移除一个动态 job。"""
+def _remove_job_now(name: str) -> None:
     _job_info.pop(name, None)
     task = _dynamic_tasks.pop(name, None)
     if task and not task.done():
         task.cancel()
+
+
+def add_job(name: str, cron: str, text: str, *, tz=None, at: float | None = None,
+            source: str | None = None, on_fire=None) -> None:
+    """动态添加一个定时 job（如果同名已存在则先移除）。可以从任何线程调用。
+
+    cron 和 at 二选一：at 是一次性触发的 unix 时间。
+    on_fire(job) 在推事件前调用，返回 False 就跳过这一次（用于每日上限、一次性任务收尾）。
+    """
+    _on_loop(functools.partial(_add_job_now, name, cron, text, tz, at, source, on_fire))
+
+
+def remove_job(name: str) -> None:
+    """移除一个动态 job。可以从任何线程调用。"""
+    _on_loop(functools.partial(_remove_job_now, name))
 
 
 def job_next_ts(name: str) -> float | None:
@@ -165,6 +200,8 @@ def job_next_ts(name: str) -> float | None:
 
 async def run() -> None:
     """常驻 async task：加载配置里的 job 和运行时定时任务并驱动它们。"""
+    global _loop
+    _loop = asyncio.get_running_loop()
     try:
         import schedule_store
         schedule_store.start_all()

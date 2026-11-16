@@ -1,6 +1,10 @@
 """
 api/schedules.py — 运行时定时任务 REST API（网页“历史 → 定时”页用）。
 
+除了“立即触发”，路由都是普通 def：schedule_store 要同步读写 SQLite，写成 async def
+会在事件循环线程上执行、慢盘或锁库时卡住整个 agent-core。def 路由由 FastAPI 放进线程池；
+scheduler.add_job / remove_job 会自己转回事件循环线程。
+
 增删改立即生效、不用重启；校验（最短间隔、每日上限、条数上限）全在 schedule_store。
 出错返回 {'ok': False, 'error': '<中文原因>'}，与 api/tasks.py 的风格一致。
 """
@@ -60,7 +64,7 @@ def _config_jobs() -> list[dict]:
 
 
 @router.get('')
-async def list_schedules():
+def list_schedules():
     return {
         'schedules': [schedule_store.to_dict(s) for s in schedule_store.list_all()],
         'settings': schedule_store.get_settings(),
@@ -69,12 +73,12 @@ async def list_schedules():
 
 
 @router.get('/settings')
-async def get_settings():
+def get_settings():
     return {'ok': True, 'settings': schedule_store.get_settings()}
 
 
 @router.patch('/settings')
-async def patch_settings(body: SettingsBody):
+def patch_settings(body: SettingsBody):
     try:
         st = schedule_store.update_settings(**body.dict())
     except ValueError as e:
@@ -83,7 +87,7 @@ async def patch_settings(body: SettingsBody):
 
 
 @router.post('/preview')
-async def preview(body: PreviewBody):
+def preview(body: PreviewBody):
     """算出 cron 接下来几次触发时间，给网页表单即时提示。"""
     tz = body.tz or schedule_store.get_settings()['default_tz']
     try:
@@ -94,7 +98,7 @@ async def preview(body: PreviewBody):
 
 
 @router.post('')
-async def create_schedule(body: ScheduleBody):
+def create_schedule(body: ScheduleBody):
     data = {k: v for k, v in body.dict().items() if v is not None}
     try:
         s = schedule_store.create(created_by='web', **data)
@@ -104,7 +108,7 @@ async def create_schedule(body: ScheduleBody):
 
 
 @router.patch('/{sid}')
-async def update_schedule(sid: str, body: ScheduleBody):
+def update_schedule(sid: str, body: ScheduleBody):
     data = {k: v for k, v in body.dict().items() if v is not None}
     if not data:
         return {'ok': False, 'error': '没有要改的内容'}
@@ -118,7 +122,7 @@ async def update_schedule(sid: str, body: ScheduleBody):
 
 
 @router.delete('/{sid}')
-async def delete_schedule(sid: str):
+def delete_schedule(sid: str):
     return {'ok': schedule_store.delete(sid)}
 
 

@@ -228,5 +228,78 @@ class TestModelTools(_Base):
             self.assertIn('已删除', r)
 
 
+class TestReviewRegressions(_Base):
+    """PR #398 审查意见对应的回归：每日上限按日期算、坏数据不拖垮启动、cron 语义、
+    同步路由不卡事件循环。"""
+
+    def test_one_shots_on_different_days_do_not_stack(self):
+        """49 个一次性定时分在 49 天：每天只有 1 次，不该被每日上限拒绝。"""
+        config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'max_schedules': 60,
+                                             'max_fires_per_day': 48}
+        base = datetime.datetime(2026, 11, 17, 8, 0, tzinfo=CN)
+        with _FakeJobs():
+            for i in range(49):
+                day = (base + datetime.timedelta(days=i)).strftime('%Y-%m-%d %H:%M')
+                schedule_store.create(name=f'o{i}', text='x', kind='once', at=day)
+
+    def test_one_shots_on_the_same_day_do_stack(self):
+        config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'max_schedules': 60,
+                                             'max_fires_per_day': 2}
+        with _FakeJobs():
+            schedule_store.create(name='a', text='x', kind='once', at='2026-12-01 08:00')
+            schedule_store.create(name='b', text='x', kind='once', at='2026-12-01 09:00')
+            with self.assertRaisesRegex(ValueError, '一天最多'):
+                schedule_store.create(name='c', text='x', kind='once', at='2026-12-01 10:00')
+            schedule_store.create(name='d', text='x', kind='once', at='2026-12-02 10:00')
+
+    def test_corrupt_row_does_not_stop_startup(self):
+        with _FakeJobs() as fj:
+            good = schedule_store.create(name='好的', text='x', cron='0 8 * * *')
+            schedule_store._schedules.clear(); fj.jobs.clear()
+            bad = schedule_store.Schedule(name='坏的', text='x', kind='once', at='不是时间')
+            schedule_store._schedules[bad.id] = bad
+            schedule_store._persist(bad)
+            self.assertEqual(schedule_store.start_all(), 1, '坏的跳过，好的照常启动')
+            self.assertIn(f'sched:{good.id}', fj.jobs)
+
+    def test_dom_and_dow_are_anded(self):
+        """'0 8 13 * 5'：13 号且是周五才触发（本调度器一直如此，不是标准 cron 的“或”）。"""
+        after = _ts('2026-11-16 00:00')
+        nxt = scheduler._next_run('0 8 13 * 5', after, 'Asia/Shanghai')
+        d = datetime.datetime.fromtimestamp(nxt, CN)
+        self.assertEqual(d.strftime('%Y-%m-%d %H:%M'), '2027-08-13 08:00')   # 13 号，周五
+
+    def test_add_job_lands_on_the_running_loop(self):
+        """从别的线程调 add_job：task 要建在事件循环线程里，不能凭空抛错。"""
+        import threading
+
+        async def main():
+            scheduler._loop = asyncio.get_running_loop()
+            err = []
+            t = threading.Thread(target=lambda: _try(lambda: scheduler.add_job('x-thread', '0 8 * * *', 'x')))
+            def _try(fn):
+                try: fn()
+                except Exception as e: err.append(e)
+            t.start(); t.join()
+            for _ in range(3):
+                await asyncio.sleep(0.01)
+            self.assertEqual(err, [])
+            self.assertIn('x-thread', scheduler._dynamic_tasks)
+            scheduler.remove_job('x-thread')
+            for _ in range(3):
+                await asyncio.sleep(0.01)
+            self.assertNotIn('x-thread', scheduler._dynamic_tasks)
+        asyncio.run(main())
+
+    def test_api_routes_are_sync(self):
+        """SQLite 读写放在 def 路由里（FastAPI 走线程池），不能是 async def。"""
+        src = (_SRC / 'api' / 'schedules.py').read_text(encoding='utf-8')
+        for name in ('list_schedules', 'create_schedule', 'update_schedule', 'delete_schedule',
+                     'patch_settings', 'preview', 'get_settings'):
+            self.assertIn(f'\ndef {name}(', src, f'{name} 应该是同步路由')
+            self.assertNotIn(f'async def {name}(', src)
+        self.assertIn('asyncio.to_thread', (_SRC / 'schedule_store.py').read_text(encoding='utf-8'))
+
+
 if __name__ == '__main__':
     unittest.main()
