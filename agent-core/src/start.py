@@ -664,6 +664,9 @@ app_api.include_router(api.history.router)
 import api.tasks
 app_api.include_router(api.tasks.router)
 
+import api.schedules
+app_api.include_router(api.schedules.router)
+
 import api.network
 app_api.include_router(api.network.router)
 

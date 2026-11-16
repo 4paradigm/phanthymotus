@@ -77,6 +77,15 @@ _DB_DEFAULTS = {
         'subscribe_topics': [],  # DDS topics core subscribes to directly (e.g. ["/robot/mic/audio/asr_event"])
     },
     'scheduler': [],
+    # 运行时定时任务的闸（schedule_store.DEFAULT_SETTINGS 是同一份默认值）
+    'scheduler_settings': {
+        'model_tools_enabled': False,   # 模型能否自己建定时（默认关）
+        'min_interval_minutes': 10,     # 同一定时任务两次触发的最短间隔
+        'max_schedules': 20,            # 启用中的定时任务条数上限
+        'max_per_skill': 6,             # 每个技能的条数上限
+        'max_fires_per_day': 48,        # 所有运行时定时任务一天合计触发上限
+        'default_tz': 'Asia/Shanghai',  # cron / 时间按这个时区解释（容器是 UTC）
+    },
     'skills': {'installed': []},
     'channel_configs': [],
     'channel_settings': {

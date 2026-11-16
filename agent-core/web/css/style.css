@@ -9802,3 +9802,14 @@ html, body {
 @media (max-width: 760px) {
   .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
 }
+/* ── 历史 → 定时 页签 ─────────────────────────────────────────────────────── */
+.schedule-tip { font-size: 12px; opacity: .75; margin: 4px 0 10px; }
+.schedule-settings { margin-bottom: 10px; }
+.schedule-settings summary { cursor: pointer; font-size: 13px; margin-bottom: 6px; }
+.schedule-settings label { display: block; font-size: 12px; margin-top: 6px; }
+.schedule-check { display: flex !important; align-items: center; gap: 6px; }
+.schedule-form #sf-cron-row.hidden, .schedule-form #sf-at-row.hidden { display: none; }
+.schedule-preview { font-size: 12px; opacity: .8; margin-top: 4px; }
+.schedule-error { color: #e5484d; }
+.schedule-msg { font-size: 12px; margin-left: 8px; }
+.schedule-section-title { font-size: 13px; font-weight: 600; margin: 16px 0 8px; opacity: .8; }

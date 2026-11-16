@@ -557,6 +557,16 @@ async def _acp_barrier(name: str, cancel_event, *,
     return result
 
 
+def _hide_schedule_tools() -> bool:
+    """模型的定时工具默认不给：管理员在设置里打开 scheduler_settings.model_tools_enabled
+    才出现。每个 turn 现读配置，改了不用重启。读配置出错时按关闭处理。"""
+    try:
+        import schedule_store
+        return not schedule_store.get_settings().get('model_tools_enabled')
+    except Exception:
+        return True
+
+
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 
 # viewer 是已注册的合法 ACL 用户（不是可以随便伪造身份的群里 Bot），"只读" 的定义
@@ -1622,6 +1632,10 @@ class Event:
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
             ('task_force_clear', event.task.task_force_clear),
+            # 运行时定时任务（默认不出现在工具表里，见 _hide_schedule_tools）
+            ('schedule_list', event.schedule.schedule_list),
+            ('schedule_create', event.schedule.schedule_create),
+            ('schedule_delete', event.schedule.schedule_delete),
             ('raw_input_info', _raw_input_info),
             ('search_history', _search_history),
             ('memory_recall', _memory_recall),
@@ -2353,6 +2367,8 @@ class Event:
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
+        if _hide_schedule_tools():
+            system_tools = [t for t in system_tools if not t['schema']['name'].startswith('schedule_')]
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools

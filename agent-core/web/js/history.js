@@ -1,11 +1,13 @@
 /**
- * history.js — 历史日志 Modal（会话记录 + 任务管理）
+ * history.js — 历史日志 Modal（会话记录 + 任务管理 + 运行时定时）
  */
 
 let _overlay, _list, _chat, _btnDeleteSelected, _selectedIds, _btnBack, _detailTitle;
 let _pollTimer = null;
 let _activeSessionId = null;
 let _activeTab = 'sessions';
+let _scheduleSettings = {};
+let _scheduleLoadId = 0;
 // 上一次渲染的内容指纹。轮询每 3 秒拉一次，内容没变就别重画 —— 重画会清掉
 // 滚动位置和展开的工具卡片。
 let _listSig = '';
@@ -46,7 +48,7 @@ export async function showHistory() {
   _overlay.classList.remove('hidden');
   _selectedIds.clear();
   _updateDeleteBtn();
-  await _loadSessions();
+  await _refreshCurrentTab();
   _startPoll();
 }
 
@@ -62,7 +64,8 @@ function _startPoll() {
   // 一个还在跑的 turn 要等下次手动点开才看得到。
   _pollTimer = setInterval(() => {
     if (_activeTab === 'sessions') { _loadSessions(); _refreshOpenSession(); }
-    else _loadTasks();
+    else if (_activeTab === 'tasks') _loadTasks();
+    // 定时页只在切换、刷新或操作后加载，避免轮询清掉正在填写的表单。
   }, POLL_MS);
 }
 
@@ -223,6 +226,7 @@ function _clearChatPane() {
 }
 
 async function clearAll() {
+  if (_activeTab === 'schedules') return;
   if (_activeTab === 'tasks') {
     if (!confirm('确认清除所有活跃任务？')) return;
     await fetch('/api/tasks', { method: 'DELETE' });
@@ -414,7 +418,7 @@ function _extractText(content) {
 function _escape(str) {
   const d = document.createElement('div');
   d.textContent = str;
-  return d.innerHTML;
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // 一律按北京时间显示：机器人分布在不同机器上，看日志的人和机器人的时区不一定一致，
@@ -456,28 +460,27 @@ function _switchTab(tab) {
   _overlay.querySelectorAll('.history-tab').forEach(t => {
     t.classList.toggle('active', t.dataset.tab === tab);
   });
-  const sessionsPane = _overlay.querySelector('.history-sessions-pane');
-  const tasksPane = document.getElementById('history-tasks');
-  const deleteBtn = _btnDeleteSelected;
+  _overlay.querySelector('.history-sessions-pane').classList.toggle('hidden', tab !== 'sessions');
+  document.getElementById('history-tasks').classList.toggle('hidden', tab !== 'tasks');
+  document.getElementById('history-schedules').classList.toggle('hidden', tab !== 'schedules');
+  _btnDeleteSelected.classList.toggle('hidden', tab !== 'sessions');
   const clearBtn = document.getElementById('history-clear-all');
+  clearBtn.classList.toggle('hidden', tab === 'schedules');
 
   if (tab === 'sessions') {
-    sessionsPane.classList.remove('hidden');
-    tasksPane.classList.add('hidden');
-    deleteBtn.classList.remove('hidden');
     clearBtn.textContent = '清空全部';
-  } else {
-    sessionsPane.classList.add('hidden');
-    tasksPane.classList.remove('hidden');
-    deleteBtn.classList.add('hidden');
+  } else if (tab === 'tasks') {
     clearBtn.textContent = '清除所有任务';
     _loadTasks();
+  } else if (tab === 'schedules') {
+    _loadSchedules();
   }
 }
 
 function _refreshCurrentTab() {
-  if (_activeTab === 'sessions') _loadSessions();
-  else _loadTasks();
+  if (_activeTab === 'sessions') return _loadSessions();
+  if (_activeTab === 'tasks') return _loadTasks();
+  if (_activeTab === 'schedules') return _loadSchedules();
 }
 
 
@@ -583,4 +586,244 @@ function _elapsedStr(createdAt) {
   if (elapsed < 60) return `${Math.floor(elapsed)}s`;
   if (elapsed < 3600) return `${Math.floor(elapsed / 60)}min`;
   return `${(elapsed / 3600).toFixed(1)}h`;
+}
+
+// ── Schedules Tab ────────────────────────────────────────────────────────────
+// 运行时定时任务（/api/schedules）。到点把文字推给机器人、叫醒它跑一轮，所以页面上
+// 一直提醒别设得太频繁；后端的最短间隔 / 每日上限会拒绝过密的设置，错误原样显示。
+
+const _CREATOR_TEXT = { web: '网页建', api: '接口建', model: '模型建' };
+
+async function _scheduleFetch(url, method = 'GET', body = null) {
+  const opts = { method };
+  if (body !== null) {
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  return res.json();
+}
+
+async function _loadSchedules() {
+  const el = document.getElementById('history-schedules');
+  const loadId = ++_scheduleLoadId;
+  if (!el.innerHTML) el.innerHTML = '<div class="history-empty">加载中…</div>';
+  try {
+    const data = await _scheduleFetch('/api/schedules');
+    if (loadId !== _scheduleLoadId) return;
+    _scheduleSettings = data.settings || {};
+    _renderSchedules(el, data);
+  } catch {
+    if (loadId !== _scheduleLoadId) return;
+    el.innerHTML = '<div class="history-empty">读不到定时任务。确认机器在线后点「刷新」重试。</div>';
+  }
+}
+
+function _scheduleWhen(s) {
+  const tz = _escape(s.tz || '容器本地时区');
+  return s.kind === 'once'
+    ? `一次：${_escape(s.at)}（${tz}）`
+    : `每次：${_escape(s.cron)}（${tz}）`;
+}
+
+function _renderSchedules(el, data) {
+  const list = data.schedules || [];
+  const jobs = data.config_jobs || [];
+  const st = _scheduleSettings;
+
+  const cards = list.map(s => `
+      <div class="task-card" data-id="${_escape(s.id)}">
+        <div class="task-header">
+          <span class="task-goal">${_escape(s.name)}</span>
+          <span class="task-badge ${s.enabled ? 'running' : 'paused'}">${s.enabled ? '启用' : '停用'}</span>
+        </div>
+        <div class="task-meta">
+          <div>${_scheduleWhen(s)}</div>
+          <div>下次：${_escape(s.next_run_text || '无')}　上次：${_escape(s.last_run_text || '从未')}　已触发 ${s.fire_count || 0} 次</div>
+          ${s.skill ? `<div>技能：${_escape(s.skill)}</div>` : ''}
+          <div>文字：${_escape(s.text)}</div>
+          <div class="task-meta-foot">${_CREATOR_TEXT[s.created_by] || _escape(s.created_by)}<span class="task-id">${_escape(s.id)}</span></div>
+        </div>
+        <div class="task-actions">
+          <button class="sched-edit-btn" data-id="${_escape(s.id)}">编辑</button>
+          <button class="sched-toggle-btn" data-id="${_escape(s.id)}">${s.enabled ? '停用' : '启用'}</button>
+          <button class="sched-run-btn" data-id="${_escape(s.id)}">立即触发</button>
+          <button class="sched-delete-btn danger" data-id="${_escape(s.id)}">删除</button>
+        </div>
+      </div>`).join('');
+
+  const jobCards = jobs.map(j => `
+      <div class="task-card">
+        <div class="task-header"><span class="task-goal">${_escape(j.name)}</span></div>
+        <div class="task-meta">
+          <div>每次：${_escape(j.cron)}（${_escape(j.tz || '容器本地时区')}）</div>
+          <div>下次：${_escape(j.next_run_text || '无')}</div>
+          <div>文字：${_escape(j.text)}</div>
+          ${j.error ? `<div class="schedule-error">${_escape(j.error)}</div>` : ''}
+        </div>
+      </div>`).join('');
+
+  el.innerHTML = `
+    <div class="schedule-tip">到点会把文字推给机器人，叫醒它做事。每次触发都要跑一轮模型，请不要设得太频繁。</div>
+    <details class="schedule-settings">
+      <summary>设置</summary>
+      <label class="schedule-check"><input type="checkbox" id="sched-set-model" ${st.model_tools_enabled ? 'checked' : ''}> 允许模型自己建定时（默认关）</label>
+      <label>最短间隔（分钟）<input type="number" min="1" class="task-input" id="sched-set-interval" value="${_escape(String(st.min_interval_minutes ?? ''))}"></label>
+      <label>每天最多触发次数<input type="number" min="1" class="task-input" id="sched-set-fires" value="${_escape(String(st.max_fires_per_day ?? ''))}"></label>
+      <label>最多条数<input type="number" min="1" class="task-input" id="sched-set-max" value="${_escape(String(st.max_schedules ?? ''))}"></label>
+      <label>每个技能最多条数<input type="number" min="0" class="task-input" id="sched-set-skill" value="${_escape(String(st.max_per_skill ?? ''))}"></label>
+      <label>默认时区<input type="text" class="task-input" id="sched-set-tz" value="${_escape(st.default_tz || '')}"></label>
+      <div class="task-actions"><button id="sched-set-save">保存设置</button><span class="schedule-msg" id="sched-set-msg"></span></div>
+    </details>
+    <div class="task-actions"><button class="task-edit-btn" id="schedule-new-btn">新建定时任务</button></div>
+    <div id="schedule-form-slot"></div>
+    ${cards || '<div class="history-empty">还没有定时任务。</div>'}
+    ${jobs.length ? `<div class="schedule-section-title">配置文件里的定时（只读，改要改配置并重启 agent-core）</div>${jobCards}` : ''}`;
+
+  el.querySelector('#schedule-new-btn').addEventListener('click', () => _openScheduleForm(null));
+  el.querySelector('#sched-set-save').addEventListener('click', _saveScheduleSettings);
+
+  const byId = id => list.find(s => s.id === id);
+  el.querySelectorAll('.sched-edit-btn').forEach(btn => {
+    btn.addEventListener('click', () => _openScheduleForm(byId(btn.dataset.id)));
+  });
+  el.querySelectorAll('.sched-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const s = byId(btn.dataset.id);
+      const r = await _scheduleFetch(`/api/schedules/${encodeURIComponent(s.id)}`, 'PATCH', { enabled: !s.enabled });
+      if (!r.ok) alert(r.error || '操作失败');
+      _loadSchedules();
+    });
+  });
+  el.querySelectorAll('.sched-run-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('现在触发一次？机器人会被叫醒跑一轮。')) return;
+      const r = await _scheduleFetch(`/api/schedules/${encodeURIComponent(btn.dataset.id)}/run`, 'POST');
+      if (!r.ok) alert(r.error || '触发失败');
+      _loadSchedules();
+    });
+  });
+  el.querySelectorAll('.sched-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('确认删除这个定时任务？')) return;
+      await _scheduleFetch(`/api/schedules/${encodeURIComponent(btn.dataset.id)}`, 'DELETE');
+      _loadSchedules();
+    });
+  });
+}
+
+async function _saveScheduleSettings() {
+  const num = id => {
+    const v = document.getElementById(id).value.trim();
+    return v === '' ? null : Number(v);
+  };
+  const msg = document.getElementById('sched-set-msg');
+  const r = await _scheduleFetch('/api/schedules/settings', 'PATCH', {
+    model_tools_enabled: document.getElementById('sched-set-model').checked,
+    min_interval_minutes: num('sched-set-interval'),
+    max_fires_per_day: num('sched-set-fires'),
+    max_schedules: num('sched-set-max'),
+    max_per_skill: num('sched-set-skill'),
+    default_tz: document.getElementById('sched-set-tz').value.trim() || null,
+  });
+  if (r.ok) {
+    _scheduleSettings = r.settings || _scheduleSettings;
+    msg.className = 'schedule-msg';
+    msg.textContent = '已保存';
+  } else {
+    msg.className = 'schedule-msg schedule-error';
+    msg.textContent = r.error || '保存失败';
+  }
+}
+
+function _openScheduleForm(s) {
+  const slot = document.getElementById('schedule-form-slot');
+  if (!slot) return;
+  const isEdit = !!s;
+  const v = s || { name: '', kind: 'cron', cron: '', at: '', tz: _scheduleSettings.default_tz || 'Asia/Shanghai',
+                   text: '', skill: '', enabled: true };
+  const atLocal = (v.at || '').replace(' ', 'T');
+  slot.innerHTML = `
+    <div class="task-card task-edit-form schedule-form">
+      <label>名字</label>
+      <input type="text" class="task-input" id="sf-name" value="${_escape(v.name)}">
+      <label>类型</label>
+      <select class="task-input" id="sf-kind">
+        <option value="cron" ${v.kind !== 'once' ? 'selected' : ''}>重复</option>
+        <option value="once" ${v.kind === 'once' ? 'selected' : ''}>只一次</option>
+      </select>
+      <div id="sf-cron-row">
+        <label>Cron</label>
+        <input type="text" class="task-input" id="sf-cron" value="${_escape(v.cron || '')}" placeholder="分 时 日 月 周，例如 0 8 * * *">
+        <div class="schedule-preview" id="sf-preview"></div>
+      </div>
+      <div id="sf-at-row">
+        <label>时间</label>
+        <input type="datetime-local" class="task-input" id="sf-at" value="${_escape(atLocal)}">
+      </div>
+      <label>时区</label>
+      <input type="text" class="task-input" id="sf-tz" value="${_escape(v.tz || '')}">
+      <label>触发文字（到点推给机器人）</label>
+      <textarea class="task-input" id="sf-text" rows="2">${_escape(v.text || '')}</textarea>
+      <label>技能 slug（可空）</label>
+      <input type="text" class="task-input" id="sf-skill" value="${_escape(v.skill || '')}">
+      <label class="schedule-check"><input type="checkbox" id="sf-enabled" ${v.enabled ? 'checked' : ''}> 启用</label>
+      <div class="schedule-msg schedule-error" id="sf-error"></div>
+      <div class="task-actions" style="margin-top:10px">
+        <button id="sf-save">保存</button>
+        <button id="sf-cancel">取消</button>
+      </div>
+    </div>`;
+
+  const kindSel = document.getElementById('sf-kind');
+  const showKind = () => {
+    const once = kindSel.value === 'once';
+    document.getElementById('sf-cron-row').classList.toggle('hidden', once);
+    document.getElementById('sf-at-row').classList.toggle('hidden', !once);
+  };
+  kindSel.addEventListener('change', showKind);
+  showKind();
+
+  let previewTimer = null;
+  const preview = async () => {
+    const out = document.getElementById('sf-preview');
+    const cron = document.getElementById('sf-cron').value.trim();
+    if (!cron) { out.textContent = ''; return; }
+    try {
+      const r = await _scheduleFetch('/api/schedules/preview', 'POST',
+        { cron, tz: document.getElementById('sf-tz').value.trim() || null });
+      out.className = r.ok ? 'schedule-preview' : 'schedule-preview schedule-error';
+      out.textContent = r.ok ? `接下来：${(r.runs || []).join('、')}` : (r.error || '');
+    } catch { out.textContent = ''; }
+  };
+  ['sf-cron', 'sf-tz'].forEach(id => document.getElementById(id).addEventListener('input', () => {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(preview, 400);
+  }));
+  preview();
+
+  document.getElementById('sf-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+  document.getElementById('sf-save').addEventListener('click', async () => {
+    const kind = kindSel.value;
+    const body = {
+      name: document.getElementById('sf-name').value.trim(),
+      kind,
+      cron: kind === 'cron' ? document.getElementById('sf-cron').value.trim() : '',
+      at: kind === 'once' ? document.getElementById('sf-at').value.replace('T', ' ') : '',
+      tz: document.getElementById('sf-tz').value.trim(),
+      text: document.getElementById('sf-text').value.trim(),
+      skill: document.getElementById('sf-skill').value.trim(),
+      enabled: document.getElementById('sf-enabled').checked,
+    };
+    const r = isEdit
+      ? await _scheduleFetch(`/api/schedules/${encodeURIComponent(s.id)}`, 'PATCH', body)
+      : await _scheduleFetch('/api/schedules', 'POST', body);
+    if (!r.ok) {
+      document.getElementById('sf-error').textContent = r.error || '保存失败';
+      return;
+    }
+    slot.innerHTML = '';
+    _loadSchedules();
+  });
+  slot.scrollIntoView({ block: 'nearest' });
 }
