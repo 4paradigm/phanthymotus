@@ -44,11 +44,29 @@ class MapGraph:
     pass
 
 
+class CameraInfo:
+    def __init__(self):
+        self.header = header()
+
+
+class SensorData:
+    def __init__(self):
+        from sensor_msgs.msg import Image, PointCloud2
+        self.header, self.data = header(), None
+        self.laser_scan = PointCloud2()
+        self.laser_scan_local_transform = TransformStamped().transform
+        self.left, self.right = Image(), Image()
+        self.left_camera_info, self.local_transform = [], []
+
+
+sys.modules['sensor_msgs.msg'].CameraInfo = CameraInfo
+
+
 for package, classes in {
     'nav_msgs': {'Odometry': Odometry},
     'geometry_msgs': {'TransformStamped': TransformStamped},
     'tf2_msgs': {'TFMessage': TFMessage},
-    'rtabmap_msgs': {'Info': Info, 'MapGraph': MapGraph},
+    'rtabmap_msgs': {'Info': Info, 'MapGraph': MapGraph, 'SensorData': SensorData},
 }.items():
     module, messages = types.ModuleType(package), types.ModuleType(package + '.msg')
     messages.__dict__.update(classes)

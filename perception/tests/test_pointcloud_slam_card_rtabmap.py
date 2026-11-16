@@ -100,7 +100,7 @@ def capture(card):
 def test_card_starts_mapping_with_cloud_and_existing_odom_without_rgbd(card):
     ready(card)
     info = call(card, 'info')
-    assert {item['format'] for item in info['topic_in']} == {'sensor/pointcloud2', 'state/odom'}
+    assert {item['format'] for item in info['topic_in'] if not item.get('optional')} == {'sensor/pointcloud2', 'state/odom'}
     assert info['backend'] == 'rtabmap'
     assert call(card, 'start_mapping', map_name='Hall')['state'] == 'running'
     assert card._node.inputs == ('/pose', '/cloud')
@@ -125,7 +125,7 @@ def test_legacy_core_roles_use_native_publisher_discovery(card, monkeypatch):
     monkeypatch.setattr(module, 'discover_input_bindings', lambda topics:
         {'/cloud': 'sensor/pointcloud2', '/pose': 'state/odom'})
     assert call(card, 'start', input_topics=['/cloud', '/pose'], input_topic='/cloud')['state'] == 'ready'
-    assert len(call(card, 'info')['topic_in']) == 2
+    assert len(call(card, 'info')['topic_in']) == 3
 
 
 def test_missing_native_runtime_prevents_false_ready(card, monkeypatch):
@@ -944,3 +944,156 @@ def test_card_passes_only_connected_camera_evidence_to_runtime_discovery(card, m
         assert plugin._session_settings['input_provenance']['clock_accuracy_validated'] is False
     finally:
         plugin.shutdown()
+
+
+def rgb_camera():
+    return {'schema': 'motus.camera/1', 'topic': '/rgb', 'format': 'image/jpeg',
+            'width': 640, 'height': 480, 'distortion_model': 'pinhole',
+            'K': [500, 0, 320, 0, 500, 240, 0, 0, 1], 'D': [0, 0, 0, 0, 0],
+            'vendor': {'frame_id': 'camera', 'clock_id': 'ros',
+                       'registration': 'registered_rectified',
+                       'timestamp_semantics': 'source_capture_mapped'}}
+
+
+def rgb_arguments(camera=None):
+    args = arguments()
+    args['input_topics'].append('/rgb')
+    args['input_bindings']['/rgb'] = 'image/jpeg'
+    if camera is not None:
+        args['camera_infos'] = {'/rgb': camera}
+    return args
+
+
+def assert_rgb_port(card, topic=None):
+    ports = call(card, 'info')['topic_in']
+    assert [port['format'] for port in ports] == [
+        'state/odom', 'sensor/pointcloud2', 'image/jpeg']
+    assert ports[2] == {'format': 'image/jpeg', 'optional': True,
+                        **({'topic': topic} if topic else {})}
+
+
+def test_optional_rgb_port_remains_visible_through_lifecycle_and_config_refresh(card, monkeypatch):
+    assert card.get_tools()[0]['topic_in'][2] == {'format': 'image/jpeg', 'optional': True}
+    assert_rgb_port(card)
+    ready(card)
+    assert_rgb_port(card)
+    assert call(card, 'config')['state'] == 'configured'
+    assert_rgb_port(card)
+    assert call(card, 'start_mapping', map_name='Visible')['state'] == 'running'
+    assert_rgb_port(card)
+    node = card._node
+    entered, release = threading.Event(), threading.Event()
+    node.before_close = lambda: (entered.set(), release.wait(5))
+    try:
+        assert call(card, 'stop')['capture_stopped'] is True
+        assert entered.wait(1)
+        assert_rgb_port(card)
+    finally:
+        release.set()
+    card.stop()
+    assert_rgb_port(card)
+    saved = call(card, 'list_maps')['maps'][0]
+    assert call(card, 'select_map', map_id=saved['id'])['state'] == 'map_selected'
+    assert_rgb_port(card)
+
+
+def test_connected_rgb_reaches_session_settings_without_changing_spatial_contract(card):
+    from test_pointcloud_slam_input import declarations
+    spatial = declarations()
+    metadata = {'/pose': dict(spatial['/o'], topic='/pose'),
+                '/cloud': dict(spatial['/c'], topic='/cloud'),
+                '/rgb': {'topic': '/rgb', 'format': 'image/jpeg'}}
+    for topic in ('/pose', '/cloud'):
+        metadata[topic]['clock'] = {'mapping': 'shared_camera_mapper', 'verified': True,
+                                   'uncertainty_ns': 10}
+    metadata['/cloud']['extrinsic']['calibrated'] = True
+    camera = rgb_camera()
+    args = {**rgb_arguments(camera), 'input_metadata': metadata}
+    assert card.dispatch('pointcloud_slam', args)['state'] == 'ready'
+    assert_rgb_port(card, '/rgb')
+    assert call(card, 'start_mapping', map_name='RGB')['state'] == 'running'
+    assert card._node.inputs == ('/pose', '/cloud')
+    assert card._session_settings['rgb_input'] == {'topic': '/rgb', 'camera_info': camera}
+    assert set(card._resolved_inputs['inputs']) == {'/pose', '/cloud'}
+    camera['vendor']['clock_id'] = 'mutated'
+    assert card._session_settings['rgb_input']['camera_info']['vendor']['clock_id'] == 'ros'
+    assert call(card, 'config')['state'] == 'configured'
+    assert_rgb_port(card, '/rgb')
+
+
+@pytest.mark.parametrize('broken', ['missing', 'intrinsics', 'clock'])
+def test_invalid_connected_rgb_falls_back_without_blocking_mapping(card, broken):
+    camera = rgb_camera()
+    if broken == 'missing':
+        camera = None
+    elif broken == 'intrinsics':
+        camera['K'] = None
+    else:
+        camera['vendor'].pop('clock_id')
+    assert card.dispatch('pointcloud_slam', rgb_arguments(camera))['state'] == 'ready'
+    info = call(card, 'info')
+    assert any(item['field'] == 'rgb_input' for item in info['input_diagnostics'])
+    assert info['rgb_input_status'] == 'fallback'
+    assert_rgb_port(card, '/rgb')
+    assert call(card, 'start_mapping', map_name='Fallback')['state'] == 'running'
+    assert card._node.inputs == ('/pose', '/cloud')
+
+
+def test_unconnected_rgb_declaration_does_not_enable_image_mode_and_restart_clears_rgb(card):
+    camera = rgb_camera()
+    assert card.dispatch('pointcloud_slam', rgb_arguments(camera))['state'] == 'ready'
+    args = arguments()
+    args['camera_infos'] = {'/rgb': camera}
+    assert card.dispatch('pointcloud_slam', args)['state'] == 'ready'
+    assert call(card, 'start_mapping', map_name='Cloud')['state'] == 'running'
+    assert 'rgb_input' not in card._session_settings
+    assert call(card, 'info')['rgb_input_status'] == 'disconnected'
+    assert_rgb_port(card)
+
+
+def test_legacy_discovery_can_prepare_the_connected_optional_rgb(card, monkeypatch):
+    monkeypatch.setattr(module, 'discover_input_bindings', lambda topics: {
+        '/pose': 'state/odom', '/cloud': 'sensor/pointcloud2', '/rgb': 'image/jpeg'})
+    args = rgb_arguments(rgb_camera())
+    del args['input_bindings']
+    assert card.dispatch('pointcloud_slam', args)['state'] == 'ready'
+    assert call(card, 'info')['input_compatibility']['mode'] == 'legacy_core'
+    assert_rgb_port(card, '/rgb')
+
+
+@pytest.mark.parametrize('extra', [
+    {'/other': 'image/jpeg'}, {'/other': 'sensor/pointcloud2'},
+    {'/other': 'image/depth-zlib'}])
+def test_optional_rgb_does_not_weaken_required_input_topology(card, extra):
+    args = rgb_arguments(rgb_camera())
+    args['input_bindings'].update(extra)
+    args['input_topics'].extend(extra)
+    assert card.dispatch('pointcloud_slam', args)['state'] == 'error'
+    assert card._node is None
+
+
+def test_unresolved_optional_rgb_diagnostic_remains_visible_through_scan_mapping_lifecycle(card):
+    diagnostic = {'field': 'rgb_input', 'port_index': 2, 'source_card_id': 'camera',
+                  'topic': '', 'reason': 'connected RGB source has no live topic'}
+    args = {**arguments(), 'optional_input_diagnostics': [diagnostic]}
+    assert card.dispatch('pointcloud_slam', args)['state'] == 'ready'
+    info = call(card, 'info')
+    assert info['rgb_input_status'] == 'fallback'
+    assert diagnostic in info['input_diagnostics']
+    assert_rgb_port(card)
+    assert call(card, 'start_mapping', map_name='Missing RGB')['state'] == 'running'
+    assert 'rgb_input' not in card._session_settings
+    assert_rgb_port(card)
+    entered, release = threading.Event(), threading.Event()
+    card._node.before_close = lambda: (entered.set(), release.wait(5))
+    try:
+        assert call(card, 'stop')['capture_stopped'] is True
+        assert entered.wait(1)
+        stopping = call(card, 'info')
+        assert stopping['rgb_input_status'] == 'fallback'
+        assert diagnostic in stopping['input_diagnostics']
+        assert_rgb_port(card)
+    finally:
+        release.set()
+    card.stop()
+    assert diagnostic in call(card, 'info')['input_diagnostics']

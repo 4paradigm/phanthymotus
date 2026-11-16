@@ -120,3 +120,21 @@ same admitted pose and exact capture stamp as its Odometry/PointCloud2 pair.
 Static camera extrinsics remain on tf_static; dynamic camera extrinsics remain
 on tf. This satisfies the native odometry lookup without inventing poses or
 using latest-time TF. No robot-facing odometry interface or clock budget changes.
+
+
+## Optional RGB appearance input
+
+The optional `image/jpeg` port is outside the two required pose/cloud spatial
+input declarations. Core routes only the connected live camera declaration.
+Its absence or invalidity never weakens the spatial input contract and never
+blocks an otherwise valid scan. RGB must carry original source-capture time
+and rectified pinhole calibration in the cloud optical frame; RGB/scan skew is
+at most 50 ms. Dynamic camera mounts require exact RGB-capture evidence.
+
+Images are optional per native frame. RGB failure or preparation timeout uses
+the same native map process with measured scan and external odometry only.
+RGB recovery does not reset the map origin. Generated feature depth comes
+only from measured points projected using the two source-time poses; holes
+remain unknown. No RGB or receipt timestamp substitutes for odometry, scan
+or capture-time mounting evidence. See README's optional RGB section for
+input freshness, bounded preparation and runtime status fields.

@@ -75,6 +75,8 @@ class PointCloudSlamPlugin:
         self._project_inputs = None
         self._topics = {}
         self._resolved_inputs = None
+        self._rgb_input = None
+        self._rgb_input_status = 'disconnected'
         self._runtime_inputs = self._runtime_provenance = None
         self._input_diagnostics = []
         self._legacy_core = True
@@ -112,6 +114,7 @@ class PointCloudSlamPlugin:
             'input_topics': {'type': 'array', 'items': {'type': 'string'}},
             'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
             'input_metadata': {'type': 'object'}, 'camera_infos': {'type': 'object'},
+            'optional_input_diagnostics': {'type': 'array', 'items': {'type': 'object'}},
             **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id')},
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': params} for k, params in _ACTIONS.items()},
@@ -124,11 +127,18 @@ class PointCloudSlamPlugin:
         return [{'name': self.PREFIX, 'type': 'processor', 'multiInstance': False,
                  'description': 'RTAB-Map point-cloud mapping with existing odometry',
                  'inputSchema': schema, 'configSchema': {'type': 'object', 'properties': props},
-                 'topic_in': [{'format': 'state/odom'}, {'format': 'sensor/pointcloud2'}],
+                 'topic_in': self._inputs(),
                  'topic_out': self._outputs()}]
 
     def start(self):
         pass  # Canvas start supplies the connected native inputs.
+
+    def _inputs(self):
+        # Stable positional ports preserve canvas wires across lifecycle refreshes.
+        topics = {fmt: topic for topic, fmt in self._topics.items()}
+        return [{'format': fmt, **({'optional': True} if fmt == 'image/jpeg' else {}),
+                 **({'topic': topics[fmt]} if fmt in topics else {})}
+                for fmt in ('state/odom', 'sensor/pointcloud2', 'image/jpeg')]
 
     def _outputs(self):
         # Stable even before project start and after it stops. The saved-map
@@ -273,7 +283,9 @@ class PointCloudSlamPlugin:
                 return {'state': 'idle', 'capture_stopped': True, 'backend': 'rtabmap',
                         'save_state': save['state'], 'save_result': save,
                         'last_recovery': deepcopy(self._last_recovery),
-                        'topic_in': [], 'topic_out': self._outputs()}
+                        'topic_in': self._inputs(), 'topic_out': self._outputs(),
+                        'rgb_input_status': self._rgb_input_status,
+                        'input_diagnostics': deepcopy(self._input_diagnostics)}
             with self._lock:
                 return {'state': 'idle' if self._capture_stop.is_set() else
                         'running' if self._node else 'save_pending' if self._pending else
@@ -288,7 +300,8 @@ class PointCloudSlamPlugin:
                             'producer_metadata_provided': self._resolved_inputs is not None},
                         'input_diagnostics': deepcopy(self._input_diagnostics),
                         'input_provenance': deepcopy(self._runtime_provenance),
-                        'topic_in': [{'topic': t, 'format': f} for t, f in self._topics.items()],
+                        'topic_in': self._inputs(),
+                        'rgb_input_status': self._rgb_input_status,
                         'topic_out': self._outputs(),
                         'input_status': self._node.status() if self._node else {'odometry': 'waiting'}}
         with self._lock:
@@ -342,14 +355,35 @@ class PointCloudSlamPlugin:
         topics = args.get('input_topics')
         legacy = 'input_bindings' not in args
         bindings = discover_input_bindings(topics) if legacy else args.get('input_bindings')
-        if (not isinstance(topics, list) or len(topics) != 2 or len(set(topics)) != 2 or
+        if (not isinstance(topics, list) or len(topics) not in (2, 3) or len(set(topics)) != len(topics) or
                 not isinstance(bindings, dict) or set(bindings) != set(topics) or
-                set(bindings.values()) != {'state/odom', 'sensor/pointcloud2'}):
-            raise ValueError('one format-resolved odometry and one PointCloud2 input required')
+                sorted(bindings.values()) != sorted(
+                    ['state/odom', 'sensor/pointcloud2'] +
+                    (['image/jpeg'] if len(topics) == 3 else []))):
+            raise ValueError('one format-resolved odometry and one PointCloud2 input required, '
+                             'with at most one optional RGB image/jpeg input')
         odom = next(t for t, f in bindings.items() if f == 'state/odom')
         self._resolved_inputs = None
         self._runtime_inputs = self._runtime_provenance = None
-        self._input_diagnostics = []
+        optional_diagnostics = args.get('optional_input_diagnostics')
+        self._input_diagnostics = [deepcopy(item) for item in optional_diagnostics
+            if isinstance(item, dict) and item.get('field') == 'rgb_input'] if isinstance(optional_diagnostics, list) else []
+        self._rgb_input = None
+        self._rgb_input_status = 'fallback' if self._input_diagnostics else 'disconnected'
+        rgb_topic = next((t for t, f in bindings.items() if f == 'image/jpeg'), None)
+        if rgb_topic is not None:
+            from .pointcloud_slam_rgb import validate_rgb_camera
+            cameras = args.get('camera_infos')
+            camera = cameras.get(rgb_topic) if isinstance(cameras, dict) else None
+            self._rgb_input = {'topic': rgb_topic, 'camera_info': deepcopy(camera)}
+            try:
+                self._rgb_input = validate_rgb_camera(camera, topic=rgb_topic)
+                self._rgb_input_status = 'ready'
+            except ValueError as error:
+                self._rgb_input_status = 'fallback'
+                self._input_diagnostics.append({
+                    'topic': rgb_topic, 'field': 'rgb_input', 'reason': str(error)})
+        spatial_bindings = {t: f for t, f in bindings.items() if f != 'image/jpeg'}
 
         if 'odom_interfaces' not in args:
             # No declaration is recoverable while an upstream producer starts.
@@ -373,20 +407,22 @@ class PointCloudSlamPlugin:
 
         if 'input_metadata' in args:
             provided = args.get('input_metadata')
+            if isinstance(provided, dict):
+                provided = {t: provided[t] for t in spatial_bindings if t in provided}
             # Core calls info() while starting an upstream camera/VO. A missing
             # producer declaration is not a contradictory claim. In particular,
             # collect_slam_inputs() may legitimately supply an empty dict when
             # both ROS topics exist but the first tracking sample does not.
             if (not isinstance(provided, dict) or
-                    any(not isinstance(provided.get(topic), dict) for topic in bindings)):
-                missing = [topic for topic in bindings if not isinstance(
+                    any(not isinstance(provided.get(topic), dict) for topic in spatial_bindings)):
+                missing = [topic for topic in spatial_bindings if not isinstance(
                     provided.get(topic) if isinstance(provided, dict) else None, dict)]
                 self._input_diagnostics.append({
                     'topic': ', '.join(missing), 'field': 'input_metadata',
                     'reason': 'waiting for producer descriptions; runtime geometry will be probed'})
             else:
                 try:
-                    self._resolved_inputs = resolve_inputs(provided, bindings)
+                    self._resolved_inputs = resolve_inputs(provided, spatial_bindings)
                     reconcile_explicit_extrinsic(self._config.get('child_from_cloud'),
                         self._resolved_inputs['settings'].get('child_from_cloud'))
                 except InputContractError as error:
@@ -474,6 +510,10 @@ class PointCloudSlamPlugin:
         session = Path(_ARCHIVE_DIR) / 'sessions' / uuid.uuid4().hex
         session.mkdir(parents=True, exist_ok=False)
         settings = deepcopy(self._settings())
+        if self._rgb_input is not None:
+            settings['rgb_input'] = deepcopy(self._rgb_input)
+        else:
+            settings.pop('rgb_input', None)
         settings['resolved_inputs'] = deepcopy((self._resolved_inputs or {}).get('inputs', {}))
         settings['input_provenance'] = deepcopy(self._runtime_provenance)
         node = None

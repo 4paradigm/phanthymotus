@@ -8,7 +8,8 @@ from copy import deepcopy
 
 POSE = 'state/odom'
 CLOUD = 'sensor/pointcloud2'
-SUPPORTED = {POSE, CLOUD}
+RGB = 'image/jpeg'
+SUPPORTED = {POSE, CLOUD, RGB}
 
 
 class SlamRoutingError(ValueError):
@@ -38,8 +39,18 @@ def _declaration(info, topic):
     return None
 
 
-def collect_slam_inputs(connections, resolved_info, topic_of_connection):
-    """Select concrete pose/cloud ports and associated producer evidence.
+def is_optional_rgb_connection(connection, input_ports):
+    """Only the consumer's declared optional slot can relax RGB routing."""
+    try:
+        index = int(connection.get('toPortIdx', 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    port = _port({'topic_out': input_ports}, index) if index >= 0 else {}
+    return port.get('format') == RGB and port.get('optional') is True
+
+
+def collect_slam_inputs(connections, resolved_info, topic_of_connection, *, input_ports=()):
+    """Select concrete pose/cloud/optional RGB ports and producer evidence.
 
     connections are only the target consumer's inbound edges. A saved connection
     format is never evidence of current type: a live info() port takes precedence.
@@ -47,6 +58,7 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
     malformed declarations are preserved or rejected, never silently dropped.
     """
     bindings, interfaces, metadata, cameras = {}, {}, {}, {}
+    optional_diagnostics = []
     for conn in connections:
         src_id = conn.get('fromCardId')
         try:
@@ -58,18 +70,44 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
         info = resolved_info.get(src_id) or {}
         port = _port(info, index)
         topic = topic_of_connection(conn)
+        if is_optional_rgb_connection(conn, input_ports):
+            reason = None
+            if not topic or not port.get('topic'):
+                reason = 'connected RGB source has no live topic; using point-cloud loop closure'
+            elif port.get('format') != RGB:
+                reason = 'connected RGB source no longer declares image/jpeg; using point-cloud loop closure'
+            elif port['topic'] != topic or (conn.get('format') and conn['format'] != RGB):
+                reason = 'connected RGB wire conflicts with its live output; using point-cloud loop closure'
+            if reason:
+                optional_diagnostics.append({'topic': topic or '', 'field': 'rgb_input',
+                    'port_index': int(conn.get('toPortIdx', 0) or 0),
+                    'source_card_id': src_id, 'reason': reason})
+                continue
         if not topic:
             raise SlamRoutingError(f'{src_id}[{index}]: unresolved source topic')
         if port.get('topic') and port['topic'] != topic:
             raise SlamRoutingError(f'{topic}: live source port topic mismatch')
         fmt = port.get('format') or conn.get('format')
         if fmt not in SUPPORTED:
-            raise SlamRoutingError(f'{topic}: expected {POSE} or {CLOUD}, got {fmt!r}')
+            raise SlamRoutingError(f'{topic}: expected {POSE}, {CLOUD} or {RGB}, got {fmt!r}')
         if port.get('format') and conn.get('format') and conn['format'] != fmt:
             raise SlamRoutingError(f'{topic}: saved wire format conflicts with live port ({fmt})')
         if topic in bindings:
             raise SlamRoutingError(f'{topic}: duplicate inbound SLAM topic')
         bindings[topic] = fmt
+
+        if fmt == RGB:
+            # Camera calibration is optional evidence from this exact live
+            # output. Cached claims without a live port cannot enable RGB.
+            if port.get('topic') == topic and port.get('format') == RGB:
+                declarations = info.get('camera_info')
+                found = [d for d in (declarations if isinstance(declarations, list) else [])
+                         if isinstance(d, dict) and d.get('topic') == topic]
+                if found:
+                    # Preserve ambiguity/malformed calibration for the optional
+                    # consumer fallback; RGB never joins the spatial contract.
+                    cameras[topic] = deepcopy(found[0] if len(found) == 1 else found)
+            continue
 
         claim = _declaration(info, topic)
         if claim is not None:
@@ -106,7 +144,8 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
                 # the same consumer-side validation as the topic-keyed form.
                 interfaces[topic] = deepcopy(info['odom_interface'])
     return {'input_bindings': bindings, 'odom_interfaces': interfaces,
-            'input_metadata': metadata, **({'camera_infos': cameras} if cameras else {})}
+            'input_metadata': metadata, **({'camera_infos': cameras} if cameras else {}),
+            **({'optional_input_diagnostics': optional_diagnostics} if optional_diagnostics else {})}
 
 
 def collect_connected_metadata(connections, resolved_info, topic_of_connection):

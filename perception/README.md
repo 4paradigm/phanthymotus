@@ -5268,3 +5268,50 @@ no packages or image build dependencies.
 Native mapping startup allows up to 30 seconds for input discovery during model
 warmup, with immediate stop-event cancellation. This startup allowance does not
 extend the receipt or measurement freshness limits on queued captures.
+
+
+### Optional RGB loop closure
+
+The SLAM card always exposes three input ports, in order: `state/odom`,
+`sensor/pointcloud2`, and optional `image/jpeg`. Existing saved cards retain their
+first two wire indices and gain the RGB port. RGB is not a visual-odometry input;
+poses still come from the connected odometry source.
+
+Without RGB, the existing scan-only native pipeline remains unchanged. With an
+RGB wire, each admitted scan uses an exact-stamped native `SensorData` envelope.
+A valid image enables appearance-based place recognition and visual initialization
+of candidate transforms; native ICP still verifies registration using measured
+scan geometry. Sparse feature depth is projected from measured scan points,
+with nearest optical Z and zero holes, never inferred or hole-filled depth.
+The native process, odometry interface and map segment do not change when RGB
+fails or recovers. Pointcloud proximity matching remains enabled.
+
+RGB must provide rectified pinhole `motus.camera/1` calibration, its original
+capture clock and the same registered optical frame as the cloud. Images are
+matched within 50 ms and rejected beyond 500 ms old or 50 ms future. A dynamic
+mount requires the exact RGB-capture certificate; cloud-time mounting is not
+substituted. The camera model includes the motion between the RGB and scan
+capture poses without changing the original RGB timestamp. No robot model,
+installation matrix or additional hardware configuration is added.
+
+Missing/unresolved RGB, invalid calibration, stale/future images, decode errors,
+missing pose/mount evidence or failed optional preparation automatically omit
+the images and continue pointcloud registration. JPEG decoding is independent;
+only one optional projection task may be in flight, and the mapping worker
+waits at most 20 ms for its own result before forwarding the scan alone. Faults
+invalidate in-flight imagery before publication. Fresh usable images resume
+image processing automatically. Calibration declarations are adopted at project
+start; fixing a missing/invalid declaration requires a project restart to adopt
+new evidence, while the current map can continue in pointcloud mode.
+
+`info().input_status.loop_closure_mode` reports `image` or `pointcloud` for the
+last forwarded frame; `rgb_input` reports availability and the fallback reason.
+`image` means usable visual evidence was forwarded, not that a loop was accepted.
+Required pointcloud/odometry checks remain strict. Neither tracking nor a detected
+loop establishes physical mapping accuracy.
+
+The standalone synthetic native check is:
+`ROS_DOMAIN_ID=149 python3 tools/rtabmap_rgb_loop_smoke.py --timeout 90`.
+It uses temporary databases and synthetic inputs only, checks native updates
+through image/fallback/recovery and saved visual evidence, and does not prove
+real-route loop closure or moving-robot accuracy.

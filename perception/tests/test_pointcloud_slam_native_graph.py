@@ -92,3 +92,12 @@ def test_graph_read_failure_still_destroys_discovery_node(monkeypatch):
     with pytest.raises(RuntimeError, match='graph unavailable'):
         ros.discover_input_bindings(['/a', '/b'])
     assert all(node.destroyed for node in _FakeNode.instances)
+
+
+def test_native_discovery_accepts_optional_rgb_without_using_topic_names(monkeypatch):
+    types = {'/a': 'sensor_msgs/msg/PointCloud2', '/b': 'std_msgs/msg/String',
+             '/c': 'sensor_msgs/msg/CompressedImage'}
+    monkeypatch.setattr(_FakeNode, 'get_publishers_info_by_topic', lambda self, topic:
+                        [NS(topic_type=types[topic])], raising=False)
+    assert ros.discover_input_bindings(['/c', '/b', '/a']) == {
+        '/a': 'sensor/pointcloud2', '/b': 'state/odom', '/c': 'image/jpeg'}

@@ -11,11 +11,14 @@ import shutil
 from types import SimpleNamespace
 import uuid
 from copy import deepcopy
+from array import array
+from concurrent.futures import Future, TimeoutError
+from contextlib import nullcontext
 
 import numpy as np
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
 from std_msgs.msg import String, UInt8MultiArray
 
 from .pointcloud_slam_rtabmap import RtabmapProcess
@@ -34,12 +37,13 @@ log = logging.getLogger(__name__)
 
 def discover_input_bindings(input_topics):
     """Resolve native publisher types, allowing one second for DDS discovery."""
-    if (not isinstance(input_topics, list) or len(input_topics) != 2 or
+    if (not isinstance(input_topics, list) or len(input_topics) not in (2, 3) or
             any(not isinstance(topic, str) or not topic.strip() for topic in input_topics) or
-            len(set(input_topics)) != 2):
-        raise ValueError('two distinct native ROS input topics required')
+            len(set(input_topics)) != len(input_topics)):
+        raise ValueError('two required native ROS topics and at most one optional RGB topic required')
     formats = {'sensor_msgs/msg/PointCloud2': 'sensor/pointcloud2',
-               'std_msgs/msg/String': 'state/odom'}
+               'std_msgs/msg/String': 'state/odom',
+               'sensor_msgs/msg/CompressedImage': 'image/jpeg'}
     node = Node('pointcloud_slam_input_discovery')
     try:
         deadline = time.monotonic() + 1.
@@ -54,8 +58,10 @@ def discover_input_bindings(input_topics):
                 if len(types) != 1 or not types <= formats.keys():
                     raise ValueError('ambiguous or unsupported native ROS input type: ' + topic)
                 bindings[topic] = formats[next(iter(types))]
-            if len(bindings) == 2:
-                if set(bindings.values()) != {'state/odom', 'sensor/pointcloud2'}:
+            if len(bindings) == len(input_topics):
+                kinds = list(bindings.values())
+                if (kinds.count('state/odom') != 1 or kinds.count('sensor/pointcloud2') != 1 or
+                        kinds.count('image/jpeg') != len(input_topics)-2):
                     raise ValueError('native ROS inputs require one String pose and one PointCloud2 cloud')
                 return bindings
             remaining = deadline - time.monotonic()
@@ -120,6 +126,16 @@ class RtabmapNode(Node):
         self._Info, self._MapGraph = Info, MapGraph
         self._settings = deepcopy(settings)
         self._settings.update((input_contract or {}).get('settings', {}))
+        self._rgb = None
+        self._rgb_mode, self._rgb_reason = 'pointcloud', None
+        self._rgb_subscription_error = None
+        self._rgb_task = None
+        if self._settings.get('rgb_input') is not None:
+            from .pointcloud_slam_rgb import RgbLoopInput
+            from rtabmap_msgs.msg import SensorData
+            self._SensorData = SensorData
+            self._rgb = RgbLoopInput(self._settings['rgb_input'], self._settings,
+                                     max_pending=self._settings.get('max_pending', 10))
         for key, default in dict(voxel_size_m=.08, max_working_nodes=3000, max_update_ms=3000,
                 max_disk_bytes=2*1024**3, reserve_bytes=1024**3,
                 preview_interval_s=1., preview_max_points=40000).items():
@@ -190,11 +206,25 @@ class RtabmapNode(Node):
                     self._input_leases.append(input_registry.acquire(topic, kind, declaration, callback))
             if input_contract:
                 self.create_subscription(String, input_contract['frame_metadata_topic'], self._cloud_metadata, _QOS)
+            if self._rgb is not None and self._rgb.camera is not None:
+                topic = self._settings['rgb_input']['topic']
+                try:
+                    if input_registry is None:
+                        self.create_subscription(CompressedImage, topic, self._rgb_image, _QOS)
+                    else:
+                        self._input_leases.append(input_registry.acquire(
+                            topic, CompressedImage, self._rgb.camera, self._rgb_image))
+                except Exception as error:
+                    self._rgb_subscription_error = 'RGB subscription unavailable: ' + str(error)
         except Exception:
             for lease in self._input_leases:
                 lease.close()
             self.destroy_node()
             raise
+
+    def _rgb_image(self, msg, context=None):
+        if not self._stopped():
+            self._rgb.image(msg, context, now_ns=self._measurement_clock_ns())
 
     def _stopped(self):
         return self._capture_stop.is_set() or self._project_stop.is_set()
@@ -229,6 +259,8 @@ class RtabmapNode(Node):
             packet = json.loads(msg.data)
             with self._lock:
                 if not self._stopped():
+                    if self._rgb is not None:
+                        self._rgb.mount(packet, self._measurement_clock_ns())
                     self._capture_clouds.mount(packet, self.stream, now=self._receipt_clock(),
                                                measurement_now_ns=self._measurement_clock_ns())
         except (TypeError, ValueError) as error:
@@ -320,6 +352,8 @@ class RtabmapNode(Node):
                     return
                 self._worker = threading.Thread(target=self._run, name='rtabmap_mapping', daemon=True)
                 self._status_worker = threading.Thread(target=self._status_loop, name='rtabmap_status', daemon=True)
+                if self._rgb is not None:
+                    self._rgb.start()
                 self._worker.start()
                 self._status_worker.start()
         finally:
@@ -369,7 +403,9 @@ class RtabmapNode(Node):
             self._segments.append(segment)
             self._active = segment
         segment['odom_pub'] = self.create_publisher(self._Odometry, namespace + '/odom', _NATIVE_QOS)
-        segment['cloud_pub'] = self.create_publisher(PointCloud2, namespace + '/scan_cloud', _NATIVE_QOS)
+        segment['cloud_pub'] = self.create_publisher(
+            self._SensorData if self._rgb is not None else PointCloud2,
+            namespace + ('/sensor_data' if self._rgb is not None else '/scan_cloud'), _NATIVE_QOS)
         segment['tf_pub'] = self.create_publisher(self._TFMessage,
             namespace + ('/tf' if self.stream.extrinsic_mode == 'dynamic' else '/tf_static'),
             _NATIVE_QOS if self.stream.extrinsic_mode == 'dynamic' else _MAP_QOS)
@@ -427,6 +463,7 @@ class RtabmapNode(Node):
         if self.stream.extrinsic_mode == 'dynamic':
             odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
+        native, rgb_generation = self._sensor_data(cloud, pose, matrix) if self._rgb is not None else (cloud, None)
         with self._lock:
             if self._stopped() or self._receipt_clock() - received > self.stream.max_age_s:
                 return
@@ -443,11 +480,121 @@ class RtabmapNode(Node):
                 segment['tf_pub'].publish(tf)
             segment['odom_tf_pub'].publish(odom_tf)
             segment['odom_pub'].publish(odom)
-            segment['cloud_pub'].publish(cloud)
+            # An optional image that expired during projection is omitted; the
+            # admitted scan and odometry continue through the same native node.
+            guard = self._rgb.publication(rgb_generation) if self._rgb is not None else nullcontext(True)
+            with guard as valid_rgb:
+                if self._rgb is not None and native.left.data and (not valid_rgb or not -50_000_000 <= (
+                        self._measurement_clock_ns() - self._stamp(native.left)) <= 500_000_000):
+                    native.left.data, native.right.data = b'', b''
+                    native.left_camera_info, native.local_transform = [], []
+                    self._rgb_mode, self._rgb_reason = 'pointcloud', 'RGB expired or invalidated before native publication'
+                segment['cloud_pub'].publish(native)
             self._forwarded += 1
             segment['forwarded'] += 1
             segment['progress'].forward(stamp,self._receipt_clock())
             self._covariance_source = 'upstream' if pose.covariance is not None else 'backend_default'
+
+    def _sensor_data(self, cloud, pose, matrix):
+        """Scan is mandatory; optional source-timed imagery may fail independently."""
+        stamp, _, points = decode_cloud(cloud, max_points=self.stream.max_cloud_points)
+        data = self._SensorData()
+        data.header = deepcopy(cloud.header)
+        # The native converter requires the scan enum to match its actual PCL
+        # layout. Carry explicit XYZ geometry without changing the input cloud.
+        data.laser_scan = deepcopy(cloud)
+        data.laser_scan.fields = [PointField(name=name, offset=i*4, datatype=7, count=1)
+                                 for i, name in enumerate(('x', 'y', 'z'))]
+        data.laser_scan.width, data.laser_scan.height = len(points), 1
+        data.laser_scan.point_step, data.laser_scan.row_step = 12, len(points)*12
+        data.laser_scan.is_bigendian, data.laser_scan.is_dense = False, True
+        data.laser_scan.data = array('B', np.ascontiguousarray(points, dtype='<f4').tobytes())
+        data.laser_scan_format, data.laser_scan_max_pts, data.laser_scan_max_range = 5, 0, 0.
+        data.laser_scan_local_transform = self._native_transform(matrix)
+        self._rgb_mode, self._rgb_reason = 'pointcloud', self._rgb_subscription_error
+        if self._rgb_subscription_error:
+            return data, None
+        key = (pose.segment_id, stamp)
+        try:
+            # At most one optional job exists. A hung decoder/projection cannot
+            # queue work or hold required scans beyond this small wait budget.
+            if self._rgb_task is None or self._rgb_task[1].done():
+                future = Future()
+                self._rgb_task = (key, future)
+
+                def prepare():
+                    try:
+                        future.set_result(self._rgb_attachment(cloud.header, stamp, pose, matrix, points))
+                    except Exception as error:
+                        future.set_exception(error)
+
+                threading.Thread(target=prepare, daemon=True, name='slam-optional-projection').start()
+            if self._rgb_task[0] != key:
+                raise TimeoutError('previous RGB preparation is still busy')
+            result = self._rgb_task[1].result(timeout=.02)
+            if result is not None:
+                left, right, info, local, generation = result
+                data.left, data.right = left, right
+                data.left_camera_info, data.local_transform = [info], [local]
+                self._rgb_mode = 'image'
+                return data, generation
+        except TimeoutError:
+            self._rgb_reason = 'optional RGB preparation exceeded 20 ms; scan forwarded without images'
+        except Exception as error:
+            self._rgb_reason = str(error)
+        return data, None
+
+    def _rgb_attachment(self, header, stamp, pose, matrix, points):
+        from sensor_msgs.msg import Image, CameraInfo
+        from .pointcloud_slam_alignment import align_pose
+        from .pointcloud_slam_rgb import project_depth
+        now_ns = self._measurement_clock_ns()
+        with self._lock:
+            rgb = self._rgb.take(stamp, now_ns)
+            if rgb is None:
+                return None
+            rgb_stamp, image, generation = rgb
+            rgb_pose = align_pose(list(self.stream._poses), rgb_stamp,
+                                  max_gap_ms=self.stream.max_gap_ms)
+            if rgb_pose.segment_id != pose.segment_id:
+                raise ValueError('RGB pose belongs to a different map segment')
+            mount = self._rgb.capture_mount(rgb_stamp, matrix, now_ns)
+            if mount is None:
+                return None
+        # Express the camera at its real capture time relative to the scan's
+        # reference pose. Neither source header is retimed to manufacture sync.
+        local = np.linalg.inv(pose_matrix(pose)) @ pose_matrix(rgb_pose) @ mount
+        depth = project_depth(points[::max(1, (len(points)+99999)//100000)],
+                              np.linalg.inv(local) @ matrix, self._rgb.K,
+                              self._rgb.width, self._rgb.height)
+        if not np.any(depth):
+            raise ValueError('measured scan has no depth in the RGB field of view')
+        left, right = Image(), Image()
+        left.header = deepcopy(header)
+        left.header.stamp.sec, left.header.stamp.nanosec = divmod(rgb_stamp, 10**9)
+        left.height, left.width = self._rgb.height, self._rgb.width
+        # ROS accepts typed uint8 arrays directly. Assigning bytes instead runs
+        # Python validation per byte, which can exhaust the optional budget.
+        left.encoding, left.step = 'bgr8', left.width*3
+        left.data = array('B', image.tobytes())
+        right.header = deepcopy(header)
+        right.height, right.width = depth.shape
+        right.encoding, right.step = '32FC1', right.width*4
+        right.data = array('B', np.asarray(depth, dtype='<f4').tobytes())
+        info = CameraInfo()
+        info.header, info.height, info.width = deepcopy(left.header), left.height, left.width
+        info.distortion_model, info.d = 'plumb_bob', [0.]*5
+        info.k, info.r = self._rgb.K.reshape(-1).tolist(), np.eye(3).reshape(-1).tolist()
+        info.p = np.column_stack((self._rgb.K, np.zeros(3))).reshape(-1).tolist()
+        return left, right, info, self._native_transform(local), generation
+
+    def _native_transform(self, matrix):
+        transform = self._TransformStamped().transform
+        for key, value in zip(('x', 'y', 'z'), matrix[:3, 3]):
+            setattr(transform.translation, key, float(value))
+        for key, value in zip(('x', 'y', 'z', 'w'), _quaternion(matrix)):
+            setattr(transform.rotation, key, float(value))
+        return transform
 
     def _run(self):
         while not self._worker_stop.is_set() and not self._stopped():
@@ -601,7 +748,11 @@ class RtabmapNode(Node):
             segment = active['segment_id'] if active else None
             rejections = dict(self._native_rejections)
             streaks = dict(self._native_rejection_streaks)
-        return dict(health, backend='rtabmap', state='error' if self._runtime_error else
+        rgb_info = self._rgb.info() if self._rgb is not None else {'state': 'disconnected', 'reason': None}
+        if self._rgb_mode == 'pointcloud' and self._rgb_reason:
+            rgb_info.update(state='fallback', reason=self._rgb_reason)
+        return dict(health, backend='rtabmap', loop_closure_mode=self._rgb_mode, rgb_input=rgb_info,
+            state='error' if self._runtime_error else
             'storage_limit' if self._stop_reason else 'stopped' if stopped else health['odometry'],
             capture_stopped=stopped, stop_reason=self._stop_reason,
             accepted_clouds=health['admitted_frames'], forwarded_clouds=forwarded,
@@ -626,6 +777,8 @@ class RtabmapNode(Node):
 
     def close(self):
         self.freeze_capture()
+        if self._rgb is not None:
+            self._rgb.close()
         for lease in self._input_leases:
             lease.close()
         self._worker_stop.set(); self._status_stop.set(); self._wake.set()
