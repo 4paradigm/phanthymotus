@@ -130,16 +130,48 @@ def load_all() -> None:
     global _loaded
     cutoff = time.time() - _FIRE_KEEP_S
     with _db() as conn:
-        rows = conn.execute('SELECT data FROM schedules').fetchall()
+        rows = conn.execute('SELECT id, data FROM schedules').fetchall()
         fires = conn.execute('SELECT ts FROM schedule_fires WHERE ts >= ?', (cutoff,)).fetchall()
     _schedules.clear()
-    for (data,) in rows:
-        d = json.loads(data)
-        s = Schedule(**{k: v for k, v in d.items() if k in Schedule.__dataclass_fields__})
+    for row_id, data in rows:
+        # 每行单独读：一行坏了（JSON 写坏、字段不对）只影响它自己
+        try:
+            d = json.loads(data)
+            s = Schedule(**{k: v for k, v in d.items() if k in Schedule.__dataclass_fields__})
+            if s.id != row_id:
+                raise ValueError(f'id 不一致：{s.id!r}')
+        except Exception as e:
+            print(f'[schedule] broken row {row_id!r}: {e}; kept as a disabled placeholder')
+            s = _placeholder(row_id, data)
+            try:
+                _persist(s)
+            except Exception as e2:
+                print(f'[schedule] failed to save placeholder {row_id!r}: {e2}')
         _schedules[s.id] = s
     # 库里的是已发出的；内存里可能还有正在发、占着名额的，合在一起
     _fire_times[:] = sorted({t for (t,) in fires} | set(_fire_times))
     _loaded = True
+
+
+def _placeholder(row_id: str, raw) -> Schedule:
+    """读不出来的行：换成一条停用的占位记录（网页上能看到、能删），原始内容留在文字里方便排查。"""
+    return Schedule(id=str(row_id), name=f'数据损坏 {row_id}'[:40], text=f'原始数据：{str(raw)[:400]}',
+                    kind='once', at='2000-01-01 00:00', enabled=False)
+
+
+def _check_timing(s: Schedule) -> None:
+    """库里读出来的定时，时间设置还能不能用（类型、时区、cron / 时间）；不能用抛错。"""
+    if s.kind not in KINDS:
+        raise ValueError(f'未知类型 {s.kind!r}')
+    tz = scheduler.get_tz(s.tz)
+    if s.kind == 'once':
+        parse_at(s.at, s.tz)
+    else:
+        scheduler.parse_cron(s.cron)
+        try:
+            scheduler._next_run(s.cron, time.time(), tz)
+        except RuntimeError:
+            raise ValueError(f'cron {s.cron!r} 两年内不会触发') from None
 
 
 def _ensure_loaded() -> None:
@@ -579,7 +611,8 @@ def _register(s: Schedule) -> None:
 def start_all() -> int:
     """启动时调用（scheduler.run）：从库里读出来，注册所有启用的定时任务。
 
-    每条单独兜错：库里有一条坏数据（比如 at 写坏了）只跳过它，不能拖垮其他定时。
+    每条单独兜错：读不出来的行换成停用的占位记录（load_all）；时间设置写坏的（时区、cron、
+    时间）在注册前校验出来、停用并落盘。都只影响它自己，不拖垮其他定时。
     """
     load_all()
     n = 0
@@ -587,6 +620,7 @@ def start_all() -> int:
         if not s.enabled:
             continue
         try:
+            _check_timing(s)           # 注册之前先校验：写坏的时区 / cron 不能算“启动了”
             if s.kind == 'once' and parse_at(s.at, s.tz) <= time.time():
                 s.enabled = False      # 关机期间错过的一次性定时：不补发，标记停用
                 _persist(s)

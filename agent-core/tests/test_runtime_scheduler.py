@@ -14,6 +14,7 @@ Run: cd agent-core && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/t
 import asyncio
 import datetime
 import importlib.util
+import json
 import os
 import pathlib
 import sqlite3
@@ -61,6 +62,17 @@ class _FakeJobs:
 
 class _Base(unittest.TestCase):
     def setUp(self):
+        # 全套跑时别的测试文件可能把 config.main 换成普通 dict 且不还原：这里换回 ConfigDB，
+        # 结束后恢复原样；scheduler_settings 和 scheduler 里排队的调用也都还原，不影响别的测试。
+        if not isinstance(config.main, config.ConfigDB):
+            saved_main = config.main
+            config.main = config.ConfigDB()
+            self.addCleanup(setattr, config, 'main', saved_main)
+        saved_settings = config.main.get('scheduler_settings')
+        self.addCleanup(lambda: config.main.__setitem__(
+            'scheduler_settings', saved_settings if saved_settings is not None
+            else dict(schedule_store.DEFAULT_SETTINGS)))
+        self.addCleanup(scheduler._pending.clear)
         schedule_store.clear_all() if schedule_store._loaded else None
         with schedule_store._get_conn() as conn:
             conn.execute('DELETE FROM schedules')
@@ -1176,6 +1188,75 @@ class TestSeventhReview(_Base):
         self.assertTrue(saved['model_tools_enabled'])
         self.assertEqual(config.ConfigDB()['scheduler_settings']['max_fires_per_day'], 30,
                          '新的 ConfigDB 实例（相当于重启后）读到的也是新值')
+
+
+class TestEighthReview(_Base):
+    """PR #398 第八轮：启动恢复逐行隔离（坏 JSON、写坏的 cron / 时区都只停用它自己），
+    测试不依赖全局状态的先后，start.py 的接线。"""
+
+    def _raw_row(self, row_id, data):
+        with schedule_store._get_conn() as conn:
+            conn.execute('INSERT OR REPLACE INTO schedules (id, data) VALUES (?, ?)', (row_id, data))
+            conn.commit()
+
+    def test_malformed_rows_do_not_block_startup(self):
+        with _FakeJobs() as fj:
+            good = schedule_store.create(name='好的', text='x', cron='0 8 * * *')
+            self._raw_row('badjson', '{不是 JSON')
+            self._raw_row('badlist', '[1, 2]')
+            self._raw_row('badfield', json.dumps({'id': '和行号对不上', 'name': 'x'}))
+            schedule_store._schedules.clear(); fj.jobs.clear()
+            self.assertEqual(schedule_store.start_all(), 1)
+            self.assertEqual(list(fj.jobs), [f'sched:{good.id}'])
+        for rid in ('badjson', 'badlist', 'badfield'):
+            ph = schedule_store._schedules[rid]
+            self.assertFalse(ph.enabled)
+            self.assertIn('数据损坏', ph.name)
+        schedule_store._schedules.clear()
+        schedule_store.load_all()
+        self.assertFalse(schedule_store._schedules['badjson'].enabled, '占位记录已落盘')
+        self.assertIn('不是 JSON', schedule_store._schedules['badjson'].text, '原始内容留着排查')
+        with _FakeJobs():
+            self.assertTrue(schedule_store.delete('badjson'), '占位记录能删')
+
+    def test_invalid_cron_or_tz_is_disabled_before_registration(self):
+        with _FakeJobs() as fj:
+            good = schedule_store.create(name='好的', text='x', cron='0 8 * * *')
+            for bad in (schedule_store.Schedule(name='坏cron', text='x', cron='61 8 * * *'),
+                        schedule_store.Schedule(name='坏时区', text='x', cron='0 8 * * *', tz='Mars/Olympus'),
+                        schedule_store.Schedule(name='不会触发', text='x', cron='0 8 30 2 *'),
+                        schedule_store.Schedule(name='坏类型', text='x', kind='weekly', cron='0 8 * * *')):
+                schedule_store._persist(bad)
+            schedule_store._schedules.clear(); fj.jobs.clear()
+            self.assertEqual(schedule_store.start_all(), 1, '坏的不算启动了')
+            self.assertEqual(list(fj.jobs), [f'sched:{good.id}'])
+        schedule_store._schedules.clear()
+        schedule_store.load_all()
+        for name in ('坏cron', '坏时区', '不会触发', '坏类型'):
+            self.assertFalse(schedule_store.find(name).enabled, name + ' 停用已落盘')
+        schedule_store.update_settings(max_schedules=5)      # 停用后不再挡改设置
+
+    def test_tests_survive_config_main_replaced_by_dict(self):
+        """模拟 test_peer_name_sync.py：把 config.main 换成 dict 不还原，下一个用例照样隔离。"""
+        saved = config.main
+        config.main = {'peer_settings': {'display_name': 'TestBot'}}
+        try:
+            other = TestSeventhReview('test_settings_are_written_to_sqlite')
+            result = unittest.TestResult()
+            other.run(result)
+            self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
+            self.assertEqual(config.main, {'peer_settings': {'display_name': 'TestBot'}}, '跑完还原成原来的对象')
+        finally:
+            config.main = saved
+
+    def test_start_py_wiring(self):
+        """start.py 导入时会拉起整个服务，单测里不导入它，这里核对接线：定时路由挂在 app_api 上，
+        app_api 挂在 /api，auth 中间件装在外层 app 上（对所有 /api/* 生效）。
+        路由本身 + 同一个中间件的行为见 TestApiRoutes。"""
+        src = (_SRC / 'start.py').read_text(encoding='utf-8')
+        self.assertIn('app_api.include_router(api.schedules.router)', src)
+        self.assertIn("app.mount('/api', app_api)", src)
+        self.assertIn("app.middleware('http')(auth.auth_middleware)", src)
 
 
 if __name__ == '__main__':

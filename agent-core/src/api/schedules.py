@@ -82,7 +82,7 @@ def get_settings():
 @router.patch('/settings')
 def patch_settings(body: SettingsBody):
     try:
-        st = schedule_store.update_settings(**body.dict())
+        st = schedule_store.update_settings(**body.model_dump())
     except ValueError as e:
         return {'ok': False, 'error': str(e)}
     except sqlite3.Error as e:
@@ -103,7 +103,7 @@ def preview(body: PreviewBody):
 
 @router.post('')
 def create_schedule(body: ScheduleBody):
-    data = {k: v for k, v in body.dict().items() if v is not None}
+    data = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
         s = schedule_store.create(created_by='web', **data)
     except (ValueError, TypeError) as e:
@@ -115,7 +115,7 @@ def create_schedule(body: ScheduleBody):
 
 @router.patch('/{sid}')
 def update_schedule(sid: str, body: ScheduleBody):
-    data = {k: v for k, v in body.dict().items() if v is not None}
+    data = {k: v for k, v in body.model_dump().items() if v is not None}
     if not data:
         return {'ok': False, 'error': '没有要改的内容'}
     try:
