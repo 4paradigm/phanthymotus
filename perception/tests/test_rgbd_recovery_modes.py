@@ -154,64 +154,38 @@ def degraded_session(card, args, now, seconds, monkeypatch, *, fusion=False):
 
 
 @pytest.mark.parametrize('fusion', [False, True])
-def test_sustained_recovered_source_restores_requested_mode_only_in_new_segment(
-        recovery, monkeypatch, fusion):
-    card, args, now, seconds = recovery
-    visual = degraded_session(card, args, now, seconds, monkeypatch, fusion=fusion)
-    segment = visual.segment
-    # One good sample is insufficient, even when the cooldown has elapsed.
+def test_formatted_recovered_source_restores_requested_mode_in_new_segment(recovery,monkeypatch,fusion):
+    card,args,now,seconds=recovery
+    visual=degraded_session(card,args,now,seconds,monkeypatch,fusion=fusion)
+    segment=visual.segment
     for _ in range(201):
-        seconds[0] += .1
-        now[0] += 100_000_000
-        images(visual, now[0])
-        feed(visual, now, now[0])
-    first = now[0]
-    send_imu(visual, now, seconds, first)
-    images(visual, now[0]); card._recover()
-    assert card.instances['one'][0] is visual
-    assert visual.info()['auxiliary_recovery']['status'] == 'warming'
-    for k in range(1, 32):
-        seconds[0] += .1
-        send_imu(visual, now, seconds, first+k*100_000_000)
-        images(visual, now[0])
-    visual.process.returncode = 0
-    card._recover()
-    restored = card.instances['one'][0]
-    restored.process.returncode = 0
-    assert restored is not visual and restored.segment != segment
+        seconds[0]+=.1;now[0]+=100_000_000
+        images(visual,now[0]);feed(visual,now,now[0])
+    send_imu(visual,now,seconds,now[0])
+    assert visual.info()['auxiliary_recovery']['status']=='ready'
+    visual.process.returncode=0
+    images(visual,now[0]);card._recover()
+    restored=card.instances['one'][0];restored.process.returncode=0
+    assert restored is not visual and restored.segment!=segment
     assert restored.imu is not None and not restored.imu.history
-    assert bool(restored.fusion) is fusion
-    assert restored.info()['mode']['degraded'] is False
-    transition = card.dispatch('rgbd_odometry', dict(action='info', instance_id='one'))['recovery']['transitions'][-1]
-    assert transition['action'] == 'restore_assistance'
-    assert transition['previous_segment'] == segment
+    assert bool(restored.fusion) is fusion and not restored.info()['mode']['degraded']
 
 
-def test_probe_requires_real_time_continuity_and_complete_compensation_calibration():
+def test_probe_requires_complete_numeric_translations_without_dwell_or_metadata_policy():
     from plugins.rgbd_recovery import AuxiliaryHealthProbe
-    probe = AuxiliaryHealthProbe('camera_optical', 'camera-global', require_translation=True)
-    start = 1_000_000_000
-    # A rapidly drained backlog cannot manufacture three seconds of health.
-    for k in range(31):
-        stamp = start+k*100_000_000
-        probe.observe(imu_packet(stamp), stamp+1_000_000, 10.)
-    assert probe.info(start+3_001_000_000, 10.)['status'] != 'ready'
-    # A source epoch change restarts the dwell, and a stale packet does not heal it.
-    probe.observe(imu_packet(start+3_100_000_000, epoch='boot2'), start+3_101_000_000, 13.1)
-    assert probe.info(start+3_101_000_000, 13.1)['healthy_for_s'] == 0.
-    probe.observe(imu_packet(start+3_200_000_000), start+4_000_000_000, 14.)
-    assert probe.info(start+4_000_000_000, 14.)['status'] != 'ready'
-    for k in range(40):
-        stamp = start+4_100_000_000+k*100_000_000
-        broken = imu_packet(stamp)
-        broken.pop('camera_from_accel_translation')
-        probe.observe(broken, stamp+1_000_000, 14.1+k*.1)
-    info = probe.info(stamp+1_000_000, 18.)
-    assert info['status'] != 'ready' and 'translation' in info['reason']
-    assert info['buffered_samples'] <= 512
+    probe=AuxiliaryHealthProbe('camera_optical','camera-global',require_translation=True)
+    start=1_000_000_000
+    probe.observe(imu_packet(start),start+1_000_000,10.)
+    assert probe.info(start+3_001_000_000,10.)['status']=='ready'
+    probe.observe(imu_packet(start+3_100_000_000,epoch='boot2'),start+3_101_000_000,13.1)
+    assert probe.info(start+3_101_000_000,13.1)['status']=='ready'
+    broken=imu_packet(start+3_200_000_000);broken.pop('camera_from_accel_translation')
+    probe.observe(broken,start+4_000_000_000,14.)
+    info=probe.info(start+4_000_000_000,14.)
+    assert info['status']!='ready' and 'translation' in info['reason']
 
 
-def test_probe_rejects_wrong_frame_or_clock_without_stopping_visual(recovery, monkeypatch):
+def test_probe_treats_frame_and_clock_names_as_producer_metadata(recovery, monkeypatch):
     card, args, now, seconds = recovery
     visual = degraded_session(card, args, now, seconds, monkeypatch)
     for k in range(40):
@@ -222,8 +196,7 @@ def test_probe_rejects_wrong_frame_or_clock_without_stopping_visual(recovery, mo
         images(visual, now[0])
         feed(visual, now, now[0])
     assert visual.gate.state == 'tracking'
-    assert visual.info()['auxiliary_recovery']['status'] != 'ready'
-    assert 'clock' in visual.info()['auxiliary_recovery']['reason']
+    assert visual.info()['auxiliary_recovery']['status']=='ready'
     assert card.instances['one'][0] is visual
 
 
@@ -310,7 +283,7 @@ def test_failed_restore_keeps_visual_output_and_waits_twenty_seconds(recovery, m
     assert card.recovery['one']['restoration_attempts'] == 2
 
 
-def test_epoch_change_needs_new_sustained_evidence_and_old_epoch_cannot_rejoin():
+def test_epoch_labels_do_not_clear_recovery_format_evidence():
     from plugins.rgbd_recovery import AuxiliaryHealthProbe
     probe = AuxiliaryHealthProbe('camera_optical', 'camera-global')
     for k in range(70):
@@ -319,14 +292,14 @@ def test_epoch_change_needs_new_sustained_evidence_and_old_epoch_cannot_rejoin()
     assert probe.info(stamp+1_000_000, 13.45)['status'] == 'ready'
     stamp += 50_000_000
     probe.observe(imu_packet(stamp, epoch='boot2'), stamp+1_000_000, 13.5)
-    assert probe.info(stamp+1_000_000, 13.5)['healthy_for_s'] == 0.
+    assert probe.info(stamp+1_000_000,13.5)['status']=='ready'
     for k in range(1, 71):
         current = stamp+k*50_000_000
         probe.observe(imu_packet(current, epoch='boot2'), current+1_000_000, 13.5+k*.05)
     info = probe.info(current+1_000_000, 17.)
     assert info['status'] == 'ready' and info['source']['epoch'] == 'boot2'
     probe.observe(imu_packet(current+50_000_000), current+51_000_000, 17.05)
-    assert probe.info(current+51_000_000, 17.05)['status'] != 'ready'
+    assert probe.info(current+51_000_000,17.05)['status']=='ready'
 
 
 def test_visual_restart_does_not_accidentally_reenable_failed_assistance(recovery, monkeypatch):
@@ -343,7 +316,7 @@ def test_visual_restart_does_not_accidentally_reenable_failed_assistance(recover
     assert new.info()['mode']['degraded']
 
 
-def test_degraded_probe_overflow_resets_health_without_retiring_visual(recovery, monkeypatch):
+def test_degraded_probe_overflow_keeps_retained_format_evidence(recovery, monkeypatch):
     card, args, now, seconds = recovery
     visual = degraded_session(card, args, now, seconds, monkeypatch)
     for _ in range(31):
@@ -355,7 +328,7 @@ def test_degraded_probe_overflow_resets_health_without_retiring_visual(recovery,
     with visual.lock:
         visual._drain_imu()
     assert visual.gate.state == 'tracking'
-    assert visual.info()['auxiliary_recovery']['status'] != 'ready'
+    assert visual.info()['auxiliary_recovery']['status']=='ready'
     assert not visual.imu_overflow
     for _ in range(32):
         healthy_visual_tick(visual, now, seconds)

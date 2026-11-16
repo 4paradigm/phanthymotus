@@ -236,28 +236,26 @@ A changed mount identity/epoch or invalid packet retires body evidence until
 the card is restarted; it does not reset the visual/IMU estimator. Hardware
 acceptance must verify the installed TF tree, domain, timestamps and calibration.
 
-Camera IMU assistance is selected automatically by wiring: connect the source's
+IMU assistance is selected automatically by wiring: connect the source's
 `sensor/imu` port alongside the two RGB-D ports to enable it; connect only the
 two image ports for pure visual odometry. Legacy `imu_assisted` settings are ignored.
 ESKF remains an independent option; without an IMU connection, saved ESKF/depth
 assistance options are inactive and the session uses pure visual odometry. The third port remains the
-existing JSON `std_msgs/String` transport; `motus.imu/1` packets carry raw SI
-vectors, capture timestamps, shared RGB-D clock identity and actual factory/TF
-rotations into the camera axes. No Core metadata routing change is needed.
-`camera_info` declares only the two image inputs; the IMU schema, frames, units,
-clock and calibration are validated on every packet before it can contribute.
-Starting a session therefore does not certify an arbitrary third topic as a valid
-IMU source: assistance remains uninitialized until valid packets arrive. Requiring
-an IMU camera declaration would reject the existing driver contract.
+existing JSON `std_msgs/String` transport. The [IMU data standard](docs/rgbd-imu.md)
+defines its numeric vectors, timestamps, rotations and full-fusion translations.
+`camera_info` declares only the two images. A connected IMU is admitted by its
+numeric packet format; source, frame/clock names, unit labels and calibration
+metadata are diagnostic, with the physical conventions supplied by the producer.
+No Core metadata routing change is needed.
 
-In the default attitude-only mode, the consumer initializes tilt from plausible gravity, integrates source-timed
-gyro rotations and corrects tilt while acceleration is plausible. Heading is
-relative, covariance/accuracy are not certified, and acceleration is never
-integrated into translation. It forwards private native `sensor_msgs/Imu` to
-RTAB-Map and waits for IMU coverage of each image. Stale/reset timestamps,
-changed source epochs/calibration and invalid geometry end the session segment;
-in this attitude-prior mode the native estimator itself consumes the IMU, so
-there is no automatic fallback to unassisted tracking after enabling IMU.
+In the default attitude-only mode, the consumer initializes tilt from a nonzero
+acceleration direction, or starts a relative identity orientation when that
+vector is zero. It integrates the supplied numerical time differences and gyro
+rotations, with tilt correction from nonzero acceleration. Heading is relative,
+covariance/accuracy are not certified, and acceleration is never integrated into
+translation in this mode. It forwards private native `sensor_msgs/Imu` to RTAB-Map.
+Interpolation uses available numeric orientation brackets; wall age, time labels,
+source epochs and calibration descriptions do not invalidate them.
 `info().imu_assistance` and pose provenance distinguish the selected mode and
 its source/health. The pinned RTAB-Map core ignores orientation quaternions
 whose xyz components are exactly zero (including a valid identity quaternion).
@@ -334,7 +332,7 @@ on each deployment; offline tests do not establish physical accuracy.
 
 ### Optional short-term ESKF and depth assistance
 
-Connect a calibrated IMU input with measurement timestamps, then enable the two ESKF/geometry options in the same `config` or `start` action:
+Connect an IMU input with the full [numeric packet format](docs/rgbd-imu.md), then enable the two ESKF/geometry options in the same `config` or `start` action:
 
 ```json
 {"action":"config","instance_id":"card-one",
@@ -351,25 +349,16 @@ In this mode the native visual estimator receives no IMU prior: the ESKF owns
 raw inertial information once. Its 15 error states cover position, velocity,
 attitude, gyro bias and accelerometer bias. Position is integrated at the
 accelerometer origin and transformed back to the camera origin using the
-actual installation offset. Packets must include finite calibrated
-`camera_from_gyro_translation`, `camera_from_accel_translation` (metres,
-sensor origins in camera coordinates), and `translation_source`. Older
-rotation-only sources continue to support attitude-only mode, but cannot
-start translational compensation. Tianyi obtains full capture-time TF;
-G1 obtains RealSense SDK factory extrinsics without another camera owner.
-Missing motion hardware/calibration is reported, never replaced by zero.
-
-Rigidly mounted body IMUs may supply the same generic `motus.imu/1` interface.
-`rotation_source: configured_fixed_mount` requires a nonempty `calibration_id`
-and proper sensor-to-camera rotation matrices. Explicit `read_completion`
-timestamps are accepted for attitude only with an unverified
-`host_wall_read_completion` mapping (`source_clock: ros_wall`, zero offset).
-Source identity, timing semantics and calibration changes retire the attitude
-segment. Diagnostics retain the timestamp semantics and calibration identity;
-these readings do not become hardware capture measurements. Such inputs must
-keep all short-term/inertial translation options disabled. ESKF rejects reading
-timestamps even if translation fields are supplied. This is a source capability
-contract, with no robot-name routing. Bumi uses this body-IMU attitude path.
+actual installation offset. Packets must include the two finite numeric
+sensor-origin translations in metres in addition to the attitude format.
+The [IMU data standard](docs/rgbd-imu.md) defines vector dimensions, SI units,
+rotation direction, translation origins, timestamp alignment and metadata.
+These physical conventions belong to the provider; runtime admission checks
+numeric structure rather than source names, calibration methods or time labels.
+Read-completion, receipt and custom timestamp sources can use full fusion.
+Source/calibration/clock descriptions are retained as diagnostics and do not
+independently stop an estimator. Rotation-only packets still need the missing
+numeric translations before they have the full ESKF input format.
 
 Initialization waits for at least 0.5 s of visually observed near-stationary
 position **and orientation**, low angular speed and stable gravity magnitude.
@@ -414,7 +403,7 @@ holds the last 16 frames' capture/arrival/processing times, latency, predicted
 and corrected sigma, visual outcome and rejection reason; each odometry sample
 carries only `last_frame`.
 
-If the ESKF stops (stale/invalid IMU, uncertainty, initialization timeout),
+If the ESKF stops (malformed numeric IMU data, uncertainty, initialization timeout),
 the independent native visual estimate — which never consumed IMU in this
 mode — continues as an explicit `visual_only` fallback (`vendor.fallback`,
 `vendor.fusion.status=lost`, tracking `reason` says so, `info().fallback`).
@@ -425,9 +414,9 @@ for supervised new-segment recovery. After a geometry-only tracking capture
 there is no same-capture native visual comparison, so the old segment is
 retired rather than assuming zero offset. Fallback poses obey the same
 three-estimate, continuity and bounded pause-declaration rules. Waiting longer
-for visual evidence does not extend inertial prediction or IMU freshness. The ESKF is not
+for visual evidence does not extend inertial prediction. The ESKF is not
 restarted inside that segment; a later new segment retries it. Predictions
-are never published as tracking and a stale IMU is never fused again.
+are never published as tracking. IMU age and source labels are not admission gates.
 Camera frame/segment, capture-clock and capture-queue faults end the segment
 instead of entering visual-only fallback.
 
@@ -451,23 +440,14 @@ retain the bundle executor. Native depth PNG messages use ROS byte arrays
 to avoid per-byte setter validation; encoding and capture headers are retained.
 These changes add no dependencies.
 
-IMU ingress uses a separate callback group and a bounded 100-packet FIFO so
-visual processing does not discard capture intervals. Filter updates remain
-serialized, processing one snapshot per pass. The 750 ms consumer freshness check runs
-when each packet is consumed;
-queue overflow retires the segment. Each accepted visual correction refreshes
-the correction timeout during recovery, while mapping still requires three
-consistent visual observations.
-This permits transport delay without replacing capture timestamps. The IMU
-inter-sample gap limit is 150 ms: deployed traces contained 100.096–110.106 ms
-intervals that retired the former 100 ms filter. ESKF propagation subdivides
-accepted gaps into steps no longer than 100 ms, using interpolation between
-actual samples and accumulating process uncertainty. Attitude-assisted image
-processing waits at most 150 ms for actual IMU coverage instead of immediately
-discarding an image that arrives first; its bounded image queue is unchanged.
-The 20 ms gyro/accel skew, future-clock and identity checks remain unchanged;
-driver-side freshness limits are independent. These are engineering tolerances,
-not a physical accuracy guarantee, and do not extend missing IMU coverage.
+IMU ingress uses a separate callback group and a bounded 100-packet FIFO.
+Filter updates process one snapshot per pass. Overflow retains the newest
+queued packets without retiring a source solely for overflow. IMU wall age,
+inter-sample gap, gyro/accel skew and provenance labels are not admission gates.
+Numerical timestamp values are preserved. ESKF interpolation subdivides large
+integration intervals into steps no longer than 100 ms. Attitude-assisted image
+processing still waits boundedly for the numeric samples needed for interpolation.
+See the [IMU data standard](docs/rgbd-imu.md) for provider responsibilities.
 
 The short-outage offline validation target is 0.5 s. A hard 1 s visual
 correction timeout ends the segment; rejection/geometry cannot extend it. The
@@ -508,7 +488,7 @@ policy, not actual robot precision or native camera tracking. On 2026-11-12,
 an isolated Tianyi F2F optical-flow session with ESKF and depth assistance
 enabled ran for 600 seconds with active IMU, 59,920 consumed motion samples
 and zero native lost reports. Maximum IMU consumption age was 266 ms against
-the unchanged 500 ms limit. There were 5,075 tracking poses against 5,821
+the then-configured 500 ms limit (historical validation, not the current format-only admission policy). There were 5,075 tracking poses against 5,821
 native reports; intermittent coasting/recovering remained. No depth registration
 was attempted in this static scene, so this does not validate geometric
 recovery, motion accuracy or uninterrupted SLAM. The host camera timestamp
@@ -5201,10 +5181,10 @@ the existing intrinsics scaling. Unexplained crops, different optics or distorte
 cross-camera geometry remain unsupported. Native output retains its exact
 chosen RGB/depth timestamp; the two original observations remain separate.
 
-IMU timing/extrinsics and physical prediction limits are unchanged. Receipt-only
-images cannot provide IMU acquisition intervals: the session reports assistance
-unavailable and runs explicit visual mode; a change of timing basis starts a new
-segment. Dynamic body mapping still needs exact capture-associated mount evidence.
+Receipt-based image timing preserves the selected IMU/fusion mode. The IMU
+consumer accepts the documented numeric format without source-time or clock-name
+admission gates; the provider supplies aligned values. A change of image timing
+basis still starts a new segment for its observation context. Dynamic body mapping still needs exact capture-associated mount evidence.
 Receipt-only data without that identity cannot use a latest/guessed transform.
 
 Chassis odometry may declare `chassis_clock_request_interval_slew`, version `2`,

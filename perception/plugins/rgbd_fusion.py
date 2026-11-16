@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import numpy as np
 
-from .rgbd_imu import ImuAttitude, _vector, rotation_from_quaternion
+from .rgbd_imu import ImuAttitude, _vector, rotation_from_quaternion, translation_extrinsics
 from .rgbd_odometry_contract import make_sample
 
 
@@ -260,7 +260,7 @@ class ShortTermFusion:
         self.samples = deque(maxlen=1024)
         self.warmup = deque(maxlen=30)
         self.filter = None
-        self.lever = self.translations = self.source_provenance = None
+        self.lever = self.translations = None
         self.geometry = DepthRegistration(K) if depth_geometry else None
         # Native association may use the same IMU even when a particular frame
         # has no hint. Keep its unknown correlation conservative for the segment.
@@ -290,21 +290,12 @@ class ShortTermFusion:
         if self.state == 'lost':
             return
         try:
-            if packet.get('stamp_source') != 'measurement':
-                raise ValueError('capture measurement time is required for inertial translation compensation')
-            if packet.get('translation_source') not in ('tf', 'sdk_factory_extrinsics'):
-                raise ValueError('calibrated IMU translation is required for compensation')
-            translations = np.r_[_vector(packet.get('camera_from_gyro_translation')),
-                                  _vector(packet.get('camera_from_accel_translation'))]
-            if self.translations is not None and not np.allclose(translations, self.translations, atol=1e-7, rtol=0):
-                raise ValueError('IMU translation changed; restart segment')
-            provenance = (packet['translation_source'], deepcopy(packet.get('clock_mapping')))
-            if self.source_provenance is not None and provenance != self.source_provenance:
-                raise ValueError('IMU calibration source or clock mapping changed; restart segment')
+            translations = translation_extrinsics(packet)
             sample = self.imu.observe(packet, now_ns)
-            self.source_provenance = provenance
             self.translations = translations
             self.lever = translations[3:].copy()
+            if self.filter is not None:
+                self.filter.lever = self.lever.copy()
             if sample is not None:
                 self.samples.append((sample['stamp_ns'], np.array(sample['angular_velocity']),
                                      np.array(sample['linear_acceleration'])))

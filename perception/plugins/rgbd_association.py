@@ -5,8 +5,7 @@ from pathlib import Path
 def association_enabled(calibration):
     return (calibration.get('inertial_association') is True and
             calibration.get('short_term_compensation') is True and
-            bool(calibration.get('imu_topic')) and
-            calibration.get('time_basis') != 'receipt_estimated')
+            bool(calibration.get('imu_topic')))
 
 
 def require_rotation_hint_runtime(executable):
@@ -44,8 +43,8 @@ class RotationHints:
             return False
         if not available:
             return self._skip('assisted mode is unavailable')
-        if attitude is None or attitude.frame != self.frame or attitude.clock != self.clock:
-            return self._skip('IMU capture frame or clock is unavailable')
+        if attitude is None:
+            return self._skip('IMU orientation is unavailable')
         quaternion = attitude.orientation_at(stamp_ns, now_ns)
         if quaternion is None:
             return self._skip('capture has no valid IMU orientation bracket')

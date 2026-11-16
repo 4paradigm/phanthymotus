@@ -378,8 +378,6 @@ def observation_calibration(calibration, ingress_clock_id):
     result = dict(calibration)
     if result.get('time_basis') == 'receipt_estimated':
         result['clock_id'] = ingress_clock_id
-        result = visual_calibration(result)
-        result['short_term_compensation'] = False
     return result
 
 
@@ -400,8 +398,7 @@ class RgbdSession:
         if association_enabled(calibration):
             # Reject old images that would silently ignore the new optional parameter.
             require_rotation_hint_runtime(require_runtime())
-        self.assistance_unavailable = ('IMU requires comparable capture timestamps'
-                                      if calibration.get('time_basis') == 'receipt_estimated' else None)
+        self.assistance_unavailable = None
         self.calibration, self.executor, self.topic = calibration, executor, topic
         self.publish_output = publish_output
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
@@ -426,7 +423,7 @@ class RgbdSession:
                     ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None)
         self.auxiliary_probe = (AuxiliaryHealthProbe(calibration['frame_id'], calibration['clock_id'],
             require_translation=bool(self.requested_calibration.get('short_term_compensation')))
-            if self.requested_calibration.get('imu_topic') and calibration.get('time_basis') != 'receipt_estimated'
+            if self.requested_calibration.get('imu_topic')
             else None)
         self.imu_topic = (calibration.get('imu_topic') or self.requested_calibration.get('imu_topic')
                           if self.auxiliary_probe is not None else calibration.get('imu_topic'))
@@ -557,10 +554,6 @@ class RgbdSession:
                     stamp = context.observation_stamp_ns
                 if stamp > self.latest_inputs.get(kind, 0) and -50_000_000 <= now-stamp <= 1_500_000_000:
                     self.latest_inputs[kind] = stamp
-                if context is not None and context.time_basis=='receipt_estimated' and self.imu is not None:
-                    self.restart_calibration = dict(self.requested_calibration,time_basis='receipt_estimated',
-                                                    clock_id=context.normalized_clock_id)
-                    self.gate.fault('capture time unavailable; restart in explicit receipt visual mode', 'clock')
                 if self.gate.status(now) == 'lost':
                     return
                 try:
@@ -667,8 +660,6 @@ class RgbdSession:
         with self.lock:
             mode = self._mode_info()
             source = getattr(self, 'restart_calibration', self.calibration)
-            if source.get('time_basis') == 'receipt_estimated':
-                return None
             health = self._auxiliary_info(now_ns, now_s)
             if (mode['degraded'] and health.get('status') == 'ready' and
                     now_s-self.mode_changed_at >= ASSISTANCE_RETRY_S):
@@ -678,7 +669,7 @@ class RgbdSession:
                     if key in self.requested_calibration:
                         calibration[key] = self.requested_calibration[key]
                 return dict(action='restore_assistance', calibration=calibration,
-                            reason='auxiliary source passed sustained capture health checks')
+                            reason='auxiliary source passed numeric format checks')
             auxiliary_loss = (self.gate.loss_kind in ('imu', 'fusion') and self.imu is not None)
             if self.gate.state == 'lost' and (auxiliary_loss or getattr(self, 'fallback', None) is not None):
                 return dict(action='degrade_assistance', calibration=visual_calibration(source),
@@ -701,8 +692,8 @@ class RgbdSession:
         with self.imu_queue_lock:
             if len(self.imu_pending) >= 100:
                 self.imu_overflow = True
-            else:
-                self.imu_pending.append(msg)
+                self.imu_pending.popleft()
+            self.imu_pending.append(msg)
 
     def _drain_imu(self):
         # Caller owns the estimator lock; ingress only touches its own queue.
@@ -711,21 +702,7 @@ class RgbdSession:
         with self.imu_queue_lock:
             pending = list(self.imu_pending)
             self.imu_pending.clear()
-            overflow = self.imu_overflow
             self.imu_overflow = False
-        if overflow:
-            reason = 'IMU ingress overflow; restart required'
-            probe = getattr(self, 'auxiliary_probe', None)
-            if probe is not None:
-                probe.reset(reason)
-            if self.imu is not None:
-                self.imu.fault(reason)
-            if self.fusion is not None and self.fallback is None:
-                # The native estimator never consumed this IMU: only the ESKF stops.
-                self.fusion.fault(reason)
-            elif self.imu is not None and self.fusion is None:
-                self.gate.fault(reason, 'imu')
-            return
         for msg in pending:
             if self.stop_event.is_set():
                 return

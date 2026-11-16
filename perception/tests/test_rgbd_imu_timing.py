@@ -19,12 +19,10 @@ def test_bounded_imu_gap_keeps_capture_time_and_integrates_attitude(gap_ns):
                               [0, 0, np.sin(gap_ns/2e9), np.cos(gap_ns/2e9)], atol=1e-9)
 
 
-def test_larger_imu_gap_still_retires_the_segment():
-    imu = aid()
-    imu.observe(packet(), 1_001_000_000)
-    with pytest.raises(ValueError):
-        imu.observe(packet(1_150_000_001), 1_350_000_001)
-    assert imu.state == 'lost'
+def test_larger_numeric_imu_gap_is_consumed():
+    imu=aid();imu.observe(packet(),1_001_000_000)
+    out=imu.observe(packet(1_150_000_001),1_350_000_001)
+    assert out['stamp_ns']==1_150_000_001 and imu.state=='active'
 
 
 def test_fusion_propagates_bounded_gap_with_original_stamp_and_growing_uncertainty():

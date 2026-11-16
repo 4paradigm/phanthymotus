@@ -222,27 +222,13 @@ def imu(session, stamp):
         translation_source='sdk_factory_extrinsics'))))
 
 
-def test_stale_imu_degrades_to_visual_only_with_explicit_provenance(fused):
-    make, now, ticks = fused
-    s = make()
-    now[0] = 1_000_000_000
-    imu(s, 999_000_000)
-    now[0] = 1_800_000_000  # IMU now >750 ms old: ESKF must stop
-    s._watchdog()
-    assert s.fusion.state == 'lost' and 'IMU' in s.fusion.reason
-    assert s.gate.state != 'lost', s.gate.reason
-    assert s.fallback['reason'].startswith('IMU')
-    for k in range(3):
-        feed(s, now, 1_800_000_000 + k*100*MS)
-    sample = last(s)
-    assert sample['vendor']['motus_slam']['status'] == 'tracking'
-    assert sample['vendor']['source'] == 'rtabmap_rgbd_odometry'
-    assert sample['vendor']['fusion']['status'] == 'lost'
-    assert sample['vendor']['fallback'] == 'visual_only'
-    assert 'visual-only' in sample['vendor']['reason']
-    assert status(s)['status'] == 'tracking'
-    info = s.info()
-    assert info['status'] == 'tracking' and info['fallback']['mode'] == 'visual_only'
+def test_old_formatted_imu_does_not_force_visual_only(fused):
+    make,now,ticks=fused
+    s=make();now[0]=1_000_000_000
+    imu(s,999_000_000)
+    now[0]=1_800_000_000;s._watchdog()
+    assert s.imu.state=='active' and s.fusion.state!='lost'
+    assert s.fallback is None
 
 
 def track_fused(s, now, offset=0.):

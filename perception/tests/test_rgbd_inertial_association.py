@@ -67,8 +67,6 @@ def test_identical_rotation_and_exact_endpoints_are_valid_hints():
 @pytest.mark.parametrize('stamp,now', [
     (999_999_999, 1_100_000_000),       # no earlier bracket
     (1_100_000_001, 1_100_000_000),   # no extrapolation
-    (1_050_000_000, 1_850_000_001),   # stale source and capture
-    (1_050_000_000, 999_999_999),     # implausibly future capture
     (0, 1_100_000_000), (True, 1_100_000_000),
     (1_050_000_000.0, 1_100_000_000),
 ])
@@ -79,15 +77,14 @@ def test_absent_or_invalid_coverage_returns_no_hint_without_mutating_state(stamp
     assert (attitude.state, attitude.last_stamp, attitude.reason) == before
 
 
-def test_initializing_or_retired_source_never_offers_a_rotation():
-    attitude = ImuAttitude('optical', 'capture-clock')
-    attitude.observe(packet(linear_acceleration=[0., 0., 0.]), 1_000_000_000)
-    assert attitude.orientation_at(1_000_000_000, 1_000_000_000) is None
-    attitude.observe(packet(1_100_000_000), 1_100_000_000)
-    assert attitude.orientation_at(1_100_000_000, 1_100_000_000) is not None
-    with pytest.raises(ValueError, match='epoch'):
-        attitude.observe(packet(1_110_000_000, epoch='next-boot'), 1_110_000_000)
-    assert attitude.orientation_at(1_100_000_000, 1_110_000_000) is None
+def test_missing_or_malformed_numeric_source_has_no_rotation_hint():
+    attitude=ImuAttitude('optical','capture-clock')
+    assert attitude.orientation_at(1_000_000_000,1_000_000_000) is None
+    attitude.observe(packet(linear_acceleration=[0.,0.,0.]),1_000_000_000)
+    assert attitude.orientation_at(1_000_000_000,1_000_000_000)==[0.,0.,0.,1.]
+    with pytest.raises(ValueError):
+        attitude.observe(packet(1_010_000_000,angular_velocity=[0.,0.]),1_010_000_000)
+    assert attitude.orientation_at(1_000_000_000,1_010_000_000) is None
 
 
 def test_bounded_orientation_history_evicts_old_captures():
@@ -98,6 +95,13 @@ def test_bounded_orientation_history_evicts_old_captures():
     assert len(attitude.orientation_history) == len(attitude.history) == 512
     assert attitude.orientation_at(1_000_000_000, stamp) is None
     assert attitude.orientation_at(stamp, stamp) is not None
+
+
+@pytest.mark.parametrize('now',[999_999_999,1_850_000_001])
+def test_numeric_hint_bracket_has_no_wall_age_or_future_policy(now):
+    attitude=observed_pair()
+    q=attitude.orientation_at(1_050_000_000,now)
+    np.testing.assert_allclose(q,[0.,0.,np.sin(.025),np.cos(.025)],atol=1e-12)
 
 
 def association_config(**changes):
@@ -123,7 +127,7 @@ def hint_node(monkeypatch):
 
 @pytest.mark.parametrize('changes', [
     {'inertial_association': False}, {'short_term_compensation': False},
-    {'imu_topic': None}, {'time_basis': 'receipt_estimated'},
+    {'imu_topic': None},
 ])
 def test_optional_hint_is_off_without_calibrated_fusion_mode(hint_node, changes):
     from plugins.rgbd_association import RotationHints
@@ -154,6 +158,16 @@ def test_private_hint_publishes_identity_at_exact_capture_without_assimilating_i
     report = hints.info()
     assert report['offered'] == 1 and report['last_offered_stamp_ns'] == stamp
     assert report['native_applied'] is None  # DDS delivery/native selection is not observed here.
+
+
+def test_receipt_hint_keeps_selected_mode_and_does_not_gate_on_names(hint_node):
+    from plugins.rgbd_association import RotationHints
+    node,_,messages=hint_node
+    hints=RotationHints(association_config(time_basis='receipt_estimated'),node,'segment-a',object())
+    attitude=observed_pair()
+    attitude.frame,attitude.clock='provider-frame','provider-clock'
+    assert hints.offer(attitude,1_050_000_000,1_100_000_000)
+    assert len(messages)==1 and hints.info()['enabled']
 
 
 def test_missing_lost_or_degraded_hint_is_skipped_without_waiting(hint_node):

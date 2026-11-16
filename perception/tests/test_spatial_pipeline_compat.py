@@ -63,13 +63,12 @@ def test_legacy_pose_precise_stamp_cannot_conflict_with_milliseconds(stamp):
     with pytest.raises(ValueError):decode_slam_odom(value)
 
 
-def test_receipt_time_makes_imu_unavailable_without_guessing_sample_intervals():
-    from plugins.rgbd_odometry_runtime import observation_calibration, estimator_parameters
+def test_receipt_time_preserves_requested_imu_and_fusion_mode():
+    from plugins.rgbd_odometry_runtime import observation_calibration,estimator_parameters
     original=dict(time_basis='receipt_estimated',clock_id=None,frame_id='optical',imu_topic='/imu',short_term_compensation=True)
     adapted=observation_calibration(original,'ingress')
     assert adapted['clock_id']=='ingress'
-    assert 'imu_topic' not in adapted and not adapted['short_term_compensation']
-    assert 'wait_imu_to_init' not in estimator_parameters(adapted,'run')
+    assert adapted['imu_topic']=='/imu' and adapted['short_term_compensation']
     assert original['imu_topic']=='/imu'
 
 

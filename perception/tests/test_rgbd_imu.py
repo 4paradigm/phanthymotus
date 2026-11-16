@@ -42,23 +42,23 @@ def test_fixed_body_imu_read_time_is_explicitly_accepted_for_attitude_only():
 @pytest.mark.parametrize('change', [dict(calibration_id=''), dict(clock_mapping=None),
     dict(clock_mapping=dict(method='host_wall_read_completion', source_clock='ros_wall',offset_ns=0,verified=True)),
     dict(clock_mapping=dict(method='host_wall_read_completion', source_clock='ros_wall',offset_ns=10,verified=False))])
-def test_read_time_source_cannot_claim_verified_capture_or_missing_calibration(change):
-    with pytest.raises(ValueError):aid().observe(body_packet(**change),1_010_000_000)
+def test_read_time_metadata_is_descriptive(change):
+    assert aid().observe(body_packet(**change),1_010_000_000)['stamp_ns']==1_000_000_000
 
 
-def test_body_fixed_calibration_or_time_semantics_change_retires_attitude_segment():
-    for change in (dict(calibration_id='fixed-v2'), dict(stamp_source='measurement')):
+def test_body_labels_can_change_without_retiring_attitude_segment():
+    for change in (dict(calibration_id='fixed-v2'),dict(stamp_source='measurement')):
         a=aid();a.observe(body_packet(),1_010_000_000)
-        with pytest.raises(ValueError):a.observe(body_packet(1_020_000_000,**change),1_030_000_000)
+        assert a.observe(body_packet(1_020_000_000,**change),1_030_000_000)
+        assert a.state=='active'
 
 
-def test_read_completion_cannot_enter_inertial_translation_even_with_tf_translation():
+def test_read_completion_enters_inertial_computation_with_numeric_translation():
     from plugins.rgbd_fusion import ShortTermFusion
     f=ShortTermFusion('segment','optical','capture-clock',np.eye(3))
-    p=body_packet(translation_source='tf',camera_from_gyro_translation=[0.,0.,0.],
-                  camera_from_accel_translation=[0.,0.,0.])
-    with pytest.raises(ValueError,match='measurement'):
-        f.observe_imu(p,1_010_000_000)
+    f.observe_imu(body_packet(camera_from_gyro_translation=[0.,0.,0.],
+                 camera_from_accel_translation=[0.,0.,0.]),1_010_000_000)
+    assert len(f.samples)==1 and f.imu.state=='active'
 
 
 def test_gravity_initialization_maps_camera_specific_force_to_world_up():
@@ -80,11 +80,9 @@ def test_known_gyro_rotation_and_factory_axis_rotation_are_applied_once():
 
 
 @pytest.mark.parametrize('change',[
-    {'clock_id':'other-clock'}, {'camera_frame_id':'body'}, {'epoch':''},
-    {'units':{'angular_velocity':'deg/s','linear_acceleration':'m/s^2'}},
-    {'camera_from_gyro':[[1,0,0],[0,1,0],[0,0,-1]]},
-    {'angular_velocity':[0,float('nan'),0]}, {'stamp_source':'received'},
-    {'accel_stamp_ns':970_000_000}, {'stamp_ns':True},
+    {'camera_from_gyro':[[1,0],[0,1]]},
+    {'angular_velocity':[0,float('nan'),0]},
+    {'accel_stamp_ns':'invalid'}, {'stamp_ns':True},
 ])
 def test_invalid_source_is_not_promoted_to_attitude(change):
     a=aid()
@@ -97,21 +95,18 @@ def test_invalid_source_is_not_promoted_to_attitude(change):
     {'gyro_frame_id':'new-frame'},
     {'camera_from_gyro':[[0,-1,0],[1,0,0],[0,0,1]]},
 ])
-def test_source_restart_or_changed_extrinsic_cannot_reuse_filter_segment(change):
+def test_valid_format_with_changed_source_or_transform_is_consumed(change):
     a=aid();a.observe(packet(),1_010_000_000)
-    with pytest.raises(ValueError):a.observe(packet(1_010_000_000,**change),1_020_000_000)
+    assert a.observe(packet(1_010_000_000,**change),1_020_000_000)
+    assert a.state=='active'
 
 
-def test_stale_gap_repeated_stamp_and_expired_source_are_latched():
-    for stamp,now in [(1_000_000_000,1_010_000_000),
-                      (1_150_000_001,1_160_000_001),
+def test_age_gap_and_repeated_timestamps_are_not_admission_rules():
+    a=aid();a.observe(packet(),1_001_000_000)
+    for stamp,now in [(1_000_000_000,1_010_000_000),(1_150_000_001,1_160_000_001),
                       (1_700_000_000,1_710_000_000)]:
-        a=aid();a.observe(packet(),1_001_000_000)
-        with pytest.raises(ValueError):a.observe(packet(stamp),now)
-        assert a.state=='lost'
-    a=aid();a.observe(packet(),1_010_000_000)
-    assert a.status(1_800_000_000)=='lost'
-    with pytest.raises(ValueError):a.observe(packet(1_805_000_000),1_810_000_000)
+        assert a.observe(packet(stamp),now)['stamp_ns']==stamp
+    assert a.status(100_000_000_000)=='active'
 
 
 @pytest.mark.parametrize('age_ns', [501_000_000, 600_000_000, 750_000_000])
@@ -123,18 +118,18 @@ def test_delayed_imu_within_750_ms_keeps_original_capture_time(age_ns):
 
 
 @pytest.mark.parametrize('gyro_offset_ns,accel_offset_ns', [(0, 10_000_000), (10_000_000, 0)])
-def test_either_imu_capture_older_than_750_ms_is_rejected(gyro_offset_ns, accel_offset_ns):
+def test_both_numeric_timestamps_are_preserved_without_age_policy(gyro_offset_ns,accel_offset_ns):
     a=aid()
-    with pytest.raises(ValueError):
-        a.observe(packet(1_000_000_000+gyro_offset_ns,
-                         accel_stamp_ns=1_000_000_000+accel_offset_ns),1_750_000_001)
-    assert a.state=='lost' and a.last_stamp==0
+    out=a.observe(packet(1_000_000_000+gyro_offset_ns,
+        accel_stamp_ns=1_000_000_000+accel_offset_ns),1_750_000_001)
+    assert out['stamp_ns']==1_000_000_000+gyro_offset_ns
+    assert a.last_accel==1_000_000_000+accel_offset_ns
 
 
-def test_imu_silence_expires_at_750_ms_without_extending_capture_time():
+def test_imu_silence_does_not_relabel_or_expire_the_last_numeric_sample():
     a=aid();a.observe(packet(),1_001_000_000)
-    assert a.status(1_750_000_000)=='active'
-    assert a.status(1_750_000_001)=='lost'
+    assert a.status(1_750_000_001)=='active'
+    assert a.last_stamp==1_000_000_000
 
 
 def test_frame_requires_bracketing_imu_coverage_with_bounded_history():
@@ -149,9 +144,9 @@ def test_frame_requires_bracketing_imu_coverage_with_bounded_history():
     assert not a.covers(1_010_000_000,t+1_000_000)
 
 
-def test_invalid_initial_gravity_waits_without_inventing_orientation():
-    a=aid();assert a.observe(packet(linear_acceleration=[0,0,0]),1_010_000_000) is None
-    assert a.state=='initializing'
+def test_zero_acceleration_can_start_a_relative_gyro_orientation():
+    a=aid();out=a.observe(packet(linear_acceleration=[0,0,0]),1_010_000_000)
+    assert out['quaternion']==[0.,0.,0.,1.] and a.state=='active'
     out=a.observe(packet(1_010_000_000),1_020_000_000)
     assert out and a.state=='active'
 
@@ -300,8 +295,8 @@ def session(monkeypatch):
     return obj,published,runtime,NS,json
 
 
-@pytest.mark.parametrize('delay_ns,active', [(101_000_000, True), (601_000_000, True), (751_000_000, False)])
-def test_imu_ingress_keeps_intervals_but_rejects_stale_backlog(monkeypatch, delay_ns, active):
+@pytest.mark.parametrize('delay_ns,active', [(101_000_000, True), (601_000_000, True), (751_000_000, True)])
+def test_imu_ingress_preserves_intervals_in_delayed_backlog(monkeypatch, delay_ns, active):
     import threading
     from collections import deque
     obj, published, runtime, NS, json = session(monkeypatch)
@@ -324,7 +319,7 @@ def test_imu_ingress_keeps_intervals_but_rejects_stale_backlog(monkeypatch, dela
         assert not published and obj.imu.state == 'lost'
 
 
-def test_imu_ingress_overflow_retires_segment_instead_of_hiding_dropped_captures(monkeypatch):
+def test_imu_ingress_stays_bounded_and_consumes_retained_formatted_samples(monkeypatch):
     import threading
     from collections import deque
     obj, published, runtime, NS, json = session(monkeypatch)
@@ -335,8 +330,8 @@ def test_imu_ingress_overflow_retires_segment_instead_of_hiding_dropped_captures
         receiver.start();receiver.join(timeout=1)
         assert not receiver.is_alive()
         obj._drain_imu()
-    assert not published and obj.gate.state == obj.imu.state == 'lost'
-    assert 'overflow' in obj.imu.reason
+    assert len(published)==100 and obj.imu.state=='active'
+    assert obj.gate.state!='lost'
 
 
 def test_imu_ingress_only_queues_and_draining_does_not_chase_new_arrivals(monkeypatch):
@@ -361,7 +356,8 @@ def test_imu_fault_during_publication_cannot_emit_a_prebuilt_tracking_pose(monke
     import sys, threading
     from collections import deque
     obj, _, runtime, NS, json = session(monkeypatch)
-    obj.imu_pending = deque();obj.imu_queue_lock = threading.Lock();obj.imu_overflow = True
+    obj.imu_pending = deque([NS(data=json.dumps(packet(angular_velocity=[0.,0.])))])
+    obj.imu_queue_lock = threading.Lock();obj.imu_overflow = False
     monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_001_000_000)
     monkeypatch.setattr(sys.modules['std_msgs.msg'], 'String', lambda **kw: NS(**kw))
     output = []
@@ -399,14 +395,14 @@ def test_enabled_imu_cannot_be_silently_bypassed_by_images_or_watchdog(monkeypat
     obj.gate.input(1_020_000_000)
     monkeypatch.setattr(runtime.time,'time_ns',lambda:1_800_000_000)
     obj._watchdog()
-    assert obj.gate.state=='lost'
+    assert obj.gate.state!='lost' and obj.imu.state=='active'
     assert not obj._imu_frame_ready(1_610_000_000,1_611_000_000)
 
 
 def test_bad_imu_packet_reports_loss_without_forwarding_a_prior(monkeypatch):
     obj,published,runtime,NS,json=session(monkeypatch)
     monkeypatch.setattr(runtime.time,'time_ns',lambda:1_010_000_000)
-    obj._imu(NS(data=json.dumps(packet(clock_id='wrong'))))
+    obj._imu(NS(data=json.dumps(packet(angular_velocity=[0.,0.]))))
     assert not published and obj.gate.state=='lost'
 
 

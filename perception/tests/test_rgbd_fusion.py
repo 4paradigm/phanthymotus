@@ -113,7 +113,7 @@ def test_outage_limit_never_promotes_prediction_or_restarts_segment(seconds):
         assert sample['pose'] is None and c.status(t+1_000_000) == 'lost'
 
 
-def test_missing_translation_and_changed_calibration_fail_closed():
+def test_missing_numeric_translation_is_rejected_and_new_numeric_translation_is_used():
     c = ShortTermFusion('run', 'optical', 'capture-clock', K)
     with pytest.raises(ValueError, match='translation'):
         c.observe_imu(packet(), 1_001_000_000)
@@ -121,9 +121,10 @@ def test_missing_translation_and_changed_calibration_fail_closed():
     c, t = warmed()
     p = source(t+5_000_000)
     p['camera_from_accel_translation'] = [0., 0., 0.]
-    with pytest.raises(ValueError):
-        c.observe_imu(p, t+6_000_000)
-    assert c.status(t+6_000_000) == 'lost'
+    c.observe_imu(p,t+6_000_000)
+    assert c.status(t+6_000_000)=='tracking'
+    np.testing.assert_allclose(c.lever,[0.,0.,0.])
+    np.testing.assert_allclose(c.filter.lever,[0.,0.,0.])
 
 
 def test_motion_during_warmup_does_not_assume_zero_velocity():
@@ -234,11 +235,10 @@ def test_independently_sampled_camera_uses_bracketing_imu_to_initialize():
 
 @pytest.mark.parametrize('change', [{'translation_source': 'tf'},
                                   {'clock_mapping': {'method': 'fixed_arrival_offset', 'offset_ns': 1000000}}])
-def test_calibration_source_and_time_mapping_changes_retire_segment(change):
-    c, stamp = warmed()
-    with pytest.raises(ValueError):
-        c.observe_imu(source(stamp+5_000_000, **change), stamp+5_000_000)
-    assert c.state == 'lost'
+def test_source_and_mapping_descriptions_do_not_retire_segment(change):
+    c,stamp=warmed()
+    c.observe_imu(source(stamp+5_000_000,**change),stamp+5_000_000)
+    assert c.state=='tracking' and c.imu.state=='active'
 
 
 def test_correlated_geometry_updates_do_not_average_away_shared_reference_error():
