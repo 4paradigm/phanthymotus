@@ -65,10 +65,16 @@ class _Base(unittest.TestCase):
             conn.execute('DELETE FROM schedules')
         schedule_store._schedules.clear()
         schedule_store._fire_times.clear()
+        schedule_store._last_fire.clear()
         with schedule_store._get_conn() as conn:
             conn.execute('DELETE FROM schedule_fires')
         schedule_store._loaded = True
         config.main['scheduler_settings'] = dict(schedule_store.DEFAULT_SETTINGS)
+
+    @staticmethod
+    def _far_cron(minute: int = 0) -> str:
+        """离现在 11 小时以上的每日 cron：手动触发的“离下次定时太近”不会误伤测试。"""
+        return f'{minute} {(datetime.datetime.now(CN).hour + 12) % 24} * * *'
 
     @staticmethod
     def _due_soon(s) -> float:
@@ -351,7 +357,7 @@ class TestSecondReview(_Base):
             sent.append((source, text))
 
         with _FakeJobs():
-            s = schedule_store.create(name='快照', text='旧文字', cron='0 8 * * *')
+            s = schedule_store.create(name='快照', text='旧文字', cron=self._far_cron())
         snap = schedule_store._snapshot(s.id)
         schedule_store._schedules[s.id].text = '被改了'
         self.assertEqual(snap.text, '旧文字', '快照是拷贝，不随后续修改变化')
@@ -552,7 +558,8 @@ class TestThirdReview(_Base):
             raise RuntimeError('down')
 
         with _FakeJobs():
-            s = schedule_store.create(name='试', text='x', cron='0 8 * * *')
+            s = schedule_store.create(name='试', text='x', cron=self._far_cron())
+            s2 = schedule_store.create(name='试2', text='x', cron=self._far_cron(30))
         orig = event_bus.enqueue
         try:
             event_bus.enqueue = broken
@@ -560,14 +567,78 @@ class TestThirdReview(_Base):
                 asyncio.run(schedule_store.fire_now(s.id))
             self.assertEqual(schedule_store._fires_today(time.time()), 0, '没发出去退回名额')
             event_bus.enqueue = ok
-            asyncio.run(schedule_store.fire_now(s.id))
+            asyncio.run(schedule_store.fire_now(s.id))       # 失败的那次不算“刚触发过”
             self.assertEqual(schedule_store._fires_today(time.time()), 1)
+            self.assertEqual(schedule_store.find('试').fire_count, 1)
+            self.assertIsNotNone(schedule_store.find('试').last_run)
             self._fill_today(47)
             with self.assertRaisesRegex(ValueError, '每日上限'):
-                asyncio.run(schedule_store.fire_now(s.id))
+                asyncio.run(schedule_store.fire_now(s2.id))
         finally:
             event_bus.enqueue = orig
         self.assertEqual(len(sent), 1)
+
+    def test_fire_now_respects_min_interval(self):
+        """P1：连点“立即触发”不能在最短间隔里反复叫醒模型。"""
+        import event_bus
+        sent = []
+
+        async def ok(source, text, payload=None):
+            sent.append(source)
+
+        with _FakeJobs():
+            s = schedule_store.create(name='间隔', text='x', cron=self._far_cron())
+        orig = event_bus.enqueue
+        event_bus.enqueue = ok
+        try:
+            asyncio.run(schedule_store.fire_now(s.id))
+            with self.assertRaisesRegex(ValueError, '刚触发过'):
+                asyncio.run(schedule_store.fire_now(s.id))
+            schedule_store._schedules[s.id].last_run = time.time() - 11 * 60
+            schedule_store._last_fire.clear()
+            asyncio.run(schedule_store.fire_now(s.id))      # 隔够了就能再触发
+        finally:
+            event_bus.enqueue = orig
+        self.assertEqual(len(sent), 2)
+
+    def test_concurrent_fire_now_only_one_passes(self):
+        import event_bus
+        sent = []
+
+        async def slow(source, text, payload=None):
+            await asyncio.sleep(0.05)
+            sent.append(source)
+
+        with _FakeJobs():
+            s = schedule_store.create(name='并发', text='x', cron=self._far_cron())
+
+        async def go():
+            return await asyncio.gather(*(schedule_store.fire_now(s.id) for _ in range(5)),
+                                        return_exceptions=True)
+        orig = event_bus.enqueue
+        event_bus.enqueue = slow
+        try:
+            res = asyncio.run(go())
+        finally:
+            event_bus.enqueue = orig
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sum(1 for r in res if not isinstance(r, Exception)), 1)
+        self.assertTrue(all(isinstance(r, ValueError) for r in res if isinstance(r, Exception)))
+        self.assertEqual(schedule_store._fires_today(time.time()), 1)
+
+    def test_fire_now_close_to_next_scheduled_run_is_refused(self):
+        soon = datetime.datetime.now(CN) + datetime.timedelta(minutes=4)
+        with _FakeJobs():
+            s = schedule_store.create(name='快到点', text='x', cron=f'{soon.minute} {soon.hour} * * *')
+        with self.assertRaisesRegex(ValueError, '自己触发'):
+            asyncio.run(schedule_store.fire_now(s.id))
+
+    def test_fire_now_disabled_is_refused(self):
+        with _FakeJobs():
+            s = schedule_store.create(name='停着', text='x', cron=self._far_cron(), enabled=False)
+        with self.assertRaisesRegex(ValueError, '已停用'):
+            asyncio.run(schedule_store.fire_now(s.id))
+        self.assertEqual(schedule_store._fires_today(time.time()), 0)
 
     def test_next_run_matches_minute_scan(self):
         """按天跳的 _next_run 和原来的逐分钟扫结果一致。"""
@@ -625,6 +696,116 @@ class TestThirdReview(_Base):
         for call in ('schedule_store.create(', 'schedule_store.update(', 'schedule_store.delete(',
                      'schedule_store.find('):
             self.assertNotIn(call, src, call + ' 应走 model_upsert / model_delete，放进线程池')
+
+
+def _has(mod: str) -> bool:
+    return importlib.util.find_spec(mod) is not None
+
+
+@unittest.skipUnless(_has('fastapi') and _has('httpx'), '需要 fastapi + httpx（容器里有）')
+class TestApiRoutes(_Base):
+    """/api/schedules 接口契约：鉴权（与 start.py 一样挂 auth.auth_middleware）、参数校验的返回、
+    停用 / 最短间隔 / 不存在时“立即触发”的语义、收紧设置被拒。"""
+
+    TOKEN = 'test-token-398'
+
+    def setUp(self):
+        super().setUp()
+        import fastapi
+        from fastapi.testclient import TestClient
+        import auth
+        import event_bus
+        spec = importlib.util.spec_from_file_location('api_schedules_under_test',
+                                                      _SRC / 'api' / 'schedules.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        app = fastapi.FastAPI()
+        app.include_router(mod.router, prefix='/api')
+        app.middleware('http')(auth.auth_middleware)
+        saved = (auth._token, auth._auth_enabled)
+        auth._token, auth._auth_enabled = self.TOKEN, True
+        self.addCleanup(lambda: (setattr(auth, '_token', saved[0]), setattr(auth, '_auth_enabled', saved[1])))
+        fj = _FakeJobs().__enter__()
+        self.addCleanup(fj.__exit__)
+        self.sent = []
+
+        async def fake(source, text, payload=None):
+            self.sent.append(source)
+        orig = event_bus.enqueue
+        event_bus.enqueue = fake
+        self.addCleanup(setattr, event_bus, 'enqueue', orig)
+        self.c = TestClient(app)
+        self.h = {'Authorization': f'Bearer {self.TOKEN}'}
+
+    def _req(self, method, path, json=None, auth=True):
+        return self.c.request(method, path, json=json, headers=self.h if auth else {})
+
+    def _create(self, **kw):
+        body = {'name': '吃药', 'text': '服药提醒定时检查', 'cron': self._far_cron(), **kw}
+        r = self._req('POST', '/api/schedules', body)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['ok'], r.json())
+        return r.json()['schedule']['id']
+
+    def test_requires_token(self):
+        for method, path in (('GET', '/api/schedules'), ('POST', '/api/schedules'),
+                             ('POST', '/api/schedules/x/run'), ('PATCH', '/api/schedules/settings'),
+                             ('DELETE', '/api/schedules/x'), ('POST', '/api/schedules/preview')):
+            self.assertEqual(self._req(method, path, {}, auth=False).status_code, 401, path)
+        bad = self.c.get('/api/schedules', headers={'Authorization': 'Bearer nope'})
+        self.assertEqual(bad.status_code, 401)
+        self.assertEqual(self._req('GET', '/api/schedules').status_code, 200)
+
+    def test_create_list_and_validation_errors(self):
+        sid = self._create()
+        names = [s['name'] for s in self._req('GET', '/api/schedules').json()['schedules']]
+        self.assertEqual(names, ['吃药'])
+        for body, word in (({'name': '太密', 'text': 'x', 'cron': '*/5 * * * *'}, '最短'),
+                           ({'name': '二月三十', 'text': 'x', 'cron': '0 8 30 2 *'}, '不会触发'),
+                           ({'name': '吃药', 'text': 'x', 'cron': '0 9 * * *'}, '已经有'),
+                           ({'name': '没文字', 'cron': '0 9 * * *'}, '文字')):
+            r = self._req('POST', '/api/schedules', body)
+            self.assertEqual(r.status_code, 200)
+            self.assertFalse(r.json()['ok'], body)
+            self.assertIn(word, r.json()['error'])
+        r = self._req('POST', '/api/schedules', {'name': 'x', 'text': 'y', 'cron': '0 8 * * *',
+                                                 'enabled': '不是布尔'})
+        self.assertEqual(r.status_code, 422)
+        self.assertIn('没有要改的', self._req('PATCH', f'/api/schedules/{sid}', {}).json()['error'])
+        self.assertIn('不存在', self._req('PATCH', '/api/schedules/nope', {'text': 'x'}).json()['error'])
+        self.assertFalse(self._req('POST', '/api/schedules/preview', {'cron': '61 * * * *'}).json()['ok'])
+        self.assertEqual(len(self._req('POST', '/api/schedules/preview',
+                                       {'cron': '0 8 * * *', 'count': 3}).json()['runs']), 3)
+
+    def test_run_now_semantics(self):
+        sid = self._create()
+        r = self._req('POST', f'/api/schedules/{sid}/run').json()
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['schedule']['fire_count'], 1)
+        r = self._req('POST', f'/api/schedules/{sid}/run').json()
+        self.assertFalse(r['ok'])
+        self.assertIn('刚触发过', r['error'])
+        self.assertTrue(self._req('PATCH', f'/api/schedules/{sid}', {'enabled': False}).json()['ok'])
+        r = self._req('POST', f'/api/schedules/{sid}/run').json()
+        self.assertFalse(r['ok'])
+        self.assertIn('已停用', r['error'])
+        self.assertIn('不存在', self._req('POST', '/api/schedules/nope/run').json()['error'])
+        self.assertEqual(len(self.sent), 1, '只有第一次真的叫醒了模型')
+        self.assertTrue(self._req('DELETE', f'/api/schedules/{sid}').json()['ok'])
+        self.assertFalse(self._req('DELETE', f'/api/schedules/{sid}').json()['ok'])
+
+    def test_settings_validation(self):
+        self._create(cron='0,10,20 8 * * *')
+        r = self._req('PATCH', '/api/schedules/settings', {'min_interval_minutes': 30}).json()
+        self.assertFalse(r['ok'])
+        self.assertIn('吃药', r['error'])
+        self.assertIn('正整数', self._req('PATCH', '/api/schedules/settings',
+                                         {'max_schedules': 0}).json()['error'])
+        self.assertIn('时区', self._req('PATCH', '/api/schedules/settings',
+                                        {'default_tz': 'Mars/Olympus'}).json()['error'])
+        self.assertEqual(self._req('GET', '/api/schedules/settings').json()['settings']['min_interval_minutes'], 10)
+        r = self._req('PATCH', '/api/schedules/settings', {'model_tools_enabled': True}).json()
+        self.assertTrue(r['ok'] and r['settings']['model_tools_enabled'])
 
 
 if __name__ == '__main__':

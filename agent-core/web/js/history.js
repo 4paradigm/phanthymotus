@@ -647,7 +647,7 @@ function _renderSchedules(el, data) {
         <div class="task-actions">
           <button class="sched-edit-btn" data-id="${_escape(s.id)}">编辑</button>
           <button class="sched-toggle-btn" data-id="${_escape(s.id)}">${s.enabled ? '停用' : '启用'}</button>
-          <button class="sched-run-btn" data-id="${_escape(s.id)}">立即触发</button>
+          <button class="sched-run-btn" data-id="${_escape(s.id)}" ${s.enabled ? '' : 'disabled title="先启用再触发"'}>立即触发</button>
           <button class="sched-delete-btn danger" data-id="${_escape(s.id)}">删除</button>
         </div>
       </div>`).join('');

@@ -16,6 +16,7 @@ schedule_store.py — 运行时定时任务：存储、校验、注册到 schedu
   · model_tools_enabled  —— 模型能不能自己建定时（默认关，见 event/schedule.py）。
 改设置时拿新的限制把现有启用的定时任务重新校验一遍，有不合规的就拒绝这次修改并列出是哪几条，
 不会出现“设置收紧了、老定时照旧按原频率跑”。
+网页上的“立即触发”守同样的闸：停用的不能触发，离上一次和下一次触发都要隔开最短间隔，占当天名额。
 
 job 名统一是 'sched:<id>'，事件 source 是 'scheduler:<name>'。
 """
@@ -73,6 +74,9 @@ _schedules: dict[str, Schedule] = {}
 # 最近两天的触发时间（unix 秒）：已发出的（也存在 schedule_fires 表里）+ 正在发、占着名额的。
 # “今天”按 default_tz 现算，所以改时区不会把计数清零。
 _fire_times: list[float] = []
+# 每条定时最近一次触发（含正在发的）的时间：手动触发要和它隔开最短间隔。库里的 last_run 只记
+# 发成功的，这里还盖住“正在发”的那一下，几个并发的“立即触发”请求只有一个能过。
+_last_fire: dict[str, float] = {}
 _loaded = False
 # API 路由跑在线程池里，可能并发；增删改、设置、名额和内存表的读写都串行。
 _lock = threading.RLock()
@@ -408,6 +412,44 @@ def _commit(slot: float | None) -> None:
     _fire_times[:] = [t for t in _fire_times if t >= cutoff]
 
 
+def _mark_fire(sid: str, ts: float) -> float | None:
+    """记下这条定时正在 ts 触发，返回之前的记录（没发出去时用来恢复）。"""
+    prev = _last_fire.get(sid)
+    _last_fire[sid] = ts
+    return prev
+
+
+def _unmark_fire(sid: str, ts: float | None, prev: float | None) -> None:
+    """没发出去：恢复成之前的记录（中间又有新的触发就不动）。"""
+    if ts is None or _last_fire.get(sid) != ts:
+        return
+    if prev is None:
+        _last_fire.pop(sid, None)
+    else:
+        _last_fire[sid] = prev
+
+
+def _manual_block_reason(s: Schedule, now: float) -> str | None:
+    """手动触发这条现在行不行；不行返回中文原因。
+
+    同一条定时两次触发至少隔 min_interval_minutes：离上一次触发（定时的或手动的，含正在发的）
+    和离下一次定时触发都要隔开这么久，所以“立即触发”不会让同一条在短时间里叫醒模型两次。"""
+    if not s.enabled:
+        return f'「{s.name}」已停用，先启用再触发'
+    gap = get_settings()['min_interval_minutes'] * 60
+    last = max(_last_fire.get(s.id) or 0.0, s.last_run or 0.0)
+    if last and now - last < gap:
+        wait = int((gap - (now - last)) // 60) + 1
+        return f'「{s.name}」{int((now - last) // 60)} 分钟前刚触发过，最短要隔 {gap // 60} 分钟，{wait} 分钟后再试'
+    try:
+        nxt = next_run_ts(s, now)
+    except (ValueError, RuntimeError):
+        nxt = None
+    if nxt and nxt - now < gap:
+        return f'「{s.name}」{int((nxt - now) // 60) + 1} 分钟内就会自己触发，不用手动触发'
+    return None
+
+
 def _cap_msg() -> str:
     return f'今天所有定时任务已经触发满 {get_settings()["max_fires_per_day"]} 次（每日上限）'
 
@@ -461,6 +503,7 @@ def _on_fire(sid: str):
                     _disable_once(s, 'skipped by the daily cap')
                 return False
             job['slot'] = slot
+            job['prev_fire'] = _mark_fire(sid, slot)
             return True
     return _cb
 
@@ -473,9 +516,11 @@ def _after_fire(sid: str):
     def _cb(job: dict, delivered: bool = True, retrying: bool = False) -> None:
         with _lock:
             slot = job.pop('slot', None)
+            prev = job.pop('prev_fire', None)
             s = _schedules.get(sid)
             if not delivered:
                 _release(slot)
+                _unmark_fire(sid, slot, prev)
                 if s and s.kind == 'once' and s.enabled and not retrying and _is_current(s, job):
                     _disable_once(s, 'could not be delivered after retries')
                 return
@@ -552,7 +597,7 @@ def find(key: str) -> Schedule | None:
 
 
 @_locked
-def create(*, name: str, text: str, kind: str = 'cron', cron: str = '', at: str = '',
+def create(*, name: str = '', text: str = '', kind: str = 'cron', cron: str = '', at: str = '',
            tz: str = '', skill: str = '', enabled: bool = True, created_by: str = 'web') -> Schedule:
     _ensure_loaded()
     s = Schedule(name=name, text=text, kind=kind, cron=cron, at=at, tz=tz, skill=skill,
@@ -587,6 +632,7 @@ def delete(sid: str) -> bool:
     _ensure_loaded()
     scheduler.remove_job(job_name(sid))
     s = _schedules.pop(sid, None)
+    _last_fire.pop(sid, None)
     _delete_row(sid)
     return s is not None
 
@@ -641,39 +687,58 @@ def _snapshot(sid: str) -> Schedule | None:
 
 
 @_locked
-def _snapshot_and_reserve(sid: str) -> tuple[Schedule | None, float | None]:
+def _snapshot_and_reserve(sid: str) -> tuple[Schedule | None, tuple | None]:
+    """手动触发的准入（持锁，一步完成）：查最短间隔、占当天名额、记下“正在触发”。
+    不让发就抛 ValueError（中文原因）。"""
     s = _snapshot(sid)
     if s is None:
         return None, None
-    slot = _reserve(time.time())
+    now = time.time()
+    why = _manual_block_reason(s, now)
+    if why:
+        raise ValueError(why)
+    slot = _reserve(now)
     if slot is None:
         raise ValueError(_cap_msg() + '，明天再试或在设置里调高上限')
-    return s, slot
+    return s, (slot, _mark_fire(sid, slot))
 
 
 @_locked
-def _settle(slot: float, delivered: bool) -> None:
-    (_commit if delivered else _release)(slot)
+def _settle_manual(sid: str, ticket: tuple, delivered: bool) -> None:
+    slot, prev = ticket
+    if not delivered:
+        _release(slot)
+        _unmark_fire(sid, slot, prev)
+        return
+    _commit(slot)
+    s = _schedules.get(sid)
+    if s:                      # 手动触发也是一次触发：记上次时间和次数，一次性任务的状态不动
+        s.last_run = slot
+        s.fire_count += 1
+        _persist(s)
 
 
 async def fire_now(sid: str) -> Schedule:
-    """立即触发一次（网页“试一下”用）。和到点触发一样占当天名额：满了抛 ValueError，
-    没发出去就退回。不改 fire_count / last_run，也不改一次性任务的状态。
+    """立即触发一次（网页“试一下”用）。和到点触发守同样的闸：
+      · 停用的不能触发；
+      · 离上一次触发、离下一次定时触发都要隔开 min_interval_minutes（并发的几个请求只放行一个）；
+      · 占当天名额，满了拒绝；没发出去退回名额。
+    不让发时抛 ValueError（中文原因）。发出去了记 last_run / fire_count；一次性任务的启用状态不变。
 
-    拍快照、占名额、记账都在线程池里（要持锁、读写库），推事件在循环里。用拍下的快照
-    推事件：名字和文字来自同一时刻；与删除的先后以拍快照为准。"""
+    准入和记账在线程池里（要持锁、读写库），推事件在循环里。用拍下的快照推事件：名字和文字
+    来自同一时刻；与删除的先后以拍快照为准。"""
     import asyncio
     import event_bus
-    s, slot = await asyncio.to_thread(_snapshot_and_reserve, sid)
+    s, ticket = await asyncio.to_thread(_snapshot_and_reserve, sid)
     if s is None:
         raise KeyError(sid)
     try:
         await event_bus.enqueue(source=f'scheduler:{s.name}', text=event_text(s))
     except Exception:
-        await asyncio.to_thread(_settle, slot, False)
+        await asyncio.to_thread(_settle_manual, sid, ticket, False)
         raise
-    await asyncio.to_thread(_settle, slot, True)
-    return s
+    await asyncio.to_thread(_settle_manual, sid, ticket, True)
+    return (await asyncio.to_thread(_snapshot, sid)) or s      # 带上刚记的 last_run / fire_count
 
 
 def to_dict(s: Schedule) -> dict:

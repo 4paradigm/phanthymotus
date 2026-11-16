@@ -129,7 +129,8 @@ def delete_schedule(sid: str):
 
 @router.post('/{sid}/run')
 async def run_now(sid: str):
-    """立即触发一次，用来试效果。和到点触发一样占当天的触发名额，满了会拒绝。"""
+    """立即触发一次，用来试效果。停用的不能触发；离上一次、下一次触发都要隔开最短间隔；
+    和到点触发一样占当天的触发名额，满了会拒绝。被拒时返回 ok=False 和中文原因。"""
     try:
         s = await schedule_store.fire_now(sid)
     except KeyError:
