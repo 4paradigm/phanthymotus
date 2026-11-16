@@ -53,6 +53,8 @@ def mapping_parameters(database_path, namespace, settings):
         'Icp/VoxelSize': str(settings['voxel_size_m']), 'Grid/Sensor': '0',
         'Grid/CellSize': str(settings['voxel_size_m']), 'Grid/3D': 'true',
         'RGBD/ProximityBySpace': 'true', 'RGBD/NeighborLinkRefining': 'true',
+        # Scan-only one-to-one registration needs a non-null pose guess.
+        'RGBD/ProximityOdomGuess': 'true', 'RGBD/ProximityPathMaxNeighbors': '1',
         'Rtabmap/MemoryThr': str(settings['max_working_nodes']),
         'Rtabmap/TimeThr': str(settings['max_update_ms']),
         'DbSqlite3/JournalMode': '0', 'DbSqlite3/Synchronous': '1'}

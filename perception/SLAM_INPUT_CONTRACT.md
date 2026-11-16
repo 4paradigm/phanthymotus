@@ -100,3 +100,23 @@ the new installation layer, the Dockerfile runs `apt-get clean` and removes
 Removing toolchains and headers from the delivered image safely would require
 a separate multi-stage build with a verified ABI-matched runtime dependency
 closure; that larger packaging change is out of scope for this fix.
+
+
+## Scan-only proximity correction
+
+The pointcloud SLAM card uses ICP with spatial proximity detection. Its
+one-to-one path explicitly enables `RGBD/ProximityOdomGuess`: the pinned
+RTAB-Map implementation otherwise attempts visual matching without a pose
+guess, although this card supplies no images. The scan-neighbor path remains
+limited to one node (`RGBD/ProximityPathMaxNeighbors=1`, matching the pinned
+ROS wrapper's scan-cloud default). ICP acceptance and graph validation
+thresholds are unchanged. This is local geometric correction near the estimated
+trajectory, not appearance-based global place recognition; zero accepted loops
+can still mean insufficient overlap, drift beyond the search radius, or a
+rejected match.
+
+The native adapter publishes segment-local dynamic odom-to-base TF from the
+same admitted pose and exact capture stamp as its Odometry/PointCloud2 pair.
+Static camera extrinsics remain on tf_static; dynamic camera extrinsics remain
+on tf. This satisfies the native odometry lookup without inventing poses or
+using latest-time TF. No robot-facing odometry interface or clock budget changes.

@@ -173,3 +173,12 @@ def test_mapping_child_receives_own_buffered_dds_profile(monkeypatch, tmp_path):
     process = running(tmp_path)
     process.close(timeout_s=3)
     assert len(environments) == 1
+
+
+def test_scan_only_proximity_has_an_odometry_guess(tmp_path):
+    value = backend().mapping_parameters(tmp_path/'map.db', '/isolated/s0',
+        dict(max_pending=2, voxel_size_m=.08, max_working_nodes=100, max_update_ms=100))
+    assert value['RGBD/ProximityOdomGuess'] == 'true'
+    assert value['RGBD/ProximityPathMaxNeighbors'] == '1'
+    assert value['Reg/Strategy'] == '1'
+    assert value['approx_sync'] is False

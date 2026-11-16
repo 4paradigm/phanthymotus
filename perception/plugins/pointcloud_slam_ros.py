@@ -367,6 +367,8 @@ class RtabmapNode(Node):
         segment['tf_pub'] = self.create_publisher(self._TFMessage,
             namespace + ('/tf' if self.stream.extrinsic_mode == 'dynamic' else '/tf_static'),
             _NATIVE_QOS if self.stream.extrinsic_mode == 'dynamic' else _MAP_QOS)
+        segment['odom_tf_pub'] = (segment['tf_pub'] if self.stream.extrinsic_mode == 'dynamic' else
+            self.create_publisher(self._TFMessage, namespace + '/tf', _NATIVE_QOS))
         for message, suffix, callback, qos in [
                 (PointCloud2, '/cloud_map', self._native_cloud, _MAP_QOS),
                 (self._MapGraph, '/mapGraph', self._native_graph, _MAP_QOS),
@@ -408,6 +410,16 @@ class RtabmapNode(Node):
             setattr(odom.pose.pose.orientation, key, value)
         if pose.covariance is not None:
             odom.pose.covariance = list(pose.covariance)
+        # Native odomUpdate looks up this exact pose even with an Odometry input.
+        odom_transform = self._TransformStamped()
+        odom_transform.header = deepcopy(odom.header)
+        odom_transform.child_frame_id = odom.child_frame_id
+        for key in ('x', 'y', 'z'):
+            setattr(odom_transform.transform.translation, key, getattr(odom.pose.pose.position, key))
+        odom_transform.transform.rotation = deepcopy(odom.pose.pose.orientation)
+        odom_tf = self._TFMessage(); odom_tf.transforms = [odom_transform]
+        if self.stream.extrinsic_mode == 'dynamic':
+            odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
         with self._lock:
             if self._stopped() or self._receipt_clock() - received > self.stream.max_age_s:
@@ -421,7 +433,9 @@ class RtabmapNode(Node):
                     ('admitting', 'waiting_for_cloud_metadata') or
                     not self.stream._poses or self.stream._poses[-1].segment_id != pose.segment_id):
                 return
-            segment['tf_pub'].publish(tf)
+            if self.stream.extrinsic_mode != 'dynamic':
+                segment['tf_pub'].publish(tf)
+            segment['odom_tf_pub'].publish(odom_tf)
             segment['odom_pub'].publish(odom)
             segment['cloud_pub'].publish(cloud)
             self._forwarded += 1
