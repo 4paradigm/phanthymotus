@@ -136,6 +136,8 @@ def next_runs(cron: str, after: float, count: int, tz=None) -> list[float]:
 _dynamic_tasks: dict[str, asyncio.Task] = {}   # name → asyncio.Task
 _job_info: dict[str, dict] = {}                # name → job（含 next_ts），供 API 展示
 _loop: asyncio.AbstractEventLoop | None = None  # run() 记下的事件循环
+ONCE_RETRY_DELAY_S = 30                         # 一次性事件入队失败后多久重试
+ONCE_MAX_RETRIES = 10
 
 
 def _on_loop(fn) -> None:
@@ -159,10 +161,10 @@ def _on_loop(fn) -> None:
         loop.call_soon_threadsafe(fn)
 
 
-def _add_job_now(name, cron, text, tz, at, source, on_fire) -> None:
+def _add_job_now(name, cron, text, tz, at, source, on_fire, after_fire=None) -> None:
     _remove_job_now(name)
     job = {'name': name, 'cron': cron, 'text': text, 'tz': tz, 'at': at,
-           'source': source, 'on_fire': on_fire}
+           'source': source, 'on_fire': on_fire, 'after_fire': after_fire}
     task = asyncio.ensure_future(_run_job(job))
     _dynamic_tasks[name] = task
     _job_info[name] = job
@@ -176,13 +178,15 @@ def _remove_job_now(name: str) -> None:
 
 
 def add_job(name: str, cron: str, text: str, *, tz=None, at: float | None = None,
-            source: str | None = None, on_fire=None) -> None:
+            source: str | None = None, on_fire=None, after_fire=None) -> None:
     """动态添加一个定时 job（如果同名已存在则先移除）。可以从任何线程调用。
 
     cron 和 at 二选一：at 是一次性触发的 unix 时间。
-    on_fire(job) 在推事件前调用，返回 False 就跳过这一次（用于每日上限、一次性任务收尾）。
+    on_fire(job) 在推事件前调用，返回 False 就跳过这一次（每日上限、已停用）。
+    after_fire(job) 只在事件成功入队后调用（记账、一次性任务收尾）。两个回调都在线程池里跑
+    （它们会读写 SQLite，不能卡事件循环）。
     """
-    _on_loop(functools.partial(_add_job_now, name, cron, text, tz, at, source, on_fire))
+    _on_loop(functools.partial(_add_job_now, name, cron, text, tz, at, source, on_fire, after_fire))
 
 
 def remove_job(name: str) -> None:
@@ -223,6 +227,7 @@ async def _run_job(job: dict) -> None:
     source = job.get('source') or f'scheduler:{name}'
     at = job.get('at')
     on_fire = job.get('on_fire')
+    after_fire = job.get('after_fire')
     try:
         tz = get_tz(job['tz']) if isinstance(job.get('tz'), str) else job.get('tz')
     except ValueError as e:
@@ -245,16 +250,32 @@ async def _run_job(job: dict) -> None:
         fire = True
         if on_fire is not None:
             try:
-                fire = on_fire(job) is not False
+                fire = (await asyncio.to_thread(on_fire, job)) is not False
             except Exception as e:
                 print(f'[scheduler] on_fire for {name!r} failed: {e}')
+        delivered = False
         if fire:
-            await event_bus.enqueue(
-                source  = source,
-                text    = text,
-            )
+            try:
+                await event_bus.enqueue(
+                    source  = source,
+                    text    = text,
+                )
+                delivered = True
+            except Exception as e:
+                print(f'[scheduler] enqueue for {name!r} failed: {e}')
+            if delivered and after_fire is not None:
+                try:
+                    await asyncio.to_thread(after_fire, job)
+                except Exception as e:
+                    print(f'[scheduler] after_fire for {name!r} failed: {e}')
 
         if at:   # 一次性
+            if fire and not delivered:
+                # 没发出去：不算完成，过一会儿再试；状态里仍是启用，重启后也会恢复。
+                job['retries'] = job.get('retries', 0) + 1
+                if job['retries'] <= ONCE_MAX_RETRIES:
+                    next_ts = time.time() + ONCE_RETRY_DELAY_S
+                    continue
             job['next_ts'] = None
             return
         try:

@@ -107,7 +107,7 @@ class TestValidation(_Base):
         config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'max_fires_per_day': 12}
         with _FakeJobs():
             schedule_store.create(name='a', text='x', cron='0,10,20,30 8,12,18 * * *')   # 12 次/天
-            with self.assertRaisesRegex(ValueError, '一天最多'):
+            with self.assertRaisesRegex(ValueError, '超过上限'):
                 schedule_store.create(name='b', text='x', cron='0 21 * * *')
 
     def test_unique_name_and_counts(self):
@@ -164,11 +164,13 @@ class TestFiring(_Base):
         with _FakeJobs():
             a = schedule_store.create(name='a', text='x', kind='once',
                                       at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
-        cb = schedule_store._on_fire(a.id)
-        self.assertTrue(cb({}))
-        self.assertFalse(schedule_store.find('a').enabled, '一次性定时触发后应停用')
+        check, done = schedule_store._on_fire(a.id), schedule_store._after_fire(a.id)
+        self.assertTrue(check({}))
+        self.assertTrue(schedule_store.find('a').enabled, '入队之前不改状态')
+        done({})
+        self.assertFalse(schedule_store.find('a').enabled, '一次性定时成功触发后应停用')
         schedule_store._schedules[a.id].enabled = True
-        self.assertFalse(cb({}), '超过每日上限应跳过')
+        self.assertFalse(check({}), '超过每日上限应跳过')
 
     def test_one_shot_job_enqueues_once(self):
         import event_bus
@@ -248,7 +250,7 @@ class TestReviewRegressions(_Base):
         with _FakeJobs():
             schedule_store.create(name='a', text='x', kind='once', at='2026-12-01 08:00')
             schedule_store.create(name='b', text='x', kind='once', at='2026-12-01 09:00')
-            with self.assertRaisesRegex(ValueError, '一天最多'):
+            with self.assertRaisesRegex(ValueError, '超过上限'):
                 schedule_store.create(name='c', text='x', kind='once', at='2026-12-01 10:00')
             schedule_store.create(name='d', text='x', kind='once', at='2026-12-02 10:00')
 
@@ -299,6 +301,116 @@ class TestReviewRegressions(_Base):
             self.assertIn(f'\ndef {name}(', src, f'{name} 应该是同步路由')
             self.assertNotIn(f'async def {name}(', src)
         self.assertIn('asyncio.to_thread', (_SRC / 'schedule_store.py').read_text(encoding='utf-8'))
+
+
+
+class TestSecondReview(_Base):
+    """PR #398 第二轮审查：逐天相加的上限估算、fire_now 快照、一次性入队失败不丢。"""
+
+    @staticmethod
+    def _next_weekday(wd: int) -> datetime.datetime:
+        d = datetime.datetime.now(CN).replace(hour=0, minute=0, second=0, microsecond=0)
+        d += datetime.timedelta(days=1)
+        while d.weekday() != wd:
+            d += datetime.timedelta(days=1)
+        return d
+
+    def test_peaks_from_different_days_are_not_added(self):
+        """周一 cron 8 次 + 周二 5 个一次性：哪天都不超过 10，不该被拒；
+        周一再加 3 个一次性就是 11 次，要拒。"""
+        config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'max_fires_per_day': 10,
+                                             'max_schedules': 30}
+        mon, tue = self._next_weekday(0), self._next_weekday(1)
+        with _FakeJobs():
+            schedule_store.create(name='周一巡检', text='x', cron='0 8-15 * * 1')
+            for i in range(5):
+                schedule_store.create(name=f'周二{i}', text='x', kind='once',
+                                      at=(tue + datetime.timedelta(hours=9 + i)).strftime('%Y-%m-%d %H:%M'))
+            schedule_store.create(name='周一a', text='x', kind='once',
+                                  at=(mon + datetime.timedelta(hours=17)).strftime('%Y-%m-%d %H:%M'))
+            schedule_store.create(name='周一b', text='x', kind='once',
+                                  at=(mon + datetime.timedelta(hours=18)).strftime('%Y-%m-%d %H:%M'))
+            with self.assertRaisesRegex(ValueError, '11 次'):
+                schedule_store.create(name='周一c', text='x', kind='once',
+                                      at=(mon + datetime.timedelta(hours=19)).strftime('%Y-%m-%d %H:%M'))
+
+    def test_fire_now_uses_a_locked_snapshot(self):
+        import event_bus
+        sent = []
+
+        async def fake(source, text, payload=None):
+            sent.append((source, text))
+
+        with _FakeJobs():
+            s = schedule_store.create(name='快照', text='旧文字', cron='0 8 * * *')
+        snap = schedule_store._snapshot(s.id)
+        schedule_store._schedules[s.id].text = '被改了'
+        self.assertEqual(snap.text, '旧文字', '快照是拷贝，不随后续修改变化')
+        orig = event_bus.enqueue
+        event_bus.enqueue = fake
+        try:
+            asyncio.run(schedule_store.fire_now(s.id))
+            with _FakeJobs():
+                schedule_store.delete(s.id)
+            with self.assertRaises(KeyError):
+                asyncio.run(schedule_store.fire_now(s.id))
+        finally:
+            event_bus.enqueue = orig
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], 'scheduler:快照')
+        self.assertIn('被改了', sent[0][1], '同一个快照里的名字和文字一致')
+
+    def test_one_shot_survives_enqueue_failure(self):
+        import event_bus
+        calls = []
+
+        async def flaky(source, text, payload=None):
+            calls.append(source)
+            if len(calls) == 1:
+                raise RuntimeError('总线暂时不可用')
+
+        with _FakeJobs():
+            a = schedule_store.create(name='一次', text='x', kind='once',
+                                      at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
+        job = {'name': 'sched:' + a.id, 'text': 'x', 'at': time.time() + 0.05, 'source': 'scheduler:一次',
+               'on_fire': schedule_store._on_fire(a.id), 'after_fire': schedule_store._after_fire(a.id)}
+
+        async def go():
+            orig, delay = event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S
+            event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S = flaky, 0.05
+            try:
+                await scheduler._run_job(job)
+            finally:
+                event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S = orig, delay
+        asyncio.run(asyncio.wait_for(go(), 5))
+        self.assertEqual(len(calls), 2, '第一次失败后重试一次')
+        s = schedule_store.find('一次')
+        self.assertFalse(s.enabled)
+        self.assertEqual(s.fire_count, 1, '只有成功的那次记账')
+
+    def test_failed_enqueue_keeps_one_shot_enabled(self):
+        import event_bus
+
+        async def broken(source, text, payload=None):
+            raise RuntimeError('down')
+
+        with _FakeJobs():
+            a = schedule_store.create(name='一次2', text='x', kind='once',
+                                      at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
+        job = {'name': 'sched:' + a.id, 'text': 'x', 'at': time.time() + 0.05, 'source': 'scheduler:一次2',
+               'on_fire': schedule_store._on_fire(a.id), 'after_fire': schedule_store._after_fire(a.id)}
+
+        async def go():
+            orig = (event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES)
+            event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES = broken, 0.02, 2
+            try:
+                await scheduler._run_job(job)
+            finally:
+                event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES = orig
+        asyncio.run(asyncio.wait_for(go(), 5))
+        s = schedule_store.find('一次2')
+        self.assertTrue(s.enabled, '一直没发出去：保持启用，重启后还会恢复')
+        self.assertEqual(s.fire_count, 0)
 
 
 if __name__ == '__main__':

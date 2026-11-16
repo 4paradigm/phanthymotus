@@ -178,21 +178,41 @@ def next_run_ts(s: Schedule, now: float | None = None) -> float | None:
     return scheduler._next_run(s.cron, now, s.tz)
 
 
-def _cron_daily_max(s: Schedule, now: float) -> int:
-    """按 cron 估算这个定时任务一天最多触发几次（看接下来 7 天里最多的一天）。"""
-    if s.kind != 'cron' or not s.enabled:
-        return 0
-    tz = scheduler.get_tz(s.tz)
-    horizon = now + 7 * 86400
-    per_day: dict[str, int] = {}
-    t = now
+def _cron_fires_between(s: Schedule, start: float, end: float) -> int:
+    """cron 定时在 [start, end) 里触发几次。"""
+    n, t = 0, start - 60          # _next_run 从 after+60 的整分钟开始找
     for _ in range(2000):
-        t = scheduler._next_run(s.cron, t, tz)
-        if t > horizon:
+        t = scheduler._next_run(s.cron, t, s.tz)
+        if t >= end:
             break
-        day = datetime.datetime.fromtimestamp(t, tz).strftime('%Y-%m-%d')
-        per_day[day] = per_day.get(day, 0) + 1
-    return max(per_day.values()) if per_day else 0
+        n += 1
+    return n
+
+
+def _peak_daily_fires(items: list[Schedule], now: float, day_tz: str) -> tuple[int, str]:
+    """所有启用的定时任务合起来，按真实日期逐天相加，返回 (最多的一天的次数, 那一天)。
+
+    要看的日子 = 接下来 7 天（覆盖按周重复的 cron）+ 每个一次性定时所在的那天；
+    每一天都把当天 cron 的实际触发数和当天的一次性定时加在一起，不拿不同日期的峰值相加。
+    """
+    tz = scheduler.get_tz(day_tz)
+    today = datetime.datetime.fromtimestamp(now, tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    days = {(today + datetime.timedelta(days=i)).date() for i in range(7)}
+    once_by_day: dict = {}
+    for x in items:
+        if x.enabled and x.kind == 'once':
+            d = datetime.datetime.fromtimestamp(parse_at(x.at, x.tz), tz).date()
+            once_by_day[d] = once_by_day.get(d, 0) + 1
+            days.add(d)
+    crons = [x for x in items if x.enabled and x.kind == 'cron']
+    best, best_day = 0, ''
+    for d in sorted(days):
+        start = datetime.datetime(d.year, d.month, d.day, tzinfo=tz).timestamp()
+        end = start + 86400
+        total = once_by_day.get(d, 0) + sum(_cron_fires_between(c, max(start, now), end) for c in crons)
+        if total > best:
+            best, best_day = total, d.isoformat()
+    return best, best_day
 
 
 # ── 校验 ─────────────────────────────────────────────────────────────────────
@@ -247,19 +267,10 @@ def validate(s: Schedule, *, now: float | None = None) -> None:
     if s.skill and st['max_per_skill'] and \
             sum(1 for o in others if o.skill == s.skill) + 1 > st['max_per_skill']:
         raise ValueError(f'技能 {s.skill} 的定时任务最多 {st["max_per_skill"]} 条')
-    # 重复的按“每天最多几次”算进每一天；一次性的只算进它自己那一天（按默认时区的日期）。
-    cron_total = 0
-    once_by_day: dict[str, int] = {}
-    for x in (s, *others):
-        if x.kind == 'once':
-            day = fmt_ts(parse_at(x.at, x.tz), st['default_tz'])[:10]
-            once_by_day[day] = once_by_day.get(day, 0) + 1
-        else:
-            cron_total += _cron_daily_max(x, now)
-    total = cron_total + max(once_by_day.values(), default=0)
+    total, day = _peak_daily_fires([s, *others], now, st['default_tz'])
     if total > st['max_fires_per_day']:
         raise ValueError(
-            f'加上这条，所有定时任务一天最多会触发 {total} 次，超过上限 {st["max_fires_per_day"]} 次')
+            f'加上这条，{day} 这一天所有定时任务会触发 {total} 次，超过上限 {st["max_fires_per_day"]} 次')
 
 
 # ── 注册到 scheduler ─────────────────────────────────────────────────────────
@@ -276,24 +287,39 @@ def event_text(s: Schedule) -> str:
 
 
 def _on_fire(sid: str):
+    """推事件之前：只判断这一次该不该发（还启用着、没到每日上限），不改任何状态。"""
     def _cb(_job: dict) -> bool:
-        s = _schedules.get(sid)
-        if not s or not s.enabled:
-            return False
-        st = get_settings()
-        day = fmt_ts(time.time(), st['default_tz'])[:10]
-        if _fires_by_day.get(day, 0) >= st['max_fires_per_day']:
-            print(f'[schedule] daily cap {st["max_fires_per_day"]} reached, skip {s.name!r}')
-            return False
-        if day not in _fires_by_day:
-            _fires_by_day.clear()      # 只留当天的计数
-        _fires_by_day[day] = _fires_by_day.get(day, 0) + 1
-        s.last_run = time.time()
-        s.fire_count += 1
-        if s.kind == 'once':
-            s.enabled = False
-        _persist(s)
-        return True
+        with _lock:
+            s = _schedules.get(sid)
+            if not s or not s.enabled:
+                return False
+            st = get_settings()
+            day = fmt_ts(time.time(), st['default_tz'])[:10]
+            if _fires_by_day.get(day, 0) >= st['max_fires_per_day']:
+                print(f'[schedule] daily cap {st["max_fires_per_day"]} reached, skip {s.name!r}')
+                return False
+            return True
+    return _cb
+
+
+def _after_fire(sid: str):
+    """事件**成功入队之后**才记账：计数、上次触发时间；一次性的这时才停用并落盘。
+    入队失败时不会走到这里，一次性定时保持启用，scheduler 会重试，重启后也还在。"""
+    def _cb(_job: dict) -> None:
+        with _lock:
+            s = _schedules.get(sid)
+            if not s:
+                return
+            st = get_settings()
+            day = fmt_ts(time.time(), st['default_tz'])[:10]
+            if day not in _fires_by_day:
+                _fires_by_day.clear()      # 只留当天的计数
+            _fires_by_day[day] = _fires_by_day.get(day, 0) + 1
+            s.last_run = time.time()
+            s.fire_count += 1
+            if s.kind == 'once':
+                s.enabled = False
+            _persist(s)
     return _cb
 
 
@@ -305,11 +331,11 @@ def _register(s: Schedule) -> None:
         t = parse_at(s.at, s.tz)
         if t <= time.time():
             return
-        scheduler.add_job(job_name(s.id), '', event_text(s), at=t,
-                          source=f'scheduler:{s.name}', on_fire=_on_fire(s.id))
+        scheduler.add_job(job_name(s.id), '', event_text(s), at=t, source=f'scheduler:{s.name}',
+                          on_fire=_on_fire(s.id), after_fire=_after_fire(s.id))
     else:
-        scheduler.add_job(job_name(s.id), s.cron, event_text(s), tz=s.tz,
-                          source=f'scheduler:{s.name}', on_fire=_on_fire(s.id))
+        scheduler.add_job(job_name(s.id), s.cron, event_text(s), tz=s.tz, source=f'scheduler:{s.name}',
+                          on_fire=_on_fire(s.id), after_fire=_after_fire(s.id))
 
 
 @_locked
@@ -416,11 +442,20 @@ async def fire_now(sid: str) -> Schedule:
     查找走线程池（首次调用可能要读库），推事件在循环里。"""
     import asyncio
     import event_bus
-    s = await asyncio.to_thread(lambda: _schedules.get(sid) if (_ensure_loaded() or True) else None)
-    if not s:
+    s = await asyncio.to_thread(_snapshot, sid)
+    if s is None:
         raise KeyError(sid)
+    # 用加锁时拍下的快照推事件：名字和文字来自同一时刻，不会和并发的修改混在一起。
+    # 与删除的先后以拿快照为准：拿到快照之后才删，就算“先触发、后删除”。
     await event_bus.enqueue(source=f'scheduler:{s.name}', text=event_text(s))
     return s
+
+
+@_locked
+def _snapshot(sid: str) -> Schedule | None:
+    _ensure_loaded()
+    s = _schedules.get(sid)
+    return Schedule(**asdict(s)) if s else None
 
 
 def to_dict(s: Schedule) -> dict:
