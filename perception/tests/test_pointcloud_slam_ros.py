@@ -562,6 +562,14 @@ def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatc
         sub = next(s for s in n.subscriptions if s.topic == '/camera/rgbd/body_mount')
         sub.callback(NS(data=json.dumps(packet(1_100_000_123))))
         assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        transforms = published(n, '/tf')[0].raw_messages[-1].transforms
+        assert len(transforms) == 2
+        assert not published(n, '/tf_static')
+        native_pose = published(n, '/odom')[0].raw_messages[-1]
+        assert transforms[0].header.frame_id == native_pose.header.frame_id
+        assert transforms[0].child_frame_id == native_pose.child_frame_id
+        assert vars(transforms[0].header.stamp) == vars(native_pose.header.stamp)
+        assert transforms[1].header.frame_id == native_pose.child_frame_id
     finally:
         n.close(); n.destroy_node()
 
@@ -661,3 +669,17 @@ def test_native_discovery_allows_slow_start_but_remains_bounded(node, monkeypatc
         else:
             assert node._activate(pose)['process'].started
             assert tick[0] == ready_at
+
+
+def test_native_odom_tf_matches_admitted_pose_and_capture(node):
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    pose = published(node, '/odom')[0].raw_messages[-1]
+    dynamic = published(node, '/tf')[0].raw_messages[-1].transforms
+    transform = next(t for t in dynamic if t.child_frame_id == pose.child_frame_id)
+    assert vars(transform.header.stamp) == vars(pose.header.stamp)
+    assert transform.header.frame_id == pose.header.frame_id
+    assert vars(transform.transform.translation) == vars(pose.pose.pose.position)
+    assert vars(transform.transform.rotation) == vars(pose.pose.pose.orientation)
+    static = published(node, '/tf_static')[0].raw_messages[-1].transforms
+    assert all(t.header.frame_id != pose.header.frame_id for t in static)
