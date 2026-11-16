@@ -92,6 +92,9 @@ class EstimateGate:
         self.recovery_policy = self.pause_context = None
         self.input_period_ns = self.processing_p95_ns = None
         self.input_intervals = deque(maxlen=32)
+        self.last_native_stamp = 0
+        self.result_period_ns = None
+        self.result_intervals = deque(maxlen=32)
 
     def input(self, stamp, *, now_ns=None):
         self.status(stamp if now_ns is None else now_ns)
@@ -117,7 +120,9 @@ class EstimateGate:
         if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
                 if self.recovery_policy is not None:
-                    self.pause_context = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, time.monotonic_ns())
+                    periods = [v for v in (self.input_period_ns, self.result_period_ns) if v is not None]
+                    self.pause_context = self.recovery_policy.begin(max(periods) if periods else None,
+                        self.processing_p95_ns, time.monotonic_ns())
                 self.recover_by = now + (self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)
             self.state, self.reason = 'recovering', 'visual estimate rejected: ' + str(reason)
 
@@ -155,6 +160,11 @@ class EstimateGate:
         if stamp <= max(self.last_stamp, self.last_result_stamp) or now - stamp > 1_500_000_000:
             self.rejection = 'stale or out-of-order visual estimate'  # never counted as evidence
             return None
+        if self.last_native_stamp and stamp > self.last_native_stamp:
+            self.result_intervals.append(stamp-self.last_native_stamp)
+            if len(self.result_intervals) >= 5:
+                self.result_period_ns = int(np.median(self.result_intervals))
+        self.last_native_stamp = stamp
         self.last_result_stamp = stamp
         try:
             if info.lost or info.inliers < 10:
@@ -226,6 +236,12 @@ def estimator_parameters(calibration, segment):
                        'Vis/CorFlowIterations': '30'})
     if calibration.get('imu_topic') and not calibration.get('short_term_compensation'):
         params.update(wait_imu_to_init=True, **{'Odom/GuessSmoothingDelay': '0'})
+    else:
+        # Camera-start map axes: optical forward/right/down become +X/-Y/-Z.
+        # This sets the world basis, not the camera child frame or a body mount.
+        # Native attitude-only IMU initialization above owns gravity alignment;
+        # fusion keeps this visual basis, including visual-only fallback.
+        params['initial_pose'] = '0 0 0 -1.5707963267948966 0 -1.5707963267948966'
     if association_enabled(calibration):
         params.update(motus_rotation_hint=True, wait_imu_to_init=False, guess_frame_id='',
                       **{'Odom/GuessMotion': 'true', 'Odom/GuessSmoothingDelay': '0',

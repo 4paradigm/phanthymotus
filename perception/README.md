@@ -102,6 +102,16 @@ relation is invented. Tianyi, G1 and Bumi source adapters live in the separate
 driver repository. G1 requires SDK global capture time; Bumi also exposes its
 existing fixed hardware-clock offset explicitly as unverified provenance.
 
+Visual-only and short-term fusion sessions initialize the native map basis at
+the camera origin with +X along initial optical forward, +Y along initial optical
+left and +Z along initial optical up (`initial_pose` RPY `-pi/2 0 -pi/2`). This
+keeps optical depth from becoming height in the Z-up mapping preview. The pose
+child remains the camera optical frame; these camera-start axes do not establish
+robot body mounting, physical vertical or floor height. Fusion and its in-segment
+visual-only fallback share this basis. Native attitude-only IMU mode retains its
+own gravity initialization without this initial-pose rotation. Existing saved
+maps keep their original coordinates.
+
 Algorithm settings are available only through the card's instance configuration
 (gear button), without duplicate form fields. The platform still supplies the
 instance ID, input topics and camera calibration automatically. Saved `config`
@@ -252,14 +262,17 @@ invalid quaternion) changes the state to `recovering`: pose output pauses, but
 the same native estimator keeps receiving frames. Tracking resumes in the same
 segment only after three consecutive valid estimates whose pose is continuous
 with the last published pose (within 5 cm + 1 m/s and 5° + 90°/s of elapsed
-time; an unvalidated engineering bound) and no later than 0.8 s after the
-last published capture. Rejected frames publish pose-less `recovering`
+time; an unvalidated engineering bound). With the shared input registry,
+the frozen recovery budget uses the slower of camera and native-result cadence
+(a median of at least five intervals), covering one rejected result, three
+recovery results and one processing P95. It stays within 1–3 s; capture-time
+resumption leaves 200 ms of that budget for jitter. Legacy inputs retain the
+0.8 s capture/1 s waiting limits. Rejected frames publish pose-less `recovering`
 samples declaring `vendor.pause` (`source=visual_gate`,
 `mapping_allowed=false`); `pointcloud_slam` honours that declaration exactly
-like an ESKF pause (same segment and clock, at most 1 s), so the resumed
-segment stays mappable. The 0.8 s producer bound leaves margin under that 1 s
-consumer limit for latency jitter. Degradation lasting 1 s, a resume after
-0.8 s, a discontinuous resume, a changed native frame or a future capture time
+like an ESKF pause (same segment and clock, the declared deadline, mapping
+disabled), so the resumed segment stays mappable. Budget expiry, a late or
+discontinuous resume, a changed native frame or a future capture time
 ends the segment. Late or repeated camera captures are dropped and counted
 (`info().input_rejections`), never paired; persistent input loss still expires
 the segment. Stale or out-of-order native results are ignored, never counted
@@ -388,7 +401,8 @@ or when no fused pose was ever published; otherwise the segment is retired
 for supervised new-segment recovery. After a geometry-only tracking capture
 there is no same-capture native visual comparison, so the old segment is
 retired rather than assuming zero offset. Fallback poses obey the same
-three-estimate, continuity, pause-declaration and 1 s/0.8 s rules. The ESKF is not
+three-estimate, continuity and bounded pause-declaration rules. Waiting longer
+for visual evidence does not extend inertial prediction or IMU freshness. The ESKF is not
 restarted inside that segment; a later new segment retries it. Predictions
 are never published as tracking and a stale IMU is never fused again.
 Camera frame/segment, capture-clock and capture-queue faults end the segment
@@ -5192,7 +5206,9 @@ separately requires a tracking pose and usable finite points; prediction/lost/
 recovering states do not map. Lidar scans do not inherit image depth-fraction rules.
 
 `motus.pause/2` freezes a waiting budget at degradation: with measured input period
-and processing P95 it is `clamp(3*period + P95, 1s, 3s)`, otherwise 1s. VO and SLAM
+and processing P95 it is `clamp(4*period + P95, 1s, 3s)`, otherwise 1s. Visual
+recovery uses the slower measured camera/native-result period so a fast source
+cannot shorten the three-estimate confirmation window. VO and SLAM
 share the declared original deadline in the same ingress process. Repeated pause
 messages cannot extend it. The period uses the median of up to 32 intervals,
 only after at least five valid intervals. Legacy pauses, physical IMU prediction, uncertainty

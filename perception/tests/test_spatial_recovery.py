@@ -43,7 +43,7 @@ def test_versioned_slam_pause_uses_producer_deadline_without_extending_predictio
 
 def test_plan_budget_uses_one_p95_and_period_uses_five_interval_median():
     from plugins.rgbd_odometry_runtime import EstimateGate
-    assert RecoveryPolicy().begin(500_000_000,200_000_000,0).budget_ns==1_700_000_000
+    assert RecoveryPolicy().begin(500_000_000,200_000_000,0).budget_ns==2_200_000_000
     gate=EstimateGate('run','camera','clock')
     for i in range(5):gate.input(1_000_000_000+i*100_000_000)
     assert gate.input_period_ns is None
