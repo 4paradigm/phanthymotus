@@ -441,6 +441,59 @@ def test_disk_limit_stops_capture_but_valid_native_database_remains_exportable(n
     assert artifacts['statistics']['state'] == 'storage_limit'
 
 
+def test_disk_budget_tolerates_sqlite_journal_removed_during_scan(node, monkeypatch):
+    from pathlib import Path
+    node._status_stop.set()
+    node._status_worker.join(timeout=1)
+    database = node._session_dir / 'rtabmap.db'
+    database.write_bytes(b'database')
+    journal = node._session_dir / 'rtabmap.db-journal'
+    journal.write_bytes(b'transient journal')
+    is_file = Path.is_file
+
+    def remove_after_discovery(path):
+        result = is_file(path)
+        if path == journal and result:
+            path.unlink()
+        return result
+
+    monkeypatch.setattr(Path, 'is_file', remove_after_discovery)
+    node._check_budget()
+    assert node._disk_bytes == 8
+    assert node.status()['capture_stopped'] is False
+    assert database.read_bytes() == b'database'
+
+
+def test_disk_budget_counts_existing_sqlite_journal(node):
+    from plugins.pointcloud_slam_ros import _StorageLimit
+    node._status_stop.set()
+    node._status_worker.join(timeout=1)
+    (node._session_dir / 'rtabmap.db').write_bytes(b'database')
+    (node._session_dir / 'rtabmap.db-journal').write_bytes(b'journal')
+    node._settings['max_disk_bytes'] = 10
+    with pytest.raises(_StorageLimit, match='disk budget'):
+        node._check_budget()
+    assert node._disk_bytes == 15
+
+
+def test_disk_budget_does_not_hide_other_io_failures(node, monkeypatch):
+    from pathlib import Path
+    node._status_stop.set()
+    node._status_worker.join(timeout=1)
+    journal = node._session_dir / 'rtabmap.db-journal'
+    journal.write_bytes(b'journal')
+    stat = Path.stat
+
+    def unreadable(path, *args, **kwargs):
+        if path == journal:
+            raise PermissionError('cannot inspect journal')
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'stat', unreadable)
+    with pytest.raises(PermissionError, match='cannot inspect journal'):
+        node._check_budget()
+
+
 def test_watchdog_does_not_treat_normal_exit_during_segment_close_as_crash(tmp_path, monkeypatch):
     import plugins.pointcloud_slam_ros as ros
     entered, release = threading.Event(), threading.Event()

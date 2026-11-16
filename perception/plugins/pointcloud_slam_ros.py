@@ -332,7 +332,13 @@ class RtabmapNode(Node):
         self._wake.set()
 
     def _check_budget(self):
-        used = sum(path.stat().st_size for path in self._session_dir.rglob('*') if path.is_file())
+        used = 0
+        for path in self._session_dir.rglob('*'):
+            try:
+                if path.is_file():
+                    used += path.stat().st_size
+            except FileNotFoundError:
+                pass  # SQLite may remove its journal between discovery and stat.
         self._disk_bytes = used
         if used > self._settings['max_disk_bytes']:
             raise _StorageLimit('RTAB-Map session disk budget reached; native data retained')
