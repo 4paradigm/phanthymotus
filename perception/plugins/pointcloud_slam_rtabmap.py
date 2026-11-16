@@ -34,7 +34,7 @@ def require_runtime():
 
 
 def mapping_parameters(database_path, namespace, settings):
-    """Production scan-only parameters, shared with the real-image smoke gate.
+    """Production scan mapping parameters, shared with the real-image smoke gate.
 
     settings supplies max_pending, voxel_size_m, max_working_nodes and
     max_update_ms. RTAB-Map algorithm parameters are strings; ROS node
@@ -58,6 +58,13 @@ def mapping_parameters(database_path, namespace, settings):
         'Rtabmap/MemoryThr': str(settings['max_working_nodes']),
         'Rtabmap/TimeThr': str(settings['max_update_ms']),
         'DbSqlite3/JournalMode': '0', 'DbSqlite3/Synchronous': '1'}
+    if settings.get('rgb_input') is not None:
+        # One envelope always contains the scan; optional images may disappear
+        # and recover per frame without restarting this native map segment.
+        parameters.update(subscribe_sensor_data=True, subscribe_scan_cloud=False,
+                          qos_sensor_data=1)
+        parameters.update({'Kp/MaxFeatures': '500', 'Mem/BadSignaturesIgnored': 'false',
+                           'Grid/RangeMax': '0'})
     parameters.update(native_overrides(settings.get('native_parameters', {})))
     return parameters
 

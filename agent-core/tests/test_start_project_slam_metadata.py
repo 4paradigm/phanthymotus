@@ -284,3 +284,107 @@ def test_slam_routing_error_log_escapes_and_caps_untrusted_topic(rig, monkeypatc
     event = next(e['payload'] for e in rig.events if e['type'] == 'project_start_item'
                  and e['payload'].get('card_id') == 'slam')
     assert topic in event['message']  # UI diagnostics remain complete.
+
+
+def test_connected_rgb_routes_only_its_live_camera_without_spatial_metadata(rig):
+    camera = {'schema': 'motus.camera/1', 'topic': '/rgb/live', 'format': 'image/jpeg',
+              'K': [500, 0, 320, 0, 500, 240, 0, 0, 1],
+              'vendor': {'clock_id': 'capture-clock'}}
+    rig.ports['rgb'] = [{'topic': '/rgb/other', 'format': 'image/jpeg'},
+                        {'topic': '/rgb/live', 'format': 'image/jpeg'}]
+    rig.extra['rgb'] = {'camera_info': [dict(camera, topic='/rgb/other'), camera],
+                        'input_metadata': [{'topic': '/rgb/live', 'format': 'image/jpeg'}]}
+    layout = {'cards': [_card('slam', 'pointcloud_slam'), _card('rgb', 'camera'),
+                        _card('odom', 'loco_state'), _card('cloud', 'lidar_cloud')],
+              'connections': [_wire('odom', 1, 'slam', '/slam/odom', 'state/odom'),
+                              _wire('cloud', 1, 'slam', '/lidar/native', 'sensor/pointcloud2'),
+                              _wire('rgb', 1, 'slam', '/rgb/live', 'image/jpeg')]}
+    assert run(layout) is not False
+    args = rig.starts['slam']
+    assert args['input_bindings']['/rgb/live'] == 'image/jpeg'
+    assert args['camera_infos'] == {'/rgb/live': camera}
+    assert set(args['input_metadata']) == {'/slam/odom', '/lidar/native'}
+    args['camera_infos']['/rgb/live']['vendor']['clock_id'] = 'changed'
+    assert camera['vendor']['clock_id'] == 'capture-clock'
+
+
+def test_rgb_camera_claim_without_live_output_is_not_forwarded():
+    wire = _wire('rgb', 0, 'slam', '/rgb', 'image/jpeg')
+    info = {'rgb': {'camera_info': [{'schema': 'motus.camera/1',
+                                     'topic': '/rgb', 'format': 'image/jpeg'}]}}
+    got = collect_slam_inputs([wire], info, lambda c: c['fromTopic'])
+    assert got['input_bindings'] == {'/rgb': 'image/jpeg'}
+    assert 'camera_infos' not in got
+
+
+def test_invalid_rgb_calibration_is_forwarded_for_optional_fallback():
+    wire = _wire('rgb', 0, 'slam', '/rgb', 'image/jpeg')
+    malformed = {'schema': 'motus.camera/1', 'topic': '/rgb', 'format': 'wrong'}
+    info = {'rgb': {'topic_out': [{'topic': '/rgb', 'format': 'image/jpeg'}],
+                    'camera_info': [malformed]}}
+    got = collect_slam_inputs([wire], info, lambda c: c['fromTopic'])
+    assert got['camera_infos']['/rgb'] == malformed
+    info['rgb']['camera_info'].append(dict(malformed))
+    got = collect_slam_inputs([wire], info, lambda c: c['fromTopic'])
+    assert got['camera_infos']['/rgb'] == [malformed, malformed]
+
+
+def optional_rgb_layout(rig, monkeypatch, *, live_format='image/jpeg', live_topic=''):
+    monkeypatch.setitem(config.main, 'services', {'mcp': [{
+        'id': 'test-mcp', 'tools': [{'name': 'pointcloud_slam',
+        'inputSchema': {'x-slam-input-contract': 'motus.slam_input/1'},
+        'topic_in': [{'format': 'state/odom'}, {'format': 'sensor/pointcloud2'},
+                     {'format': 'image/jpeg', 'optional': True}]}]}]})
+    rig.ports['rgb'] = [{'topic': live_topic, 'format': live_format}]
+    return {'cards': [_card('odom', 'loco_state'), _card('cloud', 'lidar_cloud'),
+                      _card('rgb', 'camera'), _card('slam', 'pointcloud_slam')],
+            'connections': [
+                _wire('odom', 1, 'slam', '/slam/odom', 'state/odom'),
+                dict(_wire('cloud', 1, 'slam', '/lidar/native', 'sensor/pointcloud2'), toPortIdx='1'),
+                dict(_wire('rgb', 0, 'slam', '', 'image/jpeg'), toPortIdx='2')]}
+
+
+@pytest.mark.parametrize('topic,fmt,saved_topic', [
+    ('', 'image/jpeg', ''), ('', 'image/jpeg', '/cached/rgb'),
+    ('/live/rgb', 'image/png', ''), ('/live/rgb', 'state/odom', '')])
+def test_unavailable_declared_optional_rgb_starts_with_required_pair_and_diagnostic(
+        rig, monkeypatch, topic, fmt, saved_topic):
+    layout = optional_rgb_layout(rig, monkeypatch, live_topic=topic, live_format=fmt)
+    layout['connections'][2]['fromTopic'] = saved_topic
+    assert run(layout) is not False
+    args = rig.starts['slam']
+    assert args['input_topics'] == ['/slam/odom', '/lidar/native']
+    assert args['input_bindings'] == {'/slam/odom': 'state/odom',
+                                      '/lidar/native': 'sensor/pointcloud2'}
+    diagnostic, = args['optional_input_diagnostics']
+    assert diagnostic['field'] == 'rgb_input'
+    assert diagnostic['port_index'] == 2
+    assert diagnostic['source_card_id'] == 'rgb'
+    assert diagnostic['reason']
+    assert layout['connections'][2]['toPortIdx'] == '2'
+
+
+@pytest.mark.parametrize('slot', ['0', '1', 'bad', '-1'])
+def test_unresolved_required_or_invalid_slot_is_never_optional_rgb(rig, monkeypatch, slot):
+    layout = optional_rgb_layout(rig, monkeypatch)
+    layout['connections'][2]['toPortIdx'] = slot
+    async def stop():
+        pass
+    monkeypatch.setattr(config_api, '_do_stop_project', stop)
+    assert run(layout) is False
+    assert 'slam' not in rig.starts
+
+
+def test_saved_optional_claim_cannot_exempt_a_required_consumer_port(rig, monkeypatch):
+    layout = optional_rgb_layout(rig, monkeypatch)
+    services = config.main['services']
+    services['mcp'][0]['tools'][0]['topic_in'][2]['optional'] = False
+    monkeypatch.setitem(config.main, 'services', services)
+    layout['cards'][-1]['topicIn'] = [
+        {'format': 'state/odom'}, {'format': 'sensor/pointcloud2'},
+        {'format': 'image/jpeg', 'optional': True}]
+    async def stop():
+        pass
+    monkeypatch.setattr(config_api, '_do_stop_project', stop)
+    assert run(layout) is False
+    assert 'slam' not in rig.starts

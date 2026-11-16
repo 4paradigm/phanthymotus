@@ -989,10 +989,19 @@ async def _do_start_project_impl():
         # back to unaudited runtime guesses.
         return tool_name == 'pointcloud_slam'
 
-    def _upstream_slam_inputs(card_id: str) -> dict:
+    def _consumer_input_ports(card: dict) -> list:
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != card.get('mcpId'):
+                continue
+            for tool in mcp.get('tools') or []:
+                if isinstance(tool, dict) and tool.get('name') == card.get('toolName'):
+                    return tool.get('topic_in') or []
+        return []
+
+    def _upstream_slam_inputs(card_id: str, input_ports: list) -> dict:
         from api.slam_metadata import collect_slam_inputs
         inbound = [c for c in connections if c.get('toCardId') == card_id]
-        return collect_slam_inputs(inbound, resolved_info, _topic_of_connection)
+        return collect_slam_inputs(inbound, resolved_info, _topic_of_connection, input_ports=input_ports)
 
     def _requires_source_metadata(card: dict) -> bool:
         for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
@@ -1108,6 +1117,12 @@ async def _do_start_project_impl():
     # input_topic exactly as the old "sources first" phase gave it.
     for card in all_ordered:
         input_topic, input_topics, unresolved = _resolve_input_topics(card.get('id', ''))
+        slam_consumer = _requires_slam_metadata(card)
+        input_ports = _consumer_input_ports(card) if slam_consumer else []
+        if slam_consumer:
+            from api.slam_metadata import is_optional_rgb_connection
+            unresolved = [conn for conn in unresolved
+                          if not is_optional_rgb_connection(conn, input_ports)]
         if unresolved:
             # Starting it anyway is what made this class of bug invisible: the
             # card comes up subscribed to nothing and reports 已就绪. Fail it
@@ -1135,9 +1150,14 @@ async def _do_start_project_impl():
             continue
 
         slam_inputs = None
-        if _requires_slam_metadata(card):
+        if slam_consumer:
             try:
-                slam_inputs = _upstream_slam_inputs(card.get('id', ''))
+                slam_inputs = _upstream_slam_inputs(card.get('id', ''), input_ports)
+                # Unavailable optional RGB wires are diagnosed but not passed as
+                # subscriptions. Required inputs retain their strict routing.
+                topics = list(slam_inputs['input_bindings'])
+                input_topic = topics[0] if len(topics) == 1 else ''
+                input_topics = topics if len(topics) > 1 else []
             except ValueError as error:
                 tool_name = card.get('toolName', '')
                 message = f'SLAM 输入路由失败: {error}'

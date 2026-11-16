@@ -70,6 +70,21 @@ def test_runtime_parameters_use_external_odom_exact_sync_and_scan_only(tmp_path)
         process.close(timeout_s=3)
 
 
+def test_optional_rgb_uses_one_sensor_data_process_for_image_and_scan_fallback(tmp_path):
+    params = backend().mapping_parameters(tmp_path / 'map.db', '/private/rgb', {
+        'max_pending': 10, 'voxel_size_m': .08, 'max_working_nodes': 300,
+        'max_update_ms': 100, 'rgb_input': {'topic': '/rgb', 'camera_info': {}}})
+    assert params['subscribe_sensor_data'] is True
+    assert params['subscribe_scan_cloud'] is False
+    assert params['subscribe_odom'] is True and params['approx_sync'] is False
+    assert all(params[k] is False for k in ('subscribe_rgb', 'subscribe_rgbd', 'subscribe_depth'))
+    assert params['Reg/Strategy'] == '1'
+    assert params['RGBD/ProximityOdomGuess'] == 'true'
+    assert params['RGBD/ProximityPathMaxNeighbors'] == '1'
+    assert params['Grid/RangeMax'] == '0'
+    assert params['Mem/BadSignaturesIgnored'] == 'false'
+
+
 @pytest.mark.parametrize('options,match', [({'exit_code': 7}, 'exit'),
     ({'invalid_db': True}, 'database'), ({'ignore_interrupt': True}, 'timed out')])
 def test_failed_or_incomplete_stop_never_reports_saved_and_retains_data(tmp_path, options, match):
