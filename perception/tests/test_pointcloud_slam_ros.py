@@ -534,7 +534,8 @@ def test_camera_pose_reference_reaches_native_graph_preview(node):
     assert yaw == pytest.approx(np.pi / 2)
 
 
-def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_context", [False, True])
+def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatch, with_context):
     import plugins.pointcloud_slam_ros as ros
     from plugins.pointcloud_slam_capture_mount import resolve_capture_mount
     from test_pointcloud_slam_capture_mount import camera, pose
@@ -550,7 +551,13 @@ def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatc
         later = pose(); later['stamp_ms'] = 1200
         n._odom(NS(data=json.dumps(later)))
         raw = cloud(1_100_000_123, 'camera_optical')
-        n._cloud(raw)
+        context = None
+        if with_context:
+            from plugins.spatial_time import TimePolicy
+            context = TimePolicy('ingress').select(dict(stamp_ns=1_100_000_123,
+                clock_id='camera-clock', timestamp_semantics='source_capture_mapped'),
+                1_200_000_000, 1_200_000_000)
+        n._cloud(raw, context)
         assert n.status()['forwarded_clouds'] == 0
         sub = next(s for s in n.subscriptions if s.topic == '/camera/rgbd/body_mount')
         sub.callback(NS(data=json.dumps(packet(1_100_000_123))))
@@ -599,3 +606,35 @@ def test_unknown_covariance_reports_backend_default(node):
     assert _wait_until(lambda:node.status()['forwarded_clouds']==1)
     assert node.status()['covariance_source']=='backend_default'
     assert node.status()['upstream_covariance']=='unknown'
+
+
+def test_discovery_accepts_only_resolved_camera_clock_reference(monkeypatch):
+    from importlib import import_module
+    monkeypatch.setattr(import_module("rclpy.qos"), "qos_profile_sensor_data", object(), raising=False)
+    from plugins.pointcloud_slam_config import discover_runtime_geometry
+    from plugins.spatial_time import TimePolicy
+    from test_pointcloud_slam_capture_mount import camera, pose
+    context = TimePolicy('ingress').select(dict(stamp_ns=1_100_000_123,
+        clock_id='camera-clock', timestamp_semantics='source_capture_mapped'),
+        1_200_000_000, 1_200_000_000)
+    class Registry:
+        def acquire(self, topic, kind, declaration, callback):
+            if topic == '/o': callback(NS(data=json.dumps(pose())), None)
+            else: callback(cloud(1_100_000_123, 'camera_optical'), context)
+            return NS(close=lambda: None)
+    executor = NS(add_node=lambda n: None, remove_node=lambda n: None)
+    cfg, provenance = discover_runtime_geometry(executor, '/o', '/c',
+        input_registry=Registry(), camera_info=camera(), timeout_s=.01)
+    assert cfg['clock_id'] == 'clock'
+    assert cfg['capture_mount']['source_clock'] == 'camera-clock'
+    assert provenance['clock_accuracy_validated'] is False
+    bad = camera(); bad['vendor']['clock_reference']['domain_id'] = 'other-host'
+    with pytest.raises(ValueError, match='same declared host clock reference'):
+        discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
+                                  camera_info=bad, timeout_s=.01)
+
+    from dataclasses import replace
+    context = replace(context, observation_stamp_ns=1_100_000_124)
+    with pytest.raises(ValueError, match='differs from capture timestamp'):
+        discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
+                                  camera_info=camera(), timeout_s=.01)

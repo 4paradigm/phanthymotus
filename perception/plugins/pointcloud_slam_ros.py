@@ -253,8 +253,9 @@ class RtabmapNode(Node):
             return
         try:
             if context is not None:
-                if context.normalized_clock_id!=self.stream.clock_id:
-                    raise ValueError('cloud observation clock differs from pose clock')
+                from .pointcloud_slam_capture_mount import validate_cloud_clock
+                stamp = msg.header.stamp.sec*10**9 + msg.header.stamp.nanosec
+                validate_cloud_clock(context, self.stream.clock_id, stamp, self._settings.get('capture_mount'))
                 if context.time_basis=='receipt_estimated':
                     msg=deepcopy(msg)
                     msg.header.stamp.sec,msg.header.stamp.nanosec=divmod(context.observation_stamp_ns,10**9)

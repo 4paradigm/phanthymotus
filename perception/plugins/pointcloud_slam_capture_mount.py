@@ -41,6 +41,20 @@ def resolve_capture_mount(sample, camera, cloud_frame):
         clock_reference=deepcopy(reference), clock_accuracy_validated=False)
 
 
+def validate_cloud_clock(context, clock_id, stamp_ns, capture_mount=None):
+    """Use only a previously resolved common reference for different clock names."""
+    if context is None:
+        return
+    if context.time_basis == 'source_capture' and context.observation_stamp_ns != stamp_ns:
+        raise ValueError('cloud observation differs from capture timestamp')
+    if context.normalized_clock_id == clock_id:
+        return
+    if (capture_mount is None or context.time_basis != 'source_capture' or
+            context.normalized_clock_id != capture_mount['source_clock'] or
+            capture_mount['clock_reference']['clock_id'] != clock_id):
+        raise ValueError('cloud and pose have no comparable observation clock')
+
+
 class CaptureClouds:
     """Bounded raw-cloud waiting; never substitutes latest/nearest/static TF."""
     def __init__(self, config, *, max_pending):

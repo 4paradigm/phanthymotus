@@ -122,3 +122,21 @@ def test_invalid_mount_does_not_reach_native_admission(changes):
     with pytest.raises(ValueError):
         pair.mount(p, s, now=1.2, measurement_now_ns=1_200_000_000)
     assert not s.accepted and pair.mounts.state == 'lost'
+
+
+@pytest.mark.parametrize('change', ['missing_reference', 'other_clock', 'receipt', 'stamp'])
+def test_observation_clock_alias_requires_resolved_capture_evidence(change):
+    from dataclasses import replace
+    from plugins.spatial_time import TimePolicy
+    from plugins.pointcloud_slam_capture_mount import validate_cloud_clock
+    cfg, _ = resolve_capture_mount(pose(), camera(), 'camera_optical')
+    context = TimePolicy('ingress').select(dict(stamp_ns=1_000_000_000,
+        clock_id='camera-clock', timestamp_semantics='source_capture_mapped'),
+        1_000_000_000, 1_000_000_000)
+    mount = cfg['capture_mount']
+    if change == 'missing_reference': mount = None
+    if change == 'other_clock': context = replace(context, normalized_clock_id='other')
+    if change == 'receipt': context = TimePolicy('ingress').select({}, 1_000_000_000, 1_000_000_000)
+    if change == 'stamp': context = replace(context, observation_stamp_ns=1_000_000_001)
+    with pytest.raises(ValueError):
+        validate_cloud_clock(context, cfg['clock_id'], 1_000_000_000, mount)

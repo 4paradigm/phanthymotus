@@ -154,7 +154,8 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
         except (AttributeError, ValueError, TypeError):
             return
         with lock:
-            clouds.append((frame, context.observation_stamp_ns if context is not None else stamp_ns, context))
+            clouds.append((frame, context.observation_stamp_ns if context is not None and
+                           context.time_basis == 'receipt_estimated' else stamp_ns, context))
         wake.set()
 
     try:
@@ -174,10 +175,10 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
             for frame, stamp, context in reversed(headers):
                 for sample in reversed(samples):
                     try:
-                        if context is not None and context.normalized_clock_id!=sample['vendor']['motus_slam']['clock_id']:
-                            raise ValueError('cloud and pose have no comparable observation clock')
                         settings,provenance=infer_geometry(sample, frame, stamp, manual=manual,
                                               max_gap_ms=max_gap_ms, camera_info=camera_info)
+                        from .pointcloud_slam_capture_mount import validate_cloud_clock
+                        validate_cloud_clock(context, settings['clock_id'], stamp, settings.get('capture_mount'))
                         if context is not None:
                             settings['time_basis']=context.time_basis
                             provenance['time_basis']=context.time_basis
