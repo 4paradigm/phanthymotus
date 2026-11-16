@@ -245,3 +245,42 @@ def test_metadata_start_failure_identifies_the_card(rig, monkeypatch, source, to
     done = next(e['payload'] for e in rig.events if e['type'] == 'project_start_done')
     assert done['errors'] == [f'{tool} (failed-instance)']
     assert 'failed-instance' not in rig.starts and rolled_back == [True]
+
+
+def test_connected_cloud_capture_mount_is_forwarded_without_other_ports():
+    cloud = {'schema': 'motus.camera/1', 'topic': '/metric', 'format': 'sensor/pointcloud2',
+             'vendor': {'body_mount': {'topic': '/actual/mount'}}}
+    other = {'schema': 'motus.camera/1', 'topic': '/unconnected', 'format': 'sensor/pointcloud2'}
+    infos = {'c': {'topic_out': [{'topic': '/metric', 'format': 'sensor/pointcloud2'}],
+                   'camera_info': [other, cloud]}}
+    wire = _wire('c', 0, 'slam', '/metric', 'sensor/pointcloud2')
+    got = collect_slam_inputs([wire], infos, lambda c: c['fromTopic'])
+    assert got['camera_infos'] == {'/metric': cloud}
+    got['camera_infos']['/metric']['vendor']['body_mount']['topic'] = '/changed'
+    assert cloud['vendor']['body_mount']['topic'] == '/actual/mount'
+    infos['c']['camera_info'].append(cloud)
+    with pytest.raises(SlamRoutingError, match='duplicate'):
+        collect_slam_inputs([wire], infos, lambda c: c['fromTopic'])
+
+
+def test_slam_routing_error_log_escapes_and_caps_untrusted_topic(rig, monkeypatch, capsys):
+    topic = '/lidar/\nFORGED\r\x1b[31m\x00\u2028' + 'x' * 5000
+    rig.ports['cloud'][1]['topic'] = topic
+    rig.extra['cloud']['input_metadata'] = [
+        {'topic': topic, 'format': 'sensor/pointcloud2'},
+        {'topic': topic, 'format': 'sensor/pointcloud2'},
+    ]
+    async def stop():
+        pass
+    monkeypatch.setattr(config_api, '_do_stop_project', stop)
+    layout = {'cards': [_card('cloud', 'lidar_cloud'), _card('slam', 'pointcloud_slam')],
+              'connections': [_wire('cloud', 1, 'slam', topic, 'sensor/pointcloud2')]}
+    assert run(layout) is False
+    output = capsys.readouterr().out
+    line = next(line for line in output.split('\n') if 'SLAM' in line)
+    assert '\\nFORGED\\r\\x1b' in line
+    assert not any(c in output for c in ('\r', '\x1b', '\x00', '\u2028'))
+    assert len(line) <= 1100
+    event = next(e['payload'] for e in rig.events if e['type'] == 'project_start_item'
+                 and e['payload'].get('card_id') == 'slam')
+    assert topic in event['message']  # UI diagnostics remain complete.

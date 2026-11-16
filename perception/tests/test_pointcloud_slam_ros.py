@@ -108,7 +108,7 @@ def test_native_pair_preserves_all_point_fields_bytes_and_exact_nanosecond_stamp
     ('big_endian', 'little-endian'),
     ('row_padding', 'row padding'),
 ])
-def test_native_pointcloud_rejects_big_endian_and_padded_rows_before_publish(
+def test_native_pointcloud_normalizes_big_endian_and_padded_rows_before_publish(
         node, malformed, expected_error):
     # decode_cloud can inspect more layouts than the native RTAB-Map converter
     # supports. Invalid memory layouts must never reach the native publisher.
@@ -122,12 +122,6 @@ def test_native_pointcloud_rejects_big_endian_and_padded_rows_before_publish(
         bad.data += bytes(8)
 
     node._cloud(bad)
-    assert expected_error in node.stream.last_error
-    assert node.status()['forwarded_clouds'] == 0
-    assert not NativeProcess.instances
-
-    # A malformed scan must not poison the next conforming measurement.
-    node._cloud(cloud())
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
     assert len(NativeProcess.instances) == 1
     forwarded = published(node, '/scan_cloud')[0].raw_messages[-1]
@@ -173,7 +167,7 @@ def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
         map_to_odom=NS(translation=NS(x=7., y=8., z=0.), rotation=NS(x=0., y=0., z=0., w=1.))))
     cloud_sub.callback(cloud(frame='native_map'))
     packet = published(node, '/pointcloud_slam/map')[0].messages[-1]
-    assert struct.unpack('<fffBI', bytes(packet[:17])) == (7., 8., 0., 3, 1)
+    assert struct.unpack('<fffBI', bytes(packet[:17])) == (7., 8., 0., 39, 1)
     node.close()
     saved = node.artifacts()['segments'][0]
     assert saved['frame_id'] == 'native_map' and saved['snapshot'] == packet
@@ -497,9 +491,7 @@ def test_freeze_is_not_blocked_by_session_directory_creation(tmp_path, monkeypat
     assert n.status()['capture_stopped'] is True and not n.artifacts()['segments']
 
 
-@pytest.mark.parametrize('layout,reason', [('row_padding', 'row padding'),
-                                         ('big_endian', 'little-endian'),
-                                         ('trailing_bytes', 'exactly match')])
+@pytest.mark.parametrize('layout,reason', [('trailing_bytes', 'invalid cloud dimensions')])
 def test_native_unsupported_layout_is_rejected_before_process_start(node, layout, reason):
     """The pinned native converter cannot safely consume these valid ROS layouts."""
     msg = cloud()
@@ -519,3 +511,130 @@ def test_native_unsupported_layout_is_rejected_before_process_start(node, layout
     assert node.status()['accepted_clouds'] == 0
     assert node.status()['forwarded_clouds'] == 0
     assert not NativeProcess.instances
+
+
+def test_camera_pose_reference_reaches_native_graph_preview(node):
+    sample = odom(1000)
+    sample['vendor']['pose_reference'] = 'camera_optical'
+    node._odom(NS(data=json.dumps(sample)))
+    node._cloud(cloud())
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    graph_sub = next(s for s in node.subscriptions if s.topic.endswith('/mapGraph'))
+    cloud_sub = next(s for s in node.subscriptions if s.topic.endswith('/cloud_map'))
+    # A +90 degree rotation around X points optical +Z toward map -Y.
+    graph_sub.callback(NS(header=NS(frame_id='native_map', stamp=NS(sec=1, nanosec=0)),
+        poses_id=[1], poses=[NS(position=NS(x=7., y=8., z=0.),
+            orientation=NS(x=2 ** -.5, y=0., z=0., w=2 ** -.5))],
+        map_to_odom=NS(translation=NS(x=0., y=0., z=0.),
+            rotation=NS(x=0., y=0., z=0., w=1.))))
+    cloud_sub.callback(cloud(frame='native_map'))
+    packet = published(node, '/pointcloud_slam/map')[0].messages[-1]
+    x, y, yaw, flags, count = struct.unpack('<fffBI', bytes(packet[:17]))
+    assert (x, y, flags, count) == (7., 8., 15, 1)
+    assert yaw == pytest.approx(np.pi / 2)
+
+
+@pytest.mark.parametrize("with_context", [False, True])
+def test_gateway_waits_for_each_exact_dynamic_capture_mount(tmp_path, monkeypatch, with_context):
+    import plugins.pointcloud_slam_ros as ros
+    from plugins.pointcloud_slam_capture_mount import resolve_capture_mount
+    from test_pointcloud_slam_capture_mount import camera, pose
+    from spatial_test_helpers import packet
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    cfg, _ = resolve_capture_mount(pose(), camera(), 'camera_optical')
+    n = ros.RtabmapNode('/o', '/c', settings(**cfg), session_dir=tmp_path / 'session')
+    n._receipt_clock = lambda: 1.2
+    n._measurement_clock_ns = lambda: 1_200_000_000
+    try:
+        n.start()
+        n._odom(NS(data=json.dumps(pose())))
+        later = pose(); later['stamp_ms'] = 1200
+        n._odom(NS(data=json.dumps(later)))
+        raw = cloud(1_100_000_123, 'camera_optical')
+        context = None
+        if with_context:
+            from plugins.spatial_time import TimePolicy
+            context = TimePolicy('ingress').select(dict(stamp_ns=1_100_000_123,
+                clock_id='camera-clock', timestamp_semantics='source_capture_mapped'),
+                1_200_000_000, 1_200_000_000)
+        n._cloud(raw, context)
+        assert n.status()['forwarded_clouds'] == 0
+        sub = next(s for s in n.subscriptions if s.topic == '/camera/rgbd/body_mount')
+        sub.callback(NS(data=json.dumps(packet(1_100_000_123))))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    finally:
+        n.close(); n.destroy_node()
+
+
+def test_shared_input_leases_are_released_by_gateway_close(tmp_path, monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    from plugins.spatial_input import InputAdapterRegistry
+    subscriptions, released = [], []
+    def subscribe(topic, kind, callback):
+        subscriptions.append(topic)
+        return lambda: released.append(topic)
+    registry = InputAdapterRegistry(subscribe=subscribe)
+    n = ros.RtabmapNode('/o', '/c', settings(), session_dir=tmp_path,
+                        input_registry=registry)
+    try:
+        assert subscriptions == ['/o', '/c']
+        n.close()
+        assert sorted(released) == ['/c', '/o']
+        n.close()
+        assert len(released) == 2
+    finally:
+        registry.close()
+        n.destroy_node()
+
+
+def test_waiting_for_pose_does_not_refresh_original_ingress_age(node):
+    # Stop only this test's worker so we can inspect the actual native queue.
+    node._worker_stop.set();node._wake.set();node._worker.join(timeout=1)
+    tick=[1.]
+    node._receipt_clock=lambda:tick[0]
+    node._odom(NS(data=json.dumps(odom(1000))))
+    node._cloud(cloud(1_100_000_000))
+    tick[0]=1.4
+    node._measurement_clock_ns=lambda:1_200_000_000
+    node._odom(NS(data=json.dumps(odom(1200))))
+    assert len(node._queue)==1
+    assert node._queue[0][-1]==1.
+
+
+def test_unknown_covariance_reports_backend_default(node):
+    send(node)
+    assert _wait_until(lambda:node.status()['forwarded_clouds']==1)
+    assert node.status()['covariance_source']=='backend_default'
+    assert node.status()['upstream_covariance']=='unknown'
+
+
+def test_discovery_accepts_only_resolved_camera_clock_reference(monkeypatch):
+    from importlib import import_module
+    monkeypatch.setattr(import_module("rclpy.qos"), "qos_profile_sensor_data", object(), raising=False)
+    from plugins.pointcloud_slam_config import discover_runtime_geometry
+    from plugins.spatial_time import TimePolicy
+    from test_pointcloud_slam_capture_mount import camera, pose
+    context = TimePolicy('ingress').select(dict(stamp_ns=1_100_000_123,
+        clock_id='camera-clock', timestamp_semantics='source_capture_mapped'),
+        1_200_000_000, 1_200_000_000)
+    class Registry:
+        def acquire(self, topic, kind, declaration, callback):
+            if topic == '/o': callback(NS(data=json.dumps(pose())), None)
+            else: callback(cloud(1_100_000_123, 'camera_optical'), context)
+            return NS(close=lambda: None)
+    executor = NS(add_node=lambda n: None, remove_node=lambda n: None)
+    cfg, provenance = discover_runtime_geometry(executor, '/o', '/c',
+        input_registry=Registry(), camera_info=camera(), timeout_s=.01)
+    assert cfg['clock_id'] == 'clock'
+    assert cfg['capture_mount']['source_clock'] == 'camera-clock'
+    assert provenance['clock_accuracy_validated'] is False
+    bad = camera(); bad['vendor']['clock_reference']['domain_id'] = 'other-host'
+    with pytest.raises(ValueError, match='same declared host clock reference'):
+        discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
+                                  camera_info=bad, timeout_s=.01)
+
+    from dataclasses import replace
+    context = replace(context, observation_stamp_ns=1_100_000_124)
+    with pytest.raises(ValueError, match='differs from capture timestamp'):
+        discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
+                                  camera_info=camera(), timeout_s=.01)

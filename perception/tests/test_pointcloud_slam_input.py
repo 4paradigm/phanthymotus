@@ -307,3 +307,65 @@ def test_new_bumi_segment_reuses_measured_mount_with_new_frame_names():
         s.cloud_metadata(packet(stamp_ms), now=stamp_ms / 1000)
     assert [frame.pose.segment_id for frame in s.accepted] == ['s', 't']
     assert s.status(now=1.1)['odometry'] == 'tracking'
+
+
+def slew_odom(ms=1000, offset=0):
+    value=measured_odom(ms)
+    measurement=value['vendor']['motus_slam']['measurement']
+    measurement['mapping'].update(method='chassis_clock_request_interval_slew',version='2',
+                                  offset_ns=offset,verified=True,uncertainty_ns=50_000_000)
+    measurement['stamp_ns']+=offset
+    value['stamp_ms']=measurement['stamp_ns']//1_000_000
+    return value
+
+
+@pytest.mark.parametrize('offset',[-1_000_000,1_000_000])
+def test_bounded_chassis_slew_does_not_retire_explicit_pose_segment(offset):
+    s=stream(input_contract=resolved())
+    s.odom(slew_odom(),now=1.)
+    s.odom(slew_odom(1100,offset),now=1.1)
+    assert s.status(now=1.1)['odometry']=='tracking'
+    assert not s.last_error
+
+
+@pytest.mark.parametrize('change',[
+    dict(offset_ns=1_000_001),dict(version='3'),dict(method='other'),
+    dict(verified=False),dict(uncertainty_ns=50_000_001),dict(uncertainty_ns=None),
+])
+def test_slew_does_not_admit_unbounded_or_changed_evidence(change):
+    s=stream(input_contract=resolved());s.odom(slew_odom(),now=1.)
+    value=slew_odom(1100,100_000);m=value['vendor']['motus_slam']['measurement']
+    m['mapping'].update(change)
+    m['stamp_ns']=m['source_stamp']*1_000_000+m['mapping']['offset_ns']
+    value['stamp_ms']=m['stamp_ns']//1_000_000
+    s.odom(value,now=1.1)
+    assert s.status(now=1.1)['odometry']!='tracking'
+
+
+def test_slew_preserves_source_epoch_and_unit_barriers():
+    for field,value in [('clock_epoch','new'),('source_clock','other'),('source_unit','ns')]:
+        s=stream(input_contract=resolved());s.odom(slew_odom(),now=1.)
+        changed=slew_odom(1100,100_000);m=changed['vendor']['motus_slam']['measurement']
+        m[field]=value
+        if field=='source_unit':m['source_stamp']*=1_000_000
+        s.odom(changed,now=1.1)
+        assert s.status(now=1.1)['odometry']!='tracking'
+
+
+def test_late_slew_sample_is_dropped_without_retiring_segment():
+    s=stream(input_contract=resolved())
+    s.odom(slew_odom(1000,0),now=1.)
+    s.odom(slew_odom(1100,100_000),now=1.1)
+    s.odom(slew_odom(1050,50_000),now=1.11)
+    assert s.last_error=='late odometry sample dropped'
+    assert s.status(now=1.11)['odometry']=='tracking'
+    s.odom(slew_odom(1200,200_000),now=1.2)
+    assert s.status(now=1.2)['odometry']=='tracking'
+    assert s._pose_measurement['source_stamp']==1200
+
+
+def test_same_source_stamp_cannot_be_rewritten_by_slew():
+    s=stream(input_contract=resolved())
+    s.odom(slew_odom(),now=1.)
+    s.odom(slew_odom(1000,1),now=1.01)
+    assert s.status(now=1.01)['odometry']!='tracking'

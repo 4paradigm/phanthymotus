@@ -109,7 +109,7 @@ TOOLS = [
                 "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
                 "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
-                                 "description": "启用计算输出；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
+                                 "description": "启用计算输出（PointCloud2 输出口始终显示）；要求实测深度、采集时间、物理坐标系和对应的实测内参"},
             },
         },
         "topic_in": [
@@ -119,7 +119,7 @@ TOOLS = [
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
             {"format": "data/json", "desc": "点数/范围/三区最近障碍摘要"},
-            {"format": "sensor/pointcloud2", "desc": "可选：带采集时间和物理坐标系的米制计算点云"},
+            {"format": "sensor/pointcloud2", "desc": "米制计算点云（启用计算输出后发布，带采集时间和物理坐标系）"},
         ],
     }
 ]
@@ -223,6 +223,9 @@ class _PointCloudNode(Node):
         self._metric_last_skip = None
 
         self._subs: list = []
+        self._input_registry = None
+        self._input_declaration = {}
+        self._input_leases = []
         self._input_discovery_timer = None
         self._input_discovery_errors = 0
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -270,8 +273,13 @@ class _PointCloudNode(Node):
         raw = msg_type == "sensor_msgs/msg/Image"
         self._input_format = "image/depth-z16" if raw else "image/depth-zlib"
         callback = self._depth_image_cb if raw else self._depth_comp_cb
-        self._subs.append(self.create_subscription(
-            Image if raw else CompressedImage, self._input_topic, callback, _LOW_LAT_QOS))
+        if self._input_registry is None:
+            self._subs.append(self.create_subscription(
+                Image if raw else CompressedImage, self._input_topic, callback, _LOW_LAT_QOS))
+        else:
+            self._input_leases.append(self._input_registry.acquire(
+                self._input_topic, Image if raw else CompressedImage,
+                self._input_declaration, callback))
         log.info("[pointcloud] bound %s to %s", self._input_topic, msg_type)
         return True
 
@@ -304,7 +312,7 @@ class _PointCloudNode(Node):
             if self._metric_metadata_source_topic:
                 self._subs.append(self.create_subscription(
                     String, self._metric_metadata_source_topic, self._metric_metadata_cb, _PUB_QOS))
-            if self._subs or self._input_discovery_timer is not None:
+            if self._subs or self._input_leases or self._input_discovery_timer is not None:
                 self._worker = threading.Thread(target=self._worker_loop, daemon=True,
                                                 name=f"pointcloud_worker_{self._input_topic}")
                 self._worker.start()
@@ -318,6 +326,8 @@ class _PointCloudNode(Node):
         # Worker only — subscriptions are destroyed by dispose_node after the
         # node leaves the executor (InvalidHandle race otherwise; see vop).
         self._stop_event.set()
+        for lease in self._input_leases:
+            lease.close()
         with self._lifecycle_lock:
             timer, self._input_discovery_timer = self._input_discovery_timer, None
             if timer is not None:
@@ -365,15 +375,15 @@ class _PointCloudNode(Node):
             except queue.Full:
                 pass
 
-    def _depth_comp_cb(self, msg: CompressedImage):
+    def _depth_comp_cb(self, msg: CompressedImage, context=None):
         if self._throttled():
             return
-        self._drop_stale(self._frame_queue, ("depth_zlib", msg))
+        self._drop_stale(self._frame_queue, ("depth_zlib", msg) if context is None else ("depth_zlib", msg, context))
 
-    def _depth_image_cb(self, msg: Image):
+    def _depth_image_cb(self, msg: Image, context=None):
         if self._throttled():
             return
-        self._drop_stale(self._frame_queue, ("depth_z16", msg))
+        self._drop_stale(self._frame_queue, ("depth_z16", msg) if context is None else ("depth_z16", msg, context))
 
 
     # ── worker：按模式出云 ─────────────────────────────────────────────────
@@ -381,10 +391,15 @@ class _PointCloudNode(Node):
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
-                _, payload = self._frame_queue.get(timeout=1.0)
+                item = self._frame_queue.get(timeout=1.0)
+                _, payload = item[:2]
+                context = item[2] if len(item) == 3 else None
                 if self._stop_event.is_set():
                     break
-                self._emit_depth(payload)
+                if context is None:
+                    self._emit_depth(payload)
+                else:
+                    self._emit_depth(payload, context)
             except queue.Empty:
                 continue
             except Exception as error:  # noqa: BLE001 — keep the worker alive
@@ -404,7 +419,7 @@ class _PointCloudNode(Node):
                     log.info("[pointcloud] worker recovered; error stream cleared")
 
     # A: 深度图 → 反投影
-    def _emit_depth(self, msg):
+    def _emit_depth(self, msg, context=None):
         depth_m, enc = _decode_depth_message(msg)
         if depth_m is None:
             if self._metric_cloud_enabled:
@@ -418,7 +433,7 @@ class _PointCloudNode(Node):
         self._publish(xyz)
         if self._metric_cloud_enabled and ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
                 (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
-            self._publish_metric(xyz, msg, w, h)
+            self._publish_metric(xyz, msg, w, h, context)
         elif self._metric_cloud_enabled:
             self._metric_skip('unsupported_encoding')
 
@@ -435,7 +450,7 @@ class _PointCloudNode(Node):
             return {'published': self._metric_published, 'skipped': dict(self._metric_skipped),
                     'last_skip_reason': self._metric_last_skip}
 
-    def _publish_metric(self, xyz, source, width, height):
+    def _publish_metric(self, xyz, source, width, height, context=None):
         if self._stop_event.is_set():
             return
         # An opt-in asserts that this source's stamp is capture time. A header
@@ -455,6 +470,10 @@ class _PointCloudNode(Node):
             self._metric_skip('missing_frame')
             return
         sec, nanosec = getattr(stamp, 'sec', None), getattr(stamp, 'nanosec', None)
+        if context is not None:
+            header = copy.deepcopy(header)
+            sec, nanosec = divmod(context.observation_stamp_ns, 1_000_000_000)
+            header.stamp.sec, header.stamp.nanosec = sec, nanosec
         if type(sec) is not int or sec <= 0 or type(nanosec) is not int or not 0 <= nanosec < 1_000_000_000:
             self._metric_skip('invalid_capture_stamp')
             return
@@ -475,8 +494,18 @@ class _PointCloudNode(Node):
         cloud.point_step, cloud.row_step = 12, 12 * len(xyz)
         cloud.is_dense = True
         cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
+        if context is not None and self._input_registry is not None:
+            self._metric_observation = context
+            self._metric_frame = header.frame_id
+            derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context, 'depth_projection')
+            if self._metric_metadata_pub is not None and not self._metric_metadata_source_topic:
+                packet = dict(schema='motus.slam_frame/2', observation=derived.to_dict(),
+                              stamp_ns=derived.observation_stamp_ns, clock_id=derived.normalized_clock_id,
+                              frame_id=header.frame_id, data_sha256=hashlib.sha256(cloud.data).hexdigest(),
+                              source_data_sha256=hashlib.sha256(source.data).hexdigest())
+                self._metric_metadata_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
         self._metric_cloud_pub.publish(cloud)
-        if self._metric_metadata_pub is not None:
+        if self._metric_metadata_pub is not None and self._metric_metadata_source_topic:
             key = (sec * 1_000_000_000 + nanosec, header.frame_id,
                    hashlib.sha256(bytes(source.data)).hexdigest())
             self._pair_metric_metadata(key, cloud_digest=hashlib.sha256(cloud.data).hexdigest())
@@ -567,7 +596,8 @@ class PointCloudPerceptionPlugin:
     PREFIX = "pointcloud"
     ALIASES = ()
 
-    def __init__(self, plugin_cfg: dict, namespace: str, executor):
+    def __init__(self, plugin_cfg: dict, namespace: str, executor, *, input_registry=None):
+        self._input_registry = input_registry
         self._namespace = namespace
         self._executor = executor
         self._plugin_cfg = dict(plugin_cfg or {})
@@ -652,12 +682,16 @@ class PointCloudPerceptionPlugin:
             with self._nodes_lock:
                 upstream = self._upstream_camera.get(node_key) or {}
             declaration = self._upstream_input_metadata.get(node_key) or {}
+            node._input_registry = self._input_registry
+            node._input_declaration = upstream
             node._input_format = declaration.get("format") or upstream.get("format")
             metadata_topic = declaration.get("frame_metadata_topic")
             if node._metric_cloud_enabled and isinstance(metadata_topic, str) and metadata_topic:
                 node._metric_metadata_source_topic = metadata_topic
                 node._metric_metadata_pub = node.create_publisher(
                     String, node._metric_metadata_topic, _PUB_QOS)
+            if node._metric_cloud_enabled and self._input_registry is not None and node._metric_metadata_pub is None:
+                node._metric_metadata_pub = node.create_publisher(String, node._metric_metadata_topic, _PUB_QOS)
             K = upstream.get("K")
             if isinstance(K, (list, tuple)) and len(K) == 9:
                 try:
@@ -761,6 +795,28 @@ class PointCloudPerceptionPlugin:
         if action == "info":
             with self._nodes_lock:
                 nodes = dict(self._nodes)
+            if instance_id:
+                nodes = {instance_id: nodes[instance_id]} if instance_id in nodes else {}
+            if not nodes:
+                # Ports describe capabilities even when metric publishing is off.
+                # Before start, derive paths only from this card's validated input.
+                topics_out = [{"format": "sensor/pointcloud"}, {"format": "data/json"},
+                              {"format": "sensor/pointcloud2"}]
+                info = {"name": "PointCloudPerception", "manufacture": "Embodied",
+                        "model": "depth", "state": "idle", "instances": {},
+                        "topic_in": [], "topic_out": topics_out,
+                        "desc": "3D point cloud from one depth map"}
+                input_topic = None
+                if args.get("input_topic") or args.get("input_topics"):
+                    try:
+                        input_topic = self._resolve_input(args)
+                    except ValueError as error:
+                        return {**info, "state": "error", "message": str(error)}
+                if input_topic:
+                    paths = (*output_topics_for(input_topic), input_topic + "/pointcloud_metric")
+                    for port, topic in zip(topics_out, paths):
+                        port["topic"] = topic
+                return info
             instances = {
                 key: {
                     "mode": node._mode,
@@ -781,24 +837,22 @@ class PointCloudPerceptionPlugin:
                 if all(t["topic"] != node._input_topic for t in topics_in):
                     topics_in.append({"topic": node._input_topic,
                                       "format": node._input_format or "image/depth-z16"})
-            # 每实例一对输出话题；多实例时不再用 output_topics_for(None)
+            # 每实例三个输出口；多实例时不再用 output_topics_for(None)
             # 的默认 /perception/... 话题把下游引向不存在的话题。
             if instance_id and instance_id in nodes:
                 node = nodes[instance_id]
                 topics_out = [
                     {"topic": node._cloud_topic, "format": "sensor/pointcloud"},
                     {"topic": node._summary_topic, "format": "data/json"},
+                    {"topic": node._metric_cloud_topic, "format": "sensor/pointcloud2"},
                 ]
-                if node._metric_cloud_enabled:
-                    topics_out.append({"topic": node._metric_cloud_topic, "format": "sensor/pointcloud2"})
             else:
                 seen: set[str] = set()
                 topics_out: list[dict[str, str]] = []
                 for node in nodes.values():
                     outputs = [(node._cloud_topic, "sensor/pointcloud"),
-                               (node._summary_topic, "data/json")]
-                    if node._metric_cloud_enabled:
-                        outputs.append((node._metric_cloud_topic, "sensor/pointcloud2"))
+                               (node._summary_topic, "data/json"),
+                               (node._metric_cloud_topic, "sensor/pointcloud2")]
                     for topic, fmt in outputs:
                         if topic and topic not in seen:
                             seen.add(topic)
@@ -835,6 +889,12 @@ class PointCloudPerceptionPlugin:
                 with self._nodes_lock:
                     upstream = self._upstream_camera.get(key)
                     declaration = copy.deepcopy(self._upstream_input_metadata.get(key))
+                observation = getattr(metric_node, '_metric_observation', None)
+                if observation is not None and observation.time_basis=='receipt_estimated':
+                    from .spatial_contract import input_declaration
+                    declaration=input_declaration(metric_node._metric_cloud_topic,'cloud',
+                        metric_node._metric_frame,observation,
+                        metadata_topic=metric_node._metric_metadata_topic)
                 if declaration:
                     declaration.update(topic=metric_node._metric_cloud_topic, kind="cloud",
                                        format="sensor/pointcloud2", length_unit="m",
@@ -884,12 +944,11 @@ class PointCloudPerceptionPlugin:
                     supported_K = False
                 if not (declared.get("schema") == "motus.camera/1"
                         and fmt in ("image/depth-z16", "image/depth-zlib")
-                        and declared.get("source") == "derived-from-K"
                         and declared.get("distortion_model") == "pinhole"
                         and isinstance(vendor, dict)
                         and vendor.get("depth_unit") == "mm"
-                        and vendor.get("depth_source") == "measured"
-                        and vendor.get("timestamp_semantics") == "source_capture_mapped"
+                        and vendor.get('depth_semantics', 'optical_z' if vendor.get('depth_source') == 'measured' else None) == 'optical_z'
+                        and (vendor.get("timestamp_semantics") == "source_capture_mapped" or self._input_registry is not None)
                         and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K
                         and (fmt != "image/depth-zlib" or
                              (declared.get("width") == 640 and declared.get("height") == 480))):

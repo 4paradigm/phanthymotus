@@ -280,6 +280,8 @@ plugins:
   # The following deployment settings are generic RTAB-Map/resource overrides.
   pointcloud_slam:
     enabled: true
+    # Preserve native defaults unless explicit mapping thresholds are supplied.
+    native_parameters: {}
 
   # Human keypoints + action classification. COCO-17 keypoints; postures come
   # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities

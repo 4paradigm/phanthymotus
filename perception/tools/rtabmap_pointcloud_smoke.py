@@ -68,7 +68,8 @@ def mapping_packet_summary(packet):
     if len(raw) < 17:
         raise RuntimeError('truncated mapping packet')
     x, y, yaw, flags, count = struct.unpack('<fffBI', raw[:17])
-    if flags != 3 or not 0 < count <= 80000 or len(raw) != 17 + count * 12:
+    if ((flags & 3) != 3 or flags & ~63 or (flags & 24) == 24 or
+            not 0 < count <= 80000 or len(raw) != 17 + count * 12):
         raise RuntimeError('invalid mapping header or point count')
     points = list(struct.iter_unpack('<fff', raw[17:]))
     if not all(math.isfinite(value) for value in (x, y, yaw)) or not all(

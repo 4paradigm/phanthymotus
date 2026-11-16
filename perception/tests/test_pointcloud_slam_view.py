@@ -21,7 +21,7 @@ def test_saved_map_publishes_original_packet_with_historical_identity_and_stops(
         assert not context.get('actions')
         assert 'plane' not in context
         assert len(view.publishers) == 1 and view.publishers[0].topic == PREVIEW_TOPIC
-        assert view.publishers[0].messages[-1] == packet
+        assert view.publishers[0].messages[-1] == packet[:12] + bytes([39]) + packet[13:]
         view.rename('Renamed')
         assert view.outputs()[0]['metadata']['map_view']['name'] == 'Renamed'
         count = len(view.publishers[0].messages)
@@ -56,7 +56,7 @@ def test_multiple_disconnected_segments_use_latest_only_and_one_publisher():
         assert len(view.publishers) == 1
         assert view.outputs()[0]['topic'] == PREVIEW_TOPIC
         assert view.outputs()[0]['metadata']['map_view']['segment_count'] == 2
-        assert view.publishers[0].messages[-1] == latest
+        assert view.publishers[0].messages[-1] == latest[:12] + bytes([39]) + latest[13:]
         assert first != latest  # never combine unrelated segment frames
     finally:
         view.close()

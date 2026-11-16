@@ -11,7 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import UInt8MultiArray
 
-from .pointcloud_slam_preview import PREVIEW_TOPIC
+from .pointcloud_slam_preview import PREVIEW_TOPIC, historical_mapping
 
 _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                   history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -48,7 +48,7 @@ class SavedMapView(Node):
                     'desc': 'Live or saved RTAB-Map preview',
                     'metadata': metadata,
                 }]
-                self._packet = item['packet']
+                self._packet = historical_mapping(item['packet'])
                 self._publisher = self.create_publisher(UInt8MultiArray, PREVIEW_TOPIC, _QOS)
         except Exception:
             self.destroy_node()

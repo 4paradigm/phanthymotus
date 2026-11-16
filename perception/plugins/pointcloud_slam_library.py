@@ -135,7 +135,8 @@ def _mapping_packet(packet, max_points=80000):
     if not isinstance(packet, bytes) or not 17 <= len(packet) <= MAX_SNAPSHOT_BYTES:
         raise ValueError('invalid saved mapping packet')
     x, y, yaw, flags, count = struct.unpack('<fffBI', packet[:17])
-    if flags != 3 or len(packet) != 17 + 12 * count or not np.isfinite([x, y, yaw]).all():
+    if ((flags & 3) != 3 or flags & ~63 or (flags & 24) == 24 or
+            len(packet) != 17 + 12 * count or not np.isfinite([x, y, yaw]).all()):
         raise ValueError('invalid saved mapping packet')
     points = np.frombuffer(packet[17:], dtype='<f4').reshape(-1, 3)
     if not np.isfinite(points).all():

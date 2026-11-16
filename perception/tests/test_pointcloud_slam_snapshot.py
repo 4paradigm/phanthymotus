@@ -107,3 +107,14 @@ def test_rebuild_uses_scan_and_local_transform_when_cells_are_absent(tmp_path):
     _, _, _, _, points = _decode(packet)
     assert len(points) == 1
     assert np.allclose(points[0], [2, 1, 0], atol=1e-5)
+
+
+def test_rebuilt_snapshot_preserves_typed_historical_heading(tmp_path):
+    database = _database(tmp_path / 'native.db', [
+        (1, _pose_blob(1, 2), _cloud_blob([[0, 0, 0]]), None, None, None),
+    ], links=[(1, 1)])
+    for flags in (15, 23, 39, 47):
+        fallback = struct.pack('<fffBI', 5., 6., -.75, flags, 0)
+        packet = module.rebuild(database, max_points=20, fallback=fallback)
+        assert packet[:13] == fallback[:13]
+        assert len(packet) == 29

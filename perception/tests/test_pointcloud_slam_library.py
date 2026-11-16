@@ -271,3 +271,16 @@ def test_idempotent_retry_rejects_missing_or_corrupted_committed_artifacts(tmp_p
         (directory / segment['snapshot']).write_bytes(packet(x=9.))
     with pytest.raises((ValueError, OSError)):
         save()
+
+
+@pytest.mark.parametrize('flags', [15, 23, 39, 47])
+def test_typed_heading_survives_save_load_and_point_limit(tmp_path, flags):
+    source = packet()
+    typed = source[:12] + bytes([flags]) + source[13:]
+    artifacts = {'segments': [{'segment_id': 'a', 'frame_id': 'map_a',
+        'database': str(database(tmp_path / 'source.db')), 'snapshot': typed}], 'statistics': {}}
+    map_id = library.save_rtabmap_revision(tmp_path, artifacts,
+        {'reserve_bytes': 0, 'map_plane': 'xy'}, 'Typed', None, 'one')[0]
+    loaded = library.load_map_snapshots(tmp_path, map_id, max_points=1)[0]['packet']
+    assert loaded[:13] == typed[:13]
+    assert len(loaded) == 29

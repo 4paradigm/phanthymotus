@@ -132,3 +132,14 @@ def test_mapping_parameters_are_available_without_creating_runtime_or_files(tmp_
     assert value['frame_id'] == 'isolated/s0/base' and value['map_frame_id'] == 'isolated/s0/map'
     assert value['Grid/3D'] == 'true' and value['Rtabmap/MemoryThr'] == '50'
     assert not (tmp_path/'unused').exists()
+
+
+def test_native_defaults_preserved_and_whitelist_rejects_unknown(tmp_path):
+    from plugins.pointcloud_slam_rtabmap import mapping_parameters
+    settings=dict(max_pending=2,voxel_size_m=.08,max_working_nodes=300,max_update_ms=100)
+    before=mapping_parameters(tmp_path/'map.db','/scope',settings)
+    assert 'RGBD/LinearUpdate' not in before and 'RGBD/AngularUpdate' not in before
+    changed=mapping_parameters(tmp_path/'map.db','/scope',dict(settings,native_parameters={'RGBD/LinearUpdate':.2}))
+    assert changed['RGBD/LinearUpdate']=='0.2'
+    assert {k:v for k,v in changed.items() if k!='RGBD/LinearUpdate'}==before
+    with pytest.raises(ValueError):mapping_parameters(tmp_path/'map.db','/scope',dict(settings,native_parameters={'Optimizer/Strategy':2}))

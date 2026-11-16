@@ -26,7 +26,7 @@ _DEFAULTS = {'max_gap_ms': 200, 'max_age_s': 2,
              'max_pending': 10, 'max_cloud_points': 1000000,
              'voxel_size_m': .08, 'max_working_nodes': 3000, 'max_update_ms': 3000,
              'max_disk_bytes': 2147483648, 'reserve_bytes': 1073741824,
-             'preview_interval_s': 1, 'preview_max_points': 40000}
+             'preview_interval_s': 1, 'preview_max_points': 40000, 'native_parameters': {}}
 _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calibrated',
             'preview_enabled', 'preview_backend', 'preview_geometry', 'preview_relocalization',
             'preview_odom_sigmas', 'archive_name', 'restore_archive',
@@ -58,7 +58,8 @@ def _config_properties():
 class PointCloudSlamPlugin:
     PREFIX = 'pointcloud_slam'
 
-    def __init__(self, config, executor):
+    def __init__(self, config, executor, *, input_registry=None):
+        self._input_registry = input_registry
         # 标点移至后续导航卡片；忽略旧画布中的标注平面，不阻止项目启动。
         # Retired/unknown deployment keys are ignored, never fatal: old config
         # rows and old canvas documents must not block a project start. The
@@ -110,7 +111,7 @@ class PointCloudSlamPlugin:
                        'oneOf': [{'const': k, 'title': k} for k in verbs]},
             'input_topics': {'type': 'array', 'items': {'type': 'string'}},
             'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
-            'input_metadata': {'type': 'object'},
+            'input_metadata': {'type': 'object'}, 'camera_infos': {'type': 'object'},
             **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id')},
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': params} for k, params in _ACTIONS.items()},
@@ -156,6 +157,8 @@ class PointCloudSlamPlugin:
         live connected inputs, deployment config or producer declarations; their
         absence is reported when mapping starts instead of while saving config.
         """
+        from .pointcloud_slam_rtabmap import native_overrides
+        native_overrides(cfg.get('native_parameters', {}))
         if cfg.get('extrinsic_mode', 'static') not in ('static', 'dynamic'):
             raise ValueError('extrinsic_mode must be static or dynamic')
         if cfg.get('extrinsic_mode', 'static') != 'dynamic' and cfg.get('child_from_cloud') is not None:
@@ -441,17 +444,24 @@ class PointCloudSlamPlugin:
             raise ValueError('finish the pending map save first')
         if not self._project_inputs or self._capture_stop.is_set():
             raise ValueError('start the project before mapping')
-        # Startup declarations may be incomplete. Learn missing geometry from
+        # Core main passes only topic names. Learn the missing geometry from
         # fresh ROS pointcloud and tracking odometry, never a model preset.
         if self._resolved_inputs is None and any(
                 self._config.get(key) is None for key in
                 ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')):
             odom_topic = next(t for t, f in self._topics.items() if f == 'state/odom')
             cloud_topic = next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2')
+            cameras = self._project_inputs.get('camera_infos', {})
+            camera = cameras.get(cloud_topic) if isinstance(cameras, dict) else None
+            if camera is not None and (not isinstance(camera, dict) or
+                    camera.get('topic') != cloud_topic or camera.get('format') != 'sensor/pointcloud2'):
+                raise ValueError('connected cloud camera_info topic/format mismatch')
             self._runtime_inputs, self._runtime_provenance = discover_runtime_geometry(
                 self._executor, odom_topic, cloud_topic,
                 manual=self._config.get('child_from_cloud'),
-                max_gap_ms=self._config['max_gap_ms'])
+                max_gap_ms=self._config['max_gap_ms'],
+                **({'camera_info': camera} if camera is not None else {}),
+                **({'input_registry':self._input_registry} if self._input_registry else {}))
         self._require_mapping_inputs(self._settings())
         self._validate(self._settings())
         name = validate_map_name(args.get('map_name'))
@@ -470,7 +480,9 @@ class PointCloudSlamPlugin:
         try:
             node = RtabmapNode(next(t for t, f in self._topics.items() if f == 'state/odom'),
                 next(t for t, f in self._topics.items() if f == 'sensor/pointcloud2'), settings,
-                session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop)
+                session_dir=str(session), input_contract=self._resolved_inputs, capture_stop=self._capture_stop,
+                **({"input_registry": self._input_registry,
+                    "input_declarations":self._project_inputs.get("camera_infos",{})} if self._input_registry else {}))
             # A new mapping session replaces the saved view, never competes for
             # the single mapping topic.
             self._close_view()

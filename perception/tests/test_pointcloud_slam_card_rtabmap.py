@@ -922,3 +922,25 @@ def test_core_main_topics_can_resolve_generic_geometry_without_robot_name(card, 
         assert len(plugin.get_tools()[0]['topic_out']) == 1
     finally:
         plugin.shutdown()
+
+
+def test_card_passes_only_connected_camera_evidence_to_runtime_discovery(card, monkeypatch):
+    from test_pointcloud_slam_capture_mount import camera, pose
+    from plugins.pointcloud_slam_capture_mount import resolve_capture_mount
+    c = camera()
+    cfg, evidence = resolve_capture_mount(pose(), c, 'camera_optical')
+    def discover(executor, odom_topic, cloud_topic, **kwargs):
+        assert kwargs['camera_info'] == c
+        return cfg, evidence
+    monkeypatch.setattr(module, 'discover_runtime_geometry', discover)
+    plugin = module.PointCloudSlamPlugin({'reserve_bytes': 0}, _FakeExecutor())
+    try:
+        args = arguments()
+        args['camera_infos'] = {'/cloud': c, '/unconnected': {'invalid': True}}
+        assert plugin.dispatch('pointcloud_slam', args)['state'] == 'ready'
+        assert call(plugin, 'start_mapping', map_name='Dynamic')['state'] == 'running'
+        assert plugin._session_settings['child_from_cloud'] is None
+        assert plugin._session_settings['capture_mount']['declaration'] == c['vendor']['body_mount']
+        assert plugin._session_settings['input_provenance']['clock_accuracy_validated'] is False
+    finally:
+        plugin.shutdown()

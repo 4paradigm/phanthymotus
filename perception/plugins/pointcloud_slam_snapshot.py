@@ -164,6 +164,8 @@ def rebuild(database_path, *, max_points, fallback=None):
         if not len(points) or not np.isfinite(points).all():
             raise ValueError('no finite graph points')
         packet = encode_mapping(points, marker, max_points=int(max_points))
+        # The marker already has its display axis applied; preserve it exactly.
+        packet = fallback[:13] + packet[13:]
         log.info('rebuilt saved map snapshot from database: graph_nodes=%d '
                  'points=%d bytes=%d time=%.2fs',
                  len(sources), len(points), len(packet), time.monotonic() - started)

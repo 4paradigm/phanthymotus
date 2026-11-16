@@ -46,7 +46,7 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
     Missing capability declarations remain pending at the consumer. Explicit
     malformed declarations are preserved or rejected, never silently dropped.
     """
-    bindings, interfaces, metadata = {}, {}, {}
+    bindings, interfaces, metadata, cameras = {}, {}, {}, {}
     for conn in connections:
         src_id = conn.get('fromCardId')
         try:
@@ -77,6 +77,16 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
                 raise SlamRoutingError(f'{topic}: input_metadata topic/format mismatch')
             metadata[topic] = deepcopy(claim)
 
+        if fmt == CLOUD:
+            found = [d for d in (info.get('camera_info') or [])
+                     if isinstance(d, dict) and d.get('topic') == topic]
+            if len(found) > 1:
+                raise SlamRoutingError(f'{topic}: duplicate camera_info declarations')
+            if found:
+                if found[0].get('format') != fmt:
+                    raise SlamRoutingError(f'{topic}: camera_info format mismatch')
+                cameras[topic] = deepcopy(found[0])
+
         if fmt == POSE:
             if 'odom_interfaces' in info:
                 by_topic = info['odom_interfaces']
@@ -96,7 +106,7 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection):
                 # the same consumer-side validation as the topic-keyed form.
                 interfaces[topic] = deepcopy(info['odom_interface'])
     return {'input_bindings': bindings, 'odom_interfaces': interfaces,
-            'input_metadata': metadata}
+            'input_metadata': metadata, **({'camera_infos': cameras} if cameras else {})}
 
 
 def collect_connected_metadata(connections, resolved_info, topic_of_connection):

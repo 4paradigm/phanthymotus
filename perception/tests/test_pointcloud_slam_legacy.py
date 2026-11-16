@@ -48,7 +48,7 @@ def test_legacy_view_uses_saved_optimized_prefix_and_odometry_tail_without_write
     snapshots = library.load_map_snapshots(tmp_path, 'a' * 32, max_points=4)
     assert [s['segment_id'] for s in snapshots] == ['a', 'b']
     assert snapshots[0]['frame_id'] == 'a_odom_archive'
-    assert struct.unpack('<fffBI', snapshots[0]['packet'][:17]) == (11., 0., 0., 3, 4)
+    assert struct.unpack('<fffBI', snapshots[0]['packet'][:17]) == (11., 0., 0., 39, 4)
     xyz = np.frombuffer(snapshots[0]['packet'][17:], dtype='<f4').reshape(-1, 3)
     assert xyz.tolist() == [[10., 0., 0.], [11., 0., 0.], [11., 0., 0.], [13., 0., 0.]]
     assert snapshots[0]['metadata']['tracking'] is False

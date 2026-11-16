@@ -104,3 +104,14 @@ def test_manual_mount_must_match_even_unverified_producer_mount():
     with pytest.raises(ValueError, match='conflicts'):
         infer_geometry(sample(calibrated=False), 'sensor_optical',
                        1_000_000_000, manual=IDENTITY)
+
+
+def test_runtime_discovery_selects_declared_dynamic_mount_without_static_guess():
+    from test_pointcloud_slam_capture_mount import camera, pose
+    cfg, provenance = infer_geometry(pose(), 'camera_optical', 1_000_000_000,
+                                     camera_info=camera())
+    assert cfg['extrinsic_mode'] == 'dynamic' and cfg['child_from_cloud'] is None
+    assert provenance['clock_accuracy_validated'] is False
+    with pytest.raises(ValueError, match='static'):
+        infer_geometry(pose(), 'camera_optical', 1_000_000_000,
+                       camera_info=camera(), manual=IDENTITY)

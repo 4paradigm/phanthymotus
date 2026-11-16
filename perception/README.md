@@ -4656,3 +4656,47 @@ autoload on, **176 passed** with it off.
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
 ```
+
+### Standalone SLAM synchronization with PR #371 (2026-11-16)
+
+This branch includes the pointcloud, external-odometry SLAM and shared spatial
+input changes through PR #371 commit `d0389877`. It does not include the RGB-D
+odometry card, image pairing/visual estimation, IMU/ESKF/depth assistance,
+rotation-hint patches or the native `rtabmap_odom` package.
+
+Pointcloud keeps its output ports visible before startup and when metric output
+is disabled. A shared bounded input registry preserves the original ingress
+context across depth projection and SLAM, with isolated consumer queues. The
+`motus.observation/1`, `motus.slam_input/2` and `motus.slam_frame/2` contracts
+retain source/epoch, geometry and mapping identity and exact payload association.
+Receipt estimates remain explicitly approximate; they cannot authorize exact
+capture-time body mounts. The original Driver v1 contract stays unchanged.
+
+External chassis poses using `chassis_clock_request_interval_slew` version `2`
+can update only their integer offset within one segment, with verified declared
+uncertainty no greater than 50 ms and offset changes bounded to 1% of source
+elapsed time. Compatible late samples are dropped without retiring the segment;
+rewritten timestamps and changed identities/mapping versions remain barriers.
+
+A connected cloud's declared body-mount sidecar is forwarded by Core and joined
+at the exact capture timestamp. Different source clock names are accepted only
+through a resolved common host clock reference; observation/header timestamps
+must agree. Missing or stale TF never uses a held/latest transform. Estimated
+mount provenance and unknown physical accuracy remain explicit. The generic
+capture cache is in `plugins/spatial_mount.py`; `plugins/spatial_pose.py` builds
+validated sample envelopes without estimating poses or asserting camera origin.
+These replace dependencies on the visual-odometry modules in the source branch.
+
+Map admission requires tracking poses and usable finite points. Producer pause
+budgets retain their original deadline and cannot be extended by repeated
+messages. PointCloud2 normalization validates original bytes before converting
+noncanonical XYZ layouts, keeping source and output digests distinct. Native
+progress, segment lifecycle and unknown covariance are reported explicitly;
+suspected stalls do not automatically restart the backend or merge unknown map
+origins. Deployment-only `pointcloud_slam.native_parameters` accepts finite,
+nonnegative `RGBD/LinearUpdate` and `RGBD/AngularUpdate`; `{}` keeps native defaults.
+Live and saved mapping previews preserve the latest heading/status flags.
+
+The standalone native build, package selection and existing dependency footprint
+are retained. Source-branch robot tests do not constitute deployment or motion
+accuracy validation of this extracted PR.
