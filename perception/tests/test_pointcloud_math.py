@@ -83,12 +83,12 @@ def test_encode_packet_header_matches_js_protocol():
 
 
 def test_encode_packet_axis_order_is_display_ready():
-    """出包 (p_x,p_y,p_z) = (−z, x, y_down)：渲染器默认映射后不镜像。"""
-    xyz = np.array([[2.0, -1.0, 3.0]], dtype=np.float32)  # x右, y下, z前
-    vals = np.frombuffer(pcm.encode_packet(xyz)[8:], dtype="<f4")
-    assert vals[0] == pytest.approx(-3.0)  # p_x = -z
-    assert vals[1] == pytest.approx(2.0)   # p_y = x
-    assert vals[2] == pytest.approx(-1.0)  # p_z = y_down
+    """Optical axes use the same forward/left/up convention as map previews."""
+    xyz = np.array([[2.0, -1.0, 3.0]], dtype=np.float32)
+    packet = np.frombuffer(pcm.encode_packet(xyz)[8:], dtype="<f4")
+    display = np.array([packet[1], -packet[2], -packet[0]])
+    body = np.array([3.0, -2.0, 1.0])
+    np.testing.assert_allclose(display, [body[0], body[2], -body[1]])
 
 
 def test_encode_packet_rejects_wrong_shape():
@@ -102,7 +102,7 @@ def test_encode_packet_round_trips_many_points():
     packet = pcm.encode_packet(xyz)
     _, n = struct.unpack("<II", packet[:8])
     out = np.frombuffer(packet[8:], dtype="<f4").reshape(n, 3)
-    expected = np.stack((-xyz[:, 2], xyz[:, 0], xyz[:, 1]), axis=-1)
+    expected = np.stack((-xyz[:, 0], xyz[:, 2], xyz[:, 1]), axis=-1)
     assert np.allclose(out, expected)
 
 

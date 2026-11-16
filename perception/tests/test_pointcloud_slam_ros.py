@@ -638,3 +638,26 @@ def test_discovery_accepts_only_resolved_camera_clock_reference(monkeypatch):
     with pytest.raises(ValueError, match='differs from capture timestamp'):
         discover_runtime_geometry(executor, '/o', '/c', input_registry=Registry(),
                                   camera_info=camera(), timeout_s=.01)
+
+@pytest.mark.parametrize('ready_at', [18., None])
+def test_native_discovery_allows_slow_start_but_remains_bounded(node, monkeypatch, ready_at):
+    import plugins.pointcloud_slam_ros as ros
+    tick = [0.]
+    create = node.create_publisher
+    def publisher(*args, **kwargs):
+        p = create(*args, **kwargs)
+        p.get_subscription_count = lambda: int(ready_at is not None and tick[0] >= ready_at)
+        return p
+    with monkeypatch.context() as patch:
+        patch.setattr(ros, 'time', NS(monotonic=lambda: tick[0]))
+        patch.setattr(node, 'create_publisher', publisher)
+        patch.setattr(node, '_capture_stop', NS(is_set=lambda: False,
+            wait=lambda delay: tick.__setitem__(0, tick[0] + 1.)))
+        pose = NS(segment_id='slow', frame_id='odom')
+        if ready_at is None:
+            with pytest.raises(RuntimeError, match='discovery timed out'):
+                node._activate(pose)
+            assert tick[0] == 30.
+        else:
+            assert node._activate(pose)['process'].started
+            assert tick[0] == ready_at

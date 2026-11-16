@@ -109,3 +109,15 @@ def test_main_without_udp_profile_preserves_environment(monkeypatch, tmp_path, p
     with pytest.raises(RuntimeError, match='stop at ROS init'):
         main.main()
     assert os.environ.get(key) == original
+
+@pytest.mark.parametrize('kind', ['missing', 'directory'])
+def test_bad_profile_mount_has_actionable_diagnostic_without_ros_fallback(monkeypatch, tmp_path, kind):
+    import main
+    profile = tmp_path/'dds.xml'
+    if kind == 'directory':
+        profile.mkdir()
+    monkeypatch.setenv('FASTRTPS_DEFAULT_PROFILES_FILE', str(profile))
+    monkeypatch.setattr(main.rclpy, 'init', lambda: pytest.fail('must not start unisolated ROS'), raising=False)
+    with pytest.raises(RuntimeError, match='DDS profile.*regular file'):
+        main.main()
+    assert os.environ['FASTRTPS_DEFAULT_PROFILES_FILE'] == str(profile)

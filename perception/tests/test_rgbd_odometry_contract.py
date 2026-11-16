@@ -124,13 +124,13 @@ def test_shared_unverified_mapping_is_retained_without_body_extrinsic():
     assert all(d['vendor']['clock_mapping_verified'] is False for d in data.values())
 
 
-def test_inherited_valid_intrinsics_and_estimated_metric_depth_are_accepted():
+def test_inherited_valid_intrinsics_and_measured_metric_depth_are_accepted():
     data=declarations()
     data['/depth']['source']='inherited'
     data['/depth']['K'][0] += 1e-7
-    data['/depth']['vendor'].update(depth_source='estimated', depth_semantics='optical_z')
+    data['/depth']['vendor'].update(depth_source='measured', depth_semantics='optical_z')
     result=validate_inputs(data,['/rgb','/depth'])
-    assert result['depth_source']=='estimated'
+    assert result['depth_source']=='measured'
 
 
 def test_missing_capture_declaration_uses_explicit_receipt_capability():
@@ -154,3 +154,10 @@ def test_registered_color_resize_uses_existing_intrinsics_scaling():
 def test_one_missing_clock_declaration_selects_receipt_without_false_capture_claim():
     data=declarations();data['/depth']['vendor'].pop('clock_id')
     assert validate_inputs(data,['/rgb','/depth'])['time_basis']=='receipt_estimated'
+
+@pytest.mark.parametrize('source', ['estimated', None])
+def test_optical_z_does_not_authorize_unmeasured_odometry_depth(source):
+    data = declarations()
+    data['/depth']['vendor'].update(depth_source=source, depth_semantics='optical_z')
+    with pytest.raises(ValueError, match='measured'):
+        validate_inputs(data, ['/rgb', '/depth'])

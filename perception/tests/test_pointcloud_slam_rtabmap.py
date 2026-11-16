@@ -143,3 +143,33 @@ def test_native_defaults_preserved_and_whitelist_rejects_unknown(tmp_path):
     assert changed['RGBD/LinearUpdate']=='0.2'
     assert {k:v for k,v in changed.items() if k!='RGBD/LinearUpdate'}==before
     with pytest.raises(ValueError):mapping_parameters(tmp_path/'map.db','/scope',dict(settings,native_parameters={'Optimizer/Strategy':2}))
+
+
+def test_mapping_child_receives_own_buffered_dds_profile(monkeypatch, tmp_path):
+    import os
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+    module = backend()
+    profile = tmp_path/'source.xml'
+    profile.write_text('<profiles><transport_descriptors><transport_descriptor>'
+        '<transport_id>local</transport_id><type>UDPv4</type>'
+        '<interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>'
+        '</transport_descriptor></transport_descriptors></profiles>')
+    monkeypatch.setenv('FASTRTPS_DEFAULT_PROFILES_FILE', str(profile))
+    popen = module.subprocess.Popen
+    environments = []
+    def launch(*args, **kwargs):
+        env = kwargs.get('env')
+        assert env is not None
+        private = Path(env['FASTRTPS_DEFAULT_PROFILES_FILE'])
+        assert private != profile and private.is_file()
+        tree = ET.parse(private)
+        assert tree.find('.//receiveBufferSize').text == '1048576'
+        assert tree.find('.//interfaceWhiteList/address').text == '127.0.0.1'
+        assert os.environ['FASTRTPS_DEFAULT_PROFILES_FILE'] == str(profile)
+        environments.append(private)
+        return popen(*args, **kwargs)
+    monkeypatch.setattr(module.subprocess, 'Popen', launch)
+    process = running(tmp_path)
+    process.close(timeout_s=3)
+    assert len(environments) == 1

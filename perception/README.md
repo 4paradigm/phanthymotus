@@ -5236,3 +5236,24 @@ summaries, input drops, time context, mapping decisions, native progress and seg
 lifecycle. CPU tests and synthetic fault replay validate contracts/lifecycle only.
 ROS/Jetson smoke, real turning trajectories, map quality, CPU/GPU/memory under
 robot load and motion accuracy still require target-environment acceptance.
+
+### Preview axes and reviewed input boundaries (2026-11-16)
+
+The display-only depth cloud now uses the same forward/left/up convention and
+initial viewing angle as the mapping renderer. This is a generic camera-start
+basis, not a robot-specific mounting estimate: metric PointCloud2, SLAM map
+coordinates and the map heading remain unchanged. Robot extrinsics still come
+from capture-time TF. Existing browser views need a refresh for the new default
+viewpoint.
+
+Metric depth and RGB-D odometry require an explicit `depth_source: measured`,
+including when `depth_semantics: optical_z` is supplied. Estimated depth remains
+eligible only for display. Each native mapping child receives its own buffered
+DDS profile beside its segment parameters; the parent's environment and transport
+isolation are retained. A missing or directory-mounted DDS profile causes an
+explicit startup configuration error, with no unisolated fallback. This remains
+a fail-closed startup policy, not a speech-only degraded mode. These changes add
+no packages or image build dependencies.
+Native mapping startup allows up to 30 seconds for input discovery during model
+warmup, with immediate stop-event cancellation. This startup allowance does not
+extend the receipt or measurement freshness limits on queued captures.

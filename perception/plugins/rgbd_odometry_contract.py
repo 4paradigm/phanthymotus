@@ -46,9 +46,10 @@ def validate_inputs(declarations, topics):
         if (key in color['vendor'] and key in depth['vendor'] and
                 color['vendor'][key] != depth['vendor'][key]):
             raise ValueError('RGB-D source clock mapping declarations conflict: ' + key)
-    if (depth['vendor'].get('depth_unit') != 'mm' or
+    if (depth['vendor'].get('depth_source') != 'measured' or
+            depth['vendor'].get('depth_unit') != 'mm' or
             depth['vendor'].get('depth_semantics', 'optical_z' if depth['vendor'].get('depth_source') == 'measured' else None) != 'optical_z'):
-        raise ValueError('RGB-D requires millimetre optical Z depth')
+        raise ValueError('RGB-D requires measured millimetre optical Z depth')
     semantics = [d['vendor'].get('timestamp_semantics') for d in entries]
     if all(semantics) and semantics[0] != semantics[1]:
         raise ValueError('RGB-D timestamp semantics conflict')

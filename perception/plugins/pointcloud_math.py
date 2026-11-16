@@ -50,13 +50,14 @@ def encode_packet(xyz: np.ndarray) -> bytes:
     struct.pack("<II", 12, N) + N × float32 小端。
 
     轴序在此统一：入参是光学系 (x右, y下, z前)，出包 (p_x,p_y,p_z) =
-    (−z, x, y_down)。渲染器默认映射 display = (p_y, −p_z, −p_x)，代入后
-    display = (x_cam, −y_down, z_cam) —— 即 x 右 / y 上 / z 前，不镜像。
+    (−x, z, y_down)。渲染器默认映射 display = (p_y, −p_z, −p_x)，代入后
+    display = (z_cam, −y_down, x_cam)，与地图的前/左/上坐标显示约定一致。
+    仅用于预览；不声明机器人安装外参，不改变 metric PointCloud2。
     """
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError(f"expected (N, 3) cloud, got {xyz.shape}")
     x, y_down, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    packet_xyz = np.stack((-z, x, y_down), axis=-1).astype("<f4")
+    packet_xyz = np.stack((-x, z, y_down), axis=-1).astype("<f4")
     return struct.pack("<II", 12, len(packet_xyz)) + packet_xyz.tobytes()
 
 

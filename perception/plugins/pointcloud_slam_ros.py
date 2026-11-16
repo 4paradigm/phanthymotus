@@ -374,7 +374,9 @@ class RtabmapNode(Node):
             segment['subscriptions'].append(self.create_subscription(message, namespace + suffix,
                 lambda msg, target=segment, handler=callback: handler(msg, target), qos))
         process.start()
-        deadline = time.monotonic() + 10.
+        # Native initialization can exceed ten seconds during model warmup.
+        # This bounds discovery only; queued captures still pass freshness checks.
+        deadline = time.monotonic() + 30.
         while not self._stopped():
             if process.poll() is not None:
                 raise RuntimeError('RTAB-Map exited during startup (exit ' + str(process.poll()) + ')')

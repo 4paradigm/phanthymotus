@@ -946,6 +946,7 @@ class PointCloudPerceptionPlugin:
                         and fmt in ("image/depth-z16", "image/depth-zlib")
                         and declared.get("distortion_model") == "pinhole"
                         and isinstance(vendor, dict)
+                        and vendor.get("depth_source") == "measured"
                         and vendor.get("depth_unit") == "mm"
                         and vendor.get('depth_semantics', 'optical_z' if vendor.get('depth_source') == 'measured' else None) == 'optical_z'
                         and (vendor.get("timestamp_semantics") == "source_capture_mapped" or self._input_registry is not None)
