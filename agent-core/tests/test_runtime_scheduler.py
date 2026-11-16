@@ -279,6 +279,7 @@ class TestReviewRegressions(_Base):
             schedule_store._persist(bad)
             self.assertEqual(schedule_store.start_all(), 1, '坏的跳过，好的照常启动')
             self.assertIn(f'sched:{good.id}', fj.jobs)
+            self.assertFalse(schedule_store.find('坏的').enabled, '坏数据停用，不留“启用但没注册”的记录')
 
     def test_dom_and_dow_are_anded(self):
         """'0 8 13 * 5'：13 号且是周五才触发（本调度器一直如此，不是标准 cron 的“或”）。"""
@@ -793,7 +794,7 @@ class TestApiRoutes(_Base):
         self.assertIn('不存在', self._req('POST', '/api/schedules/nope/run').json()['error'])
         self.assertEqual(len(self.sent), 1, '只有第一次真的叫醒了模型')
         self.assertTrue(self._req('DELETE', f'/api/schedules/{sid}').json()['ok'])
-        self.assertFalse(self._req('DELETE', f'/api/schedules/{sid}').json()['ok'])
+        self.assertIn('不存在', self._req('DELETE', f'/api/schedules/{sid}').json()['error'])
 
     def test_settings_validation(self):
         self._create(cron='0,10,20 8 * * *')
@@ -999,6 +1000,119 @@ class TestLifecycleExtras(_Base):
                     schedule_store.create(name='hourly_check', text='x', cron='0 8 * * *')
         finally:
             config.main['scheduler'] = saved
+
+
+class TestSixthReview(_Base):
+    """PR #398 第六轮：名额先落库再放行、写库失败的各条路径、调度循环起来之前建的定时、
+    改设置时遇到坏数据不再当成没问题、删除不存在的返回原因。"""
+
+    def _once(self, name):
+        with _FakeJobs():
+            return schedule_store.create(name=name, text='x', kind='once',
+                                         at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
+
+    def test_slot_is_durable_before_enqueue(self):
+        a = self._once('落库')
+        self.assertTrue(schedule_store._on_fire(a.id)({}))
+        schedule_store._fire_times.clear()          # 模拟：放行后、记账前进程重启
+        schedule_store.load_all()
+        self.assertEqual(schedule_store._fires_today(time.time()), 1, '放行之前名额已经在库里')
+
+    def test_released_slot_is_removed_from_db(self):
+        a = self._once('退回')
+        job = {}
+        schedule_store._on_fire(a.id)(job)
+        schedule_store._after_fire(a.id)(job, False, True)
+        schedule_store._fire_times.clear()
+        schedule_store.load_all()
+        self.assertEqual(schedule_store._fires_today(time.time()), 0)
+
+    def _broken_db(self):
+        orig = schedule_store._get_conn
+
+        def boom():
+            raise sqlite3.OperationalError('database is locked')
+        schedule_store._get_conn = boom
+        self.addCleanup(setattr, schedule_store, '_get_conn', orig)
+
+    def test_db_failure_on_reserve_blocks_the_fire(self):
+        import event_bus
+        a = self._once('库忙')
+        sent = []
+
+        async def ok(source, text, payload=None):
+            sent.append(source)
+        self._broken_db()
+        with self.assertRaises(sqlite3.Error):
+            schedule_store._on_fire(a.id)({})
+        self.assertEqual(schedule_store._fire_times, [])
+
+        async def go():
+            orig = (event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES)
+            event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES = ok, 0.02, 1
+            try:
+                await scheduler._run_job({'name': 'sched:' + a.id, 'text': 'x', 'at': time.time() + 0.02,
+                                          'on_fire': schedule_store._on_fire(a.id),
+                                          'after_fire': schedule_store._after_fire(a.id)})
+            finally:
+                event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S, scheduler.ONCE_MAX_RETRIES = orig
+        asyncio.run(asyncio.wait_for(go(), 5))
+        self.assertEqual(sent, [], '记不下名额就不发')
+
+    def test_db_failure_on_manual_fire_is_a_clear_error(self):
+        with _FakeJobs():
+            s = schedule_store.create(name='手动库忙', text='x', cron=self._far_cron())
+        self._broken_db()
+        with self.assertRaisesRegex(ValueError, '没有触发'):
+            asyncio.run(schedule_store.fire_now(s.id))
+
+    def test_failed_save_leaves_nothing_behind(self):
+        with _FakeJobs() as fj:
+            s = schedule_store.create(name='原样', text='旧', cron='0 8 * * *')
+            self._broken_db()
+            with self.assertRaises(sqlite3.Error):
+                schedule_store.create(name='新建', text='x', cron='0 9 * * *')
+            with self.assertRaises(sqlite3.Error):
+                schedule_store.update(s.id, text='新')
+            with self.assertRaises(sqlite3.Error):
+                schedule_store.delete(s.id)
+        self.assertIsNone(schedule_store.find('新建'))
+        self.assertEqual(schedule_store.find('原样').text, '旧')
+        self.assertEqual(len(fj.jobs), 1, '只有原来那条注册着')
+
+    def test_settings_change_fails_closed_on_broken_row(self):
+        bad = schedule_store.Schedule(name='坏时间', text='x', kind='once', at='不是时间')
+        schedule_store._schedules[bad.id] = bad
+        with self.assertRaises(ValueError):
+            schedule_store.update_settings(max_schedules=5)
+        self.assertEqual(schedule_store.get_settings()['max_schedules'], 20)
+
+    def test_create_before_scheduler_run_is_registered_on_start(self):
+        """API 先起来、调度循环还没记下时建的定时：不报错，run() 起来后补上注册。"""
+        scheduler._loop = None
+        scheduler._pending.clear()
+        s = schedule_store.create(name='早建', text='x', cron='0 8 * * *')   # 真的 add_job
+        name = schedule_store.job_name(s.id)
+        self.assertNotIn(name, scheduler._dynamic_tasks)
+
+        async def go():
+            saved = config.main.get('scheduler', [])
+            config.main['scheduler'] = []
+            try:
+                await scheduler.run()
+            finally:
+                config.main['scheduler'] = saved
+            await asyncio.sleep(0.05)
+            self.assertIn(name, scheduler._dynamic_tasks)
+            self.assertIsNotNone(scheduler.job_next_ts(name))
+            scheduler.remove_job(name)
+            await asyncio.sleep(0)
+        try:
+            asyncio.run(asyncio.wait_for(go(), 5))
+        finally:
+            scheduler._loop = None
+            scheduler._pending.clear()
+        self.assertEqual(scheduler._pending, [])
 
 
 if __name__ == '__main__':

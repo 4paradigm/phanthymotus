@@ -706,7 +706,8 @@ function _renderSchedules(el, data) {
   el.querySelectorAll('.sched-delete-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       if (!confirm('确认删除这个定时任务？')) return;
-      await _scheduleFetch(`/api/schedules/${encodeURIComponent(btn.dataset.id)}`, 'DELETE');
+      const r = await _scheduleFetch(`/api/schedules/${encodeURIComponent(btn.dataset.id)}`, 'DELETE');
+      if (!r.ok) alert(r.error || '删除失败');
       _loadSchedules();
     });
   });

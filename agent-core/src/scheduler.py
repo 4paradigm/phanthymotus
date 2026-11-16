@@ -19,6 +19,7 @@ collector 把 scheduler 视为优先来源，会叫醒主模型：
 import asyncio
 import datetime
 import functools
+import threading
 import time
 
 import config
@@ -225,6 +226,8 @@ def min_gap_minutes(cron: str, after: float, tz=None) -> int | None:
 _dynamic_tasks: dict[str, asyncio.Task] = {}   # name → asyncio.Task
 _job_info: dict[str, dict] = {}                # name → job（含 next_ts），供 API 展示
 _loop: asyncio.AbstractEventLoop | None = None  # run() 记下的事件循环
+_pending: list = []                             # 循环起来之前收到的 add/remove，run() 时按顺序补上
+_pending_lock = threading.Lock()
 ONCE_RETRY_DELAY_S = 30                         # 一次性事件入队失败后多久重试
 ONCE_MAX_RETRIES = 10
 
@@ -235,19 +238,25 @@ def _on_loop(fn) -> None:
     api/schedules.py 的路由是同步的（SQLite 读写不能卡事件循环，FastAPI 把它们放进
     线程池），但 asyncio 的 task 只能在循环线程里建和取消，所以从别的线程来的调用
     用 call_soon_threadsafe 转回循环；按 FIFO 执行，先 remove 后 add 的顺序不会乱。
+
+    scheduler.run() 还没起来（API 已经能用、调度循环还没记下）时，调用先排队，run() 记下
+    循环后按顺序补上——不会因为“没有事件循环”报错，也不会留下存了库却没注册的定时。
     """
-    loop = _loop
-    if loop is None or not loop.is_running():
-        fn()                     # 启动前或测试里没有循环：直接执行
-        return
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
         running = None
-    if running is loop:
-        fn()                     # 已经在循环线程里
-    else:
-        loop.call_soon_threadsafe(fn)
+    with _pending_lock:
+        loop = _loop
+        if loop is not None and loop.is_running():
+            if running is loop:
+                fn()                     # 已经在循环线程里
+            else:
+                loop.call_soon_threadsafe(fn)
+        elif running is not None:
+            fn()                         # 调度循环没起来，但调用方自己在一个循环里（测试）
+        else:
+            _pending.append(fn)
 
 
 def _add_job_now(name, cron, text, tz, at, source, on_fire, after_fire=None) -> None:
@@ -298,7 +307,11 @@ def job_next_ts(name: str) -> float | None:
 async def run() -> None:
     """常驻 async task：加载配置里的 job 和运行时定时任务并驱动它们。"""
     global _loop
-    _loop = asyncio.get_running_loop()
+    with _pending_lock:
+        _loop = asyncio.get_running_loop()
+        queued, _pending[:] = list(_pending), []
+    for fn in queued:
+        fn()
     try:
         import schedule_store
         # 读库在线程池里做，不卡刚起来的事件循环；add_job 会自己转回循环线程

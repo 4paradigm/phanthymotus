@@ -10,6 +10,7 @@ scheduler.add_job / remove_job 会自己转回事件循环线程。
 出错返回 {'ok': False, 'error': '<中文原因>'}，与 api/tasks.py 的风格一致。
 """
 
+import sqlite3
 import time
 from typing import Optional
 
@@ -84,6 +85,8 @@ def patch_settings(body: SettingsBody):
         st = schedule_store.update_settings(**body.dict())
     except ValueError as e:
         return {'ok': False, 'error': str(e)}
+    except sqlite3.Error as e:
+        return {'ok': False, 'error': f'保存失败：{e}'}
     return {'ok': True, 'settings': st}
 
 
@@ -105,6 +108,8 @@ def create_schedule(body: ScheduleBody):
         s = schedule_store.create(created_by='web', **data)
     except (ValueError, TypeError) as e:
         return {'ok': False, 'error': str(e)}
+    except sqlite3.Error as e:
+        return {'ok': False, 'error': f'保存失败：{e}'}
     return {'ok': True, 'schedule': schedule_store.to_dict(s)}
 
 
@@ -119,12 +124,20 @@ def update_schedule(sid: str, body: ScheduleBody):
         return {'ok': False, 'error': f'定时任务 {sid} 不存在'}
     except ValueError as e:
         return {'ok': False, 'error': str(e)}
+    except sqlite3.Error as e:
+        return {'ok': False, 'error': f'保存失败：{e}'}
     return {'ok': True, 'schedule': schedule_store.to_dict(s)}
 
 
 @router.delete('/{sid}')
 def delete_schedule(sid: str):
-    return {'ok': schedule_store.delete(sid)}
+    try:
+        found = schedule_store.delete(sid)
+    except sqlite3.Error as e:
+        return {'ok': False, 'error': f'删除失败：{e}'}
+    if not found:
+        return {'ok': False, 'error': f'定时任务 {sid} 不存在'}
+    return {'ok': True}
 
 
 @router.post('/{sid}/run')

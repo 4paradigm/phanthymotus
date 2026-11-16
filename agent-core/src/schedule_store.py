@@ -263,10 +263,7 @@ def _conflicts(st: dict, now: float | None = None) -> list[str]:
     for s in on:
         if s.kind != 'cron':
             continue
-        try:
-            gap = scheduler.min_gap_minutes(s.cron, now, s.tz)
-        except ValueError:
-            continue
+        gap = scheduler.min_gap_minutes(s.cron, now, s.tz)
         if gap is not None and gap < st['min_interval_minutes']:
             out.append(f'「{s.name}」最短 {gap} 分钟触发一次')
     if len(on) > st['max_schedules']:
@@ -277,10 +274,7 @@ def _conflicts(st: dict, now: float | None = None) -> list[str]:
             if s.skill:
                 per[s.skill] = per.get(s.skill, 0) + 1
         out += [f'技能 {k} 有 {n} 条' for k, n in sorted(per.items()) if n > st['max_per_skill']]
-    try:
-        total, day = _peak_daily_fires(on, now, st['default_tz'], cap=st['max_fires_per_day'])
-    except ValueError:
-        total, day = 0, ''
+    total, day = _peak_daily_fires(on, now, st['default_tz'], cap=st['max_fires_per_day'])
     if total > st['max_fires_per_day']:
         out.append(f'{day} 这一天会触发 {total} 次')
     return out
@@ -392,30 +386,38 @@ def _fires_today(now: float) -> int:
 
 
 def _reserve(now: float) -> float | None:
-    """占一个当天名额，返回名额（就是时间戳）；满了返回 None。"""
+    """占一个当天名额，返回名额（就是时间戳）；满了返回 None。
+
+    名额**先写进库再放行**：写库失败就抛错、这次不发。所以每一次发出去的触发在发之前就已经
+    落了库，重启后当天的次数不会少算（没发出去的会在 _release 里删掉）。"""
     if _fires_today(now) >= get_settings()['max_fires_per_day']:
         return None
+    with _db() as conn:
+        conn.execute('INSERT INTO schedule_fires (ts) VALUES (?)', (now,))
     _fire_times.append(now)
     return now
 
 
 def _release(slot: float | None) -> None:
-    """没发出去：退回名额。"""
-    if slot is not None:
-        with contextlib.suppress(ValueError):
-            _fire_times.remove(slot)
+    """没发出去：退回名额（内存和库）。删库失败只记日志：多算一次，宁可少发不多发。"""
+    if slot is None:
+        return
+    with contextlib.suppress(ValueError):
+        _fire_times.remove(slot)
+    try:
+        with _db() as conn:
+            conn.execute('DELETE FROM schedule_fires WHERE rowid = '
+                         '(SELECT rowid FROM schedule_fires WHERE ts = ? LIMIT 1)', (slot,))
+    except Exception as e:
+        print(f'[schedule] failed to release fire slot: {e}')
 
 
 def _commit(slot: float | None) -> None:
-    """发出去了：名额写进库（重启后当天的次数还在），顺手清掉两天前的记录。"""
-    if slot is None:
-        slot = time.time()
-        _fire_times.append(slot)
-    cutoff = slot - _FIRE_KEEP_S
-    with _db() as conn:
-        conn.execute('INSERT INTO schedule_fires (ts) VALUES (?)', (slot,))
-        conn.execute('DELETE FROM schedule_fires WHERE ts < ?', (cutoff,))
+    """发出去了：名额在占的时候已经落库，这里只顺手清掉两天前的记录（失败无妨）。"""
+    cutoff = (slot or time.time()) - _FIRE_KEEP_S
     _fire_times[:] = [t for t in _fire_times if t >= cutoff]
+    with _db() as conn:
+        conn.execute('DELETE FROM schedule_fires WHERE ts < ?', (cutoff,))
 
 
 def _mark_fire(sid: str, ts: float) -> float | None:
@@ -490,10 +492,14 @@ def _is_current(s: Schedule, job: dict) -> bool:
 
 
 def _disable_once(s: Schedule, why: str) -> None:
+    """停用一次性定时：以内存为准，写库失败只记日志（重启时过期的一次性也会被停用）。"""
     print(f'[schedule] one-shot {s.name!r} {why}, disabled')
     s.enabled = False
     s.updated_at = time.time()
-    _persist(s)
+    try:
+        _persist(s)
+    except Exception as e:
+        print(f'[schedule] failed to save {s.name!r}: {e}')
 
 
 def _on_fire(sid: str):
@@ -588,7 +594,14 @@ def start_all() -> int:
             _register(s)
             n += 1
         except Exception as e:
-            print(f'[schedule] skip {s.name!r}: {e}')
+            # 坏数据（时区、cron、时间写坏了）：停用，不留“启用着却没注册”的记录，
+            # 也不再参与改设置时的重新校验
+            print(f'[schedule] disable broken schedule {s.name!r}: {e}')
+            s.enabled = False
+            try:
+                _persist(s)
+            except Exception as e2:
+                print(f'[schedule] failed to save {s.name!r}: {e2}')
     if n:
         print(f'[schedule] started {n} runtime schedule(s)')
     return n
@@ -622,8 +635,8 @@ def create(*, name: str = '', text: str = '', kind: str = 'cron', cron: str = ''
     s = Schedule(name=name, text=text, kind=kind, cron=cron, at=at, tz=tz, skill=skill,
                  enabled=enabled, created_by=created_by if created_by in CREATORS else 'api')
     validate(s)
+    _persist(s)                   # 先落库：写库失败就什么都不变（不留只在内存里的定时）
     _schedules[s.id] = s
-    _persist(s)
     _register(s)
     return s
 
@@ -640,8 +653,8 @@ def update(sid: str, **changes) -> Schedule:
             setattr(trial, k, v)
     validate(trial)
     trial.updated_at = time.time()
+    _persist(trial)               # 先落库，失败就保持原样
     _schedules[sid] = trial
-    _persist(trial)
     _register(trial)
     return trial
 
@@ -649,11 +662,13 @@ def update(sid: str, **changes) -> Schedule:
 @_locked
 def delete(sid: str) -> bool:
     _ensure_loaded()
+    if sid not in _schedules:
+        return False
+    _delete_row(sid)              # 先删库：删库失败就什么都不动
     scheduler.remove_job(job_name(sid))
-    s = _schedules.pop(sid, None)
+    _schedules.pop(sid, None)
     _last_fire.pop(sid, None)
-    _delete_row(sid)
-    return s is not None
+    return True
 
 
 @_locked
@@ -661,12 +676,12 @@ def clear_all() -> int:
     """删掉所有定时任务。当天已触发的次数不清（不能靠清空绕过每日上限）。"""
     _ensure_loaded()
     n = len(_schedules)
+    with _db() as conn:           # 先删库
+        conn.execute('DELETE FROM schedules')
     for sid in list(_schedules):
         scheduler.remove_job(job_name(sid))
     _schedules.clear()
     _last_fire.clear()
-    with _db() as conn:
-        conn.execute('DELETE FROM schedules')
     return n
 
 
@@ -717,7 +732,10 @@ def _snapshot_and_reserve(sid: str) -> tuple[Schedule | None, tuple | None]:
     why = _manual_block_reason(s, now)
     if why:
         raise ValueError(why)
-    slot = _reserve(now)
+    try:
+        slot = _reserve(now)
+    except sqlite3.Error as e:
+        raise ValueError(f'记录触发次数失败（{e}），这次没有触发，请稍后再试') from None
     if slot is None:
         raise ValueError(_cap_msg() + '，明天再试或在设置里调高上限')
     return s, (slot, _mark_fire(sid, slot))
