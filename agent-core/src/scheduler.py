@@ -273,11 +273,11 @@ def add_job(name: str, cron: str, text: str, *, tz=None, at: float | None = None
     cron 和 at 二选一：at 是一次性触发的 unix 时间。
     on_fire(job) -> bool：推事件前调用，返回 False 就跳过这一次。schedule_store 在这里
       持锁检查并**占一个当天名额**（检查和占用是同一步）。
-    after_fire(job, delivered, retrying)：on_fire 放行之后一定会调用一次。delivered=True
+    after_fire(job, delivered, retrying)：on_fire 放行（或 on_fire 自己出错）之后一定会调用一次，
+      job 在这期间被取消也一样（见 _fire_once）。delivered=True
       表示事件已入队（名额转正、记账、一次性任务收尾）；False 表示没发出去（退回名额），
       retrying 表示 scheduler 还会再试（只有一次性 job 会重试，最多 ONCE_MAX_RETRIES 次）。
-    两个回调都在线程池里跑（它们会读写 SQLite，不能卡事件循环）。job 在推事件途中被取消时
-    占着的名额不退回——算它发过了，宁可少发不多发。
+    两个回调都在线程池里跑（它们会读写 SQLite，不能卡事件循环）。
     """
     _on_loop(functools.partial(_add_job_now, name, cron, text, tz, at, source, on_fire, after_fire))
 
@@ -301,7 +301,8 @@ async def run() -> None:
     _loop = asyncio.get_running_loop()
     try:
         import schedule_store
-        schedule_store.start_all()
+        # 读库在线程池里做，不卡刚起来的事件循环；add_job 会自己转回循环线程
+        await asyncio.to_thread(schedule_store.start_all)
     except Exception as e:  # 运行时定时任务坏了不能拖垮配置里的 job
         print(f'[scheduler] failed to start runtime schedules: {e}')
 
@@ -313,8 +314,65 @@ async def run() -> None:
     await asyncio.gather(*[_run_job(job) for job in jobs])
 
 
+_SLEEP_CHUNK_S = 60      # 长等待切成小段、每段重看挂钟：开机后 NTP 校时也不会按旧时钟触发
+_settling: set = set()   # 被取消的 job 留下的、还在收尾的那一次触发（留引用，免得被回收）
+
+
+async def _fire_once(job: dict, name: str, source: str, text: str, on_fire, after_fire, at) -> bool:
+    """一次触发：准入（on_fire）→ 推事件 → 收尾（after_fire）。返回一次性 job 要不要重试。
+
+    _run_job 把它当独立 task 跑、用 shield 等：job 在中途被取消（改、删、关机）时，这一次
+    照样走完——on_fire 占的名额、“正在触发”的标记、一次性任务的状态都由 after_fire 收好尾，
+    不会留下“名额占着、标记挂着、一次性还启用着却没有协程”的半截状态。
+
+    after_fire(job, delivered, retrying) 在两种情况下调用：on_fire 放行了（不管发没发出去），
+    或 on_fire 自己出错了（delivered=False，没有占名额）。on_fire 正常返回 False（停用、
+    满额）时不调用：这时它已经自己处理好了。
+    """
+    fire, failed = True, False
+    if on_fire is not None:
+        try:
+            fire = (await asyncio.to_thread(on_fire, job)) is not False
+        except Exception as e:
+            # 检查本身出错就不发：宁可漏一次，也不越过每日上限；一次性的会重试
+            print(f'[scheduler] on_fire for {name!r} failed: {e}')
+            fire, failed = False, True
+    delivered = False
+    if fire:
+        try:
+            await event_bus.enqueue(
+                source  = source,
+                text    = text,
+            )
+            delivered = True
+        except Exception as e:
+            print(f'[scheduler] enqueue for {name!r} failed: {e}')
+            failed = True
+    retrying = (bool(at) and failed and not job.get('cancelled')
+                and job.get('retries', 0) < ONCE_MAX_RETRIES)
+    if (fire or failed) and after_fire is not None:
+        try:
+            await asyncio.to_thread(after_fire, job, delivered, retrying)
+        except Exception as e:
+            print(f'[scheduler] after_fire for {name!r} failed: {e}')
+    return retrying
+
+
 async def _run_job(job: dict) -> None:
     name = job.get('name', 'unnamed')
+    try:
+        await _run_job_loop(job, name)
+    finally:
+        # 自己结束（一次性发完 / 被跳过 / cron 写坏）时把动态 job 的登记删掉，
+        # 免得 job_next_ts 读到过期的下次时间。被 remove_job 取消时登记已经删了（或换成了
+        # 新 job），按对象比较，不会误删新的。
+        if _job_info.get(name) is job:
+            _job_info.pop(name, None)
+            if _dynamic_tasks.get(name) is asyncio.current_task():
+                _dynamic_tasks.pop(name, None)
+
+
+async def _run_job_loop(job: dict, name: str) -> None:
     cron = job.get('cron', '')
     text = job.get('text', f'[scheduler:{name}] 触发')
     source = job.get('source') or f'scheduler:{name}'
@@ -336,35 +394,19 @@ async def _run_job(job: dict) -> None:
 
     while True:
         job['next_ts'] = next_ts
-        wait = next_ts - time.time()
-        if wait > 0:
-            await asyncio.sleep(wait)
+        while (wait := next_ts - time.time()) > 0:
+            await asyncio.sleep(min(wait, _SLEEP_CHUNK_S))
 
-        fire = True
-        if on_fire is not None:
-            try:
-                fire = (await asyncio.to_thread(on_fire, job)) is not False
-            except Exception as e:
-                # 检查本身出错就不发：宁可漏一次，也不越过每日上限
-                print(f'[scheduler] on_fire for {name!r} failed: {e}')
-                fire = False
-        delivered = False
-        if fire:
-            try:
-                await event_bus.enqueue(
-                    source  = source,
-                    text    = text,
-                )
-                delivered = True
-            except Exception as e:
-                print(f'[scheduler] enqueue for {name!r} failed: {e}')
-        # 一次性的没发出去：过一会儿再试，直到重试用完
-        retrying = bool(at) and fire and not delivered and job.get('retries', 0) < ONCE_MAX_RETRIES
-        if fire and after_fire is not None:
-            try:
-                await asyncio.to_thread(after_fire, job, delivered, retrying)
-            except Exception as e:
-                print(f'[scheduler] after_fire for {name!r} failed: {e}')
+        firing = asyncio.ensure_future(_fire_once(job, name, source, text, on_fire, after_fire, at))
+        try:
+            retrying = await asyncio.shield(firing)
+        except asyncio.CancelledError:
+            # 被取消：这一次让它自己跑完收尾，job 不再重试
+            job['cancelled'] = True
+            if not firing.done():
+                _settling.add(firing)
+                firing.add_done_callback(_settling.discard)
+            raise
 
         if at:   # 一次性
             if retrying:

@@ -16,6 +16,7 @@ import datetime
 import importlib.util
 import os
 import pathlib
+import sqlite3
 import sys
 import tempfile
 import time
@@ -806,6 +807,198 @@ class TestApiRoutes(_Base):
         self.assertEqual(self._req('GET', '/api/schedules/settings').json()['settings']['min_interval_minutes'], 10)
         r = self._req('PATCH', '/api/schedules/settings', {'model_tools_enabled': True}).json()
         self.assertTrue(r['ok'] and r['settings']['model_tools_enabled'])
+
+
+class TestFifthReview(_Base):
+    """PR #398 第五轮：触发途中被取消也要收好尾、一次性结束后清掉调度登记、内存里的过期
+    触发记录要清；以及顺带的：on_fire 出错时一次性会重试、长等待按挂钟分段、启动读库不卡循环。"""
+
+    def _fill_today(self, n):
+        schedule_store._fire_times.extend([time.time() - 1] * n)
+
+    def _job(self, s, **kw):
+        return {'name': 'sched:' + s.id, 'text': 'x', 'at': self._due_soon(s), 'source': 'scheduler:' + s.name,
+                'on_fire': schedule_store._on_fire(s.id), 'after_fire': schedule_store._after_fire(s.id), **kw}
+
+    def _once(self, name):
+        with _FakeJobs():
+            return schedule_store.create(name=name, text='x', kind='once',
+                                         at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
+
+    def _cancel_mid_enqueue(self, enqueue_ok: bool):
+        """job 在推事件途中被取消：这一次照样走完收尾。"""
+        import event_bus
+        s = self._once('取消' + str(enqueue_ok))
+        job = self._job(s)
+        started = []
+
+        async def slow(source, text, payload=None):
+            started.append(1)
+            await asyncio.sleep(0.2)
+            if not enqueue_ok:
+                raise RuntimeError('down')
+
+        async def go():
+            orig = event_bus.enqueue
+            event_bus.enqueue = slow
+            try:
+                task = asyncio.ensure_future(scheduler._run_job(job))
+                while not started:
+                    await asyncio.sleep(0.01)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                for _ in range(100):           # 等留下的那一次收完尾
+                    if not scheduler._settling:
+                        break
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
+            finally:
+                event_bus.enqueue = orig
+        asyncio.run(asyncio.wait_for(go(), 10))
+        self.assertEqual(scheduler._settling, set())
+        return schedule_store.find(s.name)
+
+    def test_cancel_after_reserve_settles_delivered(self):
+        s = self._cancel_mid_enqueue(True)
+        self.assertEqual(s.fire_count, 1, '发出去了就记账')
+        self.assertFalse(s.enabled, '一次性发出去了就停用')
+        self.assertEqual(schedule_store._fires_today(time.time()), 1)
+
+    def test_cancel_after_reserve_settles_failed(self):
+        s = self._cancel_mid_enqueue(False)
+        self.assertEqual(schedule_store._fires_today(time.time()), 0, '没发出去退回名额')
+        self.assertNotIn(s.id, schedule_store._last_fire, '“正在触发”的标记要撤掉')
+        self.assertFalse(s.enabled, '被取消的 job 不再重试，一次性停用，不留启用但没有协程的记录')
+        self.assertEqual(s.fire_count, 0)
+
+    def test_cap_skipped_one_shot_clears_registry(self):
+        s = self._once('满额')
+        self._fill_today(48)
+
+        async def go():
+            scheduler._loop = asyncio.get_running_loop()
+            live = schedule_store._schedules[s.id]
+            self._due_soon(live)
+            schedule_store._register(live)
+            name = schedule_store.job_name(s.id)
+            await asyncio.sleep(0)
+            self.assertIsNotNone(scheduler.job_next_ts(name))
+            for _ in range(200):
+                if name not in scheduler._dynamic_tasks:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertNotIn(name, scheduler._dynamic_tasks)
+            self.assertNotIn(name, scheduler._job_info)
+            self.assertIsNone(scheduler.job_next_ts(name))
+        try:
+            asyncio.run(asyncio.wait_for(go(), 10))
+        finally:
+            scheduler._loop = None
+        self.assertFalse(schedule_store.find('满额').enabled)
+
+    def test_finished_job_does_not_remove_its_replacement(self):
+        async def go():
+            scheduler._loop = asyncio.get_running_loop()
+            scheduler.add_job('swap', '', 'x', at=time.time() + 0.05)
+            await asyncio.sleep(0)
+            old = scheduler._dynamic_tasks['swap']
+            scheduler.add_job('swap', '0 8 * * *', 'y')      # 换成新 job，旧的被取消
+            await asyncio.sleep(0.2)
+            self.assertIn('swap', scheduler._dynamic_tasks)
+            self.assertIsNot(scheduler._dynamic_tasks['swap'], old)
+            self.assertIsNotNone(scheduler.job_next_ts('swap'))
+            scheduler.remove_job('swap')
+            await asyncio.sleep(0)
+        try:
+            asyncio.run(asyncio.wait_for(go(), 5))
+        finally:
+            scheduler._loop = None
+
+    def test_expired_fire_times_are_pruned_on_check(self):
+        schedule_store._fire_times.extend([time.time() - 3 * 86400] * 5)
+        schedule_store._reserve(time.time())
+        self.assertEqual(len(schedule_store._fire_times), 1)
+
+    def test_on_fire_error_retries_one_shot(self):
+        import event_bus
+        calls, sent = [], []
+
+        def flaky_check(job):
+            calls.append('check')
+            if len(calls) == 1:
+                raise RuntimeError('db locked')
+            return True
+
+        def done(job, delivered, retrying):
+            calls.append((delivered, retrying))
+
+        async def ok(source, text, payload=None):
+            sent.append(source)
+
+        async def go():
+            orig, delay = event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S
+            event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S = ok, 0.02
+            try:
+                await scheduler._run_job({'name': 'r', 'text': 'x', 'at': time.time() + 0.02,
+                                          'on_fire': flaky_check, 'after_fire': done})
+            finally:
+                event_bus.enqueue, scheduler.ONCE_RETRY_DELAY_S = orig, delay
+        asyncio.run(asyncio.wait_for(go(), 5))
+        self.assertEqual(calls, ['check', (False, True), 'check', (True, False)])
+        self.assertEqual(len(sent), 1)
+
+    def test_long_waits_are_chunked(self):
+        src = (_SRC / 'scheduler.py').read_text(encoding='utf-8')
+        self.assertIn('min(wait, _SLEEP_CHUNK_S)', src)
+        self.assertIn('asyncio.to_thread(schedule_store.start_all)', src)
+
+
+class TestLifecycleExtras(_Base):
+    """自查补的：被新注册替换的旧 job 不再发事件、记账写库失败时内存状态仍正确、
+    和配置文件里的定时同名会被拒。"""
+
+    def test_stale_job_does_not_fire(self):
+        with _FakeJobs():
+            s = schedule_store.create(name='改时间', text='x', cron='0 8 * * *')
+            old_job = {'name': 'sched:' + s.id, 'cron': '0 8 * * *', 'tz': 'Asia/Shanghai', 'at': None}
+            self.assertTrue(schedule_store._on_fire(s.id)(dict(old_job)))
+            schedule_store._fire_times.clear(); schedule_store._last_fire.clear()
+            schedule_store.update(s.id, cron='0 9 * * *')
+        self.assertFalse(schedule_store._on_fire(s.id)(dict(old_job)), '旧 cron 的 job 不能再发')
+        self.assertEqual(schedule_store._fires_today(time.time()), 0)
+        new_job = dict(old_job, cron='0 9 * * *')
+        self.assertTrue(schedule_store._on_fire(s.id)(new_job))
+        self.assertFalse(schedule_store._on_fire(s.id)(dict(new_job, cancelled=True)))
+
+    def test_bookkeeping_survives_db_error(self):
+        with _FakeJobs():
+            a = schedule_store.create(name='写库失败', text='x', kind='once',
+                                      at=schedule_store.fmt_ts(time.time() + 3600, 'Asia/Shanghai'))
+        job = {}
+        self.assertTrue(schedule_store._on_fire(a.id)(job))
+        orig = schedule_store._commit
+
+        def boom(slot):
+            raise sqlite3.OperationalError('database is locked')
+        schedule_store._commit = boom
+        try:
+            schedule_store._after_fire(a.id)(job, True, False)
+        finally:
+            schedule_store._commit = orig
+        s = schedule_store.find('写库失败')
+        self.assertFalse(s.enabled)
+        self.assertEqual(s.fire_count, 1)
+
+    def test_name_clash_with_config_job(self):
+        saved = config.main.get('scheduler', [])
+        config.main['scheduler'] = [{'name': 'hourly_check', 'cron': '0 * * * *', 'text': 'x'}]
+        try:
+            with _FakeJobs():
+                with self.assertRaisesRegex(ValueError, '配置文件'):
+                    schedule_store.create(name='hourly_check', text='x', cron='0 8 * * *')
+        finally:
+            config.main['scheduler'] = saved
 
 
 if __name__ == '__main__':

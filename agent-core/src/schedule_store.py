@@ -341,6 +341,9 @@ def validate(s: Schedule, *, now: float | None = None) -> None:
     for other in _schedules.values():
         if other.id != s.id and other.name == s.name:
             raise ValueError(f'已经有叫「{s.name}」的定时任务了（id {other.id}）')
+    # 事件 source 是 'scheduler:<名字>'：和配置文件里的定时同名会撞成同一个来源
+    if any((j or {}).get('name') == s.name for j in (config.main.get('scheduler', []) or [])):
+        raise ValueError(f'配置文件里已经有叫「{s.name}」的定时了，换个名字')
 
     if s.kind == 'once':
         s.cron = ''
@@ -381,6 +384,9 @@ def validate(s: Schedule, *, now: float | None = None) -> None:
 # ── 每日名额（调用方持锁）────────────────────────────────────────────────────
 
 def _fires_today(now: float) -> int:
+    cutoff = now - _FIRE_KEEP_S              # 顺手清掉两天前的（发失败、被跳过的长期运行也不会越积越多）
+    if _fire_times and min(_fire_times) < cutoff:
+        _fire_times[:] = [t for t in _fire_times if t >= cutoff]
     start, end = _day_bounds(now, get_settings()['default_tz'])
     return sum(1 for t in _fire_times if start <= t < end)
 
@@ -468,14 +474,19 @@ def event_text(s: Schedule) -> str:
 
 
 def _is_current(s: Schedule, job: dict) -> bool:
-    """job 是不是这条一次性定时当前的注册：触发途中被改了时间就有新 job，旧 job 不能停用新的。"""
-    at = job.get('at')
-    if s.kind != 'once' or at is None:
-        return True
-    try:
-        return abs(parse_at(s.at, s.tz) - at) < 1
-    except ValueError:
-        return False
+    """job 是不是这条定时当前的注册。改了时间（cron / at / 时区 / 类型）就会注册新 job，
+    旧 job 若正好在触发：不能再发旧时间的事件，也不能停用新的一次性。"""
+    if 'at' not in job and 'cron' not in job:
+        return True                       # 直接调回调（测试）时没有 job 信息
+    if s.kind == 'once':
+        at = job.get('at')
+        if not at:
+            return False
+        try:
+            return abs(parse_at(s.at, s.tz) - at) < 1
+        except ValueError:
+            return False
+    return not job.get('at') and job.get('cron') == s.cron and job.get('tz') in (None, s.tz)
 
 
 def _disable_once(s: Schedule, why: str) -> None:
@@ -494,8 +505,8 @@ def _on_fire(sid: str):
     def _cb(job: dict) -> bool:
         with _lock:
             s = _schedules.get(sid)
-            if not s or not s.enabled:
-                return False
+            if not s or not s.enabled or job.get('cancelled') or not _is_current(s, job):
+                return False                  # 已停用 / 已删 / 这个 job 已被新的注册替换
             slot = _reserve(time.time())
             if slot is None:
                 print(f'[schedule] daily cap {get_settings()["max_fires_per_day"]} reached, skip {s.name!r}')
@@ -524,14 +535,22 @@ def _after_fire(sid: str):
                 if s and s.kind == 'once' and s.enabled and not retrying and _is_current(s, job):
                     _disable_once(s, 'could not be delivered after retries')
                 return
-            _commit(slot)                 # 发出去之后才被删的，这次照样算进当天次数
-            if not s:
-                return
-            s.last_run = time.time()
-            s.fire_count += 1
-            if s.kind == 'once' and _is_current(s, job):
-                s.enabled = False
-            _persist(s)
+            # 先改内存（以内存为准），再分别写库：写库失败只记日志，不让一次性任务在内存里
+            # 还显示“启用”却已经没有协程。发出去之后才被删的，这次照样算进当天次数。
+            if s:
+                s.last_run = time.time()
+                s.fire_count += 1
+                if s.kind == 'once' and _is_current(s, job):
+                    s.enabled = False
+            try:
+                _commit(slot)
+            except Exception as e:
+                print(f'[schedule] failed to record fire of {sid}: {e}')
+            if s:
+                try:
+                    _persist(s)
+                except Exception as e:
+                    print(f'[schedule] failed to save {s.name!r}: {e}')
     return _cb
 
 
@@ -645,6 +664,7 @@ def clear_all() -> int:
     for sid in list(_schedules):
         scheduler.remove_job(job_name(sid))
     _schedules.clear()
+    _last_fire.clear()
     with _db() as conn:
         conn.execute('DELETE FROM schedules')
     return n
