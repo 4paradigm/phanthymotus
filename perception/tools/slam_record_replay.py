@@ -352,8 +352,36 @@ def header_evidence(source,inputs,motion):
         unexpected_inputs=bad_inputs,unexpected_motion_stamps_ns=bad_motion)
 
 
+def replay_sources(args):
+    """Select original frames; only injected poses require a measured timeline."""
+    directory=Path(args.prepared)
+    frames=[json.loads(s) for s in (directory/'frames.jsonl').read_text().splitlines()]
+    samples=[];native_bootstrap=None
+    if args.pose_frames>0 or args.all_poses:
+        if not args.bootstrap_poses:raise ValueError('bootstrap poses required when injecting external poses')
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+        from plugins.pointcloud_slam_odom import PoseSample
+        path=Path(args.bootstrap_poses);verified=json.loads(path.read_text())
+        samples=[PoseSample(v['stamp_ns']//10**6,'recorded_native','recorded_camera','recorded',
+            tuple(v['pose']['position']),tuple(v['pose']['quaternion']),tuple(v['pose']['covariance']),
+            'recorded',None,None,v['stamp_ns']) for v in verified if not v['info']['lost'] and v['info']['inliers']>0]
+        if len(samples)<2:raise ValueError('at least two native registration-verified bootstrap poses required')
+        # Exclude startup gauge and endpoints outside the measured native timeline.
+        frames=[r for r in frames if samples[0].stamp_ns<=r['cloud_stamp_ns']<=samples[-1].stamp_ns]
+        native_bootstrap=dict(file=str(path.resolve()),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            summary=json.loads(path.with_name('result.json').read_text()))
+    frames=[r for r in frames if r['frame']>=args.start_frame and (args.end_frame is None or r['frame']<args.end_frame)]
+    if len(frames)<3:raise ValueError('insufficient measured frames after native bootstrap/subrange selection')
+    return frames,samples,native_bootstrap
+
+
+def cold_replay(args):
+    return bool(args.resume_run and args.pose_frames==0 and not args.all_poses)
+
+
 def replay(args):
     """Feed genuine captures through the production gateway with explicit faults."""
+    frames,samples,native_bootstrap=replay_sources(args)
     import cv2
     import numpy as np
     import rclpy
@@ -371,21 +399,10 @@ def replay(args):
     from plugins.pointcloud_slam_rgb import validate_rgb_camera
     from plugins.pointcloud_slam_ros import RtabmapNode
     from plugins.pointcloud_slam_library import save_rtabmap_revision,load_map_snapshots,copy_native_map
-    from plugins.pointcloud_slam_odom import PoseSample
     domain=os.environ.get('ROS_DOMAIN_ID','')
     if not domain.isdecimal() or not 1<=int(domain)<=232:raise ValueError('isolated nonzero ROS_DOMAIN_ID required')
     os.environ['ROS_LOCALHOST_ONLY']='1'
     directory=Path(args.prepared);output=Path(args.output);output.mkdir(parents=True,exist_ok=False)
-    frames=[json.loads(s) for s in (directory/'frames.jsonl').read_text().splitlines()]
-    verified=json.loads(Path(args.bootstrap_poses).read_text())
-    samples=[PoseSample(v['stamp_ns']//10**6,'recorded_native','recorded_camera','recorded',
-        tuple(v['pose']['position']),tuple(v['pose']['quaternion']),tuple(v['pose']['covariance']),
-        'recorded',None,None,v['stamp_ns']) for v in verified if not v['info']['lost'] and v['info']['inliers']>0]
-    if len(samples)<2:raise ValueError('at least two native registration-verified bootstrap poses required')
-    # Exclude startup gauge and endpoints outside the measured native timeline.
-    frames=[r for r in frames if samples[0].stamp_ns<=r['cloud_stamp_ns']<=samples[-1].stamp_ns
-            and r['frame']>=args.start_frame and (args.end_frame is None or r['frame']<args.end_frame)]
-    if len(frames)<3:raise ValueError('insufficient measured frames after native bootstrap/subrange selection')
     camera=json.loads((directory/'camera.json').read_text());prefix='/recorded_replay_'+uuid.uuid4().hex
     settings=dict(cloud_frame='',child_frame='',clock_id='',child_from_cloud=np.eye(4).tolist(),
         max_gap_ms=250,max_age_s=5.,max_pending=12,max_cloud_points=camera['width']*camera['height'],
@@ -429,6 +446,13 @@ def replay(args):
         preview_clouds.append(dict(stamp_ns=stamp(msg),width=msg.width,height=msg.height,
             point_step=msg.point_step,row_step=msg.row_step,data_bytes=len(msg.data),
             fields=[f.name for f in msg.fields],empty=msg.width*msg.height==0))
+    def observe(native):
+        nonlocal pid,subscriptions
+        if not subscriptions:
+            pid=native._process.pid
+            subscriptions=[producer.create_subscription(cls,native.namespace+'/'+topic,callback,private_qos)
+                for cls,topic,callback in [(Info,'info',info),(MapGraph,'mapGraph',graph),(SensorData,'sensor_data',sensor),
+                    (PointCloud2,'cloud_map',preview)]]
     motion_directory=output/'native-motion';motion_directory.mkdir()
     motion_count=[0]
     def motion(kind,msg):
@@ -468,6 +492,11 @@ def replay(args):
         gateway.start()
         if not wait(lambda:odom.get_subscription_count() and clouds.get_subscription_count() and images.get_subscription_count(),30):
             raise TimeoutError('gateway discovery')
+        if cold_replay(args):
+            gateway._activate(None)
+            observe(gateway._active['process'])
+            if not wait(lambda:all(producer.count_publishers(s.topic_name) for s in subscriptions),30):
+                raise TimeoutError('cold native observer discovery')
         next_send=time.monotonic()
         first_end=max(frames[0]['cloud_stamp_ns'],frames[0]['rgb_stamp_ns'])
         pose_cursor=max(0,sum(sample.stamp_ns<=first_end for sample in samples)-2)
@@ -509,14 +538,10 @@ def replay(args):
             if not wait(lambda:gateway._active is not None and gateway._active['process']._process is not None,35):
                 raise TimeoutError('native map process did not start')
             native=gateway._active['process']
-            if not subscriptions:
-                pid=native._process.pid
-                subscriptions=[producer.create_subscription(cls,native.namespace+'/'+topic,callback,private_qos)
-                    for cls,topic,callback in [(Info,'info',info),(MapGraph,'mapGraph',graph),(SensorData,'sensor_data',sensor),
-                        (PointCloud2,'cloud_map',preview)]]
+            observe(native)
             if index==0:wait(lambda:capture in infos,8.)
             if native._process.pid!=pid or len(gateway._segments)!=1:raise RuntimeError('native map/process segment changed')
-            record=dict(frame=row['frame'],index=index,baseline_only=index==0,phase=phase,cloud_stamp_ns=capture,rgb_stamp_ns=rgb_stamp,
+            record=dict(frame=row['frame'],index=index,baseline_only=index==0 and not cold_replay(args),phase=phase,cloud_stamp_ns=capture,rgb_stamp_ns=rgb_stamp,
                 sent_monotonic=sent,
                 external_pose_headers_ns=external_headers,
                 input_pose_source='native RGB-D feature registration' if has_pose else None,
@@ -545,7 +570,7 @@ def replay(args):
         motion_rows=[json.loads(line) for line in (motion_directory/'records.jsonl').read_text().splitlines()] if motion_count[0] else []
         evidence=recovery_evidence(records,links,persisted_nodes)
         result=dict(native_pid=pid,segments=len(artifacts['segments']),database_nodes=nodes,links=links,
-            native_motion_messages=motion_count[0],first_frame_baseline_only=True,
+            native_motion_messages=motion_count[0],first_frame_baseline_only=not cold_replay(args),
             native_drain=dict(last_actual_input_stamp_ns=last_target,info_observed=drained),
             original_header_verification=header_evidence(frames,inputs,motion_rows),
             effective_native_parameters=json.loads(gateway._active['process'].parameter_path.read_text())['/**']['ros__parameters'],
@@ -556,9 +581,7 @@ def replay(args):
                 len(evidence['persisted_visual_tracking_nodes'])>=3 and identical and drained and len(artifacts['segments'])==1,
             statistics=artifacts['statistics'],input_frames=len(records),pose_null_frames=sum(r['input_pose_source'] is None for r in records),
             provenance=dict(json.loads((directory/'provenance.json').read_text()),
-                native_bootstrap=dict(file=str(Path(args.bootstrap_poses).resolve()),
-                    sha256=hashlib.sha256(Path(args.bootstrap_poses).read_bytes()).hexdigest(),
-                    summary=json.loads(Path(args.bootstrap_poses).with_name('result.json').read_text())),
+                native_bootstrap=native_bootstrap,
                 offline_replay=dict(
                 detection_schedule='DetectionRate=0, offline ingestion of all original captures' if args.offline_all_captures else 'native default DetectionRate',
                 keyframe_insertion='LinearUpdate=0/AngularUpdate=0 to retain static observations' if args.insert_every_observation else 'native default update thresholds',
@@ -591,7 +614,7 @@ def main():
     aligned.add_argument('--stamp-semantics',required=True);aligned.add_argument('--publication-cycle-evidence',required=True)
     native=commands.add_parser('bootstrap');native.add_argument('prepared');native.add_argument('output');native.add_argument('--end-frame',type=int)
     play=commands.add_parser('replay');play.add_argument('prepared');play.add_argument('output')
-    play.add_argument('--bootstrap-poses',required=True);play.add_argument('--pose-frames',type=int,default=8)
+    play.add_argument('--bootstrap-poses');play.add_argument('--pose-frames',type=int,default=8)
     play.add_argument('--all-poses',action='store_true');play.add_argument('--interval',type=float,default=1.3)
     play.add_argument('--insert-every-observation',action='store_true')
     play.add_argument('--offline-all-captures',action='store_true')

@@ -95,13 +95,18 @@ public:
                                  {"RGBD/ProximityOdomGuess","false"}});
             imageMode_=images;
         }
-        if(images) visual=estimator_->process(data, &info);
+        if(images) visual=processVisual(data,info);
         visualInliers_=info.reg.inliers;
         const bool tracked=!visual.isNull() && !info.lost &&
             visualInliers_>=minInliers_ && validCovariance(info.reg.covariance);
+        if(images && !tracked)
+        {
+            lastVisual_.setNull(); lastNative_.setNull();
+        }
         if(external.isNull() && !missing_)
         {
-            waiting_=true; aligned_=false;
+            waiting_=true; aligned_=!lastVisual_.isNull();
+            if(aligned_) visualToNative_=lastNative_*lastVisual_.inverse();
         }
         missing_=external.isNull();
         if(waiting_ && aligned_ && !tracked)
@@ -231,7 +236,7 @@ public:
             // This seed is a verified global pose, never frozen external odometry.
             estimator_->reset(location);
             rtabmap::OdometryInfo seed;
-            estimator_->process(data,&seed);
+            processVisual(data,seed);
             visualToNative_=rtabmap::Transform::getIdentity();
         }
         aligned_=true;
@@ -242,6 +247,19 @@ public:
         return true;
     }
 private:
+    rtabmap::Transform processVisual(rtabmap::SensorData & data, rtabmap::OdometryInfo & info)
+    {
+        struct RestoreScan
+        {
+            rtabmap::SensorData & data;
+            rtabmap::LaserScan raw,compressed;
+            ~RestoreScan() {data.setLaserScan(compressed); data.setLaserScan(raw,false);}
+        } restore{data,data.laserScanRaw(),data.laserScanCompressed()};
+        // Reg/Strategy=0 needs image geometry only. Keep its features on this
+        // same envelope, while reserving scan processing for the native map.
+        data.setLaserScan(rtabmap::LaserScan());
+        return estimator_->process(data,&info);
+    }
     static bool validCovariance(const cv::Mat & c)
     {
         if(c.type()!=CV_64FC1 || c.rows!=6 || c.cols!=6 || !cv::checkRange(c)) return false;

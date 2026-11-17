@@ -90,13 +90,16 @@ def saved_native_graph_evidence(graphs, optimized):
 
 def validate_selected_sources(records, frames):
     import numpy as np
-    sources={frame['rgb_stamp_ns']:frame for frame in frames if frame['phase'] not in ('rgb_gap','external_rgb_gap')}
+    sources={frame['rgb_stamp_ns']:frame for frame in frames if frame.get('rgb_input_kind',
+        'omitted' if frame['phase']=='rgb_gap' else 'invalid' if frame['phase']=='external_rgb_gap' else 'fixture')
+        in ('fixture','black')}
     for row in records:
         image=row.get('images')
         if not image or not image['rgb']:continue
         source=sources.get(image['rgb_stamp_ns'])
         assert source and row.get('selected_rgb_stamp_ns')==source['rgb_stamp_ns'], 'RGB attachment has no original selected capture'
         assert (row.get('selected_rgb_frame')==source['frame'] and row.get('selected_rgb_x')==source['rgb_x']), 'RGB attachment selected source geometry differs from capture GT'
+        assert row.get('selected_rgb_kind','fixture')==source.get('rgb_input_kind','fixture'), 'RGB attachment selected source kind differs from sent capture'
         motion=row.get('motion')
         if motion:
             matrix=np.asarray(motion['matrix'],dtype=float)
@@ -150,9 +153,11 @@ def plan_frames(rows, mode, *, base_ns=1_794_658_670_000_000_001, origin=(0.,0.,
             'external_rgb_gap','continuous_reset','rgb_gap','second_relocalize',
             'second_visual_only','reopened','depth_gap'}
     if mode=='no-rgb':phases={'outbound','revisit'}
+    elif mode=='vo-continuation':phases={'outbound'}
     elif mode=='similar-negative':phases={'similar_negative'}
     elif mode=='novel-negative':phases={'novel_negative'}
-    frames=[]
+    frames=[];seen=set()
+    last_gap_frame=next((row[0] for row in reversed(rows) if row[4]=='rgb_gap'),None)
     period,offset=1_500_000_000,100_000_000
     for number,external,external_x,truth_x,phase in rows:
         if phase not in phases:continue
@@ -160,16 +165,36 @@ def plan_frames(rows, mode, *, base_ns=1_794_658_670_000_000_001, origin=(0.,0.,
         # Existing JPEGs were rendered at x. Solve the next scan position so
         # piecewise-linear GT passes through that exact image capture position.
         cloud_x=x if not frames else (x-offset/period*frames[-1]['cloud_x'])/(1-offset/period)
-        supplied_x=float(external_x)+cloud_x-x if int(external) else None
+        has_external=bool(int(external)) and not (mode=='vo-continuation' and len(frames)>=8)
+        supplied_x=float(external_x)+cloud_x-x if has_external else None
         supplied_position=[supplied_x,0.,0.] if supplied_x is not None else None
         if supplied_position is not None and phase in ('outbound','revisit'):
             supplied_position=[a+b for a,b in zip(supplied_position,origin)]
-        frames.append(dict(frame=int(number),index=len(frames),phase=phase,
+        kind='omitted' if mode=='no-rgb' or phase=='rgb_gap' else 'invalid' if phase=='external_rgb_gap' else 'fixture'
+        # The first gap scan can lose ICP and the second seeds its new run;
+        # only the last gap capture has measured coverage for both exposures.
+        if mode=='async' and ((phase=='relocalize' and phase not in seen) or
+                (phase=='rgb_gap' and number==last_gap_frame)):kind='black'
+        seen.add(phase)
+        frames.append(dict(frame=int(number),index=len(frames),phase=phase,rgb_input_kind=kind,
             rgb_stamp_ns=stamp-offset if frames else stamp,cloud_stamp_ns=stamp,
-            rgb_x=x,cloud_x=cloud_x,external_pose=bool(int(external)),
+            rgb_x=x,cloud_x=cloud_x,external_pose=has_external,
             external_x=supplied_x,external_position=supplied_position))
+        if mode=='vo-continuation':frames[-1]['external_pose_withheld']=not has_external
     if not frames:raise ValueError('scene has no frames for '+mode)
     return frames
+
+
+def rgb_payload(kind, source):
+    if kind=='omitted':return None
+    if kind=='invalid':return b'invalid JPEG'
+    if kind=='black':
+        import cv2
+        import numpy as np
+        ok,data=cv2.imencode('.jpg',np.zeros((240,320,3),dtype=np.uint8))
+        assert ok, 'black JPEG encoding failed'
+        return data.tobytes()
+    return source
 
 
 def async_evidence(records, persisted_nodes=None):
@@ -227,6 +252,24 @@ def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False)
         assert not any(row['native'] and row['native']['ref'] in persisted_nodes for row in records), 'negative query grew connected map'
         assert not evidence['verified_recoveries'], 'negative query recovered'
         evidence.update(async_evidence(records,persisted_nodes))
+    elif mode=='vo-continuation':
+        assert not evidence['verified_recoveries'] and not evidence['unverified_localized_frames'], 'VO continuation incorrectly relocalized'
+        null_rows=[row for row in records if not row['external_pose']]
+        assert null_rows, 'VO continuation has no external-null observations'
+        assert any(row['external_pose'] and row['index']<null_rows[0]['index'] and row['native'] and
+            row['native']['stats'].get('Motus/VisualInliers/',0)>=20 and
+            row.get('images') and row['images']['rgb'] for row in records), 'VO continuation lacks a measured paired external anchor'
+        assert len(evidence['persisted_visual_tracking_nodes'])>=3, 'VO continuation did not continue persisted mapping'
+        assert all(not row['native'] or (row['native']['stats'].get('Motus/RecoveryState/')!=2 and
+            row['native']['stats'].get('Motus/RecoveryNode/',0)==0) for row in null_rows), 'VO continuation emitted a recovery event'
+        continued=[row for row in null_rows if row['native'] and
+            row['native']['stats'].get('Motus/RecoveryState/')==3 and row['native']['ref'] in persisted_nodes]
+        assert all(row.get('images') and row['images']['rgb'] and row['images']['depth'] and
+            row.get('motion') and row.get('selected_rgb_kind')=='fixture' and
+            row['native']['stats'].get('Motus/VisualInliers/',0)>=20 for row in continued), 'VO continuation lacks actual measured attachment evidence'
+        evidence['continued_without_relocalization_nodes']=evidence['persisted_visual_tracking_nodes']
+        evidence.update(async_evidence(continued,persisted_nodes))
+        assert evidence['retained_async_frames']==len(continued), 'VO continuation attachment was not retained'
     else:
         import numpy as np
         assert evidence['verified_recoveries'] and not evidence['unverified_localized_frames'], 'no verified geometric recovery'
@@ -235,6 +278,7 @@ def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False)
         recovery_rows=[row for row in records if row['index'] in recovered]
         async_recovery_rows=[];sync_cold=set()
         for row in recovery_rows:
+            assert row.get('selected_rgb_kind','fixture')!='black', 'black capture cannot verify geometric recovery'
             image,motion=row.get('images'),row.get('motion')
             assert (image and image['rgb'] and image['depth'] and
                     row.get('selected_rgb_stamp_ns') is not None and
@@ -268,6 +312,22 @@ def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False)
         evidence['tracking_by_phase']=tracking
         evidence.update(async_evidence(records,persisted_nodes))
         assert evidence['retained_async_frames']>=1, 'no retained asynchronous motion attachment was verified'
+    blackouts=[row for row in records if row.get('rgb_input_kind')=='black']
+    losses=[]
+    for i,black in enumerate(blackouts):
+        observed=[row for row in records if row.get('selected_rgb_kind')=='black' and
+            row.get('selected_rgb_stamp_ns')==black['rgb_stamp_ns'] and row.get('images') and
+            row['images']['rgb'] and row['images']['depth'] and row['images'].get('rgb_all_zero') is True]
+        assert observed, 'black injection has no actual featureless native receipt'
+        lost=[row for row in observed if row['native'] and
+            row['native']['stats'].get('Motus/RecoveryState/')==1 and
+            0<=row['native']['stats'].get('Motus/VisualInliers/',20)<20]
+        assert lost, 'black receipt did not demonstrate native VO loss'
+        end=blackouts[i+1]['index'] if i+1<len(blackouts) else float('inf')
+        assert any(lost[0]['index']<item['index']<end for item in evidence['verified_recoveries']), 'black loss lacks subsequent normal-image geometric recovery'
+        losses.append(dict(source_index=black['index'],observation_index=lost[0]['index'],
+            rgb_stamp_ns=black['rgb_stamp_ns'],native_ref=lost[0]['native']['ref']))
+    evidence['verified_blackout_losses']=losses
     recovered={item['index']:item for item in evidence['verified_recoveries']}
     global_edges={tuple(sorted((a,b))) for a,b,kind in links if kind==1}
     visual_edges=[]
@@ -360,7 +420,7 @@ def run(scene, output, mode='async', resume_run=None):
         for topic,cls in [('odom',String),('cloud',PointCloud2),('rgb',CompressedImage)]}
     infos,inputs,motions,graphs,subscriptions,records={},{},{},[],[],[]
     sent_images={}
-    preview_clouds=[];preview_packets=[];preview_rejections=[]
+    preview_clouds=[];preview_packets=[];preview_rejections=[];rgb_publications=[]
     reliable=QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE)
     pid=None;motion_pids=set();motion_subscriptions=[];motion_namespace=None
     def stamp(msg):return msg.header.stamp.sec*10**9+msg.header.stamp.nanosec
@@ -371,7 +431,10 @@ def run(scene, output, mode='async', resume_run=None):
         mount=msg.local_transform[0] if msg.local_transform else None
         translation=[getattr(mount.translation,k) for k in ('x','y','z')] if mount else None
         quaternion=[getattr(mount.rotation,k) for k in ('x','y','z','w')] if mount else None
+        selected=sent_images.get(stamp(msg.left),{})
+        black=selected.get('rgb_input_kind')=='black'
         inputs[stamp(msg)]=dict(rgb=bool(msg.left.data),depth=bool(msg.right.data),
+            rgb_all_zero=bool(msg.left.data) and not bool(np.frombuffer(msg.left.data,dtype=np.uint8).any()) if black else None,
             cloud_stamp_ns=stamp(msg),rgb_stamp_ns=stamp(msg.left),
             local_translation=translation,local_quaternion=quaternion,
             local_matrix=pose_matrix(SimpleNamespace(position=translation,quaternion=quaternion)).tolist() if mount else None)
@@ -418,7 +481,7 @@ def run(scene, output, mode='async', resume_run=None):
     def persist_native_evidence():
         for name,value in [('graph.json',graphs),('native-info.json',infos),('motion-info.json',motions),
                            ('preview-clouds.json',preview_clouds),('preview-packets.json',preview_packets),
-                           ('preview-rejections.json',preview_rejections)]:
+                           ('preview-rejections.json',preview_rejections),('rgb-publications.json',rgb_publications)]:
             (output/name).write_text(json.dumps(value))
         completed=finalize_records(records,infos)
         (output/'info.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in completed))
@@ -449,9 +512,22 @@ def run(scene, output, mode='async', resume_run=None):
                 vendor=dict(motus_slam=dict(stamp_ns=capture,status='tracking' if xyz is not None else 'lost')))
             message=String();message.data=json.dumps(packet);pubs['odom'].publish(message)
             image=CompressedImage();image.header.stamp.sec,image.header.stamp.nanosec=divmod(frame['rgb_stamp_ns'],10**9)
-            image.format='jpeg';image.data=(scene/f"{frame['frame']}.jpg").read_bytes()
-            if phase=='external_rgb_gap':image.data=b'invalid JPEG'
-            if mode!='no-rgb' and phase!='rgb_gap':
+            source=(scene/f"{frame['frame']}.jpg").read_bytes()
+            payload=rgb_payload(frame['rgb_input_kind'],source)
+            publication=dict(index=frame['index'],frame=frame['frame'],kind=frame['rgb_input_kind'],
+                stamp_ns=frame['rgb_stamp_ns'],source_file=f"{frame['frame']}.jpg",format='jpeg',
+                header=dict(sec=image.header.stamp.sec,nanosec=image.header.stamp.nanosec,frame_id=image.header.frame_id),
+                source_sha256=hashlib.sha256(source).hexdigest(),
+                sent_sha256=hashlib.sha256(payload).hexdigest() if payload is not None else None,
+                bytes=len(payload) if payload is not None else 0)
+            if frame['rgb_input_kind'] in ('black','invalid'):
+                (output/'rgb-injections').mkdir(exist_ok=True)
+                publication['file']=f"rgb-injections/{frame['index']}.jpg"
+                (output/publication['file']).write_bytes(payload)
+            rgb_publications.append(publication)
+            image.format='jpeg'
+            if payload is not None:
+                image.data=payload
                 sent_images[frame['rgb_stamp_ns']]=frame
                 pubs['rgb'].publish(image)
             points=scan_depth(frame['cloud_x'],phase)
@@ -497,6 +573,8 @@ def run(scene, output, mode='async', resume_run=None):
                 selected_rgb_stamp_ns=rgb_capture if selected else None,
                 selected_rgb_frame=selected['frame'] if selected else None,
                 selected_rgb_x=rgb_x if selected else None,
+                selected_rgb_kind=selected['rgb_input_kind'] if selected else None,
+                rgb_publication=publication,
                 sent_monotonic=sent,native=deepcopy(infos.get(capture)),images=actual_image,
                 motion=measured,live_motion_pids=live_motion_pids,status=status)
             records.append(record)
@@ -545,7 +623,16 @@ def evaluate(directory, previous=None):
     result=json.loads((directory/'result.json').read_text())
     records=[json.loads(line) for line in (directory/'info.jsonl').read_text().splitlines()]
     records=finalize_records(records,json.loads((directory/'native-info.json').read_text()))
-    validate_selected_sources(records,json.loads((directory/'ground-truth.json').read_text())['frames'])
+    frames=json.loads((directory/'ground-truth.json').read_text())['frames']
+    validate_selected_sources(records,frames)
+    if (directory/'rgb-publications.json').is_file():
+        planned={frame['index']:frame for frame in frames}
+        for publication in json.loads((directory/'rgb-publications.json').read_text()):
+            frame=planned[publication['index']]
+            assert (publication['kind'],publication['stamp_ns'])==(frame['rgb_input_kind'],frame['rgb_stamp_ns']), 'RGB publication header/kind differs from planned capture'
+            if publication.get('file'):
+                payload=(directory/publication['file']).read_bytes()
+                assert len(payload)==publication['bytes'] and hashlib.sha256(payload).hexdigest()==publication['sent_sha256'], 'RGB injection bytes differ from actual sent payload'
     database=next((directory/'session').rglob('rtabmap.db'),directory/'restored.db')
     db=database_evidence(database)
     old=None
@@ -679,7 +766,7 @@ def compare_runs(rgb, no_rgb):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('scene');parser.add_argument('output')
-    parser.add_argument('--mode',choices=('async','no-rgb','similar-negative','novel-negative'),default='async')
+    parser.add_argument('--mode',choices=('async','vo-continuation','no-rgb','similar-negative','novel-negative'),default='async')
     parser.add_argument('--resume-run')
     parser.add_argument('--evaluate-only',action='store_true')
     parser.add_argument('--compare-no-rgb')

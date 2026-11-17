@@ -366,3 +366,97 @@ def test_partial_live_graph_cannot_claim_the_saved_global_graph_was_preserved():
     saved={2:np.eye(4)[:3],9:np.eye(4)[:3]}
     evidence=tool.saved_native_graph_evidence(graphs,saved)
     assert not evidence['comparable'] and evidence['verified'] is None
+
+
+def test_blackouts_and_vo_continuation_leave_original_captures_and_scene_unchanged():
+    tool=module()
+    rows=[[str(i),'1',str(i*.192),str(i*.18),'outbound'] for i in range(31)]
+    rows += [['31','0','0','0','relocalize'],['32','0','0','.01','relocalize'],
+        ['33','0','0','7.5','rgb_gap'],['34','0','0','7.5','rgb_gap'],
+        ['35','0','0','7.5','rgb_gap'],['36','0','0','0','second_relocalize']]
+    normal=tool.plan_frames(rows,'async');control=tool.plan_frames(rows,'vo-continuation')
+    assert [r.get('rgb_input_kind') for r in normal[31:]]==['black','fixture','omitted','omitted','black','fixture']
+    assert len(control)==31 and [r['external_pose'] for r in control]==[True]*8+[False]*23
+    assert all(r['rgb_input_kind']=='fixture' for r in control)
+    for actual,original in zip(control,normal):
+        assert all(actual[key]==original[key] for key in ('rgb_stamp_ns','cloud_stamp_ns','rgb_x','cloud_x'))
+    cold=tool.plan_frames([['0','0','0','0','reopened'],['1','0','0','.18','reopened']],'async')
+    assert all(r['rgb_input_kind']=='fixture' for r in cold)
+
+
+def test_black_jpeg_is_decode_valid_featureless_and_source_bytes_are_unchanged():
+    import cv2
+    import numpy as np
+    if not hasattr(cv2,'imdecode'):pytest.skip('actual OpenCV JPEG decoder required')
+    tool=module();source=b'original source bytes'
+    encoded=tool.rgb_payload('black',source)
+    image=cv2.imdecode(np.frombuffer(encoded,dtype=np.uint8),cv2.IMREAD_COLOR)
+    assert image.shape==(240,320,3) and not image.any()
+    assert tool.rgb_payload('fixture',source)==source
+    assert tool.rgb_payload('omitted',source) is None
+    assert tool.rgb_payload('invalid',source)==b'invalid JPEG'
+
+
+def test_normal_vo_continuation_requires_growth_without_a_global_recovery_event():
+    from copy import deepcopy
+    tool=module();rows=[]
+    for i in range(12):
+        rows.append(dict(index=i,phase='outbound',external_pose=i<8,rgb_stamp_ns=i*100+1,
+            cloud_stamp_ns=i*100+2,selected_rgb_stamp_ns=i*100+1,selected_rgb_frame=i,
+            selected_rgb_x=0.,selected_rgb_kind='fixture',rgb_input_kind='fixture',
+            images=dict(rgb=True,depth=True,rgb_stamp_ns=i*100+1,cloud_stamp_ns=i*100+2,
+                local_translation=[0.,0.,0.],local_matrix=IDENTITY),
+            motion=dict(matrix=IDENTITY,verified=2,translation_error_m=.001),
+            native=dict(ref=i+1,loop=0,stats={'Motus/RecoveryState/':0. if i<8 else 3.,
+                'Motus/VisualInliers/':35.})))
+    evidence=tool.validate_native(rows,set(range(1,13)),[],'vo-continuation')
+    assert not evidence['verified_recoveries']
+    assert evidence['continued_without_relocalization_nodes']==[9,10,11,12]
+    bad=deepcopy(rows)
+    for row in bad[8:]:row['images']=None
+    candidate=deepcopy(rows[-1]);candidate['index']=12;candidate['native']['ref']=99
+    bad.append(candidate)
+    with pytest.raises(AssertionError,match='continuation.*attachment'):
+        tool.validate_native(bad,set(range(1,13)),[],'vo-continuation')
+    rows[8]['native']['stats'].update({'Motus/RecoveryState/':2.,'Loop/Visual_inliers/':35.})
+    rows[8]['native']['loop']=2
+    with pytest.raises(AssertionError,match='continuation'):
+        tool.validate_native(rows,set(range(1,13)),[(9,2,1)],'vo-continuation')
+
+
+def test_black_capture_cannot_be_counted_as_geometric_recovery():
+    tool=module()
+    row=dict(index=0,phase='relocalize',external_pose=False,rgb_stamp_ns=100,cloud_stamp_ns=200,
+        selected_rgb_stamp_ns=100,selected_rgb_frame=0,selected_rgb_x=0.,selected_rgb_kind='black',
+        images=dict(rgb=True,depth=True,rgb_stamp_ns=100,cloud_stamp_ns=200,
+                    local_translation=[0.,0.,0.],local_matrix=IDENTITY),
+        motion=dict(matrix=IDENTITY,verified=2,translation_error_m=.001),
+        native=dict(ref=9,loop=2,stats={'Motus/RecoveryState/':2.,'Loop/Visual_inliers/':35.}))
+    rows=[row]+[dict(index=i,phase='visual_only',external_pose=False,rgb_stamp_ns=100+i,
+        cloud_stamp_ns=200+i,images=None,motion=None,
+        native=dict(ref=9+i,loop=0,stats={'Motus/RecoveryState/':3.})) for i in (1,2,3)]
+    with pytest.raises(AssertionError,match='black'):
+        tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async')
+
+
+def test_blackout_recovery_needs_an_actual_featureless_receipt_and_native_vo_loss():
+    from copy import deepcopy
+    tool=module();rows=[]
+    for i in range(5):
+        rows.append(dict(index=i,phase='relocalize' if i<2 else 'visual_only',external_pose=False,
+            rgb_stamp_ns=i*100+1,cloud_stamp_ns=i*100+2,selected_rgb_stamp_ns=i*100+1,
+            selected_rgb_frame=i,selected_rgb_x=0.,rgb_input_kind='black' if i==0 else 'fixture',
+            selected_rgb_kind='black' if i==0 else 'fixture',
+            images=dict(rgb=True,depth=True,rgb_stamp_ns=i*100+1,cloud_stamp_ns=i*100+2,
+                local_translation=[0.,0.,0.],local_matrix=IDENTITY,rgb_all_zero=i==0),
+            motion=dict(matrix=IDENTITY,verified=2,translation_error_m=.001),
+            native=dict(ref=9+i,loop=2 if i==1 else 0,stats={'Motus/RecoveryState/':1. if i==0 else 2. if i==1 else 3.,
+                'Motus/VisualInliers/':0. if i==0 else 35.,'Loop/Visual_inliers/':35. if i==1 else 0.})))
+    evidence=tool.validate_native(rows,{2,10,11,12,13},[(10,2,1)],'async')
+    assert len(evidence.get('verified_blackout_losses',[]))==1
+    bad=deepcopy(rows);bad[0]['native']['stats']['Motus/VisualInliers/']=35.
+    with pytest.raises(AssertionError,match='black.*loss'):
+        tool.validate_native(bad,{2,10,11,12,13},[(10,2,1)],'async')
+    bad=deepcopy(rows);bad[0]['images']['rgb_all_zero']=False
+    with pytest.raises(AssertionError,match='black.*receipt'):
+        tool.validate_native(bad,{2,10,11,12,13},[(10,2,1)],'async')

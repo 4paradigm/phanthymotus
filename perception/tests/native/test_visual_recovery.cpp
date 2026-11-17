@@ -17,6 +17,7 @@ int main(int argc, char **argv)
     ULogger::setType(ULogger::kTypeConsole);
     ULogger::setLevel(ULogger::kWarning);
     const std::string root=argv[1], output=argv[2], mode=argv[3];
+    const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap";
     std::map<int,int> imageMask;
     if(mode=="scan_mask")
     {
@@ -26,7 +27,7 @@ int main(int argc, char **argv)
         if(imageMask.empty()) throw std::runtime_error("empty image-availability mask");
     }
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
-        mode=="scan_mask" || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
+        mode=="scan_mask" || voHandoff || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
         mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm";
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
@@ -62,6 +63,11 @@ int main(int argc, char **argv)
     bool gapInjected=false, resetGapInjected=false, bridgePending=false; int bridgeRelocalizations=0;
     cv::Mat previousDepth; float previousTruthX=0, previousExternalX=0;
     int scanOnlyFrames=0, retainedScanClosures=0, overwrittenEvents=0;
+    int handoffFrames=0;
+    bool relocalizeBlack=false; int rgbGapFrames=0;
+    const rtabmap::Transform handoffOrigin(7.f,-3.f,.5f,0.f,0.f,.35f);
+    rtabmap::Transform lastHandoff;
+    std::map<int,rtabmap::Transform> beforeVisualFailure;
     while(manifest >> i >> hasPose >> externalX >> truthX >> phase)
     {
         if(mode!="recovery" && mode!="recovery_gap" && mode!="recovery_event" && mode!="resume" && !hasPose) break;
@@ -69,6 +75,19 @@ int main(int argc, char **argv)
         cv::Mat rgb=cv::imread(root+"/"+std::to_string(i)+".jpg");
         cv::Mat depth=cv::imread(root+"/"+std::to_string(i)+".png", cv::IMREAD_UNCHANGED);
         if(rgb.empty() || depth.empty()) throw std::runtime_error("missing scene frame");
+        const bool recoveryScenario=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event";
+        bool visualFault=false;
+        if(recoveryScenario && phase=="relocalize" && !relocalizeBlack)
+            visualFault=relocalizeBlack=true;
+        if(recoveryScenario && phase=="rgb_gap" && ++rgbGapFrames==3)
+            visualFault=true; // The first two missing images preserve the VO gauge.
+        if(visualFault) rgb.setTo(cv::Scalar::all(0));
+        if(voHandoff)
+        {
+            if(i>=3) hasPose=0;
+            if(i==7) hasPose=1; // A numerical external input cannot revive an old VO pairing.
+            if(i==6 || i==7) rgb.setTo(cv::Scalar::all(0)); // Received image, real native VO failure.
+        }
         const bool unpaired=mode=="fallback_unpaired" && i==1;
         if(unpaired) externalX-=200.f;
         const bool visualLost=mode=="fallback_lost" && i==2;
@@ -91,14 +110,18 @@ int main(int argc, char **argv)
         if(mode=="resume") depth=projectedDepth; // Production SensorData carries 32FC1 projected depth.
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
-        const bool noImages=mode=="no_rgb" || mode=="history_without_cache" || phase=="rgb_gap" || phase=="external_rgb_gap" ||
+        const bool noImages=mode=="no_rgb" || mode=="history_without_cache" ||
+            (mode=="vo_handoff_gap" && i==3) ||
+            (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
             gap || resetGap || (mode=="fallback_cov" && i==1) ||
             (mode=="scan_mask" && !imageMask.at(i));
         rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,double(i+1));
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
+        if(voHandoff && hasPose) ext=handoffOrigin*ext;
         if(mode=="history_without_cache") ext=historyExternal;
         const auto nodesBefore=map.getLocalOptimizedPoses().size();
+        if(visualLost) beforeVisualFailure=map.getLocalOptimizedPoses();
         auto started=std::chrono::steady_clock::now();
         bool accepted=nativeRecovery?
             recovery.process(map,data,ext,cv::Mat::eye(6,6,CV_64F)*(mode=="resume"?1.:.01)):
@@ -113,6 +136,12 @@ int main(int argc, char **argv)
             ++overwrittenEvents;
         }
         const auto &s=map.getStatistics(); auto pose=map.getLastLocalizationPose();
+        if(nativeRecovery && (data.laserScanRaw().size()!=count ||
+           cv::norm(data.laserScanRaw().data(),scan.colRange(0,count),cv::NORM_INF)!=0))
+            throw std::runtime_error("visual odometry must preserve the original scan for native mapping");
+        if(nativeRecovery && recovery.visualInliers()>=20 &&
+           (data.keypoints().empty() || data.descriptors().rows!=static_cast<int>(data.keypoints().size())))
+            throw std::runtime_error("visual odometry features must remain on the native map observation");
         auto stat=[&](const std::string &key) {auto j=s.data().find(key);return j==s.data().end()?0.f:j->second;};
         evidence << "{\"frame\":"<<i<<",\"phase\":\""<<phase<<"\",\"accepted\":"<<accepted
                  <<",\"ref\":"<<s.refImageId()<<",\"loop\":"<<s.loopClosureId()<<",\"proximity\":"<<s.proximityDetectionId()
@@ -121,6 +150,7 @@ int main(int argc, char **argv)
                  <<",\"recovery_node\":"<<recovery.recoveryNode()<<",\"recovery_anchor\":"<<recovery.recoveryAnchor()
                  <<",\"recovery_inliers\":"<<recovery.recoveryInliers()
                  <<",\"visual_inliers\":"<<recovery.visualInliers()<<",\"nodes\":"<<map.getLocalOptimizedPoses().size()
+                 <<",\"visual_fault\":"<<visualFault<<",\"images\":"<<!noImages
                  <<",\"hypothesis\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_id())
                  <<",\"hypothesis_value\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_value())
                  <<",\"rejected\":"<<stat(rtabmap::Statistics::kLoopRejectedHypothesis())
@@ -130,6 +160,39 @@ int main(int argc, char **argv)
                  <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
+        if(visualFault && (recovery.visualInliers()>=20 ||
+           recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+           recovery.recoveryNode()!=0))
+            throw std::runtime_error("decode-valid black image must exercise real VO loss before global recovery");
+        if(voHandoff)
+        {
+            if(mode=="vo_handoff_gap" && i==3)
+            {
+                if(accepted || recovery.state()!=motus::VisualRecovery::Searching ||
+                   !recovery.odom().isNull() || map.getLocalOptimizedPoses().size()!=nodesBefore)
+                    throw std::runtime_error("missing RGB at external loss must pause without losing the established gauge");
+            }
+            else if(i>=3 && i<=5)
+            {
+                const auto local=handoffOrigin.inverse()*recovery.odom();
+                if(!accepted || recovery.state()!=motus::VisualRecovery::VisualTracking ||
+                   recovery.visualInliers()<20 || recovery.odom().isNull() ||
+                   recovery.relocalizations()!=0 || !map.getMemory()->isIncremental() ||
+                   map.getLocalOptimizedPoses().size()<=nodesBefore ||
+                   std::abs(local.x()-(truthX+.024f))>.05f || std::abs(local.y())>.05f ||
+                   (!lastHandoff.isNull() && (lastHandoff.inverse()*recovery.odom()).getNorm()<.1f))
+                    throw std::runtime_error("continuous measured VO must map across external pose loss in the established gauge");
+                lastHandoff=recovery.odom(); ++handoffFrames;
+            }
+            if((i==6 || i==7) && (recovery.visualInliers()!=0 || recovery.state()!=motus::VisualRecovery::Searching ||
+               !recovery.odom().isNull() || recovery.recoveryNode()!=0))
+                throw std::runtime_error("real visual failure must revoke continuous VO alignment");
+            if(i==8)
+            {
+                if(handoffFrames!=(mode=="vo_handoff_gap"?2:3) || recovery.state()==motus::VisualRecovery::VisualTracking)
+                    throw std::runtime_error("old VO alignment must not bridge a real visual failure without global verification");
+            }
+        }
         if(mode=="history_without_cache")
         {
             if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
@@ -186,13 +249,35 @@ int main(int argc, char **argv)
             bridgePending=true; bridgeRelocalizations=recovery.relocalizations();
             if(accepted || !recovery.odom().isNull() || recovery.state()!=motus::VisualRecovery::Searching ||
                map.getLocalOptimizedPoses().size()!=nodesBefore || !map.getMemory()->isIncremental())
-                throw std::runtime_error("unverified external reset must not map or discard the established visual gauge");
+                throw std::runtime_error("unverified external reset must not map or discard the existing graph");
             if(unpaired) {bridgePending=false; break;}
         }
         else if(bridgePending)
         {
-            if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
-               recovery.relocalizations()!=bridgeRelocalizations)
+            if(mode=="fallback_lost")
+            {
+                if(recovery.state()!=motus::VisualRecovery::Searching &&
+                   recovery.state()!=motus::VisualRecovery::Localized)
+                    throw std::runtime_error("real visual failure requires global verification before binding an external origin");
+                if(recovery.state()==motus::VisualRecovery::Searching && !recovery.odom().isNull())
+                    throw std::runtime_error("unverified recovery cannot emit a stale pose");
+                if(recovery.state()==motus::VisualRecovery::Searching)
+                {
+                    std::map<int,rtabmap::Transform> preserved;
+                    std::multimap<int,rtabmap::Link> preservedLinks;
+                    map.getGraph(preserved,preservedLinks,true,true);
+                    if(preserved.size()!=beforeVisualFailure.size() || beforeVisualFailure.empty() ||
+                       !preserved.count(beforeVisualFailure.begin()->first) ||
+                       (beforeVisualFailure.begin()->second.inverse()*
+                        preserved.at(beforeVisualFailure.begin()->first)).getNorm()>1e-6f)
+                        throw std::runtime_error("visual loss changed the old map origin or inserted an unverified external node");
+                    for(const auto &pose:beforeVisualFailure)
+                        if(!preserved.count(pose.first))
+                            throw std::runtime_error("visual loss discarded an existing graph node");
+                }
+            }
+            else if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+                    recovery.relocalizations()!=bridgeRelocalizations)
                 throw std::runtime_error("the next tracked RGB must bridge the new external origin without relocalizing");
             bridgePending=false;
         }
@@ -214,9 +299,15 @@ int main(int argc, char **argv)
             break;
         }
         if(mode=="fallback_lost" && i==3) break;
+        if(voHandoff && i==8) break;
     }
-    if(mode=="recovery_event" && overwrittenEvents==0)
+    if(mode=="recovery_event" && overwrittenEvents<2)
         throw std::runtime_error("native recovery event was not tested after publication statistics reset");
+    if((mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event") &&
+       (!relocalizeBlack || rgbGapFrames!=3))
+        throw std::runtime_error("two real visual failure observations were not exercised");
+    if(voHandoff && (handoffFrames!=(mode=="vo_handoff_gap"?2:3) || i!=8))
+        throw std::runtime_error("continuous VO and real visual failure regression was not exercised");
     if(mode=="scan_mask" && (scanOnlyFrames<2 || retainedScanClosures==0))
         throw std::runtime_error("observed scan-only mask did not retain native ICP multi closures");
     if(mode=="fallback_unpaired" && i!=1)

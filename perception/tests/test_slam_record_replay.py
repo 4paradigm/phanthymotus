@@ -162,3 +162,76 @@ def test_f2m_inliers_and_relocalization_counter_do_not_prove_global_recovery():
     result=tool.recovery_evidence(frames,[(9,2,1)],{2,9})
     assert result['verified_recoveries']==[]
     assert result['unverified_localized_frames']==[3]
+
+
+def replay_source_args(tmp_path, **changes):
+    from types import SimpleNamespace
+    base=1794898925701466892
+    frames=[dict(frame=i,rgb_stamp_ns=base+i*50_000_000,
+                 cloud_stamp_ns=base+i*50_000_000+15_000_001) for i in range(6)]
+    (tmp_path/'frames.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in frames))
+    args=dict(prepared=tmp_path,bootstrap_poses=None,pose_frames=0,all_poses=False,
+              start_frame=0,end_frame=None)
+    args.update(changes)
+    return SimpleNamespace(**args),frames
+
+
+@pytest.mark.parametrize('bootstrap',[None,'unused-does-not-exist.json'])
+def test_pure_null_replay_does_not_require_or_crop_to_bootstrap(tmp_path,bootstrap):
+    args,original=replay_source_args(tmp_path,bootstrap_poses=bootstrap)
+    frames,samples,provenance=module().replay_sources(args)
+    assert frames==original
+    assert frames[0]['rgb_stamp_ns']==1794898925701466892
+    assert frames[-1]['cloud_stamp_ns']==1794898925966466893
+    assert all(type(row['cloud_stamp_ns']) is int for row in frames)
+    assert samples==[]
+    assert provenance is None
+    args.start_frame=2;args.end_frame=5
+    assert module().replay_sources(args)[0]==original[2:5]
+
+
+@pytest.mark.parametrize('pose_frames,all_poses',[(8,False),(0,True)])
+def test_external_pose_replay_still_requires_measured_bootstrap(tmp_path,pose_frames,all_poses):
+    args,_=replay_source_args(tmp_path,pose_frames=pose_frames,all_poses=all_poses)
+    with pytest.raises(ValueError,match='bootstrap'):
+        module().replay_sources(args)
+
+
+def test_external_pose_replay_keeps_native_timeline_cropping_and_minimum_samples(tmp_path):
+    args,original=replay_source_args(tmp_path,pose_frames=4,bootstrap_poses=tmp_path/'poses.json')
+    verified=[dict(stamp_ns=original[i]['cloud_stamp_ns'],pose=dict(position=[0.,0.,0.],
+        quaternion=[0.,0.,0.,1.],covariance=[1.]*36),info=dict(lost=False,inliers=30)) for i in (1,4)]
+    args.bootstrap_poses.write_text(json.dumps(verified))
+    (tmp_path/'result.json').write_text(json.dumps(dict(verified_poses=2)))
+    frames,samples,provenance=module().replay_sources(args)
+    assert frames==original[1:5]
+    assert [s.stamp_ns for s in samples]==[1794898925766466893,1794898925916466893]
+    assert provenance['sha256']==hashlib.sha256(args.bootstrap_poses.read_bytes()).hexdigest()
+    args.bootstrap_poses.write_text(json.dumps(verified[:1]))
+    with pytest.raises(ValueError,match='at least two'):
+        module().replay_sources(args)
+
+
+def test_pure_null_replay_cli_accepts_no_bootstrap(tmp_path,monkeypatch,capsys):
+    import sys
+    tool=module();replay_source_args(tmp_path)
+    monkeypatch.setattr(sys,'argv',['slam_record_replay','replay',str(tmp_path),'unused-output','--pose-frames','0'])
+    monkeypatch.setattr(tool,'replay',lambda args:dict(frames=len(tool.replay_sources(args)[0])))
+    tool.main()
+    assert json.loads(capsys.readouterr().out)==dict(frames=6)
+
+
+@pytest.mark.parametrize('resume,pose_frames,all_poses,eligible',[
+    ('saved-run',0,False,True),(None,0,False,False),
+    ('saved-run',4,False,False),('saved-run',0,True,False),
+])
+def test_only_preobserved_cold_null_first_frame_can_prove_global_recovery(resume,pose_frames,all_poses,eligible):
+    from types import SimpleNamespace
+    tool=module();args=SimpleNamespace(resume_run=resume,pose_frames=pose_frames,all_poses=all_poses)
+    row=dict(index=0,input_pose_source=None,baseline_only=not tool.cold_replay(args),
+        native=dict(ref=9,loop=0,stats={'Motus/RecoveryState/':2.,
+            'Motus/RecoveryNode/':9.,'Motus/RecoveryAnchor/':2.,'Motus/RecoveryInliers/':42.}))
+    result=tool.recovery_evidence([row],[(9,2,1)],{2,9})
+    assert result['verified_recoveries']==([dict(index=0,ref=9,anchor=2.,inliers=42.)] if eligible else [])
+    row['native']=None
+    assert tool.recovery_evidence([row],[(9,2,1)],{2,9})['verified_recoveries']==[]
