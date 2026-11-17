@@ -327,7 +327,8 @@ async def run() -> None:
     await asyncio.gather(*[_run_job(job) for job in jobs])
 
 
-_SLEEP_CHUNK_S = 60      # 长等待切成小段、每段重看挂钟：开机后 NTP 校时也不会按旧时钟触发
+_SLEEP_CHUNK_S = 60      # 长等待切成小段、每段醒来都检查挂钟有没有被校正（见 _run_job_loop）
+_CLOCK_JUMP_S = 5        # 一段睡眠里挂钟比单调时钟多走 / 少走超过这么多秒，算挂钟被改过
 _settling: set = set()   # 被取消的 job 留下的、还在收尾的那一次触发（留引用，免得被回收）
 
 
@@ -405,11 +406,37 @@ async def _run_job_loop(job: dict, name: str) -> None:
         print(f'[scheduler] invalid cron for {name!r}: {e}')
         return
 
+    last_occ = None    # cron 上一次触发的那个时刻（按 cron 算出的整点，不是实际发出的时间）
     while True:
         job['next_ts'] = next_ts
         while (wait := next_ts - time.time()) > 0:
+            wall0, mono0 = time.time(), time.monotonic()
             await asyncio.sleep(min(wait, _SLEEP_CHUNK_S))
+            jump = (time.time() - wall0) - (time.monotonic() - mono0)
+            if abs(jump) <= _CLOCK_JUMP_S:
+                continue
+            # 挂钟被改过（NTP 校时、手动改时间、休眠后醒来）：旧时钟算出的时刻不能直接用。
+            if not at:
+                # cron：按新挂钟重算下一次。往前跳过去的那次不补发；往回拨的按新时间等，
+                # 但已经触发过的时刻不再触发第二次（last_occ 之后才算）。last_occ 比现在晚一天
+                # 以上说明是之前的挂钟错了，不再参考它。
+                base = time.time()
+                if last_occ is not None and base < last_occ < base + 86400:
+                    base = last_occ
+                try:
+                    next_ts = _next_run(cron, base, tz)
+                except Exception as e:
+                    print(f'[scheduler] invalid cron for {name!r}: {e}')
+                    return
+            elif job.get('retries'):
+                next_ts += jump   # 一次性的重试间隔是相对时间，跟着挂钟一起平移
+            # 一次性的原定时刻是绝对时间，不动：往前跳过了就马上补发一次（宁晚不漏），
+            # 往回拨的继续等到那一刻。
+            print(f'[scheduler] wall clock jumped {jump:+.0f}s, {name!r} next at {next_ts:.0f}')
+            job['next_ts'] = next_ts
 
+        if not at:
+            last_occ = next_ts
         firing = asyncio.ensure_future(_fire_once(job, name, source, text, on_fire, after_fire, at))
         try:
             retrying = await asyncio.shield(firing)

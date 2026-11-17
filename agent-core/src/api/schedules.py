@@ -93,9 +93,11 @@ def patch_settings(body: SettingsBody):
 @router.post('/preview')
 def preview(body: PreviewBody):
     """算出 cron 接下来几次触发时间，给网页表单即时提示。"""
+    if not 1 <= body.count <= 20:
+        return {'ok': False, 'error': 'count 要在 1 到 20 之间'}
     tz = body.tz or schedule_store.get_settings()['default_tz']
     try:
-        runs = scheduler.next_runs(body.cron, time.time(), max(1, min(body.count, 20)), tz)
+        runs = scheduler.next_runs(body.cron, time.time(), body.count, tz)
     except (ValueError, RuntimeError) as e:
         return {'ok': False, 'error': str(e)}
     return {'ok': True, 'runs': [schedule_store.fmt_ts(t, tz) for t in runs]}

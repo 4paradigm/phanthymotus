@@ -266,7 +266,9 @@ class TestReviewRegressions(_Base):
         """49 个一次性定时分在 49 天：每天只有 1 次，不该被每日上限拒绝。"""
         config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'max_schedules': 60,
                                              'max_fires_per_day': 48}
-        base = datetime.datetime(2026, 11, 17, 8, 0, tzinfo=CN)
+        # 从明天起算（写死日期的话过了那天测试就会因为“时间已经过去”失败）
+        base = (datetime.datetime.now(CN) + datetime.timedelta(days=1)).replace(hour=8, minute=0,
+                                                                              second=0, microsecond=0)
         with _FakeJobs():
             for i in range(49):
                 day = (base + datetime.timedelta(days=i)).strftime('%Y-%m-%d %H:%M')
@@ -275,12 +277,13 @@ class TestReviewRegressions(_Base):
     def test_one_shots_on_the_same_day_do_stack(self):
         config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'max_schedules': 60,
                                              'max_fires_per_day': 2}
+        d1, d2 = ((datetime.datetime.now(CN) + datetime.timedelta(days=n)).strftime('%Y-%m-%d') for n in (2, 3))
         with _FakeJobs():
-            schedule_store.create(name='a', text='x', kind='once', at='2026-12-01 08:00')
-            schedule_store.create(name='b', text='x', kind='once', at='2026-12-01 09:00')
+            schedule_store.create(name='a', text='x', kind='once', at=f'{d1} 08:00')
+            schedule_store.create(name='b', text='x', kind='once', at=f'{d1} 09:00')
             with self.assertRaisesRegex(ValueError, '超过上限'):
-                schedule_store.create(name='c', text='x', kind='once', at='2026-12-01 10:00')
-            schedule_store.create(name='d', text='x', kind='once', at='2026-12-02 10:00')
+                schedule_store.create(name='c', text='x', kind='once', at=f'{d1} 10:00')
+            schedule_store.create(name='d', text='x', kind='once', at=f'{d2} 10:00')
 
     def test_corrupt_row_does_not_stop_startup(self):
         with _FakeJobs() as fj:
@@ -821,6 +824,15 @@ class TestApiRoutes(_Base):
         r = self._req('PATCH', '/api/schedules/settings', {'model_tools_enabled': True}).json()
         self.assertTrue(r['ok'] and r['settings']['model_tools_enabled'])
 
+    def test_preview_count_out_of_range_is_rejected(self):
+        for n in (0, -1, 21):
+            r = self._req('POST', '/api/schedules/preview', {'cron': '0 8 * * *', 'count': n}).json()
+            self.assertFalse(r['ok'], n)
+            self.assertIn('1 到 20', r['error'])
+        r = self._req('POST', '/api/schedules/preview', {'cron': '0 8 * * *', 'count': 20}).json()
+        self.assertTrue(r['ok'])
+        self.assertEqual(len(r['runs']), 20)
+
 
 class TestFifthReview(_Base):
     """PR #398 第五轮：触发途中被取消也要收好尾、一次性结束后清掉调度登记、内存里的过期
@@ -1257,6 +1269,117 @@ class TestEighthReview(_Base):
         self.assertIn('app_api.include_router(api.schedules.router)', src)
         self.assertIn("app.mount('/api', app_api)", src)
         self.assertIn("app.middleware('http')(auth.auth_middleware)", src)
+
+
+
+class _FakeClock:
+    """挂钟 = 起点 + 真实经过的时间 + offset；单调时钟用真的。改 offset 就是“校时”。"""
+
+    def __init__(self, start: float):
+        self.base, self.m0, self.offset = start, time.monotonic(), 0.0
+
+    def time(self):
+        return self.base + (time.monotonic() - self.m0) + self.offset
+
+    def __getattr__(self, k):
+        return getattr(time, k)
+
+
+def _utc(s: str) -> float:
+    return datetime.datetime.strptime(s, '%Y-%m-%d %H:%M:%S').replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+class TestNinthReview(_Base):
+    """PR #398 第九轮：挂钟跳变后 cron 按新时钟重算（不补发过期的、不重复已发的），
+    设置写库读回核对，last_run 用占名额的时刻，preview 的 count 越界明确报错。"""
+
+    def _run_with_clock(self, job, clock, jumps):
+        """跑 job，按 jumps=[(真实秒数, 挂钟跳多少秒)] 依次改挂钟，最后返回 job['next_ts']。"""
+        async def go():
+            task = asyncio.ensure_future(scheduler._run_job(job))
+            for after, jump in jumps:
+                await asyncio.sleep(after)
+                clock.offset += jump
+            await asyncio.sleep(0.3)
+            nxt = job.get('next_ts')
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return nxt
+        saved = (scheduler.time, scheduler._SLEEP_CHUNK_S)
+        scheduler.time, scheduler._SLEEP_CHUNK_S = clock, 0.02
+        try:
+            return asyncio.run(asyncio.wait_for(go(), 10))
+        finally:
+            scheduler.time, scheduler._SLEEP_CHUNK_S = saved
+
+    def _job(self, fired, **kw):
+        return {'name': 'clock-jump', 'text': 't', 'tz': 'UTC',
+                'on_fire': lambda j: (fired.append(time.time()), False)[1], **kw}   # 记下触发、不真推事件
+
+    def test_forward_jump_over_cron_time_skips_stale_fire(self):
+        fired = []
+        nxt = self._run_with_clock(self._job(fired, cron='0 8 * * *'),
+                                   _FakeClock(_utc('2026-11-17 07:59:00')), [(0.2, 120)])
+        self.assertEqual(fired, [], '挂钟跳过了 08:00，不按旧时刻补发')
+        self.assertEqual(nxt, _utc('2026-11-18 08:00:00'))
+
+    def test_backward_jump_recomputes_earlier_occurrence(self):
+        fired = []
+        nxt = self._run_with_clock(self._job(fired, cron='0 8 * * *'),
+                                   _FakeClock(_utc('2026-11-17 09:00:00')), [(0.2, -5400)])
+        self.assertEqual(fired, [])
+        self.assertEqual(nxt, _utc('2026-11-17 08:00:00'), '挂钟拨回 07:30，今天 08:00 还没到')
+
+    def test_backward_jump_does_not_repeat_fired_occurrence(self):
+        fired = []
+        nxt = self._run_with_clock(self._job(fired, cron='0 8 * * *'),
+                                   _FakeClock(_utc('2026-11-17 07:59:59') + 0.7),
+                                   [(0.8, -300)])
+        self.assertEqual(len(fired), 1, '08:00 发过一次')
+        self.assertEqual(nxt, _utc('2026-11-18 08:00:00'), '拨回 07:55 也不再发第二次 08:00')
+
+    def test_forward_jump_over_one_shot_fires_late_once(self):
+        fired = []
+        start = _utc('2026-11-17 07:59:00')
+        self._run_with_clock(self._job(fired, at=start + 60), _FakeClock(start), [(0.2, 120)])
+        self.assertEqual(len(fired), 1, '一次性的宁晚不漏')
+
+    def test_settings_write_is_read_back(self):
+        class Lossy(dict):
+            def __setitem__(self, k, v):
+                pass                     # 模拟写库静默没生效
+        saved = config.main
+        config.main = Lossy(scheduler_settings=dict(schedule_store.DEFAULT_SETTINGS))
+        try:
+            with self.assertRaises(sqlite3.Error):
+                schedule_store.update_settings(max_fires_per_day=7)
+            self.assertEqual(schedule_store.get_settings()['max_fires_per_day'],
+                             schedule_store.DEFAULT_SETTINGS['max_fires_per_day'])
+        finally:
+            config.main = saved
+        schedule_store.update_settings(max_fires_per_day=7)
+        self.assertEqual(config.ConfigDB()['scheduler_settings']['max_fires_per_day'], 7, '新连接读得到')
+
+    def test_last_run_is_the_reserved_slot(self):
+        with _FakeJobs():
+            s = schedule_store.create(name='慢', text='x', cron=self._far_cron(5))
+        clock = _FakeClock(time.time())
+        saved = schedule_store.time
+        schedule_store.time = clock
+        try:
+            job = {}
+            self.assertTrue(schedule_store._on_fire(s.id)(job))
+            slot = job['slot']
+            clock.offset += 50           # 推事件花了 50 秒
+            schedule_store._after_fire(s.id)(job, True, False)
+        finally:
+            schedule_store.time = saved
+        got = schedule_store._schedules[s.id]
+        self.assertEqual(got.last_run, slot)
+        self.assertEqual(got.fire_count, 1)
 
 
 if __name__ == '__main__':

@@ -339,8 +339,20 @@ def update_settings(**changes) -> dict:
     if problems:
         raise ValueError('按新的设置，现有的定时任务不合规：' + '；'.join(problems)
                          + '。请先改或停用这些定时任务，再改设置')
-    config.main['scheduler_settings'] = new
+    _save_settings(new)
     return new
+
+
+def _save_settings(st: dict) -> None:
+    """把设置写进 config 表，写不进去就抛 sqlite3.Error（API 返回“保存失败”）。
+
+    ConfigDB 的赋值本身就是落盘：config.py 的 ConfigDB.__setitem__ 执行
+    INSERT OR REPLACE 并 commit。设置没有另外的内存副本，get_settings 每次都从库里读，
+    所以写成功之前任何地方都看不到新值，重启后读到的也就是这里写进去的。写完再读回来
+    核对一遍，防止静默没写上。"""
+    config.main['scheduler_settings'] = st
+    if config.main.get('scheduler_settings') != st:
+        raise sqlite3.Error('设置写入后读回来不一致')
 
 
 # ── 校验 ─────────────────────────────────────────────────────────────────────
@@ -576,7 +588,8 @@ def _after_fire(sid: str):
             # 先改内存（以内存为准），再分别写库：写库失败只记日志，不让一次性任务在内存里
             # 还显示“启用”却已经没有协程。发出去之后才被删的，这次照样算进当天次数。
             if s:
-                s.last_run = time.time()
+                # 用占名额时的时间：和当天计数、_last_fire 用的是同一个时刻，推事件慢了也不往后挪
+                s.last_run = slot if slot is not None else time.time()
                 s.fire_count += 1
                 if s.kind == 'once' and _is_current(s, job):
                     s.enabled = False
