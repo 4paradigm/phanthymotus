@@ -159,7 +159,7 @@ export function openQQWizard({onConnected}={}) {
   root.className = 'qq-onboarding qq-qr-onboarding';
   host.closest('.channel-modal')?.classList.add('qq-onboarding-active');
   root.innerHTML = [
-    '<header class="qq-onboard-top"><h2 data-qq-wizard-title>使用 QQ 扫码创建并连接机器人</h2>',
+    '<header class="qq-onboard-top"><h2 data-qq-wizard-title>使用 QQ 扫码创建并连接 QQ 机器人</h2>',
     '<button class="qq-onboard-close" type="button" data-qq-close aria-label="关闭">×</button></header>',
     '<div class="qq-qr-panel" data-qq-qr-panel><div class="qq-qr-spinner" data-qq-spinner aria-label="正在生成二维码"></div>',
     '<img data-qq-qr alt="QQ 扫码连接二维码" hidden></div>',

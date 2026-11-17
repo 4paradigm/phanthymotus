@@ -9,7 +9,7 @@ test('QQ onboarding uses one normal add flow and displays a server-generated QR'
   assert.match(wizardSource, /\/qq\/onboard\/start/);
   assert.match(wizardSource, /\/qq\/onboard\/status/);
   assert.match(wizardSource, /data-qq-qr/);
-  assert.match(wizardSource, /使用 QQ 扫码创建并连接机器人/);
+  assert.match(wizardSource, /使用 QQ 扫码创建并连接 QQ 机器人/);
   assert.doesNotMatch(wizardSource, /扫码连接 QQ|QQ 连接<\/span>|qq-qr-intro|qq-qr-footnote|qq-qr-help/);
   assert.match(wizardSource, /data-qq-status[^>]*role="status"[^>]*aria-live="polite"/);
   assert.doesNotMatch(wizardSource, /data-qq-success-detail/);
@@ -35,7 +35,7 @@ test('user can cancel and refresh an expired QR without an external platform lin
   assert.match(wizardSource, /\/qq\/onboard\/cancel/);
   assert.match(wizardSource, /data-qq-refresh/);
   assert.doesNotMatch(wizardSource, /https:\/\/q\.qq\.com\/qqbot\/dashboard\//);
-  assert.match(wizardSource, /data-qq-error" role="alert"/);
+  assert.match(wizardSource, /data-qq-error role="alert"/);
 });
 
 test('QR credentials are never read or rendered in the browser', () => {
