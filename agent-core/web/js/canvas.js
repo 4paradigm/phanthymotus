@@ -841,7 +841,7 @@ function _setupDropZone() {
     }
   });
 
-  _canvasEl.addEventListener('drop', (e) => {
+  _canvasEl.addEventListener('drop', async (e) => {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
@@ -850,15 +850,19 @@ function _setupDropZone() {
       return;
     }
 
-    if (!_isEditor) {
-      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
-      return;
-    }
-
+    // Read the drag payload before awaiting: the browser only exposes it during
+    // the synchronous drop event. Claim the lock only for a canvas addition.
     let data;
     try {
       data = JSON.parse(e.dataTransfer.getData('application/x-cap-card'));
     } catch { return; }
+
+    if (!(await _ensureEdit())) return;
+    // Project state can change while the edit request is in flight.
+    if (_editsLocked()) {
+      _showDropReject(e, _editLockReason());
+      return;
+    }
 
     // Prevent unconfigured tools from being added
     if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {

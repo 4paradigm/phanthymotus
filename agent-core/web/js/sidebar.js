@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 import { openDeployPanel } from './deploy-panel.js';
@@ -445,9 +445,8 @@ function _buildChip(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
-  chip.addEventListener('pointerdown', () => { ensureEdit(); });
+  // The canvas claims edit permission on drop; browsing details stays read-only.
   chip.addEventListener('dragstart', (e) => {
-    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -589,9 +588,8 @@ function _buildToolCard(mcp, tool) {
   }
 
   // Drag (for canvas drop)
-  card.addEventListener('pointerdown', () => { ensureEdit(); });
+  // The canvas claims edit permission on drop; browsing details stays read-only.
   card.addEventListener('dragstart', (e) => {
-    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
