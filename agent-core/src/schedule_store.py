@@ -283,9 +283,27 @@ def _peak_daily_fires(items: list[Schedule], now: float, day_tz: str,
 
 # ── 设置 ─────────────────────────────────────────────────────────────────────
 
+# 最近一次从库里读到 / 写进库的设置。给事件循环上每个 turn 都要看的地方用（event/llm.py
+# 决定工具表里放不放定时工具、告诉模型默认时区），那里不能同步读 SQLite。
+# 改设置只走 update_settings（写库成功后更新它）；启动时 start_all 在线程池里先读一次。
+_settings_snapshot: dict | None = None
+
+
 def get_settings() -> dict:
+    """从库里读设置（同步读 SQLite：只在线程池 / 普通 def 路由里调）。顺带刷新快照。"""
+    global _settings_snapshot
     saved = config.main.get('scheduler_settings', {}) or {}
-    return {**DEFAULT_SETTINGS, **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
+    st = {**DEFAULT_SETTINGS, **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
+    _settings_snapshot = dict(st)
+    return st
+
+
+def cached_settings() -> dict:
+    """不碰数据库，返回内存里的设置快照，可以在事件循环上直接调。
+
+    还没读过库（启动最初那一下）时返回默认值：模型工具按关闭处理，宁可晚一点出现。"""
+    snap = _settings_snapshot
+    return dict(snap if snap is not None else DEFAULT_SETTINGS)
 
 
 def _conflicts(st: dict, now: float | None = None) -> list[str]:
@@ -351,9 +369,11 @@ def _save_settings(st: dict) -> None:
     INSERT OR REPLACE 并 commit。设置没有另外的内存副本，get_settings 每次都从库里读，
     所以写成功之前任何地方都看不到新值，重启后读到的也就是这里写进去的。写完再读回来
     核对一遍，防止静默没写上。"""
+    global _settings_snapshot
     config.main['scheduler_settings'] = st
     if config.main.get('scheduler_settings') != st:
         raise sqlite3.Error('设置写入后读回来不一致')
+    _settings_snapshot = {**DEFAULT_SETTINGS, **st}
 
 
 # ── 校验 ─────────────────────────────────────────────────────────────────────
@@ -653,6 +673,10 @@ def start_all() -> int:
     每条单独兜错：读不出来的行换成停用的占位记录（load_all）；时间设置写坏的（时区、cron、
     时间）在注册前校验出来、停用并落盘。都只影响它自己，不拖垮其他定时。
     """
+    try:
+        get_settings()                 # 先把设置读进快照，事件循环上的 cached_settings 就有真值了
+    except Exception as e:
+        print(f'[schedule] failed to read scheduler_settings: {e}')
     load_all()
     n = 0
     for s in _schedules.values():

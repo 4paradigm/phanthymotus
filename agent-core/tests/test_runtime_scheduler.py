@@ -83,6 +83,7 @@ class _Base(unittest.TestCase):
             conn.execute('DELETE FROM schedule_fires')
         schedule_store._loaded = True
         config.main['scheduler_settings'] = dict(schedule_store.DEFAULT_SETTINGS)
+        schedule_store._settings_snapshot = None
 
     @staticmethod
     def _far_cron(minute: int = 0) -> str:
@@ -1448,6 +1449,75 @@ class TestTenthReview(_Base):
             self.assertIn('控制字符', r['error'])
         finally:
             api.doCleanups()
+
+
+
+class TestEleventhReview(_Base):
+    """PR #398 第十一轮：模型那边每个 turn 的设置读取不碰 SQLite；工具说明和实际用的
+    默认时区一致（管理员改了默认时区也一样）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.mod = _load_tools_module()
+        self.tools = self.mod.Tools()
+
+    def test_cached_settings_never_touches_the_db(self):
+        class NoDb:
+            def get(self, *a, **k):
+                raise AssertionError('事件循环上读了数据库')
+            __getitem__ = __setitem__ = __contains__ = get
+        self.assertFalse(schedule_store.cached_settings()['model_tools_enabled'], '没读过库时按默认（关）')
+        schedule_store.update_settings(model_tools_enabled=True, default_tz='Europe/London')
+        saved = config.main
+        config.main = NoDb()
+        try:
+            st = schedule_store.cached_settings()
+        finally:
+            config.main = saved
+        self.assertTrue(st['model_tools_enabled'], '改设置后快照立即更新')
+        self.assertEqual(st['default_tz'], 'Europe/London')
+
+    def test_start_all_primes_the_snapshot(self):
+        config.main['scheduler_settings'] = {**schedule_store.DEFAULT_SETTINGS, 'model_tools_enabled': True}
+        schedule_store._settings_snapshot = None
+        schedule_store.start_all()
+        self.assertTrue(schedule_store.cached_settings()['model_tools_enabled'])
+
+    def test_llm_gate_uses_only_the_snapshot(self):
+        """event.llm 导入要整套依赖，这里按语法树检查：每个 turn 调的两个函数里不出现 get_settings
+        / config 读取，只用 cached_settings；工具表上写默认时区。"""
+        import ast
+        src = (_SRC / 'event' / 'llm.py').read_text(encoding='utf-8')
+        funcs = {n.name: n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef)}
+        for name in ('_schedule_settings', '_hide_schedule_tools'):
+            body = ast.unparse(funcs[name])
+            self.assertNotIn('get_settings', body, name)
+            self.assertNotIn('config.', body, name)
+        self.assertIn('cached_settings()', ast.unparse(funcs['_schedule_settings']))
+        self.assertIn('event.schedule.with_default_tz(t, _sched_tz)', src)
+
+    def test_tool_description_shows_the_configured_tz(self):
+        tool = {'object': None, 'schema': {
+            'name': 'schedule_create', 'description': '建一个定时任务',
+            'parameters': {'type': 'object', 'properties': {'cron': {'type': 'string', 'description': 'cron'},
+                                                           'at': {'type': 'string', 'description': 'at'}}}}}
+        out = self.mod.with_default_tz(tool, 'America/New_York')
+        self.assertIn('America/New_York', out['schema']['description'])
+        self.assertIn('America/New_York', out['schema']['parameters']['properties']['cron']['description'])
+        self.assertIn('America/New_York', out['schema']['parameters']['properties']['at']['description'])
+        self.assertNotIn('America/New_York', tool['schema']['description'], '不改注册表里的原件')
+        other = {'schema': {'name': 'schedule_list', 'description': 'x'}}
+        self.assertIs(self.mod.with_default_tz(other, 'UTC'), other)
+        src = (_SRC / 'event' / 'schedule.py').read_text(encoding='utf-8')
+        self.assertNotIn('北京时间', src, '静态说明里不再写死北京时间')
+
+    def test_model_create_uses_the_configured_default_tz(self):
+        schedule_store.update_settings(model_tools_enabled=True, default_tz='America/New_York')
+        with _FakeJobs():
+            r = asyncio.run(self.tools.schedule_create(name='纽约早上', text='x', cron=self._far_cron(7)))
+        self.assertIn('已创建', r)
+        self.assertIn('America/New_York', r, '返回的描述里写明时区')
+        self.assertEqual(schedule_store.find('纽约早上').tz, 'America/New_York')
 
 
 if __name__ == '__main__':

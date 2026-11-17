@@ -557,14 +557,20 @@ async def _acp_barrier(name: str, cancel_event, *,
     return result
 
 
-def _hide_schedule_tools() -> bool:
-    """模型的定时工具默认不给：管理员在设置里打开 scheduler_settings.model_tools_enabled
-    才出现。每个 turn 现读配置，改了不用重启。读配置出错时按关闭处理。"""
+def _schedule_settings() -> dict:
+    """定时设置的内存快照（schedule_store.cached_settings）：每个 turn 在事件循环上调，
+    不能同步读 SQLite。网页改设置后快照立即更新，不用重启。"""
     try:
         import schedule_store
-        return not schedule_store.get_settings().get('model_tools_enabled')
+        return schedule_store.cached_settings()
     except Exception:
-        return True
+        return {}
+
+
+def _hide_schedule_tools() -> bool:
+    """模型的定时工具默认不给：管理员在设置里打开 scheduler_settings.model_tools_enabled
+    才出现。读不到设置时按关闭处理。"""
+    return not _schedule_settings().get('model_tools_enabled')
 
 
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
@@ -2369,6 +2375,10 @@ class Event:
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
         if _hide_schedule_tools():
             system_tools = [t for t in system_tools if not t['schema']['name'].startswith('schedule_')]
+        else:
+            # 工具说明里写上实际的默认时区（管理员可能改过，不一定是北京时间）
+            _sched_tz = _schedule_settings().get('default_tz') or 'Asia/Shanghai'
+            system_tools = [event.schedule.with_default_tz(t, _sched_tz) for t in system_tools]
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
