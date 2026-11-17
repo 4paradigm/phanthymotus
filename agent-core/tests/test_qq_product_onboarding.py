@@ -6,7 +6,7 @@ from unittest import mock
 import fastapi
 import pytest
 
-from channel import qq_onboarding, qq_groups, qq_runtime_credentials
+from channel import qq_onboarding, qq_groups, qq_ephemeral_store
 from channel import permissions
 from channel.tool_policy import _qq_safe, _matches_filter
 from channel.qq_default_flow import ensure_default_flow
@@ -33,13 +33,13 @@ def qq_message(text, user=PERSON, chat_type='p2p', chat_id=None):
 
 def test_runtime_credential_never_in_channel_config():
     value = 'x' * 32
-    ref = qq_runtime_credentials.put(value)
+    ref = qq_ephemeral_store.put(value)
     cfg = {'protocol': 'official', 'app_id': APP, 'app_secret_runtime': ref}
     validate_qq_official_config(cfg)
     assert _load_credential(cfg) == value
     assert value not in repr(cfg)
     assert ref != value
-    qq_runtime_credentials.revoke(ref)
+    qq_ephemeral_store.revoke(ref)
     with pytest.raises(ValueError, match='not configured'):
         _load_credential(cfg)
 
@@ -67,7 +67,7 @@ def test_guided_setup_does_not_write_secret_to_disk_or_config():
     assert 'app_secret_runtime' in cfg
     assert password not in repr(cfg)
     assert _load_credential(cfg) == password
-    qq_runtime_credentials.revoke(cfg['app_secret_runtime'])
+    qq_ephemeral_store.revoke(cfg['app_secret_runtime'])
 
 
 def test_setup_requires_dashboard_auth():
@@ -321,7 +321,7 @@ def test_qq_guided_endpoints_are_registered_and_http_accessible():
 
 def test_secret_is_revoked_and_owner_grant_cleared_on_channel_deletion():
     from api import channel as channel_api
-    ref = qq_runtime_credentials.put('x' * 32)
+    ref = qq_ephemeral_store.put('x' * 32)
     state = {
         'qq_c2c_owner_grant': {'enabled':True, 'principal':PERSON},
         'qq_group_policies': {CHANNEL: {GROUP: {'status':'approved'}}},
@@ -334,7 +334,7 @@ def test_secret_is_revoked_and_owner_grant_cleared_on_channel_deletion():
           mock.patch.object(channel_api.manager, '_adapters', {})):
         result = asyncio.run(channel_api.delete_channel(CHANNEL))
     assert result['deleted'] == CHANNEL
-    assert not qq_runtime_credentials.available(ref)
+    assert not qq_ephemeral_store.available(ref)
     assert state['qq_c2c_owner_grant'] == {}
     assert CHANNEL not in state['qq_group_policies']
     assert CHANNEL not in state['channel_pending_users']

@@ -455,8 +455,6 @@ async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, bo
         from channel.manager import manager as channel_manager
         channel_manager.sync_channel_subscriptions()
     return {'code': 200}
-    apply_tool_config(mcp_id, tool_name, body, instance_id)
-    return {'code': 200}
 
 
 @router.delete('/tool-config/{mcp_id}/{tool_name}/{instance_id}')

@@ -7,7 +7,7 @@ from unittest import mock
 
 from channel.manager import add_channel_config, get_channel_config, manager
 from channel.qq_default_flow import ensure_default_flow
-from channel.qq_runtime_credentials import put, get, revoke
+from channel.qq_ephemeral_store import put, get, revoke
 
 
 def test_three_qq_bots_do_not_overwrite_channels_credentials_or_canvas():

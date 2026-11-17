@@ -29,10 +29,10 @@ def test_promotion_persists_only_after_verified_gateway(tmp_path, monkeypatch):
     import asyncio
     from unittest import mock
     from api import qq_settings
-    from channel import qq_runtime_credentials
+    from channel import qq_ephemeral_store
     monkeypatch.setattr(config, 'DB_PATH', str(tmp_path / 'data.db'))
     value = 'DEMO_VERIFIED_TEST_CREDENTIAL'
-    ref = qq_runtime_credentials.put(value)
+    ref = qq_ephemeral_store.put(value)
     old = {'protocol':'official', 'app_id':APP,
            'app_' + 'secret_runtime':ref}
     with mock.patch('api.qq_settings._save_config',
@@ -45,17 +45,17 @@ def test_promotion_persists_only_after_verified_gateway(tmp_path, monkeypatch):
     assert cfg.get('app_' + 'secret_file')
     assert not cfg.get('app_' + 'secret_runtime')
     assert _load_credential(cfg) == value
-    assert not qq_runtime_credentials.available(ref)
+    assert not qq_ephemeral_store.available(ref)
 
 
 def test_rejected_file_connection_leaves_no_persisted_version(tmp_path, monkeypatch):
     import asyncio
     from unittest import mock
     from api import qq_settings
-    from channel import qq_runtime_credentials
+    from channel import qq_ephemeral_store
     monkeypatch.setattr(config, 'DB_PATH', str(tmp_path / 'data.db'))
     value = 'DEMO_REJECTED_TEST_CREDENTIAL'
-    ref = qq_runtime_credentials.put(value)
+    ref = qq_ephemeral_store.put(value)
     old = {'protocol':'official', 'app_id':APP,
            'app_' + 'secret_runtime':ref}
     with mock.patch('api.qq_settings._save_config',
@@ -66,8 +66,8 @@ def test_rejected_file_connection_leaves_no_persisted_version(tmp_path, monkeypa
                 'qq_official_' + APP, old, ref, value))
     folder = tmp_path / 'qq-credentials'
     assert list(folder.iterdir()) == []
-    assert qq_runtime_credentials.available(ref)
-    qq_runtime_credentials.revoke(ref)
+    assert qq_ephemeral_store.available(ref)
+    qq_ephemeral_store.revoke(ref)
 
 
 def test_rejects_unmanaged_reference(tmp_path, monkeypatch):

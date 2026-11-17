@@ -14,7 +14,7 @@ from channel.manager import (
     add_channel_config, get_channel_config, update_channel_config,
     _get_channel_configs, channel_request_topic, manager,
 )
-from channel import (qq_onboarding, qq_runtime_credentials,
+from channel import (qq_onboarding, qq_ephemeral_store,
                      qq_credential_store, qq_qr_onboarding)
 from channel.qq_capabilities import apply_safe_defaults, describe as describe_capabilities
 from channel.qq_diagnostics import (snapshot as qq_telemetry_snapshot,
@@ -69,7 +69,7 @@ def _policy(value: AccessPolicy) -> dict:
 def _credential_ready(cfg: dict) -> bool:
     ref = cfg.get('app_secret_runtime')
     if ref:
-        return qq_runtime_credentials.available(ref)
+        return qq_ephemeral_store.available(ref)
     env_name = cfg.get('app_secret_env')
     if env_name:
         return bool(os.environ.get(env_name))
@@ -90,7 +90,7 @@ def _qq(channel_id: str) -> dict:
 @router.get('/qq/setup/status')
 def guided_status():
     _setup_auth()
-    from channel import qq_runtime_credentials as runtime
+    from channel import qq_ephemeral_store as runtime
     manager.sync_from_canvas()
     channels = []
     for ch in _get_channel_configs():
@@ -144,7 +144,7 @@ async def guided_setup(req: QQSetup):
     ref = ''
     if req.source in ('runtime', 'persistent'):
         try:
-            ref = qq_runtime_credentials.put(req.app_secret)
+            ref = qq_ephemeral_store.put(req.app_secret)
         except ValueError as exc:
             raise fastapi.HTTPException(400, str(exc)) from None
         cfg['app_secret_runtime'] = ref
@@ -175,7 +175,7 @@ async def guided_setup(req: QQSetup):
         await asyncio.to_thread(add_channel_config, channel_id, 'qq', cfg, True)
     except Exception:
         if ref:
-            qq_runtime_credentials.revoke(ref)
+            qq_ephemeral_store.revoke(ref)
         raise
     # Only an empty Canvas is automatically populated; existing work is kept.
     flow = ensure_default_flow(channel_id)
@@ -303,7 +303,7 @@ async def _configure_scanned_qq(app_id: str, app_secret: str) -> dict:
         if is_existing:
             old_ref = old_cfg.get('app_secret_runtime', '')
             if old_ref:
-                qq_runtime_credentials.revoke(old_ref)
+                qq_ephemeral_store.revoke(old_ref)
             old_path = old_cfg.get('app_secret_file', '')
             if old_path and old_path != secret_path:
                 await asyncio.to_thread(
@@ -393,7 +393,7 @@ async def refresh_runtime_credential(req: QQRuntimeRefresh):
     if not old_ref:
         raise fastapi.HTTPException(400, 'Channel is not configured for runtime credentials')
     try:
-        new_ref = qq_runtime_credentials.put(req.app_secret)
+        new_ref = qq_ephemeral_store.put(req.app_secret)
     except ValueError as exc:
         raise fastapi.HTTPException(400, str(exc)) from None
     try:
@@ -401,9 +401,9 @@ async def refresh_runtime_credential(req: QQRuntimeRefresh):
         await asyncio.to_thread(update_channel_config, req.channel_id, config=cfg)
         await manager.restart_adapter(req.channel_id, retries=1)
     except Exception:
-        qq_runtime_credentials.revoke(new_ref)
+        qq_ephemeral_store.revoke(new_ref)
         raise
-    qq_runtime_credentials.revoke(old_ref)
+    qq_ephemeral_store.revoke(old_ref)
     ok, reason = manager._health.get(req.channel_id, (False, 'Not connected'))
     return {'connected': bool(ok), 'detail': 'Connected' if ok else 'Not connected: check QQ credentials, network and platform permissions.'}
 

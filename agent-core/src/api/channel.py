@@ -205,7 +205,7 @@ async def delete_channel(channel_id: str):
     # Feishu inputs and sensor subscriptions are preserved.
     manager.sync_channel_subscriptions()
     if existing and existing.get('platform') == 'qq':
-        from channel.qq_runtime_credentials import revoke
+        from channel.qq_ephemeral_store import revoke
         cfg = existing.get('config') or {}
         revoke(cfg.get('app_secret_runtime', ''))
         app_id = cfg.get('app_id', '')

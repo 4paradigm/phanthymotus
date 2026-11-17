@@ -117,20 +117,20 @@ def test_qq_settings_refuse_non_qq_platform():
 
 
 def test_recover_credential_preserves_identity_and_restores_safe_c2c():
-    from channel import qq_runtime_credentials
+    from channel import qq_ephemeral_store
     original = dict(BASE, enabled_scopes=['c2c', 'group', 'guild'],
                     private_only=False, enable_interactions=True)
     channel = dict(CONFIG, config=original)
     secret = 'x' * 32
-    supplied_ref = qq_runtime_credentials.put(secret)
-    qq_runtime_credentials.revoke(supplied_ref)
+    supplied_ref = qq_ephemeral_store.put(secret)
+    qq_ephemeral_store.revoke(supplied_ref)
     # Use a deterministic non-sensitive ref to keep unit tests out of secrets.
     with (mock.patch('api.qq_settings._channel', return_value=channel),
-          mock.patch('api.qq_settings.qq_runtime_credentials.put', return_value='R' * 43),
+          mock.patch('api.qq_settings.qq_ephemeral_store.put', return_value='R' * 43),
           mock.patch('api.qq_settings._save_config',
                      new_callable=mock.AsyncMock,
                      return_value={'saved':True,'changed':True,'connected':True}) as apply,
-          mock.patch('api.qq_settings.qq_runtime_credentials.revoke') as revoke):
+          mock.patch('api.qq_settings.qq_ephemeral_store.revoke') as revoke):
         result = asyncio.run(qq_settings.recover_qq_credential(
             CHANNEL, qq_settings.QQCredentialRecovery(app_secret=secret, persist=False,
                                                     restore_basic=True)))
@@ -156,10 +156,10 @@ def test_credential_recovery_preserves_group_scope_by_default():
                     qq_config_mode='advanced')
     channel = dict(CONFIG, config=original)
     with (mock.patch('api.qq_settings._channel', return_value=channel),
-          mock.patch('api.qq_settings.qq_runtime_credentials.put', return_value='T' * 43),
+          mock.patch('api.qq_settings.qq_ephemeral_store.put', return_value='T' * 43),
           mock.patch('api.qq_settings._save_config', new_callable=mock.AsyncMock,
                      return_value={'saved': True, 'changed': True, 'connected': True}) as apply,
-          mock.patch('api.qq_settings.qq_runtime_credentials.revoke')):
+          mock.patch('api.qq_settings.qq_ephemeral_store.revoke')):
         assert qq_settings.QQCredentialRecovery(app_secret='q' * 32).restore_basic is False
         result = asyncio.run(qq_settings.recover_qq_credential(
             CHANNEL, qq_settings.QQCredentialRecovery(
@@ -173,13 +173,13 @@ def test_credential_recovery_preserves_group_scope_by_default():
 
 
 def test_recover_credential_failure_cleans_new_memory_reference():
-    from channel import qq_runtime_credentials
+    from channel import qq_ephemeral_store
     channel = dict(CONFIG, config=dict(BASE))
     with (mock.patch('api.qq_settings._channel', return_value=channel),
-          mock.patch('api.qq_settings.qq_runtime_credentials.put', return_value='N' * 43),
+          mock.patch('api.qq_settings.qq_ephemeral_store.put', return_value='N' * 43),
           mock.patch('api.qq_settings._save_config', new_callable=mock.AsyncMock,
                      side_effect=fastapi.HTTPException(409, 'Gateway rejected')),
-          mock.patch('api.qq_settings.qq_runtime_credentials.revoke') as revoke):
+          mock.patch('api.qq_settings.qq_ephemeral_store.revoke') as revoke):
         with pytest.raises(fastapi.HTTPException) as error:
             asyncio.run(qq_settings.recover_qq_credential(
                 CHANNEL, qq_settings.QQCredentialRecovery(app_secret='z'*32)))

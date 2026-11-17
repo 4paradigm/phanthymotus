@@ -6,7 +6,7 @@ authorization are separate; other messaging platforms are never touched.
 import asyncio
 from typing import Literal
 
-from channel import qq_runtime_credentials, qq_credential_store
+from channel import qq_ephemeral_store, qq_credential_store
 
 import fastapi
 from pydantic import BaseModel, Field
@@ -157,7 +157,7 @@ async def promote_verified_credential(channel_id: str, current_cfg: dict,
     except Exception:
         await asyncio.to_thread(qq_credential_store.delete, app_id, path)
         raise
-    qq_runtime_credentials.revoke(runtime_ref)
+    qq_ephemeral_store.revoke(runtime_ref)
     old_path = current_cfg.get('app_secret_file', '')
     if old_path and old_path != path:
         await asyncio.to_thread(qq_credential_store.delete, app_id, old_path)
@@ -179,7 +179,7 @@ async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
     async with lock:
         previous = dict((_channel(channel_id).get('config') or {}))
         try:
-            ref = qq_runtime_credentials.put(req.app_secret)
+            ref = qq_ephemeral_store.put(req.app_secret)
         except ValueError as exc:
             raise fastapi.HTTPException(400, str(exc)) from None
         cfg = dict(previous)
@@ -201,7 +201,7 @@ async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
             validate_qq_official_config(cfg)
             result = await _save_config(channel_id, previous, cfg)
         except Exception:
-            qq_runtime_credentials.revoke(ref)
+            qq_ephemeral_store.revoke(ref)
             raise
         if not result.get('connected') and req.persist:
             return {**result, 'credential_mode': 'runtime',
@@ -226,7 +226,7 @@ async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
             result = {**result, 'credential_mode': 'runtime',
                       'restart_requires_reentry': True}
         if old_ref and old_ref != ref:
-            qq_runtime_credentials.revoke(old_ref)
+            qq_ephemeral_store.revoke(old_ref)
         return result
 
 

@@ -12,7 +12,7 @@ import time
 
 import httpx
 
-from channel.qq_runtime_credentials import get as get_runtime_credential
+from channel.qq_ephemeral_store import get as get_runtime_credential
 from channel.adapter import (
     Attachment, ChannelAdapter, InboundMessage, OutboundMessage,
     KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE, PartialSendError,

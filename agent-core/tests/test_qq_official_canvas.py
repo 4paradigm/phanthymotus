@@ -145,6 +145,39 @@ class QQOfficialCanvasTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("消息输入订阅", start["data"]["message"])
         sync.assert_called_once_with(activate=True)
 
+    async def test_saving_channel_request_instance_applies_once_and_resyncs(self):
+        from api import canvas as canvas_api
+
+        body = {"channel_id": "qq_official"}
+        with (
+            mock.patch("api.canvas.config.main", self.config),
+            mock.patch("api.canvas.apply_tool_config") as apply,
+            mock.patch("channel.manager.manager.sync_channel_subscriptions") as sync,
+        ):
+            result = await canvas_api.save_instance_config(
+                "channel", "channel_request", "qq-in", body)
+
+        self.assertEqual(result, {"code": 200})
+        self.assertEqual(self.config["tool_config:channel:channel_request:qq-in"], body)
+        apply.assert_called_once_with("channel", "channel_request", body, "qq-in")
+        sync.assert_called_once_with()
+
+    async def test_saving_non_channel_instance_does_not_resync_subscriptions(self):
+        from api import canvas as canvas_api
+
+        body = {"sample_rate": 1}
+        with (
+            mock.patch("api.canvas.config.main", self.config),
+            mock.patch("api.canvas.apply_tool_config") as apply,
+            mock.patch("channel.manager.manager.sync_channel_subscriptions") as sync,
+        ):
+            result = await canvas_api.save_instance_config(
+                "watch7", "heart_rate", "watch-in", body)
+
+        self.assertEqual(result, {"code": 200})
+        apply.assert_called_once_with("watch7", "heart_rate", body, "watch-in")
+        sync.assert_not_called()
+
     async def test_canvas_card_start_reports_disconnected_gateway(self):
         with (
             mock.patch("api.mcp_manage.config.main", self.config),
