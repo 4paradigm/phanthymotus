@@ -23,6 +23,7 @@ from channel.adapters.qq_official_media import (
 from channel.adapters.qq_official_interactions import QQInteractionRegistry
 from channel.adapters.qq_official_sessions import QQSessionState
 from channel.adapters.qq_official_voice import read_voice_text
+from channel.qq_diagnostics import record as record_qq
 
 _MAX_INBOUND = 2000
 _MAX_OUTBOUND = 1800
@@ -229,12 +230,7 @@ class QQOfficialAdapter(ChannelAdapter):
                 if event_type == "GROUP_MESSAGE_CREATE":
                     if "group" not in self.config.get("enabled_scopes", ["c2c"]):
                         return
-                    if not _full_group_mentions_bot(
-                            raw, self.config.get("bot_group_openid", "")):
-                        if log_group:
-                            print("[qq-group] full_event_ignored_not_at_bot",
-                                  flush=True)
-                        return
+                    # Full SDK group events are validated after parsing.
                     # Same payload schema as GROUP_AT; normalize for SDK 1.2.2.
                     parsed_event_type = "GROUP_AT_MESSAGE_CREATE"
                 else:
@@ -243,7 +239,25 @@ class QQOfficialAdapter(ChannelAdapter):
                     print("[qq-group] gateway_event_received type=at",
                           flush=True)
                 event = self._parser.parse(parsed_event_type, raw)
+                if event is not None and event_type == "GROUP_MESSAGE_CREATE":
+                    # Filter BEFORE _parse_message reserves its dedup key.
+                    # Otherwise a non-@ full event may consume the message ID
+                    # before a matching GROUP_AT event gets a chance to reply.
+                    from channel.qq_groups import get_group
+                    policy = get_group(self.channel_id, getattr(event, "chat_id", ""))
+                    mentioned = _full_group_mentions_bot(
+                        raw, self.config.get("bot_group_openid", ""))
+                    if not mentioned and not (
+                            policy.get("status") == "approved"
+                            and policy.get("mention_only", True) is False):
+                        record_qq(self.channel_id, 'group_filtered')
+                        if log_group:
+                            print("[qq-group] full_event_ignored_by_policy",
+                                  flush=True)
+                        return
                 msg = self._parse_message(event)
+                if is_group_event and event is not None and msg is None:
+                    record_qq(self.channel_id, 'parse_rejected')
                 if is_group_event and log_group:
                     print(
                         f"[qq-group] sdk_parsed={event is not None} "
@@ -292,6 +306,7 @@ class QQOfficialAdapter(ChannelAdapter):
                         msg.attachments = await receive_media(
                             self._http, event, str(cache))
                         if msg.attachments:
+                            record_qq(self.channel_id, 'media_received')
                             store.maybe_prune()
                         if (not msg.attachments
                                 and (getattr(event, "attachments", None) or
@@ -302,12 +317,14 @@ class QQOfficialAdapter(ChannelAdapter):
                         transcript = await read_voice_text(
                             self._http, event, msg.attachments)
                         if transcript:
+                            record_qq(self.channel_id, 'voice_transcribed')
                             msg.text = (msg.text + " [QQ语音转写] " + transcript)[:_MAX_INBOUND]
                     if (msg.chat_type == "p2p" and self.config.get("enable_typing")
                             and self._api is not None):
                         try:
                             await self._api.send_typing(msg.chat_id, msg.message_id,
                                                         input_seconds=5)
+                            record_qq(self.channel_id, 'typing_sent')
                         except Exception:
                             pass
                     await self._on_message(msg)
@@ -377,7 +394,9 @@ class QQOfficialAdapter(ChannelAdapter):
                 timeout=float(self.config.get("connect_timeout", 20)),
             )
             self._running = True
+            record_qq(self.channel_id, 'gateway_ready')
         except Exception:
+            record_qq(self.channel_id, 'gateway_failed')
             if not self._last_error:
                 self._last_error = "QQ official authentication/Gateway READY failed"
             await self.stop()

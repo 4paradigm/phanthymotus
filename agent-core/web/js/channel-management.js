@@ -38,17 +38,16 @@ export function initQQManagement() {
     '<p class="channel-users-hint">测试阶段：QQ 开放平台 → 我的机器人 → 开发设置 → 开发体验号设置，添加测试 QQ 用户。</p>',
     '<p class="channel-users-hint">在平台的「使用范围与人员」或测试配置中找到机器人添加二维码或资料卡，分享给允许使用的用户。正式发布后按实际开放范围添加。</p>',
     '<p class="channel-users-hint">对方添加机器人并私聊后，会自动出现在用户列表中，无需再次审批。</p>',
-    '<p><a href="https://q.qq.com/" target="_blank" rel="noopener noreferrer">前往 QQ 开放平台</a></p></details>',
+    '<p><a href="https://q.qq.com/qqbot/dashboard/" target="_blank" rel="noopener noreferrer">前往 QQ 开放平台</a></p></details>',
     '<div class="qq-console-list-section"><div class="qq-management-head"><strong>私聊用户</strong><span class="channel-users-hint">已与机器人互动的用户</span></div>',
     '<div class="qq-console-list-head"><span>用户</span><span>权限</span><span>操作</span></div>',
     '<div data-manage-users></div></div>',
     '<div class="qq-console-list-section"><div class="qq-management-head"><strong>已接入群聊</strong><span class="channel-users-hint">首次 @机器人后自动接入</span></div>',
-    '<div class="qq-console-list-head"><span>群聊</span><span>权限</span><span>操作</span></div>',
+    '<div class="qq-console-list-head"><span>群聊</span><span>权限</span></div>',
     '<div data-manage-groups></div></div>',
+    '<section class="qq-console-list-section" data-qq-health><div class="qq-management-head"><strong>功能运行状态</strong><span class="channel-users-hint">基于当前进程实际收发记录</span></div>',
+    '<p class="channel-users-hint" data-qq-diagnostic-summary>尚未检测</p><div data-qq-capabilities></div></section>',
     '<div data-qq-advanced-slot></div>',
-    '<details class="qq-management-advanced" data-qq-rebind><summary>换绑管理员</summary>',
-    '<p class="channel-users-hint">仅在转交管理权时解除当前绑定，随后需要重新验证管理员身份。</p>',
-    '<button class="btn-ghost btn-sm" data-manage-revoke>解除管理员绑定</button></details>',
   ].join('');
   host.appendChild(panel);
   const $ = selector => panel.querySelector(selector);
@@ -105,10 +104,7 @@ export function initQQManagement() {
       const row = element('div', '', 'qq-management-row');
       row.appendChild(element('span', (user.display_name || 'QQ 用户') +
         ' · ' + user.user_id.slice(-6), 'qq-row-identity'));
-      if (user.role === 'owner') {
-        row.appendChild(element('span', user.tool_filter === '*' ? '管理员 · 全部工具' : '管理员 · 自定义权限', 'qq-row-permission'));
-        row.appendChild(element('span', '—', 'qq-row-action'));
-      } else {
+      {
         const blocked = user.role === 'blocked';
         row.appendChild(element('span', blocked ? '已停用' : '仅聊天', 'qq-row-permission'));
         const action = button(blocked ? '恢复' : '停用', () => run(async () => {
@@ -144,26 +140,52 @@ export function initQQManagement() {
       const row = element('div', '', 'qq-management-row');
       row.appendChild(element('span', '群 · ' + item.group_id.slice(-6), 'qq-row-identity'));
       row.appendChild(element('span', item.status === 'approved' ? '仅聊天' : '已停用', 'qq-row-permission'));
-      const action = button(item.status === 'approved' ? '停用' : '恢复', () =>
-        run(async () => {
-          const enabling = item.status !== 'approved';
-          if (!enabling && !window.confirm('确定停用这个 QQ 群？')) return;
-          await request('/qq/groups/permission', 'PUT', {
-            channel_id:channel(), group_id:item.group_id,
-            default_permission:'chat',
-            mention_only:true, enabled:enabling,
-          });
-          say(enabling ? '群聊已恢复（成员仅聊天）' : '群聊已停用');
-          await loadGroups();
-        }));
-      action.classList.add('qq-row-action');
-      row.appendChild(action);
+      // Group @ access is automatic. There is no extra permission workflow
+      // or per-group approval/disable action in the default product UI.
       target.appendChild(row);
+    }
+  }
+  async function loadDiagnostics() {
+    const report = await request('/qq/setup/diagnostics?channel_id=' + encodeURIComponent(channel()));
+    const counts = report.events?.counts || {};
+    $('[data-qq-diagnostic-summary]').textContent = [
+      'Gateway：' + (report.gateway === 'connected' ? '已连接' : '未连接'),
+      '已接收私聊 ' + (counts.private_inbound || 0),
+      '已接收群聊 ' + (counts.group_inbound || 0),
+      '平台接受回复 ' + (counts.platform_accepted || 0),
+      '发送失败 ' + (counts.send_failed || 0),
+    ].join('　·　') + '（重启后重新统计；平台接受不等于 QQ 客户端已收到）';
+    const statuses = {
+      observed: '已观测到实际事件', awaiting_real_test: '等待真实测试',
+      configured: '已配置，待重启验证', configured_unverified: '配置已打开，尚未验收',
+      not_enabled: '未启用', not_connected: '网关未连接',
+      not_ready: '画布未连接', requires_platform_or_workflow: '待平台授权或业务接入',
+    };
+    const titles = {
+      private_text:'私聊接收', group_at_text:'群聊 @ 接收',
+      inbound_media:'接收图片/文件', outbound_media:'发送图片/文件',
+      voice_transcription:'语音转写', typing:'输入状态提示',
+      session_resume:'断线会话恢复', enable_markdown:'Markdown',
+      enable_interactions:'交互按钮', enable_approvals:'审批功能',
+      enable_guild_plain_messages:'频道普通消息',
+    };
+    const output = $('[data-qq-capabilities]');
+    output.replaceChildren();
+    for (const [key, title] of Object.entries(titles)) {
+      const state = report.capabilities?.[key];
+      if (!state) continue;
+      const row = element('div', '', 'qq-management-row');
+      row.append(
+        element('span', title, 'qq-row-identity'),
+        element('span', statuses[state.state] || state.state, 'qq-row-permission'),
+      );
+      output.appendChild(row);
     }
   }
   async function refresh() {
     await loadUsers();
     await loadGroups();
+    await loadDiagnostics();
   }
   $('[data-manage-channel]').addEventListener('change', () => run(refresh));
   $('[data-manage-close]').onclick = () => {
@@ -180,13 +202,6 @@ export function initQQManagement() {
   $('[data-manage-refresh]').onclick = () => run(async () => {
     await refresh();
     document.dispatchEvent(new CustomEvent('qq-management-refresh', {detail:{channelId:channel()}}));
-  });
-  $('[data-manage-revoke]').onclick = () => run(async () => {
-    if (!window.confirm('确定解除这个 QQ 机器人的管理员绑定？原管理员权限将立即撤销。')) return;
-    await request('/qq/pair/revoke', 'POST', {
-      channel_id:channel(), confirmation:'解除管理员绑定',
-    });
-    say('旧管理员权限已撤销。请在添加渠道向导中选择现有 QQ，再绑定新管理员。');
   });
   document.getElementById('btn-channels')?.addEventListener('click', () => {
     host.hidden = true;

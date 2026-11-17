@@ -26,9 +26,9 @@ FLAGS = (
     'enable_session_resume', 'enable_markdown', 'enable_voice_transcription',
     'enable_guild_plain_messages', 'enable_interactions', 'enable_approvals',
 )
-# No new Gateway intent is needed for these optional SDK transport capabilities.
-STANDARD_FLAGS = ('enable_inbound_media', 'enable_outbound_media',
-                  'enable_typing', 'enable_session_resume')
+# Safe transport defaults do not request new Tencent Gateway intent bits.
+from channel.qq_capabilities import SAFE_DEFAULTS
+STANDARD_FLAGS = tuple(SAFE_DEFAULTS)
 _locks: dict[str, asyncio.Lock] = {}
 
 
@@ -70,7 +70,9 @@ class QQSettingsChange(BaseModel):
 
 class QQCredentialRecovery(BaseModel):
     app_secret: str
-    restore_basic: bool = True
+    # Credential recovery must not silently disable existing group permissions.
+    # Explicit restore_basic=True is reserved for opt-in C2C fallback.
+    restore_basic: bool = False
     persist: bool = True
 
 
@@ -91,7 +93,6 @@ OWNER_CAPABILITY_PATTERNS = {
 def get_settings(channel_id: str):
     channel = _channel(channel_id)
     cfg = channel.get('config') or {}
-    uid, user = _owner(channel)
     from channel.qq_credential_store import is_managed_reference
     file_path = cfg.get('app_secret_file', '')
     credential = ('runtime' if cfg.get('app_secret_runtime') else
@@ -108,9 +109,10 @@ def get_settings(channel_id: str):
         'credential_ready': _credential_available(cfg),
         'credential_source_unchanged': True,
         'connected': bool(manager._health.get(channel_id, (False, ''))[0]),
-        'owner': {'bound': bool(uid), 'suffix': uid[-6:] if uid else '',
-                  'filter': user.get('tool_filter') if user else '',
-                  'role': 'owner' if uid else ''},
+        # Legacy owner records do not grant QQ tool privileges; UI needs no
+        # administrator setup or owner permissions editor.
+        'admin_pairing_required': False,
+        'owner': {'bound': False, 'role': 'chat_user'},
     }
 
 
@@ -188,10 +190,10 @@ async def promote_verified_credential(channel_id: str, current_cfg: dict,
 
 @router.post('/{channel_id}/credential')
 async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
-    """Replace a broken credential with process-memory-only secret.
+    """Restore QQ credentials without downgrading previously configured scopes.
 
-    Default to the smallest known-good C2C event subscription; the Owner may
-    enable platform-approved group events independently after reconnection.
+    An explicit restore_basic keeps QQ C2C and group @ enabled by default;
+    extra Guild subscriptions and interaction intents can be reset separately.
     """
     _channel(channel_id)
     lock = _locks.setdefault(channel_id, asyncio.Lock())
@@ -209,8 +211,11 @@ async def recover_qq_credential(channel_id: str, req: QQCredentialRecovery):
             cfg.pop(key, None)
         cfg['app_secret_runtime'] = ref
         if req.restore_basic:
-            cfg['enabled_scopes'] = ['c2c']
-            cfg['private_only'] = True
+            # The basic preset still supports all Tencent-authorized QQ groups.
+            group_opted_out = bool(cfg.get('qq_group_scope_opt_out', False))
+            cfg['enabled_scopes'] = (['c2c'] if group_opted_out
+                                     else ['c2c', 'group'])
+            cfg['private_only'] = group_opted_out
             cfg['enable_guild_plain_messages'] = False
             cfg['enable_interactions'] = False
             cfg['enable_approvals'] = False
@@ -259,8 +264,13 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
         cfg = dict(old)
         cfg['qq_config_mode'] = req.mode
         if req.mode == 'standard':
-            # Existing platform-scoped events are preserved; no unsupported
-            # Guild/group permission is silently added during setup.
+            # All Tencent-authorized QQ groups are enabled by default. A
+            # deliberate group-wide opt-out survives future restarts/updates.
+            # Do not silently add Guild or interaction subscriptions.
+            if not cfg.get('qq_group_scope_opt_out', False):
+                scopes = list(cfg.get('enabled_scopes', ['c2c']))
+                if 'group' not in scopes:
+                    cfg['enabled_scopes'] = [*scopes, 'group']
             for flag in STANDARD_FLAGS:
                 cfg[flag] = True
         else:
@@ -270,6 +280,7 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
                 if any(scope not in SCOPES for scope in req.enabled_scopes):
                     raise fastapi.HTTPException(400, 'Unsupported QQ event scope')
                 cfg['enabled_scopes'] = req.enabled_scopes
+                cfg['qq_group_scope_opt_out'] = 'group' not in req.enabled_scopes
             if any(key not in FLAGS or not isinstance(value, bool)
                    for key, value in req.flags.items()):
                 raise fastapi.HTTPException(400, 'Unsupported QQ capability setting')
@@ -279,6 +290,7 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
             if req.group_enabled:
                 scopes.append('group')
             cfg['enabled_scopes'] = scopes
+            cfg['qq_group_scope_opt_out'] = not req.group_enabled
         scopes = cfg.get('enabled_scopes', ['c2c'])
         cfg['private_only'] = scopes == ['c2c']
         try:
@@ -295,24 +307,6 @@ async def save_settings(channel_id: str, req: QQSettingsChange):
 
 @router.put('/{channel_id}/owner')
 def update_owner(channel_id: str, req: QQOwnerChange):
-    ch = _channel(channel_id)
-    uid, user = _owner(ch)
-    if not uid or not user:
-        raise fastapi.HTTPException(409, 'Bind and verify a QQ Owner first')
-    if req.preset == 'full':
-        filt = OWNER_FILTER
-    elif req.preset == 'daily':
-        filt = DAILY_FILTER
-    elif req.preset == 'chat':
-        filt = CHAT_FILTER
-    else:
-        if not req.capabilities or len(set(req.capabilities)) != len(req.capabilities):
-            raise fastapi.HTTPException(400, 'Choose distinct capability categories')
-        patterns = [CHAT_FILTER]
-        for category in req.capabilities:
-            patterns += OWNER_CAPABILITY_PATTERNS[category]
-        filt = ','.join(patterns)
-    updated = acl.upsert_user('qq', uid, user.get('display_name', ''),
-                              role='owner', tool_filter=filt)
-    return {'role': 'owner', 'user_suffix': uid[-6:],
-            'tool_filter': updated['tool_filter'], 'preset': req.preset}
+    _channel(channel_id)
+    raise fastapi.HTTPException(
+        410, 'QQ no longer uses administrator roles; device/system tools remain blocked')

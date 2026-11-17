@@ -72,6 +72,10 @@ function _renderChannels(channels) {
         <span class="channel-item-status ${ch.status === 'connected' ? 'online' : 'offline'}"
               title="${_escAttr(ch.health_error || '')}">${_esc(ch.status)}</span>
       </div>
+      <div class="channel-users-hint">
+        消息输入：${ch.input_configured ? (ch.active_input ? '已就绪' : '未就绪') : '未接入助手'}
+        · 回复通道：${ch.active_output ? '已接入' : '未接入'}
+      </div>
       ${ch.health_error ? `<div class="channel-item-error">${_esc(ch.health_error)}</div>` : ''}
       <div class="channel-item-actions">
         ${ch.platform === 'feishu' ? `

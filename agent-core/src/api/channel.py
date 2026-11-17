@@ -97,10 +97,27 @@ async def add_channel(req: AddChannelReq):
         )
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
+    flow = None
+    if req.platform == 'qq':
+        # Every QQ registration path must attach the Bot to the shared Canvas,
+        # not only the QR onboarding path. This helper is idempotent and keeps
+        # existing cards, connections and the single shared decision_core.
+        try:
+            from channel.qq_default_flow import ensure_default_flow
+            flow = ensure_default_flow(req.id)
+            manager.sync_channel_subscriptions()
+        except Exception as exc:  # noqa: BLE001
+            flow = {'ready': False, 'reason': type(exc).__name__}
+            print('[channel] QQ Canvas attachment failed: ' + type(exc).__name__,
+                  flush=True)
+
     # 如果 enabled，立即启动
     if req.enabled:
         await manager.restart_adapter(req.id)
-    return {'channel': _safe_channel(entry)}
+    response = {'channel': _safe_channel(entry)}
+    if flow is not None:
+        response['flow'] = flow
+    return response
 
 
 class UpdateChannelReq(BaseModel):
@@ -184,6 +201,9 @@ async def delete_channel(channel_id: str):
         del manager._adapters[channel_id]
     if not await asyncio.to_thread(delete_channel_config, channel_id):
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    # Reconcile only the Channel-owned topic namespace. Other QQ Bots,
+    # Feishu inputs and sensor subscriptions are preserved.
+    manager.sync_channel_subscriptions()
     if existing and existing.get('platform') == 'qq':
         from channel.qq_runtime_credentials import revoke
         cfg = existing.get('config') or {}

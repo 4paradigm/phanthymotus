@@ -1,9 +1,9 @@
 /** QQ enhancement for the official Channels panel, scoped to QQ selection only.
  * Telegram, Slack, Feishu, LAN and the built-in Users controls remain untouched.
  */
-import { openQQWizard } from './channel-setup.js?v=8';
-import { initQQManagement } from './channel-management.js?v=6';
-import { initQQSettingsUI, interceptLegacyQQConfigure } from './qq-settings-ui.js?v=7';
+import { openQQWizard } from './qq-onboarding-v2.js?v=5';
+import { initQQManagement } from './channel-management.js?v=7';
+import { initQQSettingsUI, interceptLegacyQQConfigure } from './qq-settings-ui.js?v=8';
 
 function boot() {
   const addButton = document.getElementById('channel-add-btn');
@@ -20,6 +20,8 @@ function boot() {
   initQQManagement();
   initQQSettingsUI();
   interceptLegacyQQConfigure();
+
+  // QQ uses the normal Add Channel flow; selecting QQ opens the QR connection page.
 
   const refreshAfterSetup = () => {
     if (document.getElementById('qq-guided-setup')) return;
@@ -40,10 +42,7 @@ function boot() {
     const select = event.target;
     if (select?.id !== 'channel-form-platform' || select.value !== 'qq') return;
     document.getElementById('channel-add-form')?.remove();
-    openQQWizard({
-      onConnected: refreshAfterSetup,
-      onOtherPlatform: () => addButton.click(),
-    });
+    openQQWizard({onConnected: refreshAfterSetup});
   });
 
   // QQ uses the existing QQ configure action as its sole management entry.
@@ -86,6 +85,14 @@ function boot() {
   new MutationObserver(syncLegacyUsers)
     .observe(legacyUsersList, {childList: true});
   syncLegacyUsers();
+
+  // Optional direct link for guided setup; it does not bypass Dashboard auth.
+  if (new URLSearchParams(window.location.search).get('qq-setup') === '1') {
+    setTimeout(() => {
+      document.getElementById('btn-channels')?.click();
+      openQQWizard({onConnected: refreshAfterSetup});
+    }, 650);
+  }
 
   // Closing Channels closes any QQ-only detail view; next opening is
   // indistinguishable from the official default state.

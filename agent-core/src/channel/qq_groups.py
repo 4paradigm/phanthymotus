@@ -82,6 +82,35 @@ def observe(msg) -> bool:
     return True
 
 
+def ensure_default_group_scope(channel: dict) -> dict:
+    """Enable group @ by default on upgraded QQ installations, once.
+
+    An explicit administrator opt-out remains authoritative; no group
+    whitelist, new pairing, or per-group permission approval is required.
+    This modifies only the named QQ channel, never other platform channels.
+    """
+    if channel.get('platform') != 'qq':
+        return channel
+    cfg = channel.get('config') or {}
+    if (cfg.get('protocol') != 'official'
+            or cfg.get('qq_group_scope_opt_out') is True
+            or 'group' in cfg.get('enabled_scopes', ['c2c'])):
+        return channel
+
+    scopes = list(cfg.get('enabled_scopes', ['c2c']))
+    if not scopes:
+        return channel
+    upgraded = dict(cfg, enabled_scopes=[*scopes, 'group'],
+                    private_only=False)
+    from channel.adapters.qq_official import validate_qq_official_config
+    from channel.manager import update_channel_config
+    validate_qq_official_config(upgraded)
+    saved = update_channel_config(channel['id'], config=upgraded)
+    print('[qq-group] default group scope enabled for existing QQ channel',
+          flush=True)
+    return saved or {**channel, 'config': upgraded}
+
+
 def update(channel_id: str, group_id: str, *,
            default_permission: str, mention_only: bool, enabled: bool) -> dict:
     if default_permission != 'chat':

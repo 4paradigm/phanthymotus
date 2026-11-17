@@ -60,6 +60,8 @@ def test_guided_setup_does_not_write_secret_to_disk_or_config():
         stored.update(cfg)
     assert result['connected']
     assert result['default_flow']['ready']
+    assert cfg['enabled_scopes'] == ['c2c', 'group']
+    assert cfg['private_only'] is False
     assert 'app_secret' not in cfg
     assert 'app_secret_file' not in cfg
     assert 'app_secret_runtime' in cfg
@@ -85,8 +87,8 @@ def test_owner_binding_requires_real_private_message_and_dashboard_confirmation(
         assert not qq_onboarding.receive(qq_message('绑定 ' + code, chat_type='group'))
         assert not qq_onboarding.receive(qq_message('绑定 WRONG000'))
         assert qq_onboarding.status(CHANNEL)['status'] == 'waiting'
-        assert qq_onboarding.receive(qq_message('绑定 ' + code))
-        assert not qq_onboarding.receive(qq_message('绑定 ' + code))
+        assert qq_onboarding.receive(qq_message('连接 ' + code))
+        assert not qq_onboarding.receive(qq_message('连接 ' + code))
         assert qq_onboarding.status(CHANNEL)['status'] == 'verified'
         result = qq_onboarding.confirm(CHANNEL)
         assert result['status'] == 'bound'
@@ -109,7 +111,7 @@ def test_verified_owner_full_access_restored_without_escalating_other_users():
         assert result['status'] == 'full_access'
         assert update.call_args.kwargs['role'] == 'owner'
         assert update.call_args.kwargs['tool_filter'] == permissions.OWNER_FILTER
-        assert _qq_safe('Bash', role='owner', user_id=PERSON)
+        assert not _qq_safe('Bash', role='owner', user_id=PERSON)
         assert _matches_filter(permissions.OWNER_FILTER, 'Bash')
         assert _matches_filter(permissions.OWNER_FILTER, 'mcp__robot__loco')
         assert not _qq_safe('Bash', role='operator', user_id=PERSON)
@@ -377,7 +379,7 @@ def test_qq_guild_traffic_keeps_existing_sdk_route():
     sync.assert_called_once()
 
 
-def test_group_scope_enable_requires_platform_confirmation_and_keeps_c2c():
+def test_group_scope_enable_without_second_confirmation_keeps_c2c():
     cfg = dict(CONFIG, config={
         'app_id': APP, 'protocol': 'official',
         'enabled_scopes': ['c2c'], 'private_only': True,
@@ -389,14 +391,8 @@ def test_group_scope_enable_requires_platform_confirmation_and_keeps_c2c():
           mock.patch('api.qq_settings.update_channel_config') as update,
           mock.patch.object(setup.manager, '_health', {CHANNEL: (True, '')}),
           mock.patch.object(setup.manager, 'restart_adapter', new_callable=mock.AsyncMock)):
-        with pytest.raises(fastapi.HTTPException) as exc:
-            asyncio.run(setup.set_group_scope(
-                setup.QQGroupScope(channel_id=CHANNEL, enabled=True)))
-        assert exc.value.status_code == 400
-        update.assert_not_called()
         result = asyncio.run(setup.set_group_scope(
-            setup.QQGroupScope(channel_id=CHANNEL, enabled=True,
-                               platform_permission_confirmed=True)))
+            setup.QQGroupScope(channel_id=CHANNEL, enabled=True)))
     assert result['group_scope_enabled']
     saved = update.call_args.kwargs['config']
     assert saved['enabled_scopes'] == ['c2c', 'group']

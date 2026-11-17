@@ -132,7 +132,10 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
   const allMcps = mcps || [];
   const controllers = allMcps.filter(m => m.category === 'controller');
-  const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
+  // Show discovered driver cards even during reconnect. The header already
+  // distinguishes online, offline and pending; hiding the whole section made
+  // registered Watch7 cards vanish whenever a heartbeat was delayed.
+  const drivers = allMcps.filter(m => m.category === 'driver' && (m.tools || []).length > 0);
   const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
   const actucores = allMcps.filter(m => m.category === 'actucore' && m.online === true);
   const modelhubs = allMcps.filter(m => m.category === 'modelhub' && m.online === true);

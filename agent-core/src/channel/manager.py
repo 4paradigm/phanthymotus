@@ -43,6 +43,7 @@ _CHAT_HISTORY_TEXT_MAX = 500
 _QQ_MEMORY_LIMIT = 20
 _QQ_MEMORY_ITEM_MAX = 500
 _qq_memory_lock = RLock()
+_qq_context_lock = RLock()
 _qq_group_forward_counts = Counter()
 _qq_acl_error_counts = Counter()
 
@@ -70,8 +71,8 @@ async def _qq_inbound_acl(msg: InboundMessage) -> dict | None:
     try:
         user = await asyncio.to_thread(acl.get_user, msg.platform, msg.user_id)
         if user is None:
-            # All new ordinary QQ C2C/group users are chat-only.  The verified
-            # C2C owner retains its separate full grant.
+            # QQ is a communication channel: no user gains robot/system
+            # execution privileges by pairing or by an old owner flag.
             from channel.permissions import PRESETS
             default_role, default_filter = PRESETS['chat']
             # Do not overwrite a role inserted by an owner/administrator
@@ -557,6 +558,10 @@ class ChannelManager:
         确定哪些 channel 处于活跃状态。"""
         layout = config.main.get('canvas_layout', {})
         cards = layout.get('cards', [])
+        configured = {
+            ch.get('id'): ch for ch in _get_channel_configs()
+            if ch.get('id') and ch.get('enabled', False)
+        }
 
         input_channels = set()
         output_channels = set()
@@ -576,7 +581,7 @@ class ChannelManager:
             channel_id = None
             if instance_cfg:
                 channel_id = instance_cfg.get('channel_id', '')
-            if not channel_id:
+            if not channel_id or channel_id not in configured:
                 continue
 
             if tool_name == 'channel_request':
@@ -586,6 +591,77 @@ class ChannelManager:
 
         self._active_input_channels = input_channels
         self._active_output_channels = output_channels
+
+    def sync_channel_subscriptions(self, *, activate: bool | None = None) -> dict:
+        """Reconcile Canvas-managed Channel topics without touching other DDS inputs.
+
+        Only the reserved /channel/request/<channel-id> namespace is managed
+        here. Sensor topics and any other explicitly configured DDS subscriptions
+        remain intact. activate=False updates persisted intent and removes stale
+        subscriptions, but does not start new runtime subscriptions while the
+        project is stopped.
+        """
+        self.sync_from_canvas()
+        event_cfg = config.main.get('event', {}) or {}
+        current = event_cfg.get('subscribe_topics', [])
+        if not isinstance(current, list):
+            current = []
+
+        all_channels = _get_channel_configs()
+        known_qq_topics = {
+            channel_request_topic(ch['id'])
+            for ch in all_channels
+            if ch.get('platform') == 'qq' and ch.get('id')
+        }
+        managed_qq_topics = set(
+            config.main.get('qq_channel_request_topics', []) or []
+        ) | known_qq_topics
+        preserved = [
+            topic for topic in current
+            if isinstance(topic, str) and topic not in managed_qq_topics
+        ]
+        channel_topics = sorted(
+            channel_request_topic(channel_id)
+            for channel_id in self._active_input_channels
+        )
+        qq_channel_topics = sorted(
+            channel_request_topic(channel_id)
+            for channel_id in self._active_input_channels
+            if (get_channel_config(channel_id) or {}).get('platform') == 'qq'
+        )
+        desired = list(dict.fromkeys(preserved + channel_topics))
+        config.main['qq_channel_request_topics'] = qq_channel_topics
+        if desired != current:
+            event_cfg['subscribe_topics'] = desired
+            config.main['event'] = event_cfg
+
+        if activate is None:
+            try:
+                import collector
+                activate = collector.project_running()
+            except Exception:
+                activate = False
+
+        try:
+            import topic_subscriber
+            return topic_subscriber.reconcile(desired, activate=bool(activate))
+        except Exception as exc:  # noqa: BLE001
+            print('[channel] topic reconciliation unavailable: '
+                  + type(exc).__name__, flush=True)
+            return {'ready': False, 'active_subscriptions': [],
+                    'desired_subscriptions': desired,
+                    'pending_subscriptions': desired,
+                    'subscription_errors': {'*': type(exc).__name__}}
+
+    def is_input_subscription_ready(self, channel_id: str) -> bool:
+        """True only when the Canvas input exists and its DDS subscription is live."""
+        if channel_id not in self._active_input_channels:
+            return False
+        try:
+            import topic_subscriber
+            return topic_subscriber.is_subscribed(channel_request_topic(channel_id))
+        except Exception:
+            return False
 
     @property
     def active_input_channels(self) -> set[str]:
@@ -599,6 +675,39 @@ class ChannelManager:
         """启动所有 enabled 的 channel adapters，并拉起 watchdog。"""
         for ch_cfg in _get_channel_configs():
             if ch_cfg.get('enabled'):
+                if ch_cfg.get('platform') == 'qq':
+                    # Fill only *missing* safe transport defaults; preserve a
+                    # user's explicit False and never alter another provider.
+                    from channel.qq_capabilities import apply_safe_defaults
+                    original_cfg = ch_cfg.get('config') or {}
+                    upgraded = apply_safe_defaults(
+                        original_cfg,
+                        standard_mode=original_cfg.get('qq_config_mode', 'standard') == 'standard',
+                    )
+                    if upgraded != (ch_cfg.get('config') or {}):
+                        try:
+                            updated = await asyncio.to_thread(
+                                update_channel_config, ch_cfg['id'], config=upgraded)
+                            ch_cfg = updated or {**ch_cfg, 'config': upgraded}
+                        except Exception as exc:
+                            print('[qq-setup] safe defaults unavailable: '
+                                  + type(exc).__name__, flush=True)
+                    # QQ group @ is enabled on new installations and migrated
+                    # for old QQ config on start. No individual group approval.
+                    from channel.qq_groups import ensure_default_group_scope
+                    try:
+                        ch_cfg = await asyncio.to_thread(
+                            ensure_default_group_scope, ch_cfg)
+                    except Exception as exc:
+                        print('[qq-group] default scope upgrade unavailable: '
+                              + type(exc).__name__, flush=True)
+                    # Preserve existing robot Cards and Canvas connections.
+                    from channel.qq_default_flow import ensure_default_flow
+                    try:
+                        await asyncio.to_thread(ensure_default_flow, ch_cfg['id'])
+                    except Exception as exc:
+                        print('[qq-setup] Canvas integration unavailable: '
+                              + type(exc).__name__, flush=True)
                 await self._start_adapter(ch_cfg)
         if self._watchdog_task is None or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(self._watchdog())
@@ -745,6 +854,16 @@ class ChannelManager:
             await self._push_error(msg)
             return
 
+        if platform == 'qq':
+            # Existing installations may still reference the old one-off
+            # secret mount. Migrate only a trusted known legacy file into the
+            # managed, persistent credential directory before starting.
+            from channel.qq_credential_store import migrate_legacy
+            try:
+                ch_cfg = await asyncio.to_thread(migrate_legacy, ch_cfg)
+            except Exception as exc:
+                print('[qq-setup] Legacy credential migration failed: '
+                      + type(exc).__name__, flush=True)
         adapter_config = dict(ch_cfg.get('config', {}))
         adapter_config['bot_to_bot_enabled'] = ch_cfg.get('bot_to_bot_enabled', False)
         adapter = cls(
@@ -799,19 +918,29 @@ class ChannelManager:
         if ch_cfg and ch_cfg.get('enabled'):
             await self._start_adapter(ch_cfg, retries=retries)
 
+    def _persist_qq_inbound(self, msg: InboundMessage):
+        """Serialize per-process QQ SQLite read/modify/write operations."""
+        with _qq_context_lock:
+            self._set_last_context(
+                msg.channel_id, msg.chat_id, msg.user_id,
+                message_id=msg.message_id, sender_type=msg.sender_type,
+                chat_type=msg.chat_type, expect_reply=msg.expect_reply)
+            self._record_chat_exchange(
+                msg.channel_id, f'{msg.chat_type}:{msg.chat_id}',
+                'user', msg.text, user_label=msg.display_name or msg.user_id)
+
     # ── Inbound ──────────────────────────────────────────────────────────────
 
     async def _on_inbound_message(self, msg: InboundMessage):
         """Handle incoming platform message."""
-        # Sync active channels from canvas
-        if msg.platform == 'qq':
-            from channel.qq_onboarding import receive as receive_pairing
-            if await asyncio.to_thread(receive_pairing, msg):
-                return
+        # Ordinary QQ chat does not require administrator pairing.
         self.sync_from_canvas()
 
         # 1. Check if this channel is activated on canvas (Input connection)
         if msg.channel_id not in self.active_input_channels:
+            if msg.platform == 'qq':
+                from channel.qq_diagnostics import record
+                record(msg.channel_id, 'canvas_blocked')
             # 静默丢弃会让「消息发了但机器人没反应」完全无法排查，至少记一次
             if msg.channel_id not in self._inactive_logged:
                 self._inactive_logged.add(msg.channel_id)
@@ -840,6 +969,8 @@ class ChannelManager:
                 # SQLite ACL access must not stall the Gateway event loop.
                 user = await _qq_inbound_acl(msg)
                 if user is None:
+                    from channel.qq_diagnostics import record
+                    record(msg.channel_id, 'acl_blocked')
                     return  # fail closed on blocked/unknown/locked ACL
             else:
                 # Feishu keeps its existing synchronous path and approval flow.
@@ -869,18 +1000,19 @@ class ChannelManager:
                 if not allowed:
                     return  # 静默丢弃
 
-        # 4. Store last conversation context for reply routing (persisted)
-        self._set_last_context(
-            msg.channel_id, msg.chat_id, msg.user_id,
-            message_id=msg.message_id,
-            sender_type=msg.sender_type,
-            chat_type=msg.chat_type,
-            expect_reply=msg.expect_reply,
-        )
-        self._record_chat_exchange(msg.channel_id,
-                                   f'{msg.chat_type}:{msg.chat_id}' if msg.platform == 'qq' else msg.chat_id,
-                                   'user', msg.text,
-                                   user_label=msg.display_name or msg.user_id)
+        # 4. Persist QQ state off the async Gateway/LLM event loop.
+        if msg.platform == 'qq':
+            await asyncio.to_thread(self._persist_qq_inbound, msg)
+            from channel.qq_diagnostics import record
+            record(msg.channel_id, 'group_inbound' if msg.chat_type == 'group' else 'private_inbound')
+        else:
+            self._set_last_context(
+                msg.channel_id, msg.chat_id, msg.user_id,
+                message_id=msg.message_id, sender_type=msg.sender_type,
+                chat_type=msg.chat_type, expect_reply=msg.expect_reply)
+            self._record_chat_exchange(
+                msg.channel_id, msg.chat_id, 'user', msg.text,
+                user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -918,6 +1050,9 @@ class ChannelManager:
         if trusted_bot_id:
             self._record_trusted_bot_message(payload)
         await publish_to_topic(topic, json.dumps(payload, ensure_ascii=False))
+        if msg.platform == 'qq':
+            from channel.qq_diagnostics import record
+            record(msg.channel_id, 'inbound_forwarded')
 
         # 5. Broadcast to frontend activity stream
         from api.motus_stream import push_event
@@ -1072,6 +1207,11 @@ class ChannelManager:
                 expect_reply=expect_reply,
                 reply_to_message_id=ctx.get('message_id', ''),
             ))
+            if adapter.platform == 'qq':
+                from channel.qq_diagnostics import record
+                record(channel_id, 'platform_accepted')
+                if attachments:
+                    record(channel_id, 'media_sent')
             parts = []
             if text:
                 parts.append(f'{len(text)} chars')
@@ -1091,6 +1231,9 @@ class ChannelManager:
                 self._record_chat_exchange(channel_id, scoped_chat, 'assistant', text)
             return result
         except PartialSendError as e:
+            if adapter.platform == 'qq':
+                from channel.qq_diagnostics import record
+                record(channel_id, 'send_failed')
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍
             print(f'[channel] {channel_id} partial send: {e}')
             result = f'部分发送成功（目标 {channel_id}）：\n{e}'
@@ -1099,6 +1242,9 @@ class ChannelManager:
             await self._push_error(f'[channel] {channel_id} partial send: {e}')
             return result
         except Exception as e:
+            if adapter.platform == 'qq':
+                from channel.qq_diagnostics import record
+                record(channel_id, 'send_failed')
             error_msg = str(e)
             # 平台自己的报错通常已经写明缺哪个权限、给了授权链接 —— 原文透传，
             # 不要用猜的原因盖掉它（曾经把「缺上传权限」说成「缺 im:message:send_as_bot」，
@@ -1145,6 +1291,7 @@ class ChannelManager:
 
     def get_status(self) -> list[dict]:
         """获取所有 channel 的状态。"""
+        self.sync_from_canvas()
         result = []
         for ch_cfg in _get_channel_configs():
             channel_id = ch_cfg['id']
@@ -1187,7 +1334,8 @@ class ChannelManager:
                 'qq_approvals': (
                     ch_cfg.get('config', {}).get('enable_approvals', False)
                     if ch_cfg['platform'] == 'qq' else False),
-                'active_input': channel_id in self.active_input_channels,
+                'input_configured': channel_id in self.active_input_channels,
+                'active_input': self.is_input_subscription_ready(channel_id),
                 'active_output': channel_id in self.active_output_channels,
             })
         return result

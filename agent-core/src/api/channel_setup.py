@@ -1,7 +1,7 @@
-"""QQ guided setup, policy and verified administrator pairing.
+"""QQ setup, policy and onboarding APIs.
 
-The onboarding password is process-memory only. Managed deployments can use a
-preconfigured environment key or an already-mounted read-only secret file.
+Legacy manual credential entry may use process-memory references; the QR flow
+stores the Tencent-issued credential in the managed private secret directory.
 """
 import asyncio
 import os
@@ -12,14 +12,19 @@ from pydantic import BaseModel
 import auth
 from channel.manager import (
     add_channel_config, get_channel_config, update_channel_config,
-    _get_channel_configs, manager,
+    _get_channel_configs, channel_request_topic, manager,
 )
-from channel import qq_onboarding, qq_runtime_credentials
+from channel import (qq_onboarding, qq_runtime_credentials,
+                     qq_credential_store, qq_qr_onboarding)
+from channel.qq_capabilities import apply_safe_defaults, describe as describe_capabilities
+from channel.qq_diagnostics import (snapshot as qq_telemetry_snapshot,
+                                    classify_gateway_failure)
 from channel.permissions import assign_preset
 from channel.adapters.qq_official import validate_qq_official_config
 from channel.qq_default_flow import ensure_default_flow
 
 router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
+_QQ_QR_CONFIG_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _setup_auth():
@@ -88,7 +93,6 @@ def guided_status():
     from channel import qq_runtime_credentials as runtime
     manager.sync_from_canvas()
     channels = []
-    owner_grant = __import__('config').main.get('qq_c2c_owner_grant', {})
     for ch in _get_channel_configs():
         if ch.get('platform') != 'qq':
             continue
@@ -108,13 +112,11 @@ def guided_status():
                        else ch.get('status', 'disconnected')),
             'credential_mode': mode,
             'group_scope_enabled': 'group' in cfg.get('enabled_scopes', ['c2c']),
-            'owner_bound': bool(isinstance(owner_grant, dict)
-                                and owner_grant.get('enabled')
-                                and str(owner_grant.get('principal', '')).startswith(
-                                    'official:' + str(cfg.get('app_id', '')) + ':')),
+            'admin_pairing_required': False,
             'credential_ready': _credential_ready(cfg),
             'flow_ready': ch['id'] in manager.active_input_channels
                           and ch['id'] in manager.active_output_channels,
+            'input_subscription_ready': manager.is_input_subscription_ready(ch['id']),
         })
     return {'channels': channels, 'credential_policy': 'persistent_default_runtime_optional'}
 
@@ -133,11 +135,11 @@ async def guided_setup(req: QQSetup):
                 'channel_id': existing['id'],
             })
     channel_id = 'qq_official_' + app_id
-    cfg = {'protocol': 'official', 'app_id': app_id,
-           'enabled_scopes': ['c2c'], 'private_only': True,
-           'enable_inbound_media': req.receive_images,
-           'access_policy': {'default_permission': 'chat',
-                             'default_permission': 'chat'}}
+    cfg = apply_safe_defaults({
+        'protocol': 'official', 'app_id': app_id,
+        'enabled_scopes': ['c2c', 'group'], 'private_only': False,
+        'access_policy': {'default_permission': 'chat'},
+    })
     ref = ''
     if req.source in ('runtime', 'persistent'):
         try:
@@ -192,6 +194,196 @@ async def guided_setup(req: QQSetup):
             'default_flow': flow, 'credential_mode': req.source}
 
 
+async def _configure_scanned_qq(app_id: str, app_secret: str) -> dict:
+    """Persist a Tencent-scanned credential and attach it to the existing Core.
+
+    The credential file is committed before starting the Gateway so a transient
+    network outage cannot leave a successfully scanned bot with a process-only
+    secret that disappears on restart. Existing Channel settings are preserved.
+    """
+    app_id = str(app_id or '').strip()
+    app_secret = str(app_secret or '').strip()
+    if not re.fullmatch(r'[0-9]{5,32}', app_id):
+        raise qq_qr_onboarding.QRSessionError('QQ 平台返回的机器人信息无效，请重新扫码。')
+    if not 8 <= len(app_secret) <= 512:
+        raise qq_qr_onboarding.QRSessionError('QQ 授权凭证无效，请重新扫码。')
+
+    matches = [
+        item for item in _get_channel_configs()
+        if item.get('platform') == 'qq'
+        and str((item.get('config') or {}).get('app_id', '')) == app_id
+    ]
+    if len(matches) > 1:
+        raise qq_qr_onboarding.QRSessionError(
+            '发现重复的 QQ 通道配置，请先在渠道列表清理重复项。')
+    channel_id = matches[0]['id'] if matches else 'qq_official_' + app_id
+    lock = _QQ_QR_CONFIG_LOCKS.setdefault(channel_id, asyncio.Lock())
+
+    async with lock:
+        # Re-check after acquiring the per-AppID lock; two simultaneous scans
+        # for the same bot must not create two Channel records.
+        current = get_channel_config(channel_id)
+        is_existing = current is not None
+        old_cfg = dict((current or {}).get('config') or {})
+        if current and current.get('platform') != 'qq':
+            raise qq_qr_onboarding.QRSessionError(
+                '当前渠道编号已被其他平台占用，请检查渠道配置。')
+        if current and str(old_cfg.get('app_id', '')) != app_id:
+            raise qq_qr_onboarding.QRSessionError(
+                'QQ 机器人编号与已有渠道不一致，未覆盖原有配置。')
+        secret_path = await asyncio.to_thread(
+            qq_credential_store.persist, app_id, app_secret)
+
+        cfg = dict(old_cfg) if is_existing else {
+            'protocol': 'official',
+            'app_id': app_id,
+            'enabled_scopes': ['c2c', 'group'],
+            'private_only': False,
+            'access_policy': {'default_permission': 'chat'},
+        }
+        for key in ('app_secret', 'app_secret_env', 'app_secret_runtime',
+                    'app_secret_file'):
+            cfg.pop(key, None)
+        cfg['protocol'] = 'official'
+        cfg['app_id'] = app_id
+        cfg['app_secret_file'] = secret_path
+        cfg = apply_safe_defaults(
+            cfg,
+            standard_mode=cfg.get('qq_config_mode', 'standard') == 'standard',
+        )
+
+        try:
+            validate_qq_official_config(cfg)
+            if is_existing:
+                updated = await asyncio.to_thread(
+                    update_channel_config, channel_id, config=cfg, enabled=True)
+                if updated is None:
+                    raise RuntimeError('QQ Channel disappeared during QR setup')
+            else:
+                await asyncio.to_thread(
+                    add_channel_config, channel_id, 'qq', cfg, True)
+        except Exception:
+            await asyncio.to_thread(qq_credential_store.delete, app_id, secret_path)
+            raise
+
+        # The existing Canvas is never replaced. If it contains multiple
+        # decision cores, preserve it and report that manual selection is needed.
+        flow_error = False
+        try:
+            flow = ensure_default_flow(channel_id)
+        except Exception as exc:
+            flow_error = True
+            flow = {'ready': False, 'reason': type(exc).__name__}
+        # ensure_default_flow synchronizes Canvas card configuration. Reconcile
+        # the live DDS subscription separately: a saved card is not a live input.
+        subscription_state = manager.sync_channel_subscriptions()
+        input_subscription_ready = manager.is_input_subscription_ready(channel_id)
+        input_topic = channel_request_topic(channel_id)
+        subscription_pending = input_topic in subscription_state.get('pending_subscriptions', [])
+        flow_ready = bool(
+            flow.get('ready')
+            and channel_id in manager.active_input_channels
+            and channel_id in manager.active_output_channels
+        )
+
+        # Credentials are already stored in the persistent private file.
+        # A temporary Gateway/network failure is recoverable by the normal
+        # ChannelManager watchdog and must not force the user to scan again.
+        try:
+            await asyncio.wait_for(
+                manager.restart_adapter(channel_id, retries=1), timeout=60)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print('[qq-onboard] adapter start pending: ' + type(exc).__name__,
+                  flush=True)
+        connected = bool(manager._health.get(channel_id, (False, ''))[0])
+
+        if is_existing:
+            old_ref = old_cfg.get('app_secret_runtime', '')
+            if old_ref:
+                qq_runtime_credentials.revoke(old_ref)
+            old_path = old_cfg.get('app_secret_file', '')
+            if old_path and old_path != secret_path:
+                await asyncio.to_thread(
+                    qq_credential_store.delete, app_id, old_path)
+
+        if not flow_ready:
+            if flow_error:
+                message = (
+                    'QQ 已授权并安全保存，但自动连接助手流程时发生错误。'
+                    '原有画布未被覆盖，请在 Dashboard 检查 Canvas 后重试。'
+                )
+            else:
+                message = (
+                    'QQ 已授权并安全保存，但当前画布无法自动确定唯一助手。'
+                    '为保护已有项目，没有改动现有画布；请在 Dashboard 选择一个助手。'
+                )
+            if not connected:
+                message += ' QQ Gateway 连接也在自动重试。'
+        elif not connected:
+            message = (
+                'QQ 已授权，配置已安全保存。当前网络或 Gateway 尚未就绪，'
+                '系统会自动重试；可稍后在渠道列表查看状态。'
+            )
+        elif input_subscription_ready:
+            message = 'QQ 已连接，消息输入订阅已就绪，可以正常收发消息。'
+        elif subscription_pending:
+            message = (
+                'QQ 已连接，已加入当前助手流程。智能控制启动时会自动激活消息输入订阅。'
+            )
+        else:
+            message = (
+                'QQ 已连接，但 Agent Core 的消息输入订阅尚未就绪。'
+                '请启动智能控制检查订阅状态；无需重新扫码。'
+            )
+        return {
+            'channel_id': channel_id,
+            'connected': connected,
+            'flow_ready': flow_ready,
+            'input_subscription_ready': input_subscription_ready,
+            'subscription_pending': subscription_pending,
+            'configured': True,
+            'message': message,
+        }
+
+
+@router.post('/qq/onboard/start')
+async def start_qq_qr_onboard(response: fastapi.Response):
+    _setup_auth()
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    try:
+        return await qq_qr_onboarding.create_session(_configure_scanned_qq)
+    except qq_qr_onboarding.QRSessionError as exc:
+        raise fastapi.HTTPException(429, str(exc)) from None
+
+
+@router.get('/qq/onboard/status')
+def qq_qr_onboard_status(session_id: str, response: fastapi.Response):
+    _setup_auth()
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    try:
+        return qq_qr_onboarding.get_session(session_id)
+    except qq_qr_onboarding.QRSessionError as exc:
+        raise fastapi.HTTPException(404, str(exc)) from None
+
+
+class QQQRSessionCancel(BaseModel):
+    session_id: str
+
+
+@router.post('/qq/onboard/cancel')
+def cancel_qq_qr_onboard(req: QQQRSessionCancel, response: fastapi.Response):
+    _setup_auth()
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        return qq_qr_onboarding.cancel_session(req.session_id)
+    except qq_qr_onboarding.QRSessionError as exc:
+        raise fastapi.HTTPException(404, str(exc)) from None
+
+
 @router.post('/qq/setup/runtime-credential')
 async def refresh_runtime_credential(req: QQRuntimeRefresh):
     _setup_auth()
@@ -228,26 +420,81 @@ def diagnostics(channel_id: str):
     ch = _qq(channel_id)
     manager.sync_from_canvas()
     cfg = ch.get('config', {})
-    owner = __import__('config').main.get('qq_c2c_owner_grant', {})
+    telemetry = qq_telemetry_snapshot(channel_id)
+    gateway_ready, gateway_reason = manager._health.get(channel_id, (False, ''))
+    gateway_ready = bool(gateway_ready)
+    credential_ready = _credential_ready(cfg)
+    flow_input = channel_id in manager.active_input_channels
+    flow_output = channel_id in manager.active_output_channels
     return {
-        'gateway': ('connected' if manager._health.get(channel_id, (False, ''))[0]
-                    else ch.get('status', 'disconnected')),
-        'flow_input': channel_id in manager.active_input_channels,
-        'flow_output': channel_id in manager.active_output_channels,
-        'credential_ready': _credential_ready(cfg),
-        'owner_bound': bool(isinstance(owner, dict) and owner.get('enabled') and
-                            owner.get('principal', '').startswith('official:' + cfg.get('app_id', '') + ':')),
-        'note': 'Verify actual QQ send/receive separately; no physical Bumi is required',
+        'gateway': 'connected' if gateway_ready else ch.get('status', 'disconnected'),
+        'flow_input': flow_input,
+        'flow_output': flow_output,
+        'credential_ready': credential_ready,
+        'connection_issue': ('NONE' if gateway_ready else classify_gateway_failure(
+            gateway_reason, credential_ready=credential_ready)),
+        'admin_pairing_required': False,
+        'capabilities': describe_capabilities(
+            cfg, gateway=gateway_ready,
+            flow_ready=flow_input and flow_output, recent=telemetry),
+        'events': telemetry,
+        'note': 'Platform accepted is not proof the user read the message. '
+                'Counters reset when Agent Core restarts.',
     }
+
+
+@router.get('/qq/setup/test-status')
+def qq_test_status(channel_id: str, since: float = 0):
+    """Observe any QQ C2C greeting after setup, without binding an owner.
+
+    A reply row is written only after the QQ SDK send call returned normally;
+    this is platform acceptance, NOT proof that a human received or read it.
+    The UI requests human confirmation separately. Only booleans leave this API.
+    """
+    _setup_auth()
+    _qq(channel_id)
+    import config
+    import math
+    import time
+    now = time.time()
+    if not math.isfinite(since):
+        raise fastapi.HTTPException(400, 'Invalid verification start time')
+    lower_bound = max(now - 900, min(float(since), now + 5))
+    per_channel = (config.main.get('channel_chat_history') or {}).get(channel_id, {})
+    if not isinstance(per_channel, dict):
+        return {'message_received': False, 'reply_sent': False}
+    received, accepted = False, False
+    for chat_id, history in list(per_channel.items())[-128:]:
+        if not isinstance(chat_id, str) or not chat_id.startswith('p2p:'):
+            continue
+        if not isinstance(history, list):
+            continue
+        greetings = [
+            float(row['ts']) for row in history if isinstance(row, dict)
+            and row.get('role') == 'user'
+            and isinstance(row.get('text'), str)
+            and row['text'].strip() == '你好'
+            and isinstance(row.get('ts'), (int, float))
+            and math.isfinite(row['ts']) and row['ts'] >= lower_bound
+        ]
+        if not greetings:
+            continue
+        received = True
+        latest = max(greetings)
+        if any(isinstance(row, dict) and row.get('role') == 'assistant'
+               and isinstance(row.get('ts'), (int, float))
+               and math.isfinite(row['ts']) and row['ts'] >= latest
+               for row in history):
+            accepted = True
+            break
+    return {'message_received': received, 'reply_sent': accepted}
 
 
 @router.post('/qq/pair/start')
 def pair_start(req: Pairing):
     _setup_auth()
-    ch = _qq(req.channel_id)
-    if not ch.get('enabled'):
-        raise fastapi.HTTPException(400, 'Enable QQ channel before pairing')
-    return {'code': qq_onboarding.start(req.channel_id), 'expires_in_seconds': 300}
+    _qq(req.channel_id)
+    raise fastapi.HTTPException(410, 'QQ administrator pairing is retired; all chat users can participate')
 
 
 @router.get('/qq/pair/status')
@@ -261,10 +508,7 @@ def pair_status(channel_id: str):
 def pair_confirm(req: Pairing):
     _setup_auth()
     _qq(req.channel_id)
-    try:
-        return qq_onboarding.confirm(req.channel_id)
-    except ValueError as exc:
-        raise fastapi.HTTPException(400, str(exc)) from None
+    raise fastapi.HTTPException(410, 'QQ administrator pairing is retired')
 
 
 class PairRevocation(BaseModel):
@@ -312,9 +556,8 @@ async def set_group_scope(req: QQGroupScope):
     """Opt in to Tencent-authorized group events without affecting other scopes."""
     _setup_auth()
     ch = _qq(req.channel_id)
-    if req.enabled and not req.platform_permission_confirmed:
-        raise fastapi.HTTPException(
-            400, 'Confirm QQ platform group-event permission before enabling')
+    # A valid QQ Gateway event itself proves reachability; no separate
+    # group authorization step is required on our side.
     old_cfg = dict(ch.get('config') or {})
     scopes = list(old_cfg.get('enabled_scopes', ['c2c']))
     if req.enabled and 'group' not in scopes:
@@ -324,7 +567,8 @@ async def set_group_scope(req: QQGroupScope):
     if not scopes:
         raise fastapi.HTTPException(400, 'At least one QQ event scope is required')
     cfg = dict(old_cfg, enabled_scopes=scopes,
-               private_only=set(scopes) == {'c2c'})
+               private_only=set(scopes) == {'c2c'},
+               qq_group_scope_opt_out=not req.enabled)
     try:
         validate_qq_official_config(cfg)
     except ValueError as exc:

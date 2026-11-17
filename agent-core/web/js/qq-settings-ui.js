@@ -19,13 +19,6 @@ const FLAGS = [
   ['enable_interactions', '交互按钮事件'],
   ['enable_approvals', '可信交互审批'],
 ];
-const CATEGORIES = [
-  ['speech', 'TTS 与语音'],
-  ['sensing', '传感器和感知'],
-  ['motion', '机器人运动'],
-  ['system', 'Shell 和文件操作'],
-];
-
 const txt = (tag, content, cls = '') => {
   const el = document.createElement(tag);
   el.textContent = content;
@@ -36,16 +29,6 @@ function elCheckbox(value, title, checked = false) {
   const label = txt('label', '', 'qq-settings-checkbox');
   const input = document.createElement('input');
   input.type = 'checkbox';
-  input.value = value;
-  input.checked = checked;
-  label.append(input, document.createTextNode(' ' + title));
-  return label;
-}
-function elRadio(value, title, name, checked = false) {
-  const label = txt('label', '', 'qq-settings-checkbox');
-  const input = document.createElement('input');
-  input.type = 'radio';
-  input.name = name;
   input.value = value;
   input.checked = checked;
   label.append(input, document.createTextNode(' ' + title));
@@ -80,8 +63,8 @@ export function initQQSettingsUI() {
   overview.dataset.qqOverview = '';
   const overviewFields = {};
   for (const [key, label] of [
-    ['connection', '连接状态'], ['owner', '管理员权限'],
-    ['private', '私聊用户'], ['group', '群聊消息'],
+    ['connection', '连接状态'], ['private', '私聊用户'],
+    ['group', '群聊消息'],
   ]) {
     const cell = txt('div', '', 'qq-overview-item');
     cell.appendChild(txt('span', label, 'qq-overview-label'));
@@ -108,49 +91,20 @@ export function initQQSettingsUI() {
   advancedSave.type = 'button';
   advanced.append(txt('strong', '事件订阅'), scopes, txt('strong', 'SDK 能力'), flags, advancedSave);
 
-  const owner = txt('section', '', 'qq-settings-section qq-owner-settings');
-  owner.dataset.qqOwnerSection = '';
-  owner.appendChild(txt('strong', '管理员'));
-  const ownerHint = txt('p', '', 'qq-owner-status');
-  owner.appendChild(ownerHint);
-  const ownerEditor = document.createElement('details');
-  ownerEditor.dataset.qqOwnerEditor = '';
-  ownerEditor.className = 'qq-settings-subdetails';
-  ownerEditor.appendChild(txt('summary', '编辑管理员权限'));
-  const presets = txt('div', '', 'qq-settings-options');
-  for (const [id, label] of [
-    ['full', '全部 Agent Core 工具（管理员绑定后默认最高权限）'],
-    ['daily', '日常使用'],
-    ['chat', '仅聊天'],
-    ['custom', '自定义工具类别'],
-  ]) presets.appendChild(elRadio(id, label, 'qq-owner-permission'));
-  const categories = txt('div', '', 'qq-settings-options');
-  categories.dataset.qqOwnerCategories = '';
-  for (const [id, label] of CATEGORIES) categories.appendChild(elCheckbox(id, label));
-  categories.hidden = true;
-  const ownerSave = txt('button', '保存管理员权限', 'btn-ghost btn-sm');
-  ownerSave.type = 'button';
-  ownerEditor.append(presets, categories, ownerSave);
-  owner.appendChild(ownerEditor);
-  const rebind = host.querySelector('[data-qq-rebind]');
-  if (rebind) {
-    rebind.classList.add('qq-settings-subdetails');
-    owner.appendChild(rebind);
-  }
   const recovery = txt('section', '', 'qq-settings-section');
   recovery.hidden = true;
   const recoveryField = document.createElement('input');
   recoveryField.type = 'password';
   recoveryField.autocomplete = 'new-password';
   recoveryField.placeholder = '请输入机器人连接密钥';
-  const recoverButton = txt('button', '恢复私聊连接', 'btn-ghost btn-sm');
+  const recoverButton = txt('button', '恢复 QQ 连接', 'btn-ghost btn-sm');
   recoverButton.type = 'button';
   const persistOption = elCheckbox('persist', '保存并自动重连（推荐）', true);
   recovery.append(txt('strong', '修复 QQ 连接'),
     txt('p', '重新输入 AppSecret 即可恢复，默认安全保存以供重启自动连接。', 'channel-users-hint'),
     recoveryField, persistOption, recoverButton,
-    txt('p', '恢复时先使用私聊模式；群聊按平台授权重新开启。', 'channel-users-hint'));
-  panel.append(overview, state, message, recovery, owner);
+    txt('p', '恢复凭证会保留已启用的私聊、群聊和媒体能力，无需再次授权群聊。', 'channel-users-hint'));
+  panel.append(overview, state, message, recovery);
   const coreSlot = host.querySelector('[data-qq-core-settings-slot]');
   if (coreSlot) coreSlot.appendChild(panel);
   else host.prepend(panel);
@@ -164,14 +118,12 @@ export function initQQSettingsUI() {
   const say = value => { message.textContent = value; };
   const setBusy = value => {
     busy = !!value;
-    for (const button of [advancedSave, ownerSave, recoverButton]) button.disabled = value;
+    for (const button of [advancedSave, recoverButton]) button.disabled = value;
   };
   function display(data) {
     snapshot = data;
     overviewFields.connection.textContent = data.connected ? '已连接' : '未连接';
     overviewFields.connection.classList.toggle('qq-value-success', !!data.connected);
-    overviewFields.owner.textContent = !data.owner?.bound ? '未绑定' :
-      data.owner.filter === '*' ? '全部工具' : '自定义权限';
     overviewFields.private.textContent = '仅聊天';
     overviewFields.group.textContent = data.enabled_scopes.includes('group') ? '已订阅' : '未订阅';
     state.textContent = '连接凭证：' +
@@ -183,19 +135,6 @@ export function initQQSettingsUI() {
     flags.querySelectorAll('input').forEach(input => {
       input.checked = !!data.flags[input.value];
     });
-    const filter = data.owner?.filter || '';
-    const preset = !data.owner?.bound ? null
-      : filter === '*' ? 'full'
-      : filter === 'mcp__channel__channel_reply,finish' ? 'chat'
-      : filter.includes('mcp__*__tts') && !filter.includes('mcp__*__loco') && !filter.includes('Bash') ? 'daily'
-      : 'custom';
-    presets.querySelectorAll('input').forEach(input => input.checked = input.value === preset);
-    categories.hidden = preset !== 'custom';
-    ownerHint.textContent = data.owner?.bound
-      ? '已绑定 · ' + data.owner.suffix + ' · ' +
-        ({full:'全部工具',daily:'日常使用',chat:'仅聊天',custom:'自定义工具'}[preset] || '当前权限')
-      : '未绑定 · 请先完成身份验证';
-    ownerSave.disabled = !data.owner?.bound;
   }
   async function load(id) {
     channelId = id;
@@ -208,9 +147,6 @@ export function initQQSettingsUI() {
       say('');
     }
   }
-  presets.addEventListener('change', () => {
-    categories.hidden = presets.querySelector('input:checked')?.value !== 'custom';
-  });
   async function save(button, task, okMessage) {
     if (busy || !channelId) return;
     setBusy(true);
@@ -227,10 +163,8 @@ export function initQQSettingsUI() {
       try { await load(channelId); } catch (_) { /* preserve the actionable error */ }
       say(failure);
     } finally {
-      button.textContent = button === advancedSave ? '保存高级配置并验证连接'
-        : button === recoverButton ? '恢复私聊连接' : '保存管理员权限';
+      button.textContent = button === advancedSave ? '保存高级配置并验证连接' : '恢复 QQ 连接';
       setBusy(false);
-      ownerSave.disabled = !snapshot?.owner?.bound;
     }
   }
   advancedSave.addEventListener('click', () => save(advancedSave, () => {
@@ -242,24 +176,15 @@ export function initQQSettingsUI() {
       method:'PUT', body:{mode:'advanced', enabled_scopes:selectedScopes,flags:selectedFlags},
     });
   }, '高级配置已保存并验证'));
-  ownerSave.addEventListener('click', () => save(ownerSave, () => {
-    const preset = presets.querySelector('input:checked')?.value;
-    if (!preset) throw Error('请选择管理员权限预设');
-    const selected = [...categories.querySelectorAll('input:checked')].map(x => x.value);
-    return jsonRequest(API + '/' + encodeURIComponent(channelId) + '/owner', {
-      method:'PUT', body:{preset, capabilities:preset === 'custom' ? selected : []},
-    });
-  }, '管理员权限已更新'));
-
   recoverButton.addEventListener('click', () => {
     const credential = recoveryField.value;
     recoveryField.value = '';
     if (!credential) { say('请先输入 QQ AppSecret。'); return; }
     return save(recoverButton, () => jsonRequest(
       API + '/' + encodeURIComponent(channelId) + '/credential',
-      {method:'POST', body:{app_secret:credential,restore_basic:true,
+      {method:'POST', body:{app_secret:credential,restore_basic:false,
                             persist:persistOption.querySelector('input').checked}},
-    ), 'QQ 私聊连接已恢复。现在可按平台授权启用群聊。');
+    ), 'QQ 连接已恢复，原有群聊设置保持不变。');
   });
 
   document.addEventListener('qq-management-refresh', event => {

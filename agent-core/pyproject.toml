@@ -14,6 +14,7 @@ dependencies = [
     "pypdf>=5.0",
     "pyyaml>=6.0.2",
     "qqbot-agent-sdk==1.2.2",
+    "qrcode>=7.4.2",
     "lark-oapi>=1.4.0",
     "python-telegram-bot>=21.0",
     "slack-sdk>=3.27",

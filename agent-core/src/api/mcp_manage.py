@@ -17,6 +17,42 @@ from tool_config import (missing_required_config, plan_config_calls,
 router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
+CHANNEL_INPUT_SUBSCRIPTION_WAIT_S = 8.0
+
+
+async def _ensure_channel_input_subscription(channel_mgr, channel_id: str) -> tuple[bool, str]:
+    """Activate and verify the real DDS input subscription for one Canvas Channel.
+
+    Saving a Channel card while the project is stopped intentionally records only
+    desired topics. Starting that card is the point at which those topics must be
+    reconciled into live ROS subscriptions; adapter connectivity alone is not
+    proof that messages can reach the Collector.
+    """
+    try:
+        channel_mgr.sync_channel_subscriptions(activate=True)
+    except Exception as exc:  # noqa: BLE001
+        return False, f'Agent Core 输入订阅同步失败：{type(exc).__name__}'
+
+    if channel_id not in channel_mgr.active_input_channels:
+        return False, '当前画布没有绑定此 QQ 通道的消息输入卡片，请重新连接该 Bot。'
+
+    deadline = time.monotonic() + CHANNEL_INPUT_SUBSCRIPTION_WAIT_S
+    while time.monotonic() < deadline:
+        if channel_mgr.is_input_subscription_ready(channel_id):
+            return True, ''
+        await asyncio.sleep(0.1)
+
+    from channel.manager import channel_request_topic
+    topic = channel_request_topic(channel_id)
+    reason = 'DDS 订阅线程未就绪'
+    try:
+        import topic_subscriber
+        state = topic_subscriber.snapshot()
+        reason = (state.get('subscription_errors', {}).get(topic)
+                  or state.get('startup_error') or reason)
+    except Exception:
+        pass
+    return False, f'Agent Core 尚未建立消息输入订阅：{topic}（{reason}）'
 
 
 async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
@@ -339,7 +375,8 @@ async def mcp_list():
             'category':    m.get('category', ''),
             'depends_on':  m.get('depends_on', ''),
             'ws_path':     ('/ws/bus' + (m.get('topic_out') or [{}])[0].get('topic', '')) if m.get('topic_out') else '',
-            'online':      None,
+            'online':      (mcp_client.registry.get(m.get('id', ''), {}).get('online')
+                            if m.get('transport', 'http') == 'http' else m.get('online')),
         }
         for m in _get_mcp_list()
     ]
@@ -1255,6 +1292,13 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 if not ok:
                     print(f'[channel_request] self-check failed: {reason}')
                     return {'code': 200, 'data': {'state': 'error', 'message': reason}}
+                subscribed, subscription_reason = await _ensure_channel_input_subscription(
+                    channel_mgr, channel_id)
+                if not subscribed:
+                    print(f'[channel] input subscription not ready: {subscription_reason}')
+                    return {'code': 200, 'data': {
+                        'state': 'error', 'message': subscription_reason,
+                    }}
                 return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}

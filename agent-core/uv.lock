@@ -494,6 +494,7 @@ dependencies = [
     { name = "python-telegram-bot" },
     { name = "pyyaml" },
     { name = "qqbot-agent-sdk" },
+    { name = "qrcode" },
     { name = "slack-sdk" },
     { name = "zeroconf" },
 ]
@@ -514,6 +515,7 @@ requires-dist = [
     { name = "python-telegram-bot", specifier = ">=21.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "qqbot-agent-sdk", specifier = "==1.2.2" },
+    { name = "qrcode", specifier = ">=7.4.2" },
     { name = "slack-sdk", specifier = ">=3.27" },
     { name = "zeroconf", specifier = ">=0.136.0" },
 ]
@@ -2329,6 +2331,18 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c7/f4/f53b8297233ecc6301061144ea216d42e1eb23e944803a90e58cdbe4e97b/qqbot_agent_sdk-1.2.2.tar.gz", hash = "sha256:2fed2c66a6033cdd522c652fa749f72cdaaec9dc9e603d2c6b5d1e17bce27e75", size = 60383, upload-time = "2026-05-07T09:02:58.554Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/96/09/32b04d3f68e2c6797c5d09cd1b0c47cbd30efc28aba6b9f9c9256ba0b543/qqbot_agent_sdk-1.2.2-py3-none-any.whl", hash = "sha256:e16d2f29c9c1df6dea990ba6fb07fce35a1c23ea2f0ce9d32b24a019ea45af25", size = 67011, upload-time = "2026-05-07T09:02:57.219Z" },
+]
+
+[[package]]
+name = "qrcode"
+version = "8.2"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/8f/b2/7fc2931bfae0af02d5f53b174e9cf701adbb35f39d69c2af63d4a39f81a9/qrcode-8.2.tar.gz", hash = "sha256:35c3f2a4172b33136ab9f6b3ef1c00260dd2f66f858f24d88418a015f446506c", size = 43317, upload-time = "2025-05-01T15:44:24.726Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/dd/b8/d2d6d731733f51684bbf76bf34dab3b70a9148e8f2cef2bb544fccec681a/qrcode-8.2-py3-none-any.whl", hash = "sha256:16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f", size = 45986, upload-time = "2025-05-01T15:44:22.781Z" },
 ]
 
 [[package]]

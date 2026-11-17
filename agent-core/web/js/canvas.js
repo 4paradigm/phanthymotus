@@ -2126,7 +2126,7 @@ async function _startProject() {
 
   // Subscribe to startup progress events
   let modal = null;
-  let itemIndex = {};  // tool_name -> index in modal
+  let itemIndex = {};  // card_id -> index in modal
   // Cards that accepted start but are still loading a model (perception TTS/OCR
   // fetch and warm one up). The backend settles them with a later ready/error
   // event, so the subscription has to outlive project_start_done — otherwise
@@ -2144,12 +2144,12 @@ async function _startProject() {
     const p = event.payload || {};
     if (event.type === 'project_start_begin') {
       const cards = p.cards || [];
-      const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
+      const items = cards.map(c => ({ card: { id: c.id, toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
-      cards.forEach((c, i) => { itemIndex[`${c.mcp_id}:${c.tool}`] = i; });
+      cards.forEach((c, i) => { if (c.id) itemIndex[c.id] = i; });
     } else if (event.type === 'project_start_item') {
-      const key = `${p.mcp_id}:${p.tool}`;
-      const idx = itemIndex[key];
+      const key = p.card_id || `${p.mcp_id}:${p.tool}`;
+      const idx = p.card_id ? itemIndex[p.card_id] : itemIndex[key];
       // Anything other than 'loading' is terminal for the wait: ready, error,
       // cancelled, or a status added later.
       if (p.status === 'loading') loading.add(key);

@@ -62,7 +62,7 @@ def receive(msg) -> bool:
     if not state or state.get('principal'):
         return False
     text = msg.text.strip()
-    if not text.startswith('绑定 ') or len(text) != 11:
+    if not (text.startswith(('绑定 ', '连接 ')) and len(text) == 11):
         return False
     code = text[3:].upper()
     if not all(c in '0123456789ABCDEF' for c in code):

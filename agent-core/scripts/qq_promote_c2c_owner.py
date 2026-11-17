@@ -1,7 +1,7 @@
-"""Local administrator utility: promote only the unique registered QQ C2C principal.
+"""Legacy QQ owner utility. Promotion has been retired.
 
-No API endpoint, no QQ message command, no implicit grant to groups. Restore
-viewer with --revoke. The platform AppID must match the active official adapter.
+Only --revoke is retained for cleaning up existing owner grants. QQ chat does
+not require roles and is never permitted to execute robot/system tools.
 """
 from __future__ import annotations
 
@@ -14,9 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 def update_owner(*, revoke: bool = False) -> dict:
+    if not revoke:
+        raise ValueError("QQ administrator promotion is retired; use Dashboard to configure channels")
     import config
     from channel import acl
     from channel.tool_policy import _qq_owner_dm_identity
+    from channel.permissions import CHAT_FILTER
 
     channel_configs = config.main.get("channel_configs", [])
     active_app_ids = {
@@ -38,25 +41,15 @@ def update_owner(*, revoke: bool = False) -> dict:
     user = candidates[0]
     if user["role"] == "blocked":
         raise ValueError("Refusing to promote a blocked account")
-    new_role = "viewer" if revoke else "owner"
-    # Separate explicit local approval from the role. Never put a general
-    # owner override in the default QQ config or accept this via a QQ message.
-    # Revoke the grant before demoting; grant only after owner upsert succeeds.
-    if revoke:
-        config.main["qq_c2c_owner_grant"] = {"enabled": False}
+    # Revoke before demoting: never leave a window of elevated ACL state.
+    config.main["qq_c2c_owner_grant"] = {"enabled": False}
     updated = acl.upsert_user(
         "qq", user["user_id"], display_name=user.get("display_name", ""),
-        role=new_role,
-        tool_filter="*",
+        role="viewer", tool_filter=CHAT_FILTER,
     )
-    if not revoke:
-        config.main["qq_c2c_owner_grant"] = {
-            "enabled": True,
-            "principal": user["user_id"],
-        }
     return {
         "role": updated["role"],
-        "privileged_tools_enabled": not revoke,
+        "privileged_tools_enabled": False,
         "principal_hash": hashlib.sha256(user["user_id"].encode()).hexdigest()[:12],
         "is_private_chat": True,
         "other_qq_users_unchanged": True,
@@ -66,7 +59,7 @@ def update_owner(*, revoke: bool = False) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--promote", action="store_true")
+    group.add_argument("--promote", action="store_true", help="retired (always refused)")
     group.add_argument("--revoke", action="store_true")
     args = parser.parse_args()
     try:

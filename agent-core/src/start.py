@@ -546,6 +546,8 @@ async def lifespan(app):
 
     # 启动 Channel Manager（消息平台适配器）
     await channel_manager.start()
+    # Reconcile persisted Channel topics after QQ default-flow recovery.
+    channel_manager.sync_channel_subscriptions(activate=True)
 
     # peer discovery
     from peer.registry import registry as peer_registry

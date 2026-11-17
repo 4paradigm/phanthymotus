@@ -35,14 +35,9 @@ class QQOwnerProvisioningTests(unittest.TestCase):
             response = update_owner(revoke=revoke)
         return response, cfg
 
-    def test_local_provision_explicit_exact_user(self):
-        response, cfg = self.provision()
-        self.assertEqual(response["role"], "owner")
-        self.assertTrue(response["privileged_tools_enabled"])
-        self.assertEqual(cfg["qq_c2c_owner_grant"], {
-            "enabled": True, "principal": UID,
-        })
-        self.assertNotIn(UID, repr(response))
+    def test_promote_is_retired_no_qq_admin_grant(self):
+        with self.assertRaisesRegex(ValueError, 'promotion is retired'):
+            self.provision()
 
     def test_revocation_turns_off_privilege_first(self):
         response, cfg = self.provision(revoke=True)
@@ -57,7 +52,7 @@ class QQOwnerProvisioningTests(unittest.TestCase):
               mock.patch("channel.acl.list_users", return_value=users),
               mock.patch("channel.acl.upsert_user") as upsert):
             with self.assertRaisesRegex(ValueError, "exactly one"):
-                update_owner()
+                update_owner(revoke=True)
             upsert.assert_not_called()
 
     def test_grant_without_matching_acl_owner_does_not_allow_shell(self):
@@ -70,7 +65,9 @@ class QQOwnerProvisioningTests(unittest.TestCase):
         with (mock.patch("config.main", cfg),
               mock.patch("channel.acl.get_user", return_value={
                   "role": "owner", "tool_filter": "*" })):
-            self.assertTrue(allowed_for_principals([("qq", UID)], "Bash"))
+            self.assertFalse(allowed_for_principals([("qq", UID)], "Bash"))
+            self.assertTrue(allowed_for_principals(
+                [("qq", UID)], "mcp__channel__channel_reply"))
             self.assertFalse(allowed_for_principals([("qq", OTHER)], "Bash"))
 
 
