@@ -536,7 +536,7 @@ function _renderSkillDetail(skill, context) {
     ${skill.description ? `<div class="skill-detail-section"><div class="skill-detail-section-label">描述</div><div class="skill-detail-text">${_esc(skill.description)}</div></div>` : ''}
     ${_compatibilityHtml(skill.compatibility)}
     ${packagedSkill && context === 'installed' ? '<div id="skill-session" class="skill-detail-section"></div>' : ''}
-    ${skill.instruction ? actionSkill
+    ${skill.instruction ? packagedSkill
       ? `<details class="skill-detail-section"><summary class="skill-detail-text">调用说明</summary><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></details>`
       : `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
     ${requiredToolsHtml}
