@@ -7,10 +7,11 @@ It does not make this Jetson image compatible with every CPU/platform: each
 robot must use a supported platform build.
 
 Configure bridge_url, token, timeout_s (8) and print_timeout_s (60) in the
-canvas. `find` accepts name and host. `print` accepts name and host and retains
-the bridge ticket/idempotency protocol internally. An ambiguous or already
-admitted visit is rejected. Windows bridge configuration and its database are
-unchanged.
+canvas. `list` takes no visitor fields and returns every unadmitted visitor for
+the current local date without exposing bridge tickets. `print` accepts name
+and host, matches exactly one entry from that daily list, and retains the bridge
+ticket/idempotency protocol internally. Ambiguous, admitted and departed visits
+are rejected.
 
 ## Optional remote startup
 
@@ -42,7 +43,7 @@ key. Do not place private keys in this repository.
    U1 plugins. Confirm its tools/list no longer advertises QL_printer.
 4. Remove the old U1 canvas card and add the perception QL_printer card. Reapply
    its bridge/token/SSH configuration and reconnect the required canvas links.
-5. Test find, remote startup with bridge stopped, then one controlled print.
+5. Test list, remote startup with bridge stopped, then one controlled print.
    Verify physical paper and visitor status before considering migration done.
 
 If rollback is needed, disable the perception card and reenable the U1 card.

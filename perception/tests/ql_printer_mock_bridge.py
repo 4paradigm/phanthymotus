@@ -2,7 +2,7 @@
 """访客贴桥接服务模拟版，用于联调 QL_printer 卡片。
 
 它遵循生产桥接协议，但不连接范式+或 USB 打印机：
-    POST /find_visit {"name": "...", "host": "..."}
+    POST /list_visits {}
     POST /print_tag  {"ticket": "...", "request_id": "..."}
 
 运行：
@@ -79,6 +79,8 @@ class MockBridge:
                 path = urlparse(self.path).path
                 if path == "/find_visit":
                     self.find_visit(body)
+                elif path == "/list_visits":
+                    self.list_visits()
                 elif path == "/print_tag":
                     self.print_tag(body)
                 else:
@@ -101,6 +103,7 @@ class MockBridge:
                         }
                         visits.append({
                             "ticket": ticket,
+                            "name": visitor["name"],
                             "tail": visitor["tail"],
                             "host": visitor["host"],
                             "time": visitor["time"],
@@ -108,6 +111,27 @@ class MockBridge:
                             "status": "已入场" if visitor["id"] in bridge.printed else "未入场",
                         })
                 self.reply(200, {"count": len(visits), "visits": visits})
+
+            def list_visits(self):
+                with bridge.lock:
+                    hits = [v for v in bridge.visitors if v["id"] not in bridge.printed]
+                    visits = []
+                    for visitor in hits:
+                        ticket = secrets.token_urlsafe(24)
+                        bridge.tickets[ticket] = {
+                            "visitor_id": visitor["id"],
+                            "expires_at": time.monotonic() + bridge.ticket_seconds,
+                        }
+                        visits.append({
+                            "ticket": ticket,
+                            "name": visitor["name"],
+                            "tail": visitor["tail"],
+                            "host": visitor["host"],
+                            "time": visitor["time"],
+                            "reason": visitor["reason"],
+                            "status": "未入场",
+                        })
+                self.reply(200, {"date": "2026-11-17", "count": len(visits), "visits": visits})
 
             def print_tag(self, body: dict):
                 ticket = str(body.get("ticket", "")).strip()

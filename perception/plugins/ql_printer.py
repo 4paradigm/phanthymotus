@@ -120,6 +120,7 @@ def _visit(item: dict) -> dict:
     """只保留桥接协议允许交给 skill 的字段。"""
     return {
         "ticket": str(item.get("ticket", "")),
+        "name": str(item.get("name", "")),
         "tail": str(item.get("tail", ""))[-4:],
         "host": str(item.get("host", "")),
         "time": str(item.get("time", "")),
@@ -158,13 +159,13 @@ class QLPrinterPlugin:
             "stop": ([], "停止卡片"),
             "info": ([], "查看卡片配置是否完整"),
             "config": (["bridge_url", "token", "timeout_s", "print_timeout_s", "remote_start_enabled", "remote_start_user", "remote_start_port", "remote_start_key_path"], "保存桥接服务配置（平台在 start 前自动调用）"),
-            "find": (["name", "host"], "按访客姓名查询今天的预约；同名时可用被访人 host 缩小范围，返回短期 ticket"),
-            "print": (["name", "host"], "按访客姓名和被访人查询唯一的未入场预约并打印；ticket 和防重复编号由卡片内部处理"),
+            "list": ([], "列出今天全部未入场访客，供打印前核对姓名、被访人、时间和手机号后四位"),
+            "print": (["name", "host"], "从今天未入场访客列表中按姓名和被访人唯一匹配并打印；ticket 和防重复编号由卡片内部处理"),
         }
         properties = {
             "name": {"type": "string", "description": "访客姓名"},
             "host": {"type": "string", "description": "被访人姓名；同名访客时用于缩小范围"},
-            "ticket": {"type": "string", "description": "find 返回的短期票据，不能自己编，也不能改写"},
+            "ticket": {"type": "string", "description": "桥接内部使用的短期票据，不能自己编，也不能改写"},
             "request_id": {
                 "type": "string",
                 "description": "本次打印的唯一编号；同一次请求重试时必须复用",
@@ -182,7 +183,7 @@ class QLPrinterPlugin:
             TOOL_NAME,
             "actuator",
             "访客贴打印：通过前台电脑上的桥接服务查询范式+ 里的访客预约，并用前台的打印机打印访客贴。"
-            "先 find 核对访客身份，再用 name 和 host 调用 print；不要按猜测的名字打印。",
+            "先 list 查看今天全部未入场访客，再用 name 和 host 调用 print；不要按猜测的名字打印。",
             action_schema(actions, properties),
         )
         definition["configSchema"] = {
@@ -249,7 +250,14 @@ class QLPrinterPlugin:
             return {"state": "ready", "configured": self._configured(), "bridge_url": self._cfg["bridge_url"]}
         if action == "config":
             return self._config(args)
-        handlers = {"find": self._find, "find_and_print": self._find_and_print, "print": self._print_action}
+        handlers = {
+            "list": self._list,
+            # Keep old saved canvas actions working during rollout; find is no
+            # longer advertised and now returns the same safe daily list.
+            "find": self._list,
+            "find_and_print": self._find_and_print,
+            "print": self._print_action,
+        }
         handler = handlers.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
@@ -354,31 +362,27 @@ class QLPrinterPlugin:
                 return None
         return {"status": "error", "code": "remote_start_timeout", "error": "已通知前台电脑启动桥接，但 15 秒内未恢复"}
 
-    def _find(self, args: dict) -> dict:
-        name = str(args.get("name", "")).strip()
-        host = str(args.get("host", "")).strip()
-        if not name:
-            return {"status": "error", "code": "bad_args", "error": "find 需要访客姓名 name"}
-        if len(name) > 32 or len(host) > 64:
-            return {"status": "error", "code": "bad_args", "error": "姓名或被访人信息太长"}
+    def _daily_visits(self) -> tuple[str, list[dict]]:
         recovery = self._ensure_remote_bridge()
         if recovery is not None:
-            return recovery
-        body = {"name": name}
-        if host:
-            body["host"] = host
-        payload = self._client().request("POST", "/find_visit", body=body)
+            raise BridgeError(str(recovery.get("error") or "桥接服务不可用"), str(recovery.get("code") or "bridge_error"))
+        payload = self._client().request("POST", "/list_visits", body={})
         visits = [_visit(v) for v in payload.get("visits") or [] if isinstance(v, dict)]
         visits = [v for v in visits if v["ticket"]]
+        return str(payload.get("date") or ""), visits
+
+    def _list(self, args: dict) -> dict:
+        day, visits = self._daily_visits()
+        public = [{k: v for k, v in visit.items() if k != "ticket"} for visit in visits]
         if not visits:
-            return {"status": "not_found", "name": name, "visits": [],
-                    "hint": "范式+ 里今天没有这个访客的预约，不能打印访客贴，请联系被访人或前台同事"}
-        return {"status": "found" if len(visits) == 1 else "multiple", "name": name, "visits": visits}
+            return {"status": "empty", "date": day, "count": 0, "visits": [],
+                    "hint": "今天没有未入场访客"}
+        return {"status": "listed", "date": day, "count": len(public), "visits": public}
 
     def _print_ticket(self, args: dict) -> dict:
         ticket = str(args.get("ticket", "")).strip()
         if not ticket or len(ticket) > 512:
-            return {"status": "error", "code": "bad_args", "error": "print 需要 find 返回的短期 ticket"}
+            return {"status": "error", "code": "bad_args", "error": "旧版 print 调用缺少短期 ticket"}
         request_id = str(args.get("request_id", "")).strip()
         if not _ID_RE.match(request_id):
             return {"status": "error", "code": "bad_args",
@@ -402,27 +406,33 @@ class QLPrinterPlugin:
         }
 
     def _find_and_print(self, args: dict) -> dict:
-        found = self._find(args)
-        status = found.get("status")
-        if status == "not_found" or status == "error":
-            return found
-        if status != "found" or len(found.get("visits") or []) != 1:
+        name = str(args.get("name", "")).strip()
+        host = str(args.get("host", "")).strip()
+        if not name:
+            return {"status": "error", "code": "bad_args", "error": "print 需要访客姓名 name"}
+        if len(name) > 32 or len(host) > 64:
+            return {"status": "error", "code": "bad_args", "error": "姓名或被访人信息太长"}
+        _, visits = self._daily_visits()
+        matches = [
+            visit for visit in visits
+            if visit.get("name") == name and (not host or host in str(visit.get("host", "")))
+        ]
+        if not matches:
+            return {
+                "status": "not_found", "name": name, "visits": [],
+                "hint": "今天的未入场列表中没有匹配访客，不能打印访客贴",
+            }
+        if len(matches) != 1:
             return {
                 "status": "error",
                 "code": "visitor_ambiguous",
-                "error": "查到多条匹配预约，不能直接打印；请先用 find 核对手机号尾号和到访时间",
+                "error": "今天有多条同名未入场预约，不能直接打印；请填写被访人 host 缩小范围",
             }
 
-        visit = found["visits"][0]
-        if visit.get("status") not in ("未入场", "待打印"):
-            return {
-                "status": "failed",
-                "code": "status_not_printable",
-                "error": f"访客当前状态为“{visit.get('status') or '未知'}”，不能打印访客贴",
-            }
+        visit = matches[0]
 
         key = (
-            str(found.get("name", "")),
+            name,
             str(visit.get("host", "")),
             str(visit.get("tail", "")),
             str(visit.get("time", "")),

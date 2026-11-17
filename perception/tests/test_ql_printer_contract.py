@@ -41,16 +41,17 @@ class VisitorBadgeTest(unittest.TestCase):
         return result
 
     def find_ticket(self, name="王磊", host=""):
-        result = self.call("find", name=name, host=host)
-        self.assertEqual(result["status"], "found")
-        return result["visits"][0]["ticket"]
+        _, visits = self.card._daily_visits()
+        matches = [v for v in visits if v["name"] == name and (not host or host in v["host"])]
+        self.assertEqual(len(matches), 1)
+        return matches[0]["ticket"]
 
     def test_tool_definition_uses_ticket_protocol(self):
         definition = self.card.get_tool()
         self.assertEqual(definition["name"], "QL_printer")
         self.assertEqual(definition["type"], "actuator")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
-        self.assertEqual(set(actions), {"start", "stop", "info", "config", "find", "print"})
+        self.assertEqual(set(actions), {"start", "stop", "info", "config", "list", "print"})
         schema_text = json.dumps(definition["inputSchema"], ensure_ascii=False)
         self.assertIn('"print"', schema_text)
         props = definition["configSchema"]["properties"]
@@ -74,25 +75,22 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertTrue(self.call("info")["configured"])
         self.assertEqual(self.call("stop")["state"], "idle")
         card = QLPrinterPlugin({})
-        self.assertEqual(card.dispatch("find", {"name": "王磊"})["code"], "not_configured")
+        self.assertEqual(card.dispatch("list", {})["code"], "not_configured")
 
     def test_config_rejects_bad_url_without_losing_old_value(self):
         result = self.card.dispatch("config", {"bridge_url": "ftp://x"})
         self.assertFalse(result["adapter_ok"])
-        self.assertEqual(self.call("find", name="王磊")["status"], "found")
+        self.assertEqual(self.call("list")["status"], "listed")
 
-    def test_find_single_multiple_host_and_none(self):
-        one = self.call("find", name="王磊")
-        self.assertEqual(one["status"], "found")
-        self.assertEqual(one["visits"][0]["host"], "张三")
-        self.assertNotIn("visitor_id", one["visits"][0])
-        self.assertNotIn("phone", one["visits"][0])
-        self.assertEqual(self.call("find", name="李娜")["status"], "multiple")
-        narrowed = self.call("find", name="李娜", host="李臻")
-        self.assertEqual(narrowed["status"], "found")
-        self.assertEqual(narrowed["visits"][0]["tail"], "5678")
-        self.assertEqual(self.call("find", name="赵六")["status"], "not_found")
-        self.assertEqual(self.call("find")["code"], "bad_args")
+    def test_list_returns_all_unadmitted_visitors_without_tickets(self):
+        result = self.call("list")
+        self.assertEqual(result["status"], "listed")
+        self.assertEqual(result["date"], "2026-11-17")
+        self.assertEqual(result["count"], 3)
+        self.assertEqual({v["name"] for v in result["visits"]}, {"王磊", "李娜"})
+        self.assertTrue(all(v["status"] == "未入场" for v in result["visits"]))
+        self.assertTrue(all("ticket" not in v for v in result["visits"]))
+        self.assertTrue(all("visitor_id" not in v and "phone" not in v for v in result["visits"]))
 
     def test_print_uses_ticket_and_request_id(self):
         ticket = self.find_ticket()
@@ -113,7 +111,7 @@ class VisitorBadgeTest(unittest.TestCase):
         first = self.call("print", name="王磊", host="张三")
         self.assertEqual(first["status"], "printed")
         second = self.call("print", name="王磊", host="张三")
-        self.assertEqual(second["code"], "status_not_printable")
+        self.assertEqual(second["status"], "not_found")
         self.assertEqual(self.bridge.print_log, ["V1001"])
 
     def test_same_request_id_is_idempotent(self):
@@ -149,12 +147,12 @@ class VisitorBadgeTest(unittest.TestCase):
 
     def test_wrong_token_and_bridge_down(self):
         self.card.dispatch("config", {"token": "wrong"})
-        self.assertEqual(self.call("find", name="王磊")["code"], "unauthorized")
+        self.assertEqual(self.call("list")["code"], "unauthorized")
         self.card.dispatch("config", {"token": TOKEN, "timeout_s": 2})
         self.server.shutdown()
         self.server.server_close()
         self.server = None
-        result = self.call("find", name="王磊")
+        result = self.call("list")
         self.assertEqual(result["code"], "unreachable")
 
     def test_remote_start_runs_ssh_before_query_when_bridge_is_down(self):
@@ -170,8 +168,8 @@ class VisitorBadgeTest(unittest.TestCase):
             "plugins.ql_printer.subprocess.run",
             return_value=CompletedProcess([], 0, stdout="STARTED", stderr=""),
         ) as run, patch("plugins.ql_printer.time.sleep"):
-            result = self.call("find", name="王磊")
-        self.assertEqual(result["status"], "found")
+            result = self.call("list")
+        self.assertEqual(result["status"], "listed")
         command = run.call_args.args[0]
         self.assertEqual(command[0], "ssh")
         self.assertIn("4paradigm@127.0.0.1", command)
