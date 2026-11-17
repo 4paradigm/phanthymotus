@@ -1,0 +1,28 @@
+services:
+  motion-service:
+    build:
+      context: ../..
+      dockerfile: actucore/motion_service/Dockerfile
+    ports:
+      - "${MOTION_BIND_HOST:-127.0.0.1}:15732:15732"
+    environment:
+      MOTION_API_TOKEN: ${MOTION_API_TOKEN:?Set MOTION_API_TOKEN}
+      WANDB_MODE: offline
+      # Container-visible GPUs can be shared; the API admits only this allocation.
+      MOTION_GPU_IDS: ${MOTION_GPU_IDS:-0}
+      MUJOCO_EGL_DEVICE_ID: ${MOTION_RENDER_GPU_ID:-0}
+    volumes:
+      - ${MOTION_DATA_DIR:?Set MOTION_DATA_DIR}:/data
+      # Preserve paths written by prepare_profile: mount the generated directory
+      # at the same absolute path inside the server container.
+      - ${MOTION_PROFILE_DIR:?Set MOTION_PROFILE_DIR}:${MOTION_PROFILE_DIR}:ro
+    command: ["--host", "0.0.0.0", "--data-dir", "/data", "--profiles", "${MOTION_PROFILE_DIR}/profiles.json"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    init: true
+    restart: unless-stopped
