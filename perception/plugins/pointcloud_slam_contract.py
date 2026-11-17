@@ -2,7 +2,7 @@
 
 Wire layouts are compatible with the Driver's spatial_slam formats. Consumer
 admission intentionally checks numeric structure rather than producer evidence.
-Physical conventions are documented in docs/spatial-inputs.md. No ROS, robot
+Physical conventions are the data provider's responsibility. No ROS, robot
 SDK or NumPy dependency is needed for these parsers.
 """
 from __future__ import annotations
