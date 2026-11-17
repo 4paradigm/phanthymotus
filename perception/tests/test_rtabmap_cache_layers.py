@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
+import time
 
 import pytest
 
@@ -305,3 +306,32 @@ def test_jp511_group_selection_and_colcon_failure_propagation(tmp_path, group, e
     failure = subprocess.run(['bash', '-c', invocation], env=env,
                              capture_output=True, text=True, timeout=15)
     assert failure.returncode == 37, failure.stdout + failure.stderr
+
+
+@pytest.mark.parametrize('build_status', [0, 37])
+def test_jp61_ros_heartbeat_stops_and_preserves_build_status(tmp_path, build_status):
+    _, _, fetch, build = layers()
+    assert 'JP6.1 ROS still compiling' in build, 'JP6.1 needs the existing ROS build heartbeat'
+    prelude = shell_fixture(tmp_path)
+    fetched = run_layer(fetch, tmp_path, prelude)
+    assert fetched.returncode == 0, fetched.stdout + fetched.stderr
+    # Execute the actual Docker RUN shell; speed up its heartbeat clock only.
+    build = build.replace('time.sleep(60)', 'time.sleep(0.02)')
+    build = build.replace('import time;',
+        'import os,time; open(os.environ["TEST_ROOT"]+"/heartbeat-pid", "w").write(str(os.getpid()));')
+    prelude += '''
+colcon() {
+    python3 -c 'import time; time.sleep(0.15)'
+    return "$BUILD_STATUS"
+}
+'''
+    started = time.monotonic()
+    result = run_layer(build, tmp_path, prelude, build_status=build_status)
+    assert result.returncode == build_status, result.stdout + result.stderr
+    assert 'JP6.1 ROS still compiling' in result.stdout
+    assert time.monotonic() - started < 3, 'heartbeat kept build log pipes open after colcon exited'
+    pid = int((tmp_path / 'heartbeat-pid').read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    marker = tmp_path / 'install/share/rtabmap_slam/motus_visual_recovery_v1'
+    assert marker.exists() == (build_status == 0)

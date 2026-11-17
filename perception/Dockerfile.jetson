@@ -767,6 +767,13 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
     rtabmap_crypto="$(readlink -f /usr/lib/aarch64-linux-gnu/libcrypto.so)"; \
     test -f "${rtabmap_rcutils}"; test -f "${rtabmap_builtin}"; test -f "${rtabmap_crypto}"; \
     cd /tmp/rtabmap-ws; \
+    python3 -u -c 'import time; exec("while True:\n time.sleep(60)\n print(\"[rtabmap-build] JP6.1 ROS still compiling...\", flush=True)")' & \
+    heartbeat_pid=$!; \
+    cleanup_heartbeat() { \
+      kill "$heartbeat_pid" 2>/dev/null || true; \
+      wait "$heartbeat_pid" 2>/dev/null || true; \
+    }; \
+    trap cleanup_heartbeat EXIT; \
     MAKEFLAGS=-j2 colcon build --event-handlers console_direct+ --merge-install --install-base /opt/rtabmap_ros \
       --executor sequential --packages-select ${rtabmap_packages} --cmake-args \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF \
@@ -777,6 +784,8 @@ RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/
       -Dcrypto_LIB:FILEPATH="${rtabmap_crypto}" \
       '-DCMAKE_INSTALL_RPATH=/opt/rtabmap_ros/lib;/usr/local/lib;/opt/ros/humble/install/lib' \
       -DCMAKE_DISABLE_FIND_PACKAGE_octomap_msgs=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_grid_map_ros=TRUE; \
+    cleanup_heartbeat; \
+    trap - EXIT; \
     fi; \
     mkdir -p /opt/rtabmap_ros/share/rtabmap_odom; \
     printf '%s\n' 'motus_rotation_hint/1' > /opt/rtabmap_ros/share/rtabmap_odom/motus_rotation_hint_v1; \
