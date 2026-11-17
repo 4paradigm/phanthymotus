@@ -257,6 +257,11 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("QL_printer", {}).get("enabled", True):
+            from plugins.ql_printer import QLPrinterPlugin
+            self._plugins.append(QLPrinterPlugin(plugins_cfg.get("QL_printer", {}), executor))
+            log.info("QLPrinterPlugin loaded")
+
         if plugins_cfg.get("barcode", {}).get("enabled", False):
             from plugins.barcode import BarcodeScanPlugin
             # No try/except and no model: zxing-cpp is imported lazily by
@@ -534,11 +539,11 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
-                    music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
-                  or name == 'audio_mixer' or name.startswith('audio_mixer_'))
+                    private_call = any(name == prefix or name.startswith(prefix + '_')
+                                       for prefix in ('QL_printer', 'phanthy_music', 'audio_mixer'))
                     if not is_info:
-                        if music_call:
-                            log.info("[mcp] tools/call: phanthy_music (payload omitted)")
+                        if private_call:
+                            log.info("[mcp] tools/call: %s (payload omitted)", name)
                         else:
                             log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
@@ -559,8 +564,8 @@ def make_handler():
                             err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            if music_call:
-                                log.info("[mcp] phanthy_music result received (payload omitted)")
+                            if private_call:
+                                log.info("[mcp] %s result received (payload omitted)", name)
                             else:
                                 log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})

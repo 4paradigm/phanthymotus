@@ -369,7 +369,7 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
     chmod +x /usr/sbin/ldconfig && \
     apt-get update && \
-    apt-get install -y --no-install-recommends espeak-ng && \
+    apt-get install -y --no-install-recommends espeak-ng openssh-client && \
     mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
