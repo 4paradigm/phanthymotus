@@ -1382,5 +1382,73 @@ class TestNinthReview(_Base):
         self.assertEqual(got.fire_count, 1)
 
 
+
+class TestTenthReview(_Base):
+    """PR #398 第十轮：定时的名字 / 文字 / 技能里的控制字符（NUL、ESC 等）不能进事件和日志。"""
+
+    BAD = ('a\x00b', 'a\x1b[31mb', 'a\x7fb', 'a\x85b', 'a\u2028b')
+
+    def test_control_chars_are_rejected_on_create(self):
+        with _FakeJobs():
+            for bad in self.BAD:
+                with self.assertRaisesRegex(ValueError, '控制字符'):
+                    schedule_store.create(name='控制', text=bad, cron=self._far_cron(1))
+                with self.assertRaisesRegex(ValueError, '控制字符'):
+                    schedule_store.create(name=bad, text='x', cron=self._far_cron(1))
+                with self.assertRaisesRegex(ValueError, '控制字符'):
+                    schedule_store.create(name='控制', text='x', skill=bad, cron=self._far_cron(1))
+            with self.assertRaisesRegex(ValueError, '换行'):
+                schedule_store.create(name='两\n行', text='x', cron=self._far_cron(1))
+            s = schedule_store.create(name='多行文字', text='第一行\n第二行\t缩进', cron=self._far_cron(1))
+        self.assertIn('第一行\n第二行\t缩进', schedule_store.event_text(s), '文字里的换行和制表符照常保留')
+        self.assertEqual(schedule_store.list_all(), [s], '被拒的一条都没存')
+
+    def test_event_text_and_source_are_cleaned_for_stored_rows(self):
+        """库里的旧数据或绕过校验写进来的：推事件前再清一遍。"""
+        s = schedule_store.Schedule(id='x1', name='夜\x00间\x1b[2J', text='吃药\x00\x1b]0;pwn\x07' + 'y' * 600,
+                                    skill='med\x00check', kind='cron', cron='0 8 * * *')
+        text, source = schedule_store.event_text(s), schedule_store.event_source(s)
+        for out in (text, source):
+            self.assertIsNone(schedule_store._CTRL_RE.search(out), repr(out[:80]))
+        self.assertNotIn('\x00', text + source)
+        self.assertLessEqual(len(text.split('\n')[0]), 500, '文字截到 500 字')
+        self.assertTrue(source.startswith('scheduler:夜 间'))
+
+    def test_fire_now_never_enqueues_control_chars(self):
+        import event_bus
+        sent = []
+
+        async def fake(source, text, payload=None):
+            sent.append((source, text))
+        with _FakeJobs():
+            s = schedule_store.create(name='手动', text='ok', cron=self._far_cron(3))
+        schedule_store._schedules[s.id].text = '坏\x00数据\x1b[31m'
+        orig = event_bus.enqueue
+        event_bus.enqueue = fake
+        try:
+            asyncio.run(schedule_store.fire_now(s.id))
+        finally:
+            event_bus.enqueue = orig
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn('\x00', sent[0][1])
+        self.assertNotIn('\x1b', sent[0][1])
+        self.assertEqual(sent[0][0], 'scheduler:手动')
+
+    def test_api_rejects_nul_text(self):
+        try:
+            import fastapi  # noqa: F401
+            import httpx  # noqa: F401
+        except ImportError:
+            self.skipTest('需要 fastapi + httpx')
+        api = TestApiRoutes('test_preview_count_out_of_range_is_rejected')
+        api.setUp()
+        try:
+            r = api._req('POST', '/api/schedules', {'name': 'nul', 'text': 'a\u0000b', 'cron': self._far_cron(2)}).json()
+            self.assertFalse(r['ok'])
+            self.assertIn('控制字符', r['error'])
+        finally:
+            api.doCleanups()
+
+
 if __name__ == '__main__':
     unittest.main()

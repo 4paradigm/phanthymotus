@@ -27,6 +27,7 @@ import contextlib
 import datetime
 import functools
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -155,7 +156,7 @@ def load_all() -> None:
 
 def _placeholder(row_id: str, raw) -> Schedule:
     """读不出来的行：换成一条停用的占位记录（网页上能看到、能删），原始内容留在文字里方便排查。"""
-    return Schedule(id=str(row_id), name=f'数据损坏 {row_id}'[:40], text=f'原始数据：{str(raw)[:400]}',
+    return Schedule(id=str(row_id), name=f'数据损坏 {row_id}'[:40], text=f'原始数据：{_clean(raw)[:400]}',
                     kind='once', at='2000-01-01 00:00', enabled=False)
 
 
@@ -368,10 +369,16 @@ def validate(s: Schedule, *, now: float | None = None) -> None:
         raise ValueError('定时任务要有名字')
     if len(s.name) > 40:
         raise ValueError('名字不要超过 40 个字')
+    if _CTRL_RE.search(s.name) or '\n' in s.name or '\t' in s.name:
+        raise ValueError('名字里不能有换行或控制字符')
+    if _CTRL_RE.search(s.skill) or '\n' in s.skill or '\t' in s.skill:
+        raise ValueError('技能名里不能有换行或控制字符')
     if not s.text:
         raise ValueError('要写触发时推给机器人的文字')
     if len(s.text) > 500:
         raise ValueError('触发文字不要超过 500 个字')
+    if _CTRL_RE.search(s.text):
+        raise ValueError('触发文字里不能有控制字符（比如 NUL、ESC），换行可以')
     if s.kind not in KINDS:
         raise ValueError('kind 只能是 cron（重复）或 once（一次）')
     s.tz = (s.tz or st['default_tz']).strip()
@@ -512,11 +519,30 @@ def job_name(sid: str) -> str:
     return f'sched:{sid}'
 
 
+# 控制字符：NUL、ESC（终端转义）、DEL、C1 区以及 Unicode 行/段分隔符。事件文字会进日志
+# （decision 日志原样打印），NUL 还会搞坏 docker logs 的分帧，所以建的时候就拒绝，
+# 推事件前再清一遍（防库里的旧数据或绕过校验写进来的）。文字里允许 \n 和 \t。
+_CTRL_RE = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]')
+_TEXT_MAX = 500
+
+
+def _clean(text: str, *, one_line: bool = False) -> str:
+    """把控制字符换成空格；one_line 时连换行和制表符也换掉。"""
+    out = _CTRL_RE.sub(' ', str(text or ''))
+    return re.sub('[\n\t]', ' ', out) if one_line else out
+
+
+def event_source(s: Schedule) -> str:
+    return f'scheduler:{_clean(s.name, one_line=True)[:40]}'
+
+
 def event_text(s: Schedule) -> str:
-    hint = f'（定时任务「{s.name}」'
-    if s.skill:
-        hint += f'，对应技能 {s.skill}：先调 activate_skill(slug="{s.skill}")'
-    return f'{s.text}\n{hint}）'
+    name = _clean(s.name, one_line=True)[:40]
+    skill = _clean(s.skill, one_line=True)[:64]
+    hint = f'（定时任务「{name}」'
+    if skill:
+        hint += f'，对应技能 {skill}：先调 activate_skill(slug="{skill}")'
+    return f'{_clean(s.text)[:_TEXT_MAX]}\n{hint}）'
 
 
 def _is_current(s: Schedule, job: dict) -> bool:
@@ -613,10 +639,10 @@ def _register(s: Schedule) -> None:
         t = parse_at(s.at, s.tz)
         if t <= time.time():
             return
-        scheduler.add_job(job_name(s.id), '', event_text(s), at=t, source=f'scheduler:{s.name}',
+        scheduler.add_job(job_name(s.id), '', event_text(s), at=t, source=event_source(s),
                           on_fire=_on_fire(s.id), after_fire=_after_fire(s.id))
     else:
-        scheduler.add_job(job_name(s.id), s.cron, event_text(s), tz=s.tz, source=f'scheduler:{s.name}',
+        scheduler.add_job(job_name(s.id), s.cron, event_text(s), tz=s.tz, source=event_source(s),
                           on_fire=_on_fire(s.id), after_fire=_after_fire(s.id))
 
 
@@ -839,7 +865,7 @@ async def _fire_now_inner(sid: str) -> Schedule:
     if s is None:
         raise KeyError(sid)
     try:
-        await event_bus.enqueue(source=f'scheduler:{s.name}', text=event_text(s))
+        await event_bus.enqueue(source=event_source(s), text=event_text(s))
     except Exception:
         await asyncio.to_thread(_settle_manual, sid, ticket, False)
         raise
