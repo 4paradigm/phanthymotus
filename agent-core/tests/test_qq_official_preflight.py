@@ -1,5 +1,6 @@
 """Preflight report must identify disabled capabilities without making live claims."""
 import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -13,7 +14,7 @@ from qq_official_preflight import inspect_database
 class QQPreflightTests(unittest.TestCase):
     def _db(self, folder):
         path = Path(folder) / "test.db"
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)")
             channels = [{
                 "id": "qq-test", "platform": "qq", "enabled": True,

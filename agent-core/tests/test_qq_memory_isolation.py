@@ -157,7 +157,7 @@ def test_qq_tools_cannot_call_global_memory_even_as_owner(scope_store, monkeypat
                         {"role": "owner", "tool_filter": "*"} if principal == owner_uid else None)
     assert allowed_for_principals([("qq", owner_uid)], "channel_memory_remember")
     for admin_tool in ("update_memory", "search_history", "memory_recall", "raw_input_info"):
-        assert allowed_for_principals([("qq", owner_uid)], admin_tool), admin_tool
+        assert not allowed_for_principals([("qq", owner_uid)], admin_tool), admin_tool
     assert not _qq_safe("channel_memory_remember", role="viewer", user_id="invalid")
 
 

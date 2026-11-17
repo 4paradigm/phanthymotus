@@ -77,56 +77,31 @@ def test_setup_requires_dashboard_auth():
     assert ex.value.status_code == 403
 
 
-def test_owner_binding_requires_real_private_message_and_dashboard_confirmation():
+def test_retired_qq_admin_pairing_never_creates_owner_grant():
     state = {}
     with (mock.patch('config.main', state),
-          mock.patch('channel.manager.get_channel_config', return_value=CONFIG),
-          mock.patch('channel.acl.get_user', return_value=None),
           mock.patch('channel.acl.upsert_user') as grant):
-        code = qq_onboarding.start(CHANNEL)
-        assert not qq_onboarding.receive(qq_message('绑定 ' + code, chat_type='group'))
-        assert not qq_onboarding.receive(qq_message('绑定 WRONG000'))
-        assert qq_onboarding.status(CHANNEL)['status'] == 'waiting'
-        assert qq_onboarding.receive(qq_message('连接 ' + code))
-        assert not qq_onboarding.receive(qq_message('连接 ' + code))
-        assert qq_onboarding.status(CHANNEL)['status'] == 'verified'
-        result = qq_onboarding.confirm(CHANNEL)
-        assert result['status'] == 'bound'
-        assert state['qq_c2c_owner_grant']['principal'] == PERSON
-        assert grant.call_args.kwargs['role'] == 'owner'
-        assert grant.call_args.kwargs['tool_filter'] == permissions.OWNER_FILTER
-        assert qq_onboarding.status(CHANNEL)['status'] == 'expired'
-    assert not _qq_safe('Bash', role='owner', user_id='official:' + APP + ':other')
+        with pytest.raises(ValueError, match='retired'):
+            qq_onboarding.start(CHANNEL)
+        assert not qq_onboarding.receive(qq_message('绑定 ABCDEF12'))
+        assert qq_onboarding.status(CHANNEL)['status'] == 'retired'
+        with pytest.raises(ValueError, match='retired'):
+            qq_onboarding.confirm(CHANNEL)
+        assert 'qq_c2c_owner_grant' not in state
+        grant.assert_not_called()
+    assert not _qq_safe('Bash', role='owner', user_id=PERSON)
 
 
-def test_verified_owner_full_access_restored_without_escalating_other_users():
+def test_legacy_owner_grant_cannot_restore_privileged_access():
     state = {'qq_c2c_owner_grant': {'enabled': True, 'principal': PERSON}}
-    old = {'role': 'owner', 'display_name': 'QQ owner',
-           'tool_filter': permissions.DAILY_FILTER}
     with (mock.patch('config.main', state),
-          mock.patch('channel.manager.get_channel_config', return_value=CONFIG),
-          mock.patch('channel.acl.get_user', return_value=old),
           mock.patch('channel.acl.upsert_user') as update):
-        result = qq_onboarding.restore_owner_full_access(CHANNEL)
-        assert result['status'] == 'full_access'
-        assert update.call_args.kwargs['role'] == 'owner'
-        assert update.call_args.kwargs['tool_filter'] == permissions.OWNER_FILTER
-        assert not _qq_safe('Bash', role='owner', user_id=PERSON)
-        assert _matches_filter(permissions.OWNER_FILTER, 'Bash')
-        assert _matches_filter(permissions.OWNER_FILTER, 'mcp__robot__loco')
-        assert not _qq_safe('Bash', role='operator', user_id=PERSON)
-        assert not _qq_safe('Bash', role='owner',
-                            user_id='official:' + APP + ':OTHER_PERSON_12345')
-        assert not _qq_safe('Bash', role='owner', user_id=GROUP_PERSON)
-
-    with (mock.patch('config.main', {'qq_c2c_owner_grant': {
-            'enabled': True, 'principal': 'official:99999:OTHER_PERSON_12345'}}),
-          mock.patch('channel.manager.get_channel_config', return_value=CONFIG),
-          mock.patch('channel.acl.get_user', return_value=old),
-          mock.patch('channel.acl.upsert_user') as update):
-        with pytest.raises(ValueError, match='No verified owner'):
+        with pytest.raises(ValueError, match='retired'):
             qq_onboarding.restore_owner_full_access(CHANNEL)
         update.assert_not_called()
+        assert state['qq_c2c_owner_grant']['principal'] == PERSON
+    assert not _qq_safe('Bash', role='owner', user_id=PERSON)
+    assert not _qq_safe('mcp__robot__loco', role='owner', user_id=PERSON)
 
 
 def test_daily_preset_never_grants_shell():
@@ -209,13 +184,16 @@ def test_default_canvas_exposes_channel_reply_to_decision_core(monkeypatch):
     assert 'mcp__channel__channel_reply' in names
 
 
-def test_admin_preset_does_not_override_existing_binding():
+def test_qq_preset_rejects_daily_and_downgrades_legacy_owner_to_chat():
     with (mock.patch('channel.acl.get_user', return_value={
-            'role':'owner', 'display_name':'Owner'}),
-          mock.patch('config.main', {'qq_c2c_owner_grant':{
-              'enabled':True, 'principal':PERSON}})):
-        with pytest.raises(ValueError, match='Revoke'):
+              'role': 'owner', 'display_name': 'Legacy Owner'}),
+          mock.patch('channel.acl.upsert_user', return_value={}) as upsert):
+        with pytest.raises(ValueError, match='chat-only'):
             permissions.assign_preset('qq', PERSON, 'daily')
+        upsert.assert_not_called()
+        permissions.assign_preset('qq', PERSON, 'chat')
+        assert upsert.call_args.kwargs['role'] == 'viewer'
+        assert upsert.call_args.kwargs['tool_filter'] == permissions.CHAT_FILTER
 
 
 
@@ -294,18 +272,13 @@ def test_manager_disabled_group_never_reaches_canvas():
 
 
 
-def test_owner_revocation_removes_special_grant_and_demotes_owner():
+def test_retired_owner_revocation_cannot_modify_acl():
     state = {'qq_c2c_owner_grant': {'enabled': True, 'principal': PERSON}}
     with (mock.patch('config.main', state),
-          mock.patch('channel.manager.get_channel_config', return_value=CONFIG),
-          mock.patch('channel.acl.get_user',
-                     return_value={'role':'owner','display_name':'Owner'}),
           mock.patch('channel.acl.upsert_user') as update):
-        result = qq_onboarding.revoke(CHANNEL)
-    assert result['status'] == 'revoked'
-    assert state['qq_c2c_owner_grant'] == {}
-    assert update.call_args.kwargs['role'] == 'viewer'
-    assert update.call_args.kwargs['tool_filter'] == permissions.CHAT_FILTER
+        with pytest.raises(ValueError, match='retired'):
+            qq_onboarding.revoke(CHANNEL)
+        update.assert_not_called()
 
 
 def test_default_policy_migrates_legacy_approval_without_touching_permissions():

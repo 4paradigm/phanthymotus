@@ -85,30 +85,23 @@ def test_invalid_scopes_are_rejected_without_mutation():
     update.assert_not_called()
 
 
-def test_full_owner_permissions_preserve_verified_identity():
-    record = {'role': 'owner', 'tool_filter': 'finish',
-              'display_name': 'Owner'}
+def test_retired_owner_endpoint_never_grants_full_access():
     with (mock.patch('api.qq_settings._channel', return_value=CONFIG),
-          mock.patch('api.qq_settings._owner', return_value=(OWNER, record)),
-          mock.patch('api.qq_settings.acl.upsert_user',
-                     return_value={**record, 'tool_filter': '*'}) as update):
-        result = qq_settings.update_owner(
-            CHANNEL, qq_settings.QQOwnerChange(preset='full'))
-
-    assert result['tool_filter'] == '*'
-    assert update.call_args.args[:2] == ('qq', OWNER)
-    assert update.call_args.kwargs['role'] == 'owner'
-    assert update.call_args.kwargs['tool_filter'] == '*'
+          mock.patch('channel.acl.upsert_user') as update):
+        with pytest.raises(fastapi.HTTPException) as error:
+            qq_settings.update_owner(
+                CHANNEL, qq_settings.QQOwnerChange(preset='full'))
+    assert error.value.status_code == 410
+    update.assert_not_called()
 
 
 def test_unbound_owner_cannot_approve_full_tool_access():
     with (mock.patch('api.qq_settings._channel', return_value=CONFIG),
-          mock.patch('api.qq_settings._owner', return_value=('', None)),
-          mock.patch('api.qq_settings.acl.upsert_user') as update):
+          mock.patch('channel.acl.upsert_user') as update):
         with pytest.raises(fastapi.HTTPException) as error:
             qq_settings.update_owner(
                 CHANNEL, qq_settings.QQOwnerChange(preset='full'))
-    assert error.value.status_code == 409
+    assert error.value.status_code == 410
     update.assert_not_called()
 
 

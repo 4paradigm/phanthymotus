@@ -41,13 +41,11 @@ def fixture(fake_online=True):
 def test_settings_get_no_inline_secret_leaked():
     data = channel_data()
     data['config']['app_secret_runtime'] = 'X' * 43
-    owner = {'role':'owner', 'tool_filter':'*', 'display_name':'Owner'}
     with (mock.patch('api.qq_settings.auth.is_enabled', return_value=True),
-          mock.patch('api.qq_settings.get_channel_config', return_value=data),
-          mock.patch('api.qq_settings._owner', return_value=(OWNER, owner))):
+          mock.patch('api.qq_settings.get_channel_config', return_value=data)):
         result = settings.get_settings(CID)
     assert result['credential_mode'] == 'runtime'
-    assert result['owner']['filter'] == '*'
+    assert result['owner'] == {'bound': False, 'role': 'chat_user'}
     assert 'X' * 43 not in repr(result)
     assert result['enabled_scopes'] == ['c2c']
 
@@ -108,32 +106,27 @@ def test_group_permission_denied_rolls_back_previous_c2c_config():
     assert history[-1]['config'] == channel_data()['config']
 
 
-def test_owner_can_change_full_chat_and_custom_immediately_without_gateway_restart():
-    owner = {'role':'owner','display_name':'Owner','tool_filter':'*'}
+def test_retired_qq_admin_cannot_change_any_permission_or_restart_gateway():
     with (mock.patch('api.qq_settings.auth.is_enabled', return_value=True),
           mock.patch('api.qq_settings.get_channel_config', return_value=channel_data()),
-          mock.patch('api.qq_settings._owner', return_value=(OWNER,owner)),
-          mock.patch('api.qq_settings.acl.upsert_user', return_value={
-              'role':'owner','tool_filter':permissions.CHAT_FILTER}) as update,
+          mock.patch('channel.acl.upsert_user') as update,
           mock.patch.object(settings.manager, 'restart_adapter') as restart):
-        result = settings.update_owner(CID, settings.QQOwnerChange(preset='chat'))
-        assert result['role'] == 'owner'
-        assert update.call_args.kwargs['tool_filter'] == permissions.CHAT_FILTER
-        settings.update_owner(CID, settings.QQOwnerChange(
-            preset='custom',capabilities=['speech','motion']))
-        assert 'mcp__*__loco*' in update.call_args.kwargs['tool_filter']
-        assert 'Bash' not in update.call_args.kwargs['tool_filter']
-        restart.assert_not_called()
+        for preset in ('full', 'daily', 'chat', 'custom'):
+            with pytest.raises(fastapi.HTTPException) as error:
+                settings.update_owner(CID, settings.QQOwnerChange(
+                    preset=preset, capabilities=['speech', 'motion'] if preset == 'custom' else []))
+            assert error.value.status_code == 410
+    update.assert_not_called()
+    restart.assert_not_called()
 
 
 def test_owner_controls_reject_unverified_user():
     with (mock.patch('api.qq_settings.auth.is_enabled', return_value=True),
           mock.patch('api.qq_settings.get_channel_config', return_value=channel_data()),
-          mock.patch('api.qq_settings._owner', return_value=('',None)),
-          mock.patch('api.qq_settings.acl.upsert_user') as upsert):
+          mock.patch('channel.acl.upsert_user') as upsert):
         with pytest.raises(fastapi.HTTPException) as error:
             settings.update_owner(CID, settings.QQOwnerChange(preset='full'))
-    assert error.value.status_code == 409
+    assert error.value.status_code == 410
     upsert.assert_not_called()
 
 

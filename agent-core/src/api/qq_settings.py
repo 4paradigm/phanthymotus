@@ -12,11 +12,8 @@ import fastapi
 from pydantic import BaseModel, Field
 
 import auth
-from channel import acl
 from channel.adapters.qq_official import validate_qq_official_config
 from channel.manager import get_channel_config, update_channel_config, manager
-from channel.permissions import CHAT_FILTER, DAILY_FILTER, OWNER_FILTER
-from channel.tool_policy import _qq_owner_dm_identity
 
 router = fastapi.APIRouter(prefix='/channel/qq/manage', tags=['qq management'])
 
@@ -49,18 +46,6 @@ def _credential_available(cfg):
         return False
 
 
-def _owner(channel):
-    import config
-    cfg = channel.get('config') or {}
-    grant = config.main.get('qq_c2c_owner_grant', {})
-    uid = grant.get('principal', '') if isinstance(grant, dict) else ''
-    verified = (bool(grant.get('enabled')) if isinstance(grant, dict) else False)
-    verified = (verified and _qq_owner_dm_identity(uid)
-                and uid.split(':')[1] == str(cfg.get('app_id', '')))
-    user = acl.get_user('qq', uid) if verified else None
-    return uid if verified and user and user.get('role') == 'owner' else '', user
-
-
 class QQSettingsChange(BaseModel):
     mode: Literal['standard', 'advanced']
     group_enabled: bool | None = None
@@ -79,14 +64,6 @@ class QQCredentialRecovery(BaseModel):
 class QQOwnerChange(BaseModel):
     preset: Literal['full', 'daily', 'chat', 'custom']
     capabilities: list[Literal['speech', 'sensing', 'motion', 'system']] = Field(default_factory=list)
-
-
-OWNER_CAPABILITY_PATTERNS = {
-    'speech': ['mcp__*__tts', 'mcp__*__speaker*'],
-    'sensing': ['mcp__*__camera*', 'mcp__*__watch*', 'mcp__*__sensor*'],
-    'motion': ['mcp__*__loco*', 'mcp__*__motion*', 'mcp__*__move*'],
-    'system': ['Bash', 'mcp__*__shell*', 'mcp__*__file*'],
-}
 
 
 @router.get('/{channel_id}/settings')

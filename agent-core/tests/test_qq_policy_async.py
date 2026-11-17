@@ -19,13 +19,13 @@ class QQPolicyAsyncTests(unittest.IsolatedAsyncioTestCase):
             return {"role": "viewer", "tool_filter": "*"}
 
         with mock.patch.object(tool_policy.acl, "get_user", side_effect=blocked_get_user):
-            read = asyncio.create_task(tool_policy.snapshot_principals([("qq", "person")]))
+            read = asyncio.create_task(tool_policy.snapshot_principals([("qq", "official:1900000000:AAAAAAAABBBBBBBB")]))
             await asyncio.wait_for(asyncio.sleep(0.015), timeout=0.06)
             self.assertFalse(read.done(), "The synthetic SQLite read should still be running")
             snapshot = await read
-        self.assertEqual(snapshot[("qq", "person")]["role"], "viewer")
+        self.assertEqual(snapshot[("qq", "official:1900000000:AAAAAAAABBBBBBBB")]["role"], "viewer")
         self.assertTrue(tool_policy.allowed_for_principals(
-            [("qq", "person")], "mcp__channel__channel_reply", snapshot=snapshot))
+            [("qq", "official:1900000000:AAAAAAAABBBBBBBB")], "mcp__channel__channel_reply", snapshot=snapshot))
 
     async def test_dispatch_rechecks_revoked_role(self):
         users = iter([
@@ -34,9 +34,9 @@ class QQPolicyAsyncTests(unittest.IsolatedAsyncioTestCase):
         ])
         with mock.patch.object(tool_policy.acl, "get_user", side_effect=lambda *_: next(users)):
             first = await tool_policy.async_allowed_for_principals(
-                [("qq", "person")], "mcp__channel__channel_reply")
+                [("qq", "official:1900000000:AAAAAAAABBBBBBBB")], "mcp__channel__channel_reply")
             second = await tool_policy.async_allowed_for_principals(
-                [("qq", "person")], "mcp__channel__channel_reply")
+                [("qq", "official:1900000000:AAAAAAAABBBBBBBB")], "mcp__channel__channel_reply")
         self.assertTrue(first)
         self.assertFalse(second)
 
@@ -63,7 +63,7 @@ class QQBarrierAndMemoryAsyncTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(tool_policy.acl,"get_user",
                                 side_effect=lambda *_:dict(state))):
             self.assertTrue(await tool_policy.async_allowed_for_principals(
-                principals,"mcp__robot__loco"))
+                principals,"mcp__channel__channel_reply"))
             wait=asyncio.create_task(simulated_acp_wait())
             await ready.wait()
             self.assertFalse(wait.done())
@@ -71,7 +71,7 @@ class QQBarrierAndMemoryAsyncTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await wait
             self.assertFalse(await tool_policy.async_allowed_for_principals(
-                principals,"mcp__robot__loco"))
+                principals,"mcp__channel__channel_reply"))
         # Verify the dispatch actually rechecks after waiting, not just before.
         source=(Path(__file__).resolve().parents[1]/"src"/"event"/"llm.py").read_text(encoding="utf-8")
         start=source.index("if _bar_needed:",source.index("# ACP barrier: 只等与本次调用资源冲突"))

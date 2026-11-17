@@ -3,6 +3,7 @@
 Reports configuration readiness, not Tencent account entitlement or live delivery.
 """
 import argparse
+from contextlib import closing
 import importlib.metadata
 import json
 from pathlib import Path
@@ -22,7 +23,7 @@ FEATURE_FLAGS = (
 def inspect_database(path: Path, channel_id: str) -> dict:
     if not path.is_file():
         raise ValueError("Core database not found")
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as database:
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as database:
         def load(key, default):
             row = database.execute(
                 "SELECT value FROM config WHERE key = ?", (key,)

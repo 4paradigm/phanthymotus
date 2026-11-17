@@ -16,32 +16,32 @@ class QQSecurityTests(unittest.TestCase):
     def test_t05_viewer_cannot_act(self):
         with mock.patch('channel.acl.get_user', return_value={'role': 'viewer',
                                                                'tool_filter': '*'}):
-            self.assertTrue(allowed_for_principals([('qq', '888')], 'mcp__channel__channel_reply'))
-            self.assertFalse(allowed_for_principals([('qq', '888')], 'mcp__perception__tts'))
-            self.assertFalse(allowed_for_principals([('qq', '888')], 'mcp__bumi__loco'))
+            self.assertTrue(allowed_for_principals([('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__channel__channel_reply'))
+            self.assertFalse(allowed_for_principals([('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__perception__tts'))
+            self.assertFalse(allowed_for_principals([('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__bumi__loco'))
 
     def test_operator_cannot_execute_even_audio_in_text_only_v1(self):
         with mock.patch('channel.acl.get_user', return_value={'role': 'operator',
                                                                'tool_filter': '*'}):
             self.assertTrue(allowed_for_principals(
-                [('qq', '888')], 'mcp__channel__channel_reply'))
+                [('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__channel__channel_reply'))
             for name in ('mcp__perception__tts__speak',
                          'mcp__perception__phanthy_music__play',
                          'mcp__bumi__speaker', 'mcp__bumi__loco',
                          'mcp__actucore__navigate', 'Bash', 'subagent_spawn'):
-                self.assertFalse(allowed_for_principals([('qq', '888')], name), name)
+                self.assertFalse(allowed_for_principals([('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], name), name)
 
     def test_acl_filter_is_enforced(self):
         with mock.patch('channel.acl.get_user', return_value={
             'role': 'owner', 'tool_filter': 'tts*'}):
             self.assertFalse(allowed_for_principals(
-                [('qq', '888')], 'mcp__channel__channel_reply'))
+                [('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__channel__channel_reply'))
             self.assertFalse(allowed_for_principals(
-                [('qq', '888')], 'mcp__perception__tts__speak'))
+                [('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__perception__tts__speak'))
         with mock.patch('channel.acl.get_user', return_value={
             'role': 'operator', 'tool_filter': 'channel_reply'}):
             self.assertTrue(allowed_for_principals(
-                [('qq', '888')], 'mcp__channel__channel_reply'))
+                [('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__channel__channel_reply'))
 
     def test_blocked_deleted_and_mixed(self):
         def user(platform, uid):
@@ -49,13 +49,13 @@ class QQSecurityTests(unittest.TestCase):
                     'tool_filter': '*'}
         with mock.patch('channel.acl.get_user', side_effect=user):
             self.assertFalse(allowed_for_principals(
-                [('qq', '888'), ('qq', '999')], 'mcp__perception__tts'))
+                [('qq', 'official:1900000000:AAAAAAAABBBBBBBB'), ('qq', 'official:1900000000:CCCCCCCCDDDDDDDD')], 'mcp__perception__tts'))
         with mock.patch('channel.acl.get_user', return_value=None):
             self.assertFalse(allowed_for_principals(
-                [('qq', '888')], 'mcp__channel__channel_reply'))
+                [('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'mcp__channel__channel_reply'))
         with mock.patch('channel.acl.get_user', return_value={'role': 'blocked',
                                                                'tool_filter': '*'}):
-            self.assertFalse(allowed_for_principals([('qq', '888')], 'finish'))
+            self.assertFalse(allowed_for_principals([('qq', 'official:1900000000:AAAAAAAABBBBBBBB')], 'finish'))
 
     def test_collector_carries_principals(self):
         msg = {'source': 'dds:/channel/request/qq_main', 'ts': 1,

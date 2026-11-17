@@ -37,7 +37,8 @@ class QQOwnerACLTests(unittest.TestCase):
         self.assertTrue(_qq_owner_dm_identity(_OWNER))
         for tool in _TOOLS:
             with self.subTest(tool=tool):
-                self.assertTrue(self.check(_OWNER, "owner", tool))
+                self.assertEqual(self.check(_OWNER, "owner", tool),
+                                 tool in ("mcp__channel__channel_reply", "finish"))
 
     def test_group_owner_does_not_override_platform_cap(self):
         self.assertFalse(_qq_owner_dm_identity(_GROUP))
@@ -69,7 +70,9 @@ class QQOwnerACLTests(unittest.TestCase):
 
     def test_explicit_tool_filter_still_applies(self):
         self.assertFalse(self.check(_OWNER, "owner", "Bash", "Read"))
-        self.assertTrue(self.check(_OWNER, "owner", "Read", "Read"))
+        self.assertFalse(self.check(_OWNER, "owner", "Read", "Read"))
+        self.assertTrue(self.check(_OWNER, "owner", "mcp__channel__channel_reply",
+                                   "channel_reply"))
 
     def test_blocked_owner_and_missing_user_fail_closed(self):
         self.assertFalse(self.check(_OWNER, "blocked", "Read"))

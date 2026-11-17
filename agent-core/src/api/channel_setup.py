@@ -502,7 +502,7 @@ def pair_start(req: Pairing):
 def pair_status(channel_id: str):
     _setup_auth()
     _qq(channel_id)
-    return qq_onboarding.status(channel_id)
+    return {'status': 'retired', 'admin_pairing_required': False}
 
 
 @router.post('/qq/pair/confirm')
@@ -521,12 +521,7 @@ class PairRevocation(BaseModel):
 def pair_revoke(req: PairRevocation):
     _setup_auth()
     _qq(req.channel_id)
-    if req.confirmation != '解除管理员绑定':
-        raise fastapi.HTTPException(400, 'Explicit confirmation is required')
-    try:
-        return qq_onboarding.revoke(req.channel_id)
-    except ValueError as exc:
-        raise fastapi.HTTPException(400, str(exc)) from None
+    raise fastapi.HTTPException(410, 'QQ administrator pairing is retired')
 
 
 @router.get('/{channel_id}/access-policy')
