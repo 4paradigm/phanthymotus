@@ -101,6 +101,7 @@ def test_bundle_advertises_tool_and_explains_missing_backend(monkeypatch):
     try:
         [tool] = bundle.get_all_tools()
         assert tool["name"] == "aruco" and tool["type"] == "processor"
+        assert tool["configSchema"]["properties"]["calibration"]["advanced"] is True
         assert [port["format"] for port in tool["topic_out"]] == ["data/json", "image/jpeg"]
         unavailable = bundle.dispatch("aruco", {"action": "info"})
         assert unavailable["state"] == "error"
@@ -127,8 +128,6 @@ def test_processor_publishes_matching_json_and_jpeg_then_clears_detection(detect
     args = {"action": "start", "instance_id": "aruco-a", "input_topic": TOPIC,
             "camera_info": {TOPIC: CAMERA}}
     try:
-        assert plugin.dispatch("aruco", {**args, "camera_info": {"/other": CAMERA}})["state"] == "error"
-        assert not executor.nodes
         assert plugin.dispatch("aruco", args)["state"] == "running"
         assert plugin.dispatch("aruco", args)["state"] == "running"
         [node] = executor.nodes
@@ -141,6 +140,8 @@ def test_processor_publishes_matching_json_and_jpeg_then_clears_detection(detect
         assert _wait_until(lambda: len(overlay_pub.raw_messages) == 1)
         first = json.loads(pose_pub.messages[0])
         assert first["markers"][0]["id"] == 23
+        assert first["pose_status"] == "calibrated"
+        assert first["coordinate_frame"] == "camera_optical"
         assert first["camera_id"] == CAMERA["id"]
         assert first["frame_id"] == frame.header.frame_id
         assert first["stamp"] == {"sec": 100, "nanosec": 42}
@@ -172,6 +173,57 @@ def test_processor_publishes_matching_json_and_jpeg_then_clears_detection(detect
         plugin.shutdown()
 
 
+@pytest.mark.parametrize(("camera_info", "camera_id", "reason"), [
+    (None, "", "did not provide camera intrinsics"),
+    ({"/other": CAMERA}, "", "did not provide camera intrinsics"),
+    ({TOPIC: {**CAMERA, "K": None}}, CAMERA["id"], "did not provide camera intrinsics"),
+    ({TOPIC: {**CAMERA, "distortion_model": "unknown", "D": None}}, CAMERA["id"], "model with matching D"),
+])
+def test_preview_without_usable_calibration(detector, camera_info, camera_id, reason):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({"rate_hz": 30}, executor)
+    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": camera_info}
+    try:
+        info = plugin.dispatch("aruco", args)
+        assert info["state"] == "running" and info["pose_status"] == "detection_only"
+        assert reason in info["camera_info_note"]
+        [node] = executor.nodes
+        assert plugin.dispatch("aruco", args) == info
+        assert executor.nodes == [node]
+        pose_pub, overlay_pub = node.publishers
+        deliver = node.subscriptions[0].callback
+        rotation = np.array([2.7, -0.19, 0.28])
+        translation = np.array([0.035, -0.022, 0.4])
+        frame = _frame(render_marker(rotation, translation), 100)
+        deliver(frame)
+        assert _wait_until(lambda: len(overlay_pub.raw_messages) == 1)
+        result = json.loads(pose_pub.messages[0])
+        assert result["pose_status"] == "detection_only" and result["camera_info_note"] == info["camera_info_note"]
+        assert result["coordinate_frame"] == "image_pixels"
+        assert result["markers"] == [] and "error" not in result
+        assert result["camera_id"] == camera_id and result["frame_id"] == frame.header.frame_id
+        assert result["stamp"] == {"sec": 100, "nanosec": 42}
+        [detection] = result["detections"]
+        assert detection["id"] == 23
+        projected, _ = cv2.projectPoints(SQUARE, rotation, translation, np.array(K).reshape(3, 3), None)
+        np.testing.assert_allclose(detection["corners_px"], projected.reshape(4, 2), atol=2)
+        overlay = overlay_pub.raw_messages[0]
+        assert overlay.format == "jpeg" and overlay.header == frame.header
+        view = cv2.imdecode(np.frombuffer(overlay.data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        # The outline is yellow on the monochrome source.
+        assert ((view[30:, :, 2].astype(int) - view[30:, :, 0]) > 50).any()
+
+        deliver(_frame(np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8), 101))
+        assert _wait_until(lambda: len(overlay_pub.raw_messages) == 2)
+        cleared = json.loads(pose_pub.messages[1])
+        assert cleared["detections"] == cleared["markers"] == []
+        hint = cv2.imdecode(np.frombuffer(overlay_pub.messages[1], dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert hint[:30].min() < 100
+        assert hint[HEIGHT // 4:].min() > 245
+    finally:
+        plugin.shutdown()
+
+
 def test_instances_on_same_camera_have_distinct_topics_and_override(detector):
     executor = _FakeExecutor()
     plugin = ArucoPlugin({}, executor)
@@ -189,8 +241,8 @@ def test_instances_on_same_camera_have_distinct_topics_and_override(detector):
         assert executor.nodes == [b]
         plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "calibration": {}})
         assert plugin.dispatch("aruco", {"action": "start", "instance_id": "a",
-                                         "input_topic": TOPIC})["state"] == "error"
-        assert executor.nodes == [b]
+                                         "input_topic": TOPIC})["pose_status"] == "detection_only"
+        assert len(executor.nodes) == 2 and executor.nodes[0] is b
     finally:
         plugin.shutdown()
     assert not executor.nodes
@@ -210,11 +262,10 @@ def test_calibration_override_uses_only_matching_camera_identity(detector, camer
             "camera_info": camera_info}
     try:
         if not expected_id:
-            assert plugin.dispatch("aruco", args)["state"] == "error"
-            assert not executor.nodes
+            assert plugin.dispatch("aruco", args)["pose_status"] == "detection_only"
         plugin.dispatch("aruco", {"action": "config", "instance_id": "a",
                                   "calibration": {**CAMERA, "id": "calibration-file-id"}})
-        assert plugin.dispatch("aruco", args)["state"] == "running"
+        assert plugin.dispatch("aruco", args)["pose_status"] == "calibrated"
         [node] = executor.nodes
         node.subscriptions[0].callback(_frame(np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8), 1))
         assert _wait_until(lambda: bool(node.publishers[0].messages))
@@ -279,11 +330,18 @@ def test_same_topic_restart_applies_marker_size_and_calibration_changes(detector
         return marker["translation_m"][2]
 
     try:
-        assert plugin.dispatch("aruco", args)["state"] == "running"
+        without_calibration = {**args, "camera_info": {TOPIC: {**CAMERA, "K": []}}}
+        assert plugin.dispatch("aruco", without_calibration)["pose_status"] == "detection_only"
+        [preview] = executor.nodes
+        assert plugin.dispatch("aruco", args)["pose_status"] == "calibrated"
         [first] = executor.nodes
+        assert preview.destroyed and not preview.worker.is_alive()
+        assert first.outputs == preview.outputs
         assert depth(first, 1) == pytest.approx(0.4, abs=0.006)
-        bad_camera = {**CAMERA, "K": []}
-        assert plugin.dispatch("aruco", {**args, "camera_info": {TOPIC: bad_camera}})["state"] == "error"
+        with pytest.raises(ValueError, match="Calibration requires numeric K"):
+            plugin.dispatch("aruco", {"action": "config", "instance_id": "a",
+                                      "calibration": {**CAMERA, "K": []}})
+        assert plugin.dispatch("aruco", args)["pose_status"] == "calibrated"
         assert executor.nodes == [first] and first.worker.is_alive()
 
         plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "marker_size_m": 0.2})
@@ -301,5 +359,12 @@ def test_same_topic_restart_applies_marker_size_and_calibration_changes(detector
         assert depth(third, 3) == pytest.approx(0.4, abs=0.006)
         assert plugin.dispatch("aruco", restart)["state"] == "running"
         assert executor.nodes == [third]
+        assert plugin.dispatch("aruco", without_calibration)["pose_status"] == "detection_only"
+        [replacement] = executor.nodes
+        assert third.destroyed and not third.worker.is_alive()
+        replacement.subscriptions[0].callback(_frame(image, 4))
+        assert _wait_until(lambda: bool(replacement.publishers[0].messages))
+        result = json.loads(replacement.publishers[0].messages[0])
+        assert result["markers"] == [] and result["detections"][0]["id"] == 23
     finally:
         plugin.shutdown()

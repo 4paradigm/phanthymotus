@@ -4321,28 +4321,35 @@ at the form rather than the schema (`web/js/sidebar.js`):
 
 ## ArUco 定位 (`aruco`)
 
-Connect a camera's `image/jpeg` port to the ArUco Processor. Select the
-dictionary used to generate the marker and enter the measured length of the
-outer black square in meters. The default is `DICT_4X4_50` and 0.100 m.
-Print at 100% scale with a white margin, then measure the black square.
+Connect a camera's `image/jpeg` port to the ArUco Processor and start the
+project. Select the dictionary used to generate the marker (`DICT_4X4_50` by
+default). The card uses usable calibration from the wired camera's
+`motus.camera/1` declaration automatically. For 3D pose, print the marker with
+a white margin and set its measured outer black side length in meters
+(default 0.100 m).
 
-The card uses the connected camera's `motus.camera/1` declaration. If it
-doesn't provide usable calibration, set **Camera calibration override** in
-the card. Enter `width`, `height`, row-major `K`, `distortion_model` and `D`
-for the JPEG resolution. Use `pinhole` with an empty or zero `D` for a rectified
-or undistorted image, or provide the measured coefficients for `plumb_bob`
-or `rational_polynomial`. Enter `{}` to clear a previous override. Restart the
-card after changing settings. Start the project to pass calibration from the
-wired camera. A standalone tool call must supply that calibration explicitly
-or use the override.
+If calibration is unavailable, the card starts with a 2D preview in
+**Monitor**. The `overlay` shows the detected IDs, outlines and a calibration
+hint. The `poses` stream reports `pose_status: detection_only` and a
+`detections` list with each ID and its four `corners_px` in image coordinates.
+The `markers` list is empty in this mode. When a marker leaves the frame,
+the next result clears it.
 
-In **Monitor**, the `poses` output reports the marker ID, XYZ translation
-in meters, Rodrigues rotation vector in radians, and reprojection RMS in
-pixels. The transform maps marker coordinates into the camera optical
-frame (+X right, +Y down, +Z forward). The `overlay` output shows the same
-camera frame with red X, green Y and blue Z axes. An empty `markers` list
-clears the previous detection when the marker leaves the frame. A single
-planar marker's rotation can be ambiguous near a frontal view.
+To enable 3D pose on a camera without usable metadata, obtain calibration at
+the stream's resolution. Enter `width`, `height`, row-major `K`,
+`distortion_model` and `D` in **Camera calibration override** under **Advanced
+settings**. Use `pinhole` with an empty or zero `D` for a rectified or
+undistorted image. Use the measured coefficients for `plumb_bob` or
+`rational_polynomial`. Enter `{}` to clear a saved override and restart the
+card after changing settings. Standalone callers can pass the declaration
+for the input topic in `camera_info`.
+
+With calibration, `poses` reports `pose_status: calibrated` and each accepted
+marker pose contains XYZ translation in meters, a Rodrigues rotation vector
+in radians, and reprojection RMS in pixels. The transform maps marker
+coordinates into the camera optical frame (+X right, +Y down, +Z forward).
+The `overlay` draws red X, green Y and blue Z axes. A single planar marker's
+rotation can be ambiguous near a frontal view.
 
 The card uses the Perception image's OpenCV. Verify `cv2.aruco` in the
 actual JetPack image before deployment. If it is missing, the card reports

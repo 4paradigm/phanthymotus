@@ -1,4 +1,4 @@
-"""Calibrated ArUco detection and rendering with the image's OpenCV."""
+"""ArUco detection, calibrated pose estimation and rendering with OpenCV."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ class Calibration:
     distortion: np.ndarray | None
 
     def matches(self, other):
-        return (self.width == other.width and self.height == other.height
+        return (other is not None and self.width == other.width and self.height == other.height
                 and np.array_equal(self.matrix, other.matrix)
                 and np.array_equal(self.distortion, other.distortion))
 
@@ -76,32 +76,55 @@ class MarkerDetector:
                                "Use a compatible Perception image.") from exc
         self.cv = cv2
 
+    def _detect_markers(self, image):
+        cv = self.cv
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+        corners, ids, _ = self._detect(gray)
+        if ids is None:
+            return
+        for marker_id, quad in zip(ids.reshape(-1), corners):
+            pixels = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+            if np.isfinite(pixels).all():
+                yield int(marker_id), pixels
+
+    def _draw_marker(self, image, marker_id, pixels):
+        cv = self.cv
+        outline = np.rint(pixels).astype(np.int32)
+        color = (0, 200, 255)
+        cv.polylines(image, [outline], True, color, 1)
+        cv.putText(image, str(marker_id), tuple(outline[0]), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    def detect(self, image):
+        """Draw a 2D preview in-place and return IDs and image corners."""
+        detections = []
+        for marker_id, pixels in self._detect_markers(image):
+            self._draw_marker(image, marker_id, pixels)
+            detections.append({"id": marker_id, "corners_px": pixels.tolist()})
+        cv = self.cv
+        caption = "2D only - calibrate camera"
+        cv.putText(image, caption, (8, 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
+        cv.putText(image, caption, (8, 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+        return sorted(detections, key=lambda detection: detection["id"])
+
     def estimate(self, image, calibration, marker_size_m):
         """Draw accepted poses in-place and return marker→camera measurements."""
         cv = self.cv
         if image.shape[:2] != (calibration.height, calibration.width):
             raise ValueError("Decoded frame dimensions differ from camera calibration.")
-        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
-        corners, ids, _ = self._detect(gray)
-        if ids is None:
-            return []
         half = marker_size_m / 2
         # OpenCV IPPE_SQUARE order matches the detected, marker-oriented corners.
         square = np.array([[-half, half, 0], [half, half, 0],
                            [half, -half, 0], [-half, -half, 0]], dtype=np.float64)
         markers = []
-        for marker_id, quad in zip(ids.reshape(-1), corners):
-            pixels = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+        for marker_id, pixels in self._detect_markers(image):
             pose = self._solve(square, pixels, calibration)
             if pose is None:
                 continue
             rms, rotation, translation = pose
             cv.drawFrameAxes(image, calibration.matrix, calibration.distortion,
                              rotation, translation, half)
-            cv.polylines(image, [np.rint(pixels).astype(np.int32)], True, (0, 200, 255), 1)
-            origin = tuple(np.rint(pixels[0]).astype(int))
-            cv.putText(image, str(int(marker_id)), origin, cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-            markers.append({"id": int(marker_id), "translation_m": translation.reshape(3).tolist(),
+            self._draw_marker(image, marker_id, pixels)
+            markers.append({"id": marker_id, "translation_m": translation.reshape(3).tolist(),
                             "rotation_rvec_rad": rotation.reshape(3).tolist(), "reprojection_rms_px": rms})
         return sorted(markers, key=lambda marker: marker["id"])
 
