@@ -589,6 +589,8 @@ function _elapsedStr(createdAt) {
 }
 
 // ── Schedules Tab ────────────────────────────────────────────────────────────
+// 元素 id 一律用 sched- / schedule- / schf- 前缀：同一页面里技能编辑表单已经占了 sf-*，
+// 撞 id 时 getElementById 会拿到那边隐藏的空输入框（tests 里有检查）。
 // 运行时定时任务（/api/schedules）。到点把文字推给机器人、叫醒它跑一轮，所以页面上
 // 一直提醒别设得太频繁；后端的最短间隔 / 每日上限会拒绝过密的设置，错误原样显示。
 
@@ -839,16 +841,16 @@ function _openScheduleForm(s) {
     <div class="sched-form schedule-form">
       <div class="sched-form-title">${isEdit ? `编辑「${_escape(v.name)}」` : '新建定时任务'}</div>
       <div class="sched-grid2">
-        <label class="sched-field">名字<input type="text" class="task-input" id="sf-name" value="${_escape(v.name)}" placeholder="例如：早上服药提醒"></label>
+        <label class="sched-field">名字<input type="text" class="task-input" id="schf-name" value="${_escape(v.name)}" placeholder="例如：早上服药提醒"></label>
         <label class="sched-field">类型
-          <select class="task-input" id="sf-kind">
+          <select class="task-input" id="schf-kind">
             <option value="cron" ${v.kind !== 'once' ? 'selected' : ''}>重复</option>
             <option value="once" ${v.kind === 'once' ? 'selected' : ''}>只一次</option>
           </select>
         </label>
-        <div class="sched-field" id="sf-cron-row">
-          <label for="sf-mode">怎么重复</label>
-          <select class="task-input" id="sf-mode">
+        <div class="sched-field" id="schf-cron-row">
+          <label for="schf-mode">怎么重复</label>
+          <select class="task-input" id="schf-mode">
             <option value="daily">每天</option>
             <option value="workday">工作日（周一到周五）</option>
             <option value="weekly">每周的某几天</option>
@@ -856,79 +858,79 @@ function _openScheduleForm(s) {
             <option value="custom">自定义（高级，写 cron）</option>
           </select>
         </div>
-        <div class="sched-field" id="sf-time-row">
-          <label for="sf-time">几点</label>
-          <input type="time" class="task-input" id="sf-time" value="${_escape(rep.time || '08:00')}">
+        <div class="sched-field" id="schf-time-row">
+          <label for="schf-time">几点</label>
+          <input type="time" class="task-input" id="schf-time" value="${_escape(rep.time || '08:00')}">
         </div>
-        <div class="sched-field sched-span2" id="sf-week-row">
+        <div class="sched-field sched-span2" id="schf-week-row">
           <label>哪几天</label>
           <div class="sched-days">
             ${[1, 2, 3, 4, 5, 6, 0].map(d => `<label class="sched-day"><input type="checkbox" value="${d}" ${(rep.days || []).includes(d) ? 'checked' : ''}><span>${_WEEKDAYS[d]}</span></label>`).join('')}
           </div>
         </div>
-        <div class="sched-field" id="sf-dom-row">
-          <label for="sf-dom">每月几号</label>
-          <input type="number" min="1" max="31" class="task-input" id="sf-dom" value="${_escape(String(rep.dom || 1))}">
+        <div class="sched-field" id="schf-dom-row">
+          <label for="schf-dom">每月几号</label>
+          <input type="number" min="1" max="31" class="task-input" id="schf-dom" value="${_escape(String(rep.dom || 1))}">
           <div class="schedule-preview">没有这一天的月份（比如 2 月没有 30 号）会跳过</div>
         </div>
-        <div class="sched-field sched-span2" id="sf-custom-row">
-          <label for="sf-cron">cron（分 时 日 月 周，用空格隔开）</label>
-          <input type="text" class="task-input mono" id="sf-cron" value="${_escape(v.cron || '')}" placeholder="例如 0 8,20 * * *">
+        <div class="sched-field sched-span2" id="schf-custom-row">
+          <label for="schf-cron">cron（分 时 日 月 周，用空格隔开）</label>
+          <input type="text" class="task-input mono" id="schf-cron" value="${_escape(v.cron || '')}" placeholder="例如 0 8,20 * * *">
           <div class="schedule-preview">例：<code>0 8 * * *</code> 每天 8:00；<code>30 7,19 * * *</code> 每天 7:30 和 19:30；<code>0 9 * * 1</code> 每周一 9:00</div>
         </div>
-        <div class="sched-field sched-span2" id="sf-preview-row">
-          <div class="schedule-preview sched-preview-line" id="sf-preview"></div>
+        <div class="sched-field sched-span2" id="schf-preview-row">
+          <div class="schedule-preview sched-preview-line" id="schf-preview"></div>
         </div>
-        <div class="sched-field" id="sf-at-row">
-          <label for="sf-at">时间</label>
-          <input type="datetime-local" class="task-input" id="sf-at" value="${_escape(atLocal)}">
+        <div class="sched-field" id="schf-at-row">
+          <label for="schf-at">时间</label>
+          <input type="datetime-local" class="task-input" id="schf-at" value="${_escape(atLocal)}">
         </div>
-        <label class="sched-field">时区<input type="text" class="task-input" id="sf-tz" value="${_escape(v.tz || '')}"></label>
+        <label class="sched-field">时区<input type="text" class="task-input" id="schf-tz" value="${_escape(v.tz || '')}"></label>
         <label class="sched-field sched-span2">触发文字（到点推给机器人）
-          <textarea class="task-input" id="sf-text" rows="3" placeholder="例如：到吃早药的时间了，请提醒老人拿药盒核对。">${_escape(v.text || '')}</textarea>
+          <textarea class="task-input" id="schf-text" rows="3" placeholder="例如：到吃早药的时间了，请提醒老人拿药盒核对。">${_escape(v.text || '')}</textarea>
         </label>
-        <label class="sched-field">技能 slug（可空）<input type="text" class="task-input" id="sf-skill" value="${_escape(v.skill || '')}"></label>
-        <label class="schedule-check sched-field-check"><input type="checkbox" id="sf-enabled" ${v.enabled ? 'checked' : ''}> 启用</label>
+        <label class="sched-field">技能 slug（可空）<input type="text" class="task-input" id="schf-skill" value="${_escape(v.skill || '')}"></label>
+        <label class="schedule-check sched-field-check"><input type="checkbox" id="schf-enabled" ${v.enabled ? 'checked' : ''}> 启用</label>
       </div>
       <div class="sched-form-foot">
-        <span class="schedule-msg schedule-error" id="sf-error"></span>
-        <button class="sched-btn-ghost" id="sf-cancel">取消</button>
-        <button class="btn-primary sched-btn-sm" id="sf-save">保存</button>
+        <span class="schedule-msg schedule-error" id="schf-error"></span>
+        <button class="sched-btn-ghost" id="schf-cancel">取消</button>
+        <button class="btn-primary sched-btn-sm" id="schf-save">保存</button>
       </div>
     </div>`;
 
   const $ = id => document.getElementById(id);
-  const kindSel = $('sf-kind');
-  const modeSel = $('sf-mode');
+  const kindSel = $('schf-kind');
+  const modeSel = $('schf-mode');
   modeSel.value = rep.mode;
 
   // 当前表单对应的 cron；填得不完整时抛错（中文原因）
   const currentCron = () => {
     const mode = modeSel.value;
-    if (mode === 'custom') return $('sf-cron').value.trim();
+    if (mode === 'custom') return $('schf-cron').value.trim();
     return _cronBuild({
       mode,
-      time: $('sf-time').value,
-      days: [...document.querySelectorAll('#sf-week-row input:checked')].map(i => +i.value),
-      dom: Number($('sf-dom').value),
+      time: $('schf-time').value,
+      days: [...document.querySelectorAll('#schf-week-row input:checked')].map(i => +i.value),
+      dom: Number($('schf-dom').value),
     });
   };
 
   const showRows = () => {
     const once = kindSel.value === 'once';
     const mode = modeSel.value;
-    $('sf-cron-row').classList.toggle('hidden', once);
-    $('sf-time-row').classList.toggle('hidden', once || mode === 'custom');
-    $('sf-week-row').classList.toggle('hidden', once || mode !== 'weekly');
-    $('sf-dom-row').classList.toggle('hidden', once || mode !== 'monthly');
-    $('sf-custom-row').classList.toggle('hidden', once || mode !== 'custom');
-    $('sf-preview-row').classList.toggle('hidden', once);
-    $('sf-at-row').classList.toggle('hidden', !once);
+    $('schf-cron-row').classList.toggle('hidden', once);
+    $('schf-time-row').classList.toggle('hidden', once || mode === 'custom');
+    $('schf-week-row').classList.toggle('hidden', once || mode !== 'weekly');
+    $('schf-dom-row').classList.toggle('hidden', once || mode !== 'monthly');
+    $('schf-custom-row').classList.toggle('hidden', once || mode !== 'custom');
+    $('schf-preview-row').classList.toggle('hidden', once);
+    $('schf-at-row').classList.toggle('hidden', !once);
   };
 
   let previewTimer = null;
   const preview = async () => {
-    const out = $('sf-preview');
+    const out = $('schf-preview');
     if (kindSel.value === 'once') { out.textContent = ''; return; }
     let cron;
     try { cron = currentCron(); } catch (e) {
@@ -937,7 +939,7 @@ function _openScheduleForm(s) {
     if (!cron) { out.textContent = ''; return; }
     try {
       const r = await _scheduleFetch('/api/schedules/preview', 'POST',
-        { cron, tz: $('sf-tz').value.trim() || null, count: 3 });
+        { cron, tz: $('schf-tz').value.trim() || null, count: 3 });
       out.className = r.ok ? 'schedule-preview sched-preview-line' : 'schedule-preview sched-preview-line schedule-error';
       out.textContent = r.ok ? `接下来会在：${(r.runs || []).join('、')}` : (r.error || '');
     } catch { out.textContent = ''; }
@@ -948,55 +950,55 @@ function _openScheduleForm(s) {
   let prevMode = modeSel.value;
   modeSel.addEventListener('change', () => {
     const mode = modeSel.value;
-    if (mode === 'custom' && prevMode !== 'custom' && !$('sf-cron').value.trim()) {
+    if (mode === 'custom' && prevMode !== 'custom' && !$('schf-cron').value.trim()) {
       modeSel.value = prevMode;
-      try { $('sf-cron').value = currentCron(); } catch { /* 没填完就留空 */ }
+      try { $('schf-cron').value = currentCron(); } catch { /* 没填完就留空 */ }
       modeSel.value = 'custom';
     } else if (prevMode === 'custom') {
-      const p = _cronParse($('sf-cron').value);
+      const p = _cronParse($('schf-cron').value);
       if (p) {
-        $('sf-time').value = p.time;
-        if (p.dom) $('sf-dom').value = p.dom;
-        if (p.days) document.querySelectorAll('#sf-week-row input').forEach(i => { i.checked = p.days.includes(+i.value); });
+        $('schf-time').value = p.time;
+        if (p.dom) $('schf-dom').value = p.dom;
+        if (p.days) document.querySelectorAll('#schf-week-row input').forEach(i => { i.checked = p.days.includes(+i.value); });
       }
     }
     prevMode = mode;
     showRows(); schedulePreview();
   });
   kindSel.addEventListener('change', () => { showRows(); schedulePreview(); });
-  ['sf-time', 'sf-dom', 'sf-cron', 'sf-tz'].forEach(id => $(id).addEventListener('input', schedulePreview));
-  $('sf-week-row').addEventListener('change', schedulePreview);
+  ['schf-time', 'schf-dom', 'schf-cron', 'schf-tz'].forEach(id => $(id).addEventListener('input', schedulePreview));
+  $('schf-week-row').addEventListener('change', schedulePreview);
   showRows();
   preview();
 
-  document.getElementById('sf-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
-  document.getElementById('sf-save').addEventListener('click', async () => {
+  document.getElementById('schf-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
+  document.getElementById('schf-save').addEventListener('click', async () => {
     const kind = kindSel.value;
     let cron = '';
     if (kind === 'cron') {
-      try { cron = currentCron(); } catch (e) { $('sf-error').textContent = e.message; return; }
-      if (!cron) { $('sf-error').textContent = '要写 cron'; return; }
+      try { cron = currentCron(); } catch (e) { $('schf-error').textContent = e.message; return; }
+      if (!cron) { $('schf-error').textContent = '要写 cron'; return; }
     }
     const body = {
-      name: document.getElementById('sf-name').value.trim(),
+      name: document.getElementById('schf-name').value.trim(),
       kind,
       cron,
-      at: kind === 'once' ? document.getElementById('sf-at').value.replace('T', ' ') : '',
-      tz: document.getElementById('sf-tz').value.trim(),
-      text: document.getElementById('sf-text').value.trim(),
-      skill: document.getElementById('sf-skill').value.trim(),
-      enabled: document.getElementById('sf-enabled').checked,
+      at: kind === 'once' ? document.getElementById('schf-at').value.replace('T', ' ') : '',
+      tz: document.getElementById('schf-tz').value.trim(),
+      text: document.getElementById('schf-text').value.trim(),
+      skill: document.getElementById('schf-skill').value.trim(),
+      enabled: document.getElementById('schf-enabled').checked,
     };
     const r = isEdit
       ? await _scheduleFetch(`/api/schedules/${encodeURIComponent(s.id)}`, 'PATCH', body)
       : await _scheduleFetch('/api/schedules', 'POST', body);
     if (!r.ok) {
-      document.getElementById('sf-error').textContent = r.error || '保存失败';
+      document.getElementById('schf-error').textContent = r.error || '保存失败';
       return;
     }
     slot.innerHTML = '';
     _loadSchedules();
   });
-  document.getElementById('sf-name').focus();
+  document.getElementById('schf-name').focus();
   slot.scrollIntoView({ block: 'nearest' });
 }

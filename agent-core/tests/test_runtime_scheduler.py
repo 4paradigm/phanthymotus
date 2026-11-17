@@ -1520,5 +1520,26 @@ class TestEleventhReview(_Base):
         self.assertEqual(schedule_store.find('纽约早上').tz, 'America/New_York')
 
 
+
+class TestWebIds(unittest.TestCase):
+    """定时页签生成的元素 id 不能和页面上别的地方重复：技能编辑表单占了 sf-name 等，
+    撞了以后 getElementById 拿到的是那边隐藏的空输入框，保存时报“要有名字”。"""
+
+    def test_schedule_tab_ids_are_unique_in_the_web_ui(self):
+        import re
+        web = _SRC.parent / 'web'
+        hist = (web / 'js' / 'history.js').read_text(encoding='utf-8')
+        sec = hist[hist.index('// ── Schedules Tab'):]
+        ids = set(re.findall(r'id="([A-Za-z][\w-]*)"', sec))      # 这一段自己生成的元素
+        self.assertIn('schf-name', ids)
+        others = [p for p in web.rglob('*') if p.suffix in ('.html', '.js') and p.name != 'history.js']
+        others_text = '\n'.join(p.read_text(encoding='utf-8', errors='ignore') for p in others)
+        rest_of_history = hist[:hist.index('// ── Schedules Tab')]
+        for i in sorted(ids):
+            pat = re.compile(r'["\'#]' + re.escape(i) + r'["\'\s)]')
+            self.assertIsNone(pat.search(others_text), f'{i} 和别的页面元素撞 id')
+            self.assertIsNone(pat.search(rest_of_history), f'{i} 和 history.js 里别的元素撞 id')
+
+
 if __name__ == '__main__':
     unittest.main()
