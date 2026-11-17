@@ -228,6 +228,7 @@ _job_info: dict[str, dict] = {}                # name → job（含 next_ts）�
 _loop: asyncio.AbstractEventLoop | None = None  # run() 记下的事件循环
 _pending: list = []                             # 循环起来之前收到的 add/remove，run() 时按顺序补上
 _pending_lock = threading.Lock()
+_stopping = False                            # 退出期间禁止迟到的回调再创建 job
 ONCE_RETRY_DELAY_S = 30                         # 一次性事件入队失败后多久重试
 ONCE_MAX_RETRIES = 10
 
@@ -247,6 +248,8 @@ def _on_loop(fn) -> None:
     except RuntimeError:
         running = None
     with _pending_lock:
+        if _stopping:
+            return                        # 数据已落盘，下次启动会重新恢复
         loop = _loop
         if loop is not None and loop.is_running():
             if running is loop:
@@ -260,6 +263,8 @@ def _on_loop(fn) -> None:
 
 
 def _add_job_now(name, cron, text, tz, at, source, on_fire, after_fire=None) -> None:
+    if _stopping:
+        return                            # 此回调可能在 run() 开始退出之前就已投递
     _remove_job_now(name)
     job = {'name': name, 'cron': cron, 'text': text, 'tz': tz, 'at': at,
            'source': source, 'on_fire': on_fire, 'after_fire': after_fire}
@@ -306,25 +311,45 @@ def job_next_ts(name: str) -> float | None:
 
 async def run() -> None:
     """常驻 async task：加载配置里的 job 和运行时定时任务并驱动它们。"""
-    global _loop
+    global _loop, _stopping
+    legacy_tasks = []
+    startup = None
     with _pending_lock:
+        _stopping = False
         _loop = asyncio.get_running_loop()
         queued, _pending[:] = list(_pending), []
-    for fn in queued:
-        fn()
     try:
-        import schedule_store
-        # 读库在线程池里做，不卡刚起来的事件循环；add_job 会自己转回循环线程
-        await asyncio.to_thread(schedule_store.start_all)
-    except Exception as e:  # 运行时定时任务坏了不能拖垮配置里的 job
-        print(f'[scheduler] failed to start runtime schedules: {e}')
+        for fn in queued:
+            fn()
+        try:
+            import schedule_store
+            # 取消 to_thread 的等待不会终止线程：先等它结束，避免清理完以后又注册 job。
+            startup = asyncio.create_task(asyncio.to_thread(schedule_store.start_all))
+            await asyncio.shield(startup)
+        except Exception as e:  # 运行时定时任务坏了不能拖垮配置里的 job
+            print(f'[scheduler] failed to start runtime schedules: {e}')
 
-    jobs = list(config.main.get('scheduler', []))
-    if not jobs:
-        return
-
-    # 每个 job 独立运行一个协程
-    await asyncio.gather(*[_run_job(job) for job in jobs])
+        jobs = list(config.main.get('scheduler', []))
+        legacy_tasks = [asyncio.create_task(_run_job(job)) for job in jobs]
+        if legacy_tasks:
+            await asyncio.gather(*legacy_tasks)
+        # 动态 job 独立创建，旧配置为空或已结束都不能让它们的生命周期所有者退出。
+        await asyncio.Event().wait()
+    finally:
+        with _pending_lock:
+            _stopping = True
+            _loop = None
+        tasks = set(legacy_tasks) | set(_dynamic_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if startup is not None:
+            await asyncio.gather(startup, return_exceptions=True)
+        _dynamic_tasks.clear()
+        _job_info.clear()
+        # 已准入的那次触发沿用 shield 收尾语义；退出前等它完成，保证名额结算。
+        if _settling:
+            await asyncio.gather(*list(_settling), return_exceptions=True)
 
 
 _SLEEP_CHUNK_S = 60      # 长等待切成小段、每段醒来都检查挂钟有没有被校正（见 _run_job_loop）

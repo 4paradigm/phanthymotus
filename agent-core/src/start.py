@@ -585,8 +585,13 @@ async def lifespan(app):
         try:
             yield
         finally:
+            # 先停止所有定时任务并等已准入的一次触发结算，之后再停决策循环和通信。
+            # 否则定时事件可能在消费者已退出后才进入事件队列。
+            tasks[1].cancel()
+            await asyncio.gather(tasks[1], return_exceptions=True)
             for t in tasks:
                 t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await channel_manager.stop()
             from peer.registry import registry as peer_registry
             await peer_registry.stop()

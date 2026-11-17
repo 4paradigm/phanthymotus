@@ -73,6 +73,9 @@ class _Base(unittest.TestCase):
             'scheduler_settings', saved_settings if saved_settings is not None
             else dict(schedule_store.DEFAULT_SETTINGS)))
         self.addCleanup(scheduler._pending.clear)
+        saved_stopping = scheduler._stopping
+        scheduler._stopping = False
+        self.addCleanup(setattr, scheduler, '_stopping', saved_stopping)
         schedule_store.clear_all() if schedule_store._loaded else None
         with schedule_store._get_conn() as conn:
             conn.execute('DELETE FROM schedules')
@@ -1123,15 +1126,17 @@ class TestSixthReview(_Base):
         async def go():
             saved = config.main.get('scheduler', [])
             config.main['scheduler'] = []
+            owner = asyncio.create_task(scheduler.run())
             try:
-                await scheduler.run()
+                await asyncio.sleep(0.05)
+                self.assertIn(name, scheduler._dynamic_tasks)
+                self.assertIsNotNone(scheduler.job_next_ts(name))
+                scheduler.remove_job(name)
+                await asyncio.sleep(0)
             finally:
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
                 config.main['scheduler'] = saved
-            await asyncio.sleep(0.05)
-            self.assertIn(name, scheduler._dynamic_tasks)
-            self.assertIsNotNone(scheduler.job_next_ts(name))
-            scheduler.remove_job(name)
-            await asyncio.sleep(0)
         try:
             asyncio.run(asyncio.wait_for(go(), 5))
         finally:
@@ -1519,6 +1524,178 @@ class TestEleventhReview(_Base):
         self.assertIn('America/New_York', r, '返回的描述里写明时区')
         self.assertEqual(schedule_store.find('纽约早上').tz, 'America/New_York')
 
+
+
+class TestSchedulerShutdown(_Base):
+    """调度器的常驻任务负责动态 job 的退出；旧名称的日志保持转义。"""
+
+    def test_run_owns_dynamic_jobs_without_legacy_config(self):
+        from unittest.mock import patch
+
+        async def go():
+            ready = asyncio.Event()
+            delivered = []
+
+            def start_all():
+                scheduler.add_job('shutdown-test', '', 'x', at=time.time() + 0.1)
+                asyncio_loop.call_soon_threadsafe(ready.set)
+
+            async def enqueue(**event):
+                delivered.append(event)
+
+            asyncio_loop = asyncio.get_running_loop()
+            with patch.object(config, 'main', {'scheduler': []}), \
+                    patch.object(schedule_store, 'start_all', start_all), \
+                    patch.object(scheduler.event_bus, 'enqueue', enqueue):
+                owner = asyncio.create_task(scheduler.run())
+                try:
+                    await asyncio.wait_for(ready.wait(), 2)
+                    await asyncio.sleep(0.01)
+                    self.assertFalse(owner.done(), '没有旧配置定时也必须保持常驻')
+                    job = scheduler._dynamic_tasks['shutdown-test']
+                    owner.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await owner
+                    self.assertTrue(job.done())
+                    self.assertIsNone(scheduler._loop)
+                    self.assertEqual(scheduler._dynamic_tasks, {})
+                    self.assertEqual(scheduler._job_info, {})
+                    await asyncio.sleep(0.12)
+                    self.assertEqual(delivered, [])
+                finally:
+                    owner.cancel()
+                    await asyncio.gather(owner, return_exceptions=True)
+                    for task in list(scheduler._dynamic_tasks.values()):
+                        task.cancel()
+                    await asyncio.gather(*scheduler._dynamic_tasks.values(), return_exceptions=True)
+
+        asyncio.run(asyncio.wait_for(go(), 5))
+
+    def test_legacy_name_control_characters_are_escaped_in_logs(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+
+        s = schedule_store.Schedule(name='old\x00\x1b[31m\nname')
+        output = StringIO()
+        with patch.object(schedule_store, '_persist', side_effect=sqlite3.Error('write failed')), \
+                redirect_stdout(output):
+            schedule_store._disable_once(s, 'skipped by the daily cap')
+        logged = output.getvalue()
+        self.assertIn(repr(s.name), logged)
+        self.assertNotIn('\x00', logged)
+        self.assertNotIn('\x1b', logged)
+        self.assertEqual(len(logged.splitlines()), 2, '名称换行不能伪造新日志行')
+
+    def test_shutdown_waits_for_startup_thread_and_ignores_late_registration(self):
+        import threading
+        from unittest.mock import patch
+
+        async def go():
+            started = asyncio.Event()
+            finish_startup = threading.Event()
+            loop = asyncio.get_running_loop()
+
+            def start_all():
+                loop.call_soon_threadsafe(started.set)
+                if not finish_startup.wait(2):
+                    raise AssertionError('测试未释放启动线程')
+                scheduler.add_job('late-startup', '', 'x', at=time.time() + 60)
+
+            with patch.object(config, 'main', {'scheduler': []}), \
+                    patch.object(schedule_store, 'start_all', start_all):
+                owner = asyncio.create_task(scheduler.run())
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    owner.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(owner.done(), '不能遗留仍会注册任务的启动线程')
+                    finish_startup.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await owner
+                    self.assertIsNone(scheduler._loop)
+                    self.assertEqual(scheduler._dynamic_tasks, {})
+                    self.assertEqual(scheduler._pending, [])
+                finally:
+                    finish_startup.set()
+                    await asyncio.gather(owner, return_exceptions=True)
+
+        asyncio.run(asyncio.wait_for(go(), 5))
+
+    def test_shutdown_settles_an_admitted_fire_before_returning(self):
+        from unittest.mock import patch
+
+        async def go():
+            enqueuing = asyncio.Event()
+            release = asyncio.Event()
+            settled = []
+
+            def start_all():
+                scheduler.add_job('in-flight', '', 'x', at=time.time() - 1,
+                                  after_fire=lambda job, delivered, retrying: settled.append(delivered))
+
+            async def enqueue(**event):
+                enqueuing.set()
+                await release.wait()
+
+            with patch.object(config, 'main', {'scheduler': []}), \
+                    patch.object(schedule_store, 'start_all', start_all), \
+                    patch.object(scheduler.event_bus, 'enqueue', enqueue):
+                owner = asyncio.create_task(scheduler.run())
+                try:
+                    await asyncio.wait_for(enqueuing.wait(), 2)
+                    owner.cancel()
+                    while scheduler._loop is not None:
+                        await asyncio.sleep(0)
+                    scheduler.add_job('late-api', '', 'x', at=time.time() - 1)
+                    self.assertFalse(owner.done(), '已准入的触发必须先结算')
+                    self.assertNotIn('late-api', scheduler._dynamic_tasks)
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await owner
+                    self.assertEqual(settled, [True])
+                    self.assertEqual(scheduler._dynamic_tasks, {})
+                    self.assertFalse(scheduler._settling)
+                finally:
+                    release.set()
+                    await asyncio.gather(owner, return_exceptions=True)
+
+        asyncio.run(asyncio.wait_for(go(), 5))
+
+    def test_shutdown_cancels_legacy_jobs_together_with_dynamic_jobs(self):
+        from unittest.mock import patch
+
+        async def go():
+            started = {name: asyncio.Event() for name in ('legacy', 'dynamic')}
+            exited = set()
+
+            async def wait_job(job, name):
+                started[name].set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    exited.add(name)
+
+            def start_all():
+                scheduler.add_job('dynamic', '', 'x', at=time.time() + 60)
+
+            with patch.object(config, 'main', {'scheduler': [{'name': 'legacy'}]}), \
+                    patch.object(schedule_store, 'start_all', start_all), \
+                    patch.object(scheduler, '_run_job_loop', wait_job):
+                owner = asyncio.create_task(scheduler.run())
+                try:
+                    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in started.values())), 2)
+                    owner.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await owner
+                    self.assertEqual(exited, {'legacy', 'dynamic'})
+                    self.assertIsNone(scheduler._loop)
+                    self.assertEqual(scheduler._dynamic_tasks, {})
+                finally:
+                    owner.cancel()
+                    await asyncio.gather(owner, return_exceptions=True)
+
+        asyncio.run(asyncio.wait_for(go(), 5))
 
 
 class TestWebIds(unittest.TestCase):
