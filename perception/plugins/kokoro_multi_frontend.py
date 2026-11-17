@@ -49,6 +49,8 @@ _EN_GROUPED_NUM = r"[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?"
 _EU_GROUPED_DECIMAL = r"[1-9]\d{0,2}(?:\.\d{3})+,\d+"
 _EN_GROUPED = re.compile(r"(?<![A-Za-z0-9_.,])(?P<n>[+\-−]?" +
                          _EN_GROUPED_NUM + r")(?![A-Za-z0-9_]|[.,]\d)")
+_INTEGER_COUNT = re.compile(r"(?<![\w.,])(?P<n>[+\-−]?(?:[1-9]\d{0,2}(?P<sep>[.,])\d{3}"
+                            r"(?:(?P=sep)\d{3})*|[1-9]\d{3,}))(?!\w|[.,]\d)")
 _SPACE_GROUPED_NUM = r"[1-9]\d{0,2}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d+)?"
 _SPACE_GROUPED = re.compile(r"(?<![A-Za-z0-9_.,])(?<!\d )(?<!\d\u00a0)(?<!\d\u202f)"
                             r"(?P<n>[+\-−]?" + _SPACE_GROUPED_NUM +
@@ -475,6 +477,7 @@ def normalize_notation(text: str, language: str) -> tuple[str, list[str]]:
     if language == "ru":
         number_pattern = re.compile(r"(?<![\w.,])" + _COMMA_NUM + r"(?!\w|[.,]\d)")
     cues = [re.escape(cue) for cue in cfg.get("unit_identifier_cues", {}).get(language, [])]
+    cues.extend(re.escape(cue) for cue in cfg.get("numeric_identifier_prefixes", {}).get(language, []))
     cues.append(_IDENTIFIER_CUES[language])
     bridge = {"zh": "是|为|為", "en": "is|are", "ja": "は|が", "de": "lautet|ist",
               "fr": "est", "es": "es", "th": "คือ|เป็น"}.get(language)
@@ -502,6 +505,30 @@ def normalize_notation(text: str, language: str) -> tuple[str, list[str]]:
     for match in _address_matches(text):
         spans.append((match.start(), match.end(), match.group()))
         notes.append(f"notation:protected_literal:{match.group()}")
+    for abbreviation, reading in cfg.get("native_abbreviations", {}).get(language, {}).items():
+        for match in re.finditer(r"(?<!\w)" + re.escape(abbreviation) + r"(?!\w)", text):
+            add(match.start(), match.end(), "native_abbreviation", lambda value=reading: value)
+    code_prefixes = cfg.get("technical_code_prefixes", {}).get(language, [])
+    if code_prefixes:
+        prefix = re.compile(r"(?<!\w)(?:" + "|".join(map(re.escape, code_prefixes)) +
+                            r")" + bridge + r"[ \t:：=]*$", re.I)
+        for match in _NUMBER.finditer(text):
+            if re.fullmatch(r"\d{3}", match.group()) and prefix.search(text[max(0, match.start()-64):match.start()]):
+                add(match.start(), match.end(), "technical_code",
+                    lambda value=match.group(): _digits(value, language, cfg))
+    count_nouns = cfg.get("integer_count_nouns", {}).get(language, [])
+    if count_nouns:
+        following = re.compile(r"[ \t]+(?:" + "|".join(map(re.escape, count_nouns)) + r")(?!\w)", re.I)
+        for match in _INTEGER_COUNT.finditer(text):
+            if (following.match(text[match.end():]) and
+                    not identifier_prefix.search(text[max(0, match.start()-64):match.start()])):
+                def count(m=match):
+                    value = re.sub(r"[.,]", "", m["n"])
+                    spoken = _number(value, language, cfg)
+                    if language == "es" and abs(int(value)) >= 10**6 and int(value) % 10**6 == 0:
+                        spoken += " de"
+                    return spoken
+                add(match.start(), match.end(), "integer_count", count)
     # Keep the programming-language name available for the pronunciation
     # dictionary; its plus signs are not mathematical operators.
     for match in re.finditer(r"(?<![A-Za-z0-9_])C\+\+(?![A-Za-z0-9_+])", text):
@@ -609,7 +636,10 @@ def normalize_notation(text: str, language: str) -> tuple[str, list[str]]:
         if valid and cue:
             add(match.start(), match.end(), "ipv4",
                 lambda m=match: (" " + cfg["operator_words"][language]["dot"] + " ").join(
-                    _digits(part, language, cfg) for part in m.group().split(".")))
+                    _number(part, language, cfg)
+                    if cfg.get("ipv4_octet_reading", {}).get(language) == "cardinal"
+                    and not (len(part) > 1 and part.startswith("0"))
+                    else _digits(part, language, cfg) for part in m.group().split(".")))
     if language in {"de", "es"}:
         for match in _unit_pattern(language).finditer(text):
             prefix = text[max(0, match.start()-64):match.start()]
@@ -891,6 +921,7 @@ def normalize_notation(text: str, language: str) -> tuple[str, list[str]]:
 
 
 LANGUAGES = ("zh", "en", "ja", "ru", "de", "fr", "es", "th")
+_VOWEL_ONSETS = frozenset("AIOQWYaeiouyæɑɒɔəɛɜɪʊʌɐøœ")
 _LATIN_LETTERS = r"A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff"
 _LATIN_WORD = (rf"[{_LATIN_LETTERS}][{_LATIN_LETTERS}0-9]*"
                rf"(?:[-'&][{_LATIN_LETTERS}0-9]+)*")
@@ -1139,6 +1170,10 @@ class Frontend:
         self._lexicon_path = model_dir / "frontend_lexicon.json"
         lexicon = json.loads(self._lexicon_path.read_text(encoding="utf-8"))
         cfg = lexicon["normalization"]
+        self._chinese_readings = lexicon.get("chinese_readings", {})
+        self._unstressed_linkers = {language: frozenset(words)
+                                   for language, words in lexicon.get("unstressed_linkers", {}).items()}
+        self._mandatory_liaisons = lexicon.get("mandatory_liaisons", {})
         self._literal_digits = cfg["digits"]["en"]
         symbols = {"_": "underscore", ".": "dot", "-": "dash", "/": "slash",
                    "\\": "backslash", ":": "colon", "+": "plus"}
@@ -1169,14 +1204,25 @@ class Frontend:
         self._thai._tokenizer._engine = Tokenizer(
             custom_dict=self._thai._tokenizer.vocab, engine="newmm")
         entries = [entry for entry in lexicon["entries"] if entry["enabled"]]
-        alternatives, self._entries = [], {}
+        alternatives, self._entries, self._native_entries = [], {}, {}
+        self._entry_languages = {}
+        self._filename_languages = {}
         for index, entry in enumerate(entries):
+            default = self._dictionary_phonemes(entry)
+            native = {language: self._native(reading, language)
+                      for language, reading in entry.get("native_readings", {}).items()}
+            if languages := lexicon.get("initialism_group_stress", ()):
+                grouped = self._dictionary_phonemes(entry, group_stress=True)
+                native = {**dict.fromkeys(languages, grouped), **native}
             for form in [entry["term"], *entry["aliases"]]:
                 name = f"w{index}_{len(alternatives)}"
                 body = re.escape(form).replace(r"\ ", r"[ \t]+")
                 body = body if entry["case_sensitive"] else "(?i:" + body + ")"
                 alternatives.append((len(form), f"(?P<{name}>{body})"))
-                self._entries[name] = self._dictionary_phonemes(entry)
+                self._entries[name] = default
+                self._native_entries[name] = native
+                self._entry_languages[name] = tuple(entry.get("languages", ()))
+                self._filename_languages[name] = tuple(entry.get("filename_languages", ()))
         alternatives.sort(reverse=True)
         self._terms = re.compile(r"(?<![A-Za-z0-9_])(?:" +
                                  "|".join(body for _, body in alternatives) +
@@ -1216,7 +1262,7 @@ class Frontend:
             return "fr"
         if greeting in {"hola", "gracias", "buenas tardes", "buenas noches"}:
             return "es"
-        ordinary = self._terms.sub(" ", ordinary)
+        ordinary = self._terms.sub(lambda m: m[0] if self._entry_languages[m.lastgroup] else " ", ordinary)
         ordinary = re.sub(r"(?<!\w)IP(?:v[46])?(?!\w)", " ", ordinary, flags=re.I)
         spans = protected_spans(ordinary)
         spans += [m.span() for m in _unit_pattern().finditer(ordinary)]
@@ -1241,15 +1287,26 @@ class Frontend:
         with self._lock:
             return self._identifier.classify(ordinary)[0]
 
-    def _dictionary_phonemes(self, entry):
+    def _dictionary_matches(self, text, language):
+        return (match for match in self._terms.finditer(text)
+                if not self._entry_languages[match.lastgroup]
+                or language in self._entry_languages[match.lastgroup])
+
+    def _dictionary_phonemes(self, entry, *, group_stress=False):
         if entry.get("phonemes"):
             return entry["phonemes"]
         parts = []
         for letters, words in groupby(entry["spoken_english"].split(),
                 key=lambda word: bool(re.fullmatch(r"[A-Z]", word))):
-            text = "".join(words) if letters else " ".join(words).lower()
-            parts.append(self._english.lexicon.get_NNP(text)[0]
-                         if letters else self._english(text)[0])
+            if letters:
+                # Explicitly spaced letters remain separate spoken words.
+                values = [self._english.lexicon.get_NNP(word)[0] for word in words]
+                if group_stress:
+                    # Match Misaki's initialism stress without joining its words.
+                    values[:-1] = [value.replace("ˈ", "ˌ") for value in values[:-1]]
+                parts.extend(values)
+            else:
+                parts.append(self._english(" ".join(words).lower())[0])
         return " ".join(parts)
 
     def _english_context_readings(self, text, protected, source_text):
@@ -1291,11 +1348,7 @@ class Frontend:
         import jieba.posseg as psg
         from misaki.zh import ZHG2P
         from pypinyin import lazy_pinyin, Style
-        readings = {
-            "认识": ("ren4", "shi5"), "很长": ("hen3", "chang2"),
-            "长时间": ("chang2", "shi2", "jian1"),
-            "最长": ("zui4", "chang2"), "重试": ("chong2", "shi4"),
-        }
+        readings = self._chinese_readings
         # A transliterated name's middle dot is a word boundary, not a phone.
         text = re.sub(r"(?<=[\u4e00-\u9fff])·(?=[\u4e00-\u9fff])", " ", text)
         text = ZHG2P.map_punctuation(cn2an.transform(text, "an2cn"))
@@ -1428,7 +1481,7 @@ class Frontend:
             raise ValueError(f"Unsupported Kokoro Multi language: {language}")
         flattened = re.sub(r"[\r\n]", " ", text)
         protected_lines = (protected_spans(flattened)
-                           + [m.span() for m in self._terms.finditer(flattened)]
+                           + [m.span() for m in self._dictionary_matches(flattened, language)]
                            + [m.span() for m in _unit_pattern(language).finditer(flattened)]
                            + [m.span() for m in _FORMULA_LIKE.finditer(flattened)])
         text = re.sub(r"[\r\n]", lambda m: " " if any(a <= m.start() < b for a, b in protected_lines)
@@ -1452,24 +1505,36 @@ class Frontend:
     def iter_phonemes(self, text, language="auto"):
         """Normalize the full request once; defer tail G2P until its turn."""
         source, spoken, language = self._prepare_text(text, language)
-        protected = self._literal_spans(spoken) + [m.span() for m in self._terms.finditer(spoken)]
-        for part in first_sentence_parts(spoken, protected, clause=True):
+        protected = self._literal_spans(spoken) + [m.span() for m in self._dictionary_matches(spoken, language)]
+        # Native Latin prose keeps sentence context; mixed-name passages retain
+        # their smaller opening clause for first-audio latency.
+        clause = language not in ("en", "fr", "es") or any(self._dictionary_matches(spoken, language))
+        for part in first_sentence_parts(spoken, protected, clause=clause):
             yield self._phonemize(part, language, source)
 
     def _phonemize(self, spoken, language, source_text):
         with self._lock:
             protected = self._literal_spans(spoken)
-            matches = [match for match in self._terms.finditer(spoken)
+            matches = [match for match in self._dictionary_matches(spoken, language)
                        if not any(match.start() < end and match.end() > start
                                   for start, end in protected)
-                       or (language in {"de", "fr", "es"} and match[0].lower() == "json"
+                       or (language in self._filename_languages[match.lastgroup]
                            and spoken[match.start()-1:match.start()] == "."
                            and any(match.end() == end for _, end in protected))]
             cursor, parts = 0, []
+
+            def expand_literals(value, offset):
+                # A dictionary suffix must not discard the enclosing filename.
+                spans = [(max(0, start-offset), min(len(value), end-offset))
+                         for start, end in protected
+                         if start < offset+len(value) and end > offset]
+                return self._expand_literal_symbols(value, language, spans)
+
             if language == "en":
                 readings = []
                 for match in matches:
-                    end, phones = match.end(), self._entries[match.lastgroup]
+                    end = match.end()
+                    phones = self._native_entries[match.lastgroup].get(language, self._entries[match.lastgroup])
                     suffix = re.match(r"-\d+[A-Za-z]?(?![A-Za-z0-9_.-])", spoken[end:])
                     if suffix:
                         # A model suffix belongs to the hinted name: -82M in
@@ -1479,10 +1544,10 @@ class Frontend:
                     readings.append((match.start(), end, phones))
                 readings += self._english_context_readings(spoken, protected + [match.span() for match in matches], source_text)
                 for start, end, phones in sorted(readings):
-                    parts.extend((self._expand_literal_symbols(spoken[cursor:start], language),
+                    parts.extend((expand_literals(spoken[cursor:start], cursor),
                                   "[" + spoken[start:end] + "](/" + phones + "/)"))
                     cursor = end
-                parts.append(self._expand_literal_symbols(spoken[cursor:], language))
+                parts.append(expand_literals(spoken[cursor:], cursor))
                 return self._english("".join(parts))[0]
 
             compounds = []
@@ -1499,29 +1564,41 @@ class Frontend:
                     # F5-TTS at TTS leaves a dangling hyphen in the native branch.
                     compounds.append((word.start(), word.end(), self.convert(word[0], "en")))
                     matches = [match for match in matches if match not in hits]
-            readings = sorted([(match.start(), match.end(), self._entries[match.lastgroup])
+            readings = sorted([(match.start(), match.end(),
+                                self._native_entries[match.lastgroup].get(language, self._entries[match.lastgroup]))
                                for match in matches] + compounds)
 
-            def plain(value, offset):
-                # Keep the original literal boundaries when its final extension
-                # uses a dictionary reading, so underscores and dots survive.
-                spans = [(max(0, start-offset), min(len(value), end-offset))
-                         for start, end in protected
-                         if start < offset+len(value) and end > offset]
-                value = self._expand_literal_symbols(value, language, spans)
+            def plain(value, offset, following=""):
+                value = expand_literals(value, offset)
                 pieces = _LATIN.split(value) if language in ("zh", "ja", "ru", "th") else [value]
                 for piece in pieces:
                     if piece.strip():
                         lang = "en" if language in ("zh", "ja", "ru", "th") and _LATIN.fullmatch(piece) else language
-                        parts.append(self._native(piece, lang))
+                        phones = self._native(piece, lang)
+                        if following and (lang in self._unstressed_linkers or lang in self._mandatory_liaisons):
+                            linker = re.search(r'''([^\W\d_]+)[\s"“«(]*$''', piece)
+                            if linker:
+                                word = linker[1].lower()
+                                unstressed = word in self._unstressed_linkers.get(lang, ())
+                                liaison = self._mandatory_liaisons.get(lang, {}).get(word, "")
+                                if (following.lstrip(" ˈˌ")[:1] not in _VOWEL_ONSETS
+                                        or piece[linker.start(1)+len(linker[1]):].strip()):
+                                    liaison = ""
+                                def connect(match):
+                                    token = match[1].replace("ˈ", "").replace("ˌ", "") if unstressed else match[1]
+                                    if liaison and not token.endswith(liaison):
+                                        token += liaison
+                                    return token + match[2]
+                                # Keep weak words and mandatory links across dictionary insertions.
+                                phones = re.sub(r'''([^\s"“”«»()]+)([\s"“”«»()]*)$''', connect, phones)
+                        parts.append(phones)
 
             for start, end, phones in readings:
                 prefix = spoken[cursor:start]
-                article = re.search(r"(?<!\w)[lL]['’]$", prefix) if language == "fr" else None
-                # French l' is an elided article attached to the following
-                # name, not an isolated letter L for eSpeak to spell aloud.
-                plain(prefix[:article.start()] if article else prefix, cursor)
-                parts.append(("l" if article else "") + phones)
+                clitic = re.search(r"(?<!\w)([lLdD])['’]$", prefix) if language == "fr" else None
+                # Elided l'/d' attach to the name; do not spell them as letters.
+                plain(prefix[:clitic.start()] if clitic else prefix, cursor, following=phones)
+                parts.append((clitic[1].lower() if clitic else "") + phones)
                 cursor = end
             plain(spoken[cursor:], cursor)
             return " ".join(parts)
