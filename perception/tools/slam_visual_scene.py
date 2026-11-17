@@ -10,7 +10,9 @@ import cv2
 import numpy as np
 
 
-def generate(root, origin=(0., 0., 0.), *, resume=False):
+def generate(root, origin=(0., 0., 0.), *, resume=False, continuation_frames=0):
+    if type(continuation_frames) is not int or continuation_frames<0:
+        raise ValueError('continuation_frames must be a nonnegative integer')
     root = Path(root); root.mkdir(parents=True, exist_ok=True)
     (root/'origin.txt').write_text(' '.join(map(str, origin))+'\n')
     rng = np.random.default_rng(371)
@@ -42,6 +44,9 @@ def generate(root, origin=(0., 0., 0.), *, resume=False):
     route += [(float(x), False, 0., 'second_visual_only') for x in np.arange(.2, 1.5, .18)]
     if resume:
         route = [(i*.18, i>=10, 100+i*.18, 'depth_gap' if i in (4,5) else 'reopened') for i in range(16)]
+    last_x,last_external,last_odom,last_phase=route[-1]
+    route += [(last_x+(i+1)*.18,last_external,last_odom+(i+1)*.18 if last_external else 0.,last_phase)
+              for i in range(continuation_frames)]
     with (root/'frames.txt').open('w') as manifest:
         for i, (x, external, odom, phase) in enumerate(route):
             z = np.full_like(rx, 3.)
@@ -66,5 +71,6 @@ if __name__ == '__main__':
     parser.add_argument('output')
     parser.add_argument('--origin', nargs=3, type=float, default=(0.,0.,0.))
     parser.add_argument('--resume', action='store_true', help='16-frame saved-map recovery scene')
+    parser.add_argument('--continuation-frames',type=int,default=0,help='append fixed .18 m observations after the existing route')
     args=parser.parse_args()
-    print(generate(args.output,args.origin,resume=args.resume))
+    print(generate(args.output,args.origin,resume=args.resume,continuation_frames=args.continuation_frames))
