@@ -121,7 +121,24 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  }
  
  void OdometryROS::callbackIMU(const sensor_msgs::msg::Imu::SharedPtr msg)
-@@ -660,6 +704,7 @@
+@@ -610,14 +654,8 @@
+ 		}
+ 		previousClockTime_ = clockNow;
+ 
+-		if(previousStamp_ >= rtabmap_conversions::timestampFromROS(header.stamp))
+-		{
+-			RCLCPP_WARN(this->get_logger(), "Odometry: Detected not valid consecutive stamps (previous=%fs new=%fs). "
+-					"New stamp should be always greater than previous stamp. This new data is ignored.",
+-					previousStamp_, rtabmap_conversions::timestampFromROS(header.stamp));
+-			return;
+-		}
+-		else if(maxUpdateRate_ > 0 &&
++		// Preserve capture times; native odometry handles invalid dt without a motion guess.
++		if(maxUpdateRate_ > 0 &&
+ 				previousStamp_ > 0 &&
+ 				(rtabmap_conversions::timestampFromROS(header.stamp)-previousStamp_+(expectedUpdateRate_ > 0?1.0/expectedUpdateRate_:0)) < 1.0/maxUpdateRate_)
+ 		{
+@@ -660,6 +698,7 @@
  								groundTruthFrameId_.c_str(),
  								groundTruthBaseFrameId_.c_str());
  						odometry_->reset(groundTruth);
@@ -129,7 +146,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  					}
  				}
  			}
-@@ -747,7 +792,37 @@
+@@ -747,7 +786,37 @@
  	rtabmap::Transform pose;
  	if(!tooOldPreviousData)
  	{
@@ -168,7 +185,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  	}
  	if(!pose.isNull())
  	{
-@@ -1043,6 +1118,7 @@
+@@ -1043,6 +1112,7 @@
  					odometry_->reset(tfPose);
  				}
  			}
@@ -176,7 +193,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  			// Keep resetting if the odometry cannot initialize in next updates (e.g., lack of features).
  			// This will make sure we keep updating to latest guess pose.
  			if(resetCurrentCount_ == 0) {
-@@ -1237,6 +1313,7 @@
+@@ -1237,6 +1307,7 @@
  {
  	UScopeMutex lock(dataMutex_);
  	odometry_->reset(pose);

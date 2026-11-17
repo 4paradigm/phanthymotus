@@ -13,10 +13,21 @@
 
 int main(int argc, char **argv)
 {
-    if(argc != 4) return 2;
+    if(argc != 4 && argc != 5) return 2;
     ULogger::setType(ULogger::kTypeConsole);
     ULogger::setLevel(ULogger::kWarning);
     const std::string root=argv[1], output=argv[2], mode=argv[3];
+    std::map<int,int> imageMask;
+    if(mode=="scan_mask")
+    {
+        if(argc!=5) throw std::runtime_error("scan_mask needs the observed image-availability mask");
+        std::ifstream mask(argv[4]); int frame,available;
+        while(mask>>frame>>available) imageMask[frame]=available;
+        if(imageMask.empty()) throw std::runtime_error("empty image-availability mask");
+    }
+    const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
+        mode=="scan_mask" || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
+        mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm";
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
     p["Reg/Strategy"]="1"; p["Icp/Strategy"]="0"; p["Optimizer/Strategy"]="0";
@@ -26,52 +37,224 @@ int main(int argc, char **argv)
     p["RGBD/ProximityPathMaxNeighbors"]="1"; p["Kp/MaxFeatures"]="500";
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
+    if(nativeRecovery)
+    {
+        p["RGBD/NeighborLinkRefining"]="false"; p["RGBD/LoopCovLimited"]="true";
+        p["RGBD/ProximityOdomGuess"]="false"; // The RGB session's production configuration.
+    }
     rtabmap::Rtabmap map; map.init(p, output+".db");
+    const auto restoredNodes=map.getLocalOptimizedPoses().size();
+    if(mode=="resume" && restoredNodes==0)
+        throw std::runtime_error("cold recovery regression requires an existing optimized map");
+    rtabmap::Transform historyExternal;
+    if(mode=="history_without_cache")
+    {
+        const auto *last=map.getMemory()->getLastWorkingSignature();
+        if(!last || restoredNodes==0) throw std::runtime_error("missing historical map fixture");
+        historyExternal=last->getPose();
+        map.setOptimizedPoses({},{}); // Native LTM cold loading can reject the optimized cache.
+    }
     motus::VisualRecovery recovery(p);
     std::ifstream manifest(root+"/frames.txt");
     if(!manifest) throw std::runtime_error("missing scene manifest");
     std::ofstream evidence(output+".jsonl");
     int i, hasPose; float externalX, truthX; std::string phase;
+    bool gapInjected=false, resetGapInjected=false, bridgePending=false; int bridgeRelocalizations=0;
+    cv::Mat previousDepth; float previousTruthX=0, previousExternalX=0;
+    int scanOnlyFrames=0, retainedScanClosures=0, overwrittenEvents=0;
     while(manifest >> i >> hasPose >> externalX >> truthX >> phase)
     {
-        if(mode!="recovery" && mode!="resume" && !hasPose) break;
+        if(mode!="recovery" && mode!="recovery_gap" && mode!="recovery_event" && mode!="resume" && !hasPose) break;
         if(phase=="depth_gap") continue; // Source interruption: no metric observation.
         cv::Mat rgb=cv::imread(root+"/"+std::to_string(i)+".jpg");
         cv::Mat depth=cv::imread(root+"/"+std::to_string(i)+".png", cv::IMREAD_UNCHANGED);
         if(rgb.empty() || depth.empty()) throw std::runtime_error("missing scene frame");
+        const bool unpaired=mode=="fallback_unpaired" && i==1;
+        if(unpaired) externalX-=200.f;
+        const bool visualLost=mode=="fallback_lost" && i==2;
+        if(visualLost)
+        {
+            rgb.setTo(cv::Scalar::all(0)); depth=previousDepth;
+            truthX=previousTruthX; externalX=previousExternalX-200.f;
+        }
+        else if(mode=="fallback_lost" && i>2) externalX-=200.f;
+        previousDepth=depth.clone(); previousTruthX=truthX; previousExternalX=externalX;
         const double f=260.;
         rtabmap::CameraModel camera(f,f,rgb.cols/2.,rgb.rows/2.,rtabmap::Transform::getIdentity(),0.,rgb.size());
-        cv::Mat scan(1,depth.total(),CV_32FC3); int count=0;
+        cv::Mat scan(1,depth.total(),CV_32FC3), projectedDepth(depth.size(),CV_32F); int count=0;
         for(int v=0;v<depth.rows;++v) for(int u=0;u<depth.cols;++u)
         {
             float z=depth.at<unsigned short>(v,u)/1000.f;
+            projectedDepth.at<float>(v,u)=z;
             if(z>0) scan.at<cv::Vec3f>(0,count++)=cv::Vec3f((u-rgb.cols/2.f)*z/f,(v-rgb.rows/2.f)*z/f,z);
         }
-        rtabmap::SensorData data((mode=="no_rgb" || (phase=="rgb_gap" || phase=="external_rgb_gap"))?cv::Mat():rgb,(mode=="no_rgb" || (phase=="rgb_gap" || phase=="external_rgb_gap"))?cv::Mat():depth,camera,0,double(i+1));
+        if(mode=="resume") depth=projectedDepth; // Production SensorData carries 32FC1 projected depth.
+        const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
+        const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
+        const bool noImages=mode=="no_rgb" || mode=="history_without_cache" || phase=="rgb_gap" || phase=="external_rgb_gap" ||
+            gap || resetGap || (mode=="fallback_cov" && i==1) ||
+            (mode=="scan_mask" && !imageMask.at(i));
+        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,double(i+1));
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
+        if(mode=="history_without_cache") ext=historyExternal;
+        const auto nodesBefore=map.getLocalOptimizedPoses().size();
         auto started=std::chrono::steady_clock::now();
-        bool accepted=(mode=="recovery" || mode=="resume" || mode=="rgb" || mode=="ltm")?
-            recovery.process(map,data,ext,cv::Mat::eye(6,6,CV_64F)*.01):
+        bool accepted=nativeRecovery?
+            recovery.process(map,data,ext,cv::Mat::eye(6,6,CV_64F)*(mode=="resume"?1.:.01)):
             map.process(data,ext,cv::Mat::eye(6,6,CV_64F)*.01);
         double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+        if(mode=="recovery_event" && recovery.state()==motus::VisualRecovery::Localized)
+        {
+            // Fault injection into the publication view only: the graph/geometry are unchanged.
+            auto &published=const_cast<rtabmap::Statistics &>(map.getStatistics());
+            published.setLoopClosureId(0);
+            published.addStatistic(rtabmap::Statistics::kLoopVisual_inliers(),0.f);
+            ++overwrittenEvents;
+        }
         const auto &s=map.getStatistics(); auto pose=map.getLastLocalizationPose();
         auto stat=[&](const std::string &key) {auto j=s.data().find(key);return j==s.data().end()?0.f:j->second;};
         evidence << "{\"frame\":"<<i<<",\"phase\":\""<<phase<<"\",\"accepted\":"<<accepted
                  <<",\"ref\":"<<s.refImageId()<<",\"loop\":"<<s.loopClosureId()<<",\"proximity\":"<<s.proximityDetectionId()
                  <<",\"truth_x\":"<<truthX<<",\"x\":"<<(pose.isNull()?9999:pose.x())
-                 <<",\"state\":"<<recovery.state()<<",\"relocations\":"<<recovery.relocalizations()
+                 <<",\"state\":"<<recovery.state()<<",\"odom_null\":"<<recovery.odom().isNull()<<",\"relocations\":"<<recovery.relocalizations()
+                 <<",\"recovery_node\":"<<recovery.recoveryNode()<<",\"recovery_anchor\":"<<recovery.recoveryAnchor()
+                 <<",\"recovery_inliers\":"<<recovery.recoveryInliers()
                  <<",\"visual_inliers\":"<<recovery.visualInliers()<<",\"nodes\":"<<map.getLocalOptimizedPoses().size()
                  <<",\"hypothesis\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_id())
                  <<",\"hypothesis_value\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_value())
                  <<",\"rejected\":"<<stat(rtabmap::Statistics::kLoopRejectedHypothesis())
                  <<",\"loop_inliers\":"<<stat(rtabmap::Statistics::kLoopVisual_inliers())
                  <<",\"loop_matches\":"<<stat(rtabmap::Statistics::kLoopVisual_matches())
+                 <<",\"generic_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_visually())
+                 <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
+        if(mode=="history_without_cache")
+        {
+            if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+               map.getMemory()->isIncremental())
+                throw std::runtime_error("historical map without optimized cache must not trust a new external origin");
+            map.close(false); return 0;
+        }
+        if(nativeRecovery)
+        {
+            if(mode=="resume" && i==0 && recovery.state()!=motus::VisualRecovery::Localized)
+                throw std::runtime_error("unposed synchronous cold query did not recover on native visual geometry");
+            if(recovery.state()==motus::VisualRecovery::Searching)
+                for(const auto &link:s.odomCacheConstraints())
+                    if(link.second.type()==rtabmap::Link::kNeighbor)
+                        throw std::runtime_error("absent odometry must not create query motion constraints");
+            if(recovery.state()==motus::VisualRecovery::Localized)
+            {
+                const auto *signature=map.getMemory()->getSignature(recovery.recoveryNode());
+                if(recovery.recoveryNode()!=map.getLastLocationId() || recovery.recoveryAnchor()<=0 ||
+                   recovery.recoveryInliers()<20 || !signature ||
+                   !signature->hasLink(recovery.recoveryAnchor(),rtabmap::Link::kGlobalClosure))
+                    throw std::runtime_error("recovery event lacks committed native global visual geometry");
+                if(mode=="recovery_event" && (s.loopClosureId()!=0 || stat(rtabmap::Statistics::kLoopVisual_inliers())!=0))
+                    throw std::runtime_error("publication statistics overwrite was not exercised");
+            }
+            else if(recovery.recoveryNode()!=0 || recovery.recoveryAnchor()!=0 || recovery.recoveryInliers()!=0)
+                throw std::runtime_error("recovery event leaked into a later non-localized observation");
+        }
+        if(mode=="scan_mask" && noImages && accepted)
+        {
+            ++scanOnlyFrames;
+            const auto *signature=map.getMemory()->getLastWorkingSignature();
+            float factor=rtabmap::Parameters::defaultRGBDProximityMergedScanCovFactor();
+            rtabmap::Parameters::parse(map.getParameters(),"RGBD/ProximityMergedScanCovFactor",factor);
+            const auto &odomInfo=map.getMemory()->getOdomMaxInf();
+            for(const auto &edge:signature->getLinks()) if(edge.second.type()==rtabmap::Link::kLocalSpaceClosure)
+            {
+                std::cout<<"scan-only type2 "<<signature->id()<<"->"<<edge.first<<" info="
+                    <<edge.second.infMatrix().at<double>(0,0)<<" native_factor="<<factor<<std::endl;
+                if(stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())>0)
+                {
+                    ++retainedScanClosures;
+                    for(int axis=0;axis<6;++axis)
+                        if(edge.second.infMatrix().at<double>(axis,axis)>odomInfo.at(axis)/factor*(1.+1e-6))
+                            throw std::runtime_error("scan multi closure omitted the stock native covariance factor");
+                }
+            }
+            if(stat(rtabmap::Statistics::kProximitySpace_detections_added_visually())>0)
+                throw std::runtime_error("scan-only fallback entered the generic visual-proximity registration path");
+        }
+        if(gap || resetGap || visualLost || unpaired)
+        {
+            if(gap) gapInjected=true; else if(resetGap) resetGapInjected=true;
+            bridgePending=true; bridgeRelocalizations=recovery.relocalizations();
+            if(accepted || !recovery.odom().isNull() || recovery.state()!=motus::VisualRecovery::Searching ||
+               map.getLocalOptimizedPoses().size()!=nodesBefore || !map.getMemory()->isIncremental())
+                throw std::runtime_error("unverified external reset must not map or discard the established visual gauge");
+            if(unpaired) {bridgePending=false; break;}
+        }
+        else if(bridgePending)
+        {
+            if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+               recovery.relocalizations()!=bridgeRelocalizations)
+                throw std::runtime_error("the next tracked RGB must bridge the new external origin without relocalizing");
+            bridgePending=false;
+        }
+        if(mode=="fallback_cov" && i==1)
+        {
+            const auto &parameters=map.getParameters();
+            const auto *signature=map.getMemory()->getLastWorkingSignature();
+            if(!accepted || map.getLocalOptimizedPoses().size()<=nodesBefore || !signature)
+                throw std::runtime_error("scan fallback with external odometry must keep mapping");
+            const auto &link=signature->getLinks().begin()->second;
+            std::cout << "fallback covariance=" << link.transVariance() <<
+                " refining=" << parameters.at("RGBD/NeighborLinkRefining") <<
+                " loopCovLimited=" << parameters.at("RGBD/LoopCovLimited") << std::endl;
+            if(std::abs(signature->getPose().x()-externalX)>1e-6 ||
+               std::abs(link.transVariance()-.01)>1e-8 ||
+               parameters.at("RGBD/NeighborLinkRefining")!="false" ||
+               parameters.at("RGBD/LoopCovLimited")!="true")
+                throw std::runtime_error("optional RGB loss must preserve supplied neighbor covariance and loop weighting");
+            break;
+        }
+        if(mode=="fallback_lost" && i==3) break;
     }
+    if(mode=="recovery_event" && overwrittenEvents==0)
+        throw std::runtime_error("native recovery event was not tested after publication statistics reset");
+    if(mode=="scan_mask" && (scanOnlyFrames<2 || retainedScanClosures==0))
+        throw std::runtime_error("observed scan-only mask did not retain native ICP multi closures");
+    if(mode=="fallback_unpaired" && i!=1)
+        throw std::runtime_error("unpaired first visual registration/external origin regression was not exercised");
+    if(mode=="fallback_lost" && (i!=3 || bridgePending))
+        throw std::runtime_error("valid blank RGB/external origin recovery regression was not exercised");
+    if(mode=="recovery_gap" && (!gapInjected || !resetGapInjected || bridgePending))
+        throw std::runtime_error("missing RGB/external origin recovery regression was not exercised");
+    if(mode=="resume" && (recovery.relocalizations()==0 ||
+       map.getLocalOptimizedPoses().size()<restoredNodes+3 || recovery.state()!=motus::VisualRecovery::External))
+        throw std::runtime_error("cold recovery did not continue mapping across the new external origin");
+    const auto beforeFinalize=map.getLocalOptimizedPoses();
+    std::map<int,rtabmap::Transform> complete;
+    std::multimap<int,rtabmap::Link> completeLinks;
+    map.getGraph(complete,completeLinks,false,true);
+    if(mode=="ltm" && complete.size()<=beforeFinalize.size())
+        throw std::runtime_error("LTM finalization regression did not evict graph nodes");
     motus::VisualRecovery::finalize(map);
+    if(mode=="finalize_cache")
+        for(const auto &pose:beforeFinalize)
+            if(!map.getLocalOptimizedPoses().count(pose.first) ||
+               (pose.second.inverse()*map.getLocalOptimizedPoses().at(pose.first)).getNorm()>1e-6f)
+                throw std::runtime_error("finalization moved an already complete optimized map");
+    if(mode=="ltm")
+        for(const auto &pose:complete)
+            if(!map.getLocalOptimizedPoses().count(pose.first))
+                throw std::runtime_error("finalization omitted a connected LTM graph node");
+    const auto finalized=map.getLocalOptimizedPoses();
     map.exportPoses(output+"-optimized.txt",true,true,1);
     map.exportPoses(output+"-raw.txt",false,true,1);
     map.close();
+    if(mode=="finalize_cache")
+    {
+        rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
+        for(const auto &pose:finalized)
+            if(!reopened.getLocalOptimizedPoses().count(pose.first) ||
+               (pose.second.inverse()*reopened.getLocalOptimizedPoses().at(pose.first)).getNorm()>1e-6f)
+                throw std::runtime_error("saved optimized cache changed on cold loading");
+        reopened.close(false);
+    }
 }

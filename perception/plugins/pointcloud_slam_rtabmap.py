@@ -73,10 +73,10 @@ def mapping_parameters(database_path, namespace, settings):
 
 
 def native_overrides(values):
-    # Verified against pinned df6300e Parameters.h, RGBD section. Empty by
+    # Verified against pinned df6300e Parameters.h. Empty by
     # default: preserve native defaults and the scan-only/ICP/TORO pipeline.
     if not isinstance(values,dict):raise ValueError('native_parameters must be an object')
-    allowed={'RGBD/LinearUpdate','RGBD/AngularUpdate'}
+    allowed={'RGBD/LinearUpdate','RGBD/AngularUpdate','Rtabmap/DetectionRate'}
     result={}
     for key,value in values.items():
         if key not in allowed or isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0:

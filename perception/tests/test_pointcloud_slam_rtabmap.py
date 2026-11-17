@@ -159,6 +159,9 @@ def test_native_defaults_preserved_and_whitelist_rejects_unknown(tmp_path):
     changed=mapping_parameters(tmp_path/'map.db','/scope',dict(settings,native_parameters={'RGBD/LinearUpdate':.2}))
     assert changed['RGBD/LinearUpdate']=='0.2'
     assert {k:v for k,v in changed.items() if k!='RGBD/LinearUpdate'}==before
+    scheduled=mapping_parameters(tmp_path/'map.db','/scope',dict(settings,native_parameters={'Rtabmap/DetectionRate':0.}))
+    assert scheduled['Rtabmap/DetectionRate']=='0.0'
+    assert {k:v for k,v in scheduled.items() if k!='Rtabmap/DetectionRate'}==before
     with pytest.raises(ValueError):mapping_parameters(tmp_path/'map.db','/scope',dict(settings,native_parameters={'Optimizer/Strategy':2}))
 
 

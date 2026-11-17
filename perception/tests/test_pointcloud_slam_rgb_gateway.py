@@ -288,7 +288,7 @@ def test_no_pose_and_distinct_capture_times_does_not_invent_motion(calibrated_no
     image(n, 1110)
     assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
     n._cloud(cloud(1_100_000_000))
-    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+    assert not _wait_until(lambda: n.status()['forwarded_clouds'] == 2, timeout=.05)
     msg = published(n, '/sensor_data')[0].raw_messages[-1]
     assert not msg.left.data
     assert 'motion' in n.status()['rgb_input']['reason']
@@ -321,6 +321,19 @@ def test_native_visual_tracking_status_requires_native_recovery_evidence(calibra
     assert n.status()['native_recovery'] == dict(state='visual_tracking', relocalizations=1, visual_inliers=47)
     assert n.status()['native_loop_closures'] == 0
     assert n.status()['native_proximity_detections'] == 1
+
+
+def test_native_relocalization_match_is_separate_from_local_visual_inliers(calibrated_node):
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n._active is not None)
+    n._native_info(NS(ref_id=8,loop_closure_id=0,proximity_detection_id=0,
+        stats_keys=['Motus/RecoveryState/','Motus/Relocalizations/','Motus/VisualInliers/',
+                    'Motus/RecoveryNode/','Motus/RecoveryAnchor/','Motus/RecoveryInliers/'],
+        stats_values=[2.,1.,141.,8.,2.,43.]),n._active)
+    status=n.status()['native_recovery']
+    assert status['relocalization_node']==8 and status['relocalization_anchor']==2
+    assert status['relocalization_inliers']==43 and status['visual_inliers']==141
+    assert n.status()['native_loop_closures']==0
 
 
 def test_saved_map_can_receive_pose_less_observations_before_any_new_external_pose(tmp_path, monkeypatch):
@@ -441,3 +454,316 @@ def test_pose_less_inflight_cloud_waits_for_its_pending_decode(calibrated_node, 
     message=published(n,'/sensor_data')[0].raw_messages[-1]
     assert message.left.data and message.right.data
     assert len(NativeProcess.instances)==1
+
+
+def _local_motion(node):
+    from plugins.pointcloud_slam_motion import MotionTimeline
+    motion=NS(timeline=MotionTimeline(12),submit=lambda *args:None,close=lambda:None,
+              status=lambda:{'state':'estimating'})
+    node._motion=motion
+    return motion.timeline
+
+
+def _motion_result(timeline,stamp,x):
+    from test_pointcloud_slam_motion import result
+    pose,info=result(stamp,x)
+    timeline.observe('pose',pose);timeline.observe('info',info)
+
+
+def test_pose_less_async_projection_uses_measured_local_motion_without_global_pose(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node
+    send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    timeline=_local_motion(n)
+    _motion_result(timeline,1_000_000_000,100.)
+    _motion_result(timeline,1_200_000_000,100.2)
+    lost=odom(1100);lost['pose']=None
+    n._odom(NS(data=json.dumps(lost)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+    msg=published(n,'/sensor_data')[0].raw_messages[-1]
+    assert msg.left.data and msg.right.data
+    assert msg.left.header.stamp.nanosec==110_000_000
+    assert msg.laser_scan.header.stamp.nanosec==100_000_000
+    assert msg.local_transform[0].translation.x==pytest.approx(.01)
+    assert published(n,'/odom')[0].raw_messages[-1].pose.pose.orientation.w==0.
+    assert len(NativeProcess.instances)==1
+
+
+def test_async_lost_observation_waits_boundedly_for_actual_motion_result(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node
+    send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    timeline=_local_motion(n)
+    lost=odom(1100);lost['pose']=None
+    n._odom(NS(data=json.dumps(lost)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    n._cloud(cloud(1_100_000_000))
+    assert not _wait_until(lambda:n.status()['forwarded_clouds']>1,timeout=.05)
+    assert len(n._motion_waiting)==1
+    _motion_result(timeline,1_000_000_000,0.)
+    _motion_result(timeline,1_200_000_000,.2)
+    n._wake.set()
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+    assert published(n,'/sensor_data')[0].raw_messages[-1].left.data
+    n.freeze_capture()
+    assert not n._motion_waiting and not n._rgb_reservations
+
+
+def test_waiting_async_observation_retains_its_numeric_rgb_mount(calibrated_node, monkeypatch):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    timeline=_local_motion(n)
+    mount=np.eye(4);mount[0,3]=.02
+    monkeypatch.setattr(n._rgb,'capture_mount',lambda *args:mount.copy())
+    lost=odom(1100);lost['pose']=None;n._odom(NS(data=json.dumps(lost)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda:len(n._motion_waiting)==1)
+    mount[0,3]=.4
+    _motion_result(timeline,1_000_000_000,0.)
+    _motion_result(timeline,1_200_000_000,.2)
+    n._wake.set()
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+    msg=published(n,'/sensor_data')[0].raw_messages[-1]
+    assert msg.local_transform[0].translation.x==pytest.approx(.03)
+
+
+def test_motion_waits_and_mount_snapshots_are_bounded_and_cleared_on_stop(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    _local_motion(n)
+    lost=odom(1100);lost['pose']=None;n._odom(NS(data=json.dumps(lost)))
+    for index,ms in enumerate(range(1100,2100,100),1):
+        image(n,ms+10)
+        assert _wait_until(lambda:n._rgb.info()['decoded']==index)
+        n._cloud(cloud(ms*1_000_000))
+    assert _wait_until(lambda:len(n._motion_waiting)>0)
+    assert len(n._motion_waiting)<=n.stream.max_pending
+    assert len(n._motion_mounts)<=n.stream.max_pending*3
+    n.freeze_capture()
+    assert not n._motion_waiting and not n._motion_mounts and not n._rgb_reservations
+
+
+def test_cloud_reaches_local_motion_before_an_external_pose_exists(calibrated_node):
+    n=calibrated_node
+    observed=[]
+    _local_motion(n)
+    n._motion.submit=lambda stamp,points,matrix:observed.append((stamp,points,matrix))
+    n._cloud(cloud(1_100_000_003))
+    assert len(observed)==1 and observed[0][0]==1_100_000_003
+    np.testing.assert_array_equal(observed[0][1],[[1.,2.,3.]])
+    np.testing.assert_array_equal(observed[0][2],np.eye(4))
+    assert not published(n,'/sensor_data')
+
+
+def test_valid_external_pose_keeps_scan_mapping_when_async_motion_is_unavailable(calibrated_node):
+    n=calibrated_node
+    _local_motion(n)
+    image(n,1010)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    msg=published(n,'/sensor_data')[0].raw_messages[-1]
+    assert msg.laser_scan.data and not msg.left.data
+    assert not n._motion_waiting
+    assert published(n,'/odom')[0].raw_messages[-1].pose.pose.orientation.w==1.
+
+
+def test_external_recovery_discards_waiting_unlocated_frames(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    timeline=_local_motion(n)
+    missing=odom(1100);missing['pose']=None
+    n._odom(NS(data=json.dumps(missing)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda:len(n._motion_waiting)==1)
+    send(n,1200)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+    _motion_result(timeline,1_000_000_000,0.)
+    _motion_result(timeline,1_200_000_000,.2)
+    n._wake.set()
+    assert not _wait_until(lambda:n.status()['forwarded_clouds']>2,timeout=.1)
+    assert not n._motion_waiting and not n._motion_mounts
+
+
+def test_lost_pose_retains_a_slow_projection_without_extending_the_wait_budget(calibrated_node,monkeypatch):
+    from test_pointcloud_slam_stream import odom
+    import plugins.pointcloud_slam_rgb as rgb
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    missing=odom(1100);missing['pose']=None
+    n._odom(NS(data=json.dumps(missing)))
+    image(n,1100)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    entered,release=threading.Event(),threading.Event()
+    original=rgb.project_depth
+    def delayed(*args):
+        entered.set()
+        assert release.wait(2)
+        return original(*args)
+    monkeypatch.setattr(rgb,'project_depth',delayed)
+    try:
+        n._cloud(cloud(1_100_000_000))
+        assert entered.wait(1)
+        assert _wait_until(lambda:n.status()['rgb_preparation']['timeouts']>0)
+        assert n.status()['forwarded_clouds']==1
+        release.set();n._wake.set()
+        assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+        msg=published(n,'/sensor_data')[0].raw_messages[-1]
+        assert msg.left.data and msg.right.data
+        assert n.status()['rgb_preparation']['budget_ms']==20
+    finally:release.set()
+
+
+def test_map_has_an_internal_archive_id_without_a_producer_segment_label(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node
+    sample=odom(1000)
+    sample['vendor']['motus_slam'].pop('segment_id')
+    n._odom(NS(data=json.dumps(sample)))
+    n._cloud(cloud(1_000_000_000))
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    assert n._active['segment_id']=='segment_0'
+    n.close()
+    assert n.artifacts()['segments'][0]['segment_id']=='segment_0'
+
+
+@pytest.mark.parametrize('completion_during_publish',[False,True])
+def test_ready_projection_is_not_discarded_by_an_older_unbracketed_observation(calibrated_node,monkeypatch,completion_during_publish):
+    from test_pointcloud_slam_stream import odom
+    import plugins.pointcloud_slam_rgb as rgb
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    timeline=_local_motion(n)
+    _motion_result(timeline,1_200_000_000,0.)
+    _motion_result(timeline,1_400_000_000,.2)
+    missing=odom(1100);missing['pose']=None
+    n._odom(NS(data=json.dumps(missing)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda:len(n._motion_waiting)==1)
+    entered,release=threading.Event(),threading.Event()
+    original=rgb.project_depth
+    def delayed(*args):
+        entered.set()
+        assert release.wait(2)
+        return original(*args)
+    monkeypatch.setattr(rgb,'project_depth',delayed)
+    race_enabled,raced=threading.Event(),threading.Event()
+    publish=n._publish_pair
+    def finish_before_preparation(segment,item,motion_generation=None):
+        if completion_during_publish and race_enabled.is_set() and item[0]==1_100_000_000 and not raced.is_set():
+            raced.set();release.set()
+            assert _wait_until(lambda:n._rgb_task is not None and n._rgb_task[1].done())
+        return publish(segment,item,motion_generation)
+    monkeypatch.setattr(n,'_publish_pair',finish_before_preparation)
+    try:
+        image(n,1310)
+        assert _wait_until(lambda:n._rgb.info()['decoded']==2)
+        n._cloud(cloud(1_300_000_000))
+        assert entered.wait(1)
+        assert _wait_until(lambda:len(n._motion_waiting)==2)
+        if completion_during_publish:
+            race_enabled.set();n._wake.set()
+            assert _wait_until(raced.is_set)
+        else:release.set()
+        assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+        message=published(n,'/sensor_data')[0].raw_messages[-1]
+        assert message.header.stamp.nanosec==300_000_000
+        assert message.left.data and message.right.data
+        assert message.left.header.stamp.nanosec==310_000_000
+        assert n.status()['rgb_preparation']['budget_ms']==20
+        n.close()
+        assert n._rgb_task is None
+    finally:release.set()
+
+
+def test_external_recovery_prevents_a_cancelled_projection_restoring_old_rgb(calibrated_node,monkeypatch):
+    from test_pointcloud_slam_stream import odom
+    from plugins.pointcloud_slam_motion import MotionPending
+    n=calibrated_node;send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    timeline=_local_motion(n)
+    entered,release=threading.Event(),threading.Event()
+    def missing_motion(*args):
+        entered.set()
+        assert release.wait(2)
+        raise MotionPending('no measured bracket')
+    monkeypatch.setattr(timeline,'relative',missing_motion)
+    missing=odom(1100);missing['pose']=None
+    n._odom(NS(data=json.dumps(missing)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    try:
+        n._cloud(cloud(1_100_000_000))
+        assert entered.wait(1)
+        future=n._rgb_task[1]
+        assert _wait_until(lambda:len(n._motion_waiting)==1)
+        send(n,1200)
+        assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+        assert not n._motion_waiting and 1_100_000_000 not in n._rgb_reservations
+        release.set()
+        assert _wait_until(future.done)
+        assert 1_100_000_000 not in n._rgb_reservations
+        assert 1_100_000_000 not in n._motion_mounts
+        assert len(NativeProcess.instances)==1
+    finally:release.set()
+
+
+def test_newer_null_observation_retires_an_overtaken_waiter_but_accepts_new_smaller_stamp(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n=calibrated_node;timeline=_local_motion(n)
+    send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    missing=odom(1100);missing['pose']=None;n._odom(NS(data=json.dumps(missing)))
+    image(n,1110)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda:len(n._motion_waiting)==1)
+    image(n,1200)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==2)
+    n._cloud(cloud(1_200_000_000))
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==2)
+    _motion_result(timeline,1_000_000_000,0.)
+    _motion_result(timeline,1_200_000_000,.2)
+    n._wake.set()
+    assert not _wait_until(lambda:n.status()['forwarded_clouds']>2,timeout=.15)
+    assert _wait_until(lambda:not n._motion_waiting)
+    assert 1_100_000_000 not in n._rgb_reservations
+    assert 1_100_000_000 not in n._motion_mounts
+    assert n.status()['dropped_runtime_queue']>=1
+    image(n,1050)
+    assert _wait_until(lambda:n._rgb.info()['decoded']==3)
+    n._cloud(cloud(1_050_000_000))
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==3)
+    messages=published(n,'/sensor_data')[0].raw_messages
+    assert [m.header.stamp.sec*10**9+m.header.stamp.nanosec for m in messages]==[
+        1_000_000_000,1_200_000_000,1_050_000_000]
+    assert messages[-1].left.data and messages[-1].right.data
+
+
+def test_publish_lock_retires_an_overtaken_internal_admission(calibrated_node):
+    n=calibrated_node;_local_motion(n);send(n)
+    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
+    with n._lock:
+        n._published_seq=3
+        n._rgb_reservations[1_100_000_000]=object()
+        n._motion_mounts[1_100_000_000]=np.eye(4)
+    n._publish_pair(n._active,(1_100_000_000,cloud(1_100_000_000),None,np.eye(4),1.,2))
+    assert n.status()['forwarded_clouds']==1
+    assert n.status()['dropped_runtime_queue']==1
+    assert 1_100_000_000 not in n._rgb_reservations
+    assert 1_100_000_000 not in n._motion_mounts

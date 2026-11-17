@@ -4,8 +4,10 @@
 #include <rtabmap/core/Rtabmap.h>
 #include <rtabmap/core/Memory.h>
 #include <rtabmap/core/Signature.h>
+#include <rtabmap/core/Graph.h>
 #include <rtabmap/core/Odometry.h>
 #include <rtabmap/core/OdometryInfo.h>
+#include <rtabmap/utilite/ULogger.h>
 #include <memory>
 #include <algorithm>
 #include <cmath>
@@ -17,7 +19,8 @@ public:
     enum State { External=0, Searching=1, Localized=2, VisualTracking=3 };
     explicit VisualRecovery(const rtabmap::ParametersMap & parameters):
         state_(External), missing_(false), waiting_(false), aligned_(false),
-        localizationMode_(false), relocalizations_(0), visualInliers_(0), imageMode_(false), initialized_(false)
+        localizationMode_(false), relocalizations_(0), visualInliers_(0), imageMode_(false), initialized_(false),
+        recoveryNode_(0), recoveryAnchor_(0), recoveryInliers_(0)
     {
         auto p=parameters;
         p["Reg/Strategy"]="0"; // OdometryF2M visual geometry, not scan-only ICP.
@@ -30,20 +33,41 @@ public:
         imageMode_=!refining;
         rtabmap::Parameters::parse(p, "Vis/MinInliers", minInliers_=rtabmap::Parameters::defaultVisMinInliers());
         rtabmap::Parameters::parse(p, "RGBD/OptimizeMaxError", maxError_=rtabmap::Parameters::defaultRGBDOptimizeMaxError());
+        rtabmap::Parameters::parse(p, "RGBD/MaxOdomCacheSize", maxOdomCacheSize_=rtabmap::Parameters::defaultRGBDMaxOdomCacheSize());
     }
     int state() const {return state_;}
     int relocalizations() const {return relocalizations_;}
     int visualInliers() const {return visualInliers_;}
+    int recoveryNode() const {return recoveryNode_;}
+    int recoveryAnchor() const {return recoveryAnchor_;}
+    int recoveryInliers() const {return recoveryInliers_;}
     const rtabmap::Transform & odom() const {return odom_;}
 
     static void finalize(rtabmap::Rtabmap & map)
     {
         std::map<int,rtabmap::Transform> poses;
         std::multimap<int,rtabmap::Link> links;
-        map.getGraph(poses,links,true,true); // Native global optimization, no sensor blobs.
         const auto &local=map.getLocalOptimizedPoses();
-        if(!poses.empty() && (local.empty() || poses.count(local.begin()->first)))
+        map.getGraph(poses,links,false,true); // Connected IDs, including LTM; never use raw poses.
+        float bound=rtabmap::Parameters::defaultRGBDOptimizeMaxError();
+        rtabmap::Parameters::parse(map.getParameters(),"RGBD/OptimizeMaxError",bound);
+        auto valid=[&](const std::map<int,rtabmap::Transform> & p,
+                       const std::multimap<int,rtabmap::Link> & l)
+        {
+            float linear=0,angular=0,linearError=0,angularError=0;
+            rtabmap::graph::computeMaxGraphErrors(p,l,linear,angular,linearError,angularError);
+            return !p.empty() && std::isfinite(linear) && std::isfinite(angular) &&
+                (bound<=0 || (linear<=bound && angular<=bound));
+        };
+        if(std::all_of(poses.begin(),poses.end(),[&](const auto &p){return local.count(p.first);}) &&
+           valid(local,map.getLocalConstraints()))
+            return; // Saving an already complete, validated native graph must not move it.
+        const auto completeSize=poses.size();
+        map.getGraph(poses,links,true,true); // Native global optimization, no sensor blobs.
+        if(valid(poses,links) && (local.empty() || poses.count(local.begin()->first)))
             map.setOptimizedPoses(poses,links);
+        else
+            UWARN("Global finalization failed native graph validation; retaining %zu/%zu cached poses. Complete saved graph is unverified.",local.size(),completeSize);
     }
 
     bool process(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
@@ -51,12 +75,14 @@ public:
                  const std::vector<float> & velocity=std::vector<float>(),
                  const std::map<std::string,float> & statistics=std::map<std::string,float>())
     {
+        recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
         rtabmap::OdometryInfo info;
         rtabmap::Transform visual;
         const bool images=!data.imageRaw().empty() && !data.depthOrRightRaw().empty();
         if(!initialized_)
         {
-            waiting_=!map.getLocalOptimizedPoses().empty();
+            waiting_=!map.getLocalOptimizedPoses().empty() ||
+                (map.getMemory() && map.getMemory()->getLastWorkingSignature());
             initialized_=true;
         }
         if(images!=imageMode_)
@@ -64,9 +90,9 @@ public:
             // Keep the supplied motion covariance. Scan ICP on a weakly
             // constrained surface can replace it with an overconfident edge.
             // Visual candidates still require native visual geometry AND ICP.
-            map.parseParameters({{"RGBD/NeighborLinkRefining",images?"false":"true"},
-                                 {"RGBD/LoopCovLimited",images?"true":"false"},
-                                 {"RGBD/ProximityOdomGuess",images?"false":"true"}});
+            map.parseParameters({{"RGBD/NeighborLinkRefining","false"},
+                                 {"RGBD/LoopCovLimited","true"},
+                                 {"RGBD/ProximityOdomGuess","false"}});
             imageMode_=images;
         }
         if(images) visual=estimator_->process(data, &info);
@@ -80,6 +106,11 @@ public:
         missing_=external.isNull();
         if(waiting_ && aligned_ && !tracked)
         {
+            if(!images)
+            {
+                state_=Searching; odom_.setNull();
+                return false; // No observation reached VO; its established gauge is unchanged.
+            }
             // A localization is not a motion estimate for a later observation.
             aligned_=false;
         }
@@ -110,6 +141,18 @@ public:
                     externalToNative_=predicted*external.inverse(); odom_=predicted;
                 }
             }
+            if(!tracked || lastVisual_.isNull())
+            {
+                // Validate the supplied constraint; never replace it with an ICP pose.
+                const auto *last=map.getMemory()->getLastWorkingSignature();
+                if(last && map.getMemory()->computeIcpTransform(*last,rtabmap::Signature(data),
+                    last->getPose().inverse()*odom_).isNull())
+                {
+                    waiting_=true; aligned_=!lastVisual_.isNull();
+                    if(aligned_) visualToNative_=lastNative_*lastVisual_.inverse();
+                    state_=Searching; odom_.setNull(); return false;
+                }
+            }
             if(tracked)
             {
                 lastVisual_=visual; lastNative_=odom_;
@@ -126,7 +169,9 @@ public:
         if(!localizationMode_)
         {
             // A missing odometry guess cannot justify proximity localization.
-            map.parseParameters({{"Mem/IncrementalMemory","false"}, {"RGBD/ProximityBySpace","false"}});
+            // Native placeholder poses cannot constrain motion between queries.
+            map.parseParameters({{"Mem/IncrementalMemory","false"}, {"RGBD/ProximityBySpace","false"},
+                                 {"RGBD/MaxOdomCacheSize","0"}});
             localizationMode_=true;
         }
         const bool processed=map.process(data,rtabmap::Transform(),covariance,std::vector<float>(),statistics);
@@ -140,6 +185,7 @@ public:
             return processed;
 
         const int anchor=stats.loopClosureId(), query=stats.refImageId();
+        const int localizationInliers=static_cast<int>(inliers->second);
         const auto location=map.getLastLocalizationPose();
         const auto anchorPose=map.getPose(anchor);
         const auto locCovariance=stats.localizationCovariance().clone();
@@ -153,7 +199,8 @@ public:
         // Pinned parseParameters clears optimized poses when returning to mapping.
         // Preserve them explicitly, and promote this SAME geometrically verified
         // observation with a checked native edge into the original graph.
-        map.parseParameters({{"Mem/IncrementalMemory","true"}, {"RGBD/ProximityBySpace","true"}});
+        map.parseParameters({{"Mem/IncrementalMemory","true"}, {"RGBD/ProximityBySpace","true"},
+                             {"RGBD/MaxOdomCacheSize",std::to_string(maxOdomCacheSize_)}});
         localizationMode_=false;
         map.setOptimizedPoses(poses,links);
         odom_=location;
@@ -164,15 +211,17 @@ public:
         }
         const int node=map.getLastLocationId();
         const auto *signature=map.getMemory()->getSignature(node);
-        bool connected=signature && signature->hasLink(anchor);
-        if(!connected)
+        bool connected=signature && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
+        if(!connected && signature && !signature->hasLink(anchor))
             connected=map.addLink(rtabmap::Link(anchor,node,rtabmap::Link::kGlobalClosure,
                 anchorPose.inverse()*location,map.getInformation(locCovariance)));
+        connected=connected && signature && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
         if(!connected)
         {
             map.deleteLastLocation(); map.setOptimizedPoses(poses,links);
             odom_.setNull(); aligned_=false; return false;
         }
+        recoveryNode_=node; recoveryAnchor_=anchor; recoveryInliers_=localizationInliers;
         ++relocalizations_; state_=Localized;
         lastVisual_.setNull();
         if(tracked)
@@ -200,11 +249,12 @@ private:
         return true;
     }
     std::unique_ptr<rtabmap::Odometry> estimator_;
-    int state_, minInliers_;
+    int state_, minInliers_, maxOdomCacheSize_;
     float maxError_;
     bool missing_, waiting_, aligned_, localizationMode_;
     int relocalizations_, visualInliers_;
     bool imageMode_, initialized_;
+    int recoveryNode_, recoveryAnchor_, recoveryInliers_;
     rtabmap::Transform externalToNative_, visualToNative_, odom_;
     rtabmap::Transform lastVisual_, lastNative_;
 };

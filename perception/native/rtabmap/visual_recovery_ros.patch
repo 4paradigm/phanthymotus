@@ -120,7 +120,7 @@
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory... done!");
  }
  
-@@ -4506,6 +4521,15 @@
+@@ -4506,6 +4521,21 @@
  		msg->header.frame_id = mapFrameId_;
  
  		rtabmap_conversions::infoToROS(stats, *msg);
@@ -132,6 +132,12 @@
 +			msg->stats_values.push_back(visualRecovery_->relocalizations());
 +			msg->stats_keys.push_back("Motus/VisualInliers/");
 +			msg->stats_values.push_back(visualRecovery_->visualInliers());
++			msg->stats_keys.push_back("Motus/RecoveryNode/");
++			msg->stats_values.push_back(visualRecovery_->recoveryNode());
++			msg->stats_keys.push_back("Motus/RecoveryAnchor/");
++			msg->stats_values.push_back(visualRecovery_->recoveryAnchor());
++			msg->stats_keys.push_back("Motus/RecoveryInliers/");
++			msg->stats_values.push_back(visualRecovery_->recoveryInliers());
 +		}
  		infoPub_->publish(std::move(msg));
  	}

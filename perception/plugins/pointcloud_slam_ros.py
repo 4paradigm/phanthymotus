@@ -27,6 +27,7 @@ from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
 from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
+from .pointcloud_slam_motion import ScanMotion, MotionPending
 
 
 _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -161,6 +162,11 @@ class RtabmapNode(Node):
         self._project_stop = capture_stop if capture_stop is not None else threading.Event()
         self._worker_stop, self._status_stop, self._wake = threading.Event(), threading.Event(), threading.Event()
         self._queue = deque()
+        self._motion_waiting = deque()
+        self._motion_mounts = OrderedDict()
+        self._motion_generation = 0
+        self._admission_seq = self._published_seq = 0
+        self._motion = None
         self._cloud_ingress = OrderedDict()
         self._rgb_reservations = OrderedDict()
         self._map_decision = None
@@ -181,6 +187,9 @@ class RtabmapNode(Node):
         self._map_topic = PREVIEW_TOPIC
         self._receipt_clock = time.monotonic
         super().__init__('pointcloud_slam_gateway')
+        if self._rgb is not None and self._rgb.camera is not None:
+            self._motion = ScanMotion(self,self._namespace+'/motion',self._settings,
+                                      self._session_dir/'motion',self._wake)
         self._measurement_clock_ns = lambda: getattr(self.get_clock().now(), 'nanoseconds', None)
         keys = ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud', 'max_gap_ms',
                 'max_age_s', 'max_pending', 'max_cloud_points', 'max_measurement_age_ms', 'max_future_skew_ms')
@@ -188,6 +197,7 @@ class RtabmapNode(Node):
             self.stream = SlamStream(**{key: self._settings[key] for key in keys},
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame,
+                on_observation=self._observe_motion if self._motion is not None else None,
                 on_unlocalized_frame=self._queue_frame if self._rgb is not None and self._rgb.camera is not None else None)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
@@ -246,6 +256,11 @@ class RtabmapNode(Node):
 
     def _stopped(self):
         return self._capture_stop.is_set() or self._project_stop.is_set()
+
+    def _observe_motion(self, stamp, cloud, matrix):
+        if not self._stopped() and self._motion is not None:
+            _,_,points=decode_cloud(cloud,max_points=self.stream.max_cloud_points)
+            self._motion.submit(stamp,points,matrix)
 
     def _measurement_now(self):
         return self._measurement_clock_ns() if self.stream.max_measurement_age_ms is not None else None
@@ -349,7 +364,18 @@ class RtabmapNode(Node):
         if len(self._queue) >= self.stream.max_pending:
             self._queue.popleft()
             self._dropped += 1
-        self._queue.append((stamp, cloud, pose, matrix, received))
+        self._admission_seq += 1
+        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq))
+        if pose is not None:
+            # A usable newer observation supersedes optional unlocalized work;
+            # never replay a delayed frame into an already advanced native map.
+            self._dropped += len(self._motion_waiting)
+            self._motion_generation += 1
+            for pending in self._motion_waiting:
+                self._rgb_reservations.pop(pending[0],None)
+                self._motion_mounts.pop(pending[0],None)
+            self._motion_waiting.clear()
+            self._motion_mounts.clear()
         self._wake.set()
 
     def start(self):
@@ -376,6 +402,8 @@ class RtabmapNode(Node):
         self._capture_stop.set()
         with self._lock:
             self._queue.clear()
+            self._motion_waiting.clear()
+            self._motion_mounts.clear()
             self._rgb_reservations.clear()
             self._cloud_ingress.clear()
             self.stream._pending.clear()
@@ -417,7 +445,7 @@ class RtabmapNode(Node):
         process = RtabmapProcess(database, namespace, self._settings,
                                 **({'restored': True} if restored else {}))
         process.validate_runtime()
-        segment = dict(segment_id=restored['segment_id'] if restored else pose.segment_id,
+        segment = dict(segment_id=restored['segment_id'] if restored else pose.segment_id or 'segment_'+str(index),
             frame_id=restored['frame_id'] if restored else '', source_frame_id=pose.frame_id if pose else '',
             pose_reference=getattr(pose, 'pose_reference', None),
             process=process, snapshot=restored.get('snapshot') if restored else None,
@@ -458,8 +486,21 @@ class RtabmapNode(Node):
             self._capture_stop.wait(.05)
         return segment
 
-    def _publish_pair(self, segment, item):
-        stamp, cloud, pose, matrix, received = item
+    def _retire_overtaken(self, item):
+        if item[2] is not None or len(item)<6 or item[5]>=self._published_seq:
+            return False
+        self._rgb_reservations.pop(item[0],None)
+        self._motion_mounts.pop(item[0],None)
+        self._dropped += 1
+        return True
+
+    def _publish_pair(self, segment, item, motion_generation=None):
+        if motion_generation is None:
+            motion_generation = self._motion_generation
+        with self._lock:
+            if self._retire_overtaken(item):
+                return
+        stamp, cloud, pose, matrix, received = item[:5]
         transform = self._TransformStamped()
         transform.header = deepcopy(cloud.header)
         transform.header.frame_id = segment['process'].namespace.lstrip('/') + '/base'
@@ -495,9 +536,11 @@ class RtabmapNode(Node):
         if self.stream.extrinsic_mode == 'dynamic':
             odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
-        native, rgb_generation = self._sensor_data(cloud, pose, matrix) if self._rgb is not None else (cloud, None)
+        native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation) if self._rgb is not None else (cloud, None)
         with self._lock:
-            if self._stopped():
+            if self._stopped() or self._retire_overtaken(item):
+                return
+            if pose is None and motion_generation != self._motion_generation:
                 return
             if pose is not None and not self.stream._poses:
                 return
@@ -520,14 +563,18 @@ class RtabmapNode(Node):
                 segment['cloud_pub'].publish(native)
                 if self._rgb is not None and native.left.data:
                     self._rgb_published += 1
+            if len(item)>5:
+                self._published_seq = max(self._published_seq,item[5])
             self._forwarded += 1
             segment['forwarded'] += 1
             segment['progress'].forward(stamp,self._receipt_clock())
             self._covariance_source = ('native_visual' if pose is None else
                 'upstream' if pose.covariance is not None else 'backend_default')
 
-    def _sensor_data(self, cloud, pose, matrix):
+    def _sensor_data(self, cloud, pose, matrix, motion_generation=None):
         """Scan is mandatory; optional source-timed imagery may fail independently."""
+        if motion_generation is None:
+            motion_generation = self._motion_generation
         stamp, _, points = decode_cloud(cloud, max_points=self.stream.max_cloud_points)
         data = self._SensorData()
         data.header = deepcopy(cloud.header)
@@ -548,21 +595,30 @@ class RtabmapNode(Node):
         self._rgb_mode, self._rgb_reason = 'pointcloud', self._rgb_subscription_error
         if self._rgb_subscription_error:
             return data, None
-        key = (pose.segment_id if pose is not None else None, stamp)
+        key = (pose.segment_id if pose is not None else None, stamp, id(cloud))
         try:
             # At most one optional job exists. A hung decoder/projection cannot
             # queue work or hold required scans beyond this small wait budget.
-            if self._rgb_task is None or self._rgb_task[1].done():
+            task = self._rgb_task
+            ready = task is not None and task[1].done()
+            if ready and task[0] != key:
+                with self._lock:
+                    owned = any(frame[2] is None and frame[1] is task[2]
+                        for pending in (self._queue, self._motion_waiting) for frame in pending)
+                if owned:
+                    raise MotionPending('completed RGB preparation is waiting for its observation')
+            if task is None or ready and (pose is not None or task[0] != key):
                 future = Future()
-                self._rgb_task = (key, future)
+                self._rgb_task = (key, future, cloud)
 
                 def prepare():
                     started = time.perf_counter()
                     try:
-                        result = self._rgb_attachment(cloud.header, stamp, pose, matrix, points)
+                        result = self._rgb_attachment(cloud.header, stamp, pose, matrix, points, motion_generation)
                         with self._lock:
                             self._rgb_preparation_ms.append((time.perf_counter()-started)*1000.)
                         future.set_result(result)
+                        self._wake.set()
                     except Exception as error:
                         future.set_exception(error)
 
@@ -576,21 +632,29 @@ class RtabmapNode(Node):
                 data.left_camera_info, data.local_transform = [info], [local]
                 self._rgb_mode = 'image'
                 return data, generation
+        except MotionPending as error:
+            if self._rgb_task is not None and self._rgb_task[0] == key:
+                self._rgb_task = None
+            if pose is None:raise
+            self._rgb_reason = str(error)
         except TimeoutError:
             with self._lock:
                 self._rgb_timeouts += 1
+            if pose is None:
+                raise MotionPending('optional RGB preparation is pending within the bounded worker')
             self._rgb_reason = 'optional RGB preparation exceeded 20 ms; scan forwarded without images'
         except Exception as error:
             self._rgb_reason = str(error)
         return data, None
 
-    def _rgb_attachment(self, header, stamp, pose, matrix, points):
+    def _rgb_attachment(self, header, stamp, pose, matrix, points, motion_generation=None):
         from sensor_msgs.msg import Image, CameraInfo
         from .pointcloud_slam_alignment import align_pose
         from .pointcloud_slam_rgb import project_depth
         now_ns = self._measurement_clock_ns()
         with self._lock:
             rgb = self._rgb_reservations.pop(stamp, None)
+            saved_mount = self._motion_mounts.pop(stamp, None)
         if rgb is None:
             # Decode may still be running after the cloud left ingress/queue.
             # The caller's same 20ms total budget bounds decode + projection.
@@ -600,18 +664,35 @@ class RtabmapNode(Node):
         with self._lock:
             rgb_stamp, image, generation = rgb
             poses = list(self.stream._poses)
-            mount = self._rgb.capture_mount(rgb_stamp, matrix, now_ns)
+            mount = saved_mount if saved_mount is not None else self._rgb.capture_mount(rgb_stamp, matrix, now_ns)
             if mount is None:
                 return None
         # Express the camera at its real capture time relative to the scan's
         # reference pose. Neither source header is retimed to manufacture sync.
         if pose is None:
             if rgb_stamp != stamp:
-                raise ValueError('relative motion between RGB and cloud captures unavailable without poses')
-            local = mount
+                try:
+                    if self._motion is None:
+                        raise MotionPending('measured motion unavailable without external poses')
+                    local = self._motion.timeline.relative(rgb_stamp,stamp) @ mount
+                except MotionPending:
+                    with self._lock:
+                        if not self._stopped() and motion_generation == self._motion_generation:
+                            self._rgb_reservations[stamp] = rgb
+                            self._motion_mounts[stamp] = mount.copy()
+                            while len(self._motion_mounts)>self.stream.max_pending*3:
+                                expired,_=self._motion_mounts.popitem(last=False)
+                                self._rgb_reservations.pop(expired,None)
+                    raise
+            else:
+                local = mount
         else:
-            rgb_pose = align_pose(poses, rgb_stamp, max_gap_ms=self.stream.max_gap_ms)
-            local = np.linalg.inv(pose_matrix(pose)) @ pose_matrix(rgb_pose) @ mount
+            try:
+                rgb_pose = align_pose(poses, rgb_stamp, max_gap_ms=self.stream.max_gap_ms)
+                local = np.linalg.inv(pose_matrix(pose)) @ pose_matrix(rgb_pose) @ mount
+            except ValueError:
+                if self._motion is None:raise
+                local = self._motion.timeline.relative(rgb_stamp,stamp) @ mount
         depth = project_depth(points[::max(1, (len(points)+99999)//100000)],
                               np.linalg.inv(local) @ matrix, self._rgb.K,
                               self._rgb.width, self._rgb.height)
@@ -649,7 +730,23 @@ class RtabmapNode(Node):
             self._wake.wait(.25)
             self._wake.clear()
             with self._lock:
-                item = self._queue.popleft() if self._queue and not self._stopped() else None
+                item = None
+                if self._rgb_task is not None and self._rgb_task[1].done() and not self._stopped():
+                    # Consume a completed attachment before another pending
+                    # observation can replace its single preparation future.
+                    for pending in (self._queue, self._motion_waiting):
+                        ready = next((i for i, frame in enumerate(pending)
+                            if frame[2] is None and frame[1] is self._rgb_task[2]), None)
+                        if ready is not None:
+                            item = pending[ready]
+                            del pending[ready]
+                            break
+                if item is None:
+                    pending = self._queue if self._queue else self._motion_waiting
+                    item = pending.popleft() if pending and not self._stopped() else None
+                if item is not None and self._retire_overtaken(item):
+                    item = None
+                generation = self._motion_generation
                 if self._queue:
                     self._wake.set()
             if item is None:
@@ -665,7 +762,21 @@ class RtabmapNode(Node):
                     continue
                 if segment['process'].poll() is not None:
                     raise RuntimeError('RTAB-Map process exited (exit ' + str(segment['process'].poll()) + ')')
-                self._publish_pair(segment, item)
+                self._publish_pair(segment, item, generation)
+            except MotionPending as error:
+                with self._lock:
+                    self._rgb_reason=str(error)
+                    if not self._stopped() and generation == self._motion_generation:
+                        if len(self._motion_waiting)>=self.stream.max_pending:
+                            expired=self._motion_waiting.popleft()
+                            self._rgb_reservations.pop(expired[0],None)
+                            self._motion_mounts.pop(expired[0],None)
+                            self._dropped+=1
+                        self._motion_waiting.append(item)
+                    else:
+                        self._rgb_reservations.pop(item[0],None)
+                        self._motion_mounts.pop(item[0],None)
+                        self._dropped+=1
             except ValueError as error:
                 with self._lock:
                     self.stream.last_error = str(error)
@@ -758,7 +869,7 @@ class RtabmapNode(Node):
             if now - segment['last_preview'] < self._settings['preview_interval_s']:
                 return
             segment['last_preview'] = now
-            message = UInt8MultiArray(); message.data = packet
+            message = UInt8MultiArray(); message.data = array('B', packet)
             self._map_pub.publish(message)
 
     def _native_info(self, msg, segment):
@@ -771,6 +882,12 @@ class RtabmapNode(Node):
                 if recovery[0] in range(len(states)):
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],
                         relocalizations=int(recovery[1]), visual_inliers=int(recovery[2]))
+                    match = [values.get(key) for key in
+                        ('Motus/RecoveryNode/', 'Motus/RecoveryAnchor/', 'Motus/RecoveryInliers/')]
+                    if (recovery[0] == 2 and all(isinstance(v, (int, float)) and
+                            math.isfinite(v) and v > 0 for v in match) and match[0] == msg.ref_id):
+                        segment['native_recovery'].update(relocalization_node=int(match[0]),
+                            relocalization_anchor=int(match[1]), relocalization_inliers=int(match[2]))
             if type(msg.ref_id) is not int or msg.ref_id <= 0:
                 return
             identity = (msg.ref_id, msg.loop_closure_id, msg.proximity_detection_id)
@@ -795,6 +912,7 @@ class RtabmapNode(Node):
         with self._lock:
             health = self.stream.status(now=self._receipt_clock(), measurement_now_ns=self._measurement_now())
             queued, stopped, forwarded, dropped = len(self._queue), self._stopped(), self._forwarded, self._dropped
+            motion_pending = len(self._motion_waiting)
             samples = list(self._rgb_preparation_ms)
             rgb_preparation = dict(budget_ms=20, timeouts=self._rgb_timeouts,
                 published_images=self._rgb_published, sample_count=len(samples),
@@ -815,6 +933,8 @@ class RtabmapNode(Node):
         if self._rgb_mode == 'pointcloud' and self._rgb_reason:
             rgb_info.update(state='fallback', reason=self._rgb_reason)
         return dict(health, backend='rtabmap', loop_closure_mode=self._rgb_mode, rgb_input=rgb_info,
+            temporal_motion=self._motion.status() if self._motion is not None else {'state':'disconnected'},
+            temporal_pending=motion_pending,
             rgb_preparation=rgb_preparation,
             native_recovery=deepcopy(active['native_recovery']) if active else {'state': 'unavailable'},
             state='error' if self._runtime_error else
@@ -842,6 +962,7 @@ class RtabmapNode(Node):
 
     def close(self):
         self.freeze_capture()
+        if self._motion is not None:self._motion.close()
         if self._rgb is not None:
             self._rgb.close()
         for lease in self._input_leases:
@@ -854,6 +975,7 @@ class RtabmapNode(Node):
             for worker in (self._worker, self._status_worker):
                 if worker and worker is not threading.current_thread():
                     worker.join()
+            self._rgb_task = None
             for segment in self._segments:
                 if not segment['finalized']:
                     segment['closing'] = True

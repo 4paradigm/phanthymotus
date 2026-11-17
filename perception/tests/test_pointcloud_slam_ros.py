@@ -182,7 +182,7 @@ def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
     assert struct.unpack('<fffBI', bytes(packet[:17])) == (7., 8., 0., 39, 1)
     node.close()
     saved = node.artifacts()['segments'][0]
-    assert saved['frame_id'] == 'native_map' and saved['snapshot'] == packet
+    assert saved['frame_id'] == 'native_map' and saved['snapshot'] == bytes(packet)
     assert [(output['topic'], output['format']) for output in node.outputs()] == [
         ('/pointcloud_slam/map', 'sensor/mapping')]
     assert [publisher.topic for publisher in node.publishers

@@ -14,7 +14,7 @@ class SlamStream:
                  max_gap_ms, max_age_s, max_pending, max_cloud_points,
                  on_frame, max_measurement_age_ms=None,
                  max_future_skew_ms=None, input_contract=None, extrinsic_mode='static',
-                 on_unlocalized_frame=None):
+                 on_unlocalized_frame=None, on_observation=None):
         if any(type(v) is not int or v <= 0 for v in (max_pending, max_cloud_points)):
             raise ValueError('positive bounded capacities required')
         self.max_measurement_age_ms = max_measurement_age_ms
@@ -28,6 +28,7 @@ class SlamStream:
         self.max_pending, self.max_cloud_points = max_pending, max_cloud_points
         self.on_frame = on_frame
         self.on_unlocalized_frame = on_unlocalized_frame
+        self.on_observation = on_observation
         self._segments = OrderedDict()
         self._admitted = 0
         self._poses = deque(maxlen=512)
@@ -146,6 +147,9 @@ class SlamStream:
             _rigid(capture_context.get('child_from_cloud'))
         self._last_cloud_stamp_ns = stamp_ns
         self._last_cloud_received = now if received is None else received
+        if self.on_observation is not None:
+            matrix = _rigid(capture_context['child_from_cloud']) if capture_context is not None else self.extrinsic
+            self.on_observation(stamp_ns, cloud, matrix)
         if len(self._pending) == self.max_pending:
             oldest = self._pending.popleft()
             if self.on_unlocalized_frame is not None:

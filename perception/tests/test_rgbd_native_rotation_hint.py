@@ -50,3 +50,13 @@ def test_rotation_hint_capability_marker_requires_successful_native_build(tmp_pa
     assert succeeded.returncode == 0, succeeded.stdout + succeeded.stderr
     assert marker.is_file()
     assert marker.read_bytes() == b'motus_rotation_hint/1\n'
+
+
+def test_native_odometry_patch_removes_the_wrapper_timestamp_admission_gate():
+    patch = (ROOT / 'native/rtabmap/rotation_hint_ros.patch').read_text()
+    retired_guard = '-\t\tif(previousStamp_ >= rtabmap_conversions::timestampFromROS(header.stamp))'
+    assert retired_guard in patch, 'wrapper must delegate invalid dt to native odometry instead of silently dropping'
+    hunk = next(part for part in patch.split('@@') if retired_guard in part)
+    assert '-\t\t\treturn;' in hunk
+    assert '-\t\telse if(maxUpdateRate_' in hunk
+    assert '+\t\tif(maxUpdateRate_' in hunk
