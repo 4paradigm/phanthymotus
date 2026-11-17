@@ -593,6 +593,8 @@ function _elapsedStr(createdAt) {
 // 一直提醒别设得太频繁；后端的最短间隔 / 每日上限会拒绝过密的设置，错误原样显示。
 
 const _CREATOR_TEXT = { web: '网页建', api: '接口建', model: '模型建' };
+const _WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+let _scheduleSettingsOpen = false;
 
 async function _scheduleFetch(url, method = 'GET', body = null) {
   const opts = { method };
@@ -607,7 +609,7 @@ async function _scheduleFetch(url, method = 'GET', body = null) {
 async function _loadSchedules() {
   const el = document.getElementById('history-schedules');
   const loadId = ++_scheduleLoadId;
-  if (!el.innerHTML) el.innerHTML = '<div class="history-empty">加载中…</div>';
+  if (!el.innerHTML) el.innerHTML = '<div class="sched-empty">加载中…</div>';
   try {
     const data = await _scheduleFetch('/api/schedules');
     if (loadId !== _scheduleLoadId) return;
@@ -615,71 +617,154 @@ async function _loadSchedules() {
     _renderSchedules(el, data);
   } catch {
     if (loadId !== _scheduleLoadId) return;
-    el.innerHTML = '<div class="history-empty">读不到定时任务。确认机器在线后点「刷新」重试。</div>';
+    el.innerHTML = '<div class="sched-empty">读不到定时任务。确认机器在线后点「刷新」重试。</div>';
   }
 }
 
+// 常见的 cron（每天 / 工作日 / 每周几 / 每月几号的某个时刻）和表单里的“重复方式”互相转换；
+// 其他写法算“自定义”，原样显示 cron。
+function _cronParse(cron) {
+  const f = (cron || '').trim().split(/\s+/);
+  if (f.length !== 5 || !/^\d{1,2}$/.test(f[0]) || !/^\d{1,2}$/.test(f[1])) return null;
+  const [mi, hr, dom, mon, dow] = f;
+  if (+mi > 59 || +hr > 23 || mon !== '*') return null;
+  const time = `${hr.padStart(2, '0')}:${mi.padStart(2, '0')}`;
+  if (dom === '*' && dow === '*') return { mode: 'daily', time };
+  if (dom === '*' && dow === '1-5') return { mode: 'workday', time };
+  if (dom === '*' && /^[0-7](,[0-7])*$/.test(dow)) {
+    return { mode: 'weekly', time, days: [...new Set(dow.split(',').map(d => +d % 7))] };
+  }
+  if (/^\d{1,2}$/.test(dom) && +dom >= 1 && +dom <= 31 && dow === '*') return { mode: 'monthly', time, dom: +dom };
+  return null;
+}
+
+function _cronBuild(p) {
+  const [h, m] = (p.time || '').split(':').map(Number);
+  if (!Number.isInteger(h) || !Number.isInteger(m)) throw new Error('请选择时间');
+  if (p.mode === 'daily') return `${m} ${h} * * *`;
+  if (p.mode === 'workday') return `${m} ${h} * * 1-5`;
+  if (p.mode === 'weekly') {
+    if (!p.days || !p.days.length) throw new Error('每周至少选一天');
+    return `${m} ${h} * * ${[...p.days].sort((a, b) => a - b).join(',')}`;
+  }
+  if (p.mode === 'monthly') {
+    if (!(p.dom >= 1 && p.dom <= 31)) throw new Error('每月几号要在 1 到 31 之间');
+    return `${m} ${h} ${p.dom} * *`;
+  }
+  throw new Error('未知的重复方式');
+}
+
+function _cronHuman(cron) {
+  const p = _cronParse(cron);
+  if (!p) return '';
+  if (p.mode === 'daily') return `每天 ${p.time}`;
+  if (p.mode === 'workday') return `工作日 ${p.time}`;
+  if (p.mode === 'weekly') {
+    const order = [1, 2, 3, 4, 5, 6, 0].filter(d => p.days.includes(d));
+    return `每${order.map(d => _WEEKDAYS[d]).join('、')} ${p.time}`;
+  }
+  return `每月 ${p.dom} 号 ${p.time}`;
+}
+
 function _scheduleWhen(s) {
-  const tz = _escape(s.tz || '容器本地时区');
-  return s.kind === 'once'
-    ? `一次：${_escape(s.at)}（${tz}）`
-    : `每次：${_escape(s.cron)}（${tz}）`;
+  if (s.kind === 'once') return { main: `${s.at || ''}`, sub: '只一次' };
+  const human = _cronHuman(s.cron);
+  return human ? { main: human, sub: `cron ${s.cron}` } : { main: `cron ${s.cron}`, sub: '' };
+}
+
+function _schedSettingsSummary(st) {
+  return [
+    `最短 ${st.min_interval_minutes ?? '-'} 分钟`,
+    `每天最多 ${st.max_fires_per_day ?? '-'} 次`,
+    `最多 ${st.max_schedules ?? '-'} 条`,
+    `模型自建：${st.model_tools_enabled ? '开' : '关'}`,
+  ].join(' · ');
 }
 
 function _renderSchedules(el, data) {
   const list = data.schedules || [];
   const jobs = data.config_jobs || [];
   const st = _scheduleSettings;
+  const num = v => _escape(String(v ?? ''));
 
-  const cards = list.map(s => `
-      <div class="task-card" data-id="${_escape(s.id)}">
-        <div class="task-header">
-          <span class="task-goal">${_escape(s.name)}</span>
+  const cards = list.map(s => {
+    const w = _scheduleWhen(s);
+    return `
+      <div class="sched-card${s.enabled ? '' : ' off'}" data-id="${_escape(s.id)}">
+        <div class="sched-card-head">
+          <span class="sched-name">${_escape(s.name)}</span>
           <span class="task-badge ${s.enabled ? 'running' : 'paused'}">${s.enabled ? '启用' : '停用'}</span>
         </div>
-        <div class="task-meta">
-          <div>${_scheduleWhen(s)}</div>
-          <div>下次：${_escape(s.next_run_text || '无')}　上次：${_escape(s.last_run_text || '从未')}　已触发 ${s.fire_count || 0} 次</div>
-          ${s.skill ? `<div>技能：${_escape(s.skill)}</div>` : ''}
-          <div>文字：${_escape(s.text)}</div>
-          <div class="task-meta-foot">${_CREATOR_TEXT[s.created_by] || _escape(s.created_by)}<span class="task-id">${_escape(s.id)}</span></div>
+        <div class="sched-when">${_escape(w.main)}</div>
+        <div class="sched-when-sub">${_escape(w.sub)}${w.sub ? ' · ' : ''}${_escape(s.tz || '容器本地时区')}</div>
+        <dl class="sched-kv">
+          <dt>下次</dt><dd>${_escape(s.next_run_text || '—')}</dd>
+          <dt>上次</dt><dd>${_escape(s.last_run_text || '从未')}</dd>
+          <dt>已触发</dt><dd>${s.fire_count || 0} 次</dd>
+          ${s.skill ? `<dt>技能</dt><dd>${_escape(s.skill)}</dd>` : ''}
+        </dl>
+        <div class="sched-text" title="到点推给机器人的文字">${_escape(s.text)}</div>
+        <div class="sched-card-foot">
+          <span class="sched-origin">${_CREATOR_TEXT[s.created_by] || _escape(s.created_by || '')} · <span class="task-id">${_escape(s.id)}</span></span>
+          <span class="sched-actions">
+            <button class="sched-edit-btn" data-id="${_escape(s.id)}">编辑</button>
+            <button class="sched-toggle-btn" data-id="${_escape(s.id)}">${s.enabled ? '停用' : '启用'}</button>
+            <button class="sched-run-btn" data-id="${_escape(s.id)}" ${s.enabled ? '' : 'disabled title="先启用再触发"'}>立即触发</button>
+            <button class="sched-delete-btn danger" data-id="${_escape(s.id)}">删除</button>
+          </span>
         </div>
-        <div class="task-actions">
-          <button class="sched-edit-btn" data-id="${_escape(s.id)}">编辑</button>
-          <button class="sched-toggle-btn" data-id="${_escape(s.id)}">${s.enabled ? '停用' : '启用'}</button>
-          <button class="sched-run-btn" data-id="${_escape(s.id)}" ${s.enabled ? '' : 'disabled title="先启用再触发"'}>立即触发</button>
-          <button class="sched-delete-btn danger" data-id="${_escape(s.id)}">删除</button>
-        </div>
-      </div>`).join('');
+      </div>`;
+  }).join('');
 
-  const jobCards = jobs.map(j => `
-      <div class="task-card">
-        <div class="task-header"><span class="task-goal">${_escape(j.name)}</span></div>
-        <div class="task-meta">
-          <div>每次：${_escape(j.cron)}（${_escape(j.tz || '容器本地时区')}）</div>
-          <div>下次：${_escape(j.next_run_text || '无')}</div>
-          <div>文字：${_escape(j.text)}</div>
-          ${j.error ? `<div class="schedule-error">${_escape(j.error)}</div>` : ''}
+  const jobCards = jobs.map(j => {
+    const human = _cronHuman(j.cron);
+    return `
+      <div class="sched-card readonly">
+        <div class="sched-card-head">
+          <span class="sched-name">${_escape(j.name)}</span>
+          <span class="task-badge pending">配置文件</span>
         </div>
-      </div>`).join('');
+        <div class="sched-when">${_escape(human || `cron ${j.cron}`)}</div>
+        <div class="sched-when-sub">${human ? `cron ${_escape(j.cron)} · ` : ''}${_escape(j.tz || '容器本地时区')}</div>
+        <dl class="sched-kv"><dt>下次</dt><dd>${_escape(j.next_run_text || '—')}</dd></dl>
+        <div class="sched-text">${_escape(j.text)}</div>
+        ${j.error ? `<div class="schedule-error sched-card-error">${_escape(j.error)}</div>` : ''}
+      </div>`;
+  }).join('');
 
   el.innerHTML = `
-    <div class="schedule-tip">到点会把文字推给机器人，叫醒它做事。每次触发都要跑一轮模型，请不要设得太频繁。</div>
-    <details class="schedule-settings">
-      <summary>设置</summary>
-      <label class="schedule-check"><input type="checkbox" id="sched-set-model" ${st.model_tools_enabled ? 'checked' : ''}> 允许模型自己建定时（默认关）</label>
-      <label>最短间隔（分钟）<input type="number" min="1" class="task-input" id="sched-set-interval" value="${_escape(String(st.min_interval_minutes ?? ''))}"></label>
-      <label>每天最多触发次数<input type="number" min="1" class="task-input" id="sched-set-fires" value="${_escape(String(st.max_fires_per_day ?? ''))}"></label>
-      <label>最多条数<input type="number" min="1" class="task-input" id="sched-set-max" value="${_escape(String(st.max_schedules ?? ''))}"></label>
-      <label>每个技能最多条数<input type="number" min="0" class="task-input" id="sched-set-skill" value="${_escape(String(st.max_per_skill ?? ''))}"></label>
-      <label>默认时区<input type="text" class="task-input" id="sched-set-tz" value="${_escape(st.default_tz || '')}"></label>
-      <div class="task-actions"><button id="sched-set-save">保存设置</button><span class="schedule-msg" id="sched-set-msg"></span></div>
+    <div class="sched-bar">
+      <div class="sched-bar-text">
+        <div class="sched-title">定时任务</div>
+        <div class="schedule-tip">到点把文字推给机器人、叫醒它做事。每次触发都要跑一轮模型，请不要设得太频繁。</div>
+      </div>
+      <button class="btn-primary sched-new" id="schedule-new-btn">＋ 新建定时</button>
+    </div>
+    <details class="sched-settings" ${_scheduleSettingsOpen ? 'open' : ''}>
+      <summary><span class="sched-settings-title">限制设置</span><span class="sched-settings-sum">${_escape(_schedSettingsSummary(st))}</span></summary>
+      <div class="sched-settings-body">
+        <div class="sched-grid3">
+          <label class="sched-field">最短间隔（分钟）<input type="number" min="1" class="task-input" id="sched-set-interval" value="${num(st.min_interval_minutes)}"></label>
+          <label class="sched-field">每天最多触发次数<input type="number" min="1" class="task-input" id="sched-set-fires" value="${num(st.max_fires_per_day)}"></label>
+          <label class="sched-field">最多条数<input type="number" min="1" class="task-input" id="sched-set-max" value="${num(st.max_schedules)}"></label>
+          <label class="sched-field">每个技能最多条数<input type="number" min="0" class="task-input" id="sched-set-skill" value="${num(st.max_per_skill)}"></label>
+          <label class="sched-field">默认时区<input type="text" class="task-input" id="sched-set-tz" value="${_escape(st.default_tz || '')}"></label>
+        </div>
+        <div class="sched-settings-foot">
+          <label class="schedule-check"><input type="checkbox" id="sched-set-model" ${st.model_tools_enabled ? 'checked' : ''}> 允许模型自己建定时（默认关）</label>
+          <span class="schedule-msg" id="sched-set-msg"></span>
+          <button class="btn-primary sched-btn-sm" id="sched-set-save">保存设置</button>
+        </div>
+      </div>
     </details>
-    <div class="task-actions"><button class="task-edit-btn" id="schedule-new-btn">新建定时任务</button></div>
     <div id="schedule-form-slot"></div>
-    ${cards || '<div class="history-empty">还没有定时任务。</div>'}
-    ${jobs.length ? `<div class="schedule-section-title">配置文件里的定时（只读，改要改配置并重启 agent-core）</div>${jobCards}` : ''}`;
+    <div class="schedule-section-title">我的定时 <span class="sched-count">${list.length}</span></div>
+    ${cards ? `<div class="sched-grid">${cards}</div>`
+            : '<div class="sched-empty">还没有定时任务。点右上角「＋ 新建定时」加一条。</div>'}
+    ${jobs.length ? `<div class="schedule-section-title">配置文件里的定时 <span class="sched-section-note">只读，改要改配置并重启 agent-core</span></div>
+                     <div class="sched-grid">${jobCards}</div>` : ''}`;
 
+  el.querySelector('.sched-settings').addEventListener('toggle', e => { _scheduleSettingsOpen = e.target.open; });
   el.querySelector('#schedule-new-btn').addEventListener('click', () => _openScheduleForm(null));
   el.querySelector('#sched-set-save').addEventListener('click', _saveScheduleSettings);
 
@@ -731,6 +816,8 @@ async function _saveScheduleSettings() {
     _scheduleSettings = r.settings || _scheduleSettings;
     msg.className = 'schedule-msg';
     msg.textContent = '已保存';
+    const sum = document.querySelector('#history-schedules .sched-settings-sum');
+    if (sum) sum.textContent = _schedSettingsSummary(_scheduleSettings);
   } else {
     msg.className = 'schedule-msg schedule-error';
     msg.textContent = r.error || '保存失败';
@@ -744,72 +831,156 @@ function _openScheduleForm(s) {
   const v = s || { name: '', kind: 'cron', cron: '', at: '', tz: _scheduleSettings.default_tz || 'Asia/Shanghai',
                    text: '', skill: '', enabled: true };
   const atLocal = (v.at || '').replace(' ', 'T');
+  // 能看懂的 cron 回填成“怎么重复 + 几点”；看不懂的（比如一天多个时刻）回填到自定义
+  const parsed = v.cron ? _cronParse(v.cron) : null;
+  const rep = parsed || { mode: v.cron ? 'custom' : 'daily', time: '08:00', days: [1, 2, 3, 4, 5], dom: 1 };
+  if (!rep.days) rep.days = [1, 2, 3, 4, 5];
   slot.innerHTML = `
-    <div class="task-card task-edit-form schedule-form">
-      <label>名字</label>
-      <input type="text" class="task-input" id="sf-name" value="${_escape(v.name)}">
-      <label>类型</label>
-      <select class="task-input" id="sf-kind">
-        <option value="cron" ${v.kind !== 'once' ? 'selected' : ''}>重复</option>
-        <option value="once" ${v.kind === 'once' ? 'selected' : ''}>只一次</option>
-      </select>
-      <div id="sf-cron-row">
-        <label>Cron</label>
-        <input type="text" class="task-input" id="sf-cron" value="${_escape(v.cron || '')}" placeholder="分 时 日 月 周，例如 0 8 * * *">
-        <div class="schedule-preview" id="sf-preview"></div>
+    <div class="sched-form schedule-form">
+      <div class="sched-form-title">${isEdit ? `编辑「${_escape(v.name)}」` : '新建定时任务'}</div>
+      <div class="sched-grid2">
+        <label class="sched-field">名字<input type="text" class="task-input" id="sf-name" value="${_escape(v.name)}" placeholder="例如：早上服药提醒"></label>
+        <label class="sched-field">类型
+          <select class="task-input" id="sf-kind">
+            <option value="cron" ${v.kind !== 'once' ? 'selected' : ''}>重复</option>
+            <option value="once" ${v.kind === 'once' ? 'selected' : ''}>只一次</option>
+          </select>
+        </label>
+        <div class="sched-field" id="sf-cron-row">
+          <label for="sf-mode">怎么重复</label>
+          <select class="task-input" id="sf-mode">
+            <option value="daily">每天</option>
+            <option value="workday">工作日（周一到周五）</option>
+            <option value="weekly">每周的某几天</option>
+            <option value="monthly">每月的某一天</option>
+            <option value="custom">自定义（高级，写 cron）</option>
+          </select>
+        </div>
+        <div class="sched-field" id="sf-time-row">
+          <label for="sf-time">几点</label>
+          <input type="time" class="task-input" id="sf-time" value="${_escape(rep.time || '08:00')}">
+        </div>
+        <div class="sched-field sched-span2" id="sf-week-row">
+          <label>哪几天</label>
+          <div class="sched-days">
+            ${[1, 2, 3, 4, 5, 6, 0].map(d => `<label class="sched-day"><input type="checkbox" value="${d}" ${(rep.days || []).includes(d) ? 'checked' : ''}><span>${_WEEKDAYS[d]}</span></label>`).join('')}
+          </div>
+        </div>
+        <div class="sched-field" id="sf-dom-row">
+          <label for="sf-dom">每月几号</label>
+          <input type="number" min="1" max="31" class="task-input" id="sf-dom" value="${_escape(String(rep.dom || 1))}">
+          <div class="schedule-preview">没有这一天的月份（比如 2 月没有 30 号）会跳过</div>
+        </div>
+        <div class="sched-field sched-span2" id="sf-custom-row">
+          <label for="sf-cron">cron（分 时 日 月 周，用空格隔开）</label>
+          <input type="text" class="task-input mono" id="sf-cron" value="${_escape(v.cron || '')}" placeholder="例如 0 8,20 * * *">
+          <div class="schedule-preview">例：<code>0 8 * * *</code> 每天 8:00；<code>30 7,19 * * *</code> 每天 7:30 和 19:30；<code>0 9 * * 1</code> 每周一 9:00</div>
+        </div>
+        <div class="sched-field sched-span2" id="sf-preview-row">
+          <div class="schedule-preview sched-preview-line" id="sf-preview"></div>
+        </div>
+        <div class="sched-field" id="sf-at-row">
+          <label for="sf-at">时间</label>
+          <input type="datetime-local" class="task-input" id="sf-at" value="${_escape(atLocal)}">
+        </div>
+        <label class="sched-field">时区<input type="text" class="task-input" id="sf-tz" value="${_escape(v.tz || '')}"></label>
+        <label class="sched-field sched-span2">触发文字（到点推给机器人）
+          <textarea class="task-input" id="sf-text" rows="3" placeholder="例如：到吃早药的时间了，请提醒老人拿药盒核对。">${_escape(v.text || '')}</textarea>
+        </label>
+        <label class="sched-field">技能 slug（可空）<input type="text" class="task-input" id="sf-skill" value="${_escape(v.skill || '')}"></label>
+        <label class="schedule-check sched-field-check"><input type="checkbox" id="sf-enabled" ${v.enabled ? 'checked' : ''}> 启用</label>
       </div>
-      <div id="sf-at-row">
-        <label>时间</label>
-        <input type="datetime-local" class="task-input" id="sf-at" value="${_escape(atLocal)}">
-      </div>
-      <label>时区</label>
-      <input type="text" class="task-input" id="sf-tz" value="${_escape(v.tz || '')}">
-      <label>触发文字（到点推给机器人）</label>
-      <textarea class="task-input" id="sf-text" rows="2">${_escape(v.text || '')}</textarea>
-      <label>技能 slug（可空）</label>
-      <input type="text" class="task-input" id="sf-skill" value="${_escape(v.skill || '')}">
-      <label class="schedule-check"><input type="checkbox" id="sf-enabled" ${v.enabled ? 'checked' : ''}> 启用</label>
-      <div class="schedule-msg schedule-error" id="sf-error"></div>
-      <div class="task-actions" style="margin-top:10px">
-        <button id="sf-save">保存</button>
-        <button id="sf-cancel">取消</button>
+      <div class="sched-form-foot">
+        <span class="schedule-msg schedule-error" id="sf-error"></span>
+        <button class="sched-btn-ghost" id="sf-cancel">取消</button>
+        <button class="btn-primary sched-btn-sm" id="sf-save">保存</button>
       </div>
     </div>`;
 
-  const kindSel = document.getElementById('sf-kind');
-  const showKind = () => {
-    const once = kindSel.value === 'once';
-    document.getElementById('sf-cron-row').classList.toggle('hidden', once);
-    document.getElementById('sf-at-row').classList.toggle('hidden', !once);
+  const $ = id => document.getElementById(id);
+  const kindSel = $('sf-kind');
+  const modeSel = $('sf-mode');
+  modeSel.value = rep.mode;
+
+  // 当前表单对应的 cron；填得不完整时抛错（中文原因）
+  const currentCron = () => {
+    const mode = modeSel.value;
+    if (mode === 'custom') return $('sf-cron').value.trim();
+    return _cronBuild({
+      mode,
+      time: $('sf-time').value,
+      days: [...document.querySelectorAll('#sf-week-row input:checked')].map(i => +i.value),
+      dom: Number($('sf-dom').value),
+    });
   };
-  kindSel.addEventListener('change', showKind);
-  showKind();
+
+  const showRows = () => {
+    const once = kindSel.value === 'once';
+    const mode = modeSel.value;
+    $('sf-cron-row').classList.toggle('hidden', once);
+    $('sf-time-row').classList.toggle('hidden', once || mode === 'custom');
+    $('sf-week-row').classList.toggle('hidden', once || mode !== 'weekly');
+    $('sf-dom-row').classList.toggle('hidden', once || mode !== 'monthly');
+    $('sf-custom-row').classList.toggle('hidden', once || mode !== 'custom');
+    $('sf-preview-row').classList.toggle('hidden', once);
+    $('sf-at-row').classList.toggle('hidden', !once);
+  };
 
   let previewTimer = null;
   const preview = async () => {
-    const out = document.getElementById('sf-preview');
-    const cron = document.getElementById('sf-cron').value.trim();
+    const out = $('sf-preview');
+    if (kindSel.value === 'once') { out.textContent = ''; return; }
+    let cron;
+    try { cron = currentCron(); } catch (e) {
+      out.className = 'schedule-preview sched-preview-line schedule-error'; out.textContent = e.message; return;
+    }
     if (!cron) { out.textContent = ''; return; }
     try {
       const r = await _scheduleFetch('/api/schedules/preview', 'POST',
-        { cron, tz: document.getElementById('sf-tz').value.trim() || null });
-      out.className = r.ok ? 'schedule-preview' : 'schedule-preview schedule-error';
-      out.textContent = r.ok ? `接下来：${(r.runs || []).join('、')}` : (r.error || '');
+        { cron, tz: $('sf-tz').value.trim() || null, count: 3 });
+      out.className = r.ok ? 'schedule-preview sched-preview-line' : 'schedule-preview sched-preview-line schedule-error';
+      out.textContent = r.ok ? `接下来会在：${(r.runs || []).join('、')}` : (r.error || '');
     } catch { out.textContent = ''; }
   };
-  ['sf-cron', 'sf-tz'].forEach(id => document.getElementById(id).addEventListener('input', () => {
-    clearTimeout(previewTimer);
-    previewTimer = setTimeout(preview, 400);
-  }));
+  const schedulePreview = () => { clearTimeout(previewTimer); previewTimer = setTimeout(preview, 300); };
+
+  // 切到自定义时把刚才选的换成 cron 填进去；从自定义切回来时，能看懂的 cron 回填到选择框
+  let prevMode = modeSel.value;
+  modeSel.addEventListener('change', () => {
+    const mode = modeSel.value;
+    if (mode === 'custom' && prevMode !== 'custom' && !$('sf-cron').value.trim()) {
+      modeSel.value = prevMode;
+      try { $('sf-cron').value = currentCron(); } catch { /* 没填完就留空 */ }
+      modeSel.value = 'custom';
+    } else if (prevMode === 'custom') {
+      const p = _cronParse($('sf-cron').value);
+      if (p) {
+        $('sf-time').value = p.time;
+        if (p.dom) $('sf-dom').value = p.dom;
+        if (p.days) document.querySelectorAll('#sf-week-row input').forEach(i => { i.checked = p.days.includes(+i.value); });
+      }
+    }
+    prevMode = mode;
+    showRows(); schedulePreview();
+  });
+  kindSel.addEventListener('change', () => { showRows(); schedulePreview(); });
+  ['sf-time', 'sf-dom', 'sf-cron', 'sf-tz'].forEach(id => $(id).addEventListener('input', schedulePreview));
+  $('sf-week-row').addEventListener('change', schedulePreview);
+  showRows();
   preview();
 
   document.getElementById('sf-cancel').addEventListener('click', () => { slot.innerHTML = ''; });
   document.getElementById('sf-save').addEventListener('click', async () => {
     const kind = kindSel.value;
+    let cron = '';
+    if (kind === 'cron') {
+      try { cron = currentCron(); } catch (e) { $('sf-error').textContent = e.message; return; }
+      if (!cron) { $('sf-error').textContent = '要写 cron'; return; }
+    }
     const body = {
       name: document.getElementById('sf-name').value.trim(),
       kind,
-      cron: kind === 'cron' ? document.getElementById('sf-cron').value.trim() : '',
+      cron,
       at: kind === 'once' ? document.getElementById('sf-at').value.replace('T', ' ') : '',
       tz: document.getElementById('sf-tz').value.trim(),
       text: document.getElementById('sf-text').value.trim(),
@@ -826,5 +997,6 @@ function _openScheduleForm(s) {
     slot.innerHTML = '';
     _loadSchedules();
   });
+  document.getElementById('sf-name').focus();
   slot.scrollIntoView({ block: 'nearest' });
 }
