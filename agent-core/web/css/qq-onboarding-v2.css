@@ -120,13 +120,11 @@
   max-width: 620px;
   padding-top: 34px;
 }
-.qq-qr-onboarding .qq-onboard-top h2 { color: var(--qq-ink); }
-.qq-qr-onboarding .qq-onboard-kicker { color: #526174; }
+.qq-qr-onboarding .qq-onboard-top { margin-bottom: 24px; }
+.qq-qr-onboarding .qq-onboard-top h2 { color: var(--qq-ink); margin: 0; }
 .qq-qr-onboarding .qq-onboard-close { color: #566272; }
-.qq-qr-onboarding .qq-qr-intro {
-  max-width: 470px; margin: 18px auto 22px; text-align: center;
-  color: var(--qq-muted); line-height: 1.75; font-size: 13px;
-}
+.qq-qr-onboarding.qq-qr-result .qq-onboard-top { margin-bottom: 0; }
+.qq-qr-onboarding.qq-qr-result .qq-qr-success { padding: 48px 0 28px; }
 .qq-qr-onboarding .qq-qr-panel {
   width: 292px; height: 292px; margin: 0 auto; display: grid; place-items: center;
   border: 1px solid var(--qq-line); border-radius: 18px; background: #fff;
@@ -138,8 +136,8 @@
 }
 @keyframes qq-qr-spin { to { transform: rotate(360deg); } }
 .qq-qr-onboarding .qq-qr-status {
-  min-height: 24px; max-width: 500px; margin: 19px auto 14px;
-  text-align: center; font-size: 13px; line-height: 1.65; color: var(--qq-ink);
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
 }
 .qq-qr-onboarding .qq-qr-success { text-align: center; padding: 12px 0 0; }
 .qq-qr-onboarding .qq-qr-success > span {
@@ -147,23 +145,15 @@
   border-radius: 50%; background: #159d70; color: white; font-size: 25px;
 }
 .qq-qr-onboarding .qq-qr-success strong { font-size: 17px; }
-.qq-qr-onboarding .qq-qr-success p,
-.qq-qr-onboarding .qq-qr-footnote {
-  color: var(--qq-muted); font-size: 12px; line-height: 1.7; text-align: center;
-}
+.qq-qr-onboarding .qq-qr-success--pending > span { background: #718096; }
 .qq-qr-onboarding .qq-qr-error {
   max-width: 500px; margin: 12px auto; padding: 11px 14px; border-radius: 9px;
   background: #fff0ef; color: #ab2828; font-size: 12px; line-height: 1.6;
 }
 .qq-qr-onboarding .qq-qr-actions {
-  display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; margin: 20px 0 12px;
+  display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; margin: 20px 0 0;
 }
 .qq-qr-onboarding .qq-qr-actions button { min-width: 120px; }
-.qq-qr-onboarding .qq-qr-footnote { margin: 16px 0 4px; }
-.qq-qr-onboarding .qq-qr-help {
-  display: block; width: fit-content; margin: 8px auto 0; font-size: 11px;
-  color: var(--qq-muted); text-decoration: underline; text-underline-offset: 3px;
-}
 @media (max-width: 768px) {
   .qq-qr-onboarding { padding: 24px 18px 30px; }
   .qq-qr-onboarding .qq-qr-panel { width: 272px; height: 272px; }

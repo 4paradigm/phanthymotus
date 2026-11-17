@@ -52,6 +52,8 @@ function renderState(state) {
   const waiting = ['starting', 'waiting_scan'].includes(sessionStatus);
   const completed = ['connected', 'configured', 'action_required'].includes(sessionStatus);
   const failed = ['failed', 'expired', 'cancelled'].includes(sessionStatus);
+  root.querySelector('[data-qq-wizard-title]').hidden = completed;
+  root.classList.toggle('qq-qr-result', completed);
 
   if (state.qr_data_url && sessionStatus === 'waiting_scan') {
     image.src = state.qr_data_url;
@@ -71,17 +73,18 @@ function renderState(state) {
   success.hidden = !completed;
   if (completed) {
     const title = root.querySelector('[data-qq-success-title]');
-    const detail = root.querySelector('[data-qq-success-detail]');
+    const icon = root.querySelector('[data-qq-result-icon]');
     if (sessionStatus === 'connected') {
-      title.textContent = 'QQ 已连接';
-      detail.textContent = state.message || '消息输入订阅已就绪。现在可以在 QQ 中发送消息测试。';
+      title.textContent = '连接成功';
+      icon.textContent = '✓';
     } else if (sessionStatus === 'configured') {
-      title.textContent = 'QQ 已授权，配置已保存';
-      detail.textContent = state.message || '消息输入订阅尚未就绪。你可以返回渠道列表查看运行状态。';
+      title.textContent = '已授权，尚未就绪';
+      icon.textContent = '…';
     } else {
-      title.textContent = 'QQ 授权已完成';
-      detail.textContent = '现有画布需要选择一个助手后才能开始对话。';
+      title.textContent = '需要选择助手';
+      icon.textContent = '!';
     }
+    success.classList.toggle('qq-qr-success--pending', sessionStatus !== 'connected');
   }
   error.hidden = !failed;
   refresh.hidden = !failed;
@@ -156,19 +159,16 @@ export function openQQWizard({onConnected}={}) {
   root.className = 'qq-onboarding qq-qr-onboarding';
   host.closest('.channel-modal')?.classList.add('qq-onboarding-active');
   root.innerHTML = [
-    '<header class="qq-onboard-top"><div><span class="qq-onboard-kicker">QQ 连接</span><h2>扫码连接 QQ</h2></div>',
+    '<header class="qq-onboard-top"><h2 data-qq-wizard-title>使用 QQ 扫码创建并连接机器人</h2>',
     '<button class="qq-onboard-close" type="button" data-qq-close aria-label="关闭">×</button></header>',
-    '<p class="qq-qr-intro">打开手机 QQ 扫描二维码，按照手机上的提示确认。授权完成后，系统会自动配置并连接。</p>',
     '<div class="qq-qr-panel" data-qq-qr-panel><div class="qq-qr-spinner" data-qq-spinner aria-label="正在生成二维码"></div>',
     '<img data-qq-qr alt="QQ 扫码连接二维码" hidden></div>',
-    '<p class="qq-qr-status" data-qq-status aria-live="polite">正在生成安全连接二维码…</p>',
-    '<div class="qq-qr-success" data-qq-success hidden><span>✓</span><strong data-qq-success-title></strong><p data-qq-success-detail></p></div>',
+    '<span class="qq-qr-status" data-qq-status role="status" aria-live="polite">正在生成安全连接二维码…</span>',
+    '<div class="qq-qr-success" data-qq-success hidden><span data-qq-result-icon aria-hidden="true">✓</span><strong data-qq-success-title></strong></div>',
     '<p class="qq-qr-error" data-qq-error role="alert" hidden></p>',
     '<div class="qq-qr-actions"><button class="btn-ghost" data-qq-cancel>取消</button>',
     '<button class="btn-ghost" data-qq-refresh hidden>重新获取二维码</button>',
     '<button class="btn-primary" data-qq-finish hidden>完成</button></div>',
-    '<p class="qq-qr-footnote">无需填写机器人编号或密钥。连接凭证由系统在服务端安全保存。</p>',
-    '<a class="qq-qr-help" href="https://q.qq.com/qqbot/dashboard/" target="_blank" rel="noopener noreferrer">打开 QQ 官方平台 ↗</a>',
   ].join('');
   host.parentNode.insertBefore(root, host);
 
