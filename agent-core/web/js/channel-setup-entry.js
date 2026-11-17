@@ -56,7 +56,7 @@ function boot() {
     .observe(list, { childList: true, subtree: true });
   removeOldQQShortcuts();
 
-  // QQ identities have their own verified Owner / private / group ACL page.
+  // QQ identities have their own chat/block management page; no Owner privileges.
   // The original Users section is for the other official channel providers.
   // Keep its underlying records untouched; only avoid showing QQ identities
   // twice (especially orphaned QQ users after a Channel was removed).
@@ -86,13 +86,8 @@ function boot() {
     .observe(legacyUsersList, {childList: true});
   syncLegacyUsers();
 
-  // Optional direct link for guided setup; it does not bypass Dashboard auth.
-  if (new URLSearchParams(window.location.search).get('qq-setup') === '1') {
-    setTimeout(() => {
-      document.getElementById('btn-channels')?.click();
-      openQQWizard({onConnected: refreshAfterSetup});
-    }, 650);
-  }
+  // Dashboard refresh and bookmarked URLs must never auto-open QQ setup.
+  // Only the explicit Add Channel → QQ selection above may open the wizard.
 
   // Closing Channels closes any QQ-only detail view; next opening is
   // indistinguishable from the official default state.

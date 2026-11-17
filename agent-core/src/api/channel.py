@@ -272,8 +272,17 @@ class UpsertUserReq(BaseModel):
 
 @router.post('/users')
 def upsert_user(req: UpsertUserReq):
+    tool_filter = req.tool_filter
+    if req.platform == 'qq':
+        # Generic Channel user updates must not recreate retired QQ Owner grants.
+        from channel.permissions import CHAT_FILTER
+        if req.role not in ('viewer', 'blocked'):
+            raise fastapi.HTTPException(400, 'QQ users support chat or blocked status only')
+        if req.role == 'viewer' and tool_filter not in (None, '', CHAT_FILTER, '*'):
+            raise fastapi.HTTPException(400, 'QQ users cannot customize tool privileges')
+        tool_filter = CHAT_FILTER if req.role == 'viewer' else ''
     try:
-        user = acl.upsert_user(req.platform, req.user_id, req.display_name, req.role, req.tool_filter)
+        user = acl.upsert_user(req.platform, req.user_id, req.display_name, req.role, tool_filter)
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
     return {'user': user}

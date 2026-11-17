@@ -1,0 +1,24 @@
+# The Core image must not receive runtime data, credential files, or local DBs.
+.git
+**/.pytest_cache/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.log
+**/*.secret
+**/*.pem
+**/*.key
+**/.env
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+tests/
+web/tests/
+
+# resource/ is writable runtime state. Keep only immutable bundled defaults.
+resource/*
+!resource/memory/
+resource/memory/*
+!resource/memory/defaults/
+!resource/memory/defaults/**

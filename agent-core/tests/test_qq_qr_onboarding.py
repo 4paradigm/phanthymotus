@@ -128,7 +128,7 @@ def test_expired_qr_has_retryable_state(monkeypatch):
 def test_scanned_credentials_are_persisted_and_not_written_to_channel_config(monkeypatch):
     app_id = "12345678"
     credential_value = "y" * 32
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp_dir:
+    with tempfile.TemporaryDirectory() as temp_dir:
         credential_dir = Path(temp_dir) / "qq-credentials"
         monkeypatch.setattr(channel_setup.qq_credential_store, "directory",
                             lambda: credential_dir)
