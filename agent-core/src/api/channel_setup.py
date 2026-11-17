@@ -138,6 +138,7 @@ async def guided_setup(req: QQSetup):
     cfg = apply_safe_defaults({
         'protocol': 'official', 'app_id': app_id,
         'enabled_scopes': ['c2c', 'group'], 'private_only': False,
+        'enable_inbound_media': req.receive_images,
         'access_policy': {'default_permission': 'chat'},
     })
     ref = ''
