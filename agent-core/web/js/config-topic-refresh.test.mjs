@@ -80,7 +80,7 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     },
   };
   const api = runInNewContext(
-    code('_withOptionalInputPorts') + (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
+    code('_withSlamRgbInput') + (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
     + (revalidate ? code('_inputTopicsFor') + code('_revalidateDerivedTopics') : '')
     + code('_parseMcpCallResult') + code('_fetchTopicsFromDriver') + code('_refreshConfiguredTopics')
     + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_reloadLayout')
@@ -339,4 +339,31 @@ test('configured RGB input survives saved-card restoration and metadata/config r
     ['image/jpeg', '/connected/color'],
   ]);
   assert.equal(inputPorts(p.cards()[0]).length, 3);
+});
+
+test('SLAM input migration leaves unrelated saved cards unchanged', () => {
+  const metadata = slamMetadata();
+  metadata[0].tools[0].name = 'unrelated_processor';
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata });
+  p.add({ id: 'other', mcpId: 'robot', toolName: 'unrelated_processor', topicIn: [...slamInputs] }, false);
+  p.poll(metadata);
+  assert.deepEqual(inputPorts(p.cards()[0]).map(port => port.dataset.format),
+    ['state/odom', 'sensor/pointcloud2']);
+  assert.equal(p.cards()[0].topicIn.length, 2);
+});
+
+test('schema-declared SLAM consumers migrate only the optional JPEG input', () => {
+  const metadata = slamMetadata();
+  const tool = metadata[0].tools[0];
+  tool.name = 'renamed_mapper';
+  tool.inputSchema = { 'x-slam-input-contract': 'motus.slam_input/1' };
+  tool.topic_in.push({ format: 'text', optional: true });
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: tool.name, topicIn: [...slamInputs] }, false);
+  p.poll(metadata);
+  assert.deepEqual(inputPorts(p.cards()[0]).map(port => port.dataset.format),
+    ['state/odom', 'sensor/pointcloud2', 'image/jpeg']);
+  assert.equal(p.cards()[0].topicIn.length, 3);
 });

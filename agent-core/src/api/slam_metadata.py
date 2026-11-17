@@ -16,10 +16,15 @@ class SlamRoutingError(ValueError):
     """A canvas wire cannot be matched to one unambiguous source port."""
 
 
-def _port(info, index):
+def _port(info, index, *, source=False):
     ports = info.get('topic_out') if isinstance(info, dict) else None
-    if not isinstance(ports, list) or index >= len(ports):
+    if not isinstance(ports, list):
         return {}
+    if index >= len(ports):
+        # Match config._port_topic for saved source indices, never consumer slots.
+        if not source or len(ports) != 1:
+            return {}
+        index = 0
     return ports[index] if isinstance(ports[index], dict) else {}
 
 
@@ -68,7 +73,7 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection, *, inpu
         if index < 0:
             raise SlamRoutingError(f'{src_id}: negative fromPortIdx')
         info = resolved_info.get(src_id) or {}
-        port = _port(info, index)
+        port = _port(info, index, source=True)
         topic = topic_of_connection(conn)
         if is_optional_rgb_connection(conn, input_ports):
             reason = None
@@ -116,7 +121,8 @@ def collect_slam_inputs(connections, resolved_info, topic_of_connection, *, inpu
             metadata[topic] = deepcopy(claim)
 
         if fmt == CLOUD:
-            found = [d for d in (info.get('camera_info') or [])
+            declarations = info.get('camera_info')
+            found = [d for d in (declarations if isinstance(declarations, list) else [])
                      if isinstance(d, dict) and d.get('topic') == topic]
             if len(found) > 1:
                 raise SlamRoutingError(f'{topic}: duplicate camera_info declarations')

@@ -573,11 +573,12 @@ export async function initCanvas(initialMcps) {
   _syncEmptyState();
 }
 
-function _withOptionalInputPorts(topics, declarations) {
+function _withSlamRgbInput(topics, declarations, tool) {
   const ports = topics || [];
-  // New optional inputs must also appear on cards saved before their release.
-  // Append by format without disturbing existing topics or wire indices.
-  const missing = (declarations || []).filter(port => port.optional &&
+  if (tool?.inputSchema?.['x-slam-input-contract'] !== 'motus.slam_input/1' &&
+      tool?.name !== 'pointcloud_slam') return ports;
+  // Expose RGB on older SLAM cards without changing saved topics or wire indices.
+  const missing = (declarations || []).filter(port => port.optional && port.format === 'image/jpeg' &&
     !ports.some(saved => saved.format === port.format));
   return missing.length ? [...ports, ...missing] : ports;
 }
@@ -613,7 +614,7 @@ export function updateCanvasMcps(mcps) {
         // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
         if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
       }
-      const mergedTopicIn = _withOptionalInputPorts(card.topicIn, liveTopicIn);
+      const mergedTopicIn = _withSlamRgbInput(card.topicIn, liveTopicIn, toolObj);
       if (mergedTopicIn !== card.topicIn) { card.topicIn = mergedTopicIn; topicsChanged = true; }
       if (card.topicOutFrom === undefined && liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
         if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
@@ -953,13 +954,13 @@ function _addCard(data, save = true) {
   // Restore or initialize persisted topic data
   let topicInData  = data.topicIn  || [];
   let topicOutData = data.topicOut || [];
-  // Initialize new cards and append optional inputs absent from older layouts.
+  // Initialize new cards and append the RGB input absent from older SLAM layouts.
   const _mcp = _allMcps.find(m => m.id === mcpId);
   const _tools = _mcp?.tools || [];
   const _toolObj = _tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
   if (typeof _toolObj === 'object') {
     if (!topicInData.length  && _toolObj.topic_in)  topicInData  = _toolObj.topic_in;
-    topicInData = _withOptionalInputPorts(topicInData, _toolObj.topic_in);
+    topicInData = _withSlamRgbInput(topicInData, _toolObj.topic_in, _toolObj);
     if (topicOutFrom === undefined && !topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
   }
 
@@ -1042,7 +1043,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const staticOutHasReal = toolTopicOut?.some(t => t.topic);
   const savedInHasReal = savedTopicIn?.some(t => t.topic);
   const staticInHasReal = toolTopicIn?.some(t => t.topic);
-  const topicIn = _withOptionalInputPorts((savedInHasReal ? savedTopicIn : null) || (staticInHasReal ? toolTopicIn : null) || (savedTopicIn?.length ? savedTopicIn : null) || (toolTopicIn?.length ? toolTopicIn : (toolType || isBundleMcp ? [] : mcp?.topic_in || [])), toolTopicIn);
+  const topicIn = _withSlamRgbInput((savedInHasReal ? savedTopicIn : null) || (staticInHasReal ? toolTopicIn : null) || (savedTopicIn?.length ? savedTopicIn : null) || (toolTopicIn?.length ? toolTopicIn : (toolType || isBundleMcp ? [] : mcp?.topic_in || [])), toolTopicIn, toolObj);
   const topicOut = topicOutFrom !== undefined ? (savedTopicOut || []) : (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 

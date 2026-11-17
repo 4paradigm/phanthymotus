@@ -388,3 +388,64 @@ def test_saved_optional_claim_cannot_exempt_a_required_consumer_port(rig, monkey
     monkeypatch.setattr(config_api, '_do_stop_project', stop)
     assert run(layout) is False
     assert 'slam' not in rig.starts
+
+
+def test_reconnected_optional_rgb_uses_the_live_single_output(rig, monkeypatch):
+    layout = optional_rgb_layout(rig, monkeypatch, live_topic='/live/rgb')
+    layout['connections'][2].update(fromPortIdx='1', fromTopic='/old/rgb')
+    camera = {'schema': 'motus.camera/1', 'topic': '/live/rgb', 'format': 'image/jpeg'}
+    rig.extra['rgb'] = {'camera_info': [camera]}
+    assert run(layout) is not False
+    args = rig.starts['slam']
+    assert args['input_bindings'].get('/live/rgb') == 'image/jpeg'
+    assert args['camera_infos'] == {'/live/rgb': camera}
+    assert 'optional_input_diagnostics' not in args
+
+
+def test_reconnected_source_cannot_reuse_a_saved_format_for_a_different_live_type(rig, monkeypatch):
+    rig.ports['cloud'] = [{'topic': '/live/state', 'format': 'state/odom'}]
+    layout = {'cards': [_card('odom', 'loco_state'), _card('cloud', 'lidar_cloud'),
+                        _card('slam', 'pointcloud_slam')],
+              'connections': [_wire('odom', 1, 'slam', '/slam/odom', 'state/odom'),
+                              _wire('cloud', 1, 'slam', '/old/cloud', 'sensor/pointcloud2')]}
+    async def stop():
+        pass
+    monkeypatch.setattr(config_api, '_do_stop_project', stop)
+    assert run(layout) is False
+    assert 'slam' not in rig.starts
+    assert any('saved wire format conflicts' in e['payload'].get('message', '')
+               for e in rig.events if e['type'] == 'project_start_item')
+
+
+def test_out_of_range_consumer_slot_does_not_inherit_a_sole_optional_rgb_port():
+    wire = dict(_wire('rgb', 0, 'slam', '', 'image/jpeg'), toPortIdx='1')
+    with pytest.raises(SlamRoutingError, match='unresolved source topic'):
+        collect_slam_inputs([wire], {}, lambda c: '',
+                            input_ports=[{'format': 'image/jpeg', 'optional': True}])
+
+
+@pytest.mark.parametrize('declarations', [None, 1, True, 'not-a-list',
+    {'topic': '/lidar/native', 'format': 'sensor/pointcloud2', 'K': [1]}])
+def test_nonlist_cloud_camera_info_remains_optional_during_start(rig, declarations):
+    rig.extra['cloud']['camera_info'] = declarations
+    layout = {'cards': [_card('odom', 'loco_state'), _card('cloud', 'lidar_cloud'),
+                        _card('slam', 'pointcloud_slam')],
+              'connections': [_wire('odom', 1, 'slam', '/slam/odom', 'state/odom'),
+                              _wire('cloud', 1, 'slam', '/lidar/native', 'sensor/pointcloud2')]}
+    assert run(layout) is not False
+    args = rig.starts['slam']
+    assert args['input_bindings']['/lidar/native'] == 'sensor/pointcloud2'
+    assert 'camera_infos' not in args
+    assert args['input_metadata']['/lidar/native'] == rig.extra['cloud']['input_metadata'][0]
+
+
+@pytest.mark.parametrize('declarations,error', [
+    ([{'topic': '/cloud', 'format': 'sensor/pointcloud2'}] * 2, 'duplicate camera_info'),
+    ([{'topic': '/cloud', 'format': 'image/jpeg'}], 'camera_info format mismatch'),
+])
+def test_cloud_camera_info_lists_still_reject_duplicate_or_conflicting_formats(declarations, error):
+    wire = _wire('cloud', 0, 'slam', '/cloud', 'sensor/pointcloud2')
+    info = {'cloud': {'topic_out': [{'topic': '/cloud', 'format': 'sensor/pointcloud2'}],
+                      'camera_info': declarations}}
+    with pytest.raises(SlamRoutingError, match=error):
+        collect_slam_inputs([wire], info, lambda c: c['fromTopic'])
