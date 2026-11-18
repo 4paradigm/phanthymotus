@@ -1118,6 +1118,38 @@ def test_unresolved_optional_rgb_diagnostic_remains_visible_through_scan_mapping
     assert diagnostic in call(card, 'info')['input_diagnostics']
 
 
+def test_canvas_declares_separate_create_and_resume_actions(card):
+    schema = card.get_tools()[0]['inputSchema']
+    for action, field in [('start_mapping', 'map_name'), ('resume_mapping', 'map_id')]:
+        assert action in schema['properties']['action']['enum']
+        assert schema['x-action-params'][action]['params'] == [field]
+        assert schema['x-action-lifecycle']['actions'][action]['requires_project']
+    assert schema['properties']['map_id']['x-resource-options']['action'] == 'list_maps'
+
+
+@pytest.mark.parametrize('delete_old', [False, True])
+def test_start_mapping_creates_a_new_map_with_a_stale_form_id(card, delete_old):
+    capture(card)
+    first = call(card, 'stop_mapping')
+    if delete_old:
+        assert call(card, 'delete_map', map_id=first['map_id'])['state'] == 'deleted'
+    assert call(card, 'start_mapping', map_name='Other room', map_id=first['map_id'])['state'] == 'running'
+    saved = call(card, 'stop_mapping')
+    assert saved['map_id'] != first['map_id']
+    assert (saved['map_name'], saved['revision']) == ('Other room', 1)
+
+
+def test_resume_mapping_requires_an_existing_id_even_with_a_stale_map_name(card):
+    capture(card)
+    first = call(card, 'stop_mapping')
+    assert call(card, 'delete_map', map_id=first['map_id'])['state'] == 'deleted'
+    assert call(card, 'resume_mapping', map_name='Other room') == {
+        'state': 'error', 'message': 'map_id is required for resume_mapping'}
+    assert call(card, 'resume_mapping', map_id=first['map_id'], map_name='Other room') == {
+        'state': 'error', 'message': 'unknown map'}
+    assert card._node is None
+
+
 def test_saved_native_map_can_resume_and_save_as_the_next_revision(card, monkeypatch):
     node = capture(card)
     first = call(card, 'stop_mapping')
@@ -1129,8 +1161,9 @@ def test_saved_native_map_can_resume_and_save_as_the_next_revision(card, monkeyp
         restored.append(restored_map)
         return original(*args, **kwargs)
     monkeypatch.setattr(module, 'RtabmapNode', resume)
-    result = call(card, 'start_mapping', map_name='Hall', map_id=first['map_id'])
+    result = call(card, 'resume_mapping', map_name='stale form name', map_id=first['map_id'])
     assert result['state'] == 'running'
+    assert result['map_name'] == first['map_name']
     assert restored[0]['segment_id'] == 'run'
     assert card._session_dir in Path(restored[0]['database']).parents
     assert call(card, 'rename_map', map_id=first['map_id'], map_name='Renamed Hall')['state']=='renamed'

@@ -33,6 +33,7 @@ _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calib
             'max_frames', 'max_points', 'persistent_history'}
 _ACTIONS = {
     'start_mapping': ['map_name'],
+    'resume_mapping': ['map_id'],
     'stop_mapping': [],
     'abandon_pending': [],
     'list_maps': [],
@@ -102,7 +103,7 @@ class PointCloudSlamPlugin:
             if key in props and value is not None:
                 props[key]['default'] = json.dumps(value) if key == 'child_from_cloud' else value
         verbs = ['start', 'stop', 'info', 'config', *_ACTIONS, 'operation_status']
-        actions = {key: {'requires_project': key == 'start_mapping'} for key in _ACTIONS}
+        actions = {key: {'requires_project': key in ('start_mapping', 'resume_mapping')} for key in _ACTIONS}
         actions['operation_status'] = {'internal': True}
         actions['delete_map']['confirm'] = '删除地图及其全部版本？'
         actions['abandon_pending']['confirm'] = '保存已经失败。解除阻塞并保留原始会话文件供人工恢复？该地图不会列入已保存地图。'
@@ -111,6 +112,7 @@ class PointCloudSlamPlugin:
                 pending_states=['working'], error_states=['error'], poll_interval_ms=500)
         schema = {'type': 'object', 'properties': {
             'action': {'type': 'string', 'enum': verbs,
+                       'description': 'start_mapping 用 map_name 新建地图，resume_mapping 用 map_id 续建已有地图。',
                        'oneOf': [{'const': k, 'title': k} for k in verbs]},
             'input_topics': {'type': 'array', 'items': {'type': 'string'}},
             'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
@@ -320,8 +322,8 @@ class PointCloudSlamPlugin:
                 self._config = merged
                 self._runtime_inputs = self._runtime_provenance = None
                 return {'state': 'configured', 'config': dict(self._config)}
-            if action == 'start_mapping':
-                return self._start_mapping(args)
+            if action in ('start_mapping', 'resume_mapping'):
+                return self._start_mapping(args, resume=action == 'resume_mapping')
             return self._map_action(action, args)
 
     def _prepare_after_prior_mapping(self, args):
@@ -435,15 +437,18 @@ class PointCloudSlamPlugin:
         self._project_inputs = deepcopy(args)
         return {'state': 'ready', 'backend': 'rtabmap', 'topic_out': self._outputs()}
 
-    def _start_mapping(self, args):
+    def _start_mapping(self, args, *, resume):
         from .pointcloud_slam_library import map_entries, validate_map_name
         if self._node or self._pending:
             raise ValueError('finish the pending map save first')
         if not self._project_inputs or self._capture_stop.is_set():
             raise ValueError('start the project before mapping')
+        bound = args.get('map_id') if resume else None
+        if resume and not bound:
+            raise ValueError('map_id is required for resume_mapping')
         # Core main passes only topic names. Learn the missing geometry from
         # fresh ROS pointcloud and tracking odometry, never a model preset.
-        if args.get('map_id') is None and self._resolved_inputs is None and any(
+        if not resume and self._resolved_inputs is None and any(
                 self._config.get(key) is None for key in
                 ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud')):
             odom_topic = next(t for t, f in self._topics.items() if f == 'state/odom')
@@ -460,13 +465,12 @@ class PointCloudSlamPlugin:
                 **({'camera_info': camera} if camera is not None else {}),
                 **({'input_registry':self._input_registry} if self._input_registry else {}))
         self._validate(self._settings())
-        bound = args.get('map_id')
-        if bound is not None and self._rgb_input is None:
-            raise ValueError('RGB is required to estimate the current pose in the saved map')
         entries = map_entries(_ARCHIVE_DIR)
         entry = next((e for e in entries if e['id'] == bound), None) if bound is not None else None
         if bound is not None and entry is None:
             raise ValueError('unknown map')
+        if resume and self._rgb_input is None:
+            raise ValueError('RGB is required to estimate the current pose in the saved map')
         name = entry['name'] if entry else validate_map_name(args.get('map_name'))
         if bound is None and any(e['name'] == name for e in entries):
             raise ValueError('map name already in use')
