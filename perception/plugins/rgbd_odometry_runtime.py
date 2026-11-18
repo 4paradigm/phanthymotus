@@ -1300,7 +1300,7 @@ class RgbdSession:
                     # A bounded pending observation has no final verdict yet.
                     # A premature pause would clear SLAM's matching cloud.
                     if self.fusion.state != 'tracking' and self.observations.geometry_capture is None:
-                        self._publish(self.fusion.output(self.fusion.last_frame or now))
+                        self._publish(self.fusion.watchdog_output(now))
                     return
             if self.imu is not None and getattr(self, 'fusion', None) is None:
                 if self.imu.status(time.time_ns()) == 'lost':

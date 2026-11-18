@@ -1,6 +1,6 @@
 """Decode numeric odometry poses without depending on ROS."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 from .pointcloud_slam_contract import validate_tracking_pose
@@ -21,6 +21,7 @@ class PoseSample:
     observation: FrameContext = None
     precise_stamp_ns: int = None
     observation_parents: tuple = ()
+    prediction_anchor_ns: int = None
 
     @property
     def stamp_ns(self):
@@ -89,3 +90,28 @@ def decode_slam_odom(sample):
                       quality.get('segment_id', vendor.get('segment_id', '')), position,
                       quaternion, covariance, quality.get('clock_id'),
                       quality.get('pose_reference', vendor.get('pose_reference')), observation, precise)
+
+
+def decode_slam_prediction(sample, anchor):
+    """Read a bounded registration guess in an already measured odometry gauge."""
+    if anchor is None or not isinstance(sample, dict) or sample.get('pose') is not None:
+        raise ValueError('IMU prediction requires a measured anchor and an absent tracking pose')
+    vendor = sample.get('vendor') or {}
+    if not isinstance(vendor, dict):
+        raise ValueError('invalid IMU prediction vendor')
+    fusion, quality = vendor.get('fusion'), vendor.get('motus_slam')
+    if not isinstance(fusion, dict) or not isinstance(quality, dict):
+        raise ValueError('missing IMU prediction evidence')
+    stamp, origin = fusion.get('prediction_stamp_ns'), fusion.get('prediction_anchor_ns')
+    if (vendor.get('source') != 'rgbd_eskf' or quality.get('status') not in ('coasting', 'recovering') or
+            fusion.get('mapping_allowed') is not False or fusion.get('translation_integrated') is not True or
+            type(origin) is not int or type(stamp) is not int or stamp != quality.get('stamp_ns') or
+            origin != anchor.stamp_ns or not 0 < stamp-origin <= 2_000_000_000):
+        raise ValueError('invalid IMU prediction window')
+    pose = decode_slam_odom(dict(sample, pose=fusion.get('prediction')))
+    if (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id) != (
+            anchor.segment_id, anchor.frame_id, anchor.child_frame_id, anchor.clock_id) or pose.stamp_ns != stamp:
+        raise ValueError('IMU prediction origin or capture time changed')
+    if not pose.covariance or any(not 0 < pose.covariance[i] <= .20**2 for i in (0, 7, 14)):
+        raise ValueError('IMU prediction position covariance is out of bounds')
+    return replace(pose, prediction_anchor_ns=origin)

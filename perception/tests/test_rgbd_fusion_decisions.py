@@ -87,8 +87,8 @@ def test_default_position_sigma_limit_allows_up_to_twenty_cm_without_tracking_pr
         assert fusion['prediction'] is not None
 
 
-def test_corrected_sigma_between_old_and_new_limits_can_recover_tracking():
-    c, t = warmed()
+def test_corrected_sigma_between_old_and_new_limits_can_recover_tracking(monkeypatch):
+    c, t = warmed(monkeypatch)
     stamp = imu_until(c, t, .9)
     sample = c.observe_frame(stamp, *images(), noisy(), stamp+1_000_000)
     diagnostic = sample['vendor']['fusion']['last_frame']

@@ -8,16 +8,19 @@
 #include <rtabmap/core/Odometry.h>
 #include <rtabmap/core/OdometryInfo.h>
 #include <rtabmap/core/RegistrationIcp.h>
+#include <rtabmap/core/RegistrationInfo.h>
+#include <rtabmap/core/Compression.h>
 #include <rtabmap/utilite/ULogger.h>
 #include <memory>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace motus {
 class VisualRecovery
 {
 public:
-    enum State { External=0, Searching=1, Localized=2, VisualTracking=3 };
+    enum State { External=0, Searching=1, Localized=2, VisualTracking=3, InertialRegistration=4 };
     explicit VisualRecovery(const rtabmap::ParametersMap & parameters):
         neighborIcp_(parameters), state_(External), missing_(false), waiting_(false), aligned_(false),
         localizationMode_(false), relocalizations_(0), visualInliers_(0), imageMode_(false), initialized_(false),
@@ -28,6 +31,11 @@ public:
         p["Odom/Strategy"]="0"; p["Odom/ResetCountdown"]="0";
         p["OdomF2M/MaxSize"]="2000";
         estimator_.reset(rtabmap::Odometry::create(p));
+        auto registration=parameters;
+        registration["Icp/PointToPlane"]="true";
+        registration["Icp/PointToPlaneMinComplexity"]="0.02";
+        registration["Icp/PointToPlaneLowComplexityStrategy"]="0";
+        inertialIcp_.reset(new rtabmap::RegistrationIcp(registration));
         externalToNative_=rtabmap::Transform::getIdentity();
         bool refining=rtabmap::Parameters::defaultRGBDNeighborLinkRefining();
         rtabmap::Parameters::parse(p,"RGBD/NeighborLinkRefining",refining);
@@ -77,6 +85,9 @@ public:
                  const std::map<std::string,float> & statistics=std::map<std::string,float>())
     {
         recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
+        rtabmap::Transform guess;
+        if(external.isNull() && takePrediction(data,guess))
+            return registerPrediction(map,data,guess,statistics);
         rtabmap::OdometryInfo info;
         rtabmap::Transform visual;
         const bool images=!data.imageRaw().empty() && !data.depthOrRightRaw().empty();
@@ -299,6 +310,55 @@ public:
         return true;
     }
 private:
+    static bool takePrediction(rtabmap::SensorData & data, rtabmap::Transform & guess)
+    {
+        // Private SensorData user-data record: eight-byte tag and seven
+        // float64 pose components, in RTAB-Map's compressed byte-matrix format.
+        const auto & bytes=data.userDataCompressed();
+        if(bytes.rows!=1 || bytes.type()!=CV_8UC1 || bytes.cols<=12 || bytes.cols>128)
+            return false;
+        int shape[3];
+        std::memcpy(shape,bytes.data+bytes.cols-sizeof(shape),sizeof(shape));
+        if(shape[0]!=1 || shape[1]!=64 || shape[2]!=CV_8UC1)
+            return false;
+        const auto payload=rtabmap::uncompressData(bytes);
+        if(payload.empty() || std::memcmp(payload.data,"MOTUSIMU",8)!=0)
+            return false;
+        data.setUserData(cv::Mat(),true);
+        double p[7];
+        std::memcpy(p,payload.data+8,sizeof(p));
+        if(std::all_of(p,p+7,[](double v){return std::isfinite(v);}) &&
+           std::abs(p[3]*p[3]+p[4]*p[4]+p[5]*p[5]+p[6]*p[6]-1.)<.002)
+            guess=rtabmap::Transform(p[0],p[1],p[2],p[3],p[4],p[5],p[6]);
+        return true;
+    }
+
+    bool registerPrediction(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
+                            const rtabmap::Transform & guess,
+                            const std::map<std::string,float> & statistics)
+    {
+        state_=Searching; odom_.setNull(); visualInliers_=0;
+        // A guess may extend only the already verified, active gauge.
+        if(guess.isNull() || !cv::checkRange(guess.dataMatrix()) ||
+           !initialized_ || waiting_ || missing_ || localizationMode_ ||
+           map.getLocalOptimizedPoses().empty())
+            return false;
+        const auto * last=map.getMemory()->getLastWorkingSignature();
+        if(!last) return false;
+        rtabmap::RegistrationInfo result;
+        const auto relative=inertialIcp_->computeTransformation(last->sensorData(),data,
+            last->getPose().inverse()*externalToNative_*guess,&result);
+        if(relative.isNull() || result.icpStructuralComplexity<.02 || !validCovariance(result.covariance))
+            return false;
+        const auto measured=last->getPose()*relative;
+        auto stats=statistics;
+        stats["Motus/InertialIcpOverlap/"]=result.icpInliersRatio;
+        if(!map.process(data,measured,result.covariance,std::vector<float>(),stats))
+            return false;
+        state_=InertialRegistration; odom_=measured;
+        return true;
+    }
+
     rtabmap::Transform processVisual(rtabmap::SensorData & data, rtabmap::OdometryInfo & info)
     {
         struct RestoreScan
@@ -319,6 +379,7 @@ private:
         return true;
     }
     std::unique_ptr<rtabmap::Odometry> estimator_;
+    std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_;
     rtabmap::RegistrationIcp neighborIcp_;
     int state_, minInliers_, maxOdomCacheSize_;
     float maxError_;

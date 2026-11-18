@@ -5,7 +5,7 @@ from copy import deepcopy
 import numpy as np
 
 from .pointcloud_slam_alignment import align_pose
-from .pointcloud_slam_odom import decode_slam_odom
+from .pointcloud_slam_odom import decode_slam_odom, decode_slam_prediction
 from .pointcloud_slam_transforms import rigid as _rigid
 
 
@@ -32,6 +32,7 @@ class SlamStream:
         self._segments = OrderedDict()
         self._admitted = 0
         self._poses = deque(maxlen=512)
+        self._pose_anchor = None
         self._pending = deque()
         self._last_received = None
         self._last_cloud_received = None
@@ -52,6 +53,7 @@ class SlamStream:
     def _lose(self):
         """Numeric pose absence waits for a new pose, without retiring labels."""
         self._poses.clear()
+        self._pose_anchor = None
         self._pending.clear()
         self._last_received = None
         self._odom_state = 'waiting'
@@ -73,14 +75,24 @@ class SlamStream:
         try:
             pose = decode_slam_odom(sample)
         except ValueError as error:
-            self._lose()
-            self.last_error = str(error)
-            return
-        poses = {p.stamp_ns: p for p in self._poses}
+            try:
+                pose = decode_slam_prediction(sample, self._pose_anchor)
+            except ValueError:
+                self._lose()
+                self.last_error = str(error)
+                return
+        if pose.prediction_anchor_ns is None:
+            if self._pose_anchor is None or pose.stamp_ns >= self._pose_anchor.stamp_ns:
+                self._pose_anchor = pose
+            # Confirmed corrections supersede hypotheses beyond their capture.
+            poses = {p.stamp_ns: p for p in self._poses
+                     if p.prediction_anchor_ns is None or p.stamp_ns < pose.stamp_ns}
+        else:
+            poses = {p.stamp_ns: p for p in self._poses}
         poses[pose.stamp_ns] = pose
         self._poses = deque(sorted(poses.values(), key=lambda p: p.stamp_ns)[-512:], maxlen=512)
         self._last_received = now if received is None else received
-        self._odom_state = 'tracking'
+        self._odom_state = 'coasting' if pose.prediction_anchor_ns is not None else 'tracking'
         self._drain(now, measurement_now_ns)
 
     def _capture_context(self, packet):
@@ -176,8 +188,9 @@ class SlamStream:
                 pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
                 matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
                 self.on_frame(stamp, cloud, pose, matrix.copy(), deepcopy(context))
-                self._segments[pose.segment_id] = (pose.frame_id, pose.child_frame_id, pose.clock_id, pose.pose_reference)
-                self._admitted += 1
+                if pose.prediction_anchor_ns is None:
+                    self._segments[pose.segment_id] = (pose.frame_id, pose.child_frame_id, pose.clock_id, pose.pose_reference)
+                    self._admitted += 1
             except ValueError as error:
                 self.last_error = str(error)
         self._pending = remaining

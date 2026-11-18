@@ -49,6 +49,10 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
             if stamp_ns > cloud_stamp_ns:
                 if previous is None:
                     break
+                prediction = previous.prediction_anchor_ns or sample.prediction_anchor_ns
+                if prediction is not None and (stamp_ns-previous.stamp_ns > max_gap_ms*1_000_000 or
+                        cloud_stamp_ns <= prediction):
+                    raise ValueError('IMU prediction cannot bridge unbounded capture gaps')
                 ratio = (cloud_stamp_ns - previous.stamp_ns) / (stamp_ns - previous.stamp_ns)
                 position = tuple((1-ratio)*a + ratio*b for a, b in zip(previous.position, sample.position))
                 if not all(math.isfinite(v) for v in position):
@@ -57,6 +61,7 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                                   sample.segment_id, position,
                                   _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id,
                                   sample.pose_reference, None, cloud_stamp_ns,
-                                  tuple(c for c in (previous.observation,sample.observation) if c is not None))
+                                  tuple(c for c in (previous.observation,sample.observation) if c is not None),
+                                  prediction)
             previous = sample
     raise ValueError('no numeric pose at cloud timestamp')

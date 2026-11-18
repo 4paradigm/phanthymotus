@@ -203,6 +203,15 @@ class InertialFilter:
             self.rejection = 'innovation_gate'
             return False
         self.rejection = None
+        self._update(h, residual, covariance, correlated=correlated)
+        return True
+
+    def zero_velocity(self):
+        h = np.zeros((3, 15))
+        h[:, 3:6] = np.eye(3)
+        self._update(h, -self.v, np.eye(3)*.015**2)
+
+    def _update(self, h, residual, covariance, *, correlated=False):
         # Covariance intersection for depth corrections sharing a reference:
         # do not repeatedly average down a common reference/calibration error.
         prior = self.P/.9 if correlated else self.P
@@ -225,7 +234,6 @@ class InertialFilter:
         reset[6:9, 6:9] -= .5*skew(delta[6:9])
         self.P = reset@self.P@reset.T
         self.P = (self.P+self.P.T)/2.
-        return True
 
     def camera_pose(self):
         h = self.measurement_matrix()
@@ -239,6 +247,8 @@ class InertialFilter:
 
 SIGMA_LIMIT_M = .20
 INERTIAL_LIMIT_NS = 1_000_000_000
+MAX_IMU_GAP_NS = 100_000_000
+MAX_BRIDGE_NS = 2_000_000_000
 # Wall-clock polls lag capture time by native latency. Frames resolve within the
 # 250 ms join deadline, so 500 ms without any processed frame (>= 4 Hz) means
 # frames stopped, not that the pipeline is merely latent.
@@ -282,6 +292,15 @@ class ShortTermFusion:
         # Optional off-lock registration (GeometryWorker); None runs inline.
         self.geometry_runner = self.geometry_job = None
         self.revision = 0
+        self.zero_velocity_updates = 0
+
+    def _start_pause(self):
+        if self.pause_context is None and self.last_tracking is not None and self.recovery_policy is not None:
+            import time
+            self.pause_context = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, time.monotonic_ns())
+
+    def _bridge_budget(self):
+        return min(MAX_BRIDGE_NS, self.pause_context.budget_ns) if self.pause_context else INERTIAL_LIMIT_NS
 
     def fault(self, reason, kind='fusion'):
         if self.state != 'lost':
@@ -311,11 +330,12 @@ class ShortTermFusion:
         if self.state != 'lost' and self.imu.status(now_ns) == 'lost':
             self.fault('IMU stale or invalid: '+str(self.imu.reason))
         if self.filter is not None and self.state != 'lost':
-            if self.last_visual_wall and now_ns-self.last_visual_wall > INERTIAL_LIMIT_NS:
-                self.fault('visual correction absent for more than 1 s')
-            elif (self.state == 'tracking' and self.last_processed_ns and
+            if (self.state == 'tracking' and self.last_processed_ns and
                     now_ns-self.last_processed_ns > FRAME_SILENCE_NS):
                 self.state, self.reason = 'coasting', 'camera frames delayed'
+                self._start_pause()
+            if self.last_visual_wall and now_ns-self.last_visual_wall > self._bridge_budget():
+                self.fault('visual correction absent beyond the inertial bridge')
         return self.state
 
     def _expire(self, stamp):
@@ -323,13 +343,14 @@ class ShortTermFusion:
         if self.state != 'lost' and self.imu.status(stamp) == 'lost':
             self.fault('IMU stale or invalid: '+str(self.imu.reason))
         if self.filter is not None and self.state != 'lost':
-            if stamp-self.last_visual > INERTIAL_LIMIT_NS:
-                self.fault('visual correction absent for more than 1 s')
-            elif self.last_frame and stamp-self.last_frame > FRAME_SILENCE_NS:
+            if self.last_frame and stamp-self.last_frame > FRAME_SILENCE_NS:
                 # A normal 4 Hz capture (plus jitter) is not a failed visual
                 # correction. Only actual frame silence resets evidence here;
                 # missing/rejected corrections reset it in observe_frame.
                 self.state, self.reason, self.good = 'coasting', 'visual correction delayed', 0
+                self._start_pause()
+            if stamp-self.last_visual > self._bridge_budget():
+                self.fault('visual correction absent beyond the inertial bridge')
 
     def position_sigma(self):
         covariance = np.array(self.filter.camera_pose()['covariance']).reshape(6, 6)
@@ -368,15 +389,16 @@ class ShortTermFusion:
         self.good = 1
         return True
 
-    def _propagate(self, stamp):
-        if stamp < self.filter.stamp or not self.samples or stamp > self.samples[-1][0]:
+    def _propagate(self, stamp, estimate=None):
+        estimate = self.filter if estimate is None else estimate
+        if stamp < estimate.stamp or not self.samples or stamp > self.samples[-1][0]:
             raise ValueError('frame lacks capture-time IMU coverage')
         entries = list(self.samples)
-        if entries[0][0] > self.filter.stamp:
+        if entries[0][0] > estimate.stamp:
             raise ValueError('IMU history no longer covers estimator state')
         for i in range(len(entries)-1):
             left, right = entries[i], entries[i+1]
-            start, end = max(self.filter.stamp, left[0]), min(stamp, right[0])
+            start, end = max(estimate.stamp, left[0]), min(stamp, right[0])
             if end <= start:
                 continue
             # Accepted capture gaps can exceed the integrator's 100 ms step.
@@ -386,12 +408,36 @@ class ShortTermFusion:
                 fraction = (start-left[0]+(step_end-start)/2.)/(right[0]-left[0])
                 gyro = left[1]*(1-fraction)+right[1]*fraction
                 accel = left[2]*(1-fraction)+right[2]*fraction
-                self.filter.propagate((step_end-start)/1e9, gyro, accel)
+                estimate.propagate((step_end-start)/1e9, gyro, accel)
                 start = step_end
-            if self.filter.stamp == stamp:
+            if estimate.stamp == stamp:
                 break
-        if self.filter.stamp != stamp:
+        if estimate.stamp != stamp:
             raise ValueError('IMU history has a propagation gap')
+
+    def _stationary_update(self, stamp, measured_pose, ref_stamp, reference_pose):
+        dt = (stamp-ref_stamp)/1e9
+        if not .1 <= dt <= 1.:
+            return False
+        for pose in (measured_pose, reference_pose):
+            cov = np.asarray(pose['covariance'], dtype=float).reshape(6, 6)
+            if np.max(np.diag(cov)[:3]) > .025**2 or np.max(np.diag(cov)[3:]) > .05**2:
+                return False
+        p, r = pose_values(measured_pose)
+        ref_p, ref_r = pose_values(reference_pose)
+        if np.linalg.norm(p-ref_p) > min(.008, .02*dt) or np.linalg.norm(log_rotation(ref_r.T@r)) > .01:
+            return False
+        samples = [s for s in self.samples if ref_stamp <= s[0] <= stamp]
+        times = [ref_stamp, *(s[0] for s in samples), stamp]
+        if len(samples) < 5 or max(np.diff(times)) > MAX_IMU_GAP_NS:
+            return False
+        gravity_force = -r.T@self.filter.g
+        if any(np.linalg.norm(w-self.filter.bg) > .045 or
+               np.linalg.norm(a-self.filter.ba-gravity_force) > .25 for _, w, a in samples):
+            return False
+        self.filter.zero_velocity()
+        self.zero_velocity_updates += 1
+        return True
 
     def observe_frame(self, stamp, color, depth, visual_pose, now_ns, reason=None, *, arrival_ns=None):
         from .rgbd_geometry import observation_quality
@@ -440,6 +486,9 @@ class ShortTermFusion:
             if accepted:
                 self.revision += 1
                 diagnostic['visual'] = 'accepted'
+                if self.reference is not None:
+                    ref_stamp, _, ref_pose = self.reference
+                    diagnostic['zero_velocity'] = self._stationary_update(stamp, visual_pose, ref_stamp, ref_pose)
                 self.last_visual, self.last_visual_wall = stamp, now_ns
                 diagnostic['corrected_sigma_m'] = self.position_sigma()
                 self._accept_correction(stamp, visual_pose, depth)
@@ -586,6 +635,10 @@ class ShortTermFusion:
             self.aid = 'depth_geometry'
             self.quality['geometry'].update(accepted=True, reason=None)
             if rank == 6:
+                if self.reference is not None:
+                    stationary_pose = dict(measured, covariance=covariance.ravel().tolist())
+                    self.quality['geometry']['zero_velocity'] = self._stationary_update(
+                        self.filter.stamp, stationary_pose, self.reference[0], ref_pose)
                 self._accept_correction(self.filter.stamp)
             else:
                 # A useful partial correction cannot certify a complete pose,
@@ -597,9 +650,7 @@ class ShortTermFusion:
 
     def _finish(self, stamp, diagnostic):
         if self.state in ('coasting', 'recovering') and self.last_tracking is not None and self.recovery_policy is not None:
-            if self.pause_context is None:
-                import time
-                self.pause_context = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, time.monotonic_ns())
+            self._start_pause()
         elif self.state == 'tracking':
             self.pause_context = None
         diagnostic.update(state=self.state, aid=self.aid)
@@ -614,15 +665,45 @@ class ShortTermFusion:
         (fp, fr), (vp, vr) = pose_values(fused), pose_values(visual)
         return float(np.linalg.norm(fp-vp)), float(np.linalg.norm(log_rotation(fr.T@vr)))
 
-    def output(self, stamp):
-        pose = self.filter.camera_pose() if self.filter is not None and self.state != 'lost' else None
+    def watchdog_output(self, now_ns):
+        self.status(now_ns)
+        stamp = self.last_frame or now_ns
+        if self.state != 'coasting' or self.filter is None or not self.last_tracking or not self.samples:
+            return self.output(stamp)
+        latest = self.samples[-1][0]
+        if not (self.filter.stamp <= latest <= self.last_visual+self._bridge_budget() and
+                0 <= now_ns-latest <= MAX_IMU_GAP_NS):
+            return self.output(stamp, allow_prediction=False)
+        if latest == self.filter.stamp:
+            return self.output(stamp)
+        times = [s[0] for s in self.samples if s[0] >= self.filter.stamp]
+        if max(np.diff([self.filter.stamp, *times])) > MAX_IMU_GAP_NS:
+            return self.output(stamp, allow_prediction=False)
+        estimate = deepcopy(self.filter)
+        try:
+            self._propagate(latest, estimate)
+        except ValueError:
+            return self.output(stamp, allow_prediction=False)
+        return self.output(latest, estimate=estimate)
+
+    def output(self, stamp, *, estimate=None, allow_prediction=True):
+        estimate = self.filter if estimate is None else estimate
+        pose = estimate.camera_pose() if estimate is not None and self.state != 'lost' else None
         if pose is not None:
             pose.update(frame_id=self.segment+'_odom', child_frame_id=self.frame)
         sample = make_sample(self.state, stamp, self.segment, self.clock,
                              pose if self.state == 'tracking' else None, reason=self.reason)
         sample['vendor']['source'] = 'rgbd_eskf'
         sample['vendor']['fusion'] = self.info(stamp)
-        sample['vendor']['fusion']['prediction'] = pose if self.state in ('coasting', 'recovering') else None
+        fusion = sample['vendor']['fusion']
+        fusion['prediction'] = None
+        if pose is not None and allow_prediction and self.state in ('coasting', 'recovering'):
+            covariance = np.asarray(pose['covariance']).reshape(6, 6)[:3, :3]
+            fusion['prediction_stamp_ns'] = estimate.stamp
+            if np.linalg.eigvalsh(covariance).max() <= SIGMA_LIMIT_M**2:
+                fusion['prediction'] = pose
+                if self.last_tracking is not None:
+                    fusion['prediction_anchor_ns'] = self.last_tracking[0]
         return sample
 
     def info(self, now_ns, *, history=False):
@@ -635,6 +716,7 @@ class ShortTermFusion:
                      sigma_limit_m=SIGMA_LIMIT_M,
                      uncertainty_model='engineering_prior_unvalidated',
                      translation_integrated=True, mapping_allowed=self.state == 'tracking',
+                     zero_velocity_updates=self.zero_velocity_updates,
                      imu=self.imu.info(now_ns),
                      last_frame=deepcopy(self.frames[-1]) if self.frames else None)
         if history:

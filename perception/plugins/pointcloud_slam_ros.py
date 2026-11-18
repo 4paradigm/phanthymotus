@@ -5,6 +5,8 @@ import math
 import threading
 import time
 import logging
+import struct
+import zlib
 from collections import deque, OrderedDict
 from pathlib import Path
 import shutil
@@ -287,7 +289,7 @@ class RtabmapNode(Node):
                         context.ingress_clock_id==self.stream.ingress_clock_id else None)
                 except ValueError as error:
                     self.stream.last_error = str(error)
-                if self.stream._odom_state != 'tracking':
+                if self.stream._odom_state not in ('tracking', 'coasting'):
                     # Retire work that depended on the old numeric pose. Null
                     # pose heartbeats must leave localization queries runnable.
                     self._pose_loss_seq = self._admission_seq
@@ -364,8 +366,15 @@ class RtabmapNode(Node):
         if ingress is None:
             raise ValueError('cloud original ingress context expired')
         received, observation = ingress
+        predicted = pose is not None and pose.prediction_anchor_ns is not None
+        if predicted and (self._rgb is None or self._active is None):
+            self._rgb_reservations.pop(stamp, None)
+            self._dropped += 1
+            return
         self._map_decision = dict(action='accept' if pose is not None else 'localize',
             reason='numeric cloud and pose' if pose is not None else 'external pose absent; native visual estimation required')
+        if predicted:
+            self._map_decision = dict(action='register', reason='inertial guess requires native scan registration')
         normalized = normalize_cloud(cloud, observation, None,
                                      max_points=self.stream.max_cloud_points)
         cloud = normalized.message
@@ -517,6 +526,8 @@ class RtabmapNode(Node):
             if self._retire_overtaken(item):
                 return
         stamp, cloud, pose, matrix, received = item[:5]
+        predicted = pose is not None and pose.prediction_anchor_ns is not None
+        measured = pose if not predicted else None
         transform = self._TransformStamped()
         transform.header = deepcopy(cloud.header)
         transform.header.frame_id = segment['process'].namespace.lstrip('/') + '/base'
@@ -530,7 +541,7 @@ class RtabmapNode(Node):
         odom.header = deepcopy(cloud.header)
         odom.header.frame_id = segment['process'].namespace.lstrip('/') + '/odom'
         odom.child_frame_id = transform.header.frame_id
-        if pose is not None:
+        if measured is not None:
             for key, value in zip(('x', 'y', 'z'), pose.position):
                 setattr(odom.pose.pose.position, key, value)
             for key, value in zip(('x', 'y', 'z', 'w'), pose.quaternion):
@@ -539,7 +550,7 @@ class RtabmapNode(Node):
             # Pinned transformFromPoseMsg maps an all-zero quaternion to null.
             # This is an explicit absent estimate, never the last valid pose.
             odom.pose.pose.orientation.w = 0.
-        if pose is not None and pose.covariance is not None:
+        if measured is not None and pose.covariance is not None:
             odom.pose.covariance = list(pose.covariance)
         # Native odomUpdate looks up this exact pose even with an Odometry input.
         odom_transform = self._TransformStamped()
@@ -553,6 +564,11 @@ class RtabmapNode(Node):
             odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
         native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation) if self._rgb is not None else (cloud, None)
+        if predicted:
+            # The standard odometry input stays null. Even an older native
+            # runtime cannot mistake this private hint for a tracking pose.
+            payload = struct.pack('<8s7d', b'MOTUSIMU', *pose.position, *pose.quaternion)
+            native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
         if (self._root_deadline and pose is not None and not native.left.data and
                 (self._rgb_task is None or self._rgb_task[1].done()) and self._prefer_next_root_observation()):
             return
@@ -565,7 +581,7 @@ class RtabmapNode(Node):
                 return
             if self.stream.extrinsic_mode != 'dynamic':
                 segment['tf_pub'].publish(tf)
-            if pose is not None:
+            if measured is not None:
                 segment['odom_tf_pub'].publish(odom_tf)
             elif self.stream.extrinsic_mode == 'dynamic':
                 # Keep the numerical mount, without publishing an invalid odom TF.
@@ -587,7 +603,7 @@ class RtabmapNode(Node):
             self._forwarded += 1
             segment['forwarded'] += 1
             segment['progress'].forward(stamp,self._receipt_clock())
-            self._covariance_source = ('native_visual' if pose is None else
+            self._covariance_source = ('inertial_guess' if predicted else 'native_visual' if pose is None else
                 'upstream' if pose.covariance is not None else 'backend_default')
             startup_backlog = self._root_deadline and native.left.data and bool(self._queue)
         if startup_backlog:
@@ -633,6 +649,10 @@ class RtabmapNode(Node):
         data.laser_scan_format, data.laser_scan_max_pts, data.laser_scan_max_range = 5, 0, 0.
         data.laser_scan_local_transform = self._native_transform(matrix)
         self._rgb_mode, self._rgb_reason = 'pointcloud', self._rgb_subscription_error
+        if pose is not None and pose.prediction_anchor_ns is not None:
+            with self._lock:
+                self._rgb_reservations.pop(stamp, None)
+            return data, None  # Keep the guessed motion out of the measured scan.
         if self._rgb_subscription_error:
             return data, None
         key = (pose.segment_id if pose is not None else None, stamp, id(cloud))
@@ -935,7 +955,7 @@ class RtabmapNode(Node):
             recovery = [values.get(key) for key in
                 ('Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/')]
             if all(isinstance(v, (int, float)) and math.isfinite(v) for v in recovery):
-                states = ('external', 'searching', 'localized', 'visual_tracking')
+                states = ('external', 'searching', 'localized', 'visual_tracking', 'inertial_registration')
                 if recovery[0] in range(len(states)):
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],
                         relocalizations=int(recovery[1]), visual_inliers=int(recovery[2]))

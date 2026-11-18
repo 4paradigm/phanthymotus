@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from plugins.pointcloud_slam_stream import SlamStream
+from plugins.pointcloud_slam_odom import decode_slam_odom
 
 
 def odom(ms, x=0, segment='a', status='tracking'):
@@ -41,6 +42,31 @@ def test_bracketing_pose_emits_untouched_cloud_and_exact_nanosecond_stamp():
     assert frame.cloud_stamp_ns == 1_100_000_001
     assert frame.cloud == raw
     assert not hasattr(s, 'store') and not hasattr(s, 'graph')
+
+
+def test_inertial_prediction_is_only_a_hint_in_the_accepted_origin():
+    s = stream()
+    sample = odom(1200, .2, status='coasting')
+    predicted = sample.pop('pose')
+    predicted['covariance'] = (np.eye(6)*.01).ravel().tolist()
+    sample['pose'] = None
+    vendor = sample['vendor']
+    vendor.update(source='rgbd_eskf', fusion=dict(prediction=predicted, translation_integrated=True,
+        prediction_stamp_ns=1_200_000_000, prediction_anchor_ns=1_000_000_000, mapping_allowed=False))
+    vendor['motus_slam']['stamp_ns'] = 1_200_000_000
+    with pytest.raises(ValueError):
+        decode_slam_odom(sample)  # startup requires a measured root
+    s.odom(sample, now=1.2)
+    assert s.status(now=1.2)['odometry'] == 'waiting'
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_100_000_000, 'camera', [[1, 0, 0]], now=1.1)
+    s.odom(sample, now=1.2)
+    assert s.status(now=1.2)['odometry'] == 'coasting'
+    assert s.accepted[0].pose.prediction_anchor_ns == 1_000_000_000
+    assert s.accepted[0].pose.position == pytest.approx((.1, 0, 0))
+    vendor['motus_slam']['segment_id'] = 'another-origin'
+    s.odom(sample, now=1.21)
+    assert s.status(now=1.21)['odometry'] == 'waiting'
 
 
 def test_extrinsic_is_capture_evidence_and_never_reprojects_cloud_bytes():

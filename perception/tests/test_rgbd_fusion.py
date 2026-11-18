@@ -62,8 +62,10 @@ def source(t, **changes):
     return packet(t, **values)
 
 
-def warmed():
+def warmed(monkeypatch_without_zupt=None):
     c = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    if monkeypatch_without_zupt is not None:
+        monkeypatch_without_zupt.setattr(c, '_stationary_update', lambda *_: False)
     color, depth = images()
     for i in range(141):
         t = 1_000_000_000+i*5_000_000
@@ -94,6 +96,38 @@ def test_short_outage_is_prediction_only_and_requires_three_visual_recoveries():
     for count in range(3):
         sample, t = advance(c, t, .05, pose())
         assert (sample['pose'] is not None) == (count == 2)
+
+
+def test_imu_continues_during_camera_silence_without_advancing_filter_anchor():
+    c, t = warmed()
+    for i in range(1, 121):
+        stamp = t+i*5_000_000
+        c.observe_imu(source(stamp, linear_acceleration=[1., 0., G]), stamp+1_000_000)
+    sample = c.watchdog_output(stamp+1_000_000)
+    vendor = sample['vendor']
+    assert sample['pose'] is None and vendor['motus_slam']['status'] == 'coasting'
+    assert vendor['motus_slam']['segment_id'] == 'run'
+    assert vendor['motus_slam']['stamp_ns'] == vendor['fusion']['prediction_stamp_ns'] == stamp
+    assert vendor['fusion']['prediction']['position'][0] > .1
+    assert c.filter.stamp == t
+    stale_imu = c.watchdog_output(stamp+120_000_000)
+    assert stale_imu['vendor']['fusion']['prediction'] is None
+    expired = c.watchdog_output(t+1_100_000_000)
+    assert expired['vendor']['fusion']['prediction'] is None
+
+
+def test_zero_velocity_needs_independent_stationarity_and_quiet_imu():
+    c, t = warmed()
+    c.filter.v[0] = .025
+    assert c._stationary_update(t, pose(), t-300_000_000, pose())
+    assert abs(c.filter.v[0]) < .025
+    before = c.filter.v.copy()
+    assert not c._stationary_update(t, pose(.05), t-300_000_000, pose())
+    np.testing.assert_array_equal(c.filter.v, before)
+    uncertain = dict(pose(), covariance=(np.eye(6)*.01).ravel().tolist())
+    assert not c._stationary_update(t, uncertain, t-300_000_000, pose())
+    c.samples[-1] = (t, np.array([0., 0., .5]), np.array([0., 0., G]))
+    assert not c._stationary_update(t, pose(), t-300_000_000, pose())
 
 
 @pytest.mark.parametrize('seconds', [.1, .3, .5, 1., 2., 5.])
