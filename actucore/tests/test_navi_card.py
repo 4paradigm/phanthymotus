@@ -1431,3 +1431,46 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     observation = card.observation()[1]
     assert "ground" not in observation
     assert policy._clearance(observation, card._config)[0] == 0.55
+
+
+def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(confirm_hits=1)
+    node = _FakeNode({_DEPTH_TOPIC: ["sensor_msgs/msg/CompressedImage"]})
+    card._executor = object()
+    card._open_publisher = lambda: setattr(card, "_node", node)
+    odom_topic = "/demo/state/odom"
+    declaration = _decl(_DEPTH_TOPIC, id="demo/camera_front", distortion_model="pinhole",
+                        K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
+    reply = card.dispatch("navi", {
+        "action": "start", "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC, odom_topic],
+        "control_interface": _descriptor(footprint={"half_width": 0.23}),
+        "camera_info": {_DEPTH_TOPIC: declaration},
+    })
+    assert reply["state"] == "running"
+    assert card._config.local_planning and card._config.local_geometry.front == .23
+
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    card._state = policy.State(target="person")
+    card._objects = {"timestamp": 123.0, "objects": [
+        {"name": "person", "position": [0, 0], "confidence": .9}]}
+    card._objects_ms = 123_000
+    card._depth_map = np.full((480, 640), 2.5, dtype=np.float32)
+    card._depth_ground = np.zeros_like(card._depth_map, dtype=bool)
+    card._depth_ms = 122_950
+    card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    card._odom_ms = 123_000
+    monkeypatch.setattr(
+        policy, "_clearance",
+        lambda depth, config, lateral_offset_m=0: (
+            1.2 if lateral_offset_m > 0 else .5 if lateral_offset_m < 0 else .9, 1.0))
+    monkeypatch.setattr(local_path, "_checked_translation", lambda *args: (.04, -.06))
+    for index in range(6):
+        card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
+        command = card.next_command()
+    assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
+    assert command["obs_stamp_ms"] == 122_950
+    card._odom_ms = 0
+    assert card.next_command()["values"] == [0.0] * 6

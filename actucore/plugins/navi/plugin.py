@@ -509,6 +509,17 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
+        from .local_path import camera_square
+        footprint = descriptor.get("footprint") or {}
+        half_width = footprint.get("half_width")
+        self._config.local_planning = bool(binding.get("depth_map") and binding.get("odom"))
+        valid_width = (type(half_width) in (int, float)
+                       and math.isfinite(half_width) and half_width > 0)
+        if self._config.local_planning and valid_width:
+            self._config.local_geometry = camera_square(
+                self._config.depth_intrinsics, self._depth_vertical, half_width)
+        if self._config.local_planning and self._config.local_geometry is None:
+            self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
         # Callers may supply producer contracts keyed by the actual wired
         # topic.  Selecting only after role binding prevents a second odometry
         # producer on the canvas from donating timing to the wrong stream.
@@ -981,7 +992,9 @@ class NaviPlugin:
                            "use_lateral": self._config.use_lateral,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
                            "slow_distance_m": self._config.slow_distance_m,
-                           "side_clearance_m": self._config.side_clearance_m},
+                           "side_clearance_m": self._config.side_clearance_m,
+                           "local_planning": self._config.local_planning,
+                           "local_geometry_ready": self._config.local_geometry is not None},
                 "published": self._published,
                 "gains": {
                     "forward": {"base": self._config.k_fwd,
@@ -1533,6 +1546,9 @@ class NaviPlugin:
                                            self._deadband_for(decision.values))
 
         obs_ms = self._objects_ms or int(now * 1000)
+        if (self._config.local_planning and decision.status == policy_mod.AVOIDING
+                and depth is not None and depth.get("frame_id") is not None):
+            obs_ms = min(obs_ms, depth["frame_id"])
         return self._command_message(values, now, obs_ms)
 
     def _command_message(self, values, now, obs_ms):

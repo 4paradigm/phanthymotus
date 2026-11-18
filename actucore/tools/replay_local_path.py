@@ -9,7 +9,6 @@ This tool has no ROS or control publisher.
 from __future__ import annotations
 
 import argparse
-import heapq
 import json
 import math
 from pathlib import Path
@@ -19,123 +18,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plugins.navi import camera, depth  # noqa: E402
+from plugins.navi.local_path import (  # noqa: E402
+    FREE, OCCUPIED, UNKNOWN, Geometry, footprint_region, observe, plan_right,
+)
 
-UNKNOWN, FREE, OCCUPIED = 0, 1, 2
-STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1))
-
-
-def footprint_region(center, half_cells):
-    row, col = center
-    dr, dc = half_cells
-    return np.s_[row-dr:row+dr+1, col-dc:col+dc+1]
-
-
-def allowed_centers(grid, start, half_cells, allow_unknown=False):
-    blocked = grid == OCCUPIED if allow_unknown else grid != FREE
-    area = footprint_region(start, half_cells)
-    blocked[area] = grid[area] == OCCUPIED
-    dr, dc = half_cells
-    rectangle = np.pad(blocked, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-    blocked_count = (rectangle[2*dr+1:, 2*dc+1:] - rectangle[:-2*dr-1, 2*dc+1:]
-                     - rectangle[2*dr+1:, :-2*dc-1] + rectangle[:-2*dr-1, :-2*dc-1])
-    return np.pad(blocked_count == 0, ((dr, dr), (dc, dc)), constant_values=False)
-
-
-def shortest_path(allowed, start, goal):
-    if not (allowed[start] and allowed[goal]):
-        return None
-    queue = [(math.dist(start, goal), 0.0, start)]
-    cost = {start: 0.0}
-    parents = {}
-    while queue:
-        _, walked, current = heapq.heappop(queue)
-        if current == goal:
-            route = [goal]
-            while route[-1] != start:
-                route.append(parents[route[-1]])
-            return route[::-1]
-        if walked > cost[current]:
-            continue
-        row, col = current
-        for dr, dc in STEPS:
-            nxt = (row + dr, col + dc)
-            if not (0 <= nxt[0] < allowed.shape[0] and 0 <= nxt[1] < allowed.shape[1]):
-                continue
-            # With a fixed-heading rectangular footprint, check both cardinal
-            # translations so a diagonal cannot cut an occupied corner.
-            if not (allowed[nxt] and allowed[row + dr, col] and allowed[row, col + dc]):
-                continue
-            distance = walked + math.hypot(dr, dc)
-            if distance < cost.get(nxt, math.inf):
-                cost[nxt] = distance
-                parents[nxt] = current
-                heapq.heappush(queue, (distance + math.dist(nxt, goal), distance, nxt))
-    return None
-
-
-def plan_right(grid, start, right, goal, half_cells, allow_unknown=False):
-    allowed = allowed_centers(grid, start, half_cells, allow_unknown)
-    # Reach the right of the box before crossing its depth, continue along
-    # that side, then return toward the original centerline. All three legs
-    # are needed before a right detour is reported.
-    first = allowed.copy()
-    first[right[0]+1:, :] = False
-    passing = allowed.copy()
-    passing[:, :right[1]] = False
-    passing[:right[0], :] = False
-    passing[goal[0]+1:, :] = False
-    rejoin = allowed.copy()
-    rejoin[:goal[0], :] = False
-    right_ahead = (goal[0], right[1])
-    pieces = (shortest_path(first, start, right),
-              shortest_path(passing, right, right_ahead),
-              shortest_path(rejoin, right_ahead, goal))
-    if any(piece is None for piece in pieces):
-        return None
-    return pieces[0] + pieces[1][1:] + pieces[2][1:]
-
-
-def observe(frame, intrinsics, vertical, camera_forward, right, forward, resolution):
-    ground = depth.ground_mask(frame, intrinsics, vertical)
-    if ground is None:
-        return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
-    height, width = frame.shape
-    fx, cx = intrinsics.for_width(width)
-    calib_height, fy, cy = vertical
-    scale = height / calib_height
-    fy, cy = fy * scale, (cy + 0.5) * scale - 0.5
-    u = (np.arange(width) - cx) / fx
-    v = (np.arange(height) - cy) / fy
-    x, y = u * frame, v[:, None] * frame
-    seed = ground[::4, ::4]
-    gs = frame[::4, ::4][seed]
-    gx, gy = x[::4, ::4][seed], y[::4, ::4][seed]
-    a, b, c = np.linalg.lstsq(np.column_stack((gx, gs, np.ones_like(gs))), gy, rcond=None)[0]
-
-    z = forward - camera_forward
-    front = z > 0
-    denom = np.where(front, z, 1.0)
-    cols = np.rint(fx * right / denom + cx).astype(int)
-    floor_y = a * right + b * z + c
-    free = front & (cols >= 0) & (cols < width)
-    for height_m in (0.03, 0.08, 0.16, 0.25, 0.40):
-        rows = np.rint(fy * (floor_y - height_m) / denom + cy).astype(int)
-        in_image = free & (rows >= 0) & (rows < height)
-        distances = frame[rows[in_image], cols[in_image]]
-        free[~in_image] = False
-        free[in_image] = np.isfinite(distances) & (distances > z[in_image] + 2 * resolution)
-
-    # Occupied returns outrank clear rays. Project low to body-height points
-    # into the ground grid while preserving unknown cells behind them.
-    above_floor = a * x + b * frame + c - y
-    hits = np.isfinite(frame) & ~ground & (above_floor >= 0.02) & (above_floor <= 0.48)
-    hit_row = np.rint((frame[hits] + camera_forward - forward[0, 0]) / resolution).astype(int)
-    hit_col = np.rint((x[hits] - right[0, 0]) / resolution).astype(int)
-    in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
-               & (hit_col >= 0) & (hit_col < right.shape[1]))
-    counts = np.zeros(right.shape, dtype=int)
-    np.add.at(counts, (hit_row[in_grid], hit_col[in_grid]), 1)
-    return free, counts >= 3
 
 
 def main():
@@ -157,6 +43,8 @@ def main():
     camera_forward = -decl["vendor"]["camera_optical_from_cloud"][2][3]
     half_width = cards["loco_servo"]["control_interface"]["footprint"]["half_width"] + .10
     half_length = 0.30  # standing body estimate from the S10 model
+    geometry = Geometry(k, k_y, np.linalg.inv(decl["vendor"]["camera_optical_from_cloud"]),
+                        half_length, half_length, .40)
     span = params.end_ns - int(params.seconds * 1e9)
     def window(key):
         return [r for l in (params.capture / f"{key}.jsonl").open()
@@ -182,7 +70,7 @@ def main():
     fx, cx = k.for_width(640)
     for frame in frames:
         m = depth.decode((params.capture / frame["data"]["file"]).read_bytes())
-        free, hits = observe(m, k, k_y, camera_forward, right, forward, resolution)
+        free, hits = observe(m, geometry, right, forward, resolution, depth.ground_mask(m, k, k_y))
         free_count += free
         occupied |= hits
         box = m[top:bottom, left:right_px]

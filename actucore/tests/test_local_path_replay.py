@@ -1,6 +1,6 @@
 import numpy as np
 
-from tools import replay_local_path as replay
+from plugins.navi import local_path as replay
 
 
 def test_grid_can_make_a_complete_right_detour_with_confirmed_space():
@@ -25,3 +25,21 @@ def test_a_diagonal_step_checks_the_intermediate_sweep():
     allowed = np.zeros((8, 8), dtype=bool)
     allowed[3, 3] = allowed[4, 4] = True
     assert replay.shortest_path(allowed, (3, 3), (4, 4)) is None
+
+
+def test_front_only_plan_uses_square_footprint_and_passes_unknown_cells(monkeypatch):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .23)
+    assert geometry.front == geometry.rear == .23
+
+    def observed(_frame, _geometry, right, forward, _resolution, _ground):
+        known_obstacle = (abs(right) <= .05) & (abs(forward - .9) < .06)
+        return np.zeros_like(known_obstacle), known_obstacle
+
+    monkeypatch.setattr(replay, "observe", observed)
+    result = replay._checked_translation(None, None, geometry, .33, .9, 1, 500)
+    assert result is not None
+    vx, vy = result
+    assert (vx > 0 or vy < 0) and np.hypot(vx, vy) <= .10

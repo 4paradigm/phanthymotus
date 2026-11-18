@@ -2458,3 +2458,13 @@ def test_right_route_shorter_than_forward_slow_distance_can_be_selected():
     assert math.hypot(*decision.values[:2]) <= 0.18 + 1e-9
     assert "朝右侧避让" in decision.reason
     assert cfg.slow_distance_m == 1.5
+
+
+def test_local_planning_holds_instead_of_using_an_unchecked_avoidance_turn():
+    cfg = _cfg(stop_distance_m=0.6)
+    cfg.local_planning = True
+    obstacle = _scene(1.2, [(-0.25, 0.85, 0.28)])
+    decision = _step(detections=_detections(_obj()), depth=obstacle, config=cfg,
+                     odom={"vx": 0.0, "vy": 0.0, "wz": 0.0})
+    assert decision.values == [0.0] * 6
+    assert "局部规划" in decision.reason

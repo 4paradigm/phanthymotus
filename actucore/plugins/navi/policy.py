@@ -70,6 +70,7 @@ from dataclasses import dataclass, field
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
 from .track import Tracker
+from .local_path import Geometry, PlanCache
 
 # Status values. `arrived` and `stuck` are terminal for one `navigate_to`;
 # the rest are things that happen on the way.
@@ -127,6 +128,8 @@ class Config:
     stop_tolerance_m: float = 0.05
     slow_distance_m: float = 1.5
     side_clearance_m: float = 1.0
+    local_planning: bool = False
+    local_geometry: Geometry | None = None
     obstacle_stop_m: float = 0.6
     # Lateral offset that still allows full speed. **Not a gate** — past it the
     # speed is scaled down, reaching zero at align_full_stop. See
@@ -460,6 +463,7 @@ class State:
     # sidestep nobody asked for.
     vy_gate: Gate = field(default_factory=Gate)
     escape_side: float = 0.0
+    local_plan: PlanCache = field(default_factory=PlanCache)
     recovery: ClearanceRecovery | None = None
     # What the corridor read on the last tick. Kept so the debug overlay can
     # draw the number the decision was made from, rather than measuring the
@@ -1124,7 +1128,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         _, vy, turn, status, reason = _avoid(
             0.0, 0.0, raw_wz, depth, config, ALIGNING, reason, state,
             target_distance=distance, measured_vx=(odom or {}).get("vx"),
-            aligned=False)
+            aligned=False, odom=odom)
         wz = _finalise_yaw(turn, bool(vy), bearing, config, state, dt)
         return Decision(_twist(0.0, vy, wz), status, reason,
                         distance_m=distance, bearing=bearing,
@@ -1172,7 +1176,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     vx, vy, raw_wz, status, reason = _avoid(
         vx, vy, raw_wz, depth, config, status, reason, state,
         target_distance=distance, measured_vx=(odom or {}).get("vx"),
-        aligned=abs(bearing) < config.align_full_stop)
+        aligned=abs(bearing) < config.align_full_stop, odom=odom)
     if within and config.stop_tolerance_m > 0 and (vx or vy):
         # Avoidance may propose a sidestep after the approach has stopped.
         # A configured arrival tolerance also holds that translation while
@@ -1447,7 +1451,7 @@ def _can_turn_after_stop(depth, config: Config, state: State) -> bool:
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
-           target_distance=None, measured_vx=None, aligned=True):
+           target_distance=None, measured_vx=None, aligned=True, odom=None):
     """Slow down and prefer a measured side route around foreground obstacles."""
     ahead, coverage = _clearance(depth, config)
     if state is not None:
@@ -1531,7 +1535,17 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     vy = _scaled(vy, scale, config.floor_vy, config.vy_max)
     if state is not None:
         state.escape_side = side
-    if side:
+    if side and config.local_planning:
+        command = _local_translation(depth, config, state, odom, ahead, side)
+        if command is None or (near and command[0] > 0):
+            if state is not None:
+                state.recovery = ClearanceRecovery()
+            return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
+        vx, vy = command
+        wz = 0.0
+        state.avoidance_yaw_override = True
+        status, reason = AVOIDING, "局部规划：沿前向避障路线低速行进"
+    elif side:
         # Blend in the turn as clearance shrinks, keeping yaw towards the
         # chosen route even when the target is on the blocked side.
         weight = 1.0 if near or not aligned else 1.0 - (ahead - stop) / max(1e-6, slow - stop)
@@ -1567,7 +1581,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             return 0.0, 0.0, 0.0, AVOIDING, "当前控制限制下无法侧向避让；停下"
 
     side_route = "right" if side > 0 else "left"
-    if near:
+    if near and not config.local_planning:
         side_route += "-in-place"
         if state is not None and state.recovery is None:
             # An already measured side permits the existing near sidestep.
@@ -1592,6 +1606,29 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         if gain == 1 and not near:
             state.recovery = None
     return vx, vy, wz, status, reason
+
+
+def _local_translation(depth, config, state, odom, ahead, side):
+    if state is None or odom is None or not config.use_lateral:
+        return None
+    measured = tuple(odom.get(axis) for axis in ("vx", "vy", "wz"))
+    if any(v is None or not math.isfinite(v) for v in measured):
+        return None
+    measured_vx, measured_vy, measured_wz = measured
+    if math.hypot(measured_vx, measured_vy) > .12 or abs(measured_wz) > .04:
+        return None
+    if measured_vy * side > .06:
+        return None
+    command = state.local_plan.translation(depth, config.local_geometry,
+                                           _keepout_m(config), ahead, side, config.max_obs_age_ms)
+    if command is None:
+        return None
+    vx, vy = command
+    if not (config.floor_vx <= abs(vx) <= config.vx_max or vx == 0):
+        return None
+    if not (vy == 0 or config.floor_vy <= abs(vy) <= config.vy_max):
+        return None
+    return (vx, vy)
 
 
 def _scaled(value: float, factor: float, floor: float, ceiling: float) -> float:
