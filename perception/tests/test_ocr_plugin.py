@@ -127,7 +127,8 @@ def test_ocr_latest_frame_wins(ocr):
     time.sleep(0.2)
     assert adapter.seen == [b"f0", b"f5"], adapter.seen
     payload = json.loads(node.publishers[0].messages[-1])
-    assert payload["text"] == "f5"
+    assert payload["items"][0]["text"] == "f5"
+    assert "“f5”" in payload["text"]
 
 
 def test_ocr_stop_wakes_worker_promptly(ocr):
@@ -396,13 +397,16 @@ def test_ocr_payload_carries_size_and_hierarchy():
     assert heights == [80, 40, 30, 20]
     assert payload["items"][0]["prominence"] == 1.0
     assert payload["items"][3]["prominence"] == 0.25
-    # 同一水平带的两段并入一行，text 按行拼接
+    # Existing line metadata stays available alongside the layout description.
     lines = [item["line"] for item in payload["items"]]
     assert lines == [0, 1, 1, 2]
-    assert payload["text"] == "大标题\n左栏 右栏\n小字注脚"
+    assert "画面" in payload["text"]
+    assert all(f'“{item["text"]}”' in payload["text"] for item in items)
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == items
 
 
-def test_ocr_payload_line_join_sorts_left_to_right():
+def test_ocr_payload_without_frame_size_keeps_text_without_guessing_position():
     from plugins.ocr_runtime import build_ocr_payload
 
     items = [
@@ -410,16 +414,173 @@ def test_ocr_payload_line_join_sorts_left_to_right():
         {"text": "first", "bbox": [10, 12, 120, 48], "score": 0.9},
     ]
     payload = build_ocr_payload(items, 0.0, "en")
-    assert payload["text"] == "first second"
+    assert "“first”" in payload["text"] and "“second”" in payload["text"]
+    assert "画面" not in payload["text"]
     assert "image_size" not in payload
 
 
 def test_ocr_payload_empty_and_error():
     from plugins.ocr_runtime import build_ocr_payload
 
+    empty = build_ocr_payload([], 0.0, "zh")
+    assert empty["text"] == "当前画面没有识别到可用文字。"
+    assert empty["items"] == []
     payload = build_ocr_payload([], 0.0, "zh", error=RuntimeError("boom"))
-    assert payload["text"] == "" and payload["items"] == []
+    assert payload["text"] == "文字识别失败，暂时无法生成描述。"
+    assert payload["items"] == []
     assert payload["error"] == "boom"
+
+
+def test_ocr_layout_keeps_numbered_rows_in_visual_order():
+    from plugins.ocr_summary import build_ocr_summary
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = []
+    for number, title, y in [("03", "应用层", 40), ("02", "连接层", 130), ("01", "算力层", 220)]:
+        items += [
+            {"text": number, "bbox": [270, y, 292, y + 16], "score": .99},
+            {"text": title, "bbox": [350, y, 530, y + 16], "score": .99},
+        ]
+    text = build_ocr_summary(items, (1000, 400))
+    for number, title in [("03", "应用层"), ("02", "连接层"), ("01", "算力层")]:
+        assert f'原编号“{number}”，右侧邻近文字为“{title}”' in text
+    assert text.index("“03”") < text.index("“02”") < text.index("“01”")
+    payload = build_ocr_payload(items, 0.0, "zh", image_size=(1000, 400))
+    assert payload["text"] == text
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == items
+
+
+def test_ocr_layout_keeps_comparison_labels_and_values_on_their_rows():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [
+        {"text": "方案甲", "bbox": [430, 120, 585, 136], "score": .99},
+        {"text": "10", "bbox": [610, 120, 640, 136], "score": .99},
+        {"text": "方案乙", "bbox": [430, 210, 570, 226], "score": .99},
+        {"text": "1000+", "bbox": [850, 210, 915, 226], "score": .99},
+    ]
+    text = build_ocr_summary(items, (1000, 400))
+    assert "“方案甲”；同排右侧数值为“10”" in text
+    assert "“方案乙”；同排右侧数值为“1000+”" in text
+
+
+@pytest.mark.parametrize("missing_number", ["04", "03", "02", "01"])
+def test_ocr_layout_missing_index_leaves_its_visible_text_unassigned(missing_number):
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    titles = {"04": "应用层", "03": "编排层", "02": "连接层", "01": "算力层"}
+    for index, (number, title) in enumerate(titles.items()):
+        y = 40 + index * 90
+        if number != missing_number:
+            items.append({"text": number, "bbox": [270, y, 292, y + 16], "score": .99})
+        items.append({"text": title, "bbox": [350, y - 1, 530, y + 15], "score": .99})
+        items.append({"text": title + "说明", "bbox": [350, y + 22, 580, y + 34], "score": .99})
+    text = build_ocr_summary(items, (1000, 450))
+    orphan = f'“{titles[missing_number]}”'
+    assert orphan in text
+    for number, title in titles.items():
+        if number == missing_number:
+            assert f'“{number}”' not in text
+            continue
+        assert any(f'“{number}”' in line and f'“{title}”' in line for line in text.splitlines())
+        assert not any(f'“{number}”' in line and orphan in line for line in text.splitlines())
+
+
+def test_ocr_layout_alphabetic_sizes_are_not_described_as_numbers():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [x, y, x + width, y + 16], "score": .99}
+             for text, x, y, width in [("规格甲", 50, 80, 100), ("S", 300, 80, 20),
+                                       ("规格乙", 50, 180, 100), ("L", 300, 180, 20)]]
+    text = build_ocr_summary(items, (600, 300))
+    assert "同排右侧数值为" not in text
+    assert all(f'“{item["text"]}”' in text for item in items)
+
+
+def test_ocr_layout_distant_columns_are_not_forced_into_comparison_rows():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [x, y, x + width, y + 16], "score": .99}
+             for text, x, y, width in [("产品介绍", 50, 80, 160), ("1000+", 1100, 80, 65),
+                                       ("服务说明", 50, 180, 160), ("20+", 1100, 180, 50)]]
+    text = build_ocr_summary(items, (1300, 300))
+    assert "同排右侧数值为" not in text
+    assert all(f'“{item["text"]}”' in text for item in items)
+
+
+def test_ocr_layout_repeated_numbers_preserve_vertical_order():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [140, y, 180, y + 12], "score": .99}
+             for text, y in [("10", 30), ("20", 150), ("10", 270)]]
+    text = build_ocr_summary(items, (300, 330))
+    assert text.count("“10”") == 2
+    assert text.find("“10”") < text.find("“20”") < text.rfind("“10”")
+
+
+@pytest.mark.parametrize("boxes,image_size,positions", [
+    ([[50, 80, 130, 96], [750, 80, 830, 96]], (1000, 600), ["画面偏左", "画面偏右"]),
+    ([[450, 30, 530, 46], [450, 500, 530, 516]], (1000, 600), ["位于画面上部", "位于画面下部"]),
+    ([[450, 80, 530, 96], [450, 108, 530, 124]], (1000, 600), []),
+    ([[50, 80, 130, 96], [750, 80, 830, 96]], None, []),
+], ids=["left-right", "top-bottom", "nearby-lines", "unknown-size"])
+def test_ocr_layout_repeated_labels_preserve_distinct_observations(boxes, image_size, positions):
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [{"text": "入口", "bbox": list(box), "score": .99} for box in boxes]
+    before = [{**item, "bbox": list(item["bbox"])} for item in items]
+    payload = build_ocr_payload(items, 0.0, "zh", image_size=image_size)
+    text = payload["text"]
+    assert text.count("“入口”") == 2
+    assert all(position in text for position in positions)
+    if image_size is None:
+        assert "画面" not in text
+    assert items == before
+    assert [{key: item[key] for key in ("text", "bbox", "score")}
+            for item in payload["items"]] == before
+
+
+def test_ocr_layout_repeated_labels_do_not_move_past_intervening_text():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = [{"text": text, "bbox": [450, y, 530, y + 16], "score": .99}
+             for text, y in [("入口", 30), ("出口", 260), ("入口", 500)]]
+    text = build_ocr_summary(items, (1000, 600))
+    assert text.count("“入口”") == 2
+    assert text.find("“入口”") < text.find("“出口”") < text.rfind("“入口”")
+    assert "位于画面上部" in text and "位于画面下部" in text
+    assert build_ocr_summary(list(reversed(items)), (1000, 600)) == text
+
+
+def test_ocr_layout_date_columns_keep_their_nearby_text():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for index, date in enumerate(["2020/01", "2021/02", "2022/03", "2023/04"]):
+        x = index * 150
+        items += [
+            {"text": date, "bbox": [x, 100, x + 60, 120], "score": .99},
+            {"text": f"说明{index}", "bbox": [x, 125, x + 90, 145], "score": .99},
+        ]
+    text = build_ocr_summary(items, (600, 300))
+    for index, date in enumerate(["2020/01", "2021/02", "2022/03", "2023/04"]):
+        assert any(f'“{date}”' in line and f'“说明{index}”' in line for line in text.splitlines())
+
+
+def test_ocr_layout_aligned_columns_keep_each_title_with_its_body():
+    from plugins.ocr_summary import build_ocr_summary
+
+    items = []
+    for label, x in [("甲", 20), ("乙", 220), ("丙", 420)]:
+        items += [
+            {"text": label + "标题", "bbox": [x, 40, x + 100, 60], "score": .99},
+            {"text": label + "说明", "bbox": [x, 75, x + 100, 95], "score": .99},
+        ]
+    text = build_ocr_summary(items, (600, 300))
+    assert "从左到右" in text
+    assert all(f'“{label}标题”、“{label}说明”' in text for label in ["甲", "乙", "丙"])
 
 
 # ── config surface (培育→配置) ───────────────────────────────────────────────

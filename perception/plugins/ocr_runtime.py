@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 
 from plugins.ocr_preprocess import preprocess_for_ocr
+from plugins.ocr_summary import build_ocr_summary
 from utils.tensorrt_runtime import TensorRTEngine
 
 _log = logging.getLogger(__name__)
@@ -229,26 +230,15 @@ def build_ocr_payload(
 ) -> dict:
     """Assemble the published OCR result.
 
-    ``text`` joins recognized fragments per visual line (left-to-right)
-    with newlines between lines; ``items`` carry bbox (source-pixel
+    ``text`` describes the recognized text and its layout using fixed rules;
+    ``items`` carry the original text, bbox (source-pixel
     [x1,y1,x2,y2]), score, height, prominence and line so consumers can
     reason about size and importance; ``image_size`` ([width, height]) is
     the coordinate reference frame for every bbox.
     """
     items = annotate_ocr_items(results)
-    lines: dict[int, list[dict]] = {}
-    for item in items:
-        if item.get("text"):
-            lines.setdefault(item["line"], []).append(item)
-    text = "\n".join(
-        " ".join(
-            item["text"]
-            for item in sorted(members, key=lambda entry: entry["bbox"][0])
-        )
-        for _line, members in sorted(lines.items())
-    )
     payload = {
-        "text": text,
+        "text": build_ocr_summary(items, image_size),
         "items": items,
         "timestamp": timestamp,
         "language": language,
@@ -257,6 +247,7 @@ def build_ocr_payload(
         payload["image_size"] = [int(image_size[0]), int(image_size[1])]
     if error is not None:
         payload["error"] = str(error)
+        payload["text"] = "文字识别失败，暂时无法生成描述。"
     return payload
 
 
