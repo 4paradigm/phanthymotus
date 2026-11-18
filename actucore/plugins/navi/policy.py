@@ -94,6 +94,9 @@ ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
 BLOCKED_APPROACH_BUFFER_M = 0.30
 BLOCKED_APPROACH_MAX_MPS = 0.18
 
+# Longitudinal separation for identifying a foreground obstacle and resuming.
+FORWARD_CLEARANCE_MARGIN_M = 0.15
+
 
 @dataclass
 class Config:
@@ -248,7 +251,7 @@ class Config:
     # a chassis declares is its **static envelope with the arms at rest**, and
     # what hits a doorframe is a swinging arm and a leg mid-stride. This is the
     # difference between "the box the robot is" and "the space to keep clear".
-    clearance_margin_m: float = 0.15
+    clearance_margin_m: float = 0.10
     # How much of the corridor has to carry a real depth reading before its
     # clearance is believed. Below `coverage_min` the card stops going forward
     # and says so; between the two it slows in proportion.
@@ -1471,7 +1474,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     # around a return distinctly in front of it.
     foreground = (ahead is not None
                   and (target_distance is None or depth.get("map") is None
-                       or ahead + config.clearance_margin_m < target_distance))
+                       or ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance))
     stop = config.obstacle_stop_m
     slow = config.slow_distance_m
     if foreground:
@@ -1563,7 +1566,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if state is not None and state.recovery is not None:
         if side:
             route = side_route
-        elif ahead is not None and ahead > stop + config.clearance_margin_m and coverage >= config.coverage_full:
+        elif ahead is not None and ahead > stop + FORWARD_CLEARANCE_MARGIN_M and coverage >= config.coverage_full:
             route = "forward"
         else:
             state.recovery = ClearanceRecovery()
