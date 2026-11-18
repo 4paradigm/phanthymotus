@@ -14,6 +14,7 @@ import json
 import math
 import re
 import time
+from contextvars import ContextVar
 
 import config
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
@@ -29,6 +30,11 @@ _TRUSTED_MESSAGE_LIMIT = 256
 _TRUSTED_BOT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 _FEISHU_CHAT_ID_RE = re.compile(r'oc_[A-Za-z0-9]+')
 _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
+
+# Set by the LLM dispatcher for viewer turns. Context-local rather than an
+# argument supplied by the model, so concurrent turns/calls cannot widen it.
+viewer_reply_scope: ContextVar[tuple[frozenset[str], frozenset[str]] | None] = ContextVar(
+    'viewer_reply_scope', default=None)
 
 # 单个 chat 自己的最近往来回顾——独立于全局共享的 `self._turns`（event/llm.py）。
 # agent-core 的对话历史是进程级单例，不区分 channel/chat_id/user；飞书本身也不
@@ -282,7 +288,8 @@ class ChannelManager:
     # 一起喂给模型，降低不同会话上下文被混用的风险（详见模块顶部注释）。
 
     def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
-                              user_label: str = ''):
+                              user_label: str = '', user_id: str = '',
+                              user_role: str = '', sender_type: str = ''):
         if not channel_id or not chat_id or not text:
             return
         all_history = config.main.get('channel_chat_history', {})
@@ -298,6 +305,9 @@ class ChannelManager:
             'role': role,
             'text': text[:_CHAT_HISTORY_TEXT_MAX],
             'user_label': user_label,
+            'user_id': user_id,
+            'user_role': user_role,
+            'sender_type': sender_type,
             'ts': time.time(),
         }]
         channel_history[chat_id] = entries[-_CHAT_HISTORY_LIMIT:]
@@ -330,7 +340,8 @@ class ChannelManager:
 
     def _set_last_context(self, channel_id: str, chat_id: str, user_id: str, *,
                           message_id: str = '', sender_type: str = 'user',
-                          chat_type: str = '', expect_reply: bool | None = None):
+                          chat_type: str = '', expect_reply: bool | None = None,
+                          user_role: str = ''):
         """Persist conversation context for a channel.
 
         带 ts —— 「最近一次会话」必须靠时间戳判断：dict 就地更新不改插入顺序，
@@ -341,6 +352,7 @@ class ChannelManager:
             'user_id': user_id,
             'message_id': message_id,
             'sender_type': sender_type,
+            'user_role': user_role,
             'chat_type': chat_type,
             'expect_reply': expect_reply,
             'ts': time.time(),
@@ -687,8 +699,9 @@ class ChannelManager:
                     acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
                     user = acl.get_user(msg.platform, msg.user_id)
                 else:
-                    adapter = self._adapters.get(msg.channel_id)
-                    if adapter:
+                    if msg.notify_pending_approval is not None:
+                        await msg.notify_pending_approval()
+                    elif adapter := self._adapters.get(msg.channel_id):
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
                             text='Pending approval. An admin has been notified.',
@@ -714,9 +727,12 @@ class ChannelManager:
             sender_type=msg.sender_type,
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
+            user_role=user['role'],
         )
         self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
-                                   user_label=msg.display_name or msg.user_id)
+                                   user_label=msg.display_name or msg.user_id,
+                                   user_id=msg.user_id, user_role=user['role'],
+                                   sender_type=msg.sender_type)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -774,6 +790,9 @@ class ChannelManager:
                               trusted_bot_id: str = '') -> str:
         """Send text and/or attachments to the source message's exact chat context.
         Called by channel_reply tool dispatch."""
+        scope = viewer_reply_scope.get()
+        if scope is not None and (channel_id not in scope[0] or source_message_id not in scope[1]):
+            return 'Error: viewer replies must target the current channel and message.'
         if source_message_id and trusted_bot_id:
             return 'Error: provide source_message_id or trusted_bot_id, not both; no message was sent.'
 
@@ -912,7 +931,11 @@ class ChannelManager:
             if not mention_open_id:
                 # Bot-to-bot mentions aren't this chat's own human-facing conversation —
                 # keep the recap scoped to the human/channel side of the exchange.
-                self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
+                self._record_chat_exchange(
+                    channel_id, chat_id, 'assistant', text,
+                    user_id=ctx.get('user_id', ''), user_role=ctx.get('user_role', ''),
+                    sender_type=ctx.get('sender_type', ''),
+                )
             return result
         except PartialSendError as e:
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍

@@ -66,6 +66,10 @@ class InboundMessage:
     # Some platforms must acknowledge a message before downloading its media.
     # The manager invokes this only after checking that the sender is allowed.
     prepare: Callable[[], Awaitable[None]] | None = field(default=None, repr=False, compare=False)
+    # Long-connection adapters may reply to a pending-approval request without
+    # retaining that unapproved sender's routing state in the authorized cache.
+    notify_pending_approval: Callable[[], Awaitable[None]] | None = field(
+        default=None, repr=False, compare=False)
 
 
 @dataclass

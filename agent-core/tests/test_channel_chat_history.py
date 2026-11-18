@@ -71,10 +71,17 @@ class ChatHistoryIsolationTest(unittest.TestCase):
 
     def test_build_trigger_injects_scoped_chat_history_block(self):
         self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '帮我查电量',
-                                           user_label='Alice')
-        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'assistant', '电量 80%')
+                                           user_label='Alice', user_id='u1',
+                                           user_role='viewer', sender_type='user')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'assistant', '电量 80%',
+                                           user_id='u1', user_role='viewer', sender_type='user')
         self.manager._record_chat_exchange('feishu_r1', 'oc_b', 'user', '不相关的话',
                                            user_label='Bob')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '另一个用户的指令',
+                                           user_id='u2', user_role='operator', sender_type='user')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '旧角色指令',
+                                           user_id='u1', user_role='operator', sender_type='user')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '无权限信息的旧消息')
 
         import channel.manager as manager_mod
         original = manager_mod.manager
@@ -84,7 +91,8 @@ class ChatHistoryIsolationTest(unittest.TestCase):
                 'source': 'dds:/channel/request/feishu_r1',
                 'text': json.dumps({
                     'channel_id': 'feishu_r1', 'chat_id': 'oc_a',
-                    'sender_type': 'user', 'message_id': 'om_new',
+                    'sender_type': 'user', 'user_id': 'u1', 'user_role': 'viewer',
+                    'message_id': 'om_new',
                     'text': '我刚才说的怎么样了',
                 }, ensure_ascii=False),
                 'ts': 1,
@@ -96,6 +104,9 @@ class ChatHistoryIsolationTest(unittest.TestCase):
         self.assertIn('帮我查电量', trigger['text'])
         self.assertIn('电量 80%', trigger['text'])
         self.assertNotIn('不相关的话', trigger['text'])
+        self.assertNotIn('另一个用户的指令', trigger['text'])
+        self.assertNotIn('旧角色指令', trigger['text'])
+        self.assertNotIn('无权限信息的旧消息', trigger['text'])
 
 
 if __name__ == '__main__':

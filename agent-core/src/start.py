@@ -292,7 +292,10 @@ def _register_core_mcp(silent=False):
                     'Inbound gateway for messaging platforms (Feishu / Telegram / Slack / WeCom): delivers '
                     'messages users send from a chat app — including image and file attachments — '
                     'into the decision core. You never call this tool. The events it produces carry '
-                    'channel="channel:<platform>"; reply to those with channel_reply.'
+                    'channel="channel:<platform>"; reply to those with channel_reply. '
+                    'For a user request about an image, use Read on its path in the event files list '
+                    'before describing it. A path alone is not image content; if Read fails or vision '
+                    'input is disabled, explain that you cannot see the image.'
                 ),
                 'inputSchema': {'type': 'object', 'properties': {}},
                 'configSchema': {
@@ -339,6 +342,11 @@ def _register_core_mcp(silent=False):
                     'sensor/resource tools, read-only tools (WebSearch, search_history, memory_recall, '
                     'raw_input_info), Read for images attached to the current Channel messages, '
                     'plus this one — actuator/processor/delegated tools are rejected; '
+                    'viewer replies must use the current message ID, cannot contact other bots, '
+                    'and may attach only images from the current message. '
+                    'to answer questions about an inbound image, first use Read on its path from '
+                    'the triggering event; a file path alone is not image content. If Read fails '
+                    'or vision input is disabled, say that you cannot see the image. '
                     'reply with what you can read or look up, and say so if the request needs an action '
                     'you cannot take.'
                 ),

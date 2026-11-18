@@ -113,7 +113,9 @@ class FakeClient:
         return [frame for frame in self.sent if frame['cmd'] == cmd]
 
 
-async def _start_fake_sdk(adapter, client):
+async def _start_fake_sdk(adapter, client, *, real_progress=False):
+    if not real_progress:
+        adapter._send_progress = mock.AsyncMock()
     with mock.patch.object(adapter, '_create_client', return_value=client), \
             mock.patch.object(wecom.aiohttp, 'ClientSession', return_value=FakeSession()):
         await adapter.start()
@@ -154,7 +156,8 @@ class DummyAdapter(wecom.ChannelAdapter):
 
 def _make_adapter(on_msg=None, config=None):
     async def _noop(msg):
-        pass
+        if msg.prepare:
+            await msg.prepare()
     return WecomAdapter('wecom_test', 'wecom',
                         config if config is not None else {'bot_id': 'b', 'secret': 's'},
                         on_msg or _noop)
@@ -346,9 +349,64 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed['text'], '这是什么？')
         self.assertEqual(len(parsed['images']), 1)
 
+    async def test_download_without_aes_key_accepts_only_real_image_bytes(self):
+        adapter = await self._adapter()
+        image = b'\x89PNG\r\n\x1a\nexample'
+
+        class Content:
+            async def iter_chunked(self, size):
+                yield image
+
+        class Response:
+            status = 200
+            headers = {}
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        session = FakeSession()
+        session.get = mock.Mock(return_value=Response())
+        adapter._session = session
+        attachment = Attachment(kind=wecom.KIND_IMAGE, path='/work/resource/channel_files/x.png')
+        signed_url = 'https://example.test/%30?signature=%31%2F%2B'
+        with mock.patch('channel.store.save_bytes', return_value=attachment) as save, \
+                mock.patch.object(wecom, '_decrypt_image') as decrypt:
+            result = await adapter._download_image({'url': signed_url})
+        self.assertIs(result, attachment)
+        self.assertEqual(save.call_args.args[1], image)
+        self.assertEqual(str(session.get.call_args.args[0]), signed_url)
+        decrypt.assert_not_called()
+
+    async def test_mixed_group_image_progress_and_payload_reach_manager(self):
+        received = []
+        async def on_message(msg):
+            await msg.prepare()
+            received.append(msg)
+        adapter = _make_adapter(on_message)
+        client = FakeClient()
+        await _start_fake_sdk(adapter, client, real_progress=True)
+        self.addAsyncCleanup(adapter.stop)
+        attachment = Attachment(kind=wecom.KIND_IMAGE, path='/work/resource/channel_files/x.png')
+        adapter._download_image = mock.AsyncMock(return_value=attachment)
+        frame = _msg_frame(chattype='group', chatid='g1')
+        frame['body'].update(msgtype='mixed', text=None, mixed={'msg_item': [
+            {'msgtype': 'text', 'text': {'content': '@Bumi 这是什么？'}},
+            {'msgtype': 'image', 'image': {'url': 'https://example.test/i', 'aeskey': 'key'}},
+        ]})
+        await adapter._process_message(frame, frame['body'])
+        self.assertEqual(received[0].text, '这是什么？')
+        self.assertEqual(received[0].attachments, [attachment])
+        progress = client.frames_with('aibot_respond_msg')
+        self.assertEqual(len(progress), 1)
+        self.assertFalse(progress[0]['body']['stream']['finish'])
+        self.assertEqual(progress[0]['headers']['req_id'], 'r1')
+
     async def test_image_failures_are_sampled_without_logging_secrets(self):
         adapter = await self._adapter()
-        adapter._send_progress = mock.AsyncMock(side_effect=WecomError('PRIVATE_VALUE'))
         adapter._download_image = mock.AsyncMock(side_effect=WecomError('PRIVATE_VALUE'))
         with mock.patch('builtins.print') as printed:
             for _ in range(10):
@@ -356,10 +414,15 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
                 await adapter._prepare_images(msg, [{}] * 10)
                 self.assertIn('图片处理失败或超限：10 张', msg.text)
             lines = [call.args[0] for call in printed.call_args_list]
-            self.assertEqual(len(lines), 3)  # first progress failure; first and 100th image failures
-            self.assertIn('count=1', lines[1])
-            self.assertIn('count=100', lines[2])
+            self.assertEqual(len(lines), 2)  # first and 100th image failures
+            self.assertIn('count=1', lines[0])
+            self.assertIn('count=100', lines[1])
             self.assertNotIn('PRIVATE_VALUE', '\n'.join(lines))
+
+    def test_image_failure_category_does_not_include_url_or_key(self):
+        reason = wecom._image_failure_reason(WecomError('WeCom image download failed (HTTP 403).'))
+        self.assertEqual(reason, 'http_status=403')
+        self.assertNotIn('PRIVATE', wecom._image_failure_reason(WecomError('PRIVATE_KEY')))
 
     def test_decrypt_image_with_32_byte_padding(self):
         key = bytes(range(32))
@@ -399,6 +462,7 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
 
         async def on_message(msg):
             try:
+                await msg.prepare()
                 await adapter.send_message(OutboundMessage(
                     chat_id=msg.chat_id, text='Pending approval.',
                     source_message_id=msg.message_id,
@@ -424,12 +488,13 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.received: list[InboundMessage] = []
 
-    async def _running_adapter(self):
+    async def _running_adapter(self, *, real_progress=False):
         async def _on_msg(msg):
+            await msg.prepare()
             self.received.append(msg)
         ws = FakeClient()
         adapter = _make_adapter(_on_msg)
-        await _start_fake_sdk(adapter, ws)
+        await _start_fake_sdk(adapter, ws, real_progress=real_progress)
         self.addAsyncCleanup(adapter.stop)
         return adapter, ws
 
@@ -460,15 +525,16 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['md5'], hashlib.md5(image, usedforsecurity=False).hexdigest())
 
     async def test_image_progress_and_final_share_stream_id(self):
-        adapter, ws = await self._running_adapter()
+        adapter, ws = await self._running_adapter(real_progress=True)
         frame = _msg_frame('m1', 'r1')
         await adapter._process_message(frame, frame['body'])
-        await adapter._send_progress('m1')
         await adapter.send_message(OutboundMessage(chat_id='u1', text='完成', source_message_id='m1'))
         first, final = ws.frames_with('aibot_respond_msg')
         self.assertFalse(first['body']['stream']['finish'])
         self.assertTrue(final['body']['stream']['finish'])
         self.assertEqual(first['body']['stream']['id'], final['body']['stream']['id'])
+        self.assertTrue(first['body']['stream']['id'].startswith('stream_'))
+        self.assertNotEqual(first['body']['stream']['id'], 'm1')
 
     async def test_concurrent_messages_keep_their_own_req_id(self):
         adapter, ws = await self._running_adapter()
@@ -595,7 +661,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         adapter, _ = await self._running_adapter()
         frame = _msg_frame('m1', 'r1')
         await adapter._process_message(frame, frame['body'])
-        adapter._msgid_to_req['m1'] = ('r1', 0.0)
+        adapter._msgid_to_req['m1'] = ('r1', 0.0, 'stream_1')
         with self.assertRaises(WecomError) as ctx:
             await adapter.send_message(
                 OutboundMessage(chat_id='u1', text='x', source_message_id='m1'))
@@ -690,6 +756,36 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await self.manager._on_inbound_message(msg)
         prepare.assert_not_awaited()
 
+    async def test_blocked_messages_cannot_evict_authorized_reply_context(self):
+        self._wire_canvas()
+        ws = FakeClient()
+        adapter = _make_adapter(self.manager._on_inbound_message)
+        await _start_fake_sdk(adapter, ws)
+        self.addAsyncCleanup(adapter.stop)
+        self.manager._adapters['wecom_test'] = adapter
+        inspection = types.ModuleType('api.inspection')
+        inspection.publish_to_topic = mock.AsyncMock()
+        motus_stream = types.ModuleType('api.motus_stream')
+        motus_stream.push_event = mock.AsyncMock()
+        def get_user(platform, user_id):
+            return {'role': 'blocked' if user_id == 'blocked' else 'viewer'}
+        def check_permission(platform, user_id, required_role):
+            return (user_id != 'blocked', '')
+        with mock.patch.dict(sys.modules, {'api.inspection': inspection,
+                                           'api.motus_stream': motus_stream}), \
+                mock.patch('channel.manager.acl.get_user', side_effect=get_user), \
+                mock.patch('channel.manager.acl.check_permission', side_effect=check_permission):
+            authorized = _msg_frame('allowed', 'allowed-req', chattype='group', chatid='g1')
+            await adapter._process_message(authorized, authorized['body'])
+            for index in range(wecom.REQ_ID_MAX + 1):
+                blocked = _msg_frame(f'blocked-{index}', f'req-{index}',
+                                     chattype='group', chatid='g1', userid='blocked')
+                await adapter._process_message(blocked, blocked['body'])
+        self.assertEqual(list(adapter._msgid_to_req), ['allowed'])
+        await adapter.send_message(OutboundMessage(
+            chat_id='g1', text='ok', source_message_id='allowed'))
+        self.assertEqual(ws.frames_with('aibot_respond_msg')[-1]['headers']['req_id'], 'allowed-req')
+
     async def test_send_to_channel_forwards_source_message_id(self):
         """方案 B：触发消息的 message_id 必须透传到 OutboundMessage。"""
         self.manager._set_last_context(
@@ -742,6 +838,7 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
         replies = ws.frames_with('aibot_respond_msg')
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0]['headers']['req_id'], 'r1')
+        self.assertNotIn('m1', adapter._msgid_to_req)
 
     async def test_legacy_adapters_unaffected_by_new_field(self):
         """新字段带默认值，旧适配器按位置/关键字构造仍可用。"""

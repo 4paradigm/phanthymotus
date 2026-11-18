@@ -607,6 +607,28 @@ def _viewer_image_read_allowed(trigger_event: dict, args: dict) -> bool:
         return False
 
 
+def _viewer_channel_reply_allowed(trigger_event: dict, args: dict) -> bool:
+    """Viewer replies may target this turn and attach only its inbound images."""
+    if not isinstance(args, dict):
+        return False
+    source_ids = trigger_event.get('_channel_message_ids')
+    source_id = args.get('source_message_id')
+    if (not isinstance(source_ids, list) or not isinstance(source_id, str)
+            or not source_id or source_id not in source_ids):
+        return False
+    if args.get('trusted_bot_id') or args.get('mention_open_id') or args.get('expect_reply'):
+        return False
+    files = args.get('files') or []
+    if not isinstance(files, list):
+        return False
+    for item in files:
+        path = item if isinstance(item, str) else (
+            item.get('path') or item.get('file_path') if isinstance(item, dict) else None)
+        if not _viewer_image_read_allowed(trigger_event, {'file_path': path}):
+            return False
+    return True
+
+
 def _bot_channel_restricted(trigger_event: dict) -> bool:
     return bool(trigger_event.get('_bot_channel_event')) and not bool(
         trigger_event.get('_trusted_bot_channel_event')
@@ -614,15 +636,7 @@ def _bot_channel_restricted(trigger_event: dict) -> bool:
 
 
 def _viewer_channel_restricted(trigger_event: dict) -> bool:
-    """True when every human Channel message in this turn's batch came from a
-    'viewer' (or role-less) ACL user — no operator/owner present to justify
-    unlocking actuator/processor tools.
-
-    Before this, channel/acl.py's role levels were never enforced anywhere in
-    the dispatch path — `user_role` was only informational text handed to the
-    LLM. Any auto-approved Channel user could ask the model to call any bound
-    tool, actuators included, regardless of their recorded ACL role.
-    """
+    """Restrict read-only or unknown-role channel input, including mixed batches."""
     return bool(trigger_event.get('_viewer_channel_event'))
 
 
@@ -1517,9 +1531,12 @@ async def _raw_input_info(
     limit: typing.Annotated[int, "返回最近 N 条原始事件，默认 20"] = 20,
 ) -> str:
     """获取指定信息源的原始输入数据。当摘要信息不足以做决策时使用此工具深入查看原始事件。"""
+    if '/channel/request/' in source:
+        return 'Error: Channel messages are available only in their authorized turns.'
     events = collector.get_source_detail(source, limit=limit)
     if not events:
-        available = collector.get_available_sources()
+        available = [item for item in collector.get_available_sources()
+                     if '/channel/request/' not in item]
         return f'未找到 source={source} 的数据。当前可用 sources: {", ".join(available) if available else "(无)"}'
     # 格式化为详细 XML
     lines = []
@@ -1943,7 +1960,7 @@ class Event:
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                if not ev.get('_bot_channel_event'):
+                if not (ev.get('_bot_channel_event') or ev.get('_viewer_channel_event')):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
@@ -1958,11 +1975,12 @@ class Event:
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
-                if not ev.get('_bot_channel_event'):
+                if not (ev.get('_bot_channel_event') or ev.get('_viewer_channel_event')):
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
-                # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
-                if self._current_turn and not ev.get('_bot_channel_event'):
+                # Lower-trust channel input must not enter shared history where
+                # another turn might interpret it with higher authority.
+                if self._current_turn and not (ev.get('_bot_channel_event') or ev.get('_viewer_channel_event')):
                     self._save_current_turn(ev)
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
@@ -1972,7 +1990,8 @@ class Event:
         不存在 —— 手动刷新也刷不出来，因为要刷的行还没有。这里按当前 turn 索引 upsert，
         turn 结束时 `_save_current_turn` 再写同一个索引覆盖掉（那一份已 compact）。
         """
-        if not self._current_turn:
+        if (not self._current_turn or (trigger_event and
+                (trigger_event.get('_bot_channel_event') or trigger_event.get('_viewer_channel_event')))):
             return
         import chat_history
         try:
@@ -2336,7 +2355,7 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        if not bot_restricted:
+        if not tool_restricted:
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
@@ -2344,7 +2363,7 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
         # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
-        if (mcp_client.has_blocking_pendings() and not bot_restricted
+        if (mcp_client.has_blocking_pendings() and not tool_restricted
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
@@ -2460,7 +2479,9 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = [] if bot_restricted else self._build_history()
+            # Channel turns use the authorized sender's scoped chat recap;
+            # shared history may contain legacy messages with unknown authority.
+            history = [] if (bot_restricted or trigger_event.get('_channel_event')) else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(_scrub(turn_messages))
 
@@ -2550,7 +2571,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2 and not bot_restricted:
+                    if len(self._turns) > 2 and not (bot_restricted or trigger_event.get('_channel_event')):
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -2674,6 +2695,12 @@ class Event:
                     )
                 elif viewer_restricted and name == 'Read' and not _viewer_image_read_allowed(trigger_event, args):
                     result = 'Error: a viewer may only read images attached to the current Channel messages.'
+                elif (viewer_restricted and name == 'mcp__channel__channel_reply'
+                      and not _viewer_channel_reply_allowed(trigger_event, args)):
+                    result = (
+                        'Error: viewer replies must use a current source_message_id, cannot '
+                        'contact other bots, and may only attach images from this turn.'
+                    )
                 elif (bot_restricted and name == 'mcp__channel__channel_reply'
                       and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
                     result = (
@@ -2739,7 +2766,17 @@ class Event:
                         # Inject instance_id from canvas binding (multiInstance tools need it)
                         if name in self._bound_instance_ids and 'instance_id' not in args:
                             args['instance_id'] = self._bound_instance_ids[name]
-                        result = await mcp_client.call_tool(name, args)
+                        if viewer_restricted and name == 'mcp__channel__channel_reply':
+                            from channel.manager import viewer_reply_scope
+                            channel_ids = frozenset(_trigger_channel_ids(trigger_event))
+                            message_ids = frozenset(trigger_event.get('_channel_message_ids') or [])
+                            scope_token = viewer_reply_scope.set((channel_ids, message_ids))
+                            try:
+                                result = await mcp_client.call_tool(name, args)
+                            finally:
+                                viewer_reply_scope.reset(scope_token)
+                        else:
+                            result = await mcp_client.call_tool(name, args)
                         # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
                         if not _bar_needed and mcp_client.get_pending_actions():
                             import hooks as _hooks

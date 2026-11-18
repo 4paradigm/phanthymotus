@@ -1,7 +1,7 @@
 # 企业微信 Channel 配置与收发验收（一期）
 
 > 本文按 [`feishu-channel-setup.md`](./feishu-channel-setup.md) 的结构编写，面向 `platform = wecom` 的渠道。
-> **状态：现已迁移到企业微信官方 Python SDK，当前版本仅做静态检查。** 旧版临时程序曾通过单聊、群聊固定文本回显；该结果不代表 SDK 版已通过收发验证。SDK 版连接与收发、图片、完整 Agent 链路与真机仍待验证。部署时需要构建包含新代码的新镜像。
+> **状态：现已迁移到企业微信官方 Python SDK。** 旧版临时程序曾通过单聊、群聊固定文本回显；用户反馈 SDK 版图片处理未达到预期、群聊 @ 无回应。本次本地修正仅做静态检查，尚未重新验证这两条链路。完整 Agent 链路与真机也仍待验证。
 > **范围**：组织内 `operator` / `viewer` 两类用户、单台 bumi、自然语言文本命令及 JPG/PNG 图片收发。不含其他附件、主动推送、Bot @ Bot / Trusted Bots、模板卡片、移动端入口与个人微信触达。
 > **一期目标**：对齐 feishu-bot 的交互方式 —— 不是做一个聊天问答机器人，而是让企业微信里的一句自然语言命令，经 `decision_core` 调用已绑定的 driver actuator，**驱动真实机器人（bumi）执行动作**，并把结果回复到原会话。
 
@@ -135,7 +135,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 - **通讯层不含任何机器人动作**。`channel_request` / `channel_reply` 只是把消息送进 Agent、把结果送出去；动作由 `decision_core` 调用 Canvas 上已绑定的 driver actuator 产生。`phanthymotus-driver` 一行都不用改（bumi 的 `device.py` 已声明 `motion_state` / `semantic_action` 等卡）。
 - **没有斜杠命令表 / 按钮回调**：「命令」就是自然语言，由 LLM 决定调哪个已绑定工具。
-- 所有人员消息均为 `viewer` 的批次受只读限制；混合 `viewer` 与 `operator` 的批次尚不具备逐消息权限隔离（见 §4）。
+- Channel 消息按权限、会话和发送者分轮处理；`viewer` 和未知角色受只读限制。该隔离改动当前只经过静态检查（见 §8）。
 - `channel_reply` 回复当前消息时使用 `source_message_id` 找回精确会话，不会被后到的群聊或单聊改写目标。**一期不使用** `trusted_bot_id`、`mention_open_id` 与 `expect_reply`。
 
 **一期动作范围与当前实现**：
@@ -167,6 +167,8 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
   | `operator` / `owner` | 上述全部 + 已绑定的 actuator / processor / Skill |
 
   新用户默认 `auto_approve = true`、`default_role = viewer`，**必须手动改成 `operator` 才能让机器人执行动作**。
+
+  为避免低权限消息被后续高权限轮次继承，Channel 轮次不读取全局共享对话历史；会话回顾仅包含相同 Channel、聊天、发送者和角色的记录。旧记录若缺少权限或发送者信息，不会注入后续 Channel 轮次。`viewer` 轮次不写入共享 Agent 轮次历史，但单独的 Channel 会话记录仍然保留。`viewer` 只能回复当前 Channel 的当前消息，不可通过回复主动联系其他 Bot，附件仅限本轮收到的图片。
 
 - **回复出口**：`channel_reply` 是 Agent 向企业微信发消息的唯一出口；写在 `content` 里的纯文本不会送达。回复必须逐字复制触发事件的 `source_message_id`（每个 Channel 保留最近 100 条上下文）。
 - **图片**：支持单独图片和图文混排中的图片；解密后复用 `resource/channel_files`，沿用项目附件清理策略。图片理解还需要启用 `vision_input` 并配置支持图片的模型。图片处理失败会在入站文本中提示。图片收发和识别尚待真实验证。
@@ -208,13 +210,14 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | 回复找不到上下文 | `No reply context for this message: the inbound req_id is unknown or expired. The user must send a new message first.` | 让用户重新发一条消息；不要复用历史 `source_message_id` |
 | 回复超窗 | `Reply window expired (24h). Re-trigger from a current message ...` | 基于当前 Activity 事件重新触发 |
 | 回复被拒或回执超时 | `WeCom reply rejected ...` / `WeCom reply ACK timed out.` | 检查错误码、连接和消息上下文；发送结果以平台回执为准 |
-| 图片无法处理 | 入站文字包含 `图片处理失败或超限` | 检查图片格式、大小、下载时限及连接；不要记录图片 URL 或密钥 |
+| 图片无法处理 | 入站文字包含 `图片处理失败或超限` | 检查 `[wecom] image download failed` 的脱敏原因、图片格式、大小与网络；不要记录图片 URL 或密钥 |
+| 图片已接收但模型看不到 | 附件已出现在 Activity，但模型回复无法读取图片 | 确认 `decision_core` 开启 `vision_input`，且所选模型支持图片输入；这是模型读取图片所需的配置 |
 | 尝试发其他附件 | `WeCom currently supports image attachments only.` | 当前仅支持 JPG/PNG 图片 |
 | 其他非文本入站 | 适配器给占位文本 `[收到不支持的非文本消息]` | 当前不处理其他附件 |
 | Channel 显示 `connected` 但消息无反应 | Canvas 没有配置 `channel_request` 卡片，或智能控制未启动 | 检查卡片实例配置与启动自检；未激活 channel 的入站消息会被丢弃 |
 | Agent 能收到但不能回复 | `decision_core` 未绑定 `channel_reply`，或尚无会话上下文 | 补执行器连接；先由用户发一条消息建立上下文 |
 | 企微里找不到机器人 | 不在机器人可见范围，或用「微信插件」登录 / 未装 App 本体 | 调整可见范围；改装企业微信 App 本体 |
-| 群聊里 @ 了但没有事件 | 机器人未加入群，或 @ 不是明确指向该机器人 | 把机器人加入内部群并明确 @ |
+| 群聊里 @ 了但没有事件 | 需区分平台回调、渠道权限和 Canvas 接线 | 查看脱敏日志是否有 `received callback: chat_type=group`，检查机器人是否入群、@ 是否明确指向机器人和 `channel_request` 接线 |
 | 发了命令但机器人不动 | `user_role` 仍是默认 `viewer`，或 `decision_core` 未绑定 `operator` 的动作卡 | 在「渠道 → 用户」把角色改为 `operator`；核对第 3 节的绑定表 |
 | 凭据保存后找不到 | Bot ID / Secret 可能仅展示一次 | 在企微后台重置 Secret 并更新 Channel |
 | 无法连接且无任何日志 | 机器人所在网络未放行 `wss://openws.work.weixin.qq.com:443` | 先在网络侧验证，再排查代码 |
@@ -226,7 +229,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 - 机器人**可见范围**只包含实际测试者；扩大到全员前先确认数据与行为边界。
 - `channel_reply` 是 Agent 向企业微信发送消息的**唯一出口**；普通人工消息行为不变。
 - **单 Bot ID 单连接**：联调与正式环境不共用同一对凭据。
-- 全部人员消息均为 `viewer` 时批次受只读限制；混有 `operator` 时尚无逐消息权限隔离。`operator` 可调用已绑定的 actuator；挥手 / 握手的动作级白名单尚未实现，真机接入前必须先落实并验证。
+- Channel 批次按权限、会话和发送者隔离，`viewer` 不继承 `operator` 的工具权限。隔离方案尚待离线测试和现场复验；`operator` 可调用已绑定的 actuator，挥手 / 握手的动作级白名单尚未实现，真机接入前必须先落实并验证。
 - **不开放底层电机级控制**：Bumi 的 HighController 能力边界「原则上不超过 APP 或手柄原本可实现的功能」；跌倒保护属于底层安全机制，「具有最高优先级，不受上层控制指令影响」。
 - 执行动作前确认机器人站立、双脚着地、地面平坦防滑且周围无人无障碍。
 - 一期不配置 Trusted Bots，也不接受任何自报的机器人身份或跨群回复。
@@ -235,7 +238,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 ### 8.1 本地只做静态检查
 
-本次 SDK 迁移及图片改动只做本地静态检查；测试文件已适配 SDK 接口，但未运行。下列检查结果应以实际运行记录为准：
+本次权限隔离及收发修正只做本地静态检查；测试文件已补充，但未运行。下列检查结果应以实际运行记录为准：
 
 | 检查 | 命令 / 方法 | 结果 |
 |---|---|---|
@@ -243,9 +246,9 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | Git 差异 | `git diff --check` | 通过 |
 | 依赖一致性 | `uv lock --check --offline --no-cache` | 通过；现有包未升级 |
 | SDK 与框架接线 | 对照 SDK 1.0.2 发布包检查接口、附件和权限路径 | 已静态核对，运行行为待验证 |
-| 离线单测 | `cd agent-core && python -B tests/test_wecom_channel.py -q` | 本次 SDK 迁移后未执行 |
+| 离线单测 | `cd agent-core && python -B tests/test_wecom_channel.py -q` | 本次权限及收发修正后未执行 |
 
-> 本次未执行 pytest、未连接企业微信、未构建镜像或运行机器人。静态检查只覆盖语法、接口及依赖一致性，不代表认证、收发或动作执行成功。此前测试和评审中的通过数量不可直接用于本次 SDK 迁移。
+> 本次修正未执行 pytest、未连接企业微信、未构建镜像或运行机器人。静态检查只覆盖语法、接口及依赖一致性，不代表认证、收发或动作执行成功。此前评审的 1761 项通过结果对应旧版本，不可直接用于本次修正。
 
 ### 8.2 远程部署前提
 
@@ -254,7 +257,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | 项 | 结论 | 依据 |
 |---|---|---|
 | 新增文件会进镜像吗 | **会**。`agent-core/Dockerfile:44` 是 `COPY src/ /work/src/`，且无 `.dockerignore` 排除 `src` | `adapters/wecom.py` 随镜像进入 |
-| 需要改依赖吗 | 新增 `wecom-aibot-python-sdk>=1.0.2`（当前锁定 1.0.2）；删除企微直接声明的 `pycryptodome`，图片解密改用 SDK | `pyproject.toml` / `uv.lock` |
+| 需要改依赖吗 | 新增 `wecom-aibot-python-sdk>=1.0.2`（当前锁定 1.0.2）；图片 URL 使用的 `yarl` 从 aiohttp 传递依赖改为直接声明；图片解密改用 SDK | `pyproject.toml` / `uv.lock` |
 | 需要重建镜像吗 | **需要**。新代码必须经构建/拉取的新镜像才能到机器人；仅改本地文件不会生效 | `Dockerfile` 的 COPY 层 |
 | 重启后要做什么 | 新镜像启动后 `channel/__init__.py` 会注册 `wecom`；随后在 Dashboard 加 Channel、接 Canvas、启动智能控制（现场 `auto_start=false`，重启后需手动启动） | §0 第 7–9 步 |
 | 凭据在哪填 | **只在机器人上的 Dashboard「设置 → 渠道」填**，不进仓库、不进镜像、不进日志 | §2、§7 |
@@ -262,19 +265,24 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 SDK 的必需依赖包括 `cryptography` 和 `pyee`；本次解析还新增 `cffi` 与 `pycparser`。这些包在之前的锁文件中不存在，因此本次迁移确实增加依赖与镜像内容，不能再声称「无新增依赖」或「镜像不增长」。在使用该官方 SDK 的方案下，不能只删除这些声明或复用 `Crypto` 就跳过安装：SDK 自身会导入 `cryptography`。原有飞书 `lark-oapi` 仍传递依赖 `pycryptodome`，因此它继续留在锁文件中。
 
-`uv.lock` 是仓库既有的生成依赖元数据：迁移前为 800,369 字节（约 782 KiB），迁移后为 857,192 字节（约 837 KiB）。它超过 500 KB 审查阈值，需要在 PR 中明确说明；本次新增内容是官方 SDK 及传递依赖的版本、平台 wheel 和校验值，不是模型或二进制资产。保留为生成锁文件，不迁到 COS。现有包的锁定版本保持不变。
+`yarl` 原本就是 `aiohttp` 的必需依赖，直接声明是因为图片下载使用其 `URL(encoded=True)` 保留签名链接编码，不引入额外安装包。
 
-Dockerfile 当前在构建时重新执行 `uv lock`，所以锁文件大小或 wheel 下载大小都不等于实际镜像增量；本次没有构建镜像，不能给出已验证的镜像体积差值。
+`uv.lock` 是仓库既有的生成依赖元数据：PR 基准版本为 800,283 字节（约 782 KiB），当前本地版本为 857,265 字节（约 837 KiB），增加 56,982 字节。它超过 500 KB 审查阈值，需要在 PR 中明确说明；新增内容是官方 SDK 及传递依赖的版本、平台 wheel 和校验值，以及 `yarl` 的直接依赖声明，不是模型或二进制资产。保留为生成锁文件，不迁到 COS。现有包的锁定版本保持不变。
+
+Dockerfile 当前只复制 `pyproject.toml` 并重新执行 `uv lock`，不读取仓库内的 `uv.lock`；因此锁文件本身只增加仓库大小，SDK 及其运行时依赖会增加镜像内容。本次没有构建镜像，不能给出已验证的镜像体积差值。
+
+审查机器人对所有新增或修改且超过 500 KB 的文件做固定检查，因此说明锁文件的用途后，机器人仍可能继续标记；是否接受生成锁文件例外，需要维护者决定。
 
 ### 8.3 待进行的受控企业微信验证
 
 使用独立测试 Bot ID，先停掉使用同一凭据的旧进程。下一次获准联调时，在运行本分支代码的 Agent Core 上检查：
 
 1. 正确凭据认证成功；错误凭据启动失败；退出和重启可释放连接。
-2. 私聊和群聊 @ 消息进入正确会话；同一会话连续发送两条消息，回复仍对应各自的原消息。
+2. 私聊和群聊 @ 消息进入正确会话，先收到进度回复再收到最终回复；同一会话连续发送两条消息，回复仍对应各自的原消息。
 3. 单图、图文混排的下载解密、占位流和最终图片回复；下载失败及超过限制时出现可读提示。
 4. `blocked` 用户不会触发图片下载；viewer 图片读取仍限当前批次。
 5. 断网后 watchdog 恢复；另一进程接管后停止自动重连；发送被拒或 ACK 超时不会被报告为成功。
+6. `viewer` 与 `operator` 同时发消息，分别生成受限和授权轮次；被阻止用户连续发送超过缓存上限时，不挤掉已授权消息的回复上下文。
 
 这些是 SDK 与企业微信平台的收发验证，不需要额外硬件或 GPU 测试。机器人动作仍按 §5 单独验收。旧版固定文本回显只证明当时凭据和网络可用，不能替代上述验证。
 

@@ -39,6 +39,7 @@ from collections import OrderedDict
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from yarl import URL
 
 from channel.adapter import (
     KIND_IMAGE, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
@@ -109,6 +110,45 @@ def _image_type(data: bytes) -> tuple[str, str]:
     raise WecomError('WeCom images must be JPEG or PNG.')
 
 
+def _image_failure_reason(error: Exception) -> str:
+    """Describe expected failures without logging the signed URL or AES key."""
+    if not isinstance(error, WecomError):
+        return f'error_type={type(error).__name__}'
+    text = str(error)
+    status = re.fullmatch(r'WeCom image download failed \(HTTP (\d{3})\)\.', text)
+    if status:
+        return f'http_status={status[1]}'
+    if 'missing its URL or decryption key' in text or 'Invalid WeCom image metadata' in text:
+        return 'missing_metadata'
+    if 'exceeds the 10 MiB limit' in text:
+        return 'size_limit'
+    if 'decrypt' in text or 'encrypted data' in text:
+        return 'decrypt_failed'
+    if 'must be JPEG or PNG' in text:
+        return 'unsupported_format'
+    if 'download failed or timed out' in text:
+        return 'network_or_timeout'
+    if 'HTTPS URL' in text or 'redirect' in text:
+        return 'invalid_download_url'
+    if 'session is unavailable' in text:
+        return 'download_session_unavailable'
+    return 'image_error'
+
+
+def _progress_failure_reason(error: Exception) -> str:
+    """Return a safe platform error code when available for troubleshooting."""
+    if isinstance(error, WecomError):
+        message = str(error)
+        code = re.fullmatch(r'WeCom reply rejected \(errcode=(-?\d{1,10})\)\.', message)
+        if code:
+            return f'errcode={code[1]}'
+        if 'ACK timed out' in message:
+            return 'ack_timeout'
+        if 'not connected' in message or 'connection closed' in message:
+            return 'disconnected'
+    return f'error_type={type(error).__name__}'
+
+
 def _decrypt_image(data: bytes, aeskey: str) -> bytes:
     """Validate the envelope, then use the official SDK's public decryptor."""
     from aibot import decrypt_file
@@ -147,17 +187,19 @@ class WecomAdapter(ChannelAdapter):
         self._sdk_logger = _SdkLogger()
         self._taken_over = False
         self._last_error = ''
-        self._image_progress_failures = 0
+        self._progress_failures = 0
         self._image_download_failures = 0
         self._message_failures = 0
+        self._invalid_message_drops = 0
+        self._received_counts: dict[tuple[str, str], int] = {}
 
         # 去重（照抄 feishu.py:575-590 的有界 LRU）
         self._seen_ids: list[str] = []
         self._seen_set: set[str] = set()
         self._duplicate_drops = 0
 
-        # msgid -> (req_id, ts)。用 msgid 而非 chat_id 作 key，才能精确回复原消息。
-        self._msgid_to_req: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        # msgid -> (req_id, ts, stream_id); only authorized messages are stored.
+        self._msgid_to_req: OrderedDict[str, tuple[str, float, str]] = OrderedDict()
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
@@ -294,6 +336,15 @@ class WecomAdapter(ChannelAdapter):
         """Schedule business processing without blocking SDK callbacks/ACKs."""
         if not self._running:
             return
+        body = frame.get('body') or {}
+        if isinstance(body, dict):
+            chat_type = body.get('chattype') if body.get('chattype') in ('single', 'group') else 'other'
+            msg_type = body.get('msgtype') if body.get('msgtype') in ('text', 'image', 'mixed', 'voice') else 'other'
+            key = (chat_type, msg_type)
+            count = self._received_counts.get(key, 0) + 1
+            self._received_counts[key] = count
+            if count == 1 or count % 100 == 0:
+                print(f'[wecom] received callback: chat_type={chat_type} msg_type={msg_type} count={count}')
         task = asyncio.create_task(self._dispatch_message(frame))
         self._message_tasks.add(task)
         task.add_done_callback(self._message_tasks.discard)
@@ -387,8 +438,8 @@ class WecomAdapter(ChannelAdapter):
         if not isinstance(image, dict):
             raise WecomError('Invalid WeCom image metadata.')
         url, aeskey = image.get('url'), image.get('aeskey')
-        if not isinstance(url, str) or not isinstance(aeskey, str) or not aeskey:
-            raise WecomError('WeCom image is missing its URL or decryption key.')
+        if not isinstance(url, str) or not url or (aeskey is not None and not isinstance(aeskey, str)):
+            raise WecomError('Invalid WeCom image metadata.')
         if self._session is None or self._session.closed:
             raise WecomError('WeCom image download session is unavailable.')
 
@@ -399,7 +450,9 @@ class WecomAdapter(ChannelAdapter):
                         parsed.username is not None or parsed.password is not None):
                     raise WecomError('WeCom image download requires an HTTPS URL.')
                 async with self._session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
+                    # WeCom media URLs can be pre-signed: do not let aiohttp
+                    # requote the path/query before sending the request.
+                    URL(url, encoded=True), timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
                     allow_redirects=False, auto_decompress=False,
                 ) as response:
                     if response.status in (301, 302, 303, 307, 308):
@@ -421,7 +474,9 @@ class WecomAdapter(ChannelAdapter):
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             raise WecomError('WeCom image download failed or timed out.') from e
 
-        data = _decrypt_image(bytes(encrypted), aeskey)
+        # The SDK's download_file also permits media without an AES key. Only
+        # accept the result after checking its actual JPEG/PNG signature below.
+        data = _decrypt_image(bytes(encrypted), aeskey) if aeskey else bytes(encrypted)
         if not data or len(data) > IMAGE_MAX_BYTES:
             raise WecomError('WeCom image is empty or exceeds the 10 MiB limit.')
         mime, ext = _image_type(data)
@@ -429,16 +484,7 @@ class WecomAdapter(ChannelAdapter):
                                 name=f'image{ext}', mime=mime, fallback_ext=ext)
 
     async def _prepare_images(self, msg: InboundMessage, images: list) -> None:
-        """Acknowledge after ACL, then materialize the authorized message's media."""
-        try:
-            await self._send_progress(msg.message_id)
-        except Exception as e:
-            # The connection or platform may reject the placeholder; still pass
-            # the message onward and let the normal reply path report failures.
-            self._image_progress_failures += 1
-            if self._image_progress_failures == 1 or self._image_progress_failures % 100 == 0:
-                print('[wecom] image progress reply failed: '
-                      f'count={self._image_progress_failures} error_type={type(e).__name__}')
+        """Materialize media only after the channel and sender are authorized."""
         failures = 0
         for image in images[:IMAGE_MAX_ITEMS]:
             try:
@@ -448,7 +494,7 @@ class WecomAdapter(ChannelAdapter):
                 self._image_download_failures += 1
                 if self._image_download_failures == 1 or self._image_download_failures % 100 == 0:
                     print('[wecom] image download failed: '
-                          f'count={self._image_download_failures} error_type={type(e).__name__}')
+                          f'count={self._image_download_failures} reason={_image_failure_reason(e)}')
         failures += max(0, len(images) - IMAGE_MAX_ITEMS)
         if failures:
             msg.text += f' [图片处理失败或超限：{failures} 张]'
@@ -458,14 +504,18 @@ class WecomAdapter(ChannelAdapter):
         req_id = _frame_req_id(frame)
         msg_id = parsed['message_id']
         if not msg_id or not req_id or not parsed['user_id'] or not parsed['chat_id']:
+            self._invalid_message_drops += 1
+            if self._invalid_message_drops == 1 or self._invalid_message_drops % 100 == 0:
+                missing = [name for name, value in (
+                    ('msgid', msg_id), ('req_id', req_id),
+                    ('userid', parsed['user_id']), ('chatid', parsed['chat_id']),
+                ) if not value]
+                print('[wecom] invalid message dropped: '
+                      f'count={self._invalid_message_drops} missing={",".join(missing)}')
             return
         if self._is_duplicate(msg_id):
             return
 
-        if req_id:
-            self._msgid_to_req[msg_id] = (req_id, time.time())
-            while len(self._msgid_to_req) > REQ_ID_MAX:
-                self._msgid_to_req.popitem(last=False)
         text = parsed['text']
         if parsed['chat_type'] == 'group':
             # 剥掉群聊正文里的 @机器人名；配置了 bot_name 时只剥那一个，否则剥任意 @前缀
@@ -489,32 +539,59 @@ class WecomAdapter(ChannelAdapter):
             mentions=[],
             expect_reply=None,
         )
-        if parsed['images']:
-            msg.prepare = lambda: self._prepare_images(msg, parsed['images'])
+
+        from aibot import generate_req_id
+        stream_id = generate_req_id('stream')
+
+        async def prepare_authorized_message():
+            # Called by ChannelManager only after channel activation and ACL.
+            self._msgid_to_req[msg_id] = (req_id, time.time(), stream_id)
+            while len(self._msgid_to_req) > REQ_ID_MAX:
+                self._msgid_to_req.popitem(last=False)
+            try:
+                await self._send_progress(msg_id)
+            except Exception as e:
+                # The callback still reaches the normal message path; that path
+                # will report any subsequent reply failure to its caller.
+                self._progress_failures += 1
+                if self._progress_failures == 1 or self._progress_failures % 100 == 0:
+                    print('[wecom] progress reply failed: '
+                          f'count={self._progress_failures} reason={_progress_failure_reason(e)}')
+            if parsed['images']:
+                await self._prepare_images(msg, parsed['images'])
+
+        async def notify_pending_approval():
+            notice = OutboundMessage(chat_id=msg.chat_id, text='Pending approval. An admin has been notified.',
+                                     source_message_id=msg_id)
+            await self._send_reply(req_id, notice, stream_id=stream_id)
+
+        msg.prepare = prepare_authorized_message
+        msg.notify_pending_approval = notify_pending_approval
         await self._on_message(msg)
 
     # ── 出站 ────────────────────────────────────────────────────────────────
 
-    def _lookup_req_id(self, msg: OutboundMessage) -> str:
+    def _lookup_reply_context(self, msg: OutboundMessage) -> tuple[str, str]:
         # 方案 B：manager.send_to_channel 已把触发事件的 message_id 透传进来
         source_id = str(getattr(msg, 'source_message_id', '') or '')
         entry = self._msgid_to_req.get(source_id) if source_id else None
         if entry:
-            req_id, ts = entry
+            req_id, ts, stream_id = entry
             if time.time() - ts > REPLY_WINDOW:
                 raise WecomError(
                     'Reply window expired (24h). Re-trigger from a current '
                     'message instead of reusing an old source_message_id.'
                 )
-            return req_id
+            return req_id, stream_id
         raise WecomError(
             'No reply context for this message: the inbound req_id is unknown or '
             'expired. The user must send a new message first.'
         )
 
     async def _send_progress(self, message_id: str) -> None:
-        msg = OutboundMessage(chat_id='', text='正在处理图片…', source_message_id=message_id)
-        await self._send_reply(self._lookup_req_id(msg), msg, finish=False)
+        msg = OutboundMessage(chat_id='', text='正在处理…', source_message_id=message_id)
+        req_id, stream_id = self._lookup_reply_context(msg)
+        await self._send_reply(req_id, msg, stream_id=stream_id, finish=False)
 
     async def send_message(self, msg: OutboundMessage) -> None:
         """回复原消息。失败必须抛异常，让上层如实回报给 LLM / 用户。"""
@@ -530,7 +607,7 @@ class WecomAdapter(ChannelAdapter):
             raise WecomError('WeCom supports at most 10 images in one reply.')
         if not msg.text and not count and not msg.image_caption:
             return
-        req_id = self._lookup_req_id(msg)
+        req_id, stream_id = self._lookup_reply_context(msg)
 
         def read_image(path: str) -> bytes:
             with open(path, 'rb') as source:
@@ -556,9 +633,9 @@ class WecomAdapter(ChannelAdapter):
         content = '\n'.join(part for part in [msg.text, *captions] if part)
         reply = OutboundMessage(chat_id=msg.chat_id, text=content,
                                 source_message_id=msg.source_message_id)
-        await self._send_reply(req_id, reply, image_items=items)
+        await self._send_reply(req_id, reply, stream_id=stream_id, image_items=items)
 
-    async def _send_reply(self, req_id: str, msg: OutboundMessage, *,
+    async def _send_reply(self, req_id: str, msg: OutboundMessage, *, stream_id: str,
                           finish: bool = True, image_items: list | None = None) -> None:
         client = self._client
         if self.status() != 'connected':
@@ -574,7 +651,7 @@ class WecomAdapter(ChannelAdapter):
                 try:
                     ack = await asyncio.wait_for(client.reply_stream(
                         {'headers': {'req_id': req_id}},
-                        stream_id=msg.source_message_id,
+                        stream_id=stream_id,
                         content=msg.text, finish=finish, msg_item=image_items,
                     ), timeout=REPLY_ACK_TIMEOUT)
                 except (asyncio.TimeoutError, TimeoutError):
