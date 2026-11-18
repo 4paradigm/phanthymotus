@@ -89,6 +89,11 @@ ADAPTIVE_FWD_MAX_SCALE = 3.0
 ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
 ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
 
+# A blocked side route permits only a slow, straight approach. The extra
+# buffer covers distance uncertainty and stays outside the hard obstacle stop.
+BLOCKED_APPROACH_BUFFER_M = 0.30
+BLOCKED_APPROACH_MAX_MPS = 0.18
+
 
 @dataclass
 class Config:
@@ -1497,13 +1502,26 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             side = (state.escape_side if state and state.escape_side in usable
                     else max(usable, key=usable.get))
         else:
+            left, right = (_side_label(*rooms[s], config) for s in (-1.0, 1.0))
+            blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
+                       f"（左 {left}，右 {right}）")
+            brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
+            if (foreground and aligned and depth.get("map") is not None
+                    and target_distance is not None and coverage >= config.coverage_full
+                    and (state is None or state.recovery is None)
+                    and brake_at < ahead < slow):
+                limit = BLOCKED_APPROACH_MAX_MPS * (ahead - brake_at) / (slow - brake_at)
+                approach = min(vx * scale, limit)
+                # Stay within the limit even when the gait has a speed floor.
+                if approach > 0.0 and approach >= config.floor_vx:
+                    if state is not None:
+                        state.escape_side = 0.0
+                    return (approach, 0.0, 0.0, AVOIDING,
+                            f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
             if state is not None:
                 state.escape_side = 0.0
                 state.recovery = ClearanceRecovery()
-            left, right = (_side_label(*rooms[s], config) for s in (-1.0, 1.0))
-            return (0.0, 0.0, 0.0, AVOIDING,
-                    f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
-                    f"（左 {left}，右 {right}）；停下")
+            return 0.0, 0.0, 0.0, AVOIDING, f"{blocked}；停下"
 
     vx = _scaled(vx, scale, config.floor_vx, config.vx_max)
     vy = _scaled(vy, scale, config.floor_vy, config.vy_max)

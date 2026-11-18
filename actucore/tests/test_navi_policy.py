@@ -2348,12 +2348,34 @@ def test_brake_before_box_and_resume_only_on_successive_new_clear_frames():
     assert 0 < speeds[2] < speeds[3] < speeds[4]
 
 
-def test_box_blocking_both_routes_stops_before_entering_stopping_distance():
-    cfg = _cfg(stop_distance_m=0.6)
+def test_box_blocking_both_routes_allows_only_a_slow_straight_approach():
+    cfg = _cfg(stop_distance_m=0.6, floor_vx=0.04)
     box = _scene(2.8, [(0.0, 1.16, 0.65)])
-    decision = _step(detections=_detections(_obj()), depth=box, config=cfg)
-    assert decision.values == [0.0] * 6
+    detections = _detections(_obj(x=0.2))
+    decision = _step(detections=detections, depth=box, config=cfg)
+    assert 0.04 <= decision.values[0] < 0.10
+    assert not any(decision.values[1:])
     assert "两侧也都不可用" in decision.reason
+
+    # Reserve distance when the measured speed is still high.
+    moving = _step(detections=detections, depth=box, config=cfg, odom={"vx": 0.5})
+    assert moving.values == [0.0] * 6
+
+
+def test_blocked_approach_stops_before_the_chassis_speed_floor_and_holds():
+    cfg = _cfg(stop_distance_m=0.6, floor_vx=0.04)
+    farther = _scene(2.8, [(0.0, 1.16, 0.65)])
+    closer = _scene(2.8, [(0.0, 0.98, 0.65)])
+    state = seed(_state(), _detections(_obj()), farther, cfg)
+
+    def tick(depth, frame):
+        return _step(detections=_detections(_obj()), depth=dict(depth, frame_id=frame),
+                     config=cfg, state=state)
+
+    assert tick(farther, 100).values[0] > 0.04
+    assert tick(closer, 200).values == [0.0] * 6
+    for frame in (300, 400, 500):
+        assert tick(farther, frame).values == [0.0] * 6
 
 
 def test_near_sidestep_holds_forward_when_the_obstacle_leaves_view():
@@ -2377,7 +2399,7 @@ def test_near_sidestep_holds_forward_when_the_obstacle_leaves_view():
 
 def test_clear_frames_after_a_stop_allow_searching_for_a_lost_target():
     cfg = _cfg(stop_distance_m=0.6, lost_frames=1)
-    blocked = _scene(3.0, [(0.0, 1.16, 0.65)])
+    blocked = _scene(3.0, [(0.0, 0.85, 0.65)])
     state = seed(_state(), _detections(_obj()), blocked, cfg)
     stopped = _step(detections=_detections(_obj()), depth=blocked, state=state, config=cfg)
     assert stopped.values == [0.0] * 6
