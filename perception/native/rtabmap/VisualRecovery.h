@@ -207,14 +207,23 @@ public:
         const int anchor=stats.loopClosureId(), query=stats.refImageId();
         const int localizationInliers=static_cast<int>(inliers->second);
         const auto location=map.getLastLocalizationPose();
-        const auto anchorPose=map.getPose(anchor);
+        const auto & observations=stats.getSignaturesData();
+        const auto observation=observations.find(query);
+        rtabmap::Link measured;
+        if(observation!=observations.end())
+        {
+            const auto & edges=observation->second.getLinks();
+            const auto edge=edges.find(anchor); // Signature links are keyed by destination.
+            if(edge!=edges.end() && edge->second.type()==rtabmap::Link::kGlobalClosure)
+                measured=edge->second.inverse();
+        }
         const auto locCovariance=stats.localizationCovariance().clone();
         auto poses=map.getLocalOptimizedPoses();
         auto links=map.getLocalConstraints();
         poses.erase(query);
         for(auto i=links.begin();i!=links.end();)
             if(i->second.from()==query || i->second.to()==query) i=links.erase(i); else ++i;
-        if(anchorPose.isNull() || poses.find(anchor)==poses.end())
+        if(!measured.isValid() || poses.find(anchor)==poses.end())
         {
             map.setOptimizedPoses(previousPoses,previousLinks);
             return processed;
@@ -240,7 +249,7 @@ public:
         bool connected=inserted && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
         if(!connected && inserted && !signature->hasLink(anchor))
             connected=map.addLink(rtabmap::Link(anchor,node,rtabmap::Link::kGlobalClosure,
-                anchorPose.inverse()*location,map.getInformation(locCovariance)));
+                measured.transform(),measured.infMatrix()),true);
         connected=connected && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
         if(!connected)
         {
