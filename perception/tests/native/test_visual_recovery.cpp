@@ -36,7 +36,9 @@ int main(int argc, char **argv)
     const bool rejectedColdQuery=mode=="rejected_cold_query";
     const bool neighborRetry=mode=="neighbor_retry";
     const bool continuityVisual=mode=="external_continuity_visual";
-    const bool externalContinuity=mode=="external_continuity" || mode=="external_continuity_new_run" ||
+    const bool continuityOutage=mode=="external_continuity_outage" || mode=="external_continuity_outage_rgb" ||
+        mode=="external_continuity_outage_new_run" || mode=="external_continuity_outage_stale";
+    const bool externalContinuity=continuityOutage || mode=="external_continuity" || mode=="external_continuity_new_run" ||
         mode=="external_continuity_untagged" || mode=="external_continuity_stale";
     const bool stationaryAnchor=mode=="stationary_visual_anchor";
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
@@ -107,6 +109,8 @@ int main(int argc, char **argv)
         }
         if(firstVisualSeed && i>0) hasPose=0;
         if(failedVisualSeed && i==0) rgb.setTo(cv::Scalar::all(0));
+        const bool outage=continuityOutage && i==1;
+        if(outage && mode=="external_continuity_outage_rgb") rgb.setTo(cv::Scalar::all(0));
         const bool unpaired=mode=="fallback_unpaired" && i==1;
         if(unpaired) externalX-=200.f;
         const bool visualLost=mode=="fallback_lost" && i==2;
@@ -130,7 +134,7 @@ int main(int argc, char **argv)
         if(rejectedColdQuery) rgb.setTo(cv::Scalar::all(0));
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
-        const bool noImages=neighborRetry || externalContinuity ||
+        const bool noImages=neighborRetry || (externalContinuity && !(outage && mode=="external_continuity_outage_rgb")) ||
             (stationaryAnchor && i==0) ||
             (delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
             (mode=="vo_handoff_gap" && i==3) ||
@@ -139,7 +143,8 @@ int main(int argc, char **argv)
             (mode=="scan_mask" && !imageMask.at(i));
         // Processed scan cadence can be sparser than the measured chassis stream.
         const double skippedTime=externalContinuity && i>0?(mode=="external_continuity_stale"?5.1:2.1):0.;
-        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,i+1.+skippedTime);
+        const double outageTime=continuityOutage?(i==2 && mode=="external_continuity_outage_stale"?4.:0.):skippedTime;
+        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,i+1.+outageTime);
         if(externalContinuity && i>0)
             for(int j=0;j<count;++j) scan.at<cv::Vec3f>(0,j)[0]+=20.f; // No scan overlap with the anchor.
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
@@ -148,13 +153,16 @@ int main(int argc, char **argv)
             ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
         if(externalContinuity || continuityVisual)
         {
-            if(i!=1 || mode!="external_continuity_untagged")
+            if(!outage && (i!=1 || mode!="external_continuity_untagged"))
             {
-                cv::Mat payload(1,24,CV_8UC1,cv::Scalar::all(i==1 && mode=="external_continuity_new_run"?2:1));
+                const bool changed=(i==1 && mode=="external_continuity_new_run") ||
+                    (i==2 && mode=="external_continuity_outage_new_run");
+                cv::Mat payload(1,24,CV_8UC1,cv::Scalar::all(changed?2:1));
                 std::memcpy(payload.data,"MOTUSOD1",8);
                 data.setUserData(rtabmap::compressData2(payload),true);
             }
-            if(i==2)
+            if(outage) ext.setNull();
+            else if(i==2 && !continuityOutage)
                 ext=continuityVisual?map.getMemory()->getLastWorkingSignature()->getPose():
                     rtabmap::Transform(externalX+200.f,0,0,0,0,0);
         }
@@ -253,7 +261,14 @@ int main(int argc, char **argv)
         }
         if(externalContinuity && i>0)
         {
-            if(i==1 && mode=="external_continuity")
+            if(outage)
+            {
+                if(accepted || !recovery.odom().isNull() || recovery.state()!=motus::VisualRecovery::Searching ||
+                   map.getLocalOptimizedPoses().size()!=nodesBefore || !map.getMemory()->isIncremental())
+                    throw std::runtime_error("chassis outage must wait without publishing a pose or modifying the map");
+            }
+            else if((i==1 && mode=="external_continuity") ||
+                    (i==2 && (mode=="external_continuity_outage" || mode=="external_continuity_outage_rgb")))
             {
                 const auto error=ext.inverse()*recovery.odom();
                 if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
@@ -268,6 +283,7 @@ int main(int argc, char **argv)
                    links.begin()->second.transVariance()<.002499 || links.begin()->second.rotVariance()<.00274 ||
                    !map.getLocalOptimizedPoses().count(1))
                     throw std::runtime_error("measured external continuity must preserve the anchor and encode only a conservative neighbor edge");
+                if(continuityOutage) break;
             }
             else
             {

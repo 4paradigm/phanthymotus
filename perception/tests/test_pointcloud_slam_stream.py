@@ -61,6 +61,18 @@ def test_dense_chassis_run_has_one_continuity_token_at_aligned_scan_stamps():
     assert len(tokens) == 4 and len(tokens[0]) == 16 and len(set(tokens)) == 1
 
 
+def test_delayed_chassis_delivery_can_leave_an_unposed_scan_inside_a_certified_run():
+    unposed = []
+    s = stream(max_pending=1, on_unlocalized_frame=lambda stamp, _, pose, *args: unposed.append((stamp, pose)))
+    s.odom(chassis(1000), now=1.)
+    for ms in (1000, 1100, 1200):
+        s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
+    assert unposed == [(1_100_000_000, None)]
+    s.odom(chassis(1250, .04), now=1.25)
+    first, resumed = (frame.pose.chassis_continuity for frame in s.accepted)
+    assert first and resumed == first
+
+
 @pytest.mark.parametrize('second', [
     chassis(1200, 2.), chassis(1800), chassis(1200, segment='new-origin')
 ])

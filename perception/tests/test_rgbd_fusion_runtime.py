@@ -42,11 +42,12 @@ def test_missing_pose_timeout_and_late_results_do_not_rewrite_history():
     fusion = Fusion(); frames = CaptureObservations(fusion)
     frames.add_frame(1_000_000_000, None, None, 1_010_000_000)
     assert frames.drain(1_200_000_000) == []
-    assert frames.drain(1_260_000_000) == [{'stamp': 1_000_000_000}]
+    deadline = frames.frames[1_000_000_000]['deadline']
+    assert frames.drain(deadline) == [{'stamp': 1_000_000_000}]
     assert fusion.frames[0][1] is None
     m, i = messages(1_000_000_000)
-    frames.result('pose', m, 1_270_000_000)
-    frames.result('info', i, 1_270_000_000)
+    frames.result('pose', m, deadline+1)
+    frames.result('info', i, deadline+1)
     assert len(fusion.frames) == 1
 
 
@@ -86,8 +87,10 @@ def test_join_distinguishes_transport_absence_from_native_quality(kinds, lost, i
     info.lost, info.inliers = lost, inliers
     for kind in kinds:
         frames.result(kind, msg if kind == 'pose' else info, 1_020_000_000)
-    frames.drain(1_260_000_000)
+    frames.drain(1_510_000_000)
     assert fusion.frames == [(1_000_000_000, None, reason)]
+    assert frames.counts['native_tracking_lost'] == int(lost)
+    assert frames.counts['visual_result_missing'] == int(not lost and len(kinds) != 2)
 
 
 def test_join_accounts_for_late_and_unqueued_results_without_rewriting_history():
@@ -95,15 +98,16 @@ def test_join_accounts_for_late_and_unqueued_results_without_rewriting_history()
     frames.add_frame(1_000_000_000, None, None, 1_010_000_000)
     msg, info = messages(1_000_000_000)
     frames.result('pose', msg, 1_200_000_000)
-    frames.result('info', info, 1_260_000_001)  # expired while still pending
-    frames.result('info', info, 1_270_000_000)  # already consumed
+    frames.result('info', info, 1_510_000_001)  # expired while still pending
+    frames.result('info', info, 1_520_000_000)  # already consumed
+    frames.result('info', messages(1_010_000_000)[1], 1_521_000_000)  # never submitted
     assert len(fusion.frames) == 1 and fusion.frames[0][1] is None
     assert frames.counts['queued'] == frames.counts['completed'] == 1
     assert frames.counts['deadline_expired'] == 1
     assert frames.counts['pose_received'] == frames.counts['pose_joined'] == 1
-    assert frames.counts['info_received'] == 2
+    assert frames.counts['info_received'] == 3
     assert frames.counts['info_joined'] == 0
-    assert frames.counts['info_after_deadline'] == 1
+    assert frames.counts['info_after_deadline'] == 2
     assert frames.counts['info_unqueued'] == 1
 
 
@@ -115,17 +119,16 @@ def test_join_reports_imu_coverage_timeout_separately_from_missing_visual():
     frames.result('pose', msg, 1_020_000_000)
     frames.result('info', info, 1_020_000_000)
     assert not fusion.frames
-    frames.drain(1_260_000_000)
+    frames.drain(1_510_000_000)
     assert fusion.frames[0][1] is not None
     assert frames.counts['imu_uncovered'] == frames.counts['deadline_expired'] == 1
 
 
-def test_capture_backlog_and_repeated_frame_fail_closed():
-    for stamps in ([1_000_000_000]*2, [1_000_000_000+i*10_000_000 for i in range(9)]):
-        fusion = Fusion(); frames = CaptureObservations(fusion)
-        for stamp in stamps:
-            frames.add_frame(stamp, None, None, stamp+1_000_000)
-        assert fusion.reason
+def test_repeated_frame_fails_closed():
+    fusion = Fusion(); frames = CaptureObservations(fusion)
+    frames.add_frame(1_000_000_000, None, None, 1_001_000_000)
+    frames.add_frame(1_000_000_000, None, None, 1_002_000_000)
+    assert fusion.reason
 
 
 def test_native_visual_rejects_bad_covariance_inliers_and_changed_frames():
@@ -165,8 +168,52 @@ def test_late_native_diagnostic_is_not_accepted_between_watchdog_ticks():
     frames.add_frame(1_000_000_000, None, None, 1_000_000_000)
     msg, info = messages(1_000_000_000)
     assert frames.result('pose', msg, 1_200_000_000) == []
-    assert frames.result('info', info, 1_300_000_000) == [{'stamp': 1_000_000_000}]
+    assert frames.result('info', info, 1_500_000_001) == [{'stamp': 1_000_000_000}]
     assert fusion.frames[0][1] is None
+
+
+def test_fast_camera_can_join_a_400ms_native_result_during_startup():
+    fusion = Fusion()
+    fusion.input_period_ns = 33_333_333
+    frames = CaptureObservations(fusion)
+    stamp = 1_000_000_000
+    frames.add_frame(stamp, None, None, stamp)
+    pose, info = messages(stamp)
+    assert frames.result('pose', pose, stamp+390_000_000) == []
+    assert frames.result('info', info, stamp+400_000_000) == [{'stamp': stamp}]
+    assert fusion.frames[0][1] is not None
+
+
+def test_full_native_join_does_not_change_session_or_evict_submitted_captures():
+    fusion = Fusion()
+    frames = CaptureObservations(fusion)
+    stamps = [1_000_000_000+i*10_000_000 for i in range(8)]
+    for stamp in stamps:
+        frames.add_frame(stamp, None, None, stamp)
+    frames.add_frame(stamps[-1]+10_000_000, None, None, stamps[-1]+10_000_000)
+    assert list(frames.frames) == stamps
+    assert fusion.reason is None
+
+
+def test_native_wait_adapts_when_a_warmed_estimator_slows_down():
+    fusion = Fusion()
+    fusion.input_period_ns = 33_333_333
+    frames = CaptureObservations(fusion)
+    for stamp in range(1_000_000_000, 1_200_000_000, 50_000_000):
+        frames.add_frame(stamp, None, None, stamp)
+        pose, info = messages(stamp)
+        frames.result('pose', pose, stamp+20_000_000)
+        frames.result('info', info, stamp+30_000_000)
+    stamp = 1_200_000_000
+    frames.add_frame(stamp, None, None, stamp)
+    assert frames.frames[stamp]['deadline'] == stamp+250_000_000
+    frames.drain(stamp+250_000_000)
+    stamp = 1_500_000_000
+    frames.add_frame(stamp, None, None, stamp)
+    pose, info = messages(stamp)
+    assert not frames.result('pose', pose, stamp+390_000_000)
+    assert frames.result('info', info, stamp+400_000_000) == [{'stamp': stamp}]
+    assert fusion.frames[-1][1] is not None
 
 
 def test_camera_captures_expire_missing_native_results_before_queue_overflow():
@@ -175,10 +222,12 @@ def test_camera_captures_expire_missing_native_results_before_queue_overflow():
     for i in range(20):
         stamp = 1_000_000_000+round(i*1e9/30)
         outputs.extend(frames.add_frame(stamp, None, None, stamp) or [])
-        if i%6 == 0:
-            outputs.extend(frames.drain(stamp))
+        assert len(frames.frames) <= 8
+    outputs.extend(frames.drain(2_700_000_000))
     assert fusion.reason is None
-    assert len(outputs) >= 10
+    assert not frames.frames
+    assert len(outputs)+frames.counts['stale_capture'] == frames.counts['queued']
+    assert outputs and frames.counts['stale_capture'] > 0
     assert all(visual is None for _, visual, _ in fusion.frames)
 
 
@@ -403,6 +452,7 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     assert obj.counts['dropped_pairs'] == 0
     native_stamp = max(color_stamp, 1_000_000_123)
     assert coverage_stamps == [native_stamp]
+    assert obj.quality_by_stamp[native_stamp].depth_fraction == pytest.approx(1.)
     if mode == 'assisted':
         assert elapsed[0] == .04  # No extra serial wait after IMU arrived during encoding.
     if mode == 'fusion':

@@ -38,18 +38,27 @@ def test_rgbd_rejects_uncomputable_numeric_geometry(key, bad):
         validate_inputs(data, ['/rgb', '/depth'])
 
 
-def test_fifo_pairing_preserves_old_reset_and_mismatched_metadata():
+def test_pairing_rejects_expired_contexts_and_preserves_mismatched_capture_evidence():
     policy = TimePolicy('ingress')
     first = policy.select({}, 1_000_000_000, 10)
     second = replace(first, time_basis='source_capture', observation_stamp_ns=1, normalized_clock_id='other',
                      source_epoch='new', source_capture_id='different', ingress_monotonic_ns=10**12)
     pairer = RgbdPairer(max_wait_ns=1, max_skew_ns=1)
     pairer.push('color', NS(data=b'a'), first)
-    pair = pairer.push('depth', NS(data=b'b'), second)
-    assert pair.color_context is first and pair.depth_context is second
-    assert pair[0][0] == 1_000_000_000 and pair[1][0] == 1
+    assert pairer.push('depth', NS(data=b'b'), second) is None
+    assert pairer.dropped_by_side == {'color': 1, 'depth': 0}
+
+    pairer = RgbdPairer(max_wait_ns=1, max_skew_ns=1)
+    fresh = replace(second, ingress_monotonic_ns=11, ingress_realtime_ns=1_000_000_001)
     pairer.push('color', NS(data=b'c'), first)
-    assert pairer.push('depth', NS(data=b'd'), second).color.data == b'c'
+    pair = pairer.push('depth', NS(data=b'd'), fresh)
+    assert pair.color_context is first and pair.depth_context is fresh
+    assert pair.method == 'receipt_estimated'
+    assert pair[0][0] == 1_000_000_000 and pair[1][0] == 1_000_000_001
+    assert pair.depth_context.observation_stamp_ns == 1
+
+
+def test_legacy_pair_buffer_preserves_numeric_timestamp_behavior():
     legacy = PairBuffer(max_skew_ns=1)
     legacy.push('color', 0, 'color', 10**12)
     assert legacy.push('depth', -10, 'depth', 1) == ((0, 'color'), (-10, 'depth'))

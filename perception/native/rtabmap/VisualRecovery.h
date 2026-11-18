@@ -88,12 +88,23 @@ public:
     {
         recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
         const auto externalRun=takeExternalRun(data);
+        const double outageAge=data.stamp()-chassisOutageStart_;
+        const bool recentOutage=chassisOutageStart_>0. && outageAge>=0. && outageAge<=2.;
         const bool continuousExternal=externalRun && externalRun==externalRun_ &&
-            !waiting_ && !localizationMode_ && continuousMotion(external,data.stamp());
-        if(!continuousExternal) externalRun_.reset();
+            (!waiting_ || recentOutage) && !localizationMode_ && continuousMotion(external,data.stamp());
+        const double externalAge=data.stamp()-previousExternalStamp_;
+        const bool waitForChassis=external.isNull() && externalRun_ && !localizationMode_ &&
+            externalAge>0. && externalAge<=maxExternalScanGap_ && (!chassisOutageStart_ || recentOutage) &&
+            !map.getLocalOptimizedPoses().empty();
+        if(waitForChassis && !chassisOutageStart_) chassisOutageStart_=data.stamp();
+        if(!waitForChassis) chassisOutageStart_=0.;
+        if(!continuousExternal && !waitForChassis) externalRun_.reset();
         rtabmap::Transform guess;
         if(external.isNull() && takePrediction(data,guess))
+        {
+            chassisOutageStart_=0.; externalRun_.reset();
             return registerPrediction(map,data,guess,statistics);
+        }
         rtabmap::OdometryInfo info;
         rtabmap::Transform visual;
         const bool images=!data.imageRaw().empty() && !data.depthOrRightRaw().empty();
@@ -145,7 +156,7 @@ public:
         }
         if(images || external.isNull()) initialVisualToNative_.setNull();
         missing_=external.isNull();
-        if(waiting_ && aligned_ && !tracked)
+        if(waiting_ && aligned_ && !tracked && !continuousExternal)
         {
             if(!images)
             {
@@ -186,7 +197,7 @@ public:
             retryExternalNeighbor_=false;
         const bool verifiedRetry=waiting_ && !external.isNull() && (withinGrace || retryExternalNeighbor_) &&
             verifiesNeighbor(externalToNative_*external,withinGrace);
-        if(verifiedRetry)
+        if(verifiedRetry || continuousExternal)
             waiting_=false;
         if(!waiting_ && !external.isNull())
         {
@@ -297,7 +308,9 @@ public:
             return map.process(data,odom_,motionCovariance,std::vector<float>(),statistics);
         }
         state_=Searching; odom_.setNull();
-        if(!images) return false;
+        // A short absence does not revoke the last independently witnessed
+        // chassis run. Only a new measured pose carrying that same run may resume it.
+        if(!images || waitForChassis) return false;
         retryExternalNeighbor_=false;
         if(!localizationMode_)
         {
@@ -418,6 +431,7 @@ public:
     }
 private:
     using ExternalRun=std::array<unsigned char,16>;
+    static constexpr double maxExternalScanGap_=6.;
 
     static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns)
     {
@@ -449,7 +463,7 @@ private:
     {
         const double dt=stamp-previousExternalStamp_;
         // The gateway witnesses the dense source between accepted native scans.
-        if(external.isNull() || !(dt>0. && dt<=6.) || !cv::checkRange(external.dataMatrix()))
+        if(external.isNull() || !(dt>0. && dt<=maxExternalScanGap_) || !cv::checkRange(external.dataMatrix()))
             return false;
         const auto delta=previousExternal_.inverse()*external;
         return delta.getNorm()<=.15+1.5*dt &&
@@ -525,6 +539,7 @@ private:
     std::optional<ExternalRun> externalRun_;
     rtabmap::Transform previousExternal_;
     double previousExternalStamp_=0.;
+    double chassisOutageStart_=0.;
     double externalGraceStart_=0.;
     int recoveryNode_, recoveryAnchor_, recoveryInliers_;
     rtabmap::Transform externalToNative_, visualToNative_, odom_;

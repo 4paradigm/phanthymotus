@@ -445,6 +445,8 @@ def registration_report(sample, frontend, native=None, *, depth_enabled=False):
 
 class CaptureObservations:
     """Bounded exact-stamp joins with capture-order delivery and late-result discard."""
+    MAX_IN_FLIGHT = 8
+
     def __init__(self, fusion, startup_gate=None):
         self.fusion = fusion
         self.startup_gate = startup_gate
@@ -453,17 +455,33 @@ class CaptureObservations:
         self.geometry_capture = None
         self.last_tracking_info = None
         self.counts = Counter()
+        self.expired = deque(maxlen=32)
+        self.native_delays = deque(maxlen=16)
+        self.native_intervals = deque(maxlen=16)
+        self.last_native_received = None
+        self.retry_wait_ns = 0
+
+    def has_capacity(self):
+        return len(self.frames) < self.MAX_IN_FLIGHT
+
+    def _wait_budget(self):
+        latency = (int(np.percentile(self.native_delays, 90))+75_000_000
+                   if len(self.native_delays) >= 4 else 500_000_000)
+        cadence = (int(np.median(self.native_intervals))
+                   if self.native_intervals else 0)
+        capture_period = getattr(self.fusion, 'input_period_ns', None) or 0
+        return min(MAX_FRAME_AGE_NS, max(250_000_000, latency, self.retry_wait_ns,
+                                        2*max(cadence, capture_period)))
 
     def add_frame(self, stamp, color, depth, now):
         outputs = self.drain(now)
-        if stamp <= self.last_added or len(self.frames) >= 8:
-            self.fusion.fault('fusion capture queue repeated, reset or overflowed', 'input')
+        if stamp <= self.last_added:
+            self.fusion.fault('fusion capture timestamp repeated or reset', 'input')
+            return outputs
+        if not self.has_capacity() or now-stamp >= MAX_FRAME_AGE_NS:
             return outputs
         self.last_added = stamp
-        # A slow native frontend may return both results after the fixed fast-camera
-        # wait. Keep joins capture-ordered, bounded by the existing frame-age limit.
-        period = getattr(self.fusion, 'input_period_ns', None) or 0
-        wait = max(250_000_000, min(MAX_FRAME_AGE_NS, 2*period))
+        wait = self._wait_budget()
         self.frames[stamp] = dict(color=color, depth=depth, added=now, deadline=min(now+wait, stamp+MAX_FRAME_AGE_NS))
         self.counts['queued'] += 1
         return outputs
@@ -471,15 +489,21 @@ class CaptureObservations:
     def result(self, kind, msg, now):
         stamp = stamp_ns(msg)
         self.counts[kind+'_received'] += 1
-        if stamp not in self.frames:
-            # Includes drained captures and results never queued by this
-            # consumer; it is not evidence of a native/DDS dropped frame.
-            self.counts[kind+'_unqueued'] += 1
-        elif now > self.frames[stamp]['deadline']:
+        entry = self.frames.get(stamp)
+        if stamp in self.expired or (entry is not None and now > entry['deadline']):
             self.counts[kind+'_after_deadline'] += 1
+        elif entry is None:
+            self.counts[kind+'_unqueued'] += 1
         else:
-            self.frames[stamp][kind] = msg
+            completes = kind not in entry and ('pose' if kind == 'info' else 'info') in entry
+            entry[kind] = msg
             self.counts[kind+'_joined'] += 1
+            if completes:
+                self.native_delays.append(max(0, now-entry['added']))
+                self.retry_wait_ns = max(0, self.retry_wait_ns-75_000_000)
+                if self.last_native_received is not None and now > self.last_native_received:
+                    self.native_intervals.append(now-self.last_native_received)
+                self.last_native_received = now
         return self.drain(now)
 
     def _visual(self, stamp, entry):
@@ -521,6 +545,7 @@ class CaptureObservations:
                 # A delayed delivery is unusable without changing the capture clock.
                 self.frames.pop(stamp)
                 self.counts['stale_capture'] += 1
+                self.expired.append(stamp)
                 continue
             ready = ('pose' in entry and 'info' in entry) or getattr(entry.get('info'), 'lost', False)
             coverage = bool(self.fusion.samples) and self.fusion.samples[-1][0] >= stamp
@@ -530,6 +555,14 @@ class CaptureObservations:
             self.counts['completed'] += 1
             if not ready or not coverage:
                 self.counts['deadline_expired'] += 1
+            if not ready:
+                self.expired.append(stamp)
+                self.counts['visual_result_missing'] += 1
+                # A deadline miss provides a lower bound even when no complete
+                # pair arrives to refresh the observed latency estimate.
+                self.retry_wait_ns = max(self.retry_wait_ns, entry['deadline']-entry['added']+150_000_000)
+            elif getattr(entry.get('info'), 'lost', False):
+                self.counts['native_tracking_lost'] += 1
             if not coverage:
                 self.counts['imu_uncovered'] += 1
             visual, reason = self._visual(stamp, entry)
@@ -1018,6 +1051,14 @@ class RgbdSession:
                 # session. Keep the latest pair pending until it can receive.
                 self.stop_event.wait(.02)
                 continue
+            if self._fusing():
+                with self.lock:
+                    native_full = not self.observations.has_capacity()
+                if native_full:
+                    # Leave the unsent pair in the latest-frame queue. The
+                    # watchdog/result callbacks drain submitted captures.
+                    self.stop_event.wait(.01)
+                    continue
             try:
                 pair = self.pending.get(timeout=.1)
             except queue.Empty:
@@ -1042,12 +1083,6 @@ class RgbdSession:
                         transformations=selected.transformations+('rgbd_association',),
                         **{k:getattr(selected,k) if getattr(selected,k) is not None else getattr(other,k)
                            for k in ('source_id','source_epoch','geometry_version','mapping_version')})
-                    with self.lock:
-                        if self.gate.last_result_stamp == 0:
-                            self.gate.clock = selected.normalized_clock_id
-                            self.calibration['clock_id'] = selected.normalized_clock_id
-                        self.contexts_by_stamp[capture_stamp] = (selected, pair)
-                        while len(self.contexts_by_stamp) > 32:self.contexts_by_stamp.popitem(last=False)
                 # Prepare images while IMU arrives, retaining the original wait budget.
                 imu_deadline = time.monotonic() + .15
                 decode_started=time.monotonic_ns()
@@ -1067,11 +1102,7 @@ class RgbdSession:
                     color=deepcopy(color)
                     color.data=array('B',buffer.tobytes())
                 z16 = np.frombuffer(raw, '<u2').reshape(depth_height, depth_width)
-                image_quality = observation_quality(image, z16.astype(float)*.001)
-                with self.lock:
-                    if not hasattr(self, 'quality_by_stamp'):self.quality_by_stamp = OrderedDict()
-                    self.quality_by_stamp[capture_stamp] = QualityReport(**{k:image_quality[k] for k in ('contrast','sharpness','depth_fraction')})
-                    while len(self.quality_by_stamp) > 32:self.quality_by_stamp.popitem(last=False)
+                image_quality = observation_quality(image, z16)
                 out = RGBDImage()
                 out.header = deepcopy(depth.header)
                 # RTAB-Map supports lossless PNG depth in RGBDImage. Keep the
@@ -1115,8 +1146,24 @@ class RgbdSession:
                                 self._publish(sample)
                                 self.counts['estimates'] += 1
                             self._check_fusion(time.time_ns())
+                            if self._fusing() and capture_stamp not in self.observations.frames:
+                                self.counts['dropped_pairs'] += 1
+                                continue
                         if self.gate.state == 'lost':
                             continue
+                        if isinstance(pair, RgbdPair):
+                            if self.gate.last_result_stamp == 0:
+                                self.gate.clock = selected.normalized_clock_id
+                                self.calibration['clock_id'] = selected.normalized_clock_id
+                            self.contexts_by_stamp[capture_stamp] = (selected, pair)
+                            while len(self.contexts_by_stamp) > 32:
+                                self.contexts_by_stamp.popitem(last=False)
+                        if not hasattr(self, 'quality_by_stamp'):
+                            self.quality_by_stamp = OrderedDict()
+                        self.quality_by_stamp[capture_stamp] = QualityReport(**{
+                            k: image_quality[k] for k in ('contrast', 'sharpness', 'depth_fraction')})
+                        while len(self.quality_by_stamp) > 32:
+                            self.quality_by_stamp.popitem(last=False)
                         if getattr(self, 'rotation_hints', None) is not None:
                             self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns())
                         probe_deadline = getattr(self.gate, 'relocalization_deadline_mono', None)
@@ -1479,6 +1526,10 @@ class RgbdSession:
                     'timing': dict(end_to_end=latency_summary(self.processing_ages),
                                    **{k:latency_summary(v) for k,v in self.stage_times.items()}),
                     'input_delivery': [lease.status() for lease in self.input_leases],
+                    'pairing': dict(dropped=dict(self.pairs.dropped_by_side),
+                                    last_skew_ns=self.pairs.last_skew_ns,
+                                    pending=self.pairs.pending_count)
+                               if isinstance(self.pairs, RgbdPairer) else None,
                     'native_join': dict(self.observations.counts, pending=len(self.observations.frames))
                                    if self.observations is not None else None,
                     'body_mount': self.mounts.info(time.time_ns()) if self.mounts else {'status': 'undeclared'},
