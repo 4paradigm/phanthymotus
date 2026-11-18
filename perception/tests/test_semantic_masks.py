@@ -73,6 +73,52 @@ def test_card_registration_precedes_jetson_opencv_initialization(monkeypatch):
     assert callable(module["decode_camera_jpeg"])
 
 
+@pytest.mark.skipif(getattr(cv2, "__motus_fake__", False), reason="verify real JPEG and PNG codecs")
+def test_camera_publishes_stamped_mask_report_and_optional_overlay_from_one_frame():
+    import json
+    from types import SimpleNamespace
+    from sensor_msgs.msg import CompressedImage
+    from plugins.segment import _Camera, _ports
+    from vision_stubs import _FakeExecutor, _wait_until, frame_bytes
+
+    class Engine:
+        input_size = (8, 8)
+        calls = 0
+        def infer(self, image):
+            assert image.shape[:2] == (4, 8)
+            self.calls += 1
+            return heads(), META
+
+    engine = Engine()
+    cam = _Camera("/test/rgb", _FakeExecutor(), lambda: (engine, NAMES), .3, 10)
+    try:
+        person = _ports("/test/rgb", "person", "a", False)
+        car = _ports("/test/rgb", "car", "b", True)
+        cam.add(("person", "a"), "person", ["person"], person)
+        cam.add(("car", "b"), "car", ["car"], car)
+        frame = CompressedImage()
+        frame.data = frame_bytes(8, 4)
+        frame.header.frame_id = "cam_rgb_optical"
+        frame.header.stamp = SimpleNamespace(sec=123, nanosec=456)
+        cam.subscriptions[0].callback(frame)
+        pubs = {p.topic: p for p in cam.publishers}
+        assert len(cam.subscriptions) == 1 and len(pubs) == 5
+        assert _wait_until(lambda: all(p.raw_messages for p in pubs.values())), cam.error
+        assert engine.calls == 1
+        mask, report, preview = [pubs[port["topic"]].raw_messages[0] for port in car]
+        assert mask.format == "png" and preview.format == "jpeg"
+        assert mask.header == preview.header == frame.header
+        decoded = cv2.imdecode(np.frombuffer(mask.data, np.uint8), cv2.IMREAD_GRAYSCALE)
+        assert decoded.shape == (4, 8) and np.count_nonzero(decoded) == 16
+        info = json.loads(report.data)
+        assert info["stamp"] == {"sec": 123, "nanosec": 456}
+        assert info["frame_id"] == "cam_rgb_optical" and (info["width"], info["height"]) == (8, 4)
+        assert info["classes"] == [{"id": 0, "name": "background", "pixels": 16},
+                                   {"id": 1, "name": "car", "pixels": 16}]
+    finally:
+        cam.close()
+
+
 def test_card_registration_and_independent_instances(monkeypatch):
     import types
     import plugins.segment as cards

@@ -153,7 +153,9 @@ class _Camera(Node):
                     "classes": [{"id": i, "name": label, "pixels": int(counts[i])}
                                 for i, label in enumerate(["background"] + labels)]}
             preview = any(n == name and pubs[2] is not None for n, _, pubs in targets.values())
-            packets[name] = (_packet(msg.header, "png", mask), String(data=json.dumps(info)),
+            report = String()
+            report.data = json.dumps(info)
+            packets[name] = (_packet(msg.header, "png", mask), report,
                              _packet(msg.header, "jpg", overlay(image, mask)) if preview else None)
         with self.cv:
             if self.closed:
