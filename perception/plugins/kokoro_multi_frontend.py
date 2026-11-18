@@ -30,6 +30,7 @@ _ADDRESS = re.compile(
     r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+|"
     r"(?<!\w)(?:[A-Za-z]:[\\/]|\.?\.?/)[\w./\\+@~%-]+|"
     r"(?<![\w/])[\w.-]+(?:[/\\][\w.+@~-]+)*[/\\][\w.-]+\.[A-Za-z]{1,8}(?!\w)|"
+    r"(?<![A-Za-z0-9_.])[A-Za-z0-9_.+-]+\.(?:cfg|conf)(?![A-Za-z0-9_]|\.+[A-Za-z0-9_])|"
     r"(?<![\w.])[\w+-]+(?:\.[\w+-]+)*\.(?:txt|csv|jsonl?|onnx|pt|pth|wav|mp3|py|sh|zip|pdf|md|yaml|yml|log)(?!\w)",
     re.IGNORECASE,
 )
@@ -149,11 +150,16 @@ def _config():
 @lru_cache(maxsize=8)
 def _unit_pattern(language=""):
     cfg = _config()
-    symbols = (set(cfg["units"]) - {"hour", "minute", "second"}) | set(cfg["unit_symbol_aliases"])
+    symbols = {unit for unit, forms in cfg["units"].items()
+               if unit not in {"hour", "minute", "second"} and (not language or language in forms)}
+    symbols |= {alias for alias, unit in cfg["unit_symbol_aliases"].items() if unit in symbols}
     if language == "ru":
         symbols |= _RU_UNIT_ALIASES.keys()
     names = "|".join(re.escape(symbol) for symbol in sorted(symbols, key=len, reverse=True))
     number = r"(?:" + _EN_GROUPED_NUM + "|" + _NUM + ")" if language == "en" else _NUM
+    if language == "zh":
+        # The ported quantities accept grouping commas without changing other units.
+        number = rf"(?:{_EN_GROUPED_NUM}(?=\s*(?:mAh|‰))|{_NUM})"
     if language in _COMMA_LANGUAGES:
         # Preserve the existing separate-number reading of comma lists.
         number = r"(?:(?<!\d,)" + _COMMA_NUM + r"|(?<=\d,)" + _NUM + r")"
@@ -303,7 +309,9 @@ def _unit_form(forms, value, language):
 def _quantity(value, unit, language, cfg, genitive_decimal=False):
     if language == "ja" and unit == "minute" and value.isdigit():
         return _ja_minutes(int(value))
-    if language in {"fr", "es"}:
+    if language == "zh":
+        value = value.replace(",", "")
+    elif language in {"fr", "es"}:
         value = re.sub(r"[ \u00a0\u202f]", "", value)
     words = _number(value, language, cfg)
     if genitive_decimal:
@@ -928,6 +936,13 @@ _LATIN_LETTERS = r"A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff"
 _LATIN_WORD = (rf"[{_LATIN_LETTERS}][{_LATIN_LETTERS}0-9]*"
                rf"(?:[-'&][{_LATIN_LETTERS}0-9]+)*")
 _LATIN = re.compile(r"(" + _LATIN_WORD + r"(?:[ \t]+(?:&[ \t]+)?" + _LATIN_WORD + r")*)")
+_EN_FUNCTION_WORDS = frozenset(
+    "a an the this that these those i you he she it we they me us them "
+    "my your his her its our their is are was were be been am has have had "
+    "do does did can could may might must should will would of in on at to "
+    "from for with by after before and or but if because when where which "
+    "who what how please".split()
+)
 _SYMBOL_MAP = {"ru": {"ɭ": "l", "ɵ": "o", "ʑ": "zʲ"}, "de": {"ʏ": "y"}}
 _CLOSERS = r'''[)\]}'"’”」』】》]*'''
 _STOPS = re.compile(r'(?:[!?…。！？;；:：,，、—]+|\.(?![\w.]))' + _CLOSERS + r'\s*')
@@ -1212,6 +1227,7 @@ class Frontend:
         alternatives, self._entries, self._native_entries = [], {}, {}
         self._entry_languages = {}
         self._filename_languages = {}
+        self._opening_clause_terms = set()
         for index, entry in enumerate(entries):
             default = self._dictionary_phonemes(entry)
             native = {language: self._native(reading, language)
@@ -1228,6 +1244,8 @@ class Frontend:
                 self._native_entries[name] = native
                 self._entry_languages[name] = tuple(entry.get("languages", ()))
                 self._filename_languages[name] = tuple(entry.get("filename_languages", ()))
+                if entry.get("split_opening_clause", True):
+                    self._opening_clause_terms.add(name)
         alternatives.sort(reverse=True)
         self._terms = re.compile(r"(?<![A-Za-z0-9_])(?:" +
                                  "|".join(body for _, body in alternatives) +
@@ -1291,6 +1309,54 @@ class Frontend:
             return "es"
         with self._lock:
             return self._identifier.classify(ordinary)[0]
+
+    def bilingual_sentence_groups(self, text, inherited_language):
+        """Group complete Mandarin and English sentences by reading language."""
+        if not re.search(r"[\u4e00-\u9fff]", text) or not re.search(r"[A-Za-z]", text):
+            return []
+        protected = self._literal_spans(text) + [m.span() for m in self._terms.finditer(text)]
+        protected += [m.span() for m in _PHONE_HINT.finditer(text)]
+        first = first_sentence_parts(text, protected)
+        if len(first) == 1:
+            return []
+
+        # Treat filenames, product labels, model numbers and quantities as
+        # neutral. English prose needs evidence beyond its technical terms.
+        ordinary = list(text)
+        neutral = (protected + [m.span() for m in _CODE.finditer(text)]
+                   + [m.span() for m in _unit_pattern().finditer(text)]
+                   + [m.span() for m in _EN_HARDWARE.finditer(text)])
+        for left, right in neutral:
+            ordinary[left:right] = " " * (right - left)
+        ordinary = "".join(ordinary)
+
+        groups, seen = [], set()
+        start, language = 0, inherited_language
+        while first:
+            head = first[0]
+            end = start + len(head)
+            evidence = self.language_evidence(head)
+            if evidence not in (None, "zh", "en"):
+                return []
+            if evidence == "en":
+                words = re.findall(_LATIN_WORD, ordinary[start:end])
+                if len(words) < 2 or not (any(word.lower() in _EN_FUNCTION_WORDS for word in words)
+                                          or sum(word.islower() for word in words) >= 3):
+                    evidence = None
+            if evidence:
+                seen.add(evidence)
+                language = evidence
+            if groups and groups[-1][1] == language:
+                group, _ = groups[-1]
+                groups[-1] = (group + head, language)
+            else:
+                groups.append((head, language))
+            if len(first) == 1:
+                break
+            start = end
+            first = first_sentence_parts(text[start:],
+                                         [(a - start, b - start) for a, b in protected if b > start])
+        return groups if seen == {"zh", "en"} else []
 
     def _dictionary_matches(self, text, language):
         return (match for match in self._terms.finditer(text)
@@ -1521,11 +1587,26 @@ class Frontend:
     def iter_phonemes(self, text, language="auto"):
         """Normalize the full request once; defer tail G2P until its turn."""
         source, spoken, language = self._prepare_text(text, language)
-        protected = self._literal_spans(spoken) + [m.span() for m in self._dictionary_matches(spoken, language)]
+        matches = list(self._dictionary_matches(spoken, language))
+        protected = self._literal_spans(spoken) + [match.span() for match in matches]
+        clause = language != "en" and (language not in ("fr", "es") or any(
+            match.lastgroup in self._opening_clause_terms for match in matches))
+        parts = first_sentence_parts(spoken, protected, clause=clause)
+        prepared_parts = []
+        if language in ("en", "ja", "de", "ru", "th") and len(parts) == 2 and len(spoken) <= 120:
+            prepared_parts = [self._phonemize(part, language, source) for part in parts]
+            joined = re.sub(r"\s+", " ", " ".join(prepared_parts)).strip()
+            # Preserve punctuation while avoiding a second inference for a short request.
+            if len(joined) <= 120:
+                yield joined
+                return
+
+        def part_phones(index):
+            return prepared_parts[index] if prepared_parts else self._phonemize(parts[index], language, source)
+
         if language == "en":
             # Keep first-sentence context; prepare the remainder after first PCM.
-            parts = first_sentence_parts(spoken, protected)
-            first = self._phonemize(parts[0], language, source)
+            first = part_phones(0)
             chunks = sentence_phoneme_chunks(first, pack_tail=True)
             if len(chunks) > 1:
                 yield chunks[0]
@@ -1534,14 +1615,10 @@ class Frontend:
                 yield first
                 tail = ""
             if len(parts) > 1:
-                tail += " " + self._phonemize(parts[1], language, source)
+                tail += " " + part_phones(1)
             if tail.strip():
                 yield tail
             return
-        # Native Latin prose keeps sentence context; mixed-name passages retain
-        # their smaller opening clause for first-audio latency.
-        clause = language not in ("en", "fr", "es") or any(self._dictionary_matches(spoken, language))
-        parts = first_sentence_parts(spoken, protected, clause=clause)
         if (language == "zh" and len(spoken) <= 32 and not _LATIN.search(spoken)
                 and parts[0].rstrip().endswith((",", "，", "、"))):
             # Keep the opening comma or list separator inside a short phrase.
@@ -1555,7 +1632,7 @@ class Frontend:
             return
         for index, part in enumerate(parts):
             if language != "th" or index:
-                yield self._phonemize(part, language, source)
+                yield part_phones(index)
                 continue
             # Prepare Thai phrases lazily, retaining the existing acoustic chunks.
             # More than one chunk of lookahead fixes its original first boundary.

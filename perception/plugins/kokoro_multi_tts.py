@@ -300,21 +300,28 @@ class KokoroMultiTTSAdapter(TTSAdapter):
                         if reading_session is not None else
                         self._frontend.detect_language(text) if preference == "auto" else preference)
             speed = np.array([self._speed], dtype=np.float32)
+        groups = []
+        if preference == "auto" and language == "zh":
+            inherited = reading_session.previous_language if reading_session is not None else None
+            groups = self._frontend.bilingual_sentence_groups(text, inherited or language)
         samples, count = 0, 0
-        for phones in self._frontend.iter_phonemes(text, language):
-            frontend_done = monotonic()
-            for audio, phone_count in self._synthesize_phones(phones, language, speed, text):
-                inference_done = monotonic()
-                pcm = downsample_24k_to_16k(audio)
-                if count == 0:
-                    now = monotonic()
-                    log.info("[kokoro-multi] first_pcm language=%s seconds=%.3f "
-                             "frontend_s=%.3f inference_s=%.3f resample_s=%.3f phones=%d",
-                             language, now - started, frontend_done - started,
-                             inference_done - frontend_done, now - inference_done, phone_count)
-                samples += audio.size
-                count += 1
-                yield pcm
+        for source, reading in groups or ((text, language),):
+            for phones in self._frontend.iter_phonemes(source, reading):
+                frontend_done = monotonic()
+                for audio, phone_count in self._synthesize_phones(phones, reading, speed, source):
+                    inference_done = monotonic()
+                    pcm = downsample_24k_to_16k(audio)
+                    if count == 0:
+                        now = monotonic()
+                        log.info("[kokoro-multi] first_pcm language=%s seconds=%.3f "
+                                 "frontend_s=%.3f inference_s=%.3f resample_s=%.3f phones=%d",
+                                 reading, now - started, frontend_done - started,
+                                 inference_done - frontend_done, now - inference_done, phone_count)
+                    samples += audio.size
+                    count += 1
+                    yield pcm
+        if groups and reading_session is not None:
+            reading_session.pending_language = groups[-1][1]
         log.info("[kokoro-multi] complete language=%s chunks=%d audio_s=%.3f wall_s=%.3f",
                  language, count, samples / 24000, monotonic() - started)
 
@@ -362,9 +369,9 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 WORK = Path(__file__).resolve().parents[1]
 # Filled with the published, immutable release before submission. Missing pins
 # fail explicitly; an unverified or unrelated model is never substituted.
-ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=4cc1e20b5389aaa28434750c42c14ee489ce9c90&FilePath=kokoro-multi-jp61-fp32-v13.tar.gz"
-ASSET_SHA256 = "3bd116bb387d809e4de311a4131511b9608942a8349574fe4d307124ffb5d033"
-ASSET_SIZE = 324809306
+ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=b58705717cbea7aad9839c728da046ca294f72e1&FilePath=kokoro-multi-jp61-fp32-v14.tar.gz"
+ASSET_SHA256 = "1935bc98efe296976bef857cef18a17b1a12d8c4a3e41893bfcbdd910647dde1"
+ASSET_SIZE = 324809917
 
 
 def enabled():
