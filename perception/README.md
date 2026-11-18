@@ -4326,6 +4326,9 @@ publish a calibrated `motus.camera/1` declaration for that stream and
 resolution. If its intrinsics are missing or invalid, startup raises an error
 identifying the stream. Report the camera card and stream to its developer
 so the driver can supply the calibration.
+An invalid rewire leaves a running card on its previously calibrated topic.
+If calibration is lost on the active topic, pose output stops until a valid
+start. Frame dimensions must match that calibration and fit within 36 megapixels.
 
 The default marker side is **10 cm (0.10 m)**. If your print differs, measure an
 outer edge of the black square, excluding the white margin, and enter its

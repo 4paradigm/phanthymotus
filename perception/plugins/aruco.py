@@ -7,8 +7,10 @@ import logging
 import math
 import threading
 import time
+from io import BytesIO
 
 import numpy as np
+from PIL import Image
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
@@ -23,6 +25,7 @@ from utils.ros_lifecycle import dispose_node
 
 log = logging.getLogger(__name__)
 MAX_JPEG_BYTES = 8 * 1024 * 1024
+MAX_FRAME_PIXELS = 36_000_000  # Covers DCI 8K and bounds the full-resolution BGR allocation.
 _NODE_SEQUENCE = itertools.count()
 DEFAULTS = {"dictionary": DEFAULT_DICTIONARY, "marker_size_m": 0.1, "rate_hz": 5.0, "publish_overlay": True}
 CONFIG = {
@@ -195,6 +198,15 @@ class _ArucoNode(Node):
         try:
             if not 0 < len(frame.data) <= MAX_JPEG_BYTES:
                 raise ValueError("Camera JPEG is empty or exceeds the size limit.")
+            try:
+                with Image.open(BytesIO(frame.data), formats=("JPEG",)) as header:
+                    width, height = header.size
+            except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                raise ValueError("Could not decode camera JPEG header.") from exc
+            if width * height > MAX_FRAME_PIXELS:
+                raise ValueError("Camera JPEG exceeds the decoded pixel limit.")
+            if (width, height) != (self.calibration.width, self.calibration.height):
+                raise ValueError("Camera JPEG dimensions differ from camera calibration.")
             image = cv.imdecode(np.frombuffer(frame.data, dtype=np.uint8), cv.IMREAD_COLOR | cv.IMREAD_IGNORE_ORIENTATION)
             if image is None:
                 raise ValueError("Could not decode camera JPEG.")
@@ -315,6 +327,10 @@ class ArucoPlugin:
             try:
                 calibration, camera_id = _wired_calibration(camera_info, topic)
             except ValueError as exc:
+                # A failed rewire to another topic cannot invalidate the still-calibrated source.
+                if previous is not None and previous.input_topic != topic:
+                    raise
+                # For the active topic, stop emitting measurements as soon as it loses its calibration.
                 calibration_error = exc
                 self._pending_starts.pop(key, None)
             else:

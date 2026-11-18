@@ -169,8 +169,9 @@ def test_processor_publishes_matching_json_and_jpeg_then_clears_detection(detect
         assert _wait_until(lambda: len(pose_pub.messages) == 3)
         assert "decode" in json.loads(pose_pub.messages[2])["error"]
         deliver(_frame(np.full((240, 320, 3), 255, dtype=np.uint8), 103))
-        assert _wait_until(lambda: len(overlay_pub.messages) == 3)
+        assert _wait_until(lambda: len(pose_pub.messages) == 4)
         assert "dimensions" in json.loads(pose_pub.messages[3])["error"]
+        assert len(overlay_pub.messages) == 2
 
         assert plugin.dispatch("aruco", {"action": "stop", "instance_id": "aruco-a"})["state"] == "idle"
         deliver(frame)
@@ -205,6 +206,48 @@ def test_start_requires_intrinsics_from_the_wired_camera(camera_info):
                                       "input_topic": TOPIC, "camera_info": camera_info})
         assert TOPIC in str(error.value) and "相机卡片开发者" in str(error.value)
         assert not executor.nodes
+    finally:
+        plugin.shutdown()
+
+
+def test_failed_rewire_preserves_the_original_calibrated_camera(detector):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
+    try:
+        info = plugin.dispatch("aruco", args)
+        [original] = executor.nodes
+        with pytest.raises(ValueError, match="相机卡片开发者"):
+            plugin.dispatch("aruco", {**args, "input_topic": "/different/camera", "camera_info": {}})
+        assert plugin.dispatch("aruco", {"action": "info", "instance_id": "a"}) == info
+        assert executor.nodes == [original] and original.worker.is_alive()
+    finally:
+        plugin.shutdown()
+
+
+def test_frame_dimensions_are_checked_before_pixel_decode(detector, monkeypatch):
+    from plugins import aruco
+
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    args = {"action": "start", "input_topic": TOPIC, "camera_info": [CAMERA]}
+    wrong_size = _frame(np.zeros((240, 320), np.uint8), 1)
+    matching = _frame(np.zeros((HEIGHT, WIDTH), np.uint8), 2)
+    try:
+        assert plugin.dispatch("aruco", args)["state"] == "running"
+        [node] = executor.nodes
+        poses, overlay = node.publishers
+
+        def unexpected_decode(*_args):
+            pytest.fail("Pixels decoded before checking JPEG dimensions")
+
+        monkeypatch.setattr(cv2, "imdecode", unexpected_decode)
+        node._process(wrong_size)
+        assert "dimensions" in json.loads(poses.messages[-1])["error"]
+        monkeypatch.setattr(aruco, "MAX_FRAME_PIXELS", WIDTH * HEIGHT - 1)
+        node._process(matching)
+        assert "pixel limit" in json.loads(poses.messages[-1])["error"]
+        assert not overlay.messages
     finally:
         plugin.shutdown()
 
