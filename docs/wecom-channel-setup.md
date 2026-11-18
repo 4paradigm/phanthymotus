@@ -1,26 +1,26 @@
 # 企业微信 Channel 配置与收发验收（一期）
 
 > 本文按 [`feishu-channel-setup.md`](./feishu-channel-setup.md) 的结构编写，面向 `platform = wecom` 的渠道。
-> **状态：代码已实现（2026-11-14），待远程部署与真机验收。** `wecom` 适配器、6 处接线、单测均已落在 `feat/wecom-channel` 分支；本地只做静态检查（语法 / 编译 / 接线核对 / 离线单测），**不做本地运行时联调**。按项目部署方式，需先把分支推到远程、获取包含新代码的镜像，再部署到机器人上验证。§6 已按实现的错误文案补齐，但标注「待实测」的帧字段仍需 L0 帧样本确认。
-> **一期范围**：组织内 `operator` / `viewer` 两类用户、单台 bumi、自然语言文本命令、「发命令 → 机器人执行 → 回复原会话」一条主链路。不含附件收发、主动推送、Bot @ Bot / Trusted Bots、模板卡片、移动端入口与个人微信触达，这些留待后续调整。
+> **状态：文本适配器曾通过企业微信单聊、群聊固定文本回显；图片收发、完整 Agent 链路与真机仍待验证。** 图片改动目前按静态检查处理，尚未执行图片功能测试或真实企微联调。部署时需要构建包含新代码的新镜像。
+> **范围**：组织内 `operator` / `viewer` 两类用户、单台 bumi、自然语言文本命令及 JPG/PNG 图片收发。不含其他附件、主动推送、Bot @ Bot / Trusted Bots、模板卡片、移动端入口与个人微信触达。
 > **一期目标**：对齐 feishu-bot 的交互方式 —— 不是做一个聊天问答机器人，而是让企业微信里的一句自然语言命令，经 `decision_core` 调用已绑定的 driver actuator，**驱动真实机器人（bumi）执行动作**，并把结果回复到原会话。
 
-本文说明如何从零创建企业微信智能机器人，并把它接入 Phanthy Motus Agent Core。与飞书一样走 **WebSocket 长连接**：设备只需能出网，不需要公网 IP、回调域名或消息加解密。
+本文说明如何从零创建企业微信智能机器人，并把它接入 Phanthy Motus Agent Core。与飞书一样走 **WebSocket 长连接**：设备只需能出网，不需要公网 IP 或回调域名；收到的图片素材需用回调中的密钥解密。
 
 ## 0. 一期操作流程总览（从扫码到 bumi 执行命令）
 
 > 按「个人组建团队 / 团队形态」这条路径整理。第 4 步的帧样本不通就不要进第 5 步 —— 这是飞书 #125 修「假 connected」得到的教训。
 >
-> **本地与远程的分工**：本地只做静态检查与代码准备，**真机联调全部在远程镜像部署到机器人之后**。本地不启动 agent-core、不配渠道、不连企微长连接。
+> **本地与远程的分工**：此前曾使用临时程序在本地验证企微文本回显；图片功能当前只做静态检查。**真机联调在远程镜像部署到机器人之后**。
 
 | 步 | 在哪操作 | 做什么 | 通过标准 | 详见 |
 |---|---|---|---|---|
 | 1 | 官网注册页（已完成） | 用**个人实名微信扫码**完成「个人组建团队」 | 团队创建成功，能登录电脑端与管理后台 | §1.1 |
 | 2 | 企业微信客户端（已完成） | 装 App 本体 ≥5.0 →「工作台 → 智能机器人 → 创建机器人 → 手动创建 → **API 模式**」→ 连接方式选 **使用长连接** | 已生成 **Bot ID + Secret** | §1.2 |
 | 3 | 同上 | 填名称、可见范围（只含自己）、使用模式，保存；**立即保存凭据** | 通讯录能找到机器人，可发起单聊 | §1.2 |
-| 4 | 本地终端 | 最小 WebSocket 脚本（临时验证物，不入库）：订阅 → 收 `aibot_msg_callback` → 回显一句话；同时验证 443 出网。**记录脱敏帧样本** | 企微收到回显；帧字段名与 §8 常量区逐项核对 | §8 / P0 / L0 |
-| 5 | 本地 · `phanthymotus` · `feat/wecom-channel` | **只做静态检查**：`py_compile`、`node --check`、`OutboundMessage` 字段位置核对、6 处接线核对、离线单测（`python -B tests/test_wecom_channel.py -q`） | 静态检查全绿、离线单测通过 | §8 |
-| 6 | 远程 | 把 `feat/wecom-channel` 推到远程；**获取包含新代码的镜像**并部署到机器人。`Dockerfile:44` 是 `COPY src/ /work/src/`，新增的 `adapters/wecom.py` 会随镜像进入；`pyproject.toml` 无需改动（`aiohttp` 已是依赖） | 机器人上运行的是含 `wecom` 的新镜像 | §8 |
+| 4 | 本地终端 | 临时 WebSocket 程序验证订阅与文字收发 | 单聊和群聊固定文本回显此前已通过；图片待验证 | §8 |
+| 5 | 本地 · `phanthymotus` · `feat/wecom-channel` | 图片改动先做语法、依赖声明与接线等静态检查 | 不将静态检查等同于图片功能测试 | §8 |
+| 6 | 远程 | 在获准推送后，获取包含新代码和图片解密依赖的镜像，再部署到机器人 | 机器人上运行的是含更新代码的新镜像 | §8 |
 | 7 | 机器人上的 Agent Core Dashboard | 「设置 → 渠道」加 WeCom Channel 填 `bot_id` / `secret`；Canvas 放 **2 张复用卡 + 2 条连线**。动作级限制落实前，先只绑定只读能力 | 渠道 `connected`、两卡自检通过 | §2 §3 |
 | 8 | 「渠道 → 用户」 | 把你的 userid 从默认 `viewer` 改成 **`operator`** | 角色生效；`viewer` 仍只读 | §4 |
 | 9 | 企微 + bumi 现场 | **动作级限制落实后**，发「挥个手」→ bumi 执行 → 原会话收到回复；再用 `viewer` 发同一句验证被拒 | 飞书 F11 四要素 + 动作真的执行 | §5 |
@@ -72,7 +72,7 @@
 | 事件订阅 `im.message.receive_v1` | **不需要** | 消息由长连接直接推送 `aibot_msg_callback` |
 | 订阅方式选「使用长连接接收事件」 | 已由 API 模式涵盖 | — |
 | 应用版本发布 / 可用范围发布 | **不需要** | 但仍需配置机器人「可见范围」 |
-| Token / EncodingAESKey 与消息加解密 | **不需要** | 长连接明文 |
+| 回调模式 Token / EncodingAESKey | **不需要** | 长连接消息不需要回调模式密钥；图片文件需用消息中的 `aeskey` 解密 |
 | 公网回调 URL / 可信域名 / IP 白名单 | **不需要** | 纯出网连接 |
 
 设备侧唯一的网络前提：**能访问 `wss://openws.work.weixin.qq.com:443`**。校园网或实验室网络是否放行需实测。
@@ -82,8 +82,8 @@
 - 每个智能机器人**同一时间只能保持一条有效长连接**；新连接完成订阅会踢掉旧连接，旧连接收到 `disconnected_event`。联调与正式环境不要同时连同一个 Bot ID。
 - 单企业最多 300 个智能机器人，单个普通成员最多创建 20 个（官方帮助中心）。
 - 长连接建议每 30 秒发送一次 `ping` 保活，需实现断线检测与自动重连。
-- 当前适配器按 24 小时保留回复上下文，流式消息仅发送最终帧。回复首包的实际时限仍需联调：腾讯云 [CodeBuddy 接入指南](https://intl.cloud.tencent.com/zh/document/product/1316/84454)建议在 5 秒内发送流式首包，不能仅凭本地缓存时长认定平台一定会接受回复。
-- 一期不支持附件：入站媒体 url 仅 5 分钟有效且每条带独立 `aeskey`，出站需走上传临时素材三段式，均留待后续。
+- 当前适配器按 24 小时保留回复上下文。图片消息在渠道及用户通过检查后先发送处理中帧，再发送最终回复；文本消息仍只发送最终帧。首包时限和图片流程仍需真实联调，不能仅凭本地缓存时长认定平台一定会接受回复。
+- 入站图片 URL 有效期为 5 分钟，每张图片使用各自的 `aeskey`；当前仅支持 JPG/PNG，每张不超过 10 MiB，每条最多 10 张。出站图片使用流式回复的 `msg_item`，其他文件暂不支持。
 
 ## 2. 在 Agent Core 中添加 WeCom Channel
 
@@ -135,7 +135,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 - **通讯层不含任何机器人动作**。`channel_request` / `channel_reply` 只是把消息送进 Agent、把结果送出去；动作由 `decision_core` 调用 Canvas 上已绑定的 driver actuator 产生。`phanthymotus-driver` 一行都不用改（bumi 的 `device.py` 已声明 `motion_state` / `semantic_action` 等卡）。
 - **没有斜杠命令表 / 按钮回调**：「命令」就是自然语言，由 LLM 决定调哪个已绑定工具。
-- `viewer` 回合在第 7 步被只读闸拦下，不会到达 actuator（见 §4）。
+- 所有人员消息均为 `viewer` 的批次受只读限制；混合 `viewer` 与 `operator` 的批次尚不具备逐消息权限隔离（见 §4）。
 - `channel_reply` 回复当前消息时使用 `source_message_id` 找回精确会话，不会被后到的群聊或单聊改写目标。**一期不使用** `trusted_bot_id`、`mention_open_id` 与 `expect_reply`。
 
 **一期动作范围与当前实现**：
@@ -163,13 +163,14 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
   | 角色 | 可调用 |
   |---|---|
-  | `viewer`（默认） | `sensor` / `resource`、`finish`、只读系统工具（WebSearch / search_history / memory_recall / raw_input_info）、`channel_reply` |
+  | `viewer`（默认） | 只读批次中可用 `sensor` / `resource`、只读系统工具、`channel_reply`，以及针对当前批次图片的受限 `Read` |
   | `operator` / `owner` | 上述全部 + 已绑定的 actuator / processor / Skill |
 
   新用户默认 `auto_approve = true`、`default_role = viewer`，**必须手动改成 `operator` 才能让机器人执行动作**。
 
 - **回复出口**：`channel_reply` 是 Agent 向企业微信发消息的唯一出口；写在 `content` 里的纯文本不会送达。回复必须逐字复制触发事件的 `source_message_id`（每个 Channel 保留最近 100 条上下文）。
-- **一期不支持**：附件、`trusted_bot_id`、`mention_open_id`、`expect_reply`、无触发的主动推送、跨群回复。
+- **图片**：支持单独图片和图文混排中的图片；解密后复用 `resource/channel_files`，沿用项目附件清理策略。图片理解还需要启用 `vision_input` 并配置支持图片的模型。图片处理失败会在入站文本中提示。图片收发和识别尚待真实验证。
+- **一期不支持**：非图片附件、`trusted_bot_id`、`mention_open_id`、`expect_reply`、无触发的主动推送、跨群回复。
 
 ## 5. 五分钟收发验收
 
@@ -207,8 +208,9 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | 回复找不到上下文 | `No reply context for this message: the inbound req_id is unknown or expired. The user must send a new message first.` | 让用户重新发一条消息；不要复用历史 `source_message_id` |
 | 回复超窗 | `Reply window expired (24h). Re-trigger from a current message ...` | 基于当前 Activity 事件重新触发 |
 | 回复被拒或回执超时 | `WeCom reply rejected ...` / `WeCom reply ACK timed out.` | 检查错误码、连接和消息上下文；发送结果以平台回执为准 |
-| 尝试发附件 | `WeCom channel is text-only in phase 1; files are not supported.` | 一期不支持附件；框架已按 `SUPPORTED_FILE_KINDS=()` 提前过滤 |
-| 非文本入站 | 适配器给占位文本 `[收到非文本消息，当前仅支持文本指令]` | 一期只处理文本；Agent 会据此回复可读说明，而不是静默 |
+| 图片无法处理 | 入站文字包含 `图片处理失败或超限` | 检查图片格式、大小、下载时限及连接；不要记录图片 URL 或密钥 |
+| 尝试发其他附件 | `WeCom currently supports image attachments only.` | 当前仅支持 JPG/PNG 图片 |
+| 其他非文本入站 | 适配器给占位文本 `[收到不支持的非文本消息]` | 当前不处理其他附件 |
 | Channel 显示 `connected` 但消息无反应 | Canvas 没有配置 `channel_request` 卡片，或智能控制未启动 | 检查卡片实例配置与启动自检；未激活 channel 的入站消息会被丢弃 |
 | Agent 能收到但不能回复 | `decision_core` 未绑定 `channel_reply`，或尚无会话上下文 | 补执行器连接；先由用户发一条消息建立上下文 |
 | 企微里找不到机器人 | 不在机器人可见范围，或用「微信插件」登录 / 未装 App 本体 | 调整可见范围；改装企业微信 App 本体 |
@@ -224,7 +226,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 - 机器人**可见范围**只包含实际测试者；扩大到全员前先确认数据与行为边界。
 - `channel_reply` 是 Agent 向企业微信发送消息的**唯一出口**；普通人工消息行为不变。
 - **单 Bot ID 单连接**：联调与正式环境不共用同一对凭据。
-- `viewer` 只读；`operator` 可调用已绑定的 actuator。挥手 / 握手的动作级白名单尚未实现，真机接入前必须先落实并验证。
+- 全部人员消息均为 `viewer` 时批次受只读限制；混有 `operator` 时尚无逐消息权限隔离。`operator` 可调用已绑定的 actuator；挥手 / 握手的动作级白名单尚未实现，真机接入前必须先落实并验证。
 - **不开放底层电机级控制**：Bumi 的 HighController 能力边界「原则上不超过 APP 或手柄原本可实现的功能」；跌倒保护属于底层安全机制，「具有最高优先级，不受上层控制指令影响」。
 - 执行动作前确认机器人站立、双脚着地、地面平坦防滑且周围无人无障碍。
 - 一期不配置 Trusted Bots，也不接受任何自报的机器人身份或跨群回复。
@@ -233,15 +235,14 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 ### 8.1 本地只做静态检查
 
-本地不启动 agent-core、不配渠道、不连企微长连接。已执行的静态检查：
+图片改动当前只计划做本地静态检查；下列检查结果应以实际运行记录为准：
 
 | 检查 | 命令 / 方法 | 结果 |
 |---|---|---|
-| Python 编译 | `python -m py_compile src/channel/adapters/wecom.py src/channel/adapter.py src/channel/manager.py src/channel/__init__.py src/start.py tests/test_wecom_channel.py` | 通过 |
-| JS 语法 | `node --check web/js/channels.js` | 通过 |
-| `OutboundMessage` 兼容性 | AST 核对 `source_message_id` 位于字段末尾且带默认值 | 通过（现有 4 个适配器不受影响） |
-| 6 处接线 | 字符串核对 `register_adapter('wecom')`、`source_message_id=source_message_id`、`Supported: ... lan, wecom`、两张卡描述、`channels.js` 下拉/表单/图标 | 通过 |
-| 离线单测 | `cd agent-core && python -B tests/test_wecom_channel.py -q` | 使用模拟 WS；以本次运行结果为准 |
+| Python 语法 | 解析受影响的 Python 源码与测试文件 | 以当前运行记录为准 |
+| Git 差异 | `git diff --check` | 以当前运行记录为准 |
+| 依赖与接线 | 检查 `pyproject.toml`、`uv.lock`、附件和权限路径 | 以当前运行记录为准 |
+| 离线单测 | `cd agent-core && python -B tests/test_wecom_channel.py -q` | 图片改动后尚未执行 |
 
 > 全量 pytest 在 Windows 本地会有收集错误：`fcntl` 是 Unix-only、`cryptography` 未在 `pyproject.toml` 声明、`test_skill_files.py` 的 `PermissionError`。这些是既有环境问题，与 wecom 改动无关，**不作为本地验收依据**；以远程镜像内的运行结果为准。
 
@@ -252,15 +253,15 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | 项 | 结论 | 依据 |
 |---|---|---|
 | 新增文件会进镜像吗 | **会**。`agent-core/Dockerfile:44` 是 `COPY src/ /work/src/`，且无 `.dockerignore` 排除 `src` | `adapters/wecom.py` 随镜像进入 |
-| 需要改依赖吗 | **不需要**。`pyproject.toml:7` 已声明 `aiohttp>=3.13.5`，镜像构建那步 `uv lock && uv sync --no-dev --no-install-project` 无需变更，`uv.lock` 也不动 | 裸 WS 零新增依赖 |
+| 需要改依赖吗 | 需要直接声明 `pycryptodome`，用于图片解密；它原本已作为飞书 SDK 的传递依赖出现在锁文件中 | `pyproject.toml` / `uv.lock` |
 | 需要重建镜像吗 | **需要**。新代码必须经构建/拉取的新镜像才能到机器人；仅改本地文件不会生效 | `Dockerfile` 的 COPY 层 |
 | 重启后要做什么 | 新镜像启动后 `channel/__init__.py` 会注册 `wecom`；随后在 Dashboard 加 Channel、接 Canvas、启动智能控制（现场 `auto_start=false`，重启后需手动启动） | §0 第 7–9 步 |
 | 凭据在哪填 | **只在机器人上的 Dashboard「设置 → 渠道」填**，不进仓库、不进镜像、不进日志 | §2、§7 |
 | 单连接约束 | L0 脚本与机器人上的适配器不能同时连同一个 Bot ID，否则互踢；部署后不要再跑本地 L0 | §1.4 |
 
-### 8.3 帧格式待 L0 实测
+### 8.3 协议字段与待验证范围
 
-官方 `101463` / `60904` 页面正文是动态渲染的，静态抓取只能拿到目录导航，拿不到逐字 JSON 示例。当前 `wecom.py` 的帧字段名来自官方开发前必读 101805、帮助中心 21677 与官方 SDK 行为描述，属于**有依据的假设**：
+文本固定回显已在企微单聊和群聊验证；图片字段、流式占位和图文回复尚需真实平台验证。主要字段参考官方 SDK：
 
 | 常量 / 位置 | 当前值 | L0 需核对 |
 |---|---|---|
@@ -285,7 +286,7 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | Q4 | 机器人所在网络是否放行 `wss://openws.work.weixin.qq.com:443` | 部署后在机器人上验证；L0 可先在本地确认出网 |
 | Q5 | bumi 现场画布是否已配置过 Channel、`execConnections` 是否已绑定动作卡 | 决定第 3 节是否需要重接线 |
 | Q6 | §6 的具体错误码与字段名 | **已闭合**：§6 已按实现补齐；帧字段以 L0 实测为准（§8.3） |
-| Q7 | 远程镜像的构建/拉取与部署方式 | 由部署流程决定；本文只确认「新代码会进镜像、无需改依赖」 |
+| Q7 | 远程镜像的构建/拉取与部署方式 | 由部署流程决定；图片解密需安装已声明的 `pycryptodome` |
 
 ## 参考文档
 

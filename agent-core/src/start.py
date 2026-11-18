@@ -337,7 +337,8 @@ def _register_core_mcp(silent=False):
                     'elsewhere in your shared history and must not be attributed to this one. '
                     'If the triggering user_role is "viewer" (read-only), you will only be offered '
                     'sensor/resource tools, read-only tools (WebSearch, search_history, memory_recall, '
-                    'raw_input_info) plus this one — actuator/processor/delegated tools are rejected; '
+                    'raw_input_info), Read for images attached to the current Channel messages, '
+                    'plus this one — actuator/processor/delegated tools are rejected; '
                     'reply with what you can read or look up, and say so if the request needs an action '
                     'you cannot take.'
                 ),

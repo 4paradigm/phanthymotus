@@ -63,6 +63,9 @@ class InboundMessage:
     chat_type: str = ''        # p2p | group
     mentions: list[dict] = field(default_factory=list)
     expect_reply: bool | None = None  # 机器人协作消息是否明确要求继续 @
+    # Some platforms must acknowledge a message before downloading its media.
+    # The manager invokes this only after checking that the sender is allowed.
+    prepare: Callable[[], Awaitable[None]] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass

@@ -19,6 +19,7 @@ from event.llm import (  # noqa: E402
     _channel_tool_restricted,
     _restricted_channel_tool_allowed,
     _viewer_channel_restricted,
+    _viewer_image_read_allowed,
 )
 
 
@@ -89,6 +90,33 @@ class ViewerRoleAuthorizationTest(unittest.TestCase):
         # Still no mutating desktop tools for either — read-only means read-only.
         for name in ('Bash', 'Write', 'Edit', 'WebFetch', 'subagent_spawn'):
             self.assertFalse(_restricted_channel_tool_allowed(name, bot_restricted=False), name)
+
+    def test_viewer_read_is_limited_to_current_channel_images(self):
+        root = pathlib.Path(tempfile.mkdtemp())
+        current = root / 'channel_a' / 'current.png'
+        other = root / 'channel_a' / 'other.png'
+        trigger = {'_channel_image_paths': [str(current)]}
+        with mock.patch('channel.store._ROOT', root):
+            self.assertTrue(_viewer_image_read_allowed(trigger, {'file_path': str(current)}))
+            self.assertFalse(_viewer_image_read_allowed(trigger, {'file_path': str(other)}))
+            self.assertFalse(_viewer_image_read_allowed(trigger, {'file_path': str(root.parent / 'secret.png')}))
+        self.assertTrue(_restricted_channel_tool_allowed('Read', bot_restricted=False, viewer_has_images=True))
+        self.assertFalse(_restricted_channel_tool_allowed('Read', bot_restricted=False))
+        self.assertFalse(_restricted_channel_tool_allowed('Read', bot_restricted=True, viewer_has_images=True))
+
+    def test_collector_includes_only_human_image_attachments(self):
+        event = _human_payload('viewer')
+        payload = json.loads(event['text'])
+        payload['files'] = [
+            {'kind': 'image', 'path': '/work/resource/channel_files/current.png'},
+            {'kind': 'file', 'path': '/work/resource/channel_files/other.txt'},
+        ]
+        event['text'] = json.dumps(payload)
+        self.assertEqual(collector.channel_image_paths([event]),
+                         ['/work/resource/channel_files/current.png'])
+        payload['sender_type'] = 'bot'
+        event['text'] = json.dumps(payload)
+        self.assertEqual(collector.channel_image_paths([event]), [])
 
 
 if __name__ == '__main__':

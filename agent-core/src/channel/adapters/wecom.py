@@ -3,10 +3,10 @@ channel/adapters/wecom.py — WeCom (企业微信) 智能机器人长连接适�
 
 与第一代 webhook/relay 方案不同，这里走企业微信官方「智能机器人 · API 模式 ·
 使用长连接」：本机作为 WebSocket 客户端主动连 `wss://openws.work.weixin.qq.com`，
-只需出网，不需要公网 IP / 回调域名 / 消息加解密。
+只需出网，不需要公网 IP 或回调域名。图片素材需按消息中的密钥解密。
 
-设计上刻意不引入官方 Python SDK：`agent-core/pyproject.toml` 已有 aiohttp，
-零新增依赖、不用改 uv.lock；部署新代码仍需构建或获取包含它的新镜像。帧格式可直接调试
+设计上刻意不引入官方 Python SDK：使用 aiohttp 和 pycryptodome，
+部署新代码仍需构建或获取包含它的新镜像。帧格式可直接调试
 （飞书链路曾因 SDK 版本升级打断过，见 feishu.py 的 _enable_sdk_env_proxy）。
 
 Config: {bot_id, secret, bot_name?}
@@ -14,7 +14,7 @@ Config: {bot_id, secret, bot_name?}
   - bot_name 可选，用于剥掉群聊正文里的「@机器人名」
 
 平台能力通过类属性声明，框架据此自动适配（不需要写 if platform == 'wecom'）：
-  - SUPPORTED_FILE_KINDS = ()  → 一期文本-only，附件由 manager 自动过滤
+  - SUPPORTED_FILE_KINDS = (KIND_IMAGE,) → 支持图片，其它附件由 manager 过滤
   - SUPPORTS_BOT_TO_BOT = False / USES_TRUSTED_BOTS = False
                              → Bot@Bot / trusted_bots 配置由 api/channel.py 自动拒收
 
@@ -31,16 +31,21 @@ ACK 形态：   `{errcode, errmsg, headers: {req_id}}`
 """
 
 import asyncio
+import base64
+import binascii
+import hashlib
 import json
 import re
 import time
 import uuid
 from collections import OrderedDict
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from Crypto.Cipher import AES
 
 from channel.adapter import (
-    ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
+    KIND_IMAGE, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
 )
 
 # ── 协议常量区（L0 实测后集中调整） ──────────────────────────────────────────
@@ -70,6 +75,9 @@ STALE_AFTER = 90                 # 超过 90s 未收到任何帧 → degraded
 DEDUP_MAX = 512                  # 去重窗口，照抄 feishu.py
 REQ_ID_MAX = 512                 # msgid → req_id 映射容量
 REPLY_WINDOW = 24 * 60 * 60      # 24 小时回复窗口
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+IMAGE_MAX_ITEMS = 10
+IMAGE_DOWNLOAD_TIMEOUT = 10
 
 # 入站消息体字段的候选名（不同版本客户端/文档写法不一，逐个兜底）
 _MSG_ID_KEYS = ('msgid', 'msg_id', 'message_id')
@@ -128,11 +136,35 @@ class WecomError(RuntimeError):
     """企业微信长连接返回了非 0 errcode，或凭据/连接不可用。"""
 
 
+def _image_type(data: bytes) -> tuple[str, str]:
+    """Return the actual format, rather than trusting a URL or file extension."""
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg', '.jpg'
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png', '.png'
+    raise WecomError('WeCom images must be JPEG or PNG.')
+
+
+def _decrypt_image(data: bytes, aeskey: str) -> bytes:
+    """WeCom's AES-256-CBC uses PKCS#7 padding to a 32-byte multiple."""
+    try:
+        encoded = aeskey.encode('ascii')
+        key = base64.b64decode(encoded + b'=' * (-len(encoded) % 4), validate=True)
+    except (AttributeError, UnicodeEncodeError, ValueError, binascii.Error) as e:
+        raise WecomError('Invalid WeCom image decryption key.') from e
+    if len(key) != 32 or not data or len(data) % AES.block_size:
+        raise WecomError('Invalid WeCom image key or encrypted data.')
+    plain = AES.new(key, AES.MODE_CBC, iv=key[:16]).decrypt(data)
+    padding = plain[-1]
+    if not 1 <= padding <= 32 or padding > len(plain) or plain[-padding:] != bytes([padding]) * padding:
+        raise WecomError('WeCom image decryption failed.')
+    return plain[:-padding]
+
+
 class WecomAdapter(ChannelAdapter):
     """企业微信智能机器人（API 模式 · 长连接）适配器。"""
 
-    # 一期文本-only；附件会由 manager.py:870-875 依据本字段自动过滤
-    SUPPORTED_FILE_KINDS = ()
+    SUPPORTED_FILE_KINDS = (KIND_IMAGE,)
     SUPPORTS_BOT_TO_BOT = False
     USES_TRUSTED_BOTS = False
 
@@ -487,10 +519,20 @@ class WecomAdapter(ChannelAdapter):
             text = text_obj
         if not text and isinstance(inner.get('content'), str):
             text = inner['content']
+        image_items = []
+        if msgtype == 'image':
+            image_items.append(inner.get('image') or body.get('image') or {})
+        mixed = inner.get('mixed') or body.get('mixed') or {}
+        items = mixed.get('msg_item', []) if isinstance(mixed, dict) else []
+        if not isinstance(items, list):
+            items = []
+        if msgtype == 'mixed':
+            image_items.extend(item.get('image') or {} for item in items
+                               if isinstance(item, dict) and item.get('msgtype') == 'image')
         # mixed 消息：拼接所有 text 片段
         if not text and msgtype == 'mixed':
             parts = []
-            for item in inner.get('mixed', {}).get('msg_item', []) or []:
+            for item in items:
                 if isinstance(item, dict) and item.get('msgtype') == 'text':
                     parts.append(str((item.get('text') or {}).get('content', '')))
             text = ''.join(parts)
@@ -500,8 +542,7 @@ class WecomAdapter(ChannelAdapter):
             if isinstance(voice, dict):
                 text = str(voice.get('content') or '')
         if not text:
-            # 一期不支持附件。给一句占位说明，让 Agent 能礼貌回复而不是静默。
-            text = '[收到非文本消息，当前仅支持文本指令]'
+            text = '[图片]' if image_items else '[收到不支持的非文本消息]'
 
         return {
             'message_id': msg_id,
@@ -510,7 +551,75 @@ class WecomAdapter(ChannelAdapter):
             'chat_type': chat_type,
             'text': text,
             'msgtype': msgtype,
+            'images': image_items,
         }
+
+    async def _download_image(self, image: dict):
+        """Download and decrypt one WeCom image; never log its signed URL or key."""
+        from channel import store
+
+        if not isinstance(image, dict):
+            raise WecomError('Invalid WeCom image metadata.')
+        url, aeskey = image.get('url'), image.get('aeskey')
+        if not isinstance(url, str) or not isinstance(aeskey, str) or not aeskey:
+            raise WecomError('WeCom image is missing its URL or decryption key.')
+        if self._session is None or self._session.closed:
+            raise WecomError('WeCom image download session is unavailable.')
+
+        try:
+            for _ in range(4):
+                parsed = urlsplit(url)
+                if (parsed.scheme != 'https' or not parsed.hostname or
+                        parsed.username is not None or parsed.password is not None):
+                    raise WecomError('WeCom image download requires an HTTPS URL.')
+                async with self._session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
+                    allow_redirects=False, auto_decompress=False,
+                ) as response:
+                    if response.status in (301, 302, 303, 307, 308):
+                        location = response.headers.get('Location')
+                        if not location:
+                            raise WecomError('WeCom image redirect has no destination.')
+                        url = urljoin(url, location)
+                        continue
+                    if response.status != 200:
+                        raise WecomError(f'WeCom image download failed (HTTP {response.status}).')
+                    encrypted = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        encrypted.extend(chunk)
+                        if len(encrypted) > IMAGE_MAX_BYTES + 32:
+                            raise WecomError('WeCom image exceeds the 10 MiB limit.')
+                    break
+            else:
+                raise WecomError('Too many WeCom image redirects.')
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            raise WecomError('WeCom image download failed or timed out.') from e
+
+        data = _decrypt_image(bytes(encrypted), aeskey)
+        if not data or len(data) > IMAGE_MAX_BYTES:
+            raise WecomError('WeCom image is empty or exceeds the 10 MiB limit.')
+        mime, ext = _image_type(data)
+        return store.save_bytes(self.channel_id, data, kind=KIND_IMAGE,
+                                name=f'image{ext}', mime=mime, fallback_ext=ext)
+
+    async def _prepare_images(self, msg: InboundMessage, images: list) -> None:
+        """Acknowledge after ACL, then materialize the authorized message's media."""
+        try:
+            await self._send_progress(msg.message_id)
+        except Exception as e:
+            # The connection or platform may reject the placeholder; still pass
+            # the message onward and let the normal reply path report failures.
+            print(f'[wecom] image progress reply failed: {type(e).__name__}')
+        failures = 0
+        for image in images[:IMAGE_MAX_ITEMS]:
+            try:
+                msg.attachments.append(await self._download_image(image))
+            except Exception as e:
+                failures += 1
+                print(f'[wecom] image download failed: {type(e).__name__}')
+        failures += max(0, len(images) - IMAGE_MAX_ITEMS)
+        if failures:
+            msg.text += f' [图片处理失败或超限：{failures} 张]'
 
     async def _process_message(self, frame: dict, body: dict) -> None:
         parsed = self._extract_inbound(frame, body)
@@ -546,6 +655,8 @@ class WecomAdapter(ChannelAdapter):
             mentions=[],
             expect_reply=None,
         )
+        if parsed['images']:
+            msg.prepare = lambda: self._prepare_images(msg, parsed['images'])
         try:
             await self._on_message(msg)
         except Exception as e:
@@ -570,19 +681,29 @@ class WecomAdapter(ChannelAdapter):
             'expired. The user must send a new message first.'
         )
 
-    def _build_reply_frame(self, req_id: str, msg: OutboundMessage) -> dict:
+    def _build_reply_frame(self, req_id: str, msg: OutboundMessage, *,
+                           finish: bool = True, image_items: list | None = None) -> dict:
         if REPLY_MODE == 'stream':
             body = {
                 'msgtype': 'stream',
                 'stream': {
                     'id': str(getattr(msg, 'source_message_id', '') or uuid.uuid4().hex),
-                    'finish': True,
+                    'finish': finish,
                     'content': msg.text,
                 },
             }
+            if image_items:
+                body['stream']['msg_item'] = image_items
         else:
+            if image_items or not finish:
+                raise WecomError('WeCom image replies require stream mode.')
             body = {'msgtype': 'text', 'text': {'content': msg.text}}
         return {'cmd': CMD_RESPOND, 'headers': {'req_id': req_id}, 'body': body}
+
+    async def _send_progress(self, message_id: str) -> None:
+        msg = OutboundMessage(chat_id='', text='正在处理图片…', source_message_id=message_id)
+        req_id = self._lookup_req_id(msg)
+        await self._send_reply(req_id, self._build_reply_frame(req_id, msg, finish=False))
 
     async def send_message(self, msg: OutboundMessage) -> None:
         """回复原消息。失败必须抛异常，让上层如实回报给 LLM / 用户。"""
@@ -591,12 +712,44 @@ class WecomAdapter(ChannelAdapter):
                 'Cannot send: WeCom adapter is not connected. '
                 'Check bot_id/secret in Settings → Channels and Restart.'
             )
-        if msg.files or msg.image_bytes:
-            # SUPPORTED_FILE_KINDS=() 时 manager 已提前过滤；这里是防御性兜底
-            raise WecomError('WeCom channel is text-only in phase 1; files are not supported.')
-        if not msg.text:
+        if any(att.kind != KIND_IMAGE for att in msg.files):
+            raise WecomError('WeCom currently supports image attachments only.')
+        count = len(msg.files) + (1 if msg.image_bytes is not None else 0)
+        if count > IMAGE_MAX_ITEMS:
+            raise WecomError('WeCom supports at most 10 images in one reply.')
+        if not msg.text and not count and not msg.image_caption:
             return
         req_id = self._lookup_req_id(msg)
+
+        def read_image(path: str) -> bytes:
+            with open(path, 'rb') as source:
+                return source.read(IMAGE_MAX_BYTES + 1)
+
+        images = []
+        for att in msg.files:
+            images.append(await asyncio.to_thread(read_image, att.path))
+        if msg.image_bytes is not None:
+            images.append(msg.image_bytes)
+        items = []
+        for data in images:
+            if not data or len(data) > IMAGE_MAX_BYTES:
+                raise WecomError('WeCom image is empty or exceeds the 10 MiB limit.')
+            _image_type(data)
+            items.append({'msgtype': 'image', 'image': {
+                'base64': base64.b64encode(data).decode('ascii'),
+                'md5': hashlib.md5(data, usedforsecurity=False).hexdigest(),
+            }})
+        captions = [att.caption for att in msg.files if att.caption]
+        if msg.image_caption:
+            captions.append(msg.image_caption)
+        content = '\n'.join(part for part in [msg.text, *captions] if part)
+        reply = OutboundMessage(chat_id=msg.chat_id, text=content,
+                                source_message_id=msg.source_message_id)
+        await self._send_reply(req_id, self._build_reply_frame(req_id, reply, image_items=items))
+
+    async def _send_reply(self, req_id: str, frame: dict) -> None:
+        if not self._running or self._ws is None or self._ws.closed:
+            raise WecomError('Cannot send: WeCom adapter is not connected.')
         lock = self._reply_locks.setdefault(req_id, asyncio.Lock())
         self._reply_lock_users[req_id] = self._reply_lock_users.get(req_id, 0) + 1
         try:
@@ -607,7 +760,7 @@ class WecomAdapter(ChannelAdapter):
                 future = asyncio.get_running_loop().create_future()
                 self._pending_replies[req_id] = future
                 try:
-                    await self._send_frame(self._build_reply_frame(req_id, msg))
+                    await self._send_frame(frame)
                     try:
                         ack = await asyncio.wait_for(future, timeout=REPLY_ACK_TIMEOUT)
                     except asyncio.TimeoutError as e:

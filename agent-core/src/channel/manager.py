@@ -702,6 +702,11 @@ class ChannelManager:
             if not allowed:
                 return  # 静默丢弃
 
+        # Long-connection media can require an early reply and a download. Do
+        # both only after the channel and sender have passed authorization.
+        if msg.prepare is not None:
+            await msg.prepare()
+
         # 4. Store last conversation context for reply routing (persisted)
         self._set_last_context(
             msg.channel_id, msg.chat_id, msg.user_id,

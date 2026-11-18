@@ -9,6 +9,8 @@ test_wecom_channel.py — 企业微信长连接 ChannelAdapter 一期测试。
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -62,7 +64,7 @@ def _ensure_aiohttp():
 _ensure_aiohttp()
 
 import config  # noqa: E402
-from channel.adapter import InboundMessage, OutboundMessage  # noqa: E402
+from channel.adapter import Attachment, InboundMessage, OutboundMessage  # noqa: E402
 from channel.adapters import wecom  # noqa: E402
 from channel.adapters.wecom import WecomAdapter, WecomError  # noqa: E402
 from channel.manager import (  # noqa: E402
@@ -187,7 +189,7 @@ class WecomRegistrationTest(unittest.TestCase):
     def test_wecom_adapter_registered_and_no_a2a(self):
         self.assertFalse(supports_bot_to_bot('wecom'))
         self.assertFalse(uses_trusted_bots('wecom'))
-        self.assertEqual(WecomAdapter.SUPPORTED_FILE_KINDS, ())
+        self.assertEqual(WecomAdapter.SUPPORTED_FILE_KINDS, (wecom.KIND_IMAGE,))
         self.assertFalse(WecomAdapter.SUPPORTS_BOT_TO_BOT)
         self.assertFalse(WecomAdapter.USES_TRUSTED_BOTS)
         cls = wecom.WecomAdapter
@@ -318,10 +320,48 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
     async def test_non_text_message_gets_placeholder(self):
         adapter = await self._adapter()
         frame = _msg_frame()
-        frame['body']['msgtype'] = 'image'
+        frame['body']['msgtype'] = 'file'
         frame['body']['text'] = None
         parsed = adapter._extract_inbound(frame, frame['body'])
-        self.assertIn('仅支持文本', parsed['text'])
+        self.assertIn('不支持的非文本消息', parsed['text'])
+
+    async def test_image_is_prepared_after_authorization(self):
+        adapter = await self._adapter()
+        frame = _msg_frame()
+        frame['body'].update(msgtype='image', text=None, image={'url': 'https://example.test/image', 'aeskey': 'key'})
+        attachment = Attachment(kind=wecom.KIND_IMAGE, path='/work/resource/channel_files/x.png')
+        adapter._send_progress = mock.AsyncMock()
+        adapter._download_image = mock.AsyncMock(return_value=attachment)
+        await adapter._process_message(frame, frame['body'])
+        msg = self.received[0]
+        self.assertEqual(msg.text, '[图片]')
+        self.assertEqual(msg.attachments, [])
+        adapter._download_image.assert_not_awaited()
+        await msg.prepare()
+        adapter._send_progress.assert_awaited_once_with('m1')
+        self.assertEqual(msg.attachments, [attachment])
+
+    async def test_mixed_message_keeps_text_and_image(self):
+        adapter = await self._adapter()
+        frame = _msg_frame()
+        frame['body'].update(msgtype='mixed', text=None, mixed={'msg_item': [
+            {'msgtype': 'text', 'text': {'content': '这是什么？'}},
+            {'msgtype': 'image', 'image': {'url': 'https://example.test/image', 'aeskey': 'key'}},
+        ]})
+        parsed = adapter._extract_inbound(frame, frame['body'])
+        self.assertEqual(parsed['text'], '这是什么？')
+        self.assertEqual(len(parsed['images']), 1)
+
+    def test_decrypt_image_with_32_byte_padding(self):
+        key = bytes(range(32))
+        original = b'\x89PNG\r\n\x1a\n' + b'a' * 24
+        padding = 32 - len(original) % 32
+        ciphertext = wecom.AES.new(key, wecom.AES.MODE_CBC, iv=key[:16]).encrypt(
+            original + bytes([padding]) * padding)
+        encoded_key = base64.b64encode(key).decode().rstrip('=')
+        self.assertEqual(wecom._decrypt_image(ciphertext, encoded_key), original)
+        with self.assertRaises(WecomError):
+            wecom._decrypt_image(ciphertext, 'invalid')
 
     async def test_duplicate_msgid_dropped(self):
         adapter = await self._adapter()
@@ -399,6 +439,30 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies[0]['headers']['req_id'], 'r1')
         self.assertTrue(replies[0]['body']['stream']['finish'])
         self.assertEqual(replies[0]['body']['stream']['content'], '收到')
+
+    async def test_image_only_reply_uses_source_request(self):
+        adapter, ws = await self._running_adapter()
+        frame = _msg_frame('image-message', 'image-request')
+        await adapter._process_message(frame, frame['body'])
+        image = b'\x89PNG\r\n\x1a\nexample'
+        await adapter.send_message(OutboundMessage(
+            chat_id='u1', image_bytes=image, source_message_id='image-message'))
+        reply = ws.frames_with(wecom.CMD_RESPOND)[0]
+        self.assertEqual(reply['headers']['req_id'], 'image-request')
+        item = reply['body']['stream']['msg_item'][0]['image']
+        self.assertEqual(base64.b64decode(item['base64']), image)
+        self.assertEqual(item['md5'], hashlib.md5(image, usedforsecurity=False).hexdigest())
+
+    async def test_image_progress_and_final_share_stream_id(self):
+        adapter, ws = await self._running_adapter()
+        frame = _msg_frame('m1', 'r1')
+        await adapter._process_message(frame, frame['body'])
+        await adapter._send_progress('m1')
+        await adapter.send_message(OutboundMessage(chat_id='u1', text='完成', source_message_id='m1'))
+        first, final = ws.frames_with(wecom.CMD_RESPOND)
+        self.assertFalse(first['body']['stream']['finish'])
+        self.assertTrue(final['body']['stream']['finish'])
+        self.assertEqual(first['body']['stream']['id'], final['body']['stream']['id'])
 
     async def test_concurrent_messages_keep_their_own_req_id(self):
         adapter, ws = await self._running_adapter()
@@ -608,6 +672,18 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await self.manager._on_inbound_message(msg)
         published.assert_not_awaited()
 
+    async def test_blocked_sender_does_not_prepare_image(self):
+        self._wire_canvas()
+        prepare = mock.AsyncMock()
+        msg = InboundMessage(
+            platform='wecom', channel_id='wecom_test', user_id='u1',
+            chat_id='u1', display_name='u1', text='[图片]', message_id='m1', prepare=prepare,
+        )
+        with mock.patch('channel.manager.acl.get_user', return_value={'role': 'blocked'}), \
+                mock.patch('channel.manager.acl.check_permission', return_value=(False, 'blocked')):
+            await self.manager._on_inbound_message(msg)
+        prepare.assert_not_awaited()
+
     async def test_send_to_channel_forwards_source_message_id(self):
         """方案 B：触发消息的 message_id 必须透传到 OutboundMessage。"""
         self.manager._set_last_context(
@@ -758,7 +834,6 @@ class WecomLifecycleTest(unittest.IsolatedAsyncioTestCase):
                 OutboundMessage(chat_id='u1', text='x', source_message_id='m1'))
 
     async def test_send_message_files_rejected(self):
-        from channel.adapter import Attachment
         adapter, _ = await self._running_adapter()
         frame = _msg_frame('m1', 'r1')
         await adapter._process_message(frame, frame['body'])
@@ -766,7 +841,7 @@ class WecomLifecycleTest(unittest.IsolatedAsyncioTestCase):
             await adapter.send_message(OutboundMessage(
                 chat_id='u1', text='x', source_message_id='m1',
                 files=[Attachment(path='/tmp/a.png')]))
-        self.assertIn('text-only', str(ctx.exception))
+        self.assertIn('image attachments only', str(ctx.exception))
 
     async def test_stop_is_idempotent(self):
         adapter, ws = await self._running_adapter()

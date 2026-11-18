@@ -568,12 +568,16 @@ _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
 })
 
 
-def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) -> bool:
+def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True,
+                                     viewer_has_images: bool = False) -> bool:
     """Shared allow-list for turns that must not mutate or actuate: untrusted-bot
     Channel turns, and (see _viewer_channel_restricted) viewer-role human Channel
     turns. May read state and reply, nothing else — viewer additionally gets the
     read-only system tools (search, history/memory recall)."""
     if not name.startswith('mcp__'):
+        if name == 'Read':
+            # Dispatch additionally restricts the path to this batch's images.
+            return not bot_restricted and viewer_has_images
         allowed = _BOT_READ_ONLY_SYSTEM_TOOLS if bot_restricted else _VIEWER_READ_ONLY_SYSTEM_TOOLS
         return name in allowed
     if name == 'mcp__channel__channel_reply':
@@ -582,6 +586,25 @@ def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) 
     entry = mcp_client.registry.get(parts[1] if len(parts) > 1 else '', {})
     meta = entry.get('tool_meta', {}).get(name)
     return bool(meta and meta.get('type') in ('sensor', 'resource'))
+
+
+def _viewer_image_read_allowed(trigger_event: dict, args: dict) -> bool:
+    """Allow Read only for an image attached to the current Channel batch."""
+    if not isinstance(args, dict):
+        return False
+    path = args.get('file_path')
+    paths = trigger_event.get('_channel_image_paths')
+    if not isinstance(path, str) or not path or not isinstance(paths, list):
+        return False
+    try:
+        from channel.store import is_inbound_media
+        target = pathlib.Path(path).resolve()
+        return is_inbound_media(target) and any(
+            isinstance(candidate, str) and candidate and pathlib.Path(candidate).resolve() == target
+            for candidate in paths
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _bot_channel_restricted(trigger_event: dict) -> bool:
@@ -2244,6 +2267,7 @@ class Event:
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
         tool_restricted = bot_restricted or viewer_restricted
+        viewer_has_images = viewer_restricted and bool(trigger_event.get('_channel_image_paths'))
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2356,11 +2380,13 @@ class Event:
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
-                if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted)
+                if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted,
+                                                    viewer_has_images=viewer_has_images)
             ]
             bound_schemas = [
                 schema for schema in bound_schemas
-                if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted)
+                if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted,
+                                                    viewer_has_images=viewer_has_images)
             ]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
@@ -2639,12 +2665,15 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
+                if tool_restricted and not _restricted_channel_tool_allowed(
+                        name, bot_restricted=bot_restricted, viewer_has_images=viewer_has_images):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
                         'mutating, actuator, processor, or delegated execution tools.'
                     )
+                elif viewer_restricted and name == 'Read' and not _viewer_image_read_allowed(trigger_event, args):
+                    result = 'Error: a viewer may only read images attached to the current Channel messages.'
                 elif (bot_restricted and name == 'mcp__channel__channel_reply'
                       and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
                     result = (

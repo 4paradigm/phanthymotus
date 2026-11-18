@@ -390,6 +390,20 @@ def channel_message_ids(events: list[dict]) -> list[str]:
             if isinstance(payload.get('message_id'), str) and payload['message_id']]
 
 
+def channel_image_paths(events: list[dict]) -> list[str]:
+    """Images attached to human messages in this batch, for scoped viewer reads."""
+    paths = []
+    for payload in _human_channel_payloads(events):
+        files = payload.get('files')
+        if not isinstance(files, list):
+            continue
+        for attachment in files:
+            if (isinstance(attachment, dict) and attachment.get('kind') == 'image'
+                    and isinstance(attachment.get('path'), str) and attachment['path']):
+                paths.append(attachment['path'])
+    return paths
+
+
 def bot_channel_message_ids(events: list[dict]) -> list[str]:
     """Return bot/app message IDs from trusted Channel event payloads."""
     return [payload['message_id'] for payload in _bot_channel_payloads(events)
@@ -486,6 +500,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
         '_channel_message_ids': channel_message_ids(batch),
+        '_channel_image_paths': channel_image_paths(batch),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }
@@ -905,7 +920,9 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
-                    if has_bot_channel_event([ev]):
+                    # A new image needs its own trigger so the viewer's Read
+                    # allow-list includes that attachment and no older files.
+                    if has_bot_channel_event([ev]) or channel_image_paths([ev]):
                         _priority_pending.append(ev)
                         continue
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
