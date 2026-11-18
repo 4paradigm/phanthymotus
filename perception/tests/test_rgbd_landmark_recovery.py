@@ -41,6 +41,22 @@ def test_same_f2m_landmarks_can_relocalize_after_silence_without_any_gap_pose():
     assert s['vendor']['relocalization']['shared_landmarks'] >= 20
 
 
+def test_expired_visual_pause_requires_old_landmarks_before_resuming():
+    from plugins.spatial_recovery import RecoveryPolicy
+
+    g = anchored()
+    g.recovery_policy = RecoveryPolicy()
+    g.input(1_300_000_000)
+    g.degrade('visual rejection', 1_300_000_000)
+    assert g.status(2_301_000_000) == 'recovering'
+    assert len(g.relocalization_points) == 24
+    assert visual(g, 2_400_000_000, ids=range(24, 48)) is None
+    assert visual(g, 2_500_000_000, x=.003) is None
+    assert visual(g, 2_600_000_000, x=.003) is None
+    result = visual(g, 2_700_000_000, x=.003)
+    assert result['vendor']['relocalization']['anchor_stamp_ns'] == 1_200_000_000
+
+
 @pytest.mark.parametrize('changed', [
     dict(ids=range(5, 29)),  # 24 total inliers but only 19 old correspondences
     dict(ids=range(24, 48)), dict(ids=[1]*24), dict(world_shift=1.),

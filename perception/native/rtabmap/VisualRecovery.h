@@ -7,6 +7,7 @@
 #include <rtabmap/core/Graph.h>
 #include <rtabmap/core/Odometry.h>
 #include <rtabmap/core/OdometryInfo.h>
+#include <rtabmap/core/RegistrationIcp.h>
 #include <rtabmap/utilite/ULogger.h>
 #include <memory>
 #include <algorithm>
@@ -18,7 +19,7 @@ class VisualRecovery
 public:
     enum State { External=0, Searching=1, Localized=2, VisualTracking=3 };
     explicit VisualRecovery(const rtabmap::ParametersMap & parameters):
-        state_(External), missing_(false), waiting_(false), aligned_(false),
+        neighborIcp_(parameters), state_(External), missing_(false), waiting_(false), aligned_(false),
         localizationMode_(false), relocalizations_(0), visualInliers_(0), imageMode_(false), initialized_(false),
         recoveryNode_(0), recoveryAnchor_(0), recoveryInliers_(0)
     {
@@ -156,8 +157,9 @@ public:
             if(!tracked || lastVisual_.isNull())
             {
                 // Validate the supplied constraint; never replace it with an ICP pose.
+                // Memory::computeIcpTransform uses the stricter merged-scan overlap.
                 const auto *last=map.getMemory()->getLastWorkingSignature();
-                if(last && map.getMemory()->computeIcpTransform(*last,rtabmap::Signature(data),
+                if(last && neighborIcp_.computeTransformation(last->sensorData(),data,
                     last->getPose().inverse()*odom_).isNull())
                 {
                     waiting_=true; aligned_=!lastVisual_.isNull();
@@ -230,14 +232,28 @@ public:
         }
 
         // Pinned parseParameters clears optimized poses when returning to mapping.
-        // Preserve them explicitly, and promote this SAME geometrically verified
-        // observation with a checked native edge into the original graph.
-        map.parseParameters({{"Mem/IncrementalMemory","true"}, {"RGBD/ProximityBySpace","true"},
-                             {"RGBD/MaxOdomCacheSize",std::to_string(maxOdomCacheSize_)}});
+        // Insert the verified observation as a leaf. A second, opportunistic
+        // constraint here can move old poses or replace the measured closure.
+        rtabmap::ParametersMap restore;
+        rtabmap::ParametersMap insertion{{"Rtabmap/LoopThr","1.01"},
+            {"RGBD/AggressiveLoopThr","1.01"}, {"RGBD/ProximityByTime","false"}};
+        for(const auto & param:insertion)
+        {
+            const auto & current=map.getParameters();
+            const auto value=current.find(param.first);
+            restore[param.first]=value!=current.end()?value->second:
+                rtabmap::Parameters::getDefaultParameters().at(param.first);
+        }
+        restore["RGBD/ProximityBySpace"]="true";
+        insertion["Mem/IncrementalMemory"]="true";
+        insertion["RGBD/MaxOdomCacheSize"]=std::to_string(maxOdomCacheSize_);
+        map.parseParameters(insertion); // Spatial proximity is already off while searching.
         localizationMode_=false;
         map.setOptimizedPoses(poses,links);
         odom_=location;
-        if(!map.process(data,odom_,locCovariance,std::vector<float>(),statistics))
+        const bool promoted=map.process(data,odom_,locCovariance,std::vector<float>(),statistics);
+        map.parseParameters(restore);
+        if(!promoted)
         {
             map.setOptimizedPoses(previousPoses,previousLinks);
             odom_.setNull(); aligned_=false; return false;
@@ -246,11 +262,15 @@ public:
         const auto *signature=map.getMemory()->getSignature(node);
         const bool inserted=signature && map.isInSTM(node) && !poses.count(node) &&
             signature->getStamp()==data.stamp();
-        bool connected=inserted && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
-        if(!connected && inserted && !signature->hasLink(anchor))
+        bool connected=false;
+        if(inserted && signature->getLinks().empty() && signature->getLandmarks().empty())
+        {
+            poses.emplace(node,location);
+            map.setOptimizedPoses(poses,links);
             connected=map.addLink(rtabmap::Link(anchor,node,rtabmap::Link::kGlobalClosure,
-                measured.transform(),measured.infMatrix()),true);
-        connected=connected && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
+                measured.transform(),measured.infMatrix()),true) &&
+                signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
+        }
         if(!connected)
         {
             // Native process may discard the current observation itself.
@@ -299,6 +319,7 @@ private:
         return true;
     }
     std::unique_ptr<rtabmap::Odometry> estimator_;
+    rtabmap::RegistrationIcp neighborIcp_;
     int state_, minInliers_, maxOdomCacheSize_;
     float maxError_;
     bool missing_, waiting_, aligned_, localizationMode_;

@@ -295,6 +295,24 @@ def test_fallback_without_proven_continuity_starts_a_new_segment(fused):
     assert s.fallback is None
 
 
+def test_failed_fusion_continuity_selects_available_imu_attitude_for_next_segment(fused):
+    make, now, ticks = fused
+    s = make()
+    s.rotation_hints.enabled = True  # native hint runtime is available
+    stamp = 1_500*MS
+    now[0] = stamp
+    imu(s, stamp)
+    s.gate.last_input = stamp
+    track_fused(s, now, offset=.040)
+    assert s.gate.state == 'lost' and s.gate.last_pose is None
+    target = s.recovery_target(ticks[0], now[0])
+    config = target['calibration']
+    assert target['action'] == 'degrade_assistance'
+    assert config['imu_topic'] == s.calibration['imu_topic']
+    assert runtime.assistance_mode(config) == 'imu_attitude'
+    assert runtime.estimator_parameters(config, s.segment)['wait_imu_to_init']
+
+
 def test_fallback_with_proven_continuity_keeps_segment_and_checks_resume(fused):
     make, now, _ = fused
     s = make()
@@ -302,6 +320,23 @@ def test_fallback_with_proven_continuity_keeps_segment_and_checks_resume(fused):
     assert s.gate.state == 'recovering' and s.fallback is not None
     feed(s, now, 1_600_000_000, x=2.)  # cannot jump 2 m in 100 ms
     assert s.gate.state == 'lost' and 'discontinu' in s.gate.reason
+
+
+def test_fallback_keeps_the_frozen_fusion_recovery_window(fused):
+    make, now, _ = fused
+    s = make()
+    s.gate.recovery_policy = runtime.RecoveryPolicy()
+    s.fusion.pause_context = s.gate.recovery_policy.begin(134*MS, 800*MS, runtime.time.monotonic_ns())
+    track_fused(s, now)
+    assert s.gate.pause_context is s.fusion.pause_context
+    for offset in (803, 937, 1071):
+        feed(s, now, 1_500*MS + offset*MS)
+        if offset < 1071:
+            assert s.gate.state == 'recovering'
+    assert s.gate.state == 'tracking'
+    assert s.gate.pause_context is None
+    assert last(s)['pose'] is not None
+    assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
 
 
 def test_fallback_that_never_tracks_is_bounded(fused):

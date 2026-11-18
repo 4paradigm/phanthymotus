@@ -50,6 +50,20 @@ def test_missing_pose_timeout_and_late_results_do_not_rewrite_history():
     assert len(fusion.frames) == 1
 
 
+def test_transport_late_capture_does_not_feed_fusion_or_block_the_next_capture():
+    fusion = Fusion(); frames = CaptureObservations(fusion)
+    frames.add_frame(1_000_000_000, None, None, 1_900_000_000)
+    assert frames.drain(2_010_000_000) == []
+    assert not fusion.frames and not frames.frames
+    assert frames.counts['stale_capture'] == 1
+    stamp = 2_040_000_000
+    frames.add_frame(stamp, None, None, stamp+10_000_000)
+    msg, info = messages(stamp)
+    frames.result('pose', msg, stamp+20_000_000)
+    assert frames.result('info', info, stamp+25_000_000) == [{'stamp': stamp}]
+    assert fusion.frames[0][1] is not None and fusion.reason is None
+
+
 def test_lost_diagnostic_can_trigger_coast_without_matching_pose():
     fusion = Fusion(); frames = CaptureObservations(fusion)
     frames.add_frame(1_000_000_000, None, None, 1_010_000_000)

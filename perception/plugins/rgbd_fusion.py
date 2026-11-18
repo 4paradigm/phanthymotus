@@ -7,6 +7,8 @@ import numpy as np
 from .rgbd_imu import ImuAttitude, _vector, rotation_from_quaternion, translation_extrinsics
 from .rgbd_odometry_contract import make_sample
 
+MAX_FRAME_AGE_NS = 1_000_000_000
+
 
 def skew(v):
     x, y, z = v
@@ -404,7 +406,7 @@ class ShortTermFusion:
         if self.state == 'lost':
             return self._finish(stamp, diagnostic)
         try:
-            if stamp <= self.last_frame or not -50_000_000 <= now_ns-stamp <= 1_000_000_000:
+            if stamp <= self.last_frame or not -50_000_000 <= now_ns-stamp <= MAX_FRAME_AGE_NS:
                 self.fault('fusion frame time is stale, repeated or reset', 'clock')
                 return self._finish(stamp, diagnostic)
             self.last_frame, self.last_processed_ns = stamp, now_ns

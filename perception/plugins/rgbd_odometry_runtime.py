@@ -28,7 +28,7 @@ from .rgbd_imu import ImuAttitude
 from .rgbd_association import RotationHints, association_enabled, require_rotation_hint_runtime
 from .rgbd_recovery import (AuxiliaryHealthProbe, ASSISTANCE_RETRY_S,
                             VISUAL_INITIALIZATION_S, assistance_mode, visual_calibration)
-from .rgbd_fusion import ShortTermFusion, log_rotation, observation_covariance, pose_values
+from .rgbd_fusion import MAX_FRAME_AGE_NS, ShortTermFusion, log_rotation, observation_covariance, pose_values
 from .rgbd_body_mount import CaptureMounts
 from .rgbd_geometry import GeometryWorker, observation_quality
 from .spatial_quality import MotionGate, QualityReport
@@ -157,7 +157,7 @@ class EstimateGate:
                 if i in inliers and math.isfinite(p.x) and math.isfinite(p.y) and math.isfinite(p.z)}
 
     def _timeout(self, reason, kind):
-        if self.state == 'tracking':
+        if self.state == 'tracking' or (self.state == 'recovering' and self.pause_context is not None):
             points = self._matched_points(self.anchor_info)
             if len(points) >= F2M_SHARED_INLIERS:
                 self.relocalization_points = points
@@ -165,6 +165,7 @@ class EstimateGate:
                 self.relocalization_misses = 0
                 self.relocalization_failure = 'output'
                 self.good = 0
+                self.pause_context = self.recover_by = None
                 self.state, self.reason = 'recovering', 'waiting for native matches to the last tracked F2M landmarks'
                 return
         self.fault(reason, kind)
@@ -186,8 +187,10 @@ class EstimateGate:
         if visual_stamp and now - visual_stamp > 1_500_000_000:
             self._timeout('visual estimate stale; restart to begin a new segment', 'output')
             return self.state
-        if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
-            self.fault(f'visual degradation persisted beyond {(self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)/1e9:g} s; restart to begin a new segment', 'visual')
+        if self.state == 'recovering' and self.recover_by is not None and (
+                now > self.recover_by or
+                (self.pause_context is not None and self.pause_context.expired(time.monotonic_ns()))):
+            self._timeout(f'visual degradation persisted beyond {(self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)/1e9:g} s; restart to begin a new segment', 'visual')
         return self.state
 
     def _continuous(self, stamp, position, rotation):
@@ -259,7 +262,7 @@ class EstimateGate:
                 return None
         elif (self.state == 'recovering' and self.last_pose is not None and
                 stamp - self.last_pose[0] > (self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)):
-            self.fault(f'visual recovery exceeded the {(self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)/1e9:g} s in-segment pause bound; '
+            self._timeout(f'visual recovery exceeded the {(self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)/1e9:g} s in-segment pause bound; '
                        'restart to begin a new segment', 'visual')
             return None
         if self.state != 'tracking' and not self._continuous(stamp, position, rotation):
@@ -367,6 +370,7 @@ class CaptureObservations:
         self.frames = OrderedDict()
         self.last_added = 0
         self.geometry_capture = None
+        self.last_tracking_info = None
         self.counts = Counter()
 
     def add_frame(self, stamp, color, depth, now):
@@ -428,6 +432,11 @@ class CaptureObservations:
             self.geometry_capture = None
         while self.frames:
             stamp, entry = next(iter(self.frames.items()))
+            if now-stamp > MAX_FRAME_AGE_NS:
+                # A delayed delivery is unusable without changing the capture clock.
+                self.frames.pop(stamp)
+                self.counts['stale_capture'] += 1
+                continue
             ready = ('pose' in entry and 'info' in entry) or getattr(entry.get('info'), 'lost', False)
             coverage = bool(self.fusion.samples) and self.fusion.samples[-1][0] >= stamp
             if (not ready or not coverage) and now < entry['deadline']:
@@ -441,6 +450,8 @@ class CaptureObservations:
             visual, reason = self._visual(stamp, entry)
             sample = self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
                                                reason=reason, arrival_ns=entry['added'])
+            if visual is not None and sample.get('pose') is not None:
+                self.last_tracking_info = entry['info']
             if getattr(self.fusion, 'geometry_job', None) is not None:
                 self.geometry_capture = stamp
                 break
@@ -754,7 +765,8 @@ class RgbdSession:
                 return dict(action='restore_assistance', calibration=calibration,
                             reason='auxiliary source passed numeric format checks')
             attitude = None
-            if self.fallback is not None and not self.rotation_hints.enabled:
+            fusion_lost = self.gate.state == 'lost' and self.gate.loss_kind == 'fusion'
+            if fusion_lost or (self.fallback is not None and not self.rotation_hints.enabled):
                 attitude = self.imu
             elif (self.imu is None and health.get('attitude_ready') and
                   now_s-self.mode_changed_at >= ASSISTANCE_RETRY_S):
@@ -762,7 +774,7 @@ class RgbdSession:
             if attitude is not None and attitude.covers(self.gate.last_input, now_ns):
                 # Native gravity initialization owns a different world basis.
                 # Switch through the supervisor so it publishes a fresh segment.
-                return dict(action='restore_assistance', calibration=dict(source,
+                return dict(action='degrade_assistance' if fusion_lost else 'restore_assistance', calibration=dict(source,
                     imu_topic=self.requested_calibration['imu_topic'], imu_assisted=True,
                     short_term_compensation=False, depth_geometry=False, inertial_association=False),
                     reason='ESKF unavailable; rotation available for native attitude assistance')
@@ -1051,13 +1063,21 @@ class RgbdSession:
         self.observations.frames.clear()
         gate = self.gate
         gate.good = 0
-        gate.reason = mode.replace('_', '-') + ' fallback after ESKF loss: ' + reason
         gate.last_stamp = max(gate.last_stamp, self.fusion.last_visual)
         if self.fusion.last_tracking is not None:
             # Something was published: resuming is a bounded recovery.
             stamp, fused, _ = self.fusion.last_tracking
             gate.last_pose = (stamp, *pose_values(fused))
-            gate.state, gate.recover_by = 'recovering', now + RECOVERY_NS
+            info = self.observations.last_tracking_info
+            if info is not None and stamp_ns(info) == stamp:
+                gate.anchor_info = info
+            pause = self.fusion.pause_context
+            if pause is not None:
+                # Keep the pause already promised to downstream mapping.
+                gate.pause_context = pause
+                gate.recover_by = now + max(0, pause.deadline_monotonic_ns - time.monotonic_ns())
+            gate.degrade(reason, now)
+        gate.reason = mode.replace('_', '-') + ' fallback after ESKF loss: ' + reason
         logging.getLogger(__name__).warning('RGB-D %s: %s', self.segment, gate.reason)
 
     def _label_fallback(self, sample):
