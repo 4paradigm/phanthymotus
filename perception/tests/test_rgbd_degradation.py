@@ -86,7 +86,51 @@ def test_weak_warmup_after_two_good_frames_uses_result_liveness(sessions):
     now[0] += 1_500_000_001
     s.gate.last_input_received = now[0]
     s._watchdog()
-    assert s.gate.state == 'lost' and s.gate.loss_kind == 'visual'
+    assert s.gate.state == 'lost' and s.gate.loss_kind == 'output'
+
+
+def received_images(session, stamp):
+    for kind in ('color', 'depth'):
+        session._image(kind, NS(data=b'frame', header=NS(frame_id=session.gate.frame,
+            stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9))))
+
+
+def test_native_silence_restarts_same_frontend_with_fresh_images(recovery):
+    card, _, now, seconds = recovery
+    session = card.instances['one'][0]
+    stamp = track(session, now)
+    for _ in range(17):
+        stamp += 100*MS
+        now[0] = stamp
+        seconds[0] += .1
+        received_images(session, stamp)
+        session._watchdog()
+    assert session.gate.state == 'lost' and session.gate.loss_kind == 'output'
+    assert last(session)['pose'] is None
+    session.process.returncode = 0
+    card._recover()
+    seconds[0] += 1.
+    received_images(session, now[0]); card._recover()
+    new = card.instances['one'][0]
+    assert new.segment != session.segment
+    assert new.calibration['visual_frontend'] == session.calibration['visual_frontend']
+
+
+@pytest.mark.parametrize('duplicate_after_one_good', [False, True])
+def test_insufficient_fresh_native_results_during_startup_is_an_output_timeout(
+        recovery, duplicate_after_one_good):
+    card, _, now, seconds = recovery
+    session = card.instances['one'][0]
+    if duplicate_after_one_good:
+        stamp = now[0]
+        feed(session, now, stamp)
+        feed(session, now, stamp)
+        assert session.gate.good == 1
+    seconds[0] += runtime.VISUAL_INITIALIZATION_S + .01
+    received_images(session, now[0])
+    session._watchdog()
+    assert session.gate.state == 'lost' and session.gate.loss_kind == 'output'
+    assert last(session)['pose'] is None
 
 
 @pytest.mark.parametrize('bad', ['lost', 'inliers', 'nan', 'asymmetric', 'negative', 'indefinite', 'quaternion'])

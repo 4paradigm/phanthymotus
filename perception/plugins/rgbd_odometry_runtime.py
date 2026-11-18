@@ -135,7 +135,7 @@ class EstimateGate:
         # An anchored segment still expires against its accepted visual stamps.
         visual_stamp = self.last_stamp if self.last_pose is not None and self.pause_context is None else self.last_result_stamp
         if visual_stamp and now - visual_stamp > 1_500_000_000:
-            self.fault('visual estimate stale; restart to begin a new segment', 'visual')
+            self.fault('visual estimate stale; restart to begin a new segment', 'output')
         if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
             self.fault(f'visual degradation persisted beyond {(self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)/1e9:g} s; restart to begin a new segment', 'visual')
         return self.state
@@ -653,8 +653,10 @@ class RgbdSession:
             # An absent attitude source keeps the distinct 10 s IMU timeout.
             # A healthy attitude source does not extend visual warmup forever.
             self.initialization_timed_out = True
+            # Only a fresh result rejected after the last valid one is visual evidence.
+            kind = 'visual' if self.gate.last_result_stamp > self.gate.last_stamp else 'output'
             self.gate.fault(f'visual initialization timed out after {VISUAL_INITIALIZATION_S:g} s '
-                            'without three valid estimates; restart required', 'visual')
+                            'without three valid estimates; restart required', kind)
 
     def recovery_target(self, now_s, now_ns):
         """Recommend a new segment; never enable an auxiliary filter in place."""
