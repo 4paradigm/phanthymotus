@@ -22,10 +22,11 @@ from pydantic import BaseModel, Field
 from channel.manager import (
     manager, get_channel_config, add_channel_config,
     update_channel_config, delete_channel_config,
-    _get_channel_configs, supports_bot_to_bot, uses_trusted_bots,
+    supports_bot_to_bot, uses_trusted_bots,
 )
 from channel import acl
 import config
+import auth
 
 router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
 
@@ -48,6 +49,8 @@ class AddChannelReq(BaseModel):
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
+    if req.platform == 'qq':
+        raise fastapi.HTTPException(400, 'Use the QQ QR setup')
     if req.bot_to_bot_enabled and not supports_bot_to_bot(req.platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{req.platform}"')
@@ -92,6 +95,8 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
+    if 'qq' in (current['platform'], target_platform):
+        raise fastapi.HTTPException(400, 'Use the QQ settings endpoint')
     if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{target_platform}"')
@@ -113,12 +118,18 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
 
 @router.delete('/{channel_id}')
 async def delete_channel(channel_id: str):
+    ch = get_channel_config(channel_id)
+    if ch and ch['platform'] == 'qq':
+        _qq_idle(channel_id)
     # 先停止 adapter
     if channel_id in manager._adapters:
         await manager._adapters[channel_id].stop()
         del manager._adapters[channel_id]
     if not await asyncio.to_thread(delete_channel_config, channel_id):
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    if ch and ch['platform'] == 'qq':
+        from channel.qq_credentials import remove_secret
+        remove_secret(ch['config']['app_id'])
     return {'deleted': channel_id}
 
 
@@ -127,6 +138,10 @@ async def restart_channel(channel_id: str):
     ch = await asyncio.to_thread(get_channel_config, channel_id)
     if ch is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    if ch['platform'] == 'qq':
+        _qq_idle(channel_id)
+        manager._retry_backoff.pop(channel_id, None)
+        manager._retry_at.pop(channel_id, None)
     # Restart implies "I want this running" — otherwise restart_adapter is a no-op
     # for a previously stopped (disabled) channel.
     if not ch.get('enabled'):
@@ -140,6 +155,8 @@ async def stop_channel(channel_id: str):
     ch = await asyncio.to_thread(get_channel_config, channel_id)
     if ch is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    if ch['platform'] == 'qq':
+        _qq_idle(channel_id)
     # Persist the intent: the manager watchdog reconnects any *enabled* channel,
     # so without this a stopped channel would come back within 30s.
     await asyncio.to_thread(update_channel_config, channel_id, enabled=False)
@@ -149,6 +166,58 @@ async def stop_channel(channel_id: str):
     from channel.manager import _update_status
     _update_status(channel_id, 'stopped')
     return {'status': 'stopped'}
+
+
+def _qq_idle(channel_id):
+    if channel_id in manager._starting:
+        raise fastapi.HTTPException(409, 'QQ is connecting. Try again shortly.')
+
+
+class QQGroupSetting(BaseModel):
+    group_enabled: bool
+
+
+@router.put('/qq/{channel_id}/group')
+async def qq_group(channel_id: str, req: QQGroupSetting):
+    entry = get_channel_config(channel_id)
+    if not entry or entry['platform'] != 'qq':
+        raise fastapi.HTTPException(404, 'QQ channel not found')
+    _qq_idle(channel_id)
+    if entry['config'].get('group_enabled') != req.group_enabled:
+        update_channel_config(channel_id, config={**entry['config'], 'group_enabled': req.group_enabled})
+        await manager.restart_adapter(channel_id, retries=1)
+    return {'group_enabled': req.group_enabled}
+
+
+class QQSessionRef(BaseModel):
+    session_id: str = Field(min_length=43, max_length=43)
+
+
+def _qq_setup():
+    if not auth.is_enabled():
+        raise fastapi.HTTPException(403, 'Enable Dashboard authentication before connecting QQ')
+    from channel import qq_qr_onboarding
+    return qq_qr_onboarding
+
+
+@router.post('/qq/qr/start')
+async def start_qq_qr(response: fastapi.Response):
+    response.headers['Cache-Control'] = 'no-store'
+    session = _qq_setup().start()
+    if session is None:
+        raise fastapi.HTTPException(429, 'Too many QR sessions')
+    return session
+
+
+@router.post('/qq/qr/{action}')
+async def qq_qr_session(action: str, req: QQSessionRef, response: fastapi.Response):
+    response.headers['Cache-Control'] = 'no-store'
+    session = _qq_setup().get(req.session_id)
+    if session is None or action not in ('status', 'cancel'):
+        raise fastapi.HTTPException(404, 'QQ QR session not found')
+    if action == 'cancel':
+        session.cancel()
+    return session.snapshot()
 
 
 # ── User Management ──────────────────────────────────────────────────────────

@@ -1919,6 +1919,7 @@ class Event:
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
+            self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
@@ -1944,14 +1945,15 @@ class Event:
                     'content': '[turn interrupted by user message]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                await self._interrupt_active_outputs()
+                if not self._chat_only_active:
+                    await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                if not ev.get('_bot_channel_event'):
+                if not self._chat_only_active and not ev.get('_bot_channel_event'):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
@@ -1966,12 +1968,13 @@ class Event:
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
-                if not ev.get('_bot_channel_event'):
+                if not self._chat_only_active and not ev.get('_bot_channel_event'):
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
                 # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
-                if self._current_turn and not ev.get('_bot_channel_event'):
+                if self._current_turn and not self._chat_only_active and not ev.get('_bot_channel_event'):
                     self._save_current_turn(ev)
+                self._chat_only_active = False
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
@@ -1980,7 +1983,7 @@ class Event:
         不存在 —— 手动刷新也刷不出来，因为要刷的行还没有。这里按当前 turn 索引 upsert，
         turn 结束时 `_save_current_turn` 再写同一个索引覆盖掉（那一份已 compact）。
         """
-        if not self._current_turn:
+        if not self._current_turn or (trigger_event or {}).get('_chat_only_channel'):
             return
         import chat_history
         try:
@@ -2123,7 +2126,7 @@ class Event:
         if not work and not turn_alive:
             _narration_gate('no active work', stop=True)   # 活干完了，没什么好报的
             return
-        if _last_turn_restricted and not turn_alive:
+        if getattr(self, '_chat_only_active', False) or (_last_turn_restricted and not turn_alive):
             # 受限 turn 派出去的活，不该由我们代为出声
             _narration_gate('last turn was tool-restricted', stop=True)
             return
@@ -2274,7 +2277,11 @@ class Event:
         _turn_t0 = _time.perf_counter()
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
-        tool_restricted = bot_restricted or viewer_restricted
+        from channel import chat_only
+        isolated = bool(trigger_event.get('_chat_only_channel'))
+        if isolated:
+            reconsider_event = None
+        tool_restricted = isolated or bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2283,7 +2290,8 @@ class Event:
 
         # 任务开始 → 开始计时。用 _start_countdown（"已在计时则不动"）而不是重新计：
         # 上一件事已经沉默了 20 秒的话，新任务不该把它再往后推一个完整间隔。
-        _on_task_started()
+        if not isolated:
+            _on_task_started()
         global _last_turn_restricted
         _last_turn_restricted = tool_restricted
 
@@ -2343,7 +2351,7 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        if not bot_restricted:
+        if not (isolated or bot_restricted):
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
@@ -2351,7 +2359,7 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
         # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
-        if (mcp_client.has_blocking_pendings() and not bot_restricted
+        if (mcp_client.has_blocking_pendings() and not (isolated or bot_restricted)
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
@@ -2384,7 +2392,11 @@ class Event:
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
-        if tool_restricted:
+        if isolated:
+            system_tools = [self._sys_tools['finish']]
+            bound_schemas = [chat_only.REPLY_SCHEMA] if any(
+                s['name'] == chat_only.REPLY_TOOL for s in bound_schemas) else []
+        elif tool_restricted:
             system_tools = [
                 tool for tool in system_tools
                 if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted)
@@ -2401,7 +2413,8 @@ class Event:
         bound_tool_names = {s['name'] for s in bound_schemas}
 
         # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
-        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+        frozen_system = (chat_only.SYSTEM if isolated else
+                         prompt_mod.build_system(mcp_client.registry, bound_tool_names))
 
         finish_tool = 'finish'
         llm_cfg = config.main.get('event', {}).get('llm', {})
@@ -2465,7 +2478,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = [] if bot_restricted else self._build_history()
+            history = [] if isolated or bot_restricted else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(_scrub(turn_messages))
 
@@ -2475,6 +2488,7 @@ class Event:
                     system_msg    = frozen_system,
                     message_list  = current_history,
                     trigger_event = trigger_event,
+                    include_dynamic = not isolated,
                 )
                 # 把 trigger user message 记入 turn_messages，后续轮次能看到
                 trigger_user_msg = messages[-1]  # build() 最后一条是 L4 user
@@ -2555,7 +2569,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2 and not bot_restricted:
+                    if len(self._turns) > 2 and not (isolated or bot_restricted):
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -2670,7 +2684,9 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
+                if isolated:
+                    result = await chat_only.dispatch(name, args, trigger_event)
+                elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
@@ -2920,7 +2936,8 @@ class Event:
             # _turn_interacted 还是 False，哑火护栏会凭空多插一轮。
             if _notified_by_tool or _channel_replied:
                 _turn_interacted = True
-                _on_speaking_started()
+                if not isolated:
+                    _on_speaking_started()
 
             # ── finish 检测 ───────────────────────────────────────────────
             #
@@ -2948,11 +2965,11 @@ class Event:
             # it here would rebuild the frozen system prompt on every file read
             # and throw away the prompt cache for nothing.
             skill_tools = {'activate_skill', 'deactivate_skill'}
-            if any(c['function']['name'] in skill_tools for c in tool_calls):
+            if not isolated and any(c['function']['name'] in skill_tools for c in tool_calls):
                 frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
 
             # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
-            steered = await collector.drain_steering()
+            steered = [] if isolated else await collector.drain_steering()
             if steered:
                 deferred = [
                     sev for sev in steered
@@ -2978,7 +2995,7 @@ class Event:
             # 汇报的回灌在这里排空 —— 和 steering 同一个安全点。定时器可能在
             # assistant(tool_calls) 已入列、tool 结果还没入列的窗口触发，那时当场 append
             # 会造出 provider 会拒的消息序列。
-            while _pending_narration_feedback:
+            while _pending_narration_feedback and not isolated:
                 turn_messages.append(
                     _narration_feedback_message(_pending_narration_feedback.pop(0)))
 
@@ -3004,7 +3021,7 @@ class Event:
             # 与其去枚举每一条"谁负责重新计时"（本次数出 4 条绕过监听的路径，说明枚举
             # 法不可靠），这里放一条不变式恢复：只要循环还在转，计时就不会凭空消失。
             # _start_countdown 的"已在计时则不动"保证它不会把正在跑的 deadline 往后推。
-            if not _mouth_busy():
+            if not isolated and not _mouth_busy():
                 _start_countdown()
 
             round_idx += 1
@@ -3020,6 +3037,8 @@ class Event:
             await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
+        if isolated:
+            return
         await self._maybe_compress()
 
         # 发布决策到 /decision_core DDS topic

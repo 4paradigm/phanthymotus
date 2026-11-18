@@ -1,0 +1,43 @@
+"""Execution policy for Channels that may only answer their current chat."""
+
+PLATFORMS = frozenset({'qq'})
+REPLY_TOOL = 'mcp__channel__channel_reply'
+REPLY_SCHEMA = {
+    'name': REPLY_TOOL,
+    'description': 'Reply to the current Channel message.',
+    'parameters': {
+        'type': 'object',
+        'properties': {'action': {'type': 'string', 'enum': ['send']},
+                       'text': {'type': 'string'},
+                       'source_message_id': {'type': 'string'}},
+        'required': ['action', 'text', 'source_message_id'],
+        'additionalProperties': False,
+    },
+}
+SYSTEM = {
+    'role': 'system',
+    'content': 'You are a chat assistant. Respond in the user’s language. '
+               'Use channel_reply with action="send", text and the current message_id '
+               'as source_message_id. Use finish when done.',
+}
+
+
+async def dispatch(name, args, trigger):
+    if name == 'finish' and args == {}:
+        return 'Done'
+    if (name != REPLY_TOOL or not isinstance(args, dict)
+            or set(args) - {'action', 'text', 'source_message_id'}
+            or args.get('action') != 'send'
+            or not isinstance(args.get('text'), str)
+            or args.get('source_message_id') not in trigger['_channel_message_ids']):
+        return 'Error: only a text reply to the current chat message is allowed.'
+    from channel.manager import manager
+    from channel.qq_canvas import reply_card
+
+    channel_id = trigger['_chat_only_channel']
+    card = reply_card(channel_id)
+    if not card:
+        return 'Error: the current channel has no bound reply card.'
+    return await manager.send_to_channel(
+        channel_id, text=args['text'], source_message_id=args['source_message_id'],
+    )

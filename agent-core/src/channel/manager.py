@@ -17,7 +17,7 @@ import time
 
 import config
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
-from channel import acl
+from channel import acl, chat_only
 
 
 # ── Channel Config 持久化 ────────────────────────────────────────────────────
@@ -231,6 +231,8 @@ class ChannelManager:
         self._retry_backoff: dict[str, float] = {}       # channel_id → 当前退避秒数
         self._inactive_logged: set[str] = set()
         self._trusted_bot_messages: dict[str, dict] = {}
+        self._chat_only_pending: dict[str, tuple[str, str]] = {}
+        self._starting: set[str] = set()
         self._mention_rate: dict[tuple, list[float]] = {}
 
     def _trusted_bot_id(self, msg: InboundMessage) -> str:
@@ -524,6 +526,13 @@ class ChannelManager:
             await self._push_error(msg)
         _update_status(channel_id, 'error')
 
+        if channel_id in self._starting or (adapter and getattr(adapter, 'reconnecting', False)):
+            return
+        cfg = get_channel_config(channel_id) or {}
+        if (cfg.get('platform') in chat_only.PLATFORMS
+                and self._retry_backoff.get(channel_id, 0) >= 300):
+            return
+
         # 指数退避重连（30s → 60s → … → 300s）
         now = time.time()
         if now < self._retry_at.get(channel_id, 0):
@@ -605,6 +614,16 @@ class ChannelManager:
             on_message=self._on_inbound_message,
         )
 
+        if platform in chat_only.PLATFORMS:
+            if channel_id in self._starting:
+                return
+            self._starting.add(channel_id)
+            try:
+                await self._start_chat_adapter(adapter, ch_cfg)
+            finally:
+                self._starting.discard(channel_id)
+            return
+
         for attempt in range(retries):
             try:
                 await adapter.start()
@@ -624,6 +643,22 @@ class ChannelManager:
                     self._health[channel_id] = (False, str(e))
                     _update_status(channel_id, 'error')
 
+    async def _start_chat_adapter(self, adapter, channel):
+        channel_id = channel['id']
+        try:
+            await adapter.start()
+        except Exception as exc:
+            self._health[channel_id] = (False, str(exc))
+            _update_status(channel_id, 'error')
+            return
+        current = get_channel_config(channel_id)
+        if not current or not current.get('enabled') or current['config'] != channel['config']:
+            await adapter.stop()
+            return
+        self._adapters[channel_id] = adapter
+        self._health[channel_id] = (True, '')
+        _update_status(channel_id, 'connected')
+
     async def _push_error(self, message: str):
         """Push error to frontend activity stream."""
         try:
@@ -642,6 +677,8 @@ class ChannelManager:
             if value.get('channel_id') != channel_id
         }
         # Stop existing
+        if channel_id in self._starting:
+            return
         if channel_id in self._adapters:
             await self._adapters[channel_id].stop()
             del self._adapters[channel_id]
@@ -649,6 +686,12 @@ class ChannelManager:
         ch_cfg = get_channel_config(channel_id)
         if ch_cfg and ch_cfg.get('enabled'):
             await self._start_adapter(ch_cfg, retries=retries)
+
+    def consume_chat_input(self, topic: str, text: str, message_id: str) -> bool:
+        if self._chat_only_pending.get(message_id) != (topic, text):
+            return False
+        self._chat_only_pending.pop(message_id)
+        return True
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -667,9 +710,15 @@ class ChannelManager:
             return
         self._inactive_logged.discard(msg.channel_id)
 
+        private_chat = msg.platform in chat_only.PLATFORMS
         is_bot = msg.sender_type in ('bot', 'app')
         trusted_bot_id = self._trusted_bot_id(msg) if is_bot else ''
-        if is_bot:
+        if private_chat:
+            from channel.qq_canvas import input_ready
+            if not input_ready(msg.channel_id):
+                return
+            user = {'role': 'viewer'}
+        elif is_bot:
             # Bot 不写入人员 ACL；只有精确匹配配置的可信 Bot 继承普通输入权限。
             user = {'role': 'operator' if trusted_bot_id else 'viewer'}
         else:
@@ -731,7 +780,12 @@ class ChannelManager:
             payload['files'] = files
         if trusted_bot_id:
             self._record_trusted_bot_message(payload)
-        await publish_to_topic(topic, json.dumps(payload, ensure_ascii=False))
+        body = json.dumps(payload, ensure_ascii=False)
+        if private_chat:
+            self._chat_only_pending[msg.message_id] = (topic, body)
+            if len(self._chat_only_pending) > 256:
+                self._chat_only_pending.pop(next(iter(self._chat_only_pending)))
+        await publish_to_topic(topic, body)
 
         # 5. Broadcast to frontend activity stream
         from api.motus_stream import push_event
@@ -884,6 +938,7 @@ class ChannelManager:
                 files=attachments,
                 mention_open_id=mention_open_id,
                 expect_reply=expect_reply,
+                reply_to_message_id=ctx['message_id'] if adapter.platform in chat_only.PLATFORMS else '',
             ))
             parts = []
             if text:
@@ -955,6 +1010,7 @@ class ChannelManager:
     # ── Status ───────────────────────────────────────────────────────────────
 
     def get_status(self) -> list[dict]:
+        from channel.qq_canvas import input_ready
         """获取所有 channel 的状态。"""
         result = []
         for ch_cfg in _get_channel_configs():
@@ -964,6 +1020,9 @@ class ChannelManager:
             result.append({
                 'id': channel_id,
                 'platform': ch_cfg['platform'],
+                **({'group_enabled': ch_cfg['config'].get('group_enabled', False),
+                    'canvas_ready': input_ready(channel_id)}
+                   if ch_cfg['platform'] == 'qq' else {}),
                 'enabled': ch_cfg.get('enabled', False),
                 'bot_to_bot_enabled': ch_cfg.get('bot_to_bot_enabled', False),
                 'trusted_bots': ch_cfg.get('trusted_bots', []),
