@@ -732,12 +732,14 @@ class VideoObjectPerceptionPlugin:
 
             engine_path, vocab = self._resolve_engine()
             log.info(f"[vop] loading engine: {engine_path}")
-            self._model = VisionEngineSession(engine_path)
+            model = VisionEngineSession(engine_path)
             # The engine's own metadata wins over the bundled vocab.json: it was
             # written by the export that baked the classes into the weights, so
             # it cannot be stale or out of order. vocab.json only covers an
             # engine built without names.
-            self._vocabulary = self._model.class_names() or vocab
+            self._vocabulary = model.class_names() or vocab
+            # Other camera workers use _model as the readiness check.
+            self._model = model
             if not self._vocabulary:
                 log.warning("[vop] engine carries no class names and no vocab.json "
                             "was readable — detections will be labelled by index")

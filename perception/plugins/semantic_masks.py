@@ -2,13 +2,13 @@
 from io import BytesIO
 import math
 
-import cv2
 import numpy as np
 
 from plugins.vision_runtime import VisionDecodeError, undo_letterbox
 
 
 def decode_camera_jpeg(data):
+    import cv2
     from PIL import Image
     if not data or len(data) > 16 * 1024 * 1024:
         raise ValueError("Expected a JPEG under 16 MiB")
@@ -41,6 +41,7 @@ def _head(outputs):
 
 def semantic_maps(outputs, meta, input_size, vocabulary, presets, confidence):
     """One uint8 raster per preset. 0 is background, 1..N indexes its configured class list."""
+    import cv2
     rows, proto = _head(outputs)
     width, height = input_size
     maps = {key: np.zeros((meta.orig_h, meta.orig_w), np.uint8) for key in presets}
@@ -75,6 +76,7 @@ def semantic_maps(outputs, meta, input_size, vocabulary, presets, confidence):
 
 
 def overlay(image, labels):
+    import cv2
     palette = np.array([[0, 0, 0]] + [[(79*i+41) % 208 + 35, (97*i+99) % 208 + 35,
                                        (53*i+11) % 208 + 35] for i in range(1, 256)], dtype=np.uint8)
     blend = cv2.addWeighted(image, 0.48, palette[labels], 0.52, 0)

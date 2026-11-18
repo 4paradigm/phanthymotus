@@ -233,7 +233,6 @@ class SegmentationPlugin:
                 if not topic:
                     raise ValueError("Wire a camera JPEG to the segmentation card")
                 if self.instances.get(key) != topic:
-                    self._remove(key)
                     node = self.nodes.get(topic)
                     if node is None:
                         node = _Camera(topic, self.executor, self._model, self.confidence, self.fps)
@@ -244,6 +243,7 @@ class SegmentationPlugin:
                         if not node.targets:
                             self.nodes.pop(topic).close()
                         raise
+                    self._remove(key)
                     self.instances[key] = topic
             elif action != "info":
                 raise ValueError("Unknown segmentation card action")

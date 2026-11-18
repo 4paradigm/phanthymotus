@@ -31,7 +31,16 @@ def test_class_selection_letterbox_background_and_overlap(transpose):
     assert all(m.shape == (4,8) and m.dtype == np.uint8 for m in masks.values())
     assert np.all(masks["person"] == 1) and np.all(masks["room"] == 1)
     assert np.all(masks["car"][:,:4] == 0) and np.all(masks["car"][:,4:] == 1)
-    assert np.all(overlay(np.zeros((4,8,3), np.uint8),masks["car"])[:,:4] == 0)
+
+
+@pytest.mark.skipif(getattr(cv2, "__motus_fake__", False), reason="overlay needs OpenCV blending")
+def test_overlay_preserves_background_pixels():
+    source = np.zeros((4, 8, 3), np.uint8)
+    mask = np.zeros((4, 8), np.uint8)
+    mask[:, 4:] = 1
+    preview = overlay(source, mask)
+    np.testing.assert_array_equal(preview[:, :4], source[:, :4])
+    assert np.any(preview[:, 4:])
 
 
 def test_empty_input_no_claimed_pixels_and_crop():
@@ -49,10 +58,19 @@ def test_empty_input_no_claimed_pixels_and_crop():
 def test_detection_only_head_and_bad_image():
     with pytest.raises(VisionDecodeError):
         semantic_maps([np.zeros((1,300,6))],META,(8,8),NAMES,PRESETS,.3)
-    ok, png = cv2.imencode(".png", np.zeros((4,8,3),np.uint8))
-    assert ok
+    from io import BytesIO
+    from PIL import Image
+    png = BytesIO()
+    Image.new("RGB", (8, 4)).save(png, format="PNG")
     with pytest.raises(ValueError):
-        decode_camera_jpeg(png.tobytes())
+        decode_camera_jpeg(png.getvalue())
+
+
+def test_card_registration_precedes_jetson_opencv_initialization(monkeypatch):
+    import runpy
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "plugins/semantic_masks.py"))
+    assert callable(module["decode_camera_jpeg"])
 
 
 def test_card_registration_and_independent_instances(monkeypatch):
@@ -72,6 +90,8 @@ def test_card_registration_and_independent_instances(monkeypatch):
             self.targets = {}
             topics[topic] = self
         def add(self,key,name,labels,ports):
+            if "/unavailable/" in ports[0]["topic"]:
+                raise RuntimeError("publisher unavailable")
             self.targets[key] = (name, labels, ports)
         def remove(self,key):
             self.targets.pop(key)
@@ -94,5 +114,9 @@ def test_card_registration_and_independent_instances(monkeypatch):
     assert len(plugin.nodes) == 1 and len(topics["/cam/jpeg"].targets) == 2
     plugin.dispatch("car",dict(b,action="stop"))
     assert plugin.dispatch("person",dict(a,action="info"))["state"] == "running"
+    with pytest.raises(RuntimeError, match="publisher unavailable"):
+        plugin.dispatch("person",dict(a,action="start",input_topic="/unavailable/jpeg"))
+    assert plugin.dispatch("person",dict(a,action="info"))["topic_out"] == left["topic_out"]
+    assert topics["/unavailable/jpeg"].closed
     plugin.shutdown()
     assert topics["/cam/jpeg"].closed
