@@ -1,7 +1,8 @@
-"""Kokoro Multi FP32 TensorRT adapter and JP6 launch; assets stay external."""
+"""Kokoro Multi FP32 TensorRT adapter and JetPack launcher."""
 
 import json
 import logging
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -39,8 +40,10 @@ class KokoroTRT:
         self._logger = trt.Logger(trt.Logger.WARNING)
         self._cuda = CudaRuntime(device_id)
         try:
+            self._dynamic_activation = hasattr(trt, 'ExecutionContextAllocationStrategy')
+            if not self._dynamic_activation:
+                trt.init_libnvinfer_plugins(self._logger, '')
             self._runtime = trt.Runtime(self._logger)
-            managed = hasattr(trt, 'ExecutionContextAllocationStrategy')
             for path in paths:
                 engine = self._runtime.deserialize_cuda_engine(Path(path).read_bytes())
                 if engine is None:
@@ -48,13 +51,18 @@ class KokoroTRT:
                 self._engines.append(engine)
                 context = (engine.create_execution_context(
                     strategy=trt.ExecutionContextAllocationStrategy.USER_MANAGED)
-                    if managed else engine.create_execution_context_without_device_memory())
+                    if self._dynamic_activation else engine.create_execution_context_without_device_memory())
                 if context is None:
                     raise RuntimeError(f"Cannot create TensorRT context: {path}")
                 self._contexts.append(context)
-            # Size the serially shared arena after selecting actual shapes;
-            # the engine-wide upper bound reserves ~1 GiB even for "Hi.".
+            # TRT8 uses one shared engine-sized arena. TRT10 sizes it on demand.
             self._activation_bytes = 0
+            if not self._dynamic_activation:
+                self._activation_bytes = max(engine.device_memory_size for engine in self._engines)
+                if self._activation_bytes:
+                    pointer = self._buffer('activation', self._activation_bytes)
+                    for context in self._contexts:
+                        context.device_memory = pointer
             contracts = [({'tokens', 'style', 'speed'}, {'d', 't_en', 'duration'}),
                          ({'d', 't_en', 'indices', 'style'}, {'features', 'f0'}),
                          ({'features', 'f0', 'style'}, {'audio'})]
@@ -107,12 +115,13 @@ class KokoroTRT:
         for name, shape in shapes.items():
             if not context.set_input_shape(name, tuple(shape)):
                 raise ValueError(f"Stage {stage} rejected {name} shape {shape}")
-        required = context.update_device_memory_size_for_shapes()
-        if required <= 0:
-            raise RuntimeError(f"Stage {stage} could not size activation memory for {shapes}")
-        pointer = self._buffer('activation', required)
-        self._activation_bytes = self._buffers['activation'][1]
-        context.set_device_memory(pointer, self._activation_bytes)
+        if self._dynamic_activation:
+            required = context.update_device_memory_size_for_shapes()
+            if required <= 0:
+                raise RuntimeError(f"Stage {stage} could not size activation memory for {shapes}")
+            pointer = self._buffer('activation', required)
+            self._activation_bytes = self._buffers['activation'][1]
+            context.set_device_memory(pointer, self._activation_bytes)
 
     def _buffer(self, name, size):
         size = max(1, int(size))
@@ -214,6 +223,93 @@ class KokoroTRT:
             self._cuda = None
 
 
+def _run_jp5_trt(connection, model_dir, warmup):
+    runtime = None
+    try:
+        try:
+            root = Path(model_dir)
+            runtime = KokoroTRT(root / "encoder.plan", root / "acoustic.plan",
+                                vocoder_plan=root / "vocoder.plan")
+            runtime.infer(*warmup)
+        except Exception as error:
+            connection.send(("error", str(error)))
+            return
+        connection.send(("ready", None))
+        while True:
+            try:
+                inputs = connection.recv()
+            except EOFError:
+                return
+            try:
+                result = ("audio", runtime.infer(*inputs))
+            except SequenceTooLong as error:
+                result = ("duration", str(error))
+            except Exception as error:
+                result = ("error", str(error))
+            connection.send(result)
+    finally:
+        if runtime is not None:
+            runtime.close()
+        connection.close()
+
+
+class _JP5TRTWorker:
+    def __init__(self, model_dir, warmup):
+        context = multiprocessing.get_context("spawn")
+        self._connection, child = context.Pipe()
+        self._lock = threading.RLock()
+        self._process = context.Process(target=_run_jp5_trt, args=(child, model_dir, warmup),
+                                        name="kokoro-jp5-trt", daemon=True)
+        try:
+            try:
+                self._process.start()
+            finally:
+                child.close()
+            status, value = self._receive(120)
+            if status != "ready":
+                raise RuntimeError(f"Kokoro JP5 GPU startup failed: {value}")
+        except BaseException:
+            self.close()
+            raise
+
+    def _receive(self, seconds):
+        if not self._connection.poll(seconds):
+            raise TimeoutError(f"Kokoro JP5 GPU worker timed out after {seconds}s")
+        return self._connection.recv()
+
+    def infer(self, tokens, style, speed):
+        with self._lock:
+            if self._connection.closed:
+                raise RuntimeError("Kokoro JP5 GPU worker is closed")
+            try:
+                self._connection.send((tokens, style, speed))
+                status, value = self._receive(60)
+            except (EOFError, OSError) as error:
+                self.close()
+                raise RuntimeError("Kokoro JP5 GPU worker stopped responding") from error
+        if status == "duration":
+            raise SequenceTooLong(value)
+        if status != "audio":
+            raise RuntimeError(f"Kokoro JP5 GPU inference failed: {value}")
+        return value
+
+    def close(self):
+        with self._lock:
+            if self._connection.closed:
+                return
+            self._connection.close()
+            if self._process.pid is not None:
+                self._process.join(2)
+                if self._process.is_alive():
+                    self._process.terminate()
+                    self._process.join(2)
+                if self._process.is_alive():
+                    self._process.kill()
+                    self._process.join(2)
+            if not self._process.is_alive():
+                self._process.close()
+
+
 class KokoroMultiTTSAdapter(TTSAdapter):
     LANGUAGES = LANGUAGES
     dry_run_text = "Hi."
@@ -242,6 +338,22 @@ class KokoroMultiTTSAdapter(TTSAdapter):
         if any(v.shape != (510, 1, 256) or v.dtype != np.float32
                or not np.isfinite(v).all() for v in self._voices.values()):
             raise ValueError("Kokoro Multi voice packs must be finite float32 [510,1,256]")
+        if manifest.get("jetpack") == "5.1.1":
+            if on_status:
+                on_status("Loading TensorRT in the JP5 GPU worker")
+            ids = [self._vocab[phone] for phone in "hˈI."]
+            warmup = (np.array([[0, *ids, 0]], dtype=np.int64),
+                      self._voices["en"][len(ids) - 1], np.array([self._speed], dtype=np.float32))
+            self._runtime = _JP5TRTWorker(root, warmup)
+            log.info("[kokoro-multi] JP5 GPU worker warmup complete")
+            try:
+                if on_status:
+                    on_status("Loading eight-language frontend")
+                self._frontend = Frontend(root)
+            except BaseException:
+                self.close()
+                raise
+            return
         if on_status:
             on_status("Loading eight-language frontend")
         self._frontend = Frontend(root)
@@ -367,20 +479,29 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 
 
 WORK = Path(__file__).resolve().parents[1]
-# Filled with the published, immutable release before submission. Missing pins
-# fail explicitly; an unverified or unrelated model is never substituted.
-ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=b58705717cbea7aad9839c728da046ca294f72e1&FilePath=kokoro-multi-jp61-fp32-v14.tar.gz"
-ASSET_SHA256 = "1935bc98efe296976bef857cef18a17b1a12d8c4a3e41893bfcbdd910647dde1"
-ASSET_SIZE = 324809917
+ASSETS = {
+    "511": (
+        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=5a2fb90d487635e56a3b32398da548e7dcdabd39&FilePath=kokoro-multi-jp511-mixed-v15-fr.tar.gz",
+        "0093b34641945a49c9212d183eacd304d42a71c6222da47f304cb6dcddfe2d5d",
+        253769001,
+        "/models/kokoro-multi-trt-jp511",
+    ),
+    "61": (
+        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=31b5a89b102aca966a291d96b97ffa2857bba2c3&FilePath=kokoro-multi-jp61-fp32-v15-fr.tar.gz",
+        "da82b65029322da07e142a1c1b6e51bfadc7e0a74b7dd7e93ce8d8f9ac674788",
+        326827286,
+        "/models/kokoro-multi-trt",
+    ),
+}
 
 
 def enabled():
     jp = os.environ.get("KOKORO_MULTI_BUILT_FOR_JP", "")
-    value = os.environ.get("KOKORO_MULTI_ENABLE", "1" if jp == "61" else "0")
+    value = os.environ.get("KOKORO_MULTI_ENABLE", "0")
     if value not in ("0", "1"):
         raise ValueError("KOKORO_MULTI_ENABLE must be 0 or 1")
-    if value == "1" and jp != "61":
-        raise RuntimeError("Kokoro Multi requires the prepared JetPack 6.1 image")
+    if value == "1" and jp not in ASSETS:
+        raise RuntimeError("Kokoro Multi requires a prepared JetPack 5.1.1 or 6.1 image")
     return value == "1"
 
 
@@ -388,21 +509,23 @@ def prepare_config():
     import yaml
     from utils.model_downloader import ensure_verified_archive, require_models_subpath
 
-    url = os.environ.get("KOKORO_MULTI_ASSET_URL", ASSET_URL)
-    sha256 = os.environ.get("KOKORO_MULTI_ASSET_SHA256", ASSET_SHA256)
-    size = int(os.environ.get("KOKORO_MULTI_ASSET_SIZE", str(ASSET_SIZE)))
+    jp = os.environ["KOKORO_MULTI_BUILT_FOR_JP"]
+    asset_url, asset_sha256, asset_size, cache = ASSETS[jp]
+    url = os.environ.get("KOKORO_MULTI_ASSET_URL", asset_url)
+    sha256 = os.environ.get("KOKORO_MULTI_ASSET_SHA256", asset_sha256)
+    size = int(os.environ.get("KOKORO_MULTI_ASSET_SIZE", str(asset_size)))
     if not url or not re.fullmatch(r"[0-9a-f]{64}", sha256) or size <= 0:
         raise RuntimeError(
             "Kokoro Multi release is not pinned: set KOKORO_MULTI_ASSET_URL, "
             "KOKORO_MULTI_ASSET_SHA256 and KOKORO_MULTI_ASSET_SIZE"
         )
     model_dir = require_models_subpath(
-        os.environ.get("KOKORO_MULTI_MODEL_DIR", "/models/kokoro-multi-trt")
+        os.environ.get("KOKORO_MULTI_MODEL_DIR", cache)
     )
     # A mounted /models cache is reused. Without a mount this is the container's
     # writable layer, and each fresh container needs network access to the URL.
     ensure_verified_archive(
-        "kokoro-multi-jp61", model_dir, url, {"sha256": sha256, "size": size}
+        f"kokoro-multi-jp{jp}", model_dir, url, {"sha256": sha256, "size": size}
     )
     if not (Path(model_dir) / "manifest.json").is_file():
         raise RuntimeError("Kokoro Multi release must contain manifest.json at its root")
@@ -410,20 +533,25 @@ def prepare_config():
     source = Path(os.environ.get("CONFIG_PATH", str(WORK / "config.yaml")))
     with source.open() as handle:
         cfg = yaml.safe_load(handle)
-    cfg["plugins"] = {"tts": {
+    benchmark = os.environ.get("KOKORO_MULTI_BENCHMARK", "0") == "1"
+    tts = {
         "enabled": True,
         "engine": "kokoro-multi",
         "backend": "trt",
-        # Offline collection only: the benchmark drains audio without live playback.
-        "benchmark": True,
+        "benchmark": benchmark,
         "device": "gpu",
         "model_dir": model_dir,
         "language": "auto",
         "warmup": True,
         "speaker_id": 0,
         "speed": 1.0,
-    }, "echo_cancellation": {"enabled": False},
-       "audio_mixer": {"enabled": False}}
+    }
+    if benchmark:
+        # Darvin drains PCM without live playback.
+        cfg["plugins"] = {"tts": tts, "echo_cancellation": {"enabled": False},
+                          "audio_mixer": {"enabled": False}}
+    else:
+        cfg.setdefault("plugins", {})["tts"] = tts
     for key, default in (("mcp_port", 15720), ("ws_port", 15721)):
         port = int(os.environ.get(key.upper(), cfg.get(key, default)))
         if not 1 <= port <= 65535:
@@ -448,7 +576,7 @@ def main():
         os.environ["CONFIG_PATH"] = str(config)
         # Default Fast DDS announcements can delay a new reader by 3 seconds.
         # Scope the shorter announcement period to this Kokoro process only.
-        if "FASTRTPS_DEFAULT_PROFILES_FILE" not in os.environ:
+        if cfg["plugins"]["tts"]["benchmark"] and "FASTRTPS_DEFAULT_PROFILES_FILE" not in os.environ:
             discovery = Path(directory) / "fastdds.xml"
             discovery.write_text(
                 '<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">'
@@ -458,7 +586,8 @@ def main():
                 '</leaseAnnouncement></discovery_config></builtin></rtps>'
                 '</participant></profiles>')
             os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(discovery)
-        logging.info("Kokoro Multi JP6: MCP port %s, WS port %s, cache %s",
+        logging.info("Kokoro Multi jp%s: MCP port %s, WS port %s, cache %s",
+                     os.environ["KOKORO_MULTI_BUILT_FOR_JP"],
                      cfg["mcp_port"], cfg["ws_port"], cfg["plugins"]["tts"]["model_dir"])
         runpy.run_path(str(WORK / "main.py"), run_name="__main__")
 

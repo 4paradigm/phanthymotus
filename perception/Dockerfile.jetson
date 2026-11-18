@@ -694,32 +694,27 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# Dedicated Kokoro Multi submission layer. Default-on only for JP6; setting
-# KOKORO_MULTI_ENABLE=0 retains the official configuration and main module.
-# No weights are baked in: the entrypoint verifies a pinned runtime archive
-# in /models/kokoro-multi-trt, reusing a host-mounted cache when one is supplied.
-RUN if [ "${JP_VERSION}" = "61" ]; then \
-      pip3 uninstall -y phonemizer && \
-      pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-        numpy==1.26.4 \
-        misaki==0.9.4 \
-        spacy==3.7.5 \
-        phonemizer-fork==3.3.2 \
-        espeakng-loader==0.2.4 \
-        num2words==0.5.14 \
-        pypinyin==0.55.0 \
-        cn2an==0.5.24 \
-        jieba==0.42.1 \
-        ordered-set==4.1.0 \
-        fugashi==1.5.2 \
-        unidic-lite==1.0.8 \
-        jaconv==0.5.0 \
-        mojimoji==0.0.13 \
-        pythainlp==5.3.4 \
-        langid==1.1.6 && \
-      python3 -c "import numpy; assert numpy.__version__ == '1.26.4'; import misaki, spacy, phonemizer, fugashi, langid"; \
+# Kokoro Multi frontend dependencies for both JetPack Python ABIs.
+RUN . /etc/jetpack.env && \
+    case "${JP_VERSION}" in \
+      511) set -- fugashi==1.4.0 thinc==8.2.4 blis==0.7.11 pythainlp==5.0.4 ;; \
+      61)  set -- fugashi==1.5.2 pythainlp==5.3.4 ;; \
+      *)   exit 0 ;; \
+    esac && \
+    pip3 uninstall -y phonemizer && \
+    pip3 install --no-cache-dir -i "${PYPI_MIRROR}" "numpy==${NUMPY_VERSION}" \
+      misaki==0.9.4 spacy==3.7.5 phonemizer-fork==3.3.2 espeakng-loader==0.2.4 \
+      num2words==0.5.14 pypinyin==0.55.0 cn2an==0.5.24 jieba==0.42.1 ordered-set==4.1.0 \
+      unidic-lite==1.0.8 jaconv==0.5.0 mojimoji==0.0.13 langid==1.1.6 "$@" && \
+    python3 -c "import numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; import misaki, spacy, phonemizer, fugashi, langid"
+ARG KOKORO_MULTI_BENCHMARK=1
+# The JP5 Darvin image only runs TTS. Avoid loading Torch in its CPU frontend.
+RUN if [ "${JP_VERSION}" = "511" ] && [ "${KOKORO_MULTI_BENCHMARK}" = "1" ]; then \
+      pip3 uninstall -y torch torchvision torchaudio; \
     fi
 ENV KOKORO_MULTI_BUILT_FOR_JP=${JP_VERSION}
+ENV KOKORO_MULTI_ENABLE=${KOKORO_MULTI_BENCHMARK} \
+    KOKORO_MULTI_BENCHMARK=${KOKORO_MULTI_BENCHMARK}
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \

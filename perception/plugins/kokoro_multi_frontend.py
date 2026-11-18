@@ -557,9 +557,9 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
                         return prefix + _number(m["n"], "en", cfg) + " pounds sterling"
                     words = _integer(amount, "en", to="currency", currency="GBP")
                     if amount == int(amount):
-                        words = words.removesuffix(", zero pence")
+                        words = re.sub(r", zero pence\Z", "", words)
                     elif amount < 1:
-                        words = words.removeprefix("zero pounds sterling, ")
+                        words = re.sub(r"\Azero pounds sterling, ", "", words)
                     return prefix + words
                 return prefix + m["c"] + m["n"]
             add(match.start(), match.end(), "english_currency", money)
@@ -958,7 +958,7 @@ _ABBREVIATIONS = {
 }
 
 
-def first_sentence_parts(text, protected=(), *, clause=False):
+def first_sentence_parts(text, protected=(), *, clause=False, clause_words=4):
     """Return a natural opening boundary and its intact tail, without repacking."""
     opens = {"(": ")", "[": "]", "{": "}", "（": "）", "【": "】",
              "《": "》", "「": "」", "『": "』", "“": "”"}
@@ -978,7 +978,7 @@ def first_sentence_parts(text, protected=(), *, clause=False):
             native_letters = re.findall(r"[\u3040-\u30ff\u4e00-\u9fff\u0e00-\u0e7f]", head)
             words = re.findall(r"[^\W\d_][\w'’'-]*", head)
             # Keep a greeting such as "Hello," attached to its following clause.
-            if len(native_letters) < 4 and len(words) < 4:
+            if len(native_letters) < 4 and len(words) < clause_words:
                 continue
             # The comma before an English calendar year belongs to the date.
             if char == "," and re.match(r"\s*(?:\d{4}\b|two thousand\b|nineteen\b|twenty\b)", text[index+1:]):
@@ -1589,9 +1589,10 @@ class Frontend:
         source, spoken, language = self._prepare_text(text, language)
         matches = list(self._dictionary_matches(spoken, language))
         protected = self._literal_spans(spoken) + [match.span() for match in matches]
-        clause = language != "en" and (language not in ("fr", "es") or any(
+        clause = language not in ("en", "es") or (language == "es" and any(
             match.lastgroup in self._opening_clause_terms for match in matches))
-        parts = first_sentence_parts(spoken, protected, clause=clause)
+        parts = first_sentence_parts(spoken, protected, clause=clause,
+                                     clause_words=7 if language == "fr" else 4)
         prepared_parts = []
         if language in ("en", "ja", "de", "ru", "th") and len(parts) == 2 and len(spoken) <= 120:
             prepared_parts = [self._phonemize(part, language, source) for part in parts]
