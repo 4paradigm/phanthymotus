@@ -118,7 +118,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
 
 @router.delete('/{channel_id}')
 async def delete_channel(channel_id: str):
-    ch = get_channel_config(channel_id)
+    ch = await asyncio.to_thread(get_channel_config, channel_id)
     if ch and ch['platform'] == 'qq':
         _qq_idle(channel_id)
     # 先停止 adapter
@@ -129,7 +129,7 @@ async def delete_channel(channel_id: str):
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     if ch and ch['platform'] == 'qq':
         from channel.qq_credentials import remove_secret
-        remove_secret(ch['config']['app_id'])
+        await asyncio.to_thread(remove_secret, ch['config']['app_id'])
     return {'deleted': channel_id}
 
 
