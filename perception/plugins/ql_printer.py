@@ -136,6 +136,7 @@ class QLPrinterPlugin:
         plugin_config = plugin_config or {}
         self._lock = threading.Lock()
         self._cfg = {
+            "printer_name": str(plugin_config.get("printer_name", "") or ""),
             "bridge_url": str(plugin_config.get("bridge_url", "") or ""),
             "token": str(plugin_config.get("token", "") or ""),
             "timeout_s": float(plugin_config.get("timeout_s", 8)),
@@ -163,6 +164,7 @@ class QLPrinterPlugin:
             "print": (["name", "host"], "从今天未入场访客列表中按姓名和被访人唯一匹配并打印；ticket 和防重复编号由卡片内部处理"),
         }
         properties = {
+            "printer_name": {"type": "string"},
             "name": {"type": "string", "description": "访客姓名"},
             "host": {"type": "string", "description": "被访人姓名；同名访客时用于缩小范围"},
             "ticket": {"type": "string", "description": "桥接内部使用的短期票据，不能自己编，也不能改写"},
@@ -179,6 +181,8 @@ class QLPrinterPlugin:
             "remote_start_port": {"type": "integer"},
             "remote_start_key_path": {"type": "string"},
         }
+        actions["config"][0].append("printer_name")
+        actions["printers"] = (["bridge_url", "token"], "读取目标电脑已安装的打印机")
         definition = tool(
             TOOL_NAME,
             "actuator",
@@ -186,9 +190,11 @@ class QLPrinterPlugin:
             "先 list 查看今天全部未入场访客，再用 name 和 host 调用 print；不要按猜测的名字打印。",
             action_schema(actions, properties),
         )
+        definition["inputSchema"]["properties"]["printer_name"] = {"type": "string"}
         definition["configSchema"] = {
             "type": "object",
             "properties": {
+                "printer_name": {"type": "string", "title": "目标打印机", "scope": "shared", "format": "bridge-printer"},
                 "bridge_url": {
                     "type": "string", "title": "桥接服务地址", "scope": "shared", "x-sensitive": True,
                     "description": "前台电脑上桥接服务的地址，例如 http://192.168.1.20:8765（前台电脑要设固定 IP）",
@@ -251,6 +257,7 @@ class QLPrinterPlugin:
         if action == "config":
             return self._config(args)
         handlers = {
+            "printers": self._printers,
             "list": self._list,
             # Keep old saved canvas actions working during rollout; find is no
             # longer advertised and now returns the same safe daily list.
@@ -261,7 +268,7 @@ class QLPrinterPlugin:
         handler = handlers.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
-        if not self._configured():
+        if not self._configured() and action != "printers":
             return {"status": "error", "code": "not_configured", "error": "卡片还没配置桥接服务地址，请在卡片配置里填写"}
         try:
             return handler(args)
@@ -279,6 +286,8 @@ class QLPrinterPlugin:
 
     def _config(self, args: dict) -> dict:
         update: dict = {}
+        if "printer_name" in args:
+            update["printer_name"] = str(args["printer_name"] or "").strip()
         if "bridge_url" in args:
             url = str(args["bridge_url"] or "").strip()
             if url:
@@ -362,6 +371,11 @@ class QLPrinterPlugin:
                 return None
         return {"status": "error", "code": "remote_start_timeout", "error": "已通知前台电脑启动桥接，但 15 秒内未恢复"}
 
+    def _printers(self, args: dict) -> dict:
+        # Use unsaved dialog connection values without changing runtime config.
+        client = BridgeClient(str(args.get("bridge_url") or self._cfg["bridge_url"]), str(args.get("token") or self._cfg["token"]), 20)
+        return client.request("POST", "/printers", body={})
+
     def _daily_visits(self) -> tuple[str, list[dict]]:
         recovery = self._ensure_remote_bridge()
         if recovery is not None:
@@ -392,7 +406,7 @@ class QLPrinterPlugin:
         payload = self._client().request(
             "POST",
             "/print_tag",
-            body={"ticket": ticket, "request_id": request_id},
+            body={"ticket": ticket, "request_id": request_id, "printer_name": self._cfg["printer_name"]},
             timeout_s=print_timeout_s,
         )
         if payload.get("ok") is True:
