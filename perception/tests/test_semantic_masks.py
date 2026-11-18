@@ -215,6 +215,7 @@ def test_card_registration_and_independent_instances(monkeypatch):
     assert plugin.dispatch("person",dict(a,action="info"))["topic_out"] == left["topic_out"]
     assert topics["/unavailable/jpeg"].closed
     plugin.shutdown()
+    assert topics["/cam/jpeg"].closed
 
 
 def test_supplemental_presets_register_as_cards(monkeypatch):

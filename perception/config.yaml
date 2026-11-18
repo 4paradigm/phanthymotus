@@ -164,7 +164,7 @@ plugins:
       car: [car]
       chair: [chair]
       traffic: [bicycle, car, motorcycle, bus, truck]
-      # 补充预设：避开 person/car/chair/traffic 已覆盖的类别，新增宠物、桌面、家具三类。
+      # Supplemental presets beyond the four above: pets, tabletop items, furniture.
       pet: [dog, cat]
       tableware: [bottle, cup, bowl]
       furniture: [bed, couch]
