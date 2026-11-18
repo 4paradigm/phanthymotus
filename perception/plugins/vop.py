@@ -805,6 +805,11 @@ class VideoObjectPerceptionPlugin:
         self._ensure_model()
         return self._model
 
+    def segmentation_model(self):
+        """Share the serialized TensorRT session and its exact class ordering with mask cards."""
+        model = self._require_engine()
+        return model, model.class_names() or list(self._vocabulary)
+
     def _recognize_image(self, args: dict, url_action: str) -> dict:
         """Decode one image and run the detector over it once."""
         cfg = dict(self._plugin_cfg)

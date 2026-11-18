@@ -196,15 +196,21 @@ class PerceptionBundle:
                 log.error("PhanthyMusicPlugin failed to load; continuing without phanthy_music",
                           exc_info=True)
 
-        if plugins_cfg.get("vop", {}).get("enabled", False):
+        vop_cfg = plugins_cfg.get("vop", {})
+        segment_cfg = plugins_cfg.get("segment", {})
+        if vop_cfg.get("enabled", False) or segment_cfg.get("enabled", False):
             import re, socket
-            namespace = plugins_cfg["vop"].get("namespace", "").strip()
+            namespace = vop_cfg.get("namespace", "").strip()
             if not namespace:
                 namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
             from plugins.vop import VideoObjectPerceptionPlugin
-            plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
-            self._plugins.append(plugin)
-            log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+            plugin = VideoObjectPerceptionPlugin(vop_cfg, namespace, executor)
+            if vop_cfg.get("enabled", False):
+                self._plugins.append(plugin)
+                log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+            if segment_cfg.get("enabled", False):
+                from plugins.segment import SegmentationPlugin
+                self._plugins.append(SegmentationPlugin(segment_cfg, executor, plugin.segmentation_model))
 
         # `vdp:` is the pre-rename spelling of this section; a config.yaml a
         # machine already has on disk still uses it.
