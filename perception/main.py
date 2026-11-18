@@ -210,7 +210,8 @@ class PerceptionBundle:
                 log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
             if segment_cfg.get("enabled", False):
                 from plugins.segment import SegmentationPlugin
-                self._plugins.append(SegmentationPlugin(segment_cfg, executor, plugin.segmentation_model))
+                self._plugins.append(SegmentationPlugin(
+                    segment_cfg, executor, plugin.segmentation_model, plugin.model_load_message))
 
         # `vdp:` is the pre-rename spelling of this section; a config.yaml a
         # machine already has on disk still uses it.

@@ -119,6 +119,56 @@ def test_camera_publishes_stamped_mask_report_and_optional_overlay_from_one_fram
         cam.close()
 
 
+def test_segmentation_cold_start_reports_shared_download_progress(monkeypatch):
+    from threading import Event
+    from types import ModuleType, SimpleNamespace
+    from plugins import vision_runtime
+    from plugins.segment import SegmentationPlugin, _Camera
+    from plugins.vop import VideoObjectPerceptionPlugin
+    from utils import model_downloader
+    from vision_stubs import _FakeExecutor, _wait_until
+
+    downloading, release = Event(), Event()
+    fetches = []
+
+    def fetch(model_dir, *, progress_cb):
+        fetches.append(model_dir)
+        progress_cb(40, 2, 5)
+        downloading.set()
+        assert release.wait(10)
+        return {"example.engine": "example.engine"}
+
+    validator = ModuleType("rclpy.validate_full_topic_name")
+    validator.validate_full_topic_name = lambda topic: None
+    monkeypatch.setitem(sys.modules, validator.__name__, validator)
+    monkeypatch.setattr(_Camera, "destroy_publisher", lambda node, pub: node.publishers.remove(pub), raising=False)
+    monkeypatch.setattr(VideoObjectPerceptionPlugin, "_prefetch_vocabulary", lambda self: None)
+    monkeypatch.setattr(model_downloader, "ensure_vop_model", fetch)
+    engine = SimpleNamespace(class_names=lambda: NAMES, input_size=(8, 8))
+    monkeypatch.setattr(vision_runtime, "VisionEngineSession", lambda path: engine)
+
+    executor = _FakeExecutor()
+    vop = VideoObjectPerceptionPlugin({}, "test", executor)
+    cards = SegmentationPlugin({}, executor, vop.segmentation_model, vop.model_load_message)
+    args = {"instance_id": "left", "input_topic": "/test/rgb"}
+    try:
+        assert cards.dispatch("person", dict(args, action="start"))["state"] == "loading"
+        assert downloading.wait(5)
+        cards.dispatch("car", dict(args, action="start"))
+        for status in (cards.dispatch("person", args), cards.dispatch("car", args), vop.dispatch("info", {})):
+            assert status["state"] == "loading"
+            assert "40% (2/5 MB)" in status["message"]
+        release.set()
+        assert _wait_until(lambda: cards.dispatch("person", args)["state"] == "running")
+        assert cards.dispatch("car", args)["message"] == ""
+        assert vop.dispatch("info", {})["state"] == "idle"
+        assert vop.model_load_message() == ""
+        assert len(fetches) == 1
+    finally:
+        release.set()
+        cards.shutdown()
+
+
 def test_card_registration_and_independent_instances(monkeypatch):
     import types
     import plugins.segment as cards
@@ -149,7 +199,7 @@ def test_card_registration_and_independent_instances(monkeypatch):
     validator.validate_full_topic_name = lambda topic: None
     monkeypatch.setitem(sys.modules,"rclpy.validate_full_topic_name",validator)
     monkeypatch.setattr(cards,"_Camera",Stream)
-    plugin = SegmentationPlugin({},None,lambda:None)
+    plugin = SegmentationPlugin({}, None, lambda: None, lambda: "")
     assert {t["name"] for t in plugin.get_tools()} == {"car","person","chair","traffic"}
     a = {"instance_id":"left","input_topic":"/cam/jpeg"}
     b = {"instance_id":"right","input_topic":"/cam/jpeg"}

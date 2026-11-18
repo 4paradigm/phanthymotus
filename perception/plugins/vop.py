@@ -697,6 +697,7 @@ class VideoObjectPerceptionPlugin:
         with self._model_lock:
             if self._model is not None:
                 return
+            self._model_load_status = None
 
             # No YOLO_CONFIG_DIR / TORCH_HOME setup any more: ultralytics is not
             # in this path at all — the engine is run directly through
@@ -740,6 +741,7 @@ class VideoObjectPerceptionPlugin:
             self._vocabulary = model.class_names() or vocab
             # Other camera workers use _model as the readiness check.
             self._model = model
+            self._model_load_status = None
             if not self._vocabulary:
                 log.warning("[vop] engine carries no class names and no vocab.json "
                             "was readable — detections will be labelled by index")
@@ -811,6 +813,12 @@ class VideoObjectPerceptionPlugin:
         """Share the serialized TensorRT session and its exact class ordering with mask cards."""
         model = self._require_engine()
         return model, model.class_names() or list(self._vocabulary)
+
+    def model_load_message(self):
+        """Report the shared engine's progress without blocking a card info request."""
+        if self._model_loading or (self._model is None and self._model_lock.locked()):
+            return self._model_load_status or "Loading YOLO model..."
+        return ""
 
     def _recognize_image(self, args: dict, url_action: str) -> dict:
         """Decode one image and run the detector over it once."""
@@ -1012,11 +1020,12 @@ class VideoObjectPerceptionPlugin:
 
         if action == "info":
             # Report loading/error state
-            if self._model_loading:
+            loading = self.model_load_message()
+            if loading:
                 return {
                     "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                     "state": "loading",
-                    "desc": "Loading YOLO model...",
+                    "desc": loading, "message": loading,
                     # **The declaration does not wait for the engine.**
                     #
                     # This reply used to drop it, and agent-core records
@@ -1151,11 +1160,9 @@ class VideoObjectPerceptionPlugin:
                     def _bg_start():
                         self._model_loading = True
                         self._model_load_error = None
-                        self._model_load_status = None
                         try:
                             self._ensure_model()
                             self._model_loading = False
-                            self._model_load_status = None
                             self._start_node(node_key, input_topic)
                         except Exception as e:
                             self._model_loading = False
@@ -1164,7 +1171,7 @@ class VideoObjectPerceptionPlugin:
                     threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
                     return {"state": "loading", "input": input_topic or "",
                             "output": output_topic_for(input_topic),
-                            "message": "Model loading in background, will start automatically"}
+                            "message": self._model_load_status or "Model loading in background, will start automatically"}
                 self._start_node(node_key, input_topic)
                 with self._nodes_lock:
                     running = self._nodes.get(node_key)

@@ -172,9 +172,10 @@ class _Camera(Node):
 class SegmentationPlugin:
     PREFIX = "segment"
 
-    def __init__(self, cfg, executor, model_provider):
+    def __init__(self, cfg, executor, model_provider, model_load_message):
         self.executor = executor
         self.provider = model_provider
+        self.model_load_message = model_load_message
         self.confidence, self.fps = float(cfg.get("confidence", .30)), float(cfg.get("fps", 4))
         if not (0 < self.confidence <= 1 and 0 < self.fps <= 30 and math.isfinite(self.fps)):
             raise ValueError("segment confidence must be in (0,1] and fps in (0,30]")
@@ -251,16 +252,18 @@ class SegmentationPlugin:
                 raise ValueError("Unknown segmentation card action")
             active = self.nodes.get(self.instances.get(key))
             state = "idle"
-            err = ""
+            message = ""
             if active:
                 with active.cv:
                     state = "error" if active.load_failed else ("running" if active.ready else "loading")
-                    err = active.error
+                    message = active.error
+                    if state == "loading":
+                        message = self.model_load_message() or "Preparing segmentation model..."
                     if active.ready:
                         missing = set(self.cards[name]) - active.vocabulary
                         if missing:
-                            state, err = "error", "Classes absent from frozen YOLOE vocabulary: " + ", ".join(sorted(missing))
+                            state, message = "error", "Classes absent from frozen YOLOE vocabulary: " + ", ".join(sorted(missing))
             wired = self.instances.get(key) or topic
-            return {"state": state, "message": err, "classes": self.cards[name],
+            return {"state": state, "message": message, "classes": self.cards[name],
                     "topic_in": [{"topic": wired, "format": "image/jpeg", "desc": "Camera JPEG"}],
                     "topic_out": _ports(wired, name, key[1], self.preview)}
