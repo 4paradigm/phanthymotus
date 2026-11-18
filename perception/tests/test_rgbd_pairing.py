@@ -79,3 +79,23 @@ def test_one_missing_capture_preserves_the_other_source_time():
     assert pair[0][0]==a.observation_stamp_ns
     assert pair.color_time.original_stamp==a.original_stamp
     assert pair.depth_context.source_capture_id is None
+
+
+def test_buffered_images_choose_closest_available_capture_after_one_stream_drops_frames():
+    pairer = RgbdPairer()
+    old, current = context(1_000_000_000), context(1_066_000_000)
+    pairer.push('color', msg(), old)
+    pairer.push('color', msg(), current)
+    pair = pairer.push('depth', msg(), context(1_066_010_000))
+    assert pair.color_context is current
+    assert pair.skew_ns == 10_000 and pair.method == 'nearest_buffered'
+    assert pairer.dropped == 1 and pairer.pending_count == 0
+
+
+def test_closest_pair_preserves_later_candidates_and_breaks_ties_by_arrival():
+    pairer = RgbdPairer()
+    first, second = context(100), context(200)
+    pairer.push('depth', msg(), first)
+    pairer.push('depth', msg(), second)
+    assert pairer.push('color', msg(), context(150)).depth_context is first
+    assert pairer.push('color', msg(), context(3000)).depth_context is second

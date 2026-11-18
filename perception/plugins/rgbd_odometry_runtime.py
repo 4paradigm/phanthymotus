@@ -397,10 +397,14 @@ class RgbdSession:
         self.time_policy = TimePolicy(input_registry.clock_id if input_registry else 'rgbd_ingress/' + uuid.uuid4().hex)
         self.contexts_by_stamp = OrderedDict()
         calibration = observation_calibration(calibration, self.time_policy.clock_id)
-        if association_enabled(calibration):
-            # Reject old images that would silently ignore the new optional parameter.
-            require_rotation_hint_runtime(require_runtime())
         self.assistance_unavailable = None
+        if association_enabled(calibration):
+            binary = require_runtime()
+            try:
+                require_rotation_hint_runtime(binary)
+            except RuntimeError as error:
+                calibration['inertial_association'] = False
+                self.assistance_unavailable = str(error)
         self.calibration, self.executor, self.topic = calibration, executor, topic
         self.publish_output = publish_output
         self.segment = 'rgbd_' + uuid.uuid4().hex[:12]
@@ -427,6 +431,7 @@ class RgbdSession:
             require_translation=bool(self.requested_calibration.get('short_term_compensation')))
             if self.requested_calibration.get('imu_topic')
             else None)
+        self.imu_coverage_timed_out = False
         self.imu_topic = (calibration.get('imu_topic') or self.requested_calibration.get('imu_topic')
                           if self.auxiliary_probe is not None else calibration.get('imu_topic'))
         self.lock = threading.RLock()
@@ -581,11 +586,13 @@ class RgbdSession:
     def _probing_auxiliary(self):
         return (getattr(self, 'auxiliary_probe', None) is not None and
                 (self.imu is None or self.gate.state == 'lost' or
+                 (self.fusion is None and self.requested_calibration.get('short_term_compensation')) or
                  (getattr(self, 'fusion', None) is not None and self.fusion.state == 'lost')))
 
     def _mode_info(self):
         requested = assistance_mode(getattr(self, 'requested_calibration', self.calibration))
-        effective = 'visual_only' if getattr(self, 'fallback', None) is not None else assistance_mode(self.calibration)
+        effective = (self.fallback['mode'] if getattr(self, 'fallback', None) is not None
+                     else assistance_mode(self.calibration))
         transition = getattr(self, 'mode_transition', None)
         return dict(requested=requested, effective=effective, degraded=requested != effective,
                     reason=(self.fallback['reason'] if getattr(self, 'fallback', None) is not None else
@@ -664,8 +671,26 @@ class RgbdSession:
                         calibration[key] = self.requested_calibration[key]
                 return dict(action='restore_assistance', calibration=calibration,
                             reason='auxiliary source passed numeric format checks')
-            auxiliary_loss = (self.gate.loss_kind in ('imu', 'fusion') and self.imu is not None)
+            attitude = None
+            if self.fallback is not None and not self.rotation_hints.enabled:
+                attitude = self.imu
+            elif (self.imu is None and health.get('attitude_ready') and
+                  now_s-self.mode_changed_at >= ASSISTANCE_RETRY_S):
+                attitude = self.auxiliary_probe.validator
+            if attitude is not None and attitude.covers(self.gate.last_input, now_ns):
+                # Native gravity initialization owns a different world basis.
+                # Switch through the supervisor so it publishes a fresh segment.
+                return dict(action='restore_assistance', calibration=dict(source,
+                    imu_topic=self.requested_calibration['imu_topic'], imu_assisted=True,
+                    short_term_compensation=False, depth_geometry=False, inertial_association=False),
+                    reason='ESKF unavailable; rotation available for native attitude assistance')
+            auxiliary_loss = (self.imu is not None and
+                              (self.gate.loss_kind in ('imu', 'fusion') or self.imu_coverage_timed_out))
             if self.gate.state == 'lost' and (auxiliary_loss or getattr(self, 'fallback', None) is not None):
+                if self.rotation_hints.enabled:
+                    # Optional hints never block images. Preserve their input in
+                    # the new segment even if the next ESKF has no lever arm.
+                    return dict(action='restart', calibration=source, reason=self.gate.reason)
                 return dict(action='degrade_assistance', calibration=visual_calibration(source),
                             reason=self.gate.reason or mode['reason'])
             return None
@@ -714,7 +739,14 @@ class RgbdSession:
                     return
                 if getattr(self, 'fusion', None) is not None:
                     if self.fusion.state != 'lost':
-                        self.fusion.observe_imu(packet, time.time_ns())
+                        try:
+                            self.fusion.observe_imu(packet, time.time_ns())
+                        except ValueError:
+                            # Each stage records its own fault. Missing translation
+                            # stops ESKF but leaves a valid rotation available.
+                            return
+                    else:
+                        self.imu.observe(packet, time.time_ns())
                     return
                 sample = self.imu.observe(packet, time.time_ns())
                 if sample is None:
@@ -735,7 +767,7 @@ class RgbdSession:
                     return
                 self.imu.fault(error)
                 if getattr(self, 'fusion', None) is not None:
-                    self.fusion.fault(error)  # visual-only fallback decides continuity
+                    self.fusion.fault(error)
                 else:
                     self.gate.fault('IMU assistance: ' + str(error), 'imu')
 
@@ -758,11 +790,14 @@ class RgbdSession:
             with self.lock:
                 self._drain_imu()
                 if self.fusion is not None or self._imu_frame_ready(stamp, time.time_ns()):
+                    self.imu_coverage_timed_out = False
                     return True
                 if self.gate.state == 'lost':
                     return False
             remaining = deadline-time.monotonic()
             if remaining <= 0:
+                with self.lock:
+                    self.imu_coverage_timed_out = True
                 return False
             self.stop_event.wait(min(.005, remaining))
         return False
@@ -871,8 +906,7 @@ class RgbdSession:
                         if self.gate.state == 'lost':
                             continue
                         if getattr(self, 'rotation_hints', None) is not None:
-                            self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns(),
-                                available=self._fusing() and self.fusion.state != 'lost')
+                            self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns())
                         self.rgbd.publish(out)
                         self.counts['pairs'] += 1
             except Exception as error:
@@ -910,12 +944,14 @@ class RgbdSession:
                             f'continuity (fused/visual offset {offset[0]:.3f} m, '
                             f'{np.rad2deg(offset[1]):.1f} deg)', 'fusion')
             return
-        self.fallback = dict(mode='visual_only', reason=reason, since_ns=now,
+        hints = getattr(self, 'rotation_hints', None)
+        mode = 'visual' if hints and hints.enabled else 'visual_only'
+        self.fallback = dict(mode=mode, reason=reason, since_ns=now,
                              fused_visual_offset_m=None if offset is None else round(offset[0], 4),
                              fused_visual_offset_deg=None if offset is None else round(float(np.rad2deg(offset[1])), 2))
         self.mode_changed_at = time.monotonic()
         self.mode_transition = dict(action='degrade_assistance', previous_segment=self.segment,
-                                    from_mode=assistance_mode(self.calibration), to_mode='visual_only', reason=reason)
+                                    from_mode=assistance_mode(self.calibration), to_mode=mode, reason=reason)
         if self.gate.last_pose is None and self.fusion.last_tracking is None:
             # The visual phase gets one bounded initialization window after
             # unsuccessful fusion warmup, never one window per weak frame.
@@ -924,7 +960,7 @@ class RgbdSession:
         self.observations.frames.clear()
         gate = self.gate
         gate.good = 0
-        gate.reason = 'visual-only fallback after ESKF loss: ' + reason
+        gate.reason = mode.replace('_', '-') + ' fallback after ESKF loss: ' + reason
         gate.last_stamp = max(gate.last_stamp, self.fusion.last_visual)
         if self.fusion.last_tracking is not None:
             # Something was published: resuming is a bounded recovery.
@@ -935,11 +971,12 @@ class RgbdSession:
 
     def _label_fallback(self, sample):
         vendor = sample['vendor']
-        vendor['fallback'] = 'visual_only'
+        fallback = self.fallback['mode']
+        vendor['fallback'] = fallback
         vendor['fusion'] = {'enabled': True, 'status': 'lost', 'reason': self.fallback['reason'],
-                            'fallback': 'visual_only', 'mapping_allowed': sample['pose'] is not None}
+                            'fallback': fallback, 'mapping_allowed': sample['pose'] is not None}
         if vendor['motus_slam']['status'] == 'tracking':
-            vendor['reason'] = 'visual-only fallback: ESKF ' + self.fallback['reason'][:80]
+            vendor['reason'] = fallback.replace('_', '-') + ' fallback: ESKF ' + self.fallback['reason'][:80]
         return sample
 
     def _publish(self, sample):
@@ -1007,7 +1044,7 @@ class RgbdSession:
                 sample['vendor']['pause'] = dict(status='recovering',mapping_allowed=False)
             else:self.previous_motion = deepcopy(sample)
         sample['vendor']['imu_assistance'] = self.imu.info(time.time_ns()) if self.imu else {'enabled': False}
-        sample['vendor']['inertial_association'] = (self.rotation_hints.info()
+        sample['vendor']['inertial_association'] = (self.rotation_hints.info(stamp)
             if getattr(self, 'rotation_hints', None) is not None else {'enabled': False})
         if sample['pose'] is not None and sample['vendor']['motus_slam']['status'] == 'tracking':
             if getattr(self, 'first_tracking_at', None) is None:

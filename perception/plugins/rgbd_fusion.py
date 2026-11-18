@@ -290,8 +290,8 @@ class ShortTermFusion:
         if self.state == 'lost':
             return
         try:
-            translations = translation_extrinsics(packet)
             sample = self.imu.observe(packet, now_ns)
+            translations = translation_extrinsics(packet)
             self.translations = translations
             self.lever = translations[3:].copy()
             if self.filter is not None:

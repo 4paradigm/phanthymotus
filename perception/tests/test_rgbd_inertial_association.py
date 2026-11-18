@@ -302,10 +302,11 @@ def test_real_session_wires_private_hint_and_conservative_fusion(hint_session):
     assert sample['vendor']['inertial_association']['native_applied'] is None
 
 
+@pytest.mark.parametrize('translations', [False, True])
 @pytest.mark.parametrize('coverage', [False, True])
 @pytest.mark.parametrize('color_offset_ns', [1, 800_000])
 def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
-        hint_session, monkeypatch, coverage, color_offset_ns):
+        hint_session, monkeypatch, coverage, color_offset_ns, translations):
     import json
     import zlib
     from plugins import rgbd_odometry_runtime as runtime
@@ -319,7 +320,15 @@ def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
                          translation_source='sdk_factory_extrinsics',
                          camera_from_gyro_translation=[0., 0., 0.],
                          camera_from_accel_translation=[0., 0., 0.])
+            if not translations:
+                imu.pop('camera_from_gyro_translation')
+                imu.pop('camera_from_accel_translation')
             session._imu(NS(data=json.dumps(imu)))
+        if not translations:
+            session._check_fusion(now[0])
+            assert session.fusion.state == 'lost' and session.fallback is not None
+            assert list(session.imu.history) == [depth_stamp - 10_000_000, depth_stamp + 10_000_000]
+
     # Codec and DDS are boundaries; run the actual worker, pairing stamp choice,
     # optional-hint decision and publication order.
     monkeypatch.setitem(sys.modules, 'cv2', NS(IMREAD_COLOR=1, IMWRITE_PNG_COMPRESSION=16,
@@ -354,6 +363,29 @@ def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
         assert runtime.stamp_ns(events[0][1]) == capture
         assert capture == (depth_stamp if color_offset_ns == 1 else color_stamp)
         assert session.imu.last_stamp == depth_stamp + 10_000_000
+    if coverage and not translations:
+        assert session.info()['mode']['effective'] == 'visual'
+        assert session.rotation_hints.info(capture)['offered_for_frame'] is True
+        assert session.rotation_hints.info(capture + 100_000_000)['offered_for_frame'] is False
+        assert session.rotation_hints.info(capture)['native_applied'] is None
+        for kind in ('visual', 'input'):
+            session.gate.loss_kind = None
+            session.gate.state = 'tracking'
+            session.gate.fault('lost principal input', kind)
+            target = session.recovery_target(100., now[0])
+            assert target['calibration'].get('imu_topic') and target['calibration']['inertial_association']
     assert events[-1][1].rgb_compressed.header == originals[0]
     assert events[-1][1].depth_compressed.header == originals[1]
     assert color.header == originals[0] and depth.header == originals[1]
+
+
+def test_malformed_imu_during_rotation_fallback_does_not_supply_an_old_hint(hint_session):
+    import json
+    session, now, _ = hint_session
+    stamp = now[0]
+    session._imu(NS(data=json.dumps(packet(stamp))))
+    session._check_fusion(now[0])
+    assert session.fallback is not None and session.imu.state == 'active'
+    session._imu(NS(data='invalid json'))
+    assert session.imu.orientation_at(stamp, now[0]) is None
+    assert session.gate.state != 'lost'

@@ -33,6 +33,7 @@ class AuxiliaryHealthProbe:
     def __init__(self, frame, clock, *, require_translation=False):
         self.frame, self.clock = frame, clock
         self.require_translation = require_translation
+        self.translation_ready = False
         self.validator = None
         self.first_seen = self.last_seen = self.first_capture = None
         self.reason = 'waiting for usable auxiliary samples'
@@ -48,8 +49,6 @@ class AuxiliaryHealthProbe:
         try:
             if not isinstance(packet, dict):
                 raise ValueError('auxiliary packet must be an object')
-            if self.require_translation:
-                translation_extrinsics(packet)
             if self.validator is None:
                 self.validator = ImuAttitude(self.frame, self.clock)
             sample = self.validator.observe(packet, now_ns)
@@ -60,6 +59,14 @@ class AuxiliaryHealthProbe:
                 return
             if self.first_seen is None:
                 self.first_seen, self.first_capture = now_s, sample['stamp_ns']
+            if self.require_translation:
+                try:
+                    translation_extrinsics(packet)
+                except ValueError as error:
+                    self.translation_ready = False
+                    self.reason = str(error)
+                    return
+                self.translation_ready = True
             self.reason = 'IMU numeric format accepted'
         except (ValueError, TypeError, KeyError, OverflowError) as error:
             self.reset(error)
@@ -70,8 +77,9 @@ class AuxiliaryHealthProbe:
         if validator is not None and self.first_seen is not None:
             healthy = max(0., min(now_s-self.first_seen,
                 (validator.last_stamp-self.first_capture)/1e9))
-        ready = validator is not None and validator.state == 'active'
-        return dict(enabled=True, status='ready' if ready else 'warming' if self.first_seen is not None else 'waiting',
+        attitude_ready = validator is not None and validator.state == 'active'
+        ready = attitude_ready and (not self.require_translation or self.translation_ready)
+        return dict(enabled=True, attitude_ready=attitude_ready, status='ready' if ready else 'warming' if self.first_seen is not None else 'waiting',
                     reason='IMU numeric format ready for a new segment' if ready else self.reason,
                     healthy_for_s=round(healthy, 3), required_healthy_s=0.,
                     last_measurement_ns=validator.last_stamp if validator else None,

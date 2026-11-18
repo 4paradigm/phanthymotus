@@ -1,4 +1,5 @@
 """Optional rotation hints for the pinned native visual registration frontend."""
+from collections import deque
 from pathlib import Path
 
 
@@ -30,6 +31,7 @@ class RotationHints:
         self.enabled = association_enabled(calibration)
         self.frame, self.clock = calibration['frame_id'], calibration['clock_id']
         self.offered = self.skipped = 0
+        self.offered_stamps = deque(maxlen=64)
         self.last_offered_stamp_ns = self.last_skip_reason = None
         self.publisher = None
         if self.enabled:
@@ -58,6 +60,7 @@ class RotationHints:
         except (RuntimeError, ValueError, TypeError):
             return self._skip('hint transport unavailable')
         self.offered += 1
+        self.offered_stamps.append(stamp_ns)
         self.last_offered_stamp_ns, self.last_skip_reason = stamp_ns, None
         return True
 
@@ -66,8 +69,9 @@ class RotationHints:
         self.last_skip_reason = reason
         return False
 
-    def info(self):
+    def info(self, stamp_ns=None):
         return dict(enabled=self.enabled, offered=self.offered, skipped=self.skipped,
+                    offered_for_frame=stamp_ns in self.offered_stamps if stamp_ns is not None else None,
                     last_offered_stamp_ns=self.last_offered_stamp_ns,
                     last_skip_reason=self.last_skip_reason, native_applied=None,
                     role='rotation_initial_guess',

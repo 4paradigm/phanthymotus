@@ -334,3 +334,82 @@ def test_degraded_probe_overflow_keeps_retained_format_evidence(recovery, monkey
         healthy_visual_tick(visual, now, seconds)
     assert visual.info()['auxiliary_recovery']['status'] == 'ready'
     assert visual.gate.state == 'tracking'
+
+
+def observe_attitude_output(attitude, monkeypatch):
+    import sys
+    monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'Imu', lambda: NS(header=NS(stamp=NS()),
+        orientation=NS(), angular_velocity=NS(), linear_acceleration=NS()))
+    output = []
+    attitude.imu_pub.publish = output.append
+    return output
+
+
+@pytest.mark.parametrize('requested_hint', [False, True])
+def test_missing_lever_arm_without_native_hints_recovers_using_attitude_in_new_segment(
+        recovery, monkeypatch, requested_hint, tmp_path):
+    card, args, now, seconds = recovery
+    old = card.instances['one'][0]
+    old.process.returncode = 0
+    card.dispatch('rgbd_odometry', dict(action='stop', instance_id='one'))
+    assisted_runtime(monkeypatch)
+    monkeypatch.setattr(runtime, 'require_runtime', lambda: tmp_path / 'lib/rtabmap_odom/rgbd_odometry')
+    result = card.dispatch('rgbd_odometry', dict(args, input_topics=['/rgb','/depth','/imu'],
+        short_term_compensation=True, inertial_association=requested_hint))
+    assert result['state'] == 'running', result
+    fusion = card.instances['one'][0]
+    p = imu_packet(now[0])
+    p.pop('camera_from_gyro_translation')
+    p.pop('camera_from_accel_translation')
+    fusion._imu(NS(data=json.dumps(p)))
+    images(fusion, now[0]); fusion.process.returncode = 0
+    card._recover()
+    attitude = card.instances['one'][0]
+    attitude.process.returncode = 0
+    assert attitude.segment != fusion.segment and attitude.info()['mode']['effective'] == 'imu_attitude'
+    assert attitude.requested_calibration['short_term_compensation'] is True
+    assert runtime.estimator_parameters(attitude.calibration, attitude.segment)['wait_imu_to_init']
+    output = observe_attitude_output(attitude, monkeypatch)
+    attitude._imu(NS(data=json.dumps(p)))
+    assert len(output) == 1 and output[0].header.frame_id == attitude.calibration['frame_id']
+    assert attitude.fusion is None and not attitude.rotation_hints.enabled
+
+
+def test_timed_out_native_attitude_without_frame_coverage_restarts_visual(recovery, monkeypatch):
+    card, args, now, seconds = recovery
+    old = assisted(card, args, monkeypatch)
+    old.imu.observe(imu_packet(now[0]), now[0])
+    images(old, now[0])
+    assert not old._wait_for_imu(now[0] + 1, deadline=seconds[0])
+    old.gate.fault('visual estimate stale', 'visual')
+    old.process.returncode = 0
+    card._recover()
+    seconds[0] += 1.
+    card._recover()
+    new = card.instances['one'][0]
+    new.process.returncode = 0
+    assert new.imu is None and not runtime.estimator_parameters(new.calibration, new.segment).get('wait_imu_to_init')
+
+
+def test_rotation_only_probe_restores_native_attitude_then_complete_data_restores_eskf(
+        recovery, monkeypatch):
+    card, args, now, seconds = recovery
+    visual = degraded_session(card, args, now, seconds, monkeypatch, fusion=True)
+    p = imu_packet(now[0])
+    p.pop('camera_from_gyro_translation')
+    seconds[0] += 21.
+    visual._imu(NS(data=json.dumps(p)))
+    images(visual, now[0]); visual.process.returncode = 0
+    card._recover()
+    attitude = card.instances['one'][0]
+    attitude.process.returncode = 0
+    assert attitude is not visual and attitude.imu is not None and attitude.fusion is None
+    # ESKF-only information becomes available later in the same binding.
+    observe_attitude_output(attitude, monkeypatch)
+    seconds[0] += 21.
+    send_imu(attitude, now, seconds, now[0])
+    images(attitude, now[0])
+    card._recover()
+    restored = card.instances['one'][0]
+    restored.process.returncode = 0
+    assert restored is not attitude and restored.fusion is not None

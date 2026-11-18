@@ -66,8 +66,19 @@ class RgbdPairer:
             self._drop(oldest)
         color, depth = self.queues['color'], self.queues['depth']
         if color and depth:
+            other = depth if kind == 'color' else color
+            method = 'fifo'
+            if len(other) > 1:
+                # One stream can accumulate extra frames while the other drops
+                # samples. Prefer the closest queued partner without waiting.
+                stamp = context.observation_stamp_ns
+                nearest = min(range(len(other)),
+                              key=lambda i: abs(other[i][1].observation_stamp_ns - stamp))
+                for _ in range(nearest):
+                    self._drop(other)
+                method = 'nearest_buffered'
             cm, a, _, _ = color.popleft()
             dm, b, _, _ = depth.popleft()
-            return RgbdPair(cm, dm, a, b, uuid.uuid4().hex, 'fifo',
+            return RgbdPair(cm, dm, a, b, uuid.uuid4().hex, method,
                             abs(a.observation_stamp_ns-b.observation_stamp_ns), a, b)
         return None
