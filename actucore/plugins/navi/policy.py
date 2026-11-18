@@ -1496,52 +1496,68 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             status, reason = AVOIDING, f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速"
 
     side = 0.0
+    local_command = None
     if near or (approaching and foreground):
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
-        # A summary with a missing side band supplies no evidence of free space.
-        usable = {s: (float("inf") if room is None else room)
-                  for s, (room, cov) in rooms.items()
-                  if cov >= config.coverage_min and (target_distance is not None or near)
-                  and ((room is None and depth.get("map") is not None)
-                       or (room is not None and room > config.side_clearance_m))}
-        if usable:
-            side = (state.escape_side if state and state.escape_side in usable
-                    else max(usable, key=usable.get))
+        if config.local_planning:
+            # Side corridor readings only order the footprint-checked routes.
+            priority = {}
+            for candidate, (room, cov) in rooms.items():
+                measured = cov >= config.coverage_min
+                if room is None:
+                    room = math.inf if measured else -math.inf
+                priority[candidate] = (measured, room, cov, state is not None
+                                       and state.escape_side == candidate)
+            for candidate in sorted(rooms, key=priority.__getitem__, reverse=True):
+                command = _local_translation(depth, config, state, odom, ahead, candidate)
+                if command is not None and (not near or command[0] <= 0):
+                    side, local_command = candidate, command
+                    break
+            if local_command is None:
+                if state is not None:
+                    state.escape_side = 0.0
+                    state.recovery = ClearanceRecovery()
+                return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
-            left, right = (_side_label(*rooms[s], config) for s in (-1.0, 1.0))
-            blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
-                       f"（左 {left}，右 {right}）")
-            brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
-            if (foreground and aligned and depth.get("map") is not None
-                    and target_distance is not None and coverage >= config.coverage_full
-                    and (state is None or state.recovery is None)
-                    and brake_at < ahead < slow):
-                limit = AVOIDANCE_MAX_TRANSLATION_MPS * (ahead - brake_at) / (slow - brake_at)
-                approach = min(vx * scale, limit)
-                # Stay within the limit even when the gait has a speed floor.
-                if approach > 0.0 and approach >= config.floor_vx:
-                    if state is not None:
-                        state.escape_side = 0.0
-                    return (approach, 0.0, 0.0, AVOIDING,
-                            f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
-            if state is not None:
-                state.escape_side = 0.0
-                state.recovery = ClearanceRecovery()
-            return 0.0, 0.0, 0.0, AVOIDING, f"{blocked}；停下"
+            # A summary with a missing side band supplies no evidence of free space.
+            usable = {s: (float("inf") if room is None else room)
+                      for s, (room, cov) in rooms.items()
+                      if cov >= config.coverage_min and (target_distance is not None or near)
+                      and ((room is None and depth.get("map") is not None)
+                           or (room is not None and room > config.side_clearance_m))}
+            if usable:
+                side = (state.escape_side if state and state.escape_side in usable
+                        else max(usable, key=usable.get))
+            else:
+                left, right = (_side_label(*rooms[s], config) for s in (-1.0, 1.0))
+                blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
+                           f"（左 {left}，右 {right}）")
+                brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
+                if (foreground and aligned and depth.get("map") is not None
+                        and target_distance is not None and coverage >= config.coverage_full
+                        and (state is None or state.recovery is None)
+                        and brake_at < ahead < slow):
+                    limit = AVOIDANCE_MAX_TRANSLATION_MPS * (ahead - brake_at) / (slow - brake_at)
+                    approach = min(vx * scale, limit)
+                    # Stay within the limit even when the gait has a speed floor.
+                    if approach > 0.0 and approach >= config.floor_vx:
+                        if state is not None:
+                            state.escape_side = 0.0
+                        return (approach, 0.0, 0.0, AVOIDING,
+                                f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
+                if state is not None:
+                    state.escape_side = 0.0
+                    state.recovery = ClearanceRecovery()
+                return 0.0, 0.0, 0.0, AVOIDING, f"{blocked}；停下"
 
     vx = _scaled(vx, scale, config.floor_vx, config.vx_max)
     vy = _scaled(vy, scale, config.floor_vy, config.vy_max)
     if state is not None:
         state.escape_side = side
-    if side and config.local_planning:
-        command = _local_translation(depth, config, state, odom, ahead, side)
-        if command is None or (near and command[0] > 0):
-            if state is not None:
-                state.recovery = ClearanceRecovery()
-            return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
-        vx, vy = command
+    if local_command is not None:
+        vx, vy = local_command
         wz = 0.0
         state.avoidance_yaw_override = True
         status, reason = AVOIDING, "局部规划：沿前向避障路线低速行进"

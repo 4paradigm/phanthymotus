@@ -1465,12 +1465,19 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
     monkeypatch.setattr(
         policy, "_clearance",
         lambda depth, config, lateral_offset_m=0: (
-            1.2 if lateral_offset_m > 0 else .5 if lateral_offset_m < 0 else .9, 1.0))
-    monkeypatch.setattr(local_path, "_checked_translation", lambda *args: (.04, -.06))
+            .79 if lateral_offset_m > 0 else .80 if lateral_offset_m < 0 else .78, 1.0))
+    attempted = []
+
+    def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms):
+        attempted.append((side, half_width))
+        return (.04, -.06) if side > 0 else None
+
+    monkeypatch.setattr(local_path, "_checked_translation", plan)
     for index in range(6):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
     assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
+    assert attempted == [(-1.0, .33), (1.0, .33)]
     assert command["obs_stamp_ms"] == 122_950
     card._odom_ms = 0
     assert card.next_command()["values"] == [0.0] * 6

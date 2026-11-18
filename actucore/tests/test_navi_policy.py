@@ -2468,3 +2468,23 @@ def test_local_planning_holds_instead_of_using_an_unchecked_avoidance_turn():
                      odom={"vx": 0.0, "vy": 0.0, "wz": 0.0})
     assert decision.values == [0.0] * 6
     assert "局部规划" in decision.reason
+
+
+def test_local_planner_tries_other_side_if_preferred_route_would_advance_near_obstacle(monkeypatch):
+    cfg = _cfg(local_planning=True)
+    state = _state()
+    attempts = []
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        .95 if lateral_offset_m > 0 else .85 if lateral_offset_m < 0 else .4, 1.0))
+
+    def plan(depth, config, state, odom, ahead, side):
+        attempts.append(side)
+        return (.04, -.06) if side > 0 else (0.0, .06)
+
+    monkeypatch.setattr(P, "_local_translation", plan)
+    command = P._avoid(.1, 0, 0, _scene(2.8), cfg, P.AVOIDING, "", state,
+                       target_distance=2.8)
+
+    assert attempts == [1.0, -1.0]
+    assert command[:3] == (0.0, .06, 0.0)
+    assert state.escape_side == -1.0

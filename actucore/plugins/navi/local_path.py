@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import heapq
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -162,19 +162,21 @@ def camera_square(horizontal, vertical, half_width):
 @dataclass
 class PlanCache:
     key: tuple | None = None
-    command: tuple[float, float] | None = None
+    commands: dict[float, tuple[float, float] | None] = field(default_factory=dict)
 
     def translation(self, observation, geometry, half_width, ahead, side, max_age_ms):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
             return None
-        key = (frame, side, round(ahead, 2))
+        key = (frame, round(ahead, 2))
         if self.key != key:
-            command = _checked_translation(
+            self.key = key
+            self.commands.clear()
+        if side not in self.commands:
+            self.commands[side] = _checked_translation(
                 observation["map"], ground, geometry, half_width, ahead, side, max_age_ms)
-            self.key, self.command = key, command
-        return self.command
+        return self.commands[side]
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms):
