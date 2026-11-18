@@ -1,17 +1,18 @@
 diff --git a/rtabmap_odom/include/rtabmap_odom/OdometryROS.h b/rtabmap_odom/include/rtabmap_odom/OdometryROS.h
 --- a/rtabmap_odom/include/rtabmap_odom/OdometryROS.h
 +++ b/rtabmap_odom/include/rtabmap_odom/OdometryROS.h
-@@ -39,6 +39,9 @@
+@@ -39,6 +39,10 @@
  #include <std_srvs/srv/empty.hpp>
  #include <std_msgs/msg/header.hpp>
  #include <nav_msgs/msg/odometry.hpp>
 +#include <geometry_msgs/msg/quaternion_stamped.hpp>
 +#include <memory>
++#include <atomic>
 +#include "rtabmap_odom/RotationHintBuffer.h"
  #include <sensor_msgs/msg/imu.hpp>
  #include <sensor_msgs/msg/point_cloud2.hpp>
  
-@@ -105,6 +108,8 @@
+@@ -105,6 +109,8 @@
  	virtual void onOdomInit() {}
  
  	void callbackIMU(const sensor_msgs::msg::Imu::SharedPtr msg);
@@ -20,7 +21,7 @@ diff --git a/rtabmap_odom/include/rtabmap_odom/OdometryROS.h b/rtabmap_odom/incl
  	void reset(const rtabmap::Transform & pose = rtabmap::Transform::getIdentity());
  
  protected:
-@@ -155,6 +160,10 @@
+@@ -155,6 +161,10 @@
  	std::shared_ptr<tf2_ros::TransformListener> tfListener_;
  	rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imuSub_;
  	rclcpp::CallbackGroup::SharedPtr imuCallbackGroup_;
@@ -31,11 +32,12 @@ diff --git a/rtabmap_odom/include/rtabmap_odom/OdometryROS.h b/rtabmap_odom/incl
  
  	// Safe-threading
  	UMutex imuMutex_;
-@@ -181,6 +190,7 @@
+@@ -181,6 +191,8 @@
  	bool compressionParallelized_;
  	int odomStrategy_;
  	bool waitIMUToinit_;
 +	bool motusRotationHint_;
++	std::atomic<bool> publishMatchedLandmarks_{false};
  	bool alwaysCheckImuTf_;
  	bool imuProcessed_;
  	int processedMsgs_;
@@ -58,10 +60,11 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  	alwaysCheckImuTf_(true),
  	imuProcessed_(false),
  	processedMsgs_(0),
-@@ -149,6 +151,11 @@
+@@ -149,6 +151,12 @@
  	compressionParallelized_ = this->declare_parameter("sensor_data_parallel_compression", compressionParallelized_);
  
  	waitIMUToinit_ = this->declare_parameter("wait_imu_to_init", waitIMUToinit_);
++	publishMatchedLandmarks_ = this->declare_parameter("motus_matched_landmarks", false);
 +	motusRotationHint_ = this->declare_parameter("motus_rotation_hint", motusRotationHint_);
 +	if(motusRotationHint_ && (waitIMUToinit_ || !guessFrameId_.empty()))
 +	{
@@ -70,7 +73,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  	alwaysCheckImuTf_ = this->declare_parameter("always_check_imu_tf", alwaysCheckImuTf_);
  	
  
-@@ -372,6 +379,21 @@
+@@ -372,6 +380,21 @@
  
  	odomStrategy_ = 0;
  	Parameters::parse(this->parameters(), Parameters::kOdomStrategy(), odomStrategy_);
@@ -92,7 +95,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  	if(waitIMUToinit_)
  	{
  		imuCallbackGroup_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-@@ -415,6 +437,28 @@
+@@ -415,6 +438,30 @@
  		return odometry_->getVelocityGuess();
  	}
  	return rtabmap::Transform();
@@ -113,6 +116,8 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
 +
 +void OdometryROS::clearRotationHints()
 +{
++	// Landmark ids may be reused after a native reset in this same process.
++	publishMatchedLandmarks_ = false;
 +	UScopeMutex lock(rotationHintMutex_);
 +	if(rotationHints_)
 +	{
@@ -121,7 +126,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  }
  
  void OdometryROS::callbackIMU(const sensor_msgs::msg::Imu::SharedPtr msg)
-@@ -610,14 +654,8 @@
+@@ -610,14 +657,8 @@
  		}
  		previousClockTime_ = clockNow;
  
@@ -138,7 +143,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  				previousStamp_ > 0 &&
  				(rtabmap_conversions::timestampFromROS(header.stamp)-previousStamp_+(expectedUpdateRate_ > 0?1.0/expectedUpdateRate_:0)) < 1.0/maxUpdateRate_)
  		{
-@@ -660,6 +698,7 @@
+@@ -660,6 +701,7 @@
  								groundTruthFrameId_.c_str(),
  								groundTruthBaseFrameId_.c_str());
  						odometry_->reset(groundTruth);
@@ -146,7 +151,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  					}
  				}
  			}
-@@ -747,7 +786,37 @@
+@@ -747,7 +789,37 @@
  	rtabmap::Transform pose;
  	if(!tooOldPreviousData)
  	{
@@ -185,7 +190,7 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  	}
  	if(!pose.isNull())
  	{
-@@ -1043,6 +1112,7 @@
+@@ -1043,6 +1115,7 @@
  					odometry_->reset(tfPose);
  				}
  			}
@@ -193,7 +198,32 @@ diff --git a/rtabmap_odom/src/OdometryROS.cpp b/rtabmap_odom/src/OdometryROS.cpp
  			// Keep resetting if the odometry cannot initialize in next updates (e.g., lack of features).
  			// This will make sure we keep updating to latest guess pose.
  			if(resetCurrentCount_ == 0) {
-@@ -1237,6 +1307,7 @@
+@@ -1073,6 +1146,24 @@
+ 			infoMsg.local_map_keys.clear();
+ 			infoMsg.local_map_values.clear();
+ 			infoMsg.local_scan_map = sensor_msgs::msg::PointCloud2();
++			// Carry only F2M inliers and their map-frame coordinates on the lightweight topic.
++			if(publishMatchedLandmarks_ && info.type == 0 && !info.lost)
++			{
++				for(int id : info.reg.inliersIDs)
++				{
++					const auto landmark = info.localMap.find(id);
++					if(landmark != info.localMap.end())
++					{
++						rtabmap_msgs::msg::Point3f p;
++						p.x = landmark->second.x;
++						p.y = landmark->second.y;
++						p.z = landmark->second.z;
++						infoMsg.word_inliers.push_back(id);
++						infoMsg.local_map_keys.push_back(id);
++						infoMsg.local_map_values.push_back(p);
++					}
++				}
++			}
+ 			odomInfoLitePub_->publish(infoMsg);
+ 		}
+ 	}
+@@ -1237,6 +1328,7 @@
  {
  	UScopeMutex lock(dataMutex_);
  	odometry_->reset(pose);

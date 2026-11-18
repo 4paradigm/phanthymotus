@@ -1,0 +1,126 @@
+"""Only measured correspondences to the old native F2M map can re-open its gauge."""
+import math
+from types import SimpleNamespace as NS
+
+import pytest
+
+from plugins.rgbd_odometry_runtime import EstimateGate
+from test_rgbd_odometry import messages
+from test_rgbd_odometry_status import sessions  # noqa: F401
+
+
+def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=False):
+    msg, info = messages(stamp)
+    msg.pose.pose.position.x = x
+    msg.pose.pose.orientation.z = math.sin(math.radians(angle)/2)
+    msg.pose.pose.orientation.w = math.cos(math.radians(angle)/2)
+    info.type, info.lost, info.inliers = 0, lost, 0 if lost else len(ids)
+    info.local_map_keys = info.word_inliers = list(ids)
+    info.local_map_values = [NS(x=float(i % 5) + world_shift, y=float(i // 5), z=1.) for i in ids]
+    gate.input(stamp)
+    return gate.accept(msg, info, stamp)
+
+
+def anchored():
+    g = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for i in range(3):
+        sample = visual(g, 1_000_000_000 + i*100_000_000)
+    assert sample is not None
+    return g
+
+
+def test_same_f2m_landmarks_can_relocalize_after_silence_without_any_gap_pose():
+    g = anchored()
+    assert g.status(3_000_000_000) == 'recovering'
+    assert g.status(26_000_000_000) == 'recovering'
+    assert visual(g, 27_000_000_000, x=.003) is None
+    assert visual(g, 27_100_000_000, x=.004) is None
+    s = visual(g, 27_200_000_000, x=.003)
+    assert s['pose']['position'][0] == .003
+    assert s['vendor']['motus_slam']['segment_id'] == 'run'
+    assert s['vendor']['relocalization']['shared_landmarks'] >= 20
+
+
+@pytest.mark.parametrize('changed', [
+    dict(ids=range(5, 29)),  # 24 total inliers but only 19 old correspondences
+    dict(ids=range(24, 48)), dict(ids=[1]*24), dict(world_shift=1.),
+    dict(x=.051), dict(angle=5.1), dict(lost=True)])
+def test_novel_recycled_ids_jump_and_lost_cannot_reopen_old_gauge(changed):
+    g = anchored()
+    g.status(3_000_000_000)
+    for i in range(15):
+        s = visual(g, 5_000_000_000 + i*100_000_000, **changed)
+        assert s is None
+    assert g.state == 'lost'
+
+
+def test_output_timeout_with_no_returning_results_expires_while_inputs_are_fresh():
+    g = anchored()
+    g.status(3_000_000_000)
+    for i in range(15):g.input(5_000_000_000 + i*100_000_000)
+    assert g.state == 'lost' and g.loss_kind == 'output'
+
+
+def test_sparse_candidates_cannot_extend_the_first_relocalization_deadline():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for stamp in (5_000_000_000, 5_900_000_000, 6_010_000_000):
+        assert visual(gate, stamp, x=.003) is None
+    assert gate.state == 'lost'
+
+
+def test_process_exit_during_relocalization_fails_closed():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    gate.input(5_000_000_000)
+    gate.fault('native process exited', 'process')
+    for i in range(3):
+        assert visual(gate, 5_100_000_000 + i*100_000_000) is None
+    assert gate.state == 'lost' and gate.loss_kind == 'process'
+
+
+def test_failed_registration_to_old_map_restarts_without_switching_new_view_frontend():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(3):
+        assert visual(gate, 5_000_000_000+i*100_000_000, lost=True) is None
+    assert gate.state == 'lost' and gate.loss_kind == 'relocalization'
+
+
+def test_burst_keeps_two_measured_pairs_only_during_relocalization(sessions):
+    from test_rgbd_degradation import received_images
+
+    create, now, _ = sessions
+    session = create()
+    session.gate = anchored()
+    session.gate.frame = 'camera_optical'
+    now[0] = 4_000_000_000
+    session.gate.status(now[0])
+    for i in range(5):
+        now[0] += 20_000_000
+        received_images(session, now[0])
+    assert session.pending.qsize() == 2
+    buffered = [session.pending.get_nowait()[1][0] for _ in range(2)]
+    assert buffered == [now[0]-20_000_000, now[0]]
+
+
+@pytest.mark.parametrize('frontend', ['f2f', 'unpatched'])
+def test_frontend_without_matched_f2m_points_keeps_existing_timeout(frontend):
+    gate = anchored()
+    if frontend == 'f2f':
+        gate.anchor_info.type = 1
+    else:
+        gate.anchor_info.word_inliers = []
+    assert gate.status(3_000_000_000) == 'lost'
+
+
+def test_relocalization_expires_when_host_wall_clock_moves_back(monkeypatch):
+    import time
+
+    ticks = [100_000_000_000]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: ticks[0])
+    gate = anchored()
+    gate.status(3_000_000_000)
+    gate.input(5_000_000_000)
+    ticks[0] += 1_000_000_001
+    assert gate.status(4_000_000_000) == 'lost'

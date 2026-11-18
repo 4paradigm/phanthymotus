@@ -71,6 +71,7 @@ FALLBACK_OFFSET_M, FALLBACK_OFFSET_RAD = .02, np.deg2rad(2.)
 # a native reset/relocalization and must start a new segment.
 RESUME_TRANSLATION_M, RESUME_SPEED_MPS = .05, 1.
 RESUME_ROTATION_RAD, RESUME_RATE_RADPS = np.deg2rad(5.), np.deg2rad(90.)
+F2M_SHARED_INLIERS = 20  # pinned RTAB-Map Vis/MinInliers
 
 
 class EstimateGate:
@@ -95,10 +96,18 @@ class EstimateGate:
         self.last_native_stamp = 0
         self.result_period_ns = None
         self.result_intervals = deque(maxlen=32)
+        self.anchor_info = None
+        self.relocalization_points = None
+        self.relocalization_deadline = self.relocalization_deadline_mono = None
+        self.relocalization_failure = 'output'
+        self.relocalization_misses = 0
 
     def input(self, stamp, *, now_ns=None):
         self.status(stamp if now_ns is None else now_ns)
         if self.state != 'lost':
+            if self.relocalization_points is not None and self.relocalization_deadline is None:
+                self.relocalization_deadline = (stamp if now_ns is None else now_ns) + RECOVERY_NS
+                self.relocalization_deadline_mono = time.monotonic_ns() + RECOVERY_NS
             if self.last_input and stamp > self.last_input:
                 self.input_intervals.append(stamp-self.last_input)
                 self.input_period_ns = int(np.median(self.input_intervals)) if len(self.input_intervals)>=5 else None
@@ -118,6 +127,13 @@ class EstimateGate:
         if stamp is not None:
             self.last_result_stamp = stamp
         self.good = 0
+        if self.relocalization_points is not None:
+            self.relocalization_failure = 'relocalization'
+            self.relocalization_misses += 1
+            if self.relocalization_misses >= 3:
+                self.fault('three native registrations failed against the old F2M map; restart required',
+                           'relocalization')
+            return
         if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
                 if self.recovery_policy is not None:
@@ -127,15 +143,49 @@ class EstimateGate:
                 self.recover_by = now + (self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)
             self.state, self.reason = 'recovering', 'visual estimate rejected: ' + str(reason)
 
+    @staticmethod
+    def _matched_points(info):
+        # The native lite message carries only inliers in the current F2M world.
+        if info is None or getattr(info, 'type', None) != 0:
+            return {}
+        ids = getattr(info, 'local_map_keys', ())
+        values = getattr(info, 'local_map_values', ())
+        if len(ids) != len(values):
+            return {}
+        inliers = set(getattr(info, 'word_inliers', ()))
+        return {i: (p.x, p.y, p.z) for i, p in zip(ids, values)
+                if i in inliers and math.isfinite(p.x) and math.isfinite(p.y) and math.isfinite(p.z)}
+
+    def _timeout(self, reason, kind):
+        if self.state == 'tracking':
+            points = self._matched_points(self.anchor_info)
+            if len(points) >= F2M_SHARED_INLIERS:
+                self.relocalization_points = points
+                self.relocalization_deadline = self.relocalization_deadline_mono = None
+                self.relocalization_misses = 0
+                self.relocalization_failure = 'output'
+                self.good = 0
+                self.state, self.reason = 'recovering', 'waiting for native matches to the last tracked F2M landmarks'
+                return
+        self.fault(reason, kind)
+
     def status(self, now):
+        if self.relocalization_points is not None:
+            if self.relocalization_deadline is not None and (
+                    now > self.relocalization_deadline or time.monotonic_ns() > self.relocalization_deadline_mono):
+                self.fault('native F2M relocalization did not verify the old landmarks; restart required',
+                           self.relocalization_failure)
+            return self.state
         received = getattr(self, "last_input_received", self.last_input)
         if received and now - received > 1_500_000_000:
-            self.fault('RGB-D input stale; restart to begin a new segment', 'input')
+            self._timeout('RGB-D input stale; restart to begin a new segment', 'input')
+            return self.state
         # Before any published anchor, fresh weak results prove liveness only.
         # An anchored segment still expires against its accepted visual stamps.
         visual_stamp = self.last_stamp if self.last_pose is not None and self.pause_context is None else self.last_result_stamp
         if visual_stamp and now - visual_stamp > 1_500_000_000:
-            self.fault('visual estimate stale; restart to begin a new segment', 'output')
+            self._timeout('visual estimate stale; restart to begin a new segment', 'output')
+            return self.state
         if self.state == 'recovering' and self.recover_by is not None and now > self.recover_by:
             self.fault(f'visual degradation persisted beyond {(self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)/1e9:g} s; restart to begin a new segment', 'visual')
         return self.state
@@ -193,7 +243,21 @@ class EstimateGate:
                 # weak pose onto the output or extending an old SLAM pause.
                 self.state, self.recover_by = 'initializing', None
             return None
-        if (self.state == 'recovering' and self.last_pose is not None and
+        shared = None
+        if self.relocalization_points is not None:
+            points = self._matched_points(info)
+            unchanged = {p for i, p in points.items() if self.relocalization_points.get(i) == p}
+            shared = len(unchanged)
+            self.relocalization_misses = 0
+            _, anchor_position, anchor_rotation = self.last_pose
+            if (self.relocalization_deadline is None or shared < F2M_SHARED_INLIERS or
+                    np.linalg.matrix_rank(np.array(list(unchanged)) - next(iter(unchanged))) < 2 or
+                    np.linalg.norm(position - anchor_position) > RESUME_TRANSLATION_M or
+                    np.linalg.norm(log_rotation(anchor_rotation.T @ rotation)) > RESUME_ROTATION_RAD):
+                self.good = 0
+                self.relocalization_failure = 'relocalization'
+                return None
+        elif (self.state == 'recovering' and self.last_pose is not None and
                 stamp - self.last_pose[0] > (self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)):
             self.fault(f'visual recovery exceeded the {(self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)/1e9:g} s in-segment pause bound; '
                        'restart to begin a new segment', 'visual')
@@ -208,6 +272,12 @@ class EstimateGate:
             return None
         self.state, self.reason, self.recover_by = 'tracking', None, None
         self.pause_context = None
+        if shared is not None:
+            sample['vendor']['relocalization'] = dict(method='native_f2m_landmarks',
+                anchor_stamp_ns=self.last_pose[0], shared_landmarks=shared)
+            self.relocalization_points = None
+            self.relocalization_deadline = self.relocalization_deadline_mono = None
+        self.anchor_info = info if len(getattr(info, 'word_inliers', ())) >= F2M_SHARED_INLIERS else None
         self.last_pose = (stamp, position, rotation)
         return sample
 
@@ -233,6 +303,8 @@ def estimator_parameters(calibration, segment):
               'Odom/ResetCountdown': '0', 'Odom/Strategy': '1' if optical else '0',
               'Vis/CorType': '1' if optical else '0',
               'Vis/MaxFeatures': str(max_features)}
+    if not optical and not (calibration.get('imu_topic') and not calibration.get('short_term_compensation')):
+        params['motus_matched_landmarks'] = True
     if optical:
         params.update({'Vis/CorFlowWinSize': '16', 'Vis/CorFlowMaxLevel': '3',
                        'Vis/CorFlowIterations': '30'})
@@ -438,7 +510,9 @@ class RgbdSession:
         self.imu_queue_lock = threading.Lock()
         self.imu_pending, self.imu_overflow = deque(), False
         self.pairs = RgbdPairer() if input_registry is not None or 'input_declarations' in calibration else PairBuffer()
-        self.pending = queue.Queue(maxsize=1)
+        self.pending = queue.Queue(maxsize=2)
+        self.probe_stamp = None
+        self.probe_ack = threading.Event()
         self.latest_inputs = {}
         self.results = {'pose': OrderedDict(), 'info': OrderedDict()}
         self.registration_by_stamp = OrderedDict()
@@ -570,8 +644,14 @@ class RgbdSession:
                     return
                 if pair:
                     self.gate.input(pair[1][0], now_ns=time.time_ns())
-                    if self.pending.full():
-                        self.pending.get_nowait()
+                    # Keep the two measured successors needed after a slow first
+                    # registration. Normal tracking still takes only the latest.
+                    capacity = 2 if self.gate.relocalization_points is not None else 1
+                    while self.pending.qsize() >= capacity:
+                        try:
+                            self.pending.get_nowait()
+                        except queue.Empty:
+                            break
                         self.counts['dropped_pairs'] += 1
                     self.pending.put_nowait(pair)
             except (ValueError, queue.Full) as error:
@@ -895,6 +975,7 @@ class RgbdSession:
                     with self.lock:
                         self.counts['dropped_pairs'] += 1
                     continue
+                probe_deadline = None
                 with self.lock:
                     self._drain_imu()
                     ready = (self.gate.state != 'lost' if self.fusion is not None else
@@ -909,8 +990,16 @@ class RgbdSession:
                             continue
                         if getattr(self, 'rotation_hints', None) is not None:
                             self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns())
+                        probe_deadline = getattr(self.gate, 'relocalization_deadline_mono', None)
+                        if probe_deadline is not None:
+                            self.probe_stamp = capture_stamp
+                            self.probe_ack.clear()
                         self.rgbd.publish(out)
                         self.counts['pairs'] += 1
+                if probe_deadline is not None and not self.stop_event.is_set():
+                    # Native odometry has one processing slot. Release the
+                    # session lock while it registers this actual capture.
+                    self.probe_ack.wait(max(0., (probe_deadline - time.monotonic_ns()) / 1e9))
             except Exception as error:
                 with self.lock:
                     self.gate.fault(error)
@@ -1000,7 +1089,8 @@ class RgbdSession:
                                      reason=self.gate.reason)
             sample = self._label_fallback(sample)
         if (sample['vendor']['motus_slam']['status'] == 'recovering' and not self._fusing() and
-                self.gate.state == 'recovering' and self.gate.last_pose is not None):
+                self.gate.state == 'recovering' and self.gate.last_pose is not None and
+                self.gate.relocalization_points is None):
             # Declared, bounded in-segment pause the SLAM consumer can honour.
             sample['vendor']['pause'] = dict(source='visual_gate', status='recovering', mapping_allowed=False)
         association = getattr(self, 'contexts_by_stamp', {}).get(stamp)
@@ -1132,6 +1222,8 @@ class RgbdSession:
                 return
             if kind == 'info' and hasattr(self, 'registration_by_stamp'):
                 self._remember_native(msg)
+                if stamp_ns(msg) == getattr(self, 'probe_stamp', None):
+                    self.probe_ack.set()
             if self._fusing():
                 if self.gate.state != 'lost':
                     for sample in self.observations.result(kind, msg, time.time_ns()):
@@ -1249,6 +1341,8 @@ class RgbdSession:
 
     def close(self, *, report_idle=True):
         self.stop_event.set()
+        if hasattr(self, 'probe_ack'):
+            self.probe_ack.set()
         for lease in getattr(self, "input_leases", ()):
             lease.close()
         if self.spin_worker is not None:
