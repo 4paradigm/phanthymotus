@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="xiaoyou_darvin" is_default_profile="true">
+    <rtps>
+      <builtin>
+        <discovery_config>
+          <leaseAnnouncement>
+            <sec>0</sec>
+            <nanosec>200000000</nanosec>
+          </leaseAnnouncement>
+        </discovery_config>
+      </builtin>
+    </rtps>
+  </participant>
+</profiles>

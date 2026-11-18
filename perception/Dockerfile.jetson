@@ -694,9 +694,46 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
+# Xiaoyou uses its own CPython 3.10 frontend. The JP5 ROS interpreter stays CP38.
+ARG ENABLE_XIAOYOU_TTS=1
+RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
+      set -eu; \
+      case "${JP_VERSION}" in \
+        511) \
+          asset='cpython-3.10.22%2B20261001-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'; \
+          python3 -c 'import shutil, sys, urllib.request; url, path = sys.argv[1:]; src = urllib.request.urlopen(url, timeout=30); dst = open(path, "wb"); shutil.copyfileobj(src, dst)' \
+            "https://mirrors.nju.edu.cn/github-release/astral-sh/python-build-standalone/20261001/${asset}" /tmp/xiaoyou-python.tar.gz; \
+          printf '%s  %s\n' b25ea453d60a51c381417ed0fbf87fd393c346eb1ab3a138cdfbb86be2a4d8fe /tmp/xiaoyou-python.tar.gz | sha256sum --check --strict; \
+          mkdir /opt/xiaoyou-tts; \
+          tar -xzf /tmp/xiaoyou-python.tar.gz --strip-components=1 -C /opt/xiaoyou-tts; \
+          rm /tmp/xiaoyou-python.tar.gz ;; \
+        61) python3 -m venv --without-pip --system-site-packages /opt/xiaoyou-tts ;; \
+        *) exit 0 ;; \
+      esac; \
+      /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+        --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" pip==26.3; \
+      reuse_flags=; \
+      if [ "${JP_VERSION}" = "61" ]; then reuse_flags=--ignore-installed; fi; \
+      /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+        --no-cache-dir $reuse_flags -i "${PYPI_MIRROR}" \
+        -r /work/plugins/xiaoyou_tts/requirements.jetson.txt; \
+    fi
+
+# Darvin only passes the instance ports to the reference image.
+ARG XIAOYOU_TTS_DARVIN=1
+ENV XIAOYOU_TTS_DARVIN=${XIAOYOU_TTS_DARVIN}
+ENV XIAOYOU_TTS_IMAGE_JP=${JP_VERSION}
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     if [ \"${XIAOYOU_TTS_DARVIN}\" = 1 ] && [ \"${XIAOYOU_TTS_IMAGE_JP}\" = 511 ] && [ -z \"${CONFIG_PATH:-}\" ] \
+         && [ -n \"${MCP_PORT:-}\" ] && [ -n \"${WS_PORT:-}\" ]; then \
+         export CONFIG_PATH=/tmp/xiaoyou-darvin.json XIAOYOU01_TTS_BENCHMARK=1; \
+         if [ -z \"${FASTRTPS_DEFAULT_PROFILES_FILE:-}${FASTDDS_DEFAULT_PROFILES_FILE:-}\" ]; then \
+             export FASTRTPS_DEFAULT_PROFILES_FILE=/work/plugins/xiaoyou_tts/resources/fastdds_darvin.xml; \
+         fi; \
+         printf '{\"mcp_port\":%s,\"ws_port\":%s,\"plugins\":{\"tts\":{\"enabled\":true,\"engine\":\"xiaoyou-zh-en\"},\"audio_mixer\":{\"enabled\":false},\"echo_cancellation\":{\"enabled\":false}}}\\n' \
+             \"${MCP_PORT:-15720}\" \"${WS_PORT:-15721}\" > \"${CONFIG_PATH}\"; \
+     fi && exec python3 /work/main.py"]
