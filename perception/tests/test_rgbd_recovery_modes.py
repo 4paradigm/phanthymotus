@@ -153,6 +153,23 @@ def test_initialized_filter_without_first_tracking_has_a_finite_fusion_budget(re
     assert all(json.loads(m)['pose'] is None for m in session.publisher.messages)
 
 
+def test_rgbd_start_with_no_imu_falls_back_before_full_fusion_warmup(recovery, monkeypatch):
+    card, args, now, seconds = recovery
+    session = assisted(card, args, monkeypatch)
+    seconds[0] += 1.6
+    images(session, now[0])
+    session._watchdog()
+    assert session.fallback is not None and session.fusion.filter is None
+    assert 'IMU' in session.fallback['reason']
+    assert all(json.loads(msg)['pose'] is None for msg in session.publisher.messages)
+    for _ in range(3):
+        stamp = now[0] + 100_000_000
+        images(session, stamp)
+        feed(session, now, stamp)
+    assert session.info()['status'] == 'tracking'
+    assert json.loads(session.publisher.messages[-1])['vendor']['motus_slam']['segment_id'] == session.segment
+
+
 def degraded_session(card, args, now, seconds, monkeypatch):
     old = assisted(card, args, monkeypatch)
     old.gate.fault('IMU source expired', 'imu')
@@ -166,7 +183,7 @@ def degraded_session(card, args, now, seconds, monkeypatch):
     return new
 
 
-def test_formatted_recovered_source_restores_requested_mode_in_new_segment(recovery,monkeypatch):
+def test_formatted_recovered_source_restores_requested_mode_after_segment_loss(recovery,monkeypatch):
     card,args,now,seconds=recovery
     visual=degraded_session(card,args,now,seconds,monkeypatch)
     segment=visual.segment
@@ -175,6 +192,7 @@ def test_formatted_recovered_source_restores_requested_mode_in_new_segment(recov
         images(visual,now[0]);feed(visual,now,now[0])
     send_imu(visual,now,seconds,now[0])
     assert visual.info()['auxiliary_recovery']['status']=='ready'
+    visual.gate.fault('native process exited', 'process')
     visual.process.returncode=0
     images(visual,now[0]);card._recover()
     restored=card.instances['one'][0];restored.process.returncode=0
@@ -259,21 +277,37 @@ def test_weak_visual_budget_can_trigger_existing_auto_frontend_recovery(recovery
     assert new is not old and new.calibration['visual_frontend'] == 'f2f_optical_flow'
 
 
-def healthy_visual_tick(session, now, seconds, *, auxiliary=True):
+def healthy_visual_tick(session, now, seconds, *, auxiliary=True, emit_visual=True):
     seconds[0] += .1
     stamp = now[0]+100_000_000
     now[0] = stamp+1_000_000
     if auxiliary:
         session._imu(NS(data=json.dumps(imu_packet(stamp))))
     images(session, stamp)
-    feed(session, now, stamp)
+    if emit_visual:
+        feed(session, now, stamp)
 
 
-def test_failed_restore_keeps_visual_output_and_waits_twenty_seconds(recovery, monkeypatch):
+def test_ready_auxiliary_does_not_replace_a_tracking_visual_segment(recovery, monkeypatch):
     card, args, now, seconds = recovery
     visual = degraded_session(card, args, now, seconds, monkeypatch)
     for _ in range(240):
         healthy_visual_tick(visual, now, seconds)
+    assert visual.info()['status'] == 'tracking'
+    assert visual.info()['auxiliary_recovery']['status'] == 'ready'
+    visual.process.returncode = 0
+
+    card._recover()
+
+    assert card.instances['one'][0] is visual
+    assert card.recovery['one']['restoration_attempts'] == 0
+
+
+def test_failed_restore_keeps_visual_session_and_waits_twenty_seconds(recovery, monkeypatch):
+    card, args, now, seconds = recovery
+    visual = degraded_session(card, args, now, seconds, monkeypatch)
+    for _ in range(240):
+        healthy_visual_tick(visual, now, seconds, emit_visual=False)
     assert visual.info()['auxiliary_recovery']['status'] == 'ready'
     calls = []
     def fail(*args, **kwargs):
@@ -284,12 +318,12 @@ def test_failed_restore_keeps_visual_output_and_waits_twenty_seconds(recovery, m
     assert calls and card.instances['one'][0] is visual and not visual.node.destroyed
     published = len(visual.publisher.messages)
     for _ in range(199):
-        healthy_visual_tick(visual, now, seconds)
+        healthy_visual_tick(visual, now, seconds, emit_visual=False)
         card._recover()
     assert len(calls) == 1
-    assert len(visual.publisher.messages) > published and visual.gate.state == 'tracking'
+    assert len(visual.publisher.messages) == published
     for _ in range(2):
-        healthy_visual_tick(visual, now, seconds)
+        healthy_visual_tick(visual, now, seconds, emit_visual=False)
         card._recover()
     assert len(calls) == 2
     assert card.recovery['one']['restoration_attempts'] == 2

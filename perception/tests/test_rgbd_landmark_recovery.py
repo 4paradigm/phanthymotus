@@ -85,6 +85,34 @@ def test_sparse_candidates_cannot_extend_the_first_relocalization_deadline():
     assert gate.state == 'lost'
 
 
+def test_slow_native_cadence_can_verify_three_old_landmark_registrations():
+    from plugins.spatial_recovery import RecoveryPolicy
+
+    gate = anchored()
+    gate.recovery_policy = RecoveryPolicy()
+    gate.result_period_ns = 550_000_000
+    gate.processing_p95_ns = 80_000_000
+    assert gate.status(3_000_000_000) == 'recovering'
+    assert visual(gate, 5_000_000_000, x=.003) is None
+    assert visual(gate, 5_550_000_000, x=.003) is None
+    result = visual(gate, 6_100_000_000, x=.003)
+    assert result['vendor']['relocalization']['shared_landmarks'] == 24
+
+
+def test_result_that_triggers_timeout_can_verify_the_old_landmarks():
+    gate = anchored()
+    stamp = 2_650_000_000
+    gate.input(stamp)
+    assert gate.state == 'tracking'
+    msg, info = messages(stamp)
+    anchor = gate.anchor_info
+    for key in ('type', 'inliers', 'local_map_keys', 'local_map_values', 'word_inliers'):
+        setattr(info, key, getattr(anchor, key))
+    assert gate.accept(msg, info, stamp + 100_000_000) is None
+    assert visual(gate, 2_950_000_000) is None
+    assert visual(gate, 3_450_000_000)['vendor']['relocalization']['shared_landmarks'] == 24
+
+
 def test_process_exit_during_relocalization_fails_closed():
     gate = anchored()
     gate.status(3_000_000_000)

@@ -32,9 +32,12 @@ int main(int argc, char **argv)
     const bool delayedRgb=mode=="delayed_first_external_rgb";
     const bool delayedExternal=mode=="delayed_first_external" || delayedRgb;
     const bool rejectedColdQuery=mode=="rejected_cold_query";
+    const bool neighborRetry=mode=="neighbor_retry";
+    const bool stationaryAnchor=mode=="stationary_visual_anchor";
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
         mode=="scan_mask" || imuPrediction || voHandoff || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
-        mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm" || rejectedColdQuery || delayedExternal;
+        mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm" ||
+        rejectedColdQuery || delayedExternal || neighborRetry || stationaryAnchor;
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
     p["Reg/Strategy"]="1"; p["Icp/Strategy"]="0"; p["Optimizer/Strategy"]="0";
@@ -79,8 +82,10 @@ int main(int argc, char **argv)
     {
         if(mode!="recovery" && mode!="recovery_gap" && mode!="recovery_event" && mode!="resume" && !hasPose) break;
         if(phase=="depth_gap") continue; // Source interruption: no metric observation.
-        cv::Mat rgb=cv::imread(root+"/"+std::to_string(i)+".jpg");
-        cv::Mat depth=cv::imread(root+"/"+std::to_string(i)+".png", cv::IMREAD_UNCHANGED);
+        const int sourceFrame=stationaryAnchor?0:i;
+        if(stationaryAnchor) externalX=truthX=0.f;
+        cv::Mat rgb=cv::imread(root+"/"+std::to_string(sourceFrame)+".jpg");
+        cv::Mat depth=cv::imread(root+"/"+std::to_string(sourceFrame)+".png", cv::IMREAD_UNCHANGED);
         if(rgb.empty() || depth.empty()) throw std::runtime_error("missing scene frame");
         const bool recoveryScenario=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event";
         bool visualFault=false;
@@ -118,7 +123,8 @@ int main(int argc, char **argv)
         if(rejectedColdQuery) rgb.setTo(cv::Scalar::all(0));
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
-        const bool noImages=(delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
+        const bool noImages=neighborRetry || (stationaryAnchor && i==0) ||
+            (delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
             (mode=="vo_handoff_gap" && i==3) ||
             (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
             gap || resetGap || (mode=="fallback_cov" && i==1) ||
@@ -126,6 +132,8 @@ int main(int argc, char **argv)
         rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,double(i+1));
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
+        if(neighborRetry && (i==1 || i==2))
+            ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
         if(voHandoff && hasPose) ext=handoffOrigin*ext;
         if(mode=="history_without_cache") ext=historyExternal;
         if(rejectedColdQuery || (delayedExternal && i<2)) ext.setNull();
@@ -179,6 +187,45 @@ int main(int argc, char **argv)
                  <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
+        if(stationaryAnchor && i==1)
+        {
+            const auto *signature=map.getMemory()->getSignature(map.getLastLocationId());
+            if(!accepted || recovery.odom().isNull() ||
+               map.getLocalOptimizedPoses().size()!=2 || !signature || signature->getWords3().size()<20 ||
+               !signature->hasLink(1,rtabmap::Link::kNeighbor))
+                throw std::runtime_error("a measured stationary visual observation must anchor a scan-only root");
+        }
+        if(stationaryAnchor && i==2)
+        {
+            if(map.getLocalOptimizedPoses().size()!=2)
+                throw std::runtime_error("stationary frames must use regular keyframe gating after a visual anchor");
+            map.close();
+            rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
+            const auto *anchor=reopened.getMemory()->getSignature(2);
+            if(reopened.getLocalOptimizedPoses().size()!=2 || !anchor || anchor->getWords3().size()<20 ||
+               !anchor->hasLink(1,rtabmap::Link::kNeighbor))
+                throw std::runtime_error("the first visual anchor must stay linked after reopening");
+            reopened.close(false);
+            return 0;
+        }
+        if(neighborRetry)
+        {
+            if(i==1 || i==2)
+            {
+                if(accepted || !recovery.odom().isNull() ||
+                   recovery.state()!=motus::VisualRecovery::Searching ||
+                   map.getLocalOptimizedPoses().size()!=nodesBefore)
+                    throw std::runtime_error("a failed neighboring scan must neither publish odometry nor grow the map");
+            }
+            if(i==3)
+            {
+                if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+                   recovery.odom().isNull() || map.getLocalOptimizedPoses().size()<=nodesBefore)
+                    throw std::runtime_error("a verified neighboring scan must recover original map growth without RGB");
+                map.close();
+                return 0;
+            }
+        }
         if(visualFault && (recovery.visualInliers()>=20 ||
            recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
            recovery.recoveryNode()!=0))

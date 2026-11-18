@@ -182,6 +182,46 @@ def test_camera_captures_expire_missing_native_results_before_queue_overflow():
     assert all(visual is None for _, visual, _ in fusion.frames)
 
 
+def test_native_worker_keeps_latest_pair_queued_until_rgbd_reader_matches(monkeypatch):
+    import queue
+    import sys
+    import threading
+    from plugins import rgbd_odometry_runtime as runtime
+
+    monkeypatch.setitem(sys.modules, 'rtabmap_msgs.msg', NS(RGBDImage=NS))
+    monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'CameraInfo', NS, raising=False)
+    worker = object.__new__(runtime.RgbdSession)
+    worker.stop_event = threading.Event()
+    readers = [0]
+    worker.rgbd = NS(get_subscription_count=lambda: readers[0])
+    def discover(_):
+        readers[0] = 1
+    def dequeue(timeout):
+        assert readers[0] == 1
+        worker.stop_event.set()
+        raise queue.Empty
+    monkeypatch.setattr(worker.stop_event, 'wait', discover)
+    worker.pending = NS(get=dequeue)
+    worker._work()
+
+
+def test_weak_cold_native_seed_uses_initialization_budget_not_map_recovery():
+    from plugins.rgbd_odometry_runtime import EstimateGate
+
+    gate = EstimateGate('run', 'camera_optical', 'capture')
+    start = 1_000_000_000
+    gate.input(start)
+    msg, info = messages(start)
+    info.inliers = 0  # The first native seed can legitimately report zero.
+    assert gate.accept(msg, info, start) is None
+    assert gate.status(start+1_050_000_000) == 'initializing'
+    for i, offset in enumerate((1150, 1270, 1390)):
+        stamp = start + offset*1_000_000
+        gate.input(stamp)
+        result = gate.accept(*messages(stamp), stamp)
+        assert (result is not None) == (i == 2)
+
+
 @pytest.mark.parametrize('frontend,strategy,cor_type', [
     ('f2m_feature', '0', '0'),
     ('f2f_optical_flow', '1', '1'),
@@ -332,7 +372,7 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_001_000_123)
     published = []
     def publish(msg): published.append(msg); obj.stop_event.set()
-    obj.rgbd = NS(publish=publish)
+    obj.rgbd = NS(publish=publish, get_subscription_count=lambda: 1)
     if mode == 'assisted':
         from test_rgbd_imu import aid, packet
         obj.imu = aid()

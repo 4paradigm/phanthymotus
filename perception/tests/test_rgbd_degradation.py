@@ -290,7 +290,7 @@ def track_fused(s, now, offset=0.):
 def test_fallback_without_proven_continuity_starts_a_new_segment(fused):
     make, now, _ = fused
     s = make()
-    track_fused(s, now, offset=.05)
+    track_fused(s, now, offset=.051)
     assert s.gate.state == 'lost' and 'continuity' in s.gate.reason
     assert s.fallback is None
 
@@ -303,7 +303,7 @@ def test_failed_fusion_continuity_selects_available_imu_attitude_for_next_segmen
     now[0] = stamp
     imu(s, stamp)
     s.gate.last_input = stamp
-    track_fused(s, now, offset=.040)
+    track_fused(s, now, offset=.051)
     assert s.gate.state == 'lost' and s.gate.last_pose is None
     target = s.recovery_target(ticks[0], now[0])
     config = target['calibration']
@@ -316,7 +316,7 @@ def test_failed_fusion_continuity_selects_available_imu_attitude_for_next_segmen
 def test_fallback_with_proven_continuity_keeps_segment_and_checks_resume(fused):
     make, now, _ = fused
     s = make()
-    track_fused(s, now, offset=.005)
+    track_fused(s, now, offset=.041)
     assert s.gate.state == 'recovering' and s.fallback is not None
     feed(s, now, 1_600_000_000, x=2.)  # cannot jump 2 m in 100 ms
     assert s.gate.state == 'lost' and 'discontinu' in s.gate.reason

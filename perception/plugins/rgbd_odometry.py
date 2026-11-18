@@ -70,6 +70,10 @@ class RgbdOdometryPlugin:
                     else:
                         state['healthy_since'] = None
                     restoring = target is not None and target['action'] == 'restore_assistance'
+                    if restoring and info['status'] != 'lost' and session.first_tracking_at is not None:
+                        # A replacement resets the odometry origin. Keep a
+                        # published segment, including during bounded recovery.
+                        restoring = False
                     if info['status'] != 'lost' and not restoring:
                         state['lost_since'] = None
                         continue

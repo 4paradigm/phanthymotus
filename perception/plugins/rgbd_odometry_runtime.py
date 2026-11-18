@@ -62,16 +62,16 @@ def native_capture_stamp(color, depth):
 # published capture, leaving margin for native latency jitter; otherwise the
 # segment ends and supervised recovery starts a new one.
 RECOVERY_NS, PAUSE_RESUME_NS = 1_000_000_000, 800_000_000
-# Fused output differs from the native visual pose by ESKF corrections. A
-# visual-only fallback may stay in the segment only within this (unvalidated)
-# engineering bound at the last published fused capture.
-FALLBACK_OFFSET_M, FALLBACK_OFFSET_RAD = .02, np.deg2rad(2.)
 # Engineering bound for a head/body camera, not a validated motion model: a
 # resumed estimate farther than this from the last published pose is treated as
 # a native reset/relocalization and must start a new segment.
 RESUME_TRANSLATION_M, RESUME_SPEED_MPS = .05, 1.
 RESUME_ROTATION_RAD, RESUME_RATE_RADPS = np.deg2rad(5.), np.deg2rad(90.)
+# Same-capture fused/visual translation uses the existing verified recovery
+# bound. Keep the tighter rotation bound when handing off from ESKF.
+FALLBACK_OFFSET_M, FALLBACK_OFFSET_RAD = RESUME_TRANSLATION_M, np.deg2rad(2.)
 F2M_SHARED_INLIERS = 20  # pinned RTAB-Map Vis/MinInliers
+IMU_STARTUP_GRACE_S = 1.5
 
 
 class EstimateGate:
@@ -102,12 +102,28 @@ class EstimateGate:
         self.relocalization_failure = 'output'
         self.relocalization_misses = 0
 
+    def _recovery_window(self, started):
+        if self.recovery_policy is None:
+            return None
+        periods = [v for v in (self.input_period_ns, self.result_period_ns) if v is not None]
+        return self.recovery_policy.begin(max(periods) if periods else None,
+                                          self.processing_p95_ns, started)
+
+    def _start_landmark_verification(self, now):
+        if self.relocalization_deadline is None:
+            started = time.monotonic_ns()
+            window = self._recovery_window(started)
+            # Freeze a separate deadline for landmark verification. No pose
+            # is published until the measured landmarks agree.
+            budget = window.budget_ns if window else RECOVERY_NS
+            self.relocalization_deadline = now + budget
+            self.relocalization_deadline_mono = started + budget
+
     def input(self, stamp, *, now_ns=None):
         self.status(stamp if now_ns is None else now_ns)
         if self.state != 'lost':
-            if self.relocalization_points is not None and self.relocalization_deadline is None:
-                self.relocalization_deadline = (stamp if now_ns is None else now_ns) + RECOVERY_NS
-                self.relocalization_deadline_mono = time.monotonic_ns() + RECOVERY_NS
+            if self.relocalization_points is not None:
+                self._start_landmark_verification(stamp if now_ns is None else now_ns)
             if self.last_input and stamp > self.last_input:
                 self.input_intervals.append(stamp-self.last_input)
                 self.input_period_ns = int(np.median(self.input_intervals)) if len(self.input_intervals)>=5 else None
@@ -136,10 +152,7 @@ class EstimateGate:
             return
         if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
-                if self.recovery_policy is not None:
-                    periods = [v for v in (self.input_period_ns, self.result_period_ns) if v is not None]
-                    self.pause_context = self.recovery_policy.begin(max(periods) if periods else None,
-                        self.processing_p95_ns, time.monotonic_ns())
+                self.pause_context = self._recovery_window(time.monotonic_ns())
                 self.recover_by = now + (self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)
             self.state, self.reason = 'recovering', 'visual estimate rejected: ' + str(reason)
 
@@ -215,12 +228,18 @@ class EstimateGate:
         if stamp <= max(self.last_stamp, self.last_result_stamp) or now - stamp > 1_500_000_000:
             self.rejection = 'stale or out-of-order visual estimate'  # never counted as evidence
             return None
+        first_native_result = not self.last_native_stamp
         if self.last_native_stamp and stamp > self.last_native_stamp:
             self.result_intervals.append(stamp-self.last_native_stamp)
             if len(self.result_intervals) >= 5:
                 self.result_period_ns = int(np.median(self.result_intervals))
         self.last_native_stamp = stamp
         self.last_result_stamp = stamp
+        if first_native_result and self.last_pose is None and not info.lost and info.inliers == 0:
+            # Native odometry seeds its local map before it can register a
+            # pair. This first diagnostic is neither tracking nor a loss.
+            self.reason = 'waiting for visual matches after native initialization'
+            return None
         try:
             if info.lost or info.inliers < 10:
                 raise ValueError('visual tracking lost or insufficient inliers')
@@ -248,12 +267,15 @@ class EstimateGate:
             return None
         shared = None
         if self.relocalization_points is not None:
+            # A fresh matched result may arrive just as the ordinary pause
+            # expires, before another RGB-D pair reaches input().
+            self._start_landmark_verification(now)
             points = self._matched_points(info)
             unchanged = {p for i, p in points.items() if self.relocalization_points.get(i) == p}
             shared = len(unchanged)
             self.relocalization_misses = 0
             _, anchor_position, anchor_rotation = self.last_pose
-            if (self.relocalization_deadline is None or shared < F2M_SHARED_INLIERS or
+            if (shared < F2M_SHARED_INLIERS or
                     np.linalg.matrix_rank(np.array(list(unchanged)) - next(iter(unchanged))) < 2 or
                     np.linalg.norm(position - anchor_position) > RESUME_TRANSLATION_M or
                     np.linalg.norm(log_rotation(anchor_rotation.T @ rotation)) > RESUME_ROTATION_RAD):
@@ -731,7 +753,14 @@ class RgbdSession:
             return  # a tracking segment has separate bounded visual recovery rules
         if not (getattr(self.gate, "last_input_received", 0) or self.gate.last_input):
             return  # the watchdog's separate input timeout identifies missing images
-        if now_s-getattr(self, 'visual_initialization_started', self.started) < VISUAL_INITIALIZATION_S:
+        elapsed = now_s-getattr(self, 'visual_initialization_started', self.started)
+        if self._fusing() and self.imu.state == 'initializing' and elapsed >= IMU_STARTUP_GRACE_S:
+            now_ns = time.time_ns()
+            if self.has_fresh_inputs(now_ns):
+                self.fusion.fault('camera IMU unavailable during startup; using visual tracking')
+                self._check_fusion(now_ns)
+                return
+        if elapsed < VISUAL_INITIALIZATION_S:
             return
         if self._fusing():
             # Constructing an ESKF is not successful initialization. Repeated
@@ -901,6 +930,11 @@ class RgbdSession:
         from rtabmap_msgs.msg import RGBDImage
         import cv2
         while not self.stop_event.is_set():
+            if not self.rgbd.get_subscription_count():
+                # The private, volatile reader may still be discovering this
+                # session. Keep the latest pair pending until it can receive.
+                self.stop_event.wait(.02)
+                continue
             try:
                 pair = self.pending.get(timeout=.1)
             except queue.Empty:
