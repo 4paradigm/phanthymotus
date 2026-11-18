@@ -62,7 +62,7 @@ class TestExplicitTaskTimer(unittest.TestCase):
         """普通任务只需目标；用户指定定时时才传 check_cron。"""
         d = _build_system_tools([('task_create', task_mod.Tools().task_create)])
         props = d['task_create']['schema']['parameters']['properties']
-        self.assertEqual(list(props), ['goal', 'check_cron'])
+        self.assertEqual(list(props), ['goal', 'check_cron', 'delay_minutes', 'remind_at'])
         self.assertEqual(d['task_create']['schema']['parameters']['required'], ['goal'])
         self.assertIn(time.strftime('%Z %z'), props['check_cron']['description'])
         self.assertIn('仅用户明确要求', props['check_cron']['description'])
@@ -147,6 +147,38 @@ class TestExplicitTaskTimer(unittest.TestCase):
         self.assertIn(f'scheduler:task:{task.id}', result)
         self.assertIn('尚未触发', result)
         self.assertIn('不要现在执行提醒或标记完成', result)
+
+    def test_relative_timer_is_never_earlier_than_requested(self):
+        now = 1794990625  # 2026-11-18 16:30:25 +08:00
+        with patch.object(time, 'time', return_value=now), patch.object(scheduler, 'add_job'):
+            result = asyncio.run(task_mod.Tools().task_create(goal='一分钟后报时', delay_minutes=1))
+        task = task_store.active_tasks()[0]
+        next_ts = scheduler._next_run(task.check_cron, now)
+        self.assertEqual(next_ts, (now // 60 + 2) * 60)
+        self.assertGreaterEqual(next_ts, now + 60)
+        self.assertIn('北京时间 UTC+08:00', result)
+
+    def test_absolute_timer_converts_user_timezone_in_code(self):
+        now = 1794990625
+        with patch.object(time, 'time', return_value=now), patch.object(scheduler, 'add_job'):
+            result = asyncio.run(task_mod.Tools().task_create(goal='17:30报时', remind_at='17:30'))
+        task = task_store.active_tasks()[0]
+        next_ts = scheduler._next_run(task.check_cron, now)
+        expected = task_mod.datetime.datetime(2026, 11, 18, 17, 30,
+                    tzinfo=task_mod.datetime.timezone(task_mod.datetime.timedelta(hours=8))).timestamp()
+        self.assertEqual(next_ts, expected)
+        self.assertIn('2026-11-18 17:30 北京时间', result)
+
+    def test_invalid_or_conflicting_schedule_does_not_create_task(self):
+        for args in ({'delay_minutes': -1}, {'delay_minutes': float('nan')},
+                     {'delay_minutes': float('inf')}, {'delay_minutes': True},
+                     {'remind_at': '25:90'}, {'remind_at': '2000-01-01T08:00'},
+                     {'delay_minutes': 1, 'remind_at': '18:30'},
+                     {'check_cron': '0 8 * * *', 'delay_minutes': 1}):
+            with self.subTest(args=args):
+                result = asyncio.run(task_mod.Tools().task_create(goal='无效定时', **args))
+                self.assertIn('定时设置失败', result)
+                self.assertEqual(task_store.active_tasks(), [])
 
 
 class TestCapabilityIsKeptForHumansAndSolutions(unittest.TestCase):

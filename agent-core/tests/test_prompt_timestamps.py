@@ -62,3 +62,28 @@ def test_the_background_batch_uses_it_too():
     ])
 
     assert '18:28:39' in text
+
+
+def test_active_task_does_not_replace_clock_with_unix_timestamp(monkeypatch):
+    import task_store
+    import time
+    monkeypatch.setattr(task_store, 'active_tasks', lambda: [task_store.Task(
+        id='test0001', goal='稍后报时', created_at=MOMENT - 120, updated_at=MOMENT - 60)])
+    monkeypatch.setattr(prompt, 'format_ts', lambda **kw: '2026-09-20 18:28:39')
+    monkeypatch.setattr(time, 'time', lambda: MOMENT)
+    text = prompt._env_dynamic()
+    assert 'time="2026-09-20 18:28:39"' in text
+    assert 'timezone="UTC+08:00"' in text
+    assert 'scheduler_time=' in text
+    assert 'age="2min"' in text
+
+
+def test_future_reminder_policy_is_in_system_message(monkeypatch):
+    monkeypatch.setattr(prompt, '_system_definition', lambda: 'system')
+    monkeypatch.setattr(prompt, '_env_static', lambda *a: 'environment')
+    message = prompt.build_system({})
+    assert message['role'] == 'system'
+    assert 'delay_minutes' in message['content']
+    assert 'remind_at' in message['content']
+    assert 'scheduler:task:<id>' in message['content']
+    assert '普通任务的 check_cron 留空' in message['content']

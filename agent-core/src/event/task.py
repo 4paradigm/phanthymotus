@@ -4,6 +4,8 @@ event/task.py — 任务管理系统工具。
 提供 LLM 可调用的任务生命周期管理工具。
 """
 
+import datetime
+import math
 import time
 import typing
 
@@ -45,23 +47,59 @@ class Tools:
     @log.function_(call=True)
     async def task_create(self,
         goal: typing.Annotated[str, '任务目标描述（如"走到B点"）'],
-        check_cron: typing.Annotated[str, f'仅用户明确要求定时或周期提醒时填写的5字段cron（分 时 日 月 周）；按本机时区 {time.strftime("%Z %z")} 计算，须从用户时区换算。普通任务留空，禁止为追踪进度自行设置轮询。'] = '',
+        check_cron: typing.Annotated[str, f'仅用户明确要求周期提醒时填写的5字段cron（分 时 日 月 周）；按本机时区 {time.strftime("%Z %z")} 计算。一次性提醒使用 delay_minutes 或 remind_at。普通任务留空，禁止为追踪进度自行设置轮询。'] = '',
+        delay_minutes: typing.Annotated[float, '一次性提醒：多少分钟后执行，直接填写用户要求的分钟数；工具负责计算触发时刻，不能同时填 remind_at 或 check_cron。普通任务为0。'] = 0,
+        remind_at: typing.Annotated[str, '一次性提醒：用户指定的时刻，如HH:MM或YYYY-MM-DDTHH:MM；默认北京时间，可附ISO时区偏移。直接填用户时刻，工具负责时区换算；不能同时填 delay_minutes 或 check_cron。普通任务留空。'] = '',
     ):
         """创建一个长时间任务并开始追踪。适用于预计超过30秒的动作（导航、巡逻、等待等）。
 
-        默认只追踪，不自动定时检查。用户明确要求报时或提醒时，填写 check_cron 注册实际调度；
+        默认只追踪，不自动定时检查。一次性报时或提醒填写 delay_minutes 或 remind_at，
+        周期提醒才填写 check_cron；时间加法、分钟取整和时区转换交给工具计算。
         注册成功仅表示排期完成，当前回合只确认排期后结束，不要立即执行提醒或调用 task_done。
         等收到对应 scheduler:task:<id> 事件后才执行；一次性提醒执行后调用 task_done，避免重复。
         cron 精度为分钟，确认时使用返回的触发时间，不要承诺秒级倒计时。
         完成或失败时用 task_done / task_fail 收尾；子代理完成通知和进度播报由框架处理。
         """
         try:
+            if sum(bool(v) for v in (check_cron, delay_minutes, remind_at)) > 1:
+                raise ValueError('check_cron、delay_minutes、remind_at 只能填写一个')
+            now = time.time()
+            target = None
+            if delay_minutes:
+                if (isinstance(delay_minutes, bool) or not math.isfinite(delay_minutes)
+                        or delay_minutes <= 0):
+                    raise ValueError('delay_minutes 必须是大于0的有限分钟数')
+                target = now + delay_minutes * 60
+            elif remind_at:
+                user_tz = datetime.timezone(datetime.timedelta(hours=8))
+                try:
+                    when = datetime.datetime.fromisoformat(remind_at)
+                except ValueError:
+                    clock = datetime.time.fromisoformat(remind_at)
+                    when = datetime.datetime.combine(
+                        datetime.datetime.fromtimestamp(now, user_tz).date(), clock)
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=user_tz)
+                    if when.timestamp() <= now:
+                        when += datetime.timedelta(days=1)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=user_tz)
+                target = when.timestamp()
+                if target <= now:
+                    raise ValueError('remind_at 指定时刻已过去')
+            if target is not None:
+                # 沿用现有分钟精度 cron，向上取整，不能早于用户要求的延迟。
+                target = math.ceil(target / 60) * 60
+                check_cron = time.strftime('%M %H %d %m *', time.localtime(target))
             next_ts = scheduler._next_run(check_cron, time.time()) if check_cron else None
-        except (ValueError, RuntimeError) as e:
+        except (ValueError, RuntimeError, OverflowError) as e:
             return f'定时设置失败，未创建任务：{e}'
         task = task_store.create(goal=goal, check_cron=check_cron)
         _register_check(task)
-        timing = (f'；定时已注册，下次触发 {time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(next_ts))}。'
+        user_when = (datetime.datetime.fromtimestamp(next_ts, datetime.timezone(datetime.timedelta(hours=8)))
+                     .strftime('%Y-%m-%d %H:%M 北京时间 UTC+08:00')) if next_ts is not None else ''
+        timing = (f'；定时已注册，下次触发 {user_when}'
+                  f'（调度器 {time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(next_ts))}）。'
                   f'尚未触发：本轮只确认排期并结束，等待 scheduler:task:{task.id} 事件；'
                   '不要现在执行提醒或标记完成。') if next_ts is not None else '（未设置定时）'
         return f'任务已创建：[{task.id}] {task.goal}{timing}'

@@ -206,11 +206,12 @@ def _env_dynamic() -> str:
     每次调用都重新生成，但作为 user message 放在历史之后，
     不影响 system message 的缓存命中。
     """
-    now = format_ts(sep=' ')
+    now_text = format_ts(sep=' ')
+    import time as _time
+    scheduler_time = _time.strftime('%Y-%m-%d %H:%M:%S %Z %z')
 
     # 活跃任务
     import task_store
-    import time as _time
     active = task_store.active_tasks()
     tasks_section = ''
     if active:
@@ -368,11 +369,11 @@ def _env_dynamic() -> str:
     inner = tasks_section + sensors_section + narration_section + peers_section
     if inner:
         return (
-            f'<status time="{now}">\n'
+            f'<status time="{now_text}" timezone="UTC+08:00" scheduler_time="{scheduler_time}">\n'
             f'{inner}'
             f'</status>'
         )
-    return f'<status time="{now}" />'
+    return f'<status time="{now_text}" timezone="UTC+08:00" scheduler_time="{scheduler_time}" />'
 
 
 # ── L4 ────────────────────────────────────────────────────────────────────────
@@ -393,6 +394,29 @@ def _trigger_message(event: dict) -> str:
 
 # ── 公共入口 ──────────────────────────────────────────────────────────────────
 
+def _task_timing_policy() -> str:
+    """框架定时规则放进 system，避免只被理解成可选的任务追踪提示。"""
+    import time
+    return (
+        '\n\n<task_timing>\n'
+        '用户要求未来某个时刻、若干分钟后或周期提醒时，必须先调用 task_create，'
+        '一次性提醒直接填 delay_minutes（用户说多少分钟后）或 remind_at（用户说的时刻），'
+        '不要自己换算时区、计算分钟或生成 cron；工具负责计算。'
+        'check_cron 仅用于周期提醒。仅说现在报时才立即播报；未来的报时不能当成现在报时。\n'
+        '创建成功后，本轮只能确认排期并 finish；不要提前播报提醒内容，也不要 task_done。'
+        '只有收到对应 scheduler:task:<id> 事件才执行提醒，一次性提醒执行后 task_done。'
+        '周期提醒保留任务，用户取消时才结束。\n'
+        'status.time、event.ts 和未注明时区的用户时刻均为北京时间 UTC+08:00；'
+        f'check_cron 使用调度器时区 {time.strftime("%Z %z")}，'
+        'status.scheduler_time 给出同一时刻的调度器时间。'
+        'remind_at 默认接受北京时间，不要手工减8小时。'
+        '不能用 sleep 等待或自行建每分钟轮询。\n'
+        'cron 为分钟精度，确认时使用工具返回的真实下次触发时刻。'
+        '普通任务的 check_cron 留空，不为进展追踪自行定时。\n'
+        '</task_timing>'
+    )
+
+
 def build_system(mcp_registry: dict, bound_tools: set | None = None) -> dict:
     """构建 system message（L1 + L2-static）。
 
@@ -401,7 +425,8 @@ def build_system(mcp_registry: dict, bound_tools: set | None = None) -> dict:
     """
     return {
         'role': 'system',
-        'content': _system_definition() + '\n\n' + _env_static(mcp_registry, bound_tools),
+        'content': (_system_definition() + '\n\n' + _env_static(mcp_registry, bound_tools)
+                    + _task_timing_policy()),
     }
 
 
