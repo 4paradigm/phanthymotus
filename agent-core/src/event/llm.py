@@ -263,6 +263,47 @@ def _elide_arguments(args, value_chars: int = 40, max_chars: int = 400) -> str:
     return dumped
 
 
+# 说出口的话占的通道。和 benchmark_facts.SPEECH_CHANNELS 同一个判据：按驱动申报的
+# `x-resource`，不按工具名猜（嘴叫 tts / speaker / audio_play，各家不同）。
+_SPEECH_CHANNELS = frozenset({'mouth'})
+
+
+def _is_utterance(name: str) -> bool:
+    """这条调用的参数是不是**原话** —— 播报出去的、发到渠道里的文字。
+
+    原话的参数不能走 `_elide_arguments`。压出来的 `{"text": "我们现在到达具身智能
+    展位。前面介绍的AI更多生活在软件里，具…(略)"}` 留在历史里，在模型眼里就是一条
+    「我以前这么调用过 speak」的样例 —— 天轶导览里它照着生成了新的 speak，`…(略)`
+    是它自己写的，于是被 TTS 念了出来（深圳现场），北京日志里也有同样的新调用。
+    所以「最新一条没被压缩」不等于安全：坏的是之前的样例。
+
+    原话本身也是有用的上下文：模型要知道自己已经讲过什么，才不会重讲、也不会漏讲。
+    它的长度由「一段能念完的讲解」封顶，不是 canvas 配置那种无上限的参数。
+
+    没申报 `x-resource` 的播报工具认不出来，照旧被压 —— 和 barrier/on_notify 一样
+    只认申报，不猜。
+    """
+    if name == 'mcp__channel__channel_reply':
+        return True
+    if not name.startswith('mcp__'):
+        return False
+    entry = mcp_client.registry.get(name.split('__')[1]) or {}
+    meta = entry.get('tool_meta', {}).get(name) or {}
+    return bool((meta.get('resource') or frozenset()) & _SPEECH_CHANNELS)
+
+
+def _elide_call(tc: dict, value_chars: int, max_chars: int) -> dict:
+    """压一条 tool_call 的 arguments；原话（见 `_is_utterance`）原样返回。"""
+    fn = tc.get('function', {})
+    args = fn.get('arguments', '')
+    if _is_utterance(fn.get('name', '')):
+        return tc
+    elided = _elide_arguments(args, value_chars=value_chars, max_chars=max_chars)
+    if elided == args:
+        return tc
+    return {**tc, 'function': {**fn, 'arguments': elided}}
+
+
 def _scrub(message_list: list[dict]) -> list[dict]:
     """丢弃结构非法的 tool_call、非法的 arguments，以及失去归属的 tool 结果。
 
@@ -1310,11 +1351,7 @@ def _degrade_turn(turn: list[dict]) -> list[dict]:
                 msg = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
             msg = {**msg, 'tool_calls': [
-                {**tc, 'function': {
-                    **tc['function'],
-                    'arguments': _elide_arguments(tc['function'].get('arguments', ''),
-                                                  value_chars=20, max_chars=80),
-                }}
+                _elide_call(tc, value_chars=20, max_chars=80)
                 for tc in msg['tool_calls']
             ]}
         degraded.append(msg)
@@ -1342,17 +1379,11 @@ def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> 
                 turn_messages[i] = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
             # 保留 tool_calls 结构（API 需要），但截短 arguments —— 按结构压，
-            # 不能直接切片，切出来的半截 JSON 服务端不收。
-            new_calls = []
-            for tc in msg['tool_calls']:
-                args = tc.get('function', {}).get('arguments', '')
-                elided = _elide_arguments(args, value_chars=30, max_chars=100)
-                if elided != args:
-                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': elided}}
-                else:
-                    new_tc = tc
-                new_calls.append(new_tc)
-            turn_messages[i] = {**msg, 'tool_calls': new_calls}
+            # 不能直接切片，切出来的半截 JSON 服务端不收。原话不压，见 `_is_utterance`。
+            turn_messages[i] = {**msg, 'tool_calls': [
+                _elide_call(tc, value_chars=30, max_chars=100)
+                for tc in msg['tool_calls']
+            ]}
 
 
 _REWRITE_SUMMARY_PROMPT = """将以下两段历史摘要合并为一段简洁摘要。
