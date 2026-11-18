@@ -76,6 +76,7 @@ function _renderChannels(channels) {
           <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
             Trusted Bots: ${(ch.trusted_bots || []).length}
           </button>` : ''}
+        ${ch.platform === 'qq' ? `<button class="btn-ghost btn-sm" data-channel-action="qq-edit">Configure</button>` : ''}
         <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
         <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" data-channel-action="delete">Delete</button>
@@ -96,11 +97,19 @@ function _showAddForm() {
           <option value="slack">Slack</option>
           <option value="feishu">Feishu (飞书)</option>
           <option value="lan">LAN (机器人之间)</option>
+          <option value="qq">QQ (OneBot / NapCat)</option>
         </select>
       </div>
       <div class="channel-form-row">
         <label>ID</label>
         <input type="text" id="channel-form-id" placeholder="e.g. telegram_main" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-ws-row">
+        <label>OneBot WebSocket URL</label>
+        <input type="text" id="channel-form-qq-ws" placeholder="ws://127.0.0.1:3001/" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-qq-private-row">
+        <label><input type="checkbox" checked disabled /> Private only (V1)</label>
       </div>
       <div class="channel-form-row" id="channel-form-token-row">
         <label>Bot Token</label>
@@ -158,7 +167,9 @@ function _showAddForm() {
     document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
-      isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
+      isSlack ? 'Bot Token (xoxb-...)' : (p === 'qq' ? 'Access Token' : 'Bot Token');
+    document.getElementById('channel-form-qq-ws-row').classList.toggle('hidden', p !== 'qq');
+    document.getElementById('channel-form-qq-private-row').classList.toggle('hidden', p !== 'qq');
     document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan);
   }
 
@@ -187,7 +198,13 @@ async function _submitAdd(formEl) {
 
   const config = {};
 
-  if (platform === 'telegram') {
+  if (platform === 'qq') {
+    const wsUrl = document.getElementById('channel-form-qq-ws').value.trim();
+    if (!wsUrl || !token) { alert('QQ WebSocket URL and Access Token are required'); return; }
+    config.ws_url = wsUrl;
+    config.access_token = token;
+    config.private_only = true;
+  } else if (platform === 'telegram') {
     if (!token) { alert('Bot Token is required'); return; }
     config.bot_token = token;
   } else if (platform === 'slack') {
@@ -246,10 +263,61 @@ function _handleChannelAction(e) {
   switch (btn.dataset.channelAction) {
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
     case 'trusted-bots': _showTrustedBots(channel, item); break;
+    case 'qq-edit': _showQQEdit(channel, item); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
     case 'delete':     _channelDelete(channel.id); break;
   }
+}
+
+function _showQQEdit(channel, item) {
+  const prev = item.querySelector('[data-qq-edit-form]');
+  if (prev) { prev.remove(); return; }
+  const form = document.createElement('div');
+  form.className = 'channel-add-form';
+  form.dataset.qqEditForm = '1';
+  form.innerHTML = `
+    <div class="channel-form-row">
+      <label>OneBot WebSocket URL</label>
+      <input data-qq-ws type="text" value="${_escAttr(channel.qq_ws_url || '')}" />
+    </div>
+    <div class="channel-form-row">
+      <label>Access Token (blank keeps current)</label>
+      <input data-qq-token type="password" autocomplete="new-password" />
+    </div>
+    <div class="channel-form-row">
+      <label><input type="checkbox" checked disabled /> Private only (V1)</label>
+    </div>
+    <div class="channel-form-actions">
+      <button class="btn-primary" data-qq-save>Save & Restart</button>
+      <button class="btn-ghost" data-qq-cancel>Cancel</button>
+    </div>`;
+  item.appendChild(form);
+  form.querySelector('[data-qq-cancel]').addEventListener('click', () => form.remove());
+  form.querySelector('[data-qq-save]').addEventListener('click', async () => {
+    const url = form.querySelector('[data-qq-ws]').value.trim();
+    const token = form.querySelector('[data-qq-token]').value.trim();
+    if (!url) { alert('WebSocket URL is required'); return; }
+    const config = { ws_url: url, private_only: true };
+    if (token) config.access_token = token;
+    const saveBtn = form.querySelector('[data-qq-save]');
+    saveBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/channel/${encodeURIComponent(channel.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config }),
+      });
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}));
+        throw new Error(json.detail || `HTTP ${res.status}`);
+      }
+      _loadChannels();
+    } catch (e) {
+      alert('QQ configuration failed: ' + e.message);
+      saveBtn.disabled = false;
+    }
+  });
 }
 
 async function _channelSetBotToBot(id, enabled, btn) {

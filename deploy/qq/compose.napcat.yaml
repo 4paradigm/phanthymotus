@@ -1,0 +1,21 @@
+# Isolated NapCat companion service; does not modify existing Bumi containers.
+# Agent Core currently uses host network, so its ws_url can target 127.0.0.1:3001.
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:v4.18.37
+    restart: unless-stopped
+    environment:
+      MODE: ws
+      WEBUI_TOKEN: ${WEBUI_TOKEN:?set WEBUI_TOKEN in a private .env}
+    ports:
+      - "127.0.0.1:6099:6099"
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./data/qq:/app/.config/QQ
+      - ./data/config:/app/napcat/config
+      - ./data/plugins:/app/napcat/plugins
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,8 @@
+# NapCat runtime state; contains authenticated QQ sessions and identifiers.
+data/
+.env
+*.log
+*.db
+*.sqlite*
+*token*
+!*.example

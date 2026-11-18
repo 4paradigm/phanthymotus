@@ -677,7 +677,8 @@ class ChannelManager:
             user = acl.get_user(msg.platform, msg.user_id)
             if user is None:
                 channel_settings = self._get_channel_settings()
-                default_role = channel_settings.get('default_role', 'viewer')
+                default_role = ('viewer' if msg.platform == 'qq' else
+                                channel_settings.get('default_role', 'viewer'))
                 auto_approve = channel_settings.get('auto_approve', True)
                 if auto_approve:
                     acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
@@ -969,6 +970,8 @@ class ChannelManager:
                 'trusted_bots': ch_cfg.get('trusted_bots', []),
                 'status': adapter.status() if adapter else 'disconnected',
                 'health_error': '' if not health or health[0] else health[1],
+                'qq_ws_url': (ch_cfg.get('config', {}).get('ws_url', '')
+                              if ch_cfg['platform'] == 'qq' else ''),
                 'active_input': channel_id in self.active_input_channels,
                 'active_output': channel_id in self.active_output_channels,
             })
