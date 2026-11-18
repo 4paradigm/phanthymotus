@@ -414,6 +414,32 @@ class Gate:
 
 
 @dataclass
+class ClearanceRecovery:
+    """Confirm a route on three distinct depth updates, then ramp translation."""
+    route: str = ""
+    frames: int = 0
+    last_frame: object = None
+
+    def scale(self, route, depth, max_age_ms):
+        frame = depth.get("frame_id")
+        if frame is None:
+            # Pure-policy callers can supply an unstamped depth map.
+            frame = depth["map"] if depth.get("map") is not None else depth
+            fresh = frame is not self.last_frame
+        else:
+            previous = self.last_frame
+            fresh = not isinstance(previous, int) or frame != previous
+            if isinstance(previous, int) and not 0 <= frame - previous <= max_age_ms:
+                self.frames = 0
+        if route != self.route:
+            self.route, self.frames = route, 0
+        if fresh:
+            self.frames += 1
+        self.last_frame = frame
+        return min(1.0, max(0, self.frames - 2) / 3.0)
+
+
+@dataclass
 class State:
     """What the policy remembers between ticks. Owned by the card, passed in."""
 
@@ -424,6 +450,8 @@ class State:
     # `_approach`. It did not have one, and that is why every run began with a
     # sidestep nobody asked for.
     vy_gate: Gate = field(default_factory=Gate)
+    escape_side: float = 0.0
+    recovery: ClearanceRecovery | None = None
     # What the corridor read on the last tick. Kept so the debug overlay can
     # draw the number the decision was made from, rather than measuring the
     # depth map a second time and risking a picture that disagrees with the
@@ -987,6 +1015,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # nothing lets the watchdog stop the robot, which is the right resting
     # state for "this policy cannot see".
     if detections is None or depth is None:
+        if state.recovery is not None:
+            state.recovery = ClearanceRecovery()
         return Decision(None, BLIND,
                         "observation stale or missing (vop / depth); publishing nothing, "
                         "leaving the stop to the downstream watchdog")
@@ -994,6 +1024,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     bands = depth.get("bands") or {}
 
     if track is None:
+        if not _can_turn_after_stop(depth, config, state):
+            return Decision(_twist(0, 0, 0), AVOIDING, "近障停车，等待确认可转向")
         return _search(config, state, dt, odom)
 
     state.missing_frames = 0
@@ -1078,13 +1110,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
     align = _alignment_scale(bearing, config)
     if align <= 0.0:
         state.commanded_vx = 0.0
-        # Turning in place: the standing floor applies, so this is the one path
-        # that still needs the gate and the lift.
-        wz = _finalise_yaw(raw_wz, False, bearing, config, state, dt)
-        return Decision(_twist(0.0, 0.0, wz), ALIGNING,
-                        f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
+        state.avoidance_yaw_override = False
+        reason = f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正"
+        _, vy, turn, status, reason = _avoid(
+            0.0, 0.0, raw_wz, depth, config, ALIGNING, reason, state,
+            target_distance=distance, measured_vx=(odom or {}).get("vx"),
+            aligned=False)
+        wz = _finalise_yaw(turn, bool(vy), bearing, config, state, dt)
+        return Decision(_twist(0.0, vy, wz), status, reason,
                         distance_m=distance, bearing=bearing,
-                        k_yaw_effective=yaw_gain)
+                        k_yaw_effective=None if state.avoidance_yaw_override else yaw_gain)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
@@ -1125,8 +1160,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
                        state, dt)
     tracking_wz = raw_wz
     state.avoidance_yaw_override = False
-    vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
-                                            status, reason, state)
+    vx, vy, raw_wz, status, reason = _avoid(
+        vx, vy, raw_wz, depth, config, status, reason, state,
+        target_distance=distance, measured_vx=(odom or {}).get("vx"),
+        aligned=abs(bearing) < config.align_full_stop)
     if within and config.stop_tolerance_m > 0 and (vx or vy):
         # Avoidance may propose a sidestep after the approach has stopped.
         # A configured arrival tolerance also holds that translation while
@@ -1384,19 +1421,24 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
         dt=dt, min_dwell_s=config.min_dwell_s)
 
 
-def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
-    """Slow for what is ahead, and move out from in front of it if it is close.
+def _can_turn_after_stop(depth, config: Config, state: State) -> bool:
+    """Keep target-search turns clear of close obstacles and unmeasured space."""
+    ahead, coverage = _clearance(depth, config)
+    state.last_clearance, state.last_coverage = ahead, coverage
+    if coverage < config.coverage_min or (ahead is not None and ahead <= config.obstacle_stop_m):
+        state.recovery = ClearanceRecovery()
+        return False
+    if state.recovery is None:
+        return True
+    if ahead is None or ahead < config.slow_distance_m or coverage < config.coverage_full:
+        state.recovery = ClearanceRecovery()
+        return False
+    return state.recovery.scale("turn", depth, config.max_obs_age_ms) > 0
 
-    Backing away is not available — the depth map covers what the camera sees
-    and nothing behind the robot, so reversing is moving blind.
 
-    When something is close enough to stop for, the robot both turns towards
-    the freer side **and** steps towards it. Turning alone only changes where it
-    is pointing; on a base that can translate, the sidestep is what actually
-    gets it out of the way, and doing both at once is one continuous motion
-    rather than a pirouette followed by a walk.
-    """
-    bands = (depth or {}).get("bands") or {}
+def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
+           target_distance=None, measured_vx=None, aligned=True):
+    """Slow down and prefer a measured side route around foreground obstacles."""
     ahead, coverage = _clearance(depth, config)
     if state is not None:
         state.last_clearance, state.last_coverage = ahead, coverage
@@ -1407,7 +1449,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
     # produced the same number. The objects that make holes are the ones that
     # catch a shoulder.
     if coverage < config.coverage_min:
-        return (0.0, 0.0, wz, AVOIDING,
+        if state is not None:
+            state.recovery = ClearanceRecovery()
+            state.escape_side = 0.0
+        return (0.0, 0.0, 0.0, AVOIDING,
                 f"正前方只有 {coverage * 100:.0f}% 的深度有效，看不清就不往前走"
                 f"（需要 {config.coverage_min * 100:.0f}%）")
 
@@ -1416,101 +1461,105 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
     trust = min(1.0, max(0.0, (coverage - config.coverage_min)
                          / max(1e-6, config.coverage_full - config.coverage_min)))
 
-    if ahead is None:
-        return _scaled(vx, trust, config.floor_vx, config.vx_max), \
-                _scaled(vy, trust, config.floor_vy, config.vy_max), \
-                wz, status, reason
+    # The target itself also appears in the depth map. Only steer early
+    # around a return distinctly in front of it.
+    foreground = (ahead is not None
+                  and (target_distance is None or depth.get("map") is None
+                       or ahead + config.clearance_margin_m < target_distance))
+    stop = config.obstacle_stop_m
+    slow = config.slow_distance_m
+    if foreground:
+        # Reserve the distance travelled in one observation freshness window.
+        last_vx = state.commanded[0] if state is not None else 0.0
+        speed = max(0.0, measured_vx or 0.0, last_vx)
+        stop = min(slow, stop + speed * config.max_obs_age_ms / 1000)
+    near = ahead is not None and ahead <= stop
+    approaching = ahead is not None and ahead < slow
+    scale = trust
+    if approaching:
+        scale *= max(0.0, (ahead - stop) / max(1e-6, slow - stop))
+        if status != ALIGNING:
+            status, reason = AVOIDING, f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速"
 
-    if ahead <= config.obstacle_stop_m:
-        # **Which way out, decided on metric corridors — not on the angular
-        # thirds.**
-        #
-        # This branch was the other half of the bug the metric corridor was
-        # introduced to fix. "Is the way ahead blocked" became metric; "which way
-        # do I go" stayed on `bands`, which describe what is ahead-and-to-the-side
-        # at a couple of metres rather than what is beside the shoulder. A
-        # **doorway** beside the path is the worst case for that: you can see
-        # through it, so it reads as the *emptiest* band, and the robot steers
-        # into the one thing in reach.
-        #
-        # That is what happened on r1_sz. The robot could have walked straight
-        # through a 1.1 m door; instead it reached the doorway, deliberately
-        # turned towards it, and put a shoulder into the frame — at
-        # `wz_max` = 1.5 rad/s and `vy_max` = 1.0 m/s, because the escape was
-        # full-scale and unconditional.
-        #
-        # So both sides are now judged by the corridor the robot would actually
-        # move into, which is the same question `_may_strafe` asks, and the turn
-        # is refused outright when neither side is measured and clear.
+    side = 0.0
+    if near or (approaching and foreground):
         keep = _keepout_m(config)
-        left_room, left_cov = _clearance(depth, config, lateral_offset_m=-keep)
-        right_room, right_cov = _clearance(depth, config, lateral_offset_m=keep)
-
-        def _room(room, coverage):
-            """How much room a side offers, or None if the answer is not usable.
-
-            Unmeasured is not free. Sideways is the direction a forward-facing
-            camera knows least about, and this is the one place the policy moves
-            into space it cannot see.
-            """
-            if coverage < config.coverage_min:
-                return None
-            if room is None:
-                return float("inf")
-            return room if room > config.slow_distance_m else None
-
-        options = {-1.0: _room(left_room, left_cov),
-                   1.0: _room(right_room, right_cov)}
-        usable = {sign: room for sign, room in options.items() if room is not None}
-
-        if not usable:
-            # Nowhere to go that we can see. Keep the target-derived yaw — it at
-            # least points at the target — and do not spin towards a band: a
-            # walking humanoid rotating at wz_max sweeps its shoulders through
-            # space no corridor checked, which is exactly how one found a
-            # doorframe.
-            return (0.0, 0.0, wz, AVOIDING,
+        rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
+                 for s in (-1.0, 1.0)}
+        # A summary with a missing side band supplies no evidence of free space.
+        usable = {s: (float("inf") if room is None else room)
+                  for s, (room, cov) in rooms.items()
+                  if cov >= config.coverage_min
+                  and ((room is None and depth.get("map") is not None)
+                       or (room is not None and room > slow))}
+        if usable:
+            side = (state.escape_side if state and state.escape_side in usable
+                    else max(usable, key=usable.get))
+        else:
+            if state is not None:
+                state.escape_side = 0.0
+                state.recovery = ClearanceRecovery()
+            left, right = (_side_label(*rooms[s], config) for s in (-1.0, 1.0))
+            return (0.0, 0.0, 0.0, AVOIDING,
                     f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
-                    f"（左 {_side_label(left_room, left_cov, config)}，"
-                    f"右 {_side_label(right_room, right_cov, config)}）；停下")
+                    f"（左 {left}，右 {right}）；停下")
 
-        sign = max(usable, key=lambda k: usable[k])
-        # Turn towards the gap rather than at full scale. The gap sits at
-        # `atan(keep / ahead)` off the nose, so this is the same proportional law
-        # the main loop uses applied to the angle that actually has to be closed
-        # — bounded, derived, and about a third of what wz_max was commanding.
-        gap_angle = math.atan2(keep, max(ahead, 0.1))
+    vx = _scaled(vx, scale, config.floor_vx, config.vx_max)
+    vy = _scaled(vy, scale, config.floor_vy, config.vy_max)
+    if state is not None:
+        state.escape_side = side
+    if side:
+        # Blend in the turn as clearance shrinks, keeping yaw towards the
+        # chosen route even when the target is on the blocked side.
+        weight = 1.0 if near or not aligned else 1.0 - (ahead - stop) / max(1e-6, slow - stop)
         yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
                     else config.k_yaw)
-        wz = _clamp(-sign * yaw_gain * gap_angle, config.wz_max)
+        escape_yaw = _clamp(-side * yaw_gain * math.atan2(keep, max(ahead, 0.1)),
+                            config.wz_max)
+        tracking_yaw = wz if wz * escape_yaw > 0 else 0.0
+        wz = (1.0 - weight) * tracking_yaw + weight * escape_yaw
+        lateral = -side * config.vy_max * config.lateral_scale * weight * trust
+        vy = 0.0
+        if config.use_lateral and (aligned or near):
+            if near or abs(lateral) >= config.floor_vy * config.lateral_lift_ratio:
+                vy = _lift(lateral, config.floor_vy, config.vy_max)
+        if near or not vy:
+            vx = 0.0
         if state is not None:
             state.avoidance_yaw_override = True
-        # `sign` indexes the **offset corridor** (+1 = the one displaced to the
-        # right), while the body frame has y pointing **left** — so the sidestep
-        # takes the opposite sign. Getting this wrong steps into the obstacle it
-        # just decided to avoid, at full speed, and every other signal in the
-        # decision still looks right.
-        vy = (_lift(-sign * config.vy_max * config.lateral_scale,
-                    config.floor_vy, config.vy_max)
-              if _may_strafe(sign > 0, depth, config) else 0.0)
-        side = "右" if sign > 0 else "左"
-        return (0.0, vy, wz, AVOIDING,
-                f"走廊内 {ahead:.2f} m 处有障碍；停止前进，朝{side}侧"
-                + ("让开并转向" if vy else "转向"))
+        direction = "右" if side > 0 else "左"
+        status, reason = AVOIDING, f"走廊内 {ahead:.2f} m 处有障碍，朝{direction}侧避让"
+        if not vy and not wz:
+            if state is not None:
+                state.recovery = ClearanceRecovery()
+            return 0.0, 0.0, 0.0, AVOIDING, "当前控制限制下无法侧向避让；停下"
 
-    if ahead < config.slow_distance_m:
-        span = max(1e-6, config.slow_distance_m - config.obstacle_stop_m)
-        scale = max(0.0, (ahead - config.obstacle_stop_m) / span)
-        # Both translation axes scale together, so slowing down does not also
-        # change the direction of travel.
-        scale *= trust
-        return (_scaled(vx, scale, config.floor_vx, config.vx_max),
-                _scaled(vy, scale, config.floor_vy, config.vy_max), wz, AVOIDING,
-                f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速")
-
-    return (_scaled(vx, trust, config.floor_vx, config.vx_max),
-            _scaled(vy, trust, config.floor_vy, config.vy_max), wz,
-            status, reason)
+    side_route = "right" if side > 0 else "left"
+    if near:
+        side_route += "-in-place"
+        if state is not None and state.recovery is None:
+            # An already measured side permits the existing near sidestep.
+            # Advancing from that pose is a different route and needs new frames.
+            state.recovery = ClearanceRecovery(route=side_route, frames=5)
+    if state is not None and state.recovery is not None:
+        if side:
+            route = side_route
+        elif ahead is not None and ahead > stop + config.clearance_margin_m and coverage >= config.coverage_full:
+            route = "forward"
+        else:
+            state.recovery = ClearanceRecovery()
+            return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待通道有足够余量"
+        if route != state.recovery.route and not near:
+            state.blocked_for_s = 0.0
+        gain = state.recovery.scale(route, depth, config.max_obs_age_ms)
+        if gain == 0:
+            return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待连续新深度帧确认通道"
+        vx = _scaled(vx, gain, config.floor_vx, config.vx_max)
+        vy = _scaled(vy, gain, config.floor_vy, config.vy_max)
+        wz *= gain
+        if gain == 1 and not near:
+            state.recovery = None
+    return vx, vy, wz, status, reason
 
 
 def _scaled(value: float, factor: float, floor: float, ceiling: float) -> float:

@@ -269,10 +269,12 @@ def test_strafing_needs_the_side_it_moves_into_to_be_known_and_clear():
     blocked = _scene(5.0, [(0.55, 1.0, 0.5)])
     unmeasured = {"map": _obstacle_map(5.0), "bands": {"left": 5.0, "center": 5.0}}
     unmeasured["map"][:, 340:] = np.nan
-    for depth in (blocked, unmeasured):
-        decision = _step(detections=_detections(_obj(x=0.5)), depth=depth)
-        assert decision.values[1] == 0.0
-        assert decision.values[5] < 0, "it still turns towards the target"
+    turn_away = _step(detections=_detections(_obj(x=0.5)), depth=blocked)
+    assert turn_away.values[:2] == [0.0, 0.0]
+    assert turn_away.values[5] > 0  # The verified route goes left.
+    turn_in_place = _step(detections=_detections(_obj(x=0.5)), depth=unmeasured)
+    assert turn_in_place.values[1] == 0.0
+    assert turn_in_place.values[5] < 0
 
 
 def test_a_target_too_far_off_axis_is_turned_to_rather_than_strafed_at():
@@ -435,10 +437,10 @@ def test_arrival_distance_sum_cannot_overflow_to_infinity():
 # them separately here is what isolates the avoidance branch from the arrival
 # branch, which would otherwise both fire on the same number.
 
-def test_a_near_obstacle_ahead_slows_the_approach():
+def test_a_near_obstacle_with_an_open_side_slows_the_approach():
     far = _step(detections=_detections(_obj(x=0.0)), depth=_scene(4.0))
     near = _step(detections=_detections(_obj(x=0.0)),
-                 depth=_scene(4.0, [(0.0, 1.0, 0.6)]))
+                 depth=_scene(4.0, [(0.25, 1.0, 0.35)]))
     assert 0 < near.values[0] < far.values[0]
     assert near.status == P.AVOIDING
 
@@ -2315,3 +2317,111 @@ def test_invalid_driver_response_falls_back_to_generic_yaw(response):
     notes = P.adopt_response(config, {"response": response})
     assert config.response_yaw_gain is None
     assert len(notes) == 1 and "0.6" in notes[0]
+
+
+def test_steer_early_only_for_an_obstacle_between_robot_and_target():
+    obstacle = _scene(4.0, [(0.25, 1.0, 0.35)])
+    turn = _step(detections=_detections(_obj()), depth=obstacle)
+    assert turn.values[0] > 0 and turn.values[1] > 0 and turn.values[5] > 0
+    target = _step(detections=_detections(_obj()), depth=_scene(1.0),
+                   config=_cfg(stop_distance_m=0.6))
+    assert target.values[1] == target.values[5] == 0
+
+
+def test_brake_before_box_and_resume_only_on_successive_new_clear_frames():
+    cfg = _cfg(stop_distance_m=0.6)
+    blocked = _scene(3.0, [(0.0, 0.66, 0.65)])
+    clear = _scene(3.0)
+    state = seed(_state(), _detections(_obj()), blocked, cfg)
+
+    def tick(depth, speed=0.0):
+        return _step(detections=_detections(_obj()), depth=depth,
+                     state=state, config=cfg, odom={'vx': speed})
+
+    assert tick(blocked, 0.34).values[:2] == [0.0, 0.0]
+    first = dict(clear, frame_id=1)
+    for _ in range(6):
+        assert tick(first).values[:2] == [0.0, 0.0]
+    assert tick(None).status == P.BLIND
+    speeds = [tick(dict(clear, frame_id=i)).values[0] for i in range(2, 7)]
+    assert speeds[:2] == [0.0, 0.0]
+    assert 0 < speeds[2] < speeds[3] < speeds[4]
+
+
+def test_box_blocking_both_routes_stops_before_entering_stopping_distance():
+    cfg = _cfg(stop_distance_m=0.6)
+    box = _scene(2.8, [(0.0, 1.16, 0.65)])
+    decision = _step(detections=_detections(_obj()), depth=box, config=cfg)
+    assert decision.values == [0.0] * 6
+    assert "两侧也都不可用" in decision.reason
+
+
+def test_near_sidestep_holds_forward_when_the_obstacle_leaves_view():
+    cfg = _cfg(stop_distance_m=0.6)
+    near = _scene(4.0, [(0.25, 0.6, 0.3)])
+    clear = _scene(4.0)
+    state = seed(_state(), _detections(_obj()), near, cfg)
+
+    def tick(depth, frame_id):
+        return _step(detections=_detections(_obj()), depth=dict(depth, frame_id=frame_id),
+                     state=state, config=cfg)
+
+    for frame_id in (100, 200):
+        sidestep = tick(near, frame_id)
+        assert sidestep.values[0] == 0
+        assert sidestep.values[1] > 0
+    assert tick(clear, 300).values == [0.0] * 6
+    assert tick(clear, 400).values == [0.0] * 6
+    assert tick(clear, 500).values[0] > 0
+
+
+def test_clear_frames_after_a_stop_allow_searching_for_a_lost_target():
+    cfg = _cfg(stop_distance_m=0.6, lost_frames=1)
+    blocked = _scene(3.0, [(0.0, 1.16, 0.65)])
+    state = seed(_state(), _detections(_obj()), blocked, cfg)
+    stopped = _step(detections=_detections(_obj()), depth=blocked, state=state, config=cfg)
+    assert stopped.values == [0.0] * 6
+    state.tracker = P.Tracker()
+    for frame_id in (100, 200, 300):
+        decision = _step(detections=_detections(), state=state, config=cfg,
+                         depth=dict(_scene(3.0), frame_id=frame_id))
+        assert decision.values[:2] == [0.0, 0.0]
+        if frame_id < 300:
+            assert decision.values[5] == 0
+        else:
+            assert decision.status == P.SEARCHING and decision.values[5] != 0
+
+
+def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
+    cfg = _cfg(lost_frames=1)
+    decision = _step(detections=_detections(), depth=_scene(0.4),
+                     config=cfg, state=_state())
+    assert decision.values == [0.0] * 6
+    assert decision.status == P.AVOIDING
+
+
+def test_missing_target_range_does_not_disable_early_stop():
+    mat = _obstacle_map(2.8, [(0.0, 1.16, 0.65)])
+    mat[190:270, 260:380] = np.nan
+    decision = _step(detections=_detections(_obj(bbox=(0.42, 0.43, 0.58, 0.54))),
+                     depth=_depth(map_=mat), config=_cfg(stop_distance_m=0.6))
+    assert decision.values == [0.0] * 6
+
+
+def test_an_unexecutable_side_manoeuvre_does_not_keep_going_straight():
+    obstacle = _scene(4.0, [(0.25, 1.0, 0.35)])
+    decision = _step(detections=_detections(_obj()), depth=obstacle,
+                     config=_cfg(use_lateral=False, k_yaw=0.0))
+    assert decision.values == [0.0] * 6
+
+
+def test_a_near_side_escape_has_a_blocked_deadline():
+    cfg = _cfg(stop_distance_m=0.6, blocked_timeout_s=0.4)
+    near = _scene(4.0, [(0.25, 0.6, 0.3)])
+    state = seed(_state(), _detections(_obj()), near, cfg)
+    for frame_id in range(100, 700, 100):
+        decision = _step(detections=_detections(_obj()), depth=dict(near, frame_id=frame_id),
+                         state=state, config=cfg, odom={"vx": 0.0, "vy": 0.0, "wz": 0.0})
+        if decision.status == P.FAILED:
+            break
+    assert decision.status == P.FAILED

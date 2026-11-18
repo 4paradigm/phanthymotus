@@ -893,7 +893,7 @@ def test_visual_observation_freshness_boundary(monkeypatch, age_ms, role):
     if role == "depth" and age_ms > 1000:
         assert depth is None
     else:
-        assert depth == {"map": None, "bands": {"center": 2.0}}
+        assert depth == {"map": None, "bands": {"center": 2.0}, "frame_id": card._depth_ms}
 
 
 @pytest.mark.parametrize("age_ms", [900, 1000, 1001])
@@ -1396,3 +1396,14 @@ def test_head_depth_topic_binds_as_metric_depth():
     assert bound["depth_map"] == "/nvidia_desktop/camera/head/depth"
 
 
+
+
+def test_summary_does_not_refresh_a_bound_depth_map():
+    card = _card()
+    node = _FakeNode()
+    bound, problem = card._bind_inputs(
+        node, ["/cam/objects", "/cam/visual_depth", "/cam/visual_depth_summary"])
+    assert problem == ""
+    assert bound["depth_map"] == "/cam/visual_depth"
+    assert not bound["depth_summary"]
+    assert "/cam/visual_depth_summary" not in node.subscriptions

@@ -472,6 +472,11 @@ class NaviPlugin:
             self._state = policy_mod.State()
             self._running = True
 
+        with self._obs_lock:
+            self._depth_map = None
+            self._depth_bands = {}
+            self._depth_ms = 0
+
         try:
             self._open_publisher()
             binding, problem = self._bind_inputs(
@@ -1189,6 +1194,9 @@ class NaviPlugin:
 
         qos = _sensor_qos()
         if bound["depth_map"]:
+            # The map is authoritative for clearance. A summary must not
+            # refresh the age or identity of a different, retained map.
+            bound["depth_summary"] = ""
             topic = bound["depth_map"]
             # ``camera_info`` is optical metadata, not a wire-format registry.
             # Prefer the canvas binding when supplied; keep the declaration
@@ -1469,8 +1477,8 @@ class NaviPlugin:
         with self._obs_lock:
             objects = self._objects if now - self._objects_ms <= max_age else None
             fresh_depth = now - self._depth_ms <= max_age
-            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
-                     if fresh_depth else None)
+            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
+                      "frame_id": self._depth_ms} if fresh_depth else None)
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
