@@ -27,9 +27,9 @@ CONFIG = {
     "dictionary": {"type": "string", "title": "ArUco dictionary", "enum": list(DICTIONARIES),
                    "default": DEFAULT_DICTIONARY, "scope": "instance",
                    "description": "Match the printed marker's dictionary. IDs belong to that dictionary, whose "
-                                  "patterns are designed to reduce ID mix-ups. For new markers, use 4X4_50 for up "
-                                  "to 50 IDs when tags look small in the image, 5X5_50 for 50 IDs with more "
-                                  "separation between patterns, 6X6_250 for up to 250 IDs, or 7X7_50 for up to "
+                                  "patterns are designed to reduce ID mix-ups. For new markers, use DICT_4X4_50 for "
+                                  "up to 50 IDs when tags look small in the image, DICT_5X5_50 for 50 IDs with more "
+                                  "separation between patterns, DICT_6X6_250 for up to 250 IDs, or DICT_7X7_50 for up to "
                                   "50 highly distinct patterns when the camera can resolve the finer cells."},
     "marker_size_m": {"type": "number", "title": "Marker side (m)", "exclusiveMinimum": 0,
                       "default": DEFAULTS["marker_size_m"], "scope": "instance",

@@ -106,7 +106,7 @@ def test_bundle_advertises_tool_and_explains_missing_backend(monkeypatch):
         assert fields["publish_overlay"]["type"] == "boolean" and fields["publish_overlay"]["default"] is True
         assert fields["marker_size_m"]["default"] == 0.10 and "10 cm" in tool["description"]
         for dictionary in fields["dictionary"]["enum"]:
-            assert dictionary.removeprefix("DICT_") in fields["dictionary"]["description"]
+            assert dictionary in fields["dictionary"]["description"]
         assert [port["format"] for port in tool["topic_out"]] == ["data/json", "image/jpeg"]
         unavailable = bundle.dispatch("aruco", {"action": "info"})
         assert unavailable["state"] == "error"
