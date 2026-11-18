@@ -27,7 +27,7 @@ class Calibration:
     @classmethod
     def from_declaration(cls, value):
         if not isinstance(value, dict):
-            raise ValueError("Provide calibration for the input image (width, height, K, distortion_model, D).")
+            raise ValueError("Expected camera calibration metadata for this image stream.")
         width, height = value.get("width"), value.get("height")
         if any(type(n) is not int or n <= 0 for n in (width, height)):
             raise ValueError("Calibration needs positive integer width and height.")
@@ -49,12 +49,11 @@ class Calibration:
         if ((model == "plumb_bob" and distortion.size in (4, 5))
                 or (model == "rational_polynomial" and distortion.size == 8)):
             return cls(width, height, matrix, distortion)
-        raise ValueError("Calibration needs a pinhole, plumb_bob, or rational_polynomial model with matching D. "
-                         "For an unsupported camera model, supply calibration for a rectified stream.")
+        raise ValueError("Calibration needs a pinhole, plumb_bob, or rational_polynomial model with matching D.")
 
 
 class MarkerDetector:
-    def __init__(self, dictionary):
+    def __init__(self, dictionary, *, draw_overlay=True):
         try:
             import cv2
 
@@ -67,14 +66,17 @@ class MarkerDetector:
                 parameters = aruco.DetectorParameters_create()
                 self._detect = lambda gray: aruco.detectMarkers(gray, marker_dictionary, parameters=parameters)
             # Check the rest of the native API before accepting a camera stream.
-            if not all(callable(getattr(cv2, name, None)) for name in (
-                "solvePnP", "solvePnPGeneric", "projectPoints", "Rodrigues", "drawFrameAxes",
-            )) or not hasattr(cv2, "SOLVEPNP_IPPE_SQUARE"):
+            required = ["solvePnP", "solvePnPGeneric", "projectPoints", "Rodrigues"]
+            if draw_overlay:
+                required.append("drawFrameAxes")
+            if (not all(callable(getattr(cv2, name, None)) for name in required)
+                    or not hasattr(cv2, "SOLVEPNP_IPPE_SQUARE")):
                 raise AttributeError("calibrated pose API is unavailable")
         except (AttributeError, ImportError, OSError) as exc:
             raise RuntimeError("This Perception image lacks OpenCV ArUco or the calibrated pose API. "
                                "Use a compatible Perception image.") from exc
         self.cv = cv2
+        self.draw_overlay = draw_overlay
 
     def _detect_markers(self, image):
         cv = self.cv
@@ -94,20 +96,8 @@ class MarkerDetector:
         cv.polylines(image, [outline], True, color, 1)
         cv.putText(image, str(marker_id), tuple(outline[0]), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-    def detect(self, image):
-        """Draw a 2D preview in-place and return IDs and image corners."""
-        detections = []
-        for marker_id, pixels in self._detect_markers(image):
-            self._draw_marker(image, marker_id, pixels)
-            detections.append({"id": marker_id, "corners_px": pixels.tolist()})
-        cv = self.cv
-        caption = "2D only - calibrate camera"
-        cv.putText(image, caption, (8, 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image, caption, (8, 20), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
-        return sorted(detections, key=lambda detection: detection["id"])
-
     def estimate(self, image, calibration, marker_size_m):
-        """Draw accepted poses in-place and return marker→camera measurements."""
+        """Return each accepted marker's pose and optionally draw it on the source image."""
         cv = self.cv
         if image.shape[:2] != (calibration.height, calibration.width):
             raise ValueError("Decoded frame dimensions differ from camera calibration.")
@@ -121,9 +111,9 @@ class MarkerDetector:
             if pose is None:
                 continue
             rms, rotation, translation = pose
-            cv.drawFrameAxes(image, calibration.matrix, calibration.distortion,
-                             rotation, translation, half)
-            self._draw_marker(image, marker_id, pixels)
+            if self.draw_overlay:
+                cv.drawFrameAxes(image, calibration.matrix, calibration.distortion, rotation, translation, half)
+                self._draw_marker(image, marker_id, pixels)
             markers.append({"id": marker_id, "translation_m": translation.reshape(3).tolist(),
                             "rotation_rvec_rad": rotation.reshape(3).tolist(), "reprojection_rms_px": rms})
         return sorted(markers, key=lambda marker: marker["id"])

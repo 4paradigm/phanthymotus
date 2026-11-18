@@ -436,6 +436,7 @@ plugins:
     dictionary: DICT_4X4_50
     marker_size_m: 0.1
     rate_hz: 5.0
+    publish_overlay: true
 
   soundevent:
     enabled: true

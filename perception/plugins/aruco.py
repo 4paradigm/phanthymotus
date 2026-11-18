@@ -1,4 +1,4 @@
-"""ArUco Processor: compressed camera frames in, detections and overlays out."""
+"""Locate ArUco markers in a calibrated camera stream with an optional overlay."""
 
 import hashlib
 import json
@@ -22,26 +22,32 @@ from utils.ros_lifecycle import dispose_node
 
 log = logging.getLogger(__name__)
 MAX_JPEG_BYTES = 8 * 1024 * 1024
-DEFAULTS = {"dictionary": DEFAULT_DICTIONARY, "marker_size_m": 0.1, "rate_hz": 5.0}
+DEFAULTS = {"dictionary": DEFAULT_DICTIONARY, "marker_size_m": 0.1, "rate_hz": 5.0, "publish_overlay": True}
 CONFIG = {
     "dictionary": {"type": "string", "title": "ArUco dictionary", "enum": list(DICTIONARIES),
-                   "default": DEFAULT_DICTIONARY, "scope": "instance"},
+                   "default": DEFAULT_DICTIONARY, "scope": "instance",
+                   "description": "Match the printed marker's dictionary. IDs belong to that dictionary, whose "
+                                  "patterns are designed to reduce ID mix-ups. For new markers, use 4X4_50 for up "
+                                  "to 50 IDs when tags look small in the image, 5X5_50 for 50 IDs with more "
+                                  "separation between patterns, 6X6_250 for up to 250 IDs, or 7X7_50 for up to "
+                                  "50 highly distinct patterns when the camera can resolve the finer cells."},
     "marker_size_m": {"type": "number", "title": "Marker side (m)", "exclusiveMinimum": 0,
                       "default": DEFAULTS["marker_size_m"], "scope": "instance",
-                      "description": "For 3D pose, measure the outer black square, excluding the white margin."},
+                      "description": "Default 0.10 m (10 cm). If your marker differs, enter its measured outer "
+                                     "black side in meters. Exclude the white margin. Use one size per instance."},
     "rate_hz": {"type": "number", "title": "Maximum processing rate (Hz)", "minimum": 0.1,
                 "maximum": 30, "default": DEFAULTS["rate_hz"], "scope": "instance"},
-    "calibration": {"type": "object", "title": "Camera calibration override", "scope": "instance", "advanced": True,
-                    "description": "Leave blank to use the wired camera's calibration or detect in 2D. "
-                                   "For a calibrated override, enter width, height, row-major K, distortion_model "
-                                   "and D for this JPEG stream. Enter {} to clear a saved override."},
+    "publish_overlay": {"type": "boolean", "title": "Publish Monitor overlay", "scope": "instance",
+                        "default": DEFAULTS["publish_overlay"],
+                        "description": "Turn off to publish only pose JSON and skip drawing and JPEG encoding."},
 }
 TOOLS = [{
     "name": "aruco",
     "type": "processor",
     "multiInstance": True,
-    "description": "Detect ArUco markers in Monitor. With camera calibration, also publish 3D poses and draw XYZ axes. "
-                   "监控中显示 ArUco 标记 ID 和边框，有标定时输出米制位姿并叠加三轴。",
+    "description": "Locate multiple ArUco markers relative to the wired camera. The default black side is 10 cm "
+                   "(0.10 m). If yours differs, set Marker side (m) to the measured value. "
+                   "同帧定位同一词典内的多个标记。默认黑框外边长为 10 cm（0.10 m），实际不同时请在配置中填写实测边长（米）。",
     "inputSchema": {
         "type": "object",
         "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "config"]},
@@ -50,20 +56,19 @@ TOOLS = [{
         # Core injects camera_info independently of the canvas's editable fields.
         "x-action-params": {
             "start": {"params": ["input_topic"],
-                      "description": "Start detection. Use the wired camera's motus.camera/1 declaration for pose. "
+                      "description": "Requires the wired camera's calibrated motus.camera/1 declaration. "
                                      "Direct callers can supply camera_info keyed by topic or as a list."},
             "stop": {"params": []}, "info": {"params": []}, "config": {"params": []},
         },
     },
     "configSchema": {"type": "object", "properties": CONFIG},
     "topic_in": [{"format": "image/jpeg", "desc": "Camera JPEG"}],
-    "topic_out": [{"format": "data/json", "desc": "Calibrated marker poses (m) or 2D detections (px)"},
-                  {"format": "image/jpeg", "desc": "Camera image with marker IDs and axes when calibrated"}],
+    "topic_out": [{"format": "data/json", "desc": "Marker poses in the camera optical frame (m)"},
+                  {"format": "image/jpeg", "desc": "Optional Monitor image with marker IDs and XYZ axes"}],
 }]
 
 
 def _validate_options(options):
-    """Validate instance settings and return the optional calibration override."""
     if options["dictionary"] not in DICTIONARIES:
         raise ValueError("Select a supported ArUco dictionary.")
     for key in ("marker_size_m", "rate_hz"):
@@ -72,26 +77,29 @@ def _validate_options(options):
             raise ValueError(f"{key} must be a finite positive number.")
     if not 0.1 <= options["rate_hz"] <= 30:
         raise ValueError("rate_hz must be between 0.1 and 30.")
-    override = options.get("calibration")
-    if override is not None and override != {}:
-        return Calibration.from_declaration(override)
-    return None
+    if type(options["publish_overlay"]) is not bool:
+        raise ValueError("publish_overlay must be a boolean.")
 
 
-def _upstream_calibration(declaration):
-    if declaration.get("K") is None:
-        return None, "The input stream did not provide camera intrinsics."
+def _wired_calibration(camera_info, topic):
+    declarations = camera_info if isinstance(camera_info, (dict, list, tuple)) else None
+    declaration = for_topic(declarations, topic)
+    message = ("左侧相机卡片未提供可用内参，请反馈给相机卡片开发者修复。 "
+               f"Report missing or invalid intrinsics for {topic} to the connected camera card's developer.")
+    if (declaration.get("schema") != SCHEMA or declaration.get("topic") != topic
+            or declaration.get("format") not in (None, "", "image/jpeg") or declaration.get("K") is None):
+        raise ValueError(message)
     try:
-        return Calibration.from_declaration(declaration), ""
+        calibration = Calibration.from_declaration(declaration)
     except ValueError as exc:
-        return None, str(exc)
+        raise ValueError(f"{message} {exc}") from exc
+    camera_id = declaration.get("id")
+    return calibration, camera_id if isinstance(camera_id, str) else ""
 
 
 class _ArucoNode(Node):
-    def __init__(self, topic, key, options, calibration, detector, camera_id, camera_info_note):
+    def __init__(self, topic, key, options, calibration, detector, camera_id):
         self.calibration = calibration
-        self.camera_info_note = camera_info_note
-        self.pose_status = "calibrated" if calibration is not None else "detection_only"
         suffix = hashlib.sha256(key.encode()).hexdigest()[:16]
         super().__init__(f"aruco_{suffix}")
         self.input_topic = topic
@@ -105,12 +113,14 @@ class _ArucoNode(Node):
         self.last_error = ""
         self.worker_error = ""
         base = f"{topic}/aruco/i_{suffix}"
+        # Keep port 1 in place so a saved overlay connection cannot resolve to the JSON port.
+        overlay_topic = f"{base}/overlay" if options["publish_overlay"] else ""
         self.outputs = [{"topic": f"{base}/poses", **TOOLS[0]["topic_out"][0]},
-                        {"topic": f"{base}/overlay", **TOOLS[0]["topic_out"][1]}]
+                        {"topic": overlay_topic, **TOOLS[0]["topic_out"][1]}]
         try:
             # Keep outputs reliable for Monitor and other DDS subscribers.
             self._poses = self.create_publisher(String, self.outputs[0]["topic"], 1)
-            self._overlay = self.create_publisher(CompressedImage, self.outputs[1]["topic"], 1)
+            self._overlay = self.create_publisher(CompressedImage, overlay_topic, 1) if overlay_topic else None
             self.create_subscription(CompressedImage, topic, self.frames.push, CAMERA_QOS)
         except Exception:
             self.destroy_node()
@@ -142,13 +152,10 @@ class _ArucoNode(Node):
 
     def _frame_result(self, frame):
         stamp = frame.header.stamp
-        result = {"camera_id": self.camera_id, "frame_id": frame.header.frame_id,
-                  "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec}, "pose_status": self.pose_status,
-                  "coordinate_frame": "camera_optical", "dictionary": self.options["dictionary"],
-                  "marker_size_m": self.options["marker_size_m"], "markers": []}
-        if self.calibration is None:
-            result.update(coordinate_frame="image_pixels", detections=[], camera_info_note=self.camera_info_note)
-        return result
+        return {"camera_id": self.camera_id, "frame_id": frame.header.frame_id,
+                "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec}, "pose_status": "calibrated",
+                "coordinate_frame": "camera_optical", "dictionary": self.options["dictionary"],
+                "marker_size_m": self.options["marker_size_m"], "markers": []}
 
     def _worker_error(self, frame, error):
         detail = escape_log_text(error)
@@ -178,13 +185,10 @@ class _ArucoNode(Node):
             image = cv.imdecode(np.frombuffer(frame.data, dtype=np.uint8), cv.IMREAD_COLOR | cv.IMREAD_IGNORE_ORIENTATION)
             if image is None:
                 raise ValueError("Could not decode camera JPEG.")
-            if self.calibration is None:
-                result["detections"] = self.detector.detect(image)
-            else:
-                result["markers"] = self.detector.estimate(image, self.calibration, self.options["marker_size_m"])
+            result["markers"] = self.detector.estimate(image, self.calibration, self.options["marker_size_m"])
         except (ValueError, cv.error) as exc:
             result["error"] = str(exc)
-        if image is not None:
+        if image is not None and self._overlay is not None:
             ok, encoded = cv.imencode(".jpg", image)
             if not ok:
                 raise RuntimeError("Could not encode the ArUco overlay JPEG.")
@@ -244,16 +248,15 @@ class ArucoPlugin:
     def _info(self, node):
         if node is not None:
             info = {"state": "running", "topic_in": [{"topic": node.input_topic, "format": "image/jpeg"}],
-                    "topic_out": node.outputs, "last_frame_error": node.last_error, "pose_status": node.pose_status}
-            if node.camera_info_note:
-                info["camera_info_note"] = node.camera_info_note
+                    "topic_out": node.outputs, "last_frame_error": node.last_error, "pose_status": "calibrated",
+                    "publish_overlay": node.options["publish_overlay"]}
             if not node.worker.is_alive():
                 info.update(state="error", error="ArUco frame worker stopped. Restart the card.")
             elif node.worker_error:
                 info.update(state="error", error=node.worker_error)
             return info
         try:
-            MarkerDetector(DEFAULT_DICTIONARY)
+            MarkerDetector(self._defaults["dictionary"], draw_overlay=self._defaults["publish_overlay"])
         except RuntimeError as exc:
             return {"state": "error", "error": str(exc)}
         return {"state": "idle", "topic_out": [], "instances": list(self._nodes)}
@@ -281,34 +284,26 @@ class ArucoPlugin:
         key = instance or topic
         previous = self._nodes.get(key)
         options = {**self._defaults, **self._overrides.get(instance, {})}
+        try:
+            calibration, camera_id = _wired_calibration(camera_info, topic)
+        except ValueError:
+            # A disconnected or changed camera invalidates this instance's old metric stream.
+            self._stop(key)
+            raise
         node = None
         try:
-            calibration = _validate_options(options)
-            declarations = camera_info if isinstance(camera_info, (dict, list, tuple)) else None
-            upstream = for_topic(declarations, topic)
-            if (upstream.get("schema") != SCHEMA or upstream.get("topic") != topic
-                    or upstream.get("format") not in (None, "", "image/jpeg")):
-                upstream = {}
-            camera_info_note = ""
-            if calibration is None:
-                calibration, camera_info_note = _upstream_calibration(upstream)
-            if camera_info_note:
-                camera_info_note += " For 3D pose, use a calibrated stream or set Camera calibration override."
-            camera_id = upstream.get("id")
-            camera_id = camera_id if isinstance(camera_id, str) else ""
+            _validate_options(options)
             if (previous is not None and previous.input_topic == topic and previous.worker.is_alive()
-                    and previous.camera_id == camera_id and previous.camera_info_note == camera_info_note
-                    and (previous.calibration is calibration or
-                         (previous.calibration is not None and previous.calibration.matches(calibration)))
-                    and all(previous.options[name] == options[name] for name in DEFAULTS)):
+                    and previous.camera_id == camera_id and previous.calibration.matches(calibration)
+                    and previous.options == options):
                 return self._info(previous)
-            detector = MarkerDetector(options["dictionary"])
-            node = _ArucoNode(topic, key, options, calibration, detector, camera_id, camera_info_note)
+            detector = MarkerDetector(options["dictionary"], draw_overlay=options["publish_overlay"])
+            # The replacement uses the same ROS node name and output topics.
+            if previous is not None:
+                self._stop(key)
+            node = _ArucoNode(topic, key, options, calibration, detector, camera_id)
             if self._executor.add_node(node) is False:
                 raise RuntimeError("Could not register the ArUco node in the ROS executor.")
-            if previous is not None:
-                self._nodes.pop(key)
-                self._dispose(previous)
             node.worker.start()
         except Exception as exc:
             if node is not None:

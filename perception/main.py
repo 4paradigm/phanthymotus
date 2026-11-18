@@ -12,7 +12,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
-  aruco            ArUco 定位（相机光学坐标系位姿 + 监控叠加图）
+  aruco            ArUco 定位（相机光学坐标系位姿，可选监控叠加图）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 

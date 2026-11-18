@@ -4321,35 +4321,43 @@ at the form rather than the schema (`web/js/sidebar.js`):
 
 ## ArUco 定位 (`aruco`)
 
-Connect a camera's `image/jpeg` port to the ArUco Processor and start the
-project. Select the dictionary used to generate the marker (`DICT_4X4_50` by
-default). The card uses usable calibration from the wired camera's
-`motus.camera/1` declaration automatically. For 3D pose, print the marker with
-a white margin and set its measured outer black side length in meters
-(default 0.100 m).
+Connect the camera's `image/jpeg` output to this card. The camera card must
+publish a calibrated `motus.camera/1` declaration for that stream and
+resolution. If its intrinsics are missing or invalid, startup raises an error
+identifying the stream. Report the camera card and stream to its developer
+so the driver can supply the calibration.
 
-If calibration is unavailable, the card starts with a 2D preview in
-**Monitor**. The `overlay` shows the detected IDs, outlines and a calibration
-hint. The `poses` stream reports `pose_status: detection_only` and a
-`detections` list with each ID and its four `corners_px` in image coordinates.
-The `markers` list is empty in this mode. When a marker leaves the frame,
-the next result clears it.
+The default marker side is **10 cm (0.10 m)**. If your print differs, measure an
+outer edge of the black square, excluding the white margin, and enter its
+length in meters under **Marker side (m)**. The card uses this length for every
+marker in the frame. A wrong length scales the reported translation.
 
-To enable 3D pose on a camera without usable metadata, obtain calibration at
-the stream's resolution. Enter `width`, `height`, row-major `K`,
-`distortion_model` and `D` in **Camera calibration override** under **Advanced
-settings**. Use `pinhole` with an empty or zero `D` for a rectified or
-undistorted image. Use the measured coefficients for `plumb_bob` or
-`rational_polynomial`. Enter `{}` to clear a saved override and restart the
-card after changing settings. Standalone callers can pass the declaration
-for the input topic in `camera_info`.
+Choose the dictionary used to print your markers. An ID names a pattern
+within a dictionary. The patterns in each dictionary are deliberately
+separated to reduce the chance of confusing one ID with another. For a new set,
+the first number describes the grid of data cells and the last gives the number
+of available IDs. With the same printed size, a finer grid needs more image
+detail. [OpenCV dictionary selection guide](https://docs.opencv.org/4.x/d5/dae/tutorial_aruco_detection.html)
 
-With calibration, `poses` reports `pose_status: calibrated` and each accepted
-marker pose contains XYZ translation in meters, a Rodrigues rotation vector
-in radians, and reprojection RMS in pixels. The transform maps marker
-coordinates into the camera optical frame (+X right, +Y down, +Z forward).
-The `overlay` draws red X, green Y and blue Z axes. A single planar marker's
-rotation can be ambiguous near a frontal view.
+| Dictionary | When to choose it for new markers |
+| --- | --- |
+| `DICT_4X4_50` (default) | Up to 50 IDs. The coarse grid helps when a marker occupies few pixels, such as a small tag or one seen from farther away. |
+| `DICT_5X5_50` | Up to 50 IDs. For workbench or room-scale use when the camera resolves five cells per side and you want more separation between patterns than 4×4 provides. |
+| `DICT_6X6_250` | Up to 250 IDs. Useful for a large inventory or many distinct stations where the tag image resolves the 6×6 grid. |
+| `DICT_7X7_50` | Up to 50 IDs. Use large or close-up tags when distinguishing similar-looking observations matters and the camera resolves the finer cells. |
+
+Each frame publishes one `poses` JSON message with `pose_status: calibrated`.
+The `markers` array includes all successfully localized markers in the
+selected dictionary, sorted by ID. Each entry contains XYZ translation in
+meters, a Rodrigues rotation vector in radians and reprojection RMS in pixels.
+The transform maps marker coordinates into the camera optical frame
+(+X right, +Y down, +Z forward). A blank frame produces an empty array.
+A single planar marker's rotation can be ambiguous near a frontal view.
+
+**Publish Monitor overlay** is on by default. It draws each marker's ID,
+outline and XYZ axes (red, green and blue) in a JPEG. Turn it off and restart
+the card to publish only the same JSON poses, skipping annotation and JPEG
+encoding.
 
 The card uses the Perception image's OpenCV. Verify `cv2.aruco` in the
 actual JetPack image before deployment. If it is missing, the card reports
