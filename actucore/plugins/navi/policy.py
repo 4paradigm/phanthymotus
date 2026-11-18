@@ -89,10 +89,10 @@ ADAPTIVE_FWD_MAX_SCALE = 3.0
 ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
 ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
 
-# A blocked side route permits only a slow, straight approach. The extra
-# buffer covers distance uncertainty and stays outside the hard obstacle stop.
+# The blocked-route buffer reserves braking room outside the obstacle stop.
 BLOCKED_APPROACH_BUFFER_M = 0.30
-BLOCKED_APPROACH_MAX_MPS = 0.18
+# Limit the combined forward and lateral speed during an avoidance maneuver.
+AVOIDANCE_MAX_TRANSLATION_MPS = 0.18
 
 # Longitudinal separation for identifying a foreground obstacle and resuming.
 FORWARD_CLEARANCE_MARGIN_M = 0.15
@@ -126,6 +126,7 @@ class Config:
     # stale or predicted observations. Callers may request zero per action.
     stop_tolerance_m: float = 0.05
     slow_distance_m: float = 1.5
+    side_clearance_m: float = 1.0
     obstacle_stop_m: float = 0.6
     # Lateral offset that still allows full speed. **Not a gate** — past it the
     # speed is scaled down, reaching zero at align_full_stop. See
@@ -1313,7 +1314,7 @@ def _side_label(room, coverage, config: Config) -> str:
         return f"只有 {coverage * 100:.0f}% 深度有效"
     if room is None:
         return "无读数"
-    if room <= config.slow_distance_m:
+    if room <= config.side_clearance_m:
         return f"{room:.2f} m 处有东西"
     return f"{room:.2f} m"
 
@@ -1498,9 +1499,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         # A summary with a missing side band supplies no evidence of free space.
         usable = {s: (float("inf") if room is None else room)
                   for s, (room, cov) in rooms.items()
-                  if cov >= config.coverage_min
+                  if cov >= config.coverage_min and (target_distance is not None or near)
                   and ((room is None and depth.get("map") is not None)
-                       or (room is not None and room > slow))}
+                       or (room is not None and room > config.side_clearance_m))}
         if usable:
             side = (state.escape_side if state and state.escape_side in usable
                     else max(usable, key=usable.get))
@@ -1513,7 +1514,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     and target_distance is not None and coverage >= config.coverage_full
                     and (state is None or state.recovery is None)
                     and brake_at < ahead < slow):
-                limit = BLOCKED_APPROACH_MAX_MPS * (ahead - brake_at) / (slow - brake_at)
+                limit = AVOIDANCE_MAX_TRANSLATION_MPS * (ahead - brake_at) / (slow - brake_at)
                 approach = min(vx * scale, limit)
                 # Stay within the limit even when the gait has a speed floor.
                 if approach > 0.0 and approach >= config.floor_vx:
@@ -1546,6 +1547,15 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             if near or abs(lateral) >= config.floor_vy * config.lateral_lift_ratio:
                 vy = _lift(lateral, config.floor_vy, config.vy_max)
         if near or not vy:
+            vx = 0.0
+        speed = math.hypot(vx, vy)
+        if speed > AVOIDANCE_MAX_TRANSLATION_MPS:
+            scale = AVOIDANCE_MAX_TRANSLATION_MPS / speed
+            vx *= scale
+            vy *= scale
+        if abs(vy) < config.floor_vy:
+            vx = vy = 0.0
+        if abs(vx) < config.floor_vx:
             vx = 0.0
         if state is not None:
             state.avoidance_yaw_override = True

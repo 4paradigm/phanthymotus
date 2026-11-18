@@ -980,7 +980,8 @@ class NaviPlugin:
                            "search_rate": self._config.search_rate,
                            "use_lateral": self._config.use_lateral,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
-                           "slow_distance_m": self._config.slow_distance_m},
+                           "slow_distance_m": self._config.slow_distance_m,
+                           "side_clearance_m": self._config.side_clearance_m},
                 "published": self._published,
                 "gains": {
                     "forward": {"base": self._config.k_fwd,

@@ -285,6 +285,7 @@ plugins:
     # 前景障碍进入 slow 范围时检查侧方走廊。两侧受阻时，有可靠深度且余量足够才低速直行。
     # 停车后用连续新深度帧确认通道，再逐步恢复。
     slow_distance_m: 1.5
+    side_clearance_m: 1.0
     obstacle_stop_m: 0.6
 
     # 「走廊」是米制的，不是画面的三等分。

@@ -2350,7 +2350,7 @@ def test_brake_before_box_and_resume_only_on_successive_new_clear_frames():
 
 def test_box_blocking_both_routes_allows_only_a_slow_straight_approach():
     cfg = _cfg(stop_distance_m=0.6, floor_vx=0.04)
-    box = _scene(2.8, [(0.0, 1.16, 0.65)])
+    box = _scene(2.8, [(0.0, 1.16, 0.65), (-0.58, 0.95, 0.2), (0.58, 0.95, 0.2)])
     detections = _detections(_obj(x=0.2))
     decision = _step(detections=detections, depth=box, config=cfg)
     assert 0.04 <= decision.values[0] < 0.10
@@ -2364,7 +2364,7 @@ def test_box_blocking_both_routes_allows_only_a_slow_straight_approach():
 
 def test_blocked_approach_stops_before_the_chassis_speed_floor_and_holds():
     cfg = _cfg(stop_distance_m=0.6, floor_vx=0.04)
-    farther = _scene(2.8, [(0.0, 1.16, 0.65)])
+    farther = _scene(2.8, [(0.0, 1.16, 0.65), (-0.58, 0.95, 0.2), (0.58, 0.95, 0.2)])
     closer = _scene(2.8, [(0.0, 0.98, 0.65)])
     state = seed(_state(), _detections(_obj()), farther, cfg)
 
@@ -2447,3 +2447,14 @@ def test_a_near_side_escape_has_a_blocked_deadline():
         if decision.status == P.FAILED:
             break
     assert decision.status == P.FAILED
+
+
+def test_right_route_shorter_than_forward_slow_distance_can_be_selected():
+    cfg = _cfg(stop_distance_m=0.6)
+    obstacle = _scene(1.2, [(-0.25, 0.85, 0.28)])
+    decision = _step(detections=_detections(_obj()), depth=obstacle, config=cfg)
+    assert decision.status == P.AVOIDING
+    assert decision.values[1] < 0 and decision.values[5] < 0
+    assert math.hypot(*decision.values[:2]) <= 0.18 + 1e-9
+    assert "朝右侧避让" in decision.reason
+    assert cfg.slow_distance_m == 1.5
