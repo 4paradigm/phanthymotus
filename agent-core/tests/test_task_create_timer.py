@@ -172,13 +172,30 @@ class TestExplicitTaskTimer(unittest.TestCase):
     def test_invalid_or_conflicting_schedule_does_not_create_task(self):
         for args in ({'delay_minutes': -1}, {'delay_minutes': float('nan')},
                      {'delay_minutes': float('inf')}, {'delay_minutes': True},
+                     {'delay_minutes': '1'}, {'delay_minutes': None},
+                     {'delay_minutes': []}, {'delay_minutes': {}},
+                     {'remind_at': 1730}, {'remind_at': None},
+                     {'check_cron': 1}, {'check_cron': False},
                      {'remind_at': '25:90'}, {'remind_at': '2000-01-01T08:00'},
                      {'delay_minutes': 1, 'remind_at': '18:30'},
                      {'check_cron': '0 8 * * *', 'delay_minutes': 1}):
             with self.subTest(args=args):
-                result = asyncio.run(task_mod.Tools().task_create(goal='无效定时', **args))
+                with patch.object(scheduler, 'add_job') as add_job:
+                    result = asyncio.run(task_mod.Tools().task_create(goal='无效定时', **args))
+                    add_job.assert_not_called()
                 self.assertIn('定时设置失败', result)
                 self.assertEqual(task_store.active_tasks(), [])
+
+    def test_explicit_iso_offsets_refer_to_the_same_instant(self):
+        now = 1794990625
+        for value in ('2026-11-18T09:30+00:00', '2026-11-18T04:30-05:00'):
+            with self.subTest(value=value), patch.object(time, 'time', return_value=now), \
+                    patch.object(scheduler, 'add_job'):
+                result = asyncio.run(task_mod.Tools().task_create(goal='17:30报时', remind_at=value))
+                task = task_store.active_tasks()[0]
+                self.assertEqual(scheduler._next_run(task.check_cron, now), 1794994200)
+                self.assertIn('2026-11-18 17:30 北京时间', result)
+                task_store._tasks.clear()
 
     def test_early_wakeup_cannot_fire_the_same_cron_occurrence_twice(self):
         """G1 的整分钟边界重复唤醒曾打断第一次提醒。"""

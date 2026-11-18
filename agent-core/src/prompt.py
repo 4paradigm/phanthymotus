@@ -396,7 +396,6 @@ def _trigger_message(event: dict) -> str:
 
 def _task_timing_policy() -> str:
     """框架定时规则放进 system，避免只被理解成可选的任务追踪提示。"""
-    import time
     return (
         '\n\n<task_timing>\n'
         '用户要求未来某个时刻、若干分钟后或周期提醒时，必须先调用 task_create，'
@@ -407,7 +406,7 @@ def _task_timing_policy() -> str:
         '只有收到对应 scheduler:task:<id> 事件才执行提醒，一次性提醒执行后 task_done。'
         '周期提醒保留任务，用户取消时才结束。\n'
         'status.time、event.ts 和未注明时区的用户时刻均为北京时间 UTC+08:00；'
-        f'check_cron 使用调度器时区 {time.strftime("%Z %z")}，'
+        'check_cron 使用 status.scheduler_time 中的调度器时区，'
         'status.scheduler_time 给出同一时刻的调度器时间。'
         'remind_at 默认接受北京时间，不要手工减8小时。'
         '不能用 sleep 等待或自行建每分钟轮询。\n'

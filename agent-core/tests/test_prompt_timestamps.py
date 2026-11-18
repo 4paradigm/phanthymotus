@@ -87,3 +87,13 @@ def test_future_reminder_policy_is_in_system_message(monkeypatch):
     assert 'remind_at' in message['content']
     assert 'scheduler:task:<id>' in message['content']
     assert '普通任务的 check_cron 留空' in message['content']
+
+
+def test_system_policy_does_not_depend_on_runtime_timezone(monkeypatch):
+    import time
+    monkeypatch.setattr(prompt, '_system_definition', lambda: 'system')
+    monkeypatch.setattr(prompt, '_env_static', lambda *a: 'environment')
+    monkeypatch.setattr(time, 'strftime', lambda *a: 'UTC +0000')
+    before = prompt.build_system({})
+    monkeypatch.setattr(time, 'strftime', lambda *a: 'EDT -0400')
+    assert prompt.build_system({}) == before

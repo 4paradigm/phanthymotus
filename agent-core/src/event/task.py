@@ -61,14 +61,16 @@ class Tools:
         完成或失败时用 task_done / task_fail 收尾；子代理完成通知和进度播报由框架处理。
         """
         try:
+            if not isinstance(check_cron, str) or not isinstance(remind_at, str):
+                raise ValueError('check_cron 和 remind_at 必须是字符串')
+            if (isinstance(delay_minutes, bool) or not isinstance(delay_minutes, (int, float))
+                    or not math.isfinite(delay_minutes) or delay_minutes < 0):
+                raise ValueError('delay_minutes 必须是非负有限分钟数，0表示未设置')
             if sum(bool(v) for v in (check_cron, delay_minutes, remind_at)) > 1:
                 raise ValueError('check_cron、delay_minutes、remind_at 只能填写一个')
             now = time.time()
             target = None
             if delay_minutes:
-                if (isinstance(delay_minutes, bool) or not math.isfinite(delay_minutes)
-                        or delay_minutes <= 0):
-                    raise ValueError('delay_minutes 必须是大于0的有限分钟数')
                 target = now + delay_minutes * 60
             elif remind_at:
                 user_tz = datetime.timezone(datetime.timedelta(hours=8))
