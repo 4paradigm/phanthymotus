@@ -19,13 +19,13 @@ def images(session, stamp):
             stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9))))
 
 
-def assisted(card, args, monkeypatch, *, fusion=False):
+def assisted(card, args, monkeypatch):
     old = card.instances['one'][0]
     old.process.returncode = 0
     card.dispatch('rgbd_odometry', dict(action='stop', instance_id='one'))
     assisted_runtime(monkeypatch)
     result = card.dispatch('rgbd_odometry', dict(args,
-        input_topics=['/rgb', '/depth', '/imu'], short_term_compensation=fusion))
+        input_topics=['/rgb', '/depth', '/imu']))
     assert result['state'] == 'running', result
     return card.instances['one'][0]
 
@@ -35,6 +35,19 @@ def imu_packet(stamp, **changes):
                   translation_source='sdk_factory_extrinsics',
                   camera_from_gyro_translation=[.03, 0., 0.],
                   camera_from_accel_translation=[.03, 0., 0.], **changes)
+
+
+def attitude_session(card, args, now, monkeypatch):
+    session = assisted(card, args, monkeypatch)
+    sample = imu_packet(now[0])
+    sample.pop('camera_from_accel_translation')
+    session._imu(NS(data=json.dumps(sample)))
+    images(session, now[0])
+    session.process.returncode = 0
+    card._recover()
+    attitude = card.instances['one'][0]
+    assert attitude.info()['mode']['effective'] == 'imu_attitude'
+    return attitude
 
 
 def send_imu(session, now, seconds, stamp, **changes):
@@ -67,7 +80,7 @@ def test_fresh_weak_visual_start_has_total_budget_and_explains_progress(recovery
 
 def test_never_arriving_attitude_switches_to_new_explicit_visual_segment(recovery, monkeypatch):
     card, args, now, seconds = recovery
-    old = assisted(card, args, monkeypatch)
+    old = attitude_session(card, args, now, monkeypatch)
     now[0] += 11_000_000_000
     seconds[0] += 11.
     images(old, now[0])
@@ -86,7 +99,7 @@ def test_never_arriving_attitude_switches_to_new_explicit_visual_segment(recover
     assert any(s.topic == '/imu' for s in new.node.subscriptions)
     assert not any(p.topic.endswith('/imu') for p in new.node.publishers)
     info = card.dispatch('rgbd_odometry', dict(action='info', instance_id='one'))
-    assert info['mode']['requested'] == 'imu_attitude'
+    assert info['mode']['requested'] == 'eskf_depth'
     assert info['mode']['effective'] == 'visual_only' and info['mode']['degraded']
     assert info['config']['imu_assisted'] is True
     assert info['recovery']['transitions'][-1]['action'] == 'degrade_assistance'
@@ -96,7 +109,7 @@ def test_never_arriving_attitude_switches_to_new_explicit_visual_segment(recover
 
 def test_healthy_attitude_does_not_allow_visual_warmup_to_run_forever(recovery, monkeypatch):
     card, args, now, seconds = recovery
-    old = assisted(card, args, monkeypatch)
+    old = attitude_session(card, args, now, monkeypatch)
     start = now[0]
     for k in range(151):
         seconds[0] = 10.+k*.1
@@ -114,7 +127,7 @@ def test_healthy_attitude_does_not_allow_visual_warmup_to_run_forever(recovery, 
 def test_initialized_filter_without_first_tracking_has_a_finite_fusion_budget(recovery, monkeypatch):
     from test_rgbd_fusion import images as fusion_images, pose
     card, args, now, seconds = recovery
-    session = assisted(card, args, monkeypatch, fusion=True)
+    session = assisted(card, args, monkeypatch)
     color, depth = fusion_images()
     visual = dict(pose(), frame_id=session.segment+'_odom', child_frame_id='camera_optical')
     start = now[0]
@@ -140,8 +153,8 @@ def test_initialized_filter_without_first_tracking_has_a_finite_fusion_budget(re
     assert all(json.loads(m)['pose'] is None for m in session.publisher.messages)
 
 
-def degraded_session(card, args, now, seconds, monkeypatch, *, fusion=False):
-    old = assisted(card, args, monkeypatch, fusion=fusion)
+def degraded_session(card, args, now, seconds, monkeypatch):
+    old = assisted(card, args, monkeypatch)
     old.gate.fault('IMU source expired', 'imu')
     old.imu.fault('capture stale')
     old.process.returncode = 0
@@ -153,10 +166,9 @@ def degraded_session(card, args, now, seconds, monkeypatch, *, fusion=False):
     return new
 
 
-@pytest.mark.parametrize('fusion', [False, True])
-def test_formatted_recovered_source_restores_requested_mode_in_new_segment(recovery,monkeypatch,fusion):
+def test_formatted_recovered_source_restores_requested_mode_in_new_segment(recovery,monkeypatch):
     card,args,now,seconds=recovery
-    visual=degraded_session(card,args,now,seconds,monkeypatch,fusion=fusion)
+    visual=degraded_session(card,args,now,seconds,monkeypatch)
     segment=visual.segment
     for _ in range(201):
         seconds[0]+=.1;now[0]+=100_000_000
@@ -168,7 +180,7 @@ def test_formatted_recovered_source_restores_requested_mode_in_new_segment(recov
     restored=card.instances['one'][0];restored.process.returncode=0
     assert restored is not visual and restored.segment!=segment
     assert restored.imu is not None and not restored.imu.history
-    assert bool(restored.fusion) is fusion and not restored.info()['mode']['degraded']
+    assert restored.fusion is not None and not restored.info()['mode']['degraded']
 
 
 def test_probe_requires_complete_numeric_translations_without_dwell_or_metadata_policy():
@@ -377,14 +389,14 @@ def test_missing_lever_arm_without_native_hints_recovers_using_attitude_in_new_s
 
 def test_timed_out_native_attitude_without_frame_coverage_restarts_visual(recovery, monkeypatch):
     card, args, now, seconds = recovery
-    old = assisted(card, args, monkeypatch)
+    old = attitude_session(card, args, now, monkeypatch)
     old.imu.observe(imu_packet(now[0]), now[0])
     images(old, now[0])
     assert not old._wait_for_imu(now[0] + 1, deadline=seconds[0])
     old.gate.fault('visual estimate stale', 'visual')
     old.process.returncode = 0
     card._recover()
-    seconds[0] += 1.
+    seconds[0] += 2.  # Previous transition also starts the restart backoff.
     card._recover()
     new = card.instances['one'][0]
     new.process.returncode = 0
@@ -394,7 +406,7 @@ def test_timed_out_native_attitude_without_frame_coverage_restarts_visual(recove
 def test_rotation_only_probe_restores_native_attitude_then_complete_data_restores_eskf(
         recovery, monkeypatch):
     card, args, now, seconds = recovery
-    visual = degraded_session(card, args, now, seconds, monkeypatch, fusion=True)
+    visual = degraded_session(card, args, now, seconds, monkeypatch)
     p = imu_packet(now[0])
     p.pop('camera_from_gyro_translation')
     seconds[0] += 21.

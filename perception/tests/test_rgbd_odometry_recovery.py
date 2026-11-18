@@ -207,17 +207,14 @@ def test_lost_image_ingress_updates_freshness_without_feeding_retired_estimator(
     assert old.pending.qsize() == pending and old.gate.state == 'lost'
 
 
-@pytest.mark.parametrize('fusion', [False, True])
-def test_assisted_recovery_retains_settings_and_reinitializes_imu_history(recovery, monkeypatch, fusion):
+def test_assisted_recovery_retains_policy_and_reinitializes_imu_history(recovery, monkeypatch):
     from test_rgbd_imu import packet
     card, args, now, seconds = recovery
     card.instances['one'][0].process.returncode = 0
     card.dispatch('rgbd_odometry', dict(action='stop', instance_id='one'))
     assisted_runtime(monkeypatch)
-    settings = dict(imu_assisted=True, short_term_compensation=fusion, depth_geometry=fusion,
-                    inertial_association=False, visual_frontend='f2f_optical_flow', max_features=500)
-    assert card.dispatch('rgbd_odometry', dict(args, input_topics=['/rgb', '/depth', '/imu'],
-                                             **settings))['state'] == 'running'
+    result = card.dispatch('rgbd_odometry', dict(args, input_topics=['/rgb', '/depth', '/imu']))
+    assert result['state'] == 'running'
     old = card.instances['one'][0]
     old.imu.observe(packet(camera_frame_id='camera_optical', clock_id='camera-global'), now[0])
     assert old.imu.history
@@ -226,10 +223,9 @@ def test_assisted_recovery_retains_settings_and_reinitializes_imu_history(recove
     new = card.instances['one'][0]; new.process.returncode = 0
     assert new is not old and new.owns_executor
     assert not new.imu.history and new.imu.state == 'initializing'
-    assert bool(new.fusion) == fusion
-    if fusion: assert new.fusion.filter is None
+    assert new.fusion is not None and new.fusion.filter is None
     assert new.calibration == old.calibration
-    assert card.dispatch('rgbd_odometry', dict(action='info', instance_id='one'))['config'] == settings
+    assert card.dispatch('rgbd_odometry', dict(action='info', instance_id='one'))['config'] == result['config']
 
 
 def assisted_runtime(monkeypatch):
@@ -246,7 +242,7 @@ def assisted_runtime(monkeypatch):
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'Imu', object, raising=False)
 
 
-@pytest.mark.parametrize('failing_start', [1, 2])
+@pytest.mark.parametrize('failing_start', [1, 2, 3])
 def test_worker_start_failure_cleans_native_process_and_node_before_retry(recovery, monkeypatch, failing_start):
     card, args, now, seconds = recovery
     card.instances['one'][0].process.returncode = 0
@@ -277,5 +273,9 @@ def test_worker_start_failure_cleans_native_process_and_node_before_retry(recove
     seconds[0] += 1.
     card._recover()
     assert card.instances['one'][0] is old and not old.node.destroyed
-    assert _FakeNode.instances[-1].destroyed and not processes[0].running
+    assert _FakeNode.instances[-1].destroyed
+    if failing_start == 1:  # Geometry worker starts before the native child.
+        assert not processes
+    else:
+        assert len(processes) == 1 and not processes[0].running
     assert 'cannot start native callback worker' in card.recovery['one']['error']

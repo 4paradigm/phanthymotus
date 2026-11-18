@@ -1,4 +1,4 @@
-"""Optional auto F2M/F2F selection: one frontend at a time, switch only on
+"""Automatic F2M/F2F selection: one frontend at a time, switch only on
 persistent visual degradation with healthy input, always into a new segment."""
 import time
 
@@ -29,8 +29,7 @@ def auto(sessions, monkeypatch):
         card.shutdown()
 
 
-def start(card, args, frontend):
-    card.dispatch('rgbd_odometry', dict(action='config', instance_id='one', visual_frontend=frontend))
+def start(card, args):
     result = card.dispatch('rgbd_odometry', args)
     assert result['state'] == 'running', result
     return result
@@ -55,12 +54,10 @@ def frontend(card):
     return card.dispatch('rgbd_odometry', dict(action='info', instance_id='one'))['frontend']
 
 
-def test_auto_is_explicit_optional_and_default_is_unchanged(auto):
+def test_automatic_selection_starts_with_pinned_default(auto):
     card, args, *_ = auto
-    schema = card.get_tools()[0]['configSchema']['properties']['visual_frontend']
-    assert schema['enum'] == ['f2m_feature', 'f2f_optical_flow', 'auto']
-    assert schema['default'] == 'f2m_feature'
-    result = start(card, args, 'auto')
+    assert card.get_tools()[0]['configSchema']['properties'] == {}
+    result = start(card, args)
     assert result['config']['visual_frontend'] == 'auto'
     session = card.instances['one'][0]
     assert session.calibration['visual_frontend'] == 'f2m_feature'  # one frontend runs
@@ -72,7 +69,7 @@ def test_auto_is_explicit_optional_and_default_is_unchanged(auto):
 
 def test_persistent_visual_degradation_switches_into_a_new_segment(auto):
     card, args, now, seconds = auto
-    start(card, args, 'auto')
+    start(card, args)
     new = lose(card, now, seconds)
     assert new.calibration['visual_frontend'] == 'f2f_optical_flow'
     assert estimator_parameters(new.calibration, 'run')['Odom/Strategy'] == '1'
@@ -83,10 +80,10 @@ def test_persistent_visual_degradation_switches_into_a_new_segment(auto):
     assert len([s for s in card.instances.values()]) == 1
 
 
-@pytest.mark.parametrize('kind', ['input', 'imu', 'clock', 'frame', 'process', 'fusion', 'other'])
+@pytest.mark.parametrize('kind', ['input', 'output', 'imu', 'clock', 'frame', 'process', 'fusion', 'other'])
 def test_input_imu_clock_or_process_failures_never_switch(auto, kind):
     card, args, now, seconds = auto
-    start(card, args, 'auto')
+    start(card, args)
     new = lose(card, now, seconds, kind=kind)
     assert new.calibration['visual_frontend'] == 'f2m_feature'
     assert frontend(card)['switches'] == 0
@@ -95,7 +92,7 @@ def test_input_imu_clock_or_process_failures_never_switch(auto, kind):
 
 def test_cooldown_and_untracked_switch_limit_prevent_thrashing(auto):
     card, args, now, seconds = auto
-    start(card, args, 'auto')
+    start(card, args)
     assert lose(card, now, seconds).calibration['visual_frontend'] == 'f2f_optical_flow'
     # Within cooldown: ordinary recovery keeps the current frontend.
     assert lose(card, now, seconds).calibration['visual_frontend'] == 'f2f_optical_flow'
@@ -110,7 +107,7 @@ def test_cooldown_and_untracked_switch_limit_prevent_thrashing(auto):
 
 def test_tracking_resets_the_untracked_switch_limit(auto):
     card, args, now, seconds = auto
-    start(card, args, 'auto')
+    start(card, args)
     lose(card, now, seconds); seconds[0] += 30.
     lose(card, now, seconds); seconds[0] += 30.
     session = card.instances['one'][0]
@@ -121,23 +118,20 @@ def test_tracking_resets_the_untracked_switch_limit(auto):
 
 
 @pytest.mark.parametrize('manual', ['f2m_feature', 'f2f_optical_flow'])
-def test_manual_frontends_never_switch(auto, manual):
+def test_saved_manual_frontend_still_recovers_automatically(auto, manual):
     card, args, now, seconds = auto
-    start(card, args, manual)
-    assert lose(card, now, seconds).calibration['visual_frontend'] == manual
-    assert frontend(card)['mode'] == 'manual'
-
-
-def test_changing_to_or_from_auto_still_requires_stop(auto):
-    card, args, *_ = auto
-    start(card, args, 'auto')
-    assert card.dispatch('rgbd_odometry', dict(action='config', instance_id='one',
-                                               visual_frontend='f2m_feature'))['state'] == 'error'
+    configured = card.dispatch('rgbd_odometry', dict(action='config', instance_id='one',
+                                                      visual_frontend=manual))
+    assert configured['state'] == 'configured'
+    start(card, args)
+    assert frontend(card)['active'] == 'f2m_feature'
+    assert lose(card, now, seconds).calibration['visual_frontend'] == 'f2f_optical_flow'
+    assert frontend(card)['mode'] == 'auto'
 
 
 def test_frontend_that_only_reports_lost_can_switch_before_first_tracking(auto):
     card, args, now, seconds = auto
-    start(card, args, 'auto')
+    start(card, args)
     old = card.instances['one'][0]
     initial = now[0]
     for i in range(35):

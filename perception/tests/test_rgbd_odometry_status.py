@@ -18,8 +18,8 @@ def sessions(monkeypatch):
     monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', object(), raising=False)
     monkeypatch.setitem(sys.modules, 'rtabmap_msgs.msg', NS(RGBDImage=object, OdomInfo=object))
     monkeypatch.setitem(sys.modules, 'nav_msgs.msg', NS(Odometry=object))
-    monkeypatch.setattr(runtime, 'require_runtime', lambda: '/offline/estimator')
-    monkeypatch.setattr(card_module, 'require_runtime', lambda: '/offline/estimator')
+    monkeypatch.setattr(runtime, 'require_runtime', lambda: '/offline/lib/rtabmap_odom/rgbd_odometry')
+    monkeypatch.setattr(card_module, 'require_runtime', lambda: '/offline/lib/rtabmap_odom/rgbd_odometry')
     processes = []
     def process(*args, **kwargs):
         p = NS(returncode=None, wait=lambda **kw: 0)
@@ -74,25 +74,22 @@ def status(session):
     return json.loads(session.status_publisher.messages[-1])
 
 
-def test_compact_schema_keeps_configuration_and_original_odom_link(sessions):
+def test_compact_schema_publishes_automatic_policy_and_original_odom_link(sessions):
     create, _, _ = sessions
     card = card_module.RgbdOdometryPlugin({}, _FakeExecutor())
     tool = card.get_tools()[0]
     assert set(tool['inputSchema']['properties']) == {'action'}
     assert tool['inputSchema']['properties']['action']['enum'] == ['start', 'stop', 'info']
     settings = dict(imu_assisted=False, short_term_compensation=False, depth_geometry=False,
-                    inertial_association=False, visual_frontend='f2f_optical_flow', max_features=200)
-    assert set(tool['configSchema']['properties']) == set(settings) - {'imu_assisted'}
-    assert all(p['scope'] == 'instance' for p in tool['configSchema']['properties'].values())
-    result = card.dispatch('rgbd_odometry', dict(action='config', instance_id='one', **settings))
-    assert result['state'] == 'configured'
+                    inertial_association=False, visual_frontend='auto', max_features=1000)
+    assert tool['configSchema']['properties'] == {}
     result = card.dispatch('rgbd_odometry', dict(action='start', instance_id='one',
         input_topics=['/rgb', '/depth'], camera_info=declarations()))
     session = card.instances['one'][0]
     session.process.returncode = 0
     try:
         assert result['state'] == 'running' and result['config'] == settings
-        assert session.calibration['visual_frontend'] == 'f2f_optical_flow'
+        assert session.calibration['visual_frontend'] == 'f2m_feature'
         assert result['topic_out'] == [
             dict(topic='/rgbd_odometry/i_6f6e65/state/odom', format='state/odom'),
             dict(topic='/rgbd_odometry/i_6f6e65/status', format='data/json')]

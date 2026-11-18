@@ -16,7 +16,7 @@ _INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profil
     'supported_profiles': ['motus_slam/1', 'motus_slam/2'],
     'time_bases': ['source_capture', 'receipt_estimated']}}
 _FRONTENDS = ('f2m_feature', 'f2f_optical_flow')
-# Optional `auto`: engineering limits, not tuned on hardware. A switch needs a
+# Engineering limits, not tuned on hardware. A switch needs a
 # visual-kind loss with fresh inputs, then waits out a cooldown; after two
 # switches without tracking in between, ordinary recovery keeps the frontend.
 _AUTO_COOLDOWN_S, _AUTO_MAX_UNTRACKED_SWITCHES = 20., 2
@@ -29,12 +29,6 @@ class RgbdOdometryPlugin:
         self._input_registry = input_registry
         self.executor = executor
         self.instances = {}
-        self.defaults = {k: (config or {}).get(k, False) for k in
-                         ('short_term_compensation', 'depth_geometry', 'inertial_association')}
-        self.defaults['imu_assisted'] = False  # Derived from connected inputs, never a setting.
-        self.defaults['visual_frontend'] = (config or {}).get('visual_frontend', 'f2m_feature')
-        self.defaults['max_features'] = (config or {}).get('max_features', 1000)
-        self.settings = {}
         self.lock = threading.RLock()
         self.recovery = {}
         self.frontends = {}
@@ -137,7 +131,7 @@ class RgbdOdometryPlugin:
         frontend = self.frontends.get(instance)
         calibration = (getattr(session, 'restart_calibration', session.calibration)
                        if calibration is None else calibration)
-        if not frontend or frontend['mode'] != 'auto':
+        if not frontend:
             return calibration, None
         active, kind = frontend['active'], info.get('loss_kind')
         other = _FRONTENDS[1-_FRONTENDS.index(active)]
@@ -169,11 +163,10 @@ class RgbdOdometryPlugin:
             return None
         remaining = (0. if frontend['cooldown_until'] is None else
                      max(0., round(frontend['cooldown_until']-time.monotonic(), 1)))
-        return dict(mode=frontend['mode'], active=frontend['active'], switches=frontend['switches'],
+        return dict(mode='auto', active=frontend['active'], switches=frontend['switches'],
                     last_switch_reason=frontend['last_switch_reason'], decision=frontend['decision'],
                     cooldown_remaining_s=remaining,
-                    switching_suspended=(frontend['mode'] == 'auto' and
-                                         frontend['untracked'] >= _AUTO_MAX_UNTRACKED_SWITCHES))
+                    switching_suspended=frontend['untracked'] >= _AUTO_MAX_UNTRACKED_SWITCHES)
 
     def _stop_instance(self, instance):
         failures = []
@@ -199,23 +192,7 @@ class RgbdOdometryPlugin:
                  'description': 'RGB-D 视觉里程计：彩色和实测深度估计相机位姿，接入相机 IMU 自动启用辅助',
                  'inputSchema': {'type': 'object', 'properties': {
                      'action': {'type': 'string', 'enum': ['start', 'stop', 'info']}}},
-                 'configSchema': {'type': 'object', 'properties': {
-                     'short_term_compensation': {'type': 'boolean', 'default': False, 'scope': 'instance',
-                         'description': '启用 ESKF 短时补偿，需要 IMU 完整标定及低运动初始化'},
-                     'depth_geometry': {'type': 'boolean', 'default': False, 'scope': 'instance',
-                         'description': '启用深度几何配准辅助，需要先启用短时补偿'},
-                     'inertial_association': {'type': 'boolean', 'default': False, 'scope': 'instance',
-                         'description': '用惯性旋转引导视觉匹配和求解初值，需要短时补偿及新版原生运行时；'
-                                        '缺少旋转提示时继续视觉处理'},
-                     'visual_frontend': {'type': 'string', 'scope': 'instance',
-                                         'default': self.defaults['visual_frontend'],
-                                         'enum': [*_FRONTENDS, 'auto'],
-                                         'description': 'F2M 特征匹配（默认）、F2F 光流或 auto（持续视觉退化时'
-                                                        '切换前端并开启新段）；切换需停止实例'},
-                     'max_features': {'type': 'integer', 'scope': 'instance',
-                                      'default': self.defaults['max_features'],
-                                      'minimum': 100, 'maximum': 5000,
-                                      'description': '最大特征数，调整需停止实例'}}},
+                 'configSchema': {'type': 'object', 'properties': {}},
                  'topic_in': [{'format': 'image/jpeg'}, {'format': 'image/depth-zlib'},
                               {'format': 'sensor/imu', 'optional': True}],
                  'topic_out': self._outputs('default'), 'odom_interface': _INTERFACE}]
@@ -236,54 +213,33 @@ class RgbdOdometryPlugin:
         with self.lock:
             current = self.instances.get(instance)
             try:
-                settings = {k: args.get(k, self.settings.get(instance, self.defaults).get(k, False))
-                            for k in self.defaults}
-                # Ignore saved legacy toggles: only the actual binding enables IMU.
-                settings['imu_assisted'] = bool(current and any(
-                    p['format'] == 'sensor/imu' for p in current[2]))
-                if any(type(settings[k]) is not bool for k in
-                       ('imu_assisted', 'short_term_compensation', 'depth_geometry', 'inertial_association')):
-                    raise ValueError('IMU, compensation and geometry flags must be boolean')
-                if settings['visual_frontend'] not in (*_FRONTENDS, 'auto'):
-                    raise ValueError('unsupported visual_frontend: use f2m_feature, f2f_optical_flow or auto')
-                if (type(settings['max_features']) is not int or
-                        not 100 <= settings['max_features'] <= 5000):
-                    raise ValueError('max_features must be an integer in [100, 5000]')
-                if settings['depth_geometry'] and not settings['short_term_compensation']:
-                    raise ValueError('depth geometry requires short-term compensation')
-                if settings['inertial_association'] and not settings['short_term_compensation']:
-                    raise ValueError('inertial association requires short-term compensation')
+                topics = current[2] if current and action != 'stop' else []
+                if action == 'start':
+                    topics = start_topics(args)
+                enabled = isinstance(topics, list) and len(topics) == 3
+                # Saved canvases may still send config or old start options.
+                settings = dict(visual_frontend='auto', max_features=1000, imu_assisted=enabled,
+                                short_term_compensation=enabled, depth_geometry=enabled,
+                                inertial_association=enabled)
                 if action == 'config':
-                    if current and settings != self.settings[instance]:
-                        raise ValueError('stop RGB-D odometry before changing frontend or assistance settings')
-                    self.settings[instance] = settings
-                    return {'state': 'configured', 'config': settings.copy()}
+                    return {'state': 'configured', 'config': settings}
                 if action == 'start':
                     if self.closed:
                         raise RuntimeError('RGB-D plugin is shutting down')
                     if instance in self.retiring:
                         raise RuntimeError('finish failed RGB-D cleanup with stop before restarting')
-                    topics = start_topics(args)
-                    enabled = settings['imu_assisted'] = isinstance(topics, list) and len(topics) == 3
                     try:
                         calibration = validate_start_inputs(args.get('camera_info'), topics, enabled)
                     except ValueError as error:
                         logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
                         raise
-                    calibration.update(settings)
+                    calibration.update(settings, visual_frontend=_FRONTENDS[0])
                     calibration['input_declarations'] = deepcopy(args.get('camera_info') or {})
-                    # No IMU binding always means pure visual, even with saved ESKF options.
-                    calibration['short_term_compensation'] = enabled and settings['short_term_compensation']
-                    calibration['depth_geometry'] = enabled and settings['depth_geometry']
-                    calibration['inertial_association'] = enabled and settings['inertial_association']
-                    mode = 'auto' if settings['visual_frontend'] == 'auto' else 'manual'
-                    if mode == 'auto':
-                        calibration['visual_frontend'] = _FRONTENDS[0]  # existing default starts
                     image_topics = [calibration[k + '_topic'] for k in ('color', 'depth')]
                     geometry = {topic: {key: args['camera_info'][topic].get(key)
                                         for key in ('width', 'height', 'K', 'D')}
                                 for topic in image_topics}
-                    signature = json.dumps([image_topics, calibration.get('imu_topic'), geometry, settings],
+                    signature = json.dumps([image_topics, calibration.get('imu_topic'), geometry],
                                            sort_keys=True)
                     if current and current[1] != signature:
                         raise ValueError('stop RGB-D odometry before changing its input geometry')
@@ -297,12 +253,11 @@ class RgbdOdometryPlugin:
                         current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic'],
                             **({'input_registry': self._input_registry} if self._input_registry else {})), signature, bindings)
                         self.instances[instance] = current
-                        self.settings[instance] = settings
                         self.recovery[instance] = dict(lost_since=None, last_attempt=None,
                             attempts=0, restarts=0, previous_segment=None, reason=None, error=None,
                             failure_streak=0, next_attempt=None, backoff_s=1.5, healthy_since=None,
                             mode_retry_after=None, restoration_attempts=0, transitions=[])
-                        self.frontends[instance] = dict(mode=mode, active=calibration['visual_frontend'],
+                        self.frontends[instance] = dict(active=calibration['visual_frontend'],
                             switches=0, untracked=0, last_switch_reason=None, decision=None,
                             cooldown_until=None)
                 elif action == 'stop':
@@ -315,7 +270,7 @@ class RgbdOdometryPlugin:
                         'topic_in': current[2] if current else [],
                         'recovery': self._recovery_info(instance),
                         'frontend': self._frontend_info(instance),
-                        'config': self.settings.get(instance, self.defaults).copy()}
+                        'config': settings}
             except (ValueError, RuntimeError, ImportError, LookupError) as error:
                 return {'state': 'error', 'message': str(error)}
 

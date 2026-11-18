@@ -16,12 +16,15 @@ def test_wiring_overrides_legacy_flags_and_gates_fusion(card, legacy, imu, fusio
     assert result['state'] == 'running'
     c = card.instances['one'][0].calibration
     assert c['imu_assisted'] is imu
-    assert c['short_term_compensation'] is (imu and fusion)
-    assert c['depth_geometry'] is (imu and fusion)
+    assert c['short_term_compensation'] is imu
+    assert c['depth_geometry'] is imu
+    assert c['inertial_association'] is imu
+    assert c['max_features'] == 1000
+    assert result['config']['visual_frontend'] == 'auto'
     assert ('imu_topic' in c) is imu
     assert result['config']['imu_assisted'] is imu
     assert len(result['topic_in']) == len(topics)
-    assert 'imu_assisted' not in card.get_tools()[0]['configSchema']['properties']
+    assert card.get_tools()[0]['configSchema']['properties'] == {}
 
 
 def test_rewiring_requires_stop_and_preserves_other_instance(card):

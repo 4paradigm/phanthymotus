@@ -227,36 +227,6 @@ def test_runtime_parameter_mode_keeps_optional_hint_separate_from_legacy_imu():
     assert not legacy.get('motus_rotation_hint', False)
 
 
-def test_card_exposes_opt_in_flag_and_rejects_association_without_compensation(monkeypatch):
-    from plugins import rgbd_odometry as module
-    from test_rgbd_odometry import Session
-    from test_rgbd_odometry_contract import declarations
-    from vision_stubs import _FakeExecutor
-    class RecordingSession(Session):
-        def __init__(self, calibration, executor, topic):
-            super().__init__(calibration, executor, topic)
-            self.calibration = calibration
-    monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
-    monkeypatch.setattr(module, 'require_runtime', lambda: None)
-    card = module.RgbdOdometryPlugin({}, _FakeExecutor())
-    try:
-        prop = card.get_tools()[0]['configSchema']['properties']['inertial_association']
-        assert prop['default'] is False and prop['scope'] == 'instance'
-        bad = card.dispatch('rgbd_odometry', dict(action='config', inertial_association=True))
-        assert bad['state'] == 'error'
-        good = card.dispatch('rgbd_odometry', dict(action='config', inertial_association=True,
-                                                  short_term_compensation=True))
-        assert good['state'] == 'configured'
-        started = card.dispatch('rgbd_odometry', dict(action='start', input_topics=['/rgb', '/depth'],
-                                                    camera_info=declarations()))
-        assert started['state'] == 'running'
-        calibration = card.instances['default'][0].calibration
-        assert calibration['inertial_association'] is False  # No IMU binding.
-        assert started['config']['inertial_association'] is True  # Preserve user's preference.
-    finally:
-        card.shutdown()
-
-
 @pytest.fixture
 def hint_session(sessions, hint_node, monkeypatch, tmp_path):
     from plugins import rgbd_odometry_runtime as runtime

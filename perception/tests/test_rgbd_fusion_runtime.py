@@ -128,7 +128,7 @@ def test_native_visual_rejects_bad_covariance_inliers_and_changed_frames():
             assert fusion.reason  # resets cannot masquerade as short visual loss
 
 
-def test_fusion_mode_owns_imu_and_geometry_requires_compensation(monkeypatch):
+def test_wired_fusion_mode_owns_imu_and_enables_geometry(monkeypatch):
     from plugins import rgbd_odometry as module
     class RecordingSession(Session):
         def __init__(self, calibration, executor, topic):
@@ -136,20 +136,13 @@ def test_fusion_mode_owns_imu_and_geometry_requires_compensation(monkeypatch):
     monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
     monkeypatch.setattr(module, 'require_runtime', lambda: None)
     card = RgbdOdometryPlugin({}, _FakeExecutor())
-    props = card.get_tools()[0]['configSchema']['properties']
-    assert props['short_term_compensation']['default'] is False
-    assert props['depth_geometry']['default'] is False
-    assert card.dispatch('rgbd_odometry', dict(action='config', depth_geometry=True))['state'] == 'error'
-    assert card.dispatch('rgbd_odometry', dict(action='config', short_term_compensation=True))['state'] == 'configured'
-    result = card.dispatch('rgbd_odometry', dict(action='start', imu_assisted=True,
-        short_term_compensation=True, depth_geometry=True,
+    result = card.dispatch('rgbd_odometry', dict(action='start',
         input_topics=['/rgb', '/depth', '/imu'], camera_info=declarations()))
     assert result['state'] == 'running'
     calibration = card.instances['default'][0].calibration
     assert calibration['short_term_compensation'] and calibration['depth_geometry']
     params = estimator_parameters(calibration, 'run')
     assert not params.get('wait_imu_to_init', False)
-    assert card.dispatch('rgbd_odometry', dict(action='config', depth_geometry=False))['state'] == 'error'
     card.shutdown()
 
 
