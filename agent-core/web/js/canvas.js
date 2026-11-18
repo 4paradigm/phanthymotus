@@ -2845,6 +2845,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
 
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
+    if (input.closest('.canvas-field')?.style.display === 'none') return;
     const key = input.dataset.key;
     const val = input.value.trim();
     if (val !== '') {

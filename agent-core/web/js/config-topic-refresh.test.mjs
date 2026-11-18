@@ -98,6 +98,31 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
 const reply = topic => ({ json: async () => ({ code: 200,
   data: { topic_out: [{ topic, format: 'image/jpeg' }] } }) });
 
+test('starting a new SLAM map omits the hidden ID from a previous map action', async () => {
+  const button = {};
+  const action = { dataset: { key: 'action' }, value: 'start_mapping',
+    closest: () => ({ style: { display: '' } }) };
+  const mapId = { dataset: { key: 'map_id' }, value: 'db51ccef708646eaab91b5e0934e345b',
+    closest: () => ({ style: { display: 'none' } }) };
+  const mapName = { dataset: { key: 'map_name' }, value: 'new map',
+    closest: () => ({ style: { display: '' } }) };
+  const el = {
+    querySelector: () => button,
+    querySelectorAll: selector => selector === '.canvas-field-input' ? [action, mapId, mapName] : [],
+  };
+  const calls = [];
+  const execute = runInNewContext(code('_executeCard') + '\n_executeCard', {
+    _allMcps: [], _logActivity() {}, _showResult() {}, _truncate: text => text,
+    _formatCallResult: JSON.stringify,
+    fetch: async (_url, init) => {
+      calls.push(JSON.parse(init.body).arguments);
+      return { json: async () => ({ code: 200, data: {} }) };
+    },
+  });
+  await execute(el, 'perception', 'pointcloud_slam');
+  assert.deepEqual(calls, [{ action: 'start_mapping', map_name: 'new map' }]);
+});
+
 // Catch the save->refresh break: valid cached inputs must not suppress this read.
 test('configuration update refetches every matching instance, updates ports and saves topics', async () => {
   const cards = [card('a'), card('b'), card('other-driver', 'other'), card('other-tool', 'robot', 'asr')];
