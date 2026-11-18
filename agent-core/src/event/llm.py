@@ -598,6 +598,22 @@ async def _acp_barrier(name: str, cancel_event, *,
     return result
 
 
+def _schedule_settings() -> dict:
+    """定时设置的内存快照（schedule_store.cached_settings）：每个 turn 在事件循环上调，
+    不能同步读 SQLite。网页改设置后快照立即更新，不用重启。"""
+    try:
+        import schedule_store
+        return schedule_store.cached_settings()
+    except Exception:
+        return {}
+
+
+def _hide_schedule_tools() -> bool:
+    """模型的定时工具默认不给：管理员在设置里打开 scheduler_settings.model_tools_enabled
+    才出现。读不到设置时按关闭处理。"""
+    return not _schedule_settings().get('model_tools_enabled')
+
+
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 
 # viewer 是已注册的合法 ACL 用户（不是可以随便伪造身份的群里 Bot），"只读" 的定义
@@ -1653,6 +1669,10 @@ class Event:
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
             ('task_force_clear', event.task.task_force_clear),
+            # 运行时定时任务（默认不出现在工具表里，见 _hide_schedule_tools）
+            ('schedule_list', event.schedule.schedule_list),
+            ('schedule_create', event.schedule.schedule_create),
+            ('schedule_delete', event.schedule.schedule_delete),
             ('raw_input_info', _raw_input_info),
             ('search_history', _search_history),
             ('memory_recall', _memory_recall),
@@ -2384,6 +2404,12 @@ class Event:
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
+        if _hide_schedule_tools():
+            system_tools = [t for t in system_tools if not t['schema']['name'].startswith('schedule_')]
+        else:
+            # 工具说明里写上实际的默认时区（管理员可能改过，不一定是北京时间）
+            _sched_tz = _schedule_settings().get('default_tz') or 'Asia/Shanghai'
+            system_tools = [event.schedule.with_default_tz(t, _sched_tz) for t in system_tools]
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools

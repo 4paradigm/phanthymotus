@@ -1,0 +1,917 @@
+"""
+schedule_store.py — 运行时定时任务：存储、校验、注册到 scheduler。
+
+和配置项 [[scheduler]] 的区别：这里的定时任务在网页 / API（以及管理员打开后的模型工具）
+里增删改，**立即生效、不用重启**，存在 SQLite（与 config.py 共用 DB_PATH）里跨重启保留。
+
+每次触发都会叫醒主模型跑一轮（Tianyi 实测一轮三万多 token），所以这里管着几道闸，
+数值在 config.main['scheduler_settings']，设置页可改：
+  · min_interval_minutes —— 同一个定时任务两次触发的最短间隔；
+  · max_fires_per_day    —— 所有运行时定时任务（含网页上的“立即触发”）加起来一天最多触发
+                            几次。建 / 改的时候按 cron 逐天估算拦一次；到点时再按实际次数卡
+                            一次：推事件之前在锁里**先占一个名额**（检查和占用是同一步，几条
+                            同时到点也不会一起越过上限），没发出去就退回名额，发出去了写进
+                            schedule_fires 表（重启后当天已触发的次数还在）；
+  · max_schedules / max_per_skill —— 条数上限；
+  · model_tools_enabled  —— 模型能不能自己建定时（默认关，见 event/schedule.py）。
+改设置时拿新的限制把现有启用的定时任务重新校验一遍，有不合规的就拒绝这次修改并列出是哪几条，
+不会出现“设置收紧了、老定时照旧按原频率跑”。
+网页上的“立即触发”守同样的闸：停用的不能触发，离上一次和下一次触发都要隔开最短间隔，占当天名额。
+
+job 名统一是 'sched:<id>'，事件 source 是 'scheduler:<name>'。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import functools
+import json
+import re
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+
+import config
+import scheduler
+
+DEFAULT_SETTINGS = {
+    'model_tools_enabled': False,
+    'min_interval_minutes': 10,
+    'max_schedules': 20,
+    'max_per_skill': 6,
+    'max_fires_per_day': 48,
+    'default_tz': 'Asia/Shanghai',
+}
+
+KINDS = ('cron', 'once')
+CREATORS = ('web', 'api', 'model')
+_AT_FORMATS = ('%Y-%m-%d %H:%M', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S')
+_HORIZON_DAYS = 367          # 估算每日触发数时往后看多远（一次性定时最多设到一年后）
+_FIRE_KEEP_S = 2 * 86400     # 触发记录保留多久（算“今天”够用）
+
+
+@dataclass
+class Schedule:
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    name: str = ''
+    text: str = ''
+    kind: str = 'cron'            # cron | once
+    cron: str = ''                # kind=cron：5 字段 cron，按 tz 解释
+    at: str = ''                  # kind=once：'YYYY-MM-DD HH:MM'，按 tz 解释
+    tz: str = 'Asia/Shanghai'
+    skill: str = ''               # 对应的技能 slug（可空），写进事件文字提示模型先激活
+    enabled: bool = True
+    created_by: str = 'web'       # web | api | model
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    last_run: float | None = None
+    fire_count: int = 0
+
+
+_schedules: dict[str, Schedule] = {}
+# 最近两天的触发时间（unix 秒）：已发出的（也存在 schedule_fires 表里）+ 正在发、占着名额的。
+# “今天”按 default_tz 现算，所以改时区不会把计数清零。
+_fire_times: list[float] = []
+# 每条定时最近一次触发（含正在发的）的时间：手动触发要和它隔开最短间隔。库里的 last_run 只记
+# 发成功的，这里还盖住“正在发”的那一下，几个并发的“立即触发”请求只有一个能过。
+_last_fire: dict[str, float] = {}
+_loaded = False
+# API 路由跑在线程池里，可能并发；增删改、设置、名额和内存表的读写都串行。
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with _lock:
+            return fn(*a, **kw)
+    return wrapper
+
+
+# ── SQLite ──────────────────────────────────────────────────────────────────
+
+def _get_conn() -> sqlite3.Connection:
+    import pathlib
+    db_path = pathlib.Path(config.DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute('CREATE TABLE IF NOT EXISTS schedules (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
+    conn.execute('CREATE TABLE IF NOT EXISTS schedule_fires (ts REAL NOT NULL)')
+    conn.commit()
+    return conn
+
+
+@contextlib.contextmanager
+def _db():
+    """连接用完就关；with 块正常结束时提交。"""
+    conn = _get_conn()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def _persist(s: Schedule) -> None:
+    with _db() as conn:
+        conn.execute('INSERT OR REPLACE INTO schedules (id, data) VALUES (?, ?)',
+                     (s.id, json.dumps(asdict(s), ensure_ascii=False)))
+
+
+def _delete_row(sid: str) -> None:
+    with _db() as conn:
+        conn.execute('DELETE FROM schedules WHERE id = ?', (sid,))
+
+
+@_locked
+def load_all() -> None:
+    global _loaded
+    cutoff = time.time() - _FIRE_KEEP_S
+    with _db() as conn:
+        rows = conn.execute('SELECT id, data FROM schedules').fetchall()
+        fires = conn.execute('SELECT ts FROM schedule_fires WHERE ts >= ?', (cutoff,)).fetchall()
+    _schedules.clear()
+    for row_id, data in rows:
+        # 每行单独读：一行坏了（JSON 写坏、字段不对）只影响它自己
+        try:
+            d = json.loads(data)
+            s = Schedule(**{k: v for k, v in d.items() if k in Schedule.__dataclass_fields__})
+            if s.id != row_id:
+                raise ValueError(f'id 不一致：{s.id!r}')
+        except Exception as e:
+            print(f'[schedule] broken row {row_id!r}: {e}; kept as a disabled placeholder')
+            s = _placeholder(row_id, data)
+            try:
+                _persist(s)
+            except Exception as e2:
+                print(f'[schedule] failed to save placeholder {row_id!r}: {e2}')
+        _schedules[s.id] = s
+    # 库里的是已发出的；内存里可能还有正在发、占着名额的，合在一起
+    _fire_times[:] = sorted({t for (t,) in fires} | set(_fire_times))
+    _loaded = True
+
+
+def _placeholder(row_id: str, raw) -> Schedule:
+    """读不出来的行：换成一条停用的占位记录（网页上能看到、能删），原始内容留在文字里方便排查。"""
+    return Schedule(id=str(row_id), name=f'数据损坏 {row_id}'[:40], text=f'原始数据：{_clean(raw)[:400]}',
+                    kind='once', at='2000-01-01 00:00', enabled=False)
+
+
+def _check_timing(s: Schedule) -> None:
+    """库里读出来的定时，时间设置还能不能用（类型、时区、cron / 时间）；不能用抛错。"""
+    if s.kind not in KINDS:
+        raise ValueError(f'未知类型 {s.kind!r}')
+    tz = scheduler.get_tz(s.tz)
+    if s.kind == 'once':
+        parse_at(s.at, s.tz)
+    else:
+        scheduler.parse_cron(s.cron)
+        try:
+            scheduler._next_run(s.cron, time.time(), tz)
+        except RuntimeError:
+            raise ValueError(f'cron {s.cron!r} 两年内不会触发') from None
+
+
+def _ensure_loaded() -> None:
+    with _lock:
+        if not _loaded:
+            load_all()
+
+
+# ── 时间 ─────────────────────────────────────────────────────────────────────
+
+def parse_at(at: str, tz_name: str) -> float:
+    tz = scheduler.get_tz(tz_name)
+    for fmt in _AT_FORMATS:
+        try:
+            dt = datetime.datetime.strptime(at.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f'时间要写成 YYYY-MM-DD HH:MM，收到 {at!r}')
+    return dt.replace(tzinfo=tz).timestamp() if tz else dt.timestamp()
+
+
+def fmt_ts(ts: float | None, tz_name: str | None = None) -> str:
+    if not ts:
+        return ''
+    tz = scheduler.get_tz(tz_name or get_settings()['default_tz'])
+    return datetime.datetime.fromtimestamp(ts, tz).strftime('%Y-%m-%d %H:%M')
+
+
+def next_run_ts(s: Schedule, now: float | None = None) -> float | None:
+    if not s.enabled:
+        return None
+    now = time.time() if now is None else now
+    if s.kind == 'once':
+        t = parse_at(s.at, s.tz)
+        return t if t > now else None
+    return scheduler._next_run(s.cron, now, s.tz)
+
+
+def _midnight(d: datetime.date, tz) -> float:
+    return datetime.datetime.combine(d, datetime.time(), tzinfo=tz).timestamp()
+
+
+def _day_bounds(ts: float, tz_name: str) -> tuple[float, float]:
+    """ts 所在那一天（tz_name 时区）的 [0 点, 次日 0 点)。"""
+    tz = scheduler.get_tz(tz_name)
+    d = datetime.datetime.fromtimestamp(ts, tz).date()
+    return _midnight(d, tz), _midnight(d + datetime.timedelta(days=1), tz)
+
+
+def _day_total(d: datetime.date, crons: list[Schedule], once_n: int, tz, now: float,
+               limit: int | None = None) -> int:
+    """d 这一天（tz）还会触发几次：当天的一次性定时 + 各条 cron 在当天（从 now 起）的实际触发数。
+    limit：数到这么多就停（只想知道超没超）。"""
+    start = max(_midnight(d, tz), now)
+    end = _midnight(d + datetime.timedelta(days=1), tz)
+    n = once_n
+    for c in crons:
+        if limit is not None and n >= limit:
+            break
+        n += scheduler.fires_between(c.cron, start, end, c.tz,
+                                     None if limit is None else limit - n)
+    return n
+
+
+def _peak_daily_fires(items: list[Schedule], now: float, day_tz: str,
+                      cap: int | None = None) -> tuple[int, str]:
+    """所有启用的定时任务合起来，按真实日期逐天相加，返回 (最忙那天的次数, 那一天)。
+
+    要看的日子：
+      · 今天剩下的部分 + 往后 7 个整天 —— 日、月都是 * 的 cron 只按星期重复，每个星期几都看到；
+      · 每个一次性定时所在的那天；
+      · 日或月有限定的 cron（比如每月 1 号），接下来一年里它真正会触发的那些天。
+    每一天都把当天 cron 的实际触发数和当天的一次性定时加在一起，不拿不同日期的峰值相加。
+    给了 cap 时，碰到第一个超过 cap 的日子就返回它（次数是那天的准确值）。
+    """
+    tz = scheduler.get_tz(day_tz)
+    today = datetime.datetime.fromtimestamp(now, tz).date()
+    days = {today + datetime.timedelta(days=i) for i in range(8)}
+    once_by_day: dict = {}
+    for x in items:
+        if x.enabled and x.kind == 'once':
+            t = parse_at(x.at, x.tz)
+            if t <= now:
+                continue
+            d = datetime.datetime.fromtimestamp(t, tz).date()
+            once_by_day[d] = once_by_day.get(d, 0) + 1
+            days.add(d)
+    crons = [x for x in items if x.enabled and x.kind == 'cron']
+    for c in crons:
+        ctz = scheduler.get_tz(c.tz)
+        for cd in scheduler.matching_dates(c.cron, now, _HORIZON_DAYS, ctz) or ():
+            # cron 时区的一天落在 day_tz 里可能跨两天，两天都看
+            a = _midnight(cd, ctz)
+            b = _midnight(cd + datetime.timedelta(days=1), ctz) - 1
+            days.add(datetime.datetime.fromtimestamp(a, tz).date())
+            days.add(datetime.datetime.fromtimestamp(b, tz).date())
+    best, best_day = 0, ''
+    for d in sorted(x for x in days if x >= today):
+        n = _day_total(d, crons, once_by_day.get(d, 0), tz, now, None if cap is None else cap + 1)
+        if cap is not None and n > cap:
+            return _day_total(d, crons, once_by_day.get(d, 0), tz, now), d.isoformat()
+        if n > best:
+            best, best_day = n, d.isoformat()
+    return best, best_day
+
+
+# ── 设置 ─────────────────────────────────────────────────────────────────────
+
+# 最近一次从库里读到 / 写进库的设置。给事件循环上每个 turn 都要看的地方用（event/llm.py
+# 决定工具表里放不放定时工具、告诉模型默认时区），那里不能同步读 SQLite。
+# 改设置只走 update_settings（写库成功后更新它）；启动时 start_all 在线程池里先读一次。
+_settings_snapshot: dict | None = None
+
+
+def get_settings() -> dict:
+    """从库里读设置（同步读 SQLite：只在线程池 / 普通 def 路由里调）。顺带刷新快照。"""
+    global _settings_snapshot
+    saved = config.main.get('scheduler_settings', {}) or {}
+    st = {**DEFAULT_SETTINGS, **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
+    _settings_snapshot = dict(st)
+    return st
+
+
+def cached_settings() -> dict:
+    """不碰数据库，返回内存里的设置快照，可以在事件循环上直接调。
+
+    还没读过库（启动最初那一下）时返回默认值：模型工具按关闭处理，宁可晚一点出现。"""
+    snap = _settings_snapshot
+    return dict(snap if snap is not None else DEFAULT_SETTINGS)
+
+
+def _conflicts(st: dict, now: float | None = None) -> list[str]:
+    """按设置 st，现在启用的定时任务有哪些不合规（中文短句）。"""
+    now = time.time() if now is None else now
+    on = [s for s in _schedules.values() if s.enabled]
+    out = []
+    for s in on:
+        if s.kind != 'cron':
+            continue
+        gap = scheduler.min_gap_minutes(s.cron, now, s.tz)
+        if gap is not None and gap < st['min_interval_minutes']:
+            out.append(f'「{s.name}」最短 {gap} 分钟触发一次')
+    if len(on) > st['max_schedules']:
+        out.append(f'启用中的定时任务有 {len(on)} 条')
+    if st['max_per_skill']:
+        per: dict[str, int] = {}
+        for s in on:
+            if s.skill:
+                per[s.skill] = per.get(s.skill, 0) + 1
+        out += [f'技能 {k} 有 {n} 条' for k, n in sorted(per.items()) if n > st['max_per_skill']]
+    total, day = _peak_daily_fires(on, now, st['default_tz'], cap=st['max_fires_per_day'])
+    if total > st['max_fires_per_day']:
+        out.append(f'{day} 这一天会触发 {total} 次')
+    return out
+
+
+@_locked
+def update_settings(**changes) -> dict:
+    """改设置。新限制会拿来重新校验现有启用的定时任务：这次修改会让哪条变得不合规，
+    就整个拒绝并列出来，请先改或停用那几条（不替人偷偷停用定时）。原本就不合规的不算在内，
+    所以打开模型工具这类无关的修改不会被历史数据卡住。"""
+    _ensure_loaded()
+    cur = get_settings()
+    new = dict(cur)
+    for k, v in changes.items():
+        if k not in DEFAULT_SETTINGS or v is None:
+            continue
+        if k == 'model_tools_enabled':
+            new[k] = bool(v)
+        elif k == 'default_tz':
+            scheduler.get_tz(v)          # 未知时区直接报错
+            new[k] = v
+        else:
+            v = int(v)
+            if v < (1 if k != 'max_per_skill' else 0):
+                raise ValueError(f'{k} 必须是正整数')
+            new[k] = v
+    now = time.time()
+    before = set(_conflicts(cur, now))
+    problems = [p for p in _conflicts(new, now) if p not in before]
+    if problems:
+        raise ValueError('按新的设置，现有的定时任务不合规：' + '；'.join(problems)
+                         + '。请先改或停用这些定时任务，再改设置')
+    _save_settings(new)
+    return new
+
+
+def _save_settings(st: dict) -> None:
+    """把设置写进 config 表，写不进去就抛 sqlite3.Error（API 返回“保存失败”）。
+
+    ConfigDB 的赋值本身就是落盘：config.py 的 ConfigDB.__setitem__ 执行
+    INSERT OR REPLACE 并 commit。设置没有另外的内存副本，get_settings 每次都从库里读，
+    所以写成功之前任何地方都看不到新值，重启后读到的也就是这里写进去的。写完再读回来
+    核对一遍，防止静默没写上。"""
+    global _settings_snapshot
+    config.main['scheduler_settings'] = st
+    if config.main.get('scheduler_settings') != st:
+        raise sqlite3.Error('设置写入后读回来不一致')
+    _settings_snapshot = {**DEFAULT_SETTINGS, **st}
+
+
+# ── 校验 ─────────────────────────────────────────────────────────────────────
+
+def validate(s: Schedule, *, now: float | None = None) -> None:
+    """不合规就抛 ValueError（中文原因，直接给网页和模型看）。"""
+    now = time.time() if now is None else now
+    st = get_settings()
+    s.name = (s.name or '').strip()
+    s.text = (s.text or '').strip()
+    s.skill = (s.skill or '').strip()
+    if not s.name:
+        raise ValueError('定时任务要有名字')
+    if len(s.name) > 40:
+        raise ValueError('名字不要超过 40 个字')
+    if _CTRL_RE.search(s.name) or '\n' in s.name or '\t' in s.name:
+        raise ValueError('名字里不能有换行或控制字符')
+    if _CTRL_RE.search(s.skill) or '\n' in s.skill or '\t' in s.skill:
+        raise ValueError('技能名里不能有换行或控制字符')
+    if not s.text:
+        raise ValueError('要写触发时推给机器人的文字')
+    if len(s.text) > 500:
+        raise ValueError('触发文字不要超过 500 个字')
+    if _CTRL_RE.search(s.text):
+        raise ValueError('触发文字里不能有控制字符（比如 NUL、ESC），换行可以')
+    if s.kind not in KINDS:
+        raise ValueError('kind 只能是 cron（重复）或 once（一次）')
+    s.tz = (s.tz or st['default_tz']).strip()
+    tz = scheduler.get_tz(s.tz)
+    for other in _schedules.values():
+        if other.id != s.id and other.name == s.name:
+            raise ValueError(f'已经有叫「{s.name}」的定时任务了（id {other.id}）')
+    # 事件 source 是 'scheduler:<名字>'：和配置文件里的定时同名会撞成同一个来源
+    if any((j or {}).get('name') == s.name for j in (config.main.get('scheduler', []) or [])):
+        raise ValueError(f'配置文件里已经有叫「{s.name}」的定时了，换个名字')
+
+    if s.kind == 'once':
+        s.cron = ''
+        if not s.at:
+            raise ValueError('一次性定时要写触发时间 at（YYYY-MM-DD HH:MM）')
+        t = parse_at(s.at, s.tz)
+        if s.enabled and t <= now + 30:
+            raise ValueError(f'触发时间 {s.at}（{s.tz}）已经过去了')
+        if t > now + 366 * 86400:
+            raise ValueError('一次性定时最多设到一年以后')
+    else:
+        s.at = ''
+        scheduler.parse_cron(s.cron)
+        try:
+            scheduler._next_run(s.cron, now, tz)
+        except RuntimeError:
+            raise ValueError(f'cron {s.cron!r} 接下来两年一次都不会触发（日期不存在？）') from None
+        gap = scheduler.min_gap_minutes(s.cron, now, tz)
+        if gap is not None and gap < st['min_interval_minutes']:
+            raise ValueError(
+                f'两次触发最短只隔 {gap} 分钟，低于下限 {st["min_interval_minutes"]} 分钟。'
+                '每次触发都要跑一轮模型，请把间隔放宽')
+
+    if not s.enabled:
+        return
+    others = [o for o in _schedules.values() if o.enabled and o.id != s.id]
+    if len(others) + 1 > st['max_schedules']:
+        raise ValueError(f'启用中的定时任务最多 {st["max_schedules"]} 条')
+    if s.skill and st['max_per_skill'] and \
+            sum(1 for o in others if o.skill == s.skill) + 1 > st['max_per_skill']:
+        raise ValueError(f'技能 {s.skill} 的定时任务最多 {st["max_per_skill"]} 条')
+    cap = st['max_fires_per_day']
+    total, day = _peak_daily_fires([s, *others], now, st['default_tz'], cap=cap)
+    if total > cap:
+        raise ValueError(f'加上这条，{day} 这一天所有定时任务会触发 {total} 次，超过上限 {cap} 次')
+
+
+# ── 每日名额（调用方持锁）────────────────────────────────────────────────────
+
+def _fires_today(now: float) -> int:
+    cutoff = now - _FIRE_KEEP_S              # 顺手清掉两天前的（发失败、被跳过的长期运行也不会越积越多）
+    if _fire_times and min(_fire_times) < cutoff:
+        _fire_times[:] = [t for t in _fire_times if t >= cutoff]
+    start, end = _day_bounds(now, get_settings()['default_tz'])
+    return sum(1 for t in _fire_times if start <= t < end)
+
+
+def _reserve(now: float) -> float | None:
+    """占一个当天名额，返回名额（就是时间戳）；满了返回 None。
+
+    名额**先写进库再放行**：写库失败就抛错、这次不发。所以每一次发出去的触发在发之前就已经
+    落了库，重启后当天的次数不会少算（没发出去的会在 _release 里删掉）。"""
+    if _fires_today(now) >= get_settings()['max_fires_per_day']:
+        return None
+    with _db() as conn:
+        conn.execute('INSERT INTO schedule_fires (ts) VALUES (?)', (now,))
+    _fire_times.append(now)
+    return now
+
+
+def _release(slot: float | None) -> None:
+    """没发出去：退回名额（内存和库）。删库失败只记日志：多算一次，宁可少发不多发。"""
+    if slot is None:
+        return
+    with contextlib.suppress(ValueError):
+        _fire_times.remove(slot)
+    try:
+        with _db() as conn:
+            conn.execute('DELETE FROM schedule_fires WHERE rowid = '
+                         '(SELECT rowid FROM schedule_fires WHERE ts = ? LIMIT 1)', (slot,))
+    except Exception as e:
+        print(f'[schedule] failed to release fire slot: {e}')
+
+
+def _commit(slot: float | None) -> None:
+    """发出去了：名额在占的时候已经落库，这里只顺手清掉两天前的记录（失败无妨）。"""
+    cutoff = (slot or time.time()) - _FIRE_KEEP_S
+    _fire_times[:] = [t for t in _fire_times if t >= cutoff]
+    with _db() as conn:
+        conn.execute('DELETE FROM schedule_fires WHERE ts < ?', (cutoff,))
+
+
+def _mark_fire(sid: str, ts: float) -> float | None:
+    """记下这条定时正在 ts 触发，返回之前的记录（没发出去时用来恢复）。"""
+    prev = _last_fire.get(sid)
+    _last_fire[sid] = ts
+    return prev
+
+
+def _unmark_fire(sid: str, ts: float | None, prev: float | None) -> None:
+    """没发出去：恢复成之前的记录（中间又有新的触发就不动）。"""
+    if ts is None or _last_fire.get(sid) != ts:
+        return
+    if prev is None:
+        _last_fire.pop(sid, None)
+    else:
+        _last_fire[sid] = prev
+
+
+def _manual_block_reason(s: Schedule, now: float) -> str | None:
+    """手动触发这条现在行不行；不行返回中文原因。
+
+    同一条定时两次触发至少隔 min_interval_minutes：离上一次触发（定时的或手动的，含正在发的）
+    和离下一次定时触发都要隔开这么久，所以“立即触发”不会让同一条在短时间里叫醒模型两次。"""
+    if not s.enabled:
+        return f'「{s.name}」已停用，先启用再触发'
+    gap = get_settings()['min_interval_minutes'] * 60
+    last = max(_last_fire.get(s.id) or 0.0, s.last_run or 0.0)
+    if last and now - last < gap:
+        wait = int((gap - (now - last)) // 60) + 1
+        return f'「{s.name}」{int((now - last) // 60)} 分钟前刚触发过，最短要隔 {gap // 60} 分钟，{wait} 分钟后再试'
+    try:
+        nxt = next_run_ts(s, now)
+    except (ValueError, RuntimeError):
+        nxt = None
+    if nxt and nxt - now < gap:
+        return f'「{s.name}」{int((nxt - now) // 60) + 1} 分钟内就会自己触发，不用手动触发'
+    return None
+
+
+def _cap_msg() -> str:
+    return f'今天所有定时任务已经触发满 {get_settings()["max_fires_per_day"]} 次（每日上限）'
+
+
+# ── 注册到 scheduler ─────────────────────────────────────────────────────────
+
+def job_name(sid: str) -> str:
+    return f'sched:{sid}'
+
+
+# 控制字符：NUL、ESC（终端转义）、DEL、C1 区以及 Unicode 行/段分隔符。事件文字会进日志
+# （decision 日志原样打印），NUL 还会搞坏 docker logs 的分帧，所以建的时候就拒绝，
+# 推事件前再清一遍（防库里的旧数据或绕过校验写进来的）。文字里允许 \n 和 \t。
+_CTRL_RE = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]')
+_TEXT_MAX = 500
+
+
+def _clean(text: str, *, one_line: bool = False) -> str:
+    """把控制字符换成空格；one_line 时连换行和制表符也换掉。"""
+    out = _CTRL_RE.sub(' ', str(text or ''))
+    return re.sub('[\n\t]', ' ', out) if one_line else out
+
+
+def event_source(s: Schedule) -> str:
+    return f'scheduler:{_clean(s.name, one_line=True)[:40]}'
+
+
+def event_text(s: Schedule) -> str:
+    name = _clean(s.name, one_line=True)[:40]
+    skill = _clean(s.skill, one_line=True)[:64]
+    hint = f'（定时任务「{name}」'
+    if skill:
+        hint += f'，对应技能 {skill}：先调 activate_skill(slug="{skill}")'
+    return f'{_clean(s.text)[:_TEXT_MAX]}\n{hint}）'
+
+
+def _is_current(s: Schedule, job: dict) -> bool:
+    """job 是不是这条定时当前的注册。改了时间（cron / at / 时区 / 类型）就会注册新 job，
+    旧 job 若正好在触发：不能再发旧时间的事件，也不能停用新的一次性。"""
+    if 'at' not in job and 'cron' not in job:
+        return True                       # 直接调回调（测试）时没有 job 信息
+    if s.kind == 'once':
+        at = job.get('at')
+        if not at:
+            return False
+        try:
+            return abs(parse_at(s.at, s.tz) - at) < 1
+        except ValueError:
+            return False
+    return not job.get('at') and job.get('cron') == s.cron and job.get('tz') in (None, s.tz)
+
+
+def _disable_once(s: Schedule, why: str) -> None:
+    """停用一次性定时：以内存为准，写库失败只记日志（重启时过期的一次性也会被停用）。"""
+    print(f'[schedule] one-shot {s.name!r} {why}, disabled')
+    s.enabled = False
+    s.updated_at = time.time()
+    try:
+        _persist(s)
+    except Exception as e:
+        print(f'[schedule] failed to save {s.name!r}: {e}')
+
+
+def _on_fire(sid: str):
+    """推事件之前（线程池里、持锁）：还启用着就占一个当天名额，返回 True。
+
+    名额满了返回 False 跳过这一次；一次性的错过就是错过了，当场停用落盘，不留一条
+    “启用着但再也不会触发”的记录。检查和占名额在同一把锁里，几条同时到点的定时不会
+    都读到“还差一次”而一起放行。"""
+    def _cb(job: dict) -> bool:
+        with _lock:
+            s = _schedules.get(sid)
+            if not s or not s.enabled or job.get('cancelled') or not _is_current(s, job):
+                return False                  # 已停用 / 已删 / 这个 job 已被新的注册替换
+            slot = _reserve(time.time())
+            if slot is None:
+                print(f'[schedule] daily cap {get_settings()["max_fires_per_day"]} reached, skip {s.name!r}')
+                if s.kind == 'once' and _is_current(s, job):
+                    _disable_once(s, 'skipped by the daily cap')
+                return False
+            job['slot'] = slot
+            job['prev_fire'] = _mark_fire(sid, slot)
+            return True
+    return _cb
+
+
+def _after_fire(sid: str):
+    """每次放行之后（线程池里、持锁）收尾。
+
+    发出去了：名额转正写库，记触发次数、上次触发时间，一次性的停用落盘。
+    没发出去：退回名额；一次性的如果 scheduler 不再重试（重试用完），停用落盘。"""
+    def _cb(job: dict, delivered: bool = True, retrying: bool = False) -> None:
+        with _lock:
+            slot = job.pop('slot', None)
+            prev = job.pop('prev_fire', None)
+            s = _schedules.get(sid)
+            if not delivered:
+                _release(slot)
+                _unmark_fire(sid, slot, prev)
+                if s and s.kind == 'once' and s.enabled and not retrying and _is_current(s, job):
+                    _disable_once(s, 'could not be delivered after retries')
+                return
+            # 先改内存（以内存为准），再分别写库：写库失败只记日志，不让一次性任务在内存里
+            # 还显示“启用”却已经没有协程。发出去之后才被删的，这次照样算进当天次数。
+            if s:
+                # 用占名额时的时间：和当天计数、_last_fire 用的是同一个时刻，推事件慢了也不往后挪
+                s.last_run = slot if slot is not None else time.time()
+                s.fire_count += 1
+                if s.kind == 'once' and _is_current(s, job):
+                    s.enabled = False
+            try:
+                _commit(slot)
+            except Exception as e:
+                print(f'[schedule] failed to record fire of {sid}: {e}')
+            if s:
+                try:
+                    _persist(s)
+                except Exception as e:
+                    print(f'[schedule] failed to save {s.name!r}: {e}')
+    return _cb
+
+
+def _register(s: Schedule) -> None:
+    scheduler.remove_job(job_name(s.id))
+    if not s.enabled:
+        return
+    if s.kind == 'once':
+        t = parse_at(s.at, s.tz)
+        if t <= time.time():
+            return
+        scheduler.add_job(job_name(s.id), '', event_text(s), at=t, source=event_source(s),
+                          on_fire=_on_fire(s.id), after_fire=_after_fire(s.id))
+    else:
+        scheduler.add_job(job_name(s.id), s.cron, event_text(s), tz=s.tz, source=event_source(s),
+                          on_fire=_on_fire(s.id), after_fire=_after_fire(s.id))
+
+
+@_locked
+def start_all() -> int:
+    """启动时调用（scheduler.run）：从库里读出来，注册所有启用的定时任务。
+
+    每条单独兜错：读不出来的行换成停用的占位记录（load_all）；时间设置写坏的（时区、cron、
+    时间）在注册前校验出来、停用并落盘。都只影响它自己，不拖垮其他定时。
+    """
+    try:
+        get_settings()                 # 先把设置读进快照，事件循环上的 cached_settings 就有真值了
+    except Exception as e:
+        print(f'[schedule] failed to read scheduler_settings: {e}')
+    load_all()
+    n = 0
+    for s in _schedules.values():
+        if not s.enabled:
+            continue
+        try:
+            _check_timing(s)           # 注册之前先校验：写坏的时区 / cron 不能算“启动了”
+            if s.kind == 'once' and parse_at(s.at, s.tz) <= time.time():
+                s.enabled = False      # 关机期间错过的一次性定时：不补发，标记停用
+                _persist(s)
+                continue
+            _register(s)
+            n += 1
+        except Exception as e:
+            # 坏数据（时区、cron、时间写坏了）：停用，不留“启用着却没注册”的记录，
+            # 也不再参与改设置时的重新校验
+            print(f'[schedule] disable broken schedule {s.name!r}: {e}')
+            s.enabled = False
+            try:
+                _persist(s)
+            except Exception as e2:
+                print(f'[schedule] failed to save {s.name!r}: {e2}')
+    if n:
+        print(f'[schedule] started {n} runtime schedule(s)')
+    return n
+
+
+# ── 公开接口（都是同步的、会读写 SQLite：async 调用方要放进线程池）────────────
+
+@_locked
+def list_all() -> list[Schedule]:
+    _ensure_loaded()
+    return sorted(_schedules.values(), key=lambda s: (not s.enabled, s.created_at))
+
+
+@_locked
+def find(key: str) -> Schedule | None:
+    """按 id 或名字找。"""
+    _ensure_loaded()
+    key = (key or '').strip()
+    if key in _schedules:
+        return _schedules[key]
+    for s in _schedules.values():
+        if s.name == key:
+            return s
+    return None
+
+
+@_locked
+def create(*, name: str = '', text: str = '', kind: str = 'cron', cron: str = '', at: str = '',
+           tz: str = '', skill: str = '', enabled: bool = True, created_by: str = 'web') -> Schedule:
+    _ensure_loaded()
+    s = Schedule(name=name, text=text, kind=kind, cron=cron, at=at, tz=tz, skill=skill,
+                 enabled=enabled, created_by=created_by if created_by in CREATORS else 'api')
+    validate(s)
+    _persist(s)                   # 先落库：写库失败就什么都不变（不留只在内存里的定时）
+    _schedules[s.id] = s
+    _register(s)
+    return s
+
+
+@_locked
+def update(sid: str, **changes) -> Schedule:
+    _ensure_loaded()
+    s = _schedules.get(sid)
+    if not s:
+        raise KeyError(sid)
+    trial = Schedule(**asdict(s))
+    for k, v in changes.items():
+        if k in ('name', 'text', 'kind', 'cron', 'at', 'tz', 'skill', 'enabled') and v is not None:
+            setattr(trial, k, v)
+    validate(trial)
+    trial.updated_at = time.time()
+    _persist(trial)               # 先落库，失败就保持原样
+    _schedules[sid] = trial
+    _register(trial)
+    return trial
+
+
+@_locked
+def delete(sid: str) -> bool:
+    _ensure_loaded()
+    if sid not in _schedules:
+        return False
+    _delete_row(sid)              # 先删库：删库失败就什么都不动
+    scheduler.remove_job(job_name(sid))
+    _schedules.pop(sid, None)
+    _last_fire.pop(sid, None)
+    return True
+
+
+@_locked
+def clear_all() -> int:
+    """删掉所有定时任务。当天已触发的次数不清（不能靠清空绕过每日上限）。"""
+    _ensure_loaded()
+    n = len(_schedules)
+    with _db() as conn:           # 先删库
+        conn.execute('DELETE FROM schedules')
+    for sid in list(_schedules):
+        scheduler.remove_job(job_name(sid))
+    _schedules.clear()
+    _last_fire.clear()
+    return n
+
+
+@_locked
+def model_upsert(*, name: str, text: str, kind: str, cron: str, at: str, tz: str,
+                 skill: str) -> tuple[str, Schedule]:
+    """模型工具用：按名字建或改它自己的定时。查重、权限判断和写入在同一把锁里。
+    同名的是人建的 → PermissionError。返回 ('已创建' | '已更新', 定时任务)。"""
+    _ensure_loaded()
+    key = (name or '').strip()
+    old = next((s for s in _schedules.values() if s.name == key), None)
+    if old:
+        if old.created_by != 'model':
+            raise PermissionError(key)
+        return '已更新', update(old.id, text=text, kind=kind, cron=cron, at=at, tz=tz,
+                                skill=skill, enabled=True)
+    return '已创建', create(name=name, text=text, kind=kind, cron=cron, at=at, tz=tz,
+                            skill=skill, created_by='model')
+
+
+@_locked
+def model_delete(key: str) -> Schedule:
+    """模型工具用：删它自己建的定时。找不到 → KeyError；人建的 → PermissionError。"""
+    s = find(key)
+    if not s:
+        raise KeyError(key)
+    if s.created_by != 'model':
+        raise PermissionError(s.name)
+    delete(s.id)
+    return s
+
+
+@_locked
+def _snapshot(sid: str) -> Schedule | None:
+    _ensure_loaded()
+    s = _schedules.get(sid)
+    return Schedule(**asdict(s)) if s else None
+
+
+@_locked
+def _snapshot_and_reserve(sid: str) -> tuple[Schedule | None, tuple | None]:
+    """手动触发的准入（持锁，一步完成）：查最短间隔、占当天名额、记下“正在触发”。
+    不让发就抛 ValueError（中文原因）。"""
+    s = _snapshot(sid)
+    if s is None:
+        return None, None
+    now = time.time()
+    why = _manual_block_reason(s, now)
+    if why:
+        raise ValueError(why)
+    try:
+        slot = _reserve(now)
+    except sqlite3.Error as e:
+        raise ValueError(f'记录触发次数失败（{e}），这次没有触发，请稍后再试') from None
+    if slot is None:
+        raise ValueError(_cap_msg() + '，明天再试或在设置里调高上限')
+    return s, (slot, _mark_fire(sid, slot))
+
+
+@_locked
+def _settle_manual(sid: str, ticket: tuple, delivered: bool) -> None:
+    slot, prev = ticket
+    if not delivered:
+        _release(slot)
+        _unmark_fire(sid, slot, prev)
+        return
+    _commit(slot)
+    s = _schedules.get(sid)
+    if s:                      # 手动触发也是一次触发：记上次时间和次数，一次性任务的状态不动
+        s.last_run = slot
+        s.fire_count += 1
+        _persist(s)
+
+
+async def fire_now(sid: str) -> Schedule:
+    """立即触发一次（网页“试一下”用）。和到点触发守同样的闸：
+      · 停用的不能触发；
+      · 离上一次触发、离下一次定时触发都要隔开 min_interval_minutes（并发的几个请求只放行一个）；
+      · 占当天名额，满了拒绝；没发出去退回名额。
+    不让发时抛 ValueError（中文原因）。发出去了记 last_run / fire_count；一次性任务的启用状态不变。
+
+    准入和记账在线程池里（要持锁、读写库），推事件在循环里。用拍下的快照推事件：名字和文字
+    来自同一时刻；与删除的先后以拍快照为准。"""
+    import asyncio
+    # 准入、推事件、记账作为一个独立 task 跑，外面用 shield 等：HTTP 请求在中途被取消
+    # （客户端断开、服务关闭）时，这一次照样走完——占的名额和“正在触发”标记由
+    # _settle_manual 收好尾，不会留下占着的名额或挡住下一次手动触发的标记。
+    task = asyncio.ensure_future(_fire_now_inner(sid))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            scheduler._settling.add(task)
+            task.add_done_callback(_forget_settling)
+        raise
+
+
+def _forget_settling(task) -> None:
+    scheduler._settling.discard(task)
+    if not task.cancelled():
+        task.exception()          # 取走结果，免得“exception was never retrieved”
+
+
+async def _fire_now_inner(sid: str) -> Schedule:
+    import asyncio
+    import event_bus
+    s, ticket = await asyncio.to_thread(_snapshot_and_reserve, sid)
+    if s is None:
+        raise KeyError(sid)
+    try:
+        await event_bus.enqueue(source=event_source(s), text=event_text(s))
+    except Exception:
+        await asyncio.to_thread(_settle_manual, sid, ticket, False)
+        raise
+    await asyncio.to_thread(_settle_manual, sid, ticket, True)
+    return (await asyncio.to_thread(_snapshot, sid)) or s      # 带上刚记的 last_run / fire_count
+
+
+def to_dict(s: Schedule) -> dict:
+    d = asdict(s)
+    try:
+        nxt = next_run_ts(s)
+    except (ValueError, RuntimeError):
+        nxt = None
+    d['next_run'] = nxt
+    d['next_run_text'] = fmt_ts(nxt, s.tz)
+    d['last_run_text'] = fmt_ts(s.last_run, s.tz)
+    return d
+
+
+def describe(s: Schedule) -> str:
+    when = f'cron {s.cron}' if s.kind == 'cron' else f'一次 {s.at}'
+    state = '启用' if s.enabled else '停用'
+    nxt = to_dict(s)['next_run_text'] or '无'
+    skill = f' | 技能 {s.skill}' if s.skill else ''
+    return f'[{s.id}] {s.name} | {when}（{s.tz}）| {state} | 下次 {nxt}{skill} | 文字：{s.text}'
