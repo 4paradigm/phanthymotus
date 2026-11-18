@@ -277,6 +277,21 @@ class KokoroMultiTTSAdapter(TTSAdapter):
     def commit_reading_session(self, session):
         session.commit()
 
+    def warmup(self):
+        # Exercise each native frontend and realistic GPU shapes before readiness.
+        phrases = (
+            ("zh", "欢迎来到第四范式，请跟随工作人员参观展厅。"),
+            ("en", "Welcome to the exhibition. Please follow our guide to the next room."),
+            ("ja", "展示会へようこそ。係員の案内に従ってお進みください。"),
+            ("ru", "Добро пожаловать на выставку. Пожалуйста, следуйте за нашим гидом."),
+            ("de", "Willkommen in unserer Ausstellung. Bitte folgen Sie unserem Mitarbeiter."),
+            ("fr", "Bienvenue dans notre exposition. Veuillez suivre notre guide."),
+            ("es", "Bienvenidos a nuestra exposición. Por favor, sigan a nuestro guía."),
+            ("th", "ยินดีต้อนรับเข้าสู่นิทรรศการของเรา กรุณาเดินตามเจ้าหน้าที่ไปยังห้องถัดไป"),
+        )
+        return sum(len(pcm) for language, text in phrases
+                   for pcm in self.synthesize_stream(text, reading_language=language))
+
     def synthesize_stream(self, text, *, reading_session=None, reading_language=None):
         started = monotonic()
         with self._lock:
@@ -314,7 +329,7 @@ class KokoroMultiTTSAdapter(TTSAdapter):
             unknown -= decorations
         if unknown:
             raise ValueError(f"Kokoro Multi unsupported phonemes ({language}): {sorted(unknown)}")
-        chunks = sentence_phoneme_chunks(phones)
+        chunks = sentence_phoneme_chunks(phones, pack_tail=language in ("en", "fr", "es"))
         while chunks:
             part = chunks.pop(0)
             ids = [self._vocab[c] for c in part]
@@ -347,9 +362,9 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 WORK = Path(__file__).resolve().parents[1]
 # Filled with the published, immutable release before submission. Missing pins
 # fail explicitly; an unverified or unrelated model is never substituted.
-ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=31d4d11da76223ede9be9ec9db635fcaa90b77d8&FilePath=kokoro-multi-jp61-fp32-v11.tar.gz"
-ASSET_SHA256 = "fc72fa0c5fe01cdfd381dc36e19e1d6ed9300d3302ba9f86a6dbef79c200dbc2"
-ASSET_SIZE = 324809636
+ASSET_URL = "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=f769925e052227a23eff80f01b1612c06415da03&FilePath=kokoro-multi-jp61-fp32-v12.tar.gz"
+ASSET_SHA256 = "56057b5f64a9404d86da3c79a0168f41d8e02eeb0f24c6dea59cd590bcbc71af"
+ASSET_SIZE = 324810268
 
 
 def enabled():

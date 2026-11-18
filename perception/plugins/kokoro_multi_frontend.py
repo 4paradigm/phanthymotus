@@ -462,7 +462,7 @@ def _speak_math(node, language, cfg):
     return _join([left, words[key], right], language)
 
 
-def normalize_notation(text: str, language: str) -> tuple[str, list[str]]:
+def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[str, list[str]]:
     """Return spoken input plus decision notes; preserve uncertain source spans."""
     language = language.lower().split("-")[0].split("_")[0]
     notes, spans = [], []
@@ -505,6 +505,8 @@ def normalize_notation(text: str, language: str) -> tuple[str, list[str]]:
     for match in _address_matches(text):
         spans.append((match.start(), match.end(), match.group()))
         notes.append(f"notation:protected_literal:{match.group()}")
+    for start, end in lexical_spans:
+        add(start, end, "dictionary_reading", lambda start=start, end=end: text[start:end])
     for abbreviation, reading in cfg.get("native_abbreviations", {}).get(language, {}).items():
         for match in re.finditer(r"(?<!\w)" + re.escape(abbreviation) + r"(?!\w)", text):
             add(match.start(), match.end(), "native_abbreviation", lambda value=reading: value)
@@ -1038,15 +1040,18 @@ def sentence_parts(phones):
             if phones[start:end].strip()]
 
 
-def sentence_phoneme_chunks(phones):
-    """Pack whole sentences; split long ones without mixing their fragments."""
+def sentence_phoneme_chunks(phones, *, pack_tail=False):
+    """Pack sentences within the limit, optionally carrying a long sentence's tail."""
     chunks, pending = [], ""
     for sentence in sentence_parts(phones):
         if len(sentence) > 220:
             if pending:
                 chunks.append(pending)
                 pending = ""
-            chunks.extend(phoneme_chunks(sentence))
+            parts = phoneme_chunks(sentence)
+            chunks.extend(parts[:-1] if pack_tail else parts)
+            if pack_tail:
+                pending = parts[-1]
         elif pending and len(pending) + len(sentence) + 1 <= 220:
             pending += " " + sentence
         else:
@@ -1495,7 +1500,10 @@ class Frontend:
                 parts.extend((" " if stopped or continuation else ", ", right))
             text = "".join(parts)
         with self._lock:
-            spoken, _ = normalize_notation(text, language)
+            # Keep numbered names intact until their pronunciation entry is read.
+            names = [m.span() for m in self._dictionary_matches(text, language)
+                     if any(char.isdigit() for char in m[0])]
+            spoken, _ = normalize_notation(text, language, lexical_spans=names)
         return text, spoken, language
 
     def convert(self, text, language="auto"):
@@ -1506,11 +1514,55 @@ class Frontend:
         """Normalize the full request once; defer tail G2P until its turn."""
         source, spoken, language = self._prepare_text(text, language)
         protected = self._literal_spans(spoken) + [m.span() for m in self._dictionary_matches(spoken, language)]
+        if language == "en":
+            # Keep first-sentence context; prepare the remainder after first PCM.
+            parts = first_sentence_parts(spoken, protected)
+            first = self._phonemize(parts[0], language, source)
+            chunks = sentence_phoneme_chunks(first, pack_tail=True)
+            if len(chunks) > 1:
+                yield chunks[0]
+                tail = " ".join(chunks[1:])
+            else:
+                yield first
+                tail = ""
+            if len(parts) > 1:
+                tail += " " + self._phonemize(parts[1], language, source)
+            if tail.strip():
+                yield tail
+            return
         # Native Latin prose keeps sentence context; mixed-name passages retain
         # their smaller opening clause for first-audio latency.
         clause = language not in ("en", "fr", "es") or any(self._dictionary_matches(spoken, language))
-        for part in first_sentence_parts(spoken, protected, clause=clause):
-            yield self._phonemize(part, language, source)
+        parts = first_sentence_parts(spoken, protected, clause=clause)
+        if language in ("fr", "es"):
+            phones = [self._phonemize(part, language, source) for part in parts]
+            joined = re.sub(r"\s+", " ", " ".join(phones)).strip()
+            # A dictionary hint must not split an otherwise single short request.
+            yield from [joined] if len(joined) <= 220 else phones
+            return
+        for index, part in enumerate(parts):
+            if language != "th" or index:
+                yield self._phonemize(part, language, source)
+                continue
+            # Prepare Thai phrases lazily, retaining the existing acoustic chunks.
+            # More than one chunk of lookahead fixes its original first boundary.
+            pending, cursor = [], 0
+            for match in re.finditer(r"\s+", part):
+                end = match.end()
+                if part[end:].startswith("ๆ") or any(start < end < stop for start, stop in protected):
+                    continue
+                pending.append(self._phonemize(part[cursor:end], language, source))
+                cursor = end
+                prepared = re.sub(r"\s+", " ", " ".join(pending)).strip()
+                if len(prepared) > 220:
+                    head, *tail = sentence_phoneme_chunks(prepared)
+                    yield head
+                    rest = self._phonemize(part[cursor:], language, source)
+                    yield " ".join([*tail, rest])
+                    break
+            else:
+                pending.append(self._phonemize(part[cursor:], language, source))
+                yield " ".join(pending)
 
     def _phonemize(self, spoken, language, source_text):
         with self._lock:
