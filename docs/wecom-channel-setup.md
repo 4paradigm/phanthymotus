@@ -1,7 +1,7 @@
 # 企业微信 Channel 配置与收发验收（一期）
 
 > 本文按 [`feishu-channel-setup.md`](./feishu-channel-setup.md) 的结构编写，面向 `platform = wecom` 的渠道。
-> **状态：文本适配器曾通过企业微信单聊、群聊固定文本回显；图片收发、完整 Agent 链路与真机仍待验证。** 图片改动目前按静态检查处理，尚未执行图片功能测试或真实企微联调。部署时需要构建包含新代码的新镜像。
+> **状态：现已迁移到企业微信官方 Python SDK，当前版本仅做静态检查。** 旧版临时程序曾通过单聊、群聊固定文本回显；该结果不代表 SDK 版已通过收发验证。SDK 版连接与收发、图片、完整 Agent 链路与真机仍待验证。部署时需要构建包含新代码的新镜像。
 > **范围**：组织内 `operator` / `viewer` 两类用户、单台 bumi、自然语言文本命令及 JPG/PNG 图片收发。不含其他附件、主动推送、Bot @ Bot / Trusted Bots、模板卡片、移动端入口与个人微信触达。
 > **一期目标**：对齐 feishu-bot 的交互方式 —— 不是做一个聊天问答机器人，而是让企业微信里的一句自然语言命令，经 `decision_core` 调用已绑定的 driver actuator，**驱动真实机器人（bumi）执行动作**，并把结果回复到原会话。
 
@@ -11,7 +11,7 @@
 
 > 按「个人组建团队 / 团队形态」这条路径整理。第 4 步的帧样本不通就不要进第 5 步 —— 这是飞书 #125 修「假 connected」得到的教训。
 >
-> **本地与远程的分工**：此前曾使用临时程序在本地验证企微文本回显；图片功能当前只做静态检查。**真机联调在远程镜像部署到机器人之后**。
+> **本地与远程的分工**：此前曾使用临时程序在本地验证企微文本回显；SDK 迁移及图片功能当前只做静态检查。**真机联调在远程镜像部署到机器人之后**。
 
 | 步 | 在哪操作 | 做什么 | 通过标准 | 详见 |
 |---|---|---|---|---|
@@ -19,7 +19,7 @@
 | 2 | 企业微信客户端（已完成） | 装 App 本体 ≥5.0 →「工作台 → 智能机器人 → 创建机器人 → 手动创建 → **API 模式**」→ 连接方式选 **使用长连接** | 已生成 **Bot ID + Secret** | §1.2 |
 | 3 | 同上 | 填名称、可见范围（只含自己）、使用模式，保存；**立即保存凭据** | 通讯录能找到机器人，可发起单聊 | §1.2 |
 | 4 | 本地终端 | 临时 WebSocket 程序验证订阅与文字收发 | 单聊和群聊固定文本回显此前已通过；图片待验证 | §8 |
-| 5 | 本地 · `phanthymotus` · `feat/wecom-channel` | 图片改动先做语法、依赖声明与接线等静态检查 | 不将静态检查等同于图片功能测试 | §8 |
+| 5 | 本地 · `phanthymotus` · `feat/wecom-channel` | SDK 迁移及图片改动做语法、依赖声明与接线等静态检查 | 不将静态检查等同于功能测试 | §8 |
 | 6 | 远程 | 在获准推送后，获取包含新代码和图片解密依赖的镜像，再部署到机器人 | 机器人上运行的是含更新代码的新镜像 | §8 |
 | 7 | 机器人上的 Agent Core Dashboard | 「设置 → 渠道」加 WeCom Channel 填 `bot_id` / `secret`；Canvas 放 **2 张复用卡 + 2 条连线**。动作级限制落实前，先只绑定只读能力 | 渠道 `connected`、两卡自检通过 | §2 §3 |
 | 8 | 「渠道 → 用户」 | 把你的 userid 从默认 `viewer` 改成 **`operator`** | 角色生效；`viewer` 仍只读 | §4 |
@@ -195,15 +195,15 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 ## 6. 常见错误
 
-> 下表「适配器报错原文」来自 `agent-core/src/channel/adapters/wecom.py` 的实现；帧字段以 L0 实测为准（见 §8）。
+> 下表来自 `agent-core/src/channel/adapters/wecom.py` 的实现。SDK 原始错误和日志可能含平台数据，适配器只暴露错误码或异常类型。
 
 | 表现 | 适配器报错原文 / 成因 | 处理 |
 |---|---|---|
 | 渠道起不来，凭据为空 | `WeCom bot_id and secret are required. ...` | 在「设置 → 渠道」填 Bot ID / Secret；确认机器人是 API 模式长连接，不是 URL 回调 |
-| 订阅被拒 | `WeCom subscribe rejected (errcode=N, errmsg=...)` | 核对 Bot ID / Secret、API 模式；不要用 URL 回调的 Token / EncodingAESKey。异常文本不会带出 Secret |
+| 认证或连接失败 | `WeCom SDK connection failed (errcode=N)` 或仅错误类型 | 核对 Bot ID / Secret、API 模式；不要用 URL 回调的 Token / EncodingAESKey。异常文本不会带出 Secret |
 | 订阅超时 | `WeCom subscription timed out. Check outbound access to wss://openws.work.weixin.qq.com:443 ...` | 检查机器人 443 出网与代理；`start()` 会抛异常让框架重试，不会假 connected |
 | 连接反复断开 / `disconnected_event` | `long connection taken over by another process for the same Bot ID; automatic reconnect disabled` | **适配器会主动停止自动重连**（防止两进程互踢）。停掉另一个进程，在渠道面板 **Restart** |
-| 长时间空闲后掉线 | `heartbeat stalled: no frame received recently` / `receive task is dead — restart the channel` | 检查 30s `ping` 与 443 出网；`status()` 会显示 `degraded` 或 `disconnected` |
+| 长时间空闲后掉线 | `WeCom SDK connection closed.` 或 SDK 连接已关闭 | SDK 管理心跳，watchdog 负责重启；状态变为 `disconnected`。仅会话没有新消息不判为故障 |
 | 无法发消息 | `Cannot send: WeCom adapter is not connected. ...` | 渠道面板 **Restart**；确认订阅 ACK `errcode=0` |
 | 回复找不到上下文 | `No reply context for this message: the inbound req_id is unknown or expired. The user must send a new message first.` | 让用户重新发一条消息；不要复用历史 `source_message_id` |
 | 回复超窗 | `Reply window expired (24h). Re-trigger from a current message ...` | 基于当前 Activity 事件重新触发 |
@@ -235,16 +235,17 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 ### 8.1 本地只做静态检查
 
-图片改动当前只计划做本地静态检查；下列检查结果应以实际运行记录为准：
+本次 SDK 迁移及图片改动只做本地静态检查；测试文件已适配 SDK 接口，但未运行。下列检查结果应以实际运行记录为准：
 
 | 检查 | 命令 / 方法 | 结果 |
 |---|---|---|
-| Python 语法 | 解析受影响的 Python 源码与测试文件 | 以当前运行记录为准 |
-| Git 差异 | `git diff --check` | 以当前运行记录为准 |
-| 依赖与接线 | 检查 `pyproject.toml`、`uv.lock`、附件和权限路径 | 以当前运行记录为准 |
-| 离线单测 | `cd agent-core && python -B tests/test_wecom_channel.py -q` | 图片改动后尚未执行 |
+| Python 语法 | 按 Python 3.10 语法解析适配器与测试文件，并编译但不执行 | 通过 |
+| Git 差异 | `git diff --check` | 通过 |
+| 依赖一致性 | `uv lock --check --offline --no-cache` | 通过；现有包未升级 |
+| SDK 与框架接线 | 对照 SDK 1.0.2 发布包检查接口、附件和权限路径 | 已静态核对，运行行为待验证 |
+| 离线单测 | `cd agent-core && python -B tests/test_wecom_channel.py -q` | 本次 SDK 迁移后未执行 |
 
-> 全量 pytest 在 Windows 本地会有收集错误：`fcntl` 是 Unix-only、`cryptography` 未在 `pyproject.toml` 声明、`test_skill_files.py` 的 `PermissionError`。这些是既有环境问题，与 wecom 改动无关，**不作为本地验收依据**；以远程镜像内的运行结果为准。
+> 本次未执行 pytest、未连接企业微信、未构建镜像或运行机器人。静态检查只覆盖语法、接口及依赖一致性，不代表认证、收发或动作执行成功。此前测试和评审中的通过数量不可直接用于本次 SDK 迁移。
 
 ### 8.2 远程部署前提
 
@@ -253,28 +254,29 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | 项 | 结论 | 依据 |
 |---|---|---|
 | 新增文件会进镜像吗 | **会**。`agent-core/Dockerfile:44` 是 `COPY src/ /work/src/`，且无 `.dockerignore` 排除 `src` | `adapters/wecom.py` 随镜像进入 |
-| 需要改依赖吗 | 需要直接声明 `pycryptodome`，用于图片解密；它原本已作为飞书 SDK 的传递依赖出现在锁文件中 | `pyproject.toml` / `uv.lock` |
+| 需要改依赖吗 | 新增 `wecom-aibot-python-sdk>=1.0.2`（当前锁定 1.0.2）；删除企微直接声明的 `pycryptodome`，图片解密改用 SDK | `pyproject.toml` / `uv.lock` |
 | 需要重建镜像吗 | **需要**。新代码必须经构建/拉取的新镜像才能到机器人；仅改本地文件不会生效 | `Dockerfile` 的 COPY 层 |
 | 重启后要做什么 | 新镜像启动后 `channel/__init__.py` 会注册 `wecom`；随后在 Dashboard 加 Channel、接 Canvas、启动智能控制（现场 `auto_start=false`，重启后需手动启动） | §0 第 7–9 步 |
 | 凭据在哪填 | **只在机器人上的 Dashboard「设置 → 渠道」填**，不进仓库、不进镜像、不进日志 | §2、§7 |
 | 单连接约束 | L0 脚本与机器人上的适配器不能同时连同一个 Bot ID，否则互踢；部署后不要再跑本地 L0 | §1.4 |
 
-### 8.3 协议字段与待验证范围
+SDK 的必需依赖包括 `cryptography` 和 `pyee`；本次解析还新增 `cffi` 与 `pycparser`。这些包在之前的锁文件中不存在，因此本次迁移确实增加依赖与镜像内容，不能再声称「无新增依赖」或「镜像不增长」。在使用该官方 SDK 的方案下，不能只删除这些声明或复用 `Crypto` 就跳过安装：SDK 自身会导入 `cryptography`。原有飞书 `lark-oapi` 仍传递依赖 `pycryptodome`，因此它继续留在锁文件中。
 
-文本固定回显已在企微单聊和群聊验证；图片字段、流式占位和图文回复尚需真实平台验证。主要字段参考官方 SDK：
+`uv.lock` 是仓库既有的生成依赖元数据：迁移前为 800,369 字节（约 782 KiB），迁移后为 857,192 字节（约 837 KiB）。它超过 500 KB 审查阈值，需要在 PR 中明确说明；本次新增内容是官方 SDK 及传递依赖的版本、平台 wheel 和校验值，不是模型或二进制资产。保留为生成锁文件，不迁到 COS。现有包的锁定版本保持不变。
 
-| 常量 / 位置 | 当前值 | L0 需核对 |
-|---|---|---|
-| `WSS_URL` | `wss://openws.work.weixin.qq.com` | 端点 |
-| `CMD_SUBSCRIBE` / 凭据字段 | `aibot_subscribe` / `bot_id` + `secret` | 订阅帧结构与 ACK `errcode` |
-| `CMD_MSG_CALLBACK` | `aibot_msg_callback` | 入站 cmd |
-| 入站字段 | `msgid` / `chattype` / `from.userid` / `text.content` / `chatid` | 单聊是否真无 `chatid`、`headers.req_id` 位置 |
-| `CMD_RESPOND` / `REPLY_MODE` | `aibot_respond_msg` / `stream`（`stream.id` `finish` `content`） | 是否必须流式，普通 `text` 是否可用 |
-| `CMD_PING` / `HEARTBEAT_INTERVAL` | `ping` / 30s | 心跳帧与服务端响应 |
-| 入站回调 ACK | 不发送额外的裸 ACK，参照官方 SDK | 与真实服务端联调核对 |
-| `EVENT_DISCONNECTED` | `disconnected_event` | 被接管事件的实际名称与所在层级 |
+Dockerfile 当前在构建时重新执行 `uv lock`，所以锁文件大小或 wheel 下载大小都不等于实际镜像增量；本次没有构建镜像，不能给出已验证的镜像体积差值。
 
-协议常量和字段解析集中在 `adapters/wecom.py`；L0 联调仍需核对订阅、消息和回复回执的完整行为。回复帧发送后会等待平台 ACK，非零错误码或超时会向调用方报错。
+### 8.3 待进行的受控企业微信验证
+
+使用独立测试 Bot ID，先停掉使用同一凭据的旧进程。下一次获准联调时，在运行本分支代码的 Agent Core 上检查：
+
+1. 正确凭据认证成功；错误凭据启动失败；退出和重启可释放连接。
+2. 私聊和群聊 @ 消息进入正确会话；同一会话连续发送两条消息，回复仍对应各自的原消息。
+3. 单图、图文混排的下载解密、占位流和最终图片回复；下载失败及超过限制时出现可读提示。
+4. `blocked` 用户不会触发图片下载；viewer 图片读取仍限当前批次。
+5. 断网后 watchdog 恢复；另一进程接管后停止自动重连；发送被拒或 ACK 超时不会被报告为成功。
+
+这些是 SDK 与企业微信平台的收发验证，不需要额外硬件或 GPU 测试。机器人动作仍按 §5 单独验收。旧版固定文本回显只证明当时凭据和网络可用，不能替代上述验证。
 
 ## 待确认项
 
@@ -285,8 +287,8 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 | Q3 | 「可使用权限」是否需显式勾选「消息」才能收到 `aibot_msg_callback` | 待 L0 实测；默认含消息 |
 | Q4 | 机器人所在网络是否放行 `wss://openws.work.weixin.qq.com:443` | 部署后在机器人上验证；L0 可先在本地确认出网 |
 | Q5 | bumi 现场画布是否已配置过 Channel、`execConnections` 是否已绑定动作卡 | 决定第 3 节是否需要重接线 |
-| Q6 | §6 的具体错误码与字段名 | **已闭合**：§6 已按实现补齐；帧字段以 L0 实测为准（§8.3） |
-| Q7 | 远程镜像的构建/拉取与部署方式 | 由部署流程决定；图片解密需安装已声明的 `pycryptodome` |
+| Q6 | §6 的具体错误码与字段名 | SDK 接口与发布包已核对，真实平台验证仍按 §8.3 进行 |
+| Q7 | 远程镜像的构建/拉取与部署方式 | 由部署流程决定；新镜像需安装官方 SDK 及其依赖 |
 
 ## 参考文档
 
@@ -298,6 +300,8 @@ Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、文�
 
 **企业微信官方**
 
+- [官方 Python SDK 源码及示例](https://github.com/WecomTeam/wecom-aibot-python-sdk)
+- [PyPI 官方 SDK 1.0.2 发布包](https://pypi.org/project/wecom-aibot-python-sdk/1.0.2/)
 - [智能机器人长连接](https://developer.work.weixin.qq.com/document/path/101463)
 - [智能机器人长连接（回复消息 / 心跳 / 上传临时素材）](https://developer.work.weixin.qq.com/document/60904)
 - [长连接概述](https://developer.work.weixin.qq.com/document/path/101956)

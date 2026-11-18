@@ -1,8 +1,8 @@
 """
 test_wecom_channel.py — 企业微信长连接 ChannelAdapter 一期测试。
 
-全部离线：WS 用 FakeWS / _connect 打桩，不连真实网络、不需要 BotID/Secret。
-帧字段名集中在 wecom.py 的常量区，L0 实测回来后只需改那一处与这里的样例帧。
+全部离线：使用官方 SDK 公共接口的 FakeClient 替身，不连接真实网络。
+这些测试验证适配器行为；SDK 的认证帧、心跳与 ACK 分发由 SDK 自身负责。
 
 运行：
   cd agent-core && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_wecom_channel.py -q
@@ -18,50 +18,11 @@ import sys
 import tempfile
 import types
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test_wecom.db'))
 
-
-def _ensure_aiohttp():
-    """dev 主机可能没装 aiohttp（仓库用 uv 管理），但适配器顶层 import 了它。
-
-    与 tests/conftest.py 对 docker SDK 的做法一致：只在真的缺失时打桩，
-    镜像里跑全量套件时仍使用真实 aiohttp。
-    """
-    try:
-        import aiohttp  # noqa: F401
-        return
-    except ImportError:
-        pass
-
-    stub = types.ModuleType('aiohttp')
-
-    class _WSMsgType:
-        TEXT = 1
-        BINARY = 2
-        CLOSE = 8
-        CLOSING = 9
-        CLOSED = 256
-        ERROR = 258
-        PING = 9
-        PONG = 10
-
-    class ClientSession:  # noqa: D101
-        pass
-
-    class ClientWebSocketResponse:  # noqa: D101
-        pass
-
-    stub.WSMsgType = _WSMsgType
-    stub.ClientSession = ClientSession
-    stub.ClientWebSocketResponse = ClientWebSocketResponse
-    sys.modules['aiohttp'] = stub
-
-
-_ensure_aiohttp()
 
 import config  # noqa: E402
 from channel.adapter import Attachment, InboundMessage, OutboundMessage  # noqa: E402
@@ -72,55 +33,90 @@ from channel.manager import (  # noqa: E402
 )
 
 
-class FakeWS:
-    """最小 WebSocket 替身：记录发出的帧，按需投递收到的帧。"""
+class FakeClient:
+    """SDK public-interface double: events, connection state and stream replies."""
 
-    def __init__(self, inbound=None):
-        self.sent: list[dict] = []
-        self._inbound = asyncio.Queue()
-        for frame in inbound or []:
-            self._inbound.put_nowait(frame)
-        self._closed = False
+    def __init__(self, *, authenticate=True, auth_error=None):
+        self.sent = []
+        self.handlers = {}
+        self.is_connected = False
+        self.authenticate = authenticate
+        self.auth_error = auth_error
         self.fail_send = False
         self.auto_reply_ack = True
         self.reply_errcode = 0
-        self.subscribe_req_id = ''
         self.reply_sent = asyncio.Event()
+        self.connected = asyncio.Event()
+        self.pending = {}
 
     @property
     def closed(self):
-        return self._closed
+        return not self.is_connected
 
-    async def send_json(self, frame):
+    def on(self, event, callback):
+        self.handlers[event] = callback
+
+    def emit(self, event, *args):
+        callback = self.handlers.get(event)
+        if callback:
+            callback(*args)
+
+    async def connect(self):
+        self.is_connected = True
+        self.connected.set()
+        if self.auth_error is not None:
+            self.emit('error', self.auth_error)
+        elif self.authenticate:
+            self.emit('authenticated')
+        return self
+
+    def disconnect(self):
+        self.is_connected = False
+        for future in self.pending.values():
+            if not future.done():
+                future.set_exception(RuntimeError('Connection manually closed'))
+
+    async def reply_stream(self, frame, stream_id, content, finish=False, msg_item=None):
         if self.fail_send:
-            raise RuntimeError('simulated ws send failure')
-        self.sent.append(frame)
-        if frame.get('cmd') == wecom.CMD_SUBSCRIBE:
-            self.subscribe_req_id = frame['headers']['req_id']
-        elif frame.get('cmd') == wecom.CMD_RESPOND:
-            self.reply_sent.set()
-            if self.auto_reply_ack:
-                self.push({
-                    'errcode': self.reply_errcode,
-                    'errmsg': 'ok' if self.reply_errcode == 0 else 'rejected',
-                    'headers': {'req_id': frame['headers']['req_id']},
-                })
-
-    async def receive(self):
-        frame = await self._inbound.get()
-        if frame.get('headers', {}).get('req_id') == 'sub_req_1':
-            frame = {**frame, 'headers': {'req_id': self.subscribe_req_id}}
-        return SimpleNamespace(type=wecom.aiohttp.WSMsgType.TEXT,
-                               data=json.dumps(frame, ensure_ascii=False))
-
-    async def close(self):
-        self._closed = True
+            raise RuntimeError('simulated SDK send failure')
+        req_id = frame['headers']['req_id']
+        stream = {'id': stream_id, 'content': content, 'finish': finish}
+        if finish and msg_item:
+            stream['msg_item'] = msg_item
+        self.sent.append({'cmd': 'aibot_respond_msg', 'headers': frame['headers'],
+                          'body': {'msgtype': 'stream', 'stream': stream}})
+        self.reply_sent.set()
+        if self.auto_reply_ack:
+            if self.reply_errcode:
+                raise RuntimeError(f'Reply ack error: errcode={self.reply_errcode}, errmsg=rejected')
+            return {'headers': frame['headers'], 'errcode': 0}
+        future = asyncio.get_running_loop().create_future()
+        self.pending[req_id] = future
+        try:
+            return await future
+        finally:
+            self.pending.pop(req_id, None)
 
     def push(self, frame):
-        self._inbound.put_nowait(frame)
+        if 'errcode' in frame:
+            future = self.pending.get(frame['headers']['req_id'])
+            if future is not None and not future.done():
+                if frame['errcode']:
+                    future.set_exception(RuntimeError(
+                        f"Reply ack error: errcode={frame['errcode']}, errmsg=rejected"))
+                else:
+                    future.set_result(frame)
+            return
+        self.emit('event' if frame['cmd'] == 'aibot_event_callback' else 'message', frame)
 
     def frames_with(self, cmd):
-        return [f for f in self.sent if f.get('cmd') == cmd]
+        return [frame for frame in self.sent if frame['cmd'] == cmd]
+
+
+async def _start_fake_sdk(adapter, client):
+    with mock.patch.object(adapter, '_create_client', return_value=client), \
+            mock.patch.object(wecom.aiohttp, 'ClientSession', return_value=FakeSession()):
+        await adapter.start()
 
 
 class FakeSession:
@@ -164,11 +160,6 @@ def _make_adapter(on_msg=None, config=None):
                         on_msg or _noop)
 
 
-def _subscribe_ack(errcode=0):
-    return {'errcode': errcode, 'errmsg': 'ok' if errcode == 0 else 'bad credentials',
-            'headers': {'req_id': 'sub_req_1'}}
-
-
 def _msg_frame(msgid='m1', req_id='r1', text='你好', chattype='single',
                chatid=None, userid='u1'):
     body = {
@@ -208,80 +199,83 @@ class WecomRegistrationTest(unittest.TestCase):
 
 
 class WecomConnectionTest(unittest.IsolatedAsyncioTestCase):
-    """3-4：订阅前置校验与心跳。"""
+    """Credential preflight uses SDK events, never raw socket state alone."""
 
-    def setUp(self):
-        self.received: list[InboundMessage] = []
-
-    async def test_connection_uses_proxy_environment(self):
-        session = FakeSession()
-        ws = FakeWS()
-        session.ws_connect = mock.AsyncMock(return_value=ws)
+    async def test_sdk_options_and_http_proxy(self):
         adapter = _make_adapter()
-        with mock.patch.object(wecom.aiohttp, 'ClientSession', return_value=session) as client:
-            actual_session, actual_ws = await adapter._connect()
-        client.assert_called_once_with(trust_env=True)
-        session.ws_connect.assert_awaited_once_with(wecom.WSS_URL, heartbeat=None)
-        self.assertIs(actual_session, session)
-        self.assertIs(actual_ws, ws)
-
-    async def _start(self, inbound=None, cfg=None):
-        async def _on_msg(msg):
-            self.received.append(msg)
-        ws = FakeWS(inbound if inbound is not None else [_subscribe_ack()])
-        session = FakeSession()
-        adapter = _make_adapter(_on_msg, cfg)
-        with mock.patch.object(adapter, '_connect',
-                               new=mock.AsyncMock(return_value=(session, ws))):
+        client = FakeClient()
+        with mock.patch('aibot.WSClient', return_value=client) as factory, \
+                mock.patch.object(wecom.aiohttp, 'ClientSession', return_value=FakeSession()) as session:
             await adapter.start()
         self.addAsyncCleanup(adapter.stop)
-        return adapter, ws
-
-    async def test_start_sends_subscribe_with_credentials(self):
-        adapter, ws = await self._start()
-        subs = ws.frames_with(wecom.CMD_SUBSCRIBE)
-        self.assertEqual(len(subs), 1)
-        self.assertEqual(subs[0]['body']['bot_id'], 'b')
-        self.assertEqual(subs[0]['body']['secret'], 's')
-        self.assertTrue(subs[0]['headers']['req_id'])
+        options = factory.call_args.args[0]
+        self.assertEqual(options.bot_id, 'b')
+        self.assertEqual(options.secret, 's')
+        self.assertEqual(options.max_reconnect_attempts, 0)
+        self.assertIs(options.logger, adapter._sdk_logger)
+        session.assert_called_once_with(trust_env=True)
         self.assertEqual(adapter.status(), 'connected')
 
     async def test_start_raises_when_credentials_missing(self):
         adapter = _make_adapter(config={})
-        with self.assertRaises(WecomError) as ctx:
+        with self.assertRaisesRegex(WecomError, 'bot_id and secret'):
             await adapter.start()
-        self.assertIn('bot_id and secret', str(ctx.exception))
         self.assertFalse(adapter.is_running)
 
-    async def test_start_raises_on_bad_subscribe_ack(self):
-        ack = _subscribe_ack(errcode=40001)
-        with self.assertRaises(WecomError) as ctx:
-            await self._start([ack], cfg={'bot_id': 'b', 'secret': 'UNIQUE_SECRET_XYZ'})
-        self.assertIn('errcode=40001', str(ctx.exception))
-        # 凭据绝不能出现在异常文本里（会被日志/上层回报带出去）
-        self.assertNotIn('UNIQUE_SECRET_XYZ', str(ctx.exception))
+    async def test_start_raises_on_sdk_authentication_error(self):
+        adapter = _make_adapter(config={'bot_id': 'b', 'secret': 'PRIVATE_SECRET'})
+        client = FakeClient(auth_error=Exception(
+            'Authentication failed: PRIVATE_SECRET (code: 40001)'))
+        with mock.patch('builtins.print') as printed:
+            with self.assertRaisesRegex(WecomError, 'errcode=40001') as ctx:
+                await _start_fake_sdk(adapter, client)
+        self.assertNotIn('PRIVATE_SECRET', str(ctx.exception))
+        self.assertNotIn('PRIVATE_SECRET', str(printed.call_args_list))
+        self.assertTrue(client.closed)
+        self.assertIsNone(adapter._session)
 
-    async def test_start_raises_when_subscribe_ack_missing(self):
-        # 服务端既不返回 ACK 也不关连接 → 必须超时抛错，不能「起任务就成功」
+    async def test_start_waits_for_authentication(self):
+        adapter = _make_adapter()
+        client = FakeClient(authenticate=False)
+        task = asyncio.create_task(_start_fake_sdk(adapter, client))
+        await client.connected.wait()
+        self.assertFalse(task.done())
+        self.assertEqual(adapter.status(), 'disconnected')
+        client.emit('authenticated')
+        await task
+        self.addAsyncCleanup(adapter.stop)
+        self.assertEqual(adapter.status(), 'connected')
+
+    async def test_start_authentication_timeout_closes_client(self):
+        adapter = _make_adapter()
+        client = FakeClient(authenticate=False)
         with mock.patch.object(wecom, 'SUBSCRIBE_TIMEOUT', 0.05):
-            with self.assertRaises(WecomError) as ctx:
-                await self._start([])
-        self.assertIn('timed out', str(ctx.exception))
+            with self.assertRaisesRegex(WecomError, 'timed out'):
+                await _start_fake_sdk(adapter, client)
+        self.assertTrue(client.closed)
+        self.assertIsNone(adapter._session)
 
-    async def test_start_rejects_unmatched_subscribe_ack(self):
-        ack = _subscribe_ack()
-        ack['headers']['req_id'] = 'another-request'
-        with self.assertRaisesRegex(WecomError, 'unmatched ACK'):
-            await self._start([ack])
+    async def test_cancelled_start_closes_client(self):
+        adapter = _make_adapter()
+        client = FakeClient(authenticate=False)
+        task = asyncio.create_task(_start_fake_sdk(adapter, client))
+        await client.connected.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(client.closed)
+        self.assertIsNone(adapter._session)
 
-    async def test_heartbeat_sends_ping(self):
-        adapter, ws = await self._start()
-        with mock.patch.object(wecom, 'HEARTBEAT_INTERVAL', 0.01):
-            # 重启心跳任务以使用打桩后的间隔
-            adapter._heartbeat_task.cancel()
-            adapter._heartbeat_task = asyncio.create_task(adapter._heartbeat_loop())
-            await asyncio.sleep(0.05)
-        self.assertTrue(ws.frames_with(wecom.CMD_PING))
+    def test_sdk_logs_are_sampled_without_payloads(self):
+        logger = wecom._SdkLogger()
+        with mock.patch('builtins.print') as printed:
+            for _ in range(100):
+                logger.debug('PRIVATE_IMAGE_KEY')
+                logger.info('PRIVATE_MESSAGE')
+                logger.warn('PRIVATE_SIGNED_URL')
+                logger.error('PRIVATE_SECRET')
+        self.assertEqual(printed.call_count, 4)
+        self.assertNotIn('PRIVATE_', str(printed.call_args_list))
 
 
 class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
@@ -352,12 +346,28 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed['text'], '这是什么？')
         self.assertEqual(len(parsed['images']), 1)
 
+    async def test_image_failures_are_sampled_without_logging_secrets(self):
+        adapter = await self._adapter()
+        adapter._send_progress = mock.AsyncMock(side_effect=WecomError('PRIVATE_VALUE'))
+        adapter._download_image = mock.AsyncMock(side_effect=WecomError('PRIVATE_VALUE'))
+        with mock.patch('builtins.print') as printed:
+            for _ in range(10):
+                msg = InboundMessage('wecom', 'wecom_test', 'u1', 'u1', 'u1', '[图片]', 'm1')
+                await adapter._prepare_images(msg, [{}] * 10)
+                self.assertIn('图片处理失败或超限：10 张', msg.text)
+            lines = [call.args[0] for call in printed.call_args_list]
+            self.assertEqual(len(lines), 3)  # first progress failure; first and 100th image failures
+            self.assertIn('count=1', lines[1])
+            self.assertIn('count=100', lines[2])
+            self.assertNotIn('PRIVATE_VALUE', '\n'.join(lines))
+
     def test_decrypt_image_with_32_byte_padding(self):
         key = bytes(range(32))
         original = b'\x89PNG\r\n\x1a\n' + b'a' * 24
         padding = 32 - len(original) % 32
-        ciphertext = wecom.AES.new(key, wecom.AES.MODE_CBC, iv=key[:16]).encrypt(
-            original + bytes([padding]) * padding)
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(key[:16])).encryptor()
+        ciphertext = encryptor.update(original + bytes([padding]) * padding) + encryptor.finalize()
         encoded_key = base64.b64encode(key).decode().rstrip('=')
         self.assertEqual(wecom._decrypt_image(ciphertext, encoded_key), original)
         with self.assertRaises(WecomError):
@@ -374,12 +384,12 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
     async def test_event_callback_is_not_delivered_as_a_message(self):
         adapter = await self._adapter()
         event = {
-            'cmd': wecom.CMD_EVENT_CALLBACK,
+            'cmd': 'aibot_event_callback',
             'headers': {'req_id': 'event-req'},
             'body': {'msgid': 'event-id', 'msgtype': 'event',
                      'from': {'userid': 'u1'}, 'event': {'eventtype': 'enter_chat'}},
         }
-        await adapter._handle_frame(event)
+        adapter._handle_event(event)
         self.assertEqual(self.received, [])
 
     async def test_inbound_handler_can_wait_for_reply_ack(self):
@@ -398,16 +408,14 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 delivered.set()
 
-        ws = FakeWS([_subscribe_ack()])
+        ws = FakeClient()
         adapter = _make_adapter(on_message)
-        with mock.patch.object(adapter, '_connect',
-                               new=mock.AsyncMock(return_value=(FakeSession(), ws))):
-            await adapter.start()
+        await _start_fake_sdk(adapter, ws)
         self.addAsyncCleanup(adapter.stop)
         ws.push(_msg_frame())
         await asyncio.wait_for(delivered.wait(), timeout=1)
         self.assertEqual(errors, [])
-        self.assertEqual(len(ws.frames_with(wecom.CMD_RESPOND)), 1)
+        self.assertEqual(len(ws.frames_with('aibot_respond_msg')), 1)
 
 
 class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
@@ -419,11 +427,9 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
     async def _running_adapter(self):
         async def _on_msg(msg):
             self.received.append(msg)
-        ws = FakeWS([_subscribe_ack()])
+        ws = FakeClient()
         adapter = _make_adapter(_on_msg)
-        with mock.patch.object(adapter, '_connect',
-                               new=mock.AsyncMock(return_value=(FakeSession(), ws))):
-            await adapter.start()
+        await _start_fake_sdk(adapter, ws)
         self.addAsyncCleanup(adapter.stop)
         return adapter, ws
 
@@ -434,7 +440,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
 
         msg = OutboundMessage(chat_id='u1', text='收到', source_message_id='m1')
         await adapter.send_message(msg)
-        replies = ws.frames_with(wecom.CMD_RESPOND)
+        replies = ws.frames_with('aibot_respond_msg')
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0]['headers']['req_id'], 'r1')
         self.assertTrue(replies[0]['body']['stream']['finish'])
@@ -447,7 +453,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         image = b'\x89PNG\r\n\x1a\nexample'
         await adapter.send_message(OutboundMessage(
             chat_id='u1', image_bytes=image, source_message_id='image-message'))
-        reply = ws.frames_with(wecom.CMD_RESPOND)[0]
+        reply = ws.frames_with('aibot_respond_msg')[0]
         self.assertEqual(reply['headers']['req_id'], 'image-request')
         item = reply['body']['stream']['msg_item'][0]['image']
         self.assertEqual(base64.b64decode(item['base64']), image)
@@ -459,7 +465,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         await adapter._process_message(frame, frame['body'])
         await adapter._send_progress('m1')
         await adapter.send_message(OutboundMessage(chat_id='u1', text='完成', source_message_id='m1'))
-        first, final = ws.frames_with(wecom.CMD_RESPOND)
+        first, final = ws.frames_with('aibot_respond_msg')
         self.assertFalse(first['body']['stream']['finish'])
         self.assertTrue(final['body']['stream']['finish'])
         self.assertEqual(first['body']['stream']['id'], final['body']['stream']['id'])
@@ -473,7 +479,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
 
         await adapter.send_message(OutboundMessage(chat_id='u1', text='回A', source_message_id='mA'))
         await adapter.send_message(OutboundMessage(chat_id='u1', text='回B', source_message_id='mB'))
-        replies = ws.frames_with(wecom.CMD_RESPOND)
+        replies = ws.frames_with('aibot_respond_msg')
         self.assertEqual([f['headers']['req_id'] for f in replies], ['rA', 'rB'])
         self.assertEqual([f['body']['stream']['content'] for f in replies], ['回A', '回B'])
 
@@ -491,7 +497,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(WecomError, 'No reply context'):
             await adapter.send_message(OutboundMessage(
                 chat_id='u1', text='old reply', source_message_id='old-message'))
-        self.assertEqual(ws.frames_with(wecom.CMD_RESPOND), [])
+        self.assertEqual(ws.frames_with('aibot_respond_msg'), [])
 
     async def test_reply_without_source_id_does_not_guess_current_chat(self):
         adapter, ws = await self._running_adapter()
@@ -499,7 +505,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         await adapter._process_message(frame, frame['body'])
         with self.assertRaisesRegex(WecomError, 'No reply context'):
             await adapter.send_message(OutboundMessage(chat_id='u1', text='Pending approval.'))
-        self.assertEqual(ws.frames_with(wecom.CMD_RESPOND), [])
+        self.assertEqual(ws.frames_with('aibot_respond_msg'), [])
 
     async def test_reply_rejection_is_reported_to_caller(self):
         adapter, ws = await self._running_adapter()
@@ -534,10 +540,10 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         second = asyncio.create_task(adapter.send_message(OutboundMessage(
             chat_id='u1', text='second', source_message_id='m1')))
         await asyncio.sleep(0)
-        self.assertEqual(len(ws.frames_with(wecom.CMD_RESPOND)), 1)
+        self.assertEqual(len(ws.frames_with('aibot_respond_msg')), 1)
         ws.push({'headers': {'req_id': 'r1'}, 'errcode': 0})
         await asyncio.wait_for(ws.reply_sent.wait(), timeout=1)
-        self.assertEqual(len(ws.frames_with(wecom.CMD_RESPOND)), 2)
+        self.assertEqual(len(ws.frames_with('aibot_respond_msg')), 2)
         ws.push({'headers': {'req_id': 'r1'}, 'errcode': 0})
         await asyncio.gather(first, second)
 
@@ -554,7 +560,7 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         second = asyncio.create_task(adapter.send_message(OutboundMessage(
             chat_id='u1', text='second', source_message_id='m2')))
         await asyncio.wait_for(ws.reply_sent.wait(), timeout=1)
-        self.assertEqual(len(ws.frames_with(wecom.CMD_RESPOND)), 2)
+        self.assertEqual(len(ws.frames_with('aibot_respond_msg')), 2)
         ws.push({'headers': {'req_id': 'r1'}, 'errcode': 0})
         ws.push({'headers': {'req_id': 'r2'}, 'errcode': 0})
         await asyncio.gather(first, second)
@@ -698,11 +704,9 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.sent[0].chat_id, 'u1')
 
     async def test_manager_reports_platform_rejection(self):
-        ws = FakeWS([_subscribe_ack()])
+        ws = FakeClient()
         adapter = _make_adapter()
-        with mock.patch.object(adapter, '_connect',
-                               new=mock.AsyncMock(return_value=(FakeSession(), ws))):
-            await adapter.start()
+        await _start_fake_sdk(adapter, ws)
         self.addAsyncCleanup(adapter.stop)
         self.manager._adapters['wecom_test'] = adapter
         self.manager._push_error = mock.AsyncMock()
@@ -725,11 +729,9 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 completed.set()
 
-        ws = FakeWS([_subscribe_ack()])
+        ws = FakeClient()
         adapter = _make_adapter(on_message)
-        with mock.patch.object(adapter, '_connect',
-                               new=mock.AsyncMock(return_value=(FakeSession(), ws))):
-            await adapter.start()
+        await _start_fake_sdk(adapter, ws)
         self.addAsyncCleanup(adapter.stop)
         self.manager._adapters['wecom_test'] = adapter
         with mock.patch('channel.manager.acl.get_user', return_value=None), \
@@ -737,7 +739,7 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
                                   return_value={'auto_approve': False}):
             ws.push(_msg_frame('m1', 'r1'))
             await asyncio.wait_for(completed.wait(), timeout=1)
-        replies = ws.frames_with(wecom.CMD_RESPOND)
+        replies = ws.frames_with('aibot_respond_msg')
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0]['headers']['req_id'], 'r1')
 
@@ -750,22 +752,20 @@ class WecomFrameworkIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class WecomLifecycleTest(unittest.IsolatedAsyncioTestCase):
-    """13-16：被接管停重连、三态自检、发送失败、stop 幂等。"""
+    """被接管停重连、SDK 连接状态、发送失败及 stop 幂等。"""
 
     async def _running_adapter(self):
-        ws = FakeWS([_subscribe_ack()])
+        ws = FakeClient()
         adapter = _make_adapter()
-        with mock.patch.object(adapter, '_connect',
-                               new=mock.AsyncMock(return_value=(FakeSession(), ws))):
-            await adapter.start()
+        await _start_fake_sdk(adapter, ws)
         self.addAsyncCleanup(adapter.stop)
         return adapter, ws
 
     async def test_disconnected_event_stops_reconnect(self):
         adapter, _ = await self._running_adapter()
         frame = {'cmd': 'aibot_event_callback', 'headers': {'req_id': 'r9'},
-                 'body': {'event_type': wecom.EVENT_DISCONNECTED}}
-        await adapter._handle_frame(frame)
+                 'body': {'msgtype': 'event', 'event': {'eventtype': 'disconnected_event'}}}
+        adapter._handle_event(frame)
         self.assertTrue(adapter._taken_over)
         self.assertFalse(adapter.is_running)
         self.assertEqual(adapter.status(), 'disconnected')
@@ -775,9 +775,9 @@ class WecomLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_watchdog_does_not_restart_after_takeover(self):
         adapter, _ = await self._running_adapter()
-        await adapter._handle_frame({
-            'cmd': wecom.CMD_EVENT_CALLBACK,
-            'body': {'event': {'eventtype': wecom.EVENT_DISCONNECTED}},
+        adapter._handle_event({
+            'cmd': 'aibot_event_callback',
+            'body': {'msgtype': 'event', 'event': {'eventtype': 'disconnected_event'}},
         })
         manager = ChannelManager()
         manager._adapters[adapter.channel_id] = adapter
@@ -814,15 +814,25 @@ class WecomLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(adapter.status(), 'connected')
 
-        adapter._last_frame_at = 0.0
-        adapter._last_frame_at = wecom.time.time() - wecom.STALE_AFTER - 1
-        ok, reason = await adapter.health_check()
+        adapter._authenticated = False
+        ok, _ = await adapter.health_check()
         self.assertFalse(ok)
-        self.assertIn('heartbeat stalled', reason)
-        self.assertEqual(adapter.status(), 'degraded')
-
-        adapter._ws._closed = True
         self.assertEqual(adapter.status(), 'disconnected')
+
+        adapter._authenticated = True
+        adapter._client.is_connected = False
+        self.assertEqual(adapter.status(), 'disconnected')
+
+    async def test_sdk_disconnect_is_visible_and_old_callbacks_are_ignored(self):
+        adapter, client = await self._running_adapter()
+        client.emit('disconnected', 'PRIVATE_REASON')
+        self.assertFalse((await adapter.health_check())[0])
+        self.assertTrue(adapter.should_auto_reconnect())
+        self.assertNotIn('PRIVATE_REASON', adapter._last_error)
+        await adapter.stop()
+        client.emit('authenticated')
+        self.assertEqual(adapter.status(), 'disconnected')
+        self.assertFalse(adapter.is_running)
 
     async def test_send_message_failure_raises(self):
         adapter, ws = await self._running_adapter()
