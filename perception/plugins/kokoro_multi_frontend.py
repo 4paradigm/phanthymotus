@@ -10,7 +10,7 @@ from datetime import date
 from dataclasses import replace
 from decimal import Decimal
 from functools import lru_cache
-from itertools import groupby
+from itertools import accumulate, groupby
 import importlib.util
 import json
 import os
@@ -1374,6 +1374,14 @@ class Frontend:
             # Retain pypinyin's phrase context, including phrases Jieba splits differently.
             contextual = lazy_pinyin(span, style=Style.TONE3, neutral_tone_with_five=True,
                                      errors=lambda unknown: list(unknown))
+            # A title and a surname may be separate Jieba tokens. Match full
+            # phrases across token boundaries without changing larger words.
+            boundaries = set(accumulate((len(word) for word, _ in words), initial=0))
+            for phrase, reading in readings.items():
+                for match in re.finditer(re.escape(phrase), span):
+                    start, end = match.span()
+                    if start in boundaries and end in boundaries:
+                        contextual[start:end] = reading
             syllables = []
             offset = 0
             for index, (word, pos) in enumerate(words):
@@ -1534,6 +1542,11 @@ class Frontend:
         # their smaller opening clause for first-audio latency.
         clause = language not in ("en", "fr", "es") or any(self._dictionary_matches(spoken, language))
         parts = first_sentence_parts(spoken, protected, clause=clause)
+        if (language == "zh" and len(spoken) <= 32 and not _LATIN.search(spoken)
+                and parts[0].rstrip().endswith((",", "，", "、"))):
+            # Keep the opening comma or list separator inside a short phrase.
+            yield self._phonemize(spoken, language, source)
+            return
         if language in ("fr", "es"):
             phones = [self._phonemize(part, language, source) for part in parts]
             joined = re.sub(r"\s+", " ", " ".join(phones)).strip()
