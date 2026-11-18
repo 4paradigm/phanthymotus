@@ -633,10 +633,12 @@ RUN --mount=type=cache,id=perception-rtabmap-source-${RTABMAP_CORE_COMMIT},targe
 
 # Apply only to the copied pinned checkout, never the reusable upstream cache.
 COPY perception/native/rtabmap/rotation_hint_core.patch /tmp/rtabmap-rotation-core.patch
+COPY perception/native/rtabmap/last_parameters_core.patch /tmp/rtabmap-last-parameters.patch
 RUN set -e; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply --check /tmp/rtabmap-rotation-core.patch; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-rotation-core.patch; \
-    rm /tmp/rtabmap-rotation-core.patch
+    git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-last-parameters.patch; \
+    rm /tmp/rtabmap-rotation-core.patch /tmp/rtabmap-last-parameters.patch
 
 # Commit the complete checkout before compiling. A failed build can reuse this
 # source layer; partial object files from the failed RUN are not a Docker cache.

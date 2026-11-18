@@ -1,0 +1,19 @@
+diff --git a/corelib/src/DBDriverSqlite3.cpp b/corelib/src/DBDriverSqlite3.cpp
+--- a/corelib/src/DBDriverSqlite3.cpp
++++ b/corelib/src/DBDriverSqlite3.cpp
+@@ -1078,13 +1078,13 @@
+ 			{
+ 				query = "SELECT parameters "
+ 						 "FROM Info "
+-						 "WHERE time_enter >= (SELECT MAX(time_enter) FROM Info);";
++						 "ORDER BY time_enter DESC, rowid DESC LIMIT 1;";
+ 			}
+ 			else
+ 			{
+ 				query = "SELECT parameters "
+ 						 "FROM Statistics "
+-						 "WHERE time_enter >= (SELECT MAX(time_enter) FROM Statistics);";
++						 "ORDER BY time_enter DESC, rowid DESC LIMIT 1;";
+ 			}
+ 
+ 			int rc = SQLITE_OK;
