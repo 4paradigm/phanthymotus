@@ -215,4 +215,34 @@ def test_card_registration_and_independent_instances(monkeypatch):
     assert plugin.dispatch("person",dict(a,action="info"))["topic_out"] == left["topic_out"]
     assert topics["/unavailable/jpeg"].closed
     plugin.shutdown()
+
+
+def test_supplemental_presets_register_as_cards(monkeypatch):
+    """补充预设（宠物/桌面/家具）与内置四类一样，逐条注册成独立卡。"""
+    import types
+    import plugins.segment as cards
+    from plugins.segment import SegmentationPlugin
+
+    class Stream:
+        def __init__(self, topic, *args):
+            self.ready = True
+            self.load_failed = False
+            self.vocabulary = set(NAMES) | {"bicycle", "motorcycle", "bus", "truck",
+                                            "dog", "cat", "bottle", "cup", "bowl",
+                                            "bed", "couch"}
+            self.error = ""
+            self.targets = {}
+
+    monkeypatch.setattr(cards, "_Camera", Stream)
+    cfg = {"cards": {
+        "person": ["person"], "car": ["car"], "chair": ["chair"],
+        "traffic": ["bicycle", "car", "motorcycle", "bus", "truck"],
+        "pet": ["dog", "cat"], "tableware": ["bottle", "cup", "bowl"],
+        "furniture": ["bed", "couch"],
+    }}
+    plugin = SegmentationPlugin(cfg, None, lambda: None, lambda: "")
+    names = {t["name"] for t in plugin.get_tools()}
+    assert {"pet", "tableware", "furniture"} <= names
+    assert len(names) == 7
+    plugin.shutdown()
     assert topics["/cam/jpeg"].closed
