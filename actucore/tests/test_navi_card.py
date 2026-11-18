@@ -980,6 +980,57 @@ def test_the_card_adopts_the_geometry_of_whichever_topic_carries_the_depth():
     assert any("0.888" in note for note in card._camera_notes)
 
 
+def test_a_calibrated_corridor_excludes_the_left_doorframe():
+    import numpy as np
+    from plugins.navi import policy, view
+
+    card = _card(half_width_m=0.23)
+    depth = np.full((480, 640), 1.12, dtype=np.float32)
+    depth[168:408, 104:120] = 0.56
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336.65, 0, 420, 243, 0, 0, 1])
+    assert card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding()) == ""
+
+    assert policy._clearance({"map": depth}, card._config)[0] == 1.12
+    assert policy._clearance({"map": depth}, card._config, lateral_offset_m=-0.38)[0] == 0.56
+    assert view.corridor_edges(1.0, card._config, 640) == (217, 456)
+    assert view.corridor_edges(1.0, card._config, 320) == (108, 228)
+    assert policy._clearance({"map": depth[:, ::2]}, card._config)[0] == 1.12
+    left_coverage = policy._clearance({"map": depth}, card._config, lateral_offset_m=-0.38)[1]
+    right_coverage = policy._clearance({"map": depth}, card._config, lateral_offset_m=0.38)[1]
+    assert left_coverage == pytest.approx(0.844, abs=0.005)
+    assert right_coverage == pytest.approx(0.759, abs=0.005)
+
+    depth[168:408, 495:530] = 0.56
+    assert policy._clearance({"map": depth}, card._config)[0] == 0.56
+
+
+@pytest.mark.parametrize("intrinsics", [
+    None,
+    [315, 0, 640, 0, 420, 243, 0, 0, 1],
+    [315, 15, 336.65, 0, 420, 243, 0, 0, 1],
+    [float("inf"), 0, 336.65, 0, 420, 243, 0, 0, 1],
+    [10**400, 0, 336.65, 0, 420, 243, 0, 0, 1],
+])
+def test_unusable_intrinsics_fall_back_to_the_centered_corridor(intrinsics):
+    import numpy as np
+    from plugins.navi import policy, view
+
+    card = _card(half_width_m=0.23)
+    depth = np.full((480, 640), 1.12, dtype=np.float32)
+    depth[168:408, 104:120] = 0.56
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole", half_fov_rad=0.7934)
+    assert card._adopt_camera({_DEPTH_TOPIC: {
+        **declaration, "K": [315, 0, 336.65, 0, 420, 243, 0, 0, 1],
+    }}, _binding()) == ""
+    assert card._adopt_camera({_DEPTH_TOPIC: {**declaration, "K": intrinsics}}, _binding()) == ""
+    assert any("画面中心" in note for note in card._camera_notes)
+
+    assert policy._clearance({"map": depth}, card._config)[0] == 0.56
+    left, right = view.corridor_edges(1.0, card._config, 640)
+    assert left + right == 640
+
+
 def test_a_declaration_for_some_other_topic_is_not_used_for_the_depth():
     """The failure this keying prevents: one lens's geometry silently applied to
     another lens's picture."""

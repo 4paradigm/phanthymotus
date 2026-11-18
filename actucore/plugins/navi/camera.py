@@ -24,6 +24,7 @@ clear. The camera knew, and had no way to say so.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 SCHEMA = "motus.camera/1"
 
@@ -48,6 +49,39 @@ def for_topic(declarations, topic: str) -> dict:
         if isinstance(entry, dict) and entry.get("topic") == topic:
             return entry
     return {}
+
+
+class HorizontalIntrinsics(NamedTuple):
+    width: float
+    fx: float
+    cx: float
+
+    def for_width(self, width: int) -> tuple[float, float]:
+        """Scale the focal length and principal point using pixel centres."""
+        scale = width / self.width
+        return self.fx * scale, (self.cx + 0.5) * scale - 0.5
+
+
+def horizontal_intrinsics(declaration: dict) -> HorizontalIntrinsics | None:
+    """Read the horizontal intrinsics of a rectified depth image."""
+    if declaration.get("schema") != SCHEMA or declaration.get("distortion_model") != "pinhole":
+        return None
+    k = declaration.get("K")
+    width = declaration.get("width")
+    if not isinstance(k, (list, tuple)) or len(k) != 9:
+        return None
+    if type(width) is not int or width <= 0 or k[1] != 0 or tuple(k[6:]) != (0, 0, 1):
+        return None
+    values = (k[0], k[2])
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        return None
+    try:
+        width, fx, cx = map(float, (width, *values))
+    except OverflowError:
+        return None
+    if not (0 < fx < math.inf and 0 <= cx < width and math.isfinite(width / fx)):
+        return None
+    return HorizontalIntrinsics(width, fx, cx)
 
 
 def half_fov(declaration: dict) -> tuple:
@@ -75,10 +109,13 @@ def half_fov(declaration: dict) -> tuple:
     if isinstance(K, (list, tuple)) and len(K) == 9 and width:
         try:
             fx, width = float(K[0]), float(width)
-        except (TypeError, ValueError):
-            fx = 0.0
-        if fx > 0 and width > 0:
-            return math.atan((width / 2.0) / fx), "derived-from-K"
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if 0 < fx < math.inf and 0 < width < math.inf:
+                angle = math.atan((width / 2.0) / fx)
+                if 0 < angle < math.pi / 2:
+                    return angle, "derived-from-K"
 
     angle = declaration.get("half_fov_rad")
     if angle is None:

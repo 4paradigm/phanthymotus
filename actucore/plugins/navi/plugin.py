@@ -598,11 +598,15 @@ class NaviPlugin:
         depth has always been available and would produce confidently wrong
         distances. Now that both sides declare an `id`, it is a comparison.
         """
-        from .camera import camera_id, for_topic
+        from .camera import camera_id, for_topic, horizontal_intrinsics
 
         depth_topic = binding.get("depth_map") or binding.get("depth_summary")
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
         self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
+        self._config.depth_intrinsics = (horizontal_intrinsics(depth_decl)
+                                         if binding.get("depth_map") else None)
+        if depth_decl and binding.get("depth_map") and self._config.depth_intrinsics is None:
+            self._camera_notes.append("深度图缺少可用针孔内参 fx/cx，避障走廊按画面中心和水平视场角估算")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,

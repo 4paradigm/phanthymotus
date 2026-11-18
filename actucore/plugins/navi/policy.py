@@ -67,6 +67,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
 from .track import Tracker
 
@@ -181,6 +182,7 @@ class Config:
     # into a column range using this — and being 1.6x out there made the corridor
     # wider than any door.
     half_fov_rad: float = 0.888
+    depth_intrinsics: HorizontalIntrinsics | None = None
     # Sidestep while approaching, and to get out from in front of an obstacle.
     # Turn it off for a base with no lateral degree of freedom — the descriptor
     # pinning vy to zero does that on its own, but this says so in one place.
@@ -612,7 +614,7 @@ def _adopt_camera(config: Config, declaration: dict) -> list[str]:
     if abs(angle - previous) > 0.02:
         notes.append(
             f"相机声明的水平半视场角是 {angle:.3f} rad（{source}），已采纳 —— "
-            f"卡片配置里的 {previous:.3f} 不再生效。走廊宽度按这个数算，"
+            f"卡片配置里的 {previous:.3f} 不再生效。"
             f"两者相差 {abs(angle - previous) / max(previous, 1e-6) * 100:.0f}%")
     if source in ("unknown", "unspecified"):
         notes.append("相机没说这个视场角是量出来的还是猜的（source 缺失）")
@@ -1292,7 +1294,8 @@ def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
                               half_width_m=_keepout_m(config),
                               half_fov_rad=config.half_fov_rad,
                               reference_m=config.obstacle_stop_m,
-                              lateral_offset_m=lateral_offset_m)
+                              lateral_offset_m=lateral_offset_m,
+                              intrinsics=config.depth_intrinsics)
 
 
 def _may_strafe(towards_right: bool, depth, config: Config) -> bool:

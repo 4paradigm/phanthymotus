@@ -202,6 +202,11 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
     if not clearance or not math.isfinite(clearance) or clearance <= 0:
         return None
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    intrinsics = getattr(config, "depth_intrinsics", None)
+    if intrinsics is not None:
+        fx, cx = intrinsics.for_width(width)
+        edge_px = fx * keep / clearance
+        return int(round(cx - edge_px)), int(round(cx + edge_px))
     edge = math.atan2(keep, max(clearance, 0.05))
     return (_column_of(-edge, config.half_fov_rad, width),
             _column_of(edge, config.half_fov_rad, width))

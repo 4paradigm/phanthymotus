@@ -170,7 +170,8 @@ def bands_from_summary(summary: dict) -> dict:
 
 
 def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
-             reference_m: float, lateral_offset_m: float = 0.0):
+             reference_m: float, lateral_offset_m: float = 0.0,
+             intrinsics=None):
     """Nearest obstacle inside a metric corridor, and how much of it was measured.
 
     Returns `(clearance_m | None, coverage)`. `clearance_m` is None when nothing
@@ -221,12 +222,14 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     bottom = int(height * OBSTACLE_ROW_SPAN[1])
     rows = depth_m[top:bottom, :]
 
-    # Tangent of the horizontal angle for each column, right-positive. Derived
-    # from the half-FOV rather than from intrinsics because **nothing in this
-    # project publishes intrinsics** — see the card's degradations. It is the
-    # one number here that is a configuration rather than a measurement.
-    tangent = ((np.arange(width) - (width - 1) / 2.0)
-               * (2.0 * np.tan(half_fov_rad) / width))
+    # Right-positive ray tangents. Optical Z converts them to lateral metres.
+    if intrinsics is None:
+        cx = (width - 1) / 2.0
+        step = 2.0 * np.tan(half_fov_rad) / width
+    else:
+        fx, cx = intrinsics.for_width(width)
+        step = 1.0 / fx
+    tangent = (np.arange(width) - cx) * step
 
     lateral = tangent[None, :] * rows
     inside = np.abs(lateral - lateral_offset_m) <= half_width_m
@@ -247,7 +250,6 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     reference = max(1e-6, reference_m)
     low = (lateral_offset_m - half_width_m) / reference
     high = (lateral_offset_m + half_width_m) / reference
-    step = 2.0 * np.tan(half_fov_rad) / width
     wanted = max(1e-9, (high - low) / step)
 
     window = (tangent >= low) & (tangent <= high)
