@@ -121,6 +121,7 @@ async def _run_job(job: dict) -> None:
         )
 
         try:
-            next_ts = _next_run(cron, time.time())
+            # asyncio 的唤醒可能略早于墙钟整分钟，不能重新选中刚触发的时刻。
+            next_ts = _next_run(cron, max(next_ts, time.time()))
         except Exception:
             return   # 无法计算下次，退出

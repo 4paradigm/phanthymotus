@@ -180,6 +180,36 @@ class TestExplicitTaskTimer(unittest.TestCase):
                 self.assertIn('定时设置失败', result)
                 self.assertEqual(task_store.active_tasks(), [])
 
+    def test_early_wakeup_cannot_fire_the_same_cron_occurrence_twice(self):
+        """G1 的整分钟边界重复唤醒曾打断第一次提醒。"""
+        async def go():
+            now = 1794990625.0
+            first_due = scheduler._next_run('* * * * *', now)
+            clock = [now]
+            sleeps = []
+            fired = []
+
+            async def sleep(delay):
+                sleeps.append(delay)
+                # 模拟第一次 asyncio.sleep 在墙钟目标前半毫秒返回。
+                clock[0] += delay - 0.0005 if len(sleeps) == 1 else delay
+
+            async def enqueue(**event):
+                fired.append(clock[0])
+                if len(fired) == 2:
+                    raise asyncio.CancelledError
+
+            with patch.object(time, 'time', side_effect=lambda: clock[0]), \
+                    patch.object(asyncio, 'sleep', side_effect=sleep), \
+                    patch.object(scheduler.event_bus, 'enqueue', side_effect=enqueue):
+                with self.assertRaises(asyncio.CancelledError):
+                    await scheduler._run_job({'name': 'test', 'cron': '* * * * *', 'text': 'test'})
+            self.assertEqual(len(sleeps), 2)
+            self.assertAlmostEqual(fired[0], first_due, places=2)
+            self.assertGreaterEqual(fired[1], first_due + 60)
+
+        asyncio.run(go())
+
 
 class TestCapabilityIsKeptForHumansAndSolutions(unittest.TestCase):
     """定时检查能力本身保留 —— 删掉会砸掉 solutions（方案包声明的任务）。"""
