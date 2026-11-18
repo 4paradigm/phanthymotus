@@ -191,8 +191,14 @@ class NaviPlugin:
         self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
+        self._depth_capture_ms = None
+        self._depth_source_ms = None
+        self._depth_stamp_verified = False
         self._odom = None
         self._odom_ms = 0
+        self._odom_received_ms = 0
+        self._odom_source_ms = None
+        self._odom_stamp_verified = False
         self._odom_interface = {}
         self._odom_max_age_ms = int(self._config.max_obs_age_ms)
         self._binding = {}
@@ -480,6 +486,13 @@ class NaviPlugin:
             self._depth_vertical = None
             self._depth_bands = {}
             self._depth_ms = 0
+            self._depth_capture_ms = None
+            self._depth_source_ms = None
+            self._odom = None
+            self._odom_ms = 0
+            self._odom_received_ms = 0
+            self._odom_source_ms = None
+            self._odom_stamp_verified = False
 
         try:
             self._open_publisher()
@@ -509,7 +522,8 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
-        from .local_path import camera_square
+        from .camera import for_topic
+        from .local_path import body_square, camera_square
         footprint = descriptor.get("footprint") or {}
         half_width = footprint.get("half_width")
         self._config.local_planning = bool(binding.get("depth_map") and binding.get("odom"))
@@ -518,6 +532,11 @@ class NaviPlugin:
         if self._config.local_planning and valid_width:
             self._config.local_geometry = camera_square(
                 self._config.depth_intrinsics, self._depth_vertical, half_width)
+            depth_decl = for_topic(args.get("camera_info"), binding["depth_map"])
+            self._config.scan_geometry = body_square(self._config.local_geometry,
+                                                     depth_decl.get("vendor"))
+            if self._config.scan_geometry is None:
+                self._camera_notes.append("主动观察使用正方形近似，仅用转稳后的单视角重规划")
         if self._config.local_planning and self._config.local_geometry is None:
             self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
         # Callers may supply producer contracts keyed by the actual wired
@@ -622,6 +641,11 @@ class NaviPlugin:
 
         depth_topic = binding.get("depth_map") or binding.get("depth_summary")
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
+        vendor = depth_decl.get("vendor")
+        self._depth_stamp_verified = isinstance(vendor, dict) and (
+            vendor.get("hardware_capture_timestamp_available") is True
+            and vendor.get("source_stamp_preserved") is True
+            and not str(vendor.get("timestamp_source", "")).endswith("_unverified"))
         self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
         self._config.depth_intrinsics = (horizontal_intrinsics(depth_decl)
                                          if binding.get("depth_map") else None)
@@ -631,6 +655,8 @@ class NaviPlugin:
             self._depth_vertical = vertical_intrinsics(depth_decl)
             if self._depth_vertical is None:
                 self._camera_notes.append("深度图缺少完整针孔内参，沿用原始深度判断障碍")
+            if not self._depth_stamp_verified:
+                self._camera_notes.append("深度采集时间未验证，主动观察用转稳后的单视角重规划")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,
@@ -838,6 +864,7 @@ class NaviPlugin:
             # schedule before resume. Keep the track, but restart gain gently.
             if halted:
                 self._publish_stop_if_moving()
+                self._state.active_scan.invalidate()
             self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
@@ -1430,17 +1457,21 @@ class NaviPlugin:
                 self._odom = {axis: odom_mod.axis_of(payload, axis)
                               for axis in ("vx", "vy", "wz")}
                 stamp = payload.get("stamp_ms")
+                self._odom_received_ms = now
+                self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
+                                        and not isinstance(stamp, bool)
+                                        and math.isfinite(stamp) and stamp > 0 else None)
+                timing = self._odom_interface.get("timing") or {}
+                vendor = payload.get("vendor")
+                stamp_source = vendor.get("stamp_source", "robot") if isinstance(vendor, dict) else "robot"
+                self._odom_stamp_verified = (timing.get("stamp_source") == "robot"
+                                             and stamp_source == "robot")
                 if self._odom_interface:
                     # A declared interface makes stamp_ms authoritative. An
                     # absent/non-finite stamp is not silently upgraded to a
                     # fresh receipt-time sample, because the declared maximum
                     # measurement delay would then be meaningless.
-                    if (isinstance(stamp, (int, float))
-                            and not isinstance(stamp, bool)
-                            and math.isfinite(stamp)):
-                        self._odom_ms = int(stamp)
-                    else:
-                        self._odom_ms = 0
+                    self._odom_ms = self._odom_source_ms or 0
                 else:
                     # Backwards compatibility for old producers whose timing
                     # contract predates stamp_source.
@@ -1452,7 +1483,7 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
-    def _set_depth_map(self, depth):
+    def _set_depth_map(self, depth, *, capture_ms=None):
         received_ms = int(time.time() * 1000)
         horizontal = self._config.depth_intrinsics
         vertical = self._depth_vertical
@@ -1465,6 +1496,10 @@ class NaviPlugin:
             self._depth_ground = ground
             self._depth_bands = bands
             self._depth_ms = received_ms
+            self._depth_source_ms = capture_ms or None
+            self._depth_capture_ms = (
+                capture_ms if capture_ms and self._depth_stamp_verified
+                and 0 <= received_ms - capture_ms <= self._config.max_obs_age_ms else None)
 
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
@@ -1476,7 +1511,9 @@ class NaviPlugin:
             with self._lock:
                 self._last_error = f"深度图解码失败：{error}"
             return
-        self._set_depth_map(depth)
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        capture_ms = stamp.sec * 1000 + stamp.nanosec // 1_000_000 if stamp is not None else None
+        self._set_depth_map(depth, capture_ms=capture_ms)
 
     def _open_publisher(self):
         from rclpy.node import Node
@@ -1500,7 +1537,7 @@ class NaviPlugin:
 
     # ── the loop ─────────────────────────────────────────────────────────────
 
-    def observation(self):
+    def observation(self, *, with_capture_timing=False):
         """The three inputs, with anything stale replaced by None.
 
         Staleness is checked here rather than in the policy so that "too old"
@@ -1516,9 +1553,25 @@ class NaviPlugin:
                       "frame_id": self._depth_ms} if fresh_depth else None)
             if depth is not None and self._depth_ground is not None:
                 depth["ground"] = self._depth_ground
+            if with_capture_timing and depth is not None:
+                if self._depth_source_ms is not None:
+                    depth["source_frame_id"] = self._depth_source_ms
+                capture = self._depth_capture_ms
+                if capture is not None and 0 <= now - capture <= max_age:
+                    depth["capture_ms"] = capture
+                elif self._depth_stamp_verified and self._depth_source_ms is not None:
+                    depth["capture_invalid"] = True
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
+            if with_capture_timing and odom is not None:
+                received_ms = self._odom_received_ms or self._odom_ms
+                if 0 <= now - received_ms <= policy_mod.ODOM_GAP_MS:
+                    odom = {**odom, "received_ms": received_ms}
+                    if self._odom_source_ms is not None:
+                        odom["source_sample_id"] = self._odom_source_ms
+                if self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
+                    odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom
 
     def next_command(self):
@@ -1531,8 +1584,10 @@ class NaviPlugin:
         dt = (now - self._last_tick) if self._last_tick else 1.0 / self._rate_hz
         self._last_tick = now
 
-        objects, depth, odom = self.observation()
+        objects, depth, odom = self.observation(with_capture_timing=self._config.local_planning)
         was_moving = any(self._state.commanded)
+        scan = self._state.active_scan
+        scan_guarded = scan.active or bool(scan.result_frame)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt)
@@ -1540,7 +1595,7 @@ class NaviPlugin:
         if not decision.publishes:
             # Stop once when a policy goes quiet while the chassis may still
             # hold its last motion command under the longer watchdog.
-            if self._config.watchdog_ms <= 300 or not was_moving:
+            if (self._config.watchdog_ms <= 300 and not scan_guarded) or not was_moving:
                 return None
             decision.values = [0.0] * ACTION_DIM
             return self._command_message(decision.values, now, int(now * 1000))
@@ -1557,12 +1612,18 @@ class NaviPlugin:
                                            self._deadband_for(decision.values))
 
         obs_ms = self._objects_ms or int(now * 1000)
-        if self._config.watchdog_ms > 300 and not any(values):
+        if (self._config.watchdog_ms > 300 or scan_guarded or scan.active
+                or scan.locked) and not any(values):
             # A hold applies now, even when the last input is about to expire.
             obs_ms = int(now * 1000)
         elif (self._config.local_planning and decision.status == policy_mod.AVOIDING
                 and depth is not None and depth.get("frame_id") is not None):
-            obs_ms = min(obs_ms, depth["frame_id"])
+            obs_ms = min(obs_ms, depth.get("capture_ms", depth["frame_id"]))
+            if scan_guarded and odom is not None:
+                stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
+                obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
+                if scan.current_frame:
+                    obs_ms = min(obs_ms, scan.current_frame)
         return self._command_message(values, now, obs_ms)
 
     def _command_message(self, values, now, obs_ms):
@@ -1654,7 +1715,9 @@ class NaviPlugin:
         self._published += 1
 
     def _publish_stop_if_moving(self):
-        if (self._config.watchdog_ms <= 300 or self._publisher is None
+        scan = self._state.active_scan
+        if ((self._config.watchdog_ms <= 300 and not (scan.active or scan.result_frame))
+                or self._publisher is None
                 or not any(self._state.commanded)):
             return
         now = time.time()

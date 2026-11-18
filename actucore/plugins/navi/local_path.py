@@ -11,6 +11,11 @@ from .camera import HorizontalIntrinsics
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1))
+RESOLUTION = .05
+START = (10, 28)
+SHAPE = (77, 57)
+RIGHT, FORWARD = np.meshgrid((np.arange(SHAPE[1]) - START[1]) * RESOLUTION,
+                              (np.arange(SHAPE[0]) - START[0]) * RESOLUTION)
 
 
 def footprint_region(center, half_cells):
@@ -32,22 +37,30 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
     return np.pad(blocked_count == 0, ((rear, front), (dc, dc)), constant_values=False)
 
 
-def shortest_path(allowed, start, goal):
-    if not (allowed[start] and allowed[goal]):
+def shortest_path(allowed, start, goal, *, later_goal=False):
+    goal_row, goal_col = goal
+    last_row = allowed.shape[0] - 1 if later_goal else goal_row
+    goals = allowed[goal_row:last_row + 1, goal_col]
+    if not allowed[start] or not goals.any():
         return None
-    queue = [(math.dist(start, goal), 0.0, start)]
+
+    def distance_to_goals(point):
+        row, col = point
+        return math.hypot(max(goal_row - row, row - last_row, 0), goal_col - col)
+
+    queue = [(distance_to_goals(start), 0.0, start)]
     cost = {start: 0.0}
     parents = {}
     while queue:
         _, walked, current = heapq.heappop(queue)
-        if current == goal:
-            route = [goal]
+        row, col = current
+        if col == goal_col and goal_row <= row <= last_row:
+            route = [current]
             while route[-1] != start:
                 route.append(parents[route[-1]])
             return route[::-1]
         if walked > cost[current]:
             continue
-        row, col = current
         for dr, dc in STEPS:
             nxt = (row + dr, col + dc)
             if not (0 <= nxt[0] < allowed.shape[0] and 0 <= nxt[1] < allowed.shape[1]):
@@ -60,7 +73,7 @@ def shortest_path(allowed, start, goal):
             if distance < cost.get(nxt, math.inf):
                 cost[nxt] = distance
                 parents[nxt] = current
-                heapq.heappush(queue, (distance + math.dist(nxt, goal), distance, nxt))
+                heapq.heappush(queue, (distance + distance_to_goals(nxt), distance, nxt))
     return None
 
 
@@ -159,6 +172,33 @@ def camera_square(horizontal, vertical, half_width):
     return Geometry(horizontal, vertical, axes, half_width, half_width, None)
 
 
+def body_square(geometry, vendor):
+    """A yaw sweep needs a declared transform about the odometry body origin."""
+    if geometry is None or not isinstance(vendor, dict):
+        return None
+    matrix = vendor.get("body_from_optical")
+    invert = matrix is None and vendor.get("cloud_frame_id") in ("body", "base_link")
+    if invert:
+        matrix = vendor.get("camera_optical_from_cloud")
+    try:
+        transform = np.asarray(matrix, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (transform.shape != (4, 4) or not np.isfinite(transform).all()
+            or not np.allclose(transform[3], [0., 0., 0., 1.], atol=1e-6)):
+        return None
+    rotation = transform[:3, :3]
+    if not (np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
+            and math.isclose(np.linalg.det(rotation), 1., abs_tol=1e-5)):
+        return None
+    if invert:
+        transform = np.linalg.inv(transform)
+    if transform[0, 2] < .75:  # Unambiguous forward-facing optical axis.
+        return None
+    return Geometry(geometry.horizontal, geometry.vertical, transform,
+                    geometry.front, geometry.rear, geometry.height)
+
+
 @dataclass
 class PlanCache:
     key: tuple | None = None
@@ -169,22 +209,28 @@ class PlanCache:
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
             return None
-        key = (frame, round(ahead, 2), max_age_ms, watchdog_ms)
+        key = (frame, round(ahead, 2), max_age_ms, watchdog_ms, observation.get("scan_revision"))
         if self.key != key:
             self.key = key
             self.commands.clear()
         if side not in self.commands:
+            scan_grid = observation.get("scan_grid")
+            options = {"observed_grid": scan_grid} if scan_grid is not None else {}
             self.commands[side] = _checked_translation(
-                observation["map"], ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms)
+                observation["map"], ground, geometry, half_width, ahead, side, max_age_ms,
+                watchdog_ms, **options)
         return self.commands[side]
 
 
-def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300):
-    resolution = .05
-    row_zero, col_zero = 10, 28
-    right, forward = np.meshgrid((np.arange(57) - col_zero) * resolution,
-                                 (np.arange(77) - row_zero) * resolution)
+def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
+                         watchdog_ms=300, *, observed_grid=None):
+    resolution = RESOLUTION
+    row_zero, col_zero = START
+    right, forward = RIGHT, FORWARD
     free, occupied = observe(frame, geometry, right, forward, resolution, ground)
+    if observed_grid is not None:
+        scan_free, scan_occupied = observed_grid
+        free, occupied = free | scan_free, occupied | scan_occupied
     if side < 0:
         free, occupied = free[:, ::-1], occupied[:, ::-1]
     grid = np.where(occupied, OCCUPIED, np.where(free, FREE, UNKNOWN))
@@ -207,9 +253,17 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
                        for half in (geometry.front, half_width, geometry.rear))
     if half_cells[2] > row_zero or half_cells[1] > col_zero:
         return None
-    # Live front-only planning uses observed obstacles as constraints.
-    # Unmeasured cells are not represented as obstacles.
-    path = plan_right(grid, start, via, goal, half_cells, allow_unknown=True)
+    # Check every footprint against observed obstacles. The search can reach
+    # the passing lane at any column outside the obstacle, and rejoin on any
+    # clear centerline cell at or beyond the original rejoin distance.
+    allowed = allowed_centers(grid, start, half_cells, allow_unknown=observed_grid is None)
+    allowed[:row_zero, :] = False
+    allowed[:, :col_zero] = False
+    # An additional view can confirm space to bend earlier. In that mode the
+    # entire route requires observed clearance, even after an older view ages out.
+    lane_min = via[1] if observed_grid is None else col_zero + 1
+    allowed[via[0]:goal[0], :lane_min] = False
+    path = shortest_path(allowed, start, goal, later_goal=True)
     if path is None or len(path) < 2:
         return None
     dr, dc = (path[1][axis] - start[axis] for axis in (0, 1))

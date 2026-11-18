@@ -172,6 +172,189 @@ def test_silent_policy_stops_previous_motion_with_long_watchdog(monkeypatch, sta
     assert card.next_command() is None
 
 
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch, interrupt):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from plugins.navi import active_scan, local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    cfg = card._config
+    cfg.local_planning = True
+    cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                                  (480, 420, 243), .23)
+    cfg.scan_geometry = cfg.local_geometry
+    cfg.half_width_m = .23
+    cfg.watchdog_ms = 300 if interrupt else 600
+    card._odom_stamp_verified = True
+    now = [100_000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    card._state.target = "person"
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True)
+    monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.6 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else .90, 1.0))
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    plans = []
+
+    def plan(depth, config, state, odom, ahead, side):
+        if "scan_grid" in depth:
+            plans.append(side)
+            return (.06, 0.)
+        return None
+
+    monkeypatch.setattr(policy, "_local_translation", plan)
+
+    def tick(stamp, yaw_odometry=0, fresh=True):
+        now[0] = stamp
+        card._objects = {"objects": []}
+        card._objects_ms = stamp
+        card._odom = {"vx": 0., "vy": 0., "wz": yaw_odometry}
+        card._odom_ms = stamp
+        if fresh:
+            card._depth_map = np.ones((2, 2), dtype=float)
+            card._depth_ground = np.ones((2, 2), dtype=bool)
+            card._depth_ms = stamp
+            card._depth_capture_ms = stamp
+        return card.next_command()
+
+    assert tick(100_000)["values"] == [0.] * 6
+    assert card._state.active_scan.directions == (-1., 1.)
+    assert tick(100_050)["values"] == [0.] * 6
+    left = tick(100_150)
+    assert left["values"] == [0., 0., 0., 0., 0., .25]
+    if interrupt:
+        now[0] = 100_250
+        card._objects_ms = 99_000
+        stop = card.next_command()
+        assert stop["values"] == [0.] * 6
+        assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_250
+        assert card._state.active_scan.locked
+        assert tick(100_350)["values"] == [0.] * 6
+        assert not plans
+        return
+    for stamp in range(100_250, 101_250, 100):
+        command = tick(stamp, .25)
+    assert command["values"] == [0.] * 6
+    assert tick(101_250, fresh=False)["values"] == [0.] * 6
+    assert tick(101_400, fresh=False)["values"] == [0.] * 6
+    assert not plans
+    assert tick(101_450)["values"] == [0.] * 6
+    assert tick(101_500)["values"] == [0., 0., 0., 0., 0., -.25]
+    for stamp in range(101_600, 102_600, 100):
+        command = tick(stamp, -.25)
+    assert command["values"] == [0.] * 6
+    for stamp in (102_600, 102_750, 102_850, 102_950, 103_050):
+        command = tick(stamp)
+    assert plans and all(side == -1.0 for side in plans)
+    assert command["values"][0] > 0
+    assert command["values"][5] == 0
+    assert command["obs_stamp_ms"] == 103_050
+    decisions = len(plans)
+    card._odom_stamp_verified = False
+    assert tick(103_150)["values"] == [0.] * 6
+    assert len(plans) == decisions
+
+
+def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
+    import numpy as np
+
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    frame = np.ones((2, 2), dtype=float)
+    for capture in (None, 122_000, 123_001):
+        card._set_depth_map(frame, capture_ms=capture)
+        depth = card.observation(with_capture_timing=True)[1]
+        assert depth["frame_id"] == 123_000
+        assert "capture_ms" not in depth
+
+    card._depth_stamp_verified = True
+    card._set_depth_map(frame, capture_ms=122_000)
+    depth = card.observation(with_capture_timing=True)[1]
+    assert depth["capture_invalid"] and "capture_ms" not in depth
+    card._set_depth_map(frame, capture_ms=122_950)
+    assert card.observation(with_capture_timing=True)[1]["capture_ms"] == 122_950
+    card._depth_stamp_verified = False
+    card._set_depth_map(frame, capture_ms=122_950)
+    assert "capture_ms" not in card.observation(with_capture_timing=True)[1]
+
+
+def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(monkeypatch):
+    import numpy as np
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    cfg = card._config
+    cfg.local_planning = True
+    cfg.half_width_m = .23
+    cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                                  (480, 420, 243), .23)
+    assert cfg.scan_geometry is None
+    now = [100_000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    card._state.target = "person"
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True)
+    monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.4 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else .90, 1.0))
+    visible = local_path.FORWARD > 0
+    monkeypatch.setattr(active_scan, "observe",
+                        lambda *args: (visible, np.zeros_like(visible)))
+    replans = []
+
+    def plan(depth, config, state, odom, ahead, side):
+        if state.active_scan.ready or state.active_scan.result_frame:
+            assert "scan_grid" not in depth
+            assert "capture_ms" not in depth
+            replans.append(depth["frame_id"])
+            return (.06, 0.)
+        return None
+
+    monkeypatch.setattr(policy, "_local_translation", plan)
+
+    def tick(stamp, yaw=0., fresh=True):
+        now[0] = stamp
+        card._objects = {"objects": []}
+        card._objects_ms = stamp
+        card._odom = {"vx": 0., "vy": 0., "wz": yaw}
+        card._odom_ms = stamp
+        if fresh:
+            card._depth_map = np.ones((4, 4), dtype=float)
+            card._depth_ground = np.ones((4, 4), dtype=bool)
+            card._depth_ms = stamp
+        return card.next_command()
+
+    assert tick(100_000)["values"] == [0.] * 6
+    assert tick(100_050)["values"] == [0.] * 6
+    command = tick(100_150)
+    assert command["values"][:5] == [0.] * 5
+    assert 0 < command["values"][5] <= .18
+    yaw = command["values"][5]
+    stamp = now[0]
+    for _ in range(25):
+        stamp += 100
+        if tick(stamp, yaw)["values"][5] == 0:
+            break
+    else:
+        pytest.fail("scan never reached the angular target")
+    for _ in range(25):
+        stamp += 100
+        assert tick(stamp)["values"] == [0.] * 6
+    assert not replans
+    for _ in range(35):
+        stamp += 100
+        command = tick(stamp)
+        if command["values"][0] > 0:
+            break
+    assert replans and command["values"][0] > 0
+    assert command["values"][5] == 0
+
+
 def test_it_claims_the_base_resource():
     assert _tool()["inputSchema"]["x-resource"] == ["base"]
 
