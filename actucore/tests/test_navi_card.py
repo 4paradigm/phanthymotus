@@ -192,7 +192,8 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
     now = [100_000]
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
     card._state.target = "person"
-    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True)
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True,
+                             measured_range_m=None)
     monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
     monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
         2.6 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else .90, 1.0))
@@ -282,7 +283,8 @@ def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
     assert "capture_ms" not in card.observation(with_capture_timing=True)[1]
 
 
-def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(monkeypatch):
+@pytest.mark.parametrize("sweep_observed", [True, False])
+def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(monkeypatch, sweep_observed):
     import numpy as np
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path, policy
@@ -298,11 +300,12 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
     now = [100_000]
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
     card._state.target = "person"
-    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True)
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True,
+                             measured_range_m=None)
     monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
     monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
         2.4 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else .90, 1.0))
-    visible = local_path.FORWARD > 0
+    visible = np.ones(local_path.SHAPE, dtype=bool) if sweep_observed else local_path.FORWARD > 0
     monkeypatch.setattr(active_scan, "observe",
                         lambda *args: (visible, np.zeros_like(visible)))
     replans = []
@@ -333,6 +336,12 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
     assert tick(100_050)["values"] == [0.] * 6
     command = tick(100_150)
     assert command["values"][:5] == [0.] * 5
+    if not sweep_observed:
+        assert command["values"][5] == 0
+        assert tick(100_250)["values"] == [0.] * 6
+        assert tick(100_350)["values"] == [0.] * 6
+        assert not replans
+        return
     assert 0 < command["values"][5] <= .18
     yaw = command["values"][5]
     stamp = now[0]
@@ -353,6 +362,28 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
             break
     assert replans and command["values"][0] > 0
     assert command["values"][5] == 0
+
+
+def test_card_retains_the_outbound_twist_for_unmeasured_ego_prediction(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._descriptor = {"limits": {"min_magnitude": [.2, 0., 0., 0., 0., 0.]}}
+    monkeypatch.setattr(policy, "step", lambda **kwargs:
+                        policy.Decision([.11, 0., 0., 0., 0., 0.], policy.APPROACHING))
+    message = card.next_command()
+    assert message["values"][0] == .2
+    assert card._state.commanded == (.2, 0., 0.)
+
+
+def test_local_prefix_cannot_be_enlarged_by_the_moving_deadband(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._config.local_planning = True
+    card._state.avoidance_yaw_override = True
+    card._descriptor = {"limits": {"min_magnitude_moving": [.12, 0., 0., 0., 0., 0.]}}
+    monkeypatch.setattr(policy, "step", lambda **kwargs:
+                        policy.Decision([.075, 0., 0., 0., 0., 0.], policy.AVOIDING))
+    assert card.next_command()["values"] == [0.] * 6
 
 
 def test_it_claims_the_base_resource():
@@ -1688,7 +1719,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
             .79 if lateral_offset_m > 0 else .80 if lateral_offset_m < 0 else .78, 1.0))
     attempted = []
 
-    def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300):
+    def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300, **kwargs):
         attempted.append((side, half_width, watchdog_ms))
         return (.04, -.06) if side > 0 else None
 

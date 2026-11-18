@@ -1089,7 +1089,7 @@ class NaviPlugin:
                        "那是一个**角度**扇区，近处比机器人还窄（0.8 m 处只覆盖"
                        "±0.16 m），肩膀会擦到判据之外的东西。摘要还无法表达"
                        "「这一段有多少像素是有效的」，所以满是空洞的一段会被"
-                       "当成空旷")
+                       "当成空旷。到达需要有效的目标测距")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
                        "目标被遮挡时只能按**指令**（而非实测）推算它去了哪；"
@@ -1553,7 +1553,7 @@ class NaviPlugin:
                       "frame_id": self._depth_ms} if fresh_depth else None)
             if depth is not None and self._depth_ground is not None:
                 depth["ground"] = self._depth_ground
-            if with_capture_timing and depth is not None:
+            if depth is not None:
                 if self._depth_source_ms is not None:
                     depth["source_frame_id"] = self._depth_source_ms
                 capture = self._depth_capture_ms
@@ -1581,8 +1581,9 @@ class NaviPlugin:
         numbers and the two timestamps — is testable without a node.
         """
         now = time.time()
-        dt = (now - self._last_tick) if self._last_tick else 1.0 / self._rate_hz
-        self._last_tick = now
+        tick = time.monotonic()
+        dt = tick - self._last_tick if self._last_tick else 1.0 / self._rate_hz
+        self._last_tick = tick
 
         objects, depth, odom = self.observation(with_capture_timing=self._config.local_planning)
         was_moving = any(self._state.commanded)
@@ -1610,9 +1611,14 @@ class NaviPlugin:
         # also translates inflates a small correction and creates weaving.
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
+        if (values != decision.values and self._config.local_planning
+                and (self._state.avoidance_yaw_override or scan_guarded or scan.active)):
+            values = decision.values = [0.] * ACTION_DIM
+            decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
+        self._state.commanded = (values[0], values[1], values[5])
 
         obs_ms = self._objects_ms or int(now * 1000)
-        if (self._config.watchdog_ms > 300 or scan_guarded or scan.active
+        if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
                 or scan.locked) and not any(values):
             # A hold applies now, even when the last input is about to expire.
             obs_ms = int(now * 1000)

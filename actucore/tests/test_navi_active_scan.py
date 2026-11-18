@@ -145,31 +145,48 @@ def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
 
 
 @pytest.mark.parametrize("half_width", [.23, .35])
-def test_receipt_only_sweep_uses_real_depth_and_stops_for_a_close_projected_obstacle(half_width):
+def test_receipt_only_front_depth_cannot_confirm_rear_sweep(half_width):
     horizontal = HorizontalIntrinsics(640, 315, 337)
     vertical = (480, 420, 243)
     geometry = camera_square(horizontal, vertical, half_width)
     tangent = (np.arange(480) - 243) / 420
     floor = np.minimum(.42 / np.maximum(tangent - .02, .001), 4.0)
-    clear = np.broadcast_to(floor[:, None], (480, 640)).copy()
-    blocked = clear.copy()
-    blocked[200:206, 334:340] = .20
+    image = np.broadcast_to(floor[:, None], (480, 640)).copy()
+    look = scan.ActiveScan()
+    ground = ground_mask(image, horizontal, vertical)
+    assert ground is not None
 
-    for image, expect_turn in ((clear, True), (blocked, False)):
-        look = scan.ActiveScan()
-        ground = ground_mask(image, horizontal, vertical)
-        assert ground is not None
-
-        def update(stamp):
-            look.update({"map": image, "ground": ground, "frame_id": stamp},
-                        {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
-
-        update(1000)
-        assert look.begin((1., -1.))
-        update(1050)
+    for stamp in (1000, 1050, 1150):
+        look.update({"map": image, "ground": ground, "frame_id": stamp},
+                    {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((1., -1.))
         assert look.command(geometry, half_width + .10, .18, 600).yaw == 0
-        update(1150)
-        assert (look.command(geometry, half_width + .10, .18, 600).yaw < 0) is expect_turn
+
+
+@pytest.mark.parametrize("initial_hit", [False, True])
+def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkeypatch, initial_hit):
+    look, geometry, _, occupied = _setup(monkeypatch)
+    occupied[10, 28] = initial_hit
+    for stamp in (1000, 1050, 1150):
+        look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((1.,))
+        result = look.command(geometry, .33, .18, 600)
+    assert (result.yaw < 0) is (not initial_hit)
+
+
+def test_sweep_does_not_exempt_a_blind_cell_that_straddles_the_footprint(monkeypatch):
+    look, _, visible, _ = _setup(monkeypatch)
+    geometry = Geometry(None, None, np.eye(4), .22, .23, None)
+    # This cell is centred at forward .20 m, left .30 m. It extends .005 m
+    # past the front edge and the right turn sweeps through the exposed part.
+    visible[14, 22] = False
+    _tick(look, geometry, 1000)
+    assert look.begin((1.,))
+    _tick(look, geometry, 1050)
+    assert _tick(look, geometry, 1150).yaw == 0
 
 
 def test_receipt_only_scan_rejects_a_republished_depth_frame(monkeypatch):

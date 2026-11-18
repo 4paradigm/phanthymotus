@@ -303,11 +303,13 @@ class ActiveScan:
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
     def _clear_sweep(self, geometry, half_width, sweep, translation):
-        # The current keepout is already reserved by the stationary chassis.
+        # Only cells entirely inside the current keepout can be exempted.
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
-        initial = ((FORWARD >= -geometry.rear) & (FORWARD <= geometry.front)
-                   & (abs(RIGHT) <= half_width))
+        half_cell = RESOLUTION / 2
+        initial = ((FORWARD - half_cell >= -geometry.rear)
+                   & (FORWARD + half_cell <= geometry.front)
+                   & (abs(RIGHT) + half_cell <= half_width))
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)
         radius = math.hypot(max(geometry.front, geometry.rear), half_width)
         slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
@@ -316,10 +318,11 @@ class ActiveScan:
         swept = np.zeros(SHAPE, dtype=bool)
         for angle in np.linspace(0., sweep, samples):
             c, s = math.cos(angle), math.sin(angle)
-            extent_f = max(geometry.front, geometry.rear) * abs(c) + half_width * abs(s) + slack
+            extent_f = max(geometry.front * c, -geometry.rear * c) + half_width * abs(s) + slack
+            extent_back = max(geometry.rear * c, -geometry.front * c) + half_width * abs(s) + slack
             extent_r = max(geometry.front, geometry.rear) * abs(s) + half_width * abs(c) + slack
             if (extent_f > FORWARD[-1, 0] or extent_r > RIGHT[0, -1]
-                    or (not self.receipt_only and extent_f > -FORWARD[0, 0])):
+                    or extent_back > -FORWARD[0, 0]):
                 return False
             forward = FORWARD * c + RIGHT * s
             right = -FORWARD * s + RIGHT * c
@@ -328,10 +331,6 @@ class ActiveScan:
             swept |= outside_f**2 + outside_r**2 <= slack**2
         if (occupied & swept).any():
             return False
-        if self.receipt_only:
-            # Report no-hit only when this is a usable front projection.
-            # A rejected fit returns an all-unknown grid.
-            return bool((free & (FORWARD > 0)).any())
         return bool(free[swept & ~initial].all())
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):

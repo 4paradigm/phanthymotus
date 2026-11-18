@@ -92,6 +92,8 @@ AVOIDANCE_MAX_TRANSLATION_MPS = 0.18
 
 # Longitudinal separation for identifying a foreground obstacle and resuming.
 FORWARD_CLEARANCE_MARGIN_M = 0.15
+SIDE_SWITCH_ADVANTAGE_M = 0.15
+SIDE_SWITCH_FRAMES = 3
 
 
 @dataclass
@@ -328,6 +330,10 @@ class Config:
     # copy is a copy that goes stale. See `adopt_limits`.
     floor_vx: float = 0.0
     floor_vy: float = 0.0
+    floor_vx_moving: float | None = None
+    floor_vy_moving: float | None = None
+    right_vy_limit: float | None = None
+    scan_wz_limit: float | None = None
     floor_wz: float = 0.0
     # **The yaw floor while the robot is already translating**, which on a
     # legged robot is a different number entirely: a gait cycle that is running
@@ -430,7 +436,7 @@ class ClearanceRecovery:
     last_frame: object = None
 
     def scale(self, route, depth, max_age_ms):
-        frame = depth.get("frame_id")
+        frame = depth.get("source_frame_id", depth.get("frame_id"))
         if frame is None:
             # Pure-policy callers can supply an unstamped depth map.
             frame = depth["map"] if depth.get("map") is not None else depth
@@ -460,6 +466,8 @@ class State:
     # sidestep nobody asked for.
     vy_gate: Gate = field(default_factory=Gate)
     escape_side: float = 0.0
+    side_compare_frame: int | None = None
+    side_better_frames: int = 0
     local_plan: PlanCache = field(default_factory=PlanCache)
     active_scan: ActiveScan = field(default_factory=ActiveScan)
     recovery: ClearanceRecovery | None = None
@@ -484,6 +492,7 @@ class State:
     avoidance_yaw_override: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
+    close_sample_gap_s: float = 0.0
     idle_for_s: float = 0.0
     arrived: bool = False
     blocked_for_s: float = 0.0
@@ -692,6 +701,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         notes.append(f"观测有效期已按下游准入上限收紧到 {max_age:g}ms")
     limits = (descriptor or {}).get("limits") or {}
     floors = list(limits.get("min_magnitude") or [])
+    moving_floors = list(limits.get("min_magnitude_moving") or [])
     lower = list(limits.get("lower") or [])
     upper = list(limits.get("upper") or [])
 
@@ -705,7 +715,8 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
 
     def at(row, index):
         try:
-            return abs(float(row[index]))
+            value = abs(float(row[index]))
+            return value if math.isfinite(value) else None
         except (IndexError, TypeError, ValueError):
             return None
 
@@ -714,6 +725,14 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             return float(row[index])
         except (IndexError, TypeError, ValueError):
             return None
+
+    config.floor_vx_moving = at(moving_floors, 0)
+    config.floor_vy_moving = at(moving_floors, 1)
+    right_vy = signed_at(lower, 1)
+    config.right_vy_limit = max(0., -right_vy) if right_vy is not None else None
+    wz_lower, wz_upper = signed_at(lower, 5), signed_at(upper, 5)
+    config.scan_wz_limit = (max(0., min(-wz_lower, wz_upper))
+                            if wz_lower is not None and wz_upper is not None else None)
 
     # The three twist axes this policy drives, by their index in the six-wide
     # vector. vz/wx/wy are not here because nothing here produces them.
@@ -727,7 +746,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             # The moving floor is optional: a chassis that does not declare one
             # keeps the standing floor everywhere, which is the old behaviour
             # and errs towards commanding too much rather than too little.
-            moving = at(list(limits.get("min_magnitude_moving") or []), 5)
+            moving = at(moving_floors, 5)
             config.floor_wz_moving = floor if moving is None else moving
             if moving is not None and moving < floor:
                 notes.append(
@@ -894,9 +913,8 @@ def target_distance(obj, depth, config: Config) -> float | None:
         if bbox:
             return depth_mod.sample_box(depth["map"], bbox)
         return depth_mod.sample_point(depth["map"], obj.get("position") or [0, 0])
-    # Summary-only: the best available is the band the target sits in, which is
-    # the nearest obstacle there and not the target itself. Usable for "am I
-    # about to arrive", misleading for anything finer.
+    # Summary-only gives the nearest obstacle in the target's band. It can
+    # constrain motion but cannot confirm the distance to the target.
     bands = depth.get("bands") or {}
     return bands.get(_band_of(_bearing(obj)))
 
@@ -1017,6 +1035,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if not state.target:
         return Decision(None, IDLE, "no navigation target")
 
+    stale_capture = bool((depth or {}).get("capture_invalid"))
+    if stale_capture:
+        depth = None
+    state.close_sample_gap_s += dt
+    if state.close_sample_gap_s > config.max_obs_age_ms / 1000:
+        state.close_for_s = 0.0
+
     # The tracker runs **before** the blind check, so a spell with no
     # observation is a run of misses rather than time that did not happen. It
     # is also the only way the coast clock advances while the card is blind —
@@ -1052,7 +1077,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 return Decision(_twist(0, 0, 0), AVOIDING, command.reason)
             if not scan.ready:
                 command = scan.command(geometry, _keepout_m(config),
-                                       min(config.wz_max, scan.max_yaw_rate), config.watchdog_ms,
+                                       _scan_yaw_rate(config, scan), config.watchdog_ms,
                                        config.max_obs_age_ms)
                 return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and (track is None or not track.observed):
@@ -1062,6 +1087,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if detections is None or depth is None:
         if state.recovery is not None:
             state.recovery = ClearanceRecovery()
+        if stale_capture:
+            return Decision(_twist(0., 0., 0.), BLIND, "深度采集时间已过期或无效；保持停车")
         missing = "vop / depth"
         if detections is not None:
             missing = "depth"
@@ -1109,9 +1136,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
     raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m
-    if within:
-        state.close_for_s += dt
-    else:
+    measured = track.measured_range_m
+    measured_within = measured is not None and measured <= config.arrival_distance_m
+    if measured_within and within:
+        state.close_for_s += state.close_sample_gap_s if state.close_for_s else dt
+        state.close_sample_gap_s = 0.0
+    elif measured is not None or not within:
         state.close_for_s = 0.0
 
     # Arrived: in position and roughly facing it — or turning in place for long
@@ -1129,14 +1159,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # declare the journey over, so arrival needs a live fix. Without one the
     # code below falls through to the obstacle logic, which will stop for the
     # thing that is actually there and say so.
-    if within and live and (abs(bearing) <= config.arrive_align_tol
-                            or state.close_for_s >= config.arrive_patience_s):
+    if within and live and measured_within and (abs(bearing) <= config.arrive_align_tol
+                                               or state.close_for_s >= config.arrive_patience_s):
         state.arrived = True
         # One explicit zero before going quiet, so the chassis stops on a
         # command rather than on a watchdog timeout — arriving is a success and
         # should not look like a dropped link in the driver's log.
         return Decision(_twist(0.0, 0.0, 0.0), ARRIVED,
-                        f"target at {distance:.2f} m, stop distance reached"
+                        f"target at {measured:.2f} m, stop distance reached"
                         + f" (threshold {config.arrival_distance_m:.2f} m = "
                           f"{config.stop_distance_m:.2f} m + "
                           f"{config.stop_tolerance_m:.2f} m tolerance)"
@@ -1144,7 +1174,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
                            f" (still {bearing:+.2f} off-centre after "
                            f"{state.close_for_s:.1f}s in range; not waiting to "
                            f"align — see arrive_patience_s)"),
-                        distance_m=distance, bearing=bearing)
+                        distance_m=measured, bearing=bearing)
+
+    if within and depth.get("map") is None:
+        return Decision(_twist(0., 0., 0.), AVOIDING, "深度摘要显示近障，等待目标测距确认")
 
     # Forward speed scales continuously with alignment rather than switching.
     #
@@ -1478,12 +1511,59 @@ def _can_turn_after_stop(depth, config: Config, state: State) -> bool:
     if coverage < config.coverage_min or (ahead is not None and ahead <= config.obstacle_stop_m):
         state.recovery = ClearanceRecovery()
         return False
+    if config.local_planning and ahead is not None and ahead < config.slow_distance_m:
+        # A search turn must not substitute for a checked detour near an obstacle.
+        return False
     if state.recovery is None:
         return True
     if ahead is None or ahead < config.slow_distance_m or coverage < config.coverage_full:
         state.recovery = ClearanceRecovery()
         return False
     return state.recovery.scale("turn", depth, config.max_obs_age_ms) > 0
+
+
+def _local_side_order(rooms, config, state, frame):
+    priority = {
+        side: (coverage >= config.coverage_min,
+               room if room is not None else
+               (math.inf if coverage >= config.coverage_min else -math.inf),
+               coverage)
+        for side, (room, coverage) in rooms.items()
+    }
+    preferred = max(rooms, key=priority.__getitem__)
+    if state is None or state.escape_side not in rooms:
+        return preferred, -preferred
+
+    incumbent = state.escape_side
+    challenger = -incumbent
+    measured, room, _ = priority[challenger]
+    current_measured, current_room, _ = priority[incumbent]
+    better = measured and (not current_measured or room > current_room + SIDE_SWITCH_ADVANTAGE_M)
+    if not better or type(frame) is not int:
+        state.side_better_frames = 0
+    if type(frame) is int and frame != state.side_compare_frame:
+        previous = state.side_compare_frame
+        if previous is None or not 0 < frame - previous <= config.max_obs_age_ms:
+            state.side_better_frames = 0
+        state.side_compare_frame = frame
+        state.side_better_frames += int(better)
+    if state.side_better_frames >= SIDE_SWITCH_FRAMES:
+        return challenger, incumbent
+    return incumbent, challenger
+
+
+def _scan_yaw_rate(config, scan):
+    rate = min(config.wz_max, scan.max_yaw_rate)
+    return rate if config.scan_wz_limit is None else min(rate, config.scan_wz_limit)
+
+
+def _local_velocity_limits(config, side):
+    floor_x = config.floor_vx if config.floor_vx_moving is None else config.floor_vx_moving
+    floor_y = config.floor_vy if config.floor_vy_moving is None else config.floor_vy_moving
+    limit_y = config.vy_max
+    if side > 0 and config.right_vy_limit is not None:
+        limit_y = min(limit_y, config.right_vy_limit)
+    return (floor_x, config.vx_max), (floor_y, limit_y)
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
@@ -1502,6 +1582,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         if state is not None:
             state.recovery = ClearanceRecovery()
             state.escape_side = 0.0
+            state.side_better_frames = 0
             state.active_scan.clear_frames = 0
         return (0.0, 0.0, 0.0, AVOIDING,
                 f"正前方只有 {coverage * 100:.0f}% 的深度有效，看不清就不往前走"
@@ -1540,25 +1621,18 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
         if config.local_planning:
-            # Side corridor readings only order the footprint-checked routes.
-            priority = {}
-            for candidate, (room, cov) in rooms.items():
-                measured = cov >= config.coverage_min
-                if room is None:
-                    room = math.inf if measured else -math.inf
-                priority[candidate] = (measured, room, cov, state is not None
-                                       and state.escape_side == candidate)
-            order = tuple(sorted(rooms, key=priority.__getitem__, reverse=True))
+            order = _local_side_order(rooms, config, state,
+                                      depth.get("source_frame_id", depth.get("frame_id")))
             if scan is not None:
                 scan.clear_frames = 0
-            planning_depth = depth
+            planning_depth = dict(depth, allow_forward=not near and aligned)
             if (scan is not None and not scan.receipt_only and scan.current_frame
                     and (scan.ready or scan.has_result)):
-                planning_depth = dict(depth, scan_grid=scan.grid(),
+                planning_depth = dict(planning_depth, scan_grid=scan.grid(),
                                       scan_revision=scan.poses[-1][0])
             for candidate in order:
                 command = _local_translation(planning_depth, config, state, odom, ahead, candidate)
-                if command is not None and (not near or command[0] <= 0):
+                if command is not None and (planning_depth["allow_forward"] or command[0] <= 0):
                     side, local_command = candidate, command
                     break
             if scan is not None and scan.ready:
@@ -1571,11 +1645,12 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             if local_command is None:
                 if state is not None:
                     state.escape_side = 0.0
+                    state.side_better_frames = 0
                     state.recovery = ClearanceRecovery()
                 if (scan is not None and may_scan and foreground and not near and config.use_lateral
                         and (not scan.receipt_only or coverage >= config.coverage_full)
-                        and 0 <= config.floor_wz <= min(config.wz_max, scan.max_yaw_rate)
-                        and config.wz_max > 0 and scan.begin(order)):
+                        and config.floor_wz <= _scan_yaw_rate(config, scan)
+                        and _scan_yaw_rate(config, scan) > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
@@ -1633,6 +1708,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     vx = _scaled(vx, scale, config.floor_vx, config.vx_max)
     vy = _scaled(vy, scale, config.floor_vy, config.vy_max)
     if state is not None:
+        if side != state.escape_side:
+            state.side_better_frames = 0
+            state.side_compare_frame = depth.get("source_frame_id", depth.get("frame_id"))
         state.escape_side = side
     if local_command is not None:
         vx, vy = local_command
@@ -1694,8 +1772,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         gain = state.recovery.scale(route, depth, config.max_obs_age_ms)
         if gain == 0:
             return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待连续新深度帧确认通道"
-        vx = _scaled(vx, gain, config.floor_vx, config.vx_max)
-        vy = _scaled(vy, gain, config.floor_vy, config.vy_max)
+        if local_command is not None:
+            vx, vy = vx * gain, vy * gain
+            (floor_x, _), (floor_y, _) = _local_velocity_limits(config, side)
+            if ((vx and abs(vx) < floor_x) or (vy and abs(vy) < floor_y)):
+                return 0.0, 0.0, 0.0, AVOIDING, "安全速度低于底盘可执行范围；保持停车"
+        else:
+            vx = _scaled(vx, gain, config.floor_vx, config.vx_max)
+            vy = _scaled(vy, gain, config.floor_vy, config.vy_max)
         wz *= gain
         if gain == 1 and not near:
             state.recovery = None
@@ -1703,26 +1787,36 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
 
 
 def _local_translation(depth, config, state, odom, ahead, side):
-    if state is None or odom is None or not config.use_lateral:
+    if state is None or odom is None or not config.use_lateral or depth.get("capture_invalid"):
         return None
     measured = tuple(odom.get(axis) for axis in ("vx", "vy", "wz"))
     if any(v is None or not math.isfinite(v) for v in measured):
         return None
     measured_vx, measured_vy, measured_wz = measured
-    if math.hypot(measured_vx, measured_vy) > .12 or abs(measured_wz) > .04:
+    if math.hypot(measured_vx, measured_vy) > .12 or abs(measured_wz) > .02:
+        return None
+    allow_forward = depth.get("allow_forward", True)
+    if not allow_forward and abs(measured_vx) > .03:
         return None
     if measured_vy * side > .06:
         return None
     geometry = config.scan_geometry if "scan_grid" in depth else config.local_geometry
+    limits = _local_velocity_limits(config, side)
     command = state.local_plan.translation(depth, geometry,
                                            _keepout_m(config), ahead, side, config.max_obs_age_ms,
-                                           config.watchdog_ms)
+                                           config.watchdog_ms,
+                                           allow_forward=allow_forward,
+                                           velocity_limits=limits)
     if command is None:
         return None
     vx, vy = command
-    if not (config.floor_vx <= abs(vx) <= config.vx_max or vx == 0):
+    (floor_x, limit_x), (floor_y, limit_y) = limits
+    if not (floor_x <= abs(vx) <= limit_x or vx == 0):
         return None
-    if not (vy == 0 or config.floor_vy <= abs(vy) <= config.vy_max):
+    if not (vy == 0 or floor_y <= abs(vy) <= limit_y):
+        return None
+    speed = math.hypot(vx, vy)
+    if speed and abs(measured_vx * vy - measured_vy * vx) / speed > .04:
         return None
     return (vx, vy)
 

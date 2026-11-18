@@ -204,33 +204,36 @@ class PlanCache:
     key: tuple | None = None
     commands: dict[float, tuple[float, float] | None] = field(default_factory=dict)
 
-    def translation(self, observation, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300):
+    def translation(self, observation, geometry, half_width, ahead, side, max_age_ms,
+                    watchdog_ms=300, *, allow_forward=True, velocity_limits=None):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
             return None
-        key = (frame, round(ahead, 2), max_age_ms, watchdog_ms, observation.get("scan_revision"))
+        key = (frame, round(ahead, 2), max_age_ms, watchdog_ms, observation.get("scan_revision"),
+               allow_forward, velocity_limits)
         if self.key != key:
             self.key = key
             self.commands.clear()
         if side not in self.commands:
             scan_grid = observation.get("scan_grid")
-            options = {"observed_grid": scan_grid} if scan_grid is not None else {}
             self.commands[side] = _checked_translation(
                 observation["map"], ground, geometry, half_width, ahead, side, max_age_ms,
-                watchdog_ms, **options)
+                watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward,
+                velocity_limits=velocity_limits)
         return self.commands[side]
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
-                         watchdog_ms=300, *, observed_grid=None):
+                         watchdog_ms=300, *, observed_grid=None, allow_forward=True,
+                         velocity_limits=None):
     resolution = RESOLUTION
     row_zero, col_zero = START
     right, forward = RIGHT, FORWARD
-    free, occupied = observe(frame, geometry, right, forward, resolution, ground)
-    if observed_grid is not None:
-        scan_free, scan_occupied = observed_grid
-        free, occupied = free | scan_free, occupied | scan_occupied
+    # A fused scan is expressed at the current pose. Mixing in the original
+    # exposure a second time would mark cells free at an outdated pose.
+    free, occupied = (observe(frame, geometry, right, forward, resolution, ground)
+                      if observed_grid is None else observed_grid)
     if side < 0:
         free, occupied = free[:, ::-1], occupied[:, ::-1]
     grid = np.where(occupied, OCCUPIED, np.where(free, FREE, UNKNOWN))
@@ -256,28 +259,70 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # Check every footprint against observed obstacles. The search can reach
     # the passing lane at any column outside the obstacle, and rejoin on any
     # clear centerline cell at or beyond the original rejoin distance.
-    allowed = allowed_centers(grid, start, half_cells, allow_unknown=observed_grid is None)
+    allowed = allowed_centers(grid, start, half_cells, allow_unknown=True)
     allowed[:row_zero, :] = False
     allowed[:, :col_zero] = False
-    # An additional view can confirm space to bend earlier. In that mode the
-    # entire route requires observed clearance, even after an older view ages out.
+    if not allow_forward:
+        # A near obstacle only permits starting sideways. The diagonal edge
+        # also checks this intermediate forward-only grid cell.
+        allowed[row_zero + 1, col_zero] = False
+    # An additional view can confirm space to bend earlier.
     lane_min = via[1] if observed_grid is None else col_zero + 1
     allowed[via[0]:goal[0], :lane_min] = False
     path = shortest_path(allowed, start, goal, later_goal=True)
     if path is None or len(path) < 2:
         return None
-    dr, dc = (path[1][axis] - start[axis] for axis in (0, 1))
-    if dr < 0 or dc < 0:
-        return None
-    steps = 1
-    for i, cell in enumerate(path[2:], 2):
-        if cell != (start[0] + dr * i, start[1] + dc * i):
-            break
-        steps = i
-    # Budget the visible straight prefix through a stale frame and watchdog
-    # timeout. Replanning may extend it on the next depth update.
-    norm = math.hypot(dr, dc)
-    # Leave one 50 ms sink poll for a timeout firing between polls.
+    # A geometric path may include unobserved space, but the emitted vector
+    # must fit inside a measured prefix through staleness, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
-    speed = min(.10, steps * resolution * norm / horizon_s)
-    return speed * dr / norm, -side * speed * dc / norm
+    if velocity_limits is None:
+        velocity_limits = ((0., .10), (0., .10))
+    (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
+    blocked = grid == OCCUPIED
+    unknown = grid == UNKNOWN
+    # Cell boundaries, expanded by the moving rectangle, are obstacles in
+    # centre coordinates. For unknown cells only the portion outside the
+    # original footprint is relevant. Our rays move forward and to one side.
+    half_cell = resolution / 2
+    f0, f1 = forward - half_cell, forward + half_cell
+    r0, r1 = right - half_cell, right + half_cell
+    occupied_bounds = (f0[blocked] - geometry.front, f1[blocked] + geometry.rear,
+                       r0[blocked] - half_width, r1[blocked] + half_width)
+    front = unknown & (f1 > geometry.front)
+    flank = unknown & (r1 > half_width)
+    front_bounds = (np.maximum(0., f0[front] - geometry.front), f1[front] + geometry.rear,
+                    r0[front] - half_width, r1[front] + half_width)
+    flank_bounds = (f0[flank] - geometry.front, f1[flank] + geometry.rear,
+                    np.maximum(0., r0[flank] - half_width), r1[flank] + half_width)
+    for row, col in reversed(path[1:]):
+        dr, dc = row - row_zero, col - col_zero
+        if (dr and (not allow_forward or not max_vx)) or (dc and not max_vy):
+            continue
+        norm = math.hypot(dr, dc)
+        length = resolution * norm
+        df, dx = dr / norm, dc / norm
+        # Look ahead along the path only while a straight shortcut is clear
+        # of measured obstacles. This preserves the chosen detour's progress.
+        if _ray_entry(df, dx, occupied_bounds) <= length:
+            continue
+        clear = min(length,
+                    _ray_entry(df, dx, front_bounds) - 1e-6 if df else math.inf,
+                    _ray_entry(df, dx, flank_bounds) - 1e-6 if dx else math.inf)
+        speed = min(.10, clear / horizon_s,
+                    max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
+        vx, vy = speed * df, speed * dx
+        if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
+            return vx, -side * vy
+    return None
+
+
+def _ray_entry(df, dx, bounds):
+    """Return distance along the ray to the first intersected rectangle."""
+    f0, f1, r0, r1 = bounds
+    if not df:
+        return r0[(f0 <= 0.) & (f1 >= 0.) & (r1 >= 0.)].clip(min=0.).min(initial=math.inf)
+    if not dx:
+        return f0[(r0 <= 0.) & (r1 >= 0.) & (f1 >= 0.)].clip(min=0.).min(initial=math.inf)
+    enter = np.maximum(0., np.maximum(f0 / df, r0 / dx))
+    leave = np.minimum(f1 / df, r1 / dx)
+    return enter[enter <= leave].min(initial=math.inf)

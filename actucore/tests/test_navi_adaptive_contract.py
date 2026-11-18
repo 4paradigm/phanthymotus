@@ -16,7 +16,7 @@ def feed(card, distance, bearing=0.0):
     card._depth_map = _solid_depth(distance)
     card._depth_bands = {name: distance for name in ("left", "center", "right")}
     card._objects_ms = card._depth_ms = int(now * 1000)
-    card._last_tick = now - 0.1
+    card._last_tick = time.monotonic() - 0.1
     return card.next_command()
 
 

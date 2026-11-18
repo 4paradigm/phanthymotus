@@ -336,6 +336,32 @@ def test_default_tolerance_is_five_centimetres():
     assert decision.status == P.ARRIVED
 
 
+def test_repeated_detection_cannot_confirm_arrival_from_commanded_advance():
+    state = seed(_state(), _detections(_obj()), _depth(map_=_solid_depth(.95)))
+    detections = _detections(_obj())
+    depth = _depth(map_=_solid_depth(.95))
+    _step(detections=detections, depth=depth, state=state)
+    for _ in range(4):
+        state.commanded = (.4, 0., 0.)
+        result = _step(detections=detections, depth=depth, state=state)
+        assert result.status != P.ARRIVED
+    assert state.tracker.track.range_m < P.Config().arrival_distance_m
+
+
+def test_fresh_detection_with_invalid_target_depth_cannot_confirm_arrival():
+    state = seed(_state(), _detections(_obj()), _depth(map_=_solid_depth(.80)))
+    result = _step(detections=_detections(_obj()), state=state,
+                   depth=_depth(map_=np.full((480, 640), np.nan)))
+    assert result.status != P.ARRIVED
+
+
+def test_reported_stale_capture_holds_even_with_fresh_detection():
+    state = seed(_state(), _detections(_obj()), _depth(map_=_solid_depth(2.5)))
+    depth = dict(_depth(map_=_solid_depth(2.5)), capture_invalid=True)
+    result = _step(detections=_detections(_obj()), depth=depth, state=state)
+    assert result.status == P.BLIND and result.values == [0.] * 6
+
+
 def test_explicit_zero_tolerance_keeps_the_nominal_distance_threshold():
     config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.0)
     decision = _step(detections=_detections(_obj()),
@@ -529,17 +555,11 @@ def test_with_no_usable_side_it_stops_instead_of_spinning_towards_a_band():
 
 
 def test_the_summary_only_path_cannot_separate_target_from_obstacle():
-    """The documented cost of wiring only the depth summary.
-
-    With no map, the target's distance is the nearest reading in its band —
-    which is the nearest *obstacle* there, not the target. When something is
-    inside the stop distance the card therefore reports arrival rather than
-    avoidance. Pinned so the degradation is a known property rather than a
-    surprise, and so `info()`'s warning about it keeps earning its place.
-    """
+    """A band reading is enough to stop but cannot confirm the target range."""
     decision = _step(detections=_detections(_obj(x=0.0)),
                      depth=_depth({"left": 5.0, "center": 0.4, "right": 5.0}))
-    assert decision.status == P.ARRIVED
+    assert decision.status == P.AVOIDING
+    assert decision.values == [0.] * 6
 
 
 def test_unknown_bands_do_not_invent_an_obstacle():
@@ -2488,3 +2508,74 @@ def test_local_planner_tries_other_side_if_preferred_route_would_advance_near_ob
     assert attempts == [1.0, -1.0]
     assert command[:3] == (0.0, .06, 0.0)
     assert state.escape_side == -1.0
+
+
+def test_local_planner_holds_side_through_centimetre_noise_and_switches_if_blocked(monkeypatch):
+    cfg, state = _cfg(local_planning=True), _state()
+    rooms = {-1.: 2., 1.: 2.01}
+    blocked = set()
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        rooms[np.sign(lateral_offset_m)] if lateral_offset_m else .9, 1.0))
+    monkeypatch.setattr(P, "_local_translation", lambda depth, config, state, odom, ahead, side:
+                        None if side in blocked else (0., -.06 * side))
+
+    def step(frame):
+        return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
+                        P.AVOIDING, "", state, target_distance=2.8)[1]
+
+    assert step(100) < 0
+    for frame in range(200, 800, 100):
+        rooms[-1.], rooms[1.] = rooms[1.], rooms[-1.]
+        assert step(frame) < 0
+    blocked.add(1.)
+    assert step(800) > 0
+
+
+def test_local_planner_requires_distinct_frames_before_switching_for_more_space(monkeypatch):
+    cfg, state = _cfg(local_planning=True), _state(escape_side=1.)
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.3 if lateral_offset_m < 0 else 2.0 if lateral_offset_m > 0 else .9, 1.0))
+    monkeypatch.setattr(P, "_local_translation", lambda depth, config, state, odom, ahead, side:
+                        (0., -.06 * side))
+
+    def step(frame):
+        return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
+                        P.AVOIDING, "", state, target_distance=2.8)[1]
+
+    assert all(step(100) < 0 for _ in range(5))
+    assert step(200) < 0
+    assert step(300) > 0
+
+
+def test_local_recovery_keeps_its_checked_direction_or_holds_below_driver_floor(monkeypatch):
+    cfg = _cfg(local_planning=True, floor_vx=.04, floor_vy=.04)
+    state = _state(escape_side=1., recovery=P.ClearanceRecovery("right", 2, 100))
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.1 if lateral_offset_m > 0 else 2.0 if lateral_offset_m < 0 else .9, 1.0))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: (.063, -.077))
+
+    def step(frame):
+        return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
+                        P.AVOIDING, "", state, target_distance=2.8)[:3]
+
+    assert step(200) == (0., 0., 0.)
+    assert step(300) == pytest.approx((.042, -.077 * 2 / 3, 0.))
+
+
+def test_local_command_respects_moving_floors_and_the_signed_driver_bounds():
+    cfg = _cfg(local_planning=True)
+    P.adopt_limits(cfg, {"limits": {"lower": [-.3, -.03, 0., 0., 0., -.08],
+                                   "upper": [.3, .2, 0., 0., 0., .4],
+                                   "min_magnitude": [.04, 0., 0., 0., 0., 0.],
+                                   "min_magnitude_moving": [.06, .05, 0., 0., 0., 0.]}})
+    assert P._local_velocity_limits(cfg, 1.) == ((.06, .3), (.05, .03))
+    assert P._local_velocity_limits(cfg, -1.) == ((.06, .3), (.05, .2))
+    assert P._scan_yaw_rate(cfg, P.ActiveScan()) == .08
+
+
+@pytest.mark.parametrize("odom", [{"vx": 0., "vy": -.05, "wz": 0.},
+                                  {"vx": 0., "vy": 0., "wz": .035}])
+def test_local_prefix_waits_for_motion_off_its_checked_axis(monkeypatch, odom):
+    state = _state()
+    monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: (.08, 0.))
+    assert P._local_translation({}, _cfg(local_planning=True), state, odom, .9, 1.) is None
