@@ -1332,7 +1332,8 @@ def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
                               half_fov_rad=config.half_fov_rad,
                               reference_m=config.obstacle_stop_m,
                               lateral_offset_m=lateral_offset_m,
-                              intrinsics=config.depth_intrinsics)
+                              intrinsics=config.depth_intrinsics,
+                              ground=depth.get("ground"))
 
 
 def _may_strafe(towards_right: bool, depth, config: Config) -> bool:

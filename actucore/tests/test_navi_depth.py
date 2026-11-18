@@ -274,3 +274,77 @@ def test_the_offset_corridor_is_the_space_a_sidestep_moves_into():
     assert _corridor(depth_map, lateral_offset_m=-0.33)[0] == pytest.approx(5.0)
 
 
+
+
+def _floor_scene():
+    # Camera looks slightly down at a floor 42 cm below it.
+    row_tangent = (np.arange(D.HEIGHT) - 243.2) / 420.0
+    floor_range = 0.42 / np.maximum(row_tangent - 0.02, 0.001)
+    return np.broadcast_to(np.minimum(floor_range, 4.0)[:, None],
+                           (D.HEIGHT, D.WIDTH)).astype(np.float32).copy()
+
+
+def test_ground_is_excluded_from_obstacle_distance_but_retains_coverage():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    camera = HorizontalIntrinsics(640, 315, 337)
+    frame = _floor_scene()
+    unfiltered, coverage = _corridor(frame, intrinsics=camera)
+    ground = D.ground_mask(frame, camera, (480, 420, 243.2))
+    filtered, filtered_coverage = _corridor(frame, intrinsics=camera, ground=ground)
+    assert unfiltered < 1.5
+    assert ground is not None and ground[404, 320]
+    assert filtered > 1.5
+    assert filtered_coverage == coverage
+
+
+def test_ground_filter_preserves_raised_obstacles_and_rejects_a_wall():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    camera = HorizontalIntrinsics(640, 315, 337)
+    vertical = (480, 420, 243.2)
+    frame = _floor_scene()
+    # The top is 8 cm above the floor, in the bottom of the obstacle region.
+    frame[381:408, 170:470] = 1.02
+    ground = D.ground_mask(frame, camera, vertical)
+    assert ground is not None and not ground[392, 320]
+    assert _corridor(frame, intrinsics=camera, ground=ground)[0] < 1.5
+    assert D.ground_mask(np.full_like(frame, 0.55), camera, vertical) is None
+    frame[407:, :320] = np.nan
+    assert D.ground_mask(frame, camera, vertical) is None
+
+
+def test_ground_mask_keeps_a_surface_two_centimetres_above_the_floor():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[380:408, 160:480] *= 0.4 / 0.42
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+    assert ground is not None
+    assert not ground[380:408, 160:480].any()
+
+
+def test_a_broad_raised_platform_does_not_replace_the_floor():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    # A raised horizontal surface spans the whole fitting band, but the
+    # visible floor in the distance lies on a different plane.
+    frame[355:] *= 0.34 / 0.42
+    camera = HorizontalIntrinsics(640, 315, 337)
+    assert D.ground_mask(frame, camera, (480, 420, 243.2)) is None
+
+
+def test_floor_only_corridor_reports_its_observed_free_extent():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    row_tangent = (np.arange(D.HEIGHT) - 243.2) / 420.0
+    ground_depth = 0.55 / np.maximum(row_tangent + 0.23, 0.001)
+    frame = np.broadcast_to(ground_depth[:, None], (D.HEIGHT, D.WIDTH)).astype(np.float32)
+    frame[ground_depth > 12] = np.nan
+    camera = HorizontalIntrinsics(640, 315, 337)
+    ground = D.ground_mask(frame, camera, (480, 420, 243.2))
+    assert ground is not None
+    clearance, coverage = _corridor(frame, intrinsics=camera, ground=ground)
+    assert clearance is not None and clearance > 0.95
+    assert coverage > 0.9

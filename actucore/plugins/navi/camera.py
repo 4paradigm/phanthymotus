@@ -84,6 +84,26 @@ def horizontal_intrinsics(declaration: dict) -> HorizontalIntrinsics | None:
     return HorizontalIntrinsics(width, fx, cx)
 
 
+def vertical_intrinsics(declaration: dict) -> tuple[int, float, float] | None:
+    """Read the vertical axis of the rectified depth camera calibration."""
+    if horizontal_intrinsics(declaration) is None:
+        return None
+    height = declaration.get("height")
+    k = declaration["K"]
+    if type(height) is not int or height <= 0 or k[3] != 0:
+        return None
+    fy, cy = k[4], k[5]
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (fy, cy)):
+        return None
+    try:
+        fy, cy = float(fy), float(cy)
+    except OverflowError:
+        return None
+    if not (0 < fy < math.inf and 0 <= cy < height and math.isfinite(height / fy)):
+        return None
+    return height, fy, cy
+
+
 def half_fov(declaration: dict) -> tuple:
     """`(half_fov_rad, source)` for the horizontal axis, or `(None, reason)`.
 

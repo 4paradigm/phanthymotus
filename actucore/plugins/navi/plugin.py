@@ -187,6 +187,8 @@ class NaviPlugin:
         from collections import deque
         self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
+        self._depth_ground = None
+        self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
         self._odom = None
@@ -474,6 +476,8 @@ class NaviPlugin:
 
         with self._obs_lock:
             self._depth_map = None
+            self._depth_ground = None
+            self._depth_vertical = None
             self._depth_bands = {}
             self._depth_ms = 0
 
@@ -603,7 +607,7 @@ class NaviPlugin:
         depth has always been available and would produce confidently wrong
         distances. Now that both sides declare an `id`, it is a comparison.
         """
-        from .camera import camera_id, for_topic, horizontal_intrinsics
+        from .camera import camera_id, for_topic, horizontal_intrinsics, vertical_intrinsics
 
         depth_topic = binding.get("depth_map") or binding.get("depth_summary")
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
@@ -612,6 +616,10 @@ class NaviPlugin:
                                          if binding.get("depth_map") else None)
         if depth_decl and binding.get("depth_map") and self._config.depth_intrinsics is None:
             self._camera_notes.append("深度图缺少可用针孔内参 fx/cx，避障走廊按画面中心和水平视场角估算")
+        if binding.get("depth_map"):
+            self._depth_vertical = vertical_intrinsics(depth_decl)
+            if self._depth_vertical is None:
+                self._camera_notes.append("深度图缺少完整针孔内参，沿用原始深度判断障碍")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,
@@ -1426,10 +1434,18 @@ class NaviPlugin:
             self._image_ms = int(time.time() * 1000)
 
     def _set_depth_map(self, depth):
+        received_ms = int(time.time() * 1000)
+        horizontal = self._config.depth_intrinsics
+        vertical = self._depth_vertical
+        ground = None
+        if horizontal is not None and vertical is not None:
+            ground = depth_mod.ground_mask(depth, horizontal, vertical)
+        bands = depth_mod.nearest_by_band(depth)
         with self._obs_lock:
             self._depth_map = depth
-            self._depth_bands = depth_mod.nearest_by_band(depth)
-            self._depth_ms = int(time.time() * 1000)
+            self._depth_ground = ground
+            self._depth_bands = bands
+            self._depth_ms = received_ms
 
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
@@ -1479,6 +1495,8 @@ class NaviPlugin:
             fresh_depth = now - self._depth_ms <= max_age
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
                       "frame_id": self._depth_ms} if fresh_depth else None)
+            if depth is not None and self._depth_ground is not None:
+                depth["ground"] = self._depth_ground
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)

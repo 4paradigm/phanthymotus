@@ -169,13 +169,75 @@ def bands_from_summary(summary: dict) -> dict:
 # ── the corridor: what the robot will actually drive through ─────────────────
 
 
+_GROUND_TOLERANCE_M = 0.025
+
+
+def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
+    """Identify a broadly supported floor in this rectified optical depth frame.
+
+    Fit Y = a*X + b*Z + c from below the obstacle crop. The camera coordinates
+    have positive Y down. A plausible floor is below the camera, roughly
+    horizontal, and has support both across the image and along depth.
+    """
+    height, width = depth_m.shape
+    fx, cx = horizontal.for_width(width)
+    source_height, fy, cy = vertical
+    scale = height / source_height
+    fy, cy = fy * scale, (cy + 0.5) * scale - 0.5
+    u = (np.arange(width) - cx) / fx
+    v = (np.arange(height) - cy) / fy
+
+    bottom = slice(int(height * OBSTACLE_ROW_SPAN[1]), height, 4)
+    columns = slice(width // 16, width - width // 16, 4)
+    seed = depth_m[bottom, columns]
+    valid = np.isfinite(seed) & (seed > 0.10) & (seed < 4.0)
+    if valid.mean() < 0.8:
+        return None
+    x = (u[columns][None, :] * seed)[valid]
+    y = (v[bottom][:, None] * seed)[valid]
+    z = seed[valid]
+    points = np.column_stack((x, z, np.ones_like(z)))
+
+    inliers = np.ones(len(z), dtype=bool)
+    if not (np.isfinite(points).all() and np.isfinite(y).all()):
+        return None
+    for tolerance in (0.05, _GROUND_TOLERANCE_M, _GROUND_TOLERANCE_M):
+        try:
+            a, b, c = np.linalg.lstsq(points[inliers], y[inliers], rcond=None)[0]
+        except np.linalg.LinAlgError:
+            return None
+        inliers = np.abs(a * x + b * z + c - y) <= tolerance
+        if inliers.sum() < 0.8 * seed.size:
+            return None
+    if not (0.15 <= c <= 2.0 and np.hypot(a, b) <= 0.5):
+        return None
+    near, far = np.percentile(z[inliers], [10, 90])
+    if far - near < 0.1:
+        return None
+    support = np.zeros_like(valid)
+    support[valid] = inliers
+    if any(part.mean() < 0.65 for part in np.array_split(support, 3, axis=1)):
+        return None
+
+    distance = (v[:, None] - a * u[None, :] - b) * depth_m - c
+    # Be stricter above the plane to retain low obstacles.
+    ground = (distance >= -0.015) & (distance <= _GROUND_TOLERANCE_M)
+    # Verify the fit farther into the scene. A raised platform can occupy the
+    # entire bottom band and still fit a wide, nearly horizontal plane.
+    farther = ground[int(height * 0.69):int(height * 0.7375), columns]
+    thirds = np.array_split(farther, 3, axis=1)
+    if sum(part.mean() >= 0.06 for part in thirds) < 2:
+        return None
+    return ground
+
+
 def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
              reference_m: float, lateral_offset_m: float = 0.0,
-             intrinsics=None):
+             intrinsics=None, ground=None):
     """Nearest obstacle inside a metric corridor, and how much of it was measured.
 
-    Returns `(clearance_m | None, coverage)`. `clearance_m` is None when nothing
-    valid falls inside the corridor; `coverage` is the fraction of the frame
+    Returns `(clearance_m | None, coverage)`. With floor returns only, clearance
+    is bounded by their observed depth across the corridor. `coverage` is the fraction of the frame
     region the corridor occupies at `reference_m` that carries a real reading.
 
     ── why this exists, and why `nearest_by_band` is not enough ─────────────
@@ -234,9 +296,27 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     lateral = tangent[None, :] * rows
     inside = np.abs(lateral - lateral_offset_m) <= half_width_m
     valid = inside & np.isfinite(rows)
+    # Ground returns still contribute to depth coverage. Holes remain unknown.
+    if ground is not None:
+        valid &= ~ground[top:bottom]
     samples = rows[valid]
     clearance = (round(float(np.percentile(samples, OBSTACLE_PERCENTILE)), 3)
                  if samples.size else None)
+    if clearance is None and ground is not None:
+        # If everything we saw was floor, report a conservative observed
+        # depth bound. Require floor returns across the width of the corridor.
+        floor = inside & ground[top:bottom]
+        strip_width = 2 * half_width_m / 3
+        left = lateral_offset_m - half_width_m
+        extents = []
+        for strip in range(3):
+            low = left + strip * strip_width
+            depths = rows[floor & (lateral >= low) & (lateral <= low + strip_width)]
+            if depths.size < 16:
+                break
+            extents.append(float(np.percentile(depths, 80)))
+        if len(extents) == 3:
+            clearance = round(min(extents), 3)
 
     # Coverage denominator: the columns the corridor projects onto at
     # `reference_m` — **including the part that falls outside the lens**.

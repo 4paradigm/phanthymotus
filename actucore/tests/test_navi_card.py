@@ -1407,3 +1407,27 @@ def test_summary_does_not_refresh_a_bound_depth_map():
     assert bound["depth_map"] == "/cam/visual_depth"
     assert not bound["depth_summary"]
     assert "/cam/visual_depth_summary" not in node.subscriptions
+
+
+def test_full_depth_frames_filter_floor_only_for_avoidance():
+    import numpy as np
+    from plugins.navi import depth, policy
+
+    card = _card(half_width_m=0.23)
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336.65, 0, 420, 243, 0, 0, 1])
+    assert card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding()) == ""
+    rows = (np.arange(480) - 243) / 420 - 0.02
+    floor = np.minimum(0.42 / np.maximum(rows, 0.001), 4.0).astype(np.float32)
+    frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+
+    card._set_depth_map(frame)
+    observation = card.observation()[1]
+    assert observation["map"] is frame
+    assert depth.sample_box(observation["map"], (0.4, 0.8, 0.6, 0.85)) < 1.5
+    assert policy._clearance(observation, card._config)[0] > 1.5
+
+    card._set_depth_map(np.full_like(frame, 0.55))
+    observation = card.observation()[1]
+    assert "ground" not in observation
+    assert policy._clearance(observation, card._config)[0] == 0.55
