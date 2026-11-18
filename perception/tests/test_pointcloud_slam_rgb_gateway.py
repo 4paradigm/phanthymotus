@@ -369,37 +369,39 @@ def test_saved_map_can_receive_pose_less_observations_before_any_new_external_po
         n.close(); n.destroy_node()
 
 
-def test_odom_silence_keeps_each_pending_clouds_matching_rgb(calibrated_node):
-    n=calibrated_node
-    image(n,1000)
-    assert _wait_until(lambda:n._rgb.info()['decoded']==1)
+@pytest.mark.parametrize('jpeg_first', [True, False], ids=['jpeg-before-cloud', 'jpeg-after-cloud'])
+def test_odom_silence_keeps_each_pending_clouds_matching_rgb(calibrated_node, jpeg_first):
+    n = calibrated_node
+    if jpeg_first:
+        image(n, 1000)
+        assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
     send(n)
-    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
-    for i,ms in enumerate(range(1100,1700,100),2):
-        image(n,ms)
-        assert _wait_until(lambda:n._rgb.info()['decoded']==i)
-        n._cloud(cloud(ms*1_000_000))
-    assert _wait_until(lambda:n.status()['forwarded_clouds']==5)
-    messages=published(n,'/sensor_data')[0].raw_messages[1:]
-    assert all(msg.left.data and msg.right.data for msg in messages)
-    assert [msg.left.header.stamp.nanosec for msg in messages]==[100_000_000,200_000_000,300_000_000,400_000_000]
-    assert len(n._rgb_reservations)<=n.stream.max_pending*3
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+
+    for count, ms in enumerate(range(1100, 1700, 100), 1):
+        scan = cloud(ms * 1_000_000)
+        if not jpeg_first:
+            n._cloud(scan)
+        image(n, ms)
+        assert _wait_until(lambda: n._rgb.info()['decoded'] == count + int(jpeg_first))
+        if jpeg_first:
+            n._cloud(scan)
+        # Once the odometry wait queue fills, each arrival releases its oldest
+        # scan. Let the native worker publish it before sending the next input.
+        if count > n.stream.max_pending:
+            expected = 1 + count - n.stream.max_pending
+            assert _wait_until(lambda: n.status()['forwarded_clouds'] == expected)
+
+    messages = published(n, '/sensor_data')[0].raw_messages[1:]
+    assert [msg.header.stamp.nanosec for msg in messages] == [100_000_000, 200_000_000, 300_000_000, 400_000_000]
+    assert all(msg.left.data and msg.right.data and msg.left.header.stamp == msg.header.stamp
+               and msg.right.header.stamp == msg.header.stamp for msg in messages)
+    assert n.status()['dropped_runtime_queue'] == 0
+    assert n.stream.pending_count == n.stream.max_pending
+    assert len(n._rgb_reservations) <= n.stream.max_pending * 3
     n.freeze_capture()
-    assert n.stream.pending_count==0
+    assert n.stream.pending_count == 0
     assert not n._rgb_reservations and not n._cloud_ingress
-
-
-def test_late_jpeg_decode_is_reserved_for_the_waiting_cloud(calibrated_node):
-    n=calibrated_node
-    send(n)
-    assert _wait_until(lambda:n.status()['forwarded_clouds']==1)
-    for i,ms in enumerate(range(1100,1700,100),1):
-        n._cloud(cloud(ms*1_000_000))
-        image(n,ms)
-        assert _wait_until(lambda:n._rgb.info()['decoded']==i)
-    assert _wait_until(lambda:n.status()['forwarded_clouds']==5)
-    messages=published(n,'/sensor_data')[0].raw_messages[1:]
-    assert all(msg.left.data and msg.right.data for msg in messages)
 
 
 def test_missing_native_capability_does_not_register_an_unstarted_segment(calibrated_node, monkeypatch):
