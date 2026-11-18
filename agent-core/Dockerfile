@@ -30,9 +30,9 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv
 
 WORKDIR /work
 
-COPY pyproject.toml /work/
+COPY pyproject.toml uv.lock /work/
 ENV UV_INDEX_URL=${PYPI_MIRROR}
-RUN uv lock && uv sync --no-dev --no-install-project
+RUN uv sync --locked --no-dev --no-install-project
 
 # Link system ROS2 packages into venv so sensor_msgs/rclpy are importable
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
@@ -107,4 +107,4 @@ ENV PYTHONUNBUFFERED=1
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
 EXPOSE 15678
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && uv run src/start.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && uv run --locked src/start.py"]
