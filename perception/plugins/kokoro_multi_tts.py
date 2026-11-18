@@ -481,9 +481,9 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 WORK = Path(__file__).resolve().parents[1]
 ASSETS = {
     "511": (
-        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=5a2fb90d487635e56a3b32398da548e7dcdabd39&FilePath=kokoro-multi-jp511-mixed-v15-fr.tar.gz",
-        "0093b34641945a49c9212d183eacd304d42a71c6222da47f304cb6dcddfe2d5d",
-        253769001,
+        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=32c487e8ce36ca1939cb8bd0fdf06f5a6313386e&FilePath=kokoro-multi-jp511-fp32-v16.tar.gz",
+        "10af117cbf2c0f5b65fb80c34612d006fb7871830fd97b13677f345d0177eb06",
+        332861449,
         "/models/kokoro-multi-trt-jp511",
     ),
     "61": (
