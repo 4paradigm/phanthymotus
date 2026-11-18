@@ -324,6 +324,10 @@ class ShortTermFusion:
             self.fault(error)
             raise ValueError(str(error)) from error
 
+    def _frame_silence_ns(self):
+        # The watchdog and capture-order path use the same measured cadence.
+        return max(FRAME_SILENCE_NS, min(INERTIAL_LIMIT_NS, 2*(self.input_period_ns or 0)))
+
     def status(self, now_ns):
         """Wall-clock health for watchdog/info; never judges covariance or
         resets recovery evidence, which belong to capture-time frame processing."""
@@ -331,7 +335,7 @@ class ShortTermFusion:
             self.fault('IMU stale or invalid: '+str(self.imu.reason))
         if self.filter is not None and self.state != 'lost':
             if (self.state == 'tracking' and self.last_processed_ns and
-                    now_ns-self.last_processed_ns > FRAME_SILENCE_NS):
+                    now_ns-self.last_processed_ns > self._frame_silence_ns()):
                 self.state, self.reason = 'coasting', 'camera frames delayed'
                 self._start_pause()
             if self.last_visual_wall and now_ns-self.last_visual_wall > self._bridge_budget():
@@ -343,7 +347,7 @@ class ShortTermFusion:
         if self.state != 'lost' and self.imu.status(stamp) == 'lost':
             self.fault('IMU stale or invalid: '+str(self.imu.reason))
         if self.filter is not None and self.state != 'lost':
-            if self.last_frame and stamp-self.last_frame > FRAME_SILENCE_NS:
+            if self.last_frame and stamp-self.last_frame > self._frame_silence_ns():
                 # A normal 4 Hz capture (plus jitter) is not a failed visual
                 # correction. Only actual frame silence resets evidence here;
                 # missing/rejected corrections reset it in observe_frame.
@@ -358,7 +362,11 @@ class ShortTermFusion:
 
     def _initialize(self, stamp, pose):
         self.warmup.append((stamp, deepcopy(pose)))
-        while self.warmup and stamp-self.warmup[0][0] > 700_000_000:
+        # Use the shortest measured window spanning half a second and at least
+        # three poses. A low frame rate must not force a stationary IMU to wait forever.
+        while self.warmup and stamp-self.warmup[0][0] > 1_500_000_000:
+            self.warmup.popleft()
+        while len(self.warmup) > 3 and stamp-self.warmup[1][0] >= 500_000_000:
             self.warmup.popleft()
         if len(self.warmup) < 3 or stamp-self.warmup[0][0] < 500_000_000:
             return False
@@ -366,10 +374,13 @@ class ShortTermFusion:
         if not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp:
             return False
         entries = [s for s in self.samples if first_stamp <= s[0] <= stamp]
-        if len(entries) < 20:
+        # Include the measured samples bracketing both interpolation boundaries.
+        times = np.array([s[0]-first_stamp for s in self.samples], dtype=float)
+        begin = np.searchsorted(times, 0, side='right')-1
+        end = np.searchsorted(times, stamp-first_stamp)
+        if len(entries) < 20 or np.max(np.diff(times[begin:end+1])) > MAX_IMU_GAP_NS:
             return False
         # Interpolate the independently sampled IMU at both visual boundaries.
-        times = np.array([s[0]-first_stamp for s in self.samples], dtype=float)
         values = np.array([np.r_[s[1], s[2]] for s in self.samples])
         boundaries = [np.array([np.interp(t-first_stamp, times, values[:, j]) for j in range(6)])
                       for t in (first_stamp, stamp)]

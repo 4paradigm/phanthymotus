@@ -303,6 +303,36 @@ def test_ready_auxiliary_does_not_replace_a_tracking_visual_segment(recovery, mo
     assert card.recovery['one']['restoration_attempts'] == 0
 
 
+def test_restore_keeps_visual_segment_that_starts_tracking_during_launch(recovery, monkeypatch):
+    card, args, now, seconds = recovery
+    visual = degraded_session(card, args, now, seconds, monkeypatch)
+    for _ in range(240):
+        healthy_visual_tick(visual, now, seconds, emit_visual=False)
+    visual.visual_initialization_started = seconds[0]
+    assert visual.info()['auxiliary_recovery']['status'] == 'ready'
+    assert visual.info()['status'] == 'initializing'
+    assert visual.first_tracking_at is None
+    visual.process.returncode = 0
+    create_session = module.RgbdSession
+    candidates = []
+
+    def launch(*args, **kwargs):
+        candidate = create_session(*args, **kwargs)
+        candidate.process.returncode = 0
+        candidates.append(candidate)
+        for _ in range(4):
+            healthy_visual_tick(visual, now, seconds)
+        assert visual.first_tracking_at is not None
+        return candidate
+
+    monkeypatch.setattr(module, 'RgbdSession', launch)
+    card._recover()
+
+    assert len(candidates) == 1 and candidates[0].node.destroyed
+    assert card.instances['one'][0] is visual and not visual.node.destroyed
+    assert visual.publish_output
+
+
 def test_failed_restore_keeps_visual_session_and_waits_twenty_seconds(recovery, monkeypatch):
     card, args, now, seconds = recovery
     visual = degraded_session(card, args, now, seconds, monkeypatch)

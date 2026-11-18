@@ -88,6 +88,7 @@ class EstimateGate:
         self.good = 0
         self.recover_by = None
         self.last_pose = None
+        self.last_tracking_received = self.input_resumed_at = 0
         self.loss_kind = None
         self.rejection = None
         self.recovery_policy = self.pause_context = None
@@ -97,6 +98,8 @@ class EstimateGate:
         self.result_period_ns = None
         self.result_intervals = deque(maxlen=32)
         self.anchor_info = None
+        self.uncertain_seed = None
+        self.last_verification_pose = None
         self.relocalization_points = None
         self.relocalization_deadline = self.relocalization_deadline_mono = None
         self.relocalization_failure = 'output'
@@ -127,8 +130,12 @@ class EstimateGate:
             if self.last_input and stamp > self.last_input:
                 self.input_intervals.append(stamp-self.last_input)
                 self.input_period_ns = int(np.median(self.input_intervals)) if len(self.input_intervals)>=5 else None
+            received = stamp if now_ns is None else now_ns
+            previous = getattr(self, 'last_input_received', 0)
+            if previous and received-previous > 1_500_000_000:
+                self.input_resumed_at = received
             self.last_input = stamp
-            self.last_input_received = stamp if now_ns is None else now_ns
+            self.last_input_received = received
 
     def fault(self, reason, kind='other'):
         if self.state != 'lost':
@@ -138,6 +145,8 @@ class EstimateGate:
     def degrade(self, reason, now, *, stamp=None):
         """Reject one estimate. Tracking pauses; evidence must be rebuilt."""
         self.rejection = str(reason)
+        self.uncertain_seed = None
+        self.last_verification_pose = None
         if self.state == 'lost':
             return
         if stamp is not None:
@@ -169,6 +178,14 @@ class EstimateGate:
         return {i: (p.x, p.y, p.z) for i, p in zip(ids, values)
                 if i in inliers and math.isfinite(p.x) and math.isfinite(p.y) and math.isfinite(p.z)}
 
+    @staticmethod
+    def _shared_landmarks(points, previous):
+        unchanged = {p for i, p in points.items() if previous.get(i) == p}
+        if (len(unchanged) < F2M_SHARED_INLIERS or
+                np.linalg.matrix_rank(np.array(list(unchanged))-next(iter(unchanged))) < 2):
+            return 0
+        return len(unchanged)
+
     def _timeout(self, reason, kind):
         if self.state == 'tracking' or (self.state == 'recovering' and self.pause_context is not None):
             points = self._matched_points(self.anchor_info)
@@ -191,12 +208,22 @@ class EstimateGate:
                            self.relocalization_failure)
             return self.state
         received = getattr(self, "last_input_received", self.last_input)
+        unanchored = self.last_pose is None and self.state == 'initializing'
         if received and now - received > 1_500_000_000:
+            if unanchored and now-received <= int(VISUAL_INITIALIZATION_S*1e9):
+                self.good, self.uncertain_seed = 0, None
+                return self.state
             self._timeout('RGB-D input stale; restart to begin a new segment', 'input')
             return self.state
         # Before any published anchor, fresh weak results prove liveness only.
         # An anchored segment still expires against its accepted visual stamps.
-        visual_stamp = self.last_stamp if self.last_pose is not None and self.pause_context is None else self.last_result_stamp
+        # Measure native output silence from its last delivery. A capture may
+        # already be hundreds of milliseconds old when registration finishes.
+        visual_stamp = self.last_tracking_received or self.last_stamp
+        if self.last_pose is None or self.pause_context is not None:
+            visual_stamp = self.last_result_stamp
+            if unanchored and visual_stamp:
+                visual_stamp = max(visual_stamp, self.input_resumed_at)
         if visual_stamp and now - visual_stamp > 1_500_000_000:
             self._timeout('visual estimate stale; restart to begin a new segment', 'output')
             return self.state
@@ -206,10 +233,11 @@ class EstimateGate:
             self._timeout(f'visual degradation persisted beyond {(self.pause_context.budget_ns if self.pause_context else RECOVERY_NS)/1e9:g} s; restart to begin a new segment', 'visual')
         return self.state
 
-    def _continuous(self, stamp, position, rotation):
-        if self.last_pose is None:
+    def _continuous(self, stamp, position, rotation, anchor=None):
+        anchor = self.last_pose if anchor is None else anchor
+        if anchor is None:
             return True
-        last_stamp, last_position, last_rotation = self.last_pose
+        last_stamp, last_position, last_rotation = anchor
         dt = max(0., (stamp - last_stamp) / 1e9)
         return (np.linalg.norm(position - last_position) <= RESUME_TRANSLATION_M + RESUME_SPEED_MPS*dt and
                 np.linalg.norm(log_rotation(last_rotation.T @ rotation)) <=
@@ -257,31 +285,60 @@ class EstimateGate:
         except (ValueError, TypeError, AttributeError) as error:
             self.degrade(error, now)
             return None
-        if np.any(np.diag(covariance)[:3] > .04):
+        verifying = self.relocalization_points is not None
+        recent = verifying and stamp-self.last_pose[0] <= 3_000_000_000
+        uncertain = np.any(np.diag(covariance)[:3] > .04)
+        points = self._matched_points(info) if verifying or uncertain else {}
+        shared = self._shared_landmarks(points, self.relocalization_points) if verifying else None
+        support = 0
+        seed = None
+        if uncertain and (not verifying or recent) and (
+                np.linalg.eigvalsh(covariance).min() >= -1e-10 and
+                np.linalg.eigvalsh(covariance[:3, :3]).max() <= .25 and
+                np.linalg.eigvalsh(covariance[3:, 3:]).max() <= .12):
+            # Native variances describe an uncertain measured position. Require
+            # independent repeated registrations in this same F2M world.
+            if verifying:
+                support = shared
+            elif len(points) >= F2M_SHARED_INLIERS:
+                reference = ((self.last_pose, self._matched_points(self.anchor_info))
+                             if self.last_pose is not None else self.uncertain_seed)
+                if reference is not None:
+                    anchor, previous = reference
+                    if stamp-anchor[0] <= 1_500_000_000 and self._continuous(stamp, position, rotation, anchor):
+                        support = self._shared_landmarks(points, previous)
+                if self.last_pose is None:
+                    seed = ((stamp, position, rotation), points)
+        if uncertain and not support:
             self.degrade('visual covariance exceeds tracking bounds', now)
+            self.uncertain_seed = seed
             if self.last_pose is None and np.linalg.eigvalsh(covariance).min() >= -1e-10:
                 # No map/pose has been published in this segment. Keep the
                 # native map alive while quality settles, without allowing a
                 # weak pose onto the output or extending an old SLAM pause.
                 self.state, self.recover_by = 'initializing', None
             return None
-        shared = None
-        if self.relocalization_points is not None:
+        self.uncertain_seed = seed
+        if support:
+            sample['vendor']['visual_uncertainty'] = dict(method='native_f2m_landmarks',
+                                                         shared_landmarks=support)
+        if verifying:
             # A fresh matched result may arrive just as the ordinary pause
             # expires, before another RGB-D pair reaches input().
             self._start_landmark_verification(now)
-            points = self._matched_points(info)
-            unchanged = {p for i, p in points.items() if self.relocalization_points.get(i) == p}
-            shared = len(unchanged)
             self.relocalization_misses = 0
-            _, anchor_position, anchor_rotation = self.last_pose
-            if (shared < F2M_SHARED_INLIERS or
-                    np.linalg.matrix_rank(np.array(list(unchanged)) - next(iter(unchanged))) < 2 or
-                    np.linalg.norm(position - anchor_position) > RESUME_TRANSLATION_M or
-                    np.linalg.norm(log_rotation(anchor_rotation.T @ rotation)) > RESUME_ROTATION_RAD):
+            # Short interruptions can occur while the camera is moving. Even
+            # with the old landmark proof, cap motion at one second of travel.
+            # Beyond the bounded pause require the old stationary anchor.
+            motion_stamp = min(stamp, self.last_pose[0]+1_000_000_000) if recent else self.last_pose[0]
+            if (not shared or not self._continuous(motion_stamp, position, rotation) or
+                    (self.last_verification_pose is not None and
+                     not self._continuous(stamp, position, rotation, self.last_verification_pose))):
                 self.good = 0
+                self.last_verification_pose = None
                 self.relocalization_failure = 'relocalization'
                 return None
+            self.last_verification_pose = (stamp, position, rotation)
         elif (self.state == 'recovering' and self.last_pose is not None and
                 stamp - self.last_pose[0] > (self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)):
             self._timeout(f'visual recovery exceeded the {(self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)/1e9:g} s in-segment pause bound; '
@@ -300,10 +357,11 @@ class EstimateGate:
         if shared is not None:
             sample['vendor']['relocalization'] = dict(method='native_f2m_landmarks',
                 anchor_stamp_ns=self.last_pose[0], shared_landmarks=shared)
-            self.relocalization_points = None
+            self.relocalization_points = self.last_verification_pose = None
             self.relocalization_deadline = self.relocalization_deadline_mono = None
         self.anchor_info = info if len(getattr(info, 'word_inliers', ())) >= F2M_SHARED_INLIERS else None
         self.last_pose = (stamp, position, rotation)
+        self.last_tracking_received = now
         return sample
 
 
@@ -387,8 +445,9 @@ def registration_report(sample, frontend, native=None, *, depth_enabled=False):
 
 class CaptureObservations:
     """Bounded exact-stamp joins with capture-order delivery and late-result discard."""
-    def __init__(self, fusion):
+    def __init__(self, fusion, startup_gate=None):
         self.fusion = fusion
+        self.startup_gate = startup_gate
         self.frames = OrderedDict()
         self.last_added = 0
         self.geometry_capture = None
@@ -401,7 +460,11 @@ class CaptureObservations:
             self.fusion.fault('fusion capture queue repeated, reset or overflowed', 'input')
             return outputs
         self.last_added = stamp
-        self.frames[stamp] = dict(color=color, depth=depth, added=now, deadline=now+250_000_000)
+        # A slow native frontend may return both results after the fixed fast-camera
+        # wait. Keep joins capture-ordered, bounded by the existing frame-age limit.
+        period = getattr(self.fusion, 'input_period_ns', None) or 0
+        wait = max(250_000_000, min(MAX_FRAME_AGE_NS, 2*period))
+        self.frames[stamp] = dict(color=color, depth=depth, added=now, deadline=min(now+wait, stamp+MAX_FRAME_AGE_NS))
         self.counts['queued'] += 1
         return outputs
 
@@ -472,6 +535,17 @@ class CaptureObservations:
             visual, reason = self._visual(stamp, entry)
             sample = self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
                                                reason=reason, arrival_ns=entry['added'])
+            probe = self.startup_gate
+            if probe is not None:
+                if self.fusion.filter is not None:
+                    self.startup_gate = None
+                elif ready and 'pose' in entry and 'info' in entry:
+                    if probe.status(now) == 'lost':
+                        probe = self.startup_gate = EstimateGate(probe.segment, probe.frame, probe.clock)
+                    probe.input(stamp, now_ns=now)
+                    probe.accept(entry['pose'], entry['info'], now)
+                else:
+                    probe.degrade(reason or 'incomplete visual measurement', now)
             if visual is not None and sample.get('pose') is not None:
                 self.last_tracking_info = entry['info']
             if getattr(self.fusion, 'geometry_job', None) is not None:
@@ -527,7 +601,8 @@ class RgbdSession:
                        if calibration.get('short_term_compensation') else None)
         if self.fusion is not None:
             self.fusion.recovery_policy = self.gate.recovery_policy
-        self.observations = CaptureObservations(self.fusion) if self.fusion else None
+        self.observations = (CaptureObservations(self.fusion, EstimateGate(
+            self.segment, calibration['frame_id'], calibration['clock_id'])) if self.fusion else None)
         self.mounts = (CaptureMounts(calibration['body_mount'], calibration['frame_id'], calibration['clock_id'])
                        if calibration.get('body_mount') else None)
         self.imu = (self.fusion.imu if self.fusion else
@@ -758,6 +833,14 @@ class RgbdSession:
             now_ns = time.time_ns()
             if self.has_fresh_inputs(now_ns):
                 self.fusion.fault('camera IMU unavailable during startup; using visual tracking')
+                self._check_fusion(now_ns)
+                return
+        if self._fusing() and elapsed >= 5.:
+            probe = getattr(self.observations, 'startup_gate', None)
+            now_ns = time.time_ns()
+            if (probe is not None and probe.state == 'tracking' and
+                    0 <= now_ns-probe.last_stamp <= MAX_FRAME_AGE_NS and self.fusion.filter is None):
+                self.fusion.fault('ESKF awaits low-motion initialization; measured visual tracking available')
                 self._check_fusion(now_ns)
                 return
         if elapsed < VISUAL_INITIALIZATION_S:
@@ -1098,6 +1181,14 @@ class RgbdSession:
         gate = self.gate
         gate.good = 0
         gate.last_stamp = max(gate.last_stamp, self.fusion.last_visual)
+        probe = getattr(self.observations, 'startup_gate', None)
+        if (self.fusion.last_tracking is None and probe is not None and probe.state == 'tracking'
+                and 0 <= now-probe.last_stamp <= MAX_FRAME_AGE_NS):
+            # No fused pose was published. Keep the evidence already verified
+            # in the same native world; the next distinct capture must qualify.
+            gate.good, gate.last_result_stamp = 2, probe.last_stamp
+            gate.uncertain_seed = (probe.last_pose, gate._matched_points(probe.anchor_info))
+        self.observations.startup_gate = None
         if self.fusion.last_tracking is not None:
             # Something was published: resuming is a bounded recovery.
             stamp, fused, _ = self.fusion.last_tracking

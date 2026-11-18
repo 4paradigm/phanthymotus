@@ -21,6 +21,8 @@ int main(int argc, char **argv)
     const std::string root=argv[1], output=argv[2], mode=argv[3];
     const bool imuPrediction=mode=="imu_prediction";
     const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap";
+    const bool failedVisualSeed=mode=="first_visual_seed_failed";
+    const bool firstVisualSeed=mode=="first_visual_seed" || failedVisualSeed;
     std::map<int,int> imageMask;
     if(mode=="scan_mask")
     {
@@ -33,11 +35,14 @@ int main(int argc, char **argv)
     const bool delayedExternal=mode=="delayed_first_external" || delayedRgb;
     const bool rejectedColdQuery=mode=="rejected_cold_query";
     const bool neighborRetry=mode=="neighbor_retry";
+    const bool continuityVisual=mode=="external_continuity_visual";
+    const bool externalContinuity=mode=="external_continuity" || mode=="external_continuity_new_run" ||
+        mode=="external_continuity_untagged" || mode=="external_continuity_stale";
     const bool stationaryAnchor=mode=="stationary_visual_anchor";
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
-        mode=="scan_mask" || imuPrediction || voHandoff || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
+        mode=="scan_mask" || imuPrediction || voHandoff || firstVisualSeed || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
         mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm" ||
-        rejectedColdQuery || delayedExternal || neighborRetry || stationaryAnchor;
+        rejectedColdQuery || delayedExternal || neighborRetry || externalContinuity || continuityVisual || stationaryAnchor;
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
     p["Reg/Strategy"]="1"; p["Icp/Strategy"]="0"; p["Optimizer/Strategy"]="0";
@@ -100,6 +105,8 @@ int main(int argc, char **argv)
             if(i==7) hasPose=1; // A numerical external input cannot revive an old VO pairing.
             if(i==6 || i==7) rgb.setTo(cv::Scalar::all(0)); // Received image, real native VO failure.
         }
+        if(firstVisualSeed && i>0) hasPose=0;
+        if(failedVisualSeed && i==0) rgb.setTo(cv::Scalar::all(0));
         const bool unpaired=mode=="fallback_unpaired" && i==1;
         if(unpaired) externalX-=200.f;
         const bool visualLost=mode=="fallback_lost" && i==2;
@@ -123,18 +130,35 @@ int main(int argc, char **argv)
         if(rejectedColdQuery) rgb.setTo(cv::Scalar::all(0));
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
-        const bool noImages=neighborRetry || (stationaryAnchor && i==0) ||
+        const bool noImages=neighborRetry || externalContinuity ||
+            (stationaryAnchor && i==0) ||
             (delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
             (mode=="vo_handoff_gap" && i==3) ||
             (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
             gap || resetGap || (mode=="fallback_cov" && i==1) ||
             (mode=="scan_mask" && !imageMask.at(i));
-        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,double(i+1));
+        // Processed scan cadence can be sparser than the measured chassis stream.
+        const double skippedTime=externalContinuity && i>0?(mode=="external_continuity_stale"?5.1:2.1):0.;
+        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,i+1.+skippedTime);
+        if(externalContinuity && i>0)
+            for(int j=0;j<count;++j) scan.at<cv::Vec3f>(0,j)[0]+=20.f; // No scan overlap with the anchor.
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
         if(neighborRetry && (i==1 || i==2))
             ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
-        if(voHandoff && hasPose) ext=handoffOrigin*ext;
+        if(externalContinuity || continuityVisual)
+        {
+            if(i!=1 || mode!="external_continuity_untagged")
+            {
+                cv::Mat payload(1,24,CV_8UC1,cv::Scalar::all(i==1 && mode=="external_continuity_new_run"?2:1));
+                std::memcpy(payload.data,"MOTUSOD1",8);
+                data.setUserData(rtabmap::compressData2(payload),true);
+            }
+            if(i==2)
+                ext=continuityVisual?map.getMemory()->getLastWorkingSignature()->getPose():
+                    rtabmap::Transform(externalX+200.f,0,0,0,0,0);
+        }
+        if((voHandoff || firstVisualSeed) && hasPose) ext=handoffOrigin*ext;
         if(mode=="history_without_cache") ext=historyExternal;
         if(rejectedColdQuery || (delayedExternal && i<2)) ext.setNull();
         if(imuPrediction && (i==0 || i==2 || i==3))
@@ -151,7 +175,8 @@ int main(int argc, char **argv)
         if(visualLost) beforeVisualFailure=map.getLocalOptimizedPoses();
         auto started=std::chrono::steady_clock::now();
         bool accepted=nativeRecovery?
-            recovery.process(map,data,ext,cv::Mat::eye(6,6,CV_64F)*(mode=="resume"?1.:.01)):
+            recovery.process(map,data,ext,cv::Mat::eye(6,6,CV_64F)*
+                (mode=="resume"?1.:(externalContinuity || continuityVisual)?.0001:.01)):
             map.process(data,ext,cv::Mat::eye(6,6,CV_64F)*.01);
         double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
         if(mode=="recovery_event" && recovery.state()==motus::VisualRecovery::Localized)
@@ -226,10 +251,63 @@ int main(int argc, char **argv)
                 return 0;
             }
         }
+        if(externalContinuity && i>0)
+        {
+            if(i==1 && mode=="external_continuity")
+            {
+                const auto error=ext.inverse()*recovery.odom();
+                if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+                   error.isNull() || error.getNorm()>1e-6f || error.getAngle(rtabmap::Transform::getIdentity())>1e-6f ||
+                   map.getLocalOptimizedPoses().size()!=nodesBefore+1)
+                    throw std::runtime_error("verified measured external motion must grow the original graph through zero scan overlap");
+                if(stat("Motus/MeasuredExternalContinuity/")!=1.f || !data.userDataCompressed().empty())
+                    throw std::runtime_error("external continuity must be reported without persisting the internal run marker");
+                const auto *signature=map.getMemory()->getLastWorkingSignature();
+                const auto &links=signature->getLinks();
+                if(links.size()!=1 || links.begin()->second.type()!=rtabmap::Link::kNeighbor ||
+                   links.begin()->second.transVariance()<.002499 || links.begin()->second.rotVariance()<.00274 ||
+                   !map.getLocalOptimizedPoses().count(1))
+                    throw std::runtime_error("measured external continuity must preserve the anchor and encode only a conservative neighbor edge");
+            }
+            else
+            {
+                if(accepted || recovery.state()!=motus::VisualRecovery::Searching ||
+                   !recovery.odom().isNull() || map.getLocalOptimizedPoses().size()!=nodesBefore)
+                    throw std::runtime_error("unverified external continuity must preserve the graph and publish no pose");
+                break;
+            }
+        }
+        if(continuityVisual && i==2)
+        {
+            const auto correction=ext.inverse()*recovery.odom();
+            if(!accepted || recovery.state()!=motus::VisualRecovery::External || recovery.visualInliers()<20 ||
+               stat("Motus/MeasuredExternalContinuity/")!=1.f || correction.isNull() || correction.x()<.10f ||
+               map.getLocalOptimizedPoses().size()<=nodesBefore)
+                throw std::runtime_error("a continuous chassis stream must retain independent visual correction");
+            break;
+        }
         if(visualFault && (recovery.visualInliers()>=20 ||
            recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
            recovery.recoveryNode()!=0))
             throw std::runtime_error("decode-valid black image must exercise real VO loss before global recovery");
+        if(firstVisualSeed)
+        {
+            if(i==0 && (!accepted || recovery.state()!=motus::VisualRecovery::External ||
+               recovery.visualInliers()!=0 || map.getLocalOptimizedPoses().size()!=1))
+                throw std::runtime_error("first-frame handoff requires one measured map anchor before visual motion");
+            if(i>0 && failedVisualSeed && (!recovery.odom().isNull() ||
+               recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses().size()!=1))
+                throw std::runtime_error("failed initial visual geometry cannot seed the map gauge");
+            if(i>0 && !failedVisualSeed)
+            {
+                const auto local=handoffOrigin.inverse()*recovery.odom();
+                if(!accepted || recovery.state()!=motus::VisualRecovery::VisualTracking || recovery.visualInliers()<20 ||
+                   local.isNull() || std::abs(local.x()-truthX)>.05f || std::abs(local.y())>.05f ||
+                   recovery.relocalizations()!=0 || map.getLocalOptimizedPoses().size()!=nodesBefore+1)
+                    throw std::runtime_error("first measured RGB-D anchor must support later geometrically tracked visual-only growth");
+            }
+            if(i==2) break;
+        }
         if(voHandoff)
         {
             if(mode=="vo_handoff_gap" && i==3)

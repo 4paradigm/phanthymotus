@@ -106,6 +106,17 @@ class RgbdOdometryPlugin:
                                             self._outputs(instance)[0]['topic'], publish_output=False,
                                             requested_calibration=requested, mode_transition=transition,
                                             **({'input_registry': self._input_registry} if self._input_registry else {}))
+                    # The old worker can finish its first tracking estimate
+                    # while the candidate starts. Decide before it can publish again.
+                    with session.lock:
+                        keep_session = (session.info()['status'] != 'lost' and
+                                        (not restoring or session.first_tracking_at is not None))
+                        if not keep_session:
+                            session.publish_output = False
+                    if keep_session:
+                        candidate.close(report_idle=False)
+                        state['lost_since'] = None
+                        continue
                     session.close(report_idle=False)
                     with candidate.lock:
                         self.instances[instance] = candidate, signature, bindings

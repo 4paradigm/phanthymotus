@@ -1,6 +1,9 @@
 """Bounded numeric cloud/pose association; producers own physical alignment."""
 from collections import deque, OrderedDict
 from copy import deepcopy
+from dataclasses import replace
+import math
+import uuid
 
 import numpy as np
 
@@ -33,6 +36,7 @@ class SlamStream:
         self._admitted = 0
         self._poses = deque(maxlen=512)
         self._pose_anchor = None
+        self._chassis_run = None
         self._pending = deque()
         self._last_received = None
         self._last_cloud_received = None
@@ -54,6 +58,7 @@ class SlamStream:
         """Numeric pose absence waits for a new pose, without retiring labels."""
         self._poses.clear()
         self._pose_anchor = None
+        self._chassis_run = None
         self._pending.clear()
         self._last_received = None
         self._odom_state = 'waiting'
@@ -82,18 +87,69 @@ class SlamStream:
                 self.last_error = str(error)
                 return
         if pose.prediction_anchor_ns is None:
+            pose = self._track_chassis(sample, pose)
             if self._pose_anchor is None or pose.stamp_ns >= self._pose_anchor.stamp_ns:
                 self._pose_anchor = pose
             # Confirmed corrections supersede hypotheses beyond their capture.
             poses = {p.stamp_ns: p for p in self._poses
                      if p.prediction_anchor_ns is None or p.stamp_ns < pose.stamp_ns}
         else:
+            self._chassis_run = None
             poses = {p.stamp_ns: p for p in self._poses}
         poses[pose.stamp_ns] = pose
         self._poses = deque(sorted(poses.values(), key=lambda p: p.stamp_ns)[-512:], maxlen=512)
         self._last_received = now if received is None else received
         self._odom_state = 'coasting' if pose.prediction_anchor_ns is not None else 'tracking'
         self._drain(now, measurement_now_ns)
+
+    def _track_chassis(self, sample, pose):
+        vendor = sample.get('vendor')
+        quality = vendor.get('motus_slam') if isinstance(vendor, dict) else None
+        origin = (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id,
+                  quality.get('source_topic') if isinstance(quality, dict) else None)
+        if (not isinstance(quality, dict) or quality.get('pose_source') != 'chassis_odometry' or
+                quality.get('pose_reference') != 'body' or quality.get('status') != 'tracking' or
+                quality.get('stamp_source') != 'measurement' or quality.get('stamp_ns') != pose.stamp_ns or
+                pose.stamp_ns <= 0 or not all(isinstance(value, str) and value for value in origin)):
+            self._chassis_run = None
+            return pose
+        observation = pose.observation
+        measurement = quality.get('measurement')
+        measurement = measurement if isinstance(measurement, dict) else {}
+        mapping = measurement.get('mapping')
+        reference = quality.get('clock_reference')
+        fusion = vendor.get('fusion')
+        if ((observation is not None and
+             (observation.time_basis != 'source_capture' or
+              observation.normalized_clock_id not in ('', pose.clock_id) or
+              (observation.mapping_offset_ns is not None and not observation.mapping_verified))) or
+                measurement.get('stamp_ns', pose.stamp_ns) != pose.stamp_ns or
+                measurement.get('clock_id', pose.clock_id) != pose.clock_id or
+                measurement.get('frame_id', pose.frame_id) != pose.frame_id or
+                (isinstance(mapping, dict) and mapping.get('verified') is False) or
+                (isinstance(fusion, dict) and fusion.get('mapping_allowed') is False)):
+            self._chassis_run = None
+            return pose
+        origin += (measurement.get('clock_epoch'), measurement.get('source_generation'),
+                   measurement.get('source_clock'), reference.get('domain_id') if isinstance(reference, dict) else None,
+                   observation.source_id if observation is not None else None,
+                   observation.source_epoch if observation is not None else None)
+        token = None
+        if self._chassis_run is not None:
+            last_origin, previous = self._chassis_run
+            dt = (pose.stamp_ns - previous.stamp_ns) / 1e9
+            distance = math.dist(pose.position, previous.position)
+            dot = abs(sum(a*b for a, b in zip(pose.quaternion, previous.quaternion)))
+            angle = 2*math.acos(min(1., dot))
+            if last_origin == origin and (
+                    (dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
+                    (0 < dt <= .5 and distance <= .1 + 1.5*dt and angle <= math.radians(10) + 2.5*dt)):
+                token = previous.chassis_continuity
+        # This token is carried only through an observed, bounded source run.
+        # A new token requires independent registration in the native map.
+        pose = replace(pose, chassis_continuity=token or uuid.uuid4().bytes)
+        self._chassis_run = origin, pose
+        return pose
 
     def _capture_context(self, packet):
         evidence = packet.get('extrinsic')

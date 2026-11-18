@@ -9,12 +9,13 @@ from test_rgbd_odometry import messages
 from test_rgbd_odometry_status import sessions  # noqa: F401
 
 
-def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=False):
+def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=False, variance=.001, kind=0):
     msg, info = messages(stamp)
+    msg.pose.covariance[0] = variance
     msg.pose.pose.position.x = x
     msg.pose.pose.orientation.z = math.sin(math.radians(angle)/2)
     msg.pose.pose.orientation.w = math.cos(math.radians(angle)/2)
-    info.type, info.lost, info.inliers = 0, lost, 0 if lost else len(ids)
+    info.type, info.lost, info.inliers = kind, lost, 0 if lost else len(ids)
     info.local_map_keys = info.word_inliers = list(ids)
     info.local_map_values = [NS(x=float(i % 5) + world_shift, y=float(i // 5), z=1.) for i in ids]
     gate.input(stamp)
@@ -168,3 +169,75 @@ def test_relocalization_expires_when_host_wall_clock_moves_back(monkeypatch):
     gate.input(5_000_000_000)
     ticks[0] += 1_000_000_001
     assert gate.status(4_000_000_000) == 'lost'
+
+
+def test_moderately_uncertain_visual_pose_requires_measured_repeat_landmarks_and_keeps_covariance():
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for i in range(4):
+        sample = visual(gate, 1_000_000_000+i*250_000_000, x=.08*i, variance=.20)
+        if i < 3:
+            assert sample is None
+    assert sample['pose']['position'][0] == .24
+    assert sample['pose']['covariance'][0] == .20
+    assert sample['vendor']['visual_uncertainty']['shared_landmarks'] == 24
+
+
+@pytest.mark.parametrize('change', [dict(ids=range(5, 29)), dict(world_shift=.01),
+                                    dict(x=1.), dict(kind=1), dict(variance=.26), dict(lost=True)])
+def test_uncertain_covariance_rejects_weak_or_discontinuous_geometry(change):
+    gate = anchored()
+    assert visual(gate, 1_300_000_000, **dict(dict(variance=.20), **change)) is None
+
+
+def test_uncertain_covariance_cannot_relocalize_a_frozen_world():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(5):
+        assert visual(gate, 5_000_000_000+i*100_000_000, variance=.20) is None
+
+def test_short_depth_gap_before_first_pose_keeps_native_origin_alive():
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    assert visual(gate, 1_000_000_000) is None
+    assert gate.status(3_500_000_000) == 'initializing'
+    assert visual(gate, 3_700_000_000) is None
+    assert visual(gate, 4_000_000_000) is None
+    assert visual(gate, 4_300_000_000)['pose'] is not None
+
+
+def test_same_native_worker_can_return_before_its_receipt_timeout():
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for i in range(3):
+        stamp = 1_000_000_000 + i*300_000_000
+        gate.input(stamp, now_ns=stamp+100_000_000)
+        gate.accept(*messages(stamp), stamp+400_000_000)
+    gate.input(2_950_000_000, now_ns=3_050_000_000)
+    sample = gate.accept(*messages(2_950_000_000), 3_300_000_000)
+    assert sample is not None and sample['vendor']['motus_slam']['stamp_ns'] == 2_950_000_000
+
+
+def test_recent_moving_f2m_pose_relocalizes_only_against_the_frozen_world():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(3):
+        sample = visual(gate, 3_200_000_000+i*120_000_000, x=.36+i*.04, variance=.2)
+        if i < 2:
+            assert sample is None
+    assert sample['pose']['position'][0] == pytest.approx(.44)
+    assert sample['pose']['covariance'][0] == .2
+    assert sample['vendor']['relocalization']['shared_landmarks'] == 24
+    assert sample['vendor']['visual_uncertainty']['shared_landmarks'] == 24
+
+
+@pytest.mark.parametrize('change', [dict(ids=range(5, 29)), dict(world_shift=1.), dict(kind=1),
+                                    dict(x=2.), dict(variance=.26), dict(lost=True)])
+def test_recent_f2m_recovery_still_requires_bounded_measured_motion_and_old_geometry(change):
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(3):
+        assert visual(gate, 3_200_000_000+i*120_000_000, **dict(dict(x=.36, variance=.20), **change)) is None
+
+def test_moving_relocalization_requires_consecutive_measurements_to_agree():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i, x in enumerate((.4, -.4, .4)):
+        assert visual(gate, 3_200_000_000+i*120_000_000, x=x, variance=.2) is None

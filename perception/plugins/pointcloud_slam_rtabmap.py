@@ -63,7 +63,10 @@ def mapping_parameters(database_path, namespace, settings):
         # and recover per frame without restarting this native map segment.
         parameters.update(subscribe_sensor_data=True, subscribe_scan_cloud=False,
                           qos_sensor_data=1, motus_visual_recovery=True)
+        # Follow the default 2 Hz metric cloud stream so that successive
+        # observations can preserve geometric overlap through a turn.
         parameters.update({'Kp/MaxFeatures': '500', 'Mem/BadSignaturesIgnored': 'false',
+                           'Rtabmap/DetectionRate': '2',
                            'RGBD/NeighborLinkRefining': 'false',
                            'RGBD/LoopCovLimited': 'true',
                            'RGBD/ProximityOdomGuess': 'false',

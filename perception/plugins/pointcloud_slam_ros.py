@@ -569,6 +569,9 @@ class RtabmapNode(Node):
             # runtime cannot mistake this private hint for a tracking pose.
             payload = struct.pack('<8s7d', b'MOTUSIMU', *pose.position, *pose.quaternion)
             native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
+        elif measured is not None and measured.chassis_continuity is not None and self._rgb is not None:
+            payload = b'MOTUSOD1' + measured.chassis_continuity
+            native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
         if (self._root_deadline and pose is not None and not native.left.data and
                 (self._rgb_task is None or self._rgb_task[1].done()) and self._prefer_next_root_observation()):
             return

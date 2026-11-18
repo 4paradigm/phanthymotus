@@ -329,3 +329,43 @@ def test_correction_matches_full_matrix_solution_with_cross_covariance(correlate
     for actual, wanted in zip((f.p, f.v, f.R, f.bg, f.ba), expected):
         np.testing.assert_allclose(actual, wanted, rtol=1e-12, atol=1e-14)
     np.testing.assert_allclose(f.P, expected_p, rtol=1e-12, atol=1e-14)
+
+
+def test_two_hz_measured_visuals_can_initialize_and_remain_tracking():
+    fusion = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    fusion.input_period_ns = 530_000_000
+    stamps = set(1_000_000_000 + i*530_000_000 for i in range(6))
+    tracking = []
+    for i in range(531):
+        t = 1_000_000_000 + i*5_000_000
+        fusion.observe_imu(source(t), t)
+        if t in stamps:
+            sample = fusion.observe_frame(t, *images(), pose(), t)
+            if sample['pose'] is not None:
+                tracking.append(t)
+    assert len(tracking) >= 2
+
+
+def test_slow_warmup_cannot_initialize_across_an_unmeasured_imu_gap():
+    fusion = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    t0 = 1_000_000_000
+    fusion.lever = np.zeros(3)
+    for i in range(151):
+        t = t0 + i*5_000_000
+        if i < 50 or i > 90:
+            fusion.samples.append((t, np.zeros(3), np.array([0., 0., G])))
+        if i % 50 == 0:
+            assert not fusion._initialize(t, pose())
+
+@pytest.mark.parametrize('side', ['start', 'end'])
+def test_imu_interpolation_needs_measured_support_at_both_visual_boundaries(side):
+    fusion = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    fusion.lever = np.zeros(3)
+    t = 1_000_000_000
+    offsets = list(range(5_000_000, 750_000_000, 5_000_000))
+    offsets.extend([-150_000_000 if side == 'start' else 0,
+                    900_000_000 if side == 'end' else 750_000_000])
+    for offset in sorted(offsets):
+        fusion.samples.append((t+offset, np.zeros(3), np.array([0., 0., G])))
+    for offset in (0, 375_000_000, 750_000_000):
+        assert not fusion._initialize(t+offset, pose())

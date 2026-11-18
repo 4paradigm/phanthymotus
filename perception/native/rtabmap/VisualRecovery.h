@@ -13,8 +13,10 @@
 #include <rtabmap/utilite/ULogger.h>
 #include <memory>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <optional>
 
 namespace motus {
 class VisualRecovery
@@ -85,6 +87,10 @@ public:
                  const std::map<std::string,float> & statistics=std::map<std::string,float>())
     {
         recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
+        const auto externalRun=takeExternalRun(data);
+        const bool continuousExternal=externalRun && externalRun==externalRun_ &&
+            !waiting_ && !localizationMode_ && continuousMotion(external,data.stamp());
+        if(!continuousExternal) externalRun_.reset();
         rtabmap::Transform guess;
         if(external.isNull() && takePrediction(data,guess))
             return registerPrediction(map,data,guess,statistics);
@@ -118,15 +124,26 @@ public:
         visualInliers_=info.reg.inliers;
         const bool tracked=!visual.isNull() && !info.lost &&
             visualInliers_>=minInliers_ && validCovariance(info.reg.covariance);
+        const bool visualSeed=!visual.isNull() && !info.lost && info.keyFrameAdded &&
+            estimator_->framesProcessed()==1 && info.localMapSize>=minInliers_ && cv::checkRange(visual.dataMatrix());
         if(images && !tracked)
         {
             lastVisual_.setNull(); lastNative_.setNull();
         }
         if(external.isNull() && !missing_)
         {
-            waiting_=true; aligned_=!lastVisual_.isNull();
-            if(aligned_) visualToNative_=lastNative_*lastVisual_.inverse();
+            if(!waiting_ && !localizationMode_ && !tracked && visualInliers_>0 && !map.getLocalOptimizedPoses().empty())
+            {
+                const auto *anchor=map.getMemory()->getLastWorkingSignature();
+                const double age=anchor?data.stamp()-anchor->getStamp():0.;
+                if(age>0. && age<=4.) externalGraceStart_=data.stamp();
+            }
+            waiting_=true;
+            const auto alignment=lastVisual_.isNull()?initialVisualToNative_:lastNative_*lastVisual_.inverse();
+            aligned_=!alignment.isNull();
+            if(aligned_) visualToNative_=alignment;
         }
+        if(images || external.isNull()) initialVisualToNative_.setNull();
         missing_=external.isNull();
         if(waiting_ && aligned_ && !tracked)
         {
@@ -143,16 +160,32 @@ public:
             externalToNative_=visualToNative_*visual*external.inverse();
             waiting_=false;
         }
-        const auto verifiesNeighbor=[&](const rtabmap::Transform & candidate)
+        const auto verifiesNeighbor=[&](const rtabmap::Transform & candidate, bool requireAgreement=false)
         {
             const auto *last=map.getMemory()->getLastWorkingSignature();
-            return !last || !neighborIcp_.computeTransformation(last->sensorData(),data,
-                last->getPose().inverse()*candidate).isNull();
+            if(!last) return !requireAgreement;
+            const auto expected=last->getPose().inverse()*candidate;
+            const auto near=[](const rtabmap::Transform & relative)
+            {
+                return relative.getNorm()<=.1 && relative.getAngle(rtabmap::Transform::getIdentity())<=5.*CV_PI/180.;
+            };
+            if(requireAgreement && !near(expected)) return false;
+            const auto measured=neighborIcp_.computeTransformation(last->sensorData(),data,expected);
+            return !measured.isNull() && (!requireAgreement || near(expected.inverse()*measured));
         };
+        const double graceAge=data.stamp()-externalGraceStart_;
+        const bool withinGrace=externalGraceStart_>0. && graceAge>=0. && graceAge<=2.;
+        if(withinGrace && external.isNull() && (!images || info.features>0))
+        {
+            // A weak observation cannot move the map. Give the measured stream
+            // time to return before RTAB-Map saves and reloads for localization.
+            state_=Searching; odom_.setNull(); return false;
+        }
+        externalGraceStart_=0.;
         if(external.isNull())
             retryExternalNeighbor_=false;
-        const bool verifiedRetry=waiting_ && retryExternalNeighbor_ &&
-            verifiesNeighbor(externalToNative_*external);
+        const bool verifiedRetry=waiting_ && !external.isNull() && (withinGrace || retryExternalNeighbor_) &&
+            verifiesNeighbor(externalToNative_*external,withinGrace);
         if(verifiedRetry)
             waiting_=false;
         if(!waiting_ && !external.isNull())
@@ -178,7 +211,7 @@ public:
                     externalToNative_=predicted*external.inverse(); odom_=predicted;
                 }
             }
-            if(!verifiedRetry && (!tracked || lastVisual_.isNull()))
+            if(!continuousExternal && !verifiedRetry && (!tracked || lastVisual_.isNull()))
             {
                 // Validate the supplied constraint; never replace it with an ICP pose.
                 // Memory::computeIcpTransform uses the stricter merged-scan overlap.
@@ -196,6 +229,34 @@ public:
             {
                 lastVisual_=visual; lastNative_=odom_;
             }
+            const auto processExternal=[&]()
+            {
+                bool accepted;
+                if(continuousExternal)
+                {
+                    // A verified stream can turn past the camera's field of view.
+                    // Its measured pose defines a neighbor edge, with no added loop edge.
+                    cv::Mat motionCovariance=validCovariance(covariance)?covariance.clone():cv::Mat::eye(6,6,CV_64F);
+                    constexpr double positionVariance=.05*.05, angleVariance=(3.*CV_PI/180.)*(3.*CV_PI/180.);
+                    for(int i=0;i<6;++i)
+                        motionCovariance.at<double>(i,i)=std::max(motionCovariance.at<double>(i,i),
+                            i<3?positionVariance:angleVariance);
+                    auto stats=statistics;
+                    stats["Motus/MeasuredExternalContinuity/"]=1.f;
+                    accepted=map.process(data,odom_,motionCovariance,velocity,stats);
+                }
+                else accepted=map.process(data,odom_,covariance,velocity,statistics);
+                // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
+                // Only a later tracked frame may use this measured anchor during external loss.
+                if(accepted && visualSeed) initialVisualToNative_=odom_*visual.inverse();
+                if(accepted && externalRun)
+                {
+                    externalRun_=externalRun;
+                    previousExternal_=external;
+                    previousExternalStamp_=data.stamp();
+                }
+                return accepted;
+            };
             if(images && map.getLocalOptimizedPoses().size()==1)
             {
                 const auto *root=map.getMemory()->getSignature(map.getLocalOptimizedPoses().begin()->first);
@@ -215,12 +276,12 @@ public:
                             rtabmap::Parameters::getDefaultParameters().at(key):value->second;
                     }
                     map.parseParameters({{"RGBD/LinearUpdate","0"},{"RGBD/AngularUpdate","0"}});
-                    const bool accepted=map.process(data,odom_,covariance,velocity,statistics);
+                    const bool accepted=processExternal();
                     map.parseParameters(restore);
                     return accepted;
                 }
             }
-            return map.process(data,odom_,covariance,velocity,statistics);
+            return processExternal();
         }
         if(aligned_ && tracked)
         {
@@ -356,21 +417,49 @@ public:
         return true;
     }
 private:
-    static bool takePrediction(rtabmap::SensorData & data, rtabmap::Transform & guess)
+    using ExternalRun=std::array<unsigned char,16>;
+
+    static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns)
     {
-        // Private SensorData user-data record: eight-byte tag and seven
-        // float64 pose components, in RTAB-Map's compressed byte-matrix format.
+        // Private SensorData records use RTAB-Map's compressed byte-matrix format.
         const auto & bytes=data.userDataCompressed();
         if(bytes.rows!=1 || bytes.type()!=CV_8UC1 || bytes.cols<=12 || bytes.cols>128)
-            return false;
+            return {};
         int shape[3];
         std::memcpy(shape,bytes.data+bytes.cols-sizeof(shape),sizeof(shape));
-        if(shape[0]!=1 || shape[1]!=64 || shape[2]!=CV_8UC1)
-            return false;
+        if(shape[0]!=1 || shape[1]!=columns || shape[2]!=CV_8UC1)
+            return {};
         const auto payload=rtabmap::uncompressData(bytes);
-        if(payload.empty() || std::memcmp(payload.data,"MOTUSIMU",8)!=0)
-            return false;
+        if(payload.empty() || std::memcmp(payload.data,tag,8)!=0)
+            return {};
         data.setUserData(cv::Mat(),true);
+        return payload;
+    }
+
+    static std::optional<ExternalRun> takeExternalRun(rtabmap::SensorData & data)
+    {
+        const auto payload=takePayload(data,"MOTUSOD1",24);
+        if(payload.empty()) return {};
+        ExternalRun token;
+        std::memcpy(token.data(),payload.data+8,token.size());
+        return token;
+    }
+
+    bool continuousMotion(const rtabmap::Transform & external, double stamp) const
+    {
+        const double dt=stamp-previousExternalStamp_;
+        // The gateway witnesses the dense source between accepted native scans.
+        if(external.isNull() || !(dt>0. && dt<=6.) || !cv::checkRange(external.dataMatrix()))
+            return false;
+        const auto delta=previousExternal_.inverse()*external;
+        return delta.getNorm()<=.15+1.5*dt &&
+            delta.getAngle(rtabmap::Transform::getIdentity())<=10.*CV_PI/180.+2.5*dt;
+    }
+
+    static bool takePrediction(rtabmap::SensorData & data, rtabmap::Transform & guess)
+    {
+        const auto payload=takePayload(data,"MOTUSIMU",64);
+        if(payload.empty()) return false;
         double p[7];
         std::memcpy(p,payload.data+8,sizeof(p));
         if(std::all_of(p,p+7,[](double v){return std::isfinite(v);}) &&
@@ -433,8 +522,12 @@ private:
     int relocalizations_, visualInliers_;
     bool imageMode_, initialized_;
     bool retryExternalNeighbor_=false;
+    std::optional<ExternalRun> externalRun_;
+    rtabmap::Transform previousExternal_;
+    double previousExternalStamp_=0.;
+    double externalGraceStart_=0.;
     int recoveryNode_, recoveryAnchor_, recoveryInliers_;
     rtabmap::Transform externalToNative_, visualToNative_, odom_;
-    rtabmap::Transform lastVisual_, lastNative_;
+    rtabmap::Transform lastVisual_, lastNative_, initialVisualToNative_;
 };
 }

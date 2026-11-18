@@ -44,6 +44,81 @@ def test_bracketing_pose_emits_untouched_cloud_and_exact_nanosecond_stamp():
     assert not hasattr(s, 'store') and not hasattr(s, 'graph')
 
 
+def chassis(ms, x=0., segment='a'):
+    sample = odom(ms, x, segment)
+    sample['vendor']['motus_slam'].update(pose_source='chassis_odometry', pose_reference='body',
+                                        source_topic='wheel_pose', stamp_ns=ms*1_000_000)
+    return sample
+
+
+def test_dense_chassis_run_has_one_continuity_token_at_aligned_scan_stamps():
+    s = stream()
+    for ms, x in [(1000, 0.), (1100, .03), (1200, .06), (1300, .09)]:
+        s.odom(chassis(ms, x), now=ms/1000)
+    for ms in (1000, 1150, 1250, 1300):
+        s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=1.4)
+    tokens = [frame.pose.chassis_continuity for frame in s.accepted]
+    assert len(tokens) == 4 and len(tokens[0]) == 16 and len(set(tokens)) == 1
+
+
+@pytest.mark.parametrize('second', [
+    chassis(1200, 2.), chassis(1800), chassis(1200, segment='new-origin')
+])
+def test_chassis_gap_jump_and_new_origin_do_not_certify_interpolated_pose(second):
+    s = stream()
+    s.odom(chassis(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[0, 0, 1]], now=1.)
+    s.odom(second, now=2.)
+    s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=2.)
+    s.cloud(second['stamp_ms']*1_000_000, 'camera', [[0, 0, 1]], now=2.)
+    old, middle, new = (frame.pose.chassis_continuity for frame in s.accepted)
+    assert len(old) == len(new) == 16 and old != new
+    assert middle is None
+
+
+def test_missing_or_non_chassis_pose_cannot_extend_the_measured_run():
+    s = stream()
+    s.odom(chassis(1000), now=1.)
+    s.cloud(1_000_000_000, 'camera', [[0, 0, 1]], now=1.)
+    s.odom(dict(chassis(1100), pose=None), now=1.1)
+    s.odom(chassis(1200), now=1.2)
+    s.cloud(1_200_000_000, 'camera', [[0, 0, 1]], now=1.2)
+    s.odom(odom(1300), now=1.3)
+    s.cloud(1_300_000_000, 'camera', [[0, 0, 1]], now=1.3)
+    before, after, unauthenticated = (frame.pose.chassis_continuity for frame in s.accepted)
+    assert before != after and unauthenticated is None
+
+
+@pytest.mark.parametrize('metadata', [
+    {'observation': {'time_basis': 'receipt_estimated', 'normalized_clock_id': 'clock'}},
+    {'observation': {'time_basis': 'source_capture', 'normalized_clock_id': 'other'}},
+    {'measurement': {'mapping': {'verified': False}}},
+    {'measurement': {'stamp_ns': 1_050_000_000}},
+])
+def test_chassis_timing_contradiction_keeps_numeric_pose_without_continuity(metadata):
+    s = stream()
+    sample = chassis(1100, .03)
+    if 'observation' in metadata:
+        metadata = {'observation': dict(metadata['observation'], schema='motus.observation/1',
+                                        observation_stamp_ns=1_100_000_000)}
+    sample['vendor']['motus_slam'].update(metadata)
+    s.odom(sample, now=1.1)
+    s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=1.1)
+    assert s.accepted[0].pose.position == (.03, 0., 0.)
+    assert s.accepted[0].pose.chassis_continuity is None
+
+
+def test_chassis_measurement_epoch_change_starts_a_new_continuity_run():
+    s = stream()
+    for ms, epoch in ((1000, 'first'), (1100, 'second')):
+        sample = chassis(ms)
+        sample['vendor']['motus_slam']['measurement'] = {'clock_epoch': epoch}
+        s.odom(sample, now=ms/1000)
+        s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
+    tokens = [frame.pose.chassis_continuity for frame in s.accepted]
+    assert all(tokens) and tokens[0] != tokens[1]
+
+
 def test_inertial_prediction_is_only_a_hint_in_the_accepted_origin():
     s = stream()
     sample = odom(1200, .2, status='coasting')

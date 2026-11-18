@@ -430,3 +430,41 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     assert bytes(out.depth_compressed.data) == png
     assert encoded[0][0] == '.png' and encoded[0][2] == [cv2.IMWRITE_PNG_COMPRESSION, 1]
     np.testing.assert_array_equal(encoded[0][1], depth)
+
+
+def test_slow_native_join_accepts_a_measured_pair_after_250ms_in_original_order():
+    fusion = Fusion()
+    fusion.input_period_ns = 350_000_000
+    frames = CaptureObservations(fusion)
+    stamp = 1_000_000_000
+    frames.add_frame(stamp, None, None, stamp+120_000_000)
+    msg, info = messages(stamp)
+    assert frames.result('pose', msg, stamp+590_000_000) == []
+    assert frames.result('info', info, stamp+610_000_000) == [{'stamp': stamp}]
+    assert fusion.frames[0][1] is not None
+
+def test_startup_can_fall_back_to_repeated_measured_visual_before_the_full_timeout():
+    from plugins.rgbd_odometry_runtime import RgbdSession, EstimateGate
+    import time
+    now = time.time_ns()
+    session = RgbdSession.__new__(RgbdSession)
+    session.started, session.segment = 0., 'run'
+    session.imu = NS(state='ready')
+    session.fallback = None
+    session.fusion = Fusion()
+    session.fusion.filter = None
+    session._check_fusion = lambda now: None
+    session.gate = EstimateGate('run', 'camera_optical', 'clock')
+    session.gate.input(now)
+    session.observations = CaptureObservations(session.fusion, startup_gate=EstimateGate('run', 'camera_optical', 'clock'))
+    for i in range(3):
+        stamp = now-500_000_000+i*200_000_000
+        session.fusion.samples = [(stamp, None, None)]
+        session.observations.add_frame(stamp, None, None, stamp)
+        pose, info = messages(stamp)
+        session.observations.result('pose', pose, stamp)
+        session.observations.result('info', info, stamp)
+    session._check_initialization(1.)
+    assert session.fusion.reason is None
+    session._check_initialization(6.)
+    assert 'measured visual' in session.fusion.reason

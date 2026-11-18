@@ -59,6 +59,29 @@ def test_fallback_does_not_bypass_required_odometry_loss(rgb_node):
     assert not published(n, '/sensor_data')
 
 
+def test_native_envelope_marks_only_continuous_measured_chassis_poses(rgb_node):
+    import struct
+    import zlib
+    from test_pointcloud_slam_stream import chassis, odom
+
+    n = rgb_node
+    samples = [chassis(1000), chassis(1100, .02), odom(1200, .03)]
+    for index, sample in enumerate(samples, start=1):
+        ns = sample['stamp_ms'] * 1_000_000
+        n._measurement_clock_ns = lambda t=ns: t
+        n._odom(NS(data=json.dumps(sample)))
+        n._cloud(cloud(ns))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == index)
+
+    first, second, other = published(n, '/sensor_data')[0].raw_messages
+    for message in (first, second):
+        wire = bytes(message.user_data)
+        assert struct.unpack('<iii', wire[-12:]) == (1, 24, 0)
+        assert zlib.decompress(wire[:-12]).startswith(b'MOTUSOD1')
+    assert bytes(first.user_data) == bytes(second.user_data)
+    assert not getattr(other, 'user_data', None)
+
+
 def rgb_camera():
     return {'schema': 'motus.camera/1', 'topic': '/rgb', 'format': 'image/jpeg',
             'width': 4, 'height': 4, 'K': [1, 0, 1, 0, 1, 1, 0, 0, 1],

@@ -85,6 +85,7 @@ def test_optional_rgb_uses_one_sensor_data_process_for_image_and_scan_fallback(t
     assert params['RGBD/LoopCovLimited'] == 'true'
     assert params['Grid/RangeMax'] == '0'
     assert params['Mem/BadSignaturesIgnored'] == 'false'
+    assert params['Rtabmap/DetectionRate'] == '2'
 
 
 @pytest.mark.parametrize('options,match', [({'exit_code': 7}, 'exit'),
