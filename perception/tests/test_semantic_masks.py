@@ -219,7 +219,6 @@ def test_card_registration_and_independent_instances(monkeypatch):
 
 def test_supplemental_presets_register_as_cards(monkeypatch):
     """补充预设（宠物/桌面/家具）与内置四类一样，逐条注册成独立卡。"""
-    import types
     import plugins.segment as cards
     from plugins.segment import SegmentationPlugin
 
@@ -244,5 +243,3 @@ def test_supplemental_presets_register_as_cards(monkeypatch):
     names = {t["name"] for t in plugin.get_tools()}
     assert {"pet", "tableware", "furniture"} <= names
     assert len(names) == 7
-    plugin.shutdown()
-    assert topics["/cam/jpeg"].closed

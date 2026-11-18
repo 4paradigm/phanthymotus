@@ -2,7 +2,7 @@
 
 ### Semantic segmentation cards
 
-Wire a camera JPEG to `segment_person` (people), `segment_car` (cars), `segment_chair` (indoor seating of class `chair`), or `segment_traffic` (bicycles, cars, motorcycles, buses and trucks). Each is a separate processor in the Dashboard. Cards on the same camera share one YOLOE-26s-seg inference per sampled frame.
+Wire a camera JPEG to `segment_person` (people), `segment_car` (cars), `segment_chair` (indoor seating of class `chair`), or `segment_traffic` (bicycles, cars, motorcycles, buses and trucks). Additional presets ship by default: `segment_pet` (dogs and cats), `segment_tableware` (bottles, cups and bowls), and `segment_furniture` (beds and couches). Each is a separate processor in the Dashboard. Cards on the same camera share one YOLOE-26s-seg inference per sampled frame.
 
 The first port publishes a lossless, single-channel PNG at the source resolution. Pixel value 0 is background or outside the card's selected classes. Values 1 and above follow that card's configured class order. The second port publishes the class mapping, pixel counts, dimensions and original capture stamp as JSON. The third port shows a colour overlay. Set `plugins.segment.publish_overlay` to false to skip preview encoding. All outputs carry the same source timestamp.
 
