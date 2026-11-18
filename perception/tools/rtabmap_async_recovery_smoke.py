@@ -378,6 +378,7 @@ def run(scene, output, mode='async', resume_run=None):
     os.environ['ROS_LOCALHOST_ONLY']='1'
     import numpy as np
     import rclpy
+    from geometry_msgs.msg import PoseWithCovarianceStamped
     from nav_msgs.msg import Odometry
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.qos import qos_profile_sensor_data as qos,QoSProfile,ReliabilityPolicy
@@ -420,6 +421,7 @@ def run(scene, output, mode='async', resume_run=None):
         for topic,cls in [('odom',String),('cloud',PointCloud2),('rgb',CompressedImage)]}
     infos,inputs,motions,graphs,subscriptions,records={},{},{},[],[],[]
     sent_images={}
+    localization_stamps=[]
     preview_clouds=[];preview_packets=[];preview_rejections=[];rgb_publications=[]
     reliable=QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE)
     pid=None;motion_pids=set();motion_subscriptions=[];motion_namespace=None
@@ -479,7 +481,7 @@ def run(scene, output, mode='async', resume_run=None):
         return [int(row.split()[0]) for row in children.splitlines()
                 if len(row.split())>=2 and Path(row.split()[1]).name=='icp_odometry']
     def persist_native_evidence():
-        for name,value in [('graph.json',graphs),('native-info.json',infos),('motion-info.json',motions),
+        for name,value in [('graph.json',graphs),('localization-stamps.json',localization_stamps),('native-info.json',infos),('motion-info.json',motions),
                            ('preview-clouds.json',preview_clouds),('preview-packets.json',preview_packets),
                            ('preview-rejections.json',preview_rejections),('rgb-publications.json',rgb_publications)]:
             (output/name).write_text(json.dumps(value))
@@ -543,6 +545,8 @@ def run(scene, output, mode='async', resume_run=None):
                 pid=native._process.pid
                 subscriptions += [producer.create_subscription(cls,native.namespace+'/'+topic,callback,qos)
                     for cls,topic,callback in [(Info,'info',info),(MapGraph,'mapGraph',graph),(SensorData,'sensor_data',sensor)]]
+                subscriptions.append(producer.create_subscription(PoseWithCovarianceStamped,
+                    native.namespace+'/localization_pose',lambda msg:localization_stamps.append(stamp(msg)),reliable))
                 subscriptions.append(producer.create_subscription(PointCloud2,native.namespace+'/cloud_map',preview_cloud,reliable))
             wait(lambda:capture in infos,8. if frame['index']==0 else 3.)
             if native._process.pid!=pid or len(gateway._segments)!=1:
@@ -588,6 +592,10 @@ def run(scene, output, mode='async', resume_run=None):
             raise RuntimeError('local scan motion native process remained alive after close')
         if not motion_pids or private_process_pids():raise RuntimeError('local scan native process lifecycle audit failed')
         persist_native_evidence()
+        searching={t for t,n in infos.items() if n['stats'].get('Motus/RecoveryState/')==1}
+        assert searching.isdisjoint(localization_stamps), 'searching observation published a localization pose'
+        assert searching.isdisjoint(g['stamp_ns'] for g in graphs), 'searching observation published a temporary map graph'
+        assert searching.isdisjoint(c['stamp_ns'] for c in preview_clouds+preview_rejections), 'searching observation published a map cloud'
         identity,revision,_=save_rtabmap_revision(output/'archive',artifacts,settings,'asynchronous synthetic recovery',None,'replay')
         reopened=load_map_snapshots(output/'archive',identity,revision,max_points=settings['preview_max_points'])
         archived=archive_roundtrip([s['snapshot'] for s in artifacts['segments'] if s['snapshot'] is not None],
@@ -668,7 +676,9 @@ def evaluate(directory, previous=None):
     if old:
         assert root==min(old['optimized']), 'cold reopening replaced original map root'
         if result['mode'].endswith('-negative'):
-            assert set(db['optimized'])==set(old['optimized']), 'negative query added connected optimized nodes'
+            assert set(db['optimized'])==set(old['optimized']), 'negative query changed the saved optimized node set'
+            assert all(np.allclose(pose, old['optimized'][node], atol=1e-6, rtol=0)
+                for node,pose in db['optimized'].items()), 'negative query moved the saved optimized graph'
         else:
             assert len(db['optimized'])>len(old['optimized'])+3, 'cold reopen did not continue original map'
             assert any(v['anchor'] in old['optimized'] for v in evidence['verified_recoveries']), 'reopen did not geometrically match saved history'

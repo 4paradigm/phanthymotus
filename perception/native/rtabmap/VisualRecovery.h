@@ -83,6 +83,13 @@ public:
         {
             waiting_=!map.getLocalOptimizedPoses().empty() ||
                 (map.getMemory() && map.getMemory()->getLastWorkingSignature());
+            if(!waiting_ && external.isNull())
+            {
+                // An empty database has no anchor to localize against. Wait for
+                // the first measured origin before entering localization mode.
+                state_=Searching;
+                return false;
+            }
             initialized_=true;
         }
         if(images!=imageMode_)
@@ -171,6 +178,7 @@ public:
             return map.process(data,odom_,info.reg.covariance,std::vector<float>(),statistics);
         }
         state_=Searching; odom_.setNull();
+        if(!images) return false;
         if(!localizationMode_)
         {
             // A missing odometry guess cannot justify proximity localization.
@@ -179,15 +187,22 @@ public:
                                  {"RGBD/MaxOdomCacheSize","0"}});
             localizationMode_=true;
         }
+        // Failed localization can clear RTAB-Map's optimized cache when there
+        // is no previous localization node. Keep the last accepted graph.
+        const auto previousPoses=map.getLocalOptimizedPoses();
+        const auto previousLinks=map.getLocalConstraints();
         const bool processed=map.process(data,rtabmap::Transform(),covariance,std::vector<float>(),statistics);
         const auto &stats=map.getStatistics();
         // Native loop id is emitted only after registration and graph validation.
         // Proximity and appearance hypotheses alone cannot authorize recovery.
         auto inliers=stats.data().find(rtabmap::Statistics::kLoopVisual_inliers());
-        if(!processed || !images || stats.loopClosureId()<=0 ||
+        if(!processed || stats.loopClosureId()<=0 ||
            inliers==stats.data().end() || inliers->second<minInliers_ ||
            !validCovariance(stats.localizationCovariance()) || map.getLastLocalizationPose().isNull())
+        {
+            map.setOptimizedPoses(previousPoses,previousLinks);
             return processed;
+        }
 
         const int anchor=stats.loopClosureId(), query=stats.refImageId();
         const int localizationInliers=static_cast<int>(inliers->second);
@@ -199,7 +214,11 @@ public:
         poses.erase(query);
         for(auto i=links.begin();i!=links.end();)
             if(i->second.from()==query || i->second.to()==query) i=links.erase(i); else ++i;
-        if(anchorPose.isNull() || poses.find(anchor)==poses.end()) return processed;
+        if(anchorPose.isNull() || poses.find(anchor)==poses.end())
+        {
+            map.setOptimizedPoses(previousPoses,previousLinks);
+            return processed;
+        }
 
         // Pinned parseParameters clears optimized poses when returning to mapping.
         // Preserve them explicitly, and promote this SAME geometrically verified
@@ -211,19 +230,23 @@ public:
         odom_=location;
         if(!map.process(data,odom_,locCovariance,std::vector<float>(),statistics))
         {
-            map.setOptimizedPoses(poses,links);
-            aligned_=false; return false;
+            map.setOptimizedPoses(previousPoses,previousLinks);
+            odom_.setNull(); aligned_=false; return false;
         }
         const int node=map.getLastLocationId();
         const auto *signature=map.getMemory()->getSignature(node);
-        bool connected=signature && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
-        if(!connected && signature && !signature->hasLink(anchor))
+        const bool inserted=signature && map.isInSTM(node) && !poses.count(node) &&
+            signature->getStamp()==data.stamp();
+        bool connected=inserted && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
+        if(!connected && inserted && !signature->hasLink(anchor))
             connected=map.addLink(rtabmap::Link(anchor,node,rtabmap::Link::kGlobalClosure,
                 anchorPose.inverse()*location,map.getInformation(locCovariance)));
-        connected=connected && signature && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
+        connected=connected && signature->hasLink(anchor,rtabmap::Link::kGlobalClosure);
         if(!connected)
         {
-            map.deleteLastLocation(); map.setOptimizedPoses(poses,links);
+            // Native process may discard the current observation itself.
+            if(inserted) map.deleteLastLocation();
+            map.setOptimizedPoses(previousPoses,previousLinks);
             odom_.setNull(); aligned_=false; return false;
         }
         recoveryNode_=node; recoveryAnchor_=anchor; recoveryInliers_=localizationInliers;

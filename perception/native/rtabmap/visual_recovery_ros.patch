@@ -9,6 +9,15 @@
  #include <rclcpp/rclcpp.hpp>
  
  #include <std_srvs/srv/empty.hpp>
+@@ -284,7 +286,7 @@
+ 	void loadParameters(const std::string & configFile, rtabmap::ParametersMap & parameters);
+ 	void saveParameters(const std::string & configFile);
+ 
+-	void publishStats(const rclcpp::Time & stamp);
++	void publishStats(const rclcpp::Time & stamp, bool processed = true);
+ 	void publishCurrentGoal(const rclcpp::Time & stamp);
+ #ifdef WITH_NAV2_MSGS
+ #ifdef NAV_MSGS_FOXY
 @@ -301,6 +303,7 @@
  
  private:
@@ -70,7 +79,7 @@
  	UTimer timer;
  	if(rtabmap_.isIDsGenerated() || data.id() > 0)
  	{
-@@ -2290,7 +2294,14 @@
+@@ -2290,7 +2294,20 @@
  		}
  
  		timeMsgConversion += timer.ticks();
@@ -82,21 +91,17 @@
 +			odom=visualRecovery_->odom();
 +		}
 +		else processed=rtabmap_.process(data,odom,covariance,odomVelocity,externalStats);
-+		if(processed)
++		if(visualRecovery_ && visualRecovery_->state()==motus::VisualRecovery::Searching)
++		{
++			timeRtabmap = timer.ticks();
++			// Report searching without publishing a temporary graph or pose.
++			this->publishStats(stamp, processed);
++		}
++		else if(processed)
  		{
  			timeRtabmap = timer.ticks();
  			mapToOdomMutex_.lock();
-@@ -2319,7 +2330,8 @@
- 							rtabmap_.getStatistics().proximityDetectionId()!=0 ||
- 							static_cast<int>(uValue(rtabmap_.getStatistics().data(), rtabmap::Statistics::kLoopLandmark_detected(), 0.0f))!=0;
- 
--                    if(localized || !pubLocPoseOnlyWhenLocalizing_)
-+                    if((localized || !pubLocPoseOnlyWhenLocalizing_) &&
-+                        (!visualRecovery_ || visualRecovery_->state()!=motus::VisualRecovery::Searching))
- 					{
- 						geometry_msgs::msg::PoseWithCovarianceStamped poseMsg;
- 					    poseMsg.header.frame_id = mapFrameId_;
-@@ -3162,6 +3174,7 @@
+@@ -3162,6 +3179,7 @@
  {
  	RCLCPP_INFO(this->get_logger(), "rtabmap: Reset");
  	rtabmap_.resetMemory();
@@ -104,7 +109,7 @@
  
  	lastPoseMutex_.lock();
  	lastPoseCovariance_ = cv::Mat();
-@@ -3351,6 +3364,7 @@
+@@ -3351,6 +3369,7 @@
  
  	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database...");
  	rtabmap_.init(parameters_, databasePath_);
@@ -112,7 +117,7 @@
  	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database... done!");
  
  	if(rtabmap_.getMemory())
-@@ -3446,6 +3460,7 @@
+@@ -3446,6 +3465,7 @@
  
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory...");
  	rtabmap_.init(parameters_, databasePath_);
@@ -120,10 +125,30 @@
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory... done!");
  }
  
-@@ -4506,6 +4521,21 @@
+@@ -4493,10 +4513,11 @@
+ 	}
+ }
+ 
+-void CoreWrapper::publishStats(const rclcpp::Time & stamp)
++void CoreWrapper::publishStats(const rclcpp::Time & stamp, bool processed)
+ {
+ 	UDEBUG("Publishing stats...");
+ 	const rtabmap::Statistics & stats = rtabmap_.getStatistics();
++	const bool searching = visualRecovery_ && visualRecovery_->state()==motus::VisualRecovery::Searching;
+ 
+ 	if(infoPub_->get_subscription_count())
+ 	{
+@@ -4505,9 +4526,30 @@
+ 		msg->header.stamp = stamp;
  		msg->header.frame_id = mapFrameId_;
  
- 		rtabmap_conversions::infoToROS(stats, *msg);
+-		rtabmap_conversions::infoToROS(stats, *msg);
++		if(processed) rtabmap_conversions::infoToROS(stats, *msg);
++		if(searching)
++		{
++			msg->loop_closure_id = 0;
++			msg->proximity_detection_id = 0;
++		}
 +		if(visualRecovery_)
 +		{
 +			msg->stats_keys.push_back("Motus/RecoveryState/");
@@ -141,4 +166,7 @@
 +		}
  		infoPub_->publish(std::move(msg));
  	}
++	if(searching) return;
  
+ 	if(mapDataPub_->get_subscription_count())
+ 	{

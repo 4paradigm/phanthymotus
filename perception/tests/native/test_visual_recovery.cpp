@@ -26,9 +26,12 @@ int main(int argc, char **argv)
         while(mask>>frame>>available) imageMask[frame]=available;
         if(imageMask.empty()) throw std::runtime_error("empty image-availability mask");
     }
+    const bool delayedRgb=mode=="delayed_first_external_rgb";
+    const bool delayedExternal=mode=="delayed_first_external" || delayedRgb;
+    const bool rejectedColdQuery=mode=="rejected_cold_query";
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
         mode=="scan_mask" || voHandoff || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
-        mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm";
+        mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm" || rejectedColdQuery || delayedExternal;
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
     p["Reg/Strategy"]="1"; p["Icp/Strategy"]="0"; p["Optimizer/Strategy"]="0";
@@ -45,8 +48,9 @@ int main(int argc, char **argv)
     }
     rtabmap::Rtabmap map; map.init(p, output+".db");
     const auto restoredNodes=map.getLocalOptimizedPoses().size();
-    if(mode=="resume" && restoredNodes==0)
+    if((mode=="resume" || rejectedColdQuery) && restoredNodes==0)
         throw std::runtime_error("cold recovery regression requires an existing optimized map");
+    const auto originalPoses=map.getLocalOptimizedPoses();
     rtabmap::Transform historyExternal;
     if(mode=="history_without_cache")
     {
@@ -108,9 +112,10 @@ int main(int argc, char **argv)
             if(z>0) scan.at<cv::Vec3f>(0,count++)=cv::Vec3f((u-rgb.cols/2.f)*z/f,(v-rgb.rows/2.f)*z/f,z);
         }
         if(mode=="resume") depth=projectedDepth; // Production SensorData carries 32FC1 projected depth.
+        if(rejectedColdQuery) rgb.setTo(cv::Scalar::all(0));
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
-        const bool noImages=mode=="no_rgb" || mode=="history_without_cache" ||
+        const bool noImages=(delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
             (mode=="vo_handoff_gap" && i==3) ||
             (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
             gap || resetGap || (mode=="fallback_cov" && i==1) ||
@@ -120,6 +125,7 @@ int main(int argc, char **argv)
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
         if(voHandoff && hasPose) ext=handoffOrigin*ext;
         if(mode=="history_without_cache") ext=historyExternal;
+        if(rejectedColdQuery || (delayedExternal && i<2)) ext.setNull();
         const auto nodesBefore=map.getLocalOptimizedPoses().size();
         if(visualLost) beforeVisualFailure=map.getLocalOptimizedPoses();
         auto started=std::chrono::steady_clock::now();
@@ -193,12 +199,53 @@ int main(int argc, char **argv)
                     throw std::runtime_error("old VO alignment must not bridge a real visual failure without global verification");
             }
         }
+        if(delayedExternal)
+        {
+            if(i<2 && (!recovery.odom().isNull() || recovery.state()!=motus::VisualRecovery::Searching ||
+                       !map.getLocalOptimizedPoses().empty()))
+                throw std::runtime_error("an empty map without an external pose must await its first anchor");
+            if(i==2 && (!accepted || recovery.state()!=motus::VisualRecovery::External ||
+                       recovery.odom().isNull() || (ext.inverse()*recovery.odom()).getNorm()>1e-6f ||
+                       ext.getAngle(recovery.odom())>1e-6f || map.getLocalOptimizedPoses().size()!=1 ||
+                       !map.getMemory()->isIncremental() || recovery.relocalizations()!=0))
+                throw std::runtime_error("first measured external pose must seed an empty map without RGB");
+            if(i==3)
+            {
+                if(!accepted || map.getLocalOptimizedPoses().size()<=nodesBefore)
+                    throw std::runtime_error("scan-only mapping must grow after a delayed first pose");
+                const int rootId=map.getLocalOptimizedPoses().begin()->first;
+                const int neighborId=map.getLastLocationId();
+                map.close();
+                if(delayedRgb)
+                {
+                    rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
+                    const auto *rootSignature=reopened.getMemory()->getSignature(rootId);
+                    if(!reopened.getLocalOptimizedPoses().count(rootId) || !rootSignature ||
+                       rootSignature->getWords().empty() || rootSignature->getWords3().empty() ||
+                       !rootSignature->hasLink(neighborId,rtabmap::Link::kNeighbor))
+                        throw std::runtime_error("first RGB-D anchor lacks persisted features or a connected neighbor");
+                    auto saved=reopened.getMemory()->getNodeData(rootId,true,false,false,false);
+                    if(saved.imageCompressed().empty() || saved.depthOrRightCompressed().empty())
+                        throw std::runtime_error("first RGB-D anchor lacks saved color or depth");
+                    reopened.close(false);
+                }
+                return 0;
+            }
+        }
         if(mode=="history_without_cache")
         {
-            if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
-               map.getMemory()->isIncremental())
+            if(accepted || recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+               !map.getLocalOptimizedPoses().empty())
                 throw std::runtime_error("historical map without optimized cache must not trust a new external origin");
             map.close(false); return 0;
+        }
+        if(rejectedColdQuery)
+        {
+            if(!accepted || recovery.state()!=motus::VisualRecovery::Searching ||
+               recovery.relocalizations()!=0 || !recovery.odom().isNull() ||
+               map.getLocalOptimizedPoses()!=originalPoses)
+                throw std::runtime_error("rejected cold query must retain the original optimized graph");
+            if(i==2) break;
         }
         if(nativeRecovery)
         {
@@ -326,6 +373,8 @@ int main(int argc, char **argv)
     if(mode=="ltm" && complete.size()<=beforeFinalize.size())
         throw std::runtime_error("LTM finalization regression did not evict graph nodes");
     motus::VisualRecovery::finalize(map);
+    if(rejectedColdQuery && (i!=2 || map.getLocalOptimizedPoses()!=originalPoses))
+        throw std::runtime_error("finalizing rejected cold queries changed the original graph");
     if(mode=="finalize_cache")
         for(const auto &pose:beforeFinalize)
             if(!map.getLocalOptimizedPoses().count(pose.first) ||
@@ -339,6 +388,13 @@ int main(int argc, char **argv)
     map.exportPoses(output+"-optimized.txt",true,true,1);
     map.exportPoses(output+"-raw.txt",false,true,1);
     map.close();
+    if(rejectedColdQuery)
+    {
+        rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
+        if(reopened.getLocalOptimizedPoses()!=originalPoses)
+            throw std::runtime_error("reopening rejected cold queries changed the original graph");
+        reopened.close(false);
+    }
     if(mode=="finalize_cache")
     {
         rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
