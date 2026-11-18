@@ -226,7 +226,14 @@ public:
         {
             state_=VisualTracking; odom_=visualToNative_*visual;
             lastVisual_=visual; lastNative_=odom_;
-            return map.process(data,odom_,info.reg.covariance,std::vector<float>(),statistics);
+            cv::Mat motionCovariance=info.reg.covariance.clone();
+            // Native registration alone omits uncertainty from the projected
+            // depth and RGB/scan time alignment used by this mapping input.
+            constexpr double positionVariance=.02*.02, angleVariance=(CV_PI/180.)*(CV_PI/180.);
+            for(int i=0;i<6;++i)
+                motionCovariance.at<double>(i,i)=std::max(motionCovariance.at<double>(i,i),
+                    i<3?positionVariance:angleVariance);
+            return map.process(data,odom_,motionCovariance,std::vector<float>(),statistics);
         }
         state_=Searching; odom_.setNull();
         if(!images) return false;

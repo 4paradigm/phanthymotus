@@ -248,6 +248,13 @@ int main(int argc, char **argv)
                    std::abs(local.x()-(truthX+.024f))>.05f || std::abs(local.y())>.05f ||
                    (!lastHandoff.isNull() && (lastHandoff.inverse()*recovery.odom()).getNorm()<.1f))
                     throw std::runtime_error("continuous measured VO must map across external pose loss in the established gauge");
+                const auto &links=map.getMemory()->getLastWorkingSignature()->getLinks();
+                const auto link=std::find_if(links.begin(),links.end(),[](const auto & edge) {
+                    return edge.second.type()==rtabmap::Link::kNeighbor;
+                });
+                if(link==links.end() || link->second.transVariance()<.000399 ||
+                   link->second.rotVariance()<.000304)
+                    throw std::runtime_error("visual-only graph edges must retain conservative motion uncertainty");
                 lastHandoff=recovery.odom(); ++handoffFrames;
             }
             if((i==6 || i==7) && (recovery.visualInliers()!=0 || recovery.state()!=motus::VisualRecovery::Searching ||
