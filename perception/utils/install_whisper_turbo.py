@@ -9,8 +9,8 @@ import os
 from pathlib import Path
 import subprocess
 
-REVISION = "e29905dbd76212ba987e8a486fbd46c475591af3"
-MANIFEST_SHA256 = "8049a2aaf4e93d69ea0192f1767457170740a1ea3befada2d3fdde3fc764a980"
+REVISION = "8d3418f062777d4ebdf8a828edfa1023119038db"
+MANIFEST_SHA256 = "b1736556b6e86b8ce4dd3865ed6ee341c58b1718bf57993918e4456bc7f29646"
 MANIFEST_SIZE = 7790
 BASE_URL = ("https://www.modelscope.cn/models/"
             "Flame4pd/asr-whisper-large-v3-turbo-q5-v1/resolve/" + REVISION)

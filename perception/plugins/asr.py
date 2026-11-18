@@ -30,7 +30,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from plugins.vad_preroll import PcmHistory
-from plugins.whisper_turbo import WhisperTurboAdapter
+from plugins.whisper_turbo import LANGUAGE_OPTIONS as WHISPER_LANGUAGE_OPTIONS, WhisperTurboAdapter
 from utils.install_whisper_turbo import MODEL_DIR as WHISPER_TURBO_MODEL_DIR
 
 log = logging.getLogger(__name__)
@@ -660,7 +660,14 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model. Whisper Turbo Q5 uses automatic language detection and GPU, downloads on first start, and has no token timing for precise wake direction", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small", "whisper-turbo-q5"], "description": "ASR model. Whisper Turbo Q5 requires GPU, downloads on first start, and has no token timing for precise wake direction", "default": "sensevoice-small", "scope": "shared"},
+                "whisper_language": {
+                    "type": "string", "title": "Whisper 识别语种",
+                    "oneOf": [{"const": value, "title": title}
+                              for value, title in WHISPER_LANGUAGE_OPTIONS.items()],
+                    "default": "auto", "scope": "shared",
+                    "x-show-when": {"asr_model": "whisper-turbo-q5"},
+                },
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -1016,7 +1023,7 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 # measurements and perception/README.md for the admission checklist.
 ASR_MODELS = {
     "whisper-turbo-q5": {
-        "label": "Whisper Turbo Q5 (automatic multilingual, GPU)",
+        "label": "Whisper Turbo Q5 (multilingual, GPU)",
         "adapter": WhisperTurboAdapter,
         "lazy": True,
         "devices": {"gpu": {"dir": WHISPER_TURBO_MODEL_DIR, "dtype": "q5_0",
@@ -2175,6 +2182,10 @@ class ASRPlugin:
     def __init__(self, plugin_cfg: dict, executor, speaker=None):
         from utils.onnx_provider import normalize_device
         self._language     = plugin_cfg.get('language', 'zh-CN')
+        self._whisper_language = plugin_cfg.get('whisper_language', 'auto')
+        if not isinstance(self._whisper_language, str) or self._whisper_language not in WHISPER_LANGUAGE_OPTIONS:
+            log.warning("[asr] Unrecognized saved Whisper language %r; using automatic detection", self._whisper_language)
+            self._whisper_language = 'auto'
         self._asr_model    = plugin_cfg.get('asr_model', DEFAULT_ASR_MODEL)
         # Mirrors what _build_asr_adapter resolved, including its fall back to cpu
         # for a model with no weights for the requested device, so `info` and the
@@ -2289,10 +2300,13 @@ class ASRPlugin:
             log.warning(f"[asr] failed to destroy ROS node '{key}': {error}")
         return result
 
+    def _recognition_language(self) -> str:
+        return self._whisper_language if self._asr_model == 'whisper-turbo-q5' else self._language
+
     def _sync_cfg(self, node: _ASRNode) -> None:
         """Push current shared plugin config into an existing node."""
         node._adapter = self._adapter
-        node._language = self._language
+        node._language = self._recognition_language()
         node._vad_backend = self._vad_backend
         node._vad_threshold = self._vad_threshold
         node._vad_silence_ms = self._vad_silence_ms
@@ -2577,7 +2591,7 @@ class ASRPlugin:
                     return {"state": "idle"}
                 node = self._nodes.get(node_key)
                 if node is None:
-                    node = _ASRNode(input_topic, self._adapter, self._language,
+                    node = _ASRNode(input_topic, self._adapter, self._recognition_language(),
                                     self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                                     kws_cfg=self._kws_cfg,
                                     node_suffix=node_key.replace('/', '_').replace('-', '_'),
@@ -2651,6 +2665,15 @@ class ASRPlugin:
 
         elif action == "config":
             cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
+            # Resolve old saved model names before interpreting model-specific fields.
+            new_model = resolve_asr_model(cfg.get('asr_model', self._asr_model))
+            whisper_language = cfg.get('whisper_language', self._whisper_language)
+            if new_model == 'whisper-turbo-q5' and (
+                not isinstance(whisper_language, str) or whisper_language not in WHISPER_LANGUAGE_OPTIONS
+            ):
+                return {"status": "error", "asr_model": self._asr_model,
+                        "message": f"Unknown Whisper language {whisper_language!r}; "
+                                   f"available: {', '.join(WHISPER_LANGUAGE_OPTIONS)}"}
             # Shared config update
             self._language = cfg.get('language', self._language)
             if 'vad_threshold' in cfg:
@@ -2686,9 +2709,6 @@ class ASRPlugin:
             # because a request can change both at once, and whether a device is
             # allowed depends on the model.
             from utils.onnx_provider import normalize_device
-            # Resolve before validating, so a card still holding a removed name
-            # reconfigures onto the replacement instead of erroring out.
-            new_model = resolve_asr_model(cfg.get('asr_model', self._asr_model))
             new_device = (normalize_device(cfg['device']) if 'device' in cfg
                           else self._device)
             if new_model not in ASR_MODELS:
@@ -2739,6 +2759,12 @@ class ASRPlugin:
                             "value would fail, so using cpu.", new_model, new_device)
                 new_device = "cpu"
 
+            language_info = {}
+            if new_model == 'whisper-turbo-q5':
+                self._whisper_language = whisper_language
+                self._plugin_cfg['whisper_language'] = whisper_language
+                language_info['whisper_language'] = whisper_language
+
             if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
                 with self._nodes_lock:
@@ -2767,7 +2793,7 @@ class ASRPlugin:
                         self._load_error = None
                         self._load_status = ""
                     return {"status": "configured", "asr_model": new_model,
-                            "device": new_device}
+                            "device": new_device, **language_info}
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "device": self._device,
@@ -2788,10 +2814,10 @@ class ASRPlugin:
                 # the wire. Reporting "configured" here ended the dashboard's
                 # progress text mid-download and left it on a bare spinner.
                 return {"status": "loading", "asr_model": self._asr_model,
-                        "device": self._device,
+                        "device": self._device, **language_info,
                         "message": self._load_status or
                                    f"正在加载模型 '{self._asr_model}' ({self._device})"}
-            return {"status": "configured", "asr_model": self._asr_model}
+            return {"status": "configured", "asr_model": self._asr_model, **language_info}
 
         return None
 

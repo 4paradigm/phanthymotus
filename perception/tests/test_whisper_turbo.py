@@ -161,6 +161,34 @@ def test_constructor_info_config_and_invalid_start_are_lazy(monkeypatch):
     assert plugin._adapter is None and not plugin._loading
 
 
+def test_saved_whisper_configs_keep_auto_then_apply_fixed_language(monkeypatch):
+    adapter = SimpleNamespace(prepare=lambda **kwargs: None)
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: adapter)
+    started = []
+
+    def start_node(node):
+        node.state = "running"
+        started.append(node._language)
+        return {"state": "running"}
+
+    def stop_node(node):
+        node.state = "idle"
+        return {"state": "idle"}
+
+    monkeypatch.setattr(asr._ASRNode, "start", start_node)
+    monkeypatch.setattr(asr._ASRNode, "stop", stop_node)
+    saved = {"asr_model": "whisper-turbo-q5", "device": "gpu", "language": "zh-CN"}
+    plugin = asr.ASRPlugin(saved.copy(), _FakeExecutor())
+    # Old saved cards sent language=zh-CN even when Whisper used automatic LID.
+    assert plugin.dispatch("asr", {"action": "config", **saved})["whisper_language"] == "auto"
+    card = {"instance_id": "card", "input_topic": "/mic"}
+    assert plugin.dispatch("asr", {"action": "start", **card})["state"] == "running"
+    assert plugin.dispatch("asr", {"action": "config", "whisper_language": "ja"})["whisper_language"] == "ja"
+    assert plugin.dispatch("asr", {"action": "config", "whisper_language": "auto"})["whisper_language"] == "auto"
+    assert started == ["auto", "ja", "auto"] and plugin._adapter is adapter
+    plugin.dispatch("asr", {"action": "stop", **card})
+
+
 def test_config_switch_does_not_start_native_worker(monkeypatch):
     builds = []
     monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **kw: builds.append(a) or object())
@@ -479,12 +507,15 @@ def test_stale_deferred_start_cannot_revive_after_stop(monkeypatch):
     assert len(adapters) == 1 and adapters[0].closed and plugin._adapter is None
 
 
-def test_worker_protocol_reuses_one_process_and_returns_language(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fixed_language_supported", [False, True])
+def test_worker_protocol_reuses_one_process_and_returns_language(tmp_path, monkeypatch, fixed_language_supported):
     worker = tmp_path / "worker"
     worker.write_text("#!/usr/bin/env python3\nimport json,sys\n"
-                     "print(json.dumps({'ready':True,'gpu':True}),flush=True)\n"
+                     f"print(json.dumps({{'ready':True,'gpu':True,'supports_fixed_language':{fixed_language_supported}}}),flush=True)\n"
                      "for line in sys.stdin:\n"
-                     " print(json.dumps({'raw_text':'hello','predicted_language':'ja'}),flush=True)\n")
+                     " language=json.loads(line).get('language')\n"
+                     " print(json.dumps({'raw_text':language or 'auto',"
+                     "'predicted_language':language or 'ja'}),flush=True)\n")
     worker.chmod(0o755)
     (tmp_path / "model.bin").write_bytes(b"protocol fixture")
     monkeypatch.setenv("WHISPER_TURBO_WORKER", str(worker))
@@ -494,9 +525,14 @@ def test_worker_protocol_reuses_one_process_and_returns_language(tmp_path, monke
     try:
         adapter.prepare()
         pid = adapter._process.pid
-        for _ in range(2):
-            assert adapter.transcribe_rich(wav_bytes()) == ("hello", {"lang": "ja"})
-            assert adapter._process.pid == pid
+        assert adapter.transcribe_rich(wav_bytes()) == ("auto", {"lang": "ja"})
+        if fixed_language_supported:
+            assert adapter.transcribe_rich(wav_bytes(), "th") == ("th", {"lang": "th"})
+        else:
+            with pytest.raises(RuntimeError, match="update the runtime"):
+                adapter.transcribe_rich(wav_bytes(), "th")
+        assert adapter.transcribe_rich(wav_bytes()) == ("auto", {"lang": "ja"})
+        assert adapter._process.pid == pid
     finally:
         adapter.close()
     assert adapter._process is None
@@ -511,7 +547,7 @@ def test_whisper_wake_direction_uses_existing_no_alignment_rules(
 ):
     adapter = WhisperTurboAdapter(str(tmp_path))
     assert isinstance(adapter, asr.ASRAdapter)
-    monkeypatch.setattr(adapter, "_transcribe", lambda _: (text, "zh"))
+    monkeypatch.setattr(adapter, "_transcribe", lambda *_: (text, "zh"))
     transcript, tags, alignment = adapter.transcribe_aligned(b"protocol fixture")
     assert transcript == text and tags == {"lang": "zh"} and alignment is None
     char_ends = [i + 1 for i, char in enumerate(text) if char != "，"]

@@ -17,10 +17,11 @@ The ASR plugin (VAD + speech recognition) has strict requirements on the audio s
 Select `asr_model: whisper-turbo-q5` with `device: gpu` to use the optional
 whisper.cpp CUDA backend. The first valid `start` downloads any missing pinned
 runtime/model files and initializes the worker; `info` and `config` do not
-preload it. During recognition, one base model and the published Japanese,
-Thai and Russian adapters stay loaded, and automatic language identification
-selects the matching adapter for each segment. Other supported languages use
-the base model.
+preload it. In the ASR configuration, `Whisper 识别语种`
+(`whisper_language`) defaults to automatic detection per speech segment.
+Select a language to use it for decoding and skip language detection. One base
+model and the Japanese, Thai and Russian adapters stay loaded, and the selected
+or detected language chooses the corresponding adapter when available.
 
 ### ROS2 Message Type
 

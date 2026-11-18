@@ -19,7 +19,17 @@ from plugins.numeric_dictation import normalize_long_numeric_dictation
 from plugins.asr_numeric import NumericOutputNormalizer
 
 log = logging.getLogger(__name__)
-LANGUAGES = ("en", "zh", "ja", "fr", "de", "es", "ru", "th")
+LANGUAGE_OPTIONS = {
+    "auto": "自动识别",
+    "zh": "中文",
+    "en": "英语",
+    "ja": "日语",
+    "fr": "法语",
+    "de": "德语",
+    "es": "西班牙语",
+    "ru": "俄语",
+    "th": "泰语",
+}
 
 
 class WhisperTurboAdapter:
@@ -43,6 +53,7 @@ class WhisperTurboAdapter:
         self._closed = False
         self._stderr = None
         self._numeric = None
+        self._supports_fixed_language = False
         self.last_language = None
         self.last_language_probability = None
 
@@ -93,6 +104,7 @@ class WhisperTurboAdapter:
             ready = self._read(60.0)
             if not ready.get("ready") or not ready.get("gpu"):
                 raise RuntimeError("Whisper Turbo failed CUDA initialization")
+            self._supports_fixed_language = ready.get("supports_fixed_language") is True
         except Exception:
             self._close_worker()
             raise
@@ -122,7 +134,9 @@ class WhisperTurboAdapter:
                 raise RuntimeError("Invalid Whisper Turbo worker response")
             return reply
 
-    def _transcribe(self, wav_bytes):
+    def _transcribe(self, wav_bytes, language="auto"):
+        if language not in LANGUAGE_OPTIONS:
+            raise ValueError(f"Unsupported Whisper Turbo language: {language!r}")
         with wave.open(io.BytesIO(wav_bytes), "rb") as audio:
             if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, 16000):
                 raise ValueError("ASR expects mono 16kHz PCM16 WAV audio")
@@ -132,6 +146,8 @@ class WhisperTurboAdapter:
             return "", ""
         with self._lock:
             self._start()
+            if language != "auto" and not self._supports_fixed_language:
+                raise RuntimeError("Whisper Turbo worker does not support fixed language; update the runtime")
             handle, path = tempfile.mkstemp(prefix="whisper-turbo-", suffix=".wav")
             os.close(handle)
             try:
@@ -140,7 +156,10 @@ class WhisperTurboAdapter:
                     out.setsampwidth(2)
                     out.setframerate(16000)
                     out.writeframes(pcm)
-                self._process.stdin.write(json.dumps({"audio": path}) + "\n")
+                request = {"audio": path}
+                if language != "auto":
+                    request["language"] = language
+                self._process.stdin.write(json.dumps(request) + "\n")
                 self._process.stdin.flush()
                 reply = self._read(130.0)
                 if reply.get("error"):
@@ -152,20 +171,20 @@ class WhisperTurboAdapter:
                 raise
             finally:
                 os.unlink(path)
-            language = str(reply.get("predicted_language") or "").strip().lower()
-            if language not in LANGUAGES:
-                language = ""
-            self.last_language = language or None
+            detected = str(reply.get("predicted_language") or "").strip().lower()
+            if detected == "auto" or detected not in LANGUAGE_OPTIONS:
+                detected = ""
+            self.last_language = detected or None
             text = str(reply.get("raw_text") or "").strip()
-            rendered = (self._numeric.normalize(text, language) if self._numeric is not None
-                        else normalize_long_numeric_dictation(text, language))
-            return rendered, language
+            rendered = (self._numeric.normalize(text, detected) if self._numeric is not None
+                        else normalize_long_numeric_dictation(text, detected))
+            return rendered, detected
 
     def transcribe(self, wav_bytes, language="auto"):
-        return self._transcribe(wav_bytes)[0]
+        return self._transcribe(wav_bytes, language)[0]
 
     def transcribe_rich(self, wav_bytes, language="auto", include_emotion=False):
-        text, detected = self._transcribe(wav_bytes)
+        text, detected = self._transcribe(wav_bytes, language)
         return text, ({"lang": detected} if detected else {})
 
     def transcribe_aligned(self, wav_bytes, language="auto", include_emotion=False):
