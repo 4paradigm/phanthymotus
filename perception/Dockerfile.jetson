@@ -728,7 +728,7 @@ CMD ["/bin/bash", "-c", \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     if [ \"${XIAOYOU_TTS_DARVIN}\" = 1 ] && [ \"${XIAOYOU_TTS_IMAGE_JP}\" = 511 ] && [ -z \"${CONFIG_PATH:-}\" ] \
+     if [ \"${XIAOYOU_TTS_DARVIN}\" = 1 ] && [[ \"${XIAOYOU_TTS_IMAGE_JP}\" = 511 || \"${XIAOYOU_TTS_IMAGE_JP}\" = 61 ]] && [ -z \"${CONFIG_PATH:-}\" ] \
          && [ -n \"${MCP_PORT:-}\" ] && [ -n \"${WS_PORT:-}\" ]; then \
          export CONFIG_PATH=/tmp/xiaoyou-darvin.json XIAOYOU01_TTS_BENCHMARK=1; \
          if [ -z \"${FASTRTPS_DEFAULT_PROFILES_FILE:-}${FASTDDS_DEFAULT_PROFILES_FILE:-}\" ]; then \
