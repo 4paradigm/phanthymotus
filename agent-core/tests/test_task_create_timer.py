@@ -136,6 +136,18 @@ class TestExplicitTaskTimer(unittest.TestCase):
         self.assertEqual(task_store.active_tasks(), [])
         self.assertFalse(add.called)
 
+    def test_created_timer_reports_local_time_and_waits_for_its_event(self):
+        next_ts = 1794990120.0
+        expected_time = time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(next_ts))
+        with patch.object(scheduler, '_next_run', return_value=next_ts), \
+                patch.object(scheduler, 'add_job'):
+            result = asyncio.run(task_mod.Tools().task_create(goal='稍后报时', check_cron='0 8 * * *'))
+        task = task_store.active_tasks()[0]
+        self.assertIn(expected_time, result)
+        self.assertIn(f'scheduler:task:{task.id}', result)
+        self.assertIn('尚未触发', result)
+        self.assertIn('不要现在执行提醒或标记完成', result)
+
 
 class TestCapabilityIsKeptForHumansAndSolutions(unittest.TestCase):
     """定时检查能力本身保留 —— 删掉会砸掉 solutions（方案包声明的任务）。"""

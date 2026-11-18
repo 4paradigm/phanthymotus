@@ -50,7 +50,9 @@ class Tools:
         """创建一个长时间任务并开始追踪。适用于预计超过30秒的动作（导航、巡逻、等待等）。
 
         默认只追踪，不自动定时检查。用户明确要求报时或提醒时，填写 check_cron 注册实际调度；
-        只有工具返回定时注册成功才能告知用户已设置。一次性提醒执行后调用 task_done，避免重复。
+        注册成功仅表示排期完成，当前回合只确认排期后结束，不要立即执行提醒或调用 task_done。
+        等收到对应 scheduler:task:<id> 事件后才执行；一次性提醒执行后调用 task_done，避免重复。
+        cron 精度为分钟，确认时使用返回的触发时间，不要承诺秒级倒计时。
         完成或失败时用 task_done / task_fail 收尾；子代理完成通知和进度播报由框架处理。
         """
         try:
@@ -59,7 +61,9 @@ class Tools:
             return f'定时设置失败，未创建任务：{e}'
         task = task_store.create(goal=goal, check_cron=check_cron)
         _register_check(task)
-        timing = f'；定时已注册，下次触发 {time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(next_ts))}' if next_ts is not None else '（未设置定时）'
+        timing = (f'；定时已注册，下次触发 {time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(next_ts))}。'
+                  f'尚未触发：本轮只确认排期并结束，等待 scheduler:task:{task.id} 事件；'
+                  '不要现在执行提醒或标记完成。') if next_ts is not None else '（未设置定时）'
         return f'任务已创建：[{task.id}] {task.goal}{timing}'
 
     @log.function_(call=True)
