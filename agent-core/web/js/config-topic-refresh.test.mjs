@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { inputArgs, inputKey } from './topic-derive.js';
 
-const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
+const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 function code(name) {
   const at = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   return at < 0 ? '' : source.slice(at, source.indexOf('\n}\n', at) + 3);
@@ -70,11 +70,12 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     _makeDraggable() {}, _syncGeometryObservers() {}, _syncEmptyState() {},
     _debouncedSave() { saves++; },
     _viewport: viewport, _isEditor: true, _sessionId: 'editor', _execConnections: [],
+    _editorRevision: 0, _editClaimPromise: null,
     _zoom: 1, _tx: 0, _ty: 0, _updateEditorUI() {},
     fetch: async (url, init) => {
       if (url === '/api/canvas/layout') {
         if (init) persisted = JSON.parse(init.body);
-        return { status: 200, json: async () => ({ data: persisted, editor: 'editor' }) };
+        return { ok: true, status: 200, json: async () => ({ data: persisted, editor: 'editor' }) };
       }
       return fetch(url, init);
     },
@@ -83,7 +84,8 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
     + (revalidate ? code('_inputTopicsFor') + code('_revalidateDerivedTopics') : '')
     + code('_parseMcpCallResult') + code('_fetchTopicsFromDriver') + code('_refreshConfiguredTopics')
-    + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_reloadLayout')
+    + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard')
+    + code('_setEditorState') + code('_saveLayout') + code('_reloadLayout')
     + `\n({ refresh: _refreshConfiguredTopics, info: _fetchTopicsFromDriver, poll: updateCanvasMcps,
       add: _addCard, save: _saveLayout, reload: _reloadLayout, resolve: _resolveAllTopics, cards: () => _cards });`, scope);
   let listener, refreshing;
