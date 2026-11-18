@@ -1,0 +1,20 @@
+{
+  "bind_host": "0.0.0.0",
+  "port": 8765,
+  "shared_token": "安装程序生成的随机密钥",
+  "database_path": "data/bridge.db",
+  "ticket_seconds": 300,
+  "printable_statuses": ["未入场"],
+  "success_statuses": ["已入场"],
+  "edge": {
+    "profile_dir": "data/edge-profile",
+    "list_url": "https://p-visitor.4paradigm.com/#/VisitorInfo/visitorinfo-list",
+    "query_url": "https://p-visitor.4paradigm.com/smart-admin-api/visitInfo/page/query",
+    "query_endpoint_contains": "/visitInfo/page/query",
+    "headless": false,
+    "kiosk_printing": true,
+    "print_render_wait_ms": 1500,
+    "auto_set_default_printer": true,
+    "printer_name": "Brother QL-820NWB"
+  }
+}

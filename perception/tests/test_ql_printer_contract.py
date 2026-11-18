@@ -51,7 +51,7 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(definition["name"], "QL_printer")
         self.assertEqual(definition["type"], "actuator")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
-        self.assertEqual(set(actions), {"start", "stop", "info", "config", "list", "print", "printers"})
+        self.assertEqual(set(actions), {"start", "stop", "info", "config", "list", "print", "printers", "initialize", "initialize_status"})
         schema_text = json.dumps(definition["inputSchema"], ensure_ascii=False)
         self.assertIn('"print"', schema_text)
         props = definition["configSchema"]["properties"]

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import re
 import subprocess
@@ -152,6 +153,7 @@ class QLPrinterPlugin:
             ),
         }
         self._direct_request_ids: dict[tuple[str, str, str, str], str] = {}
+        self._deploy_state = {"status": "idle"}
 
     # ── 卡片定义 ──────────────────────────────────────────────────────────
     def get_tool(self) -> dict:
@@ -183,6 +185,8 @@ class QLPrinterPlugin:
         }
         actions["config"][0].append("printer_name")
         actions["printers"] = (["bridge_url", "token"], "读取目标电脑已安装的打印机")
+        actions["initialize"] = (["bridge_url", "token", "remote_start_user", "remote_start_port", "remote_start_key_path"], "通过管理员 SSH 初始化目标电脑，仅在安装设置时使用")
+        actions["initialize_status"] = ([], "读取初始化进度")
         definition = tool(
             TOOL_NAME,
             "actuator",
@@ -257,6 +261,8 @@ class QLPrinterPlugin:
         if action == "config":
             return self._config(args)
         handlers = {
+            "initialize": self._initialize,
+            "initialize_status": lambda args: dict(self._deploy_state),
             "printers": self._printers,
             "list": self._list,
             # Keep old saved canvas actions working during rollout; find is no
@@ -268,7 +274,7 @@ class QLPrinterPlugin:
         handler = handlers.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
-        if not self._configured() and action != "printers":
+        if not self._configured() and action not in ("printers", "initialize", "initialize_status"):
             return {"status": "error", "code": "not_configured", "error": "卡片还没配置桥接服务地址，请在卡片配置里填写"}
         try:
             return handler(args)
@@ -353,7 +359,8 @@ class QLPrinterPlugin:
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
             "-o", "StrictHostKeyChecking=yes",
             "-o", f"UserKnownHostsFile={known_hosts}",
-            f"{user}@{host}", "start-bridge",
+            f"{user}@{host}", "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(
+                "Start-ScheduledTask -TaskName 'Paradigm Visitor Bridge Watchdog'".encode('utf-16le')).decode(),
         ]
         try:
             completed = subprocess.run(
@@ -370,6 +377,24 @@ class QLPrinterPlugin:
             if self._bridge_is_healthy():
                 return None
         return {"status": "error", "code": "remote_start_timeout", "error": "已通知前台电脑启动桥接，但 15 秒内未恢复"}
+
+    def _initialize(self, args: dict) -> dict:
+        with self._lock:
+            if self._deploy_state.get("status") == "installing":
+                return dict(self._deploy_state)
+            config = dict(self._cfg)
+            config.update({k: v for k, v in args.items() if k in config})
+            self._deploy_state = {"status": "installing"}
+        def work():
+            try:
+                from .bridge_deploy import deploy
+                result = deploy(config)
+            except Exception:
+                result = {"status": "error", "error": "初始化失败：检查管理员 SSH 权限、known_hosts、网络及电脑上的 bootstrap.log"}
+            with self._lock:
+                self._deploy_state = result
+        threading.Thread(target=work, daemon=True).start()
+        return {"status": "installing"}
 
     def _printers(self, args: dict) -> dict:
         # Use unsaved dialog connection values without changing runtime config.
