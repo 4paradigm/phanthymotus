@@ -68,9 +68,24 @@ TOOLS = [{
     },
     "configSchema": {"type": "object", "properties": CONFIG},
     "topic_in": [{"format": "image/jpeg", "desc": "Camera JPEG"}],
-    "topic_out": [{"format": "data/json", "desc": "Marker poses in the camera optical frame (m)"},
+    "topic_out": [{"format": "data/json", "desc": "Marker poses in the camera optical frame (m) for downstream cards"},
                   {"format": "image/jpeg", "desc": "Optional Monitor image with marker IDs and XYZ axes"}],
 }]
+
+
+def _is_camera_topic(topic):
+    return isinstance(topic, str) and topic.startswith("/") and not topic.endswith("/")
+
+
+def _instance_suffix(key):
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _output_ports(input_topic, suffix, publish_overlay):
+    base = f"{input_topic}/aruco/i_{suffix}" if input_topic else ""
+    # Keep port 1 in place so a saved overlay connection cannot resolve to port 0 (JSON).
+    return [{**TOOLS[0]["topic_out"][0], "topic": f"{base}/poses" if base else ""},
+            {**TOOLS[0]["topic_out"][1], "topic": f"{base}/overlay" if base and publish_overlay else ""}]
 
 
 def _validate_options(options):
@@ -107,7 +122,7 @@ def _wired_calibration(camera_info, topic):
 class _ArucoNode(Node):
     def __init__(self, topic, key, options, calibration, detector, camera_id):
         self.calibration = calibration
-        suffix = hashlib.sha256(key.encode()).hexdigest()[:16]
+        suffix = _instance_suffix(key)
         # A retiring incarnation may still own its ROS name during a concurrent start.
         super().__init__(f"aruco_{suffix}_{next(_NODE_SEQUENCE)}")
         self.input_topic = topic
@@ -120,11 +135,8 @@ class _ArucoNode(Node):
         self._error_log = SampledLogGate()
         self.last_error = ""
         self.worker_error = ""
-        base = f"{topic}/aruco/i_{suffix}"
-        # Keep port 1 in place so a saved overlay connection cannot resolve to the JSON port.
-        overlay_topic = f"{base}/overlay" if options["publish_overlay"] else ""
-        self.outputs = [{"topic": f"{base}/poses", **TOOLS[0]["topic_out"][0]},
-                        {"topic": overlay_topic, **TOOLS[0]["topic_out"][1]}]
+        self.outputs = _output_ports(topic, suffix, options["publish_overlay"])
+        overlay_topic = self.outputs[1]["topic"]
         try:
             # Keep outputs reliable for Monitor and other DDS subscribers.
             self._poses = self.create_publisher(String, self.outputs[0]["topic"], 1)
@@ -259,7 +271,7 @@ class ArucoPlugin:
         if action == "start":
             return self._start(instance, topic, args.get("camera_info"))
         if action == "info":
-            return self._info(instance or topic)
+            return self._info(instance, topic)
         if action == "stop":
             self._stop(instance or topic)
             return {"state": "idle"}
@@ -279,21 +291,27 @@ class ArucoPlugin:
             info.update(state="error", error=node.worker_error)
         return info
 
-    def _info(self, key):
+    def _info(self, instance, input_topic):
+        topic = input_topic if _is_camera_topic(input_topic) else ""
+        key = instance or topic
         with self._lock:
             instances = sorted(self._nodes.keys() | self._pending_starts.keys())
             if not key and len(instances) == 1:
                 key = instances[0]
-            if key in self._pending_starts:
-                return {"state": "starting", "topic_out": [], "instances": instances}
-            if key in self._nodes:
+            starting = key in self._pending_starts
+            if not starting and key in self._nodes:
                 return self._node_info(self._nodes[key])
-            options = {**self._defaults, **self._overrides.get(key, {})}
-        try:
-            MarkerDetector(options["dictionary"], draw_overlay=options["publish_overlay"])
-        except RuntimeError as exc:
-            return {"state": "error", "error": str(exc)}
-        return {"state": "idle", "topic_out": [], "instances": instances}
+            options = {**self._defaults, **self._overrides.get(instance, {})}
+        if not starting:
+            try:
+                MarkerDetector(options["dictionary"], draw_overlay=options["publish_overlay"])
+            except RuntimeError as exc:
+                return {"state": "error", "error": str(exc), "topic_out": _output_ports("", "", False)}
+        # The canvas uses even an idle info reply to render its output ports and resolve links.
+        suffix = _instance_suffix(key) if topic else ""
+        return {"state": "starting" if starting else "idle",
+                "topic_out": _output_ports(topic, suffix, options["publish_overlay"]),
+                "instances": instances}
 
     def _config(self, instance, args):
         changes = {key: args[key] for key in CONFIG if key in args}
@@ -311,7 +329,7 @@ class ArucoPlugin:
         return {"state": "configured", "message": "Settings take effect on the next start."}
 
     def _start(self, instance, topic, camera_info):
-        if not isinstance(topic, str) or not topic.startswith("/") or topic.endswith("/"):
+        if not _is_camera_topic(topic):
             return {"state": "error", "error": "Connect a camera or provide an absolute camera JPEG topic."}
         key = instance or topic
         calibration_error = None

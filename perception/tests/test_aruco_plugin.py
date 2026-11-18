@@ -113,9 +113,60 @@ def test_bundle_advertises_tool_and_explains_missing_backend(monkeypatch):
         unavailable = bundle.dispatch("aruco", {"action": "info"})
         assert unavailable["state"] == "error"
         assert "OpenCV ArUco" in unavailable["error"]
+        assert unavailable["topic_out"] == [{**port, "topic": ""} for port in tool["topic_out"]]
         assert not executor.nodes
     finally:
         bundle.shutdown()
+
+
+@pytest.mark.parametrize("publish_overlay", [True, False])
+def test_output_ports_are_available_before_start(detector, publish_overlay):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    instance = {"instance_id": "aruco-card"}
+    wired = {**instance, "input_topic": TOPIC}
+    try:
+        plugin.dispatch("aruco", {**instance, "action": "config", "publish_overlay": publish_overlay})
+        unbound = plugin.dispatch("aruco", {**instance, "action": "info", "input_topic": ""})
+        assert unbound["state"] == "idle"
+        ports = plugin.get_tools()[0]["topic_out"]
+        assert unbound["topic_out"] == [{**port, "topic": ""} for port in ports]
+
+        preview = plugin.dispatch("aruco", {**wired, "action": "info"})
+        assert preview["state"] == "idle"
+        assert not executor.nodes
+        poses, overlay = preview["topic_out"]
+        assert poses["format"] == "data/json" and poses["topic"].endswith("/poses")
+        assert overlay["format"] == "image/jpeg"
+        if publish_overlay:
+            assert overlay["topic"].endswith("/overlay")
+        else:
+            assert overlay["topic"] == ""
+
+        started = plugin.dispatch("aruco", {**wired, "action": "start", "camera_info": [CAMERA]})
+        assert started["state"] == "running"
+        assert started["topic_out"] == preview["topic_out"]
+        [node] = executor.nodes
+        assert [pub.topic for pub in node.publishers] == [p["topic"] for p in preview["topic_out"] if p["topic"]]
+        plugin.dispatch("aruco", {**instance, "action": "stop"})
+        assert plugin.dispatch("aruco", {**wired, "action": "info"}) == preview
+    finally:
+        plugin.shutdown()
+
+
+def test_output_preview_uses_the_wired_camera_and_card_id(detector):
+    plugin = ArucoPlugin({}, _FakeExecutor())
+    try:
+        args = {"action": "info", "input_topic": TOPIC, "instance_id": "first"}
+        first = plugin.dispatch("aruco", args)["topic_out"][0]["topic"]
+        second = plugin.dispatch("aruco", {**args, "instance_id": "second"})["topic_out"][0]["topic"]
+        rewired = plugin.dispatch("aruco", {**args, "input_topic": "/other/color"})["topic_out"][0]["topic"]
+        assert first.startswith(f"{TOPIC}/aruco/") and second.startswith(f"{TOPIC}/aruco/")
+        assert first != second
+        assert rewired == first.replace(TOPIC, "/other/color", 1)
+        assert plugin.dispatch("aruco", {**args, "input_topic": "not-absolute"})["topic_out"][0]["topic"] == ""
+    finally:
+        plugin.shutdown()
 
 
 def _frame(image, sec):

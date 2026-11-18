@@ -4330,6 +4330,11 @@ An invalid rewire leaves a running card on its previously calibrated topic.
 If calibration is lost on the active topic, pose output stops until a valid
 start. Frame dimensions must match that calibration and fit within 36 megapixels.
 
+Connect the right-hand `data/json` port to a downstream `data/json` input,
+such as `decision_core`. The port is visible before the card starts. Wiring a
+camera resolves the instance's `poses` topic, and starting the canvas passes
+the calibration to ArUco and the resolved topic to the downstream card.
+
 The default marker side is **10 cm (0.10 m)**. If your print differs, measure an
 outer edge of the black square, excluding the white margin, and enter its
 length in meters under **Marker side (m)**. The card uses this length for every
