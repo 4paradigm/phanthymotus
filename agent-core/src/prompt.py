@@ -409,7 +409,6 @@ def build(
     system_msg:    dict,
     message_list:  list[dict],
     trigger_event: dict,
-    include_dynamic: bool = True,
 ) -> list[dict]:
     """
     返回完整的 messages 列表（首轮，含 L4 触发事件）。
@@ -420,7 +419,7 @@ def build(
         trigger_event: L4 触发事件（从 collector 取到的 dict）。
     """
     # L2 动态信息 + L4 触发合并为一条 user message，减少消息数
-    dynamic = _env_dynamic() + '\n\n' if include_dynamic else ''
+    dynamic = _env_dynamic() + '\n\n'
     trigger = _trigger_message(trigger_event)
 
     return [

@@ -2413,8 +2413,7 @@ class Event:
         bound_tool_names = {s['name'] for s in bound_schemas}
 
         # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
-        frozen_system = (chat_only.SYSTEM if isolated else
-                         prompt_mod.build_system(mcp_client.registry, bound_tool_names))
+        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
 
         finish_tool = 'finish'
         llm_cfg = config.main.get('event', {}).get('llm', {})
@@ -2488,7 +2487,6 @@ class Event:
                     system_msg    = frozen_system,
                     message_list  = current_history,
                     trigger_event = trigger_event,
-                    include_dynamic = not isolated,
                 )
                 # 把 trigger user message 记入 turn_messages，后续轮次能看到
                 trigger_user_msg = messages[-1]  # build() 最后一条是 L4 user

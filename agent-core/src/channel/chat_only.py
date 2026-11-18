@@ -4,7 +4,9 @@ PLATFORMS = frozenset({'qq'})
 REPLY_TOOL = 'mcp__channel__channel_reply'
 REPLY_SCHEMA = {
     'name': REPLY_TOOL,
-    'description': 'Reply to the current Channel message.',
+    'description': ('Send a text reply to the QQ message that triggered this turn. '
+                    'Set action="send" and source_message_id to the current message_id; '
+                    'finish when done. No other action is permitted.'),
     'parameters': {
         'type': 'object',
         'properties': {'action': {'type': 'string', 'enum': ['send']},
@@ -14,13 +16,6 @@ REPLY_SCHEMA = {
         'additionalProperties': False,
     },
 }
-SYSTEM = {
-    'role': 'system',
-    'content': 'You are a chat assistant. Respond in the user’s language. '
-               'Use channel_reply with action="send", text and the current message_id '
-               'as source_message_id. Use finish when done.',
-}
-
 
 async def dispatch(name, args, trigger):
     if name == 'finish' and args == {}:

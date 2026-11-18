@@ -528,11 +528,8 @@ class ChannelManager:
 
         if channel_id in self._starting or (adapter and getattr(adapter, 'reconnecting', False)):
             return
-        cfg = get_channel_config(channel_id) or {}
-        if (cfg.get('platform') in chat_only.PLATFORMS
-                and self._retry_backoff.get(channel_id, 0) >= 300):
-            return
-
+        # Keep retrying after a long outage. The delay is capped, not the number
+        # of attempts; stopping forever would require a manual restart after Wi-Fi returns.
         # 指数退避重连（30s → 60s → … → 300s）
         now = time.time()
         if now < self._retry_at.get(channel_id, 0):
@@ -708,15 +705,20 @@ class ChannelManager:
                 print(f'[channel] {msg.channel_id} message discarded: no channel_request card '
                       f'on the canvas is configured for this channel')
             return
-        self._inactive_logged.discard(msg.channel_id)
-
         private_chat = msg.platform in chat_only.PLATFORMS
-        is_bot = msg.sender_type in ('bot', 'app')
-        trusted_bot_id = self._trusted_bot_id(msg) if is_bot else ''
         if private_chat:
             from channel.qq_canvas import input_ready
             if not input_ready(msg.channel_id):
+                if msg.channel_id not in self._inactive_logged:
+                    self._inactive_logged.add(msg.channel_id)
+                    print(f'[channel] {msg.channel_id} message discarded: '
+                          'robot project stopped or QQ Canvas input is not ready')
                 return
+        self._inactive_logged.discard(msg.channel_id)
+
+        is_bot = msg.sender_type in ('bot', 'app')
+        trusted_bot_id = self._trusted_bot_id(msg) if is_bot else ''
+        if private_chat:
             user = {'role': 'viewer'}
         elif is_bot:
             # Bot 不写入人员 ACL；只有精确匹配配置的可信 Bot 继承普通输入权限。
