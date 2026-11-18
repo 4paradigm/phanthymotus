@@ -179,12 +179,14 @@ class QQGroupSetting(BaseModel):
 
 @router.put('/qq/{channel_id}/group')
 async def qq_group(channel_id: str, req: QQGroupSetting):
-    entry = get_channel_config(channel_id)
+    entry = await asyncio.to_thread(get_channel_config, channel_id)
     if not entry or entry['platform'] != 'qq':
         raise fastapi.HTTPException(404, 'QQ channel not found')
     _qq_idle(channel_id)
     if entry['config'].get('group_enabled') != req.group_enabled:
-        update_channel_config(channel_id, config={**entry['config'], 'group_enabled': req.group_enabled})
+        await asyncio.to_thread(
+            update_channel_config, channel_id,
+            config={**entry['config'], 'group_enabled': req.group_enabled})
         await manager.restart_adapter(channel_id, retries=1)
     return {'group_enabled': req.group_enabled}
 
@@ -217,7 +219,7 @@ async def qq_qr_session(action: str, req: QQSessionRef, response: fastapi.Respon
         raise fastapi.HTTPException(404, 'QQ QR session not found')
     if action == 'cancel':
         session.cancel()
-    return session.snapshot()
+    return await asyncio.to_thread(session.snapshot)
 
 
 # ── User Management ──────────────────────────────────────────────────────────

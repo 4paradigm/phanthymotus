@@ -52,6 +52,18 @@ class Session:
             self.task.cancel()
 
 
+def _save_credentials_config(app_id, secret, channel_id):
+    """Keep synchronous credential and SQLite writes off the event loop."""
+    existing = get_channel_config(channel_id)
+    if existing and (existing['platform'] != 'qq' or existing['config'].get('app_id') != app_id):
+        raise ValueError('QQ channel ID already in use')
+    write_secret(app_id, secret)
+    if existing:
+        update_channel_config(channel_id, enabled=True)
+    else:
+        add_channel_config(channel_id, 'qq', {'app_id': app_id, 'group_enabled': False}, True)
+
+
 async def _run(session):
     def qr_ready(url):
         if session.state != 'starting':
@@ -70,20 +82,16 @@ async def _run(session):
         async with _SETUP_LOCK:
             app_id = validate_app_id(result.app_id)
             channel_id = f'qq_{app_id}'
-            existing = get_channel_config(channel_id)
-            if existing and (existing['platform'] != 'qq' or existing['config'].get('app_id') != app_id):
-                raise ValueError('QQ channel ID already in use')
             if channel_id in manager._starting:
                 raise ValueError('QQ channel already connecting')
-            write_secret(app_id, result.client_secret)
+            await asyncio.to_thread(_save_credentials_config, app_id, result.client_secret, channel_id)
             del result
-            if existing:
-                update_channel_config(channel_id, enabled=True)
-            else:
-                add_channel_config(channel_id, 'qq', {'app_id': app_id, 'group_enabled': False}, True)
             session.channel_id = channel_id
             try:
-                qq_canvas.wire(channel_id)
+                changed = await asyncio.to_thread(qq_canvas.wire, channel_id, notify=False)
+                if changed is True:
+                    from api.canvas import notify_layout_changed
+                    notify_layout_changed()
             except Exception:
                 # The channel is already durable. Its state can be checked
                 # while the operator completes Canvas wiring manually.

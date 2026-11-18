@@ -34,7 +34,7 @@ def wired(channel_id, layout=None):
     return bool(reply_card(channel_id, layout))
 
 
-def wire(channel_id):
+def wire(channel_id, *, notify=True):
     from api.canvas import current_editor, notify_layout_changed
     from api import config as project_api
 
@@ -82,7 +82,9 @@ def wire(channel_id):
         executions.append(dict(id=uuid4().hex, fromCardId=core, toCardId=reply,
                                toMcpId='channel', toToolName='channel_reply'))
     config.main['canvas_layout'] = dict(layout, cards=cards, connections=links, execConnections=executions)
-    notify_layout_changed()
+    if notify:
+        notify_layout_changed()
+    return True
 
 
 def input_ready(channel_id):
