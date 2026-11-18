@@ -132,7 +132,10 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
   const allMcps = mcps || [];
   const controllers = allMcps.filter(m => m.category === 'controller');
-  const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
+  // Show discovered driver cards even during reconnect. The header already
+  // distinguishes online, offline and pending; hiding the whole section made
+  // registered Watch7 cards vanish whenever a heartbeat was delayed.
+  const drivers = allMcps.filter(m => m.category === 'driver' && (m.tools || []).length > 0);
   const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
   const actucores = allMcps.filter(m => m.category === 'actucore' && m.online === true);
   const modelhubs = allMcps.filter(m => m.category === 'modelhub' && m.online === true);
@@ -1057,7 +1060,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         for (const ch of channels) {
           const opt = document.createElement('option');
           opt.value = ch.id;
-          opt.textContent = `${ch.id} (${ch.platform})`;
+          opt.textContent = `${ch.id} (${ch.platform === 'qq' ? (ch.qq_protocol === 'official' ? 'QQ 官方' : 'QQ OneBot') : ch.platform})`;
           if (saved === ch.id) opt.selected = true;
           input.appendChild(opt);
         }
@@ -1424,7 +1427,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         for (const ch of channels) {
           const opt = document.createElement('option');
           opt.value = ch.id;
-          opt.textContent = `${ch.id} (${ch.platform})`;
+          opt.textContent = `${ch.id} (${ch.platform === 'qq' ? (ch.qq_protocol === 'official' ? 'QQ 官方' : 'QQ OneBot') : ch.platform})`;
           if (saved === ch.id) opt.selected = true;
           input.appendChild(opt);
         }

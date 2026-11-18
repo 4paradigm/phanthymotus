@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { inputArgs, inputKey } from './topic-derive.js';
 
-const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
+const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 function code(name) {
   const at = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   return at < 0 ? '' : source.slice(at, source.indexOf('\n}\n', at) + 3);

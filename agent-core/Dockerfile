@@ -30,9 +30,9 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv
 
 WORKDIR /work
 
-COPY pyproject.toml /work/
+COPY pyproject.toml uv.lock /work/
 ENV UV_INDEX_URL=${PYPI_MIRROR}
-RUN uv lock && uv sync --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Link system ROS2 packages into venv so sensor_msgs/rclpy are importable
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
@@ -43,7 +43,9 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
 COPY web/      /work/web/
 COPY src/      /work/src/
 COPY tools/    /work/tools/
-COPY resource/ /work/resource/
+# Runtime resource/ contains user memory, channel files, SQLite data, and
+# QQ credential references. Only ship immutable cold-start defaults.
+COPY resource/memory/defaults/ /work/resource/memory/defaults/
 COPY deploy/   /deploy/
 
 # Bake defaults to a path immune to volume mounts (for cold-start init)

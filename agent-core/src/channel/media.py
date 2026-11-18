@@ -27,6 +27,7 @@ LIMITS: dict[str, dict[str, int]] = {
     'feishu':   {KIND_IMAGE: 10 * 1024 * 1024, '_default': 30 * 1024 * 1024},
     'telegram': {KIND_IMAGE: 10 * 1024 * 1024, '_default': 50 * 1024 * 1024},
     'slack':    {'_default': 1024 * 1024 * 1024},
+    'qq':       {KIND_IMAGE: 10 * 1024 * 1024, '_default': 20 * 1024 * 1024},
 }
 
 

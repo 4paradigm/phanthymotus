@@ -417,11 +417,33 @@ def _bot_trust_class(events: list[dict]) -> int:
     return 1 if has_bot_channel_event(events) else 0
 
 
+def _qq_source_identity(ev: dict) -> tuple[str, str] | None:
+    """QQ messages are private conversations: never batch different senders."""
+    payloads = _channel_payloads([ev])
+    if not payloads or payloads[0].get('platform') != 'qq':
+        return None
+    payload = payloads[0]
+    channel_id, chat_id = payload.get('channel_id'), payload.get('chat_id')
+    if not isinstance(channel_id, str) or not isinstance(chat_id, str):
+        return None
+    kind = payload.get('chat_type') or ('group' if ':group:' in str(payload.get('user_id', '')) else 'p2p')
+    if kind not in ('group', 'p2p'):
+        return None
+    return (channel_id, f'{kind}:{chat_id}')
+
+
+def _security_batch_key(ev: dict) -> tuple:
+    qq_identity = _qq_source_identity(ev)
+    if qq_identity is not None:
+        return ('qq', *qq_identity)
+    return ('other', _bot_trust_class([ev]))
+
+
 def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
-    """Keep trusted bots, other bots, and people in separate LLM turns."""
+    """Separate bot trust levels AND private QQ sessions into distinct turns."""
     batches = []
     for ev in events:
-        if not batches or _bot_trust_class([batches[-1][0]]) != _bot_trust_class([ev]):
+        if not batches or _security_batch_key(batches[-1][0]) != _security_batch_key(ev):
             batches.append([])
         batches[-1].append(ev)
     return batches
@@ -447,7 +469,12 @@ def _chat_history_blocks(batch: list[dict]) -> str:
         if not channel_id or not chat_id or (channel_id, chat_id) in seen:
             continue
         seen.add((channel_id, chat_id))
-        history = channel_manager.get_chat_history(channel_id, chat_id)
+        if payload.get('platform') == 'qq':
+            kind = payload.get('chat_type') or ('group' if ':group:' in str(payload.get('user_id', '')) else 'p2p')
+            chat_history_id = f'{kind}:{chat_id}'
+        else:
+            chat_history_id = chat_id
+        history = channel_manager.get_chat_history(channel_id, chat_history_id)
         if not history:
             continue
         lines = []
@@ -485,7 +512,29 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_bot_channel_event': bool(bot_payloads),
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
+        # Private QQ turns must not inherit the shared LLM history or be saved
+        # to it; ChannelManager maintains the per-chat recap separately.
+        '_qq_channel_turn': bool(batch) and all(
+            _qq_source_identity(ev) is not None for ev in batch),
+        '_qq_chat_id': (_qq_source_identity(batch[0]) or ('', ''))[1]
+                       if batch and all(_qq_source_identity(ev) is not None for ev in batch)
+                       else '',
+        '_qq_channel_id': next((
+            payload.get('channel_id', '') for payload in _channel_payloads(batch)
+            if payload.get('platform') == 'qq'
+        ), ''),
+        # QQ attachment metadata is owned by ChannelManager; the decision
+        # layer revalidates every path against the private media directory.
+        '_qq_image_files': [
+            file for payload in _channel_payloads(batch)
+            if payload.get('platform') == 'qq'
+            for file in (payload.get('files') or [])[:3]
+            if isinstance(file, dict) and file.get('kind') == 'image'
+        ][:2],
         '_channel_message_ids': channel_message_ids(batch),
+        '_channel_principals': list(dict.fromkeys(
+            (str(p.get('platform', '')), str(p.get('user_id', '')))
+            for p in _human_channel_payloads(batch))),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }
@@ -890,6 +939,12 @@ async def _drain_loop():
             if not _busy:
                 await _emit_batch([ev], urgent=True)
             else:
+                # Do not steer Channel messages into an existing higher-privilege
+                # turn: its ACL was calculated before the new sender arrived.
+                # Queue a new turn so the sender's permissions are evaluated.
+                if '/channel/request/' in str(source):
+                    _priority_pending.append(ev)
+                    continue
                 # Barge-in 检测：ASR 事件 duration 不足时视为 backchannel，丢弃
                 if 'asr' in source.lower() and _barge_in_threshold_ms > 0:
                     duration_ms = ev.get('payload', {}).get('duration_ms', 0)

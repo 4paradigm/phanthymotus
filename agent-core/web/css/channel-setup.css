@@ -1,0 +1,172 @@
+/* QQ first-run wizard: scoped to Channels modal, no global layout changes. */
+#channel-list[hidden], #channel-add-btn[hidden] { display: none !important; }
+.qq-management-advanced { margin: 10px 0; }
+.qq-management-advanced summary { cursor: pointer; font-size: 12px; }
+
+.qq-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  margin: 12px 0 16px;
+}
+.qq-settings [hidden] { display: none !important; }
+.qq-setting-section {
+  border: 1px solid var(--border, #dadada);
+  border-radius: 10px; padding: 14px;
+  background: var(--bg-card, transparent);
+}
+.qq-setting-section .channel-users-hint { font-size: 12px; line-height: 1.6; }
+.qq-setting-section label { display: block; margin: 9px 0; }
+.qq-setting-section input[type="checkbox"],
+.qq-setting-section input[type="radio"] { margin-right: 6px; accent-color: var(--accent, #bf673b); }
+.qq-setting-section fieldset { margin: 12px 0; }
+.qq-sdk-advanced { margin: 12px 0; border-top: 1px solid var(--border, #dadada); padding-top: 12px; }
+.qq-settings [data-qq-owner-custom] {
+  margin: 8px 0; padding: 8px 12px;
+  border-left: 2px solid var(--border, #dadada);
+}
+.qq-setting-section [role="status"] { overflow-wrap: anywhere; }
+.qq-group-members { padding: 6px 12px 12px; border-bottom: 1px solid var(--border, #dadada); }
+.qq-group-members summary { cursor: pointer; font-size: 12px; }
+
+
+.channel-details-panel[hidden], #channel-users-panel[hidden] { display: none !important; }
+.channel-details-panel {
+  padding: 0 0 10px;
+  border-bottom: 1px solid var(--border, #d9d9d9);
+  scroll-margin-top: 20px;
+}
+.channel-details-panel .qq-management {
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--border, #d9d9d9);
+  border-radius: 10px;
+  background: var(--bg-card, var(--bg-secondary, transparent));
+}
+
+.qq-management {
+  margin-top: 18px; padding: 15px 0 4px;
+  border-top: 1px solid var(--border, #535761);
+}
+.qq-management label { display: block; font-size: 12px; margin: 8px 0; }
+.qq-management select {
+  color: inherit; background: var(--bg-input, #252a33);
+  border: 1px solid var(--border, #535761); border-radius: 6px;
+  padding: 6px 8px; max-width: 100%;
+}
+.qq-management fieldset { border: 1px solid var(--border, #535761); border-radius: 8px; padding: 10px; margin: 12px 0; }
+.qq-management legend { font-size: 12px; }
+.qq-management-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 14px; }
+.qq-management-row { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; border-bottom: 1px solid var(--border, #535761); padding: 10px 0; font-size: 12px; }
+.qq-management-row span { margin-right: auto; }
+.qq-management [data-manage-message] { font-size: 12px; color: var(--text-dim, #aaa); }
+
+.qq-guided-setup {
+  margin: 12px 0 18px;
+  padding: 18px;
+  border: 1px solid var(--border, #535761);
+  border-radius: 12px;
+  background: var(--bg-card, var(--bg-secondary, #1c2027));
+  color: var(--text-primary, inherit);
+}
+.qq-guided-setup [hidden] { display: none !important; }
+.qq-wizard-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.qq-wizard-head strong { font-size: 16px; flex: 1; }
+.qq-wizard-head span { font-size: 12px; color: var(--text-dim, #aaa); }
+.qq-guided-setup h3 { font-size: 15px; margin: 12px 0; }
+.qq-guided-setup p { line-height: 1.6; font-size: 13px; margin: 8px 0; }
+.qq-guided-setup a { text-decoration: underline; }
+.qq-guided-setup label { display: block; margin: 10px 0; font-size: 13px; }
+.qq-guided-setup input:not([type="radio"]), .qq-guided-setup select {
+  box-sizing: border-box; width: 100%; margin-top: 7px; padding: 9px 10px;
+  color: inherit; background: var(--bg-input, #252a33);
+  border-radius: 6px; border: 1px solid var(--border, #535761);
+}
+.qq-guided-setup input[type="radio"] { margin-right: 7px; }
+.qq-guided-setup fieldset {
+  border: 1px solid var(--border, #535761); border-radius: 8px;
+  margin: 14px 0; padding: 8px 12px;
+}
+.qq-guided-setup legend { font-size: 13px; font-weight: 600; }
+.qq-wizard-error { color: #e67b7b; min-height: 12px; }
+.qq-pair-code { font-family: monospace; font-weight: 700; font-size: 20px !important; user-select: all; }
+.qq-wizard-diagnostics { white-space: pre-wrap; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
+.qq-guided-setup .channel-form-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+@media(max-width:600px) { .qq-guided-setup { padding: 12px; } .qq-wizard-head { flex-wrap: wrap; } }
+
+/* QQ control console: concise defaults, scoped to this channel only. */
+#qq-management [hidden] { display:none !important; }
+#qq-management .qq-console-header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+#qq-management .qq-console-header strong { font-size:16px; }
+#qq-management .qq-console-actions { display:flex; gap:8px; flex-wrap:wrap; }
+#qq-management [data-manage-selected] { margin:4px 0 10px; }
+#qq-management .qq-config-settings { display:grid; gap:12px; }
+#qq-management .qq-overview {
+  display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px;
+  margin:4px 0 0;
+}
+#qq-management .qq-overview-item {
+  display:flex; flex-direction:column; gap:5px; min-width:0; padding:11px 12px;
+  border:1px solid var(--border,#dadada); border-radius:9px;
+  background:var(--bg-secondary,transparent);
+}
+#qq-management .qq-overview-label { font-size:11px; color:var(--text-dim,#777); }
+#qq-management .qq-overview-value { font-size:14px; font-weight:650; overflow-wrap:anywhere; }
+#qq-management .qq-value-success { color:var(--success,#178b62); }
+#qq-management .qq-credential-status { margin:0 0 2px; }
+#qq-management [role="status"]:empty { display:none; }
+#qq-management .qq-settings-section {
+  display:flex; flex-direction:column; align-items:flex-start; gap:9px;
+  margin:0; padding:13px 14px; border:1px solid var(--border,#dadada);
+  border-radius:10px; background:var(--bg-card,transparent);
+}
+#qq-management .qq-settings-section > strong { font-size:14px; }
+#qq-management .qq-settings-section > .channel-users-hint { margin:0; }
+#qq-management .qq-basic-settings .qq-settings-checkbox { margin:0; font-size:13px; }
+#qq-management .qq-basic-settings > button { margin:0; }
+#qq-management .qq-owner-status { font-size:13px; margin:0; }
+#qq-management .qq-settings-subdetails { width:100%; font-size:12px; }
+#qq-management .qq-settings-subdetails > summary { cursor:pointer; width:fit-content; }
+#qq-management .qq-settings-subdetails[open] { padding:8px 0; }
+#qq-management .qq-settings-subdetails .qq-settings-options { padding:7px 0; }
+#qq-management .qq-settings-subdetails .qq-settings-checkbox { display:block; margin:5px 0; }
+#qq-management .qq-console-invite {
+  margin:13px 0; padding:12px 14px; border-radius:9px;
+  border:1px solid var(--border,#dadada);
+}
+#qq-management .qq-console-invite > summary { cursor:pointer; font-weight:600; font-size:13px; }
+#qq-management .qq-console-invite p { margin:9px 0; }
+#qq-management .qq-console-list-section { margin-top:14px; }
+#qq-management .qq-management-head { margin:0 0 8px; align-items:baseline; }
+#qq-management .qq-management-head strong { font-size:14px; }
+#qq-management .qq-console-list-head,
+#qq-management .qq-management-row {
+  display:grid; grid-template-columns:minmax(0,1fr) minmax(95px,155px) 80px;
+  gap:12px; align-items:center;
+}
+#qq-management .qq-console-list-head {
+  padding:7px 9px; font-size:11px; color:var(--text-dim,#777);
+  background:var(--bg-secondary,transparent); border-radius:6px;
+}
+#qq-management .qq-management-row {
+  margin:0; padding:9px; border-bottom:1px solid var(--border,#dadada);
+  font-size:12px; min-height:38px;
+}
+#qq-management .qq-management-row span { margin-right:0; }
+#qq-management .qq-row-identity { font-weight:500; overflow-wrap:anywhere; }
+#qq-management .qq-row-permission { color:var(--text-dim,#777); }
+#qq-management .qq-row-action { justify-self:end; white-space:nowrap; }
+#qq-management [data-qq-advanced-slot] { margin-top:16px; }
+#qq-management .qq-advanced-settings { display:block; }
+#qq-management .qq-advanced-settings > summary { cursor:pointer; font-size:13px; }
+#qq-management .qq-advanced-settings .qq-settings-options {
+  display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px 12px; margin:8px 0 12px;
+}
+#qq-management .qq-advanced-settings label { font-size:12px; }
+@media (max-width:720px) {
+  #qq-management .qq-overview { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #qq-management .qq-console-list-head,
+  #qq-management .qq-management-row { grid-template-columns:minmax(0,1fr) 88px 52px; gap:6px; }
+  #qq-management .qq-console-header { flex-wrap:wrap; }
+  #qq-management .qq-advanced-settings .qq-settings-options { grid-template-columns:1fr; }
+}

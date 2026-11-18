@@ -1146,8 +1146,8 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
 
     async def stop_one(card: dict) -> dict:
         tool_name = card.get('toolName', '')
-        entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
-                 'card_id': card.get('id', ''), 'ok': False, 'error': ''}
+        entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
+                 'ok': False, 'error': ''}
         rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
         try:
             async def stop_and_confirm():

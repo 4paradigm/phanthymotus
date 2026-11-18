@@ -1,0 +1,161 @@
+/* Focused QQ setup. Styles are scoped; Feishu and other channels are unchanged. */
+.channel-modal.qq-onboarding-active { width: min(740px, calc(100vw - 28px)); }
+.channel-modal.qq-onboarding-active > .modal-header,
+.channel-modal.qq-onboarding-active .channel-toolbar,
+.channel-modal.qq-onboarding-active #channel-users-panel,
+.channel-modal.qq-onboarding-active #channel-details-panel { display: none !important; }
+.channel-modal.qq-onboarding-active .channel-body { padding: 0; }
+.qq-onboarding {
+  --qq-ink: var(--text-primary, #f4f5f6);
+  --qq-muted: var(--text-dim, #929aa5);
+  --qq-line: var(--border, rgba(130,140,160,.24));
+  color: var(--qq-ink); width: 100%; max-width: 740px;
+  margin: 0 auto; padding: 30px 48px 42px;
+  box-sizing: border-box; font-size: 14px;
+}
+.qq-onboarding [hidden] { display: none !important; }
+.qq-onboarding .qq-onboard-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+.qq-onboarding .qq-onboard-top h2 { font-size: 25px; font-weight: 650; letter-spacing: -.7px; line-height: 1.3; margin: 8px 0 0; }
+.qq-onboarding .qq-onboard-kicker { letter-spacing: 1.6px; color: var(--qq-muted); font-size: 10px; font-weight: 750; }
+.qq-onboarding .qq-onboard-close { background: transparent; border: 0; color: var(--qq-muted); font-size: 28px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.qq-onboarding .qq-onboard-close:hover { color: var(--qq-ink); }
+.qq-onboarding .qq-onboard-meter { height: 3px; border-radius: 12px; background: var(--qq-line); margin: 24px 0 9px; overflow: hidden; }
+.qq-onboarding .qq-onboard-meter span { display: block; height: 100%; width: 33%; border-radius: inherit; background: var(--accent, #c77948); transition: width .25s ease; }
+.qq-onboarding .qq-onboard-counter { display: flex; justify-content: space-between; color: var(--qq-muted); font-size: 11px; font-weight: 550; }
+.qq-onboarding .qq-onboard-error { min-height: 0; font-size: 12px; color: #df7674; line-height: 1.5; margin: 8px 0; }
+.qq-onboarding .qq-onboard-error:empty { display: none; }
+.qq-onboarding .qq-onboard-title { display: flex; align-items: center; gap: 15px; margin: 26px 0 20px; }
+.qq-onboarding .qq-onboard-title > span {
+  width: 43px; height: 43px; border: 1px solid var(--qq-line); border-radius: 13px;
+  display: grid; place-items: center; font-size: 17px; font-weight: 650; color: var(--qq-muted);
+}
+.qq-onboarding .qq-onboard-title h3 { font-size: 17px; font-weight: 650; margin: 0 0 5px; letter-spacing: -.3px; }
+.qq-onboarding .qq-onboard-title p { font-size: 12px; color: var(--qq-muted); margin: 0; }
+.qq-onboarding .qq-onboard-visual { overflow: hidden; border: 1px solid var(--qq-line); border-radius: 15px; background: var(--bg-secondary, #252930); }
+.qq-onboarding .qq-onboard-image { width: 100%; aspect-ratio: 26 / 15; height: auto; margin: 0 auto; position: relative; overflow: hidden; background: #f6f7fa; }
+.qq-onboarding .qq-onboard-image img { width: 100%; aspect-ratio: 26 / 15; object-fit: contain; display: block; }
+.qq-onboarding .qq-onboard-points { position: absolute; inset: 0; pointer-events: none; }
+.qq-onboarding .qq-onboard-spot {
+  position: absolute; transform: translate(-50%, -50%);
+  width: 32px; height: 32px; display: grid; place-items: center;
+  border-radius: 50%; color: white; font-size: 15px; font-weight: 800;
+  background: #e94145; border: 3px solid white; box-shadow: 0 5px 18px rgba(210,36,43,.38);
+}
+.qq-onboarding .qq-onboard-spot:after {
+  content: ''; position: absolute; left: 50%; top: 30px; transform: translateX(-50%);
+  width: 0; height: 0; border: 7px solid transparent; border-top-color: #e94145;
+}
+.qq-onboarding .qq-onboard-photo-note { border-top: 1px solid var(--qq-line); font-size: 13px; padding: 13px 18px; line-height: 1.5; }
+.qq-onboarding .qq-onboard-slide-caption { display: flex; justify-content: space-between; align-items: center; padding: 17px 2px 12px; }
+.qq-onboarding .qq-onboard-slide-caption strong { font-size: 13px; font-weight: 650; }
+.qq-onboarding .qq-onboard-slide-caption span { color: var(--qq-muted); font-size: 11px; }
+.qq-onboarding .qq-onboard-navigation { display: flex; gap: 10px; margin: 10px 0 0; justify-content: flex-end; }
+.qq-onboarding button.btn-primary,
+.qq-onboarding button.btn-ghost { min-height: 39px; padding: 8px 17px; border-radius: 9px; }
+.qq-onboarding .qq-onboard-navigation .btn-primary { min-width: 165px; }
+.qq-onboarding .qq-onboard-outlink { display: flex; align-items: center; justify-content: center; min-height: 44px;
+  border: 1px solid #1587ea; border-radius: 10px; margin: 16px 0 12px; font-weight: 700; text-decoration: none;
+  background: #147ef5; color: #fff; transition: background .15s ease, transform .15s ease; }
+.qq-onboarding .qq-onboard-outlink:hover { background: #096bd7; color: #fff; }
+.qq-onboarding .qq-onboard-outlink:focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; }
+.qq-onboarding .qq-onboard-outlink--secondary { background: transparent; color: var(--qq-ink); border-color: var(--qq-line);
+  font-size: 13px; margin: 10px 0 4px; }
+.qq-onboarding .qq-onboard-outlink--secondary:hover { background: var(--bg-secondary, #252930); color: var(--qq-ink); }
+.qq-onboarding .qq-onboard-illustration-note { font-size: 11px; line-height: 1.6; margin: 16px 0 7px; color: var(--qq-muted); }
+.qq-onboarding .qq-onboard-info { padding: 12px 14px; margin: 14px 0 20px; border: 1px solid var(--qq-line);
+  border-left: 3px solid #147ef5; border-radius: 10px; background: var(--bg-secondary, #252930);
+  font-size: 12px; font-weight: 400; line-height: 1.7; }
+.qq-onboarding .qq-onboard-info--quiet { border-left-color: #f59e0b; margin: 18px 0 8px; }
+.qq-onboarding .qq-onboard-troubleshoot-link { display: inline-flex; margin: 7px 0; font-size: 12px;
+  color: #66aaff; text-decoration: underline; text-underline-offset: 3px; }
+.qq-onboarding .qq-onboard-photo-note { color: #364152; background: #f4f8fc; font-weight: 550; }
+.qq-onboarding .qq-onboard-image img { color: #243447; }
+
+.qq-onboarding .qq-onboard-subtle { display: block; border: none; background: transparent; color: var(--qq-muted);
+  cursor: pointer; padding: 7px 0; font-size: 12px; text-decoration: underline; text-underline-offset: 4px; }
+.qq-onboarding .qq-onboard-existing { display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  margin-top: 16px; padding: 12px; background: var(--bg-secondary, #222831); border-radius: 10px; }
+.qq-onboarding .qq-onboard-existing span { font-size: 12px; color: var(--qq-muted); }
+.qq-onboarding .qq-onboard-existing select { flex: 1; min-width: 145px; max-width: 240px; border-radius: 8px;
+  padding: 8px; color: inherit; background: var(--bg-input, #242831); border: 1px solid var(--qq-line); }
+.qq-onboarding .qq-onboard-field { display: block; margin: 21px 0; font-size: 13px; font-weight: 650; }
+.qq-onboarding .qq-onboard-field small { color: var(--qq-muted); font-weight: 400; margin-left: 5px; }
+.qq-onboarding .qq-onboard-field input { box-sizing: border-box; display: block; width: 100%; margin-top: 9px;
+  padding: 13px 15px; border-radius: 10px; border: 1px solid var(--qq-line);
+  color: var(--qq-ink); background: var(--bg-input, #22262f); font-size: 14px; }
+.qq-onboarding .qq-onboard-field input:focus { outline: 2px solid var(--accent, #bb805c); outline-offset: 2px; }
+.qq-onboarding .qq-onboard-hint { font-size: 12px; color: var(--qq-muted); margin: 12px 0 32px; line-height: 1.5; }
+.qq-onboarding .qq-onboard-connected { display: flex; gap: 9px; align-items: center; background: var(--bg-secondary, #222832);
+  border: 1px solid var(--qq-line); padding: 14px 16px; border-radius: 11px; margin: 18px 0 26px; font-size: 13px; }
+.qq-onboarding .qq-onboard-connected span { width: 8px; height: 8px; border-radius: 50%; background: #2cbf89; box-shadow: 0 0 0 4px rgba(44,191,137,.12); }
+.qq-onboarding [data-first-message] > p, .qq-onboarding [data-second-message] > p { font-size: 13px; margin-bottom: 11px; }
+.qq-onboarding .qq-onboard-command { display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  border: 1px solid var(--qq-line); border-radius: 10px; padding: 10px 15px; background: var(--bg-secondary, #222832); }
+.qq-onboarding .qq-onboard-command code { font-size: 18px; font-weight: 650; user-select: all; }
+.qq-onboarding .qq-onboard-command > span { color: var(--qq-muted); font-size: 11px; }
+.qq-onboarding .qq-onboard-wait { font-size: 12px; color: var(--qq-muted); padding: 13px 0; }
+.qq-onboarding .qq-onboard-wide { width: 100%; margin-top: 14px; }
+.qq-onboarding .qq-onboard-success { text-align: center; padding: 20px 0 14px; }
+.qq-onboarding .qq-onboard-success > span { display: grid; place-items: center; margin: 0 auto 17px;
+  width: 54px; height: 54px; border-radius: 50%; font-size: 26px; color: white; background: #2cbf89; }
+.qq-onboarding .qq-onboard-success h3 { font-size: 19px; margin: 0 0 9px; }
+.qq-onboarding .qq-onboard-success p { font-size: 13px; color: var(--qq-muted); margin: 0; }
+@media (max-width: 768px) {
+  .channel-modal.qq-onboarding-active { width: 100vw; max-width: 100vw; }
+  .qq-onboarding { padding: 24px 18px 35px; }
+  .qq-onboarding .qq-onboard-top h2 { font-size: 21px; }
+  .qq-onboarding .qq-onboard-image { width: 100%; }
+  .qq-onboarding .qq-onboard-navigation .btn-primary { min-width: 130px; }
+}
+
+
+/* Single-action QR onboarding: no AppID, AppSecret, owner or bot-count choices. */
+.qq-qr-onboarding {
+  /* QR setup uses a stable light surface even when Dashboard is in dark mode. */
+  --qq-ink: #202936;
+  --qq-muted: #586678;
+  --qq-line: #dbe2e9;
+  background: #fffcf8;
+  color: var(--qq-ink);
+  max-width: 620px;
+  padding-top: 34px;
+}
+.qq-qr-onboarding .qq-onboard-top { margin-bottom: 24px; }
+.qq-qr-onboarding .qq-onboard-top h2 { color: var(--qq-ink); margin: 0; }
+.qq-qr-onboarding .qq-onboard-close { color: #566272; }
+.qq-qr-onboarding.qq-qr-result .qq-onboard-top { margin-bottom: 0; }
+.qq-qr-onboarding.qq-qr-result .qq-qr-success { padding: 48px 0 28px; }
+.qq-qr-onboarding .qq-qr-panel {
+  width: 292px; height: 292px; margin: 0 auto; display: grid; place-items: center;
+  border: 1px solid var(--qq-line); border-radius: 18px; background: #fff;
+}
+.qq-qr-onboarding .qq-qr-panel img { width: 264px; height: 264px; object-fit: contain; }
+.qq-qr-onboarding .qq-qr-spinner {
+  width: 38px; height: 38px; border: 3px solid #e5e7eb;
+  border-top-color: #1684e8; border-radius: 50%; animation: qq-qr-spin .8s linear infinite;
+}
+@keyframes qq-qr-spin { to { transform: rotate(360deg); } }
+.qq-qr-onboarding .qq-qr-status {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.qq-qr-onboarding .qq-qr-success { text-align: center; padding: 12px 0 0; }
+.qq-qr-onboarding .qq-qr-success > span {
+  display: grid; place-items: center; width: 48px; height: 48px; margin: 0 auto 10px;
+  border-radius: 50%; background: #159d70; color: white; font-size: 25px;
+}
+.qq-qr-onboarding .qq-qr-success strong { font-size: 17px; }
+.qq-qr-onboarding .qq-qr-success--pending > span { background: #718096; }
+.qq-qr-onboarding .qq-qr-error {
+  max-width: 500px; margin: 12px auto; padding: 11px 14px; border-radius: 9px;
+  background: #fff0ef; color: #ab2828; font-size: 12px; line-height: 1.6;
+}
+.qq-qr-onboarding .qq-qr-actions {
+  display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; margin: 20px 0 0;
+}
+.qq-qr-onboarding .qq-qr-actions button { min-width: 120px; }
+@media (max-width: 768px) {
+  .qq-qr-onboarding { padding: 24px 18px 30px; }
+  .qq-qr-onboarding .qq-qr-panel { width: 272px; height: 272px; }
+  .qq-qr-onboarding .qq-qr-panel img { width: 244px; height: 244px; }
+}

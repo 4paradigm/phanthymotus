@@ -359,6 +359,9 @@ async def save_layout(layout: CanvasLayout):
     # walks the saved cards — so its plugin instance would keep running forever.
     from api.config import stop_removed_cards
     await stop_removed_cards(old_cards, save_data.get('cards', []))
+    # Canvas membership determines which Channel input topics remain valid.
+    from channel.manager import manager as channel_manager
+    channel_manager.sync_channel_subscriptions()
     notify_layout_changed(session_id or '')
     return {'code': 200}
 
@@ -448,6 +451,9 @@ async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, bo
     """Save config for a specific tool instance and apply it."""
     config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
     apply_tool_config(mcp_id, tool_name, body, instance_id)
+    if mcp_id in ('channel', 'agentcore') and tool_name == 'channel_request':
+        from channel.manager import manager as channel_manager
+        channel_manager.sync_channel_subscriptions()
     return {'code': 200}
 
 

@@ -30,6 +30,33 @@ import config
 router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
 
 
+def _safe_channel(entry: dict) -> dict:
+    result = dict(entry)
+    cfg = dict(result.get('config') or {})
+    for key in ('access_token', 'bot_token', 'app_token', 'app_secret', 'app_secret_runtime', 'token'):
+        if key in cfg:
+            cfg[key] = '***' if cfg[key] else ''
+    result['config'] = cfg
+    return result
+
+
+def _validate_channel_config(platform: str, cfg: dict, *, allow_legacy_inline: bool = False) -> None:
+    if platform == 'qq':
+        try:
+            if 'app_secret' in cfg and not allow_legacy_inline:
+                raise ValueError(
+                    'Inline QQ AppSecret is not accepted; use '
+                    'app_secret_env or app_secret_file')
+            protocol = cfg.get('protocol', 'official')
+            if protocol == 'official':
+                from channel.adapters.qq_official import validate_qq_official_config
+                validate_qq_official_config(cfg)
+            else:
+                raise ValueError('Unsupported QQ protocol')
+        except (ValueError, AttributeError) as exc:
+            raise fastapi.HTTPException(400, str(exc)) from None
+
+
 # ── Channel CRUD ─────────────────────────────────────────────────────────────
 
 @router.get('/list')
@@ -48,6 +75,7 @@ class AddChannelReq(BaseModel):
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
+    _validate_channel_config(req.platform, req.config)
     if req.bot_to_bot_enabled and not supports_bot_to_bot(req.platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{req.platform}"')
@@ -69,10 +97,27 @@ async def add_channel(req: AddChannelReq):
         )
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
+    flow = None
+    if req.platform == 'qq':
+        # Every QQ registration path must attach the Bot to the shared Canvas,
+        # not only the QR onboarding path. This helper is idempotent and keeps
+        # existing cards, connections and the single shared decision_core.
+        try:
+            from channel.qq_default_flow import ensure_default_flow
+            flow = ensure_default_flow(req.id)
+            manager.sync_channel_subscriptions()
+        except Exception as exc:  # noqa: BLE001
+            flow = {'ready': False, 'reason': type(exc).__name__}
+            print('[channel] QQ Canvas attachment failed: ' + type(exc).__name__,
+                  flush=True)
+
     # 如果 enabled，立即启动
     if req.enabled:
         await manager.restart_adapter(req.id)
-    return {'channel': entry}
+    response = {'channel': _safe_channel(entry)}
+    if flow is not None:
+        response['flow'] = flow
+    return response
 
 
 class UpdateChannelReq(BaseModel):
@@ -92,6 +137,42 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
+    if target_platform == 'qq':
+        if 'config' in updates:
+            merged = dict(current.get('config') or {})
+            supplied = updates['config']
+            if not isinstance(supplied, dict):
+                raise fastapi.HTTPException(400, 'QQ configuration must be an object')
+            for key in ('app_secret', 'app_secret_env', 'app_secret_file', 'app_secret_runtime'):
+                if key in supplied and not isinstance(supplied[key], str):
+                    raise fastapi.HTTPException(400, f'QQ official {key} must be a string')
+            if 'app_secret' in supplied:
+                raise fastapi.HTTPException(
+                    400, 'Inline QQ AppSecret is no longer accepted; '
+                         'migrate to app_secret_env or app_secret_file')
+            old_protocol = merged.get('protocol', 'official')
+            new_protocol = supplied.get('protocol', old_protocol)
+            if old_protocol != new_protocol:
+                merged = {}
+            credential_keys = (
+                'access_token', 'access_token_env', 'access_token_file', 'app_secret_runtime',
+                'app_secret', 'app_secret_env', 'app_secret_file',
+            )
+            provided = [key for key in credential_keys if supplied.get(key)]
+            if len(provided) > 1:
+                raise fastapi.HTTPException(400, 'Use only one QQ credential source')
+            if provided:
+                for key in credential_keys:
+                    merged.pop(key, None)
+            merged.update({key: value for key, value in supplied.items()
+                           if key not in credential_keys or value})
+            updates['config'] = merged
+        # Keep old inline credentials usable until explicitly migrated.
+        # Editing legacy QQ config requires switching to a secret reference;
+        # enable/disable updates remain backwards compatible.
+        _validate_channel_config(
+            'qq', updates.get('config', current.get('config') or {}),
+            allow_legacy_inline=('config' not in updates))
     if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{target_platform}"')
@@ -108,17 +189,40 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
         raise fastapi.HTTPException(400, str(e))
     # 重启 adapter 以应用新配置
     await manager.restart_adapter(channel_id)
-    return {'channel': result}
+    return {'channel': _safe_channel(result)}
 
 
 @router.delete('/{channel_id}')
 async def delete_channel(channel_id: str):
+    existing = await asyncio.to_thread(get_channel_config, channel_id)
     # 先停止 adapter
     if channel_id in manager._adapters:
         await manager._adapters[channel_id].stop()
         del manager._adapters[channel_id]
     if not await asyncio.to_thread(delete_channel_config, channel_id):
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    # Reconcile only the Channel-owned topic namespace. Other QQ Bots,
+    # Feishu inputs and sensor subscriptions are preserved.
+    manager.sync_channel_subscriptions()
+    if existing and existing.get('platform') == 'qq':
+        from channel.qq_ephemeral_store import revoke
+        cfg = existing.get('config') or {}
+        revoke(cfg.get('app_secret_runtime', ''))
+        app_id = cfg.get('app_id', '')
+        grant = config.main.get('qq_c2c_owner_grant', {})
+        if (isinstance(grant, dict) and app_id and
+                str(grant.get('principal', '')).startswith(f'official:{app_id}:')):
+            config.main['qq_c2c_owner_grant'] = {}
+        for key in ('qq_onboarding_pairing', 'qq_group_challenge'):
+            state = config.main.get(key, {})
+            if isinstance(state, dict) and state.get('channel_id') == channel_id:
+                config.main[key] = {}
+        for key in ('qq_group_policies', 'channel_pending_users'):
+            records = config.main.get(key, {})
+            if isinstance(records, dict) and channel_id in records:
+                remaining = dict(records)
+                remaining.pop(channel_id, None)
+                config.main[key] = remaining
     return {'deleted': channel_id}
 
 
@@ -163,13 +267,22 @@ class UpsertUserReq(BaseModel):
     user_id: str
     display_name: str = ''
     role: str = 'viewer'
-    tool_filter: str = '*'
+    tool_filter: str | None = None
 
 
 @router.post('/users')
 def upsert_user(req: UpsertUserReq):
+    tool_filter = req.tool_filter
+    if req.platform == 'qq':
+        # Generic Channel user updates must not recreate retired QQ Owner grants.
+        from channel.permissions import CHAT_FILTER
+        if req.role not in ('viewer', 'blocked'):
+            raise fastapi.HTTPException(400, 'QQ users support chat or blocked status only')
+        if req.role == 'viewer' and tool_filter not in (None, '', CHAT_FILTER, '*'):
+            raise fastapi.HTTPException(400, 'QQ users cannot customize tool privileges')
+        tool_filter = CHAT_FILTER if req.role == 'viewer' else ''
     try:
-        user = acl.upsert_user(req.platform, req.user_id, req.display_name, req.role, req.tool_filter)
+        user = acl.upsert_user(req.platform, req.user_id, req.display_name, req.role, tool_filter)
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
     return {'user': user}
