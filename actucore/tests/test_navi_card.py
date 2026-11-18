@@ -136,6 +136,42 @@ def test_the_interrupt_hooks_stop_navigation():
     assert hooks["on_interrupt_motion"]["action"] == "stop_navigation"
 
 
+@pytest.mark.parametrize("action", ["pause", "stop_navigation", "stop", "navigate_to"])
+def test_lifecycle_stops_previous_motion_with_long_watchdog(monkeypatch, action):
+    card = _card()
+    card._running = True
+    card._publisher = object()
+    card._config.watchdog_ms = 600
+    card._state.commanded = (.10, 0., 0.)
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append, raising=False)
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    card.dispatch("navi", {"action": action, "target": "person"})
+    assert len(published) == 1
+    assert published[0]["values"] == [0.0] * 6
+    assert published[0]["obs_stamp_ms"] == published[0]["stamp_ms"] == 123_000
+    assert not any(card._state.commanded)
+
+
+@pytest.mark.parametrize("status", ["searching", "failed"])
+def test_silent_policy_stops_previous_motion_with_long_watchdog(monkeypatch, status):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._config.watchdog_ms = 600
+    card._state.commanded = (.10, 0., 0.)
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+
+    def step(**kwargs):
+        kwargs["state"].commanded = (0., 0., 0.)
+        return policy.Decision(None, status)
+
+    monkeypatch.setattr(policy, "step", step)
+    stop = card.next_command()
+    assert stop["values"] == [0.0] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+    assert card.next_command() is None
+
+
 def test_it_claims_the_base_resource():
     assert _tool()["inputSchema"]["x-resource"] == ["base"]
 
@@ -1446,7 +1482,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
                         K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
     reply = card.dispatch("navi", {
         "action": "start", "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC, odom_topic],
-        "control_interface": _descriptor(footprint={"half_width": 0.23}),
+        "control_interface": _descriptor(footprint={"half_width": 0.23},
+                                         rate={"max_hz": 20, "watchdog_ms": 600}),
         "camera_info": {_DEPTH_TOPIC: declaration},
     })
     assert reply["state"] == "running"
@@ -1468,8 +1505,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
             .79 if lateral_offset_m > 0 else .80 if lateral_offset_m < 0 else .78, 1.0))
     attempted = []
 
-    def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms):
-        attempted.append((side, half_width))
+    def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300):
+        attempted.append((side, half_width, watchdog_ms))
         return (.04, -.06) if side > 0 else None
 
     monkeypatch.setattr(local_path, "_checked_translation", plan)
@@ -1477,7 +1514,15 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
     assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
-    assert attempted == [(-1.0, .33), (1.0, .33)]
+    assert attempted == [(-1.0, .33, 600), (1.0, .33, 600)]
     assert command["obs_stamp_ms"] == 122_950
+    card._depth_ms = 0
+    stop = card.next_command()
+    assert stop["values"] == [0.0] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+    assert card.next_command() is None
+    card._depth_ms = 122_950
     card._odom_ms = 0
-    assert card.next_command()["values"] == [0.0] * 6
+    stop = card.next_command()
+    assert stop["values"] == [0.0] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000

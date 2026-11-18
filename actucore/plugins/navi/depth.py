@@ -198,37 +198,55 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     z = seed[valid]
     points = np.column_stack((x, z, np.ones_like(z)))
 
-    inliers = np.ones(len(z), dtype=bool)
     if not (np.isfinite(points).all() and np.isfinite(y).all()):
         return None
-    for tolerance in (0.05, _GROUND_TOLERANCE_M, _GROUND_TOLERANCE_M):
-        try:
-            a, b, c = np.linalg.lstsq(points[inliers], y[inliers], rcond=None)[0]
-        except np.linalg.LinAlgError:
-            return None
-        inliers = np.abs(a * x + b * z + c - y) <= tolerance
-        if inliers.sum() < 0.8 * seed.size:
-            return None
-    if not (0.15 <= c <= 2.0 and np.hypot(a, b) <= 0.5):
-        return None
-    near, far = np.percentile(z[inliers], [10, 90])
-    if far - near < 0.1:
-        return None
-    support = np.zeros_like(valid)
-    support[valid] = inliers
-    if any(part.mean() < 0.65 for part in np.array_split(support, 3, axis=1)):
-        return None
 
-    distance = (v[:, None] - a * u[None, :] - b) * depth_m - c
-    # Be stricter above the plane to retain low obstacles.
-    ground = (distance >= -0.015) & (distance <= _GROUND_TOLERANCE_M)
-    # Verify the fit farther into the scene. A raised platform can occupy the
-    # entire bottom band and still fit a wide, nearly horizontal plane.
-    farther = ground[int(height * 0.69):int(height * 0.7375), columns]
-    thirds = np.array_split(farther, 3, axis=1)
-    if sum(part.mean() >= 0.06 for part in thirds) < 2:
-        return None
-    return ground
+    def fit(inliers, *, outside_only=False):
+        if np.count_nonzero(inliers) < 3:
+            return None
+        for tolerance in (0.05, _GROUND_TOLERANCE_M, _GROUND_TOLERANCE_M):
+            try:
+                a, b, c = np.linalg.lstsq(points[inliers], y[inliers], rcond=None)[0]
+            except np.linalg.LinAlgError:
+                return None
+            inliers = np.abs(a * x + b * z + c - y) <= tolerance
+            if inliers.sum() < 0.8 * seed.size:
+                return None
+        if not (0.15 <= c <= 2.0 and np.hypot(a, b) <= 0.5):
+            return None
+        near, far = np.percentile(z[inliers], [10, 90])
+        if far - near < 0.1:
+            return None
+        support = np.zeros_like(valid)
+        support[valid] = inliers
+        thirds = np.array_split(support, 3, axis=1)
+        if any(part.mean() < 0.65 for part in (thirds[::2] if outside_only else thirds)):
+            return None
+
+        distance = (v[:, None] - a * u[None, :] - b) * depth_m - c
+        # Be stricter above the plane to retain low obstacles.
+        ground = (distance >= -0.015) & (distance <= _GROUND_TOLERANCE_M)
+        # Verify the fit farther into the scene to reject a raised platform
+        # occupying most of the bottom band.
+        farther = ground[int(height * 0.69):int(height * 0.7375), columns]
+        if sum(part.mean() >= 0.06 for part in np.array_split(farther, 3, axis=1)) < 2:
+            return None
+        return ground
+
+    ground = fit(np.ones(len(z), dtype=bool))
+    if ground is not None:
+        return ground
+
+    # A foreground box can bias the seed fit even when most samples are floor.
+    # Seed from the outside of the image and verify against the full bottom band.
+    positions = np.nonzero(valid)[1]
+    third = seed.shape[1] // 3
+    left, right = positions < third, positions >= 2 * third
+    for outside in (left | right, left, right):
+        ground = fit(outside, outside_only=True)
+        if ground is not None:
+            return ground
+    return None
 
 
 def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,

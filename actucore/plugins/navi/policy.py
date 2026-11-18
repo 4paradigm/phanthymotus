@@ -51,15 +51,9 @@ Two consequences that are not obvious and were both bugs here:
 
 ── the safety property that matters more than any of the above ──────────────
 
-**When in doubt, emit nothing.** Stale observation, unreadable depth, target
-lost for too long, stuck, arrived — all of them return `values=None`, and the
-card then publishes nothing at all. The driver's watchdog brings the chassis to
-a stop within `watchdog_ms`.
-
-That is a deliberate choice against the alternative, which is to emit an
-explicit zero. Emitting zero would also stop the robot, but it would keep the
-watchdog fed, so a policy that silently died would leave a robot that believes
-it is being driven. Silence is the one signal a broken upstream cannot fake.
+When the policy goes quiet after commanding motion, the card sends one zero
+twist if the downstream watchdog exceeds 300 ms. The driver watchdog still
+protects an interrupted command stream.
 """
 
 from __future__ import annotations
@@ -237,6 +231,7 @@ class Config:
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
     max_obs_age_ms: int = 500
+    watchdog_ms: float = 300
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
     # Confidence needed to **start** following something. Below this a
@@ -681,7 +676,12 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """
     notes: list[str] = []
     notes.extend(_adopt_footprint(config, descriptor))
-    max_age = ((descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+    rate = (descriptor or {}).get("rate") or {}
+    watchdog = rate.get("watchdog_ms")
+    if (isinstance(watchdog, (int, float)) and not isinstance(watchdog, bool)
+            and math.isfinite(watchdog) and watchdog > 0):
+        config.watchdog_ms = watchdog
+    max_age = rate.get("max_obs_age_ms")
     if (isinstance(max_age, (int, float)) and not isinstance(max_age, bool)
             and math.isfinite(max_age) and max_age > 0
             and max_age < config.max_obs_age_ms):
@@ -1024,15 +1024,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt)
 
-    # No usable observation is not the same as "nothing is there". Emitting
-    # nothing lets the watchdog stop the robot, which is the right resting
-    # state for "this policy cannot see".
     if detections is None or depth is None:
         if state.recovery is not None:
             state.recovery = ClearanceRecovery()
-        return Decision(None, BLIND,
-                        "observation stale or missing (vop / depth); publishing nothing, "
-                        "leaving the stop to the downstream watchdog")
+        missing = "vop / depth"
+        if detections is not None:
+            missing = "depth"
+        elif depth is not None:
+            missing = "vop"
+        return Decision(None, BLIND, f"observation stale or missing ({missing})")
 
     bands = depth.get("bands") or {}
 
@@ -1636,7 +1636,8 @@ def _local_translation(depth, config, state, odom, ahead, side):
     if measured_vy * side > .06:
         return None
     command = state.local_plan.translation(depth, config.local_geometry,
-                                           _keepout_m(config), ahead, side, config.max_obs_age_ms)
+                                           _keepout_m(config), ahead, side, config.max_obs_age_ms,
+                                           config.watchdog_ms)
     if command is None:
         return None
     vx, vy = command

@@ -314,6 +314,20 @@ def test_ground_filter_preserves_raised_obstacles_and_rejects_a_wall():
     assert D.ground_mask(frame, camera, vertical) is None
 
 
+def test_ground_fit_recovers_floor_beside_a_box_that_reaches_the_bottom():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[270:, 280:360] = .6
+    camera = HorizontalIntrinsics(640, 315, 337)
+    ground = D.ground_mask(frame, camera, (480, 420, 243.2))
+
+    assert ground is not None
+    assert ground[420, 120] and ground[420, 520]
+    assert not ground[270:, 280:360].any()
+    assert _corridor(frame, intrinsics=camera, ground=ground)[0] == pytest.approx(.6)
+
+
 def test_ground_mask_keeps_a_surface_two_centimetres_above_the_floor():
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -333,6 +347,19 @@ def test_a_broad_raised_platform_does_not_replace_the_floor():
     frame[355:] *= 0.34 / 0.42
     camera = HorizontalIntrinsics(640, 315, 337)
     assert D.ground_mask(frame, camera, (480, 420, 243.2)) is None
+
+
+def test_outside_seed_does_not_use_an_off_center_raised_platform_as_floor():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    rays = (np.arange(D.HEIGHT)[:, None] - 243.2) / 420.0
+    lateral = (np.arange(D.WIDTH)[None, :] - 337) / 315.0
+    top = .34 / np.maximum(rays - .02, .001)
+    raised = (lateral * top <= .40) & (top > .52) & (top < 1.9)
+    frame = np.where(raised, top, _floor_scene())
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+
+    assert ground is None or not ground[raised].any()
 
 
 def test_floor_only_corridor_reports_its_observed_free_extent():

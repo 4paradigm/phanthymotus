@@ -164,22 +164,22 @@ class PlanCache:
     key: tuple | None = None
     commands: dict[float, tuple[float, float] | None] = field(default_factory=dict)
 
-    def translation(self, observation, geometry, half_width, ahead, side, max_age_ms):
+    def translation(self, observation, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
             return None
-        key = (frame, round(ahead, 2))
+        key = (frame, round(ahead, 2), max_age_ms, watchdog_ms)
         if self.key != key:
             self.key = key
             self.commands.clear()
         if side not in self.commands:
             self.commands[side] = _checked_translation(
-                observation["map"], ground, geometry, half_width, ahead, side, max_age_ms)
+                observation["map"], ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms)
         return self.commands[side]
 
 
-def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms):
+def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300):
     resolution = .05
     row_zero, col_zero = 10, 28
     right, forward = np.meshgrid((np.arange(57) - col_zero) * resolution,
@@ -223,6 +223,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # Budget the visible straight prefix through a stale frame and watchdog
     # timeout. Replanning may extend it on the next depth update.
     norm = math.hypot(dr, dc)
-    horizon_s = max_age_ms / 1000 + .30
+    # Leave one 50 ms sink poll for a timeout firing between polls.
+    horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
     speed = min(.10, steps * resolution * norm / horizon_s)
     return speed * dr / norm, -side * speed * dc / norm

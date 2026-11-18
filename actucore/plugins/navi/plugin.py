@@ -756,6 +756,7 @@ class NaviPlugin:
             # A new target discards everything remembered about the old one —
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
+            self._publish_stop_if_moving()
             self._state = policy_mod.State(target=target)
             self._paused = False
             # **The card mints this, agent-core does not supply it.** The ACP
@@ -821,6 +822,7 @@ class NaviPlugin:
                 return {"state": "idle", "message": "卡片未在运行"}
             action_id, self._acp_action_id = self._acp_action_id, ""
             target = self._state.target
+            self._publish_stop_if_moving()
             self._state = policy_mod.State()
             if action_id:
                 result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
@@ -834,6 +836,8 @@ class NaviPlugin:
                 return {"state": "idle", "message": "卡片未在运行"}
             # A paused policy does not tick, so it cannot clear its own gain
             # schedule before resume. Keep the track, but restart gain gently.
+            if halted:
+                self._publish_stop_if_moving()
             self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
@@ -845,6 +849,7 @@ class NaviPlugin:
                 self._start_cancelled = True
             if not self._running:
                 return {"state": "idle"}
+            self._publish_stop_if_moving()
             self._running = False
             self._paused = False
             node, self._node = self._node, None
@@ -1172,8 +1177,8 @@ class NaviPlugin:
         `output_topics_for` 决定，是个确定的契约，不依赖时序。消息类型只在名字
         认不出来时作为兜底 —— 那时图里有没有发布者才真的有参考价值。
 
-        还没有数据不是错误：`observation()` 的过期检查已经覆盖它，而那条路径的
-        结论是「什么都不发，让下游 watchdog 停住底盘」，正是此时该做的事。
+        还没有数据不是错误：`observation()` 会把未收到或过期的输入视为缺失，
+        此时策略不会开始运动。
         """
         bound = {"objects": "", "depth_map": "", "depth_summary": "", "odom": "",
                  "image": ""}
@@ -1527,12 +1532,18 @@ class NaviPlugin:
         self._last_tick = now
 
         objects, depth, odom = self.observation()
+        was_moving = any(self._state.commanded)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt)
         self._last_decision = decision
         if not decision.publishes:
-            return None
+            # Stop once when a policy goes quiet while the chassis may still
+            # hold its last motion command under the longer watchdog.
+            if self._config.watchdog_ms <= 300 or not was_moving:
+                return None
+            decision.values = [0.0] * ACTION_DIM
+            return self._command_message(decision.values, now, int(now * 1000))
 
         # Lift the command out of the robot's deadband, or drop it to zero. The
         # threshold comes from the downstream descriptor — it is a property of
@@ -1546,7 +1557,10 @@ class NaviPlugin:
                                            self._deadband_for(decision.values))
 
         obs_ms = self._objects_ms or int(now * 1000)
-        if (self._config.local_planning and decision.status == policy_mod.AVOIDING
+        if self._config.watchdog_ms > 300 and not any(values):
+            # A hold applies now, even when the last input is about to expire.
+            obs_ms = int(now * 1000)
+        elif (self._config.local_planning and decision.status == policy_mod.AVOIDING
                 and depth is not None and depth.get("frame_id") is not None):
             obs_ms = min(obs_ms, depth["frame_id"])
         return self._command_message(values, now, obs_ms)
@@ -1612,17 +1626,12 @@ class NaviPlugin:
 
     def _tick(self):
         with self._lock:
-            publisher = self._publisher
-            if publisher is None or not self._running or self._paused:
+            if self._publisher is None or not self._running or self._paused:
                 return
             try:
                 message = self.next_command()
                 if message is not None:
-                    from std_msgs.msg import String
-                    payload = String()
-                    payload.data = json.dumps(message, ensure_ascii=False)
-                    publisher.publish(payload)
-                    self._published += 1
+                    self._publish_command(message)
             except Exception as error:                        # noqa: BLE001
                 self._last_error = f"{type(error).__name__}: {error}"
                 log.warning("navi tick failed: %s", error)
@@ -1635,6 +1644,27 @@ class NaviPlugin:
         self._publish_view()
 
         self._maybe_complete()
+
+    def _publish_command(self, message):
+        from std_msgs.msg import String
+
+        payload = String()
+        payload.data = json.dumps(message, ensure_ascii=False)
+        self._publisher.publish(payload)
+        self._published += 1
+
+    def _publish_stop_if_moving(self):
+        if (self._config.watchdog_ms <= 300 or self._publisher is None
+                or not any(self._state.commanded)):
+            return
+        now = time.time()
+        try:
+            self._publish_command(self._command_message([0.0] * ACTION_DIM, now, int(now * 1000)))
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi stop command failed: %s", error)
+            return
+        self._state.commanded = (0.0, 0.0, 0.0)
+        self._state.commanded_vx = 0.0
 
     def _publish_view(self):
         """Hand the current decision to the render thread. **Never render here.**
