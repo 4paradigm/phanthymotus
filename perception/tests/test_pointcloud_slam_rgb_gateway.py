@@ -213,7 +213,9 @@ def test_stalled_optional_projection_does_not_block_scan_mapping(calibrated_node
         assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
         send(n)
         assert entered.wait(1)
-        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1, timeout=.2)
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1, timeout=.6)
+        assert n.status()['rgb_preparation']['first_map_budget_ms'] == 250
+        assert 'exceeded 250 ms' in n.status()['rgb_input']['reason']
         n._measurement_clock_ns = lambda: 1_100_000_000
         send(n, 1100)
         assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2, timeout=.2)
@@ -767,3 +769,157 @@ def test_publish_lock_retires_an_overtaken_internal_admission(calibrated_node):
     assert n.status()['dropped_runtime_queue']==1
     assert 1_100_000_000 not in n._rgb_reservations
     assert 1_100_000_000 not in n._motion_mounts
+
+
+@pytest.fixture
+def held_projection(monkeypatch):
+    import plugins.pointcloud_slam_rgb as rgb
+    entered, release = threading.Event(), threading.Event()
+    project = rgb.project_depth
+
+    def delayed(*args):
+        entered.set()
+        assert release.wait(2)
+        return project(*args)
+
+    monkeypatch.setattr(rgb, 'project_depth', delayed)
+    yield entered, release
+    release.set()
+
+
+@pytest.mark.parametrize("action", ["deliver", "lose_pose_again", "stop"])
+def test_searching_handles_slow_rgb_for_returning_external_pose(calibrated_node, held_projection, action):
+    """A new external origin alone cannot locate an observation on the old map."""
+    from test_pointcloud_slam_stream import odom
+    n = calibrated_node
+    send(n)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    missing = odom(1050, status='lost')
+    missing['pose'] = None
+    n._odom(NS(data=json.dumps(missing)))
+    n._native_info(NS(ref_id=0, stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/',
+        'Motus/VisualInliers/'], stats_values=[1., 0., 0.]), n._active)
+
+    entered, release = held_projection
+    image(n, 1100)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    n._odom(NS(data=json.dumps(odom(1100, x=20, segment='new-origin'))))
+    n._cloud(cloud(1_100_000_000))
+    assert entered.wait(1)
+    assert _wait_until(lambda: n.status()['rgb_preparation']['timeouts'] >= 1)
+    future = n._rgb_task[1]
+    if action == 'lose_pose_again':
+        n._odom(NS(data=json.dumps(missing)))
+        n._odom(NS(data=json.dumps(odom(1200, x=-40, segment='third-origin'))))
+    elif action == 'stop':
+        n.freeze_capture()
+    release.set()
+    assert _wait_until(future.done)
+    if action != 'deliver':
+        assert not _wait_until(lambda: n.status()['forwarded_clouds'] > 1, timeout=.1)
+        assert not n._motion_waiting
+        return
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+    replayed = published(n, '/sensor_data')[0].raw_messages[-1]
+    assert replayed.left.data and replayed.right.data and replayed.laser_scan.data
+    assert replayed.left.header.stamp.nanosec == 100_000_000
+    assert published(n, '/odom')[0].raw_messages[-1].pose.pose.position.x == 20.
+    assert len(NativeProcess.instances) == 1
+    assert n.status()['native_recovery']['state'] == 'searching'
+    assert not n._motion_waiting
+
+
+def test_null_pose_heartbeats_preserve_admitted_localization_queries(calibrated_node):
+    from test_pointcloud_slam_stream import odom
+    n = calibrated_node
+    send(n)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    absent = odom(1100, status='lost')
+    absent['pose'] = None
+    heartbeat = NS(data=json.dumps(absent))
+    with n._lock:
+        n._odom(heartbeat)
+        n._cloud(cloud(1_100_000_000))
+        assert len(n._queue) == 1
+        n._odom(heartbeat)
+        assert len(n._queue) == 1
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+    assert published(n, '/odom')[0].raw_messages[-1].pose.pose.orientation.w == 0.
+
+
+def test_overtaken_external_observation_cannot_publish_after_later_query(calibrated_node):
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    from test_pointcloud_slam_stream import odom
+    n = calibrated_node
+    send(n)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    with n._lock:
+        n._published_seq = 3
+    pose = decode_slam_odom(odom(1100))
+    n._publish_pair(n._active, (1_100_000_000, cloud(1_100_000_000), pose, np.eye(4), 1., 2))
+    assert n.status()['forwarded_clouds'] == 1
+    assert n.status()['dropped_runtime_queue'] >= 1
+
+
+def test_new_map_retains_first_scan_with_its_slow_visual_anchor(calibrated_node, held_projection):
+    n = calibrated_node
+    entered, release = held_projection
+    image(n, 1000)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    send(n)
+    assert entered.wait(1)
+    # The first view can become the only connected retrieval anchor.
+    assert not _wait_until(lambda: n.status()['forwarded_clouds'], timeout=.06)
+    release.set()
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    root = published(n, '/sensor_data')[0].raw_messages[0]
+    assert root.left.data and root.right.data and root.laser_scan.data
+    assert root.left.header.stamp == root.header.stamp
+
+
+@pytest.mark.parametrize('first_visual_unconfirmed', [False, True])
+def test_new_map_prefers_complete_observation_until_native_root(calibrated_node, first_visual_unconfirmed):
+    from test_pointcloud_slam_stream import odom
+    n = calibrated_node
+    expected = []
+    if first_visual_unconfirmed:
+        image(n, 900)
+        assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+        send(n, 900)
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        expected.append(900)
+    image(n, 1000)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == len(expected) + 1)
+    n._odom(NS(data=json.dumps(odom(1000))))
+    n._cloud(cloud(1_000_000_000, points=[(.1, .1, -1.)]))
+    image(n, 1100)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == len(expected) + 2)
+    send(n, 1100)
+    expected.append(1100)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] >= len(expected))
+    envelopes = published(n, '/sensor_data')[0].raw_messages
+    assert [(m.header.stamp.sec * 1000 + m.header.stamp.nanosec // 1_000_000,
+             bool(m.left.data and m.right.data)) for m in envelopes] == [(ms, True) for ms in expected]
+    n._native_info(NS(ref_id=1, loop_closure_id=0, proximity_detection_id=0,
+                      stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/'],
+                      stats_values=[0., 0., 0.]), n._active)
+    send(n, 1200)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == len(expected) + 1, timeout=.2)
+    assert not envelopes[-1].left.data
+
+
+@pytest.mark.parametrize("phase", ["projection", "native_ack"])
+def test_freeze_interrupts_pending_root_work(calibrated_node, held_projection, phase):
+    n = calibrated_node
+    entered, release = held_projection
+    image(n, 1000)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    send(n)
+    assert entered.wait(1)
+    send(n, 1100)
+    if phase == 'native_ack':
+        release.set()
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    n.freeze_capture()
+    assert _wait_until(lambda: not n._worker.is_alive(), timeout=.1)
+    assert n.status()['forwarded_clouds'] == int(phase == 'native_ack')
