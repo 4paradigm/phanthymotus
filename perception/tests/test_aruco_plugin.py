@@ -1,7 +1,9 @@
 """Real OpenCV geometry and JPEGs, with ROS message/executor stubs."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import cv2
@@ -184,6 +186,10 @@ def test_processor_publishes_matching_json_and_jpeg_then_clears_detection(detect
     {TOPIC: {**CAMERA, "schema": "other.camera/1"}},
     {TOPIC: {**CAMERA, "topic": "/another/color"}},
     {TOPIC: {**CAMERA, "format": "image/depth-zlib"}},
+    {TOPIC: {k: v for k, v in CAMERA.items() if k != "id"}},
+    {TOPIC: {**CAMERA, "id": ""}},
+    {TOPIC: {**CAMERA, "id": "   "}},
+    {TOPIC: {**CAMERA, "id": 17}},
     {TOPIC: {**CAMERA, "K": None}},
     {TOPIC: {**CAMERA, "K": []}},
     {TOPIC: {**CAMERA, "distortion_model": "unknown"}},
@@ -239,6 +245,72 @@ def test_overlay_is_per_instance_and_invalid_restart_stops_only_that_instance(de
             plugin.dispatch("aruco", {**start, "instance_id": "a", "camera_info": {}})
         assert first.destroyed and not first.worker.is_alive()
         assert executor.nodes == [second] and second.worker.is_alive()
+    finally:
+        plugin.shutdown()
+
+
+@pytest.mark.parametrize("blocked_stage", ["teardown", "launch"])
+def test_stop_cancels_a_replacement_in_flight(detector, monkeypatch, blocked_stage):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    start = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
+    entered, release = Event(), Event()
+    try:
+        assert plugin.dispatch("aruco", start)["state"] == "running"
+        [old] = executor.nodes
+        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "publish_overlay": False})
+        if blocked_stage == "teardown":
+            original = plugin._dispose
+        else:
+            original = type(old).start_worker
+
+        def pause(node):
+            entered.set()
+            assert release.wait(5)
+            original(node)
+
+        if blocked_stage == "teardown":
+            monkeypatch.setattr(plugin, "_dispose", pause)
+        else:
+            monkeypatch.setattr(type(old), "start_worker", pause)
+
+        with ThreadPoolExecutor(max_workers=2) as requests:
+            replacing = requests.submit(plugin.dispatch, "aruco", start)
+            try:
+                assert entered.wait(2)
+                info = requests.submit(plugin.dispatch, "aruco", {"action": "info", "instance_id": "a"})
+                assert info.result(timeout=2)["state"] == "starting"
+                stopping = requests.submit(plugin.dispatch, "aruco", {"action": "stop", "instance_id": "a"})
+                assert stopping.result(timeout=2)["state"] == "idle"
+            finally:
+                release.set()
+            assert replacing.result(timeout=2)["state"] == "idle"
+        assert not executor.nodes and old.destroyed
+        assert plugin.dispatch("aruco", start)["state"] == "running"
+        assert len(executor.nodes) == 1
+    finally:
+        release.set()
+        plugin.shutdown()
+
+
+def test_failed_registration_releases_ros_handles_and_allows_retry(detector, monkeypatch):
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    start = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
+    allocated = []
+
+    def broken_add(node):
+        allocated.append(node)
+        executor.nodes.append(node)
+        raise RuntimeError("registration failed")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(executor, "add_node", broken_add)
+            assert plugin.dispatch("aruco", start) == {"state": "error", "error": "registration failed"}
+        assert allocated[0].destroyed and not executor.nodes
+        assert plugin.dispatch("aruco", {"action": "info", "instance_id": "a"})["state"] == "idle"
+        assert plugin.dispatch("aruco", start)["state"] == "running"
     finally:
         plugin.shutdown()
 

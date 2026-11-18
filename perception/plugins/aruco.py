@@ -1,6 +1,7 @@
 """Locate ArUco markers in a calibrated camera stream with an optional overlay."""
 
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from utils.ros_lifecycle import dispose_node
 
 log = logging.getLogger(__name__)
 MAX_JPEG_BYTES = 8 * 1024 * 1024
+_NODE_SEQUENCE = itertools.count()
 DEFAULTS = {"dictionary": DEFAULT_DICTIONARY, "marker_size_m": 0.1, "rate_hz": 5.0, "publish_overlay": True}
 CONFIG = {
     "dictionary": {"type": "string", "title": "ArUco dictionary", "enum": list(DICTIONARIES),
@@ -89,19 +91,22 @@ def _wired_calibration(camera_info, topic):
     if (declaration.get("schema") != SCHEMA or declaration.get("topic") != topic
             or declaration.get("format") not in (None, "", "image/jpeg") or declaration.get("K") is None):
         raise ValueError(message)
+    camera_id = declaration.get("id")
+    if not isinstance(camera_id, str) or not camera_id.strip():
+        raise ValueError(f"{message} Missing camera ID.")
     try:
         calibration = Calibration.from_declaration(declaration)
     except ValueError as exc:
         raise ValueError(f"{message} {exc}") from exc
-    camera_id = declaration.get("id")
-    return calibration, camera_id if isinstance(camera_id, str) else ""
+    return calibration, camera_id
 
 
 class _ArucoNode(Node):
     def __init__(self, topic, key, options, calibration, detector, camera_id):
         self.calibration = calibration
         suffix = hashlib.sha256(key.encode()).hexdigest()[:16]
-        super().__init__(f"aruco_{suffix}")
+        # A retiring incarnation may still own its ROS name during a concurrent start.
+        super().__init__(f"aruco_{suffix}_{next(_NODE_SEQUENCE)}")
         self.input_topic = topic
         self.options = options
         self.camera_id = camera_id
@@ -127,10 +132,18 @@ class _ArucoNode(Node):
             raise
         self.worker = threading.Thread(target=self._run, name=f"aruco_{suffix}", daemon=True)
 
+    def start_worker(self):
+        with self._publish_lock:
+            if not self._closed.is_set():
+                self.worker.start()
+
+    def request_stop(self):
+        self._closed.set()
+        self.frames.close()
+
     def close(self):
         with self._publish_lock:
-            self._closed.set()
-        self.frames.close()
+            self.request_stop()
         if self.worker.ident is not None:
             self.worker.join(timeout=2)
 
@@ -219,6 +232,7 @@ class ArucoPlugin:
         self._defaults = {**DEFAULTS, **{key: cfg[key] for key in CONFIG if key in cfg}}
         self._overrides = {}
         self._nodes = {}
+        self._pending_starts = {}
         self._lock = threading.Lock()
         self._closed = False
 
@@ -230,36 +244,44 @@ class ArucoPlugin:
         action = args.get("action", name)
         instance = args.get("instance_id") or ""
         topic = args.get("input_topic") or ""
-        with self._lock:
-            if action == "start":
-                return self._start(instance, topic, args.get("camera_info"))
-            if action == "info":
-                node = self._nodes.get(instance or topic)
-                if not (instance or topic) and len(self._nodes) == 1:
-                    node = next(iter(self._nodes.values()))
-                return self._info(node)
-            if action == "stop":
-                self._stop(instance or topic)
-                return {"state": "idle"}
-            if action == "config":
+        if action == "start":
+            return self._start(instance, topic, args.get("camera_info"))
+        if action == "info":
+            return self._info(instance or topic)
+        if action == "stop":
+            self._stop(instance or topic)
+            return {"state": "idle"}
+        if action == "config":
+            with self._lock:
                 return self._config(instance, args)
         return None
 
-    def _info(self, node):
-        if node is not None:
-            info = {"state": "running", "topic_in": [{"topic": node.input_topic, "format": "image/jpeg"}],
-                    "topic_out": node.outputs, "last_frame_error": node.last_error, "pose_status": "calibrated",
-                    "publish_overlay": node.options["publish_overlay"]}
-            if not node.worker.is_alive():
-                info.update(state="error", error="ArUco frame worker stopped. Restart the card.")
-            elif node.worker_error:
-                info.update(state="error", error=node.worker_error)
-            return info
+    @staticmethod
+    def _node_info(node):
+        info = {"state": "running", "topic_in": [{"topic": node.input_topic, "format": "image/jpeg"}],
+                "topic_out": node.outputs, "last_frame_error": node.last_error, "pose_status": "calibrated",
+                "publish_overlay": node.options["publish_overlay"]}
+        if not node.worker.is_alive():
+            info.update(state="error", error="ArUco frame worker stopped. Restart the card.")
+        elif node.worker_error:
+            info.update(state="error", error=node.worker_error)
+        return info
+
+    def _info(self, key):
+        with self._lock:
+            instances = sorted(self._nodes.keys() | self._pending_starts.keys())
+            if not key and len(instances) == 1:
+                key = instances[0]
+            if key in self._pending_starts:
+                return {"state": "starting", "topic_out": [], "instances": instances}
+            if key in self._nodes:
+                return self._node_info(self._nodes[key])
+            options = {**self._defaults, **self._overrides.get(key, {})}
         try:
-            MarkerDetector(self._defaults["dictionary"], draw_overlay=self._defaults["publish_overlay"])
+            MarkerDetector(options["dictionary"], draw_overlay=options["publish_overlay"])
         except RuntimeError as exc:
             return {"state": "error", "error": str(exc)}
-        return {"state": "idle", "topic_out": [], "instances": list(self._nodes)}
+        return {"state": "idle", "topic_out": [], "instances": instances}
 
     def _config(self, instance, args):
         changes = {key: args[key] for key in CONFIG if key in args}
@@ -277,52 +299,90 @@ class ArucoPlugin:
         return {"state": "configured", "message": "Settings take effect on the next start."}
 
     def _start(self, instance, topic, camera_info):
-        if self._closed or self._executor is None:
-            return {"state": "error", "error": "ArUco ROS executor is unavailable."}
         if not isinstance(topic, str) or not topic.startswith("/") or topic.endswith("/"):
             return {"state": "error", "error": "Connect a camera or provide an absolute camera JPEG topic."}
         key = instance or topic
-        previous = self._nodes.get(key)
-        options = {**self._defaults, **self._overrides.get(instance, {})}
-        try:
-            calibration, camera_id = _wired_calibration(camera_info, topic)
-        except ValueError:
-            # A disconnected or changed camera invalidates this instance's old metric stream.
-            self._stop(key)
-            raise
-        node = None
-        try:
-            _validate_options(options)
-            if (previous is not None and previous.input_topic == topic and previous.worker.is_alive()
-                    and previous.camera_id == camera_id and previous.calibration.matches(calibration)
-                    and previous.options == options):
-                return self._info(previous)
-            detector = MarkerDetector(options["dictionary"], draw_overlay=options["publish_overlay"])
-            # The replacement uses the same ROS node name and output topics.
+        calibration_error = None
+        with self._lock:
+            if self._closed or self._executor is None:
+                return {"state": "error", "error": "ArUco ROS executor is unavailable."}
+            previous = self._nodes.get(key)
+            options = {**self._defaults, **self._overrides.get(instance, {})}
+            try:
+                _validate_options(options)
+            except (ValueError, OverflowError) as exc:
+                return {"state": "error", "error": str(exc)}
+            try:
+                calibration, camera_id = _wired_calibration(camera_info, topic)
+            except ValueError as exc:
+                calibration_error = exc
+                self._pending_starts.pop(key, None)
+            else:
+                if (previous is not None and previous.input_topic == topic and previous.worker.is_alive()
+                        and previous.camera_id == camera_id and previous.calibration.matches(calibration)
+                        and previous.options == options):
+                    return self._node_info(previous)
+                ticket = object()
+                self._pending_starts[key] = ticket
+            self._nodes.pop(key, None)
             if previous is not None:
-                self._stop(key)
-            node = _ArucoNode(topic, key, options, calibration, detector, camera_id)
-            if self._executor.add_node(node) is False:
-                raise RuntimeError("Could not register the ArUco node in the ROS executor.")
-            node.worker.start()
+                previous.request_stop()
+
+        if calibration_error is not None:
+            if previous is not None:
+                self._dispose(previous)
+            raise calibration_error
+        node = None
+        registered = False
+        try:
+            if previous is not None:
+                self._dispose(previous)
+            detector = MarkerDetector(options["dictionary"], draw_overlay=options["publish_overlay"])
+            with self._lock:
+                if self._pending_starts.get(key) is not ticket:
+                    return {"state": "idle"}
+                node = _ArucoNode(topic, key, options, calibration, detector, camera_id)
+                if self._executor.add_node(node) is False:
+                    raise RuntimeError("Could not register the ArUco node in the ROS executor.")
+                self._nodes[key] = node
+                registered = True
+            node.start_worker()
+            with self._lock:
+                return self._node_info(node) if self._nodes.get(key) is node else {"state": "idle"}
         except Exception as exc:
+            # After registration, a concurrent stop or replacement owns cleanup if it took the node.
+            with self._lock:
+                if registered and self._nodes.get(key) is node:
+                    self._nodes.pop(key)
+                elif registered:
+                    node = None
             if node is not None:
                 self._dispose(node)
             return {"state": "error", "error": str(exc)}
-        self._nodes[key] = node
-        return self._info(node)
+        finally:
+            with self._lock:
+                if self._pending_starts.get(key) is ticket:
+                    del self._pending_starts[key]
 
     def _dispose(self, node):
         node.close()
         dispose_node(self._executor, node, label=node.input_topic)
 
     def _stop(self, key=""):
-        for existing in ([key] if key else list(self._nodes)):
-            node = self._nodes.pop(existing, None)
-            if node is not None:
-                self._dispose(node)
+        with self._lock:
+            if key:
+                self._pending_starts.pop(key, None)
+                nodes = [self._nodes.pop(key)] if key in self._nodes else []
+            else:
+                self._pending_starts.clear()
+                nodes = list(self._nodes.values())
+                self._nodes.clear()
+            for node in nodes:
+                node.request_stop()
+        for node in nodes:
+            self._dispose(node)
 
     def shutdown(self):
         with self._lock:
             self._closed = True
-            self._stop()
+        self._stop()
