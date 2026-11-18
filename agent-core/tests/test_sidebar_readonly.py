@@ -78,25 +78,33 @@ sandbox.mcp = { id: 'robot', server_name: 'Robot' };
 // Execute the real drop handler, with rendering and lock I/O recorded separately.
 const canvas = fs.readFileSync(process.argv[1] + '/canvas.js', 'utf8');
 const dropSource = canvas.match(/^function _setupDropZone\(\) \{[\s\S]*?^\}/m)[0];
+const dropEditSource = canvas.match(/^async function _withDropEdit\(edit\) \{[\s\S]*?^\}/m)[0];
 let running = false;
 let added = [];
 let rejected = [];
+let releases = 0;
 let finishClaim;
 let configured = true;
 const area = new Element();
 Object.assign(sandbox, {
   _canvasEl: area, _cards: [], _tx: 0, _ty: 0, _zoom: 1,
+  _isEditor: false, _editClaimPromise: null, _dropEditLease: null,
   _editsLocked: () => running,
   _editLockReason: () => 'Project running',
   _showDropReject: (event, reason) => rejected.push(reason),
   _ensureEdit: () => {
+    if (sandbox._isEditor) return Promise.resolve(true);
     claims++;
-    return new Promise(resolve => { finishClaim = resolve; });
+    return new Promise(resolve => {
+      finishClaim = granted => { sandbox._isEditor = granted; resolve(granted); };
+    });
   },
+  _releaseEdit: async () => { releases++; sandbox._isEditor = false; },
   isToolConfigured: () => configured,
   _findNonOverlappingPos: (x, y) => ({ x, y }),
   _addCard: data => added.push(data),
 });
+run(dropEditSource);
 run(dropSource);
 run('_setupDropZone();');
 
@@ -172,6 +180,8 @@ def test_drop_waits_for_permission_and_keeps_drag_payload():
       assert.equal(added[0].toolName, 'camera');
       assert.equal(added[0].x, 190);
       assert.equal(added[0].y, 176);
+      assert.equal(releases, 0);
+      assert.equal(sandbox._isEditor, true);
     """)
 
 
@@ -182,6 +192,7 @@ def test_drop_is_rejected_when_another_editor_holds_permission():
       await pending;
       assert.equal(claims, 1);
       assert.equal(added.length, 0);
+      assert.equal(releases, 0);
     """)
 
 
@@ -192,6 +203,7 @@ def test_running_project_rejects_drop_before_claiming():
       assert.equal(claims, 0);
       assert.equal(added.length, 0);
       assert.equal(rejected.length, 1);
+      assert.equal(releases, 0);
     """)
 
 
@@ -203,6 +215,8 @@ def test_project_started_while_waiting_for_permission_rejects_drop():
       await pending;
       assert.equal(added.length, 0);
       assert.equal(rejected.length, 1);
+      assert.equal(releases, 1);
+      assert.equal(sandbox._isEditor, false);
     """)
 
 
@@ -216,4 +230,23 @@ def test_drop_rechecks_tool_state_after_permission(reason):
       await pending;
       assert.equal(added.length, 0);
       assert.equal(rejected.length, 1);
+      assert.equal(releases, 1);
+      assert.equal(sandbox._isEditor, false);
+    """)
+
+
+@pytest.mark.parametrize('reason', ['running', 'duplicate', 'unconfigured'])
+def test_rejected_drop_preserves_preexisting_edit_permission(reason):
+    run_js(f"""
+      sandbox._isEditor = true;
+      const pending = drop({{ mcpId: 'robot', toolName: 'camera', hasConfig: true }});
+      if ('{reason}' === 'running') running = true;
+      else if ('{reason}' === 'duplicate') sandbox._cards.push({{ mcpId: 'robot', toolName: 'camera' }});
+      else configured = false;
+      await pending;
+      assert.equal(added.length, 0);
+      assert.equal(rejected.length, 1);
+      assert.equal(claims, 0);
+      assert.equal(releases, 0);
+      assert.equal(sandbox._isEditor, true);
     """)

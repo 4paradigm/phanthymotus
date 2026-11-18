@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
 const names = ['_ensureEdit', '_claimEdit', '_requestEditor', '_setEditorState',
-  '_releaseEdit', '_applyEditorState', '_checkEditStatus', '_reloadLayout'];
+  '_releaseEdit', '_applyEditorState', '_checkEditStatus', '_reloadLayout', '_withDropEdit'];
 const functions = names.map(name => source.match(
   new RegExp(`^(?:async )?function ${name}\\([^]*?^\\}`, 'm'),
 )?.[0] || '').join('\n');
@@ -24,6 +24,7 @@ function fixture(fetch) {
     const _EDIT_REQUEST_TIMEOUT_MS = 30;
     let _isEditor = false, _currentEditor = null, _editorRevision = 0;
     let _editClaimPromise = null;
+    let _dropEditLease = null;
     let _cards = [], _connections = [], _execConnections = [];
     ${functions}
   `, context);
@@ -147,3 +148,102 @@ test('an older claim response cannot undo a newer release', async () => {
   assert.equal(await pending, false);
   assert.equal(env.read('_isEditor'), false);
 });
+
+function dropFixture() {
+  const requests = [];
+  const claim = deferred();
+  const env = fixture(url => {
+    requests.push(url);
+    return url.endsWith('/claim-edit') ? claim.promise
+      : Promise.resolve(response(200, {}));
+  });
+  return { ...env, requests, grant: () => claim.resolve(response(200, { editor: 'session-a' })) };
+}
+
+test('a rejected drop releases the edit lock it acquired', async () => {
+  const env = dropFixture();
+  const drop = env.context._withDropEdit(() => false);
+  env.grant();
+  await drop;
+  assert.equal(env.requests.filter(url => url.endsWith('/release-edit')).length, 1);
+  assert.equal(env.read('_isEditor'), false);
+});
+
+test('a rejected drop preserves a lock the session already held', async () => {
+  const env = dropFixture();
+  env.context._applyEditorState('session-a', 'claim');
+  await env.context._withDropEdit(() => false);
+  assert.equal(env.requests.length, 0);
+  assert.equal(env.read('_isEditor'), true);
+});
+
+for (const firstAccepted of [false, true]) {
+  test(`a rejected concurrent drop preserves a successful ${firstAccepted ? 'earlier' : 'later'} drop's lock`, async () => {
+    const env = dropFixture();
+    const first = env.context._withDropEdit(() => firstAccepted);
+    const second = env.context._withDropEdit(() => !firstAccepted);
+    env.grant();
+    await Promise.all([first, second]);
+    assert.equal(env.requests.filter(url => url.endsWith('/claim-edit')).length, 1);
+    assert.equal(env.requests.filter(url => url.endsWith('/release-edit')).length, 0);
+    assert.equal(env.read('_isEditor'), true);
+  });
+}
+
+test('concurrent rejected drops release their shared temporary lock exactly once', async () => {
+  const env = dropFixture();
+  const drops = [env.context._withDropEdit(() => false), env.context._withDropEdit(() => false)];
+  env.grant();
+  await Promise.all(drops);
+  assert.equal(env.requests.filter(url => url.endsWith('/claim-edit')).length, 1);
+  assert.equal(env.requests.filter(url => url.endsWith('/release-edit')).length, 1);
+  assert.equal(env.read('_isEditor'), false);
+});
+
+test('a rejected drop preserves a concurrent explicit edit request', async () => {
+  const env = dropFixture();
+  const drop = env.context._withDropEdit(() => false);
+  const edit = env.context._ensureEdit();
+  env.grant();
+  await drop;
+  assert.equal(await edit, true);
+  assert.equal(env.requests.filter(url => url.endsWith('/release-edit')).length, 0);
+  assert.equal(env.read('_isEditor'), true);
+});
+
+test('a rejected drop preserves an explicit edit request that was already pending', async () => {
+  const env = dropFixture();
+  const edit = env.context._ensureEdit();
+  const drop = env.context._withDropEdit(() => false);
+  env.grant();
+  await drop;
+  assert.equal(await edit, true);
+  assert.equal(env.requests.filter(url => url.endsWith('/release-edit')).length, 0);
+  assert.equal(env.read('_isEditor'), true);
+});
+
+for (const operation of ['edit', 'drop']) {
+  test(`a new ${operation} waits for temporary-lock cleanup before claiming again`, { timeout: 1000 }, async () => {
+    const releasing = deferred();
+    const releaseStarted = deferred();
+    const requests = [];
+    const env = fixture(url => {
+      requests.push(url);
+      if (url.endsWith('/release-edit')) {
+        releaseStarted.resolve();
+        return releasing.promise;
+      }
+      return Promise.resolve(response(200, { editor: 'session-a' }));
+    });
+    const drop = env.context._withDropEdit(() => false);
+    await releaseStarted.promise;
+    const edit = operation === 'edit' ? env.context._ensureEdit()
+      : env.context._withDropEdit(() => true);
+    assert.equal(requests.filter(url => url.endsWith('/claim-edit')).length, 1);
+    releasing.resolve(response(200, {}));
+    await drop;
+    assert.equal(await edit, true);
+    assert.equal(requests.filter(url => url.endsWith('/claim-edit')).length, 2);
+    assert.equal(env.read('_isEditor'), true);
+  });
+}

@@ -59,6 +59,7 @@ let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
 let _editorRevision = 0;    // advances whenever an authoritative editor state is adopted
 let _editClaimPromise = null;
+let _dropEditLease = null;
 const _EDIT_REQUEST_TIMEOUT_MS = 8000;
 
 function _setEditorState(editor) {
@@ -88,8 +89,12 @@ async function _requestEditor(url, options = {}) {
  * Ensure current session holds the edit lock, auto-claiming it if free.
  * Returns true if editing may proceed, false if the canvas is occupied by
  * another session (in which case a toast + locked UI state is shown).
+ * Drops pass retain=false until validation accepts the edit; other callers
+ * keep the lock even if a concurrent drop is rejected.
  */
-async function _ensureEdit() {
+async function _ensureEdit(retain = true) {
+  if (_dropEditLease?.releasePromise) await _dropEditLease.releasePromise;
+  if (retain && _dropEditLease) _dropEditLease.retained = true;
   if (_editClaimPromise) return _editClaimPromise;
   if (_isEditor) return true;
   _editorRevision += 1;  // invalidate reads started before this ownership change
@@ -884,6 +889,34 @@ function _setupControlButtons() {
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
 
+async function _withDropEdit(edit) {
+  if (_dropEditLease?.releasePromise) await _dropEditLease.releasePromise;
+  // Drops sharing an in-flight claim must finish validation before deciding
+  // whether to keep it. Any accepted drop or ordinary edit retains the lock.
+  const lease = _dropEditLease ||= {
+    pending: 0, retained: _isEditor || !!_editClaimPromise, releasePromise: null,
+  };
+  lease.pending += 1;
+  try {
+    if (!(await _ensureEdit(false))) return false;
+    const accepted = edit();
+    if (accepted) lease.retained = true;
+    return accepted;
+  } finally {
+    lease.pending -= 1;
+    if (lease.pending === 0) {
+      try {
+        if (!lease.retained && _isEditor) {
+          lease.releasePromise = _releaseEdit();
+          await lease.releasePromise;
+        }
+      } finally {
+        _dropEditLease = null;
+      }
+    }
+  }
+}
+
 function _setupDropZone() {
   _canvasEl.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -913,40 +946,42 @@ function _setupDropZone() {
       data = JSON.parse(e.dataTransfer.getData('application/x-cap-card'));
     } catch { return; }
 
-    if (!(await _ensureEdit())) return;
-    // Project state can change while the edit request is in flight.
-    if (_editsLocked()) {
-      _showDropReject(e, _editLockReason());
-      return;
-    }
-
-    // Prevent unconfigured tools from being added
-    if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
-      _showDropReject(e, '请先配置后再使用');
-      return;
-    }
-
-    // Prevent same tool from being added twice (unless multiInstance)
-    if (!data.multiInstance) {
-      const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
-      if (existing) {
-        _showDropReject(e, '不能两次加入同样的组件');
-        return;
+    return _withDropEdit(() => {
+      // Project state can change while the edit request is in flight.
+      if (_editsLocked()) {
+        _showDropReject(e, _editLockReason());
+        return false;
       }
-    }
 
-    // Convert screen coords → world coords
-    const rect   = _canvasEl.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-    let x = (screenX - _tx) / _zoom - 110;
-    let y = (screenY - _ty) / _zoom - 24;
+      // Prevent unconfigured tools from being added
+      if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
+        _showDropReject(e, '请先配置后再使用');
+        return false;
+      }
 
-    // Avoid overlapping existing cards
-    ({ x, y } = _findNonOverlappingPos(x, y));
+      // Prevent same tool from being added twice (unless multiInstance)
+      if (!data.multiInstance) {
+        const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
+        if (existing) {
+          _showDropReject(e, '不能两次加入同样的组件');
+          return false;
+        }
+      }
 
-    const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    _addCard({ id, mcpId: data.mcpId, toolName: data.toolName, driverName: data.driverName, x, y }, true);
+      // Convert screen coords → world coords
+      const rect   = _canvasEl.getBoundingClientRect();
+      const screenX = e.clientX - rect.left;
+      const screenY = e.clientY - rect.top;
+      let x = (screenX - _tx) / _zoom - 110;
+      let y = (screenY - _ty) / _zoom - 24;
+
+      // Avoid overlapping existing cards
+      ({ x, y } = _findNonOverlappingPos(x, y));
+
+      const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      _addCard({ id, mcpId: data.mcpId, toolName: data.toolName, driverName: data.driverName, x, y }, true);
+      return true;
+    });
   });
 }
 
