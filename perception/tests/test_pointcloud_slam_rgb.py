@@ -7,7 +7,7 @@ import time
 import numpy as np
 import pytest
 
-from plugins.pointcloud_slam_rgb import RgbLoopInput, project_depth, validate_rgb_camera
+from plugins.pointcloud_slam_rgb import RgbLoopInput, project_depth, project_measured_depth, validate_rgb_camera
 from test_rgbd_body_mount import declaration as mount_declaration, packet
 
 STAMP = 1_000_000_123
@@ -231,6 +231,17 @@ def test_projection_keeps_nearest_measured_z_and_zero_holes():
     assert np.array_equal(depth, [[1,1,0], [0,0,0]])
     moved = np.eye(4); moved[0,3] = 1
     assert project_depth([[0,0,1]], moved, np.eye(3), 3, 2)[0,1] == 1
+
+
+def test_measured_depth_warp_keeps_nearest_surface_without_filling_holes():
+    measured = np.array([[1., 2., 0., np.nan], [0., 2., 7., 2.]], dtype=np.float32)
+    transform = np.eye(4)
+    transform[2, 3] = 1.
+    # The first two rays in row zero hit the same output pixel. The
+    # foreground must win and invalid source pixels must never acquire Z.
+    target = np.diag([.5, 1.5, 1.])
+    actual = project_measured_depth((measured, (1., 1., 0., 0.), .1, 5.), transform, target, 3, 2)
+    np.testing.assert_array_equal(actual, [[2., 0., 0.], [3., 3., 0.]])
 
 
 def test_raw_queue_retains_only_latest_and_close_discards_inflight_decode():

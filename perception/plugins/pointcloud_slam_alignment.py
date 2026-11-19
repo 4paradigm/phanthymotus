@@ -57,8 +57,8 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                 position = tuple((1-ratio)*a + ratio*b for a, b in zip(previous.position, sample.position))
                 if not all(math.isfinite(v) for v in position):
                     raise ValueError('interpolated pose is not finite')
-                continuity = (sample.chassis_continuity
-                              if previous.chassis_continuity == sample.chassis_continuity else None)
+                continuity = (sample.external_continuity
+                              if previous.external_continuity == sample.external_continuity else None)
                 return PoseSample(cloud_stamp_ns // 1_000_000, sample.frame_id, sample.child_frame_id,
                                   sample.segment_id, position,
                                   _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id,

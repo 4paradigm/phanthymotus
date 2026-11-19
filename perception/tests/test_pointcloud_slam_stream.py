@@ -1,4 +1,5 @@
 """The admission gate retains provenance and poses, never map/keyframe history."""
+from dataclasses import replace
 from types import SimpleNamespace as NS
 
 import numpy as np
@@ -6,6 +7,7 @@ import pytest
 
 from plugins.pointcloud_slam_stream import SlamStream
 from plugins.pointcloud_slam_odom import decode_slam_odom
+from plugins.spatial_time import FrameContext
 
 
 def odom(ms, x=0, segment='a', status='tracking'):
@@ -51,13 +53,25 @@ def chassis(ms, x=0., segment='a'):
     return sample
 
 
+def measured_rgbd(ms, x=0., segment='a', ingress='local'):
+    sample = odom(ms, x, segment)
+    stamp = ms*1_000_000
+    parent = FrameContext(f'pair-{ms}', stamp, 'clock', 'source_capture', stamp, stamp, ingress,
+                          transformations=('rgbd_association',))
+    sample['pose']['covariance'] = (np.eye(6)*.01).ravel().tolist()
+    sample['vendor'].update(source='rtabmap_rgbd_odometry', pose_reference='camera_optical',
+                            registration=dict(status='tracking', native_lost=False, native_inliers=64))
+    sample['vendor']['motus_slam'].update(stamp_ns=stamp, observation=parent.to_dict())
+    return sample, parent
+
+
 def test_dense_chassis_run_has_one_continuity_token_at_aligned_scan_stamps():
     s = stream()
     for ms, x in [(1000, 0.), (1100, .03), (1200, .06), (1300, .09)]:
         s.odom(chassis(ms, x), now=ms/1000)
     for ms in (1000, 1150, 1250, 1300):
         s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=1.4)
-    tokens = [frame.pose.chassis_continuity for frame in s.accepted]
+    tokens = [frame.pose.external_continuity for frame in s.accepted]
     assert len(tokens) == 4 and len(tokens[0]) == 16 and len(set(tokens)) == 1
 
 
@@ -69,7 +83,7 @@ def test_delayed_chassis_delivery_can_leave_an_unposed_scan_inside_a_certified_r
         s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
     assert unposed == [(1_100_000_000, None)]
     s.odom(chassis(1250, .04), now=1.25)
-    first, resumed = (frame.pose.chassis_continuity for frame in s.accepted)
+    first, resumed = (frame.pose.external_continuity for frame in s.accepted)
     assert first and resumed == first
 
 
@@ -83,7 +97,7 @@ def test_chassis_gap_jump_and_new_origin_do_not_certify_interpolated_pose(second
     s.odom(second, now=2.)
     s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=2.)
     s.cloud(second['stamp_ms']*1_000_000, 'camera', [[0, 0, 1]], now=2.)
-    old, middle, new = (frame.pose.chassis_continuity for frame in s.accepted)
+    old, middle, new = (frame.pose.external_continuity for frame in s.accepted)
     assert len(old) == len(new) == 16 and old != new
     assert middle is None
 
@@ -97,7 +111,7 @@ def test_missing_or_non_chassis_pose_cannot_extend_the_measured_run():
     s.cloud(1_200_000_000, 'camera', [[0, 0, 1]], now=1.2)
     s.odom(odom(1300), now=1.3)
     s.cloud(1_300_000_000, 'camera', [[0, 0, 1]], now=1.3)
-    before, after, unauthenticated = (frame.pose.chassis_continuity for frame in s.accepted)
+    before, after, unauthenticated = (frame.pose.external_continuity for frame in s.accepted)
     assert before != after and unauthenticated is None
 
 
@@ -117,7 +131,7 @@ def test_chassis_timing_contradiction_keeps_numeric_pose_without_continuity(meta
     s.odom(sample, now=1.1)
     s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=1.1)
     assert s.accepted[0].pose.position == (.03, 0., 0.)
-    assert s.accepted[0].pose.chassis_continuity is None
+    assert s.accepted[0].pose.external_continuity is None
 
 
 def test_chassis_measurement_epoch_change_starts_a_new_continuity_run():
@@ -127,8 +141,32 @@ def test_chassis_measurement_epoch_change_starts_a_new_continuity_run():
         sample['vendor']['motus_slam']['measurement'] = {'clock_epoch': epoch}
         s.odom(sample, now=ms/1000)
         s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
-    tokens = [frame.pose.chassis_continuity for frame in s.accepted]
+    tokens = [frame.pose.external_continuity for frame in s.accepted]
     assert all(tokens) and tokens[0] != tokens[1]
+
+
+@pytest.mark.parametrize('second,loss', [
+    ((2101, .1), False), ((1100, 1.), False), ((1100, .1), True),
+    ((900, 0.), False),
+])
+def test_measured_visual_break_cannot_extend_previous_token(second, loss):
+    s = stream()
+    s.ingress_clock_id = 'local'
+
+    def push(ms, x):
+        sample, parent = measured_rgbd(ms, x)
+        context = replace(parent, observation_id=f'derived-{ms}',
+                          parent_observation_ids=(parent.observation_id,),
+                          transformations=parent.transformations+('rgbd_odometry',))
+        s.odom(sample, now=ms/1000, context=context)
+        s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
+
+    push(1000, 0.)
+    if loss:
+        s.odom(dict(odom(1020, status='lost'), pose=None), now=1.02)
+    push(*second)
+    first, changed = [frame.pose.external_continuity for frame in s.accepted]
+    assert first and changed and changed != first
 
 
 def test_inertial_prediction_is_only_a_hint_in_the_accepted_origin():

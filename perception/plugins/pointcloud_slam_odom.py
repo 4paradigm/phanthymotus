@@ -22,7 +22,7 @@ class PoseSample:
     precise_stamp_ns: int = None
     observation_parents: tuple = ()
     prediction_anchor_ns: int = None
-    chassis_continuity: bytes = None
+    external_continuity: bytes = None
 
     @property
     def stamp_ns(self):

@@ -28,6 +28,17 @@ def validate_rgb_camera(declaration, *, topic):
         raise ValueError('invalid optional RGB declaration') from error
 
 
+def _nearest_depth(u, v, z, width, height):
+    """Keep nearest positive optical Z at each observed pixel."""
+    valid = ((u >= 0) & (u < width) & (v >= 0) & (v < height) &
+             (z > 0) & (z <= np.finfo(np.float32).max))
+    indices = v[valid].astype(np.intp)*width + u[valid].astype(np.intp)
+    depth = np.full(width*height, np.inf, dtype=np.float32)
+    np.minimum.at(depth, indices, z[valid].astype(np.float32))
+    depth[~np.isfinite(depth)] = 0
+    return depth.reshape(height, width)
+
+
 def project_depth(points, camera_from_cloud, K, width, height):
     """Nearest optical Z of measured points; holes remain zero metres."""
     transform = rigid(camera_from_cloud)
@@ -39,26 +50,38 @@ def project_depth(points, camera_from_cloud, K, width, height):
     pixels = moved @ k.T
     with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
         uv = np.rint(pixels[:, :2]/pixels[:, 2:3])
-    valid = (np.isfinite(uv).all(axis=1) & (uv[:, 0] >= 0) & (uv[:, 0] < width) &
-             (uv[:, 1] >= 0) & (uv[:, 1] < height) & (moved[:, 2] <= np.finfo(np.float32).max))
-    uv = uv[valid].astype(np.int64)
-    depth = np.full(width*height, np.inf, dtype=np.float32)
-    np.minimum.at(depth, uv[:, 1]*width+uv[:, 0], moved[valid, 2].astype(np.float32))
-    depth[~np.isfinite(depth)] = 0
-    return depth.reshape(height, width)
+    return _nearest_depth(uv[:, 0], uv[:, 1], moved[:, 2], width, height)
 
 
 def project_measured_depth(measured, camera_from_cloud, K, width, height):
-    from .pointcloud_math import backproject_depth
-
     depth, (fx, fy, cx, cy), minimum, maximum = measured
+    valid = np.isfinite(depth) & (depth > 0.) & (depth >= minimum) & (depth <= maximum)
+    depth = np.where(valid, depth, 0.)
     source_K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
     if (depth.shape == (height, width) and np.allclose(source_K, K, atol=1e-8, rtol=0.) and
             np.allclose(camera_from_cloud, np.eye(4), atol=1e-8, rtol=0.)):
-        valid = np.isfinite(depth) & (depth > 0.) & (depth >= minimum) & (depth <= maximum)
-        return np.where(valid, depth, 0.)
-    points = backproject_depth(depth, fx, fy, cx, cy, 1, minimum, maximum)
-    return project_depth(points[points[:, 2] > 0.], camera_from_cloud, K, width, height)
+        return depth
+    # Keep separate grid coordinates to avoid packing and copying dense XYZ
+    # point lists or competing with native tracking for BLAS worker threads.
+    transform = rigid(camera_from_cloud)[:3]
+    projection = np.asarray(K, dtype=float).reshape(3, 3) @ transform
+    columns = np.arange(depth.shape[1], dtype=np.float32) - cx
+    rows = (np.arange(depth.shape[0], dtype=np.float32) - cy)[:, None]
+    # Match the float32 backprojection used by the metric cloud before warping.
+    x = (columns*depth/fx).astype(np.float32, copy=False).astype(float)
+    y = (rows*depth/fy).astype(np.float32, copy=False).astype(float)
+    depth = depth.astype(float)
+
+    def component(row):
+        return row[0]*x + row[1]*y + row[2]*depth + row[3]
+
+    z = component(transform[2])
+    scale = z if np.array_equal(projection[2], transform[2]) else component(projection[2])
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        u = np.rint(component(projection[0])/scale)
+        v = np.rint(component(projection[1])/scale)
+    z[~valid] = 0.
+    return _nearest_depth(u, v, z, width, height)
 
 
 class RgbLoopInput:

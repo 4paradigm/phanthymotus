@@ -124,13 +124,19 @@ class InputAdapterRegistry:
         self._domain = id(getattr(executor, 'context', executor))
 
     def _ros_subscribe(self, topic, message_type, callback):
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         if self._node is None:
             self._node = Node('spatial_input_' + uuid.uuid4().hex[:8],
                               context=getattr(self.executor, 'context', None))
             self.executor.add_node(self._node)
-        subscription = self._node.create_subscription(message_type, topic, callback, qos_profile_sensor_data)
+        # Humble can leave a callback group busy when a subscription is
+        # destroyed between scheduling and taking its message. Keep that
+        # group's lifetime scoped to one subscription.
+        subscription = self._node.create_subscription(
+            message_type, topic, callback, qos_profile_sensor_data,
+            callback_group=MutuallyExclusiveCallbackGroup())
         return lambda: self._node.destroy_subscription(subscription)
 
     def acquire(self, topic, message_type, declaration, consumer):
@@ -221,6 +227,13 @@ class InputAdapterRegistry:
                        sum(entry[0].nbytes for entry in self._derived_depth.values()) > self.max_bytes):
                     self._derived_depth.popitem(last=False)
         return context
+
+    def is_derived(self, topic, message, context):
+        if context is None:
+            return False
+        identity = _identity(topic, message)
+        with self._lock:
+            return self._derived.get(identity) is context
 
     def derived_depth(self, observation):
         with self._lock:

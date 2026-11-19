@@ -1,3 +1,4 @@
+import sys
 import threading
 import time
 from types import SimpleNamespace as NS
@@ -107,3 +108,38 @@ def test_consumer_timing_separates_queue_wait_from_callback_work():
         assert timing['queue_wait']['count']==1
         assert timing['callback']['p95_ms']>=0
     finally:lease.close();r.close()
+
+
+def test_ros_subscriptions_isolate_callback_groups_across_one_topic_restart(monkeypatch):
+    from rclpy import node, qos
+
+    default_group = object()
+    created, removed = [], []
+
+    def subscribe(kind, topic, callback, profile, *, callback_group=None):
+        sub = NS(topic=topic, group=callback_group or default_group)
+        created.append(sub)
+        return sub
+
+    ros_node = NS(create_subscription=subscribe, destroy_subscription=removed.append,
+                  destroy_node=lambda: None)
+    monkeypatch.setattr(node, 'Node', lambda *args, **kwargs: ros_node)
+    monkeypatch.setattr(qos, 'qos_profile_sensor_data', object(), raising=False)
+    monkeypatch.setitem(sys.modules, 'rclpy.callback_groups', NS(MutuallyExclusiveCallbackGroup=object))
+    executor = NS(add_node=lambda node: None, remove_node=lambda node: None)
+    registry = InputAdapterRegistry(executor)
+    consume = lambda *args: None
+    try:
+        first = registry.acquire('/depth', object, {}, consume)
+        second = registry.acquire('/depth', object, {}, consume)
+        registry.acquire('/rgb', object, {}, consume)
+        assert len(created) == 2
+        first.close()
+        assert not removed
+        second.close()
+        assert removed == created[:1]
+        registry.acquire('/depth', object, {}, consume)
+        assert [sub.topic for sub in created] == ['/depth', '/rgb', '/depth']
+        assert len({sub.group for sub in created}) == 3
+    finally:
+        registry.close()

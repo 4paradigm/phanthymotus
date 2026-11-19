@@ -82,6 +82,47 @@ def test_native_envelope_marks_only_continuous_measured_chassis_poses(rgb_node):
     assert not getattr(other, 'user_data', None)
 
 
+def test_native_envelope_carries_only_witnessed_measured_visual_runs(rgb_node):
+    from dataclasses import replace
+    import zlib
+    from plugins.spatial_input import InputAdapterRegistry
+    from test_pointcloud_slam_stream import measured_rgbd
+
+    n = rgb_node
+    registry = InputAdapterRegistry()
+    n._input_registry = registry
+    n.stream.ingress_clock_id = registry.clock_id
+
+    def send(ms, x, segment='a', witness=True):
+        sample, parent = measured_rgbd(ms, x, segment, registry.clock_id)
+        msg = NS(data=json.dumps(sample))
+        if witness:
+            context = registry.register_derived('/o', msg, parent, 'rgbd_odometry')
+        else:
+            # Metadata can claim the expected lineage without a local publication.
+            context = replace(parent, observation_id='copied', parent_observation_ids=(parent.observation_id,),
+                              transformations=parent.transformations+('rgbd_odometry',))
+        stamp = parent.observation_stamp_ns
+        n._measurement_clock_ns = lambda: stamp
+        n._odom(msg, context)
+        n._cloud(cloud(stamp))
+
+    samples = [(1000, 0.), (1900, .08), (2000, .09, 'reset'), (2100, .10, 'reset', False)]
+    for count, values in enumerate(samples, 1):
+        send(*values)
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == count)
+
+    n._cloud(cloud(1_900_000_000))  # A delayed cloud cannot carry the retired token.
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 5)
+    first, next_pose, reset, unwitnessed, delayed = published(n, '/sensor_data')[0].raw_messages
+    old_run = zlib.decompress(bytes(first.user_data)[:-12])
+    assert old_run.startswith(b'MOTUSOD1')
+    assert zlib.decompress(bytes(next_pose.user_data)[:-12]) == old_run
+    assert zlib.decompress(bytes(reset.user_data)[:-12]) != old_run
+    assert not getattr(unwitnessed, 'user_data', None)
+    assert not getattr(delayed, 'user_data', None)
+
+
 def rgb_camera():
     return {'schema': 'motus.camera/1', 'topic': '/rgb', 'format': 'image/jpeg',
             'width': 4, 'height': 4, 'K': [1, 0, 1, 0, 1, 1, 0, 0, 1],

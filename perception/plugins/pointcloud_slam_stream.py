@@ -36,7 +36,7 @@ class SlamStream:
         self._admitted = 0
         self._poses = deque(maxlen=512)
         self._pose_anchor = None
-        self._chassis_run = None
+        self._measured_run = None
         self._pending = deque()
         self._last_received = None
         self._last_cloud_received = None
@@ -54,11 +54,15 @@ class SlamStream:
     def pending_count(self):
         return len(self._pending)
 
+    @property
+    def continuity_token(self):
+        return self._measured_run[1].external_continuity if self._measured_run is not None else None
+
     def _lose(self):
         """Numeric pose absence waits for a new pose, without retiring labels."""
         self._poses.clear()
         self._pose_anchor = None
-        self._chassis_run = None
+        self._measured_run = None
         self._pending.clear()
         self._last_received = None
         self._odom_state = 'waiting'
@@ -76,7 +80,7 @@ class SlamStream:
         if type(stamp_ns) is not int:
             raise ValueError('measurement timestamp must be integer nanoseconds')
 
-    def odom(self, sample, *, now, measurement_now_ns=None, received=None):
+    def odom(self, sample, *, now, measurement_now_ns=None, received=None, context=None):
         try:
             pose = decode_slam_odom(sample)
         except ValueError as error:
@@ -87,14 +91,14 @@ class SlamStream:
                 self.last_error = str(error)
                 return
         if pose.prediction_anchor_ns is None:
-            pose = self._track_chassis(sample, pose)
+            pose = self._track_measured_run(sample, pose, context)
             if self._pose_anchor is None or pose.stamp_ns >= self._pose_anchor.stamp_ns:
                 self._pose_anchor = pose
             # Confirmed corrections supersede hypotheses beyond their capture.
             poses = {p.stamp_ns: p for p in self._poses
                      if p.prediction_anchor_ns is None or p.stamp_ns < pose.stamp_ns}
         else:
-            self._chassis_run = None
+            self._measured_run = None
             poses = {p.stamp_ns: p for p in self._poses}
         poses[pose.stamp_ns] = pose
         self._poses = deque(sorted(poses.values(), key=lambda p: p.stamp_ns)[-512:], maxlen=512)
@@ -102,16 +106,19 @@ class SlamStream:
         self._odom_state = 'coasting' if pose.prediction_anchor_ns is not None else 'tracking'
         self._drain(now, measurement_now_ns)
 
-    def _track_chassis(self, sample, pose):
+    def _track_measured_run(self, sample, pose, context):
         vendor = sample.get('vendor')
         quality = vendor.get('motus_slam') if isinstance(vendor, dict) else None
+        chassis = (isinstance(quality, dict) and quality.get('pose_source') == 'chassis_odometry' and
+                   quality.get('pose_reference') == 'body')
+        visual = (isinstance(vendor, dict) and vendor.get('source') == 'rtabmap_rgbd_odometry' and
+                  self._witnessed_visual(vendor, pose, context))
         origin = (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id,
-                  quality.get('source_topic') if isinstance(quality, dict) else None)
-        if (not isinstance(quality, dict) or quality.get('pose_source') != 'chassis_odometry' or
-                quality.get('pose_reference') != 'body' or quality.get('status') != 'tracking' or
+                  quality.get('source_topic') if chassis else vendor.get('source') if visual else None)
+        if (not (chassis or visual) or not isinstance(quality, dict) or quality.get('status') != 'tracking' or
                 quality.get('stamp_source') != 'measurement' or quality.get('stamp_ns') != pose.stamp_ns or
                 pose.stamp_ns <= 0 or not all(isinstance(value, str) and value for value in origin)):
-            self._chassis_run = None
+            self._measured_run = None
             return pose
         observation = pose.observation
         measurement = quality.get('measurement')
@@ -128,28 +135,48 @@ class SlamStream:
                 measurement.get('frame_id', pose.frame_id) != pose.frame_id or
                 (isinstance(mapping, dict) and mapping.get('verified') is False) or
                 (isinstance(fusion, dict) and fusion.get('mapping_allowed') is False)):
-            self._chassis_run = None
+            self._measured_run = None
             return pose
         origin += (measurement.get('clock_epoch'), measurement.get('source_generation'),
                    measurement.get('source_clock'), reference.get('domain_id') if isinstance(reference, dict) else None,
                    observation.source_id if observation is not None else None,
-                   observation.source_epoch if observation is not None else None)
+                   observation.source_epoch if observation is not None else None, chassis)
         token = None
-        if self._chassis_run is not None:
-            last_origin, previous = self._chassis_run
+        if self._measured_run is not None:
+            last_origin, previous = self._measured_run
             dt = (pose.stamp_ns - previous.stamp_ns) / 1e9
             distance = math.dist(pose.position, previous.position)
             dot = abs(sum(a*b for a, b in zip(pose.quaternion, previous.quaternion)))
             angle = 2*math.acos(min(1., dot))
+            # Measured VO can skip captures while its same-stamp registration
+            # is still valid. Keep that observed walk bounded to one second.
+            max_interval = .5 if chassis else 1.
             if last_origin == origin and (
                     (dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
-                    (0 < dt <= .5 and distance <= .1 + 1.5*dt and angle <= math.radians(10) + 2.5*dt)):
-                token = previous.chassis_continuity
+                    (0 < dt <= max_interval and distance <= .1 + 1.5*dt and
+                     angle <= math.radians(10) + 2.5*dt)):
+                token = previous.external_continuity
         # This token is carried only through an observed, bounded source run.
         # A new token requires independent registration in the native map.
-        pose = replace(pose, chassis_continuity=token or uuid.uuid4().bytes)
-        self._chassis_run = origin, pose
+        pose = replace(pose, external_continuity=token or uuid.uuid4().bytes)
+        self._measured_run = origin, pose
         return pose
+
+    def _witnessed_visual(self, vendor, pose, context):
+        observation, report = pose.observation, vendor.get('registration')
+        # The local registry, not a source's topic name or segment label,
+        # attests that this output was produced by our RGB-D runtime.
+        return (context is not None and observation is not None and self.ingress_clock_id is not None and
+                context.ingress_clock_id == observation.ingress_clock_id == self.ingress_clock_id and
+                context.time_basis == observation.time_basis == 'source_capture' and
+                context.normalized_clock_id == observation.normalized_clock_id == pose.clock_id and
+                context.observation_stamp_ns == pose.stamp_ns and
+                context.parent_observation_ids == (observation.observation_id,) and
+                context.transformations == observation.transformations+('rgbd_odometry',) and
+                isinstance(report, dict) and report.get('status') == 'tracking' and
+                report.get('native_lost') is False and type(report.get('native_inliers')) is int and
+                report['native_inliers'] > 0 and pose.covariance is not None and
+                all(pose.covariance[i] > 0. for i in (0, 7, 14, 21, 28, 35)))
 
     def _capture_context(self, packet):
         evidence = packet.get('extrinsic')

@@ -130,6 +130,7 @@ class RtabmapNode(Node):
                  restored_map=None):
         self._restored_map = deepcopy(restored_map)
         self._input_registry, self._input_leases = input_registry, []
+        self._odom_topic = odom_topic
         from nav_msgs.msg import Odometry
         from geometry_msgs.msg import TransformStamped
         from tf2_msgs.msg import TFMessage
@@ -282,6 +283,8 @@ class RtabmapNode(Node):
             sample = normalize_pose_time(json.loads(msg.data), context)
         except (TypeError, ValueError):
             sample = None
+        derived = (context if context is not None and self._input_registry is not None and
+                   self._input_registry.is_derived(self._odom_topic, msg, context) else None)
         with self._lock:
             if not self._stopped():
                 try:
@@ -289,7 +292,7 @@ class RtabmapNode(Node):
                         self._capture_clouds.validate_pose(sample, self.stream)
                     self.stream.odom(sample, now=self._receipt_clock(), measurement_now_ns=self._measurement_now(),
                         received=context.ingress_monotonic_ns/1e9 if context is not None and
-                        context.ingress_clock_id==self.stream.ingress_clock_id else None)
+                        context.ingress_clock_id==self.stream.ingress_clock_id else None, context=derived)
                 except ValueError as error:
                     self.stream.last_error = str(error)
                 if self.stream._odom_state not in ('tracking', 'coasting'):
@@ -577,9 +580,6 @@ class RtabmapNode(Node):
             # runtime cannot mistake this private hint for a tracking pose.
             payload = struct.pack('<8s7d', b'MOTUSIMU', *pose.position, *pose.quaternion)
             native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
-        elif measured is not None and measured.chassis_continuity is not None and self._rgb is not None:
-            payload = b'MOTUSOD1' + measured.chassis_continuity
-            native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
         if (self._root_deadline and pose is not None and not native.left.data and
                 (self._rgb_task is None or self._rgb_task[1].done()) and self._prefer_next_root_observation()):
             return
@@ -590,6 +590,12 @@ class RtabmapNode(Node):
                 return
             if pose is not None and not self.stream._poses:
                 return
+            token = self.stream.continuity_token
+            if (self._rgb is not None and measured is not None and token is not None and
+                    measured.external_continuity == token):
+                # Optional preparation can outlive the source run of a queued pose.
+                payload = b'MOTUSOD1' + token
+                native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
             if self.stream.extrinsic_mode != 'dynamic':
                 segment['tf_pub'].publish(tf)
             if measured is not None:
