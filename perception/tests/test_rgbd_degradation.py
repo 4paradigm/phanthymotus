@@ -89,6 +89,22 @@ def test_weak_warmup_after_two_good_frames_uses_result_liveness(sessions):
     assert s.gate.state == 'lost' and s.gate.loss_kind == 'output'
 
 
+def test_visual_warmup_measures_output_silence_from_result_delivery():
+    gate = runtime.EstimateGate('run', 'camera_optical', 'camera-clock')
+    stamp = 2_000*MS
+    delivered = stamp + 450*MS
+    gate.input(stamp, now_ns=delivered)
+    assert gate.accept(*messages(stamp), delivered) is None
+    assert gate.good == 1
+
+    # A fresh RGB-D pair can arrive while the prior registration ages out.
+    # It may still complete within the same output-silence budget.
+    gate.input(stamp + 1_600*MS, now_ns=delivered + 1_200*MS)
+    assert gate.status(delivered + 1_200*MS) == 'initializing'
+    assert gate.status(delivered + 1_500*MS + 1) == 'lost'
+    assert gate.loss_kind == 'output'
+
+
 def received_images(session, stamp):
     for kind in ('color', 'depth'):
         session._image(kind, NS(data=b'frame', header=NS(frame_id=session.gate.frame,

@@ -968,7 +968,7 @@ class RtabmapNode(Node):
             valid_ref = type(msg.ref_id) is int and msg.ref_id > 0
             has_recovery_state = False
             if all(isinstance(v, (int, float)) and math.isfinite(v) for v in recovery):
-                states = ('external', 'searching', 'localized', 'visual_tracking', 'inertial_registration')
+                states = ('external', 'searching', 'localized', 'visual_tracking', 'inertial_registration', 'scan_tracking')
                 if recovery[0] in range(len(states)):
                     has_recovery_state = True
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],

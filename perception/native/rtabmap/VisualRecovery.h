@@ -23,7 +23,7 @@ namespace motus {
 class VisualRecovery
 {
 public:
-    enum State { External=0, Searching=1, Localized=2, VisualTracking=3, InertialRegistration=4 };
+    enum State { External=0, Searching=1, Localized=2, VisualTracking=3, InertialRegistration=4, ScanTracking=5 };
     explicit VisualRecovery(const rtabmap::ParametersMap & parameters):
         neighborIcp_(parameters), state_(External), missing_(false), waiting_(false), aligned_(false),
         localizationMode_(false), relocalizations_(0), visualInliers_(0), imageMode_(false), initialized_(false),
@@ -39,6 +39,10 @@ public:
         registration["Icp/PointToPlaneMinComplexity"]="0.02";
         registration["Icp/PointToPlaneLowComplexityStrategy"]="0";
         inertialIcp_.reset(new rtabmap::RegistrationIcp(registration));
+        // Scan tracking starts without a motion guess, so allow a little more translation.
+        registration["Icp/MaxTranslation"]="0.25";
+        registration["Icp/CorrespondenceRatio"]="0.07";
+        scanIcp_.reset(new rtabmap::RegistrationIcp(registration));
         externalToNative_=rtabmap::Transform::getIdentity();
         bool refining=rtabmap::Parameters::defaultRGBDNeighborLinkRefining();
         rtabmap::Parameters::parse(p,"RGBD/NeighborLinkRefining",refining);
@@ -203,16 +207,10 @@ public:
             reacquisitionStats["Motus/VisualReacquiredInliers/"]=static_cast<float>(reacquired);
         }
         const auto &acceptedStats=reacquisitionStats.empty()?statistics:reacquisitionStats;
-        if(waiting_ && aligned_ && !tracked && !continuousExternal)
-        {
-            if(!images)
-            {
-                state_=Searching; odom_.setNull();
-                return false; // No observation reached VO; its established gauge is unchanged.
-            }
-            // A localization is not a motion estimate for a later observation.
+        // A failed measured image can revoke VO alignment. A scan without
+        // images leaves the visual estimator's established gauge unchanged.
+        if(waiting_ && aligned_ && !tracked && !continuousExternal && images)
             aligned_=false;
-        }
         if(waiting_ && aligned_ && !external.isNull() && tracked && !recoveredVisual)
         {
             externalToNative_=visualToNative_*visual*external.inverse();
@@ -233,6 +231,36 @@ public:
         };
         const double graceAge=data.stamp()-externalGraceStart_;
         const bool withinGrace=externalGraceStart_>0. && graceAge>=0. && graceAge<=2.;
+        const double scanAge=scanAnchor_?data.stamp()-scanAnchor_->scan.stamp():0.;
+        const double scanRunAge=scanAnchor_?data.stamp()-scanAnchor_->referenceStamp:0.;
+        if((external.isNull() || (waiting_ && !continuousExternal)) && !(aligned_ && tracked) &&
+           !localizationMode_ && scanAge>0. && scanRunAge<=4. &&
+           ((images && info.features>0) || (!images && scanAnchor_->recovered)))
+        {
+            if(registerScan(map,data,acceptedStats,scanAge))
+            {
+                if(tracked)
+                {
+                    visualToNative_=odom_*visual.inverse();
+                    aligned_=true;
+                    rememberVisualAlignment(data.stamp(),visual,info);
+                }
+                externalGraceStart_=0.;
+                return true;
+            }
+            if(scanAnchor_->recovered)
+            {
+                // A failed registration publishes no pose. A later scan can
+                // still verify motion before the last measured anchor expires.
+                state_=Searching; odom_.setNull();
+                return false;
+            }
+        }
+        if(waiting_ && aligned_ && !tracked && !continuousExternal && !images)
+        {
+            state_=Searching; odom_.setNull();
+            return false;
+        }
         if(withinGrace && external.isNull() && (!images || info.features>0))
         {
             // A weak observation cannot move the map. Give the measured stream
@@ -305,6 +333,7 @@ public:
                     accepted=map.process(data,odom_,motionCovariance,velocity,stats);
                 }
                 else accepted=map.process(data,odom_,covariance,velocity,acceptedStats);
+                if(accepted) rememberScan(data);
                 // Chassis-only growth preserves any pending visual recovery.
                 if(accepted && tracked) rememberVisualAlignment(data.stamp(),visual,info);
                 // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
@@ -354,6 +383,7 @@ public:
             {
                 retryExternalNeighbor_=false;
                 rememberVisualAlignment(data.stamp(),visual,info);
+                rememberScan(data);
             }
             return accepted;
         }
@@ -366,6 +396,7 @@ public:
         {
             visualLossStamp_=0.;
             visualAlignment_.reset();
+            scanAnchor_.reset();
             // A missing odometry guess cannot justify proximity localization.
             // Native placeholder poses cannot constrain motion between queries.
             map.parseParameters({{"Mem/IncrementalMemory","false"}, {"RGBD/ProximityBySpace","false"},
@@ -463,6 +494,7 @@ public:
         }
         recoveryNode_=node; recoveryAnchor_=anchor; recoveryInliers_=localizationInliers;
         ++relocalizations_; state_=Localized;
+        rememberScan(data);
         lastVisual_.setNull();
         if(tracked)
         {
@@ -581,6 +613,48 @@ private:
         return true;
     }
 
+    struct ScanAnchor
+    {
+        rtabmap::SensorData scan;
+        rtabmap::Transform pose;
+        double referenceStamp; // Scan registrations do not extend their own recovery budget.
+        bool recovered;
+    };
+
+    void rememberScan(const rtabmap::SensorData & data)
+    {
+        if(data.laserScanRaw().empty()) {scanAnchor_.reset(); return;}
+        rtabmap::SensorData scan;
+        scan.setLaserScan(data.laserScanRaw());
+        scan.setStamp(data.stamp());
+        const double referenceStamp=state_==ScanTracking?scanAnchor_->referenceStamp:data.stamp();
+        scanAnchor_=ScanAnchor{std::move(scan),odom_,referenceStamp,state_==Localized || state_==ScanTracking};
+    }
+
+    bool registerScan(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
+                      const std::map<std::string,float> & statistics,double dt)
+    {
+        if(map.getLocalOptimizedPoses().empty()) return false;
+        rtabmap::RegistrationInfo result;
+        const auto relative=scanIcp_->computeTransformation(scanAnchor_->scan,data,
+            rtabmap::Transform::getIdentity(),&result);
+        if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
+           !validCovariance(result.covariance) || !plausibleMotion(relative,dt))
+            return false;
+        const auto measured=scanAnchor_->pose*relative;
+        auto stats=statistics;
+        stats["Motus/ScanTrackingOverlap/"]=result.icpInliersRatio;
+        cv::Mat covariance=result.covariance.clone();
+        constexpr double positionVariance=.05*.05, angleVariance=(3.*CV_PI/180.)*(3.*CV_PI/180.);
+        for(int i=0;i<6;++i)
+            covariance.at<double>(i,i)=std::max(i<3?positionVariance:angleVariance,covariance.at<double>(i,i));
+        if(!map.process(data,measured,covariance,std::vector<float>(),stats))
+            return false;
+        state_=ScanTracking; odom_=measured;
+        rememberScan(data); // Small motion may leave the persisted keyframe unchanged.
+        return true;
+    }
+
     bool registerPrediction(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
                             const rtabmap::Transform & guess,
                             const std::map<std::string,float> & statistics)
@@ -627,7 +701,7 @@ private:
         return true;
     }
     std::unique_ptr<rtabmap::Odometry> estimator_;
-    std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_;
+    std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_,scanIcp_;
     rtabmap::RegistrationIcp neighborIcp_;
     int state_, minInliers_, maxOdomCacheSize_;
     float maxError_;
@@ -636,6 +710,7 @@ private:
     bool imageMode_, initialized_;
     double visualLossStamp_=0.;
     std::optional<VisualAlignment> visualAlignment_;
+    std::optional<ScanAnchor> scanAnchor_;
     bool retryExternalNeighbor_=false;
     std::optional<ExternalRun> externalRun_;
     rtabmap::Transform previousExternal_;

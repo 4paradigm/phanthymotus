@@ -94,7 +94,7 @@ class EstimateGate:
         self.recovery_policy = self.pause_context = None
         self.input_period_ns = self.processing_p95_ns = None
         self.input_intervals = deque(maxlen=32)
-        self.last_native_stamp = 0
+        self.last_native_stamp = self.last_result_received = 0
         self.result_period_ns = self.native_processing_p95_ns = None
         self.result_intervals = deque(maxlen=32)
         self.anchor_info = None
@@ -152,6 +152,7 @@ class EstimateGate:
             return
         if stamp is not None:
             self.last_result_stamp = stamp
+            self.last_result_received = now
         self.good = 0
         if self.relocalization_points is not None:
             self.relocalization_failure = 'relocalization'
@@ -222,7 +223,7 @@ class EstimateGate:
         # already be hundreds of milliseconds old when registration finishes.
         visual_stamp = self.last_tracking_received or self.last_stamp
         if self.last_pose is None or self.pause_context is not None:
-            visual_stamp = self.last_result_stamp
+            visual_stamp = self.last_result_received or self.last_result_stamp
             if unanchored and visual_stamp:
                 visual_stamp = max(visual_stamp, self.input_resumed_at)
         if visual_stamp and now - visual_stamp > 1_500_000_000:
@@ -264,6 +265,7 @@ class EstimateGate:
                 self.result_period_ns = int(np.median(self.result_intervals))
         self.last_native_stamp = stamp
         self.last_result_stamp = stamp
+        self.last_result_received = now
         if first_native_result and self.last_pose is None and not info.lost and info.inliers == 0:
             # Native odometry seeds its local map before it can register a
             # pair. This first diagnostic is neither tracking nor a loss.
@@ -1244,6 +1246,7 @@ class RgbdSession:
             # No fused pose was published. Keep the evidence already verified
             # in the same native world; the next distinct capture must qualify.
             gate.good, gate.last_result_stamp = 2, probe.last_stamp
+            gate.last_result_received = probe.last_result_received
             gate.uncertain_seed = (probe.last_pose, gate._matched_points(probe.anchor_info))
         self.observations.startup_gate = None
         if self.fusion.last_tracking is not None:
