@@ -443,9 +443,47 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
     return {'code': 200, 'data': data}
 
 
+async def _save_live_stream_instance(mcp_id: str, instance_id: str, body: Any):
+    """Only acknowledge a live-stream secret after the Driver accepted it."""
+    from api.mcp_manage import MCPCallRequest, mcp_call_tool
+    from tool_config import find_tool, plan_config_calls
+
+    if not isinstance(body, dict) or not isinstance(body.get("rtmp_url"), str):
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422, "message": "请填写完整的 RTMP 地址"})
+    calls = plan_config_calls(find_tool(mcp_id, "live_stream"), {}, body, instance_id)
+    if not calls:
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422, "message": "直播 Card 配置字段未注册"})
+    for cfg, extra in calls:
+        try:
+            req = MCPCallRequest(tool="live_stream", arguments={"action": "config", **cfg, **extra})
+            response = await mcp_call_tool(mcp_id, req, timeout_s=8)
+        except Exception:
+            response = {"code": 503}
+        if response.get("code") != 200:
+            # Never return the supplied secret or low-level exception details.
+            message = response.get("message", "") if response.get("code") == 400 else ""
+            return fastapi.responses.JSONResponse(
+                status_code=422, content={"code": 422,
+                    "message": str(message)[:240] or "机器人未确认配置，未保存；请检查 Driver 状态"})
+    content = response.get("data") or []
+    ready = False
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        try:
+            ready = bool(json.loads(content[0].get("text", "{}")).get("ready_to_go_live"))
+        except (ValueError, TypeError, AttributeError):
+            pass
+    config.main[tool_config_key(mcp_id, "live_stream", instance_id)] = body
+    _broadcast({"type": "tool_config_updated", "payload": {
+        "mcp_id": mcp_id, "tool": "live_stream", "instance_id": instance_id}})
+    return {"code": 200, "applied": True, "ready_to_go_live": ready}
+
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
+    if tool_name == "live_stream":
+        return await _save_live_stream_instance(mcp_id, instance_id, body)
     config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
     apply_tool_config(mcp_id, tool_name, body, instance_id)
     return {'code': 200}

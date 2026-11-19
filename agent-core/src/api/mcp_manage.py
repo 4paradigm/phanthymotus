@@ -1326,7 +1326,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             # Auto-config: start 前自动 apply 已保存的 config
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
-            _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
+            _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config', 'end_live'}
             if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
@@ -1366,10 +1366,14 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                                     'message': f'[{req.tool}] 配置失败：{cfg_error.get("message", "unknown error")}',
                                     'data': None}
                         cfg_result = cfg_data.get('result', {})
+                        from tool_response import tool_failure
+                        failure = tool_failure(cfg_result)
+                        if failure:
+                            return {'code': 400, 'message': f'[{req.tool}] 配置失败：{failure}', 'data': None}
                         cfg_content = (cfg_result.get('content') or [{}])[0].get('text', '{}')
                         try:
                             parsed = json.loads(cfg_content)
-                            if not parsed.get('adapter_ok', True):
+                            if isinstance(parsed, dict) and not parsed.get('adapter_ok', True):
                                 return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
                         except (json.JSONDecodeError, IndexError):
                             pass
@@ -1415,6 +1419,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                                         if isinstance(item, dict) and item.get('type') == 'text')
                     return {'code': 500, 'message': message[:1000] or 'Tool call error',
                             'data': content or None}
+                from tool_response import tool_failure
+                failure = tool_failure(result)
+                if failure:
+                    return {'code': 400, 'message': f'[{req.tool}] {failure}', 'data': result.get('content')}
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):
