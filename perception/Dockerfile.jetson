@@ -695,7 +695,8 @@ ENV PYTHONUNBUFFERED=1
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # Kokoro Multi frontend dependencies for both JetPack Python ABIs.
-RUN pip3 uninstall -y phonemizer && \
+RUN . /etc/jetpack.env && \
+    pip3 uninstall -y phonemizer && \
     pip3 install --no-cache-dir -i "${PYPI_MIRROR}" "numpy==${NUMPY_VERSION}" \
       -r /work/plugins/requirements.kokoro-multi.txt && \
     python3 -c "import numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; import misaki, spacy, phonemizer, fugashi, langid"
