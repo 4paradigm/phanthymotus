@@ -193,12 +193,18 @@ _JP5_MODEL_RELEASE = {
 
 
 def detect_jetpack_major():
+    image_major = {'511': 5, '61': 6}.get(os.environ.get('XIAOYOU_TTS_IMAGE_JP'))
     try:
         release = Path('/etc/nv_tegra_release').read_text()
+    except FileNotFoundError:
+        return image_major
     except OSError:
         return None
     match = re.match(r'^#\s*R(35|36)\b', release)
-    return {'35': 5, '36': 6}[match[1]] if match else None
+    release_major = {'35': 5, '36': 6}[match[1]] if match else None
+    if release_major is not None and image_major is not None and release_major != image_major:
+        raise RuntimeError('Xiaoyou JetPack image and L4T release differ')
+    return release_major
 
 
 def _model_release(jetpack_major):
