@@ -305,7 +305,7 @@ public:
                     accepted=map.process(data,odom_,motionCovariance,velocity,stats);
                 }
                 else accepted=map.process(data,odom_,covariance,velocity,acceptedStats);
-                if(accepted) visualLossStamp_=0.;
+                // Chassis-only growth preserves any pending visual recovery.
                 if(accepted && tracked) rememberVisualAlignment(data.stamp(),visual,info);
                 // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
                 // Only a later tracked frame may use this measured anchor during external loss.

@@ -225,6 +225,27 @@ def test_out_of_order_estimate_is_ignored_without_counting_as_good(sessions):
     assert last(s)['vendor']['motus_slam']['stamp_ns'] == stamp
 
 
+@pytest.mark.parametrize('entries,accepted', [
+    ({(0, 1): .002}, False),
+    ({(3, 3): 99.}, False),
+    ({(3, 3): .08, (4, 4): .08, (3, 4): .05}, False),
+    ({(0, 1): .001 + 5e-11, (3, 3): .12}, True),
+], ids=['indefinite', 'large-rotation', 'correlated-rotation', 'numerical-tolerance'])
+def test_nominal_translation_requires_valid_visual_covariance(entries, accepted):
+    gate = runtime.EstimateGate('run', 'camera_optical', 'camera-clock')
+    for k in range(3):
+        stamp = (1_000+100*k)*MS
+        gate.input(stamp)
+        msg, info = messages(stamp)
+        covariance = np.eye(6)*.001
+        for (row, col), value in entries.items():
+            covariance[row, col] = covariance[col, row] = value
+        msg.pose.covariance = covariance.ravel().tolist()
+        sample = gate.accept(msg, info, stamp+20*MS)
+        assert (sample is not None) == (accepted and k == 2)
+    assert gate.state == ('tracking' if accepted else 'recovering')
+
+
 def test_repeated_or_old_source_images_are_admitted(sessions):
     create, now, _ = sessions
     s = create()
@@ -326,9 +347,11 @@ def test_fallback_keeps_the_frozen_fusion_recovery_window(fused):
     make, now, _ = fused
     s = make()
     s.gate.recovery_policy = runtime.RecoveryPolicy()
+    s.gate.result_period_ns = 134*MS
     s.fusion.pause_context = s.gate.recovery_policy.begin(134*MS, 800*MS, runtime.time.monotonic_ns())
     track_fused(s, now)
     assert s.gate.pause_context is s.fusion.pause_context
+    assert s.gate.result_period_ns == 134*MS
     for offset in (803, 937, 1071):
         feed(s, now, 1_500*MS + offset*MS)
         if offset < 1071:
@@ -339,15 +362,7 @@ def test_fallback_keeps_the_frozen_fusion_recovery_window(fused):
     assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
 
 
-@pytest.mark.parametrize('failure,period_ms,budget_ms', [
-    ('visual_rejection', 500, 2_400),
-    ('fusion_failure', 500, 2_400),
-    ('fusion_failure', 700, 3_000),
-    ('fusion_failure_during_pause', 500, 2_400),
-    ('inertial_expiry', 500, 2_400),
-])
-def test_fast_source_slow_native_results_have_time_for_measured_recovery(
-        fused, failure, period_ms, budget_ms):
+def timed_fusion(fused, period):
     from test_rgbd_fusion import images as fusion_images
 
     make, now, ticks = fused
@@ -363,27 +378,51 @@ def test_fast_source_slow_native_results_have_time_for_measured_recovery(
             imu(s, next_imu)
             next_imu += 5*MS
         while next_input <= deadline:
+            ticks[0] = next_input
             s.gate.input(next_input)
             next_input += 33_333_333
         ticks[0] = now[0] = deadline
         s.fusion.input_period_ns = s.gate.input_period_ns
 
-    def result(stamp, *, lost=False):
+    def result(stamp, *, lost=False, landmarks=False, processing_ns=None):
         advance(stamp)
         if s._fusing():
             assert s.observations.add_frame(stamp, color, depth, now[0]) == []
         advance(stamp+400*MS)
+        if processing_ns is not None:
+            context = s.time_policy.select({}, stamp, ticks[0]-processing_ns)
+            pair = NS(association_id=str(stamp), method='receipt_estimated', skew_ns=0,
+                      color_context=context, depth_context=context)
+            s.contexts_by_stamp[stamp] = (context, pair)
         msg, info = native(s, stamp, lost=lost)
+        if landmarks:
+            info.type = 0
+            info.local_map_keys = info.word_inliers = list(range(24))
+            info.local_map_values = [NS(x=float(i % 5), y=float(i // 5), z=1.) for i in range(24)]
         s._result('pose', msg)
         s._result('info', info)
 
-    period = period_ms*MS
     anchor = 1_000*MS + 6*period
     for stamp in range(1_000*MS, anchor+1, period):
-        result(stamp)
+        result(stamp, landmarks=True)
     assert last(s)['pose'] is not None
     assert s.fusion.last_tracking[0] == anchor
     assert s.gate.input_period_ns == 33_333_333
+    return s, advance, result, anchor
+
+
+@pytest.mark.parametrize('failure,period_ms,budget_ms', [
+    ('visual_rejection', 500, 2_400),
+    ('fusion_failure', 500, 2_400),
+    ('fusion_failure', 700, 3_000),
+    ('fusion_failure_during_pause', 500, 2_400),
+    ('inertial_expiry', 500, 2_400),
+])
+def test_fast_source_slow_native_results_have_time_for_measured_recovery(
+        fused, failure, period_ms, budget_ms):
+    _, now, _ = fused
+    period = period_ms*MS
+    s, advance, result, anchor = timed_fusion(fused, period)
 
     if failure != 'fusion_failure':
         result(anchor+period, lost=True)
@@ -411,6 +450,52 @@ def test_fast_source_slow_native_results_have_time_for_measured_recovery(
         result(anchor+first_offset+count*period)
         assert (last(s)['pose'] is not None) == (count == 2)
     assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
+
+
+def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
+    _, now, _ = fused
+    period = 550*MS
+    s, advance, result, anchor = timed_fusion(fused, period)
+    result(anchor+period, lost=True)
+    pause = s.fusion.pause_context
+    assert pause.budget_ns == 2_600*MS
+
+    pending = anchor+2*period
+    advance(pending)
+    assert s.observations.add_frame(pending, None, None, now[0]) == []
+    s.fusion.fault('measured IMU unavailable')
+    s._check_fusion(now[0])
+    assert s.gate.pause_context is pause
+    assert s.observations.counts['cancelled_on_fallback'] == 1
+
+    result(pending, landmarks=True)
+    assert s.gate.good == 0
+    for k in (3, 4):
+        result(anchor+k*period, landmarks=True, processing_ns=100*MS)
+        assert s.gate.good == k-2 and last(s)['pose'] is None
+    assert s.processing_ages[-1] == 100*MS
+
+    # The third fresh capture is outside the frozen in-segment pause bound.
+    result(anchor+5*period, landmarks=True)
+    assert last(s)['pose'] is None
+    assert s.gate.relocalization_points and s.gate.good == 0
+    advance(now[0]+33_333_333)
+    assert 2_566*MS < s.gate.relocalization_deadline_mono-now[0] <= 2_600*MS
+
+    # The three old-landmark candidates span 1.1 s before processing delay.
+    for k in (6, 7, 8):
+        result(anchor+k*period, landmarks=True)
+        assert (last(s)['pose'] is not None) == (k == 8)
+    assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
+    assert last(s)['vendor']['relocalization'] == dict(method='native_f2m_landmarks',
+                                                     anchor_stamp_ns=anchor, shared_landmarks=24)
+    assert s.gate.state == 'tracking'
+
+    # Fresh results replace inherited timing for later pauses.
+    for k in range(1, 7):
+        result(anchor+8*period+k*450*MS, processing_ns=100*MS)
+    s.gate.degrade('subsequent visual rejection', now[0])
+    assert s.gate.pause_context.budget_ns == 1_900*MS
 
 
 def test_fallback_does_not_count_cancelled_fusion_captures(fused):

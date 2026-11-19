@@ -95,7 +95,7 @@ class EstimateGate:
         self.input_period_ns = self.processing_p95_ns = None
         self.input_intervals = deque(maxlen=32)
         self.last_native_stamp = 0
-        self.result_period_ns = None
+        self.result_period_ns = self.native_processing_p95_ns = None
         self.result_intervals = deque(maxlen=32)
         self.anchor_info = None
         self.uncertain_seed = None
@@ -109,8 +109,9 @@ class EstimateGate:
         if self.recovery_policy is None:
             return None
         periods = [v for v in (self.input_period_ns, self.result_period_ns) if v is not None]
+        tails = [v for v in (self.processing_p95_ns, self.native_processing_p95_ns) if v is not None]
         return self.recovery_policy.begin(max(periods) if periods else None,
-                                          self.processing_p95_ns, started)
+                                          max(tails, default=None), started)
 
     def _start_landmark_verification(self, now):
         if self.relocalization_deadline is None:
@@ -274,15 +275,17 @@ class EstimateGate:
             covariance = np.asarray(msg.pose.covariance, dtype=float).reshape(6, 6)
             if (not np.isfinite(covariance).all() or
                     not np.allclose(covariance, covariance.T, atol=1e-8) or
-                    np.any(np.diag(covariance) < 0)):
+                    np.any(np.diag(covariance) < 0) or
+                    not (np.linalg.eigvalsh(covariance).min() >= -1e-10)):
                 raise ValueError('visual covariance exceeds tracking bounds')
+            rotation_ok = np.linalg.eigvalsh(covariance[3:, 3:]).max() <= .12
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
             pose = dict(position=[p.x, p.y, p.z], quaternion=[q.x, q.y, q.z, q.w],
                         frame_id=msg.header.frame_id, child_frame_id=self.frame,
                         covariance=covariance.ravel().tolist())
             sample = make_sample('tracking', stamp, self.segment, self.clock, pose)
             position, rotation = pose_values(pose)
-        except (ValueError, TypeError, AttributeError) as error:
+        except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError) as error:
             self.degrade(error, now)
             return None
         verifying = self.relocalization_points is not None
@@ -292,10 +295,8 @@ class EstimateGate:
         shared = self._shared_landmarks(points, self.relocalization_points) if verifying else None
         support = 0
         seed = None
-        if uncertain and (not verifying or recent) and (
-                np.linalg.eigvalsh(covariance).min() >= -1e-10 and
-                np.linalg.eigvalsh(covariance[:3, :3]).max() <= .25 and
-                np.linalg.eigvalsh(covariance[3:, 3:]).max() <= .12):
+        if (uncertain and rotation_ok and (not verifying or recent) and
+                np.linalg.eigvalsh(covariance[:3, :3]).max() <= .25):
             # Native variances describe an uncertain measured position. Require
             # independent repeated registrations in this same F2M world.
             if verifying:
@@ -309,10 +310,10 @@ class EstimateGate:
                         support = self._shared_landmarks(points, previous)
                 if self.last_pose is None:
                     seed = ((stamp, position, rotation), points)
-        if uncertain and not support:
+        if not rotation_ok or (uncertain and not support):
             self.degrade('visual covariance exceeds tracking bounds', now)
             self.uncertain_seed = seed
-            if self.last_pose is None and np.linalg.eigvalsh(covariance).min() >= -1e-10:
+            if uncertain and self.last_pose is None:
                 # No map/pose has been published in this segment. Keep the
                 # native map alive while quality settles, without allowing a
                 # weak pose onto the output or extending an old SLAM pause.
@@ -1231,6 +1232,10 @@ class RgbdSession:
         self.observations.counts['cancelled_on_fallback'] += len(self.observations.frames)
         self.observations.frames.clear()
         gate = self.gate
+        # Keep the native timing evidence for subsequent recovery phases.
+        if self.fusion.result_period_ns is not None:
+            gate.result_period_ns = self.fusion.result_period_ns
+        gate.native_processing_p95_ns = self.fusion.native_processing_p95_ns
         gate.good = 0
         gate.last_stamp = max(gate.last_stamp, self.fusion.last_visual)
         probe = getattr(self.observations, 'startup_gate', None)
@@ -1310,6 +1315,8 @@ class RgbdSession:
             self.processing_observations.append(context.observation_id)
             self.processing_ages.append(max(0, time.monotonic_ns()-context.ingress_monotonic_ns))
             self.gate.processing_p95_ns = int(np.percentile(self.processing_ages, 95))
+            if len(self.gate.result_intervals) >= 5:
+                self.gate.native_processing_p95_ns = None
             if self.fusion is not None:
                 self.fusion.input_period_ns = self.gate.input_period_ns
                 self.fusion.processing_p95_ns = self.gate.processing_p95_ns

@@ -45,10 +45,11 @@ int main(int argc, char **argv)
     const bool stationaryAnchor=mode=="stationary_visual_anchor";
     const bool refreshAnchor=mode=="refresh_visual_anchor";
     const bool visualDuringChassisWait=mode=="vo_reacquire_chassis_wait";
+    const bool staggeredChassisLoss=mode=="vo_reacquire_staggered_chassis";
     const bool visualAfterNeighborFailure=mode=="vo_reacquire_neighbor_retry";
     const bool externalDuringVisualLoss=mode=="vo_reacquire_unverified_external";
     const bool disagreeingNeighborRetry=mode=="vo_reacquire_disagreeing_neighbor";
-    const bool crossedRecovery=visualDuringChassisWait || visualAfterNeighborFailure ||
+    const bool crossedRecovery=visualDuringChassisWait || staggeredChassisLoss || visualAfterNeighborFailure ||
         externalDuringVisualLoss || disagreeingNeighborRetry;
     const int reacquisitionFrame=externalDuringVisualLoss || disagreeingNeighborRetry?5:4;
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
@@ -200,13 +201,13 @@ int main(int argc, char **argv)
             data.setUserData(rtabmap::compressData2(hint),true);
             ext.setNull();
         }
-        if(visualDuringChassisWait && i<3)
+        if((visualDuringChassisWait && i<3) || (staggeredChassisLoss && i<=3))
         {
             cv::Mat payload(1,24,CV_8UC1,cv::Scalar::all(1));
             std::memcpy(payload.data,"MOTUSOD1",8);
             data.setUserData(rtabmap::compressData2(payload),true);
         }
-        if(crossedRecovery && i>=3)
+        if(crossedRecovery && i>=3 && !(staggeredChassisLoss && crossedLoss))
         {
             if((visualAfterNeighborFailure && i<=reacquisitionFrame) || (externalDuringVisualLoss && i==4) ||
                (disagreeingNeighborRetry && i==3))
@@ -223,6 +224,7 @@ int main(int argc, char **argv)
                 throw std::runtime_error("fixture must produce valid ICP that disagrees with the external pose");
         }
         const auto nodesBefore=map.getLocalOptimizedPoses().size();
+        const int previousLocation=map.getLastLocationId();
         if(visualLost) beforeVisualFailure=map.getLocalOptimizedPoses();
         auto started=std::chrono::steady_clock::now();
         bool accepted=nativeRecovery?
@@ -253,6 +255,7 @@ int main(int argc, char **argv)
                  <<",\"recovery_node\":"<<recovery.recoveryNode()<<",\"recovery_anchor\":"<<recovery.recoveryAnchor()
                  <<",\"recovery_inliers\":"<<recovery.recoveryInliers()
                  <<",\"visual_reacquired_inliers\":"<<stat("Motus/VisualReacquiredInliers/")
+                 <<",\"measured_external_continuity\":"<<stat("Motus/MeasuredExternalContinuity/")
                  <<",\"visual_inliers\":"<<recovery.visualInliers()<<",\"nodes\":"<<map.getLocalOptimizedPoses().size()
                  <<",\"visual_fault\":"<<(visualFault || crossedLoss)<<",\"images\":"<<!noImages
                  <<",\"hypothesis\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_id())
@@ -264,7 +267,17 @@ int main(int argc, char **argv)
                  <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
-        if(crossedLoss && (accepted || recovery.state()!=motus::VisualRecovery::Searching ||
+        if(staggeredChassisLoss && crossedLoss)
+        {
+            const auto *signature=map.getMemory()->getLastWorkingSignature();
+            if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+               recovery.odom().isNull() || recovery.visualInliers()!=0 ||
+               stat("Motus/MeasuredExternalContinuity/")!=1.f ||
+               map.getLocalOptimizedPoses().size()!=nodesBefore+1 || !map.getMemory()->isIncremental() ||
+               !signature || !signature->hasLink(previousLocation,rtabmap::Link::kNeighbor))
+                throw std::runtime_error("the verified chassis must extend the active graph during visual loss");
+        }
+        if(crossedLoss && !staggeredChassisLoss && (accepted || recovery.state()!=motus::VisualRecovery::Searching ||
            !recovery.odom().isNull() || recovery.visualInliers()!=0 ||
            map.getLocalOptimizedPoses().size()!=nodesBefore || !map.getMemory()->isIncremental()))
             throw std::runtime_error("failed visual recovery must preserve the active graph without emitting a pose");
@@ -283,7 +296,8 @@ int main(int argc, char **argv)
                 return edge.second.type()==rtabmap::Link::kNeighbor;
             });
             if(link==signature->getLinks().end() || link->second.transVariance()<.000399 ||
-               link->second.rotVariance()<.000304 || !map.getLocalOptimizedPoses().count(1))
+               link->second.rotVariance()<.000304 || !map.getLocalOptimizedPoses().count(1) ||
+               (staggeredChassisLoss && !signature->hasLink(previousLocation,rtabmap::Link::kNeighbor)))
                 throw std::runtime_error("recovered visual pose must preserve the graph anchor and carry visual motion uncertainty");
             if(!reacquiring) break;
         }
@@ -685,7 +699,7 @@ int main(int argc, char **argv)
     {
         rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
         const auto *signature=reopened.getMemory()->getSignature(lastLocation);
-        if(i!=reacquisitionFrame+1 || reopened.getLocalOptimizedPoses()!=finalized || finalized.size()!=5 ||
+        if(i!=reacquisitionFrame+1 || reopened.getLocalOptimizedPoses()!=finalized || finalized.size()!=(staggeredChassisLoss?6u:5u) ||
            !signature || !signature->hasLink(lastLocation-1,rtabmap::Link::kNeighbor))
             throw std::runtime_error("grown visual recovery graph must retain its nodes and links after reopening");
         reopened.close(false);

@@ -254,3 +254,114 @@ def test_only_preobserved_cold_null_first_frame_can_prove_global_recovery(resume
     assert result['verified_recoveries']==([dict(index=0,ref=9,anchor=2.,inliers=42.)] if eligible else [])
     row['native']=None
     assert tool.recovery_evidence([row],[(9,2,1)],{2,9})['verified_recoveries']==[]
+
+
+def test_short_recovery_can_pass_with_only_neighbor_edges():
+    tool = module()
+    frames = [dict(index=i, input_pose_source=None, native=dict(ref=ref, loop=0, stats=stats))
+              for i, (ref, stats) in enumerate([
+                  (0, {'Motus/RecoveryState/': 1.}),
+                  (3, {'Motus/RecoveryState/': 3., 'Motus/VisualReacquiredInliers/': 24.,
+                       'Motus/VisualInliers/': 30.}),
+                  (4, {'Motus/RecoveryState/': 3.}),
+                  (5, {'Motus/RecoveryState/': 3.}),
+                  (6, {'Motus/RecoveryState/': 3.}),
+              ])]
+    links = [(2, 4, 0), (4, 5, 0), (5, 6, 0)]
+    evidence = tool.recovery_evidence(frames, links, {2, 4, 5, 6})
+    assert evidence['verified_recoveries'] == []
+    assert evidence['verified_short_recoveries'] == [dict(index=1, ref=3, inliers=24.)]
+    assert evidence['tracking_after_recovery'] == [dict(kind='short_visual', index=1, nodes=[4, 5, 6])]
+
+
+def test_growth_must_follow_its_recovery_and_cannot_cross_another_loss():
+    tool = module()
+    frames = [dict(index=i, input_pose_source=None, native=dict(ref=ref, loop=0, stats=stats))
+              for i, (ref, stats) in enumerate([
+                  (3, {'Motus/RecoveryState/': 3.}),
+                  (4, {'Motus/RecoveryState/': 3., 'Motus/VisualReacquiredInliers/': 24.,
+                       'Motus/VisualInliers/': 30.}),
+                  (3, {'Motus/RecoveryState/': 3.}),
+                  (5, {'Motus/RecoveryState/': 3.}),
+                  (0, {'Motus/RecoveryState/': 1.}),
+                  (6, {'Motus/RecoveryState/': 2., 'Motus/RecoveryNode/': 6.,
+                       'Motus/RecoveryAnchor/': 2., 'Motus/RecoveryInliers/': 33.}),
+                  (7, {'Motus/RecoveryState/': 3.}),
+                  (8, {'Motus/RecoveryState/': 3.}),
+                  (9, {'Motus/RecoveryState/': 3.}),
+                  (12, {'Motus/RecoveryState/': 3.}),
+              ])]
+    links = [(2, 3, 0), (3, 4, 0), (4, 5, 0), (2, 6, 1), (6, 7, 0), (7, 8, 0), (8, 9, 0)]
+    evidence = tool.recovery_evidence(frames, links, set(range(2, 10)) | {12})
+    assert evidence['tracking_after_recovery'] == [dict(kind='short_visual', index=1, nodes=[5]),
+                                                   dict(kind='global', index=5, nodes=[7, 8, 9])]
+
+
+@pytest.mark.parametrize('ref,all_inliers', [(9, 30.), (2, 30.), (3, 21.), (3, float('inf'))])
+def test_short_recovery_rejects_isolated_historical_or_inconsistent_info(ref, all_inliers):
+    tool = module()
+    row = dict(index=1, input_pose_source=None, native=dict(ref=ref, loop=0,
+        stats={'Motus/RecoveryState/': 3., 'Motus/VisualReacquiredInliers/': 24.,
+               'Motus/VisualInliers/': all_inliers}))
+    evidence = tool.recovery_evidence([row], [(2, 4, 0)], {4, 9}, graph_nodes={2, 4, 9})
+    assert evidence['verified_short_recoveries'] == []
+    assert evidence['tracking_after_recovery'] == []
+
+
+@pytest.mark.parametrize('break_with', ['no_info', 'external', 'inertial'])
+def test_recovery_growth_stops_when_visual_evidence_is_interrupted(break_with):
+    tool = module()
+    frames = [
+        dict(index=i, input_pose_source=None, images={'rgb': True}, native=dict(
+            ref=3+i, loop=0, stats={'Motus/RecoveryState/': 3.}))
+        for i in range(4)
+    ]
+    frames[0]['native']['stats'].update({'Motus/VisualReacquiredInliers/': 24.,
+                                       'Motus/VisualInliers/': 30.})
+    if break_with == 'no_info':
+        frames[2]['native'] = None
+    elif break_with == 'external':
+        frames[2]['input_pose_source'] = 'chassis'
+    else:
+        frames[2]['native']['stats']['Motus/RecoveryState/'] = 4.
+    evidence = tool.recovery_evidence(frames, [(i, i+1, 0) for i in range(2, 6)], set(range(2, 7)))
+    assert evidence['tracking_after_recovery'] == [dict(kind='short_visual', index=0, nodes=[4])]
+
+
+def test_growth_requires_live_connection_and_saved_timestamp_before_any_later_closure():
+    tool = module()
+    frames = [
+        dict(index=i, cloud_stamp_ns=(3+i)*10**9, input_pose_source=None,
+             native=dict(ref=3+i, loop=0, stats={'Motus/RecoveryState/': 3.}))
+        for i in range(4)
+    ]
+    frames[0]['native']['stats'].update({'Motus/VisualReacquiredInliers/': 24.,
+                                       'Motus/VisualInliers/': 30.})
+    links = [(2, 3, 0), (3, 4, 0), (5, 6, 0), (4, 5, 1)]
+    graphs = [dict(stamp_ns=i*10**9, ids=list(range(2, i+1)), links=[
+        dict(from_id=a, to_id=b, type=kind) for a, b, kind in links if kind == 0 and b <= i])
+        for i in range(3, 7)]
+    graphs.append(dict(stamp_ns=7*10**9, ids=list(range(2, 7)), links=[
+        dict(from_id=a, to_id=b, type=kind) for a, b, kind in links]))
+    evidence = tool.recovery_evidence(frames, links, {2, 3, 4, 5, 6}, live_graphs=graphs,
+                                      node_stamps={i: float(i) for i in range(2, 7)})
+    assert evidence['tracking_after_recovery'] == [dict(kind='short_visual', index=0, nodes=[4])]
+    evidence = tool.recovery_evidence(frames, links, {2, 3, 4, 5, 6}, live_graphs=graphs,
+                                      node_stamps={3: 3., 4: 3.9})
+    assert evidence['tracking_after_recovery'] == [dict(kind='short_visual', index=0, nodes=[])]
+
+
+def test_global_growth_waits_for_promotion_edge_in_live_graph():
+    tool = module()
+    frames = [dict(index=i, input_pose_source=None, cloud_stamp_ns=(i+3)*10**9,
+                   native=dict(ref=i+3, loop=0, stats={'Motus/RecoveryState/': 3.}))
+              for i in range(3)]
+    frames[0]['native']['stats'].update({'Motus/RecoveryState/': 2., 'Motus/RecoveryNode/': 3.,
+                                       'Motus/RecoveryAnchor/': 2., 'Motus/RecoveryInliers/': 24.})
+    links = [(2, 3, 1), (2, 4, 0), (3, 5, 0)]
+    graphs = [dict(stamp_ns=i*10**9, ids=list(range(2, i+1)), links=[
+        dict(from_id=a, to_id=b, type=kind) for a, b, kind in links if b<=i and (kind!=1 or i==5)])
+        for i in range(3, 6)]
+    evidence = tool.recovery_evidence(frames, links, {2, 3, 4, 5}, live_graphs=graphs,
+                                      node_stamps={i: float(i) for i in range(2, 6)})
+    assert evidence['tracking_after_recovery'] == [dict(kind='global', index=0, nodes=[5])]

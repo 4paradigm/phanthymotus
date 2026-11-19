@@ -11,6 +11,7 @@ from array import array
 from copy import deepcopy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -316,7 +317,8 @@ def bootstrap(args):
         log.close();node.destroy_node();rclpy.shutdown()
 
 
-def recovery_evidence(records,links,persisted_nodes,*,graph_nodes=None,original_root=None):
+def recovery_evidence(records,links,persisted_nodes,*,graph_nodes=None,original_root=None,
+                      live_graphs=None,node_stamps=None):
     """Require replay evidence to belong to the original persisted pose graph."""
     perception_root=str(Path(__file__).resolve().parents[1])
     if perception_root not in sys.path:sys.path.insert(0,perception_root)
@@ -327,25 +329,67 @@ def recovery_evidence(records,links,persisted_nodes,*,graph_nodes=None,original_
     root=min(graph_nodes,default=0) if original_root is None else original_root
     connected=connected_nodes(graph_nodes,links,(root,))
     retained=connected.intersection(persisted_nodes)
+    live_by_stamp={}
+    if live_graphs is not None:
+        known={root}
+        for graph in sorted(live_graphs,key=lambda value:value['stamp_ns']):
+            ids=set(graph['ids'])
+            edges=((edge['from_id'],edge['to_id'],edge['type']) for edge in graph['links'])
+            reachable=connected_nodes(ids,edges,{root} if root in ids else known)
+            if reachable:known=reachable
+            live_by_stamp[graph['stamp_ns']]=(reachable,ids)
     global_edges={tuple(sorted((a,b))) for a,b,kind in links if kind==1}
-    verified=[];tracking=[];unverified=[]
+    verified=[];short_recoveries=[];tracking=[];unverified=[]
+    tracking_after_recovery=[];continuation=None;continuation_ref=None;seen=set()
     event_fields=('Motus/RecoveryNode/','Motus/RecoveryAnchor/','Motus/RecoveryInliers/')
     for row in records:
         native=row['native']
-        if native is None or row['input_pose_source'] is not None or row.get('baseline_only'):continue
+        if native is None:
+            if row.get('images') is not None:continuation=None
+            continue
         ref,anchor=native['ref'],native['loop'];stats=native['stats']
         state=stats.get('Motus/RecoveryState/');inliers=stats.get('Loop/Visual_inliers/',0)
+        capture=row.get('cloud_stamp_ns',0)
+        live,live_ids=(connected,graph_nodes) if live_graphs is None else live_by_stamp.get(capture,(set(),set()))
+        sec,nsec=divmod(capture,10**9)
+        same_capture=node_stamps is None or node_stamps.get(ref)==sec+nsec*1e-9
+        new_node=ref in retained and ref in live and same_capture and ref not in seen
+        if new_node:seen.add(ref)
+        visual_only=row['input_pose_source'] is None and not row.get('baseline_only')
+        if state!=3 or not visual_only:continuation=None
+        if not visual_only:continue
+        kind=None
         if state==2:
             event_valid=True
             # Promotion clears standard loop stats; never mix a partial event with them.
             if any(key in stats for key in event_fields):
                 node,anchor,inliers=(stats.get(key,0) for key in event_fields)
                 event_valid=all(key in stats for key in event_fields) and node==ref
-            if event_valid and ref in retained and anchor in connected and inliers>=20 and tuple(sorted((ref,anchor))) in global_edges:
+            if event_valid and ref in retained and anchor in connected and math.isfinite(inliers) and inliers>=20 and tuple(sorted((ref,anchor))) in global_edges:
                 verified.append(dict(index=row['index'],ref=ref,anchor=anchor,inliers=inliers))
+                # The promotion edge can first appear in the next MapGraph.
+                if anchor in live and ref in live_ids and same_capture:kind='global'
             else:unverified.append(row['index'])
-        if state==3 and ref in retained:tracking.append(ref)
+        if state==3:
+            if ref in retained:tracking.append(ref)
+            old_inliers=stats.get('Motus/VisualReacquiredInliers/',0)
+            all_inliers=stats.get('Motus/VisualInliers/',0)
+            # A validated small-motion query can be omitted from the optimized graph.
+            eligible_ref=ref>0 and ((ref in retained and ref in live and same_capture)
+                                   or (ref not in graph_nodes and ref not in live_ids))
+            if live and eligible_ref and (
+                    math.isfinite(old_inliers) and math.isfinite(all_inliers) and 20<=old_inliers<=all_inliers):
+                short_recoveries.append(dict(index=row['index'],ref=ref,inliers=old_inliers))
+                kind='short_visual'
+            elif new_node and continuation is not None and (continuation_ref is None or continuation_ref in live):
+                continuation['nodes'].append(ref)
+        if kind is not None:
+            # Count subsequent new nodes once, stopping at the next loss or recovery.
+            continuation=dict(kind=kind,index=row['index'],nodes=[])
+            continuation_ref=ref if kind=='global' else None
+            tracking_after_recovery.append(continuation)
     return dict(verified_recoveries=verified,unverified_localized_frames=unverified,
+        verified_short_recoveries=short_recoveries,tracking_after_recovery=tracking_after_recovery,
         persisted_visual_tracking_nodes=sorted(set(tracking)))
 
 
@@ -408,6 +452,7 @@ def replay(args):
     from plugins.pointcloud_slam_rgb import validate_rgb_camera
     from plugins.pointcloud_slam_ros import RtabmapNode
     from plugins.pointcloud_slam_library import save_rtabmap_revision,load_map_snapshots,copy_native_map
+    from plugins.pointcloud_slam_snapshot import _optimized_poses
     domain=os.environ.get('ROS_DOMAIN_ID','')
     if not domain.isdecimal() or not 1<=int(domain)<=232:raise ValueError('isolated nonzero ROS_DOMAIN_ID required')
     os.environ['ROS_LOCALHOST_ONLY']='1'
@@ -420,12 +465,14 @@ def replay(args):
         preview_max_points=10000,rgb_input=validate_rgb_camera(camera,topic=prefix+'/rgb'),
         native_parameters={'RGBD/LinearUpdate':0.,'RGBD/AngularUpdate':0.} if args.insert_every_observation else {})
     if args.offline_all_captures:settings['native_parameters']['Rtabmap/DetectionRate']=0.
-    restored=None;historical_nodes=set()
+    restored=None;historical_nodes=set();original_root=None
     if args.resume_run:
         previous=Path(args.resume_run);saved=json.loads((previous/'result.json').read_text())
         restored=copy_native_map(previous/'archive',saved['map_id'],saved['revision'],output/'restored.db')
         with sqlite3.connect(restored['database']) as db:
             historical_nodes={node for node, in db.execute('SELECT id FROM Node WHERE id>0')}
+            try:original_root=min(_optimized_poses(db) or historical_nodes,default=None)
+            except ValueError:original_root=min(historical_nodes,default=None)
     rclpy.init();producer=rclpy.create_node('recorded_replay_producer')
     gateway=RtabmapNode(prefix+'/odom',prefix+'/cloud',settings,session_dir=output/'session',restored_map=restored)
     executor=MultiThreadedExecutor(num_threads=3);executor.add_node(producer);executor.add_node(gateway)
@@ -577,10 +624,18 @@ def replay(args):
         expected=[s['snapshot'] for s in artifacts['segments'] if s['snapshot'] is not None]
         identical=[s['packet'] for s in reopened]==expected
         with sqlite3.connect(artifacts['segments'][0]['database']) as db:
-            links=db.execute('SELECT from_id,to_id,type FROM Link').fetchall();persisted_nodes={row[0] for row in db.execute('SELECT id FROM Node WHERE id>0')};nodes=len(persisted_nodes)
+            links=db.execute('SELECT from_id,to_id,type FROM Link').fetchall()
+            node_stamps=dict(db.execute('SELECT id,stamp FROM Node WHERE id>0'))
+            try:optimized=_optimized_poses(db)
+            except ValueError:optimized={}
+        persisted_nodes=set(node_stamps);nodes=len(persisted_nodes)
         motion_rows=[json.loads(line) for line in (motion_directory/'records.jsonl').read_text().splitlines()] if motion_count[0] else []
         evidence=recovery_evidence(records,links,persisted_nodes-historical_nodes,
-            graph_nodes=persisted_nodes,original_root=min(historical_nodes,default=None))
+            graph_nodes=optimized or (),original_root=original_root,
+            live_graphs=graphs,node_stamps=node_stamps)
+        acceptance={kind: bool(reopened) and identical and drained and len(artifacts['segments'])==1 and
+            any(run['kind']==kind and len(run['nodes'])>=3 for run in evidence['tracking_after_recovery'])
+            for kind in ('short_visual','global')}
         result=dict(native_pid=pid,segments=len(artifacts['segments']),database_nodes=nodes,links=links,
             native_motion_messages=motion_count[0],first_frame_baseline_only=not cold_replay(args),
             native_drain=dict(last_actual_input_stamp_ns=last_target,info_observed=drained),
@@ -589,8 +644,8 @@ def replay(args):
             persisted_node_ids=sorted(persisted_nodes),selected_source_frames=[r['frame'] for r in frames],
             map_id=identity,revision=revision,archive_reopened_identically=identical,
             evidence=evidence,
-            offline_recovery_acceptance=bool(evidence['verified_recoveries']) and
-                len(evidence['persisted_visual_tracking_nodes'])>=3 and identical and drained and len(artifacts['segments'])==1,
+            offline_recovery_acceptance=acceptance['global'],
+            offline_recovery_acceptance_by_type=acceptance,
             statistics=artifacts['statistics'],input_frames=len(records),pose_null_frames=sum(r['input_pose_source'] is None for r in records),
             provenance=dict(json.loads((directory/'provenance.json').read_text()),
                 native_bootstrap=native_bootstrap,
