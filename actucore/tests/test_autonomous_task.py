@@ -50,6 +50,40 @@ def test_cancel_while_model_is_deciding():
     driver.execute.assert_not_called()
 
 
+def test_transient_inference_failure_reobserves_and_never_replays_motion(monkeypatch):
+    card = plugin.AutonomousTaskPlugin({}, None)
+    model, driver, cameras, cancel = Mock(), Mock(), Mock(), threading.Event()
+    monkeypatch.setattr(cancel, "wait", lambda seconds: False)
+    monkeypatch.setattr(card, "_publish", Mock())
+    model.last_note, model.last_model = "seen", "vision"
+    model.decide.side_effect = [("left_move_by", {}), plugin.TransientModelError("timeout"),
+                                ("done", {"reason": "done"})]
+    model.review.side_effect = [plugin.TransientModelError("503"), ("done", {"reason": "verified"})]
+    driver.execute.return_value = {"status": "completed", "motion_sent": True}
+    run = {"action_id": "r", "instruction": "move", "arm_mode": "left", "history": []}
+    assert card._loop(run, model, driver, cameras, cancel, None) == ("completed", "verified")
+    assert cameras.snapshot.call_count == driver.observe.call_count == 5
+    assert driver.execute.call_count == 1
+    assert [r["tool"] for r in run["history"]] == [
+        "left_move_by", "model_unavailable", "done", "model_unavailable", "done"]
+
+
+def test_unconfirmed_gripper_outcome_is_observed_and_not_published(monkeypatch):
+    card = plugin.AutonomousTaskPlugin({}, None)
+    model, driver, cameras = Mock(), Mock(), Mock()
+    monkeypatch.setattr(card, "_publish", Mock())
+    model.last_note, model.last_model = "check the actual opening", "vision"
+    model.decide.side_effect = [("left_set_gripper", {"opening_mm": 60}),
+                                ("failed", {"reason": "jaw path occluded"})]
+    driver.execute.return_value = {"status": "target_not_reached", "motion_sent": True}
+    run = {"action_id": "r", "instruction": "move", "arm_mode": "left", "history": []}
+    assert card._loop(run, model, driver, cameras, threading.Event(), None) == (
+        "failed", "jaw path occluded")
+    assert cameras.snapshot.call_count == 2 and driver.execute.call_count == 1
+    assert run["history"][0]["feedback"] == driver.execute.return_value
+    card._publish.assert_not_called()
+
+
 def test_duplicate_and_busy_submit(monkeypatch):
     card = plugin.AutonomousTaskPlugin({"model_name": "vision", "base_url": "http://localhost",
                                         "key": "private"}, None)

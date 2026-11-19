@@ -13,7 +13,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from .cameras import CameraInputs, camera_ports, resolve_cameras
-from .model import Model
+from .model import Model, TransientModelError
 
 log = logging.getLogger(__name__)
 _MODES = {"left": ("left",), "right": ("right",), "both": ("left", "right")}
@@ -238,6 +238,7 @@ class AutonomousTaskPlugin:
     def _loop(self, run, model, driver, cameras, cancel, path):
         arms = _MODES[run["arm_mode"]]
         review = False
+        inference_failures = 0
         deadline = time.monotonic() + _TIME_LIMIT
 
         def check():
@@ -262,7 +263,18 @@ class AutonomousTaskPlugin:
             with self._lock:
                 run["phase"] = "reviewing" if review else "deciding"
             decide = model.review if review else model.decide
-            name, args = decide(run["instruction"], arms, images, state, run["history"])
+            try:
+                name, args = decide(run["instruction"], arms, images, state, run["history"])
+            except TransientModelError as error:
+                inference_failures += 1
+                self._record(run, path, {"step": step, "review": review,
+                                         "tool": "model_unavailable", "note": str(error),
+                                         "feedback": {"motion_sent": False}}, state)
+                if inference_failures >= 3:
+                    return "failed", f"连续三次推理没有获得响应：{error}"
+                cancel.wait(2 * inference_failures)
+                continue
+            inference_failures = 0
             record = {"step": step, "review": review, "tool": name, "args": args,
                       "note": model.last_note, "model": model.last_model}
             check()
@@ -279,7 +291,7 @@ class AutonomousTaskPlugin:
                     self._record(run, path, record, state)
                     raise
                 record["feedback"] = result
-                if result["motion_sent"]:
+                if result["motion_sent"] and result["status"] == "completed":
                     self._publish(run["action_id"], step, name, args, result)
             self._record(run, path, record, state)
             check()

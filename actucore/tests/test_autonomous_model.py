@@ -121,3 +121,82 @@ def test_http_error_does_not_expose_provider_body(monkeypatch, model):
     with pytest.raises(RuntimeError, match="HTTP 401") as exc:
         model.decide("lift", ("left",), {"head": b"now"}, {}, [])
     assert "test-key" not in str(exc.value)
+
+
+def test_review_keeps_gripper_and_motion_evidence_after_recent_images_expire(monkeypatch, model):
+    payloads = []
+    def send(payload):
+        payloads.append(payload)
+        return reply(message('{"status":"observe","reason":"inspect"}'))
+    monkeypatch.setattr(model, "_post", send)
+    history = []
+    xyz = [0., 0., 0.]
+    width = 85
+    actions = {
+        2: ("set_gripper", {"opening_mm": 5}),
+        3: ("move_by", {"position_m": [0., 0., .03]}),
+        5: ("move_by", {"position_m": [0., .05, .03]}),
+        7: ("set_gripper", {"opening_mm": 80}),
+        8: ("move_by", {"position_m": [.02, .09, .09]}),  # post-opening withdrawal
+    }
+    for step in range(1, 21):
+        state = {"arms": {"left": {"gripper": {"opening_mm": width}, "eef": {"position_m": xyz}}}}
+        model.decide("relocate", ["left"], {"head": bytes([step])}, state, history)
+        entry = {"step": step, "tool": "observe"}
+        if step in actions:
+            tool, measured = actions[step]
+            entry.update(tool="left_" + tool, feedback={"actual": measured, "status": "completed",
+                                                       "motion_sent": True})
+            xyz = measured.get("position_m", xyz)
+            width = measured.get("opening_mm", width)
+        if step == 10:
+            entry.update(tool="left_set_gripper", feedback={"actual": {"opening_mm": 0},
+                         "status": "rejected", "motion_sent": False})
+        history.append(entry)
+    model.review("relocate", ["left"], {"head": b"fresh"}, state, history)
+    parts = payloads[-1]["input"][0]["content"]
+    events = json.loads(parts[0]["text"])["measured_event_observations"]
+    actual = {e["measured_event"]: (e["before_observation"], e["after_observation"]) for e in events}
+    assert actual == {"jaws_narrowed": (2, 3), "highest_measured_eef": (3, 4),
+                      "furthest_measured_eef_xy": (5, 6), "jaws_widened": (7, 8)}
+    labels = [p["text"] for p in parts[1:] if p["type"] == "input_text"]
+    assert len(labels) <= 10
+    for step in range(1, 9):
+        assert f"HISTORICAL observation {step}: head RGB" in labels
+    assert labels[-1] == "CURRENT observation 21: head RGB"
+
+
+def test_close_handover_only_offers_the_marked_side_and_consumes_one_decision(monkeypatch, model):
+    state = {"arms": {"left": {"gripper": {}},
+                      "right": {"gripper": {"close_handover_action_id": "open-1"}}}}
+    payloads = []
+    answers = iter([message('{"status":"observe","reason":"手在工作区内"}'),
+                    call("right_set_gripper", {"opening_mm": 0}),
+                    message('{"status":"failed","reason":"夹爪状态仍受限"}')])
+    def send(payload):
+        payloads.append(payload)
+        return reply(next(answers))
+    monkeypatch.setattr(model, "_post", send)
+    for answer in ("observe", "right_set_gripper", "failed"):
+        decision, _ = model.decide("move", ["left", "right"], {"head": b"fresh"}, state, [])
+        assert decision == answer
+    for payload in payloads[:2]:
+        tool, = payload["tools"]
+        assert tool["name"] == "right_set_gripper"
+        assert tool["parameters"]["properties"]["opening_mm"]["enum"] == [0]
+        assert "person's hand" in payload["instructions"]
+    assert payloads[-1]["tools"] == []
+
+
+@pytest.mark.parametrize("answer", [
+    call("left_set_gripper", {"opening_mm": 0.5}),
+    call("right_set_gripper", {"opening_mm": 0}),
+    call("left_move_by", {"translation_m": [0, 0, .01],
+                          "rotation_vector_rad": [0, 0, 0], "duration_s": 3}),
+    message('{"status":"done","reason":"好"}'),
+])
+def test_close_handover_rejects_other_outputs_locally(monkeypatch, model, answer):
+    state = {"arms": {"left": {"gripper": {"close_handover_action_id": "open-1"}}}}
+    monkeypatch.setattr(model, "_post", lambda body: reply(answer))
+    with pytest.raises(ValueError):
+        model.decide("move", ["left","right"], {"head": b"fresh"}, state, [])

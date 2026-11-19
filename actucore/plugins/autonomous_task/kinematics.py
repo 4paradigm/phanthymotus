@@ -223,6 +223,26 @@ class Kinematics:
             raise ValueError(f"{arm} joints_rad exceeds the {limits}")
         return q
 
+    def command_seed(self, arm, measured, tolerance_rad):
+        """Use a settled encoder reading as an IK seed within command bounds.
+
+        FK and safety checks keep using the original encoder vector. Only the
+        optimizer's initial guess can be adjusted, within a proven tolerance.
+        """
+        measured = self._configuration(arm, measured)
+        lower, upper = self._limits[arm]
+        seed = np.clip(measured, lower, upper)
+        changes = []
+        for index in np.flatnonzero(seed != measured):
+            joint = JOINT_NAMES[int(index) + (7 if arm == "right" else 0)]
+            delta = float(seed[index] - measured[index])
+            if abs(delta) > tolerance_rad:
+                raise ValueError(f"{joint} measured outside command limit by {abs(delta):.6g} rad; "
+                                 f"verified seed tolerance {tolerance_rad:.6g} rad")
+            changes.append({"joint": joint, "measured_rad": float(measured[index]),
+                            "seed_rad": float(seed[index]), "correction_rad": delta})
+        return seed, changes
+
     def _fk(self, arm, q):
         transform, origins, axes, index = np.eye(4), [], [], 0
         for joint in self._chains[arm]:
@@ -244,7 +264,11 @@ class Kinematics:
         return {"position_m": transform[:3, 3].tolist(),
                 "quaternion_xyzw": _quaternion(transform[:3, :3]).tolist(),
                 "frame": "base_Link", "eef_frame": EEF_FRAMES[arm],
-                "reference_label": REFERENCE_LABEL}
+                "reference_label": REFERENCE_LABEL,
+                # TRON2 grasper geometry: the fingers extend along local -Z;
+                # the two jaws move oppositely along the local Y axis.
+                "finger_direction_base": (-transform[:3, 2]).tolist(),
+                "jaw_opening_axis_base": transform[:3, 1].tolist()}
 
     def forward(self, arm, q7):
         """Read a pose within URDF mechanical limits, not a command admission."""
@@ -316,8 +340,21 @@ class Kinematics:
             # Local trust region, damping, and backtracking preserve the seed
             # neighbourhood without silently accepting an unconverged solution.
             for damping in (0.002, 0.01, 0.05):
-                step = weighted_j.T @ np.linalg.solve(
-                    weighted_j @ weighted_j.T + damping*damping*np.eye(6), weighted_e)
+                # At a bound, clipping an outward step repeatedly loses that
+                # column's contribution while the other joints still assume
+                # it moved. Re-solve the same Cartesian request on free axes.
+                free = np.ones(len(q), dtype=bool)
+                step = np.zeros_like(q)
+                while np.any(free):
+                    jac = weighted_j[:, free]
+                    step[free] = jac.T @ np.linalg.solve(
+                        jac @ jac.T + damping*damping*np.eye(6), weighted_e)
+                    outward = free & (((q <= lower + 1e-10) & (step < 0)) |
+                                      ((q >= upper - 1e-10) & (step > 0)))
+                    if not np.any(outward):
+                        break
+                    step[outward] = 0.
+                    free[outward] = False
                 step *= min(1., .15 / max(float(np.max(np.abs(step))), 1e-15))
                 for scale in (1., .5, .25, .125, .0625):
                     candidate = np.clip(q + scale * step, lower, upper)
@@ -331,5 +368,11 @@ class Kinematics:
                     break
             if not accepted:
                 break
+        margin = np.minimum(q - lower, upper - q)
+        index = int(np.argmin(margin))
+        joint = JOINT_NAMES[index + (7 if arm == "right" else 0)]
+        boundary = "lower" if q[index] - lower[index] <= upper[index] - q[index] else "upper"
         raise ValueError(f"IK did not converge from seed: position_error_m={position_error:.6g}, "
-                         f"rotation_error_rad={rotation_error:.6g}, iterations={iteration}")
+                         f"rotation_error_rad={rotation_error:.6g}, iterations={iteration}; "
+                         f"closest command limit at final IK iterate: {joint} {boundary}, "
+                         f"margin_rad={margin[index]:.5g}")

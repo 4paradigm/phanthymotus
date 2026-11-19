@@ -26,6 +26,46 @@ def _angle(a, b):
     return 2 * math.acos(min(1.0, dot))
 
 
+def _guarded_open(side, owner):
+    """A failed open that the driver's explicit close entry can take over."""
+    motion = owner.get("motion") or {}
+    if (owner.get("side") == side and owner.get("state") == "blocked_requires_operator_check"
+            and owner.get("recovering") is False and owner.get("waiting_action") is None
+            and owner.get("can_accept_motion") is False
+            and motion.get("action_id") and motion.get("side") == side and motion.get("action") == "open"
+            and motion.get("state") == "blocked_requires_operator_check" and motion.get("status") == "error"
+            and motion.get("error_code") == "target_not_reached" and motion.get("motion_sent") is True
+            and motion.get("vendor_acknowledged") is True and motion.get("callback_delivered") is True
+            and motion.get("no_op") is False and motion.get("target_opening_verified") is False
+            and motion.get("reported_speed") == 0):
+        return motion
+    return None
+
+
+def _command_opening_mm(requested):
+    # Zero is the driver's distinct explicit-close command. A small positive
+    # request must therefore stay on the open pathway, even below half a tick.
+    ticks = max(1, math.floor(requested * 94 / 85 + .5)) if requested else 0
+    return ticks * 85 / 94
+
+
+def _settled_tolerance_rad(receipt):
+    # TRON2 verifies MoveJ with three stable samples within one degree. A
+    # claimed looser threshold must not silently widen this adapter's bound.
+    tolerance = receipt.get("tolerance_deg")
+    measured = receipt.get("max_error_deg")
+    if (receipt.get("action") == "move" and receipt.get("status") == "completed"
+            and receipt.get("action_id") and receipt.get("arrival_verified") is True
+            and receipt.get("motion_sent") is True and receipt.get("vendor_acknowledged") is True
+            and receipt.get("motion_may_continue") is False and receipt.get("callback_delivered") is True
+            and receipt.get("verification") == "post_duration_stable_feedback"
+            and receipt.get("joint_count") == 14 and _number(receipt.get("verified_samples"))
+            and receipt["verified_samples"] >= 3 and _number(tolerance) and _number(measured)
+            and 0 <= measured <= tolerance <= 1):
+        return math.radians(tolerance)
+    return 0.0
+
+
 class Tron2:
     """One instance per task worker; observe() arms an execution exactly once."""
 
@@ -98,16 +138,26 @@ class Tron2:
                 or not all(_number(values.get(key)) for key in ("opening", "speed", "force"))
                 or not _number(data.get("vendor_timestamp_ms"))):
             raise RuntimeError(f"No fresh {side} gripper feedback")
-        if (owner.get("state") != "ready" or owner.get("can_accept_motion") is not True
-                or owner.get("recovering") is not False or values["speed"] != 0):
+        motion = _guarded_open(side, owner)
+        if (values["speed"] != 0 or owner.get("recovering") is not False or
+                (not motion and (owner.get("state") != "ready" or owner.get("can_accept_motion") is not True))):
             raise RuntimeError(f"{side} gripper is not ready: {owner.get('state')}")
-        return {"opening_raw": values["opening"], "opening_mm": values["opening"] * 85 / 94,
-                "speed": values["speed"], "force_level": values["force"],
-                "vendor_timestamp_ms": data["vendor_timestamp_ms"], "grasp_verified": False}
+        state = {"opening_raw": values["opening"], "opening_mm": values["opening"] * 85 / 94,
+                 "speed": values["speed"], "force_level": values["force"],
+                 "vendor_timestamp_ms": data["vendor_timestamp_ms"], "grasp_verified": False}
+        if motion:
+            state.update(close_handover_action_id=motion["action_id"],
+                         previous_open_error=motion.get("error") or motion["error_code"],
+                         previous_target_opening_mm=motion.get("target_opening_mm"))
+        return state
 
     def _snapshot(self, arms):
         grippers = {side: self._gripper(side) for side in arms}
         health, q, dq, stamp = self._joints()
+        for side in ("left", "right"):
+            owner = (health.get("grippers") or {}).get("gripper_" + side) or {}
+            if side not in grippers and owner.get("state") == "blocked_requires_operator_check":
+                raise RuntimeError(f"Unselected {side} gripper is blocked")
         if any(abs(v) > .05 for v in dq):
             raise RuntimeError("TRON2 is moving")
         for key in ("arm_motion", "head_motion", "pose_motion"):
@@ -117,7 +167,7 @@ class Tron2:
         servo = health.get("loco_servo_arm") or {}
         if servo.get("output_active") or servo.get("state") == "running":
             raise RuntimeError("A TRON2 servo controller is active")
-        return q, stamp, grippers
+        return q, stamp, grippers, health.get("arm_motion") or {}
 
     def observe(self, arms):
         self._baseline = None
@@ -126,7 +176,7 @@ class Tron2:
             raise ValueError("Select left and/or right arm")
         if self._kinematics is None:
             self._kinematics = Kinematics(self._call("model", {})["urdf"])
-        q, stamp, grippers = self._snapshot(arms)
+        q, stamp, grippers, _ = self._snapshot(arms)
         state = {}
         for side in arms:
             offset = 7 if side == "right" else 0
@@ -136,12 +186,12 @@ class Tron2:
         self._baseline = (q, stamp, grippers)
         return {"arms": state, "robot_timestamp": stamp}
 
-    def _move(self, side, tool, args, q, reference):
+    def _move(self, side, tool, args, q, reference, receipt):
         duration = args["duration_s"]
         if not _number(duration) or not 1 <= duration <= 60:
             raise ValueError("Duration must be 1–60 seconds")
         offset = 7 if side == "right" else 0
-        seed = q[offset:offset+7]
+        measured = q[offset:offset+7]
         if tool == "move_by":
             dp, dr = args["translation_m"], args["rotation_vector_rad"]
             if math.hypot(*dp) > .1 or math.hypot(*dr) > math.pi / 6:
@@ -154,10 +204,12 @@ class Tron2:
         if not math.isfinite(norm) or abs(norm - 1) > .001:
             raise ValueError("Expected an xyzw unit quaternion")
         target = {"position_m": pose["position_m"], "quaternion_xyzw": [v/norm for v in quaternion]}
-        current = self._kinematics.forward(side, seed)
+        current = self._kinematics.forward(side, measured)
         if (math.dist(current["position_m"], target["position_m"]) > .1001
                 or _angle(current["quaternion_xyzw"], target["quaternion_xyzw"]) > math.pi/6 + .001):
             raise ValueError("Use a smaller move of at most 10 cm and 30 degrees")
+        tolerance = _settled_tolerance_rad(receipt)
+        seed, changes = self._kinematics.command_seed(side, measured, tolerance)
         solved = self._kinematics.solve(side, target["position_m"], target["quaternion_xyzw"], seed)
         joints = list(q[:14])
         joints[offset:offset+7] = solved["joints_rad"]
@@ -166,7 +218,9 @@ class Tron2:
             raise ValueError("IK exceeds 35 degrees per move or 20 degrees/s average joint rate")
         if any(not low <= value <= high for value, low, high in zip(joints, ARM_LOWER, ARM_UPPER)):
             raise ValueError("MoveJ target exceeds joint limits")
-        return {"action": "move", "joint": joints, "time": duration}, target
+        seed_info = ({"corrections": changes, "tolerance_rad": tolerance,
+                      "source_action_id": receipt["action_id"]} if changes else None)
+        return {"action": "move", "joint": joints, "time": duration}, target, seed_info
 
     def _completion(self, side, driver, action_id, duration):
         deadline = time.monotonic() + duration + 22
@@ -180,6 +234,8 @@ class Tron2:
             if record.get("action_id") != action_id:
                 raise RuntimeError(f"TRON2 lost ownership of {action_id}; outcome unknown")
             if record.get("status") == "error" or record.get("state") == "blocked_requires_operator_check":
+                if driver == "gripper" and _guarded_open(side, owner):
+                    return record
                 raise RuntimeError(f"TRON2 {action_id} {record.get('error') or record.get('state')}")
             if record.get("status") == "completed" and record.get("callback_delivered") is True:
                 if record.get("motion_may_continue") is not False:
@@ -194,9 +250,19 @@ class Tron2:
         if not baseline or side not in baseline[2] or tool not in ("move_to", "move_by", "set_gripper"):
             raise RuntimeError("Action is outside the most recent observation or arm mode")
         reference, observed_stamp, observed = baseline
-        q, stamp, grippers = self._snapshot(observed)
+        q, stamp, grippers, previous_motion = self._snapshot(observed)
         if stamp <= observed_stamp:
             raise RuntimeError("TRON2 joint timestamp did not advance since the observation")
+        handovers = {s: g["close_handover_action_id"] for s, g in grippers.items()
+                     if g.get("close_handover_action_id")}
+        previous = {s: g["close_handover_action_id"] for s, g in observed.items()
+                    if g.get("close_handover_action_id")}
+        if handovers != previous:
+            return {"status": "rejected", "motion_sent": False, "reason": "Gripper ownership changed during inference"}
+        if handovers and not (side in handovers and tool == "set_gripper" and args.get("opening_mm") == 0):
+            return {"status": "rejected", "motion_sent": False, "reason":
+                    "A failed open retains ownership. Only an explicit zero-width close on its side "
+                    "can request the driver's guarded handover; inspect the new images first."}
         if (_difference(reference, q) > .035 or any(
                 abs(observed[s]["opening_raw"] - g["opening_raw"]) > 2 for s, g in grippers.items())):
             return {"status": "rejected", "motion_sent": False, "reason": "Robot changed during inference"}
@@ -206,14 +272,17 @@ class Tron2:
                 raise ValueError("Expected nominal opening in [0, 85] mm")
             before = grippers[side]
             driver = "gripper"
-            command = {"side": side, "opening_mm": opening, "speed": 15, "force": 30}
+            command = {"side": side, "opening_mm": _command_opening_mm(opening), "speed": 15, "force": 30}
             duration = 20
         else:
             driver = "arm_control"
             try:
-                command, target = self._move(side, tool, args, q, reference)
+                command, target, seed_info = self._move(side, tool, args, q, reference, previous_motion)
             except (ValueError, TypeError, KeyError, OverflowError) as exc:
-                return {"status": "rejected", "motion_sent": False, "reason": str(exc)}
+                return {"status": "rejected", "motion_sent": False, "reason": str(exc),
+                        "planning_feedback": "No movement. Reassess the fresh views and measured "
+                                             "finger direction; a smaller step or a different "
+                                             "orientation with visible clearance may be reachable."}
             duration = command["time"]
 
         if cancel_event.is_set():
@@ -237,14 +306,24 @@ class Tron2:
             raise RuntimeError(f"TRON2 {action_id} lacks confirmed dispatch or gripper no-op")
         result = {"status": "completed", "action_id": action_id, "motion_sent": sent}
         if driver == "gripper":
+            if record.get("side") != side:
+                raise RuntimeError(f"TRON2 {action_id} reported the wrong gripper")
             after = self._gripper(side)
-            actual, goal = after["opening_raw"], opening * 94 / 85
-            if (record.get("side") != side or record.get("target_opening_verified") is not True
-                    or after["vendor_timestamp_ms"] <= before["vendor_timestamp_ms"]
-                    or abs(actual - goal) > 1.000001
-                    or (sent and (actual-before["opening_raw"])*(goal-before["opening_raw"]) <= 0)):
-                raise RuntimeError(f"TRON2 {action_id} gripper progress/position unverified")
-            result.update(actual=after, no_op=not sent, target_opening_mm=opening)
+            if sent and after["vendor_timestamp_ms"] <= before["vendor_timestamp_ms"]:
+                raise RuntimeError(f"TRON2 {action_id} has no new gripper feedback")
+            if side in handovers:
+                prior = record.get("previous_action_error") or {}
+                if prior.get("action_id") != handovers[side] or prior.get("error_code") != "target_not_reached":
+                    raise RuntimeError(f"TRON2 {action_id} guarded close did not confirm its previous owner")
+                result["previous_open_action_id"] = prior["action_id"]
+            if record.get("status") == "error":
+                if after.get("close_handover_action_id") != action_id:
+                    raise RuntimeError(f"TRON2 {action_id} failed opening no longer owns the gripper")
+                result.update(status="failed", reason=after["previous_open_error"],
+                              error_code=record["error_code"], motion_may_continue=record.get("motion_may_continue"),
+                              close_handover_action_id=action_id)
+            result.update(actual=after, no_op=not sent, requested_opening_mm=opening,
+                          target_opening_mm=command["opening_mm"])
             return result
 
         _, measured, speeds, new_stamp = self._joints()
@@ -257,9 +336,9 @@ class Tron2:
         position_error = math.dist(actual["position_m"], target["position_m"])
         angle_error = _angle(actual["quaternion_xyzw"], target["quaternion_xyzw"])
         result.update(actual=actual, target=target, position_error_m=position_error, angle_error_rad=angle_error)
+        if seed_info:
+            result["ik_seed_adjustment"] = seed_info
         start = self._kinematics.forward(side, q[offset:offset+7])
-        no_progress = (math.dist(start["position_m"], target["position_m"]) > .0002
-                       and math.dist(start["position_m"], actual["position_m"]) < .0002)
-        if position_error > .010 or angle_error > math.radians(.5) or no_progress:
-            result.update(status="completed_with_warning", reason="Settled; endpoint feedback differs from request")
+        result["measured_translation_m"] = [end - begin for end, begin in
+                                            zip(actual["position_m"], start["position_m"])]
         return result
