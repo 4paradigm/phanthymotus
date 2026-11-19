@@ -296,24 +296,19 @@ class ActiveScan:
         if not self._clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon):
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
-            return self.interrupt("主动观察：转身扫掠区有障碍或缺少观测，停车")
+            return self.interrupt("主动观察：转身扫掠区有障碍或超出网格范围，停车")
         self.issued_yaw = True
         direction = "右" if error > 0 else "左"
         description = "回到观察前的朝向" if returning else f"向{direction}观察"
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
     def _clear_sweep(self, geometry, half_width, sweep, translation):
-        # Only cells entirely inside the current keepout can be exempted.
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
-        half_cell = RESOLUTION / 2
-        initial = ((FORWARD - half_cell >= -geometry.rear)
-                   & (FORWARD + half_cell <= geometry.front)
-                   & (abs(RIGHT) + half_cell <= half_width))
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)
         radius = math.hypot(max(geometry.front, geometry.rear), half_width)
         slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
-        free, occupied = self.grid()
+        _, occupied = self.grid()
         occupied = occupied | self.views[-1][3]
         swept = np.zeros(SHAPE, dtype=bool)
         for angle in np.linspace(0., sweep, samples):
@@ -329,9 +324,7 @@ class ActiveScan:
             outside_f = np.maximum(0., np.maximum(-geometry.rear - forward, forward - geometry.front))
             outside_r = np.maximum(0., abs(right) - half_width)
             swept |= outside_f**2 + outside_r**2 <= slack**2
-        if (occupied & swept).any():
-            return False
-        return bool(free[swept & ~initial].all())
+        return not (occupied & swept).any()
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):
         if self.active:

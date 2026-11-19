@@ -336,12 +336,6 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
     assert tick(100_050)["values"] == [0.] * 6
     command = tick(100_150)
     assert command["values"][:5] == [0.] * 5
-    if not sweep_observed:
-        assert command["values"][5] == 0
-        assert tick(100_250)["values"] == [0.] * 6
-        assert tick(100_350)["values"] == [0.] * 6
-        assert not replans
-        return
     assert 0 < command["values"][5] <= .18
     yaw = command["values"][5]
     stamp = now[0]

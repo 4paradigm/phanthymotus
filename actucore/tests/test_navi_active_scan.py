@@ -64,20 +64,15 @@ def test_active_scan_turns_right_and_waits_for_post_turn_depth(monkeypatch):
     assert _tick(lookout, geometry, 4000).yaw > 0
 
 
-def test_active_scan_holds_unknown_or_occupied_sweep(monkeypatch):
-    for missing in (True, False):
-        lookout, geometry, visible, blocked = _setup(monkeypatch)
-        visible[:] = not missing
-        blocked[14, 28] = not missing
-        _tick(lookout, geometry, 1000)
-        assert lookout.begin((1., -1.))
-        assert _tick(lookout, geometry, 1050).yaw == 0
-        result = _tick(lookout, geometry, 1200)
-        assert result.yaw == 0
-        assert _tick(lookout, geometry, 1250).yaw == 0
-        assert _tick(lookout, geometry, 1350).yaw == 0
-        assert not lookout.active
-        assert not lookout.begin((1., -1.))
+def test_active_scan_holds_an_occupied_sweep(monkeypatch):
+    lookout, geometry, _, blocked = _setup(monkeypatch)
+    blocked[14, 28] = True
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((1., -1.))
+    for stamp in (1050, 1200, 1250, 1350):
+        assert _tick(lookout, geometry, stamp).yaw == 0
+    assert not lookout.active
+    assert not lookout.begin((1., -1.))
 
 
 def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(monkeypatch):
@@ -124,12 +119,12 @@ def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(mon
     assert lookout.command(geometry, .33, .25, 600).yaw > 0
 
 
-def test_scan_requires_coverage_around_the_rear_corners(monkeypatch):
+def test_scan_allows_an_unobserved_rear_sweep(monkeypatch):
     lookout, geometry, visible, _ = _setup(monkeypatch)
     visible[:] = scan.FORWARD > 0
     _tick(lookout, geometry, 1000)
-    assert not lookout._clear_sweep(geometry, .33, scan.ANGLE, 0.)
-    assert not lookout._clear_sweep(geometry, .33, -scan.ANGLE, 0.)
+    assert lookout._clear_sweep(geometry, .33, scan.ANGLE, 0.)
+    assert lookout._clear_sweep(geometry, .33, -scan.ANGLE, 0.)
 
 
 def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
@@ -144,8 +139,8 @@ def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
     np.testing.assert_allclose(mounted.base_from_optical, transform)
 
 
-@pytest.mark.parametrize("half_width", [.23, .35])
-def test_receipt_only_front_depth_cannot_confirm_rear_sweep(half_width):
+@pytest.mark.parametrize(("half_width", "expected_yaw"), [(.23, -.18), (.35, 0.)])
+def test_receipt_only_scan_turns_with_front_depth_inside_the_grid(half_width, expected_yaw):
     horizontal = HorizontalIntrinsics(640, 315, 337)
     vertical = (480, 420, 243)
     geometry = camera_square(horizontal, vertical, half_width)
@@ -161,7 +156,8 @@ def test_receipt_only_front_depth_cannot_confirm_rear_sweep(half_width):
                     {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
         if stamp == 1000:
             assert look.begin((1., -1.))
-        assert look.command(geometry, half_width + .10, .18, 600).yaw == 0
+        result = look.command(geometry, half_width + .10, .18, 600)
+    assert result.yaw == expected_yaw
 
 
 @pytest.mark.parametrize("initial_hit", [False, True])
@@ -177,12 +173,12 @@ def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkey
     assert (result.yaw < 0) is (not initial_hit)
 
 
-def test_sweep_does_not_exempt_a_blind_cell_that_straddles_the_footprint(monkeypatch):
-    look, _, visible, _ = _setup(monkeypatch)
+def test_sweep_stops_for_an_occupied_cell_that_straddles_the_footprint(monkeypatch):
+    look, _, _, occupied = _setup(monkeypatch)
     geometry = Geometry(None, None, np.eye(4), .22, .23, None)
     # This cell is centred at forward .20 m, left .30 m. It extends .005 m
     # past the front edge and the right turn sweeps through the exposed part.
-    visible[14, 22] = False
+    occupied[14, 22] = True
     _tick(look, geometry, 1000)
     assert look.begin((1.,))
     _tick(look, geometry, 1050)
