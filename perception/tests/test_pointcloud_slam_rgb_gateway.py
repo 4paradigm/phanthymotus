@@ -348,6 +348,21 @@ def test_native_visual_tracking_status_requires_native_recovery_evidence(calibra
     assert n.status()['native_proximity_detections'] == 1
 
 
+def test_native_local_visual_reacquisition_reports_old_landmark_inliers(calibrated_node):
+    n = calibrated_node
+    send(n)
+    assert _wait_until(lambda: n._active is not None)
+    msg = NS(ref_id=8, loop_closure_id=0, proximity_detection_id=0,
+        stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/',
+                    'Motus/VisualReacquiredInliers/'], stats_values=[3., 1., 74., 55.])
+    n._native_info(msg, n._active)
+    assert n.status()['native_recovery'] == dict(state='visual_tracking', relocalizations=1,
+        visual_inliers=74, visual_reacquired_inliers=55)
+    msg.stats_values[0] = 1.
+    n._native_info(msg, n._active)
+    assert 'visual_reacquired_inliers' not in n.status()['native_recovery']
+
+
 def test_native_relocalization_match_is_separate_from_local_visual_inliers(calibrated_node):
     n=calibrated_node;send(n)
     assert _wait_until(lambda:n._active is not None)

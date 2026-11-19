@@ -20,7 +20,9 @@ int main(int argc, char **argv)
     ULogger::setLevel(ULogger::kWarning);
     const std::string root=argv[1], output=argv[2], mode=argv[3];
     const bool imuPrediction=mode=="imu_prediction";
-    const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap";
+    const bool regressedVisualCapture=mode=="vo_reacquire_regressed";
+    const bool shortVisualLoss=mode=="vo_reacquire" || mode=="vo_reacquire_expired" || regressedVisualCapture;
+    const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap" || shortVisualLoss;
     const bool failedVisualSeed=mode=="first_visual_seed_failed";
     const bool firstVisualSeed=mode=="first_visual_seed" || failedVisualSeed;
     std::map<int,int> imageMask;
@@ -83,6 +85,8 @@ int main(int argc, char **argv)
     int scanOnlyFrames=0, retainedScanClosures=0, overwrittenEvents=0;
     int handoffFrames=0;
     bool relocalizeBlack=false; int rgbGapFrames=0;
+    bool postClosureLoss=false, postClosureReacquired=false;
+    size_t postClosureNodes=0;
     const rtabmap::Transform handoffOrigin(7.f,-3.f,.5f,0.f,0.f,.35f);
     rtabmap::Transform lastHandoff;
     std::map<int,rtabmap::Transform> beforeVisualFailure;
@@ -102,12 +106,15 @@ int main(int argc, char **argv)
             visualFault=relocalizeBlack=true;
         if(recoveryScenario && phase=="rgb_gap" && ++rgbGapFrames==3)
             visualFault=true; // The first two missing images preserve the VO gauge.
+        const bool loseAfterClosure=mode=="recovery" && !postClosureLoss && phase=="relocalize" &&
+            recovery.state()==motus::VisualRecovery::Localized && recovery.relocalizations()==1;
+        if(loseAfterClosure) visualFault=true;
         if(visualFault) rgb.setTo(cv::Scalar::all(0));
         if(voHandoff)
         {
             if(i>=3) hasPose=0;
-            if(i==7) hasPose=1; // A numerical external input cannot revive an old VO pairing.
-            if(i==6 || i==7) rgb.setTo(cv::Scalar::all(0)); // Received image, real native VO failure.
+            if(i==7 && !shortVisualLoss) hasPose=1; // A numerical external input cannot revive an old VO pairing.
+            if(i==6 || (i==7 && !shortVisualLoss)) rgb.setTo(cv::Scalar::all(0));
         }
         if(firstVisualSeed && i>0) hasPose=0;
         if(failedVisualSeed && i==0) rgb.setTo(cv::Scalar::all(0));
@@ -146,7 +153,9 @@ int main(int argc, char **argv)
         // Processed scan cadence can be sparser than the measured chassis stream.
         const double skippedTime=externalContinuity && i>0?(mode=="external_continuity_stale"?5.1:2.1):0.;
         const double outageTime=continuityOutage?(i==2 && mode=="external_continuity_outage_stale"?4.:0.):skippedTime;
-        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,i+1.+outageTime);
+        const double stamp=regressedVisualCapture && i==7?6.5:
+            i+1.+outageTime+(mode=="vo_reacquire_expired" && i>=7?2.:0.);
+        rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,stamp);
         if(externalContinuity && i>0)
             for(int j=0;j<count;++j) scan.at<cv::Vec3f>(0,j)[0]+=20.f; // No scan overlap with the anchor.
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
@@ -211,6 +220,7 @@ int main(int argc, char **argv)
                  <<",\"state\":"<<recovery.state()<<",\"odom_null\":"<<recovery.odom().isNull()<<",\"relocations\":"<<recovery.relocalizations()
                  <<",\"recovery_node\":"<<recovery.recoveryNode()<<",\"recovery_anchor\":"<<recovery.recoveryAnchor()
                  <<",\"recovery_inliers\":"<<recovery.recoveryInliers()
+                 <<",\"visual_reacquired_inliers\":"<<stat("Motus/VisualReacquiredInliers/")
                  <<",\"visual_inliers\":"<<recovery.visualInliers()<<",\"nodes\":"<<map.getLocalOptimizedPoses().size()
                  <<",\"visual_fault\":"<<visualFault<<",\"images\":"<<!noImages
                  <<",\"hypothesis\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_id())
@@ -318,6 +328,23 @@ int main(int argc, char **argv)
            recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
            recovery.recoveryNode()!=0))
             throw std::runtime_error("decode-valid black image must exercise real VO loss before global recovery");
+        if(loseAfterClosure)
+        {
+            if(accepted || !map.getMemory()->isIncremental() || map.getLocalOptimizedPoses().size()!=nodesBefore)
+                throw std::runtime_error("short visual loss after closure must leave the old graph and mapping mode intact");
+            postClosureLoss=true;
+            postClosureNodes=nodesBefore;
+        }
+        else if(postClosureLoss && !postClosureReacquired)
+        {
+            if(!accepted || recovery.state()!=motus::VisualRecovery::VisualTracking || recovery.relocalizations()!=1 ||
+               recovery.odom().isNull() || stat("Motus/VisualReacquiredInliers/")<20.f)
+                throw std::runtime_error("a mapped visual landmark must support local restoration after global closure");
+            postClosureReacquired=true;
+        }
+        if(mode=="recovery" && phase=="visual_only" && i==78 && (!postClosureReacquired ||
+           map.getLocalOptimizedPoses().size()<postClosureNodes+3 || !map.getLocalOptimizedPoses().count(1)))
+            throw std::runtime_error("reacquired visual tracking must continue growing the original graph");
         if(firstVisualSeed)
         {
             if(i==0 && (!accepted || recovery.state()!=motus::VisualRecovery::External ||
@@ -363,14 +390,34 @@ int main(int argc, char **argv)
                     throw std::runtime_error("visual-only graph edges must retain conservative motion uncertainty");
                 lastHandoff=recovery.odom(); ++handoffFrames;
             }
-            if((i==6 || i==7) && (recovery.visualInliers()!=0 || recovery.state()!=motus::VisualRecovery::Searching ||
+            if((i==6 || (i==7 && !shortVisualLoss)) && (recovery.visualInliers()!=0 || recovery.state()!=motus::VisualRecovery::Searching ||
                !recovery.odom().isNull() || recovery.recoveryNode()!=0))
                 throw std::runtime_error("real visual failure must revoke continuous VO alignment");
-            if(i==8)
+            if(shortVisualLoss && i==6 && (map.getLocalOptimizedPoses().size()!=nodesBefore ||
+               stat("Motus/VisualReacquiredInliers/")!=0.f))
+                throw std::runtime_error("a failed visual frame must not move the graph");
+            if(mode=="vo_reacquire" && i>=7)
+            {
+                const auto local=handoffOrigin.inverse()*recovery.odom();
+                if(!accepted || recovery.state()!=motus::VisualRecovery::VisualTracking || local.isNull() ||
+                   recovery.relocalizations()!=0 || map.getLocalOptimizedPoses().size()<=nodesBefore ||
+                   !map.getLocalOptimizedPoses().count(1) || !map.getMemory()->isIncremental() ||
+                   (i==7 && (std::abs(local.x()-(truthX+.024f))>.05f || std::abs(local.y())>.05f ||
+                     stat("Motus/VisualReacquiredInliers/")<20.f)))
+                    throw std::runtime_error("reacquired pre-loss F2M landmarks must extend the original graph");
+            }
+            if(regressedVisualCapture && i==7 && (accepted || !recovery.odom().isNull() ||
+               recovery.state()!=motus::VisualRecovery::Searching || recovery.visualInliers()!=0 ||
+               map.getLocalOptimizedPoses().size()!=nodesBefore))
+                throw std::runtime_error("a capture older than the visual loss must not update VO or the map");
+            if(regressedVisualCapture && i==8 && recovery.state()==motus::VisualRecovery::VisualTracking)
+                throw std::runtime_error("timestamp regression must invalidate the pending visual alignment");
+            if((i==8 && !shortVisualLoss) || (i==7 && mode=="vo_reacquire_expired"))
             {
                 if(handoffFrames!=(mode=="vo_handoff_gap"?2:3) || recovery.state()==motus::VisualRecovery::VisualTracking)
                     throw std::runtime_error("old VO alignment must not bridge a real visual failure without global verification");
             }
+            if(i==7 && mode=="vo_reacquire_expired") break;
         }
         if(imuPrediction)
         {
@@ -540,7 +587,9 @@ int main(int argc, char **argv)
     if((mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event") &&
        (!relocalizeBlack || rgbGapFrames!=3))
         throw std::runtime_error("two real visual failure observations were not exercised");
-    if(voHandoff && (handoffFrames!=(mode=="vo_handoff_gap"?2:3) || i!=8))
+    if(mode=="recovery" && !postClosureReacquired)
+        throw std::runtime_error("short visual loss after global recovery was not exercised");
+    if(voHandoff && (handoffFrames!=(mode=="vo_handoff_gap"?2:3) || i!=(mode=="vo_reacquire_expired"?7:8)))
         throw std::runtime_error("continuous VO and real visual failure regression was not exercised");
     if(mode=="scan_mask" && (scanOnlyFrames<2 || retainedScanClosures==0))
         throw std::runtime_error("observed scan-only mask did not retain native ICP multi closures");

@@ -965,6 +965,9 @@ class RtabmapNode(Node):
                 if recovery[0] in range(len(states)):
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],
                         relocalizations=int(recovery[1]), visual_inliers=int(recovery[2]))
+                    reacquired = values.get('Motus/VisualReacquiredInliers/')
+                    if recovery[0] in (0, 3) and isinstance(reacquired, (int, float)) and 0 < reacquired <= recovery[2]:
+                        segment['native_recovery']['visual_reacquired_inliers'] = int(reacquired)
                     match = [values.get(key) for key in
                         ('Motus/RecoveryNode/', 'Motus/RecoveryAnchor/', 'Motus/RecoveryInliers/')]
                     if (recovery[0] == 2 and all(isinstance(v, (int, float)) and

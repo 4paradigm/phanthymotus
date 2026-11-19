@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <optional>
+#include <set>
 
 namespace motus {
 class VisualRecovery
@@ -87,6 +88,13 @@ public:
                  const std::map<std::string,float> & statistics=std::map<std::string,float>())
     {
         recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
+        if(visualLossStamp_>0. && !(data.stamp()>visualLossStamp_))
+        {
+            // Reject delayed observations before they can alter F2M. A clock
+            // regression also invalidates the pending same-gauge recovery.
+            visualLossStamp_=0.; visualAlignment_.reset(); visualInliers_=0;
+            state_=Searching; odom_.setNull(); return false;
+        }
         const auto externalRun=takeExternalRun(data);
         const double outageAge=data.stamp()-chassisOutageStart_;
         const bool recentOutage=chassisOutageStart_>0. && outageAge>=0. && outageAge<=2.;
@@ -131,6 +139,7 @@ public:
                                  {"RGBD/ProximityOdomGuess","false"}});
             imageMode_=images;
         }
+        const auto framesBefore=estimator_->framesProcessed();
         if(images) visual=processVisual(data,info);
         visualInliers_=info.reg.inliers;
         const bool tracked=!visual.isNull() && !info.lost &&
@@ -156,6 +165,43 @@ public:
         }
         if(images || external.isNull()) initialVisualToNative_.setNull();
         missing_=external.isNull();
+        int reacquired=0;
+        if(!localizationMode_ && !continuousExternal && !waitForChassis && waiting_ && visualAlignment_ &&
+           (visualLossStamp_>0. || (images && !tracked)))
+        {
+            const auto &anchor=*visualAlignment_;
+            const double age=data.stamp()-anchor.stamp;
+            const bool sameSequence=age>0. && age<=2. && framesBefore==anchor.frames &&
+                estimator_->framesProcessed()==framesBefore+(tracked?1u:0u);
+            aligned_=false;
+            if(sameSequence && !tracked && external.isNull())
+            {
+                // Keep the old alignment as evidence only. The failed frame
+                // must not create a pose, an edge, or enter localization mode.
+                visualLossStamp_=data.stamp();
+                state_=Searching; odom_.setNull(); return false;
+            }
+            visualLossStamp_=0.;
+            if(sameSequence && tracked && cv::checkRange(visual.dataMatrix()) &&
+               plausibleMotion(anchor.visual.inverse()*visual,age))
+                reacquired=countOldVisualInliers(info,anchor.landmarks);
+            if(reacquired>=minInliers_)
+            {
+                lastVisual_=anchor.visual; lastNative_=anchor.native;
+                visualToNative_=lastNative_*lastVisual_.inverse();
+                aligned_=true;
+                externalGraceStart_=0.;
+            }
+            else
+                visualAlignment_.reset();
+        }
+        std::map<std::string,float> reacquisitionStats;
+        if(reacquired>=minInliers_)
+        {
+            reacquisitionStats=statistics;
+            reacquisitionStats["Motus/VisualReacquiredInliers/"]=static_cast<float>(reacquired);
+        }
+        const auto &acceptedStats=reacquisitionStats.empty()?statistics:reacquisitionStats;
         if(waiting_ && aligned_ && !tracked && !continuousExternal)
         {
             if(!images)
@@ -252,11 +298,12 @@ public:
                     for(int i=0;i<6;++i)
                         motionCovariance.at<double>(i,i)=std::max(motionCovariance.at<double>(i,i),
                             i<3?positionVariance:angleVariance);
-                    auto stats=statistics;
+                    auto stats=acceptedStats;
                     stats["Motus/MeasuredExternalContinuity/"]=1.f;
                     accepted=map.process(data,odom_,motionCovariance,velocity,stats);
                 }
-                else accepted=map.process(data,odom_,covariance,velocity,statistics);
+                else accepted=map.process(data,odom_,covariance,velocity,acceptedStats);
+                if(accepted && tracked) rememberVisualAlignment(data.stamp(),visual,info);
                 // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
                 // Only a later tracked frame may use this measured anchor during external loss.
                 if(accepted && visualSeed) initialVisualToNative_=odom_*visual.inverse();
@@ -299,7 +346,9 @@ public:
             for(int i=0;i<6;++i)
                 motionCovariance.at<double>(i,i)=std::max(motionCovariance.at<double>(i,i),
                     i<3?positionVariance:angleVariance);
-            return map.process(data,odom_,motionCovariance,std::vector<float>(),statistics);
+            const bool accepted=map.process(data,odom_,motionCovariance,std::vector<float>(),acceptedStats);
+            if(accepted) rememberVisualAlignment(data.stamp(),visual,info);
+            return accepted;
         }
         state_=Searching; odom_.setNull();
         // A short absence does not revoke the last independently witnessed
@@ -308,6 +357,8 @@ public:
         retryExternalNeighbor_=false;
         if(!localizationMode_)
         {
+            visualLossStamp_=0.;
+            visualAlignment_.reset();
             // A missing odometry guess cannot justify proximity localization.
             // Native placeholder poses cannot constrain motion between queries.
             map.parseParameters({{"Mem/IncrementalMemory","false"}, {"RGBD/ProximityBySpace","false"},
@@ -407,13 +458,18 @@ public:
         ++relocalizations_; state_=Localized;
         lastVisual_.setNull();
         if(tracked)
+        {
             visualToNative_=location*visual.inverse();
+            rememberVisualAlignment(data.stamp(),visual,info);
+        }
         else
         {
             // This seed is a verified global pose, never frozen external odometry.
             estimator_->reset(location);
             rtabmap::OdometryInfo seed;
-            processVisual(data,seed);
+            const auto seeded=processVisual(data,seed);
+            if(!seeded.isNull() && !seed.lost && estimator_->framesProcessed()==1)
+                rememberVisualAlignment(data.stamp(),seeded,seed);
             visualToNative_=rtabmap::Transform::getIdentity();
         }
         aligned_=true;
@@ -426,6 +482,37 @@ public:
 private:
     using ExternalRun=std::array<unsigned char,16>;
     static constexpr double maxExternalScanGap_=6.;
+
+    struct VisualAlignment
+    {
+        rtabmap::Transform visual,native;
+        double stamp;
+        unsigned int frames;
+        std::map<int,cv::Point3f> landmarks;
+    };
+
+    void rememberVisualAlignment(double stamp,const rtabmap::Transform & visual,rtabmap::OdometryInfo & info)
+    {
+        visualLossStamp_=0.;
+        if(info.localMap.size()>=static_cast<size_t>(minInliers_) && cv::checkRange(visual.dataMatrix()))
+            visualAlignment_=VisualAlignment{visual,odom_,stamp,estimator_->framesProcessed(),std::move(info.localMap)};
+        else
+            visualAlignment_.reset();
+    }
+
+    static int countOldVisualInliers(const rtabmap::OdometryInfo & info,const std::map<int,cv::Point3f> & old)
+    {
+        std::set<int> inliers;
+        for(int id:info.reg.inliersIDs)
+        {
+            const auto before=old.find(id), after=info.localMap.find(id);
+            // IDs alone can recur after reset. Also check the metric landmark
+            // in the F2M gauge, allowing small bundle-adjustment refinements.
+            if(before!=old.end() && after!=info.localMap.end() && cv::norm(before->second-after->second)<=.02)
+                inliers.insert(id);
+        }
+        return static_cast<int>(inliers.size());
+    }
 
     bool hasVisualGeometry(const std::vector<cv::Point3f> & points) const
     {
@@ -466,7 +553,11 @@ private:
         // The gateway witnesses the dense source between accepted native scans.
         if(external.isNull() || !(dt>0. && dt<=maxExternalScanGap_) || !cv::checkRange(external.dataMatrix()))
             return false;
-        const auto delta=previousExternal_.inverse()*external;
+        return plausibleMotion(previousExternal_.inverse()*external,dt);
+    }
+
+    static bool plausibleMotion(const rtabmap::Transform & delta,double dt)
+    {
         return delta.getNorm()<=.15+1.5*dt &&
             delta.getAngle(rtabmap::Transform::getIdentity())<=10.*CV_PI/180.+2.5*dt;
     }
@@ -536,6 +627,8 @@ private:
     bool missing_, waiting_, aligned_, localizationMode_;
     int relocalizations_, visualInliers_;
     bool imageMode_, initialized_;
+    double visualLossStamp_=0.;
+    std::optional<VisualAlignment> visualAlignment_;
     bool retryExternalNeighbor_=false;
     std::optional<ExternalRun> externalRun_;
     rtabmap::Transform previousExternal_;
