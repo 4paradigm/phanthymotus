@@ -234,6 +234,7 @@ class Config:
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
     max_obs_age_ms: int = 500
+    max_depth_age_ms: int | None = None
     watchdog_ms: float = 300
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
@@ -346,7 +347,14 @@ class Config:
     # facing" turned out to be.
     floor_wz_moving: float = 0.0
 
+    @property
+    def depth_age_limit_ms(self) -> int:
+        return self.max_obs_age_ms if self.max_depth_age_ms is None else self.max_depth_age_ms
+
     def __post_init__(self):
+        if self.max_depth_age_ms is not None and (
+                type(self.max_depth_age_ms) is not int or self.max_depth_age_ms <= 0):
+            raise ValueError("max_depth_age_ms must be a positive integer")
         for key in ("response_yaw_gain",):
             value = getattr(self, key)
             if value is None:
@@ -1079,7 +1087,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if not scan.ready:
                 command = scan.command(geometry, _keepout_m(config),
                                        _scan_yaw_rate(config), config.watchdog_ms,
-                                       config.max_obs_age_ms, min_yaw_rate=config.floor_wz,
+                                       config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
                                        now_ms=(odom or {}).get("control_ms"), tick_s=dt)
                 return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and (track is None or not track.observed):
@@ -1529,7 +1537,7 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (scan.motion, state.commanded)):
             return "原地搜索：等待平移或反向转动停稳"
-        horizon = (config.watchdog_ms + config.max_obs_age_ms + 50) / 1000
+        horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
         rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
         if not scan.clear_sweep(geometry, _keepout_m(config), direction * (rate + .10) * horizon,
                                 STILL_LINEAR * horizon):
@@ -1540,7 +1548,7 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
                 ahead is None or ahead < config.slow_distance_m)):
             state.recovery = ClearanceRecovery()
             return "近障停车，等待足够的深度观测"
-        if state.recovery.scale("turn", depth, config.max_obs_age_ms) <= 0:
+        if state.recovery.scale("turn", depth, config.depth_age_limit_ms) <= 0:
             return "近障停车，等待连续新深度确认可转向"
     return None
 
@@ -1566,7 +1574,7 @@ def _local_side_order(rooms, config, state, frame):
         state.side_better_frames = 0
     if type(frame) is int and frame != state.side_compare_frame:
         previous = state.side_compare_frame
-        if previous is None or not 0 < frame - previous <= config.max_obs_age_ms:
+        if previous is None or not 0 < frame - previous <= config.depth_age_limit_ms:
             state.side_better_frames = 0
         state.side_compare_frame = frame
         state.side_better_frames += int(better)
@@ -1630,7 +1638,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             measured_vx = motion[0]
         last_vx = state.commanded[0] if state is not None else 0.0
         speed = max(0.0, measured_vx or 0.0, last_vx)
-        stop = min(slow, stop + speed * config.max_obs_age_ms / 1000)
+        stop = min(slow, stop + speed * config.depth_age_limit_ms / 1000)
     near = ahead is not None and ahead <= stop
     approaching = ahead is not None and ahead < slow
     scale = trust
@@ -1706,7 +1714,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         and target_distance is not None and coverage >= config.coverage_full
                         and (state is None or state.recovery is None)
                         and brake_at < ahead < slow):
-                    horizon_s = (config.max_obs_age_ms + config.watchdog_ms + 50) / 1000
+                    horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
                     limit = (ahead - brake_at) / horizon_s
                     approach = min(vx * scale, config.vx_max, limit)
                     # Stay within the limit even when the gait has a speed floor.
@@ -1801,7 +1809,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待通道有足够余量"
         if route != state.recovery.route and not near:
             state.blocked_for_s = 0.0
-        gain = state.recovery.scale(route, depth, config.max_obs_age_ms)
+        gain = state.recovery.scale(route, depth, config.depth_age_limit_ms)
         if gain == 0:
             return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待连续新深度帧确认通道"
         if local_command is not None:
@@ -1838,7 +1846,7 @@ def _local_translation(depth, config, state, odom, ahead, side):
     if return_limit <= 0 or return_floor > return_limit:
         return None
     command = state.local_plan.translation(depth, geometry,
-                                           _keepout_m(config), ahead, side, config.max_obs_age_ms,
+                                           _keepout_m(config), ahead, side, config.depth_age_limit_ms,
                                            config.watchdog_ms,
                                            allow_forward=allow_forward,
                                            velocity_limits=limits)

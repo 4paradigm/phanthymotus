@@ -1790,11 +1790,12 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
-def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
+@pytest.mark.parametrize("depth_age_ms,depth_limit_ms", [(50, None), (700, 800)])
+def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms):
     import numpy as np
     from plugins.navi import local_path, policy
 
-    card = _card(confirm_hits=1)
+    card = _card(confirm_hits=1, max_depth_age_ms=depth_limit_ms)
     node = _FakeNode({_DEPTH_TOPIC: ["sensor_msgs/msg/CompressedImage"]})
     card._executor = object()
     card._open_publisher = lambda: setattr(card, "_node", node)
@@ -1804,7 +1805,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
     reply = card.dispatch("navi", {
         "action": "start", "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC, odom_topic],
         "control_interface": _descriptor(footprint={"half_width": 0.23},
-                                         rate={"max_hz": 20, "watchdog_ms": 600}),
+                                         rate={"max_hz": 20, "watchdog_ms": 600,
+                                               "max_obs_age_ms": 500}),
         "camera_info": {_DEPTH_TOPIC: declaration},
     })
     assert reply["state"] == "running"
@@ -1817,7 +1819,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
     card._objects_ms = 123_000
     card._depth_map = np.full((480, 640), 2.5, dtype=np.float32)
     card._depth_ground = np.zeros_like(card._depth_map, dtype=bool)
-    card._depth_ms = 122_950
+    depth_stamp = 123_000 - depth_age_ms
+    card._depth_ms = depth_stamp
     card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
     card._odom_ms = 123_000
     monkeypatch.setattr(
@@ -1827,7 +1830,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
     attempted = []
 
     def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300, **kwargs):
-        attempted.append((side, half_width, watchdog_ms))
+        attempted.append((side, half_width, max_age_ms, watchdog_ms))
         return local_path.Detour((.04, -.06), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
 
     monkeypatch.setattr(local_path, "_checked_translation", plan)
@@ -1835,8 +1838,9 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
     assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
-    assert attempted == [(-1.0, .33, 600), (1.0, .33, 600)]
-    assert command["obs_stamp_ms"] == 122_950
+    expected_limit = depth_limit_ms or 500
+    assert attempted == [(-1.0, .33, expected_limit, 600), (1.0, .33, expected_limit, 600)]
+    assert command["obs_stamp_ms"] == depth_stamp
     assert card._state.view_detour.points == ((0., 0.), (.2, .3))
     card._depth_ms = 0
     stop = card.next_command()
@@ -1844,7 +1848,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
     assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
     assert card._state.view_detour is None
     assert card.next_command() is None
-    card._depth_ms = 122_950
+    card._depth_ms = depth_stamp
     card._odom_ms = 0
     stop = card.next_command()
     assert stop["values"] == [0.0] * 6

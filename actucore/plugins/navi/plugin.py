@@ -1015,6 +1015,7 @@ class NaviPlugin:
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
                            "max_obs_age_ms": self._config.max_obs_age_ms,
+                           "max_depth_age_ms": self._config.depth_age_limit_ms,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -1511,7 +1512,7 @@ class NaviPlugin:
             self._depth_source_ms = capture_ms or None
             self._depth_capture_ms = (
                 capture_ms if capture_ms and self._depth_stamp_verified
-                and 0 <= received_ms - capture_ms <= self._config.max_obs_age_ms else None)
+                and 0 <= received_ms - capture_ms <= self._config.depth_age_limit_ms else None)
 
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
@@ -1558,9 +1559,10 @@ class NaviPlugin:
         """
         now = int(time.time() * 1000)
         max_age = self._config.max_obs_age_ms
+        depth_age = self._config.depth_age_limit_ms
         with self._obs_lock:
             objects = self._objects if now - self._objects_ms <= max_age else None
-            fresh_depth = now - self._depth_ms <= max_age
+            fresh_depth = now - self._depth_ms <= depth_age
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
                       "frame_id": self._depth_ms} if fresh_depth else None)
             if depth is not None and self._depth_ground is not None:
@@ -1569,7 +1571,7 @@ class NaviPlugin:
                 if self._depth_source_ms is not None:
                     depth["source_frame_id"] = self._depth_source_ms
                 capture = self._depth_capture_ms
-                if capture is not None and 0 <= now - capture <= max_age:
+                if capture is not None and 0 <= now - capture <= depth_age:
                     depth["capture_ms"] = capture
                 elif self._depth_stamp_verified and self._depth_source_ms is not None:
                     depth["capture_invalid"] = True

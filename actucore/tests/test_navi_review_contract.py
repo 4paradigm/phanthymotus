@@ -116,6 +116,43 @@ def test_visual_age_obeys_both_config_and_driver(monkeypatch, configured, declar
         card._stop()
 
 
+@pytest.mark.parametrize("receipt_age,capture_age,expected", [
+    (800, None, {}),
+    (801, None, None),
+    (0, 800, {"capture_ms": 122656}),
+    (0, 801, {"capture_invalid": True}),
+    (100, 800, {"capture_ms": 122656}),
+    (100, 801, {"capture_invalid": True}),
+])
+def test_depth_age_is_independent_of_other_observations(monkeypatch, receipt_age,
+                                                        capture_age, expected):
+    import numpy as np
+
+    now_ms = 123456
+    card = _card(max_depth_age_ms=800)
+    try:
+        start_card(card, rate={"max_hz": 20, "max_obs_age_ms": 500})
+        card._depth_stamp_verified = capture_age is not None
+        frame = np.full((12, 12), 2.0)
+        monkeypatch.setattr(time, "time", lambda: (now_ms - receipt_age) / 1000)
+        card._set_depth_map(frame, capture_ms=None if capture_age is None else now_ms - capture_age)
+
+        card._objects, card._objects_ms = {"objects": []}, now_ms - 501
+        card._odom, card._odom_ms = {"vx": 0.1}, now_ms - 501
+        monkeypatch.setattr(time, "time", lambda: now_ms / 1000)
+        objects, depth, odom = card.observation()
+        assert objects is None and odom is None
+        assert card._info()["config"]["max_obs_age_ms"] == 500
+        if expected is None:
+            assert depth is None
+        else:
+            assert depth["map"] is frame
+            assert {k: depth[k] for k in ("capture_ms", "capture_invalid") if k in depth} == expected
+        assert card._info()["config"]["max_depth_age_ms"] == 800
+    finally:
+        card._stop()
+
+
 def test_observation_budget_recovers_after_switching_driver():
     card = _card(max_obs_age_ms=1000)
     try:
