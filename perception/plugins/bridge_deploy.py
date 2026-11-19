@@ -56,7 +56,8 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
         raise ValueError('初始化需要至少 24 位访问令牌；升级请填写现有令牌')
 
     names = ['bridge_core.py', 'http_server.py', 'edge_backend.py', 'run_bridge.py',
-             'login_edge.py', 'bridge_watchdog.ps1', 'remote_start_bridge.ps1', 'config.example.json']
+             'login_edge.py', 'bridge_watchdog.ps1', 'remote_start_bridge.ps1',
+             'config.example.json', 'README.txt']
     offline = package_root / 'offline'
     manifest = json.loads((offline / 'manifest.json').read_text(encoding='utf-8'))
     if 'python-3.12.10-amd64.exe' not in manifest or not any(n.endswith('.whl') for n in manifest):

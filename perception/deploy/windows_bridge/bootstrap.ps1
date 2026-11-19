@@ -92,7 +92,7 @@ try {
 
     $backup = Join-Path $install ('backup-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $backup | Out-Null
-    $allowed = @('bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json')
+    $allowed = @('bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json','README.txt')
     foreach ($name in $allowed) {
         if (!$core.core_files.$name) { throw 'Incomplete package' }
         if (Test-Path (Join-Path $install $name)) { Copy-Item -LiteralPath (Join-Path $install $name) -Destination $backup }
@@ -115,6 +115,7 @@ try {
         }
 
         foreach ($name in $allowed) { [IO.File]::WriteAllBytes((Join-Path $install $name), [Convert]::FromBase64String($core.core_files.$name)) }
+        Copy-Item -LiteralPath (Join-Path $install 'README.txt') -Destination (Join-Path $root 'README.txt') -Force
         if (!(Test-Path $cfgPath)) {
             $cfg = Get-Content (Join-Path $install 'config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
             $cfg.shared_token = $token

@@ -27,7 +27,7 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.offline_package(root)
-            for name in ['bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json','bootstrap.ps1']:
+            for name in ['bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json','README.txt','bootstrap.ps1']:
                 (root / name).write_text('# package', encoding='utf-8')
             args = dict(bridge_url='http://192.168.1.2:8765', token='t'*32, remote_start_user='operator', remote_start_key_path='/secret/key')
             with patch.object(Path, 'is_file', return_value=True), patch.object(module.subprocess, 'run', return_value=CompletedProcess([], 0, b'UPLOAD_READY BRIDGE_BOOTSTRAP_OK', b'\xd5\xe2')) as run:
@@ -46,7 +46,7 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.offline_package(root)
-            for name in ['bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json','bootstrap.ps1']:
+            for name in ['bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json','README.txt','bootstrap.ps1']:
                 (root / name).write_text('', encoding='utf-8')
             with patch.object(Path, 'is_file', return_value=True), patch.object(module.subprocess, 'run', return_value=CompletedProcess([], 0, b'STARTED', b'\xd5\xe2')):
                 with self.assertRaises(RuntimeError):
@@ -56,7 +56,7 @@ class DeployTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.offline_package(root)
-            for name in ['bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json']:
+            for name in ['bridge_core.py','http_server.py','edge_backend.py','run_bridge.py','login_edge.py','bridge_watchdog.ps1','remote_start_bridge.ps1','config.example.json','README.txt']:
                 (root / name).write_text('')
             (root / 'offline' / 'test.whl').write_bytes(b'corrupt')
             with patch.object(Path, 'is_file', return_value=True), patch.object(module.subprocess, 'run') as run:
