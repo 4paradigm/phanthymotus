@@ -54,6 +54,7 @@ export const SkeletonRenderer = {
     this._heliosUpperBody = null;
     this._lastData = null;
     this._needsFit = true;
+    this._userViewChanged = false;
     this._mcpId = mcpId;
     this._joints = {};
     this._links = {};
@@ -90,6 +91,7 @@ export const SkeletonRenderer = {
     this._controls.target.set(0, 0.4, 0);
     this._controls.enableDamping = true;
     this._controls.dampingFactor = 0.1;
+    this._controls.addEventListener('start', () => { this._userViewChanged = true; });
     this._controls.update();
 
     // Lighting
@@ -636,6 +638,9 @@ export const SkeletonRenderer = {
     this._camera.aspect = w / h;
     this._camera.updateProjectionMatrix();
     this._threeRenderer.setSize(w, h);
+    // A wide initial fit is too close after narrowing the panel. Refit until
+    // the user takes control; later layout changes must preserve their view.
+    if (this._loaded && !this._userViewChanged) this._fitModel();
   },
 
   unmount() {

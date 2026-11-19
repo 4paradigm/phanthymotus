@@ -9,6 +9,8 @@ npm test
 
 Tests execute the actual canvas, detail-panel and renderer source in a JavaScript VM, with DOM/WebGL boundaries stubbed. Three.js and xmldom are development dependencies only; there is no frontend build step or new production dependency.
 
+`.github/workflows/helios-renderers.yml` runs this suite separately on relevant pull requests and pushes. It uses Three.js 0.164.1, matching the production page's 0.164 series. These Node tests are not counted as Python unit tests or silently substituted for them.
+
 Coverage:
 
 - Live and cached canvas detail paths preserve the real MCP ID, and model fetch uses that ID.

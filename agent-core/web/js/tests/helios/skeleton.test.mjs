@@ -121,6 +121,22 @@ for (const aspect of [0.5, 2]) {
   const camera = instance._camera.position.clone();
   instance.onData(new TextEncoder().encode(JSON.stringify({joints:joints.map(j=>({...j,q:j.q+0.01}))})).buffer);
   assert.ok(camera.equals(instance._camera.position), 'live updates must preserve user camera');
+  instance._el = {clientWidth:120, clientHeight:400};
+  instance._threeRenderer = {setSize(){}};
+  instance._resize();
+  instance._scene.updateMatrixWorld(true);
+  const resized = new THREE.Box3().setFromObject(instance._rootGroup);
+  for (const x of [resized.min.x,resized.max.x]) for (const y of [resized.min.y,resized.max.y]) for (const z of [resized.min.z,resized.max.z]) {
+    const point = new THREE.Vector3(x,y,z).project(instance._camera);
+    assert.ok(Math.abs(point.x)<1 && Math.abs(point.y)<1, 'resize keeps the complete model in frame');
+  }
+  instance._userViewChanged = true;
+  const manualView = instance._camera.position.clone();
+  const manualTarget = instance._controls.target.clone();
+  instance._el.clientWidth = 800;
+  instance._resize();
+  assert.ok(manualView.equals(instance._camera.position), 'resize preserves an interacted camera');
+  assert.ok(manualTarget.equals(instance._controls.target));
 }
 console.log('PASS: early joint frames replayed, full model fits narrow/wide cards, live frames preserve camera');
 

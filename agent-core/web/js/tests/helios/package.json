@@ -7,6 +7,6 @@
   },
   "devDependencies": {
     "@xmldom/xmldom": "0.9.12",
-    "three": "0.170.0"
+    "three": "0.164.1"
   }
 }
