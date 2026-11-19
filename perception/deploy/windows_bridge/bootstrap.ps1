@@ -25,16 +25,24 @@ try {
         if ($cfg.shared_token -cne $payload.token) { throw 'Existing token differs; use current token' }
         if ($cfg.port -ne 8765) { throw 'This installer requires bridge port 8765' }
     }
+    $assets = Join-Path $root 'offline'
+    New-Item -ItemType Directory -Force -Path $assets | Out-Null
+    if (!$payload.offline) { throw 'Offline package missing; rebuild robot image' }
+    foreach ($item in $payload.offline.PSObject.Properties) {
+        if ($item.Name -notmatch '^[A-Za-z0-9_.-]+\.(exe|whl)$') { throw 'Invalid asset name' }
+        $assetPath = Join-Path $assets $item.Name
+        [IO.File]::WriteAllBytes($assetPath, [Convert]::FromBase64String($item.Value.content))
+        if ((Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash -ne $item.Value.sha256) { throw 'Offline asset hash mismatch' }
+    }
+    Add-Content -LiteralPath $log -Value 'Offline package verified; preparing Python'
     $python = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
     if (!(Test-Path $python)) {
         $python = Join-Path $root 'Python312\python.exe'
         if (!(Test-Path $python)) {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $exe = Join-Path $root 'python-installer.exe'
-            Invoke-WebRequest 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' -OutFile $exe -UseBasicParsing
+            $exe = Join-Path $assets 'python-3.12.10-amd64.exe'
             $signature = Get-AuthenticodeSignature -LiteralPath $exe
             if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Python Software Foundation') { throw 'Python installer signature invalid' }
-            $process = Start-Process -FilePath $exe -ArgumentList @('/quiet','InstallAllUsers=0',('TargetDir="' + (Join-Path $root 'Python312') + '"'),'Include_test=0','PrependPath=0') -Wait -PassThru -WindowStyle Hidden
+            $process = Start-Process -FilePath $exe -ArgumentList @('/quiet','InstallAllUsers=0',('TargetDir="' + (Join-Path $root 'Python312') + '"'),'Include_test=0','Include_launcher=0','Include_symbols=0','Include_debug=0','PrependPath=0') -Wait -PassThru -WindowStyle Hidden
             if ($process.ExitCode -notin @(0,3010)) { throw 'Python installation failed' }
         }
     }
@@ -44,7 +52,8 @@ try {
         if ($LASTEXITCODE) { throw 'venv creation failed' }
     }
     $python = Join-Path $venv 'Scripts\python.exe'
-    & $python -m pip install 'playwright>=1.48,<2' >> $log 2>&1
+    Add-Content -LiteralPath $log -Value 'Installing dependencies from local wheels (no internet download)'
+    & $python -m pip --isolated install --no-index --no-cache-dir --disable-pip-version-check --find-links $assets 'playwright==1.51.0' 'greenlet==3.1.1' 'pyee==12.1.1' 'typing_extensions==4.12.2' >> $log 2>&1
     if ($LASTEXITCODE) { throw 'Dependency installation failed' }
     $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ }
     if (!$edge) { throw 'Install Microsoft Edge before initialization' }

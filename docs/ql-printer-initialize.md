@@ -13,7 +13,10 @@ Existing task WorkingDirectory is honored; new installs use ProgramData/Paradigm
 After success refresh printers, select a printer and SAVE the settings.
 
 Prerequisites: Windows x64, enabled SSH, administrator key access, verified host key, Microsoft Edge,
-and network access to python.org/PyPI for missing dependencies. The desktop task user must remain logged in.
+and a robot image containing the offline Python installer and Windows wheels. Downloads from
+python.org/PyPI happen at image build time; frontdesk pip uses --no-index. Transferred assets
+are SHA256-checked and the Python installer signature is verified before execution.
+The desktop task user must remain logged in.
 Install printer drivers and sign into the visitor website separately. This is not a universal website adapter.
 Bootstrap logs are under ProgramData/ParadigmVisitorBridge/bootstrap.log. A successful initialization
 checks the HTTP service, not website login or physical printing. Test list and a controlled print afterward.

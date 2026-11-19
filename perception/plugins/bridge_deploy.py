@@ -1,6 +1,7 @@
 """Explicit administrator-SSH provisioning; never used by list/print."""
 import base64
 import json
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -28,6 +29,18 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     names = ['bridge_core.py', 'http_server.py', 'edge_backend.py', 'run_bridge.py',
              'login_edge.py', 'bridge_watchdog.ps1', 'remote_start_bridge.ps1', 'config.example.json']
     data = {'token': token, 'files': {n: base64.b64encode((package_root / n).read_bytes()).decode() for n in names}}
+    offline = package_root / 'offline'
+    manifest = json.loads((offline / 'manifest.json').read_text(encoding='utf-8'))
+    if 'python-3.12.10-amd64.exe' not in manifest or not any(n.endswith('.whl') for n in manifest):
+        raise ValueError('镜像缺少完整离线安装包，请重新构建 perception')
+    data['offline'] = {}
+    for name, digest in manifest.items():
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+\.(exe|whl)', name):
+            raise ValueError('Invalid offline asset name')
+        content = (offline / name).read_bytes()
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise ValueError('离线安装包校验失败')
+        data['offline'][name] = {'sha256': digest, 'content': base64.b64encode(content).decode('ascii')}
     script = (package_root / 'bootstrap.ps1').read_text(encoding='utf-8-sig')
     payload = json.dumps({'script': script, 'data': data})
     loader = "$ErrorActionPreference='Stop'; $p=[Console]::In.ReadToEnd() | ConvertFrom-Json; & ([ScriptBlock]::Create($p.script)) $p.data"
