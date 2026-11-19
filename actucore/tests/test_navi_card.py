@@ -1836,6 +1836,32 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
+def test_only_the_declared_half_width_is_needed_for_wheeled_geometry():
+    card = _card()
+    node = _FakeNode({_DEPTH_TOPIC: ["sensor_msgs/msg/CompressedImage"]})
+    card._executor = object()
+    card._open_publisher = lambda: setattr(card, "_node", node)
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
+    result = card.dispatch("navi", {
+        "action": "start",
+        "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC, "/demo/state/odom"],
+        "control_interface": _descriptor(footprint={"half_width": .275}, limits={
+            "lower": [-.3, 0., 0., 0., 0., -1.],
+            "upper": [.3, 0., 0., 0., 0., 1.],
+        }),
+        "camera_info": {_DEPTH_TOPIC: declaration},
+    })
+    try:
+        assert result["state"] == "running"
+        geometry = card._config.doorway_geometry
+        assert geometry.front == geometry.rear == card._config.half_width_m == .275
+        assert geometry.height is None
+        assert geometry.strict_occupancy
+    finally:
+        card._stop()
+
+
 @pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl",
                          [(50, None, True, 600, 400), (700, 800, True, 250, 250),
                           (50, None, False, 600, 400)])

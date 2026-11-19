@@ -47,7 +47,7 @@ def test_stops_before_turning_then_waits_for_fresh_post_turn_corridor():
         pose = PlanarPose(stamp, ("odom", "body"), x, 0., yaw)
         scan.current_frame = capture
         scan.views = [(capture,)]
-        scan.pose_origin = pose
+        scan.sweep_pose = lambda _: pose
         odom = dict(stamp_ms=stamp, door_pose=pose, vx=vx, vy=0., wz=0.)
         return door.step(odom, scan, geometry, config, 1.30, 3.0)[:2]
 
@@ -65,8 +65,9 @@ def test_stops_before_turning_then_waits_for_fresh_post_turn_corridor():
     occupied[:] = False
     vx, yaw = tick(1720, yaw=door.heading)
     assert vx > 0. and yaw == 0.
-    scan.receipt_only = True
-    assert tick(1750, yaw=door.heading) == (0., 0.)
+    scan.current_frame = 0
+    scan.sweep_pose = lambda _: None
+    assert door.step(dict(vx=0., vy=0., wz=0.), scan, geometry, config, 1.30, 3.0)[:2] == (0., 0.)
 
 
 def test_small_turn_uses_aligned_depth_with_staggered_feedback(monkeypatch):
@@ -130,7 +131,7 @@ def test_wheeled_observation_can_turn_before_the_forward_corridor_is_visible(rea
         pose = PlanarPose(stamp, ("odom", "base_link"), 0., 0., yaw)
         scan.current_frame = stamp
         scan.views = [(stamp,)]
-        scan.pose_origin = pose
+        scan.sweep_pose = lambda _: pose
         odom = dict(stamp_ms=stamp, door_pose=pose, vx=0., vy=0., wz=0.)
         return door.step(odom, scan, geometry, config, 1.30, 3.0)[:2]
 

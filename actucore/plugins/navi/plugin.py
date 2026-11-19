@@ -548,19 +548,12 @@ class NaviPlugin:
             # motion already budgets the full downstream watchdog interval.
             self._ttl_ms = negotiate.ttl_ms(rate, descriptor, periods=4.)
         self._config.odom_expected = bool(binding.get("odom"))
-        wheeled_footprint = (self._config.local_planning and valid_width
-                             and footprint.get("source") == "measured"
-                             and self._config.vy_max == 0.)
-        half_length, height = footprint.get("half_length"), footprint.get("height")
-        if (wheeled_footprint and self._config.scan_geometry is not None
-                and self._depth_stamp_verified and depth_vendor.get("accuracy_validated") is True
-                and self._config.floor_vx == 0. and self._config.floor_wz == 0.
-                and all(type(value) in (int, float) and math.isfinite(value) and value > 0.
-                        for value in (half_length, height))):
-            self._config.doorway_geometry = replace(self._config.scan_geometry, height=height,
-                                                    strict_occupancy=True)
-        elif wheeled_footprint:
-            self._camera_notes.append("门口对中需要实测车长、车高、校验后的相机到车体外参和可信采集时间")
+        if self._config.local_geometry is not None and self._config.vy_max == 0.:
+            geometry = self._config.scan_geometry or self._config.local_geometry
+            height = footprint.get("height")
+            if not (type(height) in (int, float) and math.isfinite(height) and height > 0.):
+                height = None
+            self._config.doorway_geometry = replace(geometry, height=height, strict_occupancy=True)
 
         if self._config.local_planning and self._config.local_geometry is None:
             self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
@@ -1691,8 +1684,7 @@ class NaviPlugin:
             obs_ms = min(obs_ms, depth.get("capture_ms") or scan.single_depth_ms or depth["frame_id"])
             motion_pose = (odom or {}).get("motion_pose")
             if doorway_guarded and self._state.doorway is not None:
-                motion_pose = (odom or {}).get("door_pose")
-                obs_ms = min(obs_ms, self._state.doorway.evidence_ms)
+                obs_ms = min(obs_ms, self._state.doorway.evidence_ms, scan.poses[-1][0])
             if motion_pose is not None:
                 obs_ms = min(obs_ms, motion_pose.stamp_ms)
             if (scan_guarded or checked_search) and odom is not None:

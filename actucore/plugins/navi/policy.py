@@ -1186,20 +1186,18 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
         scan = state.active_scan
         was_scanning = scan.active
-        body_geometry = config.scan_geometry
+        body_geometry = config.doorway_geometry or config.scan_geometry
         scan_odom = odom
         pose = (odom or {}).get("door_pose")
-        if state.doorway is not None or (track is None and pose is not None):
-            body_geometry = config.doorway_geometry
-            if pose is not None:
-                scan_odom = dict(odom, motion_pose=pose, pose_feedback_since_ms=pose.stamp_ms)
-        can_align = (body_geometry is not None and (depth or {}).get("capture_ms")
+        if config.doorway_geometry is not None and pose is not None:
+            scan_odom = dict(odom, motion_pose=pose, pose_feedback_since_ms=pose.stamp_ms)
+        can_align = (config.scan_geometry is not None and (depth or {}).get("capture_ms")
                      and (odom or {}).get("stamp_ms"))
         receipt_only = scan.receipt_only if was_scanning or scan.result_frame else not can_align
         geometry = (body_geometry or config.local_geometry) if receipt_only else body_geometry
         scan_depth = depth if detections is not None and not (depth or {}).get("capture_invalid") else None
         if source == "command":
-            geometry = config.scan_geometry or config.local_geometry
+            geometry = body_geometry or config.local_geometry
             update = scan.observe_single(scan_depth, geometry, config.depth_age_limit_ms,
                                          (depth or {}).get("control_ms", frame))
             depth = (dict(depth, frame_id=scan.single_depth_ms) if scan.single_depth_ms else None)
@@ -1268,7 +1266,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if state.doorway is not None:
             _, _, reason = state.doorway.interrupt("门口停车：等待目标重新出现")
             return Decision(_twist(0., 0., 0.), AVOIDING, reason)
-        reason = _search_turn_stop(depth, config, state, odom)
+        reason = _search_turn_stop(depth, config, state)
         if reason is not None:
             return Decision(_twist(0, 0, 0), AVOIDING, reason)
         return _search(config, state, dt, odom)
@@ -1692,7 +1690,7 @@ def _near_wheeled_search(config: Config, state: State) -> bool:
             and state.last_clearance <= config.obstacle_stop_m)
 
 
-def _search_turn_stop(depth, config: Config, state: State, odom=None) -> str | None:
+def _search_turn_stop(depth, config: Config, state: State) -> str | None:
     """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
     state.last_clearance, state.last_coverage = ahead, coverage
@@ -1708,12 +1706,8 @@ def _search_turn_stop(depth, config: Config, state: State, odom=None) -> str | N
         yaw_rate = config.search_rate
         if verify_sweep:
             geometry = config.doorway_geometry
-            pose = (odom or {}).get("door_pose")
             yaw_rate = min(yaw_rate, OBSERVED_TURN_RATE)
-            if (geometry is None or pose is None or scan.receipt_only or command_only
-                    or scan.pose_origin is None or scan.pose_origin.frame != pose.frame
-                    or not 0 < scan.current_frame <= pose.stamp_ms
-                    or pose.stamp_ms - scan.current_frame >= config.depth_age_limit_ms
+            if (geometry is None or scan.sweep_pose(config.depth_age_limit_ms) is None
                     or yaw_rate < config.floor_wz):
                 return "原地搜索，等待可验证的转向扫掠区"
 
@@ -1884,8 +1878,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
         if (state is not None and config.doorway_geometry is not None and foreground and approaching
-                and may_scan and depth.get("ground") is not None and depth.get("capture_ms") is not None
-                and (odom or {}).get("door_pose") is not None and measured_target is not None
+                and may_scan and depth.get("ground") is not None and measured_target is not None
                 and ahead + FORWARD_CLEARANCE_MARGIN_M < measured_target):
             state.doorway = Doorway(ahead, observe_side=_observed_open_side(rooms, config))
             state.active_scan.invalidate()
@@ -1910,6 +1903,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 planning_depth = dict(planning_depth, scan_grid=scan.grid(),
                                       scan_revision=scan.poses[-1][0])
             elif (scan is not None and scan.receipt_only and scan.views
+                  and config.doorway_geometry is None
                   and (config.scan_geometry or config.local_geometry) is config.local_geometry
                   and scan.current_frame == depth.get("frame_id")):
                 planning_depth["project_scan_view"] = scan.grid

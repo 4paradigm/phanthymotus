@@ -83,15 +83,12 @@ class Doorway:
     def step(self, odom, scan, geometry, config, ahead, target_distance):
         self.evidence_ms = 0
         odom = odom or {}
-        pose = odom.get("door_pose")
+        pose = scan.sweep_pose(config.depth_age_limit_ms)
         motion = planar_feedback(odom)
         capture = scan.current_frame
-        if (geometry is None or pose is None or motion is None or scan.receipt_only
-                or scan.pose_origin is None or scan.pose_origin.frame != pose.frame
-                or (self.origin is not None and pose.frame != self.origin.frame)
-                or not 0 < capture <= pose.stamp_ms
-                or pose.stamp_ms - capture >= config.depth_age_limit_ms):
-            return self.interrupt("门口停车：缺少可信的车体几何、位姿或同步深度")
+        if (geometry is None or pose is None or motion is None
+                or (self.origin is not None and pose.frame != self.origin.frame)):
+            return self.interrupt("门口停车，等待新鲜深度和连续的运动反馈")
         if self.last_stamp and not 0 <= pose.stamp_ms - self.last_stamp <= ODOM_GAP_MS:
             self.last_stamp = pose.stamp_ms
             return self.interrupt("门口停车：里程计不连续")
@@ -127,7 +124,9 @@ class Doorway:
             elif self.stopped_since is None:
                 self.stopped_since = pose.stamp_ms
             after_stop = (self.stopped_since or pose.stamp_ms) + STOP_DWELL_MS
-            if capture <= after_stop:
+            if scan.receipt_only:
+                after_stop += config.depth_age_limit_ms
+            if min(capture, pose.stamp_ms) <= after_stop:
                 return 0., 0., "门口停车：等待停稳后的新深度"
             if self.phase == "brake":
                 still_blocked = ahead is not None and ahead < config.slow_distance_m

@@ -63,6 +63,7 @@ class ActiveScan:
     source_frame: int | None = None
     odom_source: int | None = None
     pose_origin: PlanarPose | None = None
+    pose_epoch: object = field(default_factory=object)
     pose_feedback_since_ms: int = 0
     turn_stop_ms: int | None = None
     turn_until_ms: int = 0
@@ -230,6 +231,19 @@ class ActiveScan:
         self.single_depth_ms = frame
         self.single_capture_ms = depth.get("capture_ms")
         return self._update_latest(dict(depth, frame_id=frame), geometry, now_ms, max_depth_age_ms)
+
+    def sweep_pose(self, max_depth_age_ms):
+        """Use observed motion with a fresh view, in this scan's continuous local frame."""
+        if self.command_only or not self.poses or not self.current_frame:
+            return None
+        stamp, (forward, right, heading), yaw_rate = self.poses[-1]
+        age = stamp - self.current_frame
+        if self.receipt_only:
+            if abs(yaw_rate) > STILL_YAW or abs(age) >= max_depth_age_ms:
+                return None
+        elif not 0 <= age < max_depth_age_ms:
+            return None
+        return PlanarPose(stamp, (self.pose_epoch,), forward, -right, -heading)
 
     def _pose_at(self, stamp):
         for index, (upper_time, upper, upper_yaw_rate) in enumerate(self.poses):
@@ -539,6 +553,7 @@ class ActiveScan:
         self.views.clear()
         self.pose = (0., 0., 0.)
         self.pose_origin = None
+        self.pose_epoch = object()
         self.pose_feedback_since_ms = 0
         self.turn_stop_ms = None
         return self.interrupt()

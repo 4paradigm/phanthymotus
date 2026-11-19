@@ -1634,7 +1634,7 @@ def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, sta
 
 
 @pytest.mark.parametrize("scene", [
-    "clear_sweep", "occupied", "unknown", "unregistered", "expired", "translating",
+    "clear_sweep", "receipt_only", "occupied", "unknown", "unregistered", "expired", "translating",
 ])
 def test_wheeled_near_search_requires_clear_sweep_and_commands_only_yaw(monkeypatch, scene):
     from plugins.navi import active_scan, local_path
@@ -1659,9 +1659,12 @@ def test_wheeled_near_search_requires_clear_sweep_and_commands_only_yaw(monkeypa
     depth = {"map": frame, "ground": frame.astype(bool), "frame_id": 1000, "capture_ms": 1000}
     stamp = 1000 + cfg.depth_age_limit_ms if scene == "expired" else 1000
     pose = PlanarPose(stamp, ("odom", "base_link"), 0., 0., 0.)
-    odom = dict(vx=.10 if scene == "translating" else 0., vy=0., wz=0., stamp_ms=stamp)
-    if scene != "unregistered":
-        odom["door_pose"] = pose
+    odom = dict(vx=.10 if scene == "translating" else 0., vy=0., wz=0.)
+    if scene == "receipt_only":
+        depth.pop("capture_ms")
+        odom["received_ms"] = stamp
+    elif scene != "unregistered":
+        odom.update(stamp_ms=stamp, door_pose=pose)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.43, .95))
     monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
 
@@ -1669,12 +1672,56 @@ def test_wheeled_near_search_requires_clear_sweep_and_commands_only_yaw(monkeypa
                       config=cfg, state=state, dt=.1)
 
     assert decision.values[:5] == [0.] * 5
-    if scene == "clear_sweep":
+    if scene in ("clear_sweep", "receipt_only"):
         assert decision.status == P.SEARCHING
         assert 0. < abs(decision.values[5]) < cfg.search_rate
     else:
         assert decision.status == P.AVOIDING
         assert decision.values[5] == 0.
+
+
+def test_wheeled_avoidance_can_observe_using_only_recent_twist_and_depth(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None, True)
+    config = _cfg(local_planning=True, local_geometry=geometry, doorway_geometry=geometry,
+                  use_lateral=False, vy_max=0., half_width_m=.275)
+    state = _state(motion_source="measured")
+    track = SimpleNamespace(bearing_rad=0., range_m=3., range_known=True,
+                            observed=True, measured_range_m=3.)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(P, "_clearance", lambda *args, lateral_offset_m=0.:
+                        (1.80 if lateral_offset_m < 0. else 1.30, .99))
+    free = local_path.FORWARD < .65
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, np.zeros_like(free)))
+    frame = np.ones((4, 4))
+    ground = frame.astype(bool)
+    yaws = [0.]
+    settled_at = None
+    for stamp in range(1000, 27000, 100):
+        if state.doorway is not None and state.doorway.phase == "settle" and settled_at is None:
+            settled_at = stamp
+        verified_view = settled_at is not None and stamp - settled_at > 800
+        if verified_view:
+            free[:] = True
+        depth = dict(map=frame, ground=ground, frame_id=stamp, control_ms=stamp)
+        feedback = dict(vx=0., vy=0., wz=yaws[-1], received_ms=stamp)
+        decision = P.step(detections=_detections(), depth=depth, odom=feedback,
+                          config=config, state=state, dt=.1)
+        vx, yaw = decision.values[0], decision.values[5]
+        assert decision.values[1:5] == [0.] * 4
+        if vx:
+            assert verified_view and yaw == 0.
+            break
+        yaws.append(yaw)
+    else:
+        pytest.fail("The fresh forward view did not release the crossing")
+    assert state.active_scan.receipt_only
+    assert yaws[1:9] == [0.] * 8
+    assert max(yaws) > 0.
 
 
 @pytest.mark.parametrize(("left_coverage", "turns_left"), [(.516, True), (.1, False)])
