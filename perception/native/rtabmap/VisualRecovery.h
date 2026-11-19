@@ -166,37 +166,38 @@ public:
         if(images || external.isNull()) initialVisualToNative_.setNull();
         missing_=external.isNull();
         int reacquired=0;
-        if(!localizationMode_ && !continuousExternal && !waitForChassis && waiting_ && visualAlignment_ &&
+        if(!localizationMode_ && visualAlignment_ &&
            (visualLossStamp_>0. || (images && !tracked)))
         {
             const auto &anchor=*visualAlignment_;
             const double age=data.stamp()-anchor.stamp;
             const bool sameSequence=age>0. && age<=2. && framesBefore==anchor.frames &&
                 estimator_->framesProcessed()==framesBefore+(tracked?1u:0u);
-            aligned_=false;
-            if(sameSequence && !tracked && external.isNull())
+            if(waiting_ && !continuousExternal) aligned_=false;
+            if(sameSequence && !tracked)
             {
-                // Keep the old alignment as evidence only. The failed frame
-                // must not create a pose, an edge, or enter localization mode.
+                // Keep the old landmarks while independently testing other recovery sources.
                 visualLossStamp_=data.stamp();
-                state_=Searching; odom_.setNull(); return false;
-            }
-            visualLossStamp_=0.;
-            if(sameSequence && tracked && cv::checkRange(visual.dataMatrix()) &&
-               plausibleMotion(anchor.visual.inverse()*visual,age))
-                reacquired=countOldVisualInliers(info,anchor.landmarks);
-            if(reacquired>=minInliers_)
-            {
-                lastVisual_=anchor.visual; lastNative_=anchor.native;
-                visualToNative_=lastNative_*lastVisual_.inverse();
-                aligned_=true;
-                externalGraceStart_=0.;
             }
             else
-                visualAlignment_.reset();
+            {
+                visualLossStamp_=0.;
+                if(waiting_ && !continuousExternal && sameSequence && tracked && cv::checkRange(visual.dataMatrix()) &&
+                   plausibleMotion(anchor.visual.inverse()*visual,age))
+                    reacquired=countOldVisualInliers(info,anchor.landmarks);
+                if(reacquired>=minInliers_)
+                {
+                    visualToNative_=anchor.native*anchor.visual.inverse();
+                    aligned_=true;
+                    externalGraceStart_=0.;
+                }
+                else
+                    visualAlignment_.reset();
+            }
         }
+        const bool recoveredVisual=reacquired>=minInliers_;
         std::map<std::string,float> reacquisitionStats;
-        if(reacquired>=minInliers_)
+        if(recoveredVisual)
         {
             reacquisitionStats=statistics;
             reacquisitionStats["Motus/VisualReacquiredInliers/"]=static_cast<float>(reacquired);
@@ -212,7 +213,7 @@ public:
             // A localization is not a motion estimate for a later observation.
             aligned_=false;
         }
-        if(waiting_ && aligned_ && !external.isNull() && tracked)
+        if(waiting_ && aligned_ && !external.isNull() && tracked && !recoveredVisual)
         {
             externalToNative_=visualToNative_*visual*external.inverse();
             waiting_=false;
@@ -241,8 +242,9 @@ public:
         externalGraceStart_=0.;
         if(external.isNull())
             retryExternalNeighbor_=false;
-        const bool verifiedRetry=waiting_ && !external.isNull() && (withinGrace || retryExternalNeighbor_) &&
-            verifiesNeighbor(externalToNative_*external,withinGrace);
+        const bool verifiedRetry=waiting_ && !continuousExternal && !recoveredVisual && !external.isNull() &&
+            (withinGrace || retryExternalNeighbor_ || visualLossStamp_>0.) &&
+            verifiesNeighbor(externalToNative_*external,withinGrace || visualLossStamp_>0.);
         if(verifiedRetry || continuousExternal)
             waiting_=false;
         if(!waiting_ && !external.isNull())
@@ -303,6 +305,7 @@ public:
                     accepted=map.process(data,odom_,motionCovariance,velocity,stats);
                 }
                 else accepted=map.process(data,odom_,covariance,velocity,acceptedStats);
+                if(accepted) visualLossStamp_=0.;
                 if(accepted && tracked) rememberVisualAlignment(data.stamp(),visual,info);
                 // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
                 // Only a later tracked frame may use this measured anchor during external loss.
@@ -347,13 +350,17 @@ public:
                 motionCovariance.at<double>(i,i)=std::max(motionCovariance.at<double>(i,i),
                     i<3?positionVariance:angleVariance);
             const bool accepted=map.process(data,odom_,motionCovariance,std::vector<float>(),acceptedStats);
-            if(accepted) rememberVisualAlignment(data.stamp(),visual,info);
+            if(accepted)
+            {
+                retryExternalNeighbor_=false;
+                rememberVisualAlignment(data.stamp(),visual,info);
+            }
             return accepted;
         }
         state_=Searching; odom_.setNull();
         // A short absence does not revoke the last independently witnessed
         // chassis run. Only a new measured pose carrying that same run may resume it.
-        if(!images || waitForChassis) return false;
+        if(!images || waitForChassis || visualLossStamp_>0.) return false;
         retryExternalNeighbor_=false;
         if(!localizationMode_)
         {

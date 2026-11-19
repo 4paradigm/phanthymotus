@@ -44,10 +44,17 @@ int main(int argc, char **argv)
         mode=="external_continuity_untagged" || mode=="external_continuity_stale";
     const bool stationaryAnchor=mode=="stationary_visual_anchor";
     const bool refreshAnchor=mode=="refresh_visual_anchor";
+    const bool visualDuringChassisWait=mode=="vo_reacquire_chassis_wait";
+    const bool visualAfterNeighborFailure=mode=="vo_reacquire_neighbor_retry";
+    const bool externalDuringVisualLoss=mode=="vo_reacquire_unverified_external";
+    const bool disagreeingNeighborRetry=mode=="vo_reacquire_disagreeing_neighbor";
+    const bool crossedRecovery=visualDuringChassisWait || visualAfterNeighborFailure ||
+        externalDuringVisualLoss || disagreeingNeighborRetry;
+    const int reacquisitionFrame=externalDuringVisualLoss || disagreeingNeighborRetry?5:4;
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
         mode=="scan_mask" || imuPrediction || voHandoff || firstVisualSeed || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
         mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm" ||
-        rejectedColdQuery || delayedExternal || neighborRetry || externalContinuity || continuityVisual || stationaryAnchor || refreshAnchor;
+        rejectedColdQuery || delayedExternal || neighborRetry || externalContinuity || continuityVisual || stationaryAnchor || refreshAnchor || crossedRecovery;
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
     p["Reg/Strategy"]="1"; p["Icp/Strategy"]="0"; p["Optimizer/Strategy"]="0";
@@ -94,7 +101,7 @@ int main(int argc, char **argv)
     {
         if(mode!="recovery" && mode!="recovery_gap" && mode!="recovery_event" && mode!="resume" && !hasPose) break;
         if(phase=="depth_gap") continue; // Source interruption: no metric observation.
-        const int sourceFrame=stationaryAnchor?0:(refreshAnchor && i>=3?2:i);
+        const int sourceFrame=stationaryAnchor?0:((refreshAnchor && i>=3) || (disagreeingNeighborRetry && i==4)?2:i);
         if(stationaryAnchor) externalX=truthX=0.f;
         if(refreshAnchor && i>=3) { externalX=previousExternalX; truthX=previousTruthX; }
         cv::Mat rgb=cv::imread(root+"/"+std::to_string(sourceFrame)+".jpg");
@@ -118,6 +125,8 @@ int main(int argc, char **argv)
         }
         if(firstVisualSeed && i>0) hasPose=0;
         if(failedVisualSeed && i==0) rgb.setTo(cv::Scalar::all(0));
+        const bool crossedLoss=crossedRecovery && i>=3 && i<reacquisitionFrame;
+        if(crossedLoss) rgb.setTo(cv::Scalar::all(0));
         const bool outage=continuityOutage && i==1;
         if(outage && mode=="external_continuity_outage_rgb") rgb.setTo(cv::Scalar::all(0));
         const bool unpaired=mode=="fallback_unpaired" && i==1;
@@ -153,8 +162,9 @@ int main(int argc, char **argv)
         // Processed scan cadence can be sparser than the measured chassis stream.
         const double skippedTime=externalContinuity && i>0?(mode=="external_continuity_stale"?5.1:2.1):0.;
         const double outageTime=continuityOutage?(i==2 && mode=="external_continuity_outage_stale"?4.:0.):skippedTime;
-        const double stamp=regressedVisualCapture && i==7?6.5:
-            i+1.+outageTime+(mode=="vo_reacquire_expired" && i>=7?2.:0.);
+        const double stamp=crossedRecovery?1.+i*.5:regressedVisualCapture && i==7?6.5:
+            i+1.+outageTime+(mode=="vo_reacquire_expired" && i>=7?2.:0.)+
+            (mode=="fallback_lost" && i==3?.5:0.); // F2M can track after the old map alignment expires.
         rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,stamp);
         if(externalContinuity && i>0)
             for(int j=0;j<count;++j) scan.at<cv::Vec3f>(0,j)[0]+=20.f; // No scan overlap with the anchor.
@@ -190,6 +200,28 @@ int main(int argc, char **argv)
             data.setUserData(rtabmap::compressData2(hint),true);
             ext.setNull();
         }
+        if(visualDuringChassisWait && i<3)
+        {
+            cv::Mat payload(1,24,CV_8UC1,cv::Scalar::all(1));
+            std::memcpy(payload.data,"MOTUSOD1",8);
+            data.setUserData(rtabmap::compressData2(payload),true);
+        }
+        if(crossedRecovery && i>=3)
+        {
+            if((visualAfterNeighborFailure && i<=reacquisitionFrame) || (externalDuringVisualLoss && i==4) ||
+               (disagreeingNeighborRetry && i==3))
+                ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
+            else ext.setNull();
+        }
+        if(disagreeingNeighborRetry && i==4)
+        {
+            const auto *anchor=map.getMemory()->getLastWorkingSignature();
+            const auto displaced=rtabmap::Transform(0,.16f,0,0,0,0);
+            ext=anchor->getPose()*displaced;
+            const auto measured=rtabmap::RegistrationIcp(p).computeTransformation(anchor->sensorData(),data,displaced);
+            if(measured.isNull() || (displaced.inverse()*measured).getNorm()<=.1)
+                throw std::runtime_error("fixture must produce valid ICP that disagrees with the external pose");
+        }
         const auto nodesBefore=map.getLocalOptimizedPoses().size();
         if(visualLost) beforeVisualFailure=map.getLocalOptimizedPoses();
         auto started=std::chrono::steady_clock::now();
@@ -222,7 +254,7 @@ int main(int argc, char **argv)
                  <<",\"recovery_inliers\":"<<recovery.recoveryInliers()
                  <<",\"visual_reacquired_inliers\":"<<stat("Motus/VisualReacquiredInliers/")
                  <<",\"visual_inliers\":"<<recovery.visualInliers()<<",\"nodes\":"<<map.getLocalOptimizedPoses().size()
-                 <<",\"visual_fault\":"<<visualFault<<",\"images\":"<<!noImages
+                 <<",\"visual_fault\":"<<(visualFault || crossedLoss)<<",\"images\":"<<!noImages
                  <<",\"hypothesis\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_id())
                  <<",\"hypothesis_value\":"<<stat(rtabmap::Statistics::kLoopHighest_hypothesis_value())
                  <<",\"rejected\":"<<stat(rtabmap::Statistics::kLoopRejectedHypothesis())
@@ -232,6 +264,29 @@ int main(int argc, char **argv)
                  <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
+        if(crossedLoss && (accepted || recovery.state()!=motus::VisualRecovery::Searching ||
+           !recovery.odom().isNull() || recovery.visualInliers()!=0 ||
+           map.getLocalOptimizedPoses().size()!=nodesBefore || !map.getMemory()->isIncremental()))
+            throw std::runtime_error("failed visual recovery must preserve the active graph without emitting a pose");
+        if(crossedRecovery && i>=reacquisitionFrame)
+        {
+            const bool reacquiring=i==reacquisitionFrame;
+            if(!accepted || recovery.state()!=motus::VisualRecovery::VisualTracking ||
+               recovery.odom().isNull() || std::abs(recovery.odom().x()-(truthX+.024f))>.05f ||
+               recovery.relocalizations()!=0 ||
+               (reacquiring ? stat("Motus/VisualReacquiredInliers/")<20.f : stat("Motus/VisualReacquiredInliers/")!=0.f) ||
+               stat("Motus/MeasuredExternalContinuity/")!=0.f ||
+               map.getLocalOptimizedPoses().size()!=nodesBefore+1 || !map.getMemory()->isIncremental())
+                throw std::runtime_error(mode+": recovery and following frame must extend the old graph with independently verified visual geometry");
+            const auto *signature=map.getMemory()->getLastWorkingSignature();
+            const auto link=std::find_if(signature->getLinks().begin(),signature->getLinks().end(),[](const auto & edge) {
+                return edge.second.type()==rtabmap::Link::kNeighbor;
+            });
+            if(link==signature->getLinks().end() || link->second.transVariance()<.000399 ||
+               link->second.rotVariance()<.000304 || !map.getLocalOptimizedPoses().count(1))
+                throw std::runtime_error("recovered visual pose must preserve the graph anchor and carry visual motion uncertainty");
+            if(!reacquiring) break;
+        }
         if(refreshAnchor && i==3)
         {
             const auto *last=map.getMemory()->getLastWorkingSignature();
@@ -537,9 +592,10 @@ int main(int argc, char **argv)
         {
             if(mode=="fallback_lost")
             {
-                if(recovery.state()!=motus::VisualRecovery::Searching &&
-                   recovery.state()!=motus::VisualRecovery::Localized)
-                    throw std::runtime_error("real visual failure requires global verification before binding an external origin");
+                if(recovery.visualInliers()<20 || stat("Motus/VisualReacquiredInliers/")!=0.f ||
+                   (recovery.state()!=motus::VisualRecovery::Searching &&
+                    recovery.state()!=motus::VisualRecovery::Localized))
+                    throw std::runtime_error("tracking after the verified alignment expires requires global verification before binding an external origin");
                 if(recovery.state()==motus::VisualRecovery::Searching && !recovery.odom().isNull())
                     throw std::runtime_error("unverified recovery cannot emit a stale pose");
                 if(recovery.state()==motus::VisualRecovery::Searching)
@@ -621,9 +677,19 @@ int main(int argc, char **argv)
             if(!map.getLocalOptimizedPoses().count(pose.first))
                 throw std::runtime_error("finalization omitted a connected LTM graph node");
     const auto finalized=map.getLocalOptimizedPoses();
+    const auto lastLocation=map.getLastLocationId();
     map.exportPoses(output+"-optimized.txt",true,true,1);
     map.exportPoses(output+"-raw.txt",false,true,1);
     map.close();
+    if(crossedRecovery)
+    {
+        rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
+        const auto *signature=reopened.getMemory()->getSignature(lastLocation);
+        if(i!=reacquisitionFrame+1 || reopened.getLocalOptimizedPoses()!=finalized || finalized.size()!=5 ||
+           !signature || !signature->hasLink(lastLocation-1,rtabmap::Link::kNeighbor))
+            throw std::runtime_error("grown visual recovery graph must retain its nodes and links after reopening");
+        reopened.close(false);
+    }
     if(rejectedColdQuery)
     {
         rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
