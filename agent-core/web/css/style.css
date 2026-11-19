@@ -7406,6 +7406,14 @@ html, body {
   gap: 6px;
   margin-top: 8px;
 }
+.channel-delete-confirm {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  font-size: 0.85rem;
+}
 .channel-add-form {
   background: var(--bg-card);
   border: 1px solid var(--accent);
@@ -7445,6 +7453,35 @@ html, body {
   display: flex;
   gap: 8px;
   margin-top: 12px;
+}
+.channel-qq-onboarding {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+  gap: 16px;
+  padding: 8px 0;
+  text-align: center;
+}
+.channel-qq-onboarding [role="status"] {
+  max-width: 32ch;
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.6;
+}
+.channel-qq-onboarding img:not([hidden]) {
+  display: block;
+  width: min(204px, 100%);
+  height: auto;
+  padding: 8px;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+}
+.channel-qq-onboarding .channel-form-actions {
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 0;
 }
 /* Trusted Bots — one card per Bot instead of a table row, since a group
    chat_id + open_id pair is long enough that a 4-column grid forces every
