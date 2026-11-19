@@ -219,13 +219,16 @@ export const SkeletonRenderer = {
 
         parentObj.add(jointGroup);
 
-        // Create child link group (rotation applied here for revolute joints)
+        // Apply motion to the child relative to the fixed joint origin.
         const childGroup = new THREE.Group();
-        childGroup.userData = { axis: new THREE.Vector3(j.axis.x, j.axis.y, j.axis.z) };
+        childGroup.userData = {
+          axis: new THREE.Vector3(j.axis.x, j.axis.y, j.axis.z).normalize(),
+          jointType: j.type,
+        };
         jointGroup.add(childGroup);
 
         // Store references
-        if (j.type === 'revolute') {
+        if (['revolute', 'continuous', 'prismatic'].includes(j.type)) {
           this._joints[j.name] = childGroup;
         }
         linkObj[j.childLink] = childGroup;
@@ -521,12 +524,16 @@ export const SkeletonRenderer = {
         const obj = this._joints[jointName];
         if (!obj) continue;
 
-        const angle = j.q;
+        const position = j.q;
         const axis = obj.userData.axis;
-        if (!axis) continue;
+        if (!axis || !Number.isFinite(position)) continue;
 
-        // Apply rotation around the joint axis from identity
-        obj.quaternion.setFromAxisAngle(axis, angle);
+        // Child pose is relative to the fixed URDF joint origin and RPY.
+        if (obj.userData.jointType === 'prismatic') {
+          obj.position.copy(axis).multiplyScalar(position);
+        } else {
+          obj.quaternion.setFromAxisAngle(axis, position);
+        }
       }
     } catch (e) {
       // Silently ignore parse errors (graceful degradation)

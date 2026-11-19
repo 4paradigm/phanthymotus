@@ -1,6 +1,6 @@
 /**
  * pointcloud.js — 3D point cloud renderer using Three.js.
- * Sliding window: keeps last 5 frames merged for dense Livox Mid-360 non-repetitive scan coverage.
+ * The latest frame replaces the previous one. Drivers can send accumulated snapshots.
  * Axis mapping loaded from tool config (configurable lidar orientation).
  * Expects binary WebSocket data: [uint32 point_step][uint32 total_points][raw bytes]
  *   or legacy: [uint32 numPoints][float32 x,y,z,intensity × N]
@@ -157,7 +157,6 @@ export const PointCloudRenderer = {
 
     const view = new DataView(buffer);
     const firstUint = view.getUint32(0, true);
-
     let numPoints, pointOffset, pointStride;
 
     if (firstUint < 256) {
@@ -172,6 +171,12 @@ export const PointCloudRenderer = {
       pointStride = 16;
     }
 
+    if (pointStride < 12) return;
+    if (numPoints === 0 && buffer.byteLength === pointOffset) {
+      this._frames = [];
+      this._displayDirty = true;
+      return;
+    }
     const expected = pointOffset + numPoints * pointStride;
     if (buffer.byteLength < expected) {
       numPoints = Math.floor((buffer.byteLength - pointOffset) / pointStride);
