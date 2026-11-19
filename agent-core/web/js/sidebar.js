@@ -1436,6 +1436,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
+    const extraControls = [];
     if (def.oneOf && Array.isArray(def.oneOf)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1482,6 +1483,67 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'bridge-printer' && toolName === 'QL_printer') {
+      // The canvas-card settings dialog used to fall through to the generic
+      // text input here.  Keep printer discovery available in the place where
+      // the operator actually configures a placed QL_printer card.
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.add(new Option(vals[key] || '请刷新并选择打印机', vals[key] || ''));
+
+      const refresh = document.createElement('button');
+      refresh.type = 'button';
+      refresh.textContent = '刷新打印机';
+      refresh.className = 'tool-config-action';
+      extraControls.push(refresh);
+
+      let generation = 0;
+      const connection = () => ['bridge_url', 'token'].map(k =>
+        bodyEl.querySelector(`[data-key="${k}"]`)?.value || '');
+      refresh.onclick = async () => {
+        const version = ++generation;
+        const [bridge_url, token] = connection();
+        if (!bridge_url || !token) {
+          alert('请先填写桥接服务地址和访问令牌');
+          return;
+        }
+        refresh.disabled = true;
+        try {
+          const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tool: toolName, arguments: {action: 'printers', bridge_url, token}}),
+          });
+          const envelope = await response.json();
+          if (!response.ok || envelope.code !== 0 && envelope.code !== 200) {
+            throw new Error(envelope.message || '读取失败');
+          }
+          const content = envelope.data;
+          const blocks = Array.isArray(content) ? content : content?.content;
+          const text = blocks?.find(b => b.type === 'text')?.text;
+          const result = text ? JSON.parse(text) : content;
+          if (!Array.isArray(result?.printers)) {
+            throw new Error(result?.error || '桥接需要升级，未返回打印机列表');
+          }
+          if (version !== generation || JSON.stringify(connection()) !== JSON.stringify([bridge_url, token])) return;
+          const selected = input.value;
+          input.replaceChildren(new Option('请选择打印机', ''));
+          for (const p of result.printers) {
+            input.add(new Option(p.name + (p.default ? '（系统默认）' : '') + (p.offline ? '（离线）' : ''), p.name));
+          }
+          input.value = result.printers.some(p => p.name === selected) ? selected : '';
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          refresh.disabled = false;
+        }
+      };
+      bodyEl.addEventListener('input', event => {
+        if (['bridge_url', 'token'].includes(event.target.dataset.key)) {
+          generation++;
+          input.replaceChildren(new Option('连接已变更，请刷新打印机', ''));
+        }
+      });
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
@@ -1547,6 +1609,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
     host.appendChild(label);
     host.appendChild(input);
+    for (const control of extraControls) host.appendChild(control);
     if (help) host.appendChild(help);
   }
 
