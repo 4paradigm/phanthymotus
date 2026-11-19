@@ -385,14 +385,49 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
         session.get = mock.Mock(return_value=Response())
         adapter._session = session
         attachment = Attachment(kind=wecom.KIND_IMAGE, path='/work/resource/channel_files/x.png')
-        signed_url = 'https://example.test/%30?signature=%31%2F%2B'
+        signed_url = f'https://{wecom.WECOM_IMAGE_HOST}/%30?signature=%31%2F%2B'
         with mock.patch('channel.store.save_bytes', return_value=attachment) as save, \
                 mock.patch.object(wecom, '_decrypt_image') as decrypt:
             result = await adapter._download_image({'url': signed_url})
         self.assertIs(result, attachment)
         self.assertEqual(save.call_args.args[1], image)
         self.assertEqual(str(session.get.call_args.args[0]), signed_url)
+        self.assertFalse(session.get.call_args.kwargs['allow_redirects'])
         decrypt.assert_not_called()
+
+    async def test_image_download_rejects_unapproved_urls_before_request(self):
+        adapter = await self._adapter()
+        session = FakeSession()
+        session.get = mock.Mock()
+        adapter._session = session
+        host = wecom.WECOM_IMAGE_HOST
+        urls = [
+            'https://127.0.0.1/image', 'https://[::1]/image',
+            'https://192.168.1.1/image', 'https://169.254.169.254/latest/meta-data/',
+            'https://example.test/image', f'https://{host}.attacker.test/image',
+            f'https://attacker.test@{host}/image', f'https://{host}:8443/image',
+            f'http://{host}/image', f'https://{host}/x\r\nInjected: x',
+            'https://[::1/image',
+        ]
+        for url in urls:
+            with self.subTest(url=url), self.assertRaisesRegex(WecomError, 'approved HTTPS URL'):
+                await adapter._download_image({'url': url})
+        session.get.assert_not_called()
+
+    async def test_image_download_never_follows_redirect(self):
+        adapter = await self._adapter()
+        response = mock.MagicMock()
+        response.status = 302
+        response.headers = {'Location': 'https://127.0.0.1/private'}
+        response.__aenter__ = mock.AsyncMock(return_value=response)
+        response.__aexit__ = mock.AsyncMock(return_value=False)
+        session = FakeSession()
+        session.get = mock.Mock(return_value=response)
+        adapter._session = session
+        with self.assertRaisesRegex(WecomError, 'redirects are not allowed'):
+            await adapter._download_image({'url': f'https://{wecom.WECOM_IMAGE_HOST}/image'})
+        session.get.assert_called_once()
+        self.assertFalse(session.get.call_args.kwargs['allow_redirects'])
 
     async def test_mixed_group_image_progress_and_payload_reach_manager(self):
         received = []

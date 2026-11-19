@@ -36,7 +36,7 @@ import hashlib
 import re
 import time
 from collections import OrderedDict
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 import aiohttp
 from yarl import URL
@@ -55,6 +55,8 @@ IMAGE_MAX_BYTES = 10 * 1024 * 1024
 IMAGE_MAX_ITEMS = 10
 IMAGE_UPLOAD_CHUNK_BYTES = 512 * 1024
 IMAGE_DOWNLOAD_TIMEOUT = 10
+# Host observed in published WeCom intelligent-bot image callback examples.
+WECOM_IMAGE_HOST = 'ww-aibot-img-1258476243.cos.ap-guangzhou.myqcloud.com'
 
 # 群聊正文里的 @ 前缀，例如 "@Bumi 助手 挥个手"
 _AT_PREFIX_RE = re.compile(r'^\s*@[^\s]+\s*')
@@ -445,33 +447,30 @@ class WecomAdapter(ChannelAdapter):
             raise WecomError('WeCom image download session is unavailable.')
 
         try:
-            for _ in range(4):
-                parsed = urlsplit(url)
-                if (parsed.scheme != 'https' or not parsed.hostname or
-                        parsed.username is not None or parsed.password is not None):
-                    raise WecomError('WeCom image download requires an HTTPS URL.')
-                async with self._session.get(
-                    # WeCom media URLs can be pre-signed: do not let aiohttp
-                    # requote the path/query before sending the request.
-                    URL(url, encoded=True), timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
-                    allow_redirects=False, auto_decompress=False,
-                ) as response:
-                    if response.status in (301, 302, 303, 307, 308):
-                        location = response.headers.get('Location')
-                        if not location:
-                            raise WecomError('WeCom image redirect has no destination.')
-                        url = urljoin(url, location)
-                        continue
-                    if response.status != 200:
-                        raise WecomError(f'WeCom image download failed (HTTP {response.status}).')
-                    encrypted = bytearray()
-                    async for chunk in response.content.iter_chunked(65536):
-                        encrypted.extend(chunk)
-                        if len(encrypted) > IMAGE_MAX_BYTES + 32:
-                            raise WecomError('WeCom image exceeds the 10 MiB limit.')
-                    break
-            else:
-                raise WecomError('Too many WeCom image redirects.')
+            parsed = urlsplit(url)
+            if (any(ord(ch) < 32 or ord(ch) == 127 for ch in url) or
+                    parsed.scheme != 'https' or parsed.hostname != WECOM_IMAGE_HOST or
+                    parsed.port not in (None, 443) or
+                    parsed.username is not None or parsed.password is not None):
+                raise WecomError('WeCom image download requires an approved HTTPS URL.')
+        except ValueError:
+            raise WecomError('WeCom image download requires an approved HTTPS URL.') from None
+
+        try:
+            async with self._session.get(
+                # WeCom media URLs can be pre-signed: preserve the path/query.
+                URL(url, encoded=True), timeout=aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT),
+                allow_redirects=False, auto_decompress=False,
+            ) as response:
+                if response.status in (301, 302, 303, 307, 308):
+                    raise WecomError('WeCom image redirects are not allowed.')
+                if response.status != 200:
+                    raise WecomError(f'WeCom image download failed (HTTP {response.status}).')
+                encrypted = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    encrypted.extend(chunk)
+                    if len(encrypted) > IMAGE_MAX_BYTES + 32:
+                        raise WecomError('WeCom image exceeds the 10 MiB limit.')
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             raise WecomError('WeCom image download failed or timed out.') from e
 
