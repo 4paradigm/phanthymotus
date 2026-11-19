@@ -608,7 +608,8 @@ class RtabmapNode(Node):
                 self._published_seq = max(self._published_seq,item[5])
             self._forwarded += 1
             segment['forwarded'] += 1
-            segment['progress'].forward(stamp,self._receipt_clock())
+            with self._result_lock:
+                segment['progress'].forward(stamp,self._receipt_clock())
             self._covariance_source = ('inertial_guess' if predicted else 'native_visual' if pose is None else
                 'upstream' if pose.covariance is not None else 'backend_default')
             startup_backlog = self._root_deadline and native.left.data and bool(self._queue)
@@ -917,8 +918,12 @@ class RtabmapNode(Node):
                 return
             index = max(indices, key=lambda i: msg.poses_id[i])
             pose = _native_pose(msg.poses[index])
+            stamp = self._stamp(msg)
+            nodes = {msg.poses_id[i] for i in indices}
+            links = [(link.from_id, link.to_id, link.type) for link in getattr(msg, 'links', ())]
             with self._result_lock:
-                segment['graph'] = (self._stamp(msg), msg.header.frame_id, pose)
+                segment['graph'] = (stamp, msg.header.frame_id, pose)
+                segment['progress'].graph(stamp, self._receipt_clock(), nodes, links)
             self._publish_snapshot(segment)
             self._native_accepted('graph')
         except (AttributeError, TypeError, ValueError, OverflowError) as error:
@@ -960,9 +965,12 @@ class RtabmapNode(Node):
             values = dict(zip(getattr(msg, 'stats_keys', []), getattr(msg, 'stats_values', [])))
             recovery = [values.get(key) for key in
                 ('Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/')]
+            valid_ref = type(msg.ref_id) is int and msg.ref_id > 0
+            has_recovery_state = False
             if all(isinstance(v, (int, float)) and math.isfinite(v) for v in recovery):
                 states = ('external', 'searching', 'localized', 'visual_tracking', 'inertial_registration')
                 if recovery[0] in range(len(states)):
+                    has_recovery_state = True
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],
                         relocalizations=int(recovery[1]), visual_inliers=int(recovery[2]))
                     reacquired = values.get('Motus/VisualReacquiredInliers/')
@@ -974,7 +982,12 @@ class RtabmapNode(Node):
                             math.isfinite(v) and v > 0 for v in match) and match[0] == msg.ref_id):
                         segment['native_recovery'].update(relocalization_node=int(match[0]),
                             relocalization_anchor=int(match[1]), relocalization_inliers=int(match[2]))
-            if type(msg.ref_id) is not int or msg.ref_id <= 0:
+            if valid_ref or has_recovery_state:
+                try:
+                    segment['progress'].activity(self._stamp(msg),self._receipt_clock())
+                except AttributeError:
+                    pass  # No stamped activity evidence in this native message.
+            if not valid_ref:
                 return
             if segment is self._active and segment['native_recovery']['state'] == 'external':
                 self._root_wait_done.set()
@@ -983,10 +996,6 @@ class RtabmapNode(Node):
             frame = getattr(getattr(msg, 'header', None), 'frame_id', None)
             if isinstance(frame, str) and frame.strip():
                 segment['frame_id'] = frame
-            try:
-                segment['progress'].activity(self._stamp(msg),self._receipt_clock(),nodes=msg.ref_id)
-            except AttributeError:
-                pass  # No stamped activity evidence in this native message.
             if identity == segment['last_info']:
                 return
             if segment['last_info'] is None or segment['last_info'][0] != msg.ref_id:
@@ -1018,6 +1027,7 @@ class RtabmapNode(Node):
             active = self._active
             frame = active['frame_id'] if active else None
             segment = active['segment_id'] if active else None
+            progress = active['progress'].status(self._receipt_clock()) if active else {'state': 'idle'}
             rejections = dict(self._native_rejections)
             streaks = dict(self._native_rejection_streaks)
         rgb_info = self._rgb.info() if self._rgb is not None else {'state': 'disconnected', 'reason': None}
@@ -1034,7 +1044,7 @@ class RtabmapNode(Node):
             accepted_clouds=health['admitted_frames'], forwarded_clouds=forwarded,
             upstream_covariance='known' if self._covariance_source=='upstream' else 'unknown',
             covariance_source=self._covariance_source or 'unknown',
-            backend_progress=active['progress'].status(self._receipt_clock()) if active else {'state':'idle'},
+            backend_progress=progress,
             segment_lifecycle=[dict(segment_id=s['segment_id'],database=str(s['process'].database_path),
                 state='finalized' if s['finalized'] else 'closing' if s['closing'] else 'active',
                 relation_to_previous='unknown_separate_origin') for s in self._segments],

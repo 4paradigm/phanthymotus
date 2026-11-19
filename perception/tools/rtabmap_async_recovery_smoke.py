@@ -236,12 +236,13 @@ def async_evidence(records, persisted_nodes=None):
         maximum_retained_relative_translation_error_m=max((row['motion']['translation_error_m'] for row in retained),default=None))
 
 
-def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False):
+def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False, graph_nodes=None, original_root=None):
     sys.path.insert(0,str(Path(__file__).resolve().parent))
     from slam_record_replay import recovery_evidence
     rows=[dict(row,input_pose_source='supplied external pose' if row['external_pose'] else None)
           for row in records]
-    evidence=recovery_evidence(rows,links,persisted_nodes)
+    evidence=recovery_evidence(rows,links,persisted_nodes,graph_nodes=graph_nodes,original_root=original_root)
+    tracking_nodes=set(evidence['persisted_visual_tracking_nodes'])
     if mode=='no-rgb':
         assert not any(row.get('images',{}).get('rgb') for row in records if row.get('images')), 'RGB-off input contained imagery'
         assert not evidence['verified_recoveries'], 'RGB-off recovered visually'
@@ -263,7 +264,7 @@ def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False)
         assert all(not row['native'] or (row['native']['stats'].get('Motus/RecoveryState/')!=2 and
             row['native']['stats'].get('Motus/RecoveryNode/',0)==0) for row in null_rows), 'VO continuation emitted a recovery event'
         continued=[row for row in null_rows if row['native'] and
-            row['native']['stats'].get('Motus/RecoveryState/')==3 and row['native']['ref'] in persisted_nodes]
+            row['native']['stats'].get('Motus/RecoveryState/')==3 and row['native']['ref'] in tracking_nodes]
         assert all(row.get('images') and row['images']['rgb'] and row['images']['depth'] and
             row.get('motion') and row.get('selected_rgb_kind')=='fixture' and
             row['native']['stats'].get('Motus/VisualInliers/',0)>=20 for row in continued), 'VO continuation lacks actual measured attachment evidence'
@@ -307,7 +308,7 @@ def validate_native(records, persisted_nodes, links, mode, *, cold_reopen=False)
             if phase not in phases:continue
             tracking[phase]=sorted({row['native']['ref'] for row in records if row['phase']==phase and
                 row['native'] and row['native']['stats'].get('Motus/RecoveryState/')==3 and
-                row['native']['ref'] in persisted_nodes})
+                row['native']['ref'] in tracking_nodes and not row['external_pose']})
             assert len(tracking[phase])>=3, phase+' lacks continued visual-only mapping after recovery'
         evidence['tracking_by_phase']=tracking
         evidence.update(async_evidence(records,persisted_nodes))
@@ -656,7 +657,9 @@ def evaluate(directory, previous=None):
             ignored_info.append(dict(index=row['index'],ref=native['ref'],reason='Info refers to a different saved capture'))
             qualified.append(dict(row,native=None))
         else:qualified.append(row)
-    evidence=validate_native(qualified,set(matched),db['links'],result['mode'],cold_reopen=bool(old))
+    evidence=validate_native(qualified,set(matched),db['links'],result['mode'],cold_reopen=bool(old),
+        graph_nodes=db['optimized'].keys() & db['nodes'].keys(),
+        original_root=min(old['optimized']) if old else None)
     evidence['ignored_info_reference_mismatches']=ignored_info
     by_index={row['index']:row for row in records}
     recovery_starts=[next(row for row in records if row['phase']==phase)

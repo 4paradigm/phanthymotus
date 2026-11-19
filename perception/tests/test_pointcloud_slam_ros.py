@@ -202,6 +202,47 @@ def test_native_info_counts_real_accepted_closures_without_duplicate_inflation(n
     assert status['native_loop_closures'] == 1 and status['native_proximity_detections'] == 1
 
 
+def test_native_activity_does_not_count_unconnected_or_repeated_graph_nodes(node):
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    info = next(s.callback for s in node.subscriptions if s.topic.endswith('/info'))
+    graph = next(s.callback for s in node.subscriptions if s.topic.endswith('/mapGraph'))
+
+    def header(seconds):
+        return NS(frame_id='native_map', stamp=NS(sec=seconds, nanosec=0))
+
+    def observe_graph(seconds, ids, links):
+        pose = NS(position=NS(x=0., y=0., z=0.), orientation=NS(x=0., y=0., z=0., w=1.))
+        graph(NS(header=header(seconds), poses_id=ids, poses=[pose]*len(ids),
+                 links=[NS(from_id=a, to_id=b, type=kind) for a,b,kind in links]))
+        return node.status()['backend_progress']
+
+    info(NS(header=header(2), ref_id=12, loop_closure_id=0, proximity_detection_id=0))
+    progress = node.status()['backend_progress']
+    assert progress['state'] == 'responsive_without_new_nodes'
+    assert progress['optimized_nodes'] is None
+    assert observe_graph(2, [1, 2], [(1, 2, 0)])['new_connected_nodes'] == 0
+
+    # A node may leave the local graph while a new connected keyframe arrives.
+    progress = observe_graph(3, [2, 3], [(2, 3, 0)])
+    assert progress['optimized_nodes'] == 2 and progress['new_connected_nodes'] == 1
+    assert progress['last_growth_stamp_ns'] == 3_000_000_000
+    assert progress['state'] == 'responsive'
+
+    # A virtual link and a detached cluster do not connect new poses to the original map.
+    progress = observe_graph(4, [2, 3, 4, 5], [(2, 3, 0), (3, 4, 5), (4, 5, 0)])
+    assert progress['optimized_nodes'] == 4 and progress['connected_nodes'] == 2
+    assert progress['new_connected_nodes'] == 1
+    assert progress['state'] == 'responsive_without_new_nodes'
+    assert observe_graph(3, [2, 6], [(2, 6, 0)])['last_growth_stamp_ns'] == 3_000_000_000
+
+    info(NS(header=header(5), ref_id=0, stats_keys=['Motus/RecoveryState/',
+        'Motus/Relocalizations/', 'Motus/VisualInliers/'], stats_values=[1., 0., 0.]))
+    progress = node.status()['backend_progress']
+    assert progress['activity_stamp_ns'] == 5_000_000_000
+    assert progress['last_growth_stamp_ns'] == 3_000_000_000
+
+
 def test_nonfinite_native_output_never_publishes_a_mapping_packet(node):
     send(node)
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)

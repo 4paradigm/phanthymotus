@@ -6,6 +6,7 @@ import pytest
 
 TOOL=Path(__file__).resolve().parents[1]/'tools/rtabmap_async_recovery_smoke.py'
 IDENTITY=[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]
+CONNECTED_RECOVERY=[(9,2,1),(9,10,0),(10,11,0),(11,12,0)]
 
 
 def module():
@@ -69,11 +70,11 @@ def test_native_acceptance_needs_persisted_visual_geometry_and_continued_growth(
         phase='visual_only',images=None,motion=None,
         native=dict(ref=9+i,loop=0,stats={'Motus/RecoveryState/':3.})) for i in (1,2,3)]
     with pytest.raises(AssertionError,match='geometric'):tool.validate_native(records,{2,9,10,11,12},[],'async')
-    evidence=tool.validate_native(records,{2,9,10,11,12},[(9,2,1)],'async')
+    evidence=tool.validate_native(records,{2,9,10,11,12},CONNECTED_RECOVERY,'async')
     assert evidence['verified_recoveries'][0]['inliers']==35.
     assert evidence['persisted_visual_tracking_nodes']==[10,11,12]
     records[-1]['native']=None
-    with pytest.raises(AssertionError,match='continued'):tool.validate_native(records,{2,9,10,11,12},[(9,2,1)],'async')
+    with pytest.raises(AssertionError,match='continued'):tool.validate_native(records,{2,9,10,11,12},CONNECTED_RECOVERY,'async')
 
 
 def test_negative_validation_rejects_unpersisted_localization_claims():
@@ -117,7 +118,10 @@ def test_positive_plan_retains_rgb_interruption_and_second_recovery_route():
     assert frames[2]['cloud_x']<0.  # Preserve the large reverse displacement in continuous GT.
 
 
-def test_full_positive_requires_two_geometric_recoveries_and_growth_after_each():
+@pytest.mark.parametrize('phase, missing_edge',[
+    ('visual_only',(11,12,0)),('second_visual_only',(15,16,0)),
+])
+def test_full_positive_requires_two_geometric_recoveries_and_connected_growth_after_each(phase,missing_edge):
     tool=module()
     def row(index,ref,phase,state,anchor=0):
         return dict(index=index,phase=phase,external_pose=False,selected_rgb_stamp_ns=index*100+1,selected_rgb_frame=index,selected_rgb_x=0.,rgb_stamp_ns=index*100+1,
@@ -126,13 +130,14 @@ def test_full_positive_requires_two_geometric_recoveries_and_growth_after_each()
             native=dict(ref=ref,loop=anchor,stats={'Motus/RecoveryState/':state,'Loop/Visual_inliers/':35.}))
     rows=[row(0,9,'relocalize',2.,2)]+[row(i,9+i,'visual_only',3.) for i in (1,2,3)]
     rows += [row(4,13,'second_relocalize',1.)]+[row(i,9+i,'second_visual_only',3.) for i in (5,6,7)]
-    persisted={2,*range(9,17)};links=[(9,2,1)]
+    persisted={2,*range(9,17)};links=CONNECTED_RECOVERY+[(13,14,0),(14,15,0),(15,16,0)]
     with pytest.raises(AssertionError,match='two'):tool.validate_native(rows,persisted,links,'async')
     rows[4]=row(4,13,'second_relocalize',2.,2);links.append((13,2,1))
     evidence=tool.validate_native(rows,persisted,links,'async')
     assert len(evidence['verified_recoveries'])==2
-    rows[-1]['native']=None
-    with pytest.raises(AssertionError,match='second_visual_only'):tool.validate_native(rows,persisted,links,'async')
+    assert evidence['tracking_by_phase']=={'visual_only':[10,11,12],'second_visual_only':[14,15,16]}
+    with pytest.raises(AssertionError,match=phase):
+        tool.validate_native(rows,persisted,[edge for edge in links if edge!=missing_edge],'async')
 
 
 def test_bad_motion_candidate_can_be_reported_as_rejected_without_claiming_mapped_accuracy():
@@ -206,7 +211,7 @@ def test_unretained_motion_cannot_substitute_for_missing_recovery_attachments():
         images=dict(rgb=True,depth=True,local_translation=[0.,0.,0.],rgb_stamp_ns=104,cloud_stamp_ns=204),
         motion=dict(matrix=IDENTITY,verified=2,translation_error_m=3.),native=None))
     with pytest.raises(AssertionError,match='recovery.*attachment'):
-        tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async')
+        tool.validate_native(rows,{2,9,10,11,12},CONNECTED_RECOVERY,'async')
 
 
 def test_cold_run_requires_mapping_after_external_poses_return():
@@ -299,15 +304,24 @@ def test_synchronous_cold_warmup_is_reported_separately_from_async_recovery():
         selected_rgb_stamp_ns=100,selected_rgb_frame=0,selected_rgb_x=0.,
         images=dict(rgb=True,depth=True,rgb_stamp_ns=100,cloud_stamp_ns=100,
                     local_translation=[0.,0.,0.],local_matrix=IDENTITY),motion=None,
-        native=dict(ref=9,loop=2,stats={'Motus/RecoveryState/':2.,'Loop/Visual_inliers/':35.}))]
+        native=dict(ref=9,loop=4,stats={'Motus/RecoveryState/':2.,'Loop/Visual_inliers/':35.}))]
     rows += [dict(index=i,phase='reopened',external_pose=False,rgb_stamp_ns=100+i*100-10,
         cloud_stamp_ns=100+i*100,selected_rgb_stamp_ns=100+i*100-10,selected_rgb_frame=i,selected_rgb_x=0.,
         images=dict(rgb=True,depth=True,rgb_stamp_ns=100+i*100-10,cloud_stamp_ns=100+i*100,
                     local_translation=[0.,0.,0.],local_matrix=IDENTITY),
         motion=dict(matrix=IDENTITY,verified=2,translation_error_m=.001),
         native=dict(ref=9+i,loop=0,stats={'Motus/RecoveryState/':3.})) for i in (1,2,3)]
-    with pytest.raises(AssertionError,match='asynchronous'):tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async')
-    evidence=tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async',cold_reopen=True)
+    new_nodes={9,10,11,12}
+    graph_nodes={2,4,5,*new_nodes}
+    links=[(2,4,0),(9,4,1),(4,5,0),(5,10,0),(10,11,0),(11,12,0)]
+    with pytest.raises(AssertionError,match='asynchronous'):
+        tool.validate_native(rows,new_nodes,links,'async',graph_nodes=graph_nodes)
+    evidence=tool.validate_native(rows,new_nodes,links,'async',
+        cold_reopen=True,graph_nodes=graph_nodes,original_root=2)
+    assert evidence['persisted_visual_tracking_nodes']==[10,11,12]
+    with pytest.raises(AssertionError,match='geometric'):
+        tool.validate_native(rows,new_nodes,links[1:],'async',
+            cold_reopen=True,graph_nodes=graph_nodes,original_root=2)
     assert len(evidence['verified_synchronous_cold_recoveries'])==1
     assert evidence['verified_async_recoveries']==[]
     assert evidence['retained_async_frames']==3
@@ -329,14 +343,14 @@ def test_verified_visual_edges_preserve_legacy_and_promoted_event_geometry(promo
     rows += [dict(index=i,phase='visual_only',external_pose=False,rgb_stamp_ns=100+i,
         cloud_stamp_ns=200+i,images=None,motion=None,
         native=dict(ref=9+i,loop=0,stats={'Motus/RecoveryState/':3.})) for i in (1,2,3)]
-    evidence=tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async')
+    evidence=tool.validate_native(rows,{2,9,10,11,12},CONNECTED_RECOVERY,'async')
     assert evidence.get('verified_visual_edges')==[
         dict(index=0,stamp_ns=200,ref=9,anchor=2,inliers=35.)]
     if promoted:
         stats['Motus/RecoveryInliers/']=0.
         stats['Loop/Visual_inliers/']=999.;rows[0]['native']['loop']=2
         with pytest.raises(AssertionError,match='geometric'):
-            tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async')
+            tool.validate_native(rows,{2,9,10,11,12},CONNECTED_RECOVERY,'async')
 
 
 def test_saved_poses_preserve_the_complete_native_live_optimized_graph():
@@ -409,7 +423,10 @@ def test_normal_vo_continuation_requires_growth_without_a_global_recovery_event(
             motion=dict(matrix=IDENTITY,verified=2,translation_error_m=.001),
             native=dict(ref=i+1,loop=0,stats={'Motus/RecoveryState/':0. if i<8 else 3.,
                 'Motus/VisualInliers/':35.})))
-    evidence=tool.validate_native(rows,set(range(1,13)),[],'vo-continuation')
+    nodes=set(range(1,13));links=[(i,i+1,0) for i in range(1,12)]
+    with pytest.raises(AssertionError,match='did not continue'):
+        tool.validate_native(rows,nodes,[edge for edge in links if edge!=(8,9,0)],'vo-continuation')
+    evidence=tool.validate_native(rows,nodes,links,'vo-continuation')
     assert not evidence['verified_recoveries']
     assert evidence['continued_without_relocalization_nodes']==[9,10,11,12]
     bad=deepcopy(rows)
@@ -417,11 +434,11 @@ def test_normal_vo_continuation_requires_growth_without_a_global_recovery_event(
     candidate=deepcopy(rows[-1]);candidate['index']=12;candidate['native']['ref']=99
     bad.append(candidate)
     with pytest.raises(AssertionError,match='continuation.*attachment'):
-        tool.validate_native(bad,set(range(1,13)),[],'vo-continuation')
+        tool.validate_native(bad,nodes,links,'vo-continuation')
     rows[8]['native']['stats'].update({'Motus/RecoveryState/':2.,'Loop/Visual_inliers/':35.})
     rows[8]['native']['loop']=2
     with pytest.raises(AssertionError,match='continuation'):
-        tool.validate_native(rows,set(range(1,13)),[(9,2,1)],'vo-continuation')
+        tool.validate_native(rows,nodes,links+[(9,2,1)],'vo-continuation')
 
 
 def test_black_capture_cannot_be_counted_as_geometric_recovery():
@@ -436,7 +453,7 @@ def test_black_capture_cannot_be_counted_as_geometric_recovery():
         cloud_stamp_ns=200+i,images=None,motion=None,
         native=dict(ref=9+i,loop=0,stats={'Motus/RecoveryState/':3.})) for i in (1,2,3)]
     with pytest.raises(AssertionError,match='black'):
-        tool.validate_native(rows,{2,9,10,11,12},[(9,2,1)],'async')
+        tool.validate_native(rows,{2,9,10,11,12},CONNECTED_RECOVERY,'async')
 
 
 def test_blackout_recovery_needs_an_actual_featureless_receipt_and_native_vo_loss():
@@ -452,11 +469,11 @@ def test_blackout_recovery_needs_an_actual_featureless_receipt_and_native_vo_los
             motion=dict(matrix=IDENTITY,verified=2,translation_error_m=.001),
             native=dict(ref=9+i,loop=2 if i==1 else 0,stats={'Motus/RecoveryState/':1. if i==0 else 2. if i==1 else 3.,
                 'Motus/VisualInliers/':0. if i==0 else 35.,'Loop/Visual_inliers/':35. if i==1 else 0.})))
-    evidence=tool.validate_native(rows,{2,10,11,12,13},[(10,2,1)],'async')
+    evidence=tool.validate_native(rows,{2,10,11,12,13},[(10,2,1),(10,11,0),(11,12,0),(12,13,0)],'async')
     assert len(evidence.get('verified_blackout_losses',[]))==1
     bad=deepcopy(rows);bad[0]['native']['stats']['Motus/VisualInliers/']=35.
     with pytest.raises(AssertionError,match='black.*loss'):
-        tool.validate_native(bad,{2,10,11,12,13},[(10,2,1)],'async')
+        tool.validate_native(bad,{2,10,11,12,13},[(10,2,1),(10,11,0),(11,12,0),(12,13,0)],'async')
     bad=deepcopy(rows);bad[0]['images']['rgb_all_zero']=False
     with pytest.raises(AssertionError,match='black.*receipt'):
-        tool.validate_native(bad,{2,10,11,12,13},[(10,2,1)],'async')
+        tool.validate_native(bad,{2,10,11,12,13},[(10,2,1),(10,11,0),(11,12,0),(12,13,0)],'async')

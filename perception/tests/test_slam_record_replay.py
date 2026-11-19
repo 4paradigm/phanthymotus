@@ -50,12 +50,31 @@ def test_recovery_requires_visual_inliers_and_persisted_global_edge():
         dict(index=4,input_pose_source=None,native=dict(ref=10,loop=0,stats={'Motus/RecoveryState/':3.}))]
     absent=tool.recovery_evidence(frames,[],{2,9,10})
     assert absent['verified_recoveries']==[]
-    present=tool.recovery_evidence(frames,[(9,2,1)],{2,9,10})
+    present=tool.recovery_evidence(frames,[(9,2,1),(9,10,0)],{2,9,10})
     assert present['verified_recoveries']==[dict(index=3,ref=9,anchor=2,inliers=35.)]
     assert present['persisted_visual_tracking_nodes']==[10]
     assert not tool.recovery_evidence(frames,[(9,2,0)],{2,9,10})['verified_recoveries']
     frames[0]['native']['stats']['Loop/Visual_inliers/']=0.
     assert not tool.recovery_evidence(frames,[(9,2,1)],{2,9,10})['verified_recoveries']
+
+def test_tracking_growth_requires_connection_to_the_original_persisted_map():
+    tool=module()
+    frames=[dict(index=0,input_pose_source=None,native=dict(ref=9,loop=4,stats={
+        'Motus/RecoveryState/':2.,'Loop/Visual_inliers/':35.}))]
+    frames += [dict(index=i,input_pose_source=None,native=dict(ref=9+i,loop=0,stats={
+        'Motus/RecoveryState/':3.})) for i in range(1,7)]
+    nodes={2,4,5,*range(9,16)}
+    links=[(2,4,0),(9,4,1),(9,5,6),(10,5,0),(10,11,0),(12,13,0),(13,14,0),(10,15,7)]
+
+    evidence=tool.recovery_evidence(frames,links,nodes)
+    assert evidence['verified_recoveries']==[dict(index=0,ref=9,anchor=4,inliers=35.)]
+    assert evidence['persisted_visual_tracking_nodes']==[10,11]
+
+    detached=tool.recovery_evidence(frames,links[1:],nodes)
+    assert detached['verified_recoveries']==[]
+    assert detached['unverified_localized_frames']==[0]
+    assert detached['persisted_visual_tracking_nodes']==[]
+
 
 def test_publication_cycle_pairing_excludes_previous_frameset_depth():
     tool=module();base=1794898925701466892

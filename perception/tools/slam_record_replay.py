@@ -316,8 +316,17 @@ def bootstrap(args):
         log.close();node.destroy_node();rclpy.shutdown()
 
 
-def recovery_evidence(records,links,persisted_nodes):
-    """A status alone is never geometric evidence or persisted mapping growth."""
+def recovery_evidence(records,links,persisted_nodes,*,graph_nodes=None,original_root=None):
+    """Require replay evidence to belong to the original persisted pose graph."""
+    perception_root=str(Path(__file__).resolve().parents[1])
+    if perception_root not in sys.path:sys.path.insert(0,perception_root)
+    from plugins.pointcloud_slam_graph import connected_nodes
+    persisted_nodes=set(persisted_nodes)
+    links=tuple(links)
+    graph_nodes={node for node in (persisted_nodes if graph_nodes is None else graph_nodes) if node>0}
+    root=min(graph_nodes,default=0) if original_root is None else original_root
+    connected=connected_nodes(graph_nodes,links,(root,))
+    retained=connected.intersection(persisted_nodes)
     global_edges={tuple(sorted((a,b))) for a,b,kind in links if kind==1}
     verified=[];tracking=[];unverified=[]
     event_fields=('Motus/RecoveryNode/','Motus/RecoveryAnchor/','Motus/RecoveryInliers/')
@@ -332,10 +341,10 @@ def recovery_evidence(records,links,persisted_nodes):
             if any(key in stats for key in event_fields):
                 node,anchor,inliers=(stats.get(key,0) for key in event_fields)
                 event_valid=all(key in stats for key in event_fields) and node==ref
-            if event_valid and ref in persisted_nodes and anchor>0 and inliers>=20 and tuple(sorted((ref,anchor))) in global_edges:
+            if event_valid and ref in retained and anchor in connected and inliers>=20 and tuple(sorted((ref,anchor))) in global_edges:
                 verified.append(dict(index=row['index'],ref=ref,anchor=anchor,inliers=inliers))
             else:unverified.append(row['index'])
-        if state==3 and ref in persisted_nodes:tracking.append(ref)
+        if state==3 and ref in retained:tracking.append(ref)
     return dict(verified_recoveries=verified,unverified_localized_frames=unverified,
         persisted_visual_tracking_nodes=sorted(set(tracking)))
 
@@ -411,10 +420,12 @@ def replay(args):
         preview_max_points=10000,rgb_input=validate_rgb_camera(camera,topic=prefix+'/rgb'),
         native_parameters={'RGBD/LinearUpdate':0.,'RGBD/AngularUpdate':0.} if args.insert_every_observation else {})
     if args.offline_all_captures:settings['native_parameters']['Rtabmap/DetectionRate']=0.
-    restored=None
+    restored=None;historical_nodes=set()
     if args.resume_run:
         previous=Path(args.resume_run);saved=json.loads((previous/'result.json').read_text())
         restored=copy_native_map(previous/'archive',saved['map_id'],saved['revision'],output/'restored.db')
+        with sqlite3.connect(restored['database']) as db:
+            historical_nodes={node for node, in db.execute('SELECT id FROM Node WHERE id>0')}
     rclpy.init();producer=rclpy.create_node('recorded_replay_producer')
     gateway=RtabmapNode(prefix+'/odom',prefix+'/cloud',settings,session_dir=output/'session',restored_map=restored)
     executor=MultiThreadedExecutor(num_threads=3);executor.add_node(producer);executor.add_node(gateway)
@@ -568,7 +579,8 @@ def replay(args):
         with sqlite3.connect(artifacts['segments'][0]['database']) as db:
             links=db.execute('SELECT from_id,to_id,type FROM Link').fetchall();persisted_nodes={row[0] for row in db.execute('SELECT id FROM Node WHERE id>0')};nodes=len(persisted_nodes)
         motion_rows=[json.loads(line) for line in (motion_directory/'records.jsonl').read_text().splitlines()] if motion_count[0] else []
-        evidence=recovery_evidence(records,links,persisted_nodes)
+        evidence=recovery_evidence(records,links,persisted_nodes-historical_nodes,
+            graph_nodes=persisted_nodes,original_root=min(historical_nodes,default=None))
         result=dict(native_pid=pid,segments=len(artifacts['segments']),database_nodes=nodes,links=links,
             native_motion_messages=motion_count[0],first_frame_baseline_only=not cold_replay(args),
             native_drain=dict(last_actual_input_stamp_ns=last_target,info_observed=drained),
