@@ -204,7 +204,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     positions = np.nonzero(valid)[1]
     all_points = np.ones(len(z), dtype=bool)
 
-    def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None):
+    def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None, check_below=False):
         start, end = visible_span or (0, seed.shape[1])
         visible = (positions >= start) & (positions < end)
         min_inliers = 0.6 * seed.shape[0] * (end - start)
@@ -248,7 +248,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         one_far_side = sum(support >= 0.06 for support in far_support) < 2
         if one_far_side and max(far_support) < 0.35:
             return None
-        if one_far_side or near_thirds is None:
+        if one_far_side or near_thirds is None or check_below:
             # Veto a substantial measured surface below the proposed floor.
             # This rejects a raised platform even if its top fits one patch.
             below = distance[far_start:, columns] > 2 * _GROUND_TOLERANCE_M
@@ -288,8 +288,9 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
 
     # A box against one side can hide most of that third. Require the same
     # plane in the centre and the other side, both in the seed and farther away.
-    for near_thirds, span in (((0, 1), (0, seed.shape[1] - third)),
-                              ((1, 2), ((seed.shape[1] + 2) // 3, seed.shape[1]))):
+    visible_spans = (((0, 1), (0, seed.shape[1] - third)),
+                     ((1, 2), ((seed.shape[1] + 2) // 3, seed.shape[1])))
+    for near_thirds, span in visible_spans:
         ground = fit(all_points, near_thirds=near_thirds, visible_span=span)
         if ground is not None:
             return ground
@@ -314,6 +315,13 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
             continue
         ground = fit(np.abs(a * x + b * z + c - y) <= _GROUND_TOLERANCE_M,
                      near_thirds=None)
+        if ground is not None:
+            return ground
+
+    # Mixed centre returns can bias a fit even when the outer third is clear.
+    # Verify the centre and the visible side, including a check for lower surfaces.
+    for (near_thirds, span), edge in zip(visible_spans, (left, right)):
+        ground = fit(edge, near_thirds=near_thirds, visible_span=span, check_below=True)
         if ground is not None:
             return ground
     return None

@@ -354,6 +354,47 @@ def test_ground_fit_accepts_floor_around_a_wider_center_box():
     assert not ground[270:, 225:415].any()
 
 
+@pytest.mark.parametrize("mirror", [False, True])
+def test_ground_fit_reseeds_from_the_visible_edge(mirror):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    ray_y = (np.arange(D.HEIGHT) - 229) / 492
+    floor = np.minimum(1.45 / np.maximum(ray_y + .157, .001), 8.)
+    frame = np.broadcast_to(floor[:, None], (D.HEIGHT, D.WIDTH)).astype(np.float32).copy()
+    # Foreground covers one side and part of the centre. A nearer band
+    # interrupts the floor in the far strips but leaves support above and below it.
+    frame[270:, :210] = .85
+    frame[360:, :252] = 1.6
+    frame[350:390, 230:] = .85
+    camera = HorizontalIntrinsics(640, 492, 319.5)
+    depth = frame[:, ::-1] if mirror else frame
+
+    ground = D.ground_mask(depth, camera, (480, 492, 229))
+
+    assert ground is not None
+    if mirror:
+        ground = ground[:, ::-1]
+    assert ground[440, 330] and ground[440, 515]
+    assert not ground[360:, :252].any()
+    assert not ground[350:390, 230:].any()
+
+
+def test_visible_edge_seed_rejects_a_raised_platform():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    ray_y = np.maximum((np.arange(D.HEIGHT) - 229) / 492 + .157, .001)
+    floor = np.minimum(1.60 / ray_y, 8.)
+    frame = np.broadcast_to(floor[:, None], (D.HEIGHT, D.WIDTH)).astype(np.float32).copy()
+    frame[350:, 210:] = (1.45 / ray_y[350:])[:, None]
+    frame[270:, :210] = .85
+    frame[360:, :252] = 1.6
+    frame[358:390, 230:] = .85
+
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 492, 319.5), (480, 492, 229))
+
+    assert ground is None
+
+
 def test_ground_fit_uses_single_visible_far_side_with_broad_near_support():
     from plugins.navi.camera import HorizontalIntrinsics
 
