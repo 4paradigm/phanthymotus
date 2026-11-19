@@ -1609,6 +1609,8 @@ class NaviPlugin:
         was_moving = any(self._state.commanded)
         scan = self._state.active_scan
         scan_guarded = scan.active or bool(scan.result_frame)
+        was_searching = (self._config.local_planning and self._last_decision is not None
+                         and self._last_decision.status == policy_mod.SEARCHING)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt)
@@ -1616,7 +1618,7 @@ class NaviPlugin:
         if not decision.publishes:
             # Stop once when a policy goes quiet while the chassis may still
             # hold its last motion command under the longer watchdog.
-            if (self._config.watchdog_ms <= 300 and not scan_guarded) or not was_moving:
+            if (self._config.watchdog_ms <= 300 and not (scan_guarded or was_searching)) or not was_moving:
                 return None
             decision.values = [0.0] * ACTION_DIM
             return self._command_message(decision.values, now, int(now * 1000))
@@ -1631,24 +1633,25 @@ class NaviPlugin:
         # also translates inflates a small correction and creates weaving.
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
+        checked_search = self._config.local_planning and decision.status == policy_mod.SEARCHING
         if (values != decision.values and self._config.local_planning
-                and (self._state.avoidance_yaw_override or scan_guarded or scan.active)):
+                and (self._state.avoidance_yaw_override or scan_guarded or scan.active or checked_search)):
             values = decision.values = [0.] * ACTION_DIM
             decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
         self._state.commanded = (values[0], values[1], values[5])
 
         obs_ms = self._objects_ms or int(now * 1000)
         if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
-                or scan.locked) and not any(values):
+                or scan.locked or was_searching) and not any(values):
             # A hold applies now, even when the last input is about to expire.
             obs_ms = int(now * 1000)
-        elif (self._config.local_planning and decision.status == policy_mod.AVOIDING
+        elif (self._config.local_planning and decision.status in (policy_mod.AVOIDING, policy_mod.SEARCHING)
                 and depth is not None and depth.get("frame_id") is not None):
             obs_ms = min(obs_ms, depth.get("capture_ms", depth["frame_id"]))
             motion_pose = (odom or {}).get("motion_pose")
             if motion_pose is not None:
                 obs_ms = min(obs_ms, motion_pose.stamp_ms)
-            if scan_guarded and odom is not None:
+            if (scan_guarded or checked_search) and odom is not None:
                 stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
                 obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
                 if scan.current_frame:

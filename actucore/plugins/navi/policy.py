@@ -63,7 +63,7 @@ from dataclasses import dataclass, field
 
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
-from .active_scan import ActiveScan, ODOM_GAP_MS
+from .active_scan import ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
 from .track import Tracker
 from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
 from .odom import planar_feedback
@@ -1101,8 +1101,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     bands = depth.get("bands") or {}
 
     if track is None:
-        if not _can_turn_after_stop(depth, config, state):
-            return Decision(_twist(0, 0, 0), AVOIDING, "近障停车，等待确认可转向")
+        reason = _search_turn_stop(depth, config, state)
+        if reason is not None:
+            return Decision(_twist(0, 0, 0), AVOIDING, reason)
         return _search(config, state, dt, odom)
 
     state.missing_frames = 0
@@ -1506,22 +1507,42 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
         dt=dt, min_dwell_s=config.min_dwell_s)
 
 
-def _can_turn_after_stop(depth, config: Config, state: State) -> bool:
-    """Keep target-search turns clear of close obstacles and unmeasured space."""
+def _search_turn_stop(depth, config: Config, state: State) -> str | None:
+    """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
     state.last_clearance, state.last_coverage = ahead, coverage
-    if coverage < config.coverage_min or (ahead is not None and ahead <= config.obstacle_stop_m):
+    if coverage < config.coverage_min:
         state.recovery = ClearanceRecovery()
-        return False
-    if config.local_planning and ahead is not None and ahead < config.slow_distance_m:
-        # A search turn must not substitute for a checked detour near an obstacle.
-        return False
-    if state.recovery is None:
-        return True
-    if ahead is None or ahead < config.slow_distance_m or coverage < config.coverage_full:
+        return f"原地搜索：有效深度覆盖仅 {coverage:.0%}，停车"
+    if ahead is not None and ahead <= config.obstacle_stop_m:
         state.recovery = ClearanceRecovery()
-        return False
-    return state.recovery.scale("turn", depth, config.max_obs_age_ms) > 0
+        return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
+    if config.local_planning and config.search_rate > 0:
+        scan = state.active_scan
+        geometry = (config.scan_geometry or config.local_geometry
+                    if scan.receipt_only else config.scan_geometry)
+        if geometry is None or not scan.current_frame:
+            if state.recovery is not None:
+                state.recovery = ClearanceRecovery()
+            return "原地搜索：等待可用于扫掠检查的深度和里程计"
+        direction = state.last_seen_side
+        if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
+               for vx, vy, wz in (scan.motion, state.commanded)):
+            return "原地搜索：等待平移或反向转动停稳"
+        horizon = (config.watchdog_ms + config.max_obs_age_ms + 50) / 1000
+        rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
+        if not scan.clear_sweep(geometry, _keepout_m(config), direction * (rate + .10) * horizon,
+                                STILL_LINEAR * horizon):
+            state.recovery = ClearanceRecovery()
+            return "原地搜索：转身扫掠范围有障碍或超出网格，停车"
+    if state.recovery is not None:
+        if coverage < config.coverage_full or (not config.local_planning and (
+                ahead is None or ahead < config.slow_distance_m)):
+            state.recovery = ClearanceRecovery()
+            return "近障停车，等待足够的深度观测"
+        if state.recovery.scale("turn", depth, config.max_obs_age_ms) <= 0:
+            return "近障停车，等待连续新深度确认可转向"
+    return None
 
 
 def _local_side_order(rooms, config, state, frame):

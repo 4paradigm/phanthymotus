@@ -322,8 +322,8 @@ class ActiveScan:
         def clear_sweep(rate):
             turn_rate = max(rate, abs(self.motion[2]))
             sweep = math.copysign(abs(error) + (turn_rate + .10) * horizon, error)
-            return self._clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon,
-                                     occupied=occupied)
+            return self.clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon,
+                                    occupied=occupied)
 
         if not clear_sweep(yaw_rate):
             limit = yaw_rate
@@ -347,7 +347,7 @@ class ActiveScan:
         description = "回到观察前的朝向" if returning else f"向{direction}观察"
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
-    def _clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
+    def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)

@@ -172,6 +172,51 @@ def test_silent_policy_stops_previous_motion_with_long_watchdog(monkeypatch, sta
     assert card.next_command() is None
 
 
+def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypatch):
+    import numpy as np
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    card = _card(lost_frames=1)
+    cfg = card._config
+    cfg.local_planning, cfg.half_width_m, cfg.watchdog_ms = True, .21, 300
+    cfg.depth_intrinsics = HorizontalIntrinsics(640, 600, 320)
+    card._depth_vertical = (480, 600, 240)
+    cfg.local_geometry = camera_square(cfg.depth_intrinsics, card._depth_vertical, .21)
+    card._state.target = "person"
+    now = [100_000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+
+    tangent = (np.arange(480) - 240) / 600
+    floor = np.minimum(.4 / np.maximum(tangent, .01), 5.)
+
+    def tick(stamp, obstacle=None):
+        if obstacle is not None:
+            now[0] = stamp - 50
+            frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+            frame[205:351, 255:386] = obstacle
+            card._set_depth_map(frame)
+        now[0] = stamp
+        card._objects = {"objects": []}
+        card._objects_ms = stamp
+        card._odom = {"vx": 0., "vy": 0., "wz": 0.}
+        card._odom_ms = stamp
+        return card.next_command()
+
+    assert tick(100_000, .60)["values"] == [0.] * 6
+    # Once near-stop is latched, require three new clear sweeps, even though
+    # all three depth frames still report an obstacle within 1.50 m.
+    assert tick(100_100, .80)["values"] == [0.] * 6
+    assert tick(100_200, .80)["values"] == [0.] * 6
+    search = tick(100_300, .80)
+    assert search["values"] == [0., 0., 0., 0., 0., -.60]
+    assert search["obs_stamp_ms"] == 100_250
+    stop = tick(100_800)
+    assert stop["values"] == [0.] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_800
+    assert tick(100_900) is None
+
+
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch, interrupt):
     from types import SimpleNamespace

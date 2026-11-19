@@ -149,8 +149,8 @@ def test_scan_allows_an_unobserved_rear_sweep(monkeypatch):
     lookout, geometry, visible, _ = _setup(monkeypatch)
     visible[:] = scan.FORWARD > 0
     _tick(lookout, geometry, 1000)
-    assert lookout._clear_sweep(geometry, .33, scan.ANGLE, 0.)
-    assert lookout._clear_sweep(geometry, .33, -scan.ANGLE, 0.)
+    assert lookout.clear_sweep(geometry, .33, scan.ANGLE, 0.)
+    assert lookout.clear_sweep(geometry, .33, -scan.ANGLE, 0.)
 
 
 def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():

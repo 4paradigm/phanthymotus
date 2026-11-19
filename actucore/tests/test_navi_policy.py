@@ -2444,6 +2444,35 @@ def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
     assert decision.status == P.AVOIDING
 
 
+@pytest.mark.parametrize(("ahead", "side_obstacle", "expected_yaw"), [
+    (.80, False, -.60),
+    (.60, False, 0.),
+    (2.0, True, 0.),
+])
+def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obstacle, expected_yaw):
+    from plugins.navi import active_scan as scan, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 600, 320), (480, 600, 240), .21)
+    cfg = _cfg(lost_frames=1, local_planning=True, local_geometry=geometry,
+               half_width_m=.21, obstacle_stop_m=.60, search_rate=.60)
+    depth = dict(_scene(3.0, [(0., ahead, .5)]), frame_id=1000)
+    depth["ground"] = np.zeros_like(depth["map"], dtype=bool)
+    depth["ground"][0, 0] = True
+    occupied = np.isclose(scan.FORWARD, ahead) & np.isclose(scan.RIGHT, 0.)
+    if side_obstacle:
+        # Beyond the stationary envelope and outside the front corridor, but
+        # inside the right-turn sweep once the 10 cm margin is included.
+        occupied |= np.isclose(scan.FORWARD, .15) & np.isclose(scan.RIGHT, .40)
+    monkeypatch.setattr(scan, "observe", lambda *args: (np.zeros_like(occupied), occupied))
+    odom = {"vx": 0., "vy": 0., "wz": 0., "received_ms": 1000}
+
+    decision = _step(detections=_detections(), depth=depth, odom=odom, config=cfg, state=_state())
+
+    assert decision.values == [0., 0., 0., 0., 0., expected_yaw]
+    assert decision.status == (P.SEARCHING if expected_yaw else P.AVOIDING)
+
+
 def test_missing_target_range_does_not_disable_early_stop():
     mat = _obstacle_map(2.8, [(0.0, 1.16, 0.65)])
     mat[190:270, 260:380] = np.nan
