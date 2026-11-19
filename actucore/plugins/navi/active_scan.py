@@ -94,6 +94,8 @@ class ActiveScan:
         capture = (depth or {}).get("capture_ms")
         motion = planar_feedback(odom)
         if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
+            if self.receipt_only and self.active and self.issued_yaw and geometry is not None:
+                return self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
             return self.invalidate()
         body_pose = (odom or {}).get("motion_pose")
         if self.poses and ((body_pose is None) != (self.pose_origin is None)
@@ -111,6 +113,11 @@ class ActiveScan:
         if self.poses:
             previous = self.poses[-1][0]
             if not 0 <= stamp - previous <= ODOM_GAP_MS:
+                if self.receipt_only and self.active and self.issued_yaw and stamp > previous:
+                    # A slow control tick can skip valid odometry samples.
+                    # Brake instead of integrating motion over the gap.
+                    self.poses.clear()
+                    return self.hold_for_replan("主动观察：运动反馈间隔过长，停车后重规划")
                 self.invalidate()
             elif stamp > previous and body_pose is None:
                 dt = (stamp - previous) / 1000
@@ -176,10 +183,14 @@ class ActiveScan:
             if source < self.source_frame:
                 return self.invalidate()
             if source == self.source_frame:
+                if frame != self.views[-1][0] and stamp - self.views[-1][0] > max_depth_age_ms:
+                    return self.interrupt("主动观察：收到过期的重复深度帧，停车")
                 frame = self.views[-1][0]
         ground = (depth or {}).get("ground")
         if (type(frame) is not int or abs(stamp - frame) > max_depth_age_ms
                 or ground is None or not ground[::4, ::4].any() or depth.get("map") is None):
+            if self.active and self.issued_yaw and not self.command_only:
+                return self.hold_for_replan("主动观察：深度暂不可用，停车后重规划")
             return self.interrupt()
         self.current_frame = frame
         if self.views and self.views[-1][0] == frame:
@@ -314,8 +325,9 @@ class ActiveScan:
                 self.settle_ms = stamp
             if stamp - self.settle_ms < SETTLE_MS or self.current_frame <= self.settle_ms:
                 return ScanCommand(reason="主动观察：等待停稳后的观测")
-            self.side_frame = self.current_frame
-            self.finish()
+            # The interrupted sweep did not produce a completed scan. Resume
+            # local planning from this view without retaining a scan result.
+            self.phase = "idle"
             self.issued_yaw = False
             return ScanCommand(reason="主动观察：已停稳，重新规划")
         if speed > STILL_LINEAR:
@@ -348,13 +360,7 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：等待转向停止")
             if self.settle_ms is None:
                 self.settle_ms = stamp
-                self.settle_frame = self.settle_frames = 0
-            delay = RECEIPT_SETTLE_MS if self.receipt_only else SETTLE_MS
-            if self.receipt_only and self.current_frame > max(self.settle_frame, self.settle_ms + delay):
-                self.settle_frame = self.current_frame
-                self.settle_frames += 1
-            if (stamp - self.settle_ms < delay or self.current_frame <= self.settle_ms
-                    or (self.receipt_only and self.settle_frames < 3)):
+            if stamp - self.settle_ms < SETTLE_MS or self.current_frame <= self.settle_ms:
                 return ScanCommand(reason="主动观察：等待转稳后的新深度")
             self.settle_ms = None
             if returning:
@@ -489,6 +495,14 @@ class ActiveScan:
             if (outside_f**2 + outside_r**2 <= slack**2).any():
                 return False
         return True
+
+    def hold_for_replan(self, reason):
+        self.phase = "brake_for_replan"
+        self.current_frame = 0
+        self.settle_ms = None
+        self.turn_until_ms = 0
+        self.turn_stop_ms = None
+        return ScanCommand(reason=reason)
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):
         if self.active:

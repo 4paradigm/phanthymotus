@@ -63,6 +63,10 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
     queue = [(distance_to_goals(start), 0.0, start)]
     cost = {start: 0.0}
     parents = {}
+    # Scalar access in the inner A* loop is cheaper on Python lists.
+    traversable = allowed.tolist()
+    row_count, col_count = allowed.shape
+    moves = [(dr, dc, math.hypot(dr, dc)) for dr, dc in steps]
     while queue:
         _, walked, current = heapq.heappop(queue)
         row, col = current
@@ -74,15 +78,17 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
             return route[::-1]
         if walked > cost[current]:
             continue
-        for dr, dc in steps:
-            nxt = (row + dr, col + dc)
-            if not (0 <= nxt[0] < allowed.shape[0] and 0 <= nxt[1] < allowed.shape[1]):
+        for dr, dc, step_cost in moves:
+            next_row, next_col = row + dr, col + dc
+            if not (0 <= next_row < row_count and 0 <= next_col < col_count):
                 continue
             # With a fixed-heading rectangular footprint, check both cardinal
             # translations so a diagonal cannot cut an occupied corner.
-            if not (allowed[nxt] and allowed[row + dr, col] and allowed[row, col + dc]):
+            if not (traversable[next_row][next_col] and traversable[next_row][col]
+                    and traversable[row][next_col]):
                 continue
-            distance = walked + math.hypot(dr, dc)
+            nxt = (next_row, next_col)
+            distance = walked + step_cost
             if distance < cost.get(nxt, math.inf):
                 cost[nxt] = distance
                 parents[nxt] = current

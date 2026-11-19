@@ -542,6 +542,10 @@ class NaviPlugin:
                 self._camera_notes.append("主动观察使用正方形近似，仅用转稳后的单视角重规划")
         self._config.local_planning = bool(
             binding.get("depth_map") and (binding.get("odom") or self._config.local_geometry is not None))
+        if self._config.local_geometry is not None:
+            # Local path search can miss several command periods. Its swept
+            # motion already budgets the full downstream watchdog interval.
+            self._ttl_ms = negotiate.ttl_ms(rate, descriptor, periods=4.)
         self._config.odom_expected = bool(binding.get("odom"))
         if self._config.local_planning and self._config.local_geometry is None:
             self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
@@ -1663,8 +1667,7 @@ class NaviPlugin:
                 or scan.locked or was_searching) and not any(values):
             # A hold applies now, even when the last input is about to expire.
             obs_ms = now_ms
-        elif (self._config.local_planning
-                and (decision.status in (policy_mod.AVOIDING, policy_mod.SEARCHING) or command_only)
+        elif (self._config.local_planning and any(values)
                 and depth is not None and depth.get("frame_id") is not None):
             obs_ms = min(obs_ms, depth.get("capture_ms") or scan.single_depth_ms or depth["frame_id"])
             motion_pose = (odom or {}).get("motion_pose")
@@ -1677,7 +1680,7 @@ class NaviPlugin:
                     obs_ms = min(obs_ms, scan.current_frame)
         max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
         if (self._config.local_planning and any(values)
-                and type(max_age) in (int, float) and 0 < max_age < now_ms - obs_ms):
+                and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms):
             if scan is not previous_scan or not issued_yaw:
                 scan.issued_yaw = False
             self._state.idle_for_s = idle_for_s
@@ -1686,7 +1689,7 @@ class NaviPlugin:
             values = [0.] * ACTION_DIM
             hold = policy_mod.Decision(
                 values, policy_mod.BLIND,
-                f"规划完成时观测已超出底盘准入时限（{now_ms - obs_ms} ms > {max_age:g} ms）；停车",
+                f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车",
                 distance_m=decision.distance_m, bearing=decision.bearing)
             self._last_decision = policy_mod._account_idle(hold, self._state, self._config, dt)
             obs_ms = now_ms

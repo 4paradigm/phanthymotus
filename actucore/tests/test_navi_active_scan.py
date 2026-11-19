@@ -221,6 +221,30 @@ def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkey
     assert not look.active and not look.locked and look.attempted
 
 
+@pytest.mark.parametrize("missing", ["depth", "odom", "poll_gap"])
+def test_receipt_scan_stops_then_replans_after_temporary_input_loss(monkeypatch, missing):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, depth=True, odom=True, wz=0.):
+        return look.update(_depth(stamp) if depth else None,
+                           {**_odom(stamp, wz), "received_ms": stamp} if odom else None,
+                           geometry, receipt_only=True, max_depth_age_ms=800)
+
+    update(1000)
+    assert look.begin((1., -1.))
+    update(1050)
+    assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
+    update(1150)
+    assert look.command(geometry, .33, 1., 600, 800).yaw < 0.
+    loss = 1500 if missing == "poll_gap" else 1250
+    hold = update(loss, depth=missing != "depth", odom=missing != "odom")
+    assert hold.yaw == 0. and look.active and not look.locked
+    for t, yaw in ((loss + 100, -.12), (loss + 200, 0.), (loss + 350, 0.)):
+        update(t, wz=yaw)
+        assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
+    assert look.attempted and not look.has_result and not look.active and not look.locked
+
+
 def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(monkeypatch):
     lookout, geometry, _, _ = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)

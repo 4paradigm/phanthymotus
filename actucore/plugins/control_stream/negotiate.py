@@ -233,15 +233,15 @@ def effective_rate(capabilities: dict, descriptor: dict, requested_hz=None) -> f
     return rate
 
 
-def ttl_ms(rate_hz: float, descriptor: dict) -> int:
+def ttl_ms(rate_hz: float, descriptor: dict, *, periods: float = 2.) -> int:
     """How long a command stays valid.
 
-    Use two periods with a 50 ms floor, then apply the watchdog and optional
+    Use the requested periods with a 50 ms floor, then apply the watchdog and optional
     command TTL caps. The TTL cap can preserve the command admission window
     when the driver's receive watchdog allows a longer gap between commands.
     """
     period_ms = 1000.0 / rate_hz if rate_hz > 0 else 33.0
-    ttl = max(50.0, period_ms * 2)
+    ttl = max(50.0, period_ms * periods)
     limits = (descriptor or {}).get("rate") or {}
     for key in ("watchdog_ms", "max_command_ttl_ms"):
         try:

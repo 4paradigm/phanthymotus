@@ -97,6 +97,8 @@ ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
 
 # The blocked-route buffer reserves braking room outside the obstacle stop.
 BLOCKED_APPROACH_BUFFER_M = 0.30
+LOCAL_BLOCKED_APPROACH_BUFFER_M = 0.05
+LOCAL_BLOCKED_APPROACH_MAX_MPS = 0.15
 
 # Longitudinal separation for identifying a foreground obstacle and resuming.
 FORWARD_CLEARANCE_MARGIN_M = 0.15
@@ -503,6 +505,7 @@ class State:
     # sidestep nobody asked for.
     vy_gate: Gate = field(default_factory=Gate)
     escape_side: float = 0.0
+    side_stall_s: dict[float, float] = field(default_factory=dict)
     side_compare_frame: int | None = None
     side_better_frames: int = 0
     local_plan: PlanCache = field(default_factory=PlanCache)
@@ -534,6 +537,7 @@ class State:
     commanded_vx: float = 0.0
     adaptive_fwd_scale: float = 1.0
     avoidance_yaw_override: bool = False
+    blocked_approach: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     close_sample_gap_s: float = 0.0
@@ -974,6 +978,7 @@ def _band_of(bearing: float) -> str:
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
     state.view_detour = None
+    state.blocked_approach = False
     decision = _decide(detections, depth, odom, config, state, dt)
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
@@ -1074,7 +1079,8 @@ def _wait_for_detour_goal(state, config, track, odom):
     if not config.local_planning:
         return False
     scan = state.active_scan
-    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame)
+    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame
+                     or state.blocked_approach)
     observed = track is not None and track.observed and track.range_known
     anchor = state.goal_anchor
     if anchor is None:
@@ -1146,8 +1152,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if anchor.predicted_m > config.slow_distance_m or anchor.predicted_rad > math.pi / 3:
             return Decision(_twist(0., 0., 0.), AVOIDING, "绕行目标的无反馈推算已达上限，停车")
 
+    feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
-        feedback = planar_feedback(odom)
         source = ("command" if feedback is None else
                   "pose" if odom.get("motion_pose") is not None else "measured")
         if source == "command" and config.odom_expected and not state.motion_source:
@@ -1157,6 +1163,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if state.motion_source and state.motion_source != source:
             needs_guard = any(state.commanded) or state.active_scan.active
             previous_scan = state.active_scan
+            if (source == "command" and previous_scan.receipt_only
+                    and previous_scan.active and previous_scan.issued_yaw):
+                hold = previous_scan.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
+                return Decision(_twist(0, 0, 0), AVOIDING, hold.reason)
             previous_scan.invalidate()
             state.active_scan = ActiveScan(attempted=previous_scan.attempted, locked=previous_scan.locked)
             if needs_guard:
@@ -1197,7 +1207,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             return Decision(_twist(0, 0, 0), AVOIDING, update.reason)
         if scan.active:
             ahead, _ = _clearance(depth, config)
-            if ahead is not None and ahead <= config.obstacle_stop_m:
+            if (scan.phase != "brake_for_replan" and ahead is not None
+                    and ahead <= config.obstacle_stop_m):
                 command = scan.interrupt("主动观察：检测到近障，停车")
                 return Decision(_twist(0, 0, 0), AVOIDING, command.reason)
             if not scan.ready:
@@ -1227,6 +1238,19 @@ def _decide(detections, depth, odom, config: Config, state: State,
         elif depth is not None:
             missing = "vop"
         return Decision(None, BLIND, f"observation stale or missing ({missing})")
+
+    previous_vy = state.commanded[1]
+    lateral_progress = (feedback is not None and previous_vy != 0.
+                        and math.copysign(1., previous_vy) * feedback[1] >
+                        max(STILL_LINEAR, abs(previous_vy) * config.stuck_speed_ratio))
+    side = state.escape_side
+    if feedback is not None and side * previous_vy < 0.:
+        if lateral_progress:
+            state.side_stall_s.pop(side, None)
+        else:
+            # Count only time covered by a lateral request and measured
+            # feedback. A small same-sign standing bias is not progress.
+            state.side_stall_s[side] = state.side_stall_s.get(side, 0.) + min(dt, config.watchdog_ms / 1000)
 
     bands = depth.get("bands") or {}
 
@@ -1399,12 +1423,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # that has been shuffling sideways for twelve seconds is not making
     # progress, and the caller deserves the real reason rather than a timeout
     # or, worse, a report that it arrived.
-    feedback = planar_feedback(odom) if config.local_planning and vy and not vx else None
-    previous_vy = state.commanded[1]
-    lateral_progress = (feedback is not None and previous_vy * vy > 0.
-                        and math.copysign(1., vy) * feedback[1] >
-                        max(STILL_LINEAR, abs(previous_vy) * config.stuck_speed_ratio))
-    if status == AVOIDING and not (vx or lateral_progress):
+    if status == AVOIDING and not (vx or (lateral_progress and previous_vy * vy > 0.)):
         state.blocked_for_s += dt
         if state.blocked_for_s >= config.blocked_timeout_s:
             blocked = (f"前方被挡住了 {state.blocked_for_s:.0f} 秒，绕不过去："
@@ -1757,7 +1776,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     local_command = None
     scan = state.active_scan if config.local_planning and state is not None else None
     if near or (foreground and approaching):
-        brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
+        stationary_line = config.obstacle_stop_m + LOCAL_BLOCKED_APPROACH_BUFFER_M
+        brake_at = min(slow, max(stop, stationary_line) if config.local_planning
+                       else stop + BLOCKED_APPROACH_BUFFER_M)
         horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
         approach = 0.
         if (foreground and aligned and depth.get("map") is not None
@@ -1766,11 +1787,11 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             floor = config.floor_vx
             if config.local_planning:
                 # Include the new command in the travel reserve used on the next tick.
-                stationary_line = config.obstacle_stop_m + BLOCKED_APPROACH_BUFFER_M
-                limit = min(limit, (target_distance - config.stop_distance_m) / horizon_s,
-                            (ahead - stationary_line) / (horizon_s + depth_age_s))
                 if config.floor_vx_moving is not None:
                     floor = config.floor_vx_moving
+                limit = min(limit, (target_distance - config.stop_distance_m) / horizon_s,
+                            (ahead - stationary_line) / (horizon_s + depth_age_s),
+                            max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS))
             speed = min(vx * scale, config.vx_max, limit)
             if speed > 0 and speed >= floor:
                 approach = speed
@@ -1802,6 +1823,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 planning_depth["projected_grid"] = scan.views[-1][2:]
             transitioning = False
             for candidate in order:
+                if state is not None and state.side_stall_s.get(candidate, -math.inf) >= config.stuck_window_s:
+                    continue
                 command = _local_translation(planning_depth, config, state, odom, ahead, candidate)
                 transitioning |= command is LocalHold.TRANSITION
                 if command is LocalHold.TRANSITION and candidate == state.escape_side:
@@ -1830,16 +1853,19 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     geometry = config.scan_geometry if "scan_grid" in planning_depth else config.local_geometry
                     motion = feedback if feedback is not None else state.command_tail
                     velocities = (motion, state.commanded)
+                    safe_speed = min(ahead - stationary_line,
+                                     target_distance - config.stop_distance_m) / horizon_s
                     if (geometry is not None and depth.get("ground") is not None
                             and depth.get("frame_id") is not None
                             and all(abs(vy) <= STILL_LINEAR and abs(wz) <= STILL_YAW
-                                    and abs(vx) <= approach + .02 for vx, vy, wz in velocities)):
+                                    and abs(vx) <= safe_speed for vx, vy, wz in velocities)):
                         grid = state.local_plan.grid_for(planning_depth, geometry)
                         if local_path.transition_clear(grid, geometry, keep, horizon_s,
                                                        (motion[:2], state.commanded[:2], (approach, 0.))):
                             state.recovery = None
                             state.view_detour = None
                             state.avoidance_yaw_override = True
+                            state.blocked_approach = True
                             return (approach, 0., 0., AVOIDING,
                                     f"两侧无可执行避让路线；低速接近（障碍停车线 {brake_at:.2f} m）")
                 if state is not None and state.view_detour is not None:
@@ -1879,6 +1905,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             clear = not occupied[corridor].any()
         if clear:
             scan.note_clear_path(scan.current_frame)
+            if coverage >= config.coverage_min and not scan.result_frame:
+                state.side_stall_s.clear()
         else:
             scan.clear_frames = 0
         if scan.result_frame:

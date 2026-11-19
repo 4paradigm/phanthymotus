@@ -1834,6 +1834,43 @@ def test_lateral_only_detour_uses_measured_progress_for_the_blockage_clock(monke
     assert (decision.status == P.FAILED) is fails
 
 
+@pytest.mark.parametrize("moves_sideways", [False, True])
+def test_nominal_detour_without_sideways_progress_tries_other_side_then_creeps(monkeypatch,
+                                                                            moves_sideways):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, stuck_window_s=.4)
+    state = _state(motion_source="measured")
+    state.active_scan.attempted = True
+    target = SimpleNamespace(bearing_rad=0., range_m=2.4, range_known=True,
+                             observed=True, measured_range_m=2.4)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0.: (
+        1.45 if lateral_offset_m > 0. else 1.35 if lateral_offset_m < 0. else 1.1, 1.))
+    monkeypatch.setattr(P, "_local_translation", lambda depth, config, state, odom, ahead, side:
+                        (0., -.03 * side))
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    scene = _scene(2.4)
+    decisions = []
+    for stamp in range(1000, 2400, 200):
+        depth = dict(scene, frame_id=stamp, ground=np.ones_like(scene["map"], dtype=bool))
+        odom = {"vx": state.commanded[0], "vy": -.08 if moves_sideways else -.039,
+                "wz": 0., "received_ms": stamp}
+        decisions.append(P.step(detections=_detections(), depth=depth, odom=odom,
+                                config=cfg, state=state, dt=.2))
+    assert decisions[0].values[1] < 0.
+    if moves_sideways:
+        assert all(decision.values[1] < 0. for decision in decisions)
+    else:
+        assert any(decision.values[1] > 0. for decision in decisions)
+        assert decisions[-1].values[:2] == pytest.approx([.15, 0.])
+        assert "低速接近" in decisions[-1].reason
+
+
 # ── half_fov_rad: 一个数填错，走廊就比门宽 ───────────────────────────────────
 
 def _doorway(open_w_m, wall_m, *, half_fov_rad, far_m=6.0):
@@ -2518,15 +2555,16 @@ def test_blocked_approach_stops_before_the_chassis_speed_floor_and_holds():
         assert tick(farther, frame).values == [0.0] * 6
 
 
-@pytest.mark.parametrize(("stop_distance", "target_range", "clearance", "expected_gap"), [
-    (.60, 2.0, 1.28, .38),
-    (1.45, 1.60, 1.28, .15),
-    (.60, 2.0, .90, 0.),
+@pytest.mark.parametrize(("stop_distance", "target_range", "clearance", "expected_speed"), [
+    (.60, 2.0, 1.28, .15),
+    (1.45, 1.60, 1.28, .15 / 1.45),
+    (.60, 2.0, .90, .25 / 2.25),
     (1.60, 1.60, 1.28, 0.),
-    (.60, 2.0, .94, 0.),  # only 4 cm left, below the gait's forward floor
+    (.60, 2.0, .65, 0.),
+    (.60, 2.0, .70, 0.),  # 5 cm left cannot supply the declared gait floor.
 ])
 def test_local_no_route_approach_stops_at_the_stricter_boundary(
-        monkeypatch, stop_distance, target_range, clearance, expected_gap):
+        monkeypatch, stop_distance, target_range, clearance, expected_speed):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -2553,17 +2591,15 @@ def test_local_no_route_approach_stops_at_the_stricter_boundary(
                         target_distance=target_range, odom=odom)
 
     assert sorted(tried) == [-1., 1.]
-    expected = expected_gap / (2.25 if stop_distance == .60 else 1.45)
-    assert decision[0] == pytest.approx(expected)
+    assert decision[0] == pytest.approx(expected_speed)
     assert decision[1:4] == (0., 0., P.AVOIDING)
-    if expected_gap:
+    if expected_speed:
         assert "低速接近" in decision[4]
-        if stop_distance == .60:
-            # Feeding back the first advance should yield a second slower advance.
+        if clearance == 1.28 and stop_distance == .60:
+            # Braking remains safe while the previous speed still fits the gap.
             state.commanded = (decision[0], 0., 0.)
             odom["vx"] = decision[0]
-            ahead = clearance - .1 * decision[0]
-            monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (ahead, 1.))
+            monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.88, 1.))
             following = P._avoid(.60, 0., 0., dict(depth, frame_id=1100), cfg,
                                  P.APPROACHING, "", state, target_distance=target_range, odom=odom)
             assert 0. < following[0] < decision[0]

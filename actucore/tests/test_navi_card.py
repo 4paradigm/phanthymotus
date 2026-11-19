@@ -410,11 +410,10 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
     else:
         pytest.fail("scan never reached the angular target")
     assert math.degrees(heading) == pytest.approx(20., abs=2.)
-    for _ in range(25):
-        stamp += 100
-        assert tick(stamp)["values"] == [0.] * 6
+    stamp += 100
+    assert tick(stamp)["values"] == [0.] * 6
     assert not replans
-    for _ in range(35):
+    for _ in range(8):
         stamp += 100
         command = tick(stamp)
         if command["values"][0] > 0:
@@ -1295,25 +1294,27 @@ def test_slow_planning_stamps_the_command_at_emission_and_keeps_used_observation
     assert command["ttl_ms"] == 200
 
 
-def test_a_motion_decision_that_expires_during_planning_publishes_a_stop(monkeypatch):
+@pytest.mark.parametrize("planning_ms", [200, 201])
+def test_a_motion_decision_that_expires_during_planning_publishes_a_stop(monkeypatch, planning_ms):
     card = _card()
     now_ms = [123_456]
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms[0] / 1000)
     assert _first_command(card) is not None
     card._config.local_planning = True
     card._descriptor = _descriptor(rate={"max_obs_age_ms": 500})
-    card._objects_ms = card._depth_ms = now_ms[0] - 300
+    card._objects_ms = now_ms[0] - 56
+    card._depth_ms = now_ms[0] - 300
     step = navi_plugin.policy_mod.step
 
     def slow_step(**kwargs):
         decision = step(**kwargs)
-        now_ms[0] += 201
+        now_ms[0] += planning_ms
         return decision
 
     monkeypatch.setattr(navi_plugin.policy_mod, "step", slow_step)
     message = card.next_command()
     assert message["values"] == [0.] * 6
-    assert message["obs_stamp_ms"] == message["stamp_ms"] == 123_657
+    assert message["obs_stamp_ms"] == message["stamp_ms"] == 123_456 + planning_ms
     assert card._state.commanded == (0., 0., 0.)
     assert card._last_decision.status == navi_plugin.policy_mod.BLIND
 
@@ -1835,10 +1836,11 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
-@pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom",
-                         [(50, None, True), (700, 800, True), (50, None, False)])
+@pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl",
+                         [(50, None, True, 600, 400), (700, 800, True, 250, 250),
+                          (50, None, False, 600, 400)])
 def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
-                                                          with_odom):
+                                                          with_odom, ttl_cap, expected_ttl):
     import numpy as np
     from plugins.navi import local_path, policy
 
@@ -1856,10 +1858,12 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         "action": "start", "input_topics": input_topics,
         "control_interface": _descriptor(footprint={"half_width": 0.23},
                                          rate={"max_hz": 20, "watchdog_ms": 600,
+                                                   "max_command_ttl_ms": ttl_cap,
                                                    "max_obs_age_ms": depth_limit_ms or 500}),
         "camera_info": {_DEPTH_TOPIC: declaration},
     })
     assert reply["state"] == "running"
+    assert reply["ttl_ms"] == expected_ttl
     assert card._config.local_planning and card._config.local_geometry.front == .23
 
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
@@ -1891,6 +1895,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
     assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
+    assert command["ttl_ms"] == expected_ttl
     expected_limit = depth_limit_ms or 500
     assert attempted[:2] == [(-1.0, .33, expected_limit, 600), (1.0, .33, expected_limit, 600)]
     assert all(attempt[1:] == (.33, expected_limit, 600) for attempt in attempted)
