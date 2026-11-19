@@ -1612,6 +1612,27 @@ def test_search_turn_checks_occupied_cells_with_unseen_sides(monkeypatch, blocke
         assert reason is None
 
 
+@pytest.mark.parametrize(("distance", "age_ms", "status"), [
+    (3.0, 0, P.SEARCHING),
+    (0.4, 0, P.AVOIDING),
+    (np.nan, 0, P.AVOIDING),
+    (3.0, 801, P.BLIND),
+])
+def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, status):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, max_depth_age_ms=800)
+    depth = dict(_depth(map_=_solid_depth(distance)), frame_id=1000,
+                 control_ms=1000 + age_ms)
+    state = _state(missing_frames=cfg.lost_frames - 1)
+    decision = P.step(detections=_detections(), depth=depth, odom=None,
+                      config=cfg, state=state, dt=.1)
+
+    assert decision.status == status
+    assert bool(decision.values and decision.values[5]) == (status == P.SEARCHING)
+
+
 def test_command_only_active_observation_uses_camera_geometry_without_extrinsics(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path

@@ -1657,21 +1657,20 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         command_only = state.motion_source == "command"
         geometry = (config.scan_geometry or config.local_geometry
                     if scan.receipt_only or command_only else config.scan_geometry)
-        if geometry is None or not scan.current_frame:
-            if state.recovery is not None:
-                state.recovery = ClearanceRecovery()
-            return "原地搜索：等待可用于扫掠检查的深度和几何"
         direction = state.last_seen_side
         motion = state.command_tail if command_only else scan.motion
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (motion, state.commanded)):
             return "原地搜索：等待平移或反向转动停稳"
-        horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
-        rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
-        if not scan.clear_sweep(geometry, _keepout_m(config), direction * (rate + .10) * horizon,
-                                STILL_LINEAR * horizon):
-            state.recovery = ClearanceRecovery()
-            return "原地搜索：转身扫掠范围有障碍或超出网格，停车"
+        # Target search can use the current front-depth check when the scan
+        # has no usable grid. A ready grid also checks the turn's footprint.
+        if geometry is not None and scan.current_frame:
+            horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
+            rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
+            if not scan.clear_sweep(geometry, _keepout_m(config), direction * (rate + .10) * horizon,
+                                    STILL_LINEAR * horizon):
+                state.recovery = ClearanceRecovery()
+                return "原地搜索：转身扫掠范围有障碍或超出网格，停车"
     if state.recovery is not None:
         if not config.local_planning and ahead is not None and ahead < config.slow_distance_m:
             state.recovery = ClearanceRecovery()
