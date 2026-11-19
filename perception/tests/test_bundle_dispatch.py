@@ -69,9 +69,11 @@ def test_shared_ql_printer_routes_to_real_plugin(bundle_cls):
     bundle = _bundle(bundle_cls, printer)
     tools = bundle.get_all_tools()
     assert len(tools) == 1
-    assert tools[0]["name"] == "QL_printer"
+    assert tools[0]["name"] == "Visitor_Badge_Printer"
     assert tools[0]["type"] == "actuator"
+    assert bundle.owns("Visitor_Badge_Printer") is True
     assert bundle.owns("QL_printer") is True
+    assert bundle.dispatch("Visitor_Badge_Printer", {"action": "info"}) == printer.dispatch("info", {})
     assert bundle.dispatch("QL_printer", {"action": "info"}) == printer.dispatch("info", {})
 
 

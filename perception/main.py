@@ -540,7 +540,7 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     private_call = any(name == prefix or name.startswith(prefix + '_')
-                                       for prefix in ('QL_printer', 'phanthy_music', 'audio_mixer'))
+                                       for prefix in ('QL_printer', 'Visitor_Badge_Printer', 'phanthy_music', 'audio_mixer'))
                     if not is_info:
                         if private_call:
                             log.info("[mcp] tools/call: %s (payload omitted)", name)

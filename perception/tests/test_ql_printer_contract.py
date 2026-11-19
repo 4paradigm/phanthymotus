@@ -48,7 +48,7 @@ class VisitorBadgeTest(unittest.TestCase):
 
     def test_tool_definition_uses_ticket_protocol(self):
         definition = self.card.get_tool()
-        self.assertEqual(definition["name"], "QL_printer")
+        self.assertEqual(definition["name"], "Visitor_Badge_Printer")
         self.assertEqual(definition["type"], "actuator")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(set(actions), {"start", "stop", "info", "config", "list", "print", "printers", "initialize", "initialize_status"})

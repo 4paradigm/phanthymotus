@@ -34,7 +34,7 @@ def tool(name, kind, description, schema):
             "description": description, "inputSchema": schema}
 
 
-TOOL_NAME = "QL_printer"
+TOOL_NAME = "Visitor_Badge_Printer"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -132,6 +132,7 @@ def _visit(item: dict) -> dict:
 
 class QLPrinterPlugin:
     PREFIX = TOOL_NAME
+    ALIASES = ("QL_printer",)
 
     def __init__(self, plugin_config: dict | None = None, executor=None):
         plugin_config = plugin_config or {}
@@ -190,8 +191,7 @@ class QLPrinterPlugin:
         definition = tool(
             TOOL_NAME,
             "actuator",
-            "访客贴打印：通过前台电脑上的桥接服务查询范式+ 里的访客预约，并用前台的打印机打印访客贴。"
-            "先 list 查看今天全部未入场访客，再用 name 和 host 调用 print；不要按猜测的名字打印。",
+            "查询当天未入场访客并打印访客贴。",
             action_schema(actions, properties),
         )
         definition["inputSchema"]["properties"]["printer_name"] = {"type": "string"}
@@ -207,11 +207,9 @@ class QLPrinterPlugin:
                 "printer_name": {"type": "string", "title": "目标打印机", "scope": "instance", "format": "bridge-printer"},
                 "bridge_url": {
                     "type": "string", "title": "桥接服务地址", "scope": "shared", "x-sensitive": True,
-                    "description": "前台电脑上桥接服务的地址，例如 http://192.168.1.20:8765（前台电脑要设固定 IP）",
                 },
                 "token": {
                     "type": "string", "title": "访问令牌", "scope": "shared", "format": "password",
-                    "description": "和桥接服务里设置的令牌一致，防止局域网里别人随便打印",
                 },
                 "timeout_s": {
                     "type": "number", "title": "查询超时（秒）", "scope": "shared",
@@ -220,12 +218,10 @@ class QLPrinterPlugin:
                 "print_timeout_s": {
                     "type": "number", "title": "打印超时（秒）", "scope": "shared",
                     "minimum": 10, "maximum": 120, "default": 60, "advanced": True,
-                    "description": "等待前台网页完成定位、打印并确认状态的最长时间",
                 },
                 "remote_start_enabled": {
                     "type": "boolean", "title": "机器人远程启动桥接", "scope": "shared",
                     "default": False, "advanced": True,
-                    "description": "桥接未运行时，通过受限 SSH 密钥触发前台 Windows 启动任务",
                 },
                 "remote_start_user": {
                     "type": "string", "title": "前台 SSH 用户", "scope": "shared",
@@ -255,7 +251,7 @@ class QLPrinterPlugin:
         return [self.get_tool()]
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == self.PREFIX:
+        if action == self.PREFIX or action in self.ALIASES:
             action = args.get("action", "info")
         args = {k: v for k, v in args.items() if not k.startswith("_")}
         if action == "start":

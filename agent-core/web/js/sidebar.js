@@ -1031,7 +1031,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
-    } else if (def.format === 'bridge-printer' && toolName === 'QL_printer') {
+    } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
@@ -1490,7 +1490,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
-    } else if (def.format === 'bridge-printer' && toolName === 'QL_printer') {
+    } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
       // The canvas-card settings dialog used to fall through to the generic
       // text input here.  Keep printer discovery available in the place where
       // the operator actually configures a placed QL_printer card.
