@@ -471,8 +471,8 @@ class CaptureObservations:
                    if len(self.native_delays) >= 4 else 500_000_000)
         cadence = self._native_period_ns() or 0
         capture_period = getattr(self.fusion, 'input_period_ns', None) or 0
-        return min(MAX_FRAME_AGE_NS, max(250_000_000, latency, self.retry_wait_ns,
-                                        2*max(cadence, capture_period)))
+        return min(MAX_VISUAL_RESULT_AGE_NS, max(250_000_000, latency, self.retry_wait_ns,
+                                                 2*max(cadence, capture_period)))
 
     def add_frame(self, stamp, color, depth, now):
         outputs = self.drain(now)

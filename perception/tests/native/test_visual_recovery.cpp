@@ -14,8 +14,10 @@
 #include <chrono>
 
 static void testScanRelocalization(const std::string &root, const std::string &output,
-                                  rtabmap::ParametersMap parameters, bool predictionFallback, bool partialOverlap)
+                                  rtabmap::ParametersMap parameters, const std::string &mode)
 {
+    const bool partialOverlap=mode=="partial_scan_relocalize";
+    const bool afterMotion=mode=="scan_relocalize_after_motion";
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
     if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
     parameters["RGBD/LinearUpdate"]="0.03";
@@ -52,10 +54,10 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     };
     if(!frame(1.,0.f,true,false) || !frame(1.5,.12f,true,false))
         throw std::runtime_error("cannot seed a connected old scan map");
-    const auto old=map.getLocalOptimizedPoses();
     const auto anchor=map.getLastLocationId();
-    if(predictionFallback)
+    if(mode=="rejected_prediction_fallback")
     {
+        const auto old=map.getLocalOptimizedPoses();
         if(!frame(2.,.22f,false,false,false,true) ||
            recovery.state()!=motus::VisualRecovery::ScanTracking || recovery.odom().isNull() ||
            std::abs(recovery.odom().x()-.22f)>.03f || map.getLocalOptimizedPoses().size()<=old.size())
@@ -67,18 +69,32 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         map.close();
         return;
     }
-    frame(6.,.22f,false,true,true);
-    frame(6.5,.22f,false,true);
+    if(afterMotion)
+    {
+        for(int i=1;i<=8;++i)
+        {
+            const float x=.12f+i*.075f;
+            if(!frame(1.5+i*.5,x,false,false) ||
+               recovery.state()!=motus::VisualRecovery::ScanTracking ||
+               std::abs(recovery.odom().x()-x)>.03f)
+                throw std::runtime_error("incremental scan tracking did not measure the approach");
+        }
+    }
+    const auto old=map.getLocalOptimizedPoses();
+    constexpr double recoveryStamp=7.;
+    const float recoveryX=afterMotion?.795f:.22f;
+    frame(recoveryStamp-1.0,recoveryX,false,true,true);
+    frame(recoveryStamp-.5,recoveryX,false,true);
     if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
        map.getLocalOptimizedPoses()!=old)
         throw std::runtime_error("unrelated scan must leave the old graph intact and publish no pose");
-    const bool localized=frame(7.,.22f,false,false);
+    const bool localized=frame(recoveryStamp,recoveryX,false,false);
     const auto node=recovery.recoveryNode();
     std::cout<<"scan recovery="<<localized<<" anchor="<<recovery.recoveryAnchor()<<" node="<<node
              <<" before="<<old.size()<<" after="<<map.getLocalOptimizedPoses().size()<<std::endl;
     if(!localized || recovery.state()!=motus::VisualRecovery::Localized || recovery.odom().isNull() ||
        recovery.recoveryAnchor()!=anchor || recovery.recoveryInliers()!=0 ||
-       std::abs(recovery.odom().x()-.22f)>.03f || map.getLocalOptimizedPoses().size()!=old.size()+1)
+       std::abs(recovery.odom().x()-recoveryX)>.03f || map.getLocalOptimizedPoses().size()!=old.size()+1)
         throw std::runtime_error("overlapping scan did not relocalize against the saved graph without RGB");
     if(partialOverlap)
     {
@@ -90,9 +106,26 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     for(const auto &pose:old)
         if(map.getLocalOptimizedPoses().at(pose.first)!=pose.second)
             throw std::runtime_error("scan recovery moved an existing optimized pose");
-    if(!frame(7.5,.30f,false,false) || !frame(8.,.38f,false,false) ||
+    if(!frame(recoveryStamp+.5,recoveryX+.08f,false,false) || !frame(recoveryStamp+1.,recoveryX+.16f,false,false) ||
        map.getLocalOptimizedPoses().size()<old.size()+3)
         throw std::runtime_error("old graph stopped growing after scan recovery");
+    int secondNode=0;
+    if(afterMotion)
+    {
+        for(int i=3;i<=8;++i)
+        {
+            if(!frame(recoveryStamp+i*.5,recoveryX+i*.08f,false,false) ||
+               recovery.state()!=motus::VisualRecovery::ScanTracking)
+                throw std::runtime_error("scan tracking stopped after the first closure");
+        }
+        const auto before=map.getLocalOptimizedPoses().size();
+        const float x=recoveryX+9*.08f;
+        if(!frame(recoveryStamp+4.5,x,false,false) ||
+           recovery.state()!=motus::VisualRecovery::Localized || recovery.recoveryAnchor()!=anchor ||
+           std::abs(recovery.odom().x()-x)>.03f || map.getLocalOptimizedPoses().size()!=before+1)
+            throw std::runtime_error("the same map anchor could not support a second scan closure");
+        secondNode=recovery.recoveryNode();
+    }
     const auto grown=map.getLocalOptimizedPoses();
     map.close();
     rtabmap::Rtabmap reopened;
@@ -101,6 +134,13 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     if(reopened.getLocalOptimizedPoses()!=grown || !signature ||
        !signature->hasLink(anchor,rtabmap::Link::kGlobalClosure))
         throw std::runtime_error("scan recovery constraint and graph must survive reopening");
+    if(secondNode)
+    {
+        const auto *second=reopened.getMemory()->getSignature(secondNode);
+        if(!second || !second->hasLink(anchor,rtabmap::Link::kGlobalClosure))
+            throw std::runtime_error("second scan recovery constraint must survive reopening");
+        std::cout<<"persisted second scan edge="<<anchor<<"->"<<secondNode<<std::endl;
+    }
     reopened.close(false);
     std::cout<<"reopened nodes="<<grown.size()<<" persisted scan edge="<<anchor<<"->"<<node<<std::endl;
 }
@@ -159,10 +199,11 @@ int main(int argc, char **argv)
     p["RGBD/ProximityPathMaxNeighbors"]="1"; p["Kp/MaxFeatures"]="500";
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
-    if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" || mode=="rejected_prediction_fallback")
+    if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
+       mode=="scan_relocalize_after_motion" || mode=="rejected_prediction_fallback")
     {
         p["RGBD/NeighborLinkRefining"]="false";
-        testScanRelocalization(root,output,p,mode=="rejected_prediction_fallback",mode=="partial_scan_relocalize");
+        testScanRelocalization(root,output,p,mode);
         return 0;
     }
     if(nativeRecovery)
@@ -195,7 +236,7 @@ int main(int argc, char **argv)
     bool relocalizeBlack=false; int rgbGapFrames=0;
     bool postClosureLoss=false, postClosureReacquired=false;
     size_t postClosureNodes=0;
-    int postClosureScans=0, scanBridgeNode=0, scanBridgeAnchor=0;
+    int postClosureScans=0, scanBridgeNode=0, scanBridgeAnchor=0, secondScanClosure=0;
     double scanBridgeStamp=0.;
     const double scanBridgeOffsets[]={.4,2.6,3.,3.2,3.8,4.2};
     const rtabmap::Transform handoffOrigin(7.f,-3.f,.5f,0.f,0.f,.35f);
@@ -405,7 +446,7 @@ int main(int argc, char **argv)
                  <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
-        if(scanAfterClosure && recovery.state()==motus::VisualRecovery::Localized)
+        if(scanAfterClosure && !bridgeScan && recovery.state()==motus::VisualRecovery::Localized)
         {
             scanBridgeNode=recovery.recoveryNode();
             scanBridgeAnchor=recovery.recoveryAnchor();
@@ -433,9 +474,13 @@ int main(int argc, char **argv)
             }
             if(postClosureScans==5)
             {
-                if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
-                   map.getLocalOptimizedPoses().size()!=nodesBefore)
-                    throw std::runtime_error("scan-only matches cannot extend their own recovery window");
+                if(!accepted || recovery.state()!=motus::VisualRecovery::Localized ||
+                   recovery.odom().isNull() || recovery.recoveryAnchor()!=scanBridgeNode ||
+                   recovery.relocalizations()!=2 || recovery.recoveryInliers()!=0 ||
+                   std::abs(recovery.odom().x()-(truthX+.016f))>.08f ||
+                   map.getLocalOptimizedPoses().size()!=nodesBefore+1)
+                    throw std::runtime_error("after the short window a scan must verify a new closure against the map anchor");
+                secondScanClosure=recovery.recoveryNode();
                 ++postClosureScans;
                 break;
             }
@@ -848,7 +893,7 @@ int main(int argc, char **argv)
     if(mode=="recovery" && !postClosureReacquired)
         throw std::runtime_error("short visual loss after global recovery was not exercised");
     if(scanAfterClosure && postClosureScans!=(externalAfterScan?2:6))
-        throw std::runtime_error("map must continue after one rejected scan and stop when the bridge expires");
+        throw std::runtime_error("map must continue after one rejected scan and verify recovery when the bridge expires");
     if(voHandoff && (handoffFrames!=(mode=="vo_handoff_gap"?2:3) || i!=(mode=="vo_reacquire_expired"?7:8)))
         throw std::runtime_error("continuous VO and real visual failure regression was not exercised");
     if(mode=="scan_mask" && (scanOnlyFrames<2 || retainedScanClosures==0))
@@ -892,6 +937,12 @@ int main(int argc, char **argv)
         if(reopened.getLocalOptimizedPoses()!=finalized || !signature ||
            !signature->hasLink(scanBridgeAnchor,rtabmap::Link::kGlobalClosure))
             throw std::runtime_error("scan continuation and its original closure must survive reopening");
+        if(!externalAfterScan)
+        {
+            const auto *second=reopened.getMemory()->getSignature(secondScanClosure);
+            if(!second || !second->hasLink(scanBridgeNode,rtabmap::Link::kGlobalClosure))
+                throw std::runtime_error("the scan closure after visual recovery must survive reopening");
+        }
         reopened.close(false);
     }
     if(crossedRecovery)

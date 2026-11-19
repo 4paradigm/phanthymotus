@@ -87,6 +87,18 @@ def test_submitted_capture_can_use_a_late_exact_visual_pair(complete, delay, acc
         assert fusion.frames[0][1] is not None
 
 
+def test_capture_enqueued_promptly_can_use_a_late_exact_visual_pair():
+    fusion = Fusion()
+    fusion.input_period_ns = 600_000_000
+    frames = CaptureObservations(fusion)
+    stamp = 1_000_000_000
+    frames.add_frame(stamp, None, None, stamp+10_000_000)
+    pose, info = messages(stamp)
+    frames.result('pose', pose, stamp+1_104_000_000)
+    frames.result('info', info, stamp+1_105_000_000)
+    assert len(fusion.frames) == 1 and fusion.frames[0][1] is not None
+
+
 def test_lost_diagnostic_can_trigger_coast_without_matching_pose():
     fusion = Fusion(); frames = CaptureObservations(fusion)
     frames.add_frame(1_000_000_000, None, None, 1_010_000_000)

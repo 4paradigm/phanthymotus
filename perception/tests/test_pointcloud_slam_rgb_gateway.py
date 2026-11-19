@@ -159,7 +159,8 @@ def image(n, ms, data=b'good'):
     return msg
 
 
-def test_visual_depth_keeps_the_measured_grid_after_preview_decimation(calibrated_node):
+@pytest.mark.parametrize("silent_odom", [False, True])
+def test_visual_depth_keeps_the_measured_grid_after_preview_decimation(calibrated_node, silent_odom):
     from plugins.spatial_input import InputAdapterRegistry, _identity
     from plugins.spatial_time import FrameContext
     from test_pointcloud_plugin import _FakeImage, _plugin, metric_z16_declaration
@@ -182,21 +183,43 @@ def test_visual_depth_keeps_the_measured_grid_after_preview_decimation(calibrate
     raw = np.full((h, w), 2000, dtype='<u2')
     raw[1, 1] = 0
     depth = _FakeImage(data=raw.tobytes(), encoding='16UC1', width=w, height=h, step=2*w)
-    depth.header = NS(stamp=NS(sec=1, nanosec=0), frame_id='camera')
-    context = FrameContext('depth1', 10**9, 'clock', 'source_capture', 10**9, 10**9, 'ingress')
+    ms = 1500 if silent_odom else 1000
+    stamp = ms*1_000_000
+    depth.header = NS(stamp=NS(sec=1, nanosec=stamp%10**9), frame_id='camera')
+    context = FrameContext('depth1', stamp, 'clock', 'source_capture', stamp, stamp, 'ingress')
+    expected = 1
+    if silent_odom:
+        send(n)
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        expected = 2
     try:
         producer._emit_depth(depth, context)
         metric = next(p for p in producer.publishers if p.topic.endswith('/pointcloud_metric'))
         scan = metric.raw_messages[0]
-        n._odom(NS(data=json.dumps(odom(1000))))
-        image(n, 1000)
+        n._measurement_clock_ns = lambda: stamp
+        n._receipt_clock = lambda: ms/1000
+        if not silent_odom:
+            n._odom(NS(data=json.dumps(odom(ms))))
+        image(n, ms)
         assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
         n._cloud(scan, registry._derived[_identity(metric.topic, scan)])
-        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
-        message = published(n, '/sensor_data')[0].raw_messages[0]
+        if silent_odom:
+            assert n.stream.pending_count == 1
+            with registry._lock:
+                registry._derived_depth.clear()
+            n._receipt_clock = lambda: 2.51
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == expected)
+        message = published(n, '/sensor_data')[0].raw_messages[-1]
         assert message.laser_scan.width == 19_200
         measured = np.frombuffer(message.right.data, dtype='<f4').reshape(h, w)
         np.testing.assert_array_equal(measured, raw / 1000.)
+        if silent_odom:
+            assert n._pose_loss_seq == 1
+            assert n.stream.pending_count == 0
+            n._measurement_clock_ns = lambda: 2_500_000_000
+            n._cloud(cloud(2_500_000_000))
+            assert _wait_until(lambda: n.status()['forwarded_clouds'] == expected + 1)
+            assert n.stream.pending_count == 0
     finally:
         producer.stop()
         registry.close()

@@ -17,7 +17,7 @@ class SlamStream:
                  max_gap_ms, max_age_s, max_pending, max_cloud_points,
                  on_frame, max_measurement_age_ms=None,
                  max_future_skew_ms=None, input_contract=None, extrinsic_mode='static',
-                 on_unlocalized_frame=None, on_observation=None):
+                 on_unlocalized_frame=None, on_observation=None, on_pose_loss=None):
         if any(type(v) is not int or v <= 0 for v in (max_pending, max_cloud_points)):
             raise ValueError('positive bounded capacities required')
         self.max_measurement_age_ms = max_measurement_age_ms
@@ -32,6 +32,7 @@ class SlamStream:
         self.on_frame = on_frame
         self.on_unlocalized_frame = on_unlocalized_frame
         self.on_observation = on_observation
+        self.on_pose_loss = on_pose_loss
         self._segments = OrderedDict()
         self._admitted = 0
         self._poses = deque(maxlen=512)
@@ -67,11 +68,23 @@ class SlamStream:
         self._pending.clear()
         self._last_received = None
         self._odom_state = 'waiting'
+        if self.on_pose_loss is not None:
+            self.on_pose_loss()
         if latest is not None and self.on_unlocalized_frame is not None:
-            stamp, cloud, received, context = latest
-            if now-received <= self.max_age_s:
+            self._offer_unlocalized(latest, now)
+
+    def _offer_unlocalized(self, pending, now):
+        stamp, cloud, received, context = pending
+        if now-received <= self.max_age_s:
+            try:
                 matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
                 self.on_unlocalized_frame(stamp, cloud, None, matrix.copy(), deepcopy(context))
+            except ValueError as error:
+                self.last_error = str(error)
+
+    def poll(self, *, now):
+        if self.on_unlocalized_frame is not None and self._pending:
+            self._drain(now, None)
 
     def status(self, *, now, measurement_now_ns=None):
         return {'odometry': self._odom_state,
@@ -251,37 +264,41 @@ class SlamStream:
         if self.on_observation is not None:
             matrix = _rigid(capture_context['child_from_cloud']) if capture_context is not None else self.extrinsic
             self.on_observation(stamp_ns, cloud, matrix)
-        if len(self._pending) == self.max_pending:
-            oldest = self._pending.popleft()
-            if self.on_unlocalized_frame is not None:
-                old_stamp, old_cloud, _, old_context = oldest
-                matrix = _rigid(old_context['child_from_cloud']) if old_context is not None else self.extrinsic
-                self.on_unlocalized_frame(old_stamp, old_cloud, None, matrix.copy(), deepcopy(old_context))
-            else:
-                self._dropped_pending += 1
         self._pending.append((stamp_ns, cloud, self._last_cloud_received, deepcopy(capture_context)))
         self._drain(now, measurement_now_ns)
 
     def _drain(self, now, measurement_now_ns):
+        can_localize = self.on_unlocalized_frame is not None
+        # Give late visual results a bounded opportunity to pair with the scan.
+        wait_s = min(1.5, self.max_age_s)
+        if can_localize and self._last_received is not None and now-self._last_received >= wait_s:
+            self._lose(now)
+            return
+        if len(self._pending) > self.max_pending:
+            oldest = self._pending.popleft()
+            if can_localize:
+                self._offer_unlocalized(oldest, now)
+            else:
+                self._dropped_pending += 1
         remaining = deque()
         while self._pending:
-            stamp, cloud, received, context = self._pending.popleft()
+            pending = self._pending.popleft()
+            stamp, cloud, received, context = pending
             try:
-                if not self._poses and self.on_unlocalized_frame is not None:
-                    matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
-                    self.on_unlocalized_frame(stamp, cloud, None, matrix.copy(), deepcopy(context))
-                    continue
                 if not self._poses or stamp > self._poses[-1].stamp_ns or stamp < self._poses[0].stamp_ns:
-                    remaining.append((stamp, cloud, received, context))
+                    if can_localize and (not self._poses or now-received >= wait_s):
+                        self._offer_unlocalized(pending, now)
+                    else:
+                        remaining.append(pending)
                     continue
                 matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
                 try:
                     pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
                 except ValueError as error:
                     self.last_error = str(error)
-                    if self.on_unlocalized_frame is not None:
+                    if can_localize:
                         # Geometry can still verify this scan independently.
-                        self.on_unlocalized_frame(stamp, cloud, None, matrix.copy(), deepcopy(context))
+                        self._offer_unlocalized(pending, now)
                     continue
                 self.on_frame(stamp, cloud, pose, matrix.copy(), deepcopy(context))
                 if pose.prediction_anchor_ns is None:

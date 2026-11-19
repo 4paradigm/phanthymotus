@@ -210,7 +210,8 @@ class RtabmapNode(Node):
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame,
                 on_observation=self._observe_motion if self._motion is not None else None,
-                on_unlocalized_frame=self._queue_frame if self._rgb is not None else None)
+                on_unlocalized_frame=self._queue_frame if self._rgb is not None else None,
+                on_pose_loss=self._retire_pose_work)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
             if self._settings.get('capture_mount'):
@@ -295,11 +296,11 @@ class RtabmapNode(Node):
                         context.ingress_clock_id==self.stream.ingress_clock_id else None, context=derived)
                 except ValueError as error:
                     self.stream.last_error = str(error)
-                if self.stream._odom_state not in ('tracking', 'coasting'):
-                    # Retire work that depended on the old numeric pose. Null
-                    # pose heartbeats must leave localization queries runnable.
-                    self._pose_loss_seq = self._admission_seq
         self._wake.set()
+
+    def _retire_pose_work(self):
+        # Retire work that depended on the old pose without cancelling recovery scans.
+        self._pose_loss_seq = self._admission_seq
 
     def _capture_mount(self, msg):
         try:
@@ -345,7 +346,11 @@ class RtabmapNode(Node):
             with self._lock:
                 if not self._stopped():
                     key = (stamp,frame,hashlib.sha256(msg.data).hexdigest())
-                    self._cloud_ingress[key] = (received,context)
+                    # Keep measured depth with its cloud across the bounded pose wait.
+                    depth = (self._input_registry.derived_depth(context)
+                             if self._rgb is not None and context is not None and self._input_registry is not None
+                             else None)
+                    self._cloud_ingress[key] = (received, context, depth)
                     while len(self._cloud_ingress) > self.stream.max_pending*3:self._cloud_ingress.popitem(last=False)
                     if self._rgb is not None:
                         rgb = self._rgb.take(stamp, self._measurement_clock_ns(), exact=True)
@@ -371,7 +376,7 @@ class RtabmapNode(Node):
         ingress = self._cloud_ingress.pop(key, None)
         if ingress is None:
             raise ValueError('cloud original ingress context expired')
-        received, observation = ingress
+        received, observation, depth = ingress
         predicted = pose is not None and pose.prediction_anchor_ns is not None
         if predicted and (self._rgb is None or self._active is None):
             self._rgb_reservations.pop(stamp, None)
@@ -390,7 +395,7 @@ class RtabmapNode(Node):
         self._admission_seq += 1
         # Allow the existing measured-pose wait and one bounded late result.
         rgb_deadline = time.monotonic() + (2 if pose is not None else 1) * _MEASURED_RGB_WAIT_MS / 1000.
-        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation, rgb_deadline))
+        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation, rgb_deadline, depth))
         if pose is not None:
             # A usable newer observation supersedes optional unlocalized work;
             # never replay a delayed frame into an already advanced native map.
@@ -573,7 +578,8 @@ class RtabmapNode(Node):
         cloud.header.frame_id = transform.child_frame_id
         observation = item[6] if len(item) > 6 else None
         rgb_deadline = item[7] if len(item) > 7 else time.monotonic()
-        native, rgb_generation = (self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline)
+        depth = item[8] if len(item) > 8 else None
+        native, rgb_generation = (self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline, depth)
                                   if self._rgb is not None else (cloud, None))
         if predicted:
             # The standard odometry input stays null. Even an older native
@@ -645,7 +651,8 @@ class RtabmapNode(Node):
             self._wake.wait(remaining)
         return False  # One bounded fallback scan when RGB-D never becomes usable.
 
-    def _sensor_data(self, cloud, pose, matrix, motion_generation=None, observation=None, rgb_deadline=0.):
+    def _sensor_data(self, cloud, pose, matrix, motion_generation=None, observation=None, rgb_deadline=0.,
+                     measured_depth=None):
         """Scan is mandatory; optional source-timed imagery may fail independently."""
         if motion_generation is None:
             motion_generation = self._motion_generation
@@ -700,10 +707,11 @@ class RtabmapNode(Node):
                 def prepare():
                     started = time.perf_counter()
                     try:
-                        measured_depth = (self._input_registry.derived_depth(observation)
-                                          if observation is not None and self._input_registry is not None else None)
+                        depth = measured_depth
+                        if depth is None and observation is not None and self._input_registry is not None:
+                            depth = self._input_registry.derived_depth(observation)
                         result = self._rgb_attachment(cloud.header, stamp, pose, matrix, points,
-                                                      motion_generation, measured_depth)
+                                                      motion_generation, depth)
                         with self._lock:
                             if not future.cancelled():
                                 self._rgb_preparation_ms.append((time.perf_counter()-started)*1000.)
@@ -897,6 +905,9 @@ class RtabmapNode(Node):
     def _status_loop(self):
         while not self._status_stop.wait(min(.25, self._settings['preview_interval_s'])):
             try:
+                with self._lock:
+                    if not self._stopped():
+                        self.stream.poll(now=self._receipt_clock())
                 self._check_budget()
                 active = self._active
                 if active is not None and not active['finalized'] and not active['closing'] and active['process'].poll() is not None and not self._stopped():

@@ -537,14 +537,27 @@ private:
         rtabmap::SensorData reference;
         reference.setLaserScan(scan);
         rtabmap::RegistrationInfo result;
-        const auto relative=inertialIcp_->computeTransformation(reference,data,
-            rtabmap::Transform::getIdentity(),&result);
-        // A partial view can rejoin the map, but a small matching patch cannot
-        // establish the alignment on its own.
-        if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
-           !(result.icpInliersRatio>=.30f) ||
-           !validCovariance(result.covariance))
-            return false;
+        const auto registerFrom=[&](const rtabmap::Transform & guess)
+        {
+            result=rtabmap::RegistrationInfo();
+            const auto relative=inertialIcp_->computeTransformation(reference,data,guess,&result);
+            // A small matching patch cannot establish alignment on its own.
+            if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
+               !(result.icpInliersRatio>=.30f) || !validCovariance(result.covariance))
+                return rtabmap::Transform();
+            return relative;
+        };
+        const auto identity=rtabmap::Transform::getIdentity();
+        auto relative=rtabmap::Transform();
+        if(scanMapGuess_)
+        {
+            const double age=data.stamp()-scanMapGuess_->stamp;
+            if(age>0. && age<=2. && !scanMapGuess_->relative.isNull() &&
+               scanMapGuess_->relative!=identity && cv::checkRange(scanMapGuess_->relative.dataMatrix()))
+                relative=registerFrom(scanMapGuess_->relative);
+        }
+        if(relative.isNull()) relative=registerFrom(identity);
+        if(relative.isNull()) return false;
         const auto covariance=scanCovariance(result.covariance);
         cv::Mat information;
         if(!cv::invert(covariance,information,cv::DECOMP_CHOLESKY) || !cv::checkRange(information))
@@ -557,7 +570,10 @@ private:
         stats["Motus/ScanRelocalizationCorrespondences/"]=static_cast<float>(result.icpCorrespondences);
         beginLocalization(map);
         const rtabmap::Link measured(scanMapAnchor_,0,rtabmap::Link::kGlobalClosure,relative,information);
-        return promote(map,data,measured,location,covariance,stats,poses,links,previousPoses,links);
+        if(!promote(map,data,measured,location,covariance,stats,poses,links,previousPoses,links))
+            return false;
+        scanMapGuess_=ScanMapGuess{relative,data.stamp()};
+        return true;
     }
 
     void finishLocalization(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
@@ -700,9 +716,18 @@ private:
     {
         if(data.laserScanRaw().empty()) {scanAnchor_.reset(); return;}
         const int node=map.getLastLocationId();
-        if((state_==External || state_==VisualTracking || (state_==Localized && recoveryInliers_>0)) &&
-           map.getLocalOptimizedPoses().count(node))
-            scanMapAnchor_=node;
+        if(state_==External || state_==VisualTracking || (state_==Localized && recoveryInliers_>0))
+        {
+            scanMapGuess_.reset();
+            const auto *signature=map.getMemory()->getSignature(node);
+            if(signature && map.getLocalOptimizedPoses().count(node))
+            {
+                scanMapAnchor_=node;
+                const auto & anchorOdom=signature->getPose();
+                if(!anchorOdom.isNull())
+                    scanMapGuess_=ScanMapGuess{anchorOdom.inverse()*odom_,data.stamp()};
+            }
+        }
         rtabmap::SensorData scan;
         scan.setLaserScan(data.laserScanRaw());
         scan.setStamp(data.stamp());
@@ -735,6 +760,9 @@ private:
         const auto covariance=scanCovariance(result.covariance);
         if(!map.process(data,measured,covariance,std::vector<float>(),stats))
             return false;
+        // Carry only scan motion that the map accepted. Its map anchor stays fixed.
+        if(scanMapGuess_ && scanMapGuess_->stamp==scanAnchor_->scan.stamp())
+            scanMapGuess_=ScanMapGuess{scanMapGuess_->relative*relative,data.stamp()};
         state_=ScanTracking; odom_=measured;
         rememberScan(map,data); // Small motion may leave the persisted keyframe unchanged.
         return true;
@@ -797,6 +825,12 @@ private:
     std::optional<VisualAlignment> visualAlignment_;
     std::optional<ScanAnchor> scanAnchor_;
     int scanMapAnchor_=0;
+    struct ScanMapGuess
+    {
+        rtabmap::Transform relative;
+        double stamp;
+    };
+    std::optional<ScanMapGuess> scanMapGuess_;
     bool retryExternalNeighbor_=false;
     std::optional<ExternalRun> externalRun_;
     rtabmap::Transform previousExternal_;
