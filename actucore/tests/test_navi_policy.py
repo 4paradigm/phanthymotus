@@ -1816,6 +1816,24 @@ def test_a_corridor_that_clears_resets_the_blocked_clock():
         assert decision.status != P.FAILED
 
 
+@pytest.mark.parametrize(("feedback", "fails"), [(-.12, False), (-.039, True), (.12, True)])
+def test_lateral_only_detour_uses_measured_progress_for_the_blockage_clock(monkeypatch, feedback, fails):
+    from types import SimpleNamespace
+
+    cfg = _cfg(local_planning=True, blocked_timeout_s=.2)
+    state = _state(commanded=(0., -.30, 0.))
+    target = SimpleNamespace(bearing_rad=0., range_m=2.5, range_known=True,
+                             observed=True, measured_range_m=2.5)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(P, "_avoid", lambda *args, **kwargs:
+                        (0., -.30, 0., P.AVOIDING, "局部规划"))
+    odom = {"vx": 0., "vy": feedback, "wz": 0.}
+    for _ in range(3):
+        decision = P.step(detections=_detections(), depth=_scene(2.5), odom=odom,
+                          config=cfg, state=state, dt=.1)
+    assert (decision.status == P.FAILED) is fails
+
+
 # ── half_fov_rad: 一个数填错，走廊就比门宽 ───────────────────────────────────
 
 def _doorway(open_w_m, wall_m, *, half_fov_rad, far_m=6.0):
@@ -2825,6 +2843,28 @@ def test_local_recovery_uses_the_current_checked_speed_without_waiting_for_frame
 
     assert step(200) == (.063, -.077, 0.)
     assert state.recovery is None
+
+
+def test_local_detour_reuses_receipt_only_projection_for_the_same_geometry(monkeypatch):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="command")
+    empty = np.zeros_like(local_path.FORWARD, dtype=bool)
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.views.append((1000, (0., 0., 0.), empty, empty))
+    depth = dict(_scene(2.), ground=empty, frame_id=1000)
+    calls = []
+    monkeypatch.setattr(local_path, "observe", lambda *args: (calls.append(True) or empty, empty))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.3, 1.))
+
+    P._avoid(.2, 0., 0., depth, cfg, P.APPROACHING, "", state, target_distance=2.)
+    assert not calls
+    P._avoid(.2, 0., 0., dict(depth, frame_id=1100), cfg, P.APPROACHING, "", state,
+             target_distance=2.)
+    assert len(calls) == 1
 
 
 def test_local_command_respects_moving_floors_and_the_signed_driver_bounds():

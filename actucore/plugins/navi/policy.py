@@ -1399,7 +1399,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # that has been shuffling sideways for twelve seconds is not making
     # progress, and the caller deserves the real reason rather than a timeout
     # or, worse, a report that it arrived.
-    if status == AVOIDING and not vx:
+    feedback = planar_feedback(odom) if config.local_planning and vy and not vx else None
+    previous_vy = state.commanded[1]
+    lateral_progress = (feedback is not None and previous_vy * vy > 0.
+                        and math.copysign(1., vy) * feedback[1] >
+                        max(STILL_LINEAR, abs(previous_vy) * config.stuck_speed_ratio))
+    if status == AVOIDING and not (vx or lateral_progress):
         state.blocked_for_s += dt
         if state.blocked_for_s >= config.blocked_timeout_s:
             blocked = (f"前方被挡住了 {state.blocked_for_s:.0f} 秒，绕不过去："
@@ -1787,6 +1792,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     and (scan.ready or scan.has_result)):
                 planning_depth = dict(planning_depth, scan_grid=scan.grid(),
                                       scan_revision=scan.poses[-1][0])
+            elif (scan is not None and scan.receipt_only and scan.views
+                  and (config.scan_geometry or config.local_geometry) is config.local_geometry
+                  and scan.current_frame == depth.get("frame_id")):
+                planning_depth["projected_grid"] = scan.views[-1][2:]
             transitioning = False
             for candidate in order:
                 command = _local_translation(planning_depth, config, state, odom, ahead, candidate)

@@ -1620,8 +1620,10 @@ class NaviPlugin:
         objects, depth, odom, objects_ms = self._observation_snapshot(
             with_capture_timing=self._config.local_planning)
         was_moving = any(self._state.commanded)
-        scan = self._state.active_scan
-        scan_guarded = scan.active or bool(scan.result_frame)
+        previous_scan = self._state.active_scan
+        issued_yaw = previous_scan.issued_yaw
+        idle_for_s = self._state.idle_for_s
+        scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
         was_searching = (self._config.local_planning and self._last_decision is not None
                          and self._last_decision.status == policy_mod.SEARCHING)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
@@ -1655,13 +1657,12 @@ class NaviPlugin:
                 and (self._state.avoidance_yaw_override or scan_guarded or scan.active or checked_search)):
             values = decision.values = [0.] * ACTION_DIM
             decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
-        self._state.commanded = (values[0], values[1], values[5])
-
-        obs_ms = objects_ms or int(now * 1000)
+        now_ms = int(now * 1000)
+        obs_ms = objects_ms or now_ms
         if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
                 or scan.locked or was_searching) and not any(values):
             # A hold applies now, even when the last input is about to expire.
-            obs_ms = int(now * 1000)
+            obs_ms = now_ms
         elif (self._config.local_planning
                 and (decision.status in (policy_mod.AVOIDING, policy_mod.SEARCHING) or command_only)
                 and depth is not None and depth.get("frame_id") is not None):
@@ -1674,6 +1675,22 @@ class NaviPlugin:
                 obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
                 if scan.current_frame:
                     obs_ms = min(obs_ms, scan.current_frame)
+        max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+        if (self._config.local_planning and any(values)
+                and type(max_age) in (int, float) and 0 < max_age < now_ms - obs_ms):
+            if scan is not previous_scan or not issued_yaw:
+                scan.issued_yaw = False
+            self._state.idle_for_s = idle_for_s
+            self._state.adaptive_fwd_scale = 1.
+            self._state.moving_for_s = 0.
+            values = [0.] * ACTION_DIM
+            hold = policy_mod.Decision(
+                values, policy_mod.BLIND,
+                f"规划完成时观测已超出底盘准入时限（{now_ms - obs_ms} ms > {max_age:g} ms）；停车",
+                distance_m=decision.distance_m, bearing=decision.bearing)
+            self._last_decision = policy_mod._account_idle(hold, self._state, self._config, dt)
+            obs_ms = now_ms
+        self._state.commanded = (values[0], values[1], values[5])
         return self._command_message(values, now, obs_ms)
 
     def _command_message(self, values, now, obs_ms):

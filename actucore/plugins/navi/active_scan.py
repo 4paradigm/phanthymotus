@@ -304,8 +304,22 @@ class ActiveScan:
             self.still_since = stamp
             self.phase = "turn"
             return ScanCommand(reason="主动观察：确认底盘已停稳")
-        if (speed > STILL_LINEAR
-                or math.dist(self.pose[:2], self.origin[:2]) > .18):
+        if math.dist(self.pose[:2], self.origin[:2]) > .18:
+            return self.interrupt("主动观察：检测到平移，停车")
+        if self.receipt_only and (speed > STILL_LINEAR or self.phase == "brake_for_replan"):
+            self.phase = "brake_for_replan"
+            if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
+                self.settle_ms = None
+                return ScanCommand(reason="主动观察：检测到平移，停车后重规划")
+            if self.settle_ms is None:
+                self.settle_ms = stamp
+            if stamp - self.settle_ms < SETTLE_MS or self.current_frame <= self.settle_ms:
+                return ScanCommand(reason="主动观察：等待停稳后的观测")
+            self.side_frame = self.current_frame
+            self.finish()
+            self.issued_yaw = False
+            return ScanCommand(reason="主动观察：已停稳，重新规划")
+        if speed > STILL_LINEAR:
             return self.interrupt("主动观察：检测到平移，停车")
         angle = RECEIPT_ANGLE if self.receipt_only else ANGLE
         if (abs(self.motion[2]) > yaw_rate + .10

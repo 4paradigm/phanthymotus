@@ -249,6 +249,9 @@ class PlanCache:
         scanned = observation.get("scan_grid")
         if scanned is not None:
             return scanned
+        projected = observation.get("projected_grid")
+        if projected is not None:
+            return projected
         frame = observation["frame_id"]
         if self.grid_frame != frame or self.grid_geometry is not geometry:
             self.grid = observe(observation["map"], geometry, RIGHT, FORWARD,

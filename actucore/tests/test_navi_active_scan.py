@@ -197,6 +197,26 @@ def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(
     assert lookout.locked
 
 
+def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, vx=0., vy=0., yaw=0.):
+        look.update(_depth(stamp), {"vx": vx, "vy": vy, "wz": yaw, "received_ms": stamp},
+                    geometry, receipt_only=True, max_depth_age_ms=800)
+        return look.command(geometry, .33, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((1., -1.))
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw < 0.
+    assert tick(1250, vx=.113, vy=-.014, yaw=-.204).yaw == 0.
+    assert look.active and not look.locked
+    assert tick(1400, vx=-.006, vy=-.035).yaw == 0.
+    assert look.active
+    assert tick(1550, vx=-.006, vy=-.035).yaw == 0.
+    assert not look.active and not look.locked and look.attempted
+
+
 def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(monkeypatch):
     lookout, geometry, _, _ = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)

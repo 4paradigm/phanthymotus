@@ -1294,6 +1294,29 @@ def test_slow_planning_stamps_the_command_at_emission_and_keeps_used_observation
     assert command["ttl_ms"] == 200
 
 
+def test_a_motion_decision_that_expires_during_planning_publishes_a_stop(monkeypatch):
+    card = _card()
+    now_ms = [123_456]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms[0] / 1000)
+    assert _first_command(card) is not None
+    card._config.local_planning = True
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 500})
+    card._objects_ms = card._depth_ms = now_ms[0] - 300
+    step = navi_plugin.policy_mod.step
+
+    def slow_step(**kwargs):
+        decision = step(**kwargs)
+        now_ms[0] += 201
+        return decision
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", slow_step)
+    message = card.next_command()
+    assert message["values"] == [0.] * 6
+    assert message["obs_stamp_ms"] == message["stamp_ms"] == 123_657
+    assert card._state.commanded == (0., 0., 0.)
+    assert card._last_decision.status == navi_plugin.policy_mod.BLIND
+
+
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
     card = _card()
     card._adopt_odom_interface({
@@ -1832,7 +1855,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         "action": "start", "input_topics": input_topics,
         "control_interface": _descriptor(footprint={"half_width": 0.23},
                                          rate={"max_hz": 20, "watchdog_ms": 600,
-                                               "max_obs_age_ms": 500}),
+                                                   "max_obs_age_ms": depth_limit_ms or 500}),
         "camera_info": {_DEPTH_TOPIC: declaration},
     })
     assert reply["state"] == "running"
