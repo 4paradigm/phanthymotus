@@ -1802,6 +1802,11 @@ class NaviPlugin:
         self._view_next_at = now + 1.0 / self._view_hz
 
         track = self._state.tracker.track
+        goal = self._state.goal_anchor
+        route_target = ((track.range_m, track.bearing_rad)
+                        if track is not None and track.range_known else None)
+        if goal is not None:
+            route_target = (math.hypot(goal.x, goal.y), math.atan2(-goal.y, goal.x))
         detour, key = self._state.view_detour, self._state.local_plan.key
         with self._obs_lock:
             jpeg = self._image_jpeg
@@ -1815,8 +1820,7 @@ class NaviPlugin:
             "ground": ground,
             "detour": detour,
             "depth_vertical": self._depth_vertical,
-            "route_target": ((track.range_m, track.bearing_rad)
-                             if track is not None and track.range_known else None),
+            "route_target": route_target,
             "objects": self._objects,
             "jpeg": jpeg,
             "decision": self._last_decision,

@@ -134,7 +134,7 @@ def test_live_detour_stops_if_the_start_or_passing_lane_is_blocked(monkeypatch, 
             occupied = np.isclose(right, 0) & (np.isclose(forward, .2) | np.isclose(forward, .9))
         else:
             occupied = ((np.isclose(right, 0) & np.isclose(forward, .90))
-                        | np.isclose(forward, 1.05))
+                        | np.isclose(forward, .60))
         return np.ones_like(occupied), occupied
 
     monkeypatch.setattr(replay, "observe", observed)
@@ -176,6 +176,61 @@ def test_live_detour_can_enter_passing_lane_without_a_complete_exit(monkeypatch)
     assert .90 <= detour.points[-1][0] < 1.35
     assert replay.transition_clear((~occupied, occupied), geometry, .33, 1.45,
                                    ((0., 0.), detour.command))
+
+
+@pytest.mark.parametrize("stop", [.45, .60, .90])
+def test_detour_can_finish_at_the_requested_standoff_before_the_rejoin_point(monkeypatch, stop):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .23)
+    occupied = (abs(replay.RIGHT) <= .1) & np.isclose(replay.FORWARD, 1.45)
+    monkeypatch.setattr(replay, "observe", lambda *args: (~occupied, occupied))
+    target_forward, target_right, tolerance = 1.90, .40, .05
+
+    detour = replay._checked_translation(
+        None, None, geometry, .33, 1.45, 1., 800, 600, velocity_limits=DECLARED_SPEEDS,
+        target=(target_forward, target_right, stop, tolerance))
+
+    assert detour is not None and detour.command is not None
+    forward, right = detour.points[-1]
+    assert stop <= np.hypot(target_forward - forward, target_right - right) <= stop + tolerance
+    assert forward < 1.45 + geometry.rear + .25
+
+
+def test_detour_can_start_sideways_when_the_passing_lane_is_only_partly_reachable(monkeypatch):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .23)
+    box = (abs(replay.RIGHT) <= .10) & np.isclose(replay.FORWARD, .90)
+    occupied = box | np.isclose(replay.FORWARD, 1.10)
+    monkeypatch.setattr(replay, "observe", lambda *args: (~occupied, occupied))
+
+    detour = replay._checked_translation(None, None, geometry, .33, .90, 1.,
+                                         800, 600, velocity_limits=DECLARED_SPEEDS)
+
+    assert detour is not None and detour.command[0] == 0. and detour.command[1] < 0.
+    assert replay.transition_clear((~occupied, occupied), geometry, .33, 1.45,
+                                   (detour.command,))
+
+
+def test_left_and_right_plans_reuse_the_same_depth_projection(monkeypatch):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .23)
+    empty = np.zeros_like(replay.RIGHT, dtype=bool)
+    projections = []
+
+    def observed(*_args):
+        projections.append(True)
+        return empty, empty
+
+    monkeypatch.setattr(replay, "observe", observed)
+    cache = replay.PlanCache()
+    depth = {"map": empty, "ground": empty, "frame_id": 1000}
+    for side in (-1., 1.):
+        cache.translation(depth, geometry, .33, 1.4, side, 800,
+                          velocity_limits=DECLARED_SPEEDS)
+    assert len(projections) == 1
+    cache.translation(dict(depth, frame_id=1100), geometry, .33, 1.4, 1., 800,
+                      velocity_limits=DECLARED_SPEEDS)
+    assert len(projections) == 2
 
 
 def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkeypatch):

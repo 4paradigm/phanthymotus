@@ -1868,7 +1868,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         command = card.next_command()
     assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
     expected_limit = depth_limit_ms or 500
-    assert attempted == [(-1.0, .33, expected_limit, 600), (1.0, .33, expected_limit, 600)]
+    assert attempted[:2] == [(-1.0, .33, expected_limit, 600), (1.0, .33, expected_limit, 600)]
+    assert all(attempt[1:] == (.33, expected_limit, 600) for attempt in attempted)
     assert command["obs_stamp_ms"] == depth_stamp
     assert card._state.view_detour.points == ((0., 0.), (.2, .3))
     card._depth_ms = 0

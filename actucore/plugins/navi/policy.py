@@ -1332,7 +1332,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         reason = f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正"
         _, vy, turn, status, reason = _avoid(
             0.0, 0.0, raw_wz, depth, config, ALIGNING, reason, state,
-            target_distance=distance, measured_vx=(odom or {}).get("vx"),
+            target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
             aligned=False, odom=odom, may_scan=(live or anchor is not None) and not within)
         if _wait_for_detour_goal(state, config, track, odom):
             return Decision(_twist(0., 0., 0.), AVOIDING, "停车等待原目标的有效测距")
@@ -1382,7 +1382,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     state.avoidance_yaw_override = False
     vx, vy, raw_wz, status, reason = _avoid(
         vx, vy, raw_wz, depth, config, status, reason, state,
-        target_distance=distance, measured_vx=(odom or {}).get("vx"),
+        target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
         aligned=abs(bearing) < config.align_full_stop, odom=odom,
         may_scan=(live or anchor is not None) and not within)
     if _wait_for_detour_goal(state, config, track, odom):
@@ -1651,10 +1651,15 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         if geometry is not None and scan.current_frame:
             horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
             rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
-            if not scan.clear_sweep(geometry, _keepout_m(config), direction * (rate + .10) * horizon,
-                                    STILL_LINEAR * horizon):
-                state.recovery = ClearanceRecovery()
-                return "原地搜索：转身扫掠范围有障碍或超出网格，停车"
+            sweep, slack = (rate + .10) * horizon, STILL_LINEAR * horizon
+            half_width = _keepout_m(config)
+            if not scan.clear_sweep(geometry, half_width, direction * sweep, slack):
+                if (max(abs(motion[2]), abs(state.commanded[2])) > STILL_YAW
+                        or not scan.clear_sweep(geometry, half_width, -direction * sweep, slack)):
+                    state.recovery = ClearanceRecovery()
+                    return "原地搜索：转身扫掠范围有障碍，停车"
+                state.last_seen_side = -direction
+                state.searched_rad = 0.
     if state.recovery is not None:
         if config.local_planning:
             state.recovery = None
@@ -1712,7 +1717,8 @@ def _local_velocity_limits(config, side):
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
-           target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False):
+           target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False,
+           target_bearing=None):
     """Slow down and prefer a measured side route around foreground obstacles."""
     ahead, coverage = _clearance(depth, config)
     if state is not None:
@@ -1744,11 +1750,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     side = 0.0
     local_command = None
     scan = state.active_scan if config.local_planning and state is not None else None
-    plan_at = slow
-    if config.local_planning and not (scan and (state.escape_side or scan.ready or scan.result_frame)):
-        # Slow down first. Start a new detour one third into the slowdown band.
-        plan_at = slow - (slow - stop) / 3
-    if near or (foreground and ahead < plan_at):
+    if near or (foreground and approaching):
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
@@ -1758,6 +1760,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             if scan is not None:
                 scan.clear_frames = 0
             planning_depth = dict(depth, allow_forward=not near and aligned)
+            if target_distance is not None and target_bearing is not None:
+                planning_depth["stop_target"] = (
+                    target_distance * math.cos(target_bearing), target_distance * math.sin(target_bearing),
+                    config.stop_distance_m, config.stop_tolerance_m)
             if (scan is not None and not scan.receipt_only and scan.current_frame
                     and (scan.ready or scan.has_result)):
                 planning_depth = dict(planning_depth, scan_grid=scan.grid(),
@@ -1966,9 +1972,9 @@ def _local_translation(depth, config, state, odom, ahead, side):
             return LocalHold.TRANSITION
         if grid is None:
             frame, ground = depth.get("map"), depth.get("ground")
-            if frame is None or ground is None:
+            if frame is None or ground is None or depth.get("frame_id") is None:
                 return LocalHold.TRANSITION
-            grid = local_path.observe(frame, geometry, RIGHT, FORWARD, local_path.RESOLUTION, ground)
+            grid = state.local_plan.grid_for(depth, geometry)
         horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
         keepout = _keepout_m(config)
 

@@ -77,7 +77,12 @@ def test_no_usable_reading_draws_no_corridor():
         assert V.corridor_edges(bad, config, 640) is None
 
 
-def test_route_edges_project_the_detour_and_continue_to_the_target():
+@pytest.mark.parametrize(("stop", "expected"), [
+    (.45, {(256, 343), (384, 343)}),
+    (.60, {(249, 354), (391, 354)}),
+    (.90, {(230, 385), (410, 385)}),
+])
+def test_route_edges_project_the_detour_and_stop_short_of_the_target(stop, expected):
     from plugins.navi.camera import HorizontalIntrinsics
     from plugins.navi.local_path import camera_square
 
@@ -87,13 +92,16 @@ def test_route_edges_project_the_detour_and_continue_to_the_target():
     ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
     path = ((0., 0.), (.8, .0), (1.2, .2), (1.6, .2))
 
-    lines = V.route_lines(depth, ground, geometry, path, (2., 0.), .31, 640, 480)
+    lines = V.route_lines(depth, ground, geometry, path, (2., 0.), .31, 640, 480,
+                          stop_distance_m=stop)
 
     assert ((196, 440), (291, 373), False) in lines
     assert ((444, 440), (456, 373), False) in lines
-    assert {end for _, end, dashed in lines if dashed and end[1] == 320} >= {(270, 320), (370, 320)}
-    direct = V.route_lines(depth, ground, geometry, (), (2., 0.), .31, 640, 480)
+    assert not any(dashed for _, _, dashed in lines)
+    direct = V.route_lines(depth, ground, geometry, (), (2., 0.), .31, 640, 480,
+                           stop_distance_m=stop)
     assert direct and all(dashed for _, _, dashed in direct)
+    assert expected <= {end for _, end, _ in direct}
 
 
 def _decision(vx=0.0, vy=0.0, wz=0.0, status="approaching", distance=None):

@@ -214,8 +214,9 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
             _column_of(edge, config.half_fov_rad, width))
 
 
-def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *, pending=False):
-    """Project route boundaries and a dashed connection to the tracked target."""
+def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *,
+                stop_distance_m, pending=False):
+    """Project route boundaries and dashed guidance to the stopping point."""
     if geometry is None or depth_m is None or ground is None or not (points or target):
         return []
     plane = optical_ground_plane(depth_m, geometry, ground)
@@ -233,11 +234,13 @@ def route_lines(depth_m, ground, geometry, points, target, keep, width, height, 
         distance, bearing = target
         if math.isfinite(distance) and distance > 0 and math.isfinite(bearing):
             x, z = distance * math.sin(bearing), distance * math.cos(bearing)
-            y = offset - optical_normal[0] * x - optical_normal[2] * z
-            body = rotation @ np.array([x, y, z]) + origin
+            body = rotation @ np.array([x, 0., z])
             start = points[-1] if points else (0., 0.)
-            end = (body[0], -body[1])
-            if math.dist(start, end) > .05:
+            goal = (body[0], -body[1])
+            approach = math.dist(start, goal)
+            if approach > stop_distance_m + .05:
+                end = tuple(target_m + (start_m - target_m) * stop_distance_m / approach
+                            for start_m, target_m in zip(start, goal))
                 sections.append((np.linspace(start, end, 25), True))
 
     near = .10
@@ -340,13 +343,9 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                 camera_square(config.depth_intrinsics, depth_vertical, config.half_width_m))
     lines = route_lines(depth_m, ground, geometry, detour.points if detour is not None else (),
                         route_target, keep, width, height,
+                        stop_distance_m=config.stop_distance_m,
                         pending=detour is not None and detour.command is None)
     metric_path = bool(lines)
-    if not lines and box is not None:
-        # A target box still gives a direction when the metric projection is unavailable.
-        aim = np.linspace((width // 2, height - 1), ((box[0] + box[2]) * width / 2, box[3] * height), 17)
-        pixels = aim.astype(int)
-        lines = [(tuple(a), tuple(b), True) for a, b in zip(pixels[1::2], pixels[2::2])]
     if lines:
         for a, b, dashed in lines:
             visible, a, b = cv2.clipLine((0, 0, width, height), a, b)

@@ -1633,6 +1633,22 @@ def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, sta
     assert bool(decision.values and decision.values[5]) == (status == P.SEARCHING)
 
 
+def test_search_can_turn_to_the_other_side_when_the_last_seen_side_is_blocked(monkeypatch):
+    from plugins.navi.local_path import Geometry
+
+    geometry = Geometry(None, None, np.eye(4), .23, .23, None)
+    config = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="command", last_seen_side=1., searched_rad=1.)
+    state.active_scan.current_frame = 1000
+    monkeypatch.setattr(state.active_scan, "clear_sweep",
+                        lambda _geometry, _keepout, sweep, _slack: sweep < 0.)
+
+    assert P._search_turn_stop(_depth(), config, state) is None
+    assert state.last_seen_side == -1.
+    assert state.searched_rad == 0.
+    assert P._search(config, state, .1).values is None  # short-occlusion dwell still applies
+
+
 def test_command_only_active_observation_uses_camera_geometry_without_extrinsics(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
@@ -2528,12 +2544,13 @@ def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
     assert decision.status == P.AVOIDING
 
 
-@pytest.mark.parametrize(("ahead", "side_obstacle", "expected_yaw"), [
-    (.80, False, -.60),
-    (.60, False, 0.),
-    (2.0, True, 0.),
+@pytest.mark.parametrize(("ahead", "side_obstacles", "expected_yaw"), [
+    (.80, (), -.60),
+    (.60, (), 0.),
+    (2.0, (.40,), .60),
+    (2.0, (.40, -.40), 0.),
 ])
-def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obstacle, expected_yaw):
+def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obstacles, expected_yaw):
     from plugins.navi import active_scan as scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -2544,10 +2561,10 @@ def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obsta
     depth["ground"] = np.zeros_like(depth["map"], dtype=bool)
     depth["ground"][0, 0] = True
     occupied = np.isclose(scan.FORWARD, ahead) & np.isclose(scan.RIGHT, 0.)
-    if side_obstacle:
+    for right in side_obstacles:
         # Beyond the stationary envelope and outside the front corridor, but
         # inside the right-turn sweep once the 10 cm margin is included.
-        occupied |= np.isclose(scan.FORWARD, .15) & np.isclose(scan.RIGHT, .40)
+        occupied |= np.isclose(scan.FORWARD, .15) & np.isclose(scan.RIGHT, right)
     monkeypatch.setattr(scan, "observe", lambda *args: (np.zeros_like(occupied), occupied))
     odom = {"vx": 0., "vy": 0., "wz": 0., "received_ms": 1000}
 
@@ -2619,9 +2636,9 @@ def test_local_planning_reports_pose_only_odometry(monkeypatch):
     assert "缺少可用的速度或连续位姿" in decision[4]
 
 
-def test_local_detour_starts_closer_while_slowing_earlier(monkeypatch):
+def test_local_detour_starts_at_the_slowdown_boundary(monkeypatch):
     cfg, state = _cfg(local_planning=True, obstacle_stop_m=.60, slow_distance_m=1.50), _state()
-    ahead = 1.35
+    ahead = 1.50
     attempts = []
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
         2.0 if lateral_offset_m else ahead, 1.0))
@@ -2636,7 +2653,7 @@ def test_local_detour_starts_closer_while_slowing_earlier(monkeypatch):
         return P._avoid(.20, 0., 0., _scene(3.), cfg, P.APPROACHING, "", state,
                         target_distance=3., measured_vx=0.)
 
-    assert 0. < avoid()[0] < .20
+    assert avoid()[0] == .20
     assert attempts == []
     ahead = 1.15
     assert abs(avoid()[1]) == .06
@@ -2684,6 +2701,18 @@ def test_local_planner_holds_side_through_centimetre_noise_and_switches_if_block
         assert step(frame) < 0
     blocked.add(1.)
     assert step(800) > 0
+
+
+def test_local_planner_checks_the_obstacle_at_the_start_of_the_slowdown_band(monkeypatch):
+    cfg = _cfg(local_planning=True)
+    state = _state(motion_source="command")
+    monkeypatch.setattr(P, "_clearance", lambda *_args, **_kwargs: (1.48, 1.))
+    monkeypatch.setattr(P, "_local_translation", lambda *_args: (.10, -.15))
+
+    vx, vy, _, _, _ = P._avoid(.2, 0., 0., _scene(2.16), cfg,
+                               P.APPROACHING, "", state, target_distance=2.16)
+
+    assert (vx, vy) == (.10, -.15)
 
 
 def test_local_planner_requires_distinct_frames_before_switching_for_more_space(monkeypatch):

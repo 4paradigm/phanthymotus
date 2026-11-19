@@ -397,7 +397,7 @@ class ActiveScan:
         if not yaw_rate:
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
-            return self.interrupt("主动观察：转身扫掠区有障碍或超出网格范围，停车")
+            return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
         if self.pose_origin is not None:
             if not self.turn_until_ms:
@@ -448,7 +448,7 @@ class ActiveScan:
                 geometry, half_width, sweep, STILL_LINEAR * horizon)):
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
-            return self.interrupt("主动观察：转身扫掠区有障碍或超出网格范围，停车")
+            return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
         return ScanCommand(-self.directions[0] * self.turn_yaw, "主动观察：有界短转向")
 
@@ -462,14 +462,9 @@ class ActiveScan:
             _, occupied = self.grid()
             occupied = occupied | self.views[-1][3]
         occupied_forward, occupied_right = FORWARD[occupied], RIGHT[occupied]
+        # An area outside this view is unknown. Only observed hits can block a turn.
         for angle in np.linspace(0., sweep, samples):
             c, s = math.cos(angle), math.sin(angle)
-            extent_f = max(geometry.front * c, -geometry.rear * c) + half_width * abs(s) + slack
-            extent_back = max(geometry.rear * c, -geometry.front * c) + half_width * abs(s) + slack
-            extent_r = max(geometry.front, geometry.rear) * abs(s) + half_width * abs(c) + slack
-            if (extent_f > FORWARD[-1, 0] or extent_r > RIGHT[0, -1]
-                    or extent_back > -FORWARD[0, 0]):
-                return False
             forward = occupied_forward * c + occupied_right * s
             right = -occupied_forward * s + occupied_right * c
             outside_f = np.maximum(0., np.maximum(-geometry.rear - forward, forward - geometry.front))

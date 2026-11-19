@@ -217,6 +217,22 @@ def test_scan_allows_an_unobserved_rear_sweep(monkeypatch):
     assert lookout.clear_sweep(geometry, .33, -scan.ANGLE, 0.)
 
 
+def test_s10_search_sweep_is_checked_against_hits_not_the_rear_grid_extent():
+    geometry = camera_square(object(), (480, 420, 243), .23)
+    occupied = np.zeros_like(scan.RIGHT, dtype=bool)
+    horizon = (600 + 800 + 50) / 1000
+    sweep = (.60 + .10) * horizon
+    lookout = scan.ActiveScan()
+
+    for direction in (-1, 1):
+        assert lookout.clear_sweep(geometry, .33, direction * sweep,
+                                   scan.STILL_LINEAR * horizon, occupied=occupied)
+    occupied[scan.START[0] + 6, scan.START[1]] = True
+    for direction in (-1, 1):
+        assert not lookout.clear_sweep(geometry, .33, direction * sweep,
+                                       scan.STILL_LINEAR * horizon, occupied=occupied)
+
+
 def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
     geometry = camera_square(object(), (480, 420, 243), .23)
     transform = geometry.base_from_optical.copy()
@@ -229,8 +245,8 @@ def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
     np.testing.assert_allclose(mounted.base_from_optical, transform)
 
 
-@pytest.mark.parametrize(("half_width", "expected_yaw"), [(.23, -.18), (.35, 0.)])
-def test_receipt_only_scan_turns_with_front_depth_inside_the_grid(half_width, expected_yaw):
+@pytest.mark.parametrize("half_width", [.23, .35])
+def test_receipt_only_scan_turns_with_only_front_depth(half_width):
     horizontal = HorizontalIntrinsics(640, 315, 337)
     vertical = (480, 420, 243)
     geometry = camera_square(horizontal, vertical, half_width)
@@ -247,7 +263,7 @@ def test_receipt_only_scan_turns_with_front_depth_inside_the_grid(half_width, ex
         if stamp == 1000:
             assert look.begin((1., -1.))
         result = look.command(geometry, half_width + .10, .18, 600)
-    assert result.yaw == expected_yaw
+    assert result.yaw == -.18
 
 
 @pytest.mark.parametrize("initial_hit", [False, True])
@@ -265,7 +281,8 @@ def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkey
 
 @pytest.mark.parametrize("floor", [0., .5])
 def test_scan_uses_the_fastest_executable_rate_supported_by_the_sweep(monkeypatch, floor):
-    look, geometry, _, _ = _setup(monkeypatch)
+    look, geometry, _, occupied = _setup(monkeypatch)
+    occupied[scan.START[0] + 3, scan.START[1] - 9] = True
     for stamp in (1000, 1050, 1150):
         look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
                     geometry, receipt_only=True)

@@ -38,13 +38,22 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
     return np.pad(blocked_count == 0, ((rear, front), (dc, dc)), constant_values=False)
 
 
-def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS):
-    goal_row, goal_col = goal
-    last_row = allowed.shape[0] - 1 if later_goal else goal_row
-    last_col = goal_col if last_goal_col is None else last_goal_col
-    goals = allowed[goal_row:last_row + 1, goal_col:last_col + 1]
-    if not allowed[start] or not goals.any():
+def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS,
+                  target_cells=None):
+    if not allowed[start]:
         return None
+    if target_cells is None:
+        goal_row, goal_col = goal
+        last_row = allowed.shape[0] - 1 if later_goal else goal_row
+        last_col = goal_col if last_goal_col is None else last_goal_col
+        if not allowed[goal_row:last_row + 1, goal_col:last_col + 1].any():
+            return None
+    else:
+        rows, cols = np.nonzero(allowed & target_cells)
+        if not rows.size:
+            return None
+        goal_row, last_row = int(rows.min()), int(rows.max())
+        goal_col, last_col = int(cols.min()), int(cols.max())
 
     def distance_to_goals(point):
         row, col = point
@@ -57,7 +66,8 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
     while queue:
         _, walked, current = heapq.heappop(queue)
         row, col = current
-        if goal_col <= col <= last_col and goal_row <= row <= last_row:
+        if (goal_col <= col <= last_col and goal_row <= row <= last_row
+                and (target_cells is None or target_cells[current])):
             route = [current]
             while route[-1] != start:
                 route.append(parents[route[-1]])
@@ -231,6 +241,20 @@ class Detour:
 class PlanCache:
     key: tuple | None = None
     plans: dict[float, Detour | None] = field(default_factory=dict)
+    grid_frame: int | None = None
+    grid_geometry: Geometry | None = None
+    grid: tuple | None = None
+
+    def grid_for(self, observation, geometry):
+        scanned = observation.get("scan_grid")
+        if scanned is not None:
+            return scanned
+        frame = observation["frame_id"]
+        if self.grid_frame != frame or self.grid_geometry is not geometry:
+            self.grid = observe(observation["map"], geometry, RIGHT, FORWARD,
+                                RESOLUTION, observation["ground"])
+            self.grid_frame, self.grid_geometry = frame, geometry
+        return self.grid
 
     def translation(self, observation, geometry, half_width, ahead, side, max_age_ms,
                     watchdog_ms=300, *, velocity_limits, allow_forward=True):
@@ -239,7 +263,7 @@ class PlanCache:
         if frame is None or ground is None or geometry is None:
             return None
         key = (frame, round(ahead, 2), max_age_ms, watchdog_ms, observation.get("scan_revision"),
-               allow_forward, velocity_limits)
+               allow_forward, velocity_limits, observation.get("stop_target"))
         if self.key != key:
             self.key = key
             self.plans.clear()
@@ -248,7 +272,8 @@ class PlanCache:
             self.plans[side] = _checked_translation(
                 observation["map"], ground, geometry, half_width, ahead, side, max_age_ms,
                 watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward,
-                velocity_limits=velocity_limits)
+                velocity_limits=velocity_limits, target=observation.get("stop_target"),
+                projected_grid=self.grid_for(observation, geometry))
         detour = self.plans[side]
         return detour.command if detour is not None else None
 
@@ -271,7 +296,8 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities):
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
-                         watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True):
+                         watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True,
+                         target=None, projected_grid=None):
     (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
     if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
         return None
@@ -280,8 +306,10 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     right, forward = RIGHT, FORWARD
     # A fused scan is expressed at the current pose. Use only its obstacle
     # positions when supplied, rather than combining them with the old exposure.
-    _, occupied = (observe(frame, geometry, right, forward, resolution, ground)
-                   if observed_grid is None else observed_grid)
+    grid_input = observed_grid if observed_grid is not None else projected_grid
+    if grid_input is None:
+        grid_input = observe(frame, geometry, right, forward, resolution, ground)
+    _, occupied = grid_input
     if side < 0:
         occupied = occupied[:, ::-1]
     grid = np.where(occupied, OCCUPIED, UNKNOWN)
@@ -307,20 +335,35 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # Check every footprint against observed obstacles. The search can reach
     # the passing lane at any column outside the obstacle, and rejoin on any
     # clear centerline cell at or beyond the original rejoin distance.
-    allowed = allowed_centers(grid, start, half_cells, allow_unknown=True)
+    footprint_clear = allowed_centers(grid, start, half_cells, allow_unknown=True)
+    allowed = footprint_clear.copy()
     allowed[:row_zero, :] = False
     allowed[:, :col_zero] = False
     if not allow_forward:
         # A near obstacle only permits starting sideways. The diagonal edge
         # also checks this intermediate forward-only grid cell.
         allowed[row_zero + 1, col_zero] = False
-    # An additional view can confirm space to bend earlier.
-    lane_min = via[1] if observed_grid is None else col_zero + 1
-    allowed[via[0]:goal[0], :lane_min] = False
     # A one-cell diagonal needs equal forward and lateral speeds. A longer
     # straight shortcut may still be executable at a different ratio.
     steps = STEPS if max(floor_vx, floor_vy) <= min(max_vx, max_vy) else CARDINAL_STEPS
-    path = shortest_path(allowed, start, goal, later_goal=True, steps=steps)
+    path, target_cells = None, None
+    if target is not None:
+        optical_forward, optical_right, stop, tolerance = target
+        # Translate the fixed-heading chassis by the same amount as the camera.
+        rotate = geometry.base_from_optical[:2, :3]
+        target_f, target_r = rotate @ (optical_right, 0., optical_forward)
+        target_r *= -side
+        ranges = np.hypot(forward - target_f, right - target_r)
+        allowed &= ranges >= stop
+        if target_f - stop <= forward[goal[0], 0]:
+            target_cells = ranges <= stop + max(tolerance, resolution / math.sqrt(2))
+            path = shortest_path(allowed, start, goal, steps=steps, target_cells=target_cells)
+    if path is None:
+        target_cells = None
+        # A fused view can confirm space to bend before the passing lane.
+        lane_min = via[1] if observed_grid is None else col_zero + 1
+        allowed[via[0]:goal[0], :lane_min] = False
+        path = shortest_path(allowed, start, goal, later_goal=True, steps=steps)
     last_goal_col = None
     if path is None:
         # Keep advancing on the open side if the original line stays blocked.
@@ -335,6 +378,16 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         last_goal_col = allowed.shape[1] - 1
         path = shortest_path(allowed, start, goal, later_goal=True,
                              last_goal_col=last_goal_col, steps=steps)
+    reposition = path is None
+    if reposition:
+        # A reachable lateral position with more room lets the next frame replan.
+        cols = slice(col_zero, via[1] + 1)
+        forward_cells = np.logical_and.accumulate(footprint_clear[row_zero:, cols], axis=0).sum(axis=0)
+        lateral_clear = np.logical_and.accumulate(allowed[row_zero, cols])
+        openings = np.flatnonzero(lateral_clear & (forward_cells >= forward_cells[0] + 2))
+        if not openings.size:
+            return None
+        path = [(row_zero, col_zero + offset) for offset in range(int(openings[-1]) + 1)]
     if path is None or len(path) < 2:
         return None
     # The straight command must stay within the checked path prefix through
@@ -354,6 +407,10 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         norm = math.hypot(dr, dc)
         length = resolution * norm
         df, dx = dr / norm, dc / norm
+        if target is not None:
+            closest = min(length, max(0., df * target_f + dx * target_r))
+            if math.hypot(target_f - closest * df, target_r - closest * dx) < stop:
+                return None
         # Look ahead along the path only while a straight shortcut is clear
         # of measured obstacles. This preserves the chosen detour's progress.
         if _ray_entry(df, dx, occupied_bounds) <= length:
@@ -361,7 +418,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         speed = min(length / horizon_s,
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
-        if partial and vx and vy and not transition_clear(
+        if (partial or target_cells is not None) and vx and vy and not transition_clear(
                 (None, occupied), geometry, half_width, horizon_s, ((vx, -vy),)):
             return None
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
@@ -369,6 +426,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         return None
 
     def detour(path, first, command):
+        if reposition:
+            path = path[:first + 1]
         points = ((0., 0.),) + tuple(((row - row_zero) * resolution, side * (col - col_zero) * resolution)
                                      for row, col in path[first:])
         return Detour(command, points, geometry)
@@ -383,6 +442,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
                 cardinal = detour(path, i, command)
     if cardinal is not None and cardinal.command[0] == 0.:
         return cardinal
+    if reposition:
+        return None
 
     # Search a separate route that stays on the starting row for at least
     # the travel needed to send a lateral command above the driver's floor.
@@ -390,9 +451,11 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if first_forward_col < allowed.shape[1]:
         allowed[row_zero + 1, :first_forward_col] = False
         side_path = shortest_path(allowed, start, goal, later_goal=True,
-                                  last_goal_col=last_goal_col, steps=CARDINAL_STEPS)
+                                  last_goal_col=last_goal_col, steps=CARDINAL_STEPS,
+                                  target_cells=target_cells)
         if side_path is not None:
-            first_turn = next(i - 1 for i, (row, _) in enumerate(side_path) if row != row_zero)
+            first_turn = next((i - 1 for i, (row, _) in enumerate(side_path) if row != row_zero),
+                              len(side_path) - 1)
             command = command_to(side_path[first_turn])
             if command is not None:
                 return detour(side_path, first_turn, command)
