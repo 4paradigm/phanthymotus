@@ -21,6 +21,8 @@ Coverage:
 
 Fixtures contain fixed historical protocol examples and are never used as live data. `battery.json` contains only the Driver's public battery payload. `g1-log.html` is the unmodified native text renderer's output for synthetic G1 data at a fixed clock.
 
-`helios-kinematics.urdf` is a test-only projection of the Helios Driver model: all link/joint names, origins, axes and limits are retained; inertial, visual and collision elements are removed. Original source SHA-256: `490202573e9bc6bb54668440a4fcf39c4b4f5b0af71548806be76de695bf726f`, installed manufacturer model `Rokae_Robot_2.1_AR5_v1.1` (2026-11-18). No mesh data is included. Manufacturer model rights remain with their owners; applicable release terms require confirmation before upstream acceptance.
+`synthetic-model.mjs` generates original abstract test geometry with arbitrary dimensions, axes and compound rotations. It retains only the joint/link identifiers needed to exercise the renderer's interface. No manufacturer transforms, limits, inertial values, visual geometry or model files are copied. The 20-axis/34-link counts exercise the same code paths without bundling a manufacturer model.
+
+The manufacturer-derived fixture in the initial PR commit has been deleted from the current source tree in response to review. This does not claim to erase earlier public Git history or establish redistribution permission for the original model.
 
 These checks do not replace a browser WebGL visual check, bot-image deployment or physical-motion acceptance.

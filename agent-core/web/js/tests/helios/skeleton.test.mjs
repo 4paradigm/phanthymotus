@@ -3,6 +3,7 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import {createRequire} from 'node:module';
+import {syntheticHeliosModel} from './synthetic-model.mjs';
 const xmldom=createRequire(import.meta.url)('@xmldom/xmldom');
 const base = new URL('../../', import.meta.url);
 const read = name => fs.readFile(new URL(name, base), 'utf8');
@@ -50,7 +51,7 @@ function decorate(node){
  return node;
 }
 class DOMParser {parseFromString(s,type){return decorate(new xmldom.DOMParser().parseFromString(s,type));}}
-const xml = await fs.readFile(new URL('./fixtures/helios-kinematics.urdf', import.meta.url),'utf8');
+const xml = syntheticHeliosModel();
 let requested;
 const ctx = vm.createContext({THREE,DOMParser,TextDecoder,console,fetch:async(url)=>{
  requested=url;return {json:async()=>({data:[{text:JSON.stringify({urdf:xml})}]})};}});
@@ -63,7 +64,7 @@ assert.equal(requested,'/api/mcp/'+id+'/call');
 assert.equal(Object.keys(renderer._joints).length,20);
 assert.equal(Object.keys(renderer._links).length,34);
 assert.equal(Object.keys(renderer._joints).some(n=>n.includes('knee')),false);
-const positions={left:[2.617994,1.570711,-1.570857,1.745331,0,0,0],right:[-2.617992,1.570712,1.570854,1.745330,0,0,0],body:[-1.169371,2.356204,-1.221732,0],head:[-0.004003,0.15363]};
+const positions={left:[0.1,0.2,0.3,0.4,0.5,0.6,0.7],right:[-0.1,-0.2,-0.3,-0.4,-0.5,-0.6,-0.7],body:[0.1,0.2,0.3,0.4],head:[0.2,-0.1]};
 const joints=Object.entries(positions).flatMap(([g,values])=>values.map((q,i)=>({name:g+'_joint_'+(i+1),q})));
 renderer.onData(new TextEncoder().encode(JSON.stringify({joints})).buffer,'sensor/skeleton');
 renderer._scene.updateMatrixWorld(true);
