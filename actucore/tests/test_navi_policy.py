@@ -1633,6 +1633,72 @@ def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, sta
     assert bool(decision.values and decision.values[5]) == (status == P.SEARCHING)
 
 
+@pytest.mark.parametrize("scene", [
+    "clear_sweep", "occupied", "unknown", "unregistered", "expired", "translating",
+])
+def test_wheeled_near_search_requires_clear_sweep_and_commands_only_yaw(monkeypatch, scene):
+    from plugins.navi import active_scan, local_path
+    from plugins.navi.odom import PlanarPose
+
+    shape = local_path.SHAPE
+    free = np.ones(shape, dtype=bool)
+    occupied = np.zeros(shape, dtype=bool)
+    ahead = np.isclose(local_path.FORWARD, .45) & np.isclose(local_path.RIGHT, 0.)
+    occupied[ahead] = True
+    corner = np.isclose(local_path.FORWARD, -.30) & np.isclose(local_path.RIGHT, .35)
+    if scene == "occupied":
+        occupied[corner] = True
+    if scene == "unknown":
+        free[corner] = False
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .30, .30, .50, True)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
+               doorway_geometry=geometry, use_lateral=False, vy_max=0., half_width_m=.275)
+    state = _state(motion_source="measured", missing_frames=cfg.lost_frames - 1)
+    frame = np.ones((4, 4))
+    depth = {"map": frame, "ground": frame.astype(bool), "frame_id": 1000, "capture_ms": 1000}
+    stamp = 1000 + cfg.depth_age_limit_ms if scene == "expired" else 1000
+    pose = PlanarPose(stamp, ("odom", "base_link"), 0., 0., 0.)
+    odom = dict(vx=.10 if scene == "translating" else 0., vy=0., wz=0., stamp_ms=stamp)
+    if scene != "unregistered":
+        odom["door_pose"] = pose
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.43, .95))
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
+
+    decision = P.step(detections=_detections(), depth=depth, odom=odom,
+                      config=cfg, state=state, dt=.1)
+
+    assert decision.values[:5] == [0.] * 5
+    if scene == "clear_sweep":
+        assert decision.status == P.SEARCHING
+        assert 0. < abs(decision.values[5]) < cfg.search_rate
+    else:
+        assert decision.status == P.AVOIDING
+        assert decision.values[5] == 0.
+
+
+@pytest.mark.parametrize(("left_coverage", "turns_left"), [(.516, True), (.1, False)])
+def test_wheeled_search_prefers_measured_open_side_before_turning(monkeypatch, left_coverage,
+                                                                turns_left):
+    config = _cfg(local_planning=True, use_lateral=False, vy_max=0., lost_frames=1)
+    state = _state(last_seen_side=1.)
+    depth = _depth(map_=_solid_depth(1.37))
+
+    def clearance(_, config, lateral_offset_m=0.):
+        if lateral_offset_m < 0.:
+            return 1.80, left_coverage
+        if lateral_offset_m > 0.:
+            return 1.39, .515
+        return 1.37, .99
+
+    monkeypatch.setattr(P, "_clearance", clearance)
+    decision = P.step(detections=_detections(), depth=depth, odom=None,
+                      config=config, state=state, dt=.1)
+
+    assert decision.status == P.SEARCHING and decision.values[:5] == [0.] * 5
+    assert (decision.values[5] > 0.) is turns_left
+
+
 def test_search_can_turn_to_the_other_side_when_the_last_seen_side_is_blocked(monkeypatch):
     from plugins.navi.local_path import Geometry
 
@@ -2979,6 +3045,34 @@ def test_command_only_checks_the_ramp_even_for_a_repeated_diagonal(monkeypatch):
     assert P._local_translation(depth, cfg, state, None, .9, 1.) == command
     occupied[row + 7, col - 6] = True
     assert P._local_translation(depth, cfg, state, None, .9, 1.) is P.LocalHold.TRANSITION
+
+
+def test_checked_straight_approach_keeps_tracking_the_moving_target(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .30, .30, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.)
+    state = _state()
+    track = SimpleNamespace(bearing_rad=0., range_m=3., range_known=True, observed=True,
+                            measured_range_m=3.)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (
+        np.ones(local_path.SHAPE, dtype=bool), np.zeros(local_path.SHAPE, dtype=bool)))
+    odom = dict(vx=0., vy=0., wz=0.)
+    frame = _solid_depth(3.)
+
+    def tick(stamp):
+        depth = dict(_depth(map_=frame), ground=np.ones_like(frame, dtype=bool), frame_id=stamp)
+        return P.step(detections=_detections(), depth=depth, odom=odom, config=cfg, state=state, dt=.1)
+
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.31, .99))
+    assert tick(1000).values[0] > 0.
+    track.range_m = track.measured_range_m = 4.
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.2, .99))
+    decision = tick(1100)
+    assert decision.status == P.APPROACHING and decision.values[0] > 0.
+    assert decision.distance_m == pytest.approx(4.)
 
 
 @pytest.mark.parametrize("odom", [None, {"vx": 0., "vy": 0., "wz": 0.}])

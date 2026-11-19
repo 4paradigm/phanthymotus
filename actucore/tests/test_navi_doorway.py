@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from plugins.navi.doorway import Doorway, passage_clear
 from plugins.navi.local_path import FORWARD, RIGHT
@@ -109,3 +110,43 @@ def test_small_turn_uses_aligned_depth_with_staggered_feedback(monkeypatch):
             assert 0 < abs(rate) < active_scan.STILL_YAW
     else:
         raise AssertionError((door.phase, reason, turns))
+
+
+@pytest.mark.parametrize("rear_visible", [True, False])
+def test_wheeled_observation_can_turn_before_the_forward_corridor_is_visible(rear_visible):
+    transform = np.eye(4)
+    transform[0, 2] = 1.
+    geometry = SimpleNamespace(front=.30, rear=.30, base_from_optical=transform)
+    config = Config(half_width_m=.275)
+    door = Doorway(1.30, observe_side=-1.)
+    free = FORWARD < .65
+    if not rear_visible:
+        free[FORWARD < -.31] = False
+    occupied = np.zeros_like(free)
+    scan = SimpleNamespace(receipt_only=False)
+    scan.grid = lambda *, since_ms: (free, occupied)
+
+    def tick(stamp, yaw=0.):
+        pose = PlanarPose(stamp, ("odom", "base_link"), 0., 0., yaw)
+        scan.current_frame = stamp
+        scan.views = [(stamp,)]
+        scan.pose_origin = pose
+        odom = dict(stamp_ms=stamp, door_pose=pose, vx=0., vy=0., wz=0.)
+        return door.step(odom, scan, geometry, config, 1.30, 3.0)[:2]
+
+    assert tick(1000) == (0., 0.)
+    assert tick(1150) == (0., 0.)
+    vx, yaw = tick(1250)
+    assert vx == 0.
+    if not rear_visible:
+        assert yaw == 0.
+        return
+    assert yaw > 0.
+
+    assert tick(1350, door.heading) == (0., 0.)
+    assert tick(1500, door.heading) == (0., 0.)
+    assert tick(1700, door.heading) == (0., 0.)
+    assert tick(1740, door.heading) == (0., 0.)
+    free[:] = True
+    vx, yaw = tick(1780, door.heading)
+    assert vx > 0. and yaw == 0.

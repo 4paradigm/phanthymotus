@@ -7,13 +7,15 @@ from itertools import product
 
 import numpy as np
 
-from .active_scan import ODOM_GAP_MS, SCAN_TIMEOUT_MS
+from .active_scan import ANGLE, ODOM_GAP_MS, SCAN_TIMEOUT_MS
 from .local_path import FORWARD, RESOLUTION, RIGHT
 from .odom import PlanarPose, planar_feedback
 
 STOP_DWELL_MS = 200
 STILL_LINEAR = .015
 STILL_YAW = .015
+# Leave room below ActiveScan's yaw limit for a stable registered view.
+OBSERVED_TURN_RATE = .03
 YAW_TOL = math.radians(.5)
 HEADING_OFFSETS = (0.,) + tuple(map(math.radians, (-2, 2, -4, 4, -6, 6)))
 
@@ -60,6 +62,8 @@ def passage_clear(grid, geometry, physical_half_width, half_width, yaw, travel,
 @dataclass
 class Doorway:
     obstacle_depth: float
+    observe_side: float = 0.
+    observing: bool = False
     phase: str = "brake"
     stopped_since: int | None = None
     last_stamp: int = 0
@@ -92,8 +96,9 @@ class Doorway:
             self.last_stamp = pose.stamp_ms
             return self.interrupt("门口停车：里程计不连续")
         self.last_stamp = pose.stamp_ms
+        timeout = 3 * SCAN_TIMEOUT_MS if self.observing else SCAN_TIMEOUT_MS
         if (self.phase in ("turn", "rebrake", "settle") and self.origin is not None
-                and pose.stamp_ms - self.origin.stamp_ms >= SCAN_TIMEOUT_MS):
+                and pose.stamp_ms - self.origin.stamp_ms >= timeout):
             return self.interrupt("门口停车，未能在观察时限内完成对中")
 
         vx, vy, wz = motion
@@ -137,11 +142,18 @@ class Doorway:
                     if (0. < distance < room
                             and clear(after_stop + 1, yaw, distance, turn_slack=YAW_TOL,
                                       drift=STILL_LINEAR * horizon, corridor_reserve=reserve)):
-                        self.origin, self.heading, self.travel = pose, pose.yaw + yaw, distance
-                        self.phase, self.proof_since = "turn", after_stop + 1
                         break
                 else:
-                    return 0., 0., "门口停车：转向扫掠区或前进走廊缺少可通行证据"
+                    yaw = -self.observe_side * ANGLE
+                    distance = beyond / math.cos(yaw)
+                    # A wider view may complete the forward proof after the turn.
+                    if (not still_blocked or not yaw or not 0. < distance < room
+                            or not clear(after_stop + 1, yaw, 0., turn_slack=YAW_TOL,
+                                         drift=STILL_LINEAR * horizon)):
+                        return 0., 0., "门口停车：转向扫掠区或前进走廊缺少可通行证据"
+                    self.observing = True
+                self.origin, self.heading, self.travel = pose, pose.yaw + yaw, distance
+                self.phase, self.proof_since = "turn", after_stop + 1
             else:
                 error = math.remainder(self.heading - pose.yaw, math.tau)
                 if abs(error) > YAW_TOL:
@@ -158,16 +170,17 @@ class Doorway:
                 self.phase, self.stopped_since = "settle", None
                 return 0., 0., "门口对中：转向结束，停车复核"
             origin_f, origin_l, _ = pose.relative_to(self.origin)
-            # Keep the commanded turn inside ActiveScan's stable-exposure limit.
-            yaw_rate = math.copysign(min(.03, config.wz_max, abs(error) / (2 * horizon)), error)
+            yaw_rate = math.copysign(
+                min(OBSERVED_TURN_RATE, config.wz_max, abs(error) / (2 * horizon)), error)
             if (speed > STILL_LINEAR or math.hypot(origin_f, origin_l) > .02
                     or wz * yaw_rate < -STILL_YAW * abs(yaw_rate)
                     or abs(yaw_rate) < config.floor_wz
-                    or not clear(self.proof_since, error, self.travel,
+                    or not clear(self.proof_since, error, 0. if self.observing else self.travel,
                                  turn_slack=max(YAW_TOL, abs(wz) * horizon),
                                  drift=STILL_LINEAR * horizon)):
                 return self.interrupt("门口停车：转向扫掠区或前进走廊无法继续确认")
-            return 0., yaw_rate, "门口对中：仅转向"
+            reason = "轮式避让，转向观察较空旷的一侧" if self.observing else "门口对中：仅转向"
+            return 0., yaw_rate, reason
 
         progress, lateral, _ = pose.relative_to(self.crossing_start)
         remaining = self.travel - progress

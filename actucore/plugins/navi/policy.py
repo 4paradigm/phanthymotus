@@ -67,7 +67,7 @@ import numpy as np
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
 from .active_scan import ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
-from .doorway import Doorway
+from .doorway import Doorway, OBSERVED_TURN_RATE, passage_clear
 from .track import Tracker
 from . import local_path
 from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
@@ -540,7 +540,6 @@ class State:
     commanded_vx: float = 0.0
     adaptive_fwd_scale: float = 1.0
     avoidance_yaw_override: bool = False
-    blocked_approach: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     close_sample_gap_s: float = 0.0
@@ -981,7 +980,6 @@ def _band_of(bearing: float) -> str:
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
     state.view_detour = None
-    state.blocked_approach = False
     decision = _decide(detections, depth, odom, config, state, dt)
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
@@ -1082,8 +1080,7 @@ def _wait_for_detour_goal(state, config, track, odom):
     if not config.local_planning:
         return False
     scan = state.active_scan
-    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame
-                     or state.blocked_approach)
+    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame)
     observed = track is not None and track.observed and track.range_known
     anchor = state.goal_anchor
     if anchor is None:
@@ -1191,9 +1188,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
         was_scanning = scan.active
         body_geometry = config.scan_geometry
         scan_odom = odom
-        if state.doorway is not None:
+        pose = (odom or {}).get("door_pose")
+        if state.doorway is not None or (track is None and pose is not None):
             body_geometry = config.doorway_geometry
-            pose = (odom or {}).get("door_pose")
             if pose is not None:
                 scan_odom = dict(odom, motion_pose=pose, pose_feedback_since_ms=pose.stamp_ms)
         can_align = (body_geometry is not None and (depth or {}).get("capture_ms")
@@ -1271,7 +1268,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if state.doorway is not None:
             _, _, reason = state.doorway.interrupt("门口停车：等待目标重新出现")
             return Decision(_twist(0., 0., 0.), AVOIDING, reason)
-        reason = _search_turn_stop(depth, config, state)
+        reason = _search_turn_stop(depth, config, state, odom)
         if reason is not None:
             return Decision(_twist(0, 0, 0), AVOIDING, reason)
         return _search(config, state, dt, odom)
@@ -1686,11 +1683,21 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
         dt=dt, min_dwell_s=config.min_dwell_s)
 
 
-def _search_turn_stop(depth, config: Config, state: State) -> str | None:
+def _wheeled_local_planning(config: Config) -> bool:
+    return config.local_planning and not config.use_lateral and config.vy_max == 0.
+
+
+def _near_wheeled_search(config: Config, state: State) -> bool:
+    return (_wheeled_local_planning(config) and state.last_clearance is not None
+            and state.last_clearance <= config.obstacle_stop_m)
+
+
+def _search_turn_stop(depth, config: Config, state: State, odom=None) -> str | None:
     """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
     state.last_clearance, state.last_coverage = ahead, coverage
-    if ahead is not None and ahead <= config.obstacle_stop_m:
+    verify_sweep = _near_wheeled_search(config, state) and config.search_rate > 0.
+    if ahead is not None and ahead <= config.obstacle_stop_m and not verify_sweep:
         state.recovery = ClearanceRecovery()
         return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
     if config.local_planning and config.search_rate > 0:
@@ -1698,7 +1705,27 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         command_only = state.motion_source == "command"
         geometry = (config.scan_geometry or config.local_geometry
                     if scan.receipt_only or command_only else config.scan_geometry)
+        yaw_rate = config.search_rate
+        if verify_sweep:
+            geometry = config.doorway_geometry
+            pose = (odom or {}).get("door_pose")
+            yaw_rate = min(yaw_rate, OBSERVED_TURN_RATE)
+            if (geometry is None or pose is None or scan.receipt_only or command_only
+                    or scan.pose_origin is None or scan.pose_origin.frame != pose.frame
+                    or not 0 < scan.current_frame <= pose.stamp_ms
+                    or pose.stamp_ms - scan.current_frame >= config.depth_age_limit_ms
+                    or yaw_rate < config.floor_wz):
+                return "原地搜索，等待可验证的转向扫掠区"
+
         direction = state.last_seen_side
+        if (_wheeled_local_planning(config) and not state.searching_for_s
+                and ahead is not None and ahead < config.slow_distance_m
+                and depth.get("map") is not None):
+            keep = _keepout_m(config)
+            rooms = {side: _clearance(depth, config, lateral_offset_m=side * keep)
+                     for side in (-1., 1.)}
+            direction = _observed_open_side(rooms, config) or direction
+
         motion = state.command_tail if command_only else scan.motion
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (motion, state.commanded)):
@@ -1707,16 +1734,29 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         # has no usable grid. A ready grid also checks the turn's footprint.
         if geometry is not None and scan.current_frame:
             horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
-            rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
+            rate = max(yaw_rate, abs(scan.motion[2]), abs(state.commanded[2]))
             sweep, slack = (rate + .10) * horizon, STILL_LINEAR * horizon
-            half_width = _keepout_m(config)
-            if not scan.clear_sweep(geometry, half_width, direction * sweep, slack):
-                if (max(abs(motion[2]), abs(state.commanded[2])) > STILL_YAW
-                        or not scan.clear_sweep(geometry, half_width, -direction * sweep, slack)):
+            if verify_sweep:
+                grid = scan.grid(since_ms=scan.current_frame)
+                half_width = config.half_width_m + max(.10, config.clearance_margin_m)
+            else:
+                half_width = _keepout_m(config)
+
+            def clear(side):
+                if verify_sweep:
+                    return passage_clear(grid, geometry, config.half_width_m, half_width,
+                                         -side * sweep, 0., drift=slack)
+                return scan.clear_sweep(geometry, half_width, side * sweep, slack)
+
+            if not clear(direction):
+                if max(abs(motion[2]), abs(state.commanded[2])) > STILL_YAW or not clear(-direction):
                     state.recovery = ClearanceRecovery()
+                    if verify_sweep:
+                        return "原地搜索，转向扫掠区被占用或观测不足"
                     return "原地搜索：转身扫掠范围有障碍，停车"
-                state.last_seen_side = -direction
+                direction = -direction
                 state.searched_rad = 0.
+        state.last_seen_side = direction
     if state.recovery is not None:
         if config.local_planning:
             state.recovery = None
@@ -1727,6 +1767,17 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         if state.recovery.scale("turn", depth, config.depth_age_limit_ms) <= 0:
             return "近障停车，等待连续新深度确认可转向"
     return None
+
+
+def _observed_open_side(rooms, config):
+    preferred, opposite = _local_side_order(rooms, config, None, None)
+    room, coverage = rooms[preferred]
+    other, other_coverage = rooms[opposite]
+    if (room is not None and room >= config.slow_distance_m and coverage >= config.coverage_min
+            and (other is None or other_coverage < config.coverage_min
+                 or room - other >= SIDE_SWITCH_ADVANTAGE_M)):
+        return preferred
+    return 0.
 
 
 def _local_side_order(rooms, config, state, frame):
@@ -1799,15 +1850,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         stop = min(slow, stop + speed * depth_age_s)
     near = ahead is not None and ahead <= stop
     approaching = ahead is not None and ahead < slow
-    if (state is not None and config.doorway_geometry is not None and foreground and approaching
-            and may_scan and depth.get("ground") is not None and depth.get("capture_ms") is not None
-            and (odom or {}).get("door_pose") is not None and measured_target is not None
-            and ahead + FORWARD_CLEARANCE_MARGIN_M < measured_target):
-        state.doorway = Doorway(ahead)
-        state.active_scan.invalidate()
-        state.avoidance_yaw_override = True
-        return 0., 0., 0., AVOIDING, "门口：先停车再对中"
-
     scale = 1.0
     if approaching:
         scale *= max(0.0, (ahead - stop) / max(1e-6, slow - stop))
@@ -1841,6 +1883,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
+        if (state is not None and config.doorway_geometry is not None and foreground and approaching
+                and may_scan and depth.get("ground") is not None and depth.get("capture_ms") is not None
+                and (odom or {}).get("door_pose") is not None and measured_target is not None
+                and ahead + FORWARD_CLEARANCE_MARGIN_M < measured_target):
+            state.doorway = Doorway(ahead, observe_side=_observed_open_side(rooms, config))
+            state.active_scan.invalidate()
+            state.avoidance_yaw_override = True
+            return 0., 0., 0., AVOIDING, "门口：先停车再对中"
         if config.local_planning:
             order = _local_side_order(rooms, config, state,
                                       depth.get("source_frame_id", depth.get("frame_id")))
@@ -1907,11 +1957,15 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                             state.recovery = None
                             state.view_detour = None
                             state.avoidance_yaw_override = True
-                            state.blocked_approach = True
                             return (approach, 0., 0., AVOIDING,
                                     f"两侧无可执行避让路线；低速接近（障碍停车线 {brake_at:.2f} m）")
                 if state is not None and state.view_detour is not None:
                     return 0.0, 0.0, 0.0, AVOIDING, LocalHold.PREFIX.value
+                if _wheeled_local_planning(config):
+                    if depth.get("ground") is None:
+                        return 0., 0., 0., AVOIDING, "轮式避让停车，当前深度无法验证地面"
+                    if config.doorway_geometry is None:
+                        return 0., 0., 0., AVOIDING, "轮式避让停车，缺少可验证的车体扫掠区"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
             usable = {s: (cov >= config.coverage_min, math.inf if room is None else room)
@@ -2191,7 +2245,10 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     # robot sweeps away from the last place it saw the thing — which still
     # finds it eventually, by going all the way round, and so reads as "search
     # is just slow" rather than as a wrong sign.
-    wz = -config.search_rate * state.last_seen_side
+    rate = config.search_rate
+    if _near_wheeled_search(config, state):
+        rate = min(rate, OBSERVED_TURN_RATE)
+    wz = -rate * state.last_seen_side
 
     # **The component along the direction we are turning, signed — not `abs`.**
     #
