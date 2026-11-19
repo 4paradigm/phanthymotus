@@ -700,23 +700,26 @@ RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
       set -eu; \
       case "${JP_VERSION}" in \
         511) \
-          asset='cpython-3.10.22%2B20261001-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz'; \
-          python3 -c 'import shutil, sys, urllib.request; url, path = sys.argv[1:]; src = urllib.request.urlopen(url, timeout=30); dst = open(path, "wb"); shutil.copyfileobj(src, dst)' \
-            "https://mirrors.nju.edu.cn/github-release/astral-sh/python-build-standalone/20261001/${asset}" /tmp/xiaoyou-python.tar.gz; \
-          printf '%s  %s\n' b25ea453d60a51c381417ed0fbf87fd393c346eb1ab3a138cdfbb86be2a4d8fe /tmp/xiaoyou-python.tar.gz | sha256sum --check --strict; \
+          echo '[build] Xiaoyou JP5 frontend: fetching pinned ModelScope asset'; \
+          stage="$(mktemp -d)"; \
+          trap 'rm -rf -- "$stage"' EXIT; \
+          python3 -B -c 'import sys; from pathlib import Path; from plugins.xiaoyou_tts.runtime.model_bundle import _download; _download(sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4])' \
+            'https://modelscope.cn/api/v1/models/lanxijiang/xiaoyou01/repo?Revision=25121ed0cca2593caff42d1068612f5259b3e1ac&FilePath=xiaoyou-jp511-frontend-cp310-20261119-v1.tar.gz' \
+            "$stage/frontend.tar.gz" 171397980 6f1e4c26b7abbc79cfd9fadb86a4f9ce37307b34c0b15fb5ed67e779b470a33c; \
           mkdir /opt/xiaoyou-tts; \
-          tar -xzf /tmp/xiaoyou-python.tar.gz --strip-components=1 -C /opt/xiaoyou-tts; \
-          rm /tmp/xiaoyou-python.tar.gz ;; \
-        61) python3 -m venv --without-pip --system-site-packages /opt/xiaoyou-tts ;; \
-        *) exit 0 ;; \
+          tar -xzf "$stage/frontend.tar.gz" --strip-components=1 --no-same-owner -C /opt/xiaoyou-tts; \
+          echo '[build] Xiaoyou JP5 frontend: checking native imports'; \
+          /opt/xiaoyou-tts/bin/python3 -IB -c 'import sys; from importlib.metadata import version; sys.modules["torch"] = None; import en_core_web_sm, numpy; from misaki import en, espeak, zh; assert sys.version_info[:3] == (3, 10, 22); assert numpy.__version__ == "1.26.4" and version("misaki") == "0.9.4" and version("en-core-web-sm") == "3.8.0"'; \
+          ;; \
+        61) \
+          python3 -m venv --without-pip --system-site-packages /opt/xiaoyou-tts; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" pip==26.3; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" \
+            -r /work/plugins/xiaoyou_tts/requirements.jetson.txt; \
+          ;; \
       esac; \
-      /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
-        --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" pip==26.3; \
-      reuse_flags=; \
-      if [ "${JP_VERSION}" = "61" ]; then reuse_flags=--ignore-installed; fi; \
-      /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
-        --no-cache-dir $reuse_flags -i "${PYPI_MIRROR}" \
-        -r /work/plugins/xiaoyou_tts/requirements.jetson.txt; \
     fi
 
 # Darvin only passes the instance ports to the reference image.
