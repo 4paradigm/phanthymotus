@@ -52,6 +52,12 @@ _ZH_DATE_RANGE = re.compile(r"(?<![A-Za-z0-9_./-])(?P<first>" + _DATE_ENDPOINT
                             + r")[ \t]*[-–—][ \t]*(?P<last>" + _DATE_ENDPOINT
                             + r")(?![A-Za-z0-9_]|[./-]\d)")
 _ZH_DATE_CUE = re.compile(r"日期|日程|日历|活动时间|假期|连休|放假|休假|元旦|春节")
+_ZH_MONTH_DAY = re.compile(r"(?<![A-Za-z0-9_./+−-])\d{1,2}[./]\d{1,2}(?![A-Za-z0-9_]|[./-]\d)")
+_ZH_DATE_LABEL = re.compile(r"(?:日期|日程|日历)[ \t]*(?:(?:是|为)[ \t]*)?[:：]?[ \t]*$")
+_ZH_WEEKDAY = r"(?:星期|周|礼拜)[一二三四五六日天]"
+_ZH_DATE_WEEKDAY = re.compile(r"[ \t]*(?:(?:是|为)[ \t]*" + _ZH_WEEKDAY
+                              + r"(?!\w)|(?:[，,（(][ \t]*)?" + _ZH_WEEKDAY + r")")
+_ZH_DECIMAL_LABEL = re.compile(r"小数[ \t]*(?:(?:是|为)[ \t]*)?[:：]?[ \t]*$")
 _AMBIGUOUS_PAIR = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:-\d+|\s*/\s*(?:\d+|[A-Za-z]{1,3}))(?![A-Za-z0-9_.])")
 _DOTTED = re.compile(r"(?<![A-Za-z0-9_.])\d{1,4}(?:\.\d{1,4}){2,}(?![A-Za-z0-9_.])")
 _CLOCK = re.compile(r"(?<![A-Za-z0-9_:])\d{1,3}:\d{2}(?::\d{2})?(?![A-Za-z0-9_:])")
@@ -182,8 +188,11 @@ def _unit_pattern(language=""):
     boundary = r"(?<!\d,)" if language in {"de", "es"} else ""
     left = r"(?<![\w.\-−])" if language == "ru" else r"(?<![A-Za-z0-9_.\-−])"
     right = r"(?!\w|[.\-]\w)" if language == "ru" else r"(?![A-Za-z0-9_]|[.\-][A-Za-z0-9_])"
+    quotes = (('"', '"'), ("“", "”"), ("„", "“"), ("«", "»"))
+    opening = "|".join(f"(?P<q{index}>{start})" for index, (start, _) in enumerate(quotes))
+    closing = "".join(f"(?(q{index}){end})" for index, (_, end) in enumerate(quotes))
     return re.compile(left + boundary + r"(?P<n>[+\-−]?" + number +
-        r")\s*(?P<u>" + names + r")" + right)
+        r")\s*(?:" + opening + r")?(?P<u>" + names + r")" + closing + right)
 
 
 def protected_spans(text: str) -> list[tuple[int, int]]:
@@ -687,6 +696,16 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
                 if " 到 " in spoken or text[start] in _RELATIONS:
                     spoken = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", spoken)
                     add(start, end, "measurement", lambda value=spoken: value)
+    if language == "zh":
+        for match in _ZH_MONTH_DAY.finditer(text):
+            start, end = match.span()
+            prefix = text[max(0, start-64):start]
+            if ((_ZH_DATE_LABEL.search(prefix) or _ZH_DATE_WEEKDAY.match(text, end))
+                    and not identifier_prefix.search(prefix) and not _ZH_DECIMAL_LABEL.search(prefix)
+                    and not has_explicit_math_context(text, start)):
+                # Use a leap year to validate the fields of a yearless date.
+                raw = "2000-" + re.sub(r"[./]", "-", match.group())
+                add(start, end, "month_day", lambda: _date(raw, "zh", cfg).partition("年")[2])
     for match in _DATE_LIKE.finditer(text):
         add(match.start(), match.end(), "ambiguous_date_format", lambda m=match: m.group())
     for match in _IPV4.finditer(text):
@@ -1286,6 +1305,7 @@ class Frontend:
             if languages := lexicon.get("initialism_group_stress", ()):
                 grouped = self._dictionary_phonemes(entry, group_stress=True)
                 native = {**dict.fromkeys(languages, grouped), **native}
+            native.update(entry.get("native_phonemes", {}))
             for form in [entry["term"], *entry["aliases"]]:
                 name = f"w{index}_{len(alternatives)}"
                 body = re.escape(form).replace(r"\ ", r"[ \t]+")
@@ -1298,9 +1318,10 @@ class Frontend:
                 if entry.get("split_opening_clause", True):
                     self._opening_clause_terms.add(name)
         alternatives.sort(reverse=True)
-        self._terms = re.compile(r"(?<![A-Za-z0-9_])(?:" +
+        word_characters = _LATIN_LETTERS + r"0-9_\u0300-\u036f"
+        self._terms = re.compile(rf"(?<![{word_characters}])(?:" +
                                  "|".join(body for _, body in alternatives) +
-                                 r")(?![A-Za-z0-9_]|\.[A-Za-z0-9_])")
+                                 rf")(?![{word_characters}]|\.[{word_characters}])")
         # Load lazy corpora before the first queued utterance, without running a
         # neural model or downloading resources during requests.
         for language, text in zip(LANGUAGES, (
