@@ -695,19 +695,11 @@ ENV PYTHONUNBUFFERED=1
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # Kokoro Multi frontend dependencies for both JetPack Python ABIs.
-RUN . /etc/jetpack.env && \
-    case "${JP_VERSION}" in \
-      511) set -- fugashi==1.4.0 thinc==8.2.4 blis==0.7.11 pythainlp==5.0.4 ;; \
-      61)  set -- fugashi==1.5.2 pythainlp==5.3.4 ;; \
-      *)   exit 0 ;; \
-    esac && \
-    pip3 uninstall -y phonemizer && \
+RUN pip3 uninstall -y phonemizer && \
     pip3 install --no-cache-dir -i "${PYPI_MIRROR}" "numpy==${NUMPY_VERSION}" \
-      misaki==0.9.4 spacy==3.7.5 phonemizer-fork==3.3.2 espeakng-loader==0.2.4 \
-      num2words==0.5.14 pypinyin==0.55.0 cn2an==0.5.24 jieba==0.42.1 ordered-set==4.1.0 \
-      unidic-lite==1.0.8 jaconv==0.5.0 mojimoji==0.0.13 langid==1.1.6 "$@" && \
+      -r /work/plugins/requirements.kokoro-multi.txt && \
     python3 -c "import numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; import misaki, spacy, phonemizer, fugashi, langid"
-ARG KOKORO_MULTI_BENCHMARK=1
+ARG KOKORO_MULTI_BENCHMARK=0
 # The JP5 Darvin image only runs TTS. Avoid loading Torch in its CPU frontend.
 RUN if [ "${JP_VERSION}" = "511" ] && [ "${KOKORO_MULTI_BENCHMARK}" = "1" ]; then \
       pip3 uninstall -y torch torchvision torchaudio; \
@@ -720,4 +712,8 @@ CMD ["/bin/bash", "-c", \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     exec python3 -c 'from plugins.kokoro_multi_tts import main; main()'"]
+     if [ \"${KOKORO_MULTI_ENABLE}\" = \"1\" ]; then \
+       exec python3 -c 'from plugins.kokoro_multi_tts import main; main()'; \
+     else \
+       exec python3 /work/main.py; \
+     fi"]

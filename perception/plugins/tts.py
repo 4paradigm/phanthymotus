@@ -1375,9 +1375,9 @@ def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
         cfg.get('hw_provider'),
     )
     if _is_kokoro_multi_backend(engine, cfg.get('backend')):
-        from plugins.kokoro_multi_tts import KokoroMultiTTSAdapter
+        from plugins.kokoro_multi_tts import KokoroMultiTTSAdapter, prepare_model
         return KokoroMultiTTSAdapter(
-            model_dir, speaker_id, speed, device,
+            prepare_model(cfg.get('model_dir'), on_status=on_status), speaker_id, speed, device,
             language=cfg.get('tts_language') or cfg.get('language') or 'auto',
             on_status=on_status, benchmark=bool(cfg.get('benchmark', False)))
     if engine == 'mms-th':
@@ -1891,7 +1891,7 @@ def _session_keys(cfg: dict) -> dict:
 class SherpaOnnxTTSPlugin:
     PREFIX = "tts"
 
-    def __init__(self, plugin_cfg: dict, executor):
+    def __init__(self, plugin_cfg: dict, executor, on_status=None):
         self._cfg      = plugin_cfg
         # Normalise the session keys up front so the first `config` that repeats
         # them compares equal instead of rebuilding what was just built.
@@ -1906,7 +1906,7 @@ class SherpaOnnxTTSPlugin:
         try:
             self._adapter  = _build_tts_adapter(
                 plugin_cfg,
-                on_status=lambda text: setattr(self, "_load_status", text))
+                on_status=on_status or (lambda text: setattr(self, "_load_status", text)))
         except Exception as e:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
@@ -2330,6 +2330,7 @@ class TTSPlugin:
         self._impl_engine = ""
         self._building = ""          # engine name while a build is in flight
         self._build_error = None
+        self._load_status = None
         # `start` calls that arrived while a build was in flight, keyed by
         # instance_id, replayed against the new engine once it is resident. Agent
         # Core's contract for a start that answers `state: loading` is that the
@@ -2351,6 +2352,11 @@ class TTSPlugin:
         # to the configured engine; every other engine gets its own default.
         self._configured_engine = engine
         self._configured_model_dir = self._cfg.get("model_dir") or ""
+        if _is_kokoro_multi_backend(engine, self._cfg.get("backend")):
+            # Let MCP serve `info` while the pinned archive downloads and unpacks.
+            self._building = engine
+            self._build_async(engine)
+            return
         # Built inline at startup so info/start are immediately truthful, and so
         # a misconfigured engine shows up in the boot log rather than on the
         # first utterance. Runtime switches take the background path below.
@@ -2386,13 +2392,17 @@ class TTSPlugin:
     def _build(self, engine: str):
         cfg = dict(self._cfg)
         cfg["engine"] = engine
-        cfg["model_dir"] = self._model_dir_for(engine)
         # Like model_dir, a configured backend belongs to its original engine.
         # VITS2's backend=trt must not select Kokoro Multi after a switch to Kokoro.
         if engine != self._configured_engine:
             cfg.pop("backend", None)
-        impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
-                else SherpaOnnxTTSPlugin(cfg, self._executor))
+        if _is_kokoro_multi_backend(engine, cfg.get("backend")):
+            cfg["model_dir"] = self._configured_model_dir or None
+            impl = SherpaOnnxTTSPlugin(cfg, self._executor, on_status=self._report_kokoro_load_status)
+        else:
+            cfg["model_dir"] = self._model_dir_for(engine)
+            impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
+                    else SherpaOnnxTTSPlugin(cfg, self._executor))
         # An implementation may swallow its own model-load failure and come back
         # as an object that reports error through info (sherpa does exactly
         # that). Installing it would make the facade claim ready and let a start
@@ -2404,6 +2414,11 @@ class TTSPlugin:
                 or f"engine {engine} reported an error after construction"
             )
         return impl
+
+    def _report_kokoro_load_status(self, text: str) -> None:
+        with self._lock:
+            if self._building == "kokoro-multi":
+                self._load_status = text
 
     def _build_vits2(self, cfg: dict):
         from plugins.vits2_tts import Vits2TTSPlugin
@@ -2506,6 +2521,7 @@ class TTSPlugin:
             building = self._building
             error = self._build_error
             engine = self._engine
+            load_status = self._load_status
         if impl is not None:
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
@@ -2527,7 +2543,7 @@ class TTSPlugin:
             result = {
                 "name": "TTS", "manufacture": "Embodied", "model": engine,
                 "engine": engine, "state": state,
-                "desc": (f"Switching to the {building} engine..." if building
+                "desc": (load_status or f"Switching to the {building} engine..." if building
                          else f"Engine {engine} failed to load: {error}"),
             }
             if state == "error" and error:
@@ -2607,6 +2623,7 @@ class TTSPlugin:
                     self._cfg["engine"] = engine
                     self._building = engine
                     self._build_error = None
+                    self._load_status = None
             if switching:
                 # Stop the old engine's nodes before the new one publishes on
                 # the same topics — two live TTS publishers on one topic is the

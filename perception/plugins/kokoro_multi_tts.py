@@ -224,6 +224,9 @@ class KokoroTRT:
 
 
 def _run_jp5_trt(connection, model_dir, warmup):
+    from utils import logsafe
+
+    logsafe.install(check_fd=False)
     runtime = None
     try:
         try:
@@ -505,11 +508,13 @@ def enabled():
     return value == "1"
 
 
-def prepare_config():
-    import yaml
+def prepare_model(model_dir, on_status=None):
     from utils.model_downloader import ensure_verified_archive, require_models_subpath
+    from utils.model_progress import fetch_status
 
-    jp = os.environ["KOKORO_MULTI_BUILT_FOR_JP"]
+    jp = os.environ.get("KOKORO_MULTI_BUILT_FOR_JP", "")
+    if jp not in ASSETS:
+        raise RuntimeError("Kokoro Multi requires a prepared JetPack 5.1.1 or 6.1 image")
     asset_url, asset_sha256, asset_size, cache = ASSETS[jp]
     url = os.environ.get("KOKORO_MULTI_ASSET_URL", asset_url)
     sha256 = os.environ.get("KOKORO_MULTI_ASSET_SHA256", asset_sha256)
@@ -519,16 +524,16 @@ def prepare_config():
             "Kokoro Multi release is not pinned: set KOKORO_MULTI_ASSET_URL, "
             "KOKORO_MULTI_ASSET_SHA256 and KOKORO_MULTI_ASSET_SIZE"
         )
-    model_dir = require_models_subpath(
-        os.environ.get("KOKORO_MULTI_MODEL_DIR", cache)
-    )
-    # A mounted /models cache is reused. Without a mount this is the container's
-    # writable layer, and each fresh container needs network access to the URL.
+    model_dir = require_models_subpath(os.environ.get("KOKORO_MULTI_MODEL_DIR", model_dir or cache))
+    progress_cb, stage_cb = fetch_status(on_status, "kokoro-multi")
     ensure_verified_archive(
-        f"kokoro-multi-jp{jp}", model_dir, url, {"sha256": sha256, "size": size}
-    )
-    if not (Path(model_dir) / "manifest.json").is_file():
-        raise RuntimeError("Kokoro Multi release must contain manifest.json at its root")
+        f"kokoro-multi-jp{jp}", model_dir, url, {"sha256": sha256, "size": size},
+        progress_cb=progress_cb, stage_cb=stage_cb)
+    return model_dir
+
+
+def prepare_config():
+    import yaml
 
     source = Path(os.environ.get("CONFIG_PATH", str(WORK / "config.yaml")))
     with source.open() as handle:
@@ -540,7 +545,6 @@ def prepare_config():
         "backend": "trt",
         "benchmark": benchmark,
         "device": "gpu",
-        "model_dir": model_dir,
         "language": "auto",
         "warmup": True,
         "speaker_id": 0,
@@ -586,9 +590,9 @@ def main():
                 '</leaseAnnouncement></discovery_config></builtin></rtps>'
                 '</participant></profiles>')
             os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(discovery)
-        logging.info("Kokoro Multi jp%s: MCP port %s, WS port %s, cache %s",
+        logging.info("Kokoro Multi jp%s: MCP port %s, WS port %s",
                      os.environ["KOKORO_MULTI_BUILT_FOR_JP"],
-                     cfg["mcp_port"], cfg["ws_port"], cfg["plugins"]["tts"]["model_dir"])
+                     cfg["mcp_port"], cfg["ws_port"])
         runpy.run_path(str(WORK / "main.py"), run_name="__main__")
 
 
