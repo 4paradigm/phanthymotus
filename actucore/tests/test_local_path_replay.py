@@ -125,7 +125,7 @@ def test_detour_falls_back_to_strafe_then_forward_with_bumi_speed_ranges(side):
 
 
 @pytest.mark.parametrize("start_occupied", [False, True])
-def test_live_detour_stops_if_the_start_or_all_exits_are_blocked(monkeypatch, start_occupied):
+def test_live_detour_stops_if_the_start_or_passing_lane_is_blocked(monkeypatch, start_occupied):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
 
@@ -134,7 +134,7 @@ def test_live_detour_stops_if_the_start_or_all_exits_are_blocked(monkeypatch, st
             occupied = np.isclose(right, 0) & (np.isclose(forward, .2) | np.isclose(forward, .9))
         else:
             occupied = ((np.isclose(right, 0) & np.isclose(forward, .90))
-                        | np.isclose(forward, 1.35))
+                        | np.isclose(forward, 1.05))
         return np.ones_like(occupied), occupied
 
     monkeypatch.setattr(replay, "observe", observed)
@@ -160,6 +160,24 @@ def test_live_detour_can_continue_along_the_side_when_centerline_is_blocked(monk
     assert forward >= 1.35 and side * right >= .35
 
 
+def test_live_detour_can_enter_passing_lane_without_a_complete_exit(monkeypatch):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .23)
+    box = (abs(replay.RIGHT) <= .15) & np.isclose(replay.FORWARD, .90)
+    wall = np.isclose(replay.FORWARD, 1.35)
+    occupied = box | wall
+    monkeypatch.setattr(replay, "observe", lambda *args: (~occupied, occupied))
+
+    detour = replay._checked_translation(None, None, geometry, .33, .90, 1.,
+                                         800, 600, velocity_limits=DECLARED_SPEEDS)
+
+    assert detour is not None and detour.command is not None
+    assert detour.command[1] < 0.
+    assert .90 <= detour.points[-1][0] < 1.35
+    assert replay.transition_clear((~occupied, occupied), geometry, .33, 1.45,
+                                   ((0., 0.), detour.command))
+
+
 def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkeypatch):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
@@ -170,7 +188,8 @@ def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkey
     monkeypatch.setattr(replay, "observe", lambda *args: (unmeasured, occupied))
 
     args = (None, None, geometry, .33, .90, 1., 500, 600)
-    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS) is None
+    prefix = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS)
+    assert prefix is not None and prefix.points[-1][0] < 1.35
     assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
                                        observed_grid=(unmeasured, unmeasured)) is None
     command = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,

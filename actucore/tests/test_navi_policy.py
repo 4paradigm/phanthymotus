@@ -2702,7 +2702,7 @@ def test_local_planner_requires_distinct_frames_before_switching_for_more_space(
     assert step(300) > 0
 
 
-def test_local_recovery_keeps_its_checked_direction_or_holds_below_driver_floor(monkeypatch):
+def test_local_recovery_uses_the_current_checked_speed_without_waiting_for_frames(monkeypatch):
     cfg = _cfg(local_planning=True, floor_vx=.04, floor_vy=.04)
     state = _state(escape_side=1., recovery=P.ClearanceRecovery("right", 2, 100))
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
@@ -2713,8 +2713,8 @@ def test_local_recovery_keeps_its_checked_direction_or_holds_below_driver_floor(
         return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
                         P.AVOIDING, "", state, target_distance=2.8)[:3]
 
-    assert step(200) == (0., 0., 0.)
-    assert step(300) == pytest.approx((.042, -.077 * 2 / 3, 0.))
+    assert step(200) == (.063, -.077, 0.)
+    assert state.recovery is None
 
 
 def test_local_command_respects_moving_floors_and_the_signed_driver_bounds():
@@ -2863,7 +2863,7 @@ def test_command_only_stops_before_switching_from_turn_to_translation(monkeypatc
     assert tick(1400).values[0] > 0.
 
 
-def test_lost_motion_feedback_stops_until_new_depth(monkeypatch):
+def test_lost_motion_feedback_only_brakes_and_reuses_unexpired_depth(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import local_path
 
@@ -2876,14 +2876,15 @@ def test_lost_motion_feedback_stops_until_new_depth(monkeypatch):
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
 
     def tick(frame, source):
-        depth = dict(_scene(2.5), frame_id=frame, source_frame_id=source)
+        depth = dict(_scene(2.5), frame_id=1000, control_ms=frame, source_frame_id=source)
         return P.step(detections={"objects": []}, depth=depth,
                       odom=None, config=cfg, state=state, dt=.1)
 
-    for frame in range(1000, 1600, 100):
+    for frame in range(1000, 1400, 100):
         assert tick(frame, 42).values == [0.] * 6
     assert state.motion_source == "command"
-    assert tick(1600, 43).values[0] > 0.
+    assert tick(1400, 42).values[0] > 0.
+    assert tick(1501, 42).status == P.BLIND
 
 
 def test_losing_feedback_during_a_turn_preserves_the_scan_lock(monkeypatch):

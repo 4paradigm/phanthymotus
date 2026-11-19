@@ -1531,6 +1531,7 @@ class NaviPlugin:
         self._set_depth_map(depth, capture_ms=capture_ms)
 
     def _open_publisher(self):
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from rclpy.node import Node
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
@@ -1545,7 +1546,9 @@ class NaviPlugin:
             self._view_thread = threading.Thread(
                 target=self._view_worker, daemon=True, name="navi_view")
             self._view_thread.start()
-        self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick)
+        # Sensor callbacks can refresh snapshots while the planner runs.
+        self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick,
+                                        callback_group=MutuallyExclusiveCallbackGroup())
         self._executor.add_node(node)
         with self._lock:
             self._node = node
@@ -1559,11 +1562,15 @@ class NaviPlugin:
         and "never arrived" are the same thing to the decision — both mean the
         card cannot see, and both must stop the robot.
         """
-        now = int(time.time() * 1000)
+        return self._observation_snapshot(with_capture_timing=with_capture_timing)[:3]
+
+    def _observation_snapshot(self, *, with_capture_timing):
         max_age = self._config.max_obs_age_ms
         depth_age = self._config.depth_age_limit_ms
         with self._obs_lock:
-            objects = self._objects if now - self._objects_ms <= max_age else None
+            now = int(time.time() * 1000)
+            objects_ms = self._objects_ms
+            objects = self._objects if now - objects_ms <= max_age else None
             fresh_depth = now - self._depth_ms <= depth_age
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
                       "frame_id": self._depth_ms} if fresh_depth else None)
@@ -1598,7 +1605,7 @@ class NaviPlugin:
                         odom["source_sample_id"] = self._odom_source_ms
                 if not uses_pose and self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
-        return objects, depth, odom
+        return objects, depth, odom, objects_ms
 
     def next_command(self):
         """One tick of the policy, as a message or None.
@@ -1606,12 +1613,12 @@ class NaviPlugin:
         Public and ROS-free so the whole decision path — including the sequence
         numbers and the two timestamps — is testable without a node.
         """
-        now = time.time()
         tick = time.monotonic()
         dt = tick - self._last_tick if self._last_tick else 1.0 / self._rate_hz
         self._last_tick = tick
 
-        objects, depth, odom = self.observation(with_capture_timing=self._config.local_planning)
+        objects, depth, odom, objects_ms = self._observation_snapshot(
+            with_capture_timing=self._config.local_planning)
         was_moving = any(self._state.commanded)
         scan = self._state.active_scan
         scan_guarded = scan.active or bool(scan.result_frame)
@@ -1620,6 +1627,7 @@ class NaviPlugin:
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt)
+        now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
         command_only = self._config.local_planning and self._state.motion_source == "command"
@@ -1649,7 +1657,7 @@ class NaviPlugin:
             decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
         self._state.commanded = (values[0], values[1], values[5])
 
-        obs_ms = self._objects_ms or int(now * 1000)
+        obs_ms = objects_ms or int(now * 1000)
         if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
                 or scan.locked or was_searching) and not any(values):
             # A hold applies now, even when the last input is about to expire.

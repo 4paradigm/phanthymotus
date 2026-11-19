@@ -204,13 +204,9 @@ def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypa
         return card.next_command()
 
     assert tick(100_000, .60)["values"] == [0.] * 6
-    # Once near-stop is latched, require three new clear sweeps, even though
-    # all three depth frames still report an obstacle within 1.50 m.
-    assert tick(100_100, .80)["values"] == [0.] * 6
-    assert tick(100_200, .80)["values"] == [0.] * 6
-    search = tick(100_300, .80)
+    search = tick(100_100, .80)
     assert search["values"] == [0., 0., 0., 0., 0., -.60]
-    assert search["obs_stamp_ms"] == 100_250
+    assert search["obs_stamp_ms"] == 100_050
     stop = tick(100_800)
     assert stop["values"] == [0.] * 6
     assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_800
@@ -1274,6 +1270,30 @@ def test_visual_age_controls_publication_without_rewriting_stamp(monkeypatch, ag
         assert message["ttl_ms"] == card._ttl_ms == 300
 
 
+def test_slow_planning_stamps_the_command_at_emission_and_keeps_used_observation(monkeypatch):
+    card = _card()
+    now_ms = [123_456]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms[0] / 1000)
+    assert _first_command(card) is not None
+    card._objects_ms = 123_400
+    card._depth_ms = 123_420
+    card._ttl_ms = 200
+    step = navi_plugin.policy_mod.step
+
+    def slow_step(**kwargs):
+        decision = step(**kwargs)
+        now_ms[0] += 250
+        card._objects_ms = now_ms[0]
+        return decision
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", slow_step)
+    command = card.next_command()
+
+    assert command["stamp_ms"] == 123_706
+    assert command["obs_stamp_ms"] == 123_400
+    assert command["ttl_ms"] == 200
+
+
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
     card = _card()
     card._adopt_odom_interface({
@@ -1860,6 +1880,6 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     if with_odom:
         card._depth_ms = depth_stamp
         card._odom_ms = 0
-        stop = card.next_command()
-        assert stop["values"] == [0.0] * 6
-        assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+        resumed = card.next_command()
+        assert resumed["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
+        assert resumed["obs_stamp_ms"] == depth_stamp

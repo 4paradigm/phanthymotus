@@ -525,8 +525,6 @@ class State:
     motion_source: str = ""
     feedback_boot_s: float = 0.
     feedback_guard_s: float = 0.
-    feedback_guard_frame: int = 0
-    feedback_guard_source: int | None = None
     command_tail: tuple = (0., 0., 0.)
     command_tail_s: float = 0.
     missing_frames: int = 0
@@ -1157,7 +1155,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if state.feedback_boot_s * 1000 < ODOM_GAP_MS:
                 return Decision(_twist(0, 0, 0), AVOIDING, "等待首个有效运动反馈")
         if state.motion_source and state.motion_source != source:
-            needs_guard = source == "command" or any(state.commanded) or state.active_scan.active
+            needs_guard = any(state.commanded) or state.active_scan.active
             previous_scan = state.active_scan
             previous_scan.invalidate()
             state.active_scan = ActiveScan(attempted=previous_scan.attempted, locked=previous_scan.locked)
@@ -1165,23 +1163,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
         state.motion_source = source
         frame = (depth or {}).get("frame_id") or 0
-        source_frame = (depth or {}).get("source_frame_id")
         if state.feedback_guard_s > 0.:
             state.feedback_guard_s = max(0., state.feedback_guard_s - dt)
-            now = (depth or {}).get("control_ms") or frame
-            state.feedback_guard_frame = max(state.feedback_guard_frame, now)
-            if type(source_frame) is int:
-                previous = state.feedback_guard_source
-                state.feedback_guard_source = source_frame if previous is None else max(previous, source_frame)
-            return Decision(_twist(0, 0, 0), AVOIDING, "运动反馈来源已切换，停车等待新深度")
-        if state.feedback_guard_frame:
-            capture = (depth or {}).get("capture_ms") or frame
-            source_repeated = (type(source_frame) is int and state.feedback_guard_source is not None
-                               and source_frame <= state.feedback_guard_source)
-            if capture <= state.feedback_guard_frame or source_repeated:
-                return Decision(_twist(0, 0, 0), AVOIDING, "运动反馈来源已切换，停车等待新深度")
-        state.feedback_guard_frame = 0
-        state.feedback_guard_source = None
+            return Decision(_twist(0, 0, 0), AVOIDING, "运动反馈来源已切换，等待底盘停稳")
         if any(state.commanded):
             state.command_tail = state.commanded
             state.command_tail_s = (config.watchdog_ms + 50) / 1000
@@ -1672,7 +1656,10 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
                 state.recovery = ClearanceRecovery()
                 return "原地搜索：转身扫掠范围有障碍或超出网格，停车"
     if state.recovery is not None:
-        if not config.local_planning and ahead is not None and ahead < config.slow_distance_m:
+        if config.local_planning:
+            state.recovery = None
+            return None
+        if ahead is not None and ahead < config.slow_distance_m:
             state.recovery = ClearanceRecovery()
             return "近障停车，等待足够的深度观测"
         if state.recovery.scale("turn", depth, config.depth_age_limit_ms) <= 0:
@@ -1916,17 +1903,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待通道有足够余量"
         if route != state.recovery.route and not near:
             state.blocked_for_s = 0.0
+        if config.local_planning:
+            state.recovery = None
+            return vx, vy, wz, status, reason
         gain = state.recovery.scale(route, depth, config.depth_age_limit_ms)
         if gain == 0:
             return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待连续新深度帧确认通道"
-        if local_command is not None:
-            vx, vy = vx * gain, vy * gain
-            (floor_x, _), (floor_y, _) = _local_velocity_limits(config, side)
-            if ((vx and abs(vx) < floor_x) or (vy and abs(vy) < floor_y)):
-                return 0.0, 0.0, 0.0, AVOIDING, "安全速度低于底盘可执行范围；保持停车"
-        else:
-            vx = _scaled(vx, gain, config.floor_vx, config.vx_max)
-            vy = _scaled(vy, gain, config.floor_vy, config.vy_max)
+        vx = _scaled(vx, gain, config.floor_vx, config.vx_max)
+        vy = _scaled(vy, gain, config.floor_vy, config.vy_max)
         wz *= gain
         if gain == 1 and not near:
             state.recovery = None

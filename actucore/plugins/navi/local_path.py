@@ -328,6 +328,13 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         last_goal_col = allowed.shape[1] - 1
         path = shortest_path(allowed, start, goal, later_goal=True,
                              last_goal_col=last_goal_col, steps=steps)
+    partial = path is None
+    if partial:
+        # Replan from the passing lane when the current grid has no clear exit.
+        goal = via
+        last_goal_col = allowed.shape[1] - 1
+        path = shortest_path(allowed, start, goal, later_goal=True,
+                             last_goal_col=last_goal_col, steps=steps)
     if path is None or len(path) < 2:
         return None
     # The straight command must stay within the checked path prefix through
@@ -354,6 +361,9 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         speed = min(length / horizon_s,
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
+        if partial and vx and vy and not transition_clear(
+                (None, occupied), geometry, half_width, horizon_s, ((vx, -vy),)):
+            return None
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
             return vx, -side * vy
         return None
