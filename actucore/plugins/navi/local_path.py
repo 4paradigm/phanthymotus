@@ -199,14 +199,16 @@ class Geometry:
     height: float | None
 
 
-def camera_square(horizontal, vertical, half_width):
-    """Plan in the forward camera frame with the declared square footprint."""
+def camera_square(horizontal, vertical, half_width, *, half_length=None):
+    """Plan in the camera frame, defaulting to a square footprint."""
     if horizontal is None or vertical is None:
         return None
     # Axis convention only: optical (right, down, forward) to (forward, left, up).
     axes = np.array([[0., 0., 1., 0.], [-1., 0., 0., 0.],
                      [0., -1., 0., 0.], [0., 0., 0., 1.]])
-    return Geometry(horizontal, vertical, axes, half_width, half_width, None)
+    extent = (half_length if type(half_length) in (int, float)
+              and math.isfinite(half_length) and half_length > 0 else half_width)
+    return Geometry(horizontal, vertical, axes, extent, extent, None)
 
 
 def body_square(geometry, vendor):
@@ -449,14 +451,19 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
                 return detour(path, i, command)
             if cardinal is None:
                 cardinal = detour(path, i, command)
+    # Prefer an initial lateral stretch of three cells when there is room.
+    # A single cell can produce a repeatedly selected but ineffective step.
+    lead_cells = max(3, math.ceil(floor_vy * horizon_s / resolution))
+    lateral_speed = min(max_vy, lead_cells * resolution / horizon_s)
     if cardinal is not None and cardinal.command[0] == 0.:
-        return cardinal
+        if reposition or abs(cardinal.command[1]) >= lateral_speed - 1e-9:
+            return cardinal
     if reposition:
         return None
 
-    # Search a separate route that stays on the starting row for at least
-    # the travel needed to send a lateral command above the driver's floor.
-    first_forward_col = col_zero + max(1, math.ceil(floor_vy * horizon_s / resolution))
+    # Search for a route that completes the lateral stretch before advancing.
+    # A shorter checked step is still usable when the longer lane is blocked.
+    first_forward_col = col_zero + lead_cells
     if first_forward_col < allowed.shape[1]:
         allowed[row_zero + 1, :first_forward_col] = False
         side_path = shortest_path(allowed, start, goal, later_goal=True,

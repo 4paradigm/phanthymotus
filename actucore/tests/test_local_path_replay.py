@@ -105,6 +105,20 @@ def test_near_detour_can_choose_a_verified_lateral_only_command(monkeypatch):
     assert .03 <= -command[1] <= .07
 
 
+def test_short_lateral_prefix_uses_a_longer_checked_move_when_clear():
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .20)
+    occupied = (abs(replay.RIGHT) <= .1) & np.isclose(replay.FORWARD, .90)
+    detour = replay._checked_translation(
+        None, None, geometry, .30, .90, 1., 800, 600, velocity_limits=DECLARED_SPEEDS,
+        allow_forward=False, observed_grid=(~occupied, occupied))
+    assert detour is not None
+    assert detour.command[0] == 0.
+    assert detour.command[1] <= -.15 / 1.45
+    assert replay.transition_clear((~occupied, occupied), geometry, .30, 1.45,
+                                   (detour.command,))
+
+
 @pytest.mark.parametrize('side', [-1., 1.])
 def test_detour_falls_back_to_strafe_then_forward_with_bumi_speed_ranges(side):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),

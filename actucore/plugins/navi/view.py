@@ -304,6 +304,21 @@ def _arrow(frame, origin, dx, dy, colour, label: str):
         _text(frame, label, (end[0] + 6, end[1] + 4), colour, 0.45)
 
 
+def _dashed_line(frame, a, b, colour, phase=0.):
+    length = math.dist(a, b)
+    if not length:
+        return phase
+    offset = -phase
+    while offset < length:
+        start, end = max(0., offset), min(length, offset + 8.)
+        if start < end:
+            points = [tuple(round(x + (y - x) * t / length) for x, y in zip(a, b))
+                      for t in (start, end)]
+            _line(frame, *points, colour, thickness=2)
+        offset += 15.
+    return (phase + length) % 15.
+
+
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, rgb_jpeg=None, blend: float = 0.5,
            ground=None, detour=None, depth_vertical=None, route_target=None,
@@ -345,12 +360,15 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                         route_target, keep, width, height,
                         stop_distance_m=config.stop_distance_m,
                         pending=detour is not None and detour.command is None)
-    metric_path = bool(lines)
-    if lines:
-        for a, b, dashed in lines:
-            visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
-            if visible:
-                _line(frame, a, b, _CORRIDOR, thickness=1 if dashed else 2)
+    phase, previous_end = 0., None
+    for a, b, dashed in lines:
+        visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
+        if visible:
+            if dashed:  # Guidance already contains gaps in ground coordinates.
+                _line(frame, a, b, _CORRIDOR, thickness=2)
+            else:
+                phase = _dashed_line(frame, a, b, _CORRIDOR, phase if a == previous_end else 0.)
+            previous_end = b
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -358,37 +376,17 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     # metric: the same half-width covers a different slice of the picture at
     # every range, which is the single fact that took longest to become visible.
     edges = corridor_edges(clearance, config, width)
-    if edges and not lines:
-        left, right = edges
-        blocked = clearance <= config.obstacle_stop_m
-        colour = _WARN if blocked else _CORRIDOR
-
-        # **Drawn as a dimension, not as two lines.**
-        #
-        # Two bare verticals were asked about twice: they read as unrelated
-        # marks, and nothing connected them to the `+-0.33m` in the corner. A
-        # cross-bar with arrow ends is the drawing convention for "this is a
-        # width", and putting the number on the bar rather than in a corner is
-        # what makes it answer its own question.
-        bar = int(height * 0.30)
-        for x in (left, right):
-            _line(frame, (x, bar), (x, height), colour)
-        cv2.arrowedLine(frame, (left, bar), (right, bar), _CASING, 6,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (right, bar), (left, bar), _CASING, 6,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (left, bar), (right, bar), colour, 2,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (right, bar), (left, bar), colour, 2,
-                        tipLength=0.04)
-        span = f"path {keep * 2:.2f}m wide"
-        (tw, _), _ = cv2.getTextSize(span, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        _text(frame, span, ((left + right - tw) // 2, bar - 8), colour, 0.5)
     if edges:
         colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
+        if not lines:
+            for far, near in zip(edges, corridor_edges(clearance * .5, config, width)):
+                visible, a, b = cv2.clipLine((0, 0, width, height),
+                                            (far, int(height * .62)), (near, height - 1))
+                if visible:
+                    _dashed_line(frame, a, b, colour)
         _text(frame, f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
               (8, 24), colour, 0.55)
-    if metric_path:
+    if edges or lines:
         _text(frame, f"path {2 * keep:.2f}m wide", (8, 46), _CORRIDOR, 0.5)
 
     # ── the target ───────────────────────────────────────────────────────────

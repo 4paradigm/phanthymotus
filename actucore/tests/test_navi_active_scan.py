@@ -221,6 +221,27 @@ def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkey
     assert not look.active and not look.locked and look.attempted
 
 
+def test_receipt_scan_with_no_yaw_progress_replans_before_standing_bias_locks_it(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp):
+        look.update(_depth(stamp), {**_odom(stamp), "vy": -.039, "received_ms": stamp},
+                    geometry, receipt_only=True, max_depth_age_ms=800)
+        return look.command(geometry, .30, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((1., -1.))
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw < 0.
+    for stamp in range(1250, 2550, 100):
+        tick(stamp)
+    hold = tick(2550)
+    assert hold.yaw == 0. and "转向无实测进展" in hold.reason
+    tick(2650)
+    assert tick(2800).yaw == 0.
+    assert not look.active and not look.locked
+
+
 @pytest.mark.parametrize("missing", ["depth", "odom", "poll_gap"])
 def test_receipt_scan_stops_then_replans_after_temporary_input_loss(monkeypatch, missing):
     look, geometry, _, _ = _setup(monkeypatch)

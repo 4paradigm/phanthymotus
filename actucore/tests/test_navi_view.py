@@ -224,7 +224,7 @@ def test_the_corridor_narrows_in_the_image_as_the_clearance_grows():
     image exists to show."""
     def edges(clearance):
         frame = _render(clearance=clearance)
-        lit = np.where((frame[400] == V._CORRIDOR).all(axis=1))[0]
+        lit = np.where((frame[374:412] == V._CORRIDOR).all(axis=2).any(axis=0))[0]
         return lit.min(), lit.max()
 
     near_l, near_r = edges(0.8)
@@ -343,20 +343,24 @@ def test_both_numbers_are_drawn_when_a_measurement_exists():
 
 
 @needs_cv2
-def test_the_corridor_reads_as_a_width_not_as_two_stray_lines():
-    """Asked about twice, which is the design feedback.
-
-    Two bare verticals read as unrelated marks, and nothing connected them to
-    the half-width printed in a corner. A cross-bar with arrow ends is the
-    drawing convention for "this is a width", and the number belongs on the bar.
-    """
+def test_the_fallback_corridor_uses_dashed_guides_without_a_dimension_bar():
     frame = _render(clearance=1.0)
     left, right = V.corridor_edges(1.0, P.Config(), 640)
     bar = int(480 * 0.30)
 
     between = frame[bar, left + 8:right - 8]
-    lit = (between == np.array(V._CORRIDOR)).all(axis=1).sum()
-    assert lit > (right - left) * 0.5, "两条竖线之间没有横杆把它们连起来"
+    assert not (between == V._CORRIDOR).all(axis=1).any()
+    guides = (frame[150:350] == V._CORRIDOR).all(axis=2).any(axis=1)
+    assert guides.any() and not guides.all()
+
+
+@needs_cv2
+def test_a_planned_route_is_drawn_with_dashes(monkeypatch):
+    monkeypatch.setattr(V, "route_lines", lambda *args, **kwargs: [
+        ((220, 150), (220, 350), False),
+    ])
+    column = (_render(clearance=1.0)[150:350, 220] == V._CORRIDOR).all(axis=1)
+    assert column.any() and not column.all()
 
 
 @needs_cv2

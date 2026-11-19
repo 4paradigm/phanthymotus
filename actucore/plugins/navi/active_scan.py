@@ -21,6 +21,8 @@ ODOM_GAP_MS = 250
 MAP_AGE_MS = 2500
 SCAN_TIMEOUT_MS = 8000
 POSE_TURN_BURST_MS = 400
+TURN_PROGRESS_WINDOW_MS = 1500
+TURN_PROGRESS_MIN_RAD = math.radians(3)
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class ActiveScan:
     origin: tuple = (0., 0., 0.)
     origin_set: bool = False
     still_since: int = 0
+    turn_start_heading: float = 0.
     settle_ms: int | None = None
     settle_frame: int = 0
     settle_frames: int = 0
@@ -312,6 +315,7 @@ class ActiveScan:
             if not self.origin_set:
                 self.origin, self.origin_set = self.pose, True
             self.still_since = stamp
+            self.turn_start_heading = self.pose[2]
             self.phase = "turn"
             return ScanCommand(reason="主动观察：确认底盘已停稳")
         if math.dist(self.pose[:2], self.origin[:2]) > .18:
@@ -335,6 +339,10 @@ class ActiveScan:
         if (abs(self.motion[2]) > yaw_rate + .10
                 or abs(self.pose[2] - self.origin[2]) > ANGLE + 2 * ANGLE_TOLERANCE):
             return self.interrupt("主动观察：转速或转角超出限制，停车")
+        if (self.receipt_only and self.phase == "turn" and self.issued_yaw
+                and stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS
+                and abs(self.pose[2] - self.turn_start_heading) < TURN_PROGRESS_MIN_RAD):
+            return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划")
 
         # Pose feedback can lag several ticks. Run a bounded burst, then wait
         # for measurements that bracket its explicit stop.

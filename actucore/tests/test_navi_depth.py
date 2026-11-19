@@ -354,6 +354,34 @@ def test_ground_fit_accepts_floor_around_a_wider_center_box():
     assert not ground[270:, 225:415].any()
 
 
+def test_ground_fit_uses_single_visible_far_side_with_broad_near_support():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    occluded = np.s_[287:401, :415]
+    frame[occluded] = .73
+    camera = HorizontalIntrinsics(640, 315, 337)
+    ground = D.ground_mask(frame, camera, (480, 420, 243.2))
+
+    assert ground is not None and ground[428, 200] and ground[342, 530]
+    assert not ground[occluded].any()
+    assert _corridor(frame, intrinsics=camera, ground=ground)[0] == pytest.approx(.73)
+
+
+def test_ground_fit_recovers_from_an_unobstructed_patch_beside_a_near_box():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    box = np.s_[270:, 139:312]
+    frame[box] = .62
+    camera = HorizontalIntrinsics(640, 315, 337)
+    ground = D.ground_mask(frame, camera, (480, 420, 243.2))
+
+    assert ground is not None and ground[425, 470]
+    assert not ground[box].any()
+    assert _corridor(frame, intrinsics=camera, ground=ground)[0] == pytest.approx(.62)
+
+
 def test_ground_fit_keeps_sparse_missing_pixels_unclassified():
     from plugins.navi.camera import HorizontalIntrinsics
 

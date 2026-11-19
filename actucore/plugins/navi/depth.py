@@ -211,7 +211,8 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         inliers = inliers & visible
         if np.count_nonzero(inliers) < 3:
             return None
-        for tolerance in (0.05, _GROUND_TOLERANCE_M, _GROUND_TOLERANCE_M):
+        first_tolerance = _GROUND_TOLERANCE_M if near_thirds is None else 0.05
+        for tolerance in (first_tolerance, _GROUND_TOLERANCE_M, _GROUND_TOLERANCE_M):
             try:
                 a, b, c = np.linalg.lstsq(points[inliers], y[inliers], rcond=None)[0]
             except np.linalg.LinAlgError:
@@ -227,7 +228,10 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         support = np.zeros_like(valid)
         support[valid] = inliers
         thirds = np.array_split(support, 3, axis=1)
-        if any(thirds[third].mean() < 0.65 for third in near_thirds):
+        if near_thirds is None:
+            if sum(third.mean() >= 0.50 for third in thirds) < 2:
+                return None
+        elif any(thirds[third].mean() < 0.65 for third in near_thirds):
             return None
 
         distance = (v[:, None] - a * u[None, :] - b) * depth_m - c
@@ -236,11 +240,20 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         # Verify the fit farther into the scene to reject a raised platform
         # occupying most of the bottom band.
         far_end = 0.78 if visible_span is not None else 0.7375
-        farther = ground[int(height * 0.69):int(height * far_end), columns]
+        far_start = int(height * 0.69)
+        farther = ground[far_start:int(height * far_end), columns]
         far_thirds = np.array_split(farther, 3, axis=1)
         verified = near_thirds if visible_span is not None else (0, 1, 2)
-        if sum(far_thirds[third].mean() >= 0.06 for third in verified) < 2:
+        far_support = [far_thirds[third].mean() for third in verified]
+        one_far_side = sum(support >= 0.06 for support in far_support) < 2
+        if one_far_side and max(far_support) < 0.35:
             return None
+        if one_far_side or near_thirds is None:
+            # Veto a substantial measured surface below the proposed floor.
+            # This rejects a raised platform even if its top fits one patch.
+            below = distance[far_start:, columns] > 2 * _GROUND_TOLERANCE_M
+            if any(third.mean() >= 0.12 for third in np.array_split(below, 3, axis=1)):
+                return None
         if visible_span is not None:
             # The omitted third must show a foreground occlusion. Returns
             # below the candidate can reveal a raised platform instead.
@@ -278,6 +291,29 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     for near_thirds, span in (((0, 1), (0, seed.shape[1] - third)),
                               ((1, 2), ((seed.shape[1] + 2) // 3, seed.shape[1]))):
         ground = fit(all_points, near_thirds=near_thirds, visible_span=span)
+        if ground is not None:
+            return ground
+
+    # A near box can bias the full-width fit. Seed hypotheses on narrow
+    # strips farther out, then verify them against the independent near band.
+    farther_rows = slice(int(height * 0.72), bottom.start, 4)
+    farther = depth_m[farther_rows, columns]
+    farther_x = u[columns] * farther
+    farther_y = v[farther_rows, None] * farther
+    for patch in np.array_split(np.arange(farther.shape[1]), 6):
+        patch_z = farther[:, patch]
+        usable = np.isfinite(patch_z) & (patch_z > .10) & (patch_z < 4.)
+        patch_z = patch_z[usable]
+        if patch_z.size < 12 or np.ptp(patch_z) < .15:
+            continue
+        patch_points = np.column_stack((farther_x[:, patch][usable], patch_z,
+                                       np.ones_like(patch_z)))
+        patch_y = farther_y[:, patch][usable]
+        a, b, c = np.linalg.lstsq(patch_points, patch_y, rcond=None)[0]
+        if np.mean(np.abs(patch_points @ (a, b, c) - patch_y) <= _GROUND_TOLERANCE_M) < .80:
+            continue
+        ground = fit(np.abs(a * x + b * z + c - y) <= _GROUND_TOLERANCE_M,
+                     near_thirds=None)
         if ground is not None:
             return ground
     return None

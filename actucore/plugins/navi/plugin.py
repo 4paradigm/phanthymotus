@@ -534,12 +534,13 @@ class NaviPlugin:
                        and math.isfinite(half_width) and half_width > 0)
         if binding.get("depth_map") and valid_width:
             self._config.local_geometry = camera_square(
-                self._config.depth_intrinsics, self._depth_vertical, half_width)
+                self._config.depth_intrinsics, self._depth_vertical, half_width,
+                half_length=footprint.get("half_length"))
             depth_decl = for_topic(args.get("camera_info"), binding["depth_map"])
             self._config.scan_geometry = body_square(self._config.local_geometry,
                                                      depth_decl.get("vendor"))
             if self._config.scan_geometry is None:
-                self._camera_notes.append("主动观察使用正方形近似，仅用转稳后的单视角重规划")
+                self._camera_notes.append("主动观察使用相机坐标系的底盘近似，仅用转稳后的单视角重规划")
         self._config.local_planning = bool(
             binding.get("depth_map") and (binding.get("odom") or self._config.local_geometry is not None))
         if self._config.local_geometry is not None:

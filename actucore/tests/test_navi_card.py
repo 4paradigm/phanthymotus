@@ -1856,7 +1856,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
                         K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
     reply = card.dispatch("navi", {
         "action": "start", "input_topics": input_topics,
-        "control_interface": _descriptor(footprint={"half_width": 0.23},
+        "control_interface": _descriptor(footprint={"half_width": 0.23, "half_length": 0.25},
                                          rate={"max_hz": 20, "watchdog_ms": 600,
                                                    "max_command_ttl_ms": ttl_cap,
                                                    "max_obs_age_ms": depth_limit_ms or 500}),
@@ -1864,7 +1864,9 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     })
     assert reply["state"] == "running"
     assert reply["ttl_ms"] == expected_ttl
-    assert card._config.local_planning and card._config.local_geometry.front == .23
+    assert card._config.local_planning
+    assert card._config.half_width_m == .23
+    assert card._config.local_geometry.front == card._config.local_geometry.rear == .25
 
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
     card._state = policy.State(target="person")
