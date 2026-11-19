@@ -65,7 +65,8 @@ from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
 from .active_scan import ActiveScan, ODOM_GAP_MS
 from .track import Tracker
-from .local_path import FORWARD, RIGHT, Geometry, PlanCache
+from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
+from .odom import planar_feedback
 
 # Status values. `arrived` and `stuck` are terminal for one `navigate_to`;
 # the rest are things that happen on the way.
@@ -467,6 +468,7 @@ class State:
     side_compare_frame: int | None = None
     side_better_frames: int = 0
     local_plan: PlanCache = field(default_factory=PlanCache)
+    view_detour: Detour | None = None
     active_scan: ActiveScan = field(default_factory=ActiveScan)
     recovery: ClearanceRecovery | None = None
     # What the corridor read on the last tick. Kept so the debug overlay can
@@ -927,6 +929,7 @@ def _band_of(bearing: float) -> str:
 
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
+    state.view_detour = None
     decision = _account_idle(_decide(detections, depth, odom, config, state, dt),
                              state, config, dt)
     if (decision.values is None or decision.values[0] <= 0
@@ -1654,6 +1657,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         and (not scan.receipt_only or coverage >= config.coverage_full)
                         and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
+                if planar_feedback(odom) is None:
+                    return 0.0, 0.0, 0.0, AVOIDING, "里程计 vx/vy/wz 反馈不完整，局部规划和主动观察暂停"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
             # A summary with a missing side band supplies no evidence of free space.
@@ -1718,6 +1723,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if local_command is not None:
         vx, vy = local_command
         wz = 0.0
+        state.view_detour = state.local_plan.plans.get(side)
         state.avoidance_yaw_override = True
         status, reason = AVOIDING, "局部规划：沿前向避障路线行进"
     elif side:
@@ -1788,8 +1794,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
 def _local_translation(depth, config, state, odom, ahead, side):
     if state is None or odom is None or not config.use_lateral or depth.get("capture_invalid"):
         return None
-    measured = tuple(odom.get(axis) for axis in ("vx", "vy", "wz"))
-    if any(v is None or not math.isfinite(v) for v in measured):
+    measured = planar_feedback(odom)
+    if measured is None:
         return None
     measured_vx, measured_vy, measured_wz = measured
     if abs(measured_wz) > .02:
@@ -1801,6 +1807,9 @@ def _local_translation(depth, config, state, odom, ahead, side):
         return None
     geometry = config.scan_geometry if "scan_grid" in depth else config.local_geometry
     limits = _local_velocity_limits(config, side)
+    _, (return_floor, return_limit) = _local_velocity_limits(config, -side)
+    if return_limit <= 0 or return_floor > return_limit:
+        return None
     command = state.local_plan.translation(depth, geometry,
                                            _keepout_m(config), ahead, side, config.max_obs_age_ms,
                                            config.watchdog_ms,

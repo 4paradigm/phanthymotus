@@ -2492,6 +2492,20 @@ def test_local_planning_holds_instead_of_using_an_unchecked_avoidance_turn():
     assert "局部规划" in decision.reason
 
 
+def test_local_planning_reports_pose_only_odometry(monkeypatch):
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.85, .84))
+    cfg, state = _cfg(local_planning=True, use_lateral=True), _state()
+    depth = _scene(2.5)
+    odom = {"vx": None, "vy": None, "wz": None, "received_ms": 500}
+
+    decision = P._avoid(.25, 0., 0., depth, cfg, P.APPROACHING, "", state,
+                        target_distance=2.5, odom=odom, may_scan=True)
+
+    assert decision[:3] == (0., 0., 0.)
+    assert not state.active_scan.active
+    assert "vx/vy/wz 反馈不完整" in decision[4]
+
+
 def test_local_detour_starts_closer_while_slowing_earlier(monkeypatch):
     cfg, state = _cfg(local_planning=True, obstacle_stop_m=.60, slow_distance_m=1.50), _state()
     ahead = 1.35

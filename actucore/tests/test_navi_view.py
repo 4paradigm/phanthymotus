@@ -77,6 +77,25 @@ def test_no_usable_reading_draws_no_corridor():
         assert V.corridor_edges(bad, config, 640) is None
 
 
+def test_route_edges_project_the_detour_and_continue_to_the_target():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    path = ((0., 0.), (.8, .0), (1.2, .2), (1.6, .2))
+
+    lines = V.route_lines(depth, ground, geometry, path, (2., 0.), .31, 640, 480)
+
+    assert ((196, 440), (291, 373), False) in lines
+    assert ((444, 440), (456, 373), False) in lines
+    assert {end for _, end, dashed in lines if dashed and end[1] == 320} >= {(270, 320), (370, 320)}
+    direct = V.route_lines(depth, ground, geometry, (), (2., 0.), .31, 640, 480)
+    assert direct and all(dashed for _, _, dashed in direct)
+
+
 def _decision(vx=0.0, vy=0.0, wz=0.0, status="approaching", distance=None):
     return P.Decision([vx, vy, 0.0, 0.0, 0.0, wz], status, "reason",
                       distance_m=distance, bearing=0.0)
@@ -215,7 +234,7 @@ def test_a_blocked_corridor_is_drawn_in_the_warning_colour():
 @needs_cv2
 def test_no_corridor_reading_draws_no_corridor():
     frame = _render(clearance=None)
-    assert not (frame == np.array(V._CORRIDOR)).all(axis=2).any()
+    assert not (frame[:-32] == np.array(V._CORRIDOR)).all(axis=2).any()
 
 
 # ── the target ───────────────────────────────────────────────────────────────

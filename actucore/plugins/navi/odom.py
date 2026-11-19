@@ -30,6 +30,8 @@ Spec: `phanthymotus-driver/README_dev.md` § "Robot Odometry (motus.odom/1)".
 
 from __future__ import annotations
 
+import math
+
 SCHEMA = "motus.odom/1"
 
 # Must match the producer's order, which is `motus.control/1` twist order. The
@@ -39,6 +41,12 @@ SCHEMA = "motus.odom/1"
 AXES = ("vx", "vy", "vz", "wx", "wy", "wz")
 
 BODY_FRAME = "body"
+
+
+def planar_feedback(odom):
+    """Return complete body-frame speed feedback from a parsed sample."""
+    motion = tuple((odom or {}).get(axis) for axis in ("vx", "vy", "wz"))
+    return motion if all(v is not None and math.isfinite(v) for v in motion) else None
 
 
 def axis_of(sample: dict, name: str):

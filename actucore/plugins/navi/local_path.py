@@ -10,7 +10,8 @@ import numpy as np
 from .camera import HorizontalIntrinsics
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
-STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1))
+CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
+STEPS = CARDINAL_STEPS + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 RESOLUTION = .05
 START = (10, 28)
 SHAPE = (77, 57)
@@ -37,7 +38,7 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
     return np.pad(blocked_count == 0, ((rear, front), (dc, dc)), constant_values=False)
 
 
-def shortest_path(allowed, start, goal, *, later_goal=False):
+def shortest_path(allowed, start, goal, *, later_goal=False, steps=STEPS):
     goal_row, goal_col = goal
     last_row = allowed.shape[0] - 1 if later_goal else goal_row
     goals = allowed[goal_row:last_row + 1, goal_col]
@@ -61,7 +62,7 @@ def shortest_path(allowed, start, goal, *, later_goal=False):
             return route[::-1]
         if walked > cost[current]:
             continue
-        for dr, dc in STEPS:
+        for dr, dc in steps:
             nxt = (row + dr, col + dc)
             if not (0 <= nxt[0] < allowed.shape[0] and 0 <= nxt[1] < allowed.shape[1]):
                 continue
@@ -99,24 +100,42 @@ def plan_right(grid, start, right, goal, half_cells, allow_unknown=False):
     return pieces[0] + pieces[1][1:] + pieces[2][1:]
 
 
-def observe(frame, geometry, right, forward, resolution, ground):
-    if ground is None or not ground[::4, ::4].any():
-        return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
-    height, width = frame.shape
+def intrinsics_for(geometry, height, width):
     fx, cx = geometry.horizontal.for_width(width)
     calib_height, fy, cy = geometry.vertical
     scale = height / calib_height
     fy, cy = fy * scale, (cy + 0.5) * scale - 0.5
+    return fx, cx, fy, cy
+
+
+def optical_ground_plane(frame, geometry, ground):
+    """Optical plane (normal, offset), where normal · point = offset."""
+    if ground is None:
+        return None
+    rows, cols = np.nonzero(ground[::4, ::4])
+    if rows.size < 3:
+        return None
+    rows, cols = rows * 4, cols * 4
+    fx, cx, fy, cy = intrinsics_for(geometry, *frame.shape)
+    z = frame[rows, cols]
+    x, y = (cols - cx) / fx * z, (rows - cy) / fy * z
+    a, b, c = np.linalg.lstsq(np.column_stack((x, z, np.ones_like(z))), y, rcond=None)[0]
+    return np.array([-a, 1., -b]), c
+
+
+def observe(frame, geometry, right, forward, resolution, ground):
+    plane = optical_ground_plane(frame, geometry, ground)
+    if plane is None:
+        return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
+    height, width = frame.shape
+    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     u = (np.arange(width) - cx) / fx
     v = (np.arange(height) - cy) / fy
     x, y = u * frame, v[:, None] * frame
-    seed = ground[::4, ::4]
-    gs = frame[::4, ::4][seed]
-    gx, gy = x[::4, ::4][seed], y[::4, ::4][seed]
-    a, b, c = np.linalg.lstsq(np.column_stack((gx, gs, np.ones_like(gs))), gy, rcond=None)[0]
+    optical_normal, c = plane
     transform = geometry.base_from_optical
     rotation, origin = transform[:3, :3], transform[:3, 3]
-    normal = rotation @ np.array([-a, 1.0, -b])
+    normal = rotation @ optical_normal
     if abs(normal[2]) < .5 * np.linalg.norm(normal):
         return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
     floor_z = (c + normal @ origin - normal[0]*forward + normal[1]*right) / normal[2]
@@ -138,7 +157,7 @@ def observe(frame, geometry, right, forward, resolution, ground):
         free[~in_image] = False
         free[in_image] = np.isfinite(distances) & (distances > z[in_image] + 2 * resolution)
 
-    above_floor = (y - a*x - b*frame - c) / normal[2]
+    above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
     hits = np.isfinite(frame) & ~ground & (above_floor >= .02)
     if geometry.height is not None:
         hits &= above_floor <= geometry.height + .05
@@ -199,10 +218,17 @@ def body_square(geometry, vendor):
                     geometry.front, geometry.rear, geometry.height)
 
 
+@dataclass(frozen=True)
+class Detour:
+    command: tuple[float, float]
+    points: tuple[tuple[float, float], ...]  # metres, (forward, right)
+    geometry: Geometry
+
+
 @dataclass
 class PlanCache:
     key: tuple | None = None
-    commands: dict[float, tuple[float, float] | None] = field(default_factory=dict)
+    plans: dict[float, Detour | None] = field(default_factory=dict)
 
     def translation(self, observation, geometry, half_width, ahead, side, max_age_ms,
                     watchdog_ms=300, *, velocity_limits, allow_forward=True):
@@ -214,18 +240,22 @@ class PlanCache:
                allow_forward, velocity_limits)
         if self.key != key:
             self.key = key
-            self.commands.clear()
-        if side not in self.commands:
+            self.plans.clear()
+        if side not in self.plans:
             scan_grid = observation.get("scan_grid")
-            self.commands[side] = _checked_translation(
+            self.plans[side] = _checked_translation(
                 observation["map"], ground, geometry, half_width, ahead, side, max_age_ms,
                 watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward,
                 velocity_limits=velocity_limits)
-        return self.commands[side]
+        detour = self.plans[side]
+        return detour.command if detour is not None else None
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True):
+    (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
+    if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
+        return None
     resolution = RESOLUTION
     row_zero, col_zero = START
     right, forward = RIGHT, FORWARD
@@ -268,13 +298,15 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # An additional view can confirm space to bend earlier.
     lane_min = via[1] if observed_grid is None else col_zero + 1
     allowed[via[0]:goal[0], :lane_min] = False
-    path = shortest_path(allowed, start, goal, later_goal=True)
+    # A one-cell diagonal needs equal forward and lateral speeds. A longer
+    # straight shortcut may still be executable at a different ratio.
+    steps = STEPS if max(floor_vx, floor_vy) <= min(max_vx, max_vy) else CARDINAL_STEPS
+    path = shortest_path(allowed, start, goal, later_goal=True, steps=steps)
     if path is None or len(path) < 2:
         return None
     # A geometric path may include unobserved space, but the emitted vector
     # must fit inside a measured prefix through staleness, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
-    (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
     blocked = grid == OCCUPIED
     unknown = grid == UNKNOWN
     # Cell boundaries, expanded by the moving rectangle, are obstacles in
@@ -291,17 +323,18 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
                     r0[front] - half_width, r1[front] + half_width)
     flank_bounds = (f0[flank] - geometry.front, f1[flank] + geometry.rear,
                     np.maximum(0., r0[flank] - half_width), r1[flank] + half_width)
-    for row, col in reversed(path[1:]):
+    def command_to(point):
+        row, col = point
         dr, dc = row - row_zero, col - col_zero
-        if (dr and (not allow_forward or not max_vx)) or (dc and not max_vy):
-            continue
+        if dr and not allow_forward:
+            return None
         norm = math.hypot(dr, dc)
         length = resolution * norm
         df, dx = dr / norm, dc / norm
         # Look ahead along the path only while a straight shortcut is clear
         # of measured obstacles. This preserves the chosen detour's progress.
         if _ray_entry(df, dx, occupied_bounds) <= length:
-            continue
+            return None
         clear = min(length,
                     _ray_entry(df, dx, front_bounds) - 1e-6 if df else math.inf,
                     _ray_entry(df, dx, flank_bounds) - 1e-6 if dx else math.inf)
@@ -310,7 +343,36 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         vx, vy = speed * df, speed * dx
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
             return vx, -side * vy
-    return None
+        return None
+
+    def detour(path, first, command):
+        points = ((0., 0.),) + tuple(((row - row_zero) * resolution, side * (col - col_zero) * resolution)
+                                     for row, col in path[first:])
+        return Detour(command, points, geometry)
+
+    cardinal = None
+    for i in range(len(path) - 1, 0, -1):
+        command = command_to(path[i])
+        if command is not None:
+            if all(command):
+                return detour(path, i, command)
+            if cardinal is None:
+                cardinal = detour(path, i, command)
+    if cardinal is not None and cardinal.command[0] == 0.:
+        return cardinal
+
+    # Search a separate route that stays on the starting row for at least
+    # the travel needed to send a lateral command above the driver's floor.
+    first_forward_col = col_zero + max(1, math.ceil(floor_vy * horizon_s / resolution))
+    if first_forward_col < allowed.shape[1]:
+        allowed[row_zero + 1, :first_forward_col] = False
+        side_path = shortest_path(allowed, start, goal, later_goal=True, steps=CARDINAL_STEPS)
+        if side_path is not None:
+            first_turn = next(i - 1 for i, (row, _) in enumerate(side_path) if row != row_zero)
+            command = command_to(side_path[first_turn])
+            if command is not None:
+                return detour(side_path, first_turn, command)
+    return cardinal
 
 
 def _ray_entry(df, dx, bounds):

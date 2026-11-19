@@ -1758,12 +1758,21 @@ class NaviPlugin:
         self._view_next_at = now + 1.0 / self._view_hz
 
         track = self._state.tracker.track
+        detour, key = self._state.view_detour, self._state.local_plan.key
         with self._obs_lock:
             jpeg = self._image_jpeg
+            depth, ground = self._depth_map, self._depth_ground
+            if key is None or self._depth_ms != key[0]:
+                detour = None
         snapshot = {
             # Arrays and payloads are *replaced* by their callbacks, never
             # mutated in place, so holding a reference is a safe snapshot.
-            "depth_m": self._depth_map,
+            "depth_m": depth,
+            "ground": ground,
+            "detour": detour,
+            "depth_vertical": self._depth_vertical,
+            "route_target": ((track.range_m, track.bearing_rad)
+                             if track is not None and track.range_known else None),
             "objects": self._objects,
             "jpeg": jpeg,
             "decision": self._last_decision,
@@ -1815,6 +1824,8 @@ class NaviPlugin:
                     clearance=snapshot["clearance"],
                     coverage=snapshot["coverage"],
                     rgb_jpeg=snapshot["jpeg"], blend=self._view_blend,
+                    ground=snapshot["ground"], detour=snapshot["detour"],
+                    depth_vertical=snapshot["depth_vertical"], route_target=snapshot["route_target"],
                     config=self._config)
                 message = CompressedImage()
                 message.format = "jpeg"

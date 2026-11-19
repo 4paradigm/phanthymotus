@@ -1715,7 +1715,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
 
     def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300, **kwargs):
         attempted.append((side, half_width, watchdog_ms))
-        return (.04, -.06) if side > 0 else None
+        return local_path.Detour((.04, -.06), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
 
     monkeypatch.setattr(local_path, "_checked_translation", plan)
     for index in range(6):
@@ -1724,10 +1724,12 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch):
     assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
     assert attempted == [(-1.0, .33, 600), (1.0, .33, 600)]
     assert command["obs_stamp_ms"] == 122_950
+    assert card._state.view_detour.points == ((0., 0.), (.2, .3))
     card._depth_ms = 0
     stop = card.next_command()
     assert stop["values"] == [0.0] * 6
     assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+    assert card._state.view_detour is None
     assert card.next_command() is None
     card._depth_ms = 122_950
     card._odom_ms = 0

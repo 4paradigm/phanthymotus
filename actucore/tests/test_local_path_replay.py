@@ -64,7 +64,7 @@ def test_detour_limits_speed_to_the_measured_prefix_and_full_timeout(monkeypatch
     command = replay._checked_translation(None, None, geometry, .33, .9, 1, 500, 600,
                                           velocity_limits=DECLARED_SPEEDS)
     assert command is not None
-    vx, vy = command
+    vx, vy = command.command
     assert 0 < vx < .095 / 1.15
     assert vy == 0
 
@@ -83,7 +83,7 @@ def test_live_detour_tries_a_wider_bypass_and_later_rejoin(monkeypatch, side):
     command = replay._checked_translation(None, None, geometry, .33, .90, side, 500, 600,
                                           velocity_limits=DECLARED_SPEEDS)
     assert command is not None
-    vx, vy = command
+    vx, vy = command.command
     assert vx > 0 and vy * side < 0
     assert abs(vx) != pytest.approx(abs(vy))
     assert np.hypot(vx, vy) > .10
@@ -102,6 +102,25 @@ def test_near_detour_can_choose_a_verified_lateral_only_command(monkeypatch):
                                   allow_forward=False, velocity_limits=limits)
     assert command is not None and command[0] == 0
     assert .03 <= -command[1] <= .07
+
+
+@pytest.mark.parametrize('side', [-1., 1.])
+def test_detour_falls_back_to_strafe_then_forward_with_bumi_speed_ranges(side):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .21)
+    box = (abs(replay.RIGHT) <= .05) & np.isclose(replay.FORWARD, .9)
+    # Only the lateral prefix is observed far enough for Bumi's minimum speed.
+    free = (replay.FORWARD <= .25) & (abs(replay.RIGHT) <= .65)
+    limits = ((.25, .55), (.12, .20))
+    args = (None, None, geometry, .31, .90, side, 500, 300)
+    detour = replay._checked_translation(*args, velocity_limits=limits,
+                                         observed_grid=(free, box))
+    assert detour is not None
+    assert detour.command[0] == 0. and .12 <= -side * detour.command[1] <= .20
+    assert detour.points[1][0] == 0.
+    assert detour.points[-1][0] > .9 and detour.points[-1][1] == 0.
+    assert replay._checked_translation(*args, velocity_limits=limits,
+                                       observed_grid=(free & (abs(replay.RIGHT) < .4), box)) is None
 
 
 @pytest.mark.parametrize("start_occupied", [False, True])
@@ -136,8 +155,8 @@ def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkey
                                        observed_grid=(unmeasured, unmeasured)) is None
     command = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
                                           observed_grid=(~occupied, occupied))
-    assert command is not None and 0 < np.hypot(*command)
-    assert abs(command[0]) <= .6 and abs(command[1]) <= .4
+    assert command is not None and 0 < np.hypot(*command.command)
+    assert abs(command.command[0]) <= .6 and abs(command.command[1]) <= .4
 
 
 def test_scanned_prefix_can_be_measured_before_the_passage_is_fully_seen(monkeypatch):
@@ -150,9 +169,9 @@ def test_scanned_prefix_can_be_measured_before_the_passage_is_fully_seen(monkeyp
     command = replay._checked_translation(None, None, geometry, .33, .90, 1., 500, 600,
                                           velocity_limits=DECLARED_SPEEDS,
                                           observed_grid=(nearby, box))
-    assert command is not None and 0 < np.hypot(*command)
-    assert command[0] * 1.15 <= .475 - geometry.front
-    assert abs(command[1]) * 1.15 <= .525 - .33
+    assert command is not None and 0 < np.hypot(*command.command)
+    assert command.command[0] * 1.15 <= .475 - geometry.front
+    assert abs(command.command[1]) * 1.15 <= .525 - .33
 
 
 def test_pose_aligned_scan_does_not_borrow_free_cells_from_the_original_exposure(monkeypatch):

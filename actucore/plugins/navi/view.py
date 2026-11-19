@@ -34,6 +34,8 @@ import math
 
 import numpy as np
 
+from .local_path import camera_square, intrinsics_for, optical_ground_plane
+
 # **The dashboard's own depth ramp, not a second one.**
 #
 # The first version used viridis, and the result was two panels side by side
@@ -212,6 +214,54 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
             _column_of(edge, config.half_fov_rad, width))
 
 
+def route_lines(depth_m, ground, geometry, points, target, keep, width, height):
+    """Project route boundaries and a dashed connection to the tracked target."""
+    if geometry is None or depth_m is None or ground is None or not (points or target):
+        return []
+    plane = optical_ground_plane(depth_m, geometry, ground)
+    if plane is None:
+        return []
+    optical_normal, offset = plane
+    transform = geometry.base_from_optical
+    rotation, origin = transform[:3, :3], transform[:3, 3]
+    normal = rotation @ optical_normal
+    if abs(normal[2]) < .5 * np.linalg.norm(normal):
+        return []
+    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
+    sections = [(np.asarray(points, dtype=float), False)] if points else []
+    if target is not None:
+        distance, bearing = target
+        if math.isfinite(distance) and distance > 0 and math.isfinite(bearing):
+            x, z = distance * math.sin(bearing), distance * math.cos(bearing)
+            y = offset - optical_normal[0] * x - optical_normal[2] * z
+            body = rotation @ np.array([x, y, z]) + origin
+            start = points[-1] if points else (0., 0.)
+            end = (body[0], -body[1])
+            if math.dist(start, end) > .05:
+                sections.append((np.linspace(start, end, 25), True))
+
+    near = .10
+    lines = []
+    for centre, dashed in sections:
+        forward = centre[:, 0]
+        for side in (-keep, keep):
+            right = centre[:, 1] + side
+            floor = (offset + normal @ origin - normal[0] * forward + normal[1] * right) / normal[2]
+            optical = (np.column_stack((forward, -right, floor)) - origin) @ rotation
+            for i, (a, b) in enumerate(zip(optical, optical[1:])):
+                if (dashed and i % 2 == 0) or max(a[2], b[2]) < near:
+                    continue
+                # Clip only the part behind the camera before projecting.
+                if a[2] < near:
+                    a = a + (b - a) * ((near - a[2]) / (b[2] - a[2]))
+                elif b[2] < near:
+                    b = b + (a - b) * ((near - b[2]) / (a[2] - b[2]))
+                start_px = (round(cx + fx * a[0] / a[2]), round(cy + fy * a[1] / a[2]))
+                end_px = (round(cx + fx * b[0] / b[2]), round(cy + fy * b[1] / b[2]))
+                lines.append((start_px, end_px, dashed))
+    return lines
+
+
 # Everything drawn on top gets a dark casing first.
 #
 # **The ramp this overlay now shares washes the far field out to near-white**
@@ -253,6 +303,7 @@ def _arrow(frame, origin, dx, dy, colour, label: str):
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, rgb_jpeg=None, blend: float = 0.5,
+           ground=None, detour=None, depth_vertical=None, route_target=None,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -285,6 +336,21 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                                interpolation=cv2.INTER_NEAREST)
 
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    geometry = (detour.geometry if detour is not None else
+                camera_square(config.depth_intrinsics, depth_vertical, config.half_width_m))
+    lines = route_lines(depth_m, ground, geometry, detour.points if detour is not None else (),
+                        route_target, keep, width, height)
+    metric_path = bool(lines)
+    if not lines and box is not None:
+        # A target box still gives a direction when the metric projection is unavailable.
+        aim = np.linspace((width // 2, height - 1), ((box[0] + box[2]) * width / 2, box[3] * height), 17)
+        pixels = aim.astype(int)
+        lines = [(tuple(a), tuple(b), True) for a, b in zip(pixels[1::2], pixels[2::2])]
+    if lines:
+        for a, b, dashed in lines:
+            visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
+            if visible:
+                _line(frame, a, b, _CORRIDOR, thickness=1 if dashed else 2)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -292,7 +358,7 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     # metric: the same half-width covers a different slice of the picture at
     # every range, which is the single fact that took longest to become visible.
     edges = corridor_edges(clearance, config, width)
-    if edges:
+    if edges and not lines:
         left, right = edges
         blocked = clearance <= config.obstacle_stop_m
         colour = _WARN if blocked else _CORRIDOR
@@ -318,9 +384,12 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
         span = f"path {keep * 2:.2f}m wide"
         (tw, _), _ = cv2.getTextSize(span, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         _text(frame, span, ((left + right - tw) // 2, bar - 8), colour, 0.5)
-        _text(frame,
-              f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
+    if edges:
+        colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
+        _text(frame, f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
               (8, 24), colour, 0.55)
+    if metric_path:
+        _text(frame, f"path {2 * keep:.2f}m wide", (8, 46), _CORRIDOR, 0.5)
 
     # ── the target ───────────────────────────────────────────────────────────
     if box:

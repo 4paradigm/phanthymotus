@@ -9,6 +9,7 @@ import math
 import numpy as np
 
 from .local_path import observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
+from .odom import planar_feedback
 
 ANGLE = math.radians(15)
 ANGLE_TOLERANCE = math.radians(2)
@@ -77,9 +78,8 @@ class ActiveScan:
             self.receipt_only = receipt_only
         stamp = (odom or {}).get("received_ms" if self.receipt_only else "stamp_ms")
         capture = (depth or {}).get("capture_ms")
-        motion = tuple((odom or {}).get(axis) for axis in ("vx", "vy", "wz"))
-        if (type(stamp) is not int or stamp <= 0 or geometry is None
-                or any(v is None or not math.isfinite(v) for v in motion)):
+        motion = planar_feedback(odom)
+        if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
             return self.invalidate()
         source = (odom or {}).get("source_sample_id") if self.receipt_only else None
         if source is not None and self.odom_source is not None and self.poses:
