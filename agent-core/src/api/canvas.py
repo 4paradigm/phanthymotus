@@ -212,6 +212,13 @@ def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
             except Exception:
                 pass
 
+        # Read instance topics only after the config calls have finished; the
+        # save endpoint returns before this background task applies them.
+        if calls:
+            _broadcast({'type': 'tool_config_updated', 'payload': {
+                'mcp_id': mcp_id, 'tool': tool_name, 'instance_id': instance_id,
+            }})
+
     try:
         asyncio.create_task(_apply())
     except RuntimeError:
