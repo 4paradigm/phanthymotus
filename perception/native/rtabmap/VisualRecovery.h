@@ -231,11 +231,15 @@ public:
         };
         const double graceAge=data.stamp()-externalGraceStart_;
         const bool withinGrace=externalGraceStart_>0. && graceAge>=0. && graceAge<=2.;
+        const bool verifiedRetry=waiting_ && !continuousExternal && !recoveredVisual && !external.isNull() &&
+            (withinGrace || retryExternalNeighbor_ || visualLossStamp_>0.) &&
+            verifiesNeighbor(externalToNative_*external,withinGrace || visualLossStamp_>0.);
+        if(verifiedRetry || continuousExternal)
+            waiting_=false;
         const double scanAge=scanAnchor_?data.stamp()-scanAnchor_->scan.stamp():0.;
         const double scanRunAge=scanAnchor_?data.stamp()-scanAnchor_->referenceStamp:0.;
-        if((external.isNull() || (waiting_ && !continuousExternal)) && !(aligned_ && tracked) &&
-           !localizationMode_ && scanAge>0. && scanRunAge<=4. &&
-           ((images && info.features>0) || (!images && scanAnchor_->recovered)))
+        if((external.isNull() || waiting_) && !(aligned_ && tracked) &&
+           !localizationMode_ && scanAge>0. && scanRunAge<=4.)
         {
             if(registerScan(map,data,acceptedStats,scanAge))
             {
@@ -270,11 +274,6 @@ public:
         externalGraceStart_=0.;
         if(external.isNull())
             retryExternalNeighbor_=false;
-        const bool verifiedRetry=waiting_ && !continuousExternal && !recoveredVisual && !external.isNull() &&
-            (withinGrace || retryExternalNeighbor_ || visualLossStamp_>0.) &&
-            verifiesNeighbor(externalToNative_*external,withinGrace || visualLossStamp_>0.);
-        if(verifiedRetry || continuousExternal)
-            waiting_=false;
         if(!waiting_ && !external.isNull())
         {
             retryExternalNeighbor_=false;

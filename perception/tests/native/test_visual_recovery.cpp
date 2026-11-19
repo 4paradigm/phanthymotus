@@ -20,7 +20,8 @@ int main(int argc, char **argv)
     ULogger::setLevel(ULogger::kWarning);
     const std::string root=argv[1], output=argv[2], mode=argv[3];
     const bool imuPrediction=mode=="imu_prediction";
-    const bool scanAfterClosure=mode=="scan_after_closure";
+    const bool externalAfterScan=mode=="external_after_scan";
+    const bool scanAfterClosure=mode=="scan_after_closure" || externalAfterScan;
     const bool regressedVisualCapture=mode=="vo_reacquire_regressed";
     const bool shortVisualLoss=mode=="vo_reacquire" || mode=="vo_reacquire_expired" || regressedVisualCapture;
     const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap" || shortVisualLoss;
@@ -124,15 +125,17 @@ int main(int argc, char **argv)
         if(loseAfterClosure) visualFault=true;
         if(visualFault) rgb.setTo(cv::Scalar::all(0));
         const bool bridgeScan=scanAfterClosure && recovery.relocalizations()==1;
+        const bool returningPose=externalAfterScan && bridgeScan && postClosureScans==1;
         if(bridgeScan)
         {
             cv::RNG texture(371+i);
             texture.fill(rgb,cv::RNG::UNIFORM,0,255);
+            if(!externalAfterScan && postClosureScans==0) rgb.setTo(cv::Scalar::all(0));
             // Real movement beyond the map's native keyframe threshold.
-            const int skipped=postClosureScans>=4?1:0;
+            const int skipped=returningPose || postClosureScans>=4?1:0;
             const int steps=postClosureScans-skipped;
             depth=cv::imread(root+"/"+std::to_string(i+3-skipped)+".png",cv::IMREAD_UNCHANGED);
-            truthX=.20f+.18f*steps;
+            truthX=.20f+.18f*steps+(returningPose?.06f:0.f);
         }
         if(voHandoff)
         {
@@ -175,19 +178,36 @@ int main(int argc, char **argv)
             (mode=="vo_handoff_gap" && i==3) ||
             (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
             gap || resetGap || (mode=="fallback_cov" && i==1) ||
+            (bridgeScan && !externalAfterScan && postClosureScans==1) ||
             (mode=="scan_mask" && !imageMask.at(i));
         // Processed scan cadence can be sparser than the measured chassis stream.
         const double skippedTime=externalContinuity && i>0?(mode=="external_continuity_stale"?5.1:2.1):0.;
         const double outageTime=continuityOutage?(i==2 && mode=="external_continuity_outage_stale"?4.:0.):skippedTime;
-        const double stamp=bridgeScan?scanBridgeStamp+scanBridgeOffsets[postClosureScans]:
+        const double stamp=bridgeScan?scanBridgeStamp+(returningPose?.8:scanBridgeOffsets[postClosureScans]):
             crossedRecovery?1.+i*.5:regressedVisualCapture && i==7?6.5:
             i+1.+outageTime+(mode=="vo_reacquire_expired" && i>=7?2.:0.)+
             (mode=="fallback_lost" && i==3?.5:0.); // F2M can track after the old map alignment expires.
         rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,stamp);
-        if((externalContinuity && i>0) || (bridgeScan && postClosureScans==3))
+        const bool scanAfterDisagreement=disagreeingNeighborRetry && i==4;
+        // Keep the no-motion-source cases independent of image availability.
+        const bool noScanOverlap=(externalContinuity && i>0) || (bridgeScan && postClosureScans==3) ||
+            (failedVisualSeed && i>0) || (voHandoff && (i==6 || (i==7 && !shortVisualLoss) ||
+                (mode=="vo_handoff_gap" && i==3))) ||
+            (crossedLoss && !staggeredChassisLoss && !scanAfterDisagreement) ||
+            loseAfterClosure || gap || resetGap || (recoveryScenario && phase=="rgb_gap");
+        if(noScanOverlap)
             for(int j=0;j<count;++j) scan.at<cv::Vec3f>(0,j)[0]+=20.f; // No scan overlap with the anchor.
-        data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
+        if(returningPose)
+        {
+            cv::Mat sparse(1,150,CV_32FC3);
+            for(int j=0;j<sparse.cols;++j)
+                sparse.at<cv::Vec3f>(0,j)=scan.at<cv::Vec3f>(0,j*count/sparse.cols)-cv::Vec3f(.06f,0,0);
+            scan=sparse; count=sparse.cols;
+        }
+        data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),returningPose?count:0,0.f,rtabmap::LaserScan::kXYZ));
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
+        if(returningPose)
+            ext=map.getMemory()->getLastWorkingSignature()->getPose()*rtabmap::Transform(.06f,0,0,0,0,0);
         if(neighborRetry && (i==1 || i==2))
             ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
         if(externalContinuity || continuityVisual)
@@ -231,7 +251,7 @@ int main(int argc, char **argv)
                 ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
             else ext.setNull();
         }
-        if(disagreeingNeighborRetry && i==4)
+        if(scanAfterDisagreement)
         {
             const auto *anchor=map.getMemory()->getLastWorkingSignature();
             const auto displaced=rtabmap::Transform(0,.16f,0,0,0,0);
@@ -292,6 +312,15 @@ int main(int argc, char **argv)
         }
         if(bridgeScan)
         {
+            if(returningPose)
+            {
+                const auto error=ext.inverse()*recovery.odom();
+                if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+                   error.isNull() || error.getNorm()>1e-6f)
+                    throw std::runtime_error("a verified returning external pose must take priority over scan tracking");
+                ++postClosureScans;
+                break;
+            }
             if(postClosureScans==3)
             {
                 if(accepted || recovery.state()!=motus::VisualRecovery::Searching ||
@@ -327,7 +356,15 @@ int main(int argc, char **argv)
                !signature || !signature->hasLink(previousLocation,rtabmap::Link::kNeighbor))
                 throw std::runtime_error("the verified chassis must extend the active graph during visual loss");
         }
-        if(crossedLoss && !staggeredChassisLoss && (accepted || recovery.state()!=motus::VisualRecovery::Searching ||
+        if(scanAfterDisagreement)
+        {
+            const auto scanPose=ext*rtabmap::Transform(0,-.16f,0,0,0,0);
+            const auto error=scanPose.inverse()*recovery.odom();
+            if(!accepted || recovery.state()!=motus::VisualRecovery::ScanTracking || error.isNull() ||
+               error.getNorm()>.02f || map.getLocalOptimizedPoses().size()!=nodesBefore)
+                throw std::runtime_error("a disagreeing external pose must yield to the independently measured scan");
+        }
+        else if(crossedLoss && !staggeredChassisLoss && (accepted || recovery.state()!=motus::VisualRecovery::Searching ||
            !recovery.odom().isNull() || recovery.visualInliers()!=0 ||
            map.getLocalOptimizedPoses().size()!=nodesBefore || !map.getMemory()->isIncremental()))
             throw std::runtime_error("failed visual recovery must preserve the active graph without emitting a pose");
@@ -709,7 +746,7 @@ int main(int argc, char **argv)
         throw std::runtime_error("two real visual failure observations were not exercised");
     if(mode=="recovery" && !postClosureReacquired)
         throw std::runtime_error("short visual loss after global recovery was not exercised");
-    if(scanAfterClosure && postClosureScans!=6)
+    if(scanAfterClosure && postClosureScans!=(externalAfterScan?2:6))
         throw std::runtime_error("map must continue after one rejected scan and stop when the bridge expires");
     if(voHandoff && (handoffFrames!=(mode=="vo_handoff_gap"?2:3) || i!=(mode=="vo_reacquire_expired"?7:8)))
         throw std::runtime_error("continuous VO and real visual failure regression was not exercised");
