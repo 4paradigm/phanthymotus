@@ -2373,7 +2373,9 @@ def test_box_blocking_both_routes_allows_only_a_slow_straight_approach():
     box = _scene(2.8, [(0.0, 1.16, 0.65), (-0.58, 0.95, 0.2), (0.58, 0.95, 0.2)])
     detections = _detections(_obj(x=0.2))
     decision = _step(detections=detections, depth=box, config=cfg)
-    assert 0.04 <= decision.values[0] < 0.10
+    horizon_s = (cfg.max_obs_age_ms + cfg.watchdog_ms + 50) / 1000
+    assert decision.values[0] >= .04
+    assert decision.values[0] * horizon_s <= 1.16 - .9 + 1e-12
     assert not any(decision.values[1:])
     assert "两侧也都不可用" in decision.reason
 
@@ -2475,7 +2477,7 @@ def test_right_route_shorter_than_forward_slow_distance_can_be_selected():
     decision = _step(detections=_detections(_obj()), depth=obstacle, config=cfg)
     assert decision.status == P.AVOIDING
     assert decision.values[1] < 0 and decision.values[5] < 0
-    assert math.hypot(*decision.values[:2]) <= 0.18 + 1e-9
+    assert decision.values[0] <= cfg.vx_max and abs(decision.values[1]) <= cfg.vy_max
     assert "朝右侧避让" in decision.reason
     assert cfg.slow_distance_m == 1.5
 
@@ -2596,7 +2598,16 @@ def test_local_command_respects_moving_floors_and_the_signed_driver_bounds():
                                    "min_magnitude_moving": [.06, .05, 0., 0., 0., 0.]}})
     assert P._local_velocity_limits(cfg, 1.) == ((.06, .3), (.05, .03))
     assert P._local_velocity_limits(cfg, -1.) == ((.06, .3), (.05, .2))
-    assert P._scan_yaw_rate(cfg, P.ActiveScan()) == .08
+    assert P._scan_yaw_rate(cfg) == .08
+
+
+def test_local_translation_continues_at_declared_speed_if_checked(monkeypatch):
+    cfg, state = _cfg(local_planning=True), _state()
+    monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: (.25, 0.))
+    odom = {"vx": .20, "vy": 0., "wz": 0.}
+    assert P._local_translation({}, cfg, state, odom, .9, 1.) == (.25, 0.)
+    odom["vx"] = .30
+    assert P._local_translation({}, cfg, state, odom, .9, 1.) is None
 
 
 @pytest.mark.parametrize("odom", [{"vx": 0., "vy": -.05, "wz": 0.},

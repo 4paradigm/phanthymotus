@@ -173,6 +173,21 @@ def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkey
     assert (result.yaw < 0) is (not initial_hit)
 
 
+@pytest.mark.parametrize("floor", [0., .5])
+def test_scan_uses_the_fastest_executable_rate_supported_by_the_sweep(monkeypatch, floor):
+    look, geometry, _, _ = _setup(monkeypatch)
+    for stamp in (1000, 1050, 1150):
+        look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((1.,))
+        result = look.command(geometry, .33, 1., 600, min_yaw_rate=floor)
+    if floor:
+        assert result.yaw == 0.
+    else:
+        assert -.5 < result.yaw < -.25
+
+
 def test_sweep_stops_for_an_occupied_cell_that_straddles_the_footprint(monkeypatch):
     look, _, _, occupied = _setup(monkeypatch)
     geometry = Geometry(None, None, np.eye(4), .22, .23, None)

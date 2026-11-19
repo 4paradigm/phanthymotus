@@ -205,7 +205,7 @@ class PlanCache:
     commands: dict[float, tuple[float, float] | None] = field(default_factory=dict)
 
     def translation(self, observation, geometry, half_width, ahead, side, max_age_ms,
-                    watchdog_ms=300, *, allow_forward=True, velocity_limits=None):
+                    watchdog_ms=300, *, velocity_limits, allow_forward=True):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
@@ -225,8 +225,7 @@ class PlanCache:
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
-                         watchdog_ms=300, *, observed_grid=None, allow_forward=True,
-                         velocity_limits=None):
+                         watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True):
     resolution = RESOLUTION
     row_zero, col_zero = START
     right, forward = RIGHT, FORWARD
@@ -275,8 +274,6 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # A geometric path may include unobserved space, but the emitted vector
     # must fit inside a measured prefix through staleness, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
-    if velocity_limits is None:
-        velocity_limits = ((0., .10), (0., .10))
     (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
     blocked = grid == OCCUPIED
     unknown = grid == UNKNOWN
@@ -308,7 +305,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         clear = min(length,
                     _ray_entry(df, dx, front_bounds) - 1e-6 if df else math.inf,
                     _ray_entry(df, dx, flank_bounds) - 1e-6 if dx else math.inf)
-        speed = min(.10, clear / horizon_s,
+        speed = min(clear / horizon_s,
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):

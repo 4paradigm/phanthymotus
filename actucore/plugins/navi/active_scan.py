@@ -12,8 +12,6 @@ from .local_path import observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
 
 ANGLE = math.radians(15)
 ANGLE_TOLERANCE = math.radians(2)
-MAX_YAW_RATE = .25
-RECEIPT_YAW_RATE = .18
 RECEIPT_ANGLE = math.radians(12)
 STILL_LINEAR = .05
 STILL_YAW = .04
@@ -71,10 +69,6 @@ class ActiveScan:
     @property
     def has_result(self):
         return bool(self.current_frame and self.result_frame)
-
-    @property
-    def max_yaw_rate(self):
-        return RECEIPT_YAW_RATE if self.receipt_only else MAX_YAW_RATE
 
     def update(self, depth, odom, geometry, *, receipt_only=False):
         """Update measured motion and the latest usable depth observation."""
@@ -237,7 +231,7 @@ class ActiveScan:
         self.result_frame = self.side_frame
         self.phase = "idle"
 
-    def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500):
+    def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *, min_yaw_rate=0.):
         if not self.active or self.ready:
             return ScanCommand()
         stamp = self.poses[-1][0]
@@ -290,10 +284,32 @@ class ActiveScan:
 
         # Budget tracking latency and the watchdog, including a sink poll.
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
-        sweep = math.copysign(abs(error) + (yaw_rate + .10) * horizon, error)
-        if not geometry.front > 0 or not geometry.rear > 0 or not yaw_rate > 0:
+        if not geometry.front > 0 or not geometry.rear > 0 or not yaw_rate > 0 or yaw_rate < min_yaw_rate:
             return self.interrupt()
-        if not self._clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon):
+        if self.motion[2] * math.copysign(1., error) > STILL_YAW:
+            return ScanCommand(reason="主动观察：等待反向转动停止")
+
+        _, occupied = self.grid()
+        occupied = occupied | self.views[-1][3]
+
+        def clear_sweep(rate):
+            turn_rate = max(rate, abs(self.motion[2]))
+            sweep = math.copysign(abs(error) + (turn_rate + .10) * horizon, error)
+            return self._clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon,
+                                     occupied=occupied)
+
+        if not clear_sweep(yaw_rate):
+            limit = yaw_rate
+            yaw_rate = 0.
+            if clear_sweep(min_yaw_rate):
+                yaw_rate = min_yaw_rate
+                for _ in range(5):
+                    candidate = (yaw_rate + limit) / 2
+                    if clear_sweep(candidate):
+                        yaw_rate = candidate
+                    else:
+                        limit = candidate
+        if not yaw_rate:
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍或超出网格范围，停车")
@@ -302,15 +318,16 @@ class ActiveScan:
         description = "回到观察前的朝向" if returning else f"向{direction}观察"
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
-    def _clear_sweep(self, geometry, half_width, sweep, translation):
+    def _clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)
         radius = math.hypot(max(geometry.front, geometry.rear), half_width)
         slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
-        _, occupied = self.grid()
-        occupied = occupied | self.views[-1][3]
-        swept = np.zeros(SHAPE, dtype=bool)
+        if occupied is None:
+            _, occupied = self.grid()
+            occupied = occupied | self.views[-1][3]
+        occupied_forward, occupied_right = FORWARD[occupied], RIGHT[occupied]
         for angle in np.linspace(0., sweep, samples):
             c, s = math.cos(angle), math.sin(angle)
             extent_f = max(geometry.front * c, -geometry.rear * c) + half_width * abs(s) + slack
@@ -319,12 +336,13 @@ class ActiveScan:
             if (extent_f > FORWARD[-1, 0] or extent_r > RIGHT[0, -1]
                     or extent_back > -FORWARD[0, 0]):
                 return False
-            forward = FORWARD * c + RIGHT * s
-            right = -FORWARD * s + RIGHT * c
+            forward = occupied_forward * c + occupied_right * s
+            right = -occupied_forward * s + occupied_right * c
             outside_f = np.maximum(0., np.maximum(-geometry.rear - forward, forward - geometry.front))
             outside_r = np.maximum(0., abs(right) - half_width)
-            swept |= outside_f**2 + outside_r**2 <= slack**2
-        return not (occupied & swept).any()
+            if (outside_f**2 + outside_r**2 <= slack**2).any():
+                return False
+        return True
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):
         if self.active:

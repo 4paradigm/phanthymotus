@@ -87,8 +87,6 @@ ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
 
 # The blocked-route buffer reserves braking room outside the obstacle stop.
 BLOCKED_APPROACH_BUFFER_M = 0.30
-# Limit the combined forward and lateral speed during an avoidance maneuver.
-AVOIDANCE_MAX_TRANSLATION_MPS = 0.18
 
 # Longitudinal separation for identifying a foreground obstacle and resuming.
 FORWARD_CLEARANCE_MARGIN_M = 0.15
@@ -1077,8 +1075,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 return Decision(_twist(0, 0, 0), AVOIDING, command.reason)
             if not scan.ready:
                 command = scan.command(geometry, _keepout_m(config),
-                                       _scan_yaw_rate(config, scan), config.watchdog_ms,
-                                       config.max_obs_age_ms)
+                                       _scan_yaw_rate(config), config.watchdog_ms,
+                                       config.max_obs_age_ms, min_yaw_rate=config.floor_wz)
                 return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and (track is None or not track.observed):
             scan.clear_frames = 0
@@ -1552,9 +1550,9 @@ def _local_side_order(rooms, config, state, frame):
     return incumbent, challenger
 
 
-def _scan_yaw_rate(config, scan):
-    rate = min(config.wz_max, scan.max_yaw_rate)
-    return rate if config.scan_wz_limit is None else min(rate, config.scan_wz_limit)
+def _scan_yaw_rate(config):
+    return (config.wz_max if config.scan_wz_limit is None
+            else min(config.wz_max, config.scan_wz_limit))
 
 
 def _local_velocity_limits(config, side):
@@ -1651,10 +1649,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     state.escape_side = 0.0
                     state.side_better_frames = 0
                     state.recovery = ClearanceRecovery()
+                yaw_rate = _scan_yaw_rate(config)
                 if (scan is not None and may_scan and foreground and not near and config.use_lateral
                         and (not scan.receipt_only or coverage >= config.coverage_full)
-                        and config.floor_wz <= _scan_yaw_rate(config, scan)
-                        and _scan_yaw_rate(config, scan) > 0 and scan.begin(order)):
+                        and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
@@ -1676,8 +1674,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         and target_distance is not None and coverage >= config.coverage_full
                         and (state is None or state.recovery is None)
                         and brake_at < ahead < slow):
-                    limit = AVOIDANCE_MAX_TRANSLATION_MPS * (ahead - brake_at) / (slow - brake_at)
-                    approach = min(vx * scale, limit)
+                    horizon_s = (config.max_obs_age_ms + config.watchdog_ms + 50) / 1000
+                    limit = (ahead - brake_at) / horizon_s
+                    approach = min(vx * scale, config.vx_max, limit)
                     # Stay within the limit even when the gait has a speed floor.
                     if approach > 0.0 and approach >= config.floor_vx:
                         if state is not None:
@@ -1720,7 +1719,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         vx, vy = local_command
         wz = 0.0
         state.avoidance_yaw_override = True
-        status, reason = AVOIDING, "局部规划：沿前向避障路线低速行进"
+        status, reason = AVOIDING, "局部规划：沿前向避障路线行进"
     elif side:
         # Blend in the turn as clearance shrinks, keeping yaw towards the
         # chosen route even when the target is on the blocked side.
@@ -1731,18 +1730,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                             config.wz_max)
         tracking_yaw = wz if wz * escape_yaw > 0 else 0.0
         wz = (1.0 - weight) * tracking_yaw + weight * escape_yaw
-        lateral = -side * config.vy_max * config.lateral_scale * weight * trust
+        _, (_, lateral_limit) = _local_velocity_limits(config, side)
+        lateral = -side * lateral_limit * config.lateral_scale * weight * trust
         vy = 0.0
-        if config.use_lateral and (aligned or near):
+        if config.use_lateral and lateral_limit >= config.floor_vy and (aligned or near):
             if near or abs(lateral) >= config.floor_vy * config.lateral_lift_ratio:
-                vy = _lift(lateral, config.floor_vy, config.vy_max)
+                vy = _lift(lateral, config.floor_vy, lateral_limit)
         if near or not vy:
             vx = 0.0
-        speed = math.hypot(vx, vy)
-        if speed > AVOIDANCE_MAX_TRANSLATION_MPS:
-            scale = AVOIDANCE_MAX_TRANSLATION_MPS / speed
-            vx *= scale
-            vy *= scale
         if abs(vy) < config.floor_vy:
             vx = vy = 0.0
         if abs(vx) < config.floor_vx:
@@ -1797,7 +1792,7 @@ def _local_translation(depth, config, state, odom, ahead, side):
     if any(v is None or not math.isfinite(v) for v in measured):
         return None
     measured_vx, measured_vy, measured_wz = measured
-    if math.hypot(measured_vx, measured_vy) > .12 or abs(measured_wz) > .02:
+    if abs(measured_wz) > .02:
         return None
     allow_forward = depth.get("allow_forward", True)
     if not allow_forward and abs(measured_vx) > .03:
@@ -1820,6 +1815,8 @@ def _local_translation(depth, config, state, odom, ahead, side):
     if not (vy == 0 or floor_y <= abs(vy) <= limit_y):
         return None
     speed = math.hypot(vx, vy)
+    if math.hypot(measured_vx, measured_vy) > speed + .02:
+        return None
     if speed and abs(measured_vx * vy - measured_vy * vx) / speed > .04:
         return None
     return (vx, vy)

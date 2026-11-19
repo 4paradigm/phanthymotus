@@ -180,7 +180,7 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
     from plugins.navi import active_scan, local_path, policy
     from plugins.navi.camera import HorizontalIntrinsics
 
-    card = _card()
+    card = _card(wz_max=.25)
     cfg = card._config
     cfg.local_planning = True
     cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
@@ -290,7 +290,7 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
     from plugins.navi import active_scan, local_path, policy
     from plugins.navi.camera import HorizontalIntrinsics
 
-    card = _card()
+    card = _card(wz_max=.4)
     cfg = card._config
     cfg.local_planning = True
     cfg.half_width_m = .23
@@ -336,7 +336,7 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
     assert tick(100_050)["values"] == [0.] * 6
     command = tick(100_150)
     assert command["values"][:5] == [0.] * 5
-    assert 0 < command["values"][5] <= .18
+    assert command["values"][5] == .4
     yaw = command["values"][5]
     stamp = now[0]
     for _ in range(25):

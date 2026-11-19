@@ -5,6 +5,8 @@ from plugins.navi.camera import HorizontalIntrinsics
 from plugins.navi.depth import ground_mask
 from plugins.navi import local_path as replay
 
+DECLARED_SPEEDS = ((0., .6), (0., .4))
+
 
 def test_grid_can_make_a_complete_right_detour_with_confirmed_space():
     grid = np.full((34, 33), replay.FREE, dtype=np.int8)
@@ -43,7 +45,8 @@ def test_front_depth_can_find_a_geometric_detour_without_measuring_its_prefix():
     free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
                                     replay.RESOLUTION, ground)
     assert free.any() and occupied.any()
-    assert replay._checked_translation(frame, ground, geometry, .33, .90, 1., 500, 600) is None
+    assert replay._checked_translation(frame, ground, geometry, .33, .90, 1., 500, 600,
+                                       velocity_limits=DECLARED_SPEEDS) is None
 
 
 def test_detour_limits_speed_to_the_measured_prefix_and_full_timeout(monkeypatch):
@@ -58,7 +61,8 @@ def test_detour_limits_speed_to_the_measured_prefix_and_full_timeout(monkeypatch
         return free, known_obstacle
 
     monkeypatch.setattr(replay, "observe", observed)
-    command = replay._checked_translation(None, None, geometry, .33, .9, 1, 500, 600)
+    command = replay._checked_translation(None, None, geometry, .33, .9, 1, 500, 600,
+                                          velocity_limits=DECLARED_SPEEDS)
     assert command is not None
     vx, vy = command
     assert 0 < vx < .095 / 1.15
@@ -76,12 +80,14 @@ def test_live_detour_tries_a_wider_bypass_and_later_rejoin(monkeypatch, side):
         return np.ones_like(box), box | side_obstacle
 
     monkeypatch.setattr(replay, "observe", observed)
-    command = replay._checked_translation(None, None, geometry, .33, .90, side, 500, 600)
+    command = replay._checked_translation(None, None, geometry, .33, .90, side, 500, 600,
+                                          velocity_limits=DECLARED_SPEEDS)
     assert command is not None
     vx, vy = command
     assert vx > 0 and vy * side < 0
     assert abs(vx) != pytest.approx(abs(vy))
-    assert np.hypot(vx, vy) <= .10 + 1e-12
+    assert np.hypot(vx, vy) > .10
+    assert vx <= .6 and abs(vy) <= .4
 
 
 def test_near_detour_can_choose_a_verified_lateral_only_command(monkeypatch):
@@ -111,7 +117,8 @@ def test_live_detour_stops_if_the_start_or_rejoin_is_blocked(monkeypatch, start_
         return np.ones_like(occupied), occupied
 
     monkeypatch.setattr(replay, "observe", observed)
-    assert replay._checked_translation(None, None, geometry, .33, .90, 1., 500, 600) is None
+    assert replay._checked_translation(None, None, geometry, .33, .90, 1., 500, 600,
+                                       velocity_limits=DECLARED_SPEEDS) is None
 
 
 def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkeypatch):
@@ -124,10 +131,13 @@ def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkey
     monkeypatch.setattr(replay, "observe", lambda *args: (unmeasured, occupied))
 
     args = (None, None, geometry, .33, .90, 1., 500, 600)
-    assert replay._checked_translation(*args) is None
-    assert replay._checked_translation(*args, observed_grid=(unmeasured, unmeasured)) is None
-    command = replay._checked_translation(*args, observed_grid=(~occupied, occupied))
-    assert command is not None and 0 < np.hypot(*command) <= .10 + 1e-12
+    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS) is None
+    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                       observed_grid=(unmeasured, unmeasured)) is None
+    command = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                          observed_grid=(~occupied, occupied))
+    assert command is not None and 0 < np.hypot(*command)
+    assert abs(command[0]) <= .6 and abs(command[1]) <= .4
 
 
 def test_scanned_prefix_can_be_measured_before_the_passage_is_fully_seen(monkeypatch):
@@ -138,8 +148,11 @@ def test_scanned_prefix_can_be_measured_before_the_passage_is_fully_seen(monkeyp
     monkeypatch.setattr(replay, "observe", lambda *args: (unknown, box))
     nearby = (replay.FORWARD <= .45) & (abs(replay.RIGHT) <= .5)
     command = replay._checked_translation(None, None, geometry, .33, .90, 1., 500, 600,
+                                          velocity_limits=DECLARED_SPEEDS,
                                           observed_grid=(nearby, box))
-    assert command is not None and 0 < np.hypot(*command) <= .10 + 1e-12
+    assert command is not None and 0 < np.hypot(*command)
+    assert command[0] * 1.15 <= .475 - geometry.front
+    assert abs(command[1]) * 1.15 <= .525 - .33
 
 
 def test_pose_aligned_scan_does_not_borrow_free_cells_from_the_original_exposure(monkeypatch):
@@ -148,5 +161,6 @@ def test_pose_aligned_scan_does_not_borrow_free_cells_from_the_original_exposure
     box = np.isclose(replay.RIGHT, 0) & np.isclose(replay.FORWARD, .90)
     monkeypatch.setattr(replay, "observe", lambda *args: (~box, box))
     args = (None, None, geometry, .33, .90, 1., 500, 600)
-    assert replay._checked_translation(*args) is not None
-    assert replay._checked_translation(*args, observed_grid=(np.zeros_like(box), box)) is None
+    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS) is not None
+    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                       observed_grid=(np.zeros_like(box), box)) is None
