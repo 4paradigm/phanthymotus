@@ -278,26 +278,26 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
         assert tick(100_350)["values"] == [0.] * 6
         assert not plans
         return
-    for stamp in range(100_250, 101_250, 100):
+    for stamp in range(100_250, 101_550, 100):
         command = tick(stamp, .25)
     assert command["values"] == [0.] * 6
-    assert tick(101_250, fresh=False)["values"] == [0.] * 6
-    assert tick(101_400, fresh=False)["values"] == [0.] * 6
+    assert tick(101_550, fresh=False)["values"] == [0.] * 6
+    assert tick(101_700, fresh=False)["values"] == [0.] * 6
     assert not plans
-    assert tick(101_450)["values"] == [0.] * 6
-    assert tick(101_500)["values"] == [0., 0., 0., 0., 0., -.25]
-    for stamp in range(101_600, 102_600, 100):
+    assert tick(101_750)["values"] == [0.] * 6
+    assert tick(101_800)["values"] == [0., 0., 0., 0., 0., -.25]
+    for stamp in range(101_900, 103_200, 100):
         command = tick(stamp, -.25)
     assert command["values"] == [0.] * 6
-    for stamp in (102_600, 102_750, 102_850, 102_950, 103_050):
+    for stamp in (103_200, 103_350, 103_450, 103_550, 103_650):
         command = tick(stamp)
     assert plans and all(side == -1.0 for side in plans)
     assert command["values"][0] > 0
     assert command["values"][5] == 0
-    assert command["obs_stamp_ms"] == 103_050
+    assert command["obs_stamp_ms"] == 103_650
     decisions = len(plans)
     card._odom_stamp_verified = False
-    assert tick(103_150)["values"] == [0.] * 6
+    assert tick(103_750)["values"] == [0.] * 6
     assert len(plans) == decisions
 
 
@@ -360,7 +360,7 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
             assert "capture_ms" not in depth
             replans.append(depth["frame_id"])
             return (.06, 0.)
-        return None
+        return (0., .10)  # An executable sidestep must not take priority over observation.
 
     monkeypatch.setattr(policy, "_local_translation", plan)
 
@@ -409,6 +409,7 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
             break
     else:
         pytest.fail("scan never reached the angular target")
+    assert math.degrees(heading) == pytest.approx(20., abs=2.)
     for _ in range(25):
         stamp += 100
         assert tick(stamp)["values"] == [0.] * 6

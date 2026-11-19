@@ -11,9 +11,8 @@ import numpy as np
 from .local_path import observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
 from .odom import PlanarPose, planar_feedback
 
-ANGLE = math.radians(15)
+ANGLE = math.radians(20)
 ANGLE_TOLERANCE = math.radians(2)
-RECEIPT_ANGLE = math.radians(12)
 STILL_LINEAR = .05
 STILL_YAW = .04
 SETTLE_MS = 120
@@ -321,9 +320,8 @@ class ActiveScan:
             return ScanCommand(reason="主动观察：已停稳，重新规划")
         if speed > STILL_LINEAR:
             return self.interrupt("主动观察：检测到平移，停车")
-        angle = RECEIPT_ANGLE if self.receipt_only else ANGLE
         if (abs(self.motion[2]) > yaw_rate + .10
-                or abs(self.pose[2] - self.origin[2]) > angle + 2 * ANGLE_TOLERANCE):
+                or abs(self.pose[2] - self.origin[2]) > ANGLE + 2 * ANGLE_TOLERANCE):
             return self.interrupt("主动观察：转速或转角超出限制，停车")
 
         # Pose feedback can lag several ticks. Run a bounded burst, then wait
@@ -338,7 +336,7 @@ class ActiveScan:
             self.turn_stop_ms = None
 
         returning = self.phase == "return"
-        heading = self.origin[2] if returning else self.origin[2] + self.directions[0] * angle
+        heading = self.origin[2] if returning else self.origin[2] + self.directions[0] * ANGLE
         error = heading - self.pose[2]
         if self.turn_until_ms and (abs(error) <= ANGLE_TOLERANCE or self.turn_yaw * error > 0):
             self.turn_stop_ms = control_ms
@@ -445,10 +443,15 @@ class ActiveScan:
             return ScanCommand(reason="主动观察：停车等待新的独立深度帧")
 
         if not self.timed_turn_s:
-            self.timed_turn_s = POSE_TURN_BURST_MS / 1000
+            if yaw_rate <= 0. or yaw_rate < min_yaw:
+                return self.interrupt("主动观察：底盘无可用转速，停车")
+            duration = max(POSE_TURN_BURST_MS / 1000, ANGLE / yaw_rate)
+            if tick_s > 0.:
+                duration = math.ceil(duration / tick_s) * tick_s
             if min_yaw:
-                self.timed_turn_s = min(self.timed_turn_s, RECEIPT_ANGLE / min_yaw)
-            self.turn_yaw = min(yaw_rate, RECEIPT_ANGLE / self.timed_turn_s)
+                duration = min(duration, ANGLE / min_yaw)
+            self.timed_turn_s = duration
+            self.turn_yaw = min(yaw_rate, ANGLE / duration)
             self.timed_phase_s = 0.
         if self.timed_phase_s + tick_s > self.timed_turn_s + 1e-9:
             self.phase = "settle"
@@ -457,7 +460,7 @@ class ActiveScan:
             self.settle_frames = self.settle_frame = 0
             return ScanCommand(reason="主动观察：定时转向结束，停车")
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
-        sweep = self.directions[0] * (RECEIPT_ANGLE + (self.turn_yaw + .10) * horizon)
+        sweep = self.directions[0] * (ANGLE + (self.turn_yaw + .10) * horizon)
         if (self.turn_yaw <= 0. or self.turn_yaw < min_yaw or not self.clear_sweep(
                 geometry, half_width, sweep, STILL_LINEAR * horizon)):
             if not self.issued_yaw and self.try_other_side():

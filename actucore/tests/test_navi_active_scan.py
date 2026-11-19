@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 
@@ -41,28 +43,29 @@ def test_active_scan_turns_right_and_waits_for_post_turn_depth(monkeypatch):
     assert lookout.begin((1., -1.))
     assert _tick(lookout, geometry, 1050).yaw == 0
     assert _tick(lookout, geometry, 1150).yaw < 0
-    for stamp in range(1250, 2250, 100):
+    for stamp in range(1250, 2550, 100):
         result = _tick(lookout, geometry, stamp, -.25)
     assert result.yaw == 0
-    assert _tick(lookout, geometry, 2300, capture=2150).yaw == 0
-    assert _tick(lookout, geometry, 2450, capture=2150).yaw == 0
+    assert math.degrees(lookout.pose[2]) == pytest.approx(20., abs=2.)
+    assert _tick(lookout, geometry, 2500, capture=2450).yaw == 0
+    assert _tick(lookout, geometry, 2650, capture=2450).yaw == 0
     assert not lookout.ready
     blocked[30, 38] = True
-    assert _tick(lookout, geometry, 2500).yaw == 0
-    assert _tick(lookout, geometry, 2550).yaw > 0
+    assert _tick(lookout, geometry, 2700).yaw == 0
+    assert _tick(lookout, geometry, 2750).yaw > 0
     blocked[30, 38] = False
-    for stamp in range(2650, 3650, 100):
+    for stamp in range(2850, 4150, 100):
         result = _tick(lookout, geometry, stamp, .25)
     assert result.yaw == 0
-    _tick(lookout, geometry, 3650)
-    _tick(lookout, geometry, 3800)
+    _tick(lookout, geometry, 4150)
+    _tick(lookout, geometry, 4300)
     assert lookout.ready
     _, occupied = lookout.grid()
     assert occupied.any()
     assert not occupied[30, 38]  # the side observation was reprojected
     assert lookout.try_other_side()
-    assert _tick(lookout, geometry, 3900).yaw == 0
-    assert _tick(lookout, geometry, 4000).yaw > 0
+    assert _tick(lookout, geometry, 4400).yaw == 0
+    assert _tick(lookout, geometry, 4500).yaw > 0
 
 
 def test_active_scan_holds_an_occupied_sweep(monkeypatch):
@@ -97,12 +100,12 @@ def test_pose_only_scan_converges_with_delayed_pose_and_chassis(monkeypatch, sta
             assert lookout.begin((-1., 1.))
         rate = lookout.command(geometry, .31, .83, 300, min_yaw_rate=.33, now_ms=stamp).yaw
         turn_start = (turn_start if turn_start is not None else stamp) if rate else None
-        assert abs(yaw) <= scan.RECEIPT_ANGLE + scan.ANGLE_TOLERANCE
+        assert abs(yaw) <= math.radians(22.)
         if lookout.ready:
             break
 
     assert lookout.ready
-    assert yaw == pytest.approx(scan.RECEIPT_ANGLE, abs=scan.ANGLE_TOLERANCE)
+    assert math.degrees(yaw) == pytest.approx(20., abs=2.)
 
 
 def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(monkeypatch):
@@ -116,8 +119,8 @@ def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(m
     assert not lookout.begin((1., -1.))
 
 
-@pytest.mark.parametrize("lose_depth", [False, True])
-def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth):
+@pytest.mark.parametrize("lose_depth, yaw_limit", [(False, .83), (False, .60), (True, .83)])
+def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth, yaw_limit):
     look, geometry, _, _ = _setup(monkeypatch)
     look.observe_single(_depth(1000), geometry, 800, 1000)
     assert look.begin((1., -1.))
@@ -126,7 +129,7 @@ def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth)
     for stamp in range(1100, 7400, 100):
         depth = None if lose_depth and first_turn is not None else _depth(stamp)
         look.observe_single(depth, geometry, 800, stamp)
-        command = look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33)
+        command = look.command(geometry, .31, yaw_limit, 300, 800, min_yaw_rate=.33)
         if command.yaw and first_turn is None:
             first_turn = stamp
         rates.append(command.yaw)
@@ -137,7 +140,8 @@ def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth)
             break
     assert first_turn is not None
     nonzero = [rate for rate in rates if rate]
-    assert 3 <= len(nonzero) <= 4 and all(rate < 0 for rate in nonzero)
+    assert all(-yaw_limit <= rate <= -.33 for rate in nonzero)
+    assert math.degrees(-sum(nonzero) * .1) == pytest.approx(20., abs=2.)
     assert look.ready and look.current_frame > first_turn + scan.RECEIPT_SETTLE_MS
     assert len(look.views) == 1 and not look.poses
 
@@ -312,7 +316,7 @@ def test_scan_uses_the_fastest_executable_rate_supported_by_the_sweep(monkeypatc
     if floor:
         assert result.yaw == 0.
     else:
-        assert -.5 < result.yaw < -.25
+        assert -.5 < result.yaw < -.2
 
 
 def test_sweep_stops_for_an_occupied_cell_that_straddles_the_footprint(monkeypatch):

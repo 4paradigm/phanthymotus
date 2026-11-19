@@ -1724,7 +1724,7 @@ def _local_velocity_limits(config, side):
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
            target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False,
            target_bearing=None):
-    """Slow down and prefer a measured side route around foreground obstacles."""
+    """Slow for foreground obstacles and look around them before local detours."""
     ahead, coverage = _clearance(depth, config)
     if state is not None:
         state.last_clearance, state.last_coverage = ahead, coverage
@@ -1783,6 +1783,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                       depth.get("source_frame_id", depth.get("frame_id")))
             if scan is not None:
                 scan.clear_frames = 0
+                yaw_rate = _scan_yaw_rate(config)
+                if (may_scan and foreground and not near and config.use_lateral
+                        and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
+                    return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
             planning_depth = dict(depth, allow_forward=not near and aligned)
             if target_distance is not None and target_bearing is not None:
                 planning_depth["stop_target"] = (
@@ -1819,10 +1823,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     state.escape_side = 0.0
                     state.side_better_frames = 0
                     state.recovery = ClearanceRecovery()
-                yaw_rate = _scan_yaw_rate(config)
-                if (scan is not None and may_scan and foreground and not near and config.use_lateral
-                        and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
-                    return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
                 feedback = planar_feedback(odom)
                 if state.motion_source != "command" and feedback is None:
                     return 0.0, 0.0, 0.0, AVOIDING, "缺少可用的速度或连续位姿，局部规划和主动观察暂停"
