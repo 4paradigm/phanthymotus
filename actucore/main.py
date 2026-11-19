@@ -142,6 +142,11 @@ class ActuCoreBundle:
             self._plugins.append(NaviPlugin(plugins_cfg["navi"], executor))
             log.info("NaviPlugin loaded")
 
+        if plugins_cfg.get("autonomous_task", {}).get("enabled", False):
+            from plugins.autonomous_task import AutonomousTaskPlugin
+            self._plugins.append(AutonomousTaskPlugin(plugins_cfg["autonomous_task"], executor))
+            log.info("AutonomousTaskPlugin loaded")
+
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 
@@ -281,7 +286,8 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
+                        logged = {**args, "key": "***"} if name == "autonomous_task" and "key" in args else args
+                        log.info(f"[mcp] tools/call: {name}({_brief(logged)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
