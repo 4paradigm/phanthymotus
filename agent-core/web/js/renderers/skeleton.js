@@ -118,7 +118,7 @@ export const SkeletonRenderer = {
       if (!content) { this._buildFallbackSkeleton(); return; }
       const data = JSON.parse(content);
       if (data.urdf) {
-        this._parseAndBuild(data.urdf);
+        this._parseAndBuild(data.urdf, data.skeleton_visual_links);
       } else if (data.type === 'quadruped') {
         this._buildQuadrupedSkeleton(data);
       } else {
@@ -130,7 +130,7 @@ export const SkeletonRenderer = {
     }
   },
 
-  _parseAndBuild(urdfXml) {
+  _parseAndBuild(urdfXml, visualLinks) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(urdfXml, 'text/xml');
 
@@ -228,7 +228,7 @@ export const SkeletonRenderer = {
         jointGroup.add(childGroup);
 
         // Store references
-        if (['revolute', 'continuous', 'prismatic'].includes(j.type)) {
+        if (j.type === 'revolute' || j.type === 'prismatic') {
           this._joints[j.name] = childGroup;
         }
         linkObj[j.childLink] = childGroup;
@@ -243,7 +243,17 @@ export const SkeletonRenderer = {
       }
     }
 
-    // Add joint spheres for revolute joints
+    // Only draw primitive visuals on links explicitly selected by the model resource.
+    const selected = new Set(Array.isArray(visualLinks) ? visualLinks : []);
+    for (const link of linkNodes) {
+      const name = link.getAttribute('name');
+      if (!selected.has(name) || !linkObj[name]) continue;
+      for (const visual of link.querySelectorAll('visual')) {
+        this._addPrimitiveVisual(linkObj[name], visual);
+      }
+    }
+
+    // Add markers for movable joints.
     for (const [name, obj] of Object.entries(this._joints)) {
       const isHand = name.includes('hand');
       const radius = isHand ? 0.006 : 0.012;
@@ -269,6 +279,38 @@ export const SkeletonRenderer = {
     }
 
     this._loaded = true;
+  },
+
+  _addPrimitiveVisual(link, visual) {
+    const origin = visual.querySelector('origin');
+    const vector = (value, fallback) => value == null ? fallback : value.trim().split(/\s+/).map(Number);
+    const xyz = vector(origin?.getAttribute('xyz'), [0, 0, 0]);
+    const rpy = vector(origin?.getAttribute('rpy'), [0, 0, 0]);
+    if (xyz.length !== 3 || rpy.length !== 3 || ![...xyz, ...rpy].every(Number.isFinite)) return;
+
+    const box = visual.querySelector('geometry > box');
+    const cylinder = visual.querySelector('geometry > cylinder');
+    let object;
+    if (box) {
+      const size = vector(box.getAttribute('size'), []);
+      if (size.length !== 3 || !size.every(n => Number.isFinite(n) && n > 0)) return;
+      const solid = new THREE.BoxGeometry(...size);
+      const edges = new THREE.EdgesGeometry(solid);
+      solid.dispose();
+      object = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xaabbcc }));
+    } else if (cylinder) {
+      const radius = Number(cylinder.getAttribute('radius'));
+      const length = Number(cylinder.getAttribute('length'));
+      if (![radius, length].every(n => Number.isFinite(n) && n > 0)) return;
+      const geometry = new THREE.CylinderGeometry(radius, radius, length, 8);
+      geometry.rotateX(Math.PI / 2); // URDF cylinders follow Z, Three.js cylinders follow Y.
+      object = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({ color: 0xaabbcc }));
+    } else {
+      return;
+    }
+    object.position.set(...xyz);
+    object.rotation.set(...rpy, 'ZYX');
+    link.add(object);
   },
 
   _addBoneVisual(jointGroup, joint) {
