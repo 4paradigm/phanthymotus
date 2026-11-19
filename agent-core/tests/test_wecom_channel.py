@@ -97,6 +97,19 @@ class FakeClient:
         finally:
             self.pending.pop(req_id, None)
 
+    async def reply(self, frame, body, cmd=None):
+        req_id = frame['headers']['req_id']
+        command = cmd or 'aibot_respond_msg'
+        self.sent.append({'cmd': command, 'headers': frame['headers'], 'body': body})
+        if self.fail_send or self.reply_errcode:
+            raise RuntimeError(f'Reply ack error: errcode={self.reply_errcode or 40001}, errmsg=rejected')
+        payload = {}
+        if command == 'aibot_upload_media_init':
+            payload = {'upload_id': 'test-upload'}
+        elif command == 'aibot_upload_media_finish':
+            payload = {'media_id': 'test-media'}
+        return {'headers': {'req_id': req_id}, 'errcode': 0, 'body': payload}
+
     def push(self, frame):
         if 'errcode' in frame:
             future = self.pending.get(frame['headers']['req_id'])
@@ -518,11 +531,122 @@ class WecomReqIdTest(unittest.IsolatedAsyncioTestCase):
         image = b'\x89PNG\r\n\x1a\nexample'
         await adapter.send_message(OutboundMessage(
             chat_id='u1', image_bytes=image, source_message_id='image-message'))
-        reply = ws.frames_with('aibot_respond_msg')[0]
+        reply = ws.frames_with('aibot_respond_msg')[-1]
         self.assertEqual(reply['headers']['req_id'], 'image-request')
-        item = reply['body']['stream']['msg_item'][0]['image']
-        self.assertEqual(base64.b64decode(item['base64']), image)
-        self.assertEqual(item['md5'], hashlib.md5(image, usedforsecurity=False).hexdigest())
+        self.assertEqual(reply['body'], {'msgtype': 'image', 'image': {'media_id': 'test-media'}})
+        init = ws.frames_with('aibot_upload_media_init')[0]['body']
+        chunk = ws.frames_with('aibot_upload_media_chunk')[0]['body']
+        self.assertEqual(init['md5'], hashlib.md5(image, usedforsecurity=False).hexdigest())
+        self.assertEqual(base64.b64decode(chunk['base64_data']), image)
+
+    async def test_image_upload_splits_large_content_into_ordered_chunks(self):
+        adapter, ws = await self._running_adapter()
+        image = b'\x89PNG\r\n\x1a\n' + b'x' * wecom.IMAGE_UPLOAD_CHUNK_BYTES
+        media_id = await adapter._upload_reply_image(image, '.png')
+        self.assertEqual(media_id, 'test-media')
+        init = ws.frames_with('aibot_upload_media_init')[0]['body']
+        chunks = ws.frames_with('aibot_upload_media_chunk')
+        self.assertEqual(init['total_chunks'], 2)
+        self.assertEqual(init['total_size'], len(image))
+        self.assertEqual([item['body']['chunk_index'] for item in chunks], [0, 1])
+        self.assertEqual(b''.join(base64.b64decode(item['body']['base64_data'])
+                                  for item in chunks), image)
+        self.assertTrue(all(len(base64.b64decode(item['body']['base64_data']))
+                            <= wecom.IMAGE_UPLOAD_CHUNK_BYTES for item in chunks))
+
+    async def test_image_upload_failure_reports_already_sent_text(self):
+        adapter, ws = await self._running_adapter()
+        frame = _msg_frame('m1', 'r1')
+        await adapter._process_message(frame, frame['body'])
+        image = b'\x89PNG\r\n\x1a\nexample'
+        with mock.patch.object(adapter, '_upload_reply_image',
+                               side_effect=WecomError('upload failed')):
+            with self.assertRaises(wecom.PartialSendError) as caught:
+                await adapter.send_message(OutboundMessage(
+                    chat_id='u1', text='photo ready', image_bytes=image, source_message_id='m1'))
+        self.assertEqual(caught.exception.sent, ['text'])
+        self.assertIn('image 1: upload failed', caught.exception.failures)
+        replies = ws.frames_with('aibot_respond_msg')
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]['body']['stream']['content'], 'photo ready')
+
+    async def test_invalid_upload_response_is_reported(self):
+        adapter, ws = await self._running_adapter()
+        async def malformed(frame, body, cmd=None):
+            return {'headers': frame['headers'], 'errcode': 0, 'body': ['invalid']}
+        with mock.patch.object(ws, 'reply', side_effect=malformed):
+            with self.assertRaisesRegex(WecomError, 'did not return an upload ID'):
+                await adapter._upload_reply_image(b'\x89PNG\r\n\x1a\nexample', '.png')
+
+    async def test_text_and_image_file_use_real_sdk_media_commands(self):
+        from aibot import WSClient, WSClientOptions
+        from channel import media
+
+        adapter, fake_client = await self._running_adapter(real_progress=True)
+        frame = _msg_frame('image-message', 'image-request')
+        await adapter._process_message(frame, frame['body'])
+        progress = fake_client.frames_with('aibot_respond_msg')[0]['body']['stream']
+        sdk = WSClient(WSClientOptions(bot_id='test-bot', secret='test-secret'))
+        # A real, synthetic 1x1 JPEG; no camera image or user data is needed.
+        image = base64.b64decode(
+            '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkM'
+            'EQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4I'
+            'CA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh'
+            '4eHh4eHh7/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xA'
+            'AUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAB//EABQRAQAAAA'
+            'AAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ALABFG7/2Q=='
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / 'photo.jpg'
+            path.write_bytes(image)
+            # The real allowlist is Linux /work and /tmp; allow this temporary
+            # path so the same file-resolution path also runs on Windows.
+            with mock.patch('event.desktop._check_path_allowed', return_value=None):
+                attachments, errors = media.resolve_outbound(
+                    [{'path': str(path), 'caption': 'photo caption'}], 'wecom')
+            self.assertEqual(errors, [])
+            self.assertEqual(len(attachments), 1)
+            async def send_reply(req_id, body, command):
+                result = {'headers': {'req_id': req_id}, 'errcode': 0}
+                if command == 'aibot_upload_media_init':
+                    result['body'] = {'upload_id': 'test-upload'}
+                elif command == 'aibot_upload_media_finish':
+                    result['body'] = {'media_id': 'test-media'}
+                return result
+
+            with mock.patch.object(type(sdk), 'is_connected', new_callable=mock.PropertyMock,
+                                   return_value=True), \
+                    mock.patch.object(sdk._ws_manager, 'send_reply', new_callable=mock.AsyncMock,
+                                      side_effect=send_reply) as reply:
+                adapter._client = sdk
+                try:
+                    await adapter.send_message(OutboundMessage(
+                        chat_id='u1', text='photo ready', files=attachments,
+                        source_message_id='image-message'))
+                finally:
+                    adapter._client = fake_client
+            self.assertEqual(reply.await_count, 5)
+            req_id, body, command = reply.await_args_list[0].args
+            self.assertEqual(req_id, 'image-request')
+            self.assertEqual(command, 'aibot_respond_msg')
+            self.assertEqual(body['msgtype'], 'stream')
+            self.assertTrue(body['stream']['finish'])
+            self.assertFalse(progress['finish'])
+            self.assertEqual(body['stream']['id'], progress['id'])
+            body = json.loads(json.dumps(body, ensure_ascii=False))
+            self.assertEqual(body['stream']['content'], 'photo ready\nphoto caption')
+            _, init, init_cmd = reply.await_args_list[1].args
+            _, chunk, chunk_cmd = reply.await_args_list[2].args
+            _, finish, finish_cmd = reply.await_args_list[3].args
+            req_id, media_body, media_cmd = reply.await_args_list[4].args
+            self.assertEqual((init_cmd, chunk_cmd, finish_cmd),
+                             ('aibot_upload_media_init', 'aibot_upload_media_chunk', 'aibot_upload_media_finish'))
+            self.assertEqual(init['md5'], hashlib.md5(image, usedforsecurity=False).hexdigest())
+            self.assertEqual(base64.b64decode(chunk['base64_data']), image)
+            self.assertEqual(finish, {'upload_id': 'test-upload'})
+            self.assertEqual(req_id, 'image-request')
+            self.assertEqual(media_cmd, 'aibot_respond_msg')
+            self.assertEqual(media_body, {'msgtype': 'image', 'image': {'media_id': 'test-media'}})
 
     async def test_image_progress_and_final_share_stream_id(self):
         adapter, ws = await self._running_adapter(real_progress=True)

@@ -22,7 +22,7 @@ Config: {bot_id, secret, bot_name?}
 SDK 原生使用 asyncio，无需复制飞书 SDK 专用线程和模块级事件循环补丁。
 认证成功后才报告 connected；普通断线交给 ChannelManager watchdog 重启，
 被其他进程接管后停止自动重连。旧版临时程序曾验证单聊和群聊文本回显；
-SDK 版及图片收发尚待真实企微验证。
+SDK 版独立适配器的单聊图文回复已验证；完整 Agent 链路和群聊图片仍待验证。
 详见 docs/wecom-channel-setup.md。
 
 统一帧形态： `{cmd, headers: {req_id}, body}`
@@ -42,7 +42,7 @@ import aiohttp
 from yarl import URL
 
 from channel.adapter import (
-    KIND_IMAGE, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
+    KIND_IMAGE, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage, PartialSendError,
 )
 
 SUBSCRIBE_TIMEOUT = 15           # 等订阅 ACK 的超时
@@ -53,6 +53,7 @@ REQ_ID_MAX = 512                 # msgid → req_id 映射容量
 REPLY_WINDOW = 24 * 60 * 60      # 24 小时回复窗口
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 IMAGE_MAX_ITEMS = 10
+IMAGE_UPLOAD_CHUNK_BYTES = 512 * 1024
 IMAGE_DOWNLOAD_TIMEOUT = 10
 
 # 群聊正文里的 @ 前缀，例如 "@Bumi 助手 挥个手"
@@ -618,25 +619,86 @@ class WecomAdapter(ChannelAdapter):
             images.append(await asyncio.to_thread(read_image, att.path))
         if msg.image_bytes is not None:
             images.append(msg.image_bytes)
-        items = []
+        extensions = []
         for data in images:
             if not data or len(data) > IMAGE_MAX_BYTES:
                 raise WecomError('WeCom image is empty or exceeds the 10 MiB limit.')
-            _image_type(data)
-            items.append({'msgtype': 'image', 'image': {
-                'base64': base64.b64encode(data).decode('ascii'),
-                'md5': hashlib.md5(data, usedforsecurity=False).hexdigest(),
-            }})
+            _, extension = _image_type(data)
+            extensions.append(extension)
         captions = [att.caption for att in msg.files if att.caption]
         if msg.image_caption:
             captions.append(msg.image_caption)
         content = '\n'.join(part for part in [msg.text, *captions] if part)
         reply = OutboundMessage(chat_id=msg.chat_id, text=content,
                                 source_message_id=msg.source_message_id)
-        await self._send_reply(req_id, reply, stream_id=stream_id, image_items=items)
+        # Finish the existing progress stream before sending standalone media;
+        # otherwise the client's "processing" indicator remains visible.
+        await self._send_reply(req_id, reply, stream_id=stream_id)
+        sent = ['text'] if content else []
+        failures = []
+        for index, (data, extension) in enumerate(zip(images, extensions), 1):
+            try:
+                media_id = await self._upload_reply_image(data, extension)
+                await self._send_body(req_id, {'msgtype': 'image', 'image': {'media_id': media_id}})
+                sent.append(f'image {index}')
+            except WecomError as exc:
+                failures.append(f'image {index}: {exc}')
+                if self.status() != 'connected':
+                    failures.extend(f'image {remaining}: not sent (disconnected)'
+                                    for remaining in range(index + 1, len(images) + 1))
+                    break
+        if failures:
+            if sent:
+                raise PartialSendError(sent, failures)
+            raise WecomError('; '.join(failures))
 
     async def _send_reply(self, req_id: str, msg: OutboundMessage, *, stream_id: str,
-                          finish: bool = True, image_items: list | None = None) -> None:
+                          finish: bool = True) -> None:
+        await self._send_request(
+            req_id,
+            lambda client: client.reply_stream(
+                {'headers': {'req_id': req_id}}, stream_id=stream_id,
+                content=msg.text, finish=finish,
+            ),
+        )
+
+    async def _send_body(self, req_id: str, body: dict, cmd: str | None = None) -> dict:
+        return await self._send_request(
+            req_id,
+            lambda client: client.reply({'headers': {'req_id': req_id}}, body, cmd=cmd),
+        )
+
+    async def _upload_reply_image(self, data: bytes, extension: str) -> str:
+        # The official Node SDK uses these WebSocket commands. Python SDK 1.0.2
+        # exposes them through its public generic reply() method.
+        from aibot import generate_req_id
+
+        async def command(name: str, body: dict) -> dict:
+            return await self._send_body(generate_req_id(name), body, cmd=name)
+
+        chunks = (len(data) + IMAGE_UPLOAD_CHUNK_BYTES - 1) // IMAGE_UPLOAD_CHUNK_BYTES
+        result = await command('aibot_upload_media_init', {
+            'type': 'image', 'filename': f'image{extension}', 'total_size': len(data),
+            'total_chunks': chunks, 'md5': hashlib.md5(data, usedforsecurity=False).hexdigest(),
+        })
+        response_body = result.get('body')
+        upload_id = response_body.get('upload_id') if isinstance(response_body, dict) else None
+        if not isinstance(upload_id, str) or not upload_id:
+            raise WecomError('WeCom image upload did not return an upload ID.')
+        for index in range(chunks):
+            chunk = data[index * IMAGE_UPLOAD_CHUNK_BYTES:(index + 1) * IMAGE_UPLOAD_CHUNK_BYTES]
+            await command('aibot_upload_media_chunk', {
+                'upload_id': upload_id, 'chunk_index': index,
+                'base64_data': base64.b64encode(chunk).decode('ascii'),
+            })
+        result = await command('aibot_upload_media_finish', {'upload_id': upload_id})
+        response_body = result.get('body')
+        media_id = response_body.get('media_id') if isinstance(response_body, dict) else None
+        if not isinstance(media_id, str) or not media_id:
+            raise WecomError('WeCom image upload did not return a media ID.')
+        return media_id
+
+    async def _send_request(self, req_id: str, send) -> dict:
         client = self._client
         if self.status() != 'connected':
             raise WecomError('Cannot send: WeCom adapter is not connected.')
@@ -649,11 +711,7 @@ class WecomAdapter(ChannelAdapter):
                 if self._client is not client or self.status() != 'connected':
                     raise WecomError('Cannot send: WeCom adapter is not connected.')
                 try:
-                    ack = await asyncio.wait_for(client.reply_stream(
-                        {'headers': {'req_id': req_id}},
-                        stream_id=stream_id,
-                        content=msg.text, finish=finish, msg_item=image_items,
-                    ), timeout=REPLY_ACK_TIMEOUT)
+                    ack = await asyncio.wait_for(send(client), timeout=REPLY_ACK_TIMEOUT)
                 except (asyncio.TimeoutError, TimeoutError):
                     self._last_error = 'WeCom reply ACK timed out; delivery is unknown.'
                     await self._close_client()
@@ -669,6 +727,7 @@ class WecomAdapter(ChannelAdapter):
                     raise WecomError(f'WeCom reply rejected ({_sdk_error_detail(e)}).') from None
                 if not isinstance(ack, dict) or ack.get('errcode') != 0 or _frame_req_id(ack) != req_id:
                     raise WecomError('WeCom reply returned an invalid or rejected ACK.')
+                return ack
         finally:
             remaining = self._reply_lock_users[req_id] - 1
             if remaining:
