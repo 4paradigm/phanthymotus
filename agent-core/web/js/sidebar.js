@@ -1036,15 +1036,14 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.className = 'tool-config-input';
       input.dataset.key = key;
       input.add(new Option(savedValues[key] || '请读取目标电脑打印机', savedValues[key] || ''));
-      const refresh = document.createElement('button');
-      refresh.type = 'button';
-      refresh.textContent = '刷新打印机';
-      fieldWrapper.appendChild(refresh);
       const initialize = document.createElement('button');
       initialize.type = 'button';
-      initialize.textContent = '初始化/升级电脑';
+      initialize.textContent = '安装或升级前台桥接';
+      initialize.className = 'ql-printer-init-button';
       fieldWrapper.appendChild(initialize);
       const progress = document.createElement('div');
+      progress.className = 'ql-printer-progress';
+      progress.setAttribute('aria-live', 'polite');
       fieldWrapper.appendChild(progress);
       initialize.onclick = async () => {
         if (!(await ensureEdit())) return;
@@ -1079,16 +1078,18 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
           progress.textContent = result.hint;
           const remoteStart = bodyEl.querySelector('[data-key="remote_start_enabled"]');
           if (remoteStart && read('bridge_url') === initialAddress) remoteStart.value = 'true';
-          if (read('bridge_url') === initialAddress) await refresh.onclick();
+          if (read('bridge_url') === initialAddress) await loadPrinters();
         } catch (error) { progress.textContent = error.message; }
         finally { initialize.disabled = false; }
       };
       let generation = 0;
       const connection = () => ['bridge_url', 'token'].map(k => bodyEl.querySelector(`[data-key="${k}"]`)?.value || '');
-      refresh.onclick = async () => {
+      const loadPrinters = async (silent = false) => {
         const version = ++generation;
         const [bridge_url, token] = connection();
-        refresh.disabled = true;
+        if (!bridge_url || !token) return;
+        input.disabled = true;
+        input.replaceChildren(new Option('正在读取打印机…', ''));
         try {
           const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1106,15 +1107,21 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
           input.add(new Option('请选择打印机', ''));
           for (const p of result.printers) input.add(new Option(p.name + (p.default ? '（系统默认）' : '') + (p.offline ? '（离线）' : ''), p.name));
           input.value = result.printers.some(p => p.name === selected) ? selected : '';
-        } catch (error) { alert(error.message); }
-        finally { refresh.disabled = false; }
+        } catch (error) {
+          input.replaceChildren(new Option('暂时无法读取打印机', ''));
+          if (!silent) progress.textContent = error.message;
+        } finally { input.disabled = false; }
       };
+      let reloadTimer;
       bodyEl.addEventListener('input', event => {
         if (['bridge_url', 'token'].includes(event.target.dataset.key)) {
           generation++;
-          input.replaceChildren(new Option('连接已变更，请刷新打印机', ''));
+          input.replaceChildren(new Option('正在连接前台电脑…', ''));
+          clearTimeout(reloadTimer);
+          reloadTimer = setTimeout(() => loadPrinters(true), 500);
         }
       });
+      queueMicrotask(() => loadPrinters(true));
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
@@ -1490,18 +1497,14 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      input.add(new Option(vals[key] || '请刷新并选择打印机', vals[key] || ''));
-
-      const refresh = document.createElement('button');
-      refresh.type = 'button';
-      refresh.textContent = '刷新打印机';
-      refresh.className = 'tool-config-action';
-      extraControls.push(refresh);
+      input.add(new Option(vals[key] || '正在读取打印机…', vals[key] || ''));
 
       const initialize = document.createElement('button');
       initialize.type = 'button';
-      initialize.textContent = '初始化/升级电脑';
+      initialize.textContent = '安装或升级前台桥接';
+      initialize.className = 'ql-printer-init-button';
       const progress = document.createElement('div');
+      progress.className = 'ql-printer-progress';
       progress.setAttribute('aria-live', 'polite');
       extraControls.push(initialize, progress);
       initialize.onclick = async () => {
@@ -1539,7 +1542,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
           if (read('bridge_url') === address) {
             const enabled = bodyEl.querySelector('[data-key="remote_start_enabled"]');
             if (enabled) enabled.value = 'true';
-            await refresh.onclick();
+            await loadPrinters();
           }
         } catch (error) { progress.textContent = error.message; }
         finally { initialize.disabled = false; }
@@ -1548,14 +1551,12 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       let generation = 0;
       const connection = () => ['bridge_url', 'token'].map(k =>
         bodyEl.querySelector(`[data-key="${k}"]`)?.value || '');
-      refresh.onclick = async () => {
+      const loadPrinters = async (silent = false) => {
         const version = ++generation;
         const [bridge_url, token] = connection();
-        if (!bridge_url || !token) {
-          alert('请先填写桥接服务地址和访问令牌');
-          return;
-        }
-        refresh.disabled = true;
+        if (!bridge_url || !token) return;
+        input.disabled = true;
+        input.replaceChildren(new Option('正在读取打印机…', ''));
         try {
           const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1580,17 +1581,22 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
           }
           input.value = result.printers.some(p => p.name === selected) ? selected : '';
         } catch (error) {
-          alert(error.message);
+          input.replaceChildren(new Option('暂时无法读取打印机', ''));
+          if (!silent) progress.textContent = error.message;
         } finally {
-          refresh.disabled = false;
+          input.disabled = false;
         }
       };
+      let reloadTimer;
       bodyEl.addEventListener('input', event => {
         if (['bridge_url', 'token'].includes(event.target.dataset.key)) {
           generation++;
-          input.replaceChildren(new Option('连接已变更，请刷新打印机', ''));
+          input.replaceChildren(new Option('正在连接前台电脑…', ''));
+          clearTimeout(reloadTimer);
+          reloadTimer = setTimeout(() => loadPrinters(true), 500);
         }
       });
+      queueMicrotask(() => loadPrinters(true));
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
