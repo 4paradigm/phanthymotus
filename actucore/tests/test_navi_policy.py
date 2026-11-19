@@ -2650,7 +2650,7 @@ def test_local_translation_continues_at_declared_speed_if_checked(monkeypatch):
     odom = {"vx": .20, "vy": 0., "wz": 0.}
     assert P._local_translation({}, cfg, state, odom, .9, 1.) == (.25, 0.)
     odom["vx"] = .30
-    assert P._local_translation({}, cfg, state, odom, .9, 1.) is None
+    assert P._local_translation({}, cfg, state, odom, .9, 1.) is P.LocalHold.TRANSITION
 
 
 @pytest.mark.parametrize("odom", [{"vx": 0., "vy": -.05, "wz": 0.},
@@ -2658,4 +2658,185 @@ def test_local_translation_continues_at_declared_speed_if_checked(monkeypatch):
 def test_local_prefix_waits_for_motion_off_its_checked_axis(monkeypatch, odom):
     state = _state()
     monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: (.08, 0.))
-    assert P._local_translation({}, _cfg(local_planning=True), state, odom, .9, 1.) is None
+    assert (P._local_translation({}, _cfg(local_planning=True), state, odom, .9, 1.)
+            is P.LocalHold.TRANSITION)
+
+
+@pytest.mark.parametrize("occupied,known", [(False, True), (True, True), (False, False)])
+def test_local_transition_checks_independent_axis_ramp(monkeypatch, occupied, known):
+    import numpy as np
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg, state = _cfg(local_planning=True, scan_geometry=geometry), _state(escape_side=1.)
+    grid_free = np.ones(local_path.SHAPE, dtype=bool)
+    grid_occupied = np.zeros_like(grid_free)
+    row, col = local_path.START
+    grid_occupied[row + 7, col - 6] = occupied
+    grid_free[row + 7, col - 6] = known
+    depth = {"scan_grid": (grid_free, grid_occupied)}
+    monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: (.25, -.10))
+    odom = {"vx": .16, "vy": 0., "wz": 0.}
+    expected = (.25, -.10) if known and not occupied else P.LocalHold.TRANSITION
+    assert P._local_translation(depth, cfg, state, odom, .9, 1.) == expected
+
+
+def test_blocked_transition_keeps_current_detour_and_recovery(monkeypatch):
+    cfg = _cfg(local_planning=True)
+    recovery = P.ClearanceRecovery("right", 4, 100)
+    state = _state(escape_side=1., recovery=recovery)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.9, 1.))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: P.LocalHold.TRANSITION)
+    decision = P._avoid(.2, 0., 0., {}, cfg, P.APPROACHING, "", state, target_distance=2.)
+    assert decision[:3] == (0., 0., 0.)
+    assert state.escape_side == 1. and state.recovery is recovery
+    assert not state.active_scan.attempted
+
+
+def test_command_only_checks_the_ramp_even_for_a_repeated_diagonal(monkeypatch):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg = _cfg(local_planning=True, scan_geometry=geometry)
+    command = (.25, -.10)
+    state = _state(motion_source="command", commanded=(*command, 0.), command_tail=(*command, 0.))
+    monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: command)
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    row, col = local_path.START
+    free[row + 7, col - 6] = False
+    depth = {"scan_grid": (free, np.zeros_like(free))}
+    assert P._local_translation(depth, cfg, state, None, .9, 1.) is P.LocalHold.TRANSITION
+
+
+@pytest.mark.parametrize("odom", [None, {"vx": 0., "vy": 0., "wz": 0.}])
+@pytest.mark.parametrize("already_occluded", [False, True])
+def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monkeypatch, odom,
+                                                                         already_occluded):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state()
+    track = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True,
+                             measured_range_m=2.)
+    observation = [SimpleNamespace(bearing_rad=0., range_m=2.2, range_known=True, observed=False,
+                                   measured_range_m=None, last_obs=(2., 0.))
+                   if already_occluded else track]
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: observation[0])
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.9, 1.))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: (0., -.1))
+
+    stamp = iter(range(1000, 3000, 100))
+
+    def tick():
+        return P.step(detections={"objects": []}, depth=dict(_scene(2.), frame_id=next(stamp)), odom=odom,
+                      config=cfg, state=state, dt=.1)
+
+    assert tick().values[1] == -.1
+    observation[0] = SimpleNamespace(bearing_rad=0., range_m=.5, range_known=True,
+                                     observed=True, measured_range_m=.5)
+    decision = tick()
+    assert decision.status == P.AVOIDING
+    assert decision.distance_m == pytest.approx(2., abs=.01)
+    observation[0] = None
+    decision = tick()
+    assert decision.status == P.AVOIDING and decision.values[1] == -.1
+    assert decision.distance_m == pytest.approx(2., abs=.01)
+
+    # Once the route opens, wait for a live range from the frozen goal.
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2., 1.))
+    decision = tick()
+    assert decision.values == [0.] * 6 and not state.arrived
+    observation[0] = track
+    tick()
+    assert state.goal_anchor is None
+
+
+def test_command_only_stops_before_switching_from_turn_to_translation(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="command", commanded=(0., 0., .4))
+    target = SimpleNamespace(bearing_rad=0., range_m=2.5, range_known=True, observed=True,
+                             measured_range_m=2.5)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+
+    def tick(frame):
+        return P.step(detections={"objects": []}, depth=dict(_scene(2.5), frame_id=frame),
+                      odom=None, config=cfg, state=state, dt=.1)
+
+    assert tick(1000).values == [0.] * 6
+    assert tick(1100).values == [0.] * 6
+    assert tick(1200).values == [0.] * 6
+    assert tick(1300).values == [0.] * 6
+    assert tick(1400).values[0] > 0.
+
+
+def test_lost_motion_feedback_stops_until_new_depth(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="measured", commanded=(.2, 0., 0.))
+    target = SimpleNamespace(bearing_rad=0., range_m=2.5, range_known=True, observed=True,
+                             measured_range_m=2.5)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+
+    def tick(frame, source):
+        depth = dict(_scene(2.5), frame_id=frame, source_frame_id=source)
+        return P.step(detections={"objects": []}, depth=depth,
+                      odom=None, config=cfg, state=state, dt=.1)
+
+    for frame in range(1000, 1600, 100):
+        assert tick(frame, 42).values == [0.] * 6
+    assert state.motion_source == "command"
+    assert tick(1600, 43).values[0] > 0.
+
+
+def test_losing_feedback_during_a_turn_preserves_the_scan_lock(monkeypatch):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry)
+    state = _state(motion_source="measured")
+    state.active_scan.phase = "turn"
+    state.active_scan.attempted = state.active_scan.issued_yaw = True
+
+    def tick(frame):
+        return P.step(detections={"objects": []}, depth=dict(_scene(2.5), frame_id=frame),
+                      odom=None, config=cfg, state=state, dt=.1)
+
+    for frame in range(1000, 1800, 100):
+        assert tick(frame).values == [0.] * 6
+    assert state.active_scan.locked and state.active_scan.attempted
+    assert not state.active_scan.active
+
+
+def test_command_only_cannot_reuse_a_frozen_depth_frame(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, max_depth_age_ms=800)
+    state = _state()
+    target = SimpleNamespace(bearing_rad=0., range_m=2.5, range_known=True, observed=True,
+                             measured_range_m=2.5)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+
+    def tick(received, source):
+        depth = dict(_scene(2.5), frame_id=received, control_ms=received, source_frame_id=source)
+        return P.step(detections={"objects": []}, depth=depth, odom=None,
+                      config=cfg, state=state, dt=.1)
+
+    assert tick(1000, 100).values[0] > 0.
+    assert tick(1800, 100).values[0] > 0.
+    assert tick(1801, 100).status == P.BLIND
+    assert tick(1802, 99).status == P.BLIND
+    assert tick(1803, 101).values[0] > 0.

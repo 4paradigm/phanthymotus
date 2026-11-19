@@ -76,12 +76,15 @@ def test_active_scan_holds_an_occupied_sweep(monkeypatch):
     assert not lookout.begin((1., -1.))
 
 
-def test_pose_only_scan_converges_with_a_300_ms_pose_delay(monkeypatch):
+@pytest.mark.parametrize("start_delay_ms", [0, 250])
+def test_pose_only_scan_converges_with_delayed_pose_and_chassis(monkeypatch, start_delay_ms):
     lookout, geometry, _, _ = _setup(monkeypatch)
     history = {stamp: 0. for stamp in range(99_600, 100_000, 100)}
-    yaw, rate = 0., 0.
-    for stamp in range(100_000, 107_000, 100):
-        yaw += rate * .1
+    yaw, rate, turn_start = 0., 0., None
+    for stamp in range(100_000, 115_000, 100):
+        if turn_start is not None:
+            moving_ms = min(100, max(0, stamp - turn_start - start_delay_ms))
+            yaw += rate * moving_ms / 1000
         history[stamp] = yaw
         measured = stamp - 300
         pose = PlanarPose(measured, ("odom", "body"), 0., 0., history[measured])
@@ -92,7 +95,8 @@ def test_pose_only_scan_converges_with_a_300_ms_pose_delay(monkeypatch):
         }, geometry, receipt_only=True)
         if stamp == 100_000:
             assert lookout.begin((-1., 1.))
-        rate = lookout.command(geometry, .31, .83, 300, min_yaw_rate=.33).yaw
+        rate = lookout.command(geometry, .31, .83, 300, min_yaw_rate=.33, now_ms=stamp).yaw
+        turn_start = (turn_start if turn_start is not None else stamp) if rate else None
         assert abs(yaw) <= scan.RECEIPT_ANGLE + scan.ANGLE_TOLERANCE
         if lookout.ready:
             break
@@ -110,6 +114,59 @@ def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(m
     lookout.update(_depth(1250), None, geometry)
     assert not lookout.active
     assert not lookout.begin((1., -1.))
+
+
+@pytest.mark.parametrize("lose_depth", [False, True])
+def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1., -1.))
+    rates = []
+    first_turn = None
+    for stamp in range(1100, 7400, 100):
+        depth = None if lose_depth and first_turn is not None else _depth(stamp)
+        look.observe_single(depth, geometry, 800, stamp)
+        command = look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33)
+        if command.yaw and first_turn is None:
+            first_turn = stamp
+        rates.append(command.yaw)
+        if lose_depth and first_turn is not None and depth is None:
+            assert command.yaw == 0 and not look.active
+            return
+        if look.ready:
+            break
+    assert first_turn is not None
+    nonzero = [rate for rate in rates if rate]
+    assert 3 <= len(nonzero) <= 4 and all(rate < 0 for rate in nonzero)
+    assert look.ready and look.current_frame > first_turn + scan.RECEIPT_SETTLE_MS
+    assert len(look.views) == 1 and not look.poses
+
+
+def test_command_only_scan_requires_observed_swept_space(monkeypatch):
+    look, geometry, free, _ = _setup(monkeypatch)
+    free[:] = False
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1.,))
+    for stamp in range(1100, 1700, 100):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        assert look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33).yaw == 0.
+    assert not look.active
+
+
+def test_command_only_scan_uses_capture_time_for_post_stop_frames(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1.,))
+    look.phase, look.settle_ms = "settle", 1000
+    look.timed_phase_s = scan.RECEIPT_SETTLE_MS / 1000
+    for stamp in (4501, 4600, 4700):
+        look.observe_single(dict(_depth(stamp), capture_ms=4400), geometry, 800, stamp)
+        assert look.command(geometry, .31, .83, 300).yaw == 0.
+    assert not look.ready and look.settle_frames == 0
+    for stamp in (4800, 4900, 5000):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        assert look.command(geometry, .31, .83, 300).yaw == 0.
+    assert look.ready
 
 
 def test_scan_rejects_unexpected_yaw_rate(monkeypatch):

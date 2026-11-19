@@ -340,6 +340,7 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
     card = _card(wz_max=.4)
     cfg = card._config
     cfg.local_planning = True
+    cfg.odom_expected = True
     cfg.half_width_m = .23
     cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
                                                   (480, 420, 243), .23)
@@ -1790,8 +1791,10 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
-@pytest.mark.parametrize("depth_age_ms,depth_limit_ms", [(50, None), (700, 800)])
-def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms):
+@pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom",
+                         [(50, None, True), (700, 800, True), (50, None, False)])
+def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
+                                                          with_odom):
     import numpy as np
     from plugins.navi import local_path, policy
 
@@ -1800,10 +1803,13 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     card._executor = object()
     card._open_publisher = lambda: setattr(card, "_node", node)
     odom_topic = "/demo/state/odom"
+    input_topics = [_OBJECTS_TOPIC, _DEPTH_TOPIC]
+    if with_odom:
+        input_topics.append(odom_topic)
     declaration = _decl(_DEPTH_TOPIC, id="demo/camera_front", distortion_model="pinhole",
                         K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
     reply = card.dispatch("navi", {
-        "action": "start", "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC, odom_topic],
+        "action": "start", "input_topics": input_topics,
         "control_interface": _descriptor(footprint={"half_width": 0.23},
                                          rate={"max_hz": 20, "watchdog_ms": 600,
                                                "max_obs_age_ms": 500}),
@@ -1821,8 +1827,9 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     card._depth_ground = np.zeros_like(card._depth_map, dtype=bool)
     depth_stamp = 123_000 - depth_age_ms
     card._depth_ms = depth_stamp
-    card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
-    card._odom_ms = 123_000
+    if with_odom:
+        card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+        card._odom_ms = 123_000
     monkeypatch.setattr(
         policy, "_clearance",
         lambda depth, config, lateral_offset_m=0: (
@@ -1834,6 +1841,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         return local_path.Detour((.04, -.06), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
 
     monkeypatch.setattr(local_path, "_checked_translation", plan)
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (free, ~free))
     for index in range(6):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
@@ -1848,8 +1857,9 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
     assert card._state.view_detour is None
     assert card.next_command() is None
-    card._depth_ms = depth_stamp
-    card._odom_ms = 0
-    stop = card.next_command()
-    assert stop["values"] == [0.0] * 6
-    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+    if with_odom:
+        card._depth_ms = depth_stamp
+        card._odom_ms = 0
+        stop = card.next_command()
+        assert stop["values"] == [0.0] * 6
+        assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000

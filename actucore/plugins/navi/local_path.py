@@ -253,6 +253,27 @@ class PlanCache:
         return detour.command if detour is not None else None
 
 
+def transition_clear(grid, geometry, half_width, horizon_s, velocities):
+    """Check the swept rectangle for independent forward and lateral ramps."""
+    free, occupied = grid
+    forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
+    rear = -geometry.rear + min(0., *forward)
+    front = geometry.front + max(0., *forward)
+    left = -half_width + min(0., *right)
+    right_edge = half_width + max(0., *right)
+    half = RESOLUTION / 2
+    if (rear < FORWARD[0, 0] - half or front > FORWARD[-1, 0] + half
+            or left < RIGHT[0, 0] - half or right_edge > RIGHT[0, -1] + half):
+        return False
+    swept = ((FORWARD + half > rear) & (FORWARD - half < front)
+             & (RIGHT + half > left) & (RIGHT - half < right_edge))
+    added = ((rear < -geometry.rear) & (FORWARD - half < -geometry.rear)
+             | (front > geometry.front) & (FORWARD + half > geometry.front)
+             | (left < -half_width) & (RIGHT - half < -half_width)
+             | (right_edge > half_width) & (RIGHT + half > half_width))
+    return not (swept & (occupied | (added & ~free))).any()
+
+
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True):
     (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
