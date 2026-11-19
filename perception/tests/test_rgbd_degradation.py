@@ -339,6 +339,94 @@ def test_fallback_keeps_the_frozen_fusion_recovery_window(fused):
     assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
 
 
+@pytest.mark.parametrize('failure,period_ms,budget_ms', [
+    ('visual_rejection', 500, 2_400),
+    ('fusion_failure', 500, 2_400),
+    ('fusion_failure', 700, 3_000),
+    ('fusion_failure_during_pause', 500, 2_400),
+    ('inertial_expiry', 500, 2_400),
+])
+def test_fast_source_slow_native_results_have_time_for_measured_recovery(
+        fused, failure, period_ms, budget_ms):
+    from test_rgbd_fusion import images as fusion_images
+
+    make, now, ticks = fused
+    s = make()
+    s.gate.recovery_policy = s.fusion.recovery_policy = runtime.RecoveryPolicy()
+    color, depth = fusion_images()
+    next_input = next_imu = 1_000*MS
+
+    def advance(deadline):
+        nonlocal next_input, next_imu
+        while next_imu <= deadline:
+            now[0] = next_imu
+            imu(s, next_imu)
+            next_imu += 5*MS
+        while next_input <= deadline:
+            s.gate.input(next_input)
+            next_input += 33_333_333
+        ticks[0] = now[0] = deadline
+        s.fusion.input_period_ns = s.gate.input_period_ns
+
+    def result(stamp, *, lost=False):
+        advance(stamp)
+        if s._fusing():
+            assert s.observations.add_frame(stamp, color, depth, now[0]) == []
+        advance(stamp+400*MS)
+        msg, info = native(s, stamp, lost=lost)
+        s._result('pose', msg)
+        s._result('info', info)
+
+    period = period_ms*MS
+    anchor = 1_000*MS + 6*period
+    for stamp in range(1_000*MS, anchor+1, period):
+        result(stamp)
+    assert last(s)['pose'] is not None
+    assert s.fusion.last_tracking[0] == anchor
+    assert s.gate.input_period_ns == 33_333_333
+
+    if failure != 'fusion_failure':
+        result(anchor+period, lost=True)
+        pause = s.fusion.pause_context
+        assert last(s)['pose'] is None
+        assert pause.budget_ns == budget_ms*MS
+
+    if failure == 'inertial_expiry':
+        advance(anchor+1_405*MS)
+        sample = s.fusion.watchdog_output(now[0])
+        assert s.fusion.state == 'lost' and 'inertial bridge' in s.fusion.reason
+        assert sample['vendor']['fusion']['prediction'] is None
+        return
+
+    if failure != 'visual_rejection':
+        s.fusion.fault('measured IMU unavailable')
+        s._check_fusion(now[0])
+        if failure == 'fusion_failure_during_pause':
+            assert s.gate.pause_context is pause
+        assert s.gate.pause_context.budget_ns == budget_ms*MS
+        assert s.gate.good == 0
+
+    first_offset = period if failure == 'fusion_failure' else 2*period
+    for count in range(3):
+        result(anchor+first_offset+count*period)
+        assert (last(s)['pose'] is not None) == (count == 2)
+    assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
+
+
+def test_fallback_does_not_count_cancelled_fusion_captures(fused):
+    make, now, _ = fused
+    s = make()
+    pending_stamp = 1_510*MS
+    s.observations.add_frame(pending_stamp, None, None, pending_stamp)
+    track_fused(s, now)
+    assert s.gate.state == 'recovering'
+    feed(s, now, pending_stamp)
+    assert s.gate.good == 0
+    for count, stamp in enumerate((1_600*MS, 1_700*MS, 1_800*MS)):
+        feed(s, now, stamp)
+        assert (last(s)['pose'] is not None) == (count == 2)
+
+
 def test_fallback_that_never_tracks_is_bounded(fused):
     make, now, _ = fused
     s = make()

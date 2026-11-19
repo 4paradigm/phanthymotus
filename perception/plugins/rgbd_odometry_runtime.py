@@ -464,11 +464,13 @@ class CaptureObservations:
     def has_capacity(self):
         return len(self.frames) < self.MAX_IN_FLIGHT
 
+    def _native_period_ns(self):
+        return int(np.median(self.native_intervals)) if self.native_intervals else None
+
     def _wait_budget(self):
         latency = (int(np.percentile(self.native_delays, 90))+75_000_000
                    if len(self.native_delays) >= 4 else 500_000_000)
-        cadence = (int(np.median(self.native_intervals))
-                   if self.native_intervals else 0)
+        cadence = self._native_period_ns() or 0
         capture_period = getattr(self.fusion, 'input_period_ns', None) or 0
         return min(MAX_FRAME_AGE_NS, max(250_000_000, latency, self.retry_wait_ns,
                                         2*max(cadence, capture_period)))
@@ -504,6 +506,9 @@ class CaptureObservations:
                 if self.last_native_received is not None and now > self.last_native_received:
                     self.native_intervals.append(now-self.last_native_received)
                 self.last_native_received = now
+                if len(self.native_intervals) >= 5:
+                    self.fusion.result_period_ns = self._native_period_ns()
+                    self.fusion.native_processing_p95_ns = int(np.percentile(self.native_delays, 95))
         return self.drain(now)
 
     def _visual(self, stamp, entry):
@@ -1243,9 +1248,10 @@ class RgbdSession:
             info = self.observations.last_tracking_info
             if info is not None and stamp_ns(info) == stamp:
                 gate.anchor_info = info
+            self.fusion._start_pause()
             pause = self.fusion.pause_context
             if pause is not None:
-                # Keep the pause already promised to downstream mapping.
+                # Reuse the measured cadence and any deadline already promised to mapping.
                 gate.pause_context = pause
                 gate.recover_by = now + max(0, pause.deadline_monotonic_ns - time.monotonic_ns())
             gate.degrade(reason, now)
@@ -1424,6 +1430,9 @@ class RgbdSession:
                     self._check_fusion(time.time_ns())
                 return
             stamp, now = stamp_ns(msg), time.time_ns()
+            if getattr(self, 'fallback', None) is not None and stamp <= self.observations.last_added:
+                # In-flight fusion captures were canceled at the handoff.
+                return
             if (kind == 'info' and msg.lost and
                     stamp > max(self.gate.last_stamp, self.gate.last_result_stamp) and
                     -50_000_000 <= now-stamp <= 1_500_000_000):

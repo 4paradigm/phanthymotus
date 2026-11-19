@@ -249,9 +249,6 @@ SIGMA_LIMIT_M = .20
 INERTIAL_LIMIT_NS = 1_000_000_000
 MAX_IMU_GAP_NS = 100_000_000
 MAX_BRIDGE_NS = 2_000_000_000
-# Wall-clock polls lag capture time by native latency. Frames resolve within the
-# 250 ms join deadline, so 500 ms without any processed frame (>= 4 Hz) means
-# frames stopped, not that the pipeline is merely latent.
 FRAME_SILENCE_NS = 500_000_000
 # Off-lock registration has its own bounded wait after visual resolution.
 # CaptureObservations holds subsequent filter updates within this deadline.
@@ -289,6 +286,8 @@ class ShortTermFusion:
         self.last_tracking = None
         self.recovery_policy = self.pause_context = None
         self.input_period_ns = self.processing_p95_ns = None
+        self.result_period_ns = self.native_processing_p95_ns = None
+        self.bridge_budget_ns = INERTIAL_LIMIT_NS
         # Optional off-lock registration (GeometryWorker); None runs inline.
         self.geometry_runner = self.geometry_job = None
         self.revision = 0
@@ -297,10 +296,17 @@ class ShortTermFusion:
     def _start_pause(self):
         if self.pause_context is None and self.last_tracking is not None and self.recovery_policy is not None:
             import time
-            self.pause_context = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, time.monotonic_ns())
+            started = time.monotonic_ns()
+            bridge = self.recovery_policy.begin(self.input_period_ns, self.processing_p95_ns, started)
+            self.bridge_budget_ns = min(MAX_BRIDGE_NS, bridge.budget_ns)
+            # Native result cadence budgets measured recovery. Pure inertial
+            # propagation keeps its original capture-rate bound.
+            tails = [v for v in (self.processing_p95_ns, self.native_processing_p95_ns) if v is not None]
+            self.pause_context = self.recovery_policy.begin(self._frame_period_ns(), max(tails, default=None), started)
 
-    def _bridge_budget(self):
-        return min(MAX_BRIDGE_NS, self.pause_context.budget_ns) if self.pause_context else INERTIAL_LIMIT_NS
+    def _frame_period_ns(self):
+        periods = [v for v in (self.input_period_ns, self.result_period_ns) if v is not None]
+        return max(periods, default=None)
 
     def fault(self, reason, kind='fusion'):
         if self.state != 'lost':
@@ -326,7 +332,7 @@ class ShortTermFusion:
 
     def _frame_silence_ns(self):
         # The watchdog and capture-order path use the same measured cadence.
-        return max(FRAME_SILENCE_NS, min(INERTIAL_LIMIT_NS, 2*(self.input_period_ns or 0)))
+        return max(FRAME_SILENCE_NS, min(INERTIAL_LIMIT_NS, 2*(self._frame_period_ns() or 0)))
 
     def status(self, now_ns):
         """Wall-clock health for watchdog/info; never judges covariance or
@@ -338,7 +344,7 @@ class ShortTermFusion:
                     now_ns-self.last_processed_ns > self._frame_silence_ns()):
                 self.state, self.reason = 'coasting', 'camera frames delayed'
                 self._start_pause()
-            if self.last_visual_wall and now_ns-self.last_visual_wall > self._bridge_budget():
+            if self.last_visual_wall and now_ns-self.last_visual_wall > self.bridge_budget_ns:
                 self.fault('visual correction absent beyond the inertial bridge')
         return self.state
 
@@ -353,7 +359,7 @@ class ShortTermFusion:
                 # missing/rejected corrections reset it in observe_frame.
                 self.state, self.reason, self.good = 'coasting', 'visual correction delayed', 0
                 self._start_pause()
-            if stamp-self.last_visual > self._bridge_budget():
+            if stamp-self.last_visual > self.bridge_budget_ns:
                 self.fault('visual correction absent beyond the inertial bridge')
 
     def position_sigma(self):
@@ -664,6 +670,7 @@ class ShortTermFusion:
             self._start_pause()
         elif self.state == 'tracking':
             self.pause_context = None
+            self.bridge_budget_ns = INERTIAL_LIMIT_NS
         diagnostic.update(state=self.state, aid=self.aid)
         self.frames.append(diagnostic)
         return self.output(stamp)
@@ -682,7 +689,7 @@ class ShortTermFusion:
         if self.state != 'coasting' or self.filter is None or not self.last_tracking or not self.samples:
             return self.output(stamp)
         latest = self.samples[-1][0]
-        if not (self.filter.stamp <= latest <= self.last_visual+self._bridge_budget() and
+        if not (self.filter.stamp <= latest <= self.last_visual+self.bridge_budget_ns and
                 0 <= now_ns-latest <= MAX_IMU_GAP_NS):
             return self.output(stamp, allow_prediction=False)
         if latest == self.filter.stamp:
