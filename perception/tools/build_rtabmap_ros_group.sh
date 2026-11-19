@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build JP5.11 ROS package groups in separate, reusable Docker layers.
+# Build ROS package groups in separate, reusable Docker layers.
 set -e
 . /opt/ros/humble/install/setup.bash
 if [ -f /opt/rtabmap_ros/setup.bash ]; then
@@ -12,13 +12,19 @@ case "$group" in
         candidates='geometry_msgs tf2 tf2_ros tf2_py tf2_ros_py tf2_eigen tf2_geometry_msgs message_filters'
         ;;
     support)
-        candidates='rtabmap_msgs pcl_conversions pcl_ros diagnostic_updater cv_bridge image_geometry image_transport laser_geometry rtabmap_conversions rtabmap_sync rtabmap_util'
+        candidates='rtabmap_msgs pcl_conversions pcl_ros diagnostic_updater cv_bridge image_geometry image_transport laser_geometry rtabmap_conversions rtabmap_sync'
+        ;;
+    util)
+        candidates='rtabmap_util'
+        ;;
+    odom)
+        candidates='rtabmap_odom'
         ;;
     slam)
-        candidates='rtabmap_odom rtabmap_slam'
+        candidates='rtabmap_slam'
         ;;
     *)
-        echo "[rtabmap-build] unknown JP5.11 group: $group" >&2
+        echo "[rtabmap-build] unknown ROS group: $group" >&2
         exit 2
         ;;
 esac
@@ -47,7 +53,7 @@ test -f "$rtabmap_rcutils"
 test -f "$rtabmap_builtin"
 test -f "$rtabmap_crypto"
 
-echo "[rtabmap-build] JP5.11 $group packages: ${selected[*]}"
+echo "[rtabmap-build] ROS $group packages: ${selected[*]}"
 # Review builds are terminated after 600 seconds without output. Large C++
 # translation units can remain silent; emit a heartbeat every 60 seconds.
 # A failed colcon command still returns its real error code.
@@ -58,7 +64,7 @@ import sys
 import time
 while True:
     time.sleep(60)
-    print("[rtabmap-build] JP5.11 " + sys.argv[1] + " still compiling...", flush=True)
+    print("[rtabmap-build] ROS " + sys.argv[1] + " still compiling...", flush=True)
 ' "$group" &
 heartbeat_pid=$!
 cleanup_heartbeat() {

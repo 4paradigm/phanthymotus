@@ -1,0 +1,67 @@
+--- a/rtabmap_util/include/rtabmap_util/MapsManager.h
++++ b/rtabmap_util/include/rtabmap_util/MapsManager.h
+@@ -84,6 +84,11 @@
+ 			const std::map<int, rtabmap::Transform> & poses,
+ 			const rclcpp::Time & stamp,
+ 			const std::string & mapFrameId);
++	void publishMaps(
++			const std::map<int, rtabmap::Transform> & poses,
++			const rclcpp::Time & stamp,
++			const std::string & mapFrameId,
++			std::size_t maxCloudPoints, bool refreshCloud);
+ 
+ 	cv::Mat getGridMap(
+ 			float & xMin,
+--- a/rtabmap_util/src/MapsManager.cpp
++++ b/rtabmap_util/src/MapsManager.cpp
+@@ -708,6 +708,15 @@
+ 		const std::map<int, rtabmap::Transform> & poses,
+ 		const rclcpp::Time & stamp,
+ 		const std::string & mapFrameId)
++{
++	publishMaps(poses, stamp, mapFrameId, 0, false);
++}
++
++void MapsManager::publishMaps(
++		const std::map<int, rtabmap::Transform> & poses,
++		const rclcpp::Time & stamp,
++		const std::string & mapFrameId,
++		std::size_t maxCloudPoints, bool refreshCloud)
+ {
+ 	UDEBUG("Publishing maps... poses=%d", (int)poses.size());
+ 
+@@ -984,7 +993,7 @@
+ 			(assembledGround_->empty() && assembledObstacles_->empty()) ||
+ 			(cloudGroundPub_->get_subscription_count() && !latched_.at(&cloudGroundPub_)) ||
+ 			(cloudObstaclesPub_->get_subscription_count() && !latched_.at(&cloudObstaclesPub_)) ||
+-			(cloudMapPub_->get_subscription_count() && !latched_.at(&cloudMapPub_)))
++			(cloudMapPub_->get_subscription_count() && (refreshCloud || !latched_.at(&cloudMapPub_))))
+ 		{
+ 			if(cloudGroundPub_->get_subscription_count())
+ 			{
+@@ -1006,7 +1015,24 @@
+ 			}
+ 			if(cloudMapPub_->get_subscription_count())
+ 			{
+-				pcl::PointCloud<pcl::PointXYZRGB> cloud = *assembledObstacles_ + *assembledGround_;
++				pcl::PointCloud<pcl::PointXYZRGB> cloud;
++				const auto obstacles = assembledObstacles_->size();
++				const auto total = obstacles + assembledGround_->size();
++				if(maxCloudPoints && total > maxCloudPoints)
++				{
++					cloud.reserve(maxCloudPoints);
++					for(std::size_t i=0; i<maxCloudPoints; ++i)
++					{
++						const auto index = i*total/maxCloudPoints;
++						cloud.push_back(index < obstacles ? assembledObstacles_->at(index) :
++								assembledGround_->at(index-obstacles));
++					}
++					cloud.is_dense = assembledGround_->is_dense && assembledObstacles_->is_dense;
++				}
++				else
++				{
++					cloud = *assembledObstacles_ + *assembledGround_;
++				}
+ 				sensor_msgs::msg::PointCloud2::UniquePtr cloudMsg(new sensor_msgs::msg::PointCloud2);
+ 				pcl::toROSMsg(cloud, *cloudMsg);
+ 				cloudMsg->header.stamp = stamp;

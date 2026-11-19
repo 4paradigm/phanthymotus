@@ -1,5 +1,6 @@
 """Compile and execute the same capture-hint helper installed into RTAB-Map."""
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -34,22 +35,29 @@ def test_capture_hint_policy(native_rotation_hint, case):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_rotation_hint_capability_marker_requires_successful_native_build(tmp_path):
+@pytest.mark.parametrize('build_status', [0, 37])
+def test_rotation_hint_capability_marker_requires_successful_native_build(tmp_path, build_status):
     # Execute the real Docker build shell; only unavailable network/compiler
     # dependencies use the existing fixture, not the marker creation itself.
-    from test_rtabmap_cache_layers import layers, run_layer, shell_fixture
-    _, _, fetch, build = layers()
+    from test_rtabmap_cache_layers import DOCKERFILE, layers, run_layer, shell_fixture
+    _, _, fetch, _ = layers()
     prelude = shell_fixture(tmp_path)
     fetched = run_layer(fetch, tmp_path, prelude)
     assert fetched.returncode == 0, fetched.stdout + fetched.stderr
     marker = tmp_path / 'install/share/rtabmap_odom/motus_rotation_hint_v1'
-    failed = run_layer(build, tmp_path, prelude, build_status=37)
-    assert failed.returncode == 37
-    assert not marker.exists()
-    succeeded = run_layer(build, tmp_path, prelude)
-    assert succeeded.returncode == 0, succeeded.stdout + succeeded.stderr
-    assert marker.is_file()
-    assert marker.read_bytes() == b'motus_rotation_hint/1\n'
+    recipe = DOCKERFILE.read_text().replace('\\\n', ' ')
+    for command in re.findall(r'^RUN (.*)$', recipe, re.M):
+        if '/tmp/build_rtabmap_ros_group.sh' not in command:
+            continue
+        status = build_status if command.endswith(' odom') else 0
+        result = run_layer(command, tmp_path, prelude, build_status=status)
+        assert result.returncode == status, result.stdout + result.stderr
+        if status:
+            break
+    if build_status:
+        assert not marker.exists()
+    else:
+        assert marker.read_bytes() == b'motus_rotation_hint/1\n'
 
 
 def test_native_odometry_patch_removes_the_wrapper_timestamp_admission_gate():
