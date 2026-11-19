@@ -366,14 +366,15 @@ def test_ground_fit_keeps_sparse_missing_pixels_unclassified():
     assert not ground[missing].any()
 
 
-def test_ground_mask_keeps_a_surface_two_centimetres_above_the_floor():
+@pytest.mark.parametrize(("height_m", "is_ground"), [(.018, True), (.021, False)])
+def test_ground_mask_checks_the_two_centimetre_upper_tolerance(height_m, is_ground):
     from plugins.navi.camera import HorizontalIntrinsics
 
     frame = _floor_scene()
-    frame[380:408, 160:480] *= 0.4 / 0.42
+    frame[380:408, 160:480] *= (0.42 - height_m) / 0.42
     ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
     assert ground is not None
-    assert not ground[380:408, 160:480].any()
+    assert np.all(ground[380:408, 160:480] == is_ground)
 
 
 def test_a_broad_raised_platform_does_not_replace_the_floor():

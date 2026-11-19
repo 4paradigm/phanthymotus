@@ -2490,6 +2490,32 @@ def test_local_planning_holds_instead_of_using_an_unchecked_avoidance_turn():
     assert "局部规划" in decision.reason
 
 
+def test_local_detour_starts_closer_while_slowing_earlier(monkeypatch):
+    cfg, state = _cfg(local_planning=True, obstacle_stop_m=.60, slow_distance_m=1.50), _state()
+    ahead = 1.35
+    attempts = []
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.0 if lateral_offset_m else ahead, 1.0))
+
+    def plan(depth, config, state, odom, ahead, side):
+        attempts.append(ahead)
+        return (0., -.06 * side)
+
+    monkeypatch.setattr(P, "_local_translation", plan)
+
+    def avoid():
+        return P._avoid(.20, 0., 0., _scene(3.), cfg, P.APPROACHING, "", state,
+                        target_distance=3., measured_vx=0.)
+
+    assert 0. < avoid()[0] < .20
+    assert attempts == []
+    ahead = 1.15
+    assert abs(avoid()[1]) == .06
+    ahead = 1.35
+    assert abs(avoid()[1]) == .06
+    assert attempts == [1.15, 1.35]
+
+
 def test_local_planner_tries_other_side_if_preferred_route_would_advance_near_obstacle(monkeypatch):
     cfg = _cfg(local_planning=True)
     state = _state()

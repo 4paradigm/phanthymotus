@@ -1616,7 +1616,11 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     side = 0.0
     local_command = None
     scan = state.active_scan if config.local_planning and state is not None else None
-    if near or (approaching and foreground):
+    plan_at = slow
+    if config.local_planning and not (scan and (state.escape_side or scan.ready or scan.result_frame)):
+        # Slow down first. Start a new detour one third into the slowdown band.
+        plan_at = slow - (slow - stop) / 3
+    if near or (foreground and ahead < plan_at):
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}

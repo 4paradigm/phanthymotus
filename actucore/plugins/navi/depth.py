@@ -232,7 +232,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
 
         distance = (v[:, None] - a * u[None, :] - b) * depth_m - c
         # Be stricter above the plane to retain low obstacles.
-        ground = (distance >= -0.015) & (distance <= _GROUND_TOLERANCE_M)
+        ground = (distance >= -0.020) & (distance <= _GROUND_TOLERANCE_M)
         # Verify the fit farther into the scene to reject a raised platform
         # occupying most of the bottom band.
         far_end = 0.78 if visible_span is not None else 0.7375
