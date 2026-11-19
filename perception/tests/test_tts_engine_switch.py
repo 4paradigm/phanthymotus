@@ -361,7 +361,7 @@ def test_engines_are_named_after_the_model_not_the_runtime():
     visible.
     """
     assert set(tts.TTS_ENGINES) == {"vits2-zh-en", "matcha-zh-en", "mms-th",
-                                    "kokoro-multi"}
+                                    "kokoro-multi", "xiaoyou-zh-en"}
     assert tts.DEFAULT_TTS_ENGINE == "vits2-zh-en"
     for engine in tts.TTS_ENGINES:
         assert "_" not in engine, "asr_model uses hyphens; do not mix separators"

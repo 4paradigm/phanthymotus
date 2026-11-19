@@ -34,5 +34,11 @@ def _register_builtin_adapters():
     except ImportError as e:
         print(f'[channel] lan adapter unavailable ({e})')
 
+    try:
+        from channel.adapters.qq_official import QQOfficialAdapter
+        register_adapter('qq', QQOfficialAdapter)
+    except ImportError:
+        print('[channel] QQ adapter unavailable (missing official SDK)')
+
 
 _register_builtin_adapters()

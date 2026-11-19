@@ -722,7 +722,7 @@ RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
       esac; \
     fi
 
-# Darvin only passes the instance ports to the reference image.
+# Darvin startup must be selected explicitly for benchmark images.
 ARG XIAOYOU_TTS_DARVIN=1
 ENV XIAOYOU_TTS_DARVIN=${XIAOYOU_TTS_DARVIN}
 ENV XIAOYOU_TTS_IMAGE_JP=${JP_VERSION}

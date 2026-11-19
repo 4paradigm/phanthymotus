@@ -21,22 +21,27 @@ from urllib.request import Request, urlopen
 SOURCE_SHA = 'a46bd6826d1074b93bc7a17379966d88005cd248136acd24aab4b6883e689bb0'
 
 FRONTEND_FILE = 'frontend/phonemizer.py'
-FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7ce1db0dc5'
+FRONTEND_SHA = '4d992c0b727e066c39de02fe0f53dc7d564b0347323225685320b4f7360ddbc3'
+_RELEASE_FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7ce1db0dc5'
 
 NORMALIZATION_REVISION = '01yuewen-contextual-polyphones-compact-20261118'
 
 NORMALIZATION_MODULE_SHAS = {
-    'frontend/normalization.py': '839d57f1c99a2ccd04780f117fc377f523e5447cb901f772b1da6b8cbec39047',
-    'frontend/numbers.py': 'f8941874f830b6808831df53e581de65574c01a1189346f026ae1141145888c4',
-    'frontend/pronunciation.py': '37f97358f67e9f7d57706640045a0a07b04e4399057953f46e5c2b4a8351ba23',
-    'frontend/segmentation.py': 'd94d38877734783911b10063215e0e8a80ece7729031c0dc2ac3b0e85dcfbd8d',
+    'frontend/numbers.py': '2c9042a1a8aae90c8ef755a079198e5b0220d6f7fc43c5d54aa885d8d165b75d',
+}
+_SHARED_FRONTEND_SHAS = {
+    'vits2_tts_trt/frontend/number_context.py': 'bc36994de1693f6e6993a5610a1ddb4245af3103134355bc05cff6db549c39c3',
+    'vits2_tts_trt/frontend/math_units.py': 'a612a5759ac981fb32911a921b79656cb2ac2d3ba4170a4ef1cfd982ab8a8ec0',
+    'vits2_tts_trt/frontend/numeric_formats.py': 'cb3fe35c3ba29fe697368ba54b37a7fda82f4ed15aa31a65e55a0562858d974f',
 }
 
-# The immutable checkpoint manifest records the pre-refactor source. The
-# installed source must still match the current hashes above.
+# The immutable model manifest records the source from its original export.
+# The installed frontend is verified against the current hashes above.
 _RELEASE_NORMALIZATION_MODULE_SHAS = {
-    **NORMALIZATION_MODULE_SHAS,
+    'frontend/normalization.py': '839d57f1c99a2ccd04780f117fc377f523e5447cb901f772b1da6b8cbec39047',
     'frontend/numbers.py': 'b89d92f17e977f58e0889d6f77050724e5307b15a05d35b3b3c4bb2984a68d57',
+    'frontend/pronunciation.py': '37f97358f67e9f7d57706640045a0a07b04e4399057953f46e5c2b4a8351ba23',
+    'frontend/segmentation.py': 'd94d38877734783911b10063215e0e8a80ece7729031c0dc2ac3b0e85dcfbd8d',
 }
 
 TERMS_FILE = 'frontend/terms.json'
@@ -54,7 +59,9 @@ VOICE_ID = '01yuewen'
 
 NATIVE_WEIGHTS_SHA = 'f33dcf83714f3c42cbdad5c85a6ec09d1e69bec29e6c173992bff429f72852f9'
 
+# The published archive records the pre-merge excitation source.
 PHASE_DSP_SHA = '82e542dc0d002ff5214779ae568b66407cd0f2770495bb7614fc58bc3804a4b4'
+SYNTHESIS_SOURCE_SHA = '7099f9502cd38d56d027638f9d3191203af397a79f1c4e7115a8d746153d5d85'
 
 STYLE_FILE_SHA = '1c0c128370aa247bbf3eb77bf798c0f7d4d4583074f9d582e314c4a0570ca13c'
 
@@ -151,7 +158,7 @@ def validate_frontend_files(front, directory):
     """Bind model metadata, the fixed Git contract and real package files."""
     if not isinstance(front, dict) or (
             front.get('abi') != PHONE_ABI
-            or front.get('source_sha256') != FRONTEND_SHA
+            or front.get('source_sha256') != _RELEASE_FRONTEND_SHA
             or front.get('terms_file') != TERMS_FILE
             or front.get('terms_sha256') != TERMS_SHA
             or front.get('vocab_sha256') != VOCAB_SHA
@@ -160,11 +167,12 @@ def validate_frontend_files(front, directory):
         raise ValueError('Xiaoyou frontend metadata differs from the fixed source contract')
     root = Path(directory).resolve()
     files = {FRONTEND_FILE: FRONTEND_SHA, **NORMALIZATION_MODULE_SHAS}
-    for name, expected in files.items():
-        path = root / name
-        if (path.is_symlink() or not path.is_file()
-                or root not in path.resolve().parents or sha(path) != expected):
-            raise ValueError('Xiaoyou frontend source missing, linked or SHA-mismatched: ' + name)
+    for package_root, sources in ((root, files), (root.parent, _SHARED_FRONTEND_SHAS)):
+        for name, expected in sources.items():
+            path = package_root / name
+            if (path.is_symlink() or not path.is_file()
+                    or package_root not in path.resolve().parents or sha(path) != expected):
+                raise ValueError('Xiaoyou frontend source missing, linked or SHA-mismatched: ' + name)
     return dict(files)
 
 

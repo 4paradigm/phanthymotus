@@ -39,6 +39,7 @@ _DENIED_TOOLS = {
     'subagent_cancel', 'subagent_message', 'subagent_result',
     'update_memory', 'activate_skill', 'deactivate_skill',
     'task_create', 'task_update', 'task_done', 'task_fail',
+    'schedule_create', 'schedule_cancel',
 }
 
 

@@ -2568,7 +2568,7 @@ class TTSPlugin:
                 engine != self._impl_engine or self._impl is None)
             if engine == XIAOYOU_TTS_ENGINE:
                 if switching:
-                    from plugins.xiaoyou_tts.runtime.frontend_worker import require_runtime
+                    from plugins.xiaoyou_tts.frontend.phonemizer import require_runtime
 
                     try:
                         require_runtime()
