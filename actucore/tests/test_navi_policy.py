@@ -2606,7 +2606,8 @@ def test_shared_search_prefers_the_observed_open_side_if_forward_is_blocked(monk
 
 
 @pytest.mark.parametrize("use_lateral", [True, False])
-def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch, use_lateral):
+@pytest.mark.parametrize("front", [.59, 1.30])
+def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch, use_lateral, front):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
 
@@ -2627,7 +2628,7 @@ def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch,
             return 2.50, .95
         if lateral_offset_m > 0.:
             return .80, .95
-        return (2.50 if state.active_scan.pose[2] < -.30 else 1.30), .95
+        return (2.50 if state.active_scan.pose[2] < -.30 else front), .95
 
     monkeypatch.setattr(P, "_clearance", clearance)
     frame = np.ones((4, 4))
@@ -2649,6 +2650,173 @@ def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch,
             break
     else:
         pytest.fail("The settled scan did not release a straight segment")
+
+
+@pytest.mark.parametrize("fault", [
+    "none", "depth_gap", "odom_gap", "sweeps_blocked", "corridor_blocked",
+    "recovery_left_clear", "recovery_sweeps_blocked", "recovery_corridors_blocked",
+])
+def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(monkeypatch, fault):
+    """Tianyi 2.0, 2026-11-20 06:06:52 attempt, closed loop: a 0.59 m obstacle
+    centre-left, the right side open, the person 3.4 m ahead. The chassis is a
+    simulation that executes the command and reports it back. The recorded run
+    also had a 2.3 s gap in the recorded observations. Inject the gap after
+    the simulated straight segment starts."""
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.,
+                  half_width_m=.275, vx_max=.3, wz_max=1., obstacle_stop_m=.6,
+                  clearance_margin_m=.1, stop_distance_m=.6)
+    state = _state(motion_source="measured")
+    robot = [0., 0., 0.]          # SIM pose: forward, left, yaw (ccw)
+    world_target = (3.4, -0.57)   # metres, (forward, left) at the start
+
+    def target():
+        c, s = math.cos(-robot[2]), math.sin(-robot[2])
+        dx, dy = world_target[0] - robot[0], world_target[1] - robot[1]
+        x, y = c * dx - s * dy, s * dx + c * dy
+        distance = math.hypot(x, y)
+        return SimpleNamespace(bearing_rad=math.atan2(-y, x), range_m=distance, range_known=True,
+                               measured_range_m=distance, observed=True, last_obs=None)
+
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target())
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    # Posts 0.35 m ahead at +-0.40 m: inside both 20 degree turn sweeps.
+    posts = np.isclose(local_path.FORWARD, .35) & (np.abs(np.abs(local_path.RIGHT) - .40) < .03)
+    recovery_changes_scene = fault.startswith("recovery_")
+    after_gap = False
+
+    def observe(*args):
+        blocked = fault == "sweeps_blocked" or (fault == "recovery_sweeps_blocked" and after_gap)
+        return (free & ~posts, posts) if blocked else (free, ~free)
+
+    monkeypatch.setattr(active_scan, "observe", observe)
+
+    def clearance(_, _config, lateral_offset_m=0.):
+        yaw = robot[2]
+        if lateral_offset_m < 0.:
+            return .70, .95
+        if lateral_offset_m > 0.:
+            return 2.30, .95
+        if recovery_changes_scene and after_gap:
+            return (2.50 if fault == "recovery_left_clear" and yaw > -.10 else .55), .95
+        if yaw < -.30:
+            if fault == "corridor_blocked":
+                return .90, .95
+            return 2.30 - robot[0], .95
+        if yaw > .30:
+            return .70, .95
+        return (.50 if fault == "sweeps_blocked" else .59), .95
+
+    monkeypatch.setattr(P, "_clearance", clearance)
+    frame = np.ones((4, 4))
+    previous = [0.] * 6
+    straight_started = None
+    gap = None
+    resumed = None
+    seen = []
+    recovery_turns = []
+    for stamp in range(1000, 30000, 100):
+        depth = dict(map=frame, frame_id=stamp, ground=frame.astype(bool))
+        feedback = dict(vx=previous[0], vy=0., wz=previous[5], received_ms=stamp)
+        if (straight_started is not None and gap is None and robot[0] >= .35
+                and (recovery_changes_scene or fault in ("depth_gap", "odom_gap"))):
+            gap = (stamp, stamp + 2300)
+        after_gap = gap is not None and stamp >= gap[1]
+        if gap and gap[0] <= stamp < gap[1]:
+            if fault != "odom_gap":
+                depth = None
+            if fault != "depth_gap":
+                feedback = None
+        decision = P.step(detections=_detections(), depth=depth, odom=feedback,
+                          config=config, state=state, dt=.1)
+        seen.append(decision.reason)
+        values = decision.values or [0.] * 6
+        if gap and gap[0] <= stamp < gap[1]:
+            assert values == [0.] * 6
+        assert values[1] == 0.
+        if state.active_scan.active:
+            assert not (values[0] and values[5])
+        assert "主动观察中断" not in decision.reason, decision.reason
+        assert decision.status != P.FAILED, decision.reason
+        robot[2] += values[5] * .1
+        robot[0] += values[0] * .1 * math.cos(robot[2])
+        robot[1] += values[0] * .1 * math.sin(robot[2])
+        previous = values
+        if recovery_changes_scene and after_gap:
+            if values[5]:
+                assert "主动观察：已停稳，重新规划" in seen
+                recovery_turns.append(values[5])
+            if fault == "recovery_sweeps_blocked":
+                assert values[:2] == [0., 0.] and values[5] == 0.
+                if "转身扫掠区有障碍" in decision.reason:
+                    assert "主动观察：尝试另一侧的转身空间" in seen
+                    assert state.active_scan.attempted and not state.active_scan.active
+                    return
+            elif fault == "recovery_corridors_blocked":
+                assert values[:2] == [0., 0.]
+                if "转向后的直行走廊仍然被挡住" in decision.reason:
+                    assert min(recovery_turns) < 0. < max(recovery_turns)
+                    assert state.active_scan.attempted and not state.active_scan.active
+                    return
+            elif values[0]:
+                assert min(recovery_turns) < 0. < max(recovery_turns)
+                assert decision.reason == "主动观察：转稳后直行"
+                return
+        if fault == "sweeps_blocked":
+            assert values[5] == 0. and values[0] == 0.
+            if "转身扫掠区有障碍" in decision.reason:
+                assert not state.active_scan.active and not state.active_scan.locked
+                return
+            continue
+        if fault == "corridor_blocked":
+            if "转向后的直行走廊仍然被挡住" in decision.reason:
+                assert values[0] == 0. and not state.active_scan.active
+                assert any("尝试另一侧" in reason for reason in seen)
+                return
+            continue
+        if values[0] and straight_started is None:
+            assert robot[2] < -.30, "drove before the right turn settled"
+            straight_started = stamp
+        if after_gap and not recovery_changes_scene and values[0] and not state.active_scan.active:
+            resumed = stamp
+            break
+        if fault == "none" and straight_started is not None and robot[0] > .6:
+            resumed = stamp
+            break
+    assert resumed is not None, seen[-12:]
+    assert not state.active_scan.locked
+    if gap:
+        assert any("停车后重规划" in reason for reason in seen)
+        assert any("重新规划" in reason and "已停稳" in reason for reason in seen)
+
+
+def test_close_obstacle_in_the_new_view_requires_another_turn_before_advancing(monkeypatch):
+    from plugins.navi.local_path import Geometry
+
+    geometry = Geometry(None, None, np.eye(4), .275, .275, None)
+    config = _cfg(local_planning=True, scan_geometry=geometry, obstacle_stop_m=.60)
+    state = _state()
+    scan = state.active_scan
+    scan.phase, scan.current_frame = "evaluate", 1000
+    scan.advance_m, scan.directions = 1., (-1., 1.)
+    scan.poses.append((1000, scan.pose, 0.))
+    depth = {"ground": np.ones((4, 4), dtype=bool)}
+    odom = {"vx": 0., "vy": 0., "wz": 0.}
+
+    first = P._advance_after_scan(depth, config, state, odom, .59, 1., .60, 3., .1)
+    assert first[:3] == (0., 0., 0.)
+    assert scan.phase == "brake" and scan.directions == (1.,)
+    assert scan.advance_origin is None
+
+    scan.phase = "evaluate"
+    second = P._advance_after_scan(depth, config, state, odom, .59, 1., .60, 3., .1)
+    assert second[:3] == (0., 0., 0.)
+    assert not scan.active
 
 
 def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forward_sweep(monkeypatch):
@@ -2727,7 +2895,9 @@ def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
 
 @pytest.mark.parametrize(("ahead", "side_obstacles", "expected_yaw"), [
     (.80, (), -.60),
-    (.60, (), 0.),
+    (.60, (), -.60),
+    (.60, (.40,), .60),
+    (.60, (.40, -.40), 0.),
     (2.0, (.40,), .60),
     (2.0, (.40, -.40), 0.),
 ])

@@ -203,8 +203,8 @@ def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypa
         card._odom_ms = stamp
         return card.next_command()
 
-    assert tick(100_000, .60)["values"] == [0.] * 6
-    search = tick(100_100, .80)
+    assert tick(100_000, .25)["values"] == [0.] * 6
+    search = tick(100_100, .60)
     assert search["values"] == [0., 0., 0., 0., 0., -.60]
     assert search["obs_stamp_ms"] == 100_050
     stop = tick(100_800)

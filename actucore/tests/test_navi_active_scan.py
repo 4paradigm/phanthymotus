@@ -271,9 +271,12 @@ def test_receipt_scan_with_no_yaw_progress_replans_before_standing_bias_locks_it
         tick(stamp)
     hold = tick(2550)
     assert hold.yaw == 0. and "转向无实测进展" in hold.reason
+    # A subsequent missing frame must not make a stalled turn retryable.
+    look.update(None, {**_odom(2600), "received_ms": 2600},
+                geometry, receipt_only=True, max_depth_age_ms=800)
     tick(2650)
     assert tick(2800).yaw == 0.
-    assert not look.active and not look.locked
+    assert not look.active and not look.locked and look.attempted
 
 
 @pytest.mark.parametrize("missing", ["depth", "odom", "poll_gap"])
@@ -297,7 +300,59 @@ def test_receipt_scan_stops_then_replans_after_temporary_input_loss(monkeypatch,
     for t, yaw in ((loss + 100, -.12), (loss + 200, 0.), (loss + 350, 0.)):
         update(t, wz=yaw)
         assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
-    assert look.attempted and not look.has_result and not look.active and not look.locked
+    assert not look.attempted and not look.has_result and not look.active and not look.locked
+    assert look.begin((-1., 1.))
+
+
+@pytest.mark.parametrize("released", [True, False])
+def test_receipt_scan_replan_after_travel_locks_only_before_a_released_straight_segment(
+        monkeypatch, released):
+    """Tianyi 2.0, 2026-11-20 06:06:59: depth paused for 2.3 s while the scan's
+    straight segment had already covered 0.62 m. The replan hold must settle and
+    replan from the new view. Drift of the same size with no released segment
+    is still an unexplained translation and keeps locking."""
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, vx=0., depth=True):
+        return look.update(_depth(stamp) if depth else None,
+                           {"vx": vx, "vy": 0., "wz": 0., "received_ms": stamp},
+                           geometry, receipt_only=True, max_depth_age_ms=800)
+
+    update(1000)
+    assert look.begin((1., -1.), advance_m=1.)
+    update(1050)
+    assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
+    update(1150)
+    assert look.command(geometry, .33, 1., 600, 800).yaw < 0.
+    look.phase, look.issued_yaw = "evaluate", True
+    if released:
+        look.advance_origin = look.pose
+    # 0.6 m of forward travel, as the policy's released straight segment produces.
+    for stamp in range(1250, 5300, 100):
+        assert update(stamp, vx=.15) is None
+    assert math.dist(look.pose[:2], look.origin[:2]) > .18
+    hold = update(5350, depth=False)
+    assert hold.yaw == 0. and "停车后重规划" in hold.reason and look.phase == "brake_for_replan"
+    for stamp in range(5450, 7650, 100):
+        assert update(stamp, depth=False).reason == hold.reason
+    assert update(7700) is None
+    first = look.command(geometry, .33, 1., 600, 800)
+    assert first.yaw == 0.
+    if not released:
+        assert not look.active and look.locked
+        return
+    assert look.active and not look.locked
+    assert look.attempted
+    # Fresh motion feedback alone cannot release the scan. The last depth
+    # frame was taken before the settled observation window.
+    look.update(_depth(7700), {**_odom(7850), "received_ms": 7850},
+                geometry, receipt_only=True, max_depth_age_ms=800)
+    assert "等待停稳后的观测" in look.command(geometry, .33, 1., 600, 800).reason
+    assert look.active and look.attempted
+    update(7900)
+    replan = look.command(geometry, .33, 1., 600, 800)
+    assert replan.yaw == 0. and "重新规划" in replan.reason
+    assert not look.active and not look.locked and not look.issued_yaw and not look.attempted
 
 
 def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(monkeypatch):

@@ -1205,18 +1205,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if update is not None and (scan.active or scan.result_frame):
             scan.clear_frames = 0
             return Decision(_twist(0, 0, 0), AVOIDING, update.reason)
-        if scan.active:
-            ahead, _ = _clearance(depth, config)
-            if (scan.phase != "brake_for_replan" and ahead is not None
-                    and ahead <= config.obstacle_stop_m):
-                command = scan.interrupt("主动观察：检测到近障，停车")
-                return Decision(_twist(0, 0, 0), AVOIDING, command.reason)
-            if not scan.ready:
-                command = scan.command(geometry, _keepout_m(config),
-                                       _scan_yaw_rate(config), config.watchdog_ms,
-                                       config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
-                                       now_ms=(odom or {}).get("control_ms"), tick_s=dt)
-                return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
+        if scan.active and not scan.ready:
+            command = scan.command(geometry, _keepout_m(config),
+                                   _scan_yaw_rate(config), config.watchdog_ms,
+                                   config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
+                                   now_ms=(odom or {}).get("control_ms"), tick_s=dt)
+            return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and anchor is None and (track is None or not track.observed):
             scan.clear_frames = 0
             return Decision(_twist(0, 0, 0), AVOIDING, "主动观察：等待重新确认导航目标")
@@ -1662,14 +1656,16 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
     """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
     state.last_clearance, state.last_coverage = ahead, coverage
-    if ahead is not None and ahead <= config.obstacle_stop_m:
+    scan = state.active_scan
+    command_only = state.motion_source == "command"
+    geometry = (config.scan_geometry or config.local_geometry
+                if scan.receipt_only or command_only else config.scan_geometry)
+    can_plan = config.local_planning and config.search_rate > 0
+    has_sweep = can_plan and geometry is not None and bool(scan.current_frame)
+    if not has_sweep and ahead is not None and ahead <= config.obstacle_stop_m:
         state.recovery = ClearanceRecovery()
         return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
-    if config.local_planning and config.search_rate > 0:
-        scan = state.active_scan
-        command_only = state.motion_source == "command"
-        geometry = (config.scan_geometry or config.local_geometry
-                    if scan.receipt_only or command_only else config.scan_geometry)
+    if can_plan:
         direction = state.last_seen_side
         if (not state.searching_for_s and ahead is not None and ahead < config.slow_distance_m
                 and depth.get("map") is not None):
@@ -1684,9 +1680,7 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (motion, state.commanded)):
             return "原地搜索：等待平移或反向转动停稳"
-        # Target search can use the current front-depth check when the scan
-        # has no usable grid. A ready grid also checks the turn's footprint.
-        if geometry is not None and scan.current_frame:
+        if has_sweep:
             horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
             rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
             sweep, slack = (rate + .10) * horizon, STILL_LINEAR * horizon
@@ -1824,7 +1818,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 yaw_rate = _scan_yaw_rate(config)
                 geometry = (config.scan_geometry or config.local_geometry
                             if scan.receipt_only else config.scan_geometry)
-                if (may_scan and foreground and not near and geometry is not None
+                if (may_scan and foreground and geometry is not None
                         and config.floor_wz <= yaw_rate and yaw_rate > 0):
                     transform = geometry.base_from_optical
                     obstacle = ahead * transform[0, 2] + transform[0, 3]
@@ -2016,7 +2010,7 @@ def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, targe
 
     if scan.advance_origin is None:
         if ahead is not None and ahead < config.slow_distance_m:
-            if ahead > stop and scan.try_other_side():
+            if scan.try_other_side():
                 return 0., 0., 0., AVOIDING, "主动观察：尝试另一侧"
             scan.interrupt()
             return 0., 0., 0., AVOIDING, "主动观察：转向后的直行走廊仍然被挡住"

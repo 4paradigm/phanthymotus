@@ -47,6 +47,7 @@ class ActiveScan:
     settle_ms: int | None = None
     settle_frame: int = 0
     settle_frames: int = 0
+    retry_after_hold: bool = False
     issued_yaw: bool = False
     pose: tuple = (0., 0., 0.)
     motion: tuple = (0., 0., 0.)
@@ -330,7 +331,9 @@ class ActiveScan:
             self.turn_start_heading = self.pose[2]
             self.phase = "turn"
             return ScanCommand(reason="主动观察：确认底盘已停稳")
-        if math.dist(self.pose[:2], self.origin[:2]) > .18:
+        # A released straight segment legitimately leaves the turn origin. A
+        # replan hold after it must settle and replan, not lock on that travel.
+        if self.advance_origin is None and math.dist(self.pose[:2], self.origin[:2]) > .18:
             return self.interrupt("主动观察：检测到平移，停车")
         if self.receipt_only and (speed > STILL_LINEAR or self.phase == "brake_for_replan"):
             self.phase = "brake_for_replan"
@@ -341,8 +344,11 @@ class ActiveScan:
                 self.settle_ms = stamp
             if stamp - self.settle_ms < SETTLE_MS or self.current_frame <= self.settle_ms:
                 return ScanCommand(reason="主动观察：等待停稳后的观测")
-            # The interrupted sweep did not produce a completed scan. Resume
-            # local planning from this view without retaining a scan result.
+            # Fresh inputs can re-open a scan interrupted by a gap. Keep the
+            # attempt consumed after measured drift or a turn without progress.
+            if self.retry_after_hold:
+                self.attempted = False
+                self.retry_after_hold = False
             self.phase = "idle"
             self.issued_yaw = False
             return ScanCommand(reason="主动观察：已停稳，重新规划")
@@ -354,7 +360,7 @@ class ActiveScan:
         if (self.receipt_only and self.phase == "turn" and self.issued_yaw
                 and stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS
                 and abs(self.pose[2] - self.turn_start_heading) < TURN_PROGRESS_MIN_RAD):
-            return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划")
+            return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划", retry_scan=False)
 
         # Pose feedback can lag several ticks. Run a bounded burst, then wait
         # for measurements that bracket its explicit stop.
@@ -518,7 +524,9 @@ class ActiveScan:
                 return False
         return True
 
-    def hold_for_replan(self, reason):
+    def hold_for_replan(self, reason, *, retry_scan=True):
+        if self.phase != "brake_for_replan":
+            self.retry_after_hold = retry_scan
         self.phase = "brake_for_replan"
         self.current_frame = 0
         self.settle_ms = None
@@ -530,6 +538,7 @@ class ActiveScan:
         if self.active:
             self.locked |= self.issued_yaw
         self.phase = "idle"
+        self.retry_after_hold = False
         self.turn_until_ms = 0
         self.turn_stop_ms = None
         self.clear_frames = 0
