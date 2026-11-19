@@ -234,7 +234,7 @@ class ChannelManager:
         self._retry_backoff: dict[str, float] = {}       # channel_id → 当前退避秒数
         self._inactive_logged: set[str] = set()
         self._trusted_bot_messages: dict[str, dict] = {}
-        self._chat_only_pending: dict[str, tuple[str, str]] = {}
+        self._chat_only_pending: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._starting: set[str] = set()
         self._mention_rate: dict[tuple, list[float]] = {}
 
@@ -687,10 +687,12 @@ class ChannelManager:
         if ch_cfg and ch_cfg.get('enabled'):
             await self._start_adapter(ch_cfg, retries=retries)
 
-    def consume_chat_input(self, topic: str, text: str, message_id: str) -> bool:
-        if self._chat_only_pending.get(message_id) != (topic, text):
+    def consume_chat_input(self, topic: str, text: str,
+                           channel_id: str, chat_id: str, message_id: str) -> bool:
+        key = (channel_id, chat_id, message_id)
+        if self._chat_only_pending.get(key) != (topic, text):
             return False
-        self._chat_only_pending.pop(message_id)
+        self._chat_only_pending.pop(key)
         return True
 
     # ── Inbound ──────────────────────────────────────────────────────────────
@@ -789,7 +791,7 @@ class ChannelManager:
             self._record_trusted_bot_message(payload)
         body = json.dumps(payload, ensure_ascii=False)
         if private_chat:
-            self._chat_only_pending[msg.message_id] = (topic, body)
+            self._chat_only_pending[(msg.channel_id, msg.chat_id, msg.message_id)] = (topic, body)
             if len(self._chat_only_pending) > 256:
                 self._chat_only_pending.pop(next(iter(self._chat_only_pending)))
         await publish_to_topic(topic, body)

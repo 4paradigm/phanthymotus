@@ -878,9 +878,12 @@ async def _drain_loop():
             channel = (get_channel_config(channel_id) or {}) if isinstance(channel_id, str) else {}
             if chat_only.enabled(channel) or payload.get('chat_only') is True:
                 message_id = payload.get('message_id')
-                if (isinstance(message_id, str) and source.startswith('dds:')
-                        and manager.consume_chat_input(source[4:], ev['text'], message_id)):
-                    ev['_chat_only_key'] = (channel_id, payload['chat_id'])
+                chat_id = payload.get('chat_id')
+                if (isinstance(channel_id, str) and isinstance(chat_id, str)
+                        and isinstance(message_id, str) and source.startswith('dds:')
+                        and manager.consume_chat_input(
+                            source[4:], ev['text'], channel_id, chat_id, message_id)):
+                    ev['_chat_only_key'] = (channel_id, chat_id)
                     if _busy:
                         _priority_pending.append(ev)
                     else:
