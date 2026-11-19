@@ -3,6 +3,7 @@
  * Shows each top-level key as a cell with live-updating value.
  */
 import { decodeNestedJson } from './json-util.js';
+import { isBatteryStatus, batteryLatestValues } from './battery-view.js';
 
 export const KvLatestRenderer = {
   name: 'kv-latest',
@@ -12,6 +13,8 @@ export const KvLatestRenderer = {
   _cells: {},  // { key: { el, valueEl, lastValue } }
 
   mount(container) {
+    this._batteryTimer = null;
+    this._batteryData = null;
     this._el = document.createElement('div');
     this._el.className = 'renderer-kv-latest';
     this._cells = {};
@@ -24,15 +27,52 @@ export const KvLatestRenderer = {
       const str = new TextDecoder().decode(buffer);
       const json = JSON.parse(str);
       if (json.type === 'ping' || json.type === 'meta') return;
+      if (isBatteryStatus(json)) {
+        this._batteryData = json;
+        this._batteryArrived = performance.now();
+        this._batteryTime = new Date().toLocaleTimeString();
+        this._renderBattery();
+        if (!this._batteryTimer) this._batteryTimer = setInterval(() => this._renderBattery(), 500);
+        return;
+      }
+      this._clearBattery();
+
 
       // Same second-layer decode the log view does: a field holding a JSON
       // string becomes the object it encodes, so its fields get their own
       // cells instead of one cell full of escaped source text.
       const flat = _flatten(decodeNestedJson(json));
+      // A status snapshot can drop readings when its source goes stale.
+      // Remove those cells instead of presenting the previous readings as live.
+      for (const key of Object.keys(this._cells)) {
+        if (!Object.prototype.hasOwnProperty.call(flat, key)) {
+          this._cells[key].el.remove();
+          delete this._cells[key];
+        }
+      }
       for (const [key, value] of Object.entries(flat)) {
         this._updateCell(key, value);
       }
     } catch { /* non-JSON, ignore */ }
+  },
+
+  _renderBattery() {
+    if (!this._el || !this._batteryData) return;
+    const values = batteryLatestValues(this._batteryData, performance.now() - this._batteryArrived);
+    values.updated_at = this._batteryTime;
+    for (const key of Object.keys(this._cells)) {
+      if (!Object.prototype.hasOwnProperty.call(values, key)) {
+        this._cells[key].el.remove();
+        delete this._cells[key];
+      }
+    }
+    for (const [key, value] of Object.entries(values)) this._updateCell(key, value);
+  },
+
+  _clearBattery() {
+    if (this._batteryTimer) clearInterval(this._batteryTimer);
+    this._batteryTimer = null;
+    this._batteryData = null;
   },
 
   _updateCell(key, value) {
@@ -69,6 +109,7 @@ export const KvLatestRenderer = {
   onEvent() {},
 
   unmount() {
+    this._clearBattery();
     this._el?.remove();
     this._el = null;
     this._cells = {};
