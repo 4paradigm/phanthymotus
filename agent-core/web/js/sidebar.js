@@ -1498,6 +1498,53 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       refresh.className = 'tool-config-action';
       extraControls.push(refresh);
 
+      const initialize = document.createElement('button');
+      initialize.type = 'button';
+      initialize.textContent = '初始化/升级电脑';
+      const progress = document.createElement('div');
+      progress.setAttribute('aria-live', 'polite');
+      extraControls.push(initialize, progress);
+      initialize.onclick = async () => {
+        if (!(await ensureEdit())) return;
+        const read = k => bodyEl.querySelector(`[data-key="${k}"]`)?.value || '';
+        const address = read('bridge_url');
+        const call = async args => {
+          const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tool: toolName, arguments: args}),
+          });
+          const envelope = await response.json();
+          if (!response.ok || ![0, 200].includes(envelope.code)) throw new Error('初始化请求失败');
+          const blocks = Array.isArray(envelope.data) ? envelope.data : envelope.data?.content;
+          return blocks ? JSON.parse(blocks.find(b => b.type === 'text').text) : envelope.data;
+        };
+        initialize.disabled = true;
+        try {
+          if (!address) throw new Error('请填写桥接服务地址');
+          if (!read('token')) {
+            bodyEl.querySelector('[data-key="token"]').value = Array.from(
+              crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('');
+          }
+          let result = await call({action: 'initialize', bridge_url: address, token: read('token'),
+            remote_start_user: read('remote_start_user'), remote_start_port: Number(read('remote_start_port') || 22),
+            remote_start_key_path: read('remote_start_key_path')});
+          while (result.status === 'installing') {
+            progress.textContent = '正在安装，请保持窗口打开；首次安装可能需要几分钟。';
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            if (!initialize.isConnected || overlay.classList.contains('hidden')) return;
+            result = await call({action: 'initialize_status'});
+          }
+          if (result.status !== 'installed') throw new Error(result.error || '初始化未成功');
+          progress.textContent = result.hint;
+          if (read('bridge_url') === address) {
+            const enabled = bodyEl.querySelector('[data-key="remote_start_enabled"]');
+            if (enabled) enabled.value = 'true';
+            await refresh.onclick();
+          }
+        } catch (error) { progress.textContent = error.message; }
+        finally { initialize.disabled = false; }
+      };
+
       let generation = 0;
       const connection = () => ['bridge_url', 'token'].map(k =>
         bodyEl.querySelector(`[data-key="${k}"]`)?.value || '');

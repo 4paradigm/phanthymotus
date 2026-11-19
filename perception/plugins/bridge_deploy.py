@@ -36,8 +36,10 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
                '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={known}',
                f'{user}@{host}', 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + encoded]
-    result = subprocess.run(command, input=payload, text=True, capture_output=True, timeout=900)
-    if result.returncode or 'BRIDGE_BOOTSTRAP_OK' not in result.stdout:
+    # Windows may emit diagnostics in its local code page. Keep stdout/stderr
+    # as bytes so decoding cannot mask the bootstrap result.
+    result = subprocess.run(command, input=payload.encode('utf-8'), capture_output=True, timeout=900)
+    if result.returncode or b'BRIDGE_BOOTSTRAP_OK' not in result.stdout:
         # Never return raw installer output: it may contain configuration values.
         raise RuntimeError('远程初始化失败，请检查电脑 ProgramData\\ParadigmVisitorBridge\\bootstrap.log；确认使用管理员 SSH 密钥而非仅启动密钥')
     return {'status': 'installed', 'hint': '桥接已安装并启动。请保存配置、刷新打印机；首次使用需登录访客网站。'}
