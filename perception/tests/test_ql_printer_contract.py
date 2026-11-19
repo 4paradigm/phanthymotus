@@ -55,6 +55,8 @@ class VisitorBadgeTest(unittest.TestCase):
         schema_text = json.dumps(definition["inputSchema"], ensure_ascii=False)
         self.assertIn('"print"', schema_text)
         props = definition["configSchema"]["properties"]
+        self.assertEqual(props["printer_name"]["scope"], "instance")
+        self.assertEqual(props["printer_name"]["format"], "bridge-printer")
         self.assertEqual(props["token"]["format"], "password")
         self.assertTrue(props["bridge_url"]["x-sensitive"])
         self.assertEqual(props["timeout_s"]["default"], 8)

@@ -198,7 +198,13 @@ class QLPrinterPlugin:
         definition["configSchema"] = {
             "type": "object",
             "properties": {
-                "printer_name": {"type": "string", "title": "目标打印机", "scope": "shared", "format": "bridge-printer"},
+                # The printer belongs to this canvas card, not to the
+                # perception process as a whole.  Marking it as instance
+                # configuration also gives the placed card its own settings
+                # button; the instance dialog deliberately includes the
+                # shared bridge address/token above this field, so an operator
+                # can finish the whole setup from the card in one place.
+                "printer_name": {"type": "string", "title": "目标打印机", "scope": "instance", "format": "bridge-printer"},
                 "bridge_url": {
                     "type": "string", "title": "桥接服务地址", "scope": "shared", "x-sensitive": True,
                     "description": "前台电脑上桥接服务的地址，例如 http://192.168.1.20:8765（前台电脑要设固定 IP）",
