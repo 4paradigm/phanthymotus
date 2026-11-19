@@ -723,7 +723,7 @@ RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
     fi
 
 # Darvin startup must be selected explicitly for benchmark images.
-ARG XIAOYOU_TTS_DARVIN=1
+ARG XIAOYOU_TTS_DARVIN=0
 ENV XIAOYOU_TTS_DARVIN=${XIAOYOU_TTS_DARVIN}
 ENV XIAOYOU_TTS_IMAGE_JP=${JP_VERSION}
 CMD ["/bin/bash", "-c", \
