@@ -418,11 +418,7 @@ def test_tolerance_hold_also_stops_avoidance_translation_without_disabling_yaw(m
     decision = _step(detections=_detections(_obj(x=0.25, bbox=(0.5, 0.4, 0.7, 0.6))),
                      depth=_depth(map_=_solid_depth(1.25)), config=config)
     assert decision.status != P.ARRIVED and decision.values[5] != 0
-    if tolerance:
-        assert decision.values[:2] == [0.0, 0.0]
-        assert "holding translation" in decision.reason
-    else:
-        assert decision.values[1] != 0  # The default retains the old avoidance.
+    assert decision.values[:2] == [0., 0.]
 
 
 def test_approach_finishes_in_tolerance_band_without_creeping_to_nominal_distance():
@@ -457,12 +453,12 @@ def test_arrival_distance_sum_cannot_overflow_to_infinity():
 # them separately here is what isolates the avoidance branch from the arrival
 # branch, which would otherwise both fire on the same number.
 
-def test_a_near_obstacle_with_an_open_side_slows_the_approach():
+def test_a_near_obstacle_with_an_open_side_stops_forward_before_turning():
     far = _step(detections=_detections(_obj(x=0.0)), depth=_scene(4.0))
     near = _step(detections=_detections(_obj(x=0.0)),
                  depth=_scene(4.0, [(0.25, 1.0, 0.35)]))
-    assert 0 < near.values[0] < far.values[0]
-    assert near.status == P.AVOIDING
+    assert far.values[0] > 0. and near.values[:2] == [0., 0.]
+    assert near.values[5] > 0. and near.status == P.AVOIDING
 
 
 def test_an_obstacle_inside_the_stop_distance_halts_forward_motion():
@@ -489,8 +485,7 @@ def test_it_turns_towards_the_side_the_map_says_is_free():
 
     assert to_the_right.values[5] > 0, "障碍在右，应当朝左转（逆时针为正）"
     assert to_the_left.values[5] < 0
-    # y is left-positive, so the sidestep goes the other way from the obstacle.
-    assert to_the_right.values[1] > 0 and to_the_left.values[1] < 0
+    assert to_the_right.values[:2] == to_the_left.values[:2] == [0., 0.]
 
 
 def test_a_doorway_beside_the_path_is_not_mistaken_for_the_way_out():
@@ -1477,20 +1472,14 @@ def test_a_turn_ends_once_the_target_is_well_centred():
     assert state.yaw_gate.on is False
 
 
-def test_an_obstacle_ahead_is_stepped_around_not_only_turned_from():
-    """Turning alone changes where the robot points; on a base that can
-    translate, the sidestep is what gets it out of the way — and doing both at
-    once is one motion instead of a pirouette followed by a walk."""
-    # Slightly to the right, so a step to the **left** actually clears it — a
-    # sidestep is only available when there is somewhere to step to, and an
-    # obstacle dead centre and as wide as the robot is not that case.
+def test_an_obstacle_ahead_first_causes_a_turn_in_place():
     decision = _step(detections=_detections(_obj(x=0.0)),
                      depth=_depth(bands={"left": 5.0, "center": 0.6, "right": 1.0},
                                   map_=_obstacle_map(5.0, [(0.25, 0.6, 0.3)])))
     assert decision.status == P.AVOIDING
     assert decision.values[0] == 0.0, "no forward motion into it"
-    assert decision.values[1] > 0, "stepping left, the side with room"
-    assert decision.values[5] > 0, "and turning that way too"
+    assert decision.values[1] == 0.
+    assert decision.values[5] > 0, "turning left, the side with room"
 
 
 def test_an_obstacle_with_no_room_either_side_is_not_stepped_into():
@@ -1631,119 +1620,6 @@ def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, sta
 
     assert decision.status == status
     assert bool(decision.values and decision.values[5]) == (status == P.SEARCHING)
-
-
-@pytest.mark.parametrize("scene", [
-    "clear_sweep", "receipt_only", "occupied", "unknown", "unregistered", "expired", "translating",
-])
-def test_wheeled_near_search_requires_clear_sweep_and_commands_only_yaw(monkeypatch, scene):
-    from plugins.navi import active_scan, local_path
-    from plugins.navi.odom import PlanarPose
-
-    shape = local_path.SHAPE
-    free = np.ones(shape, dtype=bool)
-    occupied = np.zeros(shape, dtype=bool)
-    ahead = np.isclose(local_path.FORWARD, .45) & np.isclose(local_path.RIGHT, 0.)
-    occupied[ahead] = True
-    corner = np.isclose(local_path.FORWARD, -.30) & np.isclose(local_path.RIGHT, .35)
-    if scene == "occupied":
-        occupied[corner] = True
-    if scene == "unknown":
-        free[corner] = False
-
-    geometry = local_path.Geometry(None, None, np.eye(4), .30, .30, .50, True)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
-               doorway_geometry=geometry, use_lateral=False, vy_max=0., half_width_m=.275)
-    state = _state(motion_source="measured", missing_frames=cfg.lost_frames - 1)
-    frame = np.ones((4, 4))
-    depth = {"map": frame, "ground": frame.astype(bool), "frame_id": 1000, "capture_ms": 1000}
-    stamp = 1000 + cfg.depth_age_limit_ms if scene == "expired" else 1000
-    pose = PlanarPose(stamp, ("odom", "base_link"), 0., 0., 0.)
-    odom = dict(vx=.10 if scene == "translating" else 0., vy=0., wz=0.)
-    if scene == "receipt_only":
-        depth.pop("capture_ms")
-        odom["received_ms"] = stamp
-    elif scene != "unregistered":
-        odom.update(stamp_ms=stamp, door_pose=pose)
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.43, .95))
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
-
-    decision = P.step(detections=_detections(), depth=depth, odom=odom,
-                      config=cfg, state=state, dt=.1)
-
-    assert decision.values[:5] == [0.] * 5
-    if scene in ("clear_sweep", "receipt_only"):
-        assert decision.status == P.SEARCHING
-        assert 0. < abs(decision.values[5]) < cfg.search_rate
-    else:
-        assert decision.status == P.AVOIDING
-        assert decision.values[5] == 0.
-
-
-def test_wheeled_avoidance_can_observe_using_only_recent_twist_and_depth(monkeypatch):
-    from types import SimpleNamespace
-    from plugins.navi import active_scan, local_path
-
-    geometry = local_path.Geometry(None, None, np.array([
-        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
-    ]), .275, .275, None, True)
-    config = _cfg(local_planning=True, local_geometry=geometry, doorway_geometry=geometry,
-                  use_lateral=False, vy_max=0., half_width_m=.275)
-    state = _state(motion_source="measured")
-    track = SimpleNamespace(bearing_rad=0., range_m=3., range_known=True,
-                            observed=True, measured_range_m=3.)
-    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
-    monkeypatch.setattr(P, "_clearance", lambda *args, lateral_offset_m=0.:
-                        (1.80 if lateral_offset_m < 0. else 1.30, .99))
-    free = local_path.FORWARD < .65
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, np.zeros_like(free)))
-    frame = np.ones((4, 4))
-    ground = frame.astype(bool)
-    yaws = [0.]
-    settled_at = None
-    for stamp in range(1000, 27000, 100):
-        if state.doorway is not None and state.doorway.phase == "settle" and settled_at is None:
-            settled_at = stamp
-        verified_view = settled_at is not None and stamp - settled_at > 800
-        if verified_view:
-            free[:] = True
-        depth = dict(map=frame, ground=ground, frame_id=stamp, control_ms=stamp)
-        feedback = dict(vx=0., vy=0., wz=yaws[-1], received_ms=stamp)
-        decision = P.step(detections=_detections(), depth=depth, odom=feedback,
-                          config=config, state=state, dt=.1)
-        vx, yaw = decision.values[0], decision.values[5]
-        assert decision.values[1:5] == [0.] * 4
-        if vx:
-            assert verified_view and yaw == 0.
-            break
-        yaws.append(yaw)
-    else:
-        pytest.fail("The fresh forward view did not release the crossing")
-    assert state.active_scan.receipt_only
-    assert yaws[1:9] == [0.] * 8
-    assert max(yaws) > 0.
-
-
-@pytest.mark.parametrize(("left_coverage", "turns_left"), [(.516, True), (.1, False)])
-def test_wheeled_search_prefers_measured_open_side_before_turning(monkeypatch, left_coverage,
-                                                                turns_left):
-    config = _cfg(local_planning=True, use_lateral=False, vy_max=0., lost_frames=1)
-    state = _state(last_seen_side=1.)
-    depth = _depth(map_=_solid_depth(1.37))
-
-    def clearance(_, config, lateral_offset_m=0.):
-        if lateral_offset_m < 0.:
-            return 1.80, left_coverage
-        if lateral_offset_m > 0.:
-            return 1.39, .515
-        return 1.37, .99
-
-    monkeypatch.setattr(P, "_clearance", clearance)
-    decision = P.step(detections=_detections(), depth=depth, odom=None,
-                      config=config, state=state, dt=.1)
-
-    assert decision.status == P.SEARCHING and decision.values[:5] == [0.] * 5
-    assert (decision.values[5] > 0.) is turns_left
 
 
 def test_search_can_turn_to_the_other_side_when_the_last_seen_side_is_blocked(monkeypatch):
@@ -1948,7 +1824,7 @@ def test_lateral_only_detour_uses_measured_progress_for_the_blockage_clock(monke
 
 
 @pytest.mark.parametrize("moves_sideways", [False, True])
-def test_nominal_detour_without_sideways_progress_tries_other_side_then_creeps(monkeypatch,
+def test_local_avoidance_does_not_execute_lateral_candidates(monkeypatch,
                                                                             moves_sideways):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
@@ -1975,12 +1851,11 @@ def test_nominal_detour_without_sideways_progress_tries_other_side_then_creeps(m
                 "wz": 0., "received_ms": stamp}
         decisions.append(P.step(detections=_detections(), depth=depth, odom=odom,
                                 config=cfg, state=state, dt=.2))
-    assert decisions[0].values[1] < 0.
+    assert all(decision.values[1:] == [0.] * 5 for decision in decisions)
     if moves_sideways:
-        assert all(decision.values[1] < 0. for decision in decisions)
+        assert all(decision.values[0] == 0. for decision in decisions)
     else:
-        assert any(decision.values[1] > 0. for decision in decisions)
-        assert decisions[-1].values[:2] == pytest.approx([.15, 0.])
+        assert decisions[-1].values[0] == pytest.approx(.15)
         assert "低速接近" in decisions[-1].reason
 
 
@@ -2610,7 +2485,7 @@ def test_invalid_driver_response_falls_back_to_generic_yaw(response):
 def test_steer_early_only_for_an_obstacle_between_robot_and_target():
     obstacle = _scene(4.0, [(0.25, 1.0, 0.35)])
     turn = _step(detections=_detections(_obj()), depth=obstacle)
-    assert turn.values[0] > 0 and turn.values[1] > 0 and turn.values[5] > 0
+    assert turn.values[:2] == [0., 0.] and turn.values[5] > 0
     target = _step(detections=_detections(_obj()), depth=_scene(1.0),
                    config=_cfg(stop_distance_m=0.6))
     assert target.values[1] == target.values[5] == 0
@@ -2718,6 +2593,64 @@ def test_local_no_route_approach_stops_at_the_stricter_boundary(
             assert 0. < following[0] < decision[0]
 
 
+@pytest.mark.parametrize("use_lateral", [True, False])
+def test_shared_search_prefers_the_observed_open_side_if_forward_is_blocked(monkeypatch, use_lateral):
+    config = _cfg(local_planning=True, use_lateral=use_lateral, lost_frames=1)
+    state = _state(last_seen_side=1.)
+    monkeypatch.setattr(P, "_clearance", lambda _d, _c, lateral_offset_m=0.: (
+        1.80 if lateral_offset_m < 0. else 1.39 if lateral_offset_m > 0. else 1.37, .51))
+    decision = P.step(detections=_detections(), depth=_depth(map_=_solid_depth(1.37)),
+                      odom=None, config=config, state=state, dt=.1)
+    assert decision.status == P.SEARCHING
+    assert decision.values[:5] == [0.] * 5 and decision.values[5] > 0.
+
+
+@pytest.mark.parametrize("use_lateral", [True, False])
+def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch, use_lateral):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=use_lateral,
+                  vy_max=.4 if use_lateral else 0., half_width_m=.275, vx_max=.3, wz_max=1.)
+    state = _state(motion_source="measured")
+    target = SimpleNamespace(bearing_rad=0., range_m=4., range_known=True,
+                             measured_range_m=4., observed=True)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+
+    def clearance(_, _config, lateral_offset_m=0.):
+        if lateral_offset_m < 0.:
+            return 2.50, .95
+        if lateral_offset_m > 0.:
+            return .80, .95
+        return (2.50 if state.active_scan.pose[2] < -.30 else 1.30), .95
+
+    monkeypatch.setattr(P, "_clearance", clearance)
+    frame = np.ones((4, 4))
+    previous = [0.] * 6
+    last_turn = None
+    for stamp in range(1000, 9000, 100):
+        depth = dict(map=frame, frame_id=stamp, ground=frame.astype(bool))
+        feedback = dict(vx=previous[0], vy=0., wz=previous[5], received_ms=stamp)
+        decision = P.step(detections=_detections(), depth=depth, odom=feedback,
+                          config=config, state=state, dt=.1)
+        assert decision.values is not None
+        previous = decision.values
+        assert previous[1] == 0. and not (previous[0] and previous[5])
+        if previous[5]:
+            assert previous[5] > 0.
+            last_turn = stamp
+        if previous[0]:
+            assert last_turn is not None and stamp - last_turn >= active_scan.SETTLE_MS
+            break
+    else:
+        pytest.fail("The settled scan did not release a straight segment")
+
+
 def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forward_sweep(monkeypatch):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
@@ -2748,7 +2681,7 @@ def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forw
     assert tick(1200)[:3] == (0., 0., 0.)
 
 
-def test_near_sidestep_holds_forward_when_the_obstacle_leaves_view():
+def test_near_turn_holds_forward_when_the_obstacle_leaves_view():
     cfg = _cfg(stop_distance_m=0.6)
     near = _scene(4.0, [(0.25, 0.6, 0.3)])
     clear = _scene(4.0)
@@ -2759,9 +2692,9 @@ def test_near_sidestep_holds_forward_when_the_obstacle_leaves_view():
                      state=state, config=cfg)
 
     for frame_id in (100, 200):
-        sidestep = tick(near, frame_id)
-        assert sidestep.values[0] == 0
-        assert sidestep.values[1] > 0
+        turn = tick(near, frame_id)
+        assert turn.values[:2] == [0., 0.]
+        assert turn.values[5] > 0.
     assert tick(clear, 300).values == [0.0] * 6
     assert tick(clear, 400).values == [0.0] * 6
     assert tick(clear, 500).values[0] > 0
@@ -2854,8 +2787,7 @@ def test_right_route_shorter_than_forward_slow_distance_can_be_selected():
     obstacle = _scene(1.2, [(-0.25, 0.85, 0.28)])
     decision = _step(detections=_detections(_obj()), depth=obstacle, config=cfg)
     assert decision.status == P.AVOIDING
-    assert decision.values[1] < 0 and decision.values[5] < 0
-    assert decision.values[0] <= cfg.vx_max and abs(decision.values[1]) <= cfg.vy_max
+    assert decision.values[:2] == [0., 0.] and decision.values[5] < 0
     assert "朝右侧避让" in decision.reason
     assert cfg.slow_distance_m == 1.5
 
@@ -2893,7 +2825,7 @@ def test_local_detour_starts_at_the_slowdown_boundary(monkeypatch):
 
     def plan(depth, config, state, odom, ahead, side):
         attempts.append(ahead)
-        return (0., -.06 * side)
+        return (.06, 0.)
 
     monkeypatch.setattr(P, "_local_translation", plan)
 
@@ -2904,13 +2836,13 @@ def test_local_detour_starts_at_the_slowdown_boundary(monkeypatch):
     assert avoid()[0] == .20
     assert attempts == []
     ahead = 1.15
-    assert abs(avoid()[1]) == .06
+    assert avoid()[:3] == (.06, 0., 0.)
     ahead = 1.35
-    assert abs(avoid()[1]) == .06
+    assert avoid()[:3] == (.06, 0., 0.)
     assert attempts == [1.15, 1.35]
 
 
-def test_local_planner_tries_other_side_if_preferred_route_would_advance_near_obstacle(monkeypatch):
+def test_local_planner_does_not_execute_a_lateral_route_near_an_obstacle(monkeypatch):
     cfg = _cfg(local_planning=True)
     state = _state()
     attempts = []
@@ -2926,8 +2858,8 @@ def test_local_planner_tries_other_side_if_preferred_route_would_advance_near_ob
                        target_distance=2.8)
 
     assert attempts == [1.0, -1.0]
-    assert command[:3] == (0.0, .06, 0.0)
-    assert state.escape_side == -1.0
+    assert command[:3] == (0., 0., 0.)
+    assert state.escape_side == 0.
 
 
 def test_local_planner_holds_side_through_centimetre_noise_and_switches_if_blocked(monkeypatch):
@@ -2937,30 +2869,31 @@ def test_local_planner_holds_side_through_centimetre_noise_and_switches_if_block
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
         rooms[np.sign(lateral_offset_m)] if lateral_offset_m else .9, 1.0))
     monkeypatch.setattr(P, "_local_translation", lambda depth, config, state, odom, ahead, side:
-                        None if side in blocked else (0., -.06 * side))
+                        None if side in blocked else (.06, 0.))
 
     def step(frame):
-        return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
-                        P.AVOIDING, "", state, target_distance=2.8)[1]
+        P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
+                 P.AVOIDING, "", state, target_distance=2.8)
+        return state.escape_side
 
-    assert step(100) < 0
+    assert step(100) > 0
     for frame in range(200, 800, 100):
         rooms[-1.], rooms[1.] = rooms[1.], rooms[-1.]
-        assert step(frame) < 0
+        assert step(frame) > 0
     blocked.add(1.)
-    assert step(800) > 0
+    assert step(800) < 0
 
 
 def test_local_planner_checks_the_obstacle_at_the_start_of_the_slowdown_band(monkeypatch):
     cfg = _cfg(local_planning=True)
     state = _state(motion_source="command")
     monkeypatch.setattr(P, "_clearance", lambda *_args, **_kwargs: (1.48, 1.))
-    monkeypatch.setattr(P, "_local_translation", lambda *_args: (.10, -.15))
+    monkeypatch.setattr(P, "_local_translation", lambda *_args: (.10, 0.))
 
     vx, vy, _, _, _ = P._avoid(.2, 0., 0., _scene(2.16), cfg,
                                P.APPROACHING, "", state, target_distance=2.16)
 
-    assert (vx, vy) == (.10, -.15)
+    assert (vx, vy) == (.10, 0.)
 
 
 def test_local_planner_requires_distinct_frames_before_switching_for_more_space(monkeypatch):
@@ -2968,15 +2901,16 @@ def test_local_planner_requires_distinct_frames_before_switching_for_more_space(
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
         2.3 if lateral_offset_m < 0 else 2.0 if lateral_offset_m > 0 else .9, 1.0))
     monkeypatch.setattr(P, "_local_translation", lambda depth, config, state, odom, ahead, side:
-                        (0., -.06 * side))
+                        (.06, 0.))
 
     def step(frame):
-        return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
-                        P.AVOIDING, "", state, target_distance=2.8)[1]
+        P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
+                 P.AVOIDING, "", state, target_distance=2.8)
+        return state.escape_side
 
-    assert all(step(100) < 0 for _ in range(5))
-    assert step(200) < 0
-    assert step(300) > 0
+    assert all(step(100) > 0 for _ in range(5))
+    assert step(200) > 0
+    assert step(300) < 0
 
 
 def test_local_recovery_uses_the_current_checked_speed_without_waiting_for_frames(monkeypatch):
@@ -2984,13 +2918,13 @@ def test_local_recovery_uses_the_current_checked_speed_without_waiting_for_frame
     state = _state(escape_side=1., recovery=P.ClearanceRecovery("right", 2, 100))
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
         2.1 if lateral_offset_m > 0 else 2.0 if lateral_offset_m < 0 else .9, 1.0))
-    monkeypatch.setattr(P, "_local_translation", lambda *args: (.063, -.077))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: (.063, 0.))
 
     def step(frame):
         return P._avoid(.1, 0, 0, dict(_scene(2.8), frame_id=frame), cfg,
                         P.AVOIDING, "", state, target_distance=2.8)[:3]
 
-    assert step(200) == (.063, -.077, 0.)
+    assert step(200) == (.063, 0., 0.)
     assert state.recovery is None
 
 
@@ -3094,34 +3028,6 @@ def test_command_only_checks_the_ramp_even_for_a_repeated_diagonal(monkeypatch):
     assert P._local_translation(depth, cfg, state, None, .9, 1.) is P.LocalHold.TRANSITION
 
 
-def test_checked_straight_approach_keeps_tracking_the_moving_target(monkeypatch):
-    from types import SimpleNamespace
-    from plugins.navi import local_path
-
-    geometry = local_path.Geometry(None, None, np.eye(4), .30, .30, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.)
-    state = _state()
-    track = SimpleNamespace(bearing_rad=0., range_m=3., range_known=True, observed=True,
-                            measured_range_m=3.)
-    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
-    monkeypatch.setattr(local_path, "observe", lambda *args: (
-        np.ones(local_path.SHAPE, dtype=bool), np.zeros(local_path.SHAPE, dtype=bool)))
-    odom = dict(vx=0., vy=0., wz=0.)
-    frame = _solid_depth(3.)
-
-    def tick(stamp):
-        depth = dict(_depth(map_=frame), ground=np.ones_like(frame, dtype=bool), frame_id=stamp)
-        return P.step(detections=_detections(), depth=depth, odom=odom, config=cfg, state=state, dt=.1)
-
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.31, .99))
-    assert tick(1000).values[0] > 0.
-    track.range_m = track.measured_range_m = 4.
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.2, .99))
-    decision = tick(1100)
-    assert decision.status == P.APPROACHING and decision.values[0] > 0.
-    assert decision.distance_m == pytest.approx(4.)
-
-
 @pytest.mark.parametrize("odom", [None, {"vx": 0., "vy": 0., "wz": 0.}])
 @pytest.mark.parametrize("already_occluded", [False, True])
 def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monkeypatch, odom,
@@ -3139,7 +3045,7 @@ def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monke
                    if already_occluded else track]
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: observation[0])
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.9, 1.))
-    monkeypatch.setattr(P, "_local_translation", lambda *args: (0., -.1))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: (.1, 0.))
 
     stamp = iter(range(1000, 3000, 100))
 
@@ -3147,16 +3053,16 @@ def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monke
         return P.step(detections={"objects": []}, depth=dict(_scene(2.), frame_id=next(stamp)), odom=odom,
                       config=cfg, state=state, dt=.1)
 
-    assert tick().values[1] == -.1
+    assert tick().values[0] == .1
     observation[0] = SimpleNamespace(bearing_rad=0., range_m=.5, range_known=True,
                                      observed=True, measured_range_m=.5)
     decision = tick()
     assert decision.status == P.AVOIDING
-    assert decision.distance_m == pytest.approx(2., abs=.01)
+    assert decision.distance_m == pytest.approx(1.99 if odom is None else 2.)
     observation[0] = None
     decision = tick()
-    assert decision.status == P.AVOIDING and decision.values[1] == -.1
-    assert decision.distance_m == pytest.approx(2., abs=.01)
+    assert decision.status == P.AVOIDING and decision.values[0] == .1
+    assert decision.distance_m == pytest.approx(1.98 if odom is None else 2.)
 
     # Once the route opens, wait for a live range from the frozen goal.
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2., 1.))

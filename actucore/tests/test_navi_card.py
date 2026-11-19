@@ -237,19 +237,10 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
                              measured_range_m=None)
     monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
     monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
-        2.6 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else .90, 1.0))
+        2.6 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else
+        2.6 if card._state.active_scan.pose[2] < -.30 else .90, 1.0))
     free = np.ones(local_path.SHAPE, dtype=bool)
     monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
-    plans = []
-
-    def plan(depth, config, state, odom, ahead, side):
-        if "scan_grid" in depth:
-            plans.append(side)
-            return (.06, 0.)
-        return None
-
-    monkeypatch.setattr(policy, "_local_translation", plan)
-
     def tick(stamp, yaw_odometry=0, fresh=True):
         now[0] = stamp
         card._objects = {"objects": []}
@@ -276,29 +267,19 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
         assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_250
         assert card._state.active_scan.locked
         assert tick(100_350)["values"] == [0.] * 6
-        assert not plans
         return
     for stamp in range(100_250, 101_550, 100):
         command = tick(stamp, .25)
     assert command["values"] == [0.] * 6
     assert tick(101_550, fresh=False)["values"] == [0.] * 6
     assert tick(101_700, fresh=False)["values"] == [0.] * 6
-    assert not plans
     assert tick(101_750)["values"] == [0.] * 6
-    assert tick(101_800)["values"] == [0., 0., 0., 0., 0., -.25]
-    for stamp in range(101_900, 103_200, 100):
-        command = tick(stamp, -.25)
-    assert command["values"] == [0.] * 6
-    for stamp in (103_200, 103_350, 103_450, 103_550, 103_650):
-        command = tick(stamp)
-    assert plans and all(side == -1.0 for side in plans)
-    assert command["values"][0] > 0
-    assert command["values"][5] == 0
-    assert command["obs_stamp_ms"] == 103_650
-    decisions = len(plans)
+    command = tick(101_850)
+    assert command["values"][0] > 0.
+    assert command["values"][1:] == [0.] * 5
+    assert command["obs_stamp_ms"] == 101_850
     card._odom_stamp_verified = False
-    assert tick(103_750)["values"] == [0.] * 6
-    assert len(plans) == decisions
+    assert tick(101_950)["values"] == [0.] * 6
 
 
 def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
@@ -348,22 +329,11 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
                              measured_range_m=None)
     monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
     monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
-        2.4 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else .90, 1.0))
+        2.4 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else
+        2.4 if heading > .30 else .90, 1.0))
     visible = np.ones(local_path.SHAPE, dtype=bool) if sweep_observed else local_path.FORWARD > 0
     monkeypatch.setattr(active_scan, "observe",
                         lambda *args: (visible, np.zeros_like(visible)))
-    replans = []
-
-    def plan(depth, config, state, odom, ahead, side):
-        if state.active_scan.ready or state.active_scan.result_frame:
-            assert "scan_grid" not in depth
-            assert "capture_ms" not in depth
-            replans.append(depth["frame_id"])
-            return (.06, 0.)
-        return (0., .10)  # An executable sidestep must not take priority over observation.
-
-    monkeypatch.setattr(policy, "_local_translation", plan)
-
     heading = 0.
 
     def tick(stamp, yaw=0., fresh=True):
@@ -412,14 +382,14 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
     assert math.degrees(heading) == pytest.approx(20., abs=2.)
     stamp += 100
     assert tick(stamp)["values"] == [0.] * 6
-    assert not replans
+    assert card._state.active_scan.advance_origin is None
     for _ in range(8):
         stamp += 100
         command = tick(stamp)
         if command["values"][0] > 0:
             break
-    assert replans and command["values"][0] > 0
-    assert command["values"][5] == 0
+    assert command["values"][0] > 0
+    assert command["values"][1:] == [0.] * 5
 
 
 def test_card_retains_the_outbound_twist_for_unmeasured_ego_prediction(monkeypatch):
@@ -1836,32 +1806,6 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
-def test_only_the_declared_half_width_is_needed_for_wheeled_geometry():
-    card = _card()
-    node = _FakeNode({_DEPTH_TOPIC: ["sensor_msgs/msg/CompressedImage"]})
-    card._executor = object()
-    card._open_publisher = lambda: setattr(card, "_node", node)
-    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
-                        K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
-    result = card.dispatch("navi", {
-        "action": "start",
-        "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC, "/demo/state/odom"],
-        "control_interface": _descriptor(footprint={"half_width": .275}, limits={
-            "lower": [-.3, 0., 0., 0., 0., -1.],
-            "upper": [.3, 0., 0., 0., 0., 1.],
-        }),
-        "camera_info": {_DEPTH_TOPIC: declaration},
-    })
-    try:
-        assert result["state"] == "running"
-        geometry = card._config.doorway_geometry
-        assert geometry.front == geometry.rear == card._config.half_width_m == .275
-        assert geometry.height is None
-        assert geometry.strict_occupancy
-    finally:
-        card._stop()
-
-
 @pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl",
                          [(50, None, True, 600, 400), (700, 800, True, 250, 250),
                           (50, None, False, 600, 400)])
@@ -1914,7 +1858,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
 
     def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300, **kwargs):
         attempted.append((side, half_width, max_age_ms, watchdog_ms))
-        return local_path.Detour((.04, -.06), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
+        return local_path.Detour((.04, 0.), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
 
     monkeypatch.setattr(local_path, "_checked_translation", plan)
     free = np.ones(local_path.SHAPE, dtype=bool)
@@ -1922,7 +1866,7 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     for index in range(6):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
-    assert command["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
+    assert command["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0]
     assert command["ttl_ms"] == expected_ttl
     expected_limit = depth_limit_ms or 500
     assert attempted[:2] == [(-1.0, .33, expected_limit, 600), (1.0, .33, expected_limit, 600)]
@@ -1939,5 +1883,5 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         card._depth_ms = depth_stamp
         card._odom_ms = 0
         resumed = card.next_command()
-        assert resumed["values"] == [.04, -.06, 0.0, 0.0, 0.0, 0.0]
+        assert resumed["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0]
         assert resumed["obs_stamp_ms"] == depth_stamp

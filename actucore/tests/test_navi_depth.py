@@ -379,6 +379,38 @@ def test_ground_fit_reseeds_from_the_visible_edge(mirror):
     assert not ground[350:390, 230:].any()
 
 
+@pytest.mark.parametrize("mirror", [False, True])
+def test_ground_fit_uses_a_continuous_side_window_around_a_wide_box(mirror):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    rays = (np.arange(D.HEIGHT) - 229) / 492 + .28
+    floor = np.minimum(1.45 / np.maximum(rays, .001), 8.)
+    frame = np.broadcast_to(floor[:, None], (D.HEIGHT, D.WIDTH)).astype(np.float32).copy()
+    frame[280:, 272:] = 1.37
+    camera = HorizontalIntrinsics(640, 492, 319.5)
+    ground = D.ground_mask(frame[:, ::-1] if mirror else frame, camera, (480, 492, 229))
+
+    assert ground is not None
+    if mirror:
+        ground = ground[:, ::-1]
+    assert ground[440, 180] and ground[351, 192]
+    assert not ground[280:, 272:].any()
+
+
+def test_ground_fit_rejects_a_raised_side_window_with_lower_floor_farther_away():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    rays = (np.arange(D.HEIGHT) - 229) / 492 + .28
+    floor = np.minimum(1.45 / np.maximum(rays, .001), 8.)
+    frame = np.broadcast_to(floor[:, None], (D.HEIGHT, D.WIDTH)).astype(np.float32).copy()
+    frame[280:, 272:] = 1.37
+    frame[387:, :272] = (1.25 / rays[387:])[:, None]
+
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 492, 319.5), (480, 492, 229))
+
+    assert ground is None or not ground[387:, :272].any()
+
+
 def test_visible_edge_seed_rejects_a_raised_platform():
     from plugins.navi.camera import HorizontalIntrinsics
 

@@ -71,26 +71,6 @@ def test_receipt_only_projects_only_the_latest_requested_frame(monkeypatch, comm
     assert len(projected) == 1 and projected[0] is newer
 
 
-def test_aligned_grid_can_require_observations_since_a_capture_time(monkeypatch):
-    look, geometry, visible, occupied = _setup(monkeypatch)
-    visible[:] = False
-    visible[22, 25] = True
-    occupied[22, 24] = True
-    _tick(look, geometry, 1000)
-    visible[22, 25] = False
-    visible[26, 29] = True
-    occupied[22, 24] = False
-    occupied[26, 28] = True
-    _tick(look, geometry, 1100)
-
-    all_free, all_hits = look.grid()
-    recent_free, recent_hits = look.grid(since_ms=1100)
-    assert all_free[22, 25] and all_free[26, 29]
-    assert not recent_free[22, 25] and recent_free[26, 29]
-    assert all_hits[22, 24] and all_hits[26, 28]
-    assert not recent_hits[22, 24] and recent_hits[26, 28]
-
-
 def test_active_scan_turns_right_and_waits_for_post_turn_depth(monkeypatch):
     lookout, geometry, _, blocked = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)

@@ -204,7 +204,8 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     positions = np.nonzero(valid)[1]
     all_points = np.ones(len(z), dtype=bool)
 
-    def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None, check_below=False):
+    def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None, check_below=False,
+            window_halves=False):
         start, end = visible_span or (0, seed.shape[1])
         visible = (positions >= start) & (positions < end)
         min_inliers = 0.6 * seed.shape[0] * (end - start)
@@ -228,7 +229,10 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         support = np.zeros_like(valid)
         support[valid] = inliers
         thirds = np.array_split(support, 3, axis=1)
-        if near_thirds is None:
+        if window_halves:
+            if any(part.mean() < 0.65 for part in np.array_split(support[:, start:end], 2, axis=1)):
+                return None
+        elif near_thirds is None:
             if sum(third.mean() >= 0.50 for third in thirds) < 2:
                 return None
         elif any(thirds[third].mean() < 0.65 for third in near_thirds):
@@ -244,7 +248,12 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         farther = ground[far_start:int(height * far_end), columns]
         far_thirds = np.array_split(farther, 3, axis=1)
         verified = near_thirds if visible_span is not None else (0, 1, 2)
-        far_support = [far_thirds[third].mean() for third in verified]
+        if window_halves:
+            far_support = [part.mean() for part in np.array_split(farther[:, start:end], 2, axis=1)]
+            if min(far_support) < .06 or max(far_support) < .35:
+                return None
+        else:
+            far_support = [far_thirds[third].mean() for third in verified]
         one_far_side = sum(support >= 0.06 for support in far_support) < 2
         if one_far_side and max(far_support) < 0.35:
             return None
@@ -322,6 +331,16 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     # Verify the centre and the visible side, including a check for lower surfaces.
     for (near_thirds, span), edge in zip(visible_spans, (left, right)):
         ground = fit(edge, near_thirds=near_thirds, visible_span=span, check_below=True)
+        if ground is not None:
+            return ground
+
+    # A wide obstacle can cover the centre and leave a continuous strip on
+    # only one side. Require support in both halves of that strip and leave
+    # all returns on the occluded side available to obstacle detection.
+    count = seed.shape[1]
+    visible = 2 * count // 5
+    for edge, span in ((left, (0, visible)), (right, (count - visible, count))):
+        ground = fit(edge, visible_span=span, check_below=True, window_halves=True)
         if ground is not None:
             return ground
     return None

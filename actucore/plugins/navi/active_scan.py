@@ -58,12 +58,14 @@ class ActiveScan:
     pending_depth: dict | None = None
     _pending_projection: tuple | None = None
     side_frame: int = 0
+    advance_m: float | None = None
+    advance_origin: tuple | None = None
+    advance_commanded_m: float = 0.
     result_frame: int = 0
     receipt_only: bool = False
     source_frame: int | None = None
     odom_source: int | None = None
     pose_origin: PlanarPose | None = None
-    pose_epoch: object = field(default_factory=object)
     pose_feedback_since_ms: int = 0
     turn_stop_ms: int | None = None
     turn_until_ms: int = 0
@@ -142,7 +144,7 @@ class ActiveScan:
         self.odom_source = source
         self.motion = motion
         timeout = 2 * SCAN_TIMEOUT_MS if self.receipt_only else SCAN_TIMEOUT_MS
-        if self.active and stamp - self.start_ms > timeout:
+        if self.active and self.advance_origin is None and stamp - self.start_ms > timeout:
             return self.interrupt("主动观察：观测超时，停车")
 
         self.current_frame = 0
@@ -232,19 +234,6 @@ class ActiveScan:
         self.single_capture_ms = depth.get("capture_ms")
         return self._update_latest(dict(depth, frame_id=frame), geometry, now_ms, max_depth_age_ms)
 
-    def sweep_pose(self, max_depth_age_ms):
-        """Use observed motion with a fresh view, in this scan's continuous local frame."""
-        if self.command_only or not self.poses or not self.current_frame:
-            return None
-        stamp, (forward, right, heading), yaw_rate = self.poses[-1]
-        age = stamp - self.current_frame
-        if self.receipt_only:
-            if abs(yaw_rate) > STILL_YAW or abs(age) >= max_depth_age_ms:
-                return None
-        elif not 0 <= age < max_depth_age_ms:
-            return None
-        return PlanarPose(stamp, (self.pose_epoch,), forward, -right, -heading)
-
     def _pose_at(self, stamp):
         for index, (upper_time, upper, upper_yaw_rate) in enumerate(self.poses):
             if upper_time == stamp:
@@ -258,8 +247,8 @@ class ActiveScan:
                 return pose, max(abs(lower_yaw_rate), abs(upper_yaw_rate)) <= STILL_YAW
         return None
 
-    def grid(self, *, since_ms=0):
-        """Use the latest view or reproject aligned views captured since a cutoff."""
+    def grid(self):
+        """Reproject nearby views. Occupation wins, and free cells need support."""
         if self.receipt_only:
             frame, pose, free, occupied = self.views[-1]
             if self._pending_projection is not None:
@@ -273,7 +262,7 @@ class ActiveScan:
         stamp = self.poses[-1][0]
         forward, right, yaw = self.pose
         for capture, (before_f, before_r, before_yaw), view_free, view_occupied in self.views:
-            if capture < since_ms or stamp - capture > MAP_AGE_MS:
+            if stamp - capture > MAP_AGE_MS:
                 continue
             df, dr = forward - before_f, right - before_r
             offset_f = df * math.cos(before_yaw) + dr * math.sin(before_yaw)
@@ -293,10 +282,11 @@ class ActiveScan:
             free |= confirmed
         return free & ~occupied, occupied
 
-    def begin(self, directions):
+    def begin(self, directions, *, advance_m=None):
         if self.attempted or not self.current_frame:
             return False
         self.directions = directions
+        self.advance_m, self.advance_origin, self.advance_commanded_m = advance_m, None, 0.
         self.attempted = True
         self.phase = "brake"
         self.origin_set = False
@@ -397,7 +387,7 @@ class ActiveScan:
                 self.issued_yaw = False
             else:
                 self.side_frame = self.current_frame
-            self.phase = "evaluate" if returning or self.receipt_only else "return"
+            self.phase = "evaluate" if returning or self.receipt_only or self.advance_m is not None else "return"
             return ScanCommand(reason="主动观察：已记录新视角")
         self.settle_ms = None
         if stamp - self.still_since < SETTLE_MS // 2:
@@ -422,6 +412,8 @@ class ActiveScan:
                 self.turn_until_ms = 0
                 self.turn_stop_ms = control_ms
                 return ScanCommand(reason="主动观察：停转等待新位姿")
+        elif self.advance_m is not None and tick_s > 0.:
+            yaw_rate = min(yaw_rate, max(min_yaw_rate, abs(error) / tick_s))
         _, occupied = self.grid()
         occupied = occupied | self.views[-1][3]
 
@@ -553,7 +545,6 @@ class ActiveScan:
         self.views.clear()
         self.pose = (0., 0., 0.)
         self.pose_origin = None
-        self.pose_epoch = object()
         self.pose_feedback_since_ms = 0
         self.turn_stop_ms = None
         return self.interrupt()
