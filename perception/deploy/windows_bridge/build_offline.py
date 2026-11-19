@@ -2,6 +2,7 @@
 import hashlib
 import json
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -34,11 +35,29 @@ def download(url, target, expected_sha256=None):
     return actual
 
 
+def download_from_mirrors(urls, target, expected_sha256=None):
+    """Try fast regional mirrors first, while accepting only the expected bytes."""
+    errors = []
+    for url in urls:
+        try:
+            return download(url, target, expected_sha256)
+        except Exception as exc:
+            target.unlink(missing_ok=True)
+            errors.append(f'{url}: {exc}')
+            print(f'[offline] mirror failed, trying the next source: {url}', flush=True)
+    raise RuntimeError('All download sources failed for %s:\n%s' %
+                       (target.name, '\n'.join(errors)))
+
+
 def build(root):
     assets = root / 'offline'
     assets.mkdir(parents=True, exist_ok=True)
     installer = assets / 'python-3.12.10-amd64.exe'
-    download('https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe', installer)
+    download_from_mirrors([
+        'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe',
+        'https://mirrors.huaweicloud.com/python/3.12.10/python-3.12.10-amd64.exe',
+        'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe',
+    ], installer, '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb')
     # Explicit Windows artifacts avoid depending on the Jetson build host's
     # Python ABI or old pip cross-platform resolver.
     packages = [('playwright', '1.51.0', 'py3-none-win_amd64.whl'),
@@ -53,7 +72,11 @@ def build(root):
             raise RuntimeError('Missing or ambiguous Windows wheel: ' + name)
         artifact = matches[0]
         target = assets / artifact['filename']
-        download(artifact['url'], target, artifact['digests']['sha256'])
+        path = urllib.parse.urlparse(artifact['url']).path
+        download_from_mirrors([
+            'https://mirrors.cloud.tencent.com/pypi' + path,
+            artifact['url'],
+        ], target, artifact['digests']['sha256'])
     manifest = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted(assets.iterdir()) if p.suffix in ('.exe', '.whl')}
     if len(manifest) != 5:
