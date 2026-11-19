@@ -18,7 +18,7 @@
 {"action":"submit","instruction":"把胶带抓起来，向左移动约 5 厘米，再放下","arm_mode":"left","request_id":"tape-transfer-01"}
 ```
 
-提交返回 `action_id`。用 `{"action":"status","action_id":"…","include_history":true}` 获取执行阶段、模型动作、SDK 回执和最终原因。用 `{"action":"cancel","action_id":"…"}` 停止后续决策。卡片会等待已经下发的动作结束。一次只接受一个任务。在同一进程保留的最近 32 个任务内，相同 `request_id`、指令和模式可重复查询。上层也可以按 ActuCore 的 ACP 契约接收完成事件。
+提交返回 `action_id`。用 `{"action":"status","action_id":"…","include_history":true}` 获取执行阶段、模型动作、SDK 回执和最终原因。用 `{"action":"cancel","action_id":"…"}` 停止后续决策。卡片会等待已经下发的动作结束。一次只接受一个任务。在同一进程保留的最近 32 个任务内，相同 `request_id`、指令和模式可重复查询。启用 `record_dir` 后，卡片重启后仍可用原 `action_id` 查询归档的终态和历史。上层也可以按 ActuCore 的 ACP 契约接收完成事件。
 
 模型请求超时或网关暂时不可用时，卡片保留动作历史，重新读取相机与状态后再推理，连续三次未收到有效响应会返回失败。如果 SDK 命令的执行结果未知，卡片会给出具体原因并结束当前任务。
 

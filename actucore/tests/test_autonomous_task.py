@@ -1,4 +1,5 @@
 """Exercise submission, interlocks and final visual verification without hardware."""
+import json
 import sys
 import threading
 from pathlib import Path
@@ -18,6 +19,18 @@ def test_card_schema_and_optional_inputs():
     assert "private" not in repr(schema)
     assert "private" not in repr(card.dispatch("task", {"action": "info"}))
     assert card.dispatch("task", {"action": "submit", "instruction": "inspect"})["state"] == "error"
+
+
+def test_query_recorded_task_after_card_restart(tmp_path):
+    action_id = "autonomous_task_" + "a" * 32
+    record = {"action_id": action_id, "state": "completed", "history": [{"step": 1, "tool": "done"}]}
+    (tmp_path / action_id).mkdir()
+    (tmp_path / action_id / "result.json").write_text(json.dumps(record))
+    card = plugin.AutonomousTaskPlugin({"record_dir": str(tmp_path)}, None)
+    args = {"action": "status", "action_id": action_id}
+    assert card.dispatch("task", args) == {"action_id": action_id, "state": "completed", "last": record["history"][0]}
+    assert card.dispatch("task", {**args, "include_history": True})["history"] == record["history"]
+    assert card.dispatch("task", {**args, "action_id": "../" + action_id})["state"] == "error"
 
 
 def test_decide_act_reobserve_and_review(monkeypatch):

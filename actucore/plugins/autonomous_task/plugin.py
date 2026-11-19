@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import time
@@ -128,8 +129,6 @@ class AutonomousTaskPlugin:
                     action_id = args.get("action_id") or self._active or next(reversed(self._runs), None)
                     if action_id is None:
                         return {"state": "idle"}
-                    if action_id not in self._runs:
-                        raise ValueError("未知 action_id")
                     if action == "cancel" and action_id == self._active:
                         self._cancel.set()
                         self._runs[action_id]["state"] = "cancelling"
@@ -202,7 +201,17 @@ class AutonomousTaskPlugin:
         return self._status(action_id)
 
     def _status(self, action_id, history=False):
-        task = self._runs[action_id]
+        task = self._runs.get(action_id)
+        if task is None:
+            archive = self._cfg.get("record_dir")
+            if not archive or not isinstance(action_id, str) or not re.fullmatch(r"autonomous_task_[0-9a-f]{32}", action_id):
+                raise ValueError("未知 action_id")
+            try:
+                task = json.loads((Path(archive) / action_id / "result.json").read_text())
+            except FileNotFoundError:
+                raise ValueError("未知 action_id") from None
+            if task.get("action_id") != action_id or task.get("state") not in ("completed", "failed", "cancelled"):
+                raise ValueError("无有效的任务终态记录")
         out = {k: v for k, v in task.items() if k != "history"}
         if task["history"]:
             out["last"] = task["history"][-1]
@@ -233,7 +242,9 @@ class AutonomousTaskPlugin:
             self._active = self._cancel = None
         try:
             if path:
-                (path / "result.json").write_text(json.dumps(run, ensure_ascii=False, indent=2))
+                pending = path / "result.tmp"
+                pending.write_text(json.dumps(run, ensure_ascii=False, indent=2))
+                pending.replace(path / "result.json")
         finally:
             _completion(action_id, status, reason)
 
