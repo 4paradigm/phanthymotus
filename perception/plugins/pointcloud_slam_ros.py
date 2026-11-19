@@ -209,7 +209,7 @@ class RtabmapNode(Node):
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame,
                 on_observation=self._observe_motion if self._motion is not None else None,
-                on_unlocalized_frame=self._queue_frame if self._rgb is not None and self._rgb.camera is not None else None)
+                on_unlocalized_frame=self._queue_frame if self._rgb is not None else None)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
             if self._settings.get('capture_mount'):
@@ -375,7 +375,7 @@ class RtabmapNode(Node):
             self._dropped += 1
             return
         self._map_decision = dict(action='accept' if pose is not None else 'localize',
-            reason='numeric cloud and pose' if pose is not None else 'external pose absent; native visual estimation required')
+            reason='numeric cloud and pose' if pose is not None else 'external pose absent; native registration required')
         if predicted:
             self._map_decision = dict(action='register', reason='inertial guess requires native scan registration')
         normalized = normalize_cloud(cloud, observation, None,
@@ -385,7 +385,9 @@ class RtabmapNode(Node):
             self._queue.popleft()
             self._dropped += 1
         self._admission_seq += 1
-        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq))
+        # Allow the existing measured-pose wait and one bounded late result.
+        rgb_deadline = time.monotonic() + (2 if pose is not None else 1) * _MEASURED_RGB_WAIT_MS / 1000.
+        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation, rgb_deadline))
         if pose is not None:
             # A usable newer observation supersedes optional unlocalized work;
             # never replay a delayed frame into an already advanced native map.
@@ -566,7 +568,10 @@ class RtabmapNode(Node):
         if self.stream.extrinsic_mode == 'dynamic':
             odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
-        native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation) if self._rgb is not None else (cloud, None)
+        observation = item[6] if len(item) > 6 else None
+        rgb_deadline = item[7] if len(item) > 7 else time.monotonic()
+        native, rgb_generation = (self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline)
+                                  if self._rgb is not None else (cloud, None))
         if predicted:
             # The standard odometry input stays null. Even an older native
             # runtime cannot mistake this private hint for a tracking pose.
@@ -634,7 +639,7 @@ class RtabmapNode(Node):
             self._wake.wait(remaining)
         return False  # One bounded fallback scan when RGB-D never becomes usable.
 
-    def _sensor_data(self, cloud, pose, matrix, motion_generation=None):
+    def _sensor_data(self, cloud, pose, matrix, motion_generation=None, observation=None, rgb_deadline=0.):
         """Scan is mandatory; optional source-timed imagery may fail independently."""
         if motion_generation is None:
             motion_generation = self._motion_generation
@@ -660,7 +665,7 @@ class RtabmapNode(Node):
             with self._lock:
                 self._rgb_reservations.pop(stamp, None)
             return data, None  # Keep the guessed motion out of the measured scan.
-        if self._rgb_subscription_error:
+        if self._rgb_subscription_error or self._rgb.camera is None:
             return data, None
         key = (pose.segment_id if pose is not None else None, stamp, id(cloud))
         # Seed a new map with visual evidence when a connected JPEG has arrived.
@@ -689,7 +694,10 @@ class RtabmapNode(Node):
                 def prepare():
                     started = time.perf_counter()
                     try:
-                        result = self._rgb_attachment(cloud.header, stamp, pose, matrix, points, motion_generation)
+                        measured_depth = (self._input_registry.derived_depth(observation)
+                                          if observation is not None and self._input_registry is not None else None)
+                        result = self._rgb_attachment(cloud.header, stamp, pose, matrix, points,
+                                                      motion_generation, measured_depth)
                         with self._lock:
                             if not future.cancelled():
                                 self._rgb_preparation_ms.append((time.perf_counter()-started)*1000.)
@@ -715,26 +723,29 @@ class RtabmapNode(Node):
         except MotionPending as error:
             if self._rgb_task is not None and self._rgb_task[0] == key:
                 self._rgb_task = None
-            if pose is None:raise
+            if pose is None and time.monotonic() < rgb_deadline:
+                raise
+            with self._lock:
+                self._rgb_reservations.pop(stamp, None)
+                self._motion_mounts.pop(stamp, None)
             self._rgb_reason = str(error)
         except TimeoutError:
             with self._lock:
                 self._rgb_timeouts += 1
             with self._result_lock:
                 searching = self._active is not None and self._active['native_recovery']['state'] == 'searching'
-            if pose is None or (searching and self._rgb_task[0] == key):
-                # A pose from an unknown origin cannot locate the scan on the
-                # saved map. Let this observation consume its own late result.
+            if time.monotonic() < rgb_deadline and (pose is None or (searching and self._rgb_task[0] == key)):
+                # Give a late image one bounded chance to accompany its scan.
                 raise MotionPending('optional RGB preparation is pending within the bounded worker')
             self._rgb_reason = f'optional RGB preparation exceeded {budget_ms} ms; scan forwarded without images'
         except Exception as error:
             self._rgb_reason = str(error)
         return data, None
 
-    def _rgb_attachment(self, header, stamp, pose, matrix, points, motion_generation=None):
+    def _rgb_attachment(self, header, stamp, pose, matrix, points, motion_generation=None, measured_depth=None):
         from sensor_msgs.msg import Image, CameraInfo
         from .pointcloud_slam_alignment import align_pose
-        from .pointcloud_slam_rgb import project_depth
+        from .pointcloud_slam_rgb import project_depth, project_measured_depth
         now_ns = self._measurement_clock_ns()
         with self._lock:
             rgb = self._rgb_reservations.pop(stamp, None)
@@ -777,9 +788,13 @@ class RtabmapNode(Node):
             except ValueError:
                 if self._motion is None:raise
                 local = self._motion.timeline.relative(rgb_stamp,stamp) @ mount
-        depth = project_depth(points[::max(1, (len(points)+99999)//100000)],
-                              np.linalg.inv(local) @ matrix, self._rgb.K,
-                              self._rgb.width, self._rgb.height)
+        registration = np.linalg.inv(local) @ matrix
+        if measured_depth is None:
+            depth = project_depth(points[::max(1, (len(points)+99999)//100000)], registration,
+                                  self._rgb.K, self._rgb.width, self._rgb.height)
+        else:
+            depth = project_measured_depth(measured_depth, registration, self._rgb.K,
+                                           self._rgb.width, self._rgb.height)
         if not np.any(depth):
             raise ValueError('measured scan has no depth in the RGB field of view')
         left, right = Image(), Image()
@@ -979,9 +994,15 @@ class RtabmapNode(Node):
                     match = [values.get(key) for key in
                         ('Motus/RecoveryNode/', 'Motus/RecoveryAnchor/', 'Motus/RecoveryInliers/')]
                     if (recovery[0] == 2 and all(isinstance(v, (int, float)) and
-                            math.isfinite(v) and v > 0 for v in match) and match[0] == msg.ref_id):
-                        segment['native_recovery'].update(relocalization_node=int(match[0]),
-                            relocalization_anchor=int(match[1]), relocalization_inliers=int(match[2]))
+                            math.isfinite(v) and v > 0 for v in match[:2]) and match[0] == msg.ref_id):
+                        correspondences = values.get('Motus/ScanRelocalizationCorrespondences/')
+                        if isinstance(correspondences, (int, float)) and math.isfinite(correspondences) and correspondences > 0:
+                            segment['native_recovery'].update(relocalization_node=int(match[0]),
+                                relocalization_anchor=int(match[1]), relocalization_source='scan',
+                                relocalization_correspondences=int(correspondences))
+                        elif isinstance(match[2], (int, float)) and math.isfinite(match[2]) and match[2] > 0:
+                            segment['native_recovery'].update(relocalization_node=int(match[0]),
+                                relocalization_anchor=int(match[1]), relocalization_inliers=int(match[2]))
             if valid_ref or has_recovery_state:
                 try:
                     segment['progress'].activity(self._stamp(msg),self._receipt_clock())

@@ -48,6 +48,19 @@ def project_depth(points, camera_from_cloud, K, width, height):
     return depth.reshape(height, width)
 
 
+def project_measured_depth(measured, camera_from_cloud, K, width, height):
+    from .pointcloud_math import backproject_depth
+
+    depth, (fx, fy, cx, cy), minimum, maximum = measured
+    source_K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
+    if (depth.shape == (height, width) and np.allclose(source_K, K, atol=1e-8, rtol=0.) and
+            np.allclose(camera_from_cloud, np.eye(4), atol=1e-8, rtol=0.)):
+        valid = np.isfinite(depth) & (depth > 0.) & (depth >= minimum) & (depth <= maximum)
+        return np.where(valid, depth, 0.)
+    points = backproject_depth(depth, fx, fy, cx, cy, 1, minimum, maximum)
+    return project_depth(points[points[:, 2] > 0.], camera_from_cloud, K, width, height)
+
+
 class RgbLoopInput:
     def __init__(self, descriptor, settings, *, max_pending=10, on_decoded=None):
         self._on_decoded = on_decoded

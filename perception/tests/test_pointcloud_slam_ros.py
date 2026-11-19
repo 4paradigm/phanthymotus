@@ -697,7 +697,7 @@ def test_waiting_for_pose_does_not_refresh_original_ingress_age(node):
     node._measurement_clock_ns=lambda:1_200_000_000
     node._odom(NS(data=json.dumps(odom(1200))))
     assert len(node._queue)==1
-    assert node._queue[0][-1]==1.
+    assert node._queue[0][4]==1.
 
 
 def test_unknown_covariance_reports_backend_default(node):

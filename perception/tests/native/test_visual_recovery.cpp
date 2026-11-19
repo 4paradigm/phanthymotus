@@ -13,6 +13,68 @@
 #include <stdexcept>
 #include <chrono>
 
+static void testScanRelocalization(const std::string &root, const std::string &output,
+                                  rtabmap::ParametersMap parameters)
+{
+    const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
+    if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
+    parameters["RGBD/LinearUpdate"]="0.03";
+    rtabmap::Rtabmap map;
+    map.init(parameters,output+".db");
+    motus::VisualRecovery recovery(parameters);
+    const auto frame=[&](double stamp, float x, bool hasPose, bool noOverlap, bool blackImage=false)
+    {
+        const float f=260.f;
+        cv::Mat scan(1,depth.total(),CV_32FC3);
+        int count=0;
+        for(int v=0;v<depth.rows;++v) for(int u=0;u<depth.cols;++u)
+        {
+            const float z=depth.at<unsigned short>(v,u)/1000.f;
+            if(z>0) scan.at<cv::Vec3f>(0,count++)={(u-depth.cols/2.f)*z/f-x+(noOverlap?20.f:0.f),
+                                                 (v-depth.rows/2.f)*z/f,z};
+        }
+        const rtabmap::CameraModel camera(f,f,depth.cols/2.,depth.rows/2.,rtabmap::Transform::getIdentity(),0.,depth.size());
+        rtabmap::SensorData data(blackImage?cv::Mat::zeros(depth.size(),CV_8UC3):cv::Mat(),
+                                 blackImage?depth:cv::Mat(),camera,0,stamp);
+        data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
+        return recovery.process(map,data,hasPose?rtabmap::Transform(x,0,0,0,0,0):rtabmap::Transform(),
+                                cv::Mat::eye(6,6,CV_64F)*.01);
+    };
+    if(!frame(1.,0.f,true,false) || !frame(1.5,.12f,true,false))
+        throw std::runtime_error("cannot seed a connected old scan map");
+    const auto old=map.getLocalOptimizedPoses();
+    const auto anchor=map.getLastLocationId();
+    frame(6.,.22f,false,true,true);
+    frame(6.5,.22f,false,true);
+    if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+       map.getLocalOptimizedPoses()!=old)
+        throw std::runtime_error("unrelated scan must leave the old graph intact and publish no pose");
+    const bool localized=frame(7.,.22f,false,false);
+    const auto node=recovery.recoveryNode();
+    std::cout<<"scan recovery="<<localized<<" anchor="<<recovery.recoveryAnchor()<<" node="<<node
+             <<" before="<<old.size()<<" after="<<map.getLocalOptimizedPoses().size()<<std::endl;
+    if(!localized || recovery.state()!=motus::VisualRecovery::Localized || recovery.odom().isNull() ||
+       recovery.recoveryAnchor()!=anchor || recovery.recoveryInliers()!=0 ||
+       std::abs(recovery.odom().x()-.22f)>.03f || map.getLocalOptimizedPoses().size()!=old.size()+1)
+        throw std::runtime_error("overlapping scan did not relocalize against the saved graph without RGB");
+    for(const auto &pose:old)
+        if(map.getLocalOptimizedPoses().at(pose.first)!=pose.second)
+            throw std::runtime_error("scan recovery moved an existing optimized pose");
+    if(!frame(7.5,.30f,false,false) || !frame(8.,.38f,false,false) ||
+       map.getLocalOptimizedPoses().size()<old.size()+3)
+        throw std::runtime_error("old graph stopped growing after scan recovery");
+    const auto grown=map.getLocalOptimizedPoses();
+    map.close();
+    rtabmap::Rtabmap reopened;
+    reopened.init(parameters,output+".db");
+    const auto *signature=reopened.getMemory()->getSignature(node);
+    if(reopened.getLocalOptimizedPoses()!=grown || !signature ||
+       !signature->hasLink(anchor,rtabmap::Link::kGlobalClosure))
+        throw std::runtime_error("scan recovery constraint and graph must survive reopening");
+    reopened.close(false);
+    std::cout<<"reopened nodes="<<grown.size()<<" persisted scan edge="<<anchor<<"->"<<node<<std::endl;
+}
+
 int main(int argc, char **argv)
 {
     if(argc != 4 && argc != 5) return 2;
@@ -67,6 +129,12 @@ int main(int argc, char **argv)
     p["RGBD/ProximityPathMaxNeighbors"]="1"; p["Kp/MaxFeatures"]="500";
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
+    if(mode=="scan_relocalize")
+    {
+        p["RGBD/NeighborLinkRefining"]="false";
+        testScanRelocalization(root,output,p);
+        return 0;
+    }
     if(nativeRecovery)
     {
         p["RGBD/NeighborLinkRefining"]="false"; p["RGBD/LoopCovLimited"]="true";
@@ -194,7 +262,8 @@ int main(int argc, char **argv)
             (failedVisualSeed && i>0) || (voHandoff && (i==6 || (i==7 && !shortVisualLoss) ||
                 (mode=="vo_handoff_gap" && i==3))) ||
             (crossedLoss && !staggeredChassisLoss && !scanAfterDisagreement) ||
-            loseAfterClosure || gap || resetGap || (recoveryScenario && phase=="rgb_gap");
+            loseAfterClosure || gap || resetGap ||
+            (recoveryScenario && (phase=="rgb_gap" || (phase=="relocalize" && visualFault)));
         if(noScanOverlap)
             for(int j=0;j<count;++j) scan.at<cv::Vec3f>(0,j)[0]+=20.f; // No scan overlap with the anchor.
         if(returningPose)

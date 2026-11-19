@@ -117,6 +117,7 @@ class InputAdapterRegistry:
         self.time_policy = TimePolicy(self.clock_id, max_age_ns=max_age_ns)
         self._lock = threading.RLock()
         self._streams, self._derived = {}, OrderedDict()
+        self._derived_depth = OrderedDict()
         self._node = None
         self._closed = False
         # A registry belongs to exactly one executor/ROS context, not all domains.
@@ -206,7 +207,7 @@ class InputAdapterRegistry:
         for lease in leases:
             lease._offer(message, context)
 
-    def register_derived(self, topic, message, parent, stage):
+    def register_derived(self, topic, message, parent, stage, *, depth=None):
         context = replace(parent, observation_id=uuid.uuid4().hex,
                           parent_observation_ids=(parent.observation_id,),
                           transformations=parent.transformations + (stage,))
@@ -214,7 +215,16 @@ class InputAdapterRegistry:
             self._derived[_identity(topic, message)] = context
             while len(self._derived) > 256:
                 self._derived.popitem(last=False)
+            if depth is not None and not self._closed and depth[0].nbytes <= self.max_bytes:
+                self._derived_depth[context.observation_id] = depth
+                while (len(self._derived_depth) > self.max_pending or
+                       sum(entry[0].nbytes for entry in self._derived_depth.values()) > self.max_bytes):
+                    self._derived_depth.popitem(last=False)
         return context
+
+    def derived_depth(self, observation):
+        with self._lock:
+            return self._derived_depth.get(observation.observation_id)
 
     def _release(self, lease):
         with self._lock:
@@ -234,6 +244,7 @@ class InputAdapterRegistry:
     def close(self):
         with self._lock:
             self._closed = True
+            self._derived_depth.clear()
             leases = [l for s in self._streams.values() for l in s['leases']]
         failures = []
         for lease in leases:

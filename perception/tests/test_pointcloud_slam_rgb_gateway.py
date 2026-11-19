@@ -118,6 +118,49 @@ def image(n, ms, data=b'good'):
     return msg
 
 
+def test_visual_depth_keeps_the_measured_grid_after_preview_decimation(calibrated_node):
+    from plugins.spatial_input import InputAdapterRegistry, _identity
+    from plugins.spatial_time import FrameContext
+    from test_pointcloud_plugin import _FakeImage, _plugin, metric_z16_declaration
+    from test_pointcloud_slam_stream import odom
+
+    n = calibrated_node
+    w, h = 640, 480
+    n._rgb.width, n._rgb.height = w, h
+    n._rgb.K = np.array([[600., 0., 319.5], [0., 600., 239.5], [0., 0., 1.]])
+    n._rgb._decode_jpeg = lambda _: np.zeros((h, w, 3), np.uint8)
+    n.stream.max_cloud_points = 20_000
+    registry = InputAdapterRegistry()
+    n._input_registry = registry
+    plugin, executor = _plugin({'metric_cloud': True})
+    calibration = dict(metric_z16_declaration(w, h), K=n._rgb.K.ravel().tolist())
+    assert plugin.dispatch('pointcloud', dict(action='start', input_topic='/depth',
+                          camera_info={'/depth': calibration}))['state'] == 'running'
+    producer = executor.nodes[0]
+    producer._input_registry = registry
+    raw = np.full((h, w), 2000, dtype='<u2')
+    raw[1, 1] = 0
+    depth = _FakeImage(data=raw.tobytes(), encoding='16UC1', width=w, height=h, step=2*w)
+    depth.header = NS(stamp=NS(sec=1, nanosec=0), frame_id='camera')
+    context = FrameContext('depth1', 10**9, 'clock', 'source_capture', 10**9, 10**9, 'ingress')
+    try:
+        producer._emit_depth(depth, context)
+        metric = next(p for p in producer.publishers if p.topic.endswith('/pointcloud_metric'))
+        scan = metric.raw_messages[0]
+        n._odom(NS(data=json.dumps(odom(1000))))
+        image(n, 1000)
+        assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+        n._cloud(scan, registry._derived[_identity(metric.topic, scan)])
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        message = published(n, '/sensor_data')[0].raw_messages[0]
+        assert message.laser_scan.width == 19_200
+        measured = np.frombuffer(message.right.data, dtype='<f4').reshape(h, w)
+        np.testing.assert_array_equal(measured, raw / 1000.)
+    finally:
+        producer.stop()
+        registry.close()
+
+
 def test_rgb_error_and_recovery_keep_forwarding_scan_in_same_map(calibrated_node):
     n = calibrated_node
     original = image(n, 1000)
@@ -825,6 +868,31 @@ def held_projection(monkeypatch):
     monkeypatch.setattr(rgb, 'project_depth', delayed)
     yield entered, release
     release.set()
+
+
+def test_searching_forwards_a_scan_even_if_rgb_preparation_stays_blocked(calibrated_node, held_projection):
+    from test_pointcloud_slam_stream import odom
+
+    n = calibrated_node
+    send(n)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    lost = odom(1100, status='lost')
+    lost['pose'] = None
+    n._odom(NS(data=json.dumps(lost)))
+    n._native_info(NS(ref_id=0, stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/',
+        'Motus/VisualInliers/'], stats_values=[1., 0., 0.]), n._active)
+    entered, release = held_projection
+    try:
+        image(n, 1100)
+        assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+        n._cloud(cloud(1_100_000_000))
+        assert entered.wait(1.)
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2, timeout=1.2)
+        scan = published(n, '/sensor_data')[0].raw_messages[-1]
+        assert scan.laser_scan.data and not scan.left.data
+        assert published(n, '/odom')[0].raw_messages[-1].pose.pose.orientation.w == 0.
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("action", ["deliver", "lose_pose_again", "stop"])

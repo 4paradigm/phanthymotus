@@ -437,7 +437,7 @@ class _PointCloudNode(Node):
         self._publish(xyz)
         if self._metric_cloud_enabled and ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
                 (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
-            self._publish_metric(xyz, msg, w, h, context)
+            self._publish_metric(xyz, msg, w, h, context, depth_m=depth_m)
         elif self._metric_cloud_enabled:
             self._metric_skip('unsupported_encoding')
 
@@ -454,7 +454,7 @@ class _PointCloudNode(Node):
             return {'published': self._metric_published, 'skipped': dict(self._metric_skipped),
                     'last_skip_reason': self._metric_last_skip}
 
-    def _publish_metric(self, xyz, source, width, height, context=None):
+    def _publish_metric(self, xyz, source, width, height, context=None, *, depth_m=None):
         if self._stop_event.is_set():
             return
         calibration = self._calibration
@@ -495,7 +495,9 @@ class _PointCloudNode(Node):
         if context is not None and self._input_registry is not None:
             self._metric_observation = context
             self._metric_frame = header.frame_id
-            derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context, 'depth_projection')
+            depth = (depth_m, intrinsics, self._min_depth_m, self._max_depth_m) if depth_m is not None else None
+            derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context,
+                                                            'depth_projection', depth=depth)
             if self._metric_metadata_pub is not None and not self._metric_metadata_source_topic:
                 packet = dict(schema='motus.slam_frame/2', observation=derived.to_dict(),
                               stamp_ns=derived.observation_stamp_ns, clock_id=derived.normalized_clock_id,
