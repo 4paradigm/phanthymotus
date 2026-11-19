@@ -1207,7 +1207,14 @@ def _apply_tasks(tasks: list) -> dict:
         task = task_store.create(goal, spec.get('check_cron', '') or '',
                                  spec.get('metadata') or {})
         created.append(task.id)
-        if task.check_cron:
+        import schedules
+        if schedules.is_schedule(task):
+            # 导出时 metadata 原样带走了定时事项；不在这里挂上，要等下次重启才生效。
+            try:
+                schedules.register(task)
+            except Exception:
+                pass
+        elif task.check_cron:
             try:
                 scheduler.add_job(
                     f'task:{task.id}', task.check_cron,
