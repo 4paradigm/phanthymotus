@@ -12,6 +12,7 @@ from std_msgs.msg import String
 
 from plugins.semantic_masks import decode_camera_jpeg, overlay, semantic_maps
 from utils.qos import CAMERA_QOS
+from utils.ros_lifecycle import dispose_node
 
 DEFAULT_CARDS = {"person": ["person"], "car": ["car"], "chair": ["chair"],
                  "traffic": ["bicycle", "car", "motorcycle", "bus", "truck"]}
@@ -90,13 +91,17 @@ class _Camera(Node):
 
     def close(self):
         # Loading TensorRT can take minutes. A stopped worker can finish the shared
-        # load but cannot touch a removed node or publish a late frame.
+        # load but cannot touch a removed node or publish a late frame. Signal
+        # closure first, let the worker exit its loop, then retire the node so no
+        # publisher is torn down while the worker could still reference it.
         with self.cv:
             self.closed = True
             self.latest = None
             self.cv.notify_all()
-            self.executor_ref.remove_node(self)
-            self.destroy_node()
+        # A worker mid-inference may take longer than the bound; the closed flag
+        # still blocks its publish at the end of _process, so a timeout is safe.
+        self.worker.join(timeout=5.0)
+        dispose_node(self.executor_ref, self, label="segment camera")
 
     def _receive(self, msg):
         with self.cv:
