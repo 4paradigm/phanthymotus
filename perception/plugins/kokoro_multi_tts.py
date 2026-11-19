@@ -484,15 +484,15 @@ class KokoroMultiTTSAdapter(TTSAdapter):
 WORK = Path(__file__).resolve().parents[1]
 ASSETS = {
     "511": (
-        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=32c487e8ce36ca1939cb8bd0fdf06f5a6313386e&FilePath=kokoro-multi-jp511-fp32-v16.tar.gz",
-        "10af117cbf2c0f5b65fb80c34612d006fb7871830fd97b13677f345d0177eb06",
-        332861449,
+        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=795b067c06b3b396a78df264dabdbb1e9bd08ad1&FilePath=kokoro-multi-jp511-fp32-v17-zh-frontend.tar.gz",
+        "87e0492202abb30dcd75bab9eaaf8fcc246f953f7a6dc6d1e01349c3df73bbda",
+        332862440,
         "/models/kokoro-multi-trt-jp511",
     ),
     "61": (
-        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=31b5a89b102aca966a291d96b97ffa2857bba2c3&FilePath=kokoro-multi-jp61-fp32-v15-fr.tar.gz",
-        "da82b65029322da07e142a1c1b6e51bfadc7e0a74b7dd7e93ce8d8f9ac674788",
-        326827286,
+        "https://www.modelscope.cn/api/v1/models/lanxijiang/Kokoro-Multi-TRT-JP61/repo?Revision=849c49cde3b0da236ce931110c5b0d080f81e2c3&FilePath=kokoro-multi-jp61-fp32-v16-zh-frontend.tar.gz",
+        "4968c2bf9cb0a07c4e5160554abdcc2bdf7e80750e5ba69a71ffae216f7f6459",
+        326829114,
         "/models/kokoro-multi-trt",
     ),
 }

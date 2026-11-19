@@ -2,7 +2,8 @@
 
 All language resources remain in the verified external release. Thai tones and
 Russian/German substitutions retain the legacy114-symbol audition baseline.
-The trained119-symbol release preserves native phonemes; review is still required. No TTSV4 source or acoustic weights are imported here.
+The trained119-symbol release preserves native phonemes. VITS2's numeric
+text rules are shared; the acoustic model receives Kokoro's own phonemes.
 """
 from __future__ import annotations
 
@@ -20,6 +21,12 @@ import sys
 import tempfile
 import threading
 from unicodedata import category
+
+from plugins.vits2_tts_trt.frontend.math_units import (
+    find_spans as find_vits2_measurements,
+    has_explicit_math_context,
+)
+from plugins.vits2_tts_trt.frontend.number_context import find_spans as find_vits2_numbers
 
 
 _LANGUAGES = {"zh", "en", "ja", "ru", "de", "fr", "es", "th"}
@@ -40,6 +47,11 @@ _VERSION = re.compile(
 )
 _DATE = re.compile(r"(?<![A-Za-z0-9_.\-])\d{4}-\d{2}-\d{2}(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])")
 _DATE_LIKE = re.compile(r"(?<![A-Za-z0-9_])\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[-/.]\d+)*(?![A-Za-z0-9_])")
+_DATE_ENDPOINT = r"(?:\d{4}[-/.]\d{1,2}[-/.]|\d{1,2}[/.])\d{1,2}"
+_ZH_DATE_RANGE = re.compile(r"(?<![A-Za-z0-9_./-])(?P<first>" + _DATE_ENDPOINT
+                            + r")[ \t]*[-–—][ \t]*(?P<last>" + _DATE_ENDPOINT
+                            + r")(?![A-Za-z0-9_]|[./-]\d)")
+_ZH_DATE_CUE = re.compile(r"日期|日程|日历|活动时间|假期|连休|放假|休假|元旦|春节")
 _AMBIGUOUS_PAIR = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:-\d+|\s*/\s*(?:\d+|[A-Za-z]{1,3}))(?![A-Za-z0-9_.])")
 _DOTTED = re.compile(r"(?<![A-Za-z0-9_.])\d{1,4}(?:\.\d{1,4}){2,}(?![A-Za-z0-9_.])")
 _CLOCK = re.compile(r"(?<![A-Za-z0-9_:])\d{1,3}:\d{2}(?::\d{2})?(?![A-Za-z0-9_:])")
@@ -366,6 +378,20 @@ def _date(raw, language, cfg, *, german_dative=False, russian_accusative=False):
     return cfg["date_templates"][language].format(day=d, month=cfg["months"][language][month-1], year=_integer(year, language))
 
 
+def _zh_date_range(first, last, cfg):
+    start, end = (tuple(map(int, re.split(r"[-/.]", endpoint))) for endpoint in (first, last))
+    start_has_year, end_has_year = len(start) == 3, len(end) == 3
+    rolls_over = end[-2:] < start[-2:]
+    year = start[0] if start_has_year else 2000
+    if end_has_year and not start_has_year:
+        year = end[0] - rolls_over
+    end_year = end[0] if end_has_year else year + (start_has_year and rolls_over)
+    left = _date(f"{year}-{start[-2]}-{start[-1]}", "zh", cfg)
+    right = _date(f"{end_year}-{end[-2]}-{end[-1]}", "zh", cfg)
+    return (left if start_has_year else left.partition("年")[2]) + "到" + (
+        right if end_has_year or end_year != year else right.partition("年")[2])
+
+
 def _clock(raw, duration, language, cfg):
     values = list(map(int, raw.split(":")))
     if any(v > 59 for v in values[1:]) or (not duration and values[0] > 23):
@@ -607,6 +633,16 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
                 return _join([prefix, spoken], language)
             return spoken
         add(start, start + len(value), "version", version)
+    if language == "zh":
+        for match in _ZH_DATE_RANGE.finditer(text):
+            # Without a year or a calendar cue, month/day can be a fraction
+            # and dotted pairs can be decimals or version components.
+            if has_explicit_math_context(text, match.start()) or not (
+                    re.match(r"\d{4}", match["first"]) or re.match(r"\d{4}", match["last"])
+                    or _ZH_DATE_CUE.search(_context(text, match.start(), match.end()))):
+                continue
+            add(match.start(), match.end(), "date_range",
+                lambda m=match: _zh_date_range(m["first"], m["last"], cfg))
     for match in _DATE.finditer(text):
         local = _context(text, match.start(), match.end())
         if any(cue in local for cue in ("พ.ศ.", "佛历", "佛曆", "buddhist")):
@@ -637,6 +673,20 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
                 date(y, month, int(m["day"]))
                 return m["month"] + " " + _integer(int(m["day"]), "en", to="ordinal")
             add(match.start(), match.end(), "english_named_date", named_date)
+    if language in {"zh", "en"} and re.search(r"\d", text):
+        def read_number(value, lang):
+            return _number(value, lang.lower(), cfg)
+
+        for start, end, spoken in find_vits2_numbers(text, language, read_number):
+            if any(char.isdigit() for char in text[start:end]):
+                add(start, end, "number_context", lambda value=spoken: value)
+        if language == "zh" and re.search(r"[–—~～到至><≤≥≠℃℉]", text):
+            # Claim whole ranges and comparisons before a lone unit can
+            # consume their right-hand side.
+            for start, end, spoken in find_vits2_measurements(text, language, read_number):
+                if " 到 " in spoken or text[start] in _RELATIONS:
+                    spoken = re.sub(r"(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])", "", spoken)
+                    add(start, end, "measurement", lambda value=spoken: value)
     for match in _DATE_LIKE.finditer(text):
         add(match.start(), match.end(), "ambiguous_date_format", lambda m=match: m.group())
     for match in _IPV4.finditer(text):
@@ -1191,6 +1241,7 @@ class Frontend:
         lexicon = json.loads(self._lexicon_path.read_text(encoding="utf-8"))
         cfg = lexicon["normalization"]
         self._chinese_readings = lexicon.get("chinese_readings", {})
+        self._chinese_reading_lengths = sorted({len(phrase) for phrase in self._chinese_readings}, reverse=True)
         self._unstressed_linkers = {language: frozenset(words)
                                    for language, words in lexicon.get("unstressed_linkers", {}).items()}
         self._mandatory_liaisons = lexicon.get("mandatory_liaisons", {})
@@ -1422,7 +1473,7 @@ class Frontend:
         readings = self._chinese_readings
         # A transliterated name's middle dot is a word boundary, not a phone.
         text = re.sub(r"(?<=[\u4e00-\u9fff])·(?=[\u4e00-\u9fff])", " ", text)
-        text = ZHG2P.map_punctuation(cn2an.transform(text, "an2cn"))
+        text = ZHG2P.map_punctuation(cn2an.transform(text.replace("–", "，"), "an2cn"))
         parts = []
         for span in re.findall(r"[\u4e00-\u9fff]+|[^\u4e00-\u9fff]+", text):
             if not re.fullmatch(r"[\u4e00-\u9fff]+", span):
@@ -1442,16 +1493,22 @@ class Frontend:
                                      errors=lambda unknown: list(unknown))
             # A title and a surname may be separate Jieba tokens. Match full
             # phrases across token boundaries without changing larger words.
-            boundaries = set(accumulate((len(word) for word, _ in words), initial=0))
-            for phrase, reading in readings.items():
-                for match in re.finditer(re.escape(phrase), span):
-                    start, end = match.span()
-                    if start in boundaries and end in boundaries:
+            boundaries = list(accumulate((len(word) for word, _ in words), initial=0))
+            ends = set(boundaries)
+            covered = 0
+            for start in boundaries[:-1]:
+                if start < covered:
+                    continue
+                for length in self._chinese_reading_lengths:
+                    end = start + length
+                    if end in ends and (reading := readings.get(span[start:end])):
                         contextual[start:end] = reading
+                        covered = end
+                        break
             syllables = []
             offset = 0
             for index, (word, pos) in enumerate(words):
-                phones = list(readings[word]) if word in readings else contextual[offset:offset + len(word)]
+                phones = contextual[offset:offset + len(word)]
                 offset += len(word)
                 previous, previous_pos = words[index - 1] if index else ("", "")
                 following, following_pos = words[index + 1] if index + 1 < len(words) else ("", "")
@@ -1474,7 +1531,7 @@ class Frontend:
             rendered = []
             offset = 0
             for word, pos in self._sandhi.pre_merge_for_modify(words):
-                phones = list(readings[word]) if word in readings else syllables[offset:offset + len(word)]
+                phones = syllables[offset:offset + len(word)]
                 offset += len(word)
                 phones = self._sandhi._bu_sandhi(word, phones)
                 phones = self._sandhi._yi_sandhi(word, phones)
