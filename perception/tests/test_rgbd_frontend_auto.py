@@ -90,6 +90,24 @@ def test_input_imu_clock_or_process_failures_never_switch(auto, kind):
     assert kind in frontend(card)['decision']
 
 
+@pytest.mark.parametrize('native_lost,switch', [(True, 'f2f_optical_flow'), (False, None)])
+def test_landmark_timeout_switches_only_for_repeated_native_loss(auto, native_lost, switch):
+    from test_rgbd_landmark_recovery import anchored, visual
+
+    card, args, _, seconds = auto
+    start(card, args)
+    session = card.instances['one'][0]
+    gate = session.gate = anchored()
+    assert gate.status(3_000_000_000) == 'recovering'
+    for i in range(3):
+        assert visual(gate, 5_000_000_000 + i*100_000_000, lost=native_lost,
+                      ids=range(24, 48)) is None
+    assert gate.status(6_001_000_000) == 'lost'
+    assert gate.loss_kind == 'relocalization'
+    _, selected = card._next_frontend('one', session, {'loss_kind': gate.loss_kind}, seconds[0])
+    assert selected == switch
+
+
 def test_cooldown_and_untracked_switch_limit_prevent_thrashing(auto):
     card, args, now, seconds = auto
     start(card, args)

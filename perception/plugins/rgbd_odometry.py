@@ -99,7 +99,7 @@ class RgbdOdometryPlugin:
                     transition = dict(action=target['action'] if target else 'restart',
                         reason=target['reason'] if target else info['reason'], previous_segment=info['segment_id'],
                         from_mode=info.get('mode', {}).get('effective', assistance_mode(session.calibration)),
-                        to_mode=assistance_mode(calibration))
+                        to_mode='visual' if calibration.get('_start_with_rotation_only') else assistance_mode(calibration))
                     requested = dict(getattr(session, 'requested_calibration', session.calibration),
                                      visual_frontend=calibration.get('visual_frontend', 'f2m_feature'))
                     candidate = RgbdSession(calibration, self.executor,
@@ -150,7 +150,8 @@ class RgbdOdometryPlugin:
             return calibration, None
         active, kind = frontend['active'], info.get('loss_kind')
         other = _FRONTENDS[1-_FRONTENDS.index(active)]
-        if kind != 'visual':
+        native_lost = kind == 'relocalization' and session.gate.relocalization_native_loss_streak >= 3
+        if kind != 'visual' and not native_lost:
             frontend['decision'] = f'kept {active}: loss kind {kind} is not visual degradation'
         elif frontend['cooldown_until'] is not None and now < frontend['cooldown_until']:
             frontend['decision'] = f'kept {active}: frontend switch cooldown'

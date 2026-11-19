@@ -272,6 +272,34 @@ def test_real_session_wires_private_hint_and_conservative_fusion(hint_session):
     assert sample['vendor']['inertial_association']['native_applied'] is None
 
 
+def test_visual_restart_preserves_optional_rotation_without_restarting_fusion(hint_session):
+    import json
+    from plugins.rgbd_odometry_runtime import RgbdSession
+    from vision_stubs import _FakeExecutor
+    session, now, _ = hint_session
+    session.fusion.fault('corrected position uncertainty exceeded limit')
+    session._check_fusion(now[0])
+    session.gate.fault('native visual tracking lost', 'visual')
+    target = session.recovery_target(100., now[0])
+    assert target['action'] == 'restart'
+    restarted = RgbdSession(target['calibration'], _FakeExecutor(), session.topic,
+                            requested_calibration=session.requested_calibration)
+    try:
+        assert restarted.info()['mode']['effective'] == 'visual'
+        assert restarted.fusion.filter is None and not restarted._fusing()
+        assert restarted.geometry_worker is None
+        assert restarted._wait_for_imu(now[0])
+        for stamp in (now[0]-10_000_000, now[0]+10_000_000):
+            restarted._imu(NS(data=json.dumps(packet(stamp))))
+        offered = []
+        restarted.rotation_hints.publisher.publish = offered.append
+        assert restarted.rotation_hints.offer(restarted.imu, now[0], now[0])
+        assert len(offered) == 1
+    finally:
+        restarted.process.returncode = 0
+        restarted.close()
+
+
 @pytest.mark.parametrize('translations', [False, True])
 @pytest.mark.parametrize('coverage', [False, True])
 @pytest.mark.parametrize('color_offset_ns', [1, 800_000])

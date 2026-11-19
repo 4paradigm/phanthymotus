@@ -279,7 +279,7 @@ class ShortTermFusion:
         self.loss_kind = None
         self.last_frame = self.last_visual = self.last_confident = 0
         self.last_processed_ns = self.last_visual_wall = 0
-        self.good = 0
+        self.good = self.visual_good = 0
         self.aid = 'none'
         self.quality = {}
         self.frames = deque(maxlen=16)
@@ -535,10 +535,15 @@ class ShortTermFusion:
                 self.fault(f'corrected position uncertainty exceeded {SIGMA_LIMIT_M:.2f} m for more than 1 s')
             return
         self.last_confident = stamp
+        if self.good == 0 or visual_pose is None:
+            self.visual_good = 0
+        if visual_pose is not None:
+            self.visual_good += 1
         self.good += 1
         if self.state == 'tracking' or self.good >= 3:
             if (self.state != 'tracking' and self.last_tracking is not None and
-                    stamp-self.last_tracking[0] > (self.pause_context.budget_ns if self.pause_context else INERTIAL_LIMIT_NS)):
+                    stamp-self.last_tracking[0] > (self.pause_context.budget_ns if self.pause_context else INERTIAL_LIMIT_NS) and
+                    not self._verified_late_visual(stamp, visual_pose)):
                 self.fault(f'fusion recovery exceeded the {(self.pause_context.budget_ns if self.pause_context else INERTIAL_LIMIT_NS)/1e9:g} s mapping pause; restart required')
             else:
                 self.state, self.reason = 'tracking', None
@@ -547,6 +552,20 @@ class ShortTermFusion:
                 self.last_tracking = (stamp, self.filter.camera_pose(), deepcopy(visual_pose))
         else:
             self.state, self.reason = 'recovering', 'waiting for three consistent observations'
+
+    def _verified_late_visual(self, stamp, visual_pose):
+        # The mapping wait can expire before three measured results finish.
+        # Only a near-stationary measured recovery may keep the old origin.
+        if (self.pause_context is None or self.visual_good < 3 or
+                stamp-self.last_tracking[0] > MAX_BRIDGE_NS or self.last_tracking[2] is None):
+            return False
+        for current, anchor in ((visual_pose, self.last_tracking[2]),
+                                (self.filter.camera_pose(), self.last_tracking[1])):
+            p, r = pose_values(current)
+            anchor_p, anchor_r = pose_values(anchor)
+            if np.linalg.norm(p-anchor_p) > .05 or np.linalg.norm(log_rotation(anchor_r.T@r)) > np.deg2rad(5.):
+                return False
+        return True
 
     def _assist_with_geometry(self, stamp, depth, now_ns, diagnostic):
         if not (self.geometry and self.reference and stamp-self.reference[0] <= 1_000_000_000):

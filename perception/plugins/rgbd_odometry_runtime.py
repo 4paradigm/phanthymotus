@@ -104,6 +104,7 @@ class EstimateGate:
         self.relocalization_points = None
         self.relocalization_deadline = self.relocalization_deadline_mono = None
         self.relocalization_failure = 'output'
+        self.relocalization_native_loss_streak = 0
 
     def _recovery_window(self, started):
         if self.recovery_policy is None:
@@ -143,7 +144,7 @@ class EstimateGate:
             self.loss_kind = kind
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
 
-    def degrade(self, reason, now, *, stamp=None):
+    def degrade(self, reason, now, *, stamp=None, native_lost=False):
         """Reject one estimate. Tracking pauses; evidence must be rebuilt."""
         self.rejection = str(reason)
         self.uncertain_seed = None
@@ -158,6 +159,7 @@ class EstimateGate:
             # Rejections clear consecutive evidence but cannot spend the rest
             # of the frozen verification window or authorize a pose.
             self.relocalization_failure = 'relocalization'
+            self.relocalization_native_loss_streak = self.relocalization_native_loss_streak + 1 if native_lost else 0
             return
         if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
@@ -193,6 +195,7 @@ class EstimateGate:
                 self.relocalization_points = points
                 self.relocalization_deadline = self.relocalization_deadline_mono = None
                 self.relocalization_failure = 'output'
+                self.relocalization_native_loss_streak = 0
                 self.good = 0
                 self.pause_context = self.recover_by = None
                 self.state, self.reason = 'recovering', 'waiting for native matches to the last tracked F2M landmarks'
@@ -285,9 +288,11 @@ class EstimateGate:
             sample = make_sample('tracking', stamp, self.segment, self.clock, pose)
             position, rotation = pose_values(pose)
         except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError) as error:
-            self.degrade(error, now)
+            self.degrade(error, now, native_lost=getattr(info, 'lost', False) is True)
             return None
         verifying = self.relocalization_points is not None
+        if verifying:
+            self.relocalization_native_loss_streak = 0
         recent = verifying and stamp-self.last_pose[0] <= 3_000_000_000
         uncertain = np.any(np.diag(covariance)[:3] > .04)
         points = self._matched_points(info) if verifying or uncertain else {}
@@ -328,8 +333,7 @@ class EstimateGate:
             self._start_landmark_verification(now)
             # Short interruptions can occur while the camera is moving. Even
             # with the old landmark proof, cap motion at one second of travel.
-            # Beyond the bounded pause require the old stationary anchor.
-            motion_stamp = min(stamp, self.last_pose[0]+1_000_000_000) if recent else self.last_pose[0]
+            motion_stamp = min(stamp, self.last_pose[0]+1_000_000_000)
             if (not shared or not self._continuous(motion_stamp, position, rotation) or
                     (self.last_verification_pose is not None and
                      not self._continuous(stamp, position, rotation, self.last_verification_pose))):
@@ -618,6 +622,8 @@ class RgbdSession:
         from std_msgs.msg import String
         from nav_msgs.msg import Odometry
         from rtabmap_msgs.msg import RGBDImage, OdomInfo
+        calibration = dict(calibration)
+        start_with_rotation_only = calibration.pop('_start_with_rotation_only', False)
         self.requested_calibration = dict(calibration if requested_calibration is None else requested_calibration)
         self.time_policy = TimePolicy(input_registry.clock_id if input_registry else 'rgbd_ingress/' + uuid.uuid4().hex)
         self.contexts_by_stamp = OrderedDict()
@@ -693,7 +699,7 @@ class RgbdSession:
         self.mode_transition = deepcopy(mode_transition)
         self.node = Node(self.segment)
         try:
-            if self.fusion is not None and self.fusion.geometry is not None:
+            if self.fusion is not None and self.fusion.geometry is not None and not start_with_rotation_only:
                 # ICP never runs under self.lock: IMU ingress, native results
                 # and stop remain responsive while it computes.
                 self.geometry_worker = GeometryWorker(self.fusion.geometry)
@@ -708,6 +714,12 @@ class RgbdSession:
                 qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
             self.rotation_hints = RotationHints(calibration, self.node, self.segment, qos_profile_sensor_data)
+            if start_with_rotation_only:
+                # Use the existing optional-hint fallback before processing any captures.
+                self.fusion.fault('recovering visual tracking before retrying ESKF')
+                self._check_fusion(time.time_ns())
+                if mode_transition is not None:
+                    self.mode_transition = dict(mode_transition, to_mode=self.fallback['mode'])
             for kind in ('color', 'depth'):
                 input_topic = calibration[kind + '_topic']
                 if input_registry is None:
@@ -912,6 +924,12 @@ class RgbdSession:
         with self.lock:
             mode = self._mode_info()
             source = getattr(self, 'restart_calibration', self.calibration)
+            if (mode['degraded'] and self.gate.state == 'lost' and
+                    self.gate.loss_kind in ('visual', 'relocalization')):
+                # Healthy IMU packets cannot fix a failed visual frontend or map rejoin.
+                calibration = (dict(source, _start_with_rotation_only=True) if self.rotation_hints.enabled
+                               else visual_calibration(source))
+                return dict(action='restart', calibration=calibration, reason=self.gate.reason)
             health = self._auxiliary_info(now_ns, now_s)
             if (mode['degraded'] and health.get('status') == 'ready' and
                     now_s-self.mode_changed_at >= ASSISTANCE_RETRY_S):
@@ -1452,7 +1470,7 @@ class RgbdSession:
                     stamp > max(self.gate.last_stamp, self.gate.last_result_stamp) and
                     -50_000_000 <= now-stamp <= MAX_VISUAL_RESULT_AGE_NS):
                 # Pause before the matching pose arrives; the same estimator keeps running.
-                self.gate.degrade('visual estimator reported lost tracking', now, stamp=stamp)
+                self.gate.degrade('visual estimator reported lost tracking', now, stamp=stamp, native_lost=True)
             if self.gate.state == 'lost':
                 return
             stamp = stamp_ns(msg)

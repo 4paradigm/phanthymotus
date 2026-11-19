@@ -18,13 +18,16 @@ static void testScanRelocalization(const std::string &root, const std::string &o
 {
     const bool partialOverlap=mode=="partial_scan_relocalize";
     const bool afterMotion=mode=="scan_relocalize_after_motion";
+    const bool weakBridge=mode=="scan_origin_weak_bridge";
+    const bool originChange=mode=="scan_origin_change" || weakBridge;
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
     if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
     parameters["RGBD/LinearUpdate"]="0.03";
     rtabmap::Rtabmap map;
     map.init(parameters,output+".db");
     motus::VisualRecovery recovery(parameters);
-    const auto frame=[&](double stamp, float x, bool hasPose, bool noOverlap, bool blackImage=false, bool badGuess=false)
+    const auto frame=[&](double stamp, float x, bool hasPose, bool noOverlap, bool blackImage=false,
+                         bool badGuess=false, int origin=0)
     {
         const float f=260.f;
         cv::Mat scan(1,depth.total(),CV_32FC3);
@@ -39,7 +42,8 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         rtabmap::SensorData data(blackImage?cv::Mat::zeros(depth.size(),CV_8UC3):cv::Mat(),
                                  blackImage?depth:cv::Mat(),camera,0,stamp);
         // A valid partial observation can occupy fewer than half of the scan's expected points.
-        const int maxPoints=partialOverlap && stamp==7.?2*count:0;
+        const int maxPoints=weakBridge && stamp==2.?6*count:
+            partialOverlap && stamp==7.?2*count:0;
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),maxPoints,0.f,rtabmap::LaserScan::kXYZ));
         if(badGuess)
         {
@@ -49,12 +53,61 @@ static void testScanRelocalization(const std::string &root, const std::string &o
             std::memcpy(hint.data+8,values,sizeof(values));
             data.setUserData(rtabmap::compressData2(hint),true);
         }
-        return recovery.process(map,data,hasPose?rtabmap::Transform(x,0,0,0,0,0):rtabmap::Transform(),
+        if(origin)
+        {
+            cv::Mat packet(1,24,CV_8UC1,cv::Scalar::all(0));
+            std::memcpy(packet.data,"MOTUSOR1",8);
+            std::fill_n(packet.data+8,16,origin);
+            data.setUserData(rtabmap::compressData2(packet),true);
+        }
+        const float reportedX=origin==2?x-.18f:x;
+        return recovery.process(map,data,hasPose?rtabmap::Transform(reportedX,0,0,0,0,0):rtabmap::Transform(),
                                 cv::Mat::eye(6,6,CV_64F)*.01);
     };
-    if(!frame(1.,0.f,true,false) || !frame(1.5,.12f,true,false))
+    if(!frame(1.,0.f,true,false,false,false,originChange?1:0) ||
+       !frame(1.5,.12f,true,false,false,false,originChange?1:0))
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto anchor=map.getLastLocationId();
+    if(weakBridge)
+    {
+        const auto old=map.getLocalOptimizedPoses();
+        if(frame(2.,.19f,false,false) || !recovery.odom().isNull() ||
+           recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses()!=old)
+            throw std::runtime_error("weak scan-only overlap cannot carry an unposed observation");
+        if(!frame(2.5,.20f,false,false) || recovery.state()!=motus::VisualRecovery::ScanTracking ||
+           map.getLocalOptimizedPoses().size()!=old.size()+1)
+            throw std::runtime_error("strong overlapping scan should still bridge interrupted odometry");
+        map.close();
+        return;
+    }
+    if(originChange)
+    {
+        const auto old=map.getLocalOptimizedPoses();
+        if(!frame(2.,.18f,true,false,false,false,2) ||
+           recovery.state()!=motus::VisualRecovery::Localized || recovery.recoveryAnchor()!=anchor ||
+           recovery.odom().isNull() || std::abs(recovery.odom().x()-.18f)>.025f ||
+           map.getLocalOptimizedPoses().size()!=old.size()+1)
+            throw std::runtime_error("a new scan-only origin must reconnect by geometry before its pose can enter the map");
+        const int closure=recovery.recoveryNode();
+        if(!frame(2.5,.27f,true,false,false,false,2) ||
+           recovery.state()!=motus::VisualRecovery::External || std::abs(recovery.odom().x()-.27f)>.025f ||
+           map.getLocalOptimizedPoses().size()!=old.size()+2)
+            throw std::runtime_error("realigned scan-only odometry did not grow the original map");
+        const auto grown=map.getLocalOptimizedPoses();
+        if(frame(3.,.27f,true,true,false,false,3) || !recovery.odom().isNull() ||
+           recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses()!=grown)
+            throw std::runtime_error("an unrelated scan with a different origin must leave the accepted graph intact");
+        map.close();
+        rtabmap::Rtabmap reopened;
+        reopened.init(parameters,output+".db");
+        const auto *node=reopened.getMemory()->getSignature(closure);
+        if(reopened.getLocalOptimizedPoses()!=grown || !node ||
+           !node->hasLink(anchor,rtabmap::Link::kGlobalClosure))
+            throw std::runtime_error("old graph and scan-only origin recovery edge must survive reopening");
+        reopened.close(false);
+        std::cout<<"reopened nodes="<<grown.size()<<" persisted origin recovery edge="<<anchor<<"->"<<closure<<std::endl;
+        return;
+    }
     if(mode=="rejected_prediction_fallback")
     {
         const auto old=map.getLocalOptimizedPoses();
@@ -153,7 +206,8 @@ int main(int argc, char **argv)
     const std::string root=argv[1], output=argv[2], mode=argv[3];
     const bool imuPrediction=mode=="imu_prediction";
     const bool externalAfterScan=mode=="external_after_scan";
-    const bool scanAfterClosure=mode=="scan_after_closure" || externalAfterScan;
+    const bool continuousAfterClosure=mode=="continuous_after_closure";
+    const bool scanAfterClosure=mode=="scan_after_closure" || externalAfterScan || continuousAfterClosure;
     const bool regressedVisualCapture=mode=="vo_reacquire_regressed";
     const bool shortVisualLoss=mode=="vo_reacquire" || mode=="vo_reacquire_expired" || regressedVisualCapture;
     const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap" || shortVisualLoss;
@@ -200,7 +254,8 @@ int main(int argc, char **argv)
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
     if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
-       mode=="scan_relocalize_after_motion" || mode=="rejected_prediction_fallback")
+       mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" ||
+       mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback")
     {
         p["RGBD/NeighborLinkRefining"]="false";
         testScanRelocalization(root,output,p,mode);
@@ -331,7 +386,7 @@ int main(int argc, char **argv)
         const bool scanAfterDisagreement=disagreeingNeighborRetry && i==4;
         // Keep the no-motion-source cases independent of image availability.
         const bool noScanOverlap=(imuPrediction && i==3) ||
-            (externalContinuity && i>0) || (bridgeScan && postClosureScans==3) ||
+            (externalContinuity && i>0) || (bridgeScan && (postClosureScans==3 || continuousAfterClosure)) ||
             (failedVisualSeed && i>0) || (voHandoff && (i==6 || (i==7 && !shortVisualLoss) ||
                 (mode=="vo_handoff_gap" && i==3))) ||
             (crossedLoss && !staggeredChassisLoss && !scanAfterDisagreement) ||
@@ -350,6 +405,14 @@ int main(int argc, char **argv)
         auto ext=hasPose?rtabmap::Transform(externalX,0,0,0,0,0):rtabmap::Transform();
         if(returningPose)
             ext=map.getMemory()->getLastWorkingSignature()->getPose()*rtabmap::Transform(.06f,0,0,0,0,0);
+        if(continuousAfterClosure && (phase=="relocalize" || bridgeScan))
+        {
+            const bool different=bridgeScan && postClosureScans==3;
+            ext=rtabmap::Transform((different?200.f:7.f)+truthX,0,0,0,0,0);
+            cv::Mat marker(1,24,CV_8UC1,cv::Scalar::all(different?2:1));
+            std::memcpy(marker.data,"MOTUSOD1",8);
+            data.setUserData(rtabmap::compressData2(marker),true);
+        }
         if(neighborRetry && (i==1 || i==2))
             ext=rtabmap::Transform(externalX+200.f,0,0,0,0,0);
         if(externalContinuity || continuityVisual)
@@ -454,6 +517,23 @@ int main(int argc, char **argv)
         }
         if(bridgeScan)
         {
+            if(continuousAfterClosure)
+            {
+                if(postClosureScans==3)
+                {
+                    if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+                       map.getLocalOptimizedPoses().size()!=nodesBefore)
+                        throw std::runtime_error("a changed run must verify its alignment before extending the old graph");
+                    break;
+                }
+                if(!accepted || recovery.state()!=motus::VisualRecovery::External ||
+                   recovery.relocalizations()!=1 || stat("Motus/MeasuredExternalContinuity/")!=1.f ||
+                   std::abs(recovery.odom().x()-truthX)>.08f ||
+                   map.getLocalOptimizedPoses().size()!=nodesBefore+1)
+                    throw std::runtime_error("the external run verified at closure must extend the graph through weak RGB");
+                ++postClosureScans;
+                continue;
+            }
             if(returningPose)
             {
                 const auto error=ext.inverse()*recovery.odom();
@@ -892,7 +972,7 @@ int main(int argc, char **argv)
         throw std::runtime_error("two real visual failure observations were not exercised");
     if(mode=="recovery" && !postClosureReacquired)
         throw std::runtime_error("short visual loss after global recovery was not exercised");
-    if(scanAfterClosure && postClosureScans!=(externalAfterScan?2:6))
+    if(scanAfterClosure && postClosureScans!=(continuousAfterClosure?3:externalAfterScan?2:6))
         throw std::runtime_error("map must continue after one rejected scan and verify recovery when the bridge expires");
     if(voHandoff && (handoffFrames!=(mode=="vo_handoff_gap"?2:3) || i!=(mode=="vo_reacquire_expired"?7:8)))
         throw std::runtime_error("continuous VO and real visual failure regression was not exercised");
@@ -937,7 +1017,7 @@ int main(int argc, char **argv)
         if(reopened.getLocalOptimizedPoses()!=finalized || !signature ||
            !signature->hasLink(scanBridgeAnchor,rtabmap::Link::kGlobalClosure))
             throw std::runtime_error("scan continuation and its original closure must survive reopening");
-        if(!externalAfterScan)
+        if(!externalAfterScan && !continuousAfterClosure)
         {
             const auto *second=reopened.getMemory()->getSignature(secondScanClosure);
             if(!second || !second->hasLink(scanBridgeNode,rtabmap::Link::kGlobalClosure))

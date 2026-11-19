@@ -167,6 +167,34 @@ def test_segment_label_changes_keep_one_native_process_and_database(node):
 
 
 
+def test_scan_only_rgbd_odom_labels_the_origin_on_each_native_envelope(tmp_path, monkeypatch):
+    import zlib
+    import plugins.pointcloud_slam_ros as ros
+
+    NativeProcess.instances = []
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    n = ros.RtabmapNode('/rgbd_odometry/i_6f6e65/state/odom', '/c', settings(),
+                        session_dir=tmp_path / 'session')
+    n._receipt_clock = lambda: 1.
+    n.start()
+    try:
+        for count, segment in enumerate(('first', 'first', 'reset'), 1):
+            ms = 1000 + count*100
+            n._measurement_clock_ns = lambda s=ms: s*1_000_000
+            send(n, ms, segment)
+            assert _wait_until(lambda: n.status()['forwarded_clouds'] == count)
+
+        assert len(NativeProcess.instances) == 1
+        native = published(n, '/sensor_data')[0].raw_messages
+        assert all(msg.laser_scan.data and not msg.left.data for msg in native)
+        markers = [zlib.decompress(bytes(msg.user_data)[:-12]) for msg in native]
+        assert all(len(marker)==24 and marker.startswith(b'MOTUSOR1') for marker in markers)
+        assert markers[0]==markers[1] and markers[0]!=markers[2]
+    finally:
+        n.close()
+        n.destroy_node()
+
+
 def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
     send(node)
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)

@@ -74,7 +74,7 @@ def test_three_failed_results_do_not_end_a_live_landmark_verification_window():
 @pytest.mark.parametrize('changed', [
     dict(ids=range(5, 29)),  # 24 total inliers but only 19 old correspondences
     dict(ids=range(24, 48)), dict(ids=[1]*24), dict(world_shift=1.),
-    dict(x=.051), dict(angle=5.1), dict(lost=True)])
+    dict(x=1.051), dict(angle=95.1), dict(lost=True)])
 def test_novel_recycled_ids_jump_and_lost_cannot_reopen_old_gauge(changed):
     g = anchored()
     g.status(3_000_000_000)
@@ -82,6 +82,17 @@ def test_novel_recycled_ids_jump_and_lost_cannot_reopen_old_gauge(changed):
         s = visual(g, 5_000_000_000 + i*100_000_000, **changed)
         assert s is None
     assert g.state == 'lost'
+
+
+def test_long_f2m_recovery_can_resume_the_same_segment_after_moving():
+    gate = anchored()
+    assert gate.status(3_000_000_000) == 'recovering'
+    assert visual(gate, 4_300_000_000, x=.10) is None
+    assert visual(gate, 4_400_000_000, x=.11) is None
+    recovered = visual(gate, 4_500_000_000, x=.12)
+    assert recovered['pose']['position'][0] == .12
+    assert recovered['vendor']['motus_slam']['segment_id'] == 'run'
+    assert recovered['vendor']['relocalization']['shared_landmarks'] == 24
 
 
 def test_output_timeout_with_no_returning_results_expires_while_inputs_are_fresh():

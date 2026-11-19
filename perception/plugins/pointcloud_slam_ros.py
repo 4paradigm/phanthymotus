@@ -147,10 +147,18 @@ class RtabmapNode(Node):
         self._root_wait_done = threading.Event()
         self._rgb_preparation_ms = deque(maxlen=64)
         self._rgb_timeouts = self._rgb_published = 0
-        if self._settings.get('rgb_input') is not None:
-            from .pointcloud_slam_rgb import RgbLoopInput
+        # The built-in RGB-D odometer can restart in a new coordinate frame.
+        # Scan geometry must verify the new origin even without an RGB wire.
+        rgb_connected = self._settings.get('rgb_input') is not None
+        self._scan_origin_recovery = (not rgb_connected and odom_topic.startswith('/rgbd_odometry/')
+                                      and odom_topic.endswith('/state/odom'))
+        self._settings['scan_origin_recovery'] = self._scan_origin_recovery
+        self._native_envelope = rgb_connected or self._scan_origin_recovery
+        if self._native_envelope:
             from rtabmap_msgs.msg import SensorData
             self._SensorData = SensorData
+        if rgb_connected:
+            from .pointcloud_slam_rgb import RgbLoopInput
             self._rgb = RgbLoopInput(self._settings['rgb_input'], self._settings,
                                      max_pending=self._settings.get('max_pending', 10),
                                      on_decoded=self._reserve_decoded_rgb)
@@ -210,7 +218,7 @@ class RtabmapNode(Node):
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame,
                 on_observation=self._observe_motion if self._motion is not None else None,
-                on_unlocalized_frame=self._queue_frame if self._rgb is not None else None,
+                on_unlocalized_frame=self._queue_frame if self._native_envelope else None,
                 on_pose_loss=self._retire_pose_work)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
@@ -378,7 +386,7 @@ class RtabmapNode(Node):
             raise ValueError('cloud original ingress context expired')
         received, observation, depth = ingress
         predicted = pose is not None and pose.prediction_anchor_ns is not None
-        if predicted and (self._rgb is None or self._active is None):
+        if predicted and (not self._native_envelope or self._active is None):
             self._rgb_reservations.pop(stamp, None)
             self._dropped += 1
             return
@@ -494,8 +502,8 @@ class RtabmapNode(Node):
             self._active = segment
         segment['odom_pub'] = self.create_publisher(self._Odometry, namespace + '/odom', _NATIVE_QOS)
         segment['cloud_pub'] = self.create_publisher(
-            self._SensorData if self._rgb is not None else PointCloud2,
-            namespace + ('/sensor_data' if self._rgb is not None else '/scan_cloud'), _NATIVE_QOS)
+            self._SensorData if self._native_envelope else PointCloud2,
+            namespace + ('/sensor_data' if self._native_envelope else '/scan_cloud'), _NATIVE_QOS)
         segment['tf_pub'] = self.create_publisher(self._TFMessage,
             namespace + ('/tf' if self.stream.extrinsic_mode == 'dynamic' else '/tf_static'),
             _NATIVE_QOS if self.stream.extrinsic_mode == 'dynamic' else _MAP_QOS)
@@ -580,7 +588,7 @@ class RtabmapNode(Node):
         rgb_deadline = item[7] if len(item) > 7 else time.monotonic()
         depth = item[8] if len(item) > 8 else None
         native, rgb_generation = (self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline, depth)
-                                  if self._rgb is not None else (cloud, None))
+                                  if self._native_envelope else (cloud, None))
         if predicted:
             # The standard odometry input stays null. Even an older native
             # runtime cannot mistake this private hint for a tracking pose.
@@ -597,11 +605,17 @@ class RtabmapNode(Node):
             if pose is not None and not self.stream._poses:
                 return
             token = self.stream.continuity_token
-            if (self._rgb is not None and measured is not None and token is not None and
-                    measured.external_continuity == token):
+            if self._native_envelope and measured is not None:
                 # Optional preparation can outlive the source run of a queued pose.
-                payload = b'MOTUSOD1' + token
-                native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
+                run = token if token is not None and measured.external_continuity == token else None
+                if self._scan_origin_recovery:
+                    identity = (measured.segment_id, measured.frame_id)
+                    origin = hashlib.blake2b(json.dumps(identity).encode(), digest_size=16).digest()
+                    payload = b'MOTUSOR1' + origin
+                else:
+                    payload = b'MOTUSOD1' + run if run else None
+                if payload:
+                    native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
             if self.stream.extrinsic_mode != 'dynamic':
                 segment['tf_pub'].publish(tf)
             if measured is not None:
@@ -678,7 +692,7 @@ class RtabmapNode(Node):
             with self._lock:
                 self._rgb_reservations.pop(stamp, None)
             return data, None  # Keep the guessed motion out of the measured scan.
-        if self._rgb_subscription_error or self._rgb.camera is None:
+        if self._rgb is None or self._rgb_subscription_error or self._rgb.camera is None:
             return data, None
         key = (pose.segment_id if pose is not None else None, stamp, id(cloud))
         # Seed a new map with visual evidence when a connected JPEG has arrived.

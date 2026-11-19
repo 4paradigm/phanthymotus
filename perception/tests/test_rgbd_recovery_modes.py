@@ -201,6 +201,32 @@ def test_formatted_recovered_source_restores_requested_mode_after_segment_loss(r
     assert restored.fusion is not None and not restored.info()['mode']['degraded']
 
 
+@pytest.mark.parametrize('loss_kind,reason', [
+    ('relocalization', 'native F2M relocalization did not verify the old landmarks'),
+    ('visual', 'visual degradation persisted beyond the recovery window'),
+])
+def test_visual_failure_restarts_without_reenabling_eskf(recovery, monkeypatch, loss_kind, reason):
+    card, args, now, seconds = recovery
+    visual = degraded_session(card, args, now, seconds, monkeypatch)
+    for _ in range(240):
+        healthy_visual_tick(visual, now, seconds)
+    assert visual.info()['status'] == 'tracking'
+    assert visual.info()['auxiliary_recovery']['status'] == 'ready'
+
+    visual.gate.fault(reason, loss_kind)
+    visual.process.returncode = 0
+    images(visual, now[0]); card._recover()
+    seconds[0] += .81
+    now[0] += 810_000_000
+    images(visual, now[0]); card._recover()
+
+    restarted = card.instances['one'][0]
+    restarted.process.returncode = 0
+    assert restarted is not visual
+    assert restarted.fusion is None
+    assert card.recovery['one']['restoration_attempts'] == 0
+
+
 def test_probe_requires_complete_numeric_translations_without_dwell_or_metadata_policy():
     from plugins.rgbd_recovery import AuxiliaryHealthProbe
     probe=AuxiliaryHealthProbe('camera_optical','camera-global',require_translation=True)

@@ -22,6 +22,8 @@
 namespace motus {
 class VisualRecovery
 {
+    using ExternalRun=std::array<unsigned char,16>;
+
 public:
     enum State { External=0, Searching=1, Localized=2, VisualTracking=3, InertialRegistration=4, ScanTracking=5 };
     explicit VisualRecovery(const rtabmap::ParametersMap & parameters):
@@ -100,12 +102,37 @@ public:
             state_=Searching; odom_.setNull(); return false;
         }
         const auto externalRun=takeExternalRun(data);
+        const auto originPacket=takePayload(data,"MOTUSOR1",24);
+        const bool declaresOrigin=!originPacket.empty() && !external.isNull();
+        bool sameOrigin=false;
+        if(declaresOrigin)
+        {
+            ExternalRun origin;
+            std::memcpy(origin.data(),originPacket.data+8,origin.size());
+            sameOrigin=externalOrigin_ && origin==*externalOrigin_;
+            if(externalOrigin_ && !sameOrigin && !map.getLocalOptimizedPoses().empty())
+            {
+                // A pose in a new gauge is a query until its scan establishes
+                // the map-to-odometry transform.
+                state_=Searching; odom_.setNull(); visualInliers_=0;
+                waiting_=true;
+                if(!relocalizeScan(map,data,statistics)) return false;
+                rtabmap::OdometryInfo info;
+                finishLocalization(map,data,external,rtabmap::Transform(),info,false,false,{});
+                externalRun_.reset();
+                previousExternal_=external;
+                previousExternalStamp_=data.stamp();
+                externalOrigin_=origin;
+                return true;
+            }
+            externalOrigin_=origin;
+        }
         const double outageAge=data.stamp()-chassisOutageStart_;
         const bool recentOutage=chassisOutageStart_>0. && outageAge>=0. && outageAge<=2.;
-        const bool continuousExternal=externalRun && externalRun==externalRun_ &&
+        const bool continuousExternal=((externalRun && externalRun==externalRun_) || sameOrigin) &&
             (!waiting_ || recentOutage) && !localizationMode_ && continuousMotion(external,data.stamp());
         const double externalAge=data.stamp()-previousExternalStamp_;
-        const bool waitForChassis=external.isNull() && externalRun_ && !localizationMode_ &&
+        const bool waitForChassis=external.isNull() && (externalRun_ || externalOrigin_) && !localizationMode_ &&
             externalAge>0. && externalAge<=maxExternalScanGap_ && (!chassisOutageStart_ || recentOutage) &&
             !map.getLocalOptimizedPoses().empty();
         if(waitForChassis && !chassisOutageStart_) chassisOutageStart_=data.stamp();
@@ -343,7 +370,7 @@ public:
                 // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
                 // Only a later tracked frame may use this measured anchor during external loss.
                 if(accepted && visualSeed) initialVisualToNative_=odom_*visual.inverse();
-                if(accepted && externalRun)
+                if(accepted && (externalRun || declaresOrigin))
                 {
                     externalRun_=externalRun;
                     previousExternal_=external;
@@ -398,7 +425,7 @@ public:
         const auto recoverGeometry=[&]()
         {
             if(!relocalizeScan(map,data,statistics)) return false;
-            finishLocalization(map,data,external,visual,info,tracked,images);
+            finishLocalization(map,data,external,visual,info,tracked,images,externalRun);
             return true;
         };
         if(!images) return recoverGeometry();
@@ -447,7 +474,7 @@ public:
         if(!promote(map,data,measured,location,locCovariance,statistics,poses,links,previousPoses,previousLinks))
             return false;
         recoveryInliers_=localizationInliers;
-        finishLocalization(map,data,external,visual,info,tracked,images);
+        finishLocalization(map,data,external,visual,info,tracked,images,externalRun);
         return true;
     }
 
@@ -543,7 +570,7 @@ private:
             const auto relative=inertialIcp_->computeTransformation(reference,data,guess,&result);
             // A small matching patch cannot establish alignment on its own.
             if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
-               !(result.icpInliersRatio>=.30f) || !validCovariance(result.covariance))
+               !(result.icpInliersRatio>=minScanRelocalizationOverlap_) || !validCovariance(result.covariance))
                 return rtabmap::Transform();
             return relative;
         };
@@ -578,7 +605,8 @@ private:
 
     void finishLocalization(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
                             const rtabmap::Transform & external, const rtabmap::Transform & visual,
-                            rtabmap::OdometryInfo & info, bool tracked, bool images)
+                            rtabmap::OdometryInfo & info, bool tracked, bool images,
+                            const std::optional<ExternalRun> & externalRun)
     {
         const auto location=odom_;
         ++relocalizations_; state_=Localized;
@@ -608,10 +636,18 @@ private:
         if(!external.isNull())
         {
             externalToNative_=location*external.inverse(); waiting_=false;
+            // The closure independently aligns this measured run. Its next
+            // pose can continue even if the local image tracker loses features.
+            if(externalRun)
+            {
+                externalRun_=externalRun;
+                previousExternal_=external;
+                previousExternalStamp_=data.stamp();
+            }
         }
     }
-    using ExternalRun=std::array<unsigned char,16>;
     static constexpr double maxExternalScanGap_=6.;
+    static constexpr float minScanRelocalizationOverlap_=.30f;
 
     struct VisualAlignment
     {
@@ -751,7 +787,10 @@ private:
         rtabmap::RegistrationInfo result;
         const auto relative=scanIcp_->computeTransformation(scanAnchor_->scan,data,
             rtabmap::Transform::getIdentity(),&result);
+        // Without an independent RGB route, a weak short bridge would become
+        // the only motion evidence for reconnecting a new odometry origin.
         if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
+           (externalOrigin_ && !(result.icpInliersRatio>=minScanRelocalizationOverlap_)) ||
            !validCovariance(result.covariance) || !plausibleMotion(relative,dt))
             return false;
         const auto measured=scanAnchor_->pose*relative;
@@ -832,7 +871,7 @@ private:
     };
     std::optional<ScanMapGuess> scanMapGuess_;
     bool retryExternalNeighbor_=false;
-    std::optional<ExternalRun> externalRun_;
+    std::optional<ExternalRun> externalRun_, externalOrigin_;
     rtabmap::Transform previousExternal_;
     double previousExternalStamp_=0.;
     double chassisOutageStart_=0.;

@@ -58,11 +58,11 @@ def mapping_parameters(database_path, namespace, settings):
         'Rtabmap/MemoryThr': str(settings['max_working_nodes']),
         'Rtabmap/TimeThr': str(settings['max_update_ms']),
         'DbSqlite3/JournalMode': '0', 'DbSqlite3/Synchronous': '1'}
-    if settings.get('rgb_input') is not None:
-        # One envelope always contains the scan; optional images may disappear
-        # and recover per frame without restarting this native map segment.
+    if settings.get('rgb_input') is not None or settings.get('scan_origin_recovery'):
+        # A native envelope always contains the scan, with optional images.
         parameters.update(subscribe_sensor_data=True, subscribe_scan_cloud=False,
                           qos_sensor_data=1, motus_visual_recovery=True)
+    if settings.get('rgb_input') is not None:
         # Follow the default 2 Hz metric cloud stream so that successive
         # observations can preserve geometric overlap through a turn.
         parameters.update({'Kp/MaxFeatures': '500', 'Mem/BadSignaturesIgnored': 'false',
@@ -116,6 +116,10 @@ class RtabmapProcess:
             marker = executable.parents[2] / 'share/rtabmap_slam/motus_visual_recovery_v1'
             if not marker.is_file() or marker.read_text().strip() != 'motus_visual_recovery/1':
                 raise RuntimeError('RTAB-Map visual recovery runtime unavailable: rebuild the pinned native overlay')
+        if self._executable is None and self._settings.get('scan_origin_recovery'):
+            marker = executable.parents[2] / 'share/rtabmap_slam/motus_scan_origin_recovery_v1'
+            if not marker.is_file() or marker.read_text().strip() != 'motus_scan_origin_recovery/1':
+                raise RuntimeError('RTAB-Map scan origin recovery unavailable: rebuild the pinned native overlay')
         return executable
 
     def start(self):

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from plugins.pointcloud_slam_odom import decode_slam_odom
+from plugins.spatial_recovery import RecoveryPolicy
 from test_rgbd_fusion import images, pose, source, warmed
 
 
@@ -59,6 +60,25 @@ def test_recovery_corrections_cannot_resume_an_expired_mapping_pause():
         sample = c.observe_frame(stamp, *images(), pose(), stamp+1_000_000)
         assert sample['pose'] is None
     assert c.state == 'lost' and 'pause' in c.reason
+
+
+@pytest.mark.parametrize('span,x,tracks', [(1.935, .003, True), (1.935, .10, False), (2.035, .003, False)])
+def test_late_same_segment_recovery_requires_bounded_measured_visual_continuity(span, x, tracks):
+    c, stamp = warmed()
+    c.recovery_policy = RecoveryPolicy()
+    c.result_period_ns, c.native_processing_p95_ns = 282_000_000, 250_000_000
+    color, depth = images()
+    for delay, value in ((.60, pose(x)), (.267, pose(x)), (span-1.267, pose(x)),
+                         (.267, pose(x)), (.133, pose(x))):
+        stamp = imu_until(c, stamp, delay)
+        sample = c.observe_frame(stamp, color, depth, value, stamp+1_000_000)
+        if delay != .133:
+            assert sample['pose'] is None
+    assert (sample['pose'] is not None) is tracks
+    if tracks:
+        assert decode_slam_odom(sample).segment_id == 'run'
+    else:
+        assert c.state == 'lost'
 
 
 def noisy(x=0., variance=.04):
