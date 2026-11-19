@@ -58,6 +58,67 @@ def test_expired_visual_pause_requires_old_landmarks_before_resuming():
     assert result['vendor']['relocalization']['anchor_stamp_ns'] == 1_200_000_000
 
 
+def test_first_frame_past_normal_pause_counts_for_landmark_recovery():
+    from plugins.spatial_recovery import RecoveryPolicy
+
+    gate = anchored()
+    gate.recovery_policy = RecoveryPolicy()
+    gate.degrade('native visual loss', 1_400_000_000, stamp=1_350_000_000)
+    assert visual(gate, 2_100_000_000) is None
+    assert gate.good == 1
+    assert visual(gate, 2_300_000_000) is None
+    assert visual(gate, 2_500_000_000)['vendor']['motus_slam']['segment_id'] == 'run'
+
+
+def test_unusable_frame_does_not_end_pause_early():
+    gate = anchored()
+    gate.degrade('native visual loss', 1_400_000_000, stamp=1_350_000_000)
+    assert visual(gate, 2_100_000_000, variance=.30) is None
+    assert gate.state == 'recovering'
+
+
+@pytest.mark.parametrize('shift,accepted', [(0., True), (1., False)])
+def test_recovery_can_follow_verified_landmarks_as_old_view_leaves(shift, accepted):
+    gate = anchored()
+    gate.status(3_000_000_000)
+    assert visual(gate, 3_100_000_000, ids=range(48)) is None
+    assert visual(gate, 3_450_000_000, ids=range(48), angle=15.) is None
+    result = visual(gate, 3_800_000_000, ids=range(24, 48), angle=42., world_shift=shift)
+    assert (result is not None) is accepted
+    if result:
+        assert result['vendor']['relocalization']['shared_landmarks'] == 24
+
+
+@pytest.mark.parametrize('variance,native_count,jump,accepted', [
+    (.055, 107, .12, True), (.063, 107, .12, False), (.055, 45, .12, False), (.055, 107, 2., False),
+])
+def test_supported_turn_can_keep_tracking_at_moderate_uncertainty(variance, native_count, jump, accepted):
+    gate = anchored()
+    ids = [*range(9, 24), *range(80, 80+native_count-15)]
+    result = visual(gate, 2_130_000_000, ids=ids, x=jump, angle=42.7, variance=variance)
+    assert (result is not None) is accepted
+    if result:
+        assert gate.state == 'tracking'
+        assert result['pose']['covariance'][0] == variance
+        assert result['vendor']['visual_uncertainty']['shared_landmarks'] == 15
+
+
+def test_strong_old_landmarks_allow_one_measured_result_after_recovery_deadline():
+    from plugins.spatial_recovery import RecoveryPolicy
+
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    gate.recovery_policy = RecoveryPolicy()
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        visual(gate, stamp, ids=range(61))
+    gate.status(3_000_000_000)
+    gate.input(3_100_000_000)
+    deadline = gate.relocalization_deadline
+    gate.result_period_ns = 300_000_000
+    assert visual(gate, deadline-250_000_000, ids=range(59)) is None
+    result = visual(gate, deadline+10_000_000, ids=range(1, 62), angle=26.)
+    assert result['vendor']['relocalization']['shared_landmarks'] == 58
+
+
 def test_three_failed_results_do_not_end_a_live_landmark_verification_window():
     gate = anchored()
     assert gate.status(3_000_000_000) == 'recovering'

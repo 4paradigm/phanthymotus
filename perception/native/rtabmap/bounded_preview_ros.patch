@@ -1,0 +1,112 @@
+--- a/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
++++ b/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
+@@ -305,6 +305,9 @@
+ 	rtabmap::Rtabmap rtabmap_;
+ 	std::unique_ptr<motus::VisualRecovery> visualRecovery_;
+ 	bool paused_;
++	int motusPreviewMaxPoints_ = 0;
++	double motusPreviewInterval_ = 1.;
++	int64_t lastMotusPreviewStamp_ = -1;
+ 
+ 	UMutex lastPoseMutex_;
+ 	rtabmap::Transform lastPose_;
+--- a/rtabmap_slam/src/CoreWrapper.cpp
++++ b/rtabmap_slam/src/CoreWrapper.cpp
+@@ -623,6 +623,9 @@
+ 
+ 	mapsManager_.setParameters(parameters_);
+ 
++	motusPreviewMaxPoints_ = std::clamp<int64_t>(this->declare_parameter("motus_preview_max_points", 0), 0, 80000);
++	motusPreviewInterval_ = std::max(0.05, this->declare_parameter("motus_preview_interval", 1.));
++
+ 	// Init RTAB-Map
+ 	rtabmap_.init(parameters_, databasePath_);
+ 	if(this->declare_parameter("motus_visual_recovery", false))
+@@ -2407,7 +2410,19 @@
+ 
+ 				timeUpdateMaps = timer.ticks();
+ 
+-				mapsManager_.publishMaps(filteredPoses, stamp, mapFrameId_);
++				// Publish a matched, bounded preview even when the native cloud cache is latched.
++				const auto previewStamp = stamp.nanoseconds();
++				const bool refreshPreview = motusPreviewMaxPoints_ > 0 &&
++						!rtabmap_.getLocalOptimizedPoses().empty() &&
++						(lastMotusPreviewStamp_ < 0 ||
++						 (previewStamp-lastMotusPreviewStamp_)*1e-9 >= motusPreviewInterval_);
++				mapsManager_.publishMaps(filteredPoses, stamp, mapFrameId_,
++						motusPreviewMaxPoints_, refreshPreview);
++				if(refreshPreview)
++				{
++					lastMotusPreviewStamp_ = previewStamp;
++					graphLatched_ = false; // Match the exact stamp of this cloud.
++				}
+ 
+ 				// Publish local graph, info
+ 				this->publishStats(stamp);
+--- a/rtabmap_util/include/rtabmap_util/MapsManager.h
++++ b/rtabmap_util/include/rtabmap_util/MapsManager.h
+@@ -84,6 +84,11 @@
+ 			const std::map<int, rtabmap::Transform> & poses,
+ 			const rclcpp::Time & stamp,
+ 			const std::string & mapFrameId);
++	void publishMaps(
++			const std::map<int, rtabmap::Transform> & poses,
++			const rclcpp::Time & stamp,
++			const std::string & mapFrameId,
++			std::size_t maxCloudPoints, bool refreshCloud);
+ 
+ 	cv::Mat getGridMap(
+ 			float & xMin,
+--- a/rtabmap_util/src/MapsManager.cpp
++++ b/rtabmap_util/src/MapsManager.cpp
+@@ -708,6 +708,15 @@
+ 		const std::map<int, rtabmap::Transform> & poses,
+ 		const rclcpp::Time & stamp,
+ 		const std::string & mapFrameId)
++{
++	publishMaps(poses, stamp, mapFrameId, 0, false);
++}
++
++void MapsManager::publishMaps(
++		const std::map<int, rtabmap::Transform> & poses,
++		const rclcpp::Time & stamp,
++		const std::string & mapFrameId,
++		std::size_t maxCloudPoints, bool refreshCloud)
+ {
+ 	UDEBUG("Publishing maps... poses=%d", (int)poses.size());
+ 
+@@ -984,7 +993,7 @@
+ 			(assembledGround_->empty() && assembledObstacles_->empty()) ||
+ 			(cloudGroundPub_->get_subscription_count() && !latched_.at(&cloudGroundPub_)) ||
+ 			(cloudObstaclesPub_->get_subscription_count() && !latched_.at(&cloudObstaclesPub_)) ||
+-			(cloudMapPub_->get_subscription_count() && !latched_.at(&cloudMapPub_)))
++			(cloudMapPub_->get_subscription_count() && (refreshCloud || !latched_.at(&cloudMapPub_))))
+ 		{
+ 			if(cloudGroundPub_->get_subscription_count())
+ 			{
+@@ -1006,7 +1015,24 @@
+ 			}
+ 			if(cloudMapPub_->get_subscription_count())
+ 			{
+-				pcl::PointCloud<pcl::PointXYZRGB> cloud = *assembledObstacles_ + *assembledGround_;
++				pcl::PointCloud<pcl::PointXYZRGB> cloud;
++				const auto obstacles = assembledObstacles_->size();
++				const auto total = obstacles + assembledGround_->size();
++				if(maxCloudPoints && total > maxCloudPoints)
++				{
++					cloud.reserve(maxCloudPoints);
++					for(std::size_t i=0; i<maxCloudPoints; ++i)
++					{
++						const auto index = i*total/maxCloudPoints;
++						cloud.push_back(index < obstacles ? assembledObstacles_->at(index) :
++								assembledGround_->at(index-obstacles));
++					}
++					cloud.is_dense = assembledGround_->is_dense && assembledObstacles_->is_dense;
++				}
++				else
++				{
++					cloud = *assembledObstacles_ + *assembledGround_;
++				}
+ 				sensor_msgs::msg::PointCloud2::UniquePtr cloudMsg(new sensor_msgs::msg::PointCloud2);
+ 				pcl::toROSMsg(cloud, *cloudMsg);
+ 				cloudMsg->header.stamp = stamp;

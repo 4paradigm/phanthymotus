@@ -146,7 +146,7 @@ def test_chassis_measurement_epoch_change_starts_a_new_continuity_run():
 
 
 @pytest.mark.parametrize('second,loss', [
-    ((2101, .1), False), ((1100, 1.), False), ((1100, .1), True),
+    ((2501, .1), False), ((1100, 1.), False), ((2201, 3.), False), ((1100, .1), True),
     ((900, 0.), False),
 ])
 def test_measured_visual_break_cannot_extend_previous_token(second, loss):
@@ -167,6 +167,21 @@ def test_measured_visual_break_cannot_extend_previous_token(second, loss):
     push(*second)
     first, changed = [frame.pose.external_continuity for frame in s.accepted]
     assert first and changed and changed != first
+
+
+@pytest.mark.parametrize('gap_ms,x', [(1068, .673), (1201, .752)])
+def test_witnessed_vo_retains_token_across_brief_capture_gap(gap_ms, x):
+    s = stream()
+    s.ingress_clock_id = 'local'
+    for ms, position in ((1000, 0.), (1000+gap_ms, x)):
+        sample, parent = measured_rgbd(ms, position)
+        context = replace(parent, observation_id=f'derived-{ms}',
+                          parent_observation_ids=(parent.observation_id,),
+                          transformations=parent.transformations+('rgbd_odometry',))
+        s.odom(sample, now=ms/1000, context=context)
+        s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
+    first, resumed = [frame.pose.external_continuity for frame in s.accepted]
+    assert first and resumed == first
 
 
 @pytest.mark.parametrize('sigma,accepted', [(.24, True), (.25, True), (.251, False)])

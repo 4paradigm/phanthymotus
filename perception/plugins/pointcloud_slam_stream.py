@@ -168,8 +168,8 @@ class SlamStream:
             dot = abs(sum(a*b for a, b in zip(pose.quaternion, previous.quaternion)))
             angle = 2*math.acos(min(1., dot))
             # Measured VO can skip captures while its same-stamp registration
-            # is still valid. Keep that observed walk bounded to one second.
-            max_interval = .5 if chassis else 1.
+            # is still valid. Match the visual runtime's 1.5 s output bound.
+            max_interval = .5 if chassis else 1.5
             if last_origin == origin and (
                     (dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
                     (0 < dt <= max_interval and distance <= .1 + 1.5*dt and

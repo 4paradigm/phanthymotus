@@ -18,6 +18,8 @@ static void testScanRelocalization(const std::string &root, const std::string &o
 {
     const bool partialOverlap=mode=="partial_scan_relocalize";
     const bool afterMotion=mode=="scan_relocalize_after_motion";
+    const bool weakWitnessedBridge=mode=="witnessed_scan_weak_bridge";
+    const bool witnessedOutage=mode=="witnessed_scan_late_handoff" || weakWitnessedBridge;
     const bool weakBridge=mode=="scan_origin_weak_bridge";
     const bool originChange=mode=="scan_origin_change" || weakBridge;
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
@@ -42,7 +44,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         rtabmap::SensorData data(blackImage?cv::Mat::zeros(depth.size(),CV_8UC3):cv::Mat(),
                                  blackImage?depth:cv::Mat(),camera,0,stamp);
         // A valid partial observation can occupy fewer than half of the scan's expected points.
-        const int maxPoints=weakBridge && stamp==2.?6*count:
+        const int maxPoints=(weakBridge || weakWitnessedBridge) && stamp==2.?6*count:
             partialOverlap && stamp==7.?2*count:0;
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),maxPoints,0.f,rtabmap::LaserScan::kXYZ));
         if(badGuess)
@@ -56,7 +58,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         if(origin)
         {
             cv::Mat packet(1,24,CV_8UC1,cv::Scalar::all(0));
-            std::memcpy(packet.data,"MOTUSOR1",8);
+            std::memcpy(packet.data,witnessedOutage?"MOTUSOD1":"MOTUSOR1",8);
             std::fill_n(packet.data+8,16,origin);
             data.setUserData(rtabmap::compressData2(packet),true);
         }
@@ -64,10 +66,30 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         return recovery.process(map,data,hasPose?rtabmap::Transform(reportedX,0,0,0,0,0):rtabmap::Transform(),
                                 cv::Mat::eye(6,6,CV_64F)*.01);
     };
-    if(!frame(1.,0.f,true,false,false,false,originChange?1:0) ||
-       !frame(1.5,.12f,true,false,false,false,originChange?1:0))
+    const int startingToken=originChange || witnessedOutage?1:0;
+    if(!frame(1.,0.f,true,false,false,false,startingToken) ||
+       !frame(1.5,.12f,true,false,false,false,startingToken))
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto anchor=map.getLastLocationId();
+    if(witnessedOutage)
+    {
+        const auto old=map.getLocalOptimizedPoses();
+        if(frame(2.,.19f,false,!weakWitnessedBridge) || !recovery.odom().isNull() ||
+           recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses()!=old)
+            throw std::runtime_error("an unverified scan cannot replace the last measured motion during a witnessed outage");
+        if(!frame(5.65,.31f,true,true,false,false,1) ||
+           recovery.state()!=motus::VisualRecovery::External || recovery.odom().isNull() ||
+           std::abs(recovery.odom().x()-.31f)>1e-5f || map.getLocalOptimizedPoses().size()!=old.size()+1)
+            throw std::runtime_error("the same observed run must resume after a sparse scan gap without RGB");
+        const auto grown=map.getLocalOptimizedPoses();
+        map.close();
+        rtabmap::Rtabmap reopened;
+        reopened.init(parameters,output+".db");
+        if(reopened.getLocalOptimizedPoses()!=grown)
+            throw std::runtime_error("same-run recovery must persist the full original graph");
+        reopened.close(false);
+        return;
+    }
     if(weakBridge)
     {
         const auto old=map.getLocalOptimizedPoses();
@@ -255,7 +277,8 @@ int main(int argc, char **argv)
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
     if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
        mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" ||
-       mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback")
+       mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" ||
+       mode=="witnessed_scan_late_handoff" || mode=="witnessed_scan_weak_bridge")
     {
         p["RGBD/NeighborLinkRefining"]="false";
         testScanRelocalization(root,output,p,mode);

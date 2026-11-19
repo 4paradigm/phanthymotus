@@ -491,17 +491,18 @@ def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
         assert s.gate.good == k-2 and last(s)['pose'] is None
     assert s.processing_ages[-1] == 100*MS
 
-    # The third fresh capture is outside the frozen in-segment pause bound.
+    # The third fresh capture is outside the normal pause and supplies the
+    # first observation for the separate old-landmark verification.
     result(anchor+5*period, landmarks=True)
     assert last(s)['pose'] is None
-    assert s.gate.relocalization_points and s.gate.good == 0
+    assert s.gate.relocalization_points and s.gate.good == 1
     advance(now[0]+33_333_333)
     assert 2_566*MS < s.gate.relocalization_deadline_mono-now[0] <= 2_600*MS
 
     # The three old-landmark candidates span 1.1 s before processing delay.
-    for k in (6, 7, 8):
+    for k in (6, 7):
         result(anchor+k*period, landmarks=True)
-        assert (last(s)['pose'] is not None) == (k == 8)
+        assert (last(s)['pose'] is not None) == (k == 7)
     assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
     assert last(s)['vendor']['relocalization'] == dict(method='native_f2m_landmarks',
                                                      anchor_stamp_ns=anchor, shared_landmarks=24)
@@ -509,7 +510,7 @@ def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
 
     # Fresh results replace inherited timing for later pauses.
     for k in range(1, 7):
-        result(anchor+8*period+k*450*MS, processing_ns=100*MS)
+        result(anchor+7*period+k*450*MS, processing_ns=100*MS)
     s.gate.degrade('subsequent visual rejection', now[0])
     assert s.gate.pause_context.budget_ns == 1_900*MS
 

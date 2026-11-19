@@ -732,10 +732,11 @@ RUN set -e; \
     cp /tmp/rtabmap-rotation-hint/RotationHintBuffer.h /tmp/rtabmap-ws/src/rtabmap_ros/rtabmap_odom/include/rtabmap_odom/RotationHintBuffer.h; \
     rm -rf /tmp/rtabmap-rotation-hint
 
-COPY perception/native/rtabmap/visual_recovery_ros.patch perception/native/rtabmap/VisualRecovery.h /tmp/rtabmap-visual-recovery/
+COPY perception/native/rtabmap/visual_recovery_ros.patch perception/native/rtabmap/bounded_preview_ros.patch perception/native/rtabmap/VisualRecovery.h /tmp/rtabmap-visual-recovery/
 RUN set -e; \
     git -C /tmp/rtabmap-ws/src/rtabmap_ros apply --check /tmp/rtabmap-visual-recovery/visual_recovery_ros.patch; \
     git -C /tmp/rtabmap-ws/src/rtabmap_ros apply /tmp/rtabmap-visual-recovery/visual_recovery_ros.patch; \
+    git -C /tmp/rtabmap-ws/src/rtabmap_ros apply /tmp/rtabmap-visual-recovery/bounded_preview_ros.patch; \
     cp /tmp/rtabmap-visual-recovery/VisualRecovery.h /tmp/rtabmap-ws/src/rtabmap_ros/rtabmap_slam/include/rtabmap_slam/VisualRecovery.h; \
     rm -rf /tmp/rtabmap-visual-recovery
 

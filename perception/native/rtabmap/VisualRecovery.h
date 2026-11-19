@@ -127,13 +127,20 @@ public:
             }
             externalOrigin_=origin;
         }
+        const double externalAge=data.stamp()-previousExternalStamp_;
         const double outageAge=data.stamp()-chassisOutageStart_;
         const bool recentOutage=chassisOutageStart_>0. && outageAge>=0. && outageAge<=2.;
-        const bool continuousExternal=((externalRun && externalRun==externalRun_) || sameOrigin) &&
-            (!waiting_ || recentOutage) && !localizationMode_ && continuousMotion(external,data.stamp());
-        const double externalAge=data.stamp()-previousExternalStamp_;
+        const bool witnessedRun=externalRun && externalRun==externalRun_;
+        // Dense verified poses can keep arriving between sparse native scans.
+        // Keep the aligned run across a short scan outage, measured from its
+        // last accepted external pose. A declared origin alone is weaker.
+        const bool witnessedGap=externalRun_ && externalAge>0. && externalAge<=4.5;
+        const bool continuousExternal=(witnessedRun || sameOrigin) &&
+            (!waiting_ || recentOutage || (witnessedRun && witnessedGap)) &&
+            !localizationMode_ && continuousMotion(external,data.stamp());
         const bool waitForChassis=external.isNull() && (externalRun_ || externalOrigin_) && !localizationMode_ &&
-            externalAge>0. && externalAge<=maxExternalScanGap_ && (!chassisOutageStart_ || recentOutage) &&
+            externalAge>0. && externalAge<=maxExternalScanGap_ &&
+            (!chassisOutageStart_ || recentOutage || witnessedGap) &&
             !map.getLocalOptimizedPoses().empty();
         if(waitForChassis && !chassisOutageStart_) chassisOutageStart_=data.stamp();
         if(!waitForChassis) chassisOutageStart_=0.;
@@ -272,7 +279,7 @@ public:
         if((external.isNull() || waiting_) && !(aligned_ && tracked) &&
            !localizationMode_ && scanAge>0. && scanRunAge<=4.)
         {
-            if(registerScan(map,data,acceptedStats,scanAge))
+            if(registerScan(map,data,acceptedStats,scanAge,waitForChassis))
             {
                 if(tracked)
                 {
@@ -781,16 +788,16 @@ private:
     }
 
     bool registerScan(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
-                      const std::map<std::string,float> & statistics,double dt)
+                      const std::map<std::string,float> & statistics,double dt,bool waitingForMeasuredRun)
     {
         if(map.getLocalOptimizedPoses().empty()) return false;
         rtabmap::RegistrationInfo result;
         const auto relative=scanIcp_->computeTransformation(scanAnchor_->scan,data,
             rtabmap::Transform::getIdentity(),&result);
-        // Without an independent RGB route, a weak short bridge would become
-        // the only motion evidence for reconnecting a new odometry origin.
+        // Require more than a small matching patch to replace a measured
+        // stream temporarily or to bridge an explicitly scan-only origin.
         if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
-           (externalOrigin_ && !(result.icpInliersRatio>=minScanRelocalizationOverlap_)) ||
+           ((externalOrigin_ || waitingForMeasuredRun) && !(result.icpInliersRatio>=minScanRelocalizationOverlap_)) ||
            !validCovariance(result.covariance) || !plausibleMotion(relative,dt))
             return false;
         const auto measured=scanAnchor_->pose*relative;

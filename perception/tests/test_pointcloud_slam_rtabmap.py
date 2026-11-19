@@ -88,6 +88,15 @@ def test_optional_rgb_uses_one_sensor_data_process_for_image_and_scan_fallback(t
     assert params['Rtabmap/DetectionRate'] == '2'
 
 
+def test_live_preview_uses_existing_interval_and_bounds_native_cloud_size(tmp_path):
+    params = backend().mapping_parameters(tmp_path / 'map.db', '/private/rgb', {
+        'max_pending': 10, 'voxel_size_m': .08, 'max_working_nodes': 300, 'max_update_ms': 100,
+        'preview_interval_s': .75, 'preview_max_points': 12000, 'rgb_input': {'topic': '/rgb'}})
+    assert params['latch'] is True
+    assert params['motus_preview_max_points'] == 12000
+    assert params['motus_preview_interval'] == .75
+
+
 @pytest.mark.parametrize('options,match', [({'exit_code': 7}, 'exit'),
     ({'invalid_db': True}, 'database'), ({'ignore_interrupt': True}, 'timed out')])
 def test_failed_or_incomplete_stop_never_reports_saved_and_retains_data(tmp_path, options, match):

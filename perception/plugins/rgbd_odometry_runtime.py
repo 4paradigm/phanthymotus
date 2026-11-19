@@ -21,7 +21,7 @@ import numpy as np
 
 from utils.dds_transport import receive_environment
 
-from .rgbd_odometry_contract import PairBuffer, make_sample
+from .rgbd_odometry_contract import PairBuffer, SIGMA_LIMIT_M, make_sample
 from .rgbd_pairing import RgbdPairer, RgbdPair
 from .spatial_time import TimePolicy
 from .rgbd_imu import ImuAttitude
@@ -72,6 +72,8 @@ RESUME_ROTATION_RAD, RESUME_RATE_RADPS = np.deg2rad(5.), np.deg2rad(90.)
 # bound. Keep the tighter rotation bound when handing off from ESKF.
 FALLBACK_OFFSET_M, FALLBACK_OFFSET_RAD = RESUME_TRANSLATION_M, np.deg2rad(2.)
 F2M_SHARED_INLIERS = 20  # pinned RTAB-Map Vis/MinInliers
+F2M_STRONG_SHARED_INLIERS = 2 * F2M_SHARED_INLIERS
+F2M_TRACKING_SHARED_INLIERS = 12
 IMU_STARTUP_GRACE_S = 1.5
 
 
@@ -101,8 +103,10 @@ class EstimateGate:
         self.anchor_info = None
         self.uncertain_seed = None
         self.last_verification_pose = None
+        self.last_verification_points = {}
         self.relocalization_points = None
         self.relocalization_deadline = self.relocalization_deadline_mono = None
+        self.relocalization_grace_used = False
         self.relocalization_failure = 'output'
         self.relocalization_native_loss_streak = 0
 
@@ -149,6 +153,7 @@ class EstimateGate:
         self.rejection = str(reason)
         self.uncertain_seed = None
         self.last_verification_pose = None
+        self.last_verification_points = {}
         if self.state == 'lost':
             return
         if stamp is not None:
@@ -181,9 +186,9 @@ class EstimateGate:
                 if i in inliers and math.isfinite(p.x) and math.isfinite(p.y) and math.isfinite(p.z)}
 
     @staticmethod
-    def _shared_landmarks(points, previous):
+    def _shared_landmarks(points, previous, minimum=F2M_SHARED_INLIERS):
         unchanged = {p for i, p in points.items() if previous.get(i) == p}
-        if (len(unchanged) < F2M_SHARED_INLIERS or
+        if (len(unchanged) < minimum or
                 np.linalg.matrix_rank(np.array(list(unchanged))-next(iter(unchanged))) < 2):
             return 0
         return len(unchanged)
@@ -194,6 +199,7 @@ class EstimateGate:
             if len(points) >= F2M_SHARED_INLIERS:
                 self.relocalization_points = points
                 self.relocalization_deadline = self.relocalization_deadline_mono = None
+                self.relocalization_grace_used = False
                 self.relocalization_failure = 'output'
                 self.relocalization_native_loss_streak = 0
                 self.good = 0
@@ -297,10 +303,14 @@ class EstimateGate:
         uncertain = np.any(np.diag(covariance)[:3] > .04)
         points = self._matched_points(info) if verifying or uncertain else {}
         shared = self._shared_landmarks(points, self.relocalization_points) if verifying else None
+        if verifying and not shared and self.good >= 2:
+            # Two anchored measurements may track a turn into a new view. The
+            # third still needs exact unchanged landmarks and bounded motion.
+            shared = self._shared_landmarks(points, self.last_verification_points)
         support = 0
         seed = None
-        if (uncertain and rotation_ok and (not verifying or recent) and
-                np.linalg.eigvalsh(covariance[:3, :3]).max() <= .25):
+        variance = np.linalg.eigvalsh(covariance[:3, :3]).max() if uncertain else 0.
+        if uncertain and rotation_ok and (not verifying or recent) and variance <= .25:
             # Native variances describe an uncertain measured position. Require
             # independent repeated registrations in this same F2M world.
             if verifying:
@@ -311,7 +321,12 @@ class EstimateGate:
                 if reference is not None:
                     anchor, previous = reference
                     if stamp-anchor[0] <= 1_500_000_000 and self._continuous(stamp, position, rotation, anchor):
-                        support = self._shared_landmarks(points, previous)
+                        # Dense native tracking can retain a near-limit frame
+                        # with fewer unchanged 3-D points during a turn.
+                        minimum = (F2M_TRACKING_SHARED_INLIERS if self.state == 'tracking' and
+                                   variance <= SIGMA_LIMIT_M**2 and info.inliers >= 4*F2M_SHARED_INLIERS
+                                   else F2M_SHARED_INLIERS)
+                        support = self._shared_landmarks(points, previous, minimum)
                 if self.last_pose is None:
                     seed = ((stamp, position, rotation), points)
         if not rotation_ok or (uncertain and not support):
@@ -327,6 +342,17 @@ class EstimateGate:
         if support:
             sample['vendor']['visual_uncertainty'] = dict(method='native_f2m_landmarks',
                                                          shared_landmarks=support)
+        if not verifying and self.state == 'recovering' and self.last_pose is not None:
+            pause = self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS
+            if stamp-self.last_pose[0] > pause:
+                self._timeout(f'visual recovery exceeded the {pause/1e9:g} s in-segment pause bound; '
+                              'restart to begin a new segment', 'visual')
+                if self.relocalization_points is None or (uncertain and stamp-self.last_pose[0] > 3_000_000_000):
+                    return None
+                verifying = True
+                points = points or self._matched_points(info)
+                shared = self._shared_landmarks(points, self.relocalization_points)
+        required = 3
         if verifying:
             # A fresh matched result may arrive just as the ordinary pause
             # expires, before another RGB-D pair reaches input().
@@ -339,21 +365,32 @@ class EstimateGate:
                      not self._continuous(stamp, position, rotation, self.last_verification_pose))):
                 self.good = 0
                 self.last_verification_pose = None
+                self.last_verification_points = {}
                 self.relocalization_failure = 'relocalization'
                 return None
+            old_points = {key: point for key, point in points.items()
+                          if self.relocalization_points.get(key) == point}
+            if not uncertain and len(old_points) >= F2M_STRONG_SHARED_INLIERS:
+                strong = self._shared_landmarks(old_points, self.last_verification_points,
+                                                F2M_STRONG_SHARED_INLIERS)
+                if strong and self.good == 1:
+                    required, shared = 2, strong
+                elif self.recovery_policy and not self.relocalization_grace_used and self.result_period_ns:
+                    # Allow one more measured interval after a strong old-map
+                    # match. Weak matches and later candidates cannot renew it.
+                    grace = min(500_000_000, self.result_period_ns)
+                    self.relocalization_deadline += grace
+                    self.relocalization_deadline_mono += grace
+                    self.relocalization_grace_used = True
             self.last_verification_pose = (stamp, position, rotation)
-        elif (self.state == 'recovering' and self.last_pose is not None and
-                stamp - self.last_pose[0] > (self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)):
-            self._timeout(f'visual recovery exceeded the {(self.pause_context.budget_ns-200_000_000 if self.pause_context else PAUSE_RESUME_NS)/1e9:g} s in-segment pause bound; '
-                       'restart to begin a new segment', 'visual')
-            return None
+            self.last_verification_points = points
         if self.state != 'tracking' and not self._continuous(stamp, position, rotation):
             self.fault('visual estimate resumed discontinuously; restart to begin a new segment', 'visual')
             return None
         self.rejection = None
         self.last_stamp = stamp
         self.good += 1
-        if self.good < 3:
+        if self.good < required:
             return None
         self.state, self.reason, self.recover_by = 'tracking', None, None
         self.pause_context = None
@@ -361,6 +398,7 @@ class EstimateGate:
             sample['vendor']['relocalization'] = dict(method='native_f2m_landmarks',
                 anchor_stamp_ns=self.last_pose[0], shared_landmarks=shared)
             self.relocalization_points = self.last_verification_pose = None
+            self.last_verification_points = {}
             self.relocalization_deadline = self.relocalization_deadline_mono = None
         self.anchor_info = info if len(getattr(info, 'word_inliers', ())) >= F2M_SHARED_INLIERS else None
         self.last_pose = (stamp, position, rotation)
