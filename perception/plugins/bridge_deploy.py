@@ -9,8 +9,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 CHUNK_SIZE = 5 * 1024 * 1024  # 5MB per chunk
-REMOTE_CHUNK_DIR = "C:\\ParadigmChunks"
-REMOTE_BOOTSTRAP = f"{REMOTE_CHUNK_DIR}\\bootstrap.ps1"
+REMOTE_CHUNK_DIR = "D:/ParadigmVisitorBridge/upload"
+REMOTE_BOOTSTRAP = f"{REMOTE_CHUNK_DIR}/bootstrap.ps1"
 
 
 def sha256_file(file_path: Path) -> str:
@@ -62,6 +62,12 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     if 'python-3.12.10-amd64.exe' not in manifest or not any(n.endswith('.whl') for n in manifest):
         raise ValueError('镜像缺少完整离线安装包，请重新构建 perception')
 
+    for name, digest in manifest.items():
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+\.(exe|whl)', name):
+            raise ValueError('Invalid offline asset name')
+        if sha256_file(offline / name) != digest:
+            raise ValueError('离线安装包校验失败')
+
     ssh_base_args = [
         "ssh", "-F", "/dev/null", "-T",
         "-i", str(key), "-p", str(port),
@@ -71,20 +77,35 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     ]
     scp_base_args = [
         "scp", "-F", "/dev/null",
-        "-i", str(key), "-p", str(port),
+        "-i", str(key), "-P", str(port),
         "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={known}",
     ]
 
-    # 远程创建分片缓存目录
-    subprocess.run(
+    def run(command, **kwargs):
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('初始化步骤超时：' + command[0]) from None
+        if result.returncode:
+            detail = (result.stderr or result.stdout).decode('utf-8', errors='replace')
+            detail = detail.replace(token, '[REDACTED]')[-1200:]
+            raise RuntimeError('初始化 %s 失败（退出码 %s）：%s' % (command[0], result.returncode, detail))
+        return result
+
+    prepare = "$ErrorActionPreference='Stop'; if (!(Test-Path 'D:/')) { throw 'D drive missing' }; New-Item -ItemType Directory -Force -Path 'D:/ParadigmVisitorBridge/upload' | Out-Null; Add-Content -LiteralPath 'D:/ParadigmVisitorBridge/bootstrap.log' -Value 'Upload preparation ready'; Write-Output 'UPLOAD_READY'"
+    encoded = base64.b64encode(prepare.encode('utf-16le')).decode('ascii')
+    # Encode PowerShell to prevent cmd.exe from interpreting its pipeline.
+    prepared = run(
         ssh_base_args + [
             f"{user}@{host}",
-            f"powershell -NoProfile -Command New-Item -ItemType Directory -Path {REMOTE_CHUNK_DIR} -Force | Out-Null"
+            'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded
         ],
         check=True
     )
+    if b'UPLOAD_READY' not in prepared.stdout:
+        raise RuntimeError('SSH 未执行上传准备命令；请检查公钥是否仍绑定强制启动命令')
 
     local_chunk_dir = Path("/tmp/ql_bridge_chunks")
     local_chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -98,7 +119,7 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     core_manifest_path = local_chunk_dir / "core.json"
     with open(core_manifest_path, "w", encoding="utf-8") as f:
         json.dump(core_payload, f, ensure_ascii=False)
-    subprocess.run(scp_base_args + [str(core_manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}\\core.json"], check=True)
+    run(scp_base_args + [str(core_manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}/core.json"])
 
     # 分片上传离线包
     for name, digest in manifest.items():
@@ -110,21 +131,21 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
         chunk_cnt = split_file(src_file, local_chunk_dir)
         for i in range(chunk_cnt):
             chunk_name = f"{name}.{i:04d}.chunk"
-            subprocess.run(scp_base_args + [str(local_chunk_dir / chunk_name), f"{user}@{host}:{REMOTE_CHUNK_DIR}\\{chunk_name}"], check=True)
+            run(scp_base_args + [str(local_chunk_dir / chunk_name), f"{user}@{host}:{REMOTE_CHUNK_DIR}/{chunk_name}"])
         man["files"].append({"name": name, "sha256": digest, "chunk_count": chunk_cnt})
 
     # 上传分片清单
     manifest_path = local_chunk_dir / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(man, f, ensure_ascii=False)
-    subprocess.run(scp_base_args + [str(manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}\\manifest.json"], check=True)
+    run(scp_base_args + [str(manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}/manifest.json"])
 
     # 上传bootstrap.ps1
     bootstrap_src = package_root / "bootstrap.ps1"
-    subprocess.run(scp_base_args + [str(bootstrap_src), f"{user}@{host}:{REMOTE_BOOTSTRAP}"], check=True)
+    run(scp_base_args + [str(bootstrap_src), f"{user}@{host}:{REMOTE_BOOTSTRAP}"])
 
     # 远程执行bootstrap
-    result = subprocess.run(
+    result = run(
         ssh_base_args + [
             f"{user}@{host}",
             f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {REMOTE_BOOTSTRAP}"
@@ -134,5 +155,5 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
 
     shutil.rmtree(local_chunk_dir, ignore_errors=True)
     if result.returncode or b'BRIDGE_BOOTSTRAP_OK' not in result.stdout:
-        raise RuntimeError('远程初始化失败，请检查电脑 ProgramData\\ParadigmVisitorBridge\\bootstrap.log；确认使用管理员 SSH 密钥而非仅启动密钥')
+        raise RuntimeError('安装未返回成功标记，请检查 D:\\ParadigmVisitorBridge\\bootstrap.log')
     return {'status': 'installed', 'hint': '桥接已安装并启动。请保存配置、刷新打印机；首次使用需登录访客网站。'}

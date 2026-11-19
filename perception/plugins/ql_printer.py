@@ -395,8 +395,9 @@ class QLPrinterPlugin:
             try:
                 from .bridge_deploy import deploy
                 result = deploy(config)
-            except Exception:
-                result = {"status": "error", "error": "初始化失败：检查管理员 SSH 权限、known_hosts、网络及电脑上的 bootstrap.log"}
+            except Exception as exc:
+                detail = str(exc).replace(str(config.get('token') or '\0'), '[REDACTED]')
+                result = {"status": "error", "error": "初始化失败：" + detail[:1600]}
             with self._lock:
                 self._deploy_state = result
         threading.Thread(target=work, daemon=True).start()

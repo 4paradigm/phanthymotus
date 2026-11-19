@@ -3,7 +3,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator SSH required' }
 
-$chunkDir = "C:\ParadigmChunks"
+$chunkDir = "D:\ParadigmVisitorBridge\upload"
 $corePath = Join-Path $chunkDir "core.json"
 $manifestPath = Join-Path $chunkDir "manifest.json"
 if (!(Test-Path $corePath) -or !(Test-Path $manifestPath)) {
@@ -13,7 +13,7 @@ $core = Get-Content -LiteralPath $corePath -Raw -Encoding UTF8 | ConvertFrom-Jso
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $token = $core.token
 
-$root = Join-Path $env:ProgramData 'ParadigmVisitorBridge'
+$root = 'D:\ParadigmVisitorBridge'
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 $log = Join-Path $root 'bootstrap.log'
 $mutex = New-Object Threading.Mutex($false, 'Global\ParadigmBridgeBootstrap')
