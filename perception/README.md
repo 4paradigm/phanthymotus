@@ -653,7 +653,7 @@ and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
 | `vits2-zh-en` (default) | VITS2 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
 | `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
 | `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
-| `kokoro-multi` | Kokoro-82M v1.0 | 英 / 中 / 日 / 西 / 法 / 意 / 葡 / 印地, code-switching | ONNX Runtime | `/models/kokoro-multi/<device>` |
+| `kokoro-multi` | Kokoro Multi | 中 / 英 / 日 / 俄 / 德 / 法 / 西 / 泰 | TensorRT on JetPack 5.1.1 and 6.1 | `/models/kokoro-multi-trt-jp511` or `/models/kokoro-multi-trt` |
 
 `vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
 `plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
@@ -722,7 +722,42 @@ Known limitation, sherpa's FSTs rather than this code: `电话13800138000` becom
 `number-zh.fst` reads it as a quantity. And a bare `2026.` with no `年` reads as
 `二千零二十六`; the year form needs the context character.
 
-### `kokoro-multi`, the multilingual voice
+### `kokoro-multi` on JetPack
+
+The Jetson Perception image includes the dependencies in
+`plugins/requirements.kokoro-multi.txt` so that an operator can switch to
+`kokoro-multi` through the existing TTS card. Selecting the engine loads one
+FP32 TensorRT model and one voice for `zh`, `en`, `ja`, `ru`, `de`,
+`fr`, `es`, and `th`. Set `tts_language` to `auto` for per-request
+language detection, or choose one of those language codes. The engine uses
+GPU inference and supports `speaker_id: 0`.
+
+The JetPack 5.1.1 and 6.1 plans are different. On first load, Perception
+downloads the pinned archive for the image's JetPack version from ModelScope,
+verifies its size and SHA-256, then extracts it under
+`/models/kokoro-multi-trt-jp511` or `/models/kokoro-multi-trt`, respectively.
+The archive includes the frontend data and the English spaCy model. Download
+and extraction progress appear in the TTS card. A verified installation is
+reused on subsequent starts.
+
+Normal Perception startup retains its configured plugins. For the standalone
+benchmark launcher, set both `KOKORO_MULTI_ENABLE=1` and
+`KOKORO_MULTI_BENCHMARK=1`. Benchmark mode selects the TTS-only configuration
+and unpaced output. Both variables default to `0`.
+
+The frontend dependencies are installed in the shared Jetson image because
+the card supports switching engines at runtime. They increase image size.
+The model archive and its frontend data are downloaded separately at runtime.
+For the JP5 PR image `release.261119.97e2878-jetson-jp5.11`, the dependency
+installation layer is 112,603,396 bytes compressed. This layer also includes
+the pinned NumPy installation, so its size is not the incremental cost of
+Kokoro dependencies alone.
+
+### Legacy sherpa-onnx `kokoro-multi`
+
+The following section documents the legacy sherpa-onnx adapter, which remains
+available for configurations that do not select the TensorRT backend. Its
+language and voice settings differ from the Jetson TensorRT path above.
 
 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) **v1.0**, added because
 `vits2-zh-en` is a Chinese male voice whose English is the weaker half, and there was
