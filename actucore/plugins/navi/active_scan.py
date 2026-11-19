@@ -56,6 +56,7 @@ class ActiveScan:
     clear_frames: int = 0
     current_frame: int = 0
     pending_depth: dict | None = None
+    _pending_projection: tuple | None = None
     side_frame: int = 0
     result_frame: int = 0
     receipt_only: bool = False
@@ -198,10 +199,12 @@ class ActiveScan:
         self.current_frame = frame
         if self.views and self.views[-1][0] == frame:
             return
-        free, occupied = observe(depth["map"], geometry, RIGHT, FORWARD, RESOLUTION, ground)
+        # Only the latest receipt-time view can contribute to the grid.
+        # Project it when a turn or local plan needs it.
+        self._pending_projection = (depth["map"], geometry, ground)
         self.source_frame = source
         self.views.clear()
-        self.views.append((frame, self.pose, free, occupied))
+        self.views.append((frame, self.pose, None, None))
 
     def observe_single(self, depth, geometry, max_depth_age_ms, now_ms):
         """Use the latest single view, preserving the receipt of repeated frames."""
@@ -241,17 +244,22 @@ class ActiveScan:
                 return pose, max(abs(lower_yaw_rate), abs(upper_yaw_rate)) <= STILL_YAW
         return None
 
-    def grid(self):
-        """Reproject nearby views. Occupation wins, and free cells need support."""
+    def grid(self, *, since_ms=0):
+        """Use the latest view or reproject aligned views captured since a cutoff."""
         if self.receipt_only:
-            _, _, free, occupied = self.views[-1]
+            frame, pose, free, occupied = self.views[-1]
+            if self._pending_projection is not None:
+                depth, geometry, ground = self._pending_projection
+                free, occupied = observe(depth, geometry, RIGHT, FORWARD, RESOLUTION, ground)
+                self.views[-1] = (frame, pose, free, occupied)
+                self._pending_projection = None
             return free, occupied
         free = np.zeros(SHAPE, dtype=bool)
         occupied = np.zeros_like(free)
         stamp = self.poses[-1][0]
         forward, right, yaw = self.pose
         for capture, (before_f, before_r, before_yaw), view_free, view_occupied in self.views:
-            if stamp - capture > MAP_AGE_MS:
+            if capture < since_ms or stamp - capture > MAP_AGE_MS:
                 continue
             df, dr = forward - before_f, right - before_r
             offset_f = df * math.cos(before_yaw) + dr * math.sin(before_yaw)
@@ -524,6 +532,7 @@ class ActiveScan:
     def invalidate(self):
         self.current_frame = 0
         self.pending_depth = None
+        self._pending_projection = None
         self.source_frame = None
         self.odom_source = None
         self.poses.clear()

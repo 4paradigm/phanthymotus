@@ -537,8 +537,8 @@ class NaviPlugin:
                 self._config.depth_intrinsics, self._depth_vertical, half_width,
                 half_length=footprint.get("half_length"))
             depth_decl = for_topic(args.get("camera_info"), binding["depth_map"])
-            self._config.scan_geometry = body_square(self._config.local_geometry,
-                                                     depth_decl.get("vendor"))
+            depth_vendor = depth_decl.get("vendor") or {}
+            self._config.scan_geometry = body_square(self._config.local_geometry, depth_vendor)
             if self._config.scan_geometry is None:
                 self._camera_notes.append("主动观察使用相机坐标系的底盘近似，仅用转稳后的单视角重规划")
         self._config.local_planning = bool(
@@ -548,6 +548,20 @@ class NaviPlugin:
             # motion already budgets the full downstream watchdog interval.
             self._ttl_ms = negotiate.ttl_ms(rate, descriptor, periods=4.)
         self._config.odom_expected = bool(binding.get("odom"))
+        wheeled_footprint = (self._config.local_planning and valid_width
+                             and footprint.get("source") == "measured"
+                             and self._config.vy_max == 0.)
+        half_length, height = footprint.get("half_length"), footprint.get("height")
+        if (wheeled_footprint and self._config.scan_geometry is not None
+                and self._depth_stamp_verified and depth_vendor.get("accuracy_validated") is True
+                and self._config.floor_vx == 0. and self._config.floor_wz == 0.
+                and all(type(value) in (int, float) and math.isfinite(value) and value > 0.
+                        for value in (half_length, height))):
+            self._config.doorway_geometry = replace(self._config.scan_geometry, height=height,
+                                                    strict_occupancy=True)
+        elif wheeled_footprint:
+            self._camera_notes.append("门口对中需要实测车长、车高、校验后的相机到车体外参和可信采集时间")
+
         if self._config.local_planning and self._config.local_geometry is None:
             self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
         # Callers may supply producer contracts keyed by the actual wired
@@ -1610,6 +1624,9 @@ class NaviPlugin:
                         odom["source_sample_id"] = self._odom_source_ms
                 if not uses_pose and self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
+                    if (self._config.doorway_geometry is not None and pose is not None
+                            and pose.stamp_ms == self._odom_ms):
+                        odom["door_pose"] = pose
         return objects, depth, odom, objects_ms
 
     def next_command(self):
@@ -1625,6 +1642,7 @@ class NaviPlugin:
         objects, depth, odom, objects_ms = self._observation_snapshot(
             with_capture_timing=self._config.local_planning)
         was_moving = any(self._state.commanded)
+        doorway_guarded = self._state.doorway is not None
         previous_scan = self._state.active_scan
         issued_yaw = previous_scan.issued_yaw
         idle_for_s = self._state.idle_for_s
@@ -1642,7 +1660,7 @@ class NaviPlugin:
             # Stop once when a policy goes quiet while the chassis may still
             # hold its last motion command under the longer watchdog.
             if (self._config.watchdog_ms <= 300
-                    and not (scan_guarded or was_searching or command_only)) or not was_moving:
+                    and not (scan_guarded or was_searching or command_only or doorway_guarded)) or not was_moving:
                 return None
             decision.values = [0.0] * ACTION_DIM
             return self._command_message(decision.values, now, int(now * 1000))
@@ -1665,13 +1683,16 @@ class NaviPlugin:
         now_ms = int(now * 1000)
         obs_ms = objects_ms or now_ms
         if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
-                or scan.locked or was_searching) and not any(values):
+                or scan.locked or was_searching or doorway_guarded) and not any(values):
             # A hold applies now, even when the last input is about to expire.
             obs_ms = now_ms
         elif (self._config.local_planning and any(values)
                 and depth is not None and depth.get("frame_id") is not None):
             obs_ms = min(obs_ms, depth.get("capture_ms") or scan.single_depth_ms or depth["frame_id"])
             motion_pose = (odom or {}).get("motion_pose")
+            if doorway_guarded and self._state.doorway is not None:
+                motion_pose = (odom or {}).get("door_pose")
+                obs_ms = min(obs_ms, self._state.doorway.evidence_ms)
             if motion_pose is not None:
                 obs_ms = min(obs_ms, motion_pose.stamp_ms)
             if (scan_guarded or checked_search) and odom is not None:

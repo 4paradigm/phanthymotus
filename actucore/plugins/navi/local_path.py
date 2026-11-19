@@ -186,7 +186,9 @@ def observe(frame, geometry, right, forward, resolution, ground):
                & (hit_col >= 0) & (hit_col < right.shape[1]))
     counts = np.zeros(right.shape, dtype=int)
     np.add.at(counts, (hit_row[in_grid], hit_col[in_grid]), 1)
-    return free, counts >= 3
+    # A doorway proof treats one hit as sufficient to override free rays
+    # sampled at a different height within the same cell.
+    return free, counts >= (1 if geometry.strict_occupancy else 3)
 
 
 @dataclass(frozen=True)
@@ -197,6 +199,7 @@ class Geometry:
     front: float
     rear: float
     height: float | None
+    strict_occupancy: bool = False
 
 
 def camera_square(horizontal, vertical, half_width, *, half_length=None):
@@ -260,6 +263,9 @@ class PlanCache:
         projected = observation.get("projected_grid")
         if projected is not None:
             return projected
+        project_scan_view = observation.get("project_scan_view")
+        if project_scan_view is not None:
+            return project_scan_view()
         frame = observation["frame_id"]
         if self.grid_frame != frame or self.grid_geometry is not geometry:
             self.grid = observe(observation["map"], geometry, RIGHT, FORWARD,

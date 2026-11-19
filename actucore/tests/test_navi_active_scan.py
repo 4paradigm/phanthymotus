@@ -37,6 +37,60 @@ def _tick(lookout, geometry, stamp, wz=0, capture=True):
     return lookout.command(geometry, .33, .25, 600)
 
 
+@pytest.mark.parametrize("command_only", [False, True])
+def test_receipt_only_projects_only_the_latest_requested_frame(monkeypatch, command_only):
+    geometry = camera_square(HorizontalIntrinsics(64, 50, 32), (48, 50, 24), .23)
+    tangent = (np.arange(48) - 24) / 50
+    image = np.broadcast_to(np.minimum(.42 / np.maximum(tangent, .001), 4.)[:, None],
+                            (48, 64)).copy()
+    ground = image < 4.
+    newer = image.copy()
+    newer[:25, 20:45] = 1.
+    expected = scan.observe(newer, geometry, scan.RIGHT, scan.FORWARD, scan.RESOLUTION, ground)
+    observe = scan.observe
+    projected = []
+
+    def project(frame, *args):
+        projected.append(frame)
+        return observe(frame, *args)
+
+    monkeypatch.setattr(scan, "observe", project)
+    look = scan.ActiveScan()
+    for stamp, frame in ((1000, image), (1100, newer)):
+        depth = {"map": frame, "ground": ground, "frame_id": stamp}
+        if command_only:
+            assert look.observe_single(depth, geometry, 500, stamp) is None
+        else:
+            odom = {**_odom(stamp), "received_ms": stamp}
+            assert look.update(depth, odom, geometry, receipt_only=True) is None
+    assert look.current_frame == 1100
+    assert not projected
+    for actual, wanted in zip(look.grid(), expected):
+        np.testing.assert_array_equal(actual, wanted)
+    look.grid()
+    assert len(projected) == 1 and projected[0] is newer
+
+
+def test_aligned_grid_can_require_observations_since_a_capture_time(monkeypatch):
+    look, geometry, visible, occupied = _setup(monkeypatch)
+    visible[:] = False
+    visible[22, 25] = True
+    occupied[22, 24] = True
+    _tick(look, geometry, 1000)
+    visible[22, 25] = False
+    visible[26, 29] = True
+    occupied[22, 24] = False
+    occupied[26, 28] = True
+    _tick(look, geometry, 1100)
+
+    all_free, all_hits = look.grid()
+    recent_free, recent_hits = look.grid(since_ms=1100)
+    assert all_free[22, 25] and all_free[26, 29]
+    assert not recent_free[22, 25] and recent_free[26, 29]
+    assert all_hits[22, 24] and all_hits[26, 28]
+    assert not recent_hits[22, 24] and recent_hits[26, 28]
+
+
 def test_active_scan_turns_right_and_waits_for_post_turn_depth(monkeypatch):
     lookout, geometry, _, blocked = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)
