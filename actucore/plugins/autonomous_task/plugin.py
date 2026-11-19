@@ -10,6 +10,7 @@ import time
 import uuid
 import urllib.request
 from collections import OrderedDict
+from contextlib import closing
 from pathlib import Path
 
 from .cameras import CameraInputs, camera_ports, resolve_cameras
@@ -220,7 +221,8 @@ class AutonomousTaskPlugin:
             if self._cfg.get("record_dir"):
                 path = Path(self._cfg["record_dir"]) / action_id
                 path.mkdir(parents=True, mode=0o700)
-            status, reason = self._loop(run, model, Tron2(), cameras, cancel, path)
+            with closing(Tron2(self._cfg)) as driver:
+                status, reason = self._loop(run, model, driver, cameras, cancel, path)
         except Exception as error:
             reason = f"{type(error).__name__}: {error}"
             log.warning("%s step %d: %s", action_id, run["step"], reason)

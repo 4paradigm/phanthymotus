@@ -145,7 +145,7 @@ class Kinematics:
     """
 
     def __init__(self, urdf):
-        """Use the model returned by the running driver's MCP resource."""
+        """Read both arm chains from the platform's supplied URDF."""
         try:
             root = ET.fromstring(urdf)
         except (ET.ParseError, TypeError) as exc:

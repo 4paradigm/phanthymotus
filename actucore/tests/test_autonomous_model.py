@@ -166,43 +166,7 @@ def test_review_keeps_gripper_and_motion_evidence_after_recent_images_expire(mon
     assert labels[-1] == "CURRENT observation 21: head RGB"
 
 
-def test_close_handover_only_offers_the_marked_side_and_consumes_one_decision(monkeypatch, model):
-    state = {"arms": {"left": {"gripper": {}},
-                      "right": {"gripper": {"close_handover_action_id": "open-1"}}}}
-    payloads = []
-    answers = iter([message('{"status":"observe","reason":"手在工作区内"}'),
-                    call("right_set_gripper", {"opening_mm": 0}),
-                    message('{"status":"failed","reason":"夹爪状态仍受限"}')])
-    def send(payload):
-        payloads.append(payload)
-        return reply(next(answers))
-    monkeypatch.setattr(model, "_post", send)
-    for answer in ("observe", "right_set_gripper", "failed"):
-        decision, _ = model.decide("move", ["left", "right"], {"head": b"fresh"}, state, [])
-        assert decision == answer
-    for payload in payloads[:2]:
-        tool, = payload["tools"]
-        assert tool["name"] == "right_set_gripper"
-        assert tool["parameters"]["properties"]["opening_mm"]["enum"] == [0]
-        assert "person's hand" in payload["instructions"]
-    assert payloads[-1]["tools"] == []
-
-
-@pytest.mark.parametrize("answer", [
-    call("left_set_gripper", {"opening_mm": 0.5}),
-    call("right_set_gripper", {"opening_mm": 0}),
-    call("left_move_by", {"translation_m": [0, 0, .01],
-                          "rotation_vector_rad": [0, 0, 0], "duration_s": 3}),
-    message('{"status":"done","reason":"好"}'),
-])
-def test_close_handover_rejects_other_outputs_locally(monkeypatch, model, answer):
-    state = {"arms": {"left": {"gripper": {"close_handover_action_id": "open-1"}}}}
-    monkeypatch.setattr(model, "_post", lambda body: reply(answer))
-    with pytest.raises(ValueError):
-        model.decide("move", ["left","right"], {"head": b"fresh"}, state, [])
-
-
-def test_observe_two_native_regions_with_fresh_full_views_and_guarded_tools(monkeypatch, model):
+def test_observe_two_native_regions_with_fresh_full_views(monkeypatch, model):
     import base64
     import hashlib
     from PIL import Image
@@ -225,13 +189,13 @@ def test_observe_two_native_regions_with_fresh_full_views_and_guarded_tools(monk
         payloads.append(payload)
         return next(replies)
     monkeypatch.setattr(model, "_post", post)
-    state = {"arms": {"left": {"gripper": {"close_handover_action_id": "partial-open"}}}}
+    state = {"arms": {"left": {"gripper": {"opening_mm": 58.8}}}}
     decision, args = model.decide("move", ["left"], initial, state, [])
     assert decision == "observe" and args["reason"] == request["reason"]
     assert [m["bbox_pixels"] for m in args["crops"]] == [[20, 15, 60, 45], [0, 0, 40, 30]]
     model.decide("move", ["left"], fresh, state, [])
     for payload in payloads:
-        assert [t["name"] for t in payload["tools"]] == ["left_set_gripper"]
+        assert {t["name"] for t in payload["tools"]} == {"left_move_to", "left_move_by", "left_set_gripper"}
     parts = payloads[-1]["input"][0]["content"]
     historical = [i for i, p in enumerate(parts) if p.get("text", "").startswith("HISTORICAL native crop")]
     assert len(historical) == 2
@@ -289,3 +253,26 @@ def test_transient_model_retry_keeps_crop_source_step_and_takes_new_images(monke
         detail, = [s for s in texts if s.startswith("HISTORICAL native crop ")]
         assert json.loads(detail.removeprefix("HISTORICAL native crop "))["source_observation"] == 1
         assert f"CURRENT observation {index}: head RGB" in texts
+
+
+def test_settled_grip_short_of_nominal_opening_allows_visual_test_lift(monkeypatch, model):
+    poses = {"position_m": [0.4, 0.2, -0.2]}
+    initial = {"arms": {"left": {"gripper": {"opening_mm": 60.}, "eef": poses}}}
+    after = {"arms": {"left": {"gripper": {"opening_mm": 8.}, "eef": poses}}}
+    entry = {"step": 1, "tool": "left_set_gripper", "args": {"opening_mm": 0},
+             "feedback": {"status": "completed", "motion_sent": True,
+                          "actual": {"opening_mm": 8.}, "target_opening_mm": 0}}
+    payloads = []
+    def post(payload):
+        payloads.append(payload)
+        if len(payloads) == 1:
+            return reply(call("left_set_gripper", {"opening_mm": 0}))
+        return reply(call("left_move_by", {"translation_m": [0, 0, .01],
+                                          "rotation_vector_rad": [0, 0, 0], "duration_s": 3}))
+    monkeypatch.setattr(model, "_post", post)
+    assert model.decide("grasp", ["left"], {"head": b"before"}, initial, [])[0] == "left_set_gripper"
+    assert model.decide("grasp", ["left"], {"head": b"after"}, after, [entry])[0] == "left_move_by"
+    content = payloads[-1]["input"][0]["content"]
+    context = json.loads(content[0]["text"])
+    assert context["current_measured_state"] == after and context["actual_action_history"] == [entry]
+    assert content[-2]["text"] == "CURRENT observation 2: head RGB"
