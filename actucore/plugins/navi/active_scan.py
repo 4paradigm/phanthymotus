@@ -9,7 +9,7 @@ import math
 import numpy as np
 
 from .local_path import observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
-from .odom import planar_feedback
+from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(15)
 ANGLE_TOLERANCE = math.radians(2)
@@ -58,6 +58,9 @@ class ActiveScan:
     receipt_only: bool = False
     source_frame: int | None = None
     odom_source: int | None = None
+    pose_origin: PlanarPose | None = None
+    pose_feedback_since_ms: int = 0
+    turn_stop_ms: int | None = None
 
     @property
     def active(self):
@@ -81,6 +84,10 @@ class ActiveScan:
         motion = planar_feedback(odom)
         if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
             return self.invalidate()
+        body_pose = (odom or {}).get("motion_pose")
+        if self.poses and ((body_pose is None) != (self.pose_origin is None)
+                           or (body_pose is not None and body_pose.frame != self.pose_origin.frame)):
+            self.invalidate()
         source = (odom or {}).get("source_sample_id") if self.receipt_only else None
         if source is not None and self.odom_source is not None and self.poses:
             if source < self.odom_source:
@@ -94,7 +101,7 @@ class ActiveScan:
             previous = self.poses[-1][0]
             if not 0 <= stamp - previous <= ODOM_GAP_MS:
                 self.invalidate()
-            elif stamp > previous:
+            elif stamp > previous and body_pose is None:
                 dt = (stamp - previous) / 1000
                 vx, vy, wz = motion
                 forward, right, heading = self.pose
@@ -102,6 +109,11 @@ class ActiveScan:
                 self.pose = (forward + dt * (vx * math.cos(mid) + vy * math.sin(mid)),
                              right + dt * (vx * math.sin(mid) - vy * math.cos(mid)),
                              heading - dt * wz)
+        if body_pose is not None:
+            self.pose_origin = self.pose_origin or body_pose
+            forward, left, yaw = body_pose.relative_to(self.pose_origin)
+            self.pose = (forward, -left, -yaw)
+            self.pose_feedback_since_ms = odom["pose_feedback_since_ms"]
         if not self.poses or stamp > self.poses[-1][0]:
             self.poses.append((stamp, self.pose, motion[2]))
         self.odom_source = source
@@ -217,12 +229,14 @@ class ActiveScan:
         self.phase = "brake"
         self.origin_set = False
         self.start_ms = self.poses[-1][0]
+        self.still_since = self.start_ms
         return True
 
     def try_other_side(self):
         self.directions = self.directions[1:]
         if self.directions:
             self.phase = "brake"
+            self.still_since = self.poses[-1][0]
         else:
             self.interrupt()
         return self.active
@@ -231,7 +245,8 @@ class ActiveScan:
         self.result_frame = self.side_frame
         self.phase = "idle"
 
-    def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *, min_yaw_rate=0.):
+    def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
+                min_yaw_rate=0., now_ms=None, tick_s=.1):
         if not self.active or self.ready:
             return ScanCommand()
         stamp = self.poses[-1][0]
@@ -239,7 +254,8 @@ class ActiveScan:
         if not self.current_frame:
             return self.interrupt("主动观察：观测超时，停车")
         if self.phase == "brake":
-            if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
+            if (speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW
+                    or (self.pose_origin is not None and self.pose_feedback_since_ms < self.still_since)):
                 return ScanCommand(reason="主动观察：等待底盘停稳")
             if not self.origin_set:
                 self.origin, self.origin_set = self.pose, True
@@ -253,6 +269,15 @@ class ActiveScan:
         if (abs(self.motion[2]) > yaw_rate + .10
                 or abs(self.pose[2] - self.origin[2]) > angle + 2 * ANGLE_TOLERANCE):
             return self.interrupt("主动观察：转速或转角超出限制，停车")
+
+        # Pose estimates can arrive several ticks after the turn. Send one
+        # pulse, stop, then wait for measurements that bracket the stopped pose.
+        if self.turn_stop_ms is not None:
+            if not self.turn_stop_ms:
+                self.turn_stop_ms = now_ms or stamp
+            if self.pose_feedback_since_ms < self.turn_stop_ms or abs(self.motion[2]) > STILL_YAW:
+                return ScanCommand(reason="主动观察：停转等待新位姿")
+            self.turn_stop_ms = None
 
         returning = self.phase == "return"
         heading = self.origin[2] if returning else self.origin[2] + self.directions[0] * angle
@@ -289,6 +314,8 @@ class ActiveScan:
         if self.motion[2] * math.copysign(1., error) > STILL_YAW:
             return ScanCommand(reason="主动观察：等待反向转动停止")
 
+        if self.pose_origin is not None:
+            yaw_rate = min(yaw_rate, max(min_yaw_rate, abs(error) / max(.001, tick_s)))
         _, occupied = self.grid()
         occupied = occupied | self.views[-1][3]
 
@@ -314,6 +341,8 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍或超出网格范围，停车")
         self.issued_yaw = True
+        if self.pose_origin is not None:
+            self.turn_stop_ms = 0
         direction = "右" if error > 0 else "左"
         description = "回到观察前的朝向" if returning else f"向{direction}观察"
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
@@ -359,6 +388,9 @@ class ActiveScan:
         self.poses.clear()
         self.views.clear()
         self.pose = (0., 0., 0.)
+        self.pose_origin = None
+        self.pose_feedback_since_ms = 0
+        self.turn_stop_ms = None
         return self.interrupt()
 
     def note_clear_path(self, frame):

@@ -198,6 +198,8 @@ class NaviPlugin:
         self._odom_ms = 0
         self._odom_received_ms = 0
         self._odom_source_ms = None
+        self._motion_pose = None
+        self._pose_feedback = None
         self._odom_stamp_verified = False
         self._odom_interface = {}
         self._odom_max_age_ms = int(self._config.max_obs_age_ms)
@@ -492,6 +494,8 @@ class NaviPlugin:
             self._odom_ms = 0
             self._odom_received_ms = 0
             self._odom_source_ms = None
+            self._motion_pose = None
+            self._pose_feedback = None
             self._odom_stamp_verified = False
 
         try:
@@ -1461,6 +1465,14 @@ class NaviPlugin:
                 self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
                                         and not isinstance(stamp, bool)
                                         and math.isfinite(stamp) and stamp > 0 else None)
+                pose = odom_mod.planar_pose(payload, self._odom_source_ms)
+                previous = self._motion_pose
+                if pose is None or pose != previous:
+                    feedback = (pose.feedback_since(previous, policy_mod.ODOM_GAP_MS)
+                                if previous is not None and pose is not None else None)
+                    self._pose_feedback = (previous.stamp_ms, feedback) if feedback is not None else None
+                    if pose is None or previous is None or pose.stamp_ms > previous.stamp_ms:
+                        self._motion_pose = pose
                 timing = self._odom_interface.get("timing") or {}
                 vendor = payload.get("vendor")
                 stamp_source = vendor.get("stamp_source", "robot") if isinstance(vendor, dict) else "robot"
@@ -1565,12 +1577,20 @@ class NaviPlugin:
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
             if with_capture_timing and odom is not None:
+                pose = self._motion_pose
+                uses_pose = (odom_mod.planar_feedback(odom) is None and self._pose_feedback is not None
+                             and pose is not None and
+                             0 <= now - pose.stamp_ms <= min(max_age, self._odom_max_age_ms))
+                if uses_pose:
+                    since_ms, rates = self._pose_feedback
+                    odom = {**odom, "motion_pose": pose, "pose_feedback": rates,
+                            "pose_feedback_since_ms": since_ms, "control_ms": now}
                 received_ms = self._odom_received_ms or self._odom_ms
                 if 0 <= now - received_ms <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "received_ms": received_ms}
                     if self._odom_source_ms is not None:
                         odom["source_sample_id"] = self._odom_source_ms
-                if self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
+                if not uses_pose and self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom
 
@@ -1625,6 +1645,9 @@ class NaviPlugin:
         elif (self._config.local_planning and decision.status == policy_mod.AVOIDING
                 and depth is not None and depth.get("frame_id") is not None):
             obs_ms = min(obs_ms, depth.get("capture_ms", depth["frame_id"]))
+            motion_pose = (odom or {}).get("motion_pose")
+            if motion_pose is not None:
+                obs_ms = min(obs_ms, motion_pose.stamp_ms)
             if scan_guarded and odom is not None:
                 stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
                 obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))

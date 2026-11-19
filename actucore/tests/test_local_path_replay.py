@@ -45,8 +45,9 @@ def test_front_depth_can_find_a_geometric_detour_without_measuring_its_prefix():
     free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
                                     replay.RESOLUTION, ground)
     assert free.any() and occupied.any()
-    assert replay._checked_translation(frame, ground, geometry, .33, .90, 1., 500, 600,
-                                       velocity_limits=DECLARED_SPEEDS) is None
+    detour = replay._checked_translation(frame, ground, geometry, .33, .90, 1., 500, 600,
+                                         velocity_limits=DECLARED_SPEEDS)
+    assert detour is not None and detour.command is None
 
 
 def test_detour_limits_speed_to_the_measured_prefix_and_full_timeout(monkeypatch):
@@ -119,12 +120,13 @@ def test_detour_falls_back_to_strafe_then_forward_with_bumi_speed_ranges(side):
     assert detour.command[0] == 0. and .12 <= -side * detour.command[1] <= .20
     assert detour.points[1][0] == 0.
     assert detour.points[-1][0] > .9 and detour.points[-1][1] == 0.
-    assert replay._checked_translation(*args, velocity_limits=limits,
-                                       observed_grid=(free & (abs(replay.RIGHT) < .4), box)) is None
+    pending = replay._checked_translation(*args, velocity_limits=limits,
+                                          observed_grid=(free & (abs(replay.RIGHT) < .4), box))
+    assert pending is not None and pending.command is None
 
 
 @pytest.mark.parametrize("start_occupied", [False, True])
-def test_live_detour_stops_if_the_start_or_rejoin_is_blocked(monkeypatch, start_occupied):
+def test_live_detour_stops_if_the_start_or_all_exits_are_blocked(monkeypatch, start_occupied):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
 
@@ -132,12 +134,31 @@ def test_live_detour_stops_if_the_start_or_rejoin_is_blocked(monkeypatch, start_
         if start_occupied:
             occupied = np.isclose(right, 0) & (np.isclose(forward, .2) | np.isclose(forward, .9))
         else:
-            occupied = (abs(right) <= .05) & (forward >= .85)
+            occupied = ((np.isclose(right, 0) & np.isclose(forward, .90))
+                        | np.isclose(forward, 1.35))
         return np.ones_like(occupied), occupied
 
     monkeypatch.setattr(replay, "observe", observed)
     assert replay._checked_translation(None, None, geometry, .33, .90, 1., 500, 600,
                                        velocity_limits=DECLARED_SPEEDS) is None
+
+
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_live_detour_can_continue_along_the_side_when_centerline_is_blocked(monkeypatch, side):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .23)
+    box = np.isclose(replay.RIGHT, 0.) & np.isclose(replay.FORWARD, .90)
+    center_wall = np.isclose(replay.RIGHT, 0.) & (replay.FORWARD >= 1.35)
+    occupied = box | center_wall
+    monkeypatch.setattr(replay, "observe", lambda *args: (~occupied, occupied))
+
+    detour = replay._checked_translation(None, None, geometry, .33, .90, side, 500, 600,
+                                         velocity_limits=DECLARED_SPEEDS)
+
+    assert detour is not None and detour.command is not None
+    assert -side * detour.command[1] > 0.
+    forward, right = detour.points[-1]
+    assert forward >= 1.35 and side * right >= .35
 
 
 def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkeypatch):
@@ -180,6 +201,7 @@ def test_pose_aligned_scan_does_not_borrow_free_cells_from_the_original_exposure
     box = np.isclose(replay.RIGHT, 0) & np.isclose(replay.FORWARD, .90)
     monkeypatch.setattr(replay, "observe", lambda *args: (~box, box))
     args = (None, None, geometry, .33, .90, 1., 500, 600)
-    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS) is not None
-    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
-                                       observed_grid=(np.zeros_like(box), box)) is None
+    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS).command is not None
+    pending = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                          observed_grid=(np.zeros_like(box), box))
+    assert pending is not None and pending.command is None

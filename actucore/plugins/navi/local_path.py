@@ -38,16 +38,18 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
     return np.pad(blocked_count == 0, ((rear, front), (dc, dc)), constant_values=False)
 
 
-def shortest_path(allowed, start, goal, *, later_goal=False, steps=STEPS):
+def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS):
     goal_row, goal_col = goal
     last_row = allowed.shape[0] - 1 if later_goal else goal_row
-    goals = allowed[goal_row:last_row + 1, goal_col]
+    last_col = goal_col if last_goal_col is None else last_goal_col
+    goals = allowed[goal_row:last_row + 1, goal_col:last_col + 1]
     if not allowed[start] or not goals.any():
         return None
 
     def distance_to_goals(point):
         row, col = point
-        return math.hypot(max(goal_row - row, row - last_row, 0), goal_col - col)
+        return math.hypot(max(goal_row - row, row - last_row, 0),
+                          max(goal_col - col, col - last_col, 0))
 
     queue = [(distance_to_goals(start), 0.0, start)]
     cost = {start: 0.0}
@@ -55,7 +57,7 @@ def shortest_path(allowed, start, goal, *, later_goal=False, steps=STEPS):
     while queue:
         _, walked, current = heapq.heappop(queue)
         row, col = current
-        if col == goal_col and goal_row <= row <= last_row:
+        if goal_col <= col <= last_col and goal_row <= row <= last_row:
             route = [current]
             while route[-1] != start:
                 route.append(parents[route[-1]])
@@ -220,7 +222,7 @@ def body_square(geometry, vendor):
 
 @dataclass(frozen=True)
 class Detour:
-    command: tuple[float, float]
+    command: tuple[float, float] | None
     points: tuple[tuple[float, float], ...]  # metres, (forward, right)
     geometry: Geometry
 
@@ -302,6 +304,13 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # straight shortcut may still be executable at a different ratio.
     steps = STEPS if max(floor_vx, floor_vy) <= min(max_vx, max_vy) else CARDINAL_STEPS
     path = shortest_path(allowed, start, goal, later_goal=True, steps=steps)
+    last_goal_col = None
+    if path is None:
+        # Keep advancing on the open side if the original line stays blocked.
+        goal = (goal[0], col_zero + 1)
+        last_goal_col = allowed.shape[1] - 1
+        path = shortest_path(allowed, start, goal, later_goal=True,
+                             last_goal_col=last_goal_col, steps=steps)
     if path is None or len(path) < 2:
         return None
     # A geometric path may include unobserved space, but the emitted vector
@@ -366,13 +375,14 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     first_forward_col = col_zero + max(1, math.ceil(floor_vy * horizon_s / resolution))
     if first_forward_col < allowed.shape[1]:
         allowed[row_zero + 1, :first_forward_col] = False
-        side_path = shortest_path(allowed, start, goal, later_goal=True, steps=CARDINAL_STEPS)
+        side_path = shortest_path(allowed, start, goal, later_goal=True,
+                                  last_goal_col=last_goal_col, steps=CARDINAL_STEPS)
         if side_path is not None:
             first_turn = next(i - 1 for i, (row, _) in enumerate(side_path) if row != row_zero)
             command = command_to(side_path[first_turn])
             if command is not None:
                 return detour(side_path, first_turn, command)
-    return cardinal
+    return cardinal or detour(path, 1, None)
 
 
 def _ray_entry(df, dx, bounds):

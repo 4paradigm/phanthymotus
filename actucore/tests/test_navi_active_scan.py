@@ -5,6 +5,7 @@ from plugins.navi import active_scan as scan
 from plugins.navi.camera import HorizontalIntrinsics
 from plugins.navi.depth import ground_mask
 from plugins.navi.local_path import Geometry, body_square, camera_square
+from plugins.navi.odom import PlanarPose
 
 
 def _depth(stamp, occupied=None):
@@ -73,6 +74,31 @@ def test_active_scan_holds_an_occupied_sweep(monkeypatch):
         assert _tick(lookout, geometry, stamp).yaw == 0
     assert not lookout.active
     assert not lookout.begin((1., -1.))
+
+
+def test_pose_only_scan_converges_with_a_300_ms_pose_delay(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    history = {stamp: 0. for stamp in range(99_600, 100_000, 100)}
+    yaw, rate = 0., 0.
+    for stamp in range(100_000, 107_000, 100):
+        yaw += rate * .1
+        history[stamp] = yaw
+        measured = stamp - 300
+        pose = PlanarPose(measured, ("odom", "body"), 0., 0., history[measured])
+        rate_at_measurement = (history[measured] - history[measured - 100]) / .1
+        lookout.update(_depth(stamp), {
+            "received_ms": stamp, "source_sample_id": measured, "motion_pose": pose,
+            "pose_feedback": (0., 0., rate_at_measurement), "pose_feedback_since_ms": measured - 100,
+        }, geometry, receipt_only=True)
+        if stamp == 100_000:
+            assert lookout.begin((-1., 1.))
+        rate = lookout.command(geometry, .31, .83, 300, min_yaw_rate=.33).yaw
+        assert abs(yaw) <= scan.RECEIPT_ANGLE + scan.ANGLE_TOLERANCE
+        if lookout.ready:
+            break
+
+    assert lookout.ready
+    assert yaw == pytest.approx(scan.RECEIPT_ANGLE, abs=scan.ANGLE_TOLERANCE)
 
 
 def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(monkeypatch):

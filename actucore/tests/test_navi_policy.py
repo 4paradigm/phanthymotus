@@ -2503,7 +2503,7 @@ def test_local_planning_reports_pose_only_odometry(monkeypatch):
 
     assert decision[:3] == (0., 0., 0.)
     assert not state.active_scan.active
-    assert "vx/vy/wz 反馈不完整" in decision[4]
+    assert "缺少可用的速度或连续位姿" in decision[4]
 
 
 def test_local_detour_starts_closer_while_slowing_earlier(monkeypatch):

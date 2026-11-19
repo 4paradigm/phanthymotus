@@ -283,8 +283,10 @@ def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
     assert "capture_ms" not in card.observation(with_capture_timing=True)[1]
 
 
-@pytest.mark.parametrize("sweep_observed", [True, False])
-def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(monkeypatch, sweep_observed):
+@pytest.mark.parametrize("sweep_observed, pose_only", [(True, False), (False, False), (False, True)])
+def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
+        monkeypatch, sweep_observed, pose_only):
+    import math
     import numpy as np
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path, policy
@@ -320,28 +322,48 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(mon
 
     monkeypatch.setattr(policy, "_local_translation", plan)
 
+    heading = 0.
+
     def tick(stamp, yaw=0., fresh=True):
+        nonlocal heading
+        heading += yaw * (stamp - now[0]) / 1000
         now[0] = stamp
         card._objects = {"objects": []}
         card._objects_ms = stamp
-        card._odom = {"vx": 0., "vy": 0., "wz": yaw}
-        card._odom_ms = stamp
+        if pose_only:
+            card._on_string("odom", SimpleNamespace(data=json.dumps({
+                "schema": "motus.odom/1", "stamp_ms": stamp - 60, "frame": "body",
+                "twist": [None] * 6,
+                "pose": {"frame_id": "odom", "child_frame_id": "base_link",
+                         "position": [0., 0., 0.],
+                         "quaternion": [0., 0., math.sin(heading / 2), math.cos(heading / 2)]},
+            })))
+        else:
+            card._odom = {"vx": 0., "vy": 0., "wz": yaw}
+            card._odom_ms = stamp
         if fresh:
             card._depth_map = np.ones((4, 4), dtype=float)
             card._depth_ground = np.ones((4, 4), dtype=bool)
             card._depth_ms = stamp
         return card.next_command()
 
+    if pose_only:
+        assert tick(99_900)["values"] == [0.] * 6
     assert tick(100_000)["values"] == [0.] * 6
     assert tick(100_050)["values"] == [0.] * 6
     command = tick(100_150)
+    if pose_only:
+        assert command["values"] == [0.] * 6
+        assert tick(100_250)["values"] == [0.] * 6
+        command = tick(100_350)
     assert command["values"][:5] == [0.] * 5
     assert command["values"][5] == .4
     yaw = command["values"][5]
     stamp = now[0]
     for _ in range(25):
         stamp += 100
-        if tick(stamp, yaw)["values"][5] == 0:
+        yaw = tick(stamp, yaw)["values"][5]
+        if yaw == 0 and card._state.active_scan.settle_ms is not None:
             break
     else:
         pytest.fail("scan never reached the angular target")
@@ -367,6 +389,52 @@ def test_card_retains_the_outbound_twist_for_unmeasured_ego_prediction(monkeypat
     message = card.next_command()
     assert message["values"][0] == .2
     assert card._state.commanded == (.2, 0., 0.)
+
+
+def test_local_avoidance_accepts_only_recent_continuous_pose_without_twist(monkeypatch):
+    import numpy as np
+    from types import SimpleNamespace
+    from plugins.navi import local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    cfg = card._config
+    cfg.local_planning = cfg.use_lateral = True
+    cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                                  (480, 420, 243), .23)
+    now = [100_200]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    occupied = np.isclose(local_path.FORWARD, .9) & np.isclose(local_path.RIGHT, 0.)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (~occupied, occupied))
+    depth = {"frame_id": now[0], "map": occupied, "ground": ~occupied}
+
+    def feed(stamp, segment="a"):
+        card._on_string("odom", SimpleNamespace(data=json.dumps({
+            "schema": "motus.odom/1", "stamp_ms": stamp, "frame": "body",
+            "twist": [None] * 6,
+            "pose": {"frame_id": "vo", "child_frame_id": "camera_mapped_to_body",
+                     "position": [0., 0., 0.], "quaternion": [0., 0., 0., 1.]},
+            "vendor": {"status": "tracking", "pose_reference": "body_axes", "segment_id": segment},
+        })))
+
+    def plan():
+        _, _, odom = card.observation(with_capture_timing=True)
+        return policy._local_translation(depth, cfg, card._state, odom, .9, 1.)
+
+    feed(100_000)
+    assert plan() is None
+    feed(100_100)
+    assert plan()[1] < 0.
+    now[0] = 100_601
+    feed(100_100)
+    assert plan() is None
+    feed(100_501)
+    assert plan() is None
+    feed(100_600, "b")
+    assert plan() is None
+    now[0] = 100_800
+    feed(100_700, "b")
+    assert plan()[1] < 0.
 
 
 def test_local_prefix_cannot_be_enlarged_by_the_moving_deadband(monkeypatch):

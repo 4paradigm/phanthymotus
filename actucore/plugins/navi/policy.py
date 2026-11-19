@@ -1079,7 +1079,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if not scan.ready:
                 command = scan.command(geometry, _keepout_m(config),
                                        _scan_yaw_rate(config), config.watchdog_ms,
-                                       config.max_obs_age_ms, min_yaw_rate=config.floor_wz)
+                                       config.max_obs_age_ms, min_yaw_rate=config.floor_wz,
+                                       now_ms=(odom or {}).get("control_ms"), tick_s=dt)
                 return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and (track is None or not track.observed):
             scan.clear_frames = 0
@@ -1603,6 +1604,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     slow = config.slow_distance_m
     if foreground:
         # Reserve the distance travelled in one observation freshness window.
+        motion = planar_feedback(odom) if config.local_planning else None
+        if motion is not None:
+            measured_vx = motion[0]
         last_vx = state.commanded[0] if state is not None else 0.0
         speed = max(0.0, measured_vx or 0.0, last_vx)
         stop = min(slow, stop + speed * config.max_obs_age_ms / 1000)
@@ -1658,7 +1662,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
                 if planar_feedback(odom) is None:
-                    return 0.0, 0.0, 0.0, AVOIDING, "里程计 vx/vy/wz 反馈不完整，局部规划和主动观察暂停"
+                    return 0.0, 0.0, 0.0, AVOIDING, "缺少可用的速度或连续位姿，局部规划和主动观察暂停"
+                if state is not None and state.view_detour is not None:
+                    return 0.0, 0.0, 0.0, AVOIDING, "局部规划：找到候选路线，首段净空待确认；停下"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
             # A summary with a missing side band supplies no evidence of free space.
@@ -1816,6 +1822,9 @@ def _local_translation(depth, config, state, odom, ahead, side):
                                            allow_forward=allow_forward,
                                            velocity_limits=limits)
     if command is None:
+        if state.view_detour is None and state.local_plan.key is not None and (
+                state.local_plan.key[0] == depth.get("frame_id")):
+            state.view_detour = state.local_plan.plans.get(side)
         return None
     vx, vy = command
     (floor_x, limit_x), (floor_y, limit_y) = limits

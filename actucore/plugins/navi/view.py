@@ -214,7 +214,7 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
             _column_of(edge, config.half_fov_rad, width))
 
 
-def route_lines(depth_m, ground, geometry, points, target, keep, width, height):
+def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *, pending=False):
     """Project route boundaries and a dashed connection to the tracked target."""
     if geometry is None or depth_m is None or ground is None or not (points or target):
         return []
@@ -228,7 +228,7 @@ def route_lines(depth_m, ground, geometry, points, target, keep, width, height):
     if abs(normal[2]) < .5 * np.linalg.norm(normal):
         return []
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
-    sections = [(np.asarray(points, dtype=float), False)] if points else []
+    sections = [(np.asarray(points, dtype=float), pending)] if points else []
     if target is not None:
         distance, bearing = target
         if math.isfinite(distance) and distance > 0 and math.isfinite(bearing):
@@ -339,7 +339,8 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     geometry = (detour.geometry if detour is not None else
                 camera_square(config.depth_intrinsics, depth_vertical, config.half_width_m))
     lines = route_lines(depth_m, ground, geometry, detour.points if detour is not None else (),
-                        route_target, keep, width, height)
+                        route_target, keep, width, height,
+                        pending=detour is not None and detour.command is None)
     metric_path = bool(lines)
     if not lines and box is not None:
         # A target box still gives a direction when the metric projection is unavailable.
