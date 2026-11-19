@@ -67,8 +67,8 @@ def noisy(x=0., variance=.04):
     return value
 
 
-@pytest.mark.parametrize('sigma,status', [(.15, 'coasting'), (.20, 'coasting'), (.201, 'lost')])
-def test_default_position_sigma_limit_allows_up_to_twenty_cm_without_tracking_prediction(sigma, status):
+@pytest.mark.parametrize('sigma,status', [(.15, 'coasting'), (.24, 'coasting'), (.25, 'coasting'), (.251, 'lost')])
+def test_position_sigma_limit_allows_prediction_up_to_twenty_five_cm(sigma, status):
     c, t = warmed()
     stamp = imu_until(c, t, .1)
     c._propagate(stamp)
@@ -77,14 +77,39 @@ def test_default_position_sigma_limit_allows_up_to_twenty_cm_without_tracking_pr
     c.filter.P[:3, :3] = np.eye(3)*sigma**2
     sample = c.observe_frame(stamp, *images(), None, stamp+1_000_000, reason='visual missing')
     fusion = sample['vendor']['fusion']
-    assert fusion['sigma_limit_m'] == .20
+    assert fusion['sigma_limit_m'] == .25
     assert fusion['last_frame']['predicted_sigma_m'] == pytest.approx(sigma)
     assert c.state == status
     assert sample['pose'] is None
     if status == 'lost':
-        assert 'exceeds 0.20 m' in c.reason
+        assert 'exceeds 0.25 m' in c.reason
     else:
         assert fusion['prediction'] is not None
+
+
+@pytest.mark.parametrize('sigma,status', [(.24, 'tracking'), (.25, 'tracking'), (.251, 'recovering')])
+def test_corrected_position_sigma_uses_the_same_limit(monkeypatch, sigma, status):
+    c, stamp = warmed()
+    monkeypatch.setattr(c, 'position_sigma', lambda: sigma)
+    c._accept_correction(stamp+100_000_000)
+    assert c.state == status
+
+
+def test_exact_visual_correction_can_arrive_after_one_second():
+    c, stamp = warmed()
+    stamp = imu_until(c, stamp, .133)
+    result = c.observe_frame(stamp, *images(), pose(), stamp+1_105_000_000)
+    assert result['vendor']['fusion']['last_frame']['visual'] == 'accepted'
+    assert result['pose'] is not None and c.state == 'tracking'
+
+
+def test_bad_late_visual_result_cannot_emit_an_inertial_guess():
+    c, stamp = warmed()
+    stamp = imu_until(c, stamp, .133)
+    result = c.observe_frame(stamp, *images(), pose(3.), stamp+1_105_000_000)
+    fusion = result['vendor']['fusion']
+    assert fusion['last_frame']['visual'] == 'rejected'
+    assert result['pose'] is None and fusion['prediction'] is None
 
 
 def test_corrected_sigma_between_old_and_new_limits_can_recover_tracking(monkeypatch):
@@ -126,7 +151,7 @@ def test_missing_or_bad_visual_cannot_extend_inertial_bound(visual, why):
     stamp = imu_until(c, t, .8)
     sample = c.observe_frame(stamp, *images(), visual, stamp+1_000_000, reason='visual missing')
     assert sample['pose'] is None and c.state == 'lost'
-    assert 'predicted position uncertainty exceeds 0.20 m' in c.reason
+    assert 'predicted position uncertainty exceeds 0.25 m' in c.reason
     assert why in str(sample['vendor']['fusion']['last_frame'])
 
 

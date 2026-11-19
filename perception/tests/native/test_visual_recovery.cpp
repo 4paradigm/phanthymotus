@@ -14,7 +14,7 @@
 #include <chrono>
 
 static void testScanRelocalization(const std::string &root, const std::string &output,
-                                  rtabmap::ParametersMap parameters)
+                                  rtabmap::ParametersMap parameters, bool predictionFallback, bool partialOverlap)
 {
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
     if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
@@ -22,7 +22,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     rtabmap::Rtabmap map;
     map.init(parameters,output+".db");
     motus::VisualRecovery recovery(parameters);
-    const auto frame=[&](double stamp, float x, bool hasPose, bool noOverlap, bool blackImage=false)
+    const auto frame=[&](double stamp, float x, bool hasPose, bool noOverlap, bool blackImage=false, bool badGuess=false)
     {
         const float f=260.f;
         cv::Mat scan(1,depth.total(),CV_32FC3);
@@ -36,7 +36,17 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         const rtabmap::CameraModel camera(f,f,depth.cols/2.,depth.rows/2.,rtabmap::Transform::getIdentity(),0.,depth.size());
         rtabmap::SensorData data(blackImage?cv::Mat::zeros(depth.size(),CV_8UC3):cv::Mat(),
                                  blackImage?depth:cv::Mat(),camera,0,stamp);
-        data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
+        // A valid partial observation can occupy fewer than half of the scan's expected points.
+        const int maxPoints=partialOverlap && stamp==7.?2*count:0;
+        data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),maxPoints,0.f,rtabmap::LaserScan::kXYZ));
+        if(badGuess)
+        {
+            cv::Mat hint(1,64,CV_8UC1);
+            const double values[]={30.,0.,0.,0.,0.,0.,1.};
+            std::memcpy(hint.data,"MOTUSIMU",8);
+            std::memcpy(hint.data+8,values,sizeof(values));
+            data.setUserData(rtabmap::compressData2(hint),true);
+        }
         return recovery.process(map,data,hasPose?rtabmap::Transform(x,0,0,0,0,0):rtabmap::Transform(),
                                 cv::Mat::eye(6,6,CV_64F)*.01);
     };
@@ -44,6 +54,19 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto old=map.getLocalOptimizedPoses();
     const auto anchor=map.getLastLocationId();
+    if(predictionFallback)
+    {
+        if(!frame(2.,.22f,false,false,false,true) ||
+           recovery.state()!=motus::VisualRecovery::ScanTracking || recovery.odom().isNull() ||
+           std::abs(recovery.odom().x()-.22f)>.03f || map.getLocalOptimizedPoses().size()<=old.size())
+            throw std::runtime_error("failed IMU guess prevented independent scan tracking");
+        const auto grown=map.getLocalOptimizedPoses();
+        if(frame(2.5,.22f,false,true,false,true) || !recovery.odom().isNull() ||
+           map.getLocalOptimizedPoses()!=grown)
+            throw std::runtime_error("bad guess and unrelated scan must preserve the previous graph");
+        map.close();
+        return;
+    }
     frame(6.,.22f,false,true,true);
     frame(6.5,.22f,false,true);
     if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
@@ -57,6 +80,13 @@ static void testScanRelocalization(const std::string &root, const std::string &o
        recovery.recoveryAnchor()!=anchor || recovery.recoveryInliers()!=0 ||
        std::abs(recovery.odom().x()-.22f)>.03f || map.getLocalOptimizedPoses().size()!=old.size()+1)
         throw std::runtime_error("overlapping scan did not relocalize against the saved graph without RGB");
+    if(partialOverlap)
+    {
+        const auto overlap=map.getStatistics().data().at("Motus/ScanRelocalizationOverlap/");
+        std::cout<<"partial scan overlap="<<overlap<<std::endl;
+        if(overlap<.3f || overlap>=.5f)
+            throw std::runtime_error("partial scan fixture must exercise the reduced overlap threshold");
+    }
     for(const auto &pose:old)
         if(map.getLocalOptimizedPoses().at(pose.first)!=pose.second)
             throw std::runtime_error("scan recovery moved an existing optimized pose");
@@ -129,10 +159,10 @@ int main(int argc, char **argv)
     p["RGBD/ProximityPathMaxNeighbors"]="1"; p["Kp/MaxFeatures"]="500";
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
-    if(mode=="scan_relocalize")
+    if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" || mode=="rejected_prediction_fallback")
     {
         p["RGBD/NeighborLinkRefining"]="false";
-        testScanRelocalization(root,output,p);
+        testScanRelocalization(root,output,p,mode=="rejected_prediction_fallback",mode=="partial_scan_relocalize");
         return 0;
     }
     if(nativeRecovery)
@@ -240,12 +270,13 @@ int main(int argc, char **argv)
         if(rejectedColdQuery) rgb.setTo(cv::Scalar::all(0));
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
+        const bool predictedFrame=imuPrediction && (i==0 || i==2 || i==3);
         const bool noImages=neighborRetry || (externalContinuity && !(outage && mode=="external_continuity_outage_rgb")) ||
             (stationaryAnchor && i==0) || (refreshAnchor && i>=1 && i<=3) ||
             (delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
             (mode=="vo_handoff_gap" && i==3) ||
             (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
-            gap || resetGap || (mode=="fallback_cov" && i==1) ||
+            gap || resetGap || predictedFrame || (mode=="fallback_cov" && i==1) ||
             (bridgeScan && !externalAfterScan && postClosureScans==1) ||
             (mode=="scan_mask" && !imageMask.at(i));
         // Processed scan cadence can be sparser than the measured chassis stream.
@@ -258,7 +289,8 @@ int main(int argc, char **argv)
         rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,stamp);
         const bool scanAfterDisagreement=disagreeingNeighborRetry && i==4;
         // Keep the no-motion-source cases independent of image availability.
-        const bool noScanOverlap=(externalContinuity && i>0) || (bridgeScan && postClosureScans==3) ||
+        const bool noScanOverlap=(imuPrediction && i==3) ||
+            (externalContinuity && i>0) || (bridgeScan && postClosureScans==3) ||
             (failedVisualSeed && i>0) || (voHandoff && (i==6 || (i==7 && !shortVisualLoss) ||
                 (mode=="vo_handoff_gap" && i==3))) ||
             (crossedLoss && !staggeredChassisLoss && !scanAfterDisagreement) ||
@@ -297,7 +329,7 @@ int main(int argc, char **argv)
         if((voHandoff || firstVisualSeed) && hasPose) ext=handoffOrigin*ext;
         if(mode=="history_without_cache") ext=historyExternal;
         if(rejectedColdQuery || (delayedExternal && i<2)) ext.setNull();
-        if(imuPrediction && (i==0 || i==2 || i==3))
+        if(predictedFrame)
         {
             constexpr char tag[]="MOTUSIMU";
             cv::Mat hint(1,64,CV_8UC1);

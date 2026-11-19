@@ -28,7 +28,8 @@ from .rgbd_imu import ImuAttitude
 from .rgbd_association import RotationHints, association_enabled, require_rotation_hint_runtime
 from .rgbd_recovery import (AuxiliaryHealthProbe, ASSISTANCE_RETRY_S,
                             VISUAL_INITIALIZATION_S, assistance_mode, visual_calibration)
-from .rgbd_fusion import MAX_FRAME_AGE_NS, ShortTermFusion, log_rotation, observation_covariance, pose_values
+from .rgbd_fusion import (MAX_FRAME_AGE_NS, MAX_VISUAL_RESULT_AGE_NS, ShortTermFusion, log_rotation,
+                          observation_covariance, pose_values)
 from .rgbd_body_mount import CaptureMounts
 from .rgbd_geometry import GeometryWorker, observation_quality
 from .spatial_quality import MotionGate, QualityReport
@@ -103,7 +104,6 @@ class EstimateGate:
         self.relocalization_points = None
         self.relocalization_deadline = self.relocalization_deadline_mono = None
         self.relocalization_failure = 'output'
-        self.relocalization_misses = 0
 
     def _recovery_window(self, started):
         if self.recovery_policy is None:
@@ -155,11 +155,9 @@ class EstimateGate:
             self.last_result_received = now
         self.good = 0
         if self.relocalization_points is not None:
+            # Rejections clear consecutive evidence but cannot spend the rest
+            # of the frozen verification window or authorize a pose.
             self.relocalization_failure = 'relocalization'
-            self.relocalization_misses += 1
-            if self.relocalization_misses >= 3:
-                self.fault('three native registrations failed against the old F2M map; restart required',
-                           'relocalization')
             return
         if self.state in ('initializing', 'tracking', 'recovering'):
             if self.recover_by is None:
@@ -194,7 +192,6 @@ class EstimateGate:
             if len(points) >= F2M_SHARED_INLIERS:
                 self.relocalization_points = points
                 self.relocalization_deadline = self.relocalization_deadline_mono = None
-                self.relocalization_misses = 0
                 self.relocalization_failure = 'output'
                 self.good = 0
                 self.pause_context = self.recover_by = None
@@ -255,7 +252,7 @@ class EstimateGate:
         if now - stamp < -50_000_000:
             self.fault('visual estimate capture time is in the future', 'clock')
             return None
-        if stamp <= max(self.last_stamp, self.last_result_stamp) or now - stamp > 1_500_000_000:
+        if stamp <= max(self.last_stamp, self.last_result_stamp) or now - stamp > MAX_VISUAL_RESULT_AGE_NS:
             self.rejection = 'stale or out-of-order visual estimate'  # never counted as evidence
             return None
         first_native_result = not self.last_native_stamp
@@ -329,7 +326,6 @@ class EstimateGate:
             # A fresh matched result may arrive just as the ordinary pause
             # expires, before another RGB-D pair reaches input().
             self._start_landmark_verification(now)
-            self.relocalization_misses = 0
             # Short interruptions can occur while the camera is moving. Even
             # with the old landmark proof, cap motion at one second of travel.
             # Beyond the bounded pause require the old stationary anchor.
@@ -487,7 +483,8 @@ class CaptureObservations:
             return outputs
         self.last_added = stamp
         wait = self._wait_budget()
-        self.frames[stamp] = dict(color=color, depth=depth, added=now, deadline=min(now+wait, stamp+MAX_FRAME_AGE_NS))
+        self.frames[stamp] = dict(color=color, depth=depth, added=now,
+                                  deadline=min(now+wait, stamp+MAX_VISUAL_RESULT_AGE_NS))
         self.counts['queued'] += 1
         return outputs
 
@@ -549,7 +546,8 @@ class CaptureObservations:
             self.geometry_capture = None
         while self.frames:
             stamp, entry = next(iter(self.frames.items()))
-            if now-stamp > MAX_FRAME_AGE_NS:
+            age = now-stamp
+            if age > MAX_VISUAL_RESULT_AGE_NS:
                 # A delayed delivery is unusable without changing the capture clock.
                 self.frames.pop(stamp)
                 self.counts['stale_capture'] += 1
@@ -560,7 +558,6 @@ class CaptureObservations:
             if (not ready or not coverage) and now < entry['deadline']:
                 break
             self.frames.pop(stamp)
-            self.counts['completed'] += 1
             if not ready or not coverage:
                 self.counts['deadline_expired'] += 1
             if not ready:
@@ -574,6 +571,14 @@ class CaptureObservations:
             if not coverage:
                 self.counts['imu_uncovered'] += 1
             visual, reason = self._visual(stamp, entry)
+            if age > MAX_FRAME_AGE_NS and (visual is None or not coverage):
+                # An older submitted frame is useful only with a matching
+                # measured correction and IMU coverage at its original stamp.
+                self.counts['stale_capture'] += 1
+                if ready:
+                    self.expired.append(stamp)
+                continue
+            self.counts['completed'] += 1
             sample = self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
                                                reason=reason, arrival_ns=entry['added'])
             probe = self.startup_gate
@@ -880,7 +885,7 @@ class RgbdSession:
             probe = getattr(self.observations, 'startup_gate', None)
             now_ns = time.time_ns()
             if (probe is not None and probe.state == 'tracking' and
-                    0 <= now_ns-probe.last_stamp <= MAX_FRAME_AGE_NS and self.fusion.filter is None):
+                    0 <= now_ns-probe.last_stamp <= MAX_VISUAL_RESULT_AGE_NS and self.fusion.filter is None):
                 self.fusion.fault('ESKF awaits low-motion initialization; measured visual tracking available')
                 self._check_fusion(now_ns)
                 return
@@ -1242,7 +1247,7 @@ class RgbdSession:
         gate.last_stamp = max(gate.last_stamp, self.fusion.last_visual)
         probe = getattr(self.observations, 'startup_gate', None)
         if (self.fusion.last_tracking is None and probe is not None and probe.state == 'tracking'
-                and 0 <= now-probe.last_stamp <= MAX_FRAME_AGE_NS):
+                and 0 <= now-probe.last_stamp <= MAX_VISUAL_RESULT_AGE_NS):
             # No fused pose was published. Keep the evidence already verified
             # in the same native world; the next distinct capture must qualify.
             gate.good, gate.last_result_stamp = 2, probe.last_stamp
@@ -1445,7 +1450,7 @@ class RgbdSession:
                 return
             if (kind == 'info' and msg.lost and
                     stamp > max(self.gate.last_stamp, self.gate.last_result_stamp) and
-                    -50_000_000 <= now-stamp <= 1_500_000_000):
+                    -50_000_000 <= now-stamp <= MAX_VISUAL_RESULT_AGE_NS):
                 # Pause before the matching pose arrives; the same estimator keeps running.
                 self.gate.degrade('visual estimator reported lost tracking', now, stamp=stamp)
             if self.gate.state == 'lost':

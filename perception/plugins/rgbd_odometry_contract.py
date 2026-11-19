@@ -7,6 +7,10 @@ import numpy as np
 from .spatial_contract import validate_tracking_pose
 
 
+# Position standard deviation limit shared by ESKF and SLAM's prediction input.
+SIGMA_LIMIT_M = .25
+
+
 def validate_inputs(declarations, topics):
     """Require decodable image roles and computable numeric camera geometry.
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 import math
 
 from .pointcloud_slam_contract import validate_tracking_pose
+from .rgbd_odometry_contract import SIGMA_LIMIT_M
 from .spatial_time import FrameContext
 
 
@@ -113,6 +114,6 @@ def decode_slam_prediction(sample, anchor):
     if (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id) != (
             anchor.segment_id, anchor.frame_id, anchor.child_frame_id, anchor.clock_id) or pose.stamp_ns != stamp:
         raise ValueError('IMU prediction origin or capture time changed')
-    if not pose.covariance or any(not 0 < pose.covariance[i] <= .20**2 for i in (0, 7, 14)):
+    if not pose.covariance or any(not 0 < pose.covariance[i] <= SIGMA_LIMIT_M**2 for i in (0, 7, 14)):
         raise ValueError('IMU prediction position covariance is out of bounds')
     return replace(pose, prediction_anchor_ns=origin)

@@ -5,9 +5,10 @@ from copy import deepcopy
 import numpy as np
 
 from .rgbd_imu import ImuAttitude, _vector, rotation_from_quaternion, translation_extrinsics
-from .rgbd_odometry_contract import make_sample
+from .rgbd_odometry_contract import SIGMA_LIMIT_M, make_sample
 
 MAX_FRAME_AGE_NS = 1_000_000_000
+MAX_VISUAL_RESULT_AGE_NS = 1_500_000_000
 
 
 def skew(v):
@@ -245,7 +246,6 @@ class InertialFilter:
                     covariance=covariance.ravel().tolist())
 
 
-SIGMA_LIMIT_M = .20
 INERTIAL_LIMIT_NS = 1_000_000_000
 MAX_IMU_GAP_NS = 100_000_000
 MAX_BRIDGE_NS = 2_000_000_000
@@ -469,7 +469,9 @@ class ShortTermFusion:
         if self.state == 'lost':
             return self._finish(stamp, diagnostic)
         try:
-            if stamp <= self.last_frame or not -50_000_000 <= now_ns-stamp <= MAX_FRAME_AGE_NS:
+            age = now_ns-stamp
+            max_age = MAX_VISUAL_RESULT_AGE_NS if visual_pose is not None else MAX_FRAME_AGE_NS
+            if stamp <= self.last_frame or not -50_000_000 <= age <= max_age:
                 self.fault('fusion frame time is stale, repeated or reset', 'clock')
                 return self._finish(stamp, diagnostic)
             self.last_frame, self.last_processed_ns = stamp, now_ns
@@ -511,7 +513,8 @@ class ShortTermFusion:
                 self._accept_correction(stamp, visual_pose, depth)
             else:
                 self.state, self.reason = 'coasting', reason or 'visual observation rejected'
-                self._assist_with_geometry(stamp, depth, now_ns, diagnostic)
+                if age <= MAX_FRAME_AGE_NS:
+                    self._assist_with_geometry(stamp, depth, now_ns, diagnostic)
                 diagnostic['corrected_sigma_m'] = self.position_sigma() if self.aid == 'depth_geometry' else None
                 if self.geometry_job is None and self.aid != 'depth_geometry':
                     self.good = 0
@@ -673,7 +676,7 @@ class ShortTermFusion:
             self.bridge_budget_ns = INERTIAL_LIMIT_NS
         diagnostic.update(state=self.state, aid=self.aid)
         self.frames.append(diagnostic)
-        return self.output(stamp)
+        return self.output(stamp, allow_prediction=diagnostic['processed_ns']-stamp <= MAX_FRAME_AGE_NS)
 
     def tracking_offset(self):
         """Fused-vs-visual offset at the last tracking capture, or None."""

@@ -54,15 +54,37 @@ def test_missing_pose_timeout_and_late_results_do_not_rewrite_history():
 def test_transport_late_capture_does_not_feed_fusion_or_block_the_next_capture():
     fusion = Fusion(); frames = CaptureObservations(fusion)
     frames.add_frame(1_000_000_000, None, None, 1_900_000_000)
-    assert frames.drain(2_010_000_000) == []
+    assert frames.drain(2_400_000_000) == []
     assert not fusion.frames and not frames.frames
     assert frames.counts['stale_capture'] == 1
-    stamp = 2_040_000_000
+    stamp = 2_410_000_000
     frames.add_frame(stamp, None, None, stamp+10_000_000)
     msg, info = messages(stamp)
     frames.result('pose', msg, stamp+20_000_000)
     assert frames.result('info', info, stamp+25_000_000) == [{'stamp': stamp}]
     assert fusion.frames[0][1] is not None and fusion.reason is None
+
+
+@pytest.mark.parametrize('complete,delay,accepted', [
+    (True, 1_105_000_000, True),
+    (False, 1_300_000_000, False),
+    (True, 1_500_000_001, False),
+])
+def test_submitted_capture_can_use_a_late_exact_visual_pair(complete, delay, accepted):
+    fusion = Fusion()
+    frames = CaptureObservations(fusion)
+    fusion.input_period_ns = 400_000_000
+    stamp = 1_000_000_000
+    frames.add_frame(stamp, None, None, stamp+500_000_000)
+    pose, info = messages(stamp)
+    frames.result('pose', pose, stamp+delay-1)
+    if complete:
+        frames.result('info', info, stamp+delay)
+    else:
+        frames.drain(stamp+delay)
+    assert [frame[0] for frame in fusion.frames] == ([stamp] if accepted else [])
+    if accepted:
+        assert fusion.frames[0][1] is not None
 
 
 def test_lost_diagnostic_can_trigger_coast_without_matching_pose():
@@ -493,7 +515,8 @@ def test_slow_native_join_accepts_a_measured_pair_after_250ms_in_original_order(
     assert frames.result('info', info, stamp+610_000_000) == [{'stamp': stamp}]
     assert fusion.frames[0][1] is not None
 
-def test_startup_can_fall_back_to_repeated_measured_visual_before_the_full_timeout():
+@pytest.mark.parametrize('result_age', [100_000_000, 1_105_000_000])
+def test_startup_can_fall_back_to_repeated_measured_visual_before_the_full_timeout(result_age):
     from plugins.rgbd_odometry_runtime import RgbdSession, EstimateGate
     import time
     now = time.time_ns()
@@ -503,17 +526,18 @@ def test_startup_can_fall_back_to_repeated_measured_visual_before_the_full_timeo
     session.fallback = None
     session.fusion = Fusion()
     session.fusion.filter = None
+    session.fusion.input_period_ns = 350_000_000
     session._check_fusion = lambda now: None
     session.gate = EstimateGate('run', 'camera_optical', 'clock')
     session.gate.input(now)
     session.observations = CaptureObservations(session.fusion, startup_gate=EstimateGate('run', 'camera_optical', 'clock'))
     for i in range(3):
-        stamp = now-500_000_000+i*200_000_000
+        stamp = now-result_age-(2-i)*200_000_000
         session.fusion.samples = [(stamp, None, None)]
-        session.observations.add_frame(stamp, None, None, stamp)
+        session.observations.add_frame(stamp, None, None, stamp+min(result_age, 500_000_000))
         pose, info = messages(stamp)
-        session.observations.result('pose', pose, stamp)
-        session.observations.result('info', info, stamp)
+        session.observations.result('pose', pose, stamp+result_age)
+        session.observations.result('info', info, stamp+result_age)
     session._check_initialization(1.)
     assert session.fusion.reason is None
     session._check_initialization(6.)

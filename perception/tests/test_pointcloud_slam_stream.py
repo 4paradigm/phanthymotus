@@ -169,11 +169,12 @@ def test_measured_visual_break_cannot_extend_previous_token(second, loss):
     assert first and changed and changed != first
 
 
-def test_inertial_prediction_is_only_a_hint_in_the_accepted_origin():
+@pytest.mark.parametrize('sigma,accepted', [(.24, True), (.25, True), (.251, False)])
+def test_inertial_prediction_is_only_a_bounded_hint_in_the_accepted_origin(sigma, accepted):
     s = stream()
     sample = odom(1200, .2, status='coasting')
     predicted = sample.pop('pose')
-    predicted['covariance'] = (np.eye(6)*.01).ravel().tolist()
+    predicted['covariance'] = (np.eye(6)*sigma**2).ravel().tolist()
     sample['pose'] = None
     vendor = sample['vendor']
     vendor.update(source='rgbd_eskf', fusion=dict(prediction=predicted, translation_integrated=True,
@@ -186,12 +187,38 @@ def test_inertial_prediction_is_only_a_hint_in_the_accepted_origin():
     s.odom(odom(1000), now=1.)
     s.cloud(1_100_000_000, 'camera', [[1, 0, 0]], now=1.1)
     s.odom(sample, now=1.2)
+    if not accepted:
+        assert s.status(now=1.2)['odometry'] == 'waiting'
+        assert not s.accepted
+        return
     assert s.status(now=1.2)['odometry'] == 'coasting'
     assert s.accepted[0].pose.prediction_anchor_ns == 1_000_000_000
     assert s.accepted[0].pose.position == pytest.approx((.1, 0, 0))
     vendor['motus_slam']['segment_id'] = 'another-origin'
     s.odom(sample, now=1.21)
     assert s.status(now=1.21)['odometry'] == 'waiting'
+
+
+def test_cloud_with_unbounded_inertial_gap_reaches_native_recovery_without_pose():
+    unlocalized = []
+    s = stream(on_unlocalized_frame=lambda *frame: unlocalized.append(frame))
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_200_000_000, 'camera', [[1, 0, 0]], now=1.2)
+    sample = odom(1450, .2, status='coasting')
+    guess = sample['pose']
+    sample['pose'] = None
+    guess['covariance'] = (np.eye(6)*.01).ravel().tolist()
+    sample['vendor'].update(source='rgbd_eskf', fusion=dict(
+        prediction=guess, translation_integrated=True, prediction_stamp_ns=1_450_000_000,
+        prediction_anchor_ns=1_000_000_000, mapping_allowed=False))
+    sample['vendor']['motus_slam']['stamp_ns'] = 1_450_000_000
+    s.odom(sample, now=1.45)
+
+    assert not s.accepted
+    assert s.pending_count == 0
+    assert s.status(now=1.45)['admitted_frames'] == 0
+    assert [(stamp, cloud, pose) for stamp, cloud, pose, *_ in unlocalized] == [
+        (1_200_000_000, [[1, 0, 0]], None)]
 
 
 def test_extrinsic_is_capture_evidence_and_never_reprojects_cloud_bytes():
@@ -264,3 +291,18 @@ def test_rgb_recovery_receives_unbracketed_clouds_when_external_pose_delivery_st
     assert all(frame[2] is None for frame in unlocalized)
     assert s.pending_count == 2
     assert not s.accepted
+
+
+def test_pose_loss_offers_newest_pending_scan_to_recovery_once():
+    unlocalized = []
+    s = stream(on_unlocalized_frame=lambda *frame: unlocalized.append(frame))
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_200_000_000, 'camera', [[1, 0, 3]], now=1.2)
+    s.cloud(1_100_000_000, 'camera', [[2, 0, 3]], now=1.25)  # delayed older scan
+    loss = dict(odom(1300, status='recovering'), pose=None)
+    s.odom(loss, now=1.3)
+    s.odom(loss, now=1.4)
+    assert [(stamp, cloud, pose) for stamp, cloud, pose, *_ in unlocalized] == [
+        (1_200_000_000, [[1, 0, 3]], None)]
+    assert s.pending_count == 0
+    assert s.status(now=1.4)['admitted_frames'] == 0

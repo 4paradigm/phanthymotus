@@ -58,6 +58,19 @@ def test_expired_visual_pause_requires_old_landmarks_before_resuming():
     assert result['vendor']['relocalization']['anchor_stamp_ns'] == 1_200_000_000
 
 
+def test_three_failed_results_do_not_end_a_live_landmark_verification_window():
+    gate = anchored()
+    assert gate.status(3_000_000_000) == 'recovering'
+    for stamp in (3_100_000_000, 3_240_000_000, 3_380_000_000):
+        assert visual(gate, stamp, lost=True) is None
+    assert gate.state == 'recovering'
+    assert visual(gate, 3_520_000_000, x=.003) is None
+    assert visual(gate, 3_660_000_000, x=.004) is None
+    result = visual(gate, 3_800_000_000, x=.003)
+    assert result['vendor']['motus_slam']['segment_id'] == 'run'
+    assert result['vendor']['relocalization']['shared_landmarks'] == 24
+
+
 @pytest.mark.parametrize('changed', [
     dict(ids=range(5, 29)),  # 24 total inliers but only 19 old correspondences
     dict(ids=range(24, 48)), dict(ids=[1]*24), dict(world_shift=1.),
@@ -129,6 +142,7 @@ def test_failed_registration_to_old_map_restarts_without_switching_new_view_fron
     gate.status(3_000_000_000)
     for i in range(3):
         assert visual(gate, 5_000_000_000+i*100_000_000, lost=True) is None
+    assert gate.status(6_001_000_000) == 'lost'
     assert gate.state == 'lost' and gate.loss_kind == 'relocalization'
 
 

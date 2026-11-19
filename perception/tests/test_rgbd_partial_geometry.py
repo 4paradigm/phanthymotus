@@ -326,7 +326,7 @@ def test_partial_to_full_recovery_requires_three_full_pose_observations(full_sou
 @pytest.mark.parametrize('asynchronous', [False, True])
 def test_partial_depth_cannot_hide_excessive_null_position_uncertainty(asynchronous):
     fusion, stamp = prepare_partial_fusion(asynchronous)
-    fusion.filter.P[0, 0] = .201**2
+    fusion.filter.P[0, 0] = .251**2
     sample, _ = partial_frame(fusion, stamp)
     assert fusion.quality['geometry']['accepted'] is True
     assert fusion.state == 'lost' and sample['pose'] is None

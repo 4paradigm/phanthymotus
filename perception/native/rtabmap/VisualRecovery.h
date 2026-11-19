@@ -114,8 +114,12 @@ public:
         rtabmap::Transform guess;
         if(external.isNull() && takePrediction(data,guess))
         {
-            chassisOutageStart_=0.; externalRun_.reset();
-            return registerPrediction(map,data,guess,statistics);
+            const auto registered=registerPrediction(map,data,guess,statistics);
+            if(registered.has_value())
+            {
+                chassisOutageStart_=0.; externalRun_.reset();
+                return *registered;
+            }
         }
         rtabmap::OdometryInfo info;
         rtabmap::Transform visual;
@@ -535,10 +539,10 @@ private:
         rtabmap::RegistrationInfo result;
         const auto relative=inertialIcp_->computeTransformation(reference,data,
             rtabmap::Transform::getIdentity(),&result);
-        // A single old-map edge cannot disambiguate a match on a small patch.
-        // Require substantial scan overlap before trusting a new map alignment.
+        // A partial view can rejoin the map, but a small matching patch cannot
+        // establish the alignment on its own.
         if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
-           !(result.icpInliersRatio>=.5f) ||
+           !(result.icpInliersRatio>=.30f) ||
            !validCovariance(result.covariance))
             return false;
         const auto covariance=scanCovariance(result.covariance);
@@ -736,23 +740,23 @@ private:
         return true;
     }
 
-    bool registerPrediction(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
-                            const rtabmap::Transform & guess,
-                            const std::map<std::string,float> & statistics)
+    std::optional<bool> registerPrediction(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
+                                          const rtabmap::Transform & guess,
+                                          const std::map<std::string,float> & statistics)
     {
         state_=Searching; odom_.setNull(); visualInliers_=0;
         // A guess may extend only the already verified, active gauge.
         if(guess.isNull() || !cv::checkRange(guess.dataMatrix()) ||
            !initialized_ || waiting_ || missing_ || localizationMode_ ||
            map.getLocalOptimizedPoses().empty())
-            return false;
+            return std::nullopt;
         const auto * last=map.getMemory()->getLastWorkingSignature();
-        if(!last) return false;
+        if(!last) return std::nullopt;
         rtabmap::RegistrationInfo result;
         const auto relative=inertialIcp_->computeTransformation(last->sensorData(),data,
             last->getPose().inverse()*externalToNative_*guess,&result);
         if(relative.isNull() || result.icpStructuralComplexity<.02 || !validCovariance(result.covariance))
-            return false;
+            return std::nullopt; // Try independent recovery before consuming the input.
         const auto measured=last->getPose()*relative;
         auto stats=statistics;
         stats["Motus/InertialIcpOverlap/"]=result.icpInliersRatio;

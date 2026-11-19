@@ -58,14 +58,20 @@ class SlamStream:
     def continuity_token(self):
         return self._measured_run[1].external_continuity if self._measured_run is not None else None
 
-    def _lose(self):
-        """Numeric pose absence waits for a new pose, without retiring labels."""
+    def _lose(self, now):
+        """Retire unavailable poses and offer the latest fresh scan for registration."""
+        latest = max(self._pending, key=lambda item: item[0], default=None)
         self._poses.clear()
         self._pose_anchor = None
         self._measured_run = None
         self._pending.clear()
         self._last_received = None
         self._odom_state = 'waiting'
+        if latest is not None and self.on_unlocalized_frame is not None:
+            stamp, cloud, received, context = latest
+            if now-received <= self.max_age_s:
+                matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
+                self.on_unlocalized_frame(stamp, cloud, None, matrix.copy(), deepcopy(context))
 
     def status(self, *, now, measurement_now_ns=None):
         return {'odometry': self._odom_state,
@@ -87,8 +93,8 @@ class SlamStream:
             try:
                 pose = decode_slam_prediction(sample, self._pose_anchor)
             except ValueError:
-                self._lose()
                 self.last_error = str(error)
+                self._lose(now)
                 return
         if pose.prediction_anchor_ns is None:
             pose = self._track_measured_run(sample, pose, context)
@@ -268,8 +274,15 @@ class SlamStream:
                 if not self._poses or stamp > self._poses[-1].stamp_ns or stamp < self._poses[0].stamp_ns:
                     remaining.append((stamp, cloud, received, context))
                     continue
-                pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
                 matrix = _rigid(context['child_from_cloud']) if context is not None else self.extrinsic
+                try:
+                    pose = align_pose(self._poses, stamp, max_gap_ms=self.max_gap_ms)
+                except ValueError as error:
+                    self.last_error = str(error)
+                    if self.on_unlocalized_frame is not None:
+                        # Geometry can still verify this scan independently.
+                        self.on_unlocalized_frame(stamp, cloud, None, matrix.copy(), deepcopy(context))
+                    continue
                 self.on_frame(stamp, cloud, pose, matrix.copy(), deepcopy(context))
                 if pose.prediction_anchor_ns is None:
                     self._segments[pose.segment_id] = (pose.frame_id, pose.child_frame_id, pose.clock_id, pose.pose_reference)

@@ -129,8 +129,8 @@ def test_pending_registration_cannot_defer_inertial_bounds_forever():
         registration.release.set(); assert worker.close(2)
 
 
-@pytest.mark.parametrize('sigma,status', [(.15, 'coasting'), (.201, 'lost')])
-def test_geometry_timeout_applies_twenty_cm_position_limit(sigma, status):
+@pytest.mark.parametrize('sigma,status', [(.25, 'coasting'), (.251, 'lost')])
+def test_geometry_timeout_applies_twenty_five_cm_position_limit(sigma, status):
     registration = BlockingRegistration()
     c, worker, stamp, color = coasting(registration)
     try:
@@ -142,7 +142,7 @@ def test_geometry_timeout_applies_twenty_cm_position_limit(sigma, status):
         c.poll_geometry(stamp+300_000_000)
         assert c.state == status
         if status == 'lost':
-            assert 'exceeds 0.20 m' in c.reason
+            assert 'exceeds 0.25 m' in c.reason
     finally:
         registration.release.set(); assert worker.close(2)
 
