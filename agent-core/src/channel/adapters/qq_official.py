@@ -62,6 +62,9 @@ class ReplySource:
 
 
 class QQOfficialAdapter(ChannelAdapter):
+    # One Gateway session per AppID: a second concurrent start would kick the first.
+    SINGLE_SESSION = True
+
     def __init__(self, channel_id, platform, config, on_message):
         super().__init__(channel_id, platform, config, on_message)
         self._ready = asyncio.Event()

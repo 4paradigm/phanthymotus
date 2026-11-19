@@ -876,7 +876,7 @@ async def _drain_loop():
             payload = payloads[0] if payloads else {}
             channel_id = payload.get('channel_id')
             channel = (get_channel_config(channel_id) or {}) if isinstance(channel_id, str) else {}
-            if channel.get('platform') in chat_only.PLATFORMS or payload.get('platform') in chat_only.PLATFORMS:
+            if chat_only.enabled(channel) or payload.get('chat_only') is True:
                 message_id = payload.get('message_id')
                 if (isinstance(message_id, str) and source.startswith('dds:')
                         and manager.consume_chat_input(source[4:], ev['text'], message_id)):

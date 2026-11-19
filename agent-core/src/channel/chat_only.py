@@ -1,10 +1,20 @@
-"""Execution policy for Channels that may only answer their current chat."""
+"""Execution policy for Channels that may only answer their current chat.
 
-PLATFORMS = frozenset({'qq'})
+A Channel-level policy (``chat_only`` on the channel config), never a platform
+one: it narrows what a turn may *do*, not what the model is told. Such turns
+share the system prompt, environment and conversation history with every
+other turn.
+"""
+
+
+def enabled(channel: dict | None) -> bool:
+    return bool(channel and channel.get('chat_only'))
+
+
 REPLY_TOOL = 'mcp__channel__channel_reply'
 REPLY_SCHEMA = {
     'name': REPLY_TOOL,
-    'description': ('Send a text reply to the QQ message that triggered this turn. '
+    'description': ('Send a text reply to the Channel message that triggered this turn. '
                     'Set action="send" and source_message_id to the current message_id; '
                     'finish when done. No other action is permitted.'),
     'parameters': {

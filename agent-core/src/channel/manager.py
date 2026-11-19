@@ -132,7 +132,8 @@ def get_channel_config(channel_id: str) -> dict | None:
 
 def add_channel_config(channel_id: str, platform: str, cfg: dict,
                        enabled: bool = False, bot_to_bot_enabled: bool = False,
-                       trusted_bots: list[dict] | None = None) -> dict:
+                       trusted_bots: list[dict] | None = None,
+                       chat_only: bool = False) -> dict:
     configs = _get_channel_configs()
     # 检查 ID 唯一
     if any(c['id'] == channel_id for c in configs):
@@ -143,6 +144,7 @@ def add_channel_config(channel_id: str, platform: str, cfg: dict,
         'enabled': enabled,
         'bot_to_bot_enabled': bot_to_bot_enabled if supports_bot_to_bot(platform) else False,
         'trusted_bots': normalize_trusted_bots(trusted_bots) if uses_trusted_bots(platform) else [],
+        'chat_only': bool(chat_only),
         'config': cfg,
         'status': 'disconnected',
         'updated_at': time.time(),
@@ -164,7 +166,8 @@ def update_channel_config(channel_id: str, **updates) -> dict | None:
             if not supports_bot_to_bot(target_platform):
                 updates['bot_to_bot_enabled'] = False
             for k, v in updates.items():
-                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots'):
+                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots',
+                         'chat_only'):
                     ch[k] = v
             ch['updated_at'] = time.time()
             _save_channel_configs(configs)
@@ -611,7 +614,7 @@ class ChannelManager:
             on_message=self._on_inbound_message,
         )
 
-        if platform in chat_only.PLATFORMS:
+        if getattr(cls, 'SINGLE_SESSION', False):
             if channel_id in self._starting:
                 return
             self._starting.add(channel_id)
@@ -705,14 +708,14 @@ class ChannelManager:
                 print(f'[channel] {msg.channel_id} message discarded: no channel_request card '
                       f'on the canvas is configured for this channel')
             return
-        private_chat = msg.platform in chat_only.PLATFORMS
+        private_chat = chat_only.enabled(get_channel_config(msg.channel_id))
         if private_chat:
             from channel.qq_canvas import input_ready
             if not input_ready(msg.channel_id):
                 if msg.channel_id not in self._inactive_logged:
                     self._inactive_logged.add(msg.channel_id)
                     print(f'[channel] {msg.channel_id} message discarded: '
-                          'robot project stopped or QQ Canvas input is not ready')
+                          'robot project stopped or Canvas input is not ready')
                 return
         self._inactive_logged.discard(msg.channel_id)
 
@@ -780,6 +783,8 @@ class ChannelManager:
         }
         if files:
             payload['files'] = files
+        if private_chat:
+            payload['chat_only'] = True
         if trusted_bot_id:
             self._record_trusted_bot_message(payload)
         body = json.dumps(payload, ensure_ascii=False)
@@ -940,7 +945,7 @@ class ChannelManager:
                 files=attachments,
                 mention_open_id=mention_open_id,
                 expect_reply=expect_reply,
-                reply_to_message_id=ctx['message_id'] if adapter.platform in chat_only.PLATFORMS else '',
+                reply_to_message_id=ctx.get('message_id', ''),
             ))
             parts = []
             if text:
@@ -1012,8 +1017,8 @@ class ChannelManager:
     # ── Status ───────────────────────────────────────────────────────────────
 
     def get_status(self) -> list[dict]:
-        from channel.qq_canvas import input_ready
         """获取所有 channel 的状态。"""
+        from channel.qq_canvas import input_ready
         result = []
         for ch_cfg in _get_channel_configs():
             channel_id = ch_cfg['id']
@@ -1028,6 +1033,7 @@ class ChannelManager:
                 'enabled': ch_cfg.get('enabled', False),
                 'bot_to_bot_enabled': ch_cfg.get('bot_to_bot_enabled', False),
                 'trusted_bots': ch_cfg.get('trusted_bots', []),
+                'chat_only': chat_only.enabled(ch_cfg),
                 'status': adapter.status() if adapter else 'disconnected',
                 'health_error': '' if not health or health[0] else health[1],
                 'active_input': channel_id in self.active_input_channels,

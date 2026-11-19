@@ -241,7 +241,7 @@ def test_canvas_and_collector_route_only_authenticated_chat(state, monkeypatch):
 
     async def run():
         config.main['core'] = {'project_running': False}
-        add_channel_config(CHANNEL, 'qq', {'app_id': APP}, True)
+        add_channel_config(CHANNEL, 'qq', {'app_id': APP}, True, chat_only=True)
         qq_canvas.wire(CHANNEL)
         assert qq_canvas.wired(CHANNEL)
         initial = config.main['canvas_layout']

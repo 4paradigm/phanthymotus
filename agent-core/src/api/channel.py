@@ -45,6 +45,7 @@ class AddChannelReq(BaseModel):
     enabled: bool = False
     bot_to_bot_enabled: bool = False
     trusted_bots: list[dict] = Field(default_factory=list)
+    chat_only: bool = False  # Channel policy: may only reply to its own chat
 
 
 @router.post('/add')
@@ -69,6 +70,7 @@ async def add_channel(req: AddChannelReq):
             req.enabled,
             req.bot_to_bot_enabled,
             req.trusted_bots,
+            req.chat_only,
         )
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
@@ -84,6 +86,7 @@ class UpdateChannelReq(BaseModel):
     enabled: bool | None = None
     bot_to_bot_enabled: bool | None = None
     trusted_bots: list[dict] | None = None
+    chat_only: bool | None = None
 
 
 @router.put('/{channel_id}')

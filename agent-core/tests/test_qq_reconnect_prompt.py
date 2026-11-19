@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from channel import chat_only, qq_canvas
+from channel import manager as manager_module
 from channel.manager import ChannelManager
 import prompt
 
@@ -57,6 +58,8 @@ def test_qq_canvas_not_ready_logs_once(monkeypatch, capsys):
     manager._active_input_channels.add("qq_test")
     monkeypatch.setattr(manager, "sync_from_canvas", lambda: None)
     monkeypatch.setattr(qq_canvas, "input_ready", lambda _: False)
+    monkeypatch.setattr(manager_module, "get_channel_config",
+                        lambda _: {"id": "qq_test", "platform": "qq", "chat_only": True})
     event = SimpleNamespace(channel_id="qq_test", platform="qq")
 
     async def exercise():
@@ -65,7 +68,7 @@ def test_qq_canvas_not_ready_logs_once(monkeypatch, capsys):
 
     asyncio.run(exercise())
     output = capsys.readouterr().out
-    assert output.count("QQ Canvas input is not ready") == 1
+    assert output.count("Canvas input is not ready") == 1
 
 
 def test_shared_prompt_contains_dynamic_context_and_qq_reply_contract(monkeypatch):
@@ -81,3 +84,11 @@ def test_shared_prompt_contains_dynamic_context_and_qq_reply_contract(monkeypatc
     assert not hasattr(chat_only, "SYSTEM")
     assert "source_message_id" in chat_only.REPLY_SCHEMA["description"]
     assert chat_only.REPLY_SCHEMA["parameters"]["additionalProperties"] is False
+
+
+def test_chat_only_is_a_channel_policy_not_a_platform_one():
+    assert chat_only.enabled({"platform": "feishu", "chat_only": True})
+    assert not chat_only.enabled({"platform": "qq"})
+    assert not chat_only.enabled(None)
+    assert not hasattr(chat_only, "PLATFORMS")
+    assert "QQ" not in chat_only.REPLY_SCHEMA["description"]

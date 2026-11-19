@@ -59,9 +59,10 @@ def _save_credentials_config(app_id, secret, channel_id):
         raise ValueError('QQ channel ID already in use')
     write_secret(app_id, secret)
     if existing:
-        update_channel_config(channel_id, enabled=True)
+        update_channel_config(channel_id, enabled=True, chat_only=True)
     else:
-        add_channel_config(channel_id, 'qq', {'app_id': app_id, 'group_enabled': False}, True)
+        add_channel_config(channel_id, 'qq', {'app_id': app_id, 'group_enabled': False}, True,
+                           chat_only=True)
 
 
 async def _run(session):
