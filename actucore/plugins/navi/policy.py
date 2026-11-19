@@ -1656,15 +1656,13 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         scan = state.active_scan
         command_only = state.motion_source == "command"
         geometry = (config.scan_geometry or config.local_geometry
-                    if scan.receipt_only and not command_only else config.scan_geometry)
-        if command_only and geometry is None:
-            return "原地搜索：无反馈转向需要已声明的相机到底盘几何"
+                    if scan.receipt_only or command_only else config.scan_geometry)
         if geometry is None or not scan.current_frame:
             if state.recovery is not None:
                 state.recovery = ClearanceRecovery()
-            return "原地搜索：等待可用于扫掠检查的深度和里程计"
+            return "原地搜索：等待可用于扫掠检查的深度和几何"
         direction = state.last_seen_side
-        motion = state.command_tail if state.motion_source == "command" else scan.motion
+        motion = state.command_tail if command_only else scan.motion
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (motion, state.commanded)):
             return "原地搜索：等待平移或反向转动停稳"
@@ -1803,15 +1801,12 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     state.recovery = ClearanceRecovery()
                 yaw_rate = _scan_yaw_rate(config)
                 if (scan is not None and may_scan and foreground and not near and config.use_lateral
-                        and (not scan.command_only or config.scan_geometry is not None)
                         and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
                 if state.motion_source != "command" and planar_feedback(odom) is None:
                     return 0.0, 0.0, 0.0, AVOIDING, "缺少可用的速度或连续位姿，局部规划和主动观察暂停"
                 if state is not None and state.view_detour is not None:
                     return 0.0, 0.0, 0.0, AVOIDING, LocalHold.PREFIX.value
-                if scan is not None and scan.command_only and config.scan_geometry is None and may_scan:
-                    return 0.0, 0.0, 0.0, AVOIDING, "无反馈主动观察需要已声明的相机到底盘几何"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
             usable = {s: (cov >= config.coverage_min, math.inf if room is None else room)

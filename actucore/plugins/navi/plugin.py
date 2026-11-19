@@ -543,8 +543,6 @@ class NaviPlugin:
         self._config.local_planning = bool(
             binding.get("depth_map") and (binding.get("odom") or self._config.local_geometry is not None))
         self._config.odom_expected = bool(binding.get("odom"))
-        if self._config.local_planning and not binding.get("odom") and self._config.scan_geometry is None:
-            self._camera_notes.append("无里程计时使用单帧深度规划，原地观察需要相机到底盘几何")
         if self._config.local_planning and self._config.local_geometry is None:
             self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
         # Callers may supply producer contracts keyed by the actual wired

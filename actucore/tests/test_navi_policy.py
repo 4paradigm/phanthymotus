@@ -1586,11 +1586,13 @@ def test_a_small_valid_part_of_the_corridor_can_still_support_approach():
 
 
 @pytest.mark.parametrize("blocked", [False, True])
-def test_search_turn_checks_occupied_cells_with_unseen_sides(monkeypatch, blocked):
+@pytest.mark.parametrize("has_extrinsic", [False, True])
+def test_search_turn_checks_occupied_cells_with_unseen_sides(monkeypatch, blocked, has_extrinsic):
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
+    cfg = _cfg(local_planning=True, local_geometry=geometry,
+               scan_geometry=geometry if has_extrinsic else None,
                half_width_m=.23, search_rate=.25)
     state = _state(motion_source="command")
     free = local_path.FORWARD > 0.
@@ -1609,6 +1611,37 @@ def test_search_turn_checks_occupied_cells_with_unseen_sides(monkeypatch, blocke
     else:
         assert reason is None
 
+
+def test_command_only_active_observation_uses_camera_geometry_without_extrinsics(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .21, .21, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.21,
+               max_depth_age_ms=800, floor_wz=.33, wz_max=.83)
+    state = _state()
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True,
+                             observed=True, measured_range_m=2.)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.9, 1.))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: None)
+    free = local_path.FORWARD > 0.
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, np.zeros_like(free)))
+    frame = np.ones((4, 4))
+
+    def tick(stamp):
+        depth = {"map": frame, "ground": frame.astype(bool), "frame_id": stamp}
+        return P.step(detections={"objects": []}, depth=depth, odom=None,
+                      config=cfg, state=state, dt=.1)
+
+    assert tick(1000).values == [0.] * 6
+    assert state.active_scan.active
+    for stamp in range(1100, 1800, 100):
+        decision = tick(stamp)
+        if decision.values[5]:
+            assert cfg.floor_wz <= abs(decision.values[5]) <= cfg.wz_max
+            return
+    pytest.fail("expected a bounded turn with camera geometry")
 
 def test_the_summary_only_path_cannot_detect_a_corridor_full_of_holes():
     """Pinned as a known limitation rather than discovered on a robot.
