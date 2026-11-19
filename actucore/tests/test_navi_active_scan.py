@@ -142,15 +142,22 @@ def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth)
     assert len(look.views) == 1 and not look.poses
 
 
-def test_command_only_scan_requires_observed_swept_space(monkeypatch):
-    look, geometry, free, _ = _setup(monkeypatch)
-    free[:] = False
+@pytest.mark.parametrize("blocked", [False, True])
+def test_command_only_scan_checks_obstacles_with_unseen_rear(monkeypatch, blocked):
+    look, geometry, free, occupied = _setup(monkeypatch)
+    free[:] = scan.FORWARD > 0.
+    row, col = scan.START
+    occupied[row + 4, col + 6] = blocked
     look.observe_single(_depth(1000), geometry, 800, 1000)
     assert look.begin((1.,))
     for stamp in range(1100, 1700, 100):
         look.observe_single(_depth(stamp), geometry, 800, stamp)
-        assert look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33).yaw == 0.
-    assert not look.active
+        result = look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33)
+        if result.yaw:
+            assert not blocked and result.yaw < 0.
+            break
+    assert look.issued_yaw is (not blocked)
+    assert look.active is (not blocked)
 
 
 def test_command_only_scan_uses_capture_time_for_post_stop_frames(monkeypatch):

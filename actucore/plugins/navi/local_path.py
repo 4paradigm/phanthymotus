@@ -255,7 +255,7 @@ class PlanCache:
 
 def transition_clear(grid, geometry, half_width, horizon_s, velocities):
     """Check the swept rectangle for independent forward and lateral ramps."""
-    free, occupied = grid
+    _, occupied = grid
     forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
     rear = -geometry.rear + min(0., *forward)
     front = geometry.front + max(0., *forward)
@@ -267,11 +267,7 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities):
         return False
     swept = ((FORWARD + half > rear) & (FORWARD - half < front)
              & (RIGHT + half > left) & (RIGHT - half < right_edge))
-    added = ((rear < -geometry.rear) & (FORWARD - half < -geometry.rear)
-             | (front > geometry.front) & (FORWARD + half > geometry.front)
-             | (left < -half_width) & (RIGHT - half < -half_width)
-             | (right_edge > half_width) & (RIGHT + half > half_width))
-    return not (swept & (occupied | (added & ~free))).any()
+    return not (swept & occupied).any()
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
@@ -282,13 +278,13 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     resolution = RESOLUTION
     row_zero, col_zero = START
     right, forward = RIGHT, FORWARD
-    # A fused scan is expressed at the current pose. Mixing in the original
-    # exposure a second time would mark cells free at an outdated pose.
-    free, occupied = (observe(frame, geometry, right, forward, resolution, ground)
-                      if observed_grid is None else observed_grid)
+    # A fused scan is expressed at the current pose. Use only its obstacle
+    # positions when supplied, rather than combining them with the old exposure.
+    _, occupied = (observe(frame, geometry, right, forward, resolution, ground)
+                   if observed_grid is None else observed_grid)
     if side < 0:
-        free, occupied = free[:, ::-1], occupied[:, ::-1]
-    grid = np.where(occupied, OCCUPIED, np.where(free, FREE, UNKNOWN))
+        occupied = occupied[:, ::-1]
+    grid = np.where(occupied, OCCUPIED, UNKNOWN)
     plane = ahead * geometry.base_from_optical[0, 2] + geometry.base_from_optical[0, 3]
     obstacle = (occupied & (abs(right) <= half_width) & (abs(forward - plane) <= .10))
     if not obstacle.any():
@@ -334,25 +330,15 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
                              last_goal_col=last_goal_col, steps=steps)
     if path is None or len(path) < 2:
         return None
-    # A geometric path may include unobserved space, but the emitted vector
-    # must fit inside a measured prefix through staleness, watchdog and sink poll.
+    # The straight command must stay within the checked path prefix through
+    # the observation window, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
-    blocked = grid == OCCUPIED
-    unknown = grid == UNKNOWN
-    # Cell boundaries, expanded by the moving rectangle, are obstacles in
-    # centre coordinates. For unknown cells only the portion outside the
-    # original footprint is relevant. Our rays move forward and to one side.
+    # Expand observed obstacle cells by the footprint in centre coordinates.
     half_cell = resolution / 2
     f0, f1 = forward - half_cell, forward + half_cell
     r0, r1 = right - half_cell, right + half_cell
-    occupied_bounds = (f0[blocked] - geometry.front, f1[blocked] + geometry.rear,
-                       r0[blocked] - half_width, r1[blocked] + half_width)
-    front = unknown & (f1 > geometry.front)
-    flank = unknown & (r1 > half_width)
-    front_bounds = (np.maximum(0., f0[front] - geometry.front), f1[front] + geometry.rear,
-                    r0[front] - half_width, r1[front] + half_width)
-    flank_bounds = (f0[flank] - geometry.front, f1[flank] + geometry.rear,
-                    np.maximum(0., r0[flank] - half_width), r1[flank] + half_width)
+    occupied_bounds = (f0[occupied] - geometry.front, f1[occupied] + geometry.rear,
+                       r0[occupied] - half_width, r1[occupied] + half_width)
     def command_to(point):
         row, col = point
         dr, dc = row - row_zero, col - col_zero
@@ -365,10 +351,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         # of measured obstacles. This preserves the chosen detour's progress.
         if _ray_entry(df, dx, occupied_bounds) <= length:
             return None
-        clear = min(length,
-                    _ray_entry(df, dx, front_bounds) - 1e-6 if df else math.inf,
-                    _ray_entry(df, dx, flank_bounds) - 1e-6 if dx else math.inf)
-        speed = min(clear / horizon_s,
+        speed = min(length / horizon_s,
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):

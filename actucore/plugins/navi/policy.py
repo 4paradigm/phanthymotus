@@ -62,6 +62,8 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 
+import numpy as np
+
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
 from .active_scan import ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
@@ -85,7 +87,7 @@ IDLE = "idle"
 
 class LocalHold(Enum):
     TRANSITION = "等待底盘速度过渡，保留当前绕行路线"
-    PREFIX = "局部规划：找到候选路线，首段净空待确认；停下"
+    PREFIX = "局部规划：找到候选路线，首段不满足执行条件；停下"
 
 # A distance schedule, not online plant identification. Bounds are fixed so a
 # stalled chassis cannot learn an ever-larger command or a new speed floor.
@@ -263,16 +265,8 @@ class Config:
     # what hits a doorframe is a swinging arm and a leg mid-stride. This is the
     # difference between "the box the robot is" and "the space to keep clear".
     clearance_margin_m: float = 0.10
-    # How much of the corridor has to carry a real depth reading before its
-    # clearance is believed. Below `coverage_min` the card stops going forward
-    # and says so; between the two it slows in proportion.
-    #
-    # **Unknown is not free.** A depth map has holes, and the things that make
-    # them — chair legs, table edges, glass — are exactly the things that catch
-    # a shoulder. Without this a corridor full of holes reads as an empty one,
-    # because every invalid pixel drops silently out of the minimum.
+    # Prefer a better observed side when ordering detour candidates.
     coverage_min: float = 0.25
-    coverage_full: float = 0.60
 
     # ── tracking (see track.py) ──────────────────────────────────────────
     # A detection this dim may not create a track, but it may keep one alive if
@@ -1131,7 +1125,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
         return Decision(None, IDLE, "no navigation target")
 
     stale_capture = bool((depth or {}).get("capture_invalid"))
-    if stale_capture:
+    frame = (depth or {}).get("map")
+    invalid_depth = frame is not None and not np.isfinite(frame).any()
+    if stale_capture or invalid_depth:
         depth = None
     state.close_sample_gap_s += dt
     if state.close_sample_gap_s > config.max_obs_age_ms / 1000:
@@ -1216,11 +1212,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
             scan.clear_frames = 0
             return Decision(_twist(0, 0, 0), AVOIDING, update.reason)
         if scan.active:
-            ahead, coverage = _clearance(depth, config)
-            min_coverage = config.coverage_full if receipt_only else config.coverage_min
-            if (coverage < min_coverage
-                    or (ahead is not None and ahead <= config.obstacle_stop_m)):
-                command = scan.interrupt("主动观察：当前深度覆盖不足或检测到近障，停车")
+            ahead, _ = _clearance(depth, config)
+            if ahead is not None and ahead <= config.obstacle_stop_m:
+                command = scan.interrupt("主动观察：检测到近障，停车")
                 return Decision(_twist(0, 0, 0), AVOIDING, command.reason)
             if not scan.ready:
                 command = scan.command(geometry, _keepout_m(config),
@@ -1237,6 +1231,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
             state.recovery = ClearanceRecovery()
         if stale_capture:
             return Decision(_twist(0., 0., 0.), BLIND, "深度采集时间已过期或无效；保持停车")
+        if invalid_depth:
+            state.recovery = ClearanceRecovery()
+            state.escape_side = 0.0
+            state.side_better_frames = 0
+            state.active_scan.clear_frames = 0
+            return Decision(_twist(0., 0., 0.), AVOIDING, "深度图没有有效测距，看不清；保持停车")
         missing = "vop / depth"
         if detections is not None:
             missing = "depth"
@@ -1538,10 +1538,8 @@ def _keepout_m(config: Config) -> float:
     return config.half_width_m + config.clearance_margin_m
 
 
-def _side_label(room, coverage, config: Config) -> str:
+def _side_label(room, config: Config) -> str:
     """One side's verdict, for a reason string an operator has to act on."""
-    if coverage < config.coverage_min:
-        return f"只有 {coverage * 100:.0f}% 深度有效"
     if room is None:
         return "无读数"
     if room <= config.side_clearance_m:
@@ -1576,25 +1574,11 @@ def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
 
 
 def _may_strafe(towards_right: bool, depth, config: Config) -> bool:
-    """Whether it is honest to put speed on `vy` right now.
-
-    The question is not "is the right third of the picture empty" — that
-    describes what is ahead-and-to-the-right at a couple of metres, not what is
-    beside the shoulder. It is whether the corridor the robot would **move
-    into** is both measured and clear. An unmeasured one blocks: sideways is
-    the direction a forward-facing camera knows least about, and this is the one
-    place the policy could move into space it cannot see.
-
-    A sidestep whose corridor falls outside the lens gets zero coverage and is
-    refused on that alone, which is the correct answer rather than a special
-    case.
-    """
+    """Check measured obstacles in the destination corridor before strafing."""
     if not config.use_lateral or config.vy_max <= 0:
         return False
     offset = _keepout_m(config) * (1.0 if towards_right else -1.0)
-    room, coverage = _clearance(depth, config, lateral_offset_m=offset)
-    if coverage < config.coverage_min:
-        return False
+    room, _ = _clearance(depth, config, lateral_offset_m=offset)
     return room is None or room > config.slow_distance_m
 
 
@@ -1665,9 +1649,6 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
     """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
     state.last_clearance, state.last_coverage = ahead, coverage
-    if coverage < config.coverage_min:
-        state.recovery = ClearanceRecovery()
-        return f"原地搜索：有效深度覆盖仅 {coverage:.0%}，停车"
     if ahead is not None and ahead <= config.obstacle_stop_m:
         state.recovery = ClearanceRecovery()
         return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
@@ -1690,12 +1671,11 @@ def _search_turn_stop(depth, config: Config, state: State) -> str | None:
         horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
         rate = max(config.search_rate, abs(scan.motion[2]), abs(state.commanded[2]))
         if not scan.clear_sweep(geometry, _keepout_m(config), direction * (rate + .10) * horizon,
-                                STILL_LINEAR * horizon, require_observed=command_only):
+                                STILL_LINEAR * horizon):
             state.recovery = ClearanceRecovery()
             return "原地搜索：转身扫掠范围有障碍或超出网格，停车"
     if state.recovery is not None:
-        if coverage < config.coverage_full or (not config.local_planning and (
-                ahead is None or ahead < config.slow_distance_m)):
+        if not config.local_planning and ahead is not None and ahead < config.slow_distance_m:
             state.recovery = ClearanceRecovery()
             return "近障停车，等待足够的深度观测"
         if state.recovery.scale("turn", depth, config.depth_age_limit_ms) <= 0:
@@ -1754,26 +1734,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if state is not None:
         state.last_clearance, state.last_coverage = ahead, coverage
 
-    # Too little of the corridor measured to say anything about it. Not the same
-    # as "clear", and it used to be treated as such — an invalid pixel simply
-    # dropped out of the minimum, so a corridor full of holes and an empty one
-    # produced the same number. The objects that make holes are the ones that
-    # catch a shoulder.
-    if coverage < config.coverage_min:
-        if state is not None:
-            state.recovery = ClearanceRecovery()
-            state.escape_side = 0.0
-            state.side_better_frames = 0
-            state.active_scan.clear_frames = 0
-        return (0.0, 0.0, 0.0, AVOIDING,
-                f"正前方只有 {coverage * 100:.0f}% 的深度有效，看不清就不往前走"
-                f"（需要 {config.coverage_min * 100:.0f}%）")
-
-    # Between the two thresholds the clearance is believed, but less of it than
-    # we would like was measured, so it is approached more slowly.
-    trust = min(1.0, max(0.0, (coverage - config.coverage_min)
-                         / max(1e-6, config.coverage_full - config.coverage_min)))
-
     # The target itself also appears in the depth map. Only steer early
     # around a return distinctly in front of it.
     foreground = (ahead is not None
@@ -1791,7 +1751,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         stop = min(slow, stop + speed * config.depth_age_limit_ms / 1000)
     near = ahead is not None and ahead <= stop
     approaching = ahead is not None and ahead < slow
-    scale = trust
+    scale = 1.0
     if approaching:
         scale *= max(0.0, (ahead - stop) / max(1e-6, slow - stop))
         if status != ALIGNING:
@@ -1843,7 +1803,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     state.recovery = ClearanceRecovery()
                 yaw_rate = _scan_yaw_rate(config)
                 if (scan is not None and may_scan and foreground and not near and config.use_lateral
-                        and (not scan.receipt_only or coverage >= config.coverage_full)
                         and (not scan.command_only or config.scan_geometry is not None)
                         and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
@@ -1855,22 +1814,20 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     return 0.0, 0.0, 0.0, AVOIDING, "无反馈主动观察需要已声明的相机到底盘几何"
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
         else:
-            # A summary with a missing side band supplies no evidence of free space.
-            usable = {s: (float("inf") if room is None else room)
+            usable = {s: (cov >= config.coverage_min, math.inf if room is None else room)
                       for s, (room, cov) in rooms.items()
-                      if cov >= config.coverage_min and (target_distance is not None or near)
-                      and ((room is None and depth.get("map") is not None)
-                           or (room is not None and room > config.side_clearance_m))}
+                      if (target_distance is not None or near)
+                      and (room is None or room > config.side_clearance_m)}
             if usable:
                 side = (state.escape_side if state and state.escape_side in usable
                         else max(usable, key=usable.get))
             else:
-                left, right = (_side_label(*rooms[s], config) for s in (-1.0, 1.0))
+                left, right = (_side_label(rooms[s][0], config) for s in (-1.0, 1.0))
                 blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
                            f"（左 {left}，右 {right}）")
                 brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
                 if (foreground and aligned and depth.get("map") is not None
-                        and target_distance is not None and coverage >= config.coverage_full
+                        and target_distance is not None
                         and (state is None or state.recovery is None)
                         and brake_at < ahead < slow):
                     horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
@@ -1890,16 +1847,13 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     elif scan is not None:
         if scan.ready:
             scan.finish()
-        clear = (ahead is not None and ahead >= config.slow_distance_m
-                 and coverage >= config.coverage_full)
-        if scan.has_result and coverage >= config.coverage_full and not near and (
-                clear or not foreground):
-            free, occupied = scan.grid()
+        clear = ahead is None or ahead >= config.slow_distance_m
+        if scan.has_result and not near and (clear or not foreground):
+            _, occupied = scan.grid()
             geometry = config.scan_geometry or config.local_geometry
             front = geometry.front + config.obstacle_stop_m
             corridor = (abs(RIGHT) <= _keepout_m(config)) & (FORWARD >= 0) & (FORWARD <= front)
-            supported = ahead is not None or (free & corridor & (FORWARD > geometry.front)).any()
-            clear = bool(supported and not occupied[corridor].any())
+            clear = not occupied[corridor].any()
         if clear:
             scan.note_clear_path(scan.current_frame)
         else:
@@ -1931,7 +1885,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         tracking_yaw = wz if wz * escape_yaw > 0 else 0.0
         wz = (1.0 - weight) * tracking_yaw + weight * escape_yaw
         _, (_, lateral_limit) = _local_velocity_limits(config, side)
-        lateral = -side * lateral_limit * config.lateral_scale * weight * trust
+        lateral = -side * lateral_limit * config.lateral_scale * weight
         vy = 0.0
         if config.use_lateral and lateral_limit >= config.floor_vy and (aligned or near):
             if near or abs(lateral) >= config.floor_vy * config.lateral_lift_ratio:
@@ -1955,13 +1909,13 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if near and not config.local_planning:
         side_route += "-in-place"
         if state is not None and state.recovery is None:
-            # An already measured side permits the existing near sidestep.
+            # The near sidestep has been selected from the current depth.
             # Advancing from that pose is a different route and needs new frames.
             state.recovery = ClearanceRecovery(route=side_route, frames=5)
     if state is not None and state.recovery is not None:
         if side:
             route = side_route
-        elif ahead is not None and ahead > stop + FORWARD_CLEARANCE_MARGIN_M and coverage >= config.coverage_full:
+        elif ahead is None or ahead > stop + FORWARD_CLEARANCE_MARGIN_M:
             route = "forward"
         else:
             state.recovery = ClearanceRecovery()

@@ -32,7 +32,7 @@ def test_a_diagonal_step_checks_the_intermediate_sweep():
     assert replay.shortest_path(allowed, (3, 3), (4, 4)) is None
 
 
-def test_front_depth_can_find_a_geometric_detour_without_measuring_its_prefix():
+def test_front_depth_can_execute_a_detour_with_an_unmeasured_prefix():
     horizontal = HorizontalIntrinsics(640, 315, 337)
     vertical = (480, 420, 243)
     geometry = replay.camera_square(horizontal, vertical, .23)
@@ -47,17 +47,16 @@ def test_front_depth_can_find_a_geometric_detour_without_measuring_its_prefix():
     assert free.any() and occupied.any()
     detour = replay._checked_translation(frame, ground, geometry, .33, .90, 1., 500, 600,
                                          velocity_limits=DECLARED_SPEEDS)
-    assert detour is not None and detour.command is None
+    assert detour is not None and detour.command is not None
+    assert -detour.command[1] > 0.
 
 
-def test_detour_limits_speed_to_the_measured_prefix_and_full_timeout(monkeypatch):
+def test_detour_limits_travel_to_the_checked_prefix_over_the_full_timeout(monkeypatch):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
 
     def observed(_frame, _geometry, right, forward, _resolution, _ground):
         known_obstacle = (abs(right) <= .05) & np.isclose(forward, .9)
-        # The next unmeasured front cell is centred at .35 m. The initial
-        # front edge is .23 m, so it can advance less than .095 m in 1.15 s.
         free = (abs(right) <= .35 + 1e-9) & (forward > .20) & (forward <= .30 + 1e-9)
         return free, known_obstacle
 
@@ -66,8 +65,9 @@ def test_detour_limits_speed_to_the_measured_prefix_and_full_timeout(monkeypatch
                                           velocity_limits=DECLARED_SPEEDS)
     assert command is not None
     vx, vy = command.command
-    assert 0 < vx < .095 / 1.15
-    assert vy == 0
+    assert .095 / 1.15 < vx <= .6
+    assert 0 < -vy <= .4
+    assert np.hypot(vx, vy) * 1.15 <= np.hypot(*command.points[1]) + 1e-12
 
 
 @pytest.mark.parametrize("side", [-1., 1.])
@@ -110,19 +110,18 @@ def test_detour_falls_back_to_strafe_then_forward_with_bumi_speed_ranges(side):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .21)
     box = (abs(replay.RIGHT) <= .05) & np.isclose(replay.FORWARD, .9)
-    # Only the lateral prefix is observed far enough for Bumi's minimum speed.
     free = (replay.FORWARD <= .25) & (abs(replay.RIGHT) <= .65)
     limits = ((.25, .55), (.12, .20))
     args = (None, None, geometry, .31, .90, side, 500, 300)
-    detour = replay._checked_translation(*args, velocity_limits=limits,
+    detour = replay._checked_translation(*args, velocity_limits=limits, allow_forward=False,
                                          observed_grid=(free, box))
     assert detour is not None
     assert detour.command[0] == 0. and .12 <= -side * detour.command[1] <= .20
     assert detour.points[1][0] == 0.
     assert detour.points[-1][0] > .9 and detour.points[-1][1] == 0.
-    pending = replay._checked_translation(*args, velocity_limits=limits,
-                                          observed_grid=(free & (abs(replay.RIGHT) < .4), box))
-    assert pending is not None and pending.command is None
+    limited_view = replay._checked_translation(*args, velocity_limits=limits, allow_forward=False,
+                                               observed_grid=(free & (abs(replay.RIGHT) < .4), box))
+    assert limited_view.command == detour.command
 
 
 @pytest.mark.parametrize("start_occupied", [False, True])
@@ -180,28 +179,29 @@ def test_scanned_free_space_supports_a_bend_before_returning_to_the_route(monkey
     assert abs(command.command[0]) <= .6 and abs(command.command[1]) <= .4
 
 
-def test_scanned_prefix_can_be_measured_before_the_passage_is_fully_seen(monkeypatch):
+def test_unmeasured_scanned_cells_do_not_change_the_detour_command():
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
     box = (abs(replay.RIGHT) <= .05) & np.isclose(replay.FORWARD, .9)
     unknown = np.zeros_like(box)
-    monkeypatch.setattr(replay, "observe", lambda *args: (unknown, box))
     nearby = (replay.FORWARD <= .45) & (abs(replay.RIGHT) <= .5)
-    command = replay._checked_translation(None, None, geometry, .33, .90, 1., 500, 600,
-                                          velocity_limits=DECLARED_SPEEDS,
-                                          observed_grid=(nearby, box))
-    assert command is not None and 0 < np.hypot(*command.command)
-    assert command.command[0] * 1.15 <= .475 - geometry.front
-    assert abs(command.command[1]) * 1.15 <= .525 - .33
+    args = (None, None, geometry, .33, .90, 1., 500, 600)
+    narrow = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                         observed_grid=(nearby, box))
+    blind = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                        observed_grid=(unknown, box))
+    assert 0 < np.hypot(*narrow.command)
+    assert blind.command == narrow.command and blind.points == narrow.points
 
 
-def test_pose_aligned_scan_does_not_borrow_free_cells_from_the_original_exposure(monkeypatch):
+def test_pose_aligned_scan_uses_only_obstacles_at_the_current_pose(monkeypatch):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
     box = np.isclose(replay.RIGHT, 0) & np.isclose(replay.FORWARD, .90)
-    monkeypatch.setattr(replay, "observe", lambda *args: (~box, box))
+    original = box | (np.isclose(replay.RIGHT, 0) & np.isclose(replay.FORWARD, .20))
+    monkeypatch.setattr(replay, "observe", lambda *args: (~original, original))
     args = (None, None, geometry, .33, .90, 1., 500, 600)
-    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS).command is not None
-    pending = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
-                                          observed_grid=(np.zeros_like(box), box))
-    assert pending is not None and pending.command is None
+    assert replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS) is None
+    detour = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
+                                         observed_grid=(np.zeros_like(box), box))
+    assert detour is not None and detour.command is not None

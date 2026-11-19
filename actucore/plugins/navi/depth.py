@@ -311,13 +311,7 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     So the test is metric: convert each pixel's column to a lateral offset at
     its own measured depth, and keep what lies inside the robot's width.
 
-    ── unknown is not free ──────────────────────────────────────────────────
-
-    `coverage` is the other half, and the more important one. A depth map has
-    holes — dark, shiny, thin, or too close — and the objects that produce them
-    are exactly the ones that catch a shoulder: chair legs, table edges, glass.
-    Returning only a clearance lets a corridor full of holes read as an empty
-    one, because every invalid pixel silently drops out of the minimum.
+    `coverage` reports how much of that corridor has a valid depth return.
 
     The denominator is the image region the corridor would occupy at
     `reference_m` (pass the distance you care about — the stop distance).
@@ -370,15 +364,8 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
         if len(extents) == 3:
             clearance = round(min(extents), 3)
 
-    # Coverage denominator: the columns the corridor projects onto at
-    # `reference_m` — **including the part that falls outside the lens**.
-    #
-    # That last clause matters more than it looks. Close in, the robot is wider
-    # than the field of view: at half a metre a ±0.33 m corridor spans about 67°
-    # and a 63° lens does not reach the edges of it. Counting only the visible
-    # columns would report a fully-measured corridor while a third of the
-    # robot's width was never in frame — the same "unknown reads as clear"
-    # failure this function exists to close, one level up.
+    # Count the entire projected corridor at `reference_m`, including columns
+    # outside the lens, so the reported coverage reflects the field of view.
     reference = max(1e-6, reference_m)
     low = (lateral_offset_m - half_width_m) / reference
     high = (lateral_offset_m + half_width_m) / reference

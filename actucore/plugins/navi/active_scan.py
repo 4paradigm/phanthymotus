@@ -445,29 +445,22 @@ class ActiveScan:
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
         sweep = self.directions[0] * (RECEIPT_ANGLE + (self.turn_yaw + .10) * horizon)
         if (self.turn_yaw <= 0. or self.turn_yaw < min_yaw or not self.clear_sweep(
-                geometry, half_width, sweep, STILL_LINEAR * horizon, require_observed=True)):
+                geometry, half_width, sweep, STILL_LINEAR * horizon)):
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍或超出网格范围，停车")
         self.issued_yaw = True
         return ScanCommand(-self.directions[0] * self.turn_yaw, "主动观察：有界短转向")
 
-    def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None,
-                    require_observed=False):
+    def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)
         radius = math.hypot(max(geometry.front, geometry.rear), half_width)
         slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
         if occupied is None:
-            free, occupied = self.grid()
+            _, occupied = self.grid()
             occupied = occupied | self.views[-1][3]
-            if require_observed:
-                outside_f = np.maximum(0., np.maximum(-geometry.rear - FORWARD,
-                                                       FORWARD - geometry.front))
-                outside_r = np.maximum(0., abs(RIGHT) - half_width)
-                newly_swept = outside_f**2 + outside_r**2 > RESOLUTION**2 / 2
-                occupied = occupied | (~free & newly_swept)
         occupied_forward, occupied_right = FORWARD[occupied], RIGHT[occupied]
         for angle in np.linspace(0., sweep, samples):
             c, s = math.cos(angle), math.sin(angle)

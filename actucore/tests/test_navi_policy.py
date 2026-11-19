@@ -259,22 +259,16 @@ def test_vy_points_at_the_target_and_is_zero_dead_ahead():
     assert _step(detections=_detections(_obj(x=-0.5)), depth=_depth()).values[1] > 0
 
 
-def test_strafing_needs_the_side_it_moves_into_to_be_known_and_clear():
-    """Sideways is the direction a forward-facing depth map knows least about,
-    so an unknown band **blocks** rather than defaulting to permission. This is
-    the one place the policy could move into space it cannot see, and it does
-    not take it."""
-    # Something in the space a sidestep to the right would move into, and a
-    # frame where that space simply has no readings. Both must refuse.
+def test_strafing_checks_observed_obstacles_with_an_unmeasured_side():
     blocked = _scene(5.0, [(0.55, 1.0, 0.5)])
     unmeasured = {"map": _obstacle_map(5.0), "bands": {"left": 5.0, "center": 5.0}}
     unmeasured["map"][:, 340:] = np.nan
     turn_away = _step(detections=_detections(_obj(x=0.5)), depth=blocked)
     assert turn_away.values[:2] == [0.0, 0.0]
     assert turn_away.values[5] > 0  # The verified route goes left.
-    turn_in_place = _step(detections=_detections(_obj(x=0.5)), depth=unmeasured)
-    assert turn_in_place.values[1] == 0.0
-    assert turn_in_place.values[5] < 0
+    strafe = _step(detections=_detections(_obj(x=0.5)), depth=unmeasured)
+    assert strafe.values[1] < 0.0
+    assert strafe.values[5] < 0
 
 
 def test_a_target_too_far_off_axis_is_turned_to_rather_than_strafed_at():
@@ -1580,6 +1574,42 @@ def test_a_corridor_it_cannot_measure_is_not_driven_into():
     assert "看不清" in decision.reason
 
 
+def test_a_small_valid_part_of_the_corridor_can_still_support_approach():
+    config = _cfg()
+    frame = np.full((480, 640), np.nan, dtype=np.float32)
+    frame[:, 310:330] = 3.
+    depth = _depth(map_=frame)
+    _, coverage = P._clearance(depth, config)
+    assert 0. < coverage < config.coverage_min
+    decision = _step(detections=_detections(_obj(x=0.0)), depth=depth, config=config)
+    assert decision.status == P.APPROACHING and decision.values[0] > 0.
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_search_turn_checks_occupied_cells_with_unseen_sides(monkeypatch, blocked):
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
+               half_width_m=.23, search_rate=.25)
+    state = _state(motion_source="command")
+    free = local_path.FORWARD > 0.
+    occupied = np.zeros_like(free)
+    row, col = local_path.START
+    occupied[row + 4, col + 6] = blocked
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, occupied))
+    monkeypatch.setattr(P, "_clearance", lambda *args: (None, .05))
+    frame = np.ones((4, 4))
+    depth = {"map": frame, "ground": frame.astype(bool), "frame_id": 1000}
+    state.active_scan.observe_single(depth, geometry, 800, 1000)
+
+    reason = P._search_turn_stop(depth, cfg, state)
+    if blocked:
+        assert "扫掠范围有障碍" in reason
+    else:
+        assert reason is None
+
+
 def test_the_summary_only_path_cannot_detect_a_corridor_full_of_holes():
     """Pinned as a known limitation rather than discovered on a robot.
 
@@ -2677,7 +2707,7 @@ def test_local_transition_checks_independent_axis_ramp(monkeypatch, occupied, kn
     depth = {"scan_grid": (grid_free, grid_occupied)}
     monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: (.25, -.10))
     odom = {"vx": .16, "vy": 0., "wz": 0.}
-    expected = (.25, -.10) if known and not occupied else P.LocalHold.TRANSITION
+    expected = P.LocalHold.TRANSITION if occupied else (.25, -.10)
     assert P._local_translation(depth, cfg, state, odom, .9, 1.) == expected
 
 
@@ -2704,7 +2734,10 @@ def test_command_only_checks_the_ramp_even_for_a_repeated_diagonal(monkeypatch):
     free = np.ones(local_path.SHAPE, dtype=bool)
     row, col = local_path.START
     free[row + 7, col - 6] = False
-    depth = {"scan_grid": (free, np.zeros_like(free))}
+    occupied = np.zeros_like(free)
+    depth = {"scan_grid": (free, occupied)}
+    assert P._local_translation(depth, cfg, state, None, .9, 1.) == command
+    occupied[row + 7, col - 6] = True
     assert P._local_translation(depth, cfg, state, None, .9, 1.) is P.LocalHold.TRANSITION
 
 
