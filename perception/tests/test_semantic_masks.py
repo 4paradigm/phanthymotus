@@ -244,3 +244,14 @@ def test_supplemental_presets_register_as_cards(monkeypatch):
     names = {t["name"] for t in plugin.get_tools()}
     assert {"pet", "tableware", "furniture"} <= names
     assert len(names) == 7
+
+
+def test_config_yaml_ships_the_supplemental_presets():
+    """config.yaml 的 segment.cards 必须带着补充预设，卡名才能在下一次启动注册。"""
+    import yaml
+    config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+    with open(config_path) as handle:
+        cards = yaml.safe_load(handle)["plugins"]["segment"]["cards"]
+    assert cards["pet"] == ["dog", "cat"]
+    assert cards["tableware"] == ["bottle", "cup", "bowl"]
+    assert cards["furniture"] == ["bed", "couch"]
