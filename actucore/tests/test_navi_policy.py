@@ -2795,6 +2795,59 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
         assert any("重新规划" in reason and "已停稳" in reason for reason in seen)
 
 
+@pytest.mark.parametrize("blocked_sweep", [False, True])
+def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_segment(
+        monkeypatch, blocked_sweep):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
+                  half_width_m=.275, clearance_margin_m=.1)
+    state = _state(motion_source="measured")
+    target = SimpleNamespace(bearing_rad=0., range_m=3.5, range_known=True,
+                             observed=True, measured_range_m=3.5)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    occupied = ~free
+    if blocked_sweep:
+        occupied[local_path.START[0] + 5, local_path.START[1] + 7] = True
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
+
+    def clearance(_, _config, lateral_offset_m=0.):
+        if lateral_offset_m:
+            return (2.15 if -.15 < lateral_offset_m < -.08 else 1.10), .96
+        heading = -math.degrees(state.active_scan.pose[2])
+        return (2.15 if 4. <= heading <= 8. else 1.10), .96
+
+    monkeypatch.setattr(P, "_clearance", clearance)
+    frame = np.ones((4, 4))
+    previous = [0.] * 6
+    last_turn = None
+    for stamp in range(1000, 4000, 100):
+        decision = P.step(detections=_detections(),
+                          depth=dict(map=frame, frame_id=stamp, ground=frame.astype(bool)),
+                          odom=dict(vx=previous[0], vy=0., wz=previous[5], received_ms=stamp),
+                          config=config, state=state, dt=.1)
+        previous = decision.values
+        assert previous is not None and previous[1] == 0.
+        if blocked_sweep:
+            assert previous == [0.] * 6
+            if "转身扫掠区有障碍" in decision.reason:
+                return
+        if previous[5]:
+            assert previous[0] == 0.
+            last_turn = stamp
+        if previous[0]:
+            assert decision.reason == "主动观察：转稳后直行"
+            assert last_turn is not None and stamp - last_turn >= active_scan.SETTLE_MS
+            assert 4. <= -math.degrees(state.active_scan.pose[2]) <= 8.
+            return
+    pytest.fail("No straight segment was released through the measured opening")
+
+
 def test_close_obstacle_in_the_new_view_requires_another_turn_before_advancing(monkeypatch):
     from plugins.navi.local_path import Geometry
 
@@ -3196,6 +3249,76 @@ def test_command_only_checks_the_ramp_even_for_a_repeated_diagonal(monkeypatch):
     assert P._local_translation(depth, cfg, state, None, .9, 1.) == command
     occupied[row + 7, col - 6] = True
     assert P._local_translation(depth, cfg, state, None, .9, 1.) is P.LocalHold.TRANSITION
+
+
+def test_checked_straight_approach_keeps_tracking_a_moving_target(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .30, .30, None)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.)
+    state = _state()
+    track = SimpleNamespace(bearing_rad=0., range_m=3., range_known=True, observed=True,
+                            measured_range_m=3.)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (
+        np.ones(local_path.SHAPE, dtype=bool), np.zeros(local_path.SHAPE, dtype=bool)))
+    odom = dict(vx=0., vy=0., wz=0.)
+    frame = _solid_depth(3.)
+
+    def tick(stamp):
+        depth = dict(_depth(map_=frame), ground=np.ones_like(frame, dtype=bool), frame_id=stamp)
+        return P.step(detections=_detections(), depth=depth, odom=odom, config=cfg, state=state, dt=.1)
+
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.31, .99))
+    assert tick(1000).values[0] > 0.
+    assert state.goal_anchor is None
+    track.range_m = track.measured_range_m = 4.
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.2, .99))
+    decision = tick(1100)
+    assert decision.status == P.APPROACHING and decision.values[0] > 0.
+    assert decision.distance_m == pytest.approx(4.)
+
+
+@pytest.mark.parametrize("same_track, measured", [(True, True), (False, True), (True, False)])
+def test_scan_replan_requires_a_fresh_range_from_the_original_track(monkeypatch, same_track, measured):
+    from types import SimpleNamespace
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    state = _state(motion_source="measured")
+    track = SimpleNamespace(bearing_rad=0., range_m=3.81, range_known=True,
+                            observed=True, measured_range_m=3.81)
+    observation = track
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: observation)
+    clearance = 1.21
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (clearance, .98))
+
+    def tick(stamp):
+        frame = np.ones((4, 4))
+        return P.step(detections=_detections(),
+                      depth=dict(map=frame, frame_id=stamp, ground=frame.astype(bool)),
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=stamp),
+                      config=config, state=state, dt=.1)
+
+    assert tick(1000).values == [0.] * 6
+    assert state.active_scan.active and state.goal_anchor is not None
+    state.active_scan.hold_for_replan("input gap")
+    assert tick(1100).values == [0.] * 6
+    assert "已停稳，重新规划" in tick(1300).reason
+    clearance = 2.1
+    if not same_track:
+        observation = SimpleNamespace(**vars(track))
+    observation.range_m = 4.6
+    observation.measured_range_m = 4.6 if measured else None
+    decision = tick(1400)
+    if same_track and measured:
+        assert decision.values[0] > 0. and decision.distance_m == pytest.approx(4.6)
+        assert state.goal_anchor is None
+    else:
+        assert decision.values == [0.] * 6 and "等待原目标" in decision.reason
+        assert state.goal_anchor is not None
 
 
 @pytest.mark.parametrize("odom", [None, {"vx": 0., "vy": 0., "wz": 0.}])

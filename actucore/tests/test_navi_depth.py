@@ -478,6 +478,51 @@ def test_ground_mask_checks_the_two_centimetre_upper_tolerance(height_m, is_grou
     assert np.all(ground[380:408, 160:480] == is_ground)
 
 
+@pytest.mark.parametrize("raised_center", [False, True])
+def test_floor_visible_between_two_near_walls(raised_center):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[:, :205] = .7
+    frame[:, 435:] = .9
+    if raised_center:
+        frame[385:, 205:435] *= .34 / .42
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+
+    if raised_center:
+        assert ground is None or not ground[408:, 220:420].any()
+    else:
+        assert ground is not None
+        assert ground[408:, 220:420].mean() > .95
+        assert not ground[:, :205].any()
+        assert not ground[:, 435:].any()
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+@pytest.mark.parametrize("raised_strip", [False, True])
+def test_floor_in_a_narrow_offset_strip_passes_only_with_far_support(mirror, raised_strip):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[:, :196] = .7
+    frame[:, 292:] = .9
+    if raised_strip:
+        frame[385:, 196:292] *= .34 / .42
+    if mirror:
+        frame = frame[:, ::-1]
+
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+    if raised_strip:
+        assert ground is None
+    else:
+        assert ground is not None
+        if mirror:
+            ground = ground[:, ::-1]
+        assert ground[408:, 196:292].mean() > .50
+        assert not ground[:, :196].any()
+        assert not ground[:, 292:].any()
+
+
 def test_a_broad_raised_platform_does_not_replace_the_floor():
     from plugins.navi.camera import HorizontalIntrinsics
 

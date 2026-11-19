@@ -1289,6 +1289,28 @@ def test_a_motion_decision_that_expires_during_planning_publishes_a_stop(monkeyp
     assert card._last_decision.status == navi_plugin.policy_mod.BLIND
 
 
+def test_first_avoidance_turn_that_expires_during_planning_reenters_a_stop_hold(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card(local_planning=True)
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 600})
+    scan = card._state.active_scan
+    scan.phase, scan.receipt_only, scan.attempted = "turn", True, True
+    card._state.motion_source = "measured"
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 100.000)
+    monkeypatch.setattr(card, "_observation_snapshot",
+                        lambda **kw: ({}, {"frame_id": 99400}, {"received_ms": 99900}, 99900))
+
+    def turn(**kwargs):
+        scan.current_frame = 99400
+        scan.issued_yaw = True
+        return policy.Decision([0., 0., 0., 0., 0., .3], policy.AVOIDING, "向左观察")
+
+    monkeypatch.setattr(policy, "step", turn)
+    assert card.next_command()["values"] == [0.] * 6
+    assert not scan.issued_yaw
+    assert scan.phase == "brake_for_replan" and scan.attempted
+
+
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
     card = _card()
     card._adopt_odom_interface({

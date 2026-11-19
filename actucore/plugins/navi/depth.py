@@ -190,6 +190,8 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     bottom = slice(int(height * OBSTACLE_ROW_SPAN[1]), height, 4)
     columns = slice(width // 16, width - width // 16, 4)
     seed = depth_m[bottom, columns]
+    count = seed.shape[1]
+    narrow = max(2, count // 8)
     valid = np.isfinite(seed) & (seed > 0.10) & (seed < 4.0)
     if valid.mean() < 0.6:
         return None
@@ -261,25 +263,36 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
             # Veto a substantial measured surface below the proposed floor.
             # This rejects a raised platform even if its top fits one patch.
             below = distance[far_start:, columns] > 2 * _GROUND_TOLERANCE_M
+            if end - start == narrow and below[:, start:end].mean() >= .12:
+                return None
             if any(third.mean() >= 0.12 for third in np.array_split(below, 3, axis=1)):
                 return None
         if visible_span is not None:
-            # The omitted third must show a foreground occlusion. Returns
-            # below the candidate can reveal a raised platform instead.
-            excluded = slice(None, start) if start else slice(end, None)
-            residual = distance[bottom, columns][:, excluded]
-            observed = valid[:, excluded]
+            # Each excluded side must show a foreground occlusion. Returns
+            # below the candidate can reveal a raised platform.
             occlusion_margin = 2 * _GROUND_TOLERANCE_M
-            foreground = observed & (residual < -occlusion_margin)
-            below = observed & (residual > occlusion_margin)
-            if foreground.mean() < 0.2 or below.mean() >= 0.2:
-                return None
-            # The occluded third did not verify this plane. Keep its returns
+            for excluded in (slice(0, start), slice(end, seed.shape[1])):
+                residual = distance[bottom, columns][:, excluded]
+                if not residual.size:
+                    continue
+                observed = valid[:, excluded]
+                foreground = observed & (residual < -occlusion_margin)
+                below = observed & (residual > occlusion_margin)
+                if foreground.mean() < 0.2 or below.mean() >= 0.2:
+                    return None
+            # The occluded sides did not verify this plane. Keep their returns
             # available to obstacle detection even if they touch the plane.
             if start:
                 ground[:, :columns.start + start * columns.step] = False
             if end < seed.shape[1]:
                 ground[:, columns.start + end * columns.step:] = False
+            if end - start == narrow:
+                # The edge of a narrow window can still include a jamb.
+                # A return where the jamb crosses the plane is not floor.
+                verified_columns = ground[bottom].mean(axis=0) >= .65
+                if not verified_columns.any():
+                    return None
+                ground[:, ~verified_columns] = False
         return ground
 
     ground = fit(all_points)
@@ -337,10 +350,25 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     # A wide obstacle can cover the centre and leave a continuous strip on
     # only one side. Require support in both halves of that strip and leave
     # all returns on the occluded side available to obstacle detection.
-    count = seed.shape[1]
     visible = 2 * count // 5
     for edge, span in ((left, (0, visible)), (right, (count - visible, count))):
         ground = fit(edge, visible_span=span, check_below=True, window_halves=True)
+        if ground is not None:
+            return ground
+
+    # Two foreground surfaces can leave a continuous strip of floor in the
+    # middle. Apply the same support checks and require occlusion on both sides.
+    start = (count - visible) // 2
+    ground = fit(all_points, visible_span=(start, start + visible),
+                 check_below=True, window_halves=True)
+    if ground is not None:
+        return ground
+
+    # An oblique view can leave a narrower floor strip away from the centre.
+    # Keep the same near/far checks and retain all depth outside the strip.
+    for start in range(1, count - narrow, max(1, narrow // 8)):
+        ground = fit(all_points, visible_span=(start, start + narrow),
+                     check_below=True, window_halves=True)
         if ground is not None:
             return ground
     return None

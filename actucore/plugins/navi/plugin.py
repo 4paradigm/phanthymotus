@@ -1684,6 +1684,8 @@ class NaviPlugin:
                 and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms):
             if scan is not previous_scan or not issued_yaw:
                 scan.issued_yaw = False
+            if scan.active and scan.receipt_only and not scan.command_only:
+                scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
             self._state.idle_for_s = idle_for_s
             self._state.adaptive_fwd_scale = 1.
             self._state.moving_for_s = 0.

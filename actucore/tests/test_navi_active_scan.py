@@ -355,6 +355,32 @@ def test_receipt_scan_replan_after_travel_locks_only_before_a_released_straight_
     assert not look.active and not look.locked and not look.issued_yaw and not look.attempted
 
 
+@pytest.mark.parametrize("missing", ["depth", "odom"])
+def test_receipt_scan_retries_if_input_lapses_while_braking_before_first_turn(monkeypatch, missing):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, *, depth=True, odom=True, vx=0.):
+        return look.update(_depth(stamp) if depth else None,
+                           {**_odom(stamp), "received_ms": stamp, "vx": vx} if odom else None,
+                           geometry, receipt_only=True)
+
+    for stamp in range(1000, 1900, 100):
+        update(stamp, vx=.3)
+    assert look.pose[0] > .18
+    assert look.begin((-1., 1.))
+    assert not look.origin_set and not look.issued_yaw
+    update(1900, depth=missing != "depth", odom=missing != "odom")
+    assert look.phase == "brake_for_replan" and look.attempted
+
+    update(2000)
+    assert look.command(geometry, .33, 1., 600).yaw == 0.
+    assert look.active and look.attempted
+    update(2200)
+    assert "已停稳，重新规划" in look.command(geometry, .33, 1., 600).reason
+    assert not look.locked
+    assert look.begin((-1., 1.))
+
+
 def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(monkeypatch):
     lookout, geometry, _, _ = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)

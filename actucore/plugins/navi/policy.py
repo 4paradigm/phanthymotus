@@ -67,7 +67,7 @@ import numpy as np
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
 from .active_scan import ANGLE, ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
-from .track import Tracker
+from .track import Track, Tracker
 from . import local_path
 from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
 from .odom import PlanarPose, planar_feedback
@@ -473,6 +473,7 @@ class DetourGoal:
     pose: PlanarPose | None = None
     predicted_m: float = 0.
     predicted_rad: float = 0.
+    track: Track | None = None
 
     def advance(self, odom, command, dt):
         pose = (odom or {}).get("motion_pose")
@@ -537,7 +538,6 @@ class State:
     commanded_vx: float = 0.0
     adaptive_fwd_scale: float = 1.0
     avoidance_yaw_override: bool = False
-    blocked_approach: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     close_sample_gap_s: float = 0.0
@@ -978,7 +978,6 @@ def _band_of(bearing: float) -> str:
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
     state.view_detour = None
-    state.blocked_approach = False
     decision = _decide(detections, depth, odom, config, state, dt)
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
@@ -1079,8 +1078,7 @@ def _wait_for_detour_goal(state, config, track, odom):
     if not config.local_planning:
         return False
     scan = state.active_scan
-    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame
-                     or state.blocked_approach)
+    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame)
     observed = track is not None and track.observed and track.range_known
     anchor = state.goal_anchor
     if anchor is None:
@@ -1093,7 +1091,7 @@ def _wait_for_detour_goal(state, config, track, odom):
                 x, y = track.last_obs
             else:
                 return True
-            state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"))
+            state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"), track=track)
         return False
     if detouring:
         return False
@@ -1163,8 +1161,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if state.motion_source and state.motion_source != source:
             needs_guard = any(state.commanded) or state.active_scan.active
             previous_scan = state.active_scan
-            if (source == "command" and previous_scan.receipt_only
-                    and previous_scan.active and previous_scan.issued_yaw):
+            if source == "command" and previous_scan.receipt_only and previous_scan.active:
                 hold = previous_scan.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
                 return Decision(_twist(0, 0, 0), AVOIDING, hold.reason)
             previous_scan.invalidate()
@@ -1248,6 +1245,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     bands = depth.get("bands") or {}
 
+    scan = state.active_scan
+    if (anchor is not None and track is not None and anchor.track is track
+            and track.observed and track.measured_range_m is not None
+            and not (state.escape_side or scan.active or scan.result_frame)):
+        # The original track can move while the detour uses its frozen point.
+        # Replan from a fresh depth match on that track after leaving the detour.
+        anchor = state.goal_anchor = None
+
     if track is None and anchor is None:
         reason = _search_turn_stop(depth, config, state)
         if reason is not None:
@@ -1312,7 +1317,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # declare the journey over, so arrival needs a live fix. Without one the
     # code below falls through to the obstacle logic, which will stop for the
     # thing that is actually there and say so.
-    scan = state.active_scan
     detouring = config.local_planning and (state.escape_side or scan.active or scan.result_frame)
     if (within and live and measured_within and not detouring
             and (abs(bearing) <= config.arrive_align_tol or state.close_for_s >= config.arrive_patience_s)):
@@ -1819,11 +1823,26 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 geometry = (config.scan_geometry or config.local_geometry
                             if scan.receipt_only else config.scan_geometry)
                 if (may_scan and foreground and geometry is not None
-                        and config.floor_wz <= yaw_rate and yaw_rate > 0):
+                        and config.floor_wz <= yaw_rate and yaw_rate > 0
+                        and scan.current_frame and not scan.attempted):
+                    turn_angle = ANGLE
+                    if (not scan.command_only and
+                            all(room is not None and room < slow for room, _ in rooms.values())):
+                        # A nearby opening can require only small alignment.
+                        # This preview ranks the heading; the settled view
+                        # still has to pass the normal straight-corridor checks.
+                        alignment = math.radians(6)
+                        for direction in order:
+                            offset = direction * ahead * math.tan(alignment)
+                            room, seen = _clearance(depth, config, lateral_offset_m=offset)
+                            if room is not None and room >= slow and seen >= config.coverage_min:
+                                turn_angle = alignment
+                                order = (direction, -direction, direction)
+                                break
                     transform = geometry.base_from_optical
                     obstacle = ahead * transform[0, 2] + transform[0, 3]
                     advance = (obstacle + geometry.rear + .25) / math.cos(ANGLE)
-                    if advance > 0. and scan.begin(order, advance_m=advance):
+                    if advance > 0. and scan.begin(order, advance_m=advance, turn_angle=turn_angle):
                         return 0., 0., 0., AVOIDING, "主动观察：停车后观察较空旷的一侧"
             planning_depth = dict(depth, allow_forward=not near and aligned)
             if target_distance is not None and target_bearing is not None:
@@ -1883,7 +1902,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                             state.recovery = None
                             state.view_detour = None
                             state.avoidance_yaw_override = True
-                            state.blocked_approach = True
                             return (approach, 0., 0., AVOIDING,
                                     f"两侧无可执行避让路线；低速接近（障碍停车线 {brake_at:.2f} m）")
                 if state is not None and state.view_detour is not None:

@@ -39,6 +39,7 @@ class ActiveScan:
     attempted: bool = False
     locked: bool = False
     directions: tuple = ()
+    turn_angle: float = ANGLE
     start_ms: int = 0
     origin: tuple = (0., 0., 0.)
     origin_set: bool = False
@@ -102,7 +103,7 @@ class ActiveScan:
         capture = (depth or {}).get("capture_ms")
         motion = planar_feedback(odom)
         if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
-            if self.receipt_only and self.active and self.issued_yaw and geometry is not None:
+            if self.receipt_only and self.active and geometry is not None:
                 return self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
             return self.invalidate()
         body_pose = (odom or {}).get("motion_pose")
@@ -121,7 +122,7 @@ class ActiveScan:
         if self.poses:
             previous = self.poses[-1][0]
             if not 0 <= stamp - previous <= ODOM_GAP_MS:
-                if self.receipt_only and self.active and self.issued_yaw and stamp > previous:
+                if self.receipt_only and self.active and stamp > previous:
                     # A slow control tick can skip valid odometry samples.
                     # Brake instead of integrating motion over the gap.
                     self.poses.clear()
@@ -197,7 +198,7 @@ class ActiveScan:
         ground = (depth or {}).get("ground")
         if (type(frame) is not int or abs(stamp - frame) > max_depth_age_ms
                 or ground is None or not ground[::4, ::4].any() or depth.get("map") is None):
-            if self.active and self.issued_yaw and not self.command_only:
+            if self.active and not self.command_only:
                 return self.hold_for_replan("主动观察：深度暂不可用，停车后重规划")
             return self.interrupt()
         self.current_frame = frame
@@ -283,10 +284,11 @@ class ActiveScan:
             free |= confirmed
         return free & ~occupied, occupied
 
-    def begin(self, directions, *, advance_m=None):
+    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE):
         if self.attempted or not self.current_frame:
             return False
         self.directions = directions
+        self.turn_angle = turn_angle
         self.advance_m, self.advance_origin, self.advance_commanded_m = advance_m, None, 0.
         self.attempted = True
         self.phase = "brake"
@@ -299,6 +301,7 @@ class ActiveScan:
     def try_other_side(self):
         self.directions = self.directions[1:]
         if self.directions:
+            self.turn_angle = ANGLE
             self.phase = "brake"
             self.still_since = self.single_control_ms if self.command_only else self.poses[-1][0]
             self.timed_phase_s = self.timed_turn_s = 0.
@@ -333,7 +336,8 @@ class ActiveScan:
             return ScanCommand(reason="主动观察：确认底盘已停稳")
         # A released straight segment legitimately leaves the turn origin. A
         # replan hold after it must settle and replan, not lock on that travel.
-        if self.advance_origin is None and math.dist(self.pose[:2], self.origin[:2]) > .18:
+        if (self.origin_set and self.advance_origin is None
+                and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
         if self.receipt_only and (speed > STILL_LINEAR or self.phase == "brake_for_replan"):
             self.phase = "brake_for_replan"
@@ -374,7 +378,7 @@ class ActiveScan:
             self.turn_stop_ms = None
 
         returning = self.phase == "return"
-        heading = self.origin[2] if returning else self.origin[2] + self.directions[0] * ANGLE
+        heading = self.origin[2] if returning else self.origin[2] + self.directions[0] * self.turn_angle
         error = heading - self.pose[2]
         if self.turn_until_ms and (abs(error) <= ANGLE_TOLERANCE or self.turn_yaw * error > 0):
             self.turn_stop_ms = control_ms
