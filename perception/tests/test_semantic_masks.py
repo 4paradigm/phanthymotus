@@ -247,11 +247,21 @@ def test_supplemental_presets_register_as_cards(monkeypatch):
 
 
 def test_config_yaml_ships_the_supplemental_presets():
-    """config.yaml 的 segment.cards 必须带着补充预设，卡名才能在下一次启动注册。"""
+    """config.yaml 的 segment 段必须既含补充预设，又能原样驱动插件注册这七张卡。"""
     import yaml
+    from plugins.segment import SegmentationPlugin
     config_path = Path(__file__).resolve().parents[1] / "config.yaml"
     with open(config_path) as handle:
-        cards = yaml.safe_load(handle)["plugins"]["segment"]["cards"]
-    assert cards["pet"] == ["dog", "cat"]
-    assert cards["tableware"] == ["bottle", "cup", "bowl"]
-    assert cards["furniture"] == ["bed", "couch"]
+        segment = yaml.safe_load(handle)["plugins"]["segment"]
+    expected = {
+        "person": ["person"], "car": ["car"], "chair": ["chair"],
+        "traffic": ["bicycle", "car", "motorcycle", "bus", "truck"],
+        "pet": ["dog", "cat"], "tableware": ["bottle", "cup", "bowl"],
+        "furniture": ["bed", "couch"],
+    }
+    assert segment["cards"] == expected
+    # 用真实的 segment 段实例化插件，确认 YAML 里的每个卡名/类别列表都被
+    # 注册成卡（而不是只停留在配置里），抓配置接线回归。
+    plugin = SegmentationPlugin(segment, None, lambda: None, lambda: "")
+    assert plugin.cards == expected
+    assert {t["name"] for t in plugin.get_tools()} == set(expected)
