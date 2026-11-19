@@ -2500,6 +2500,87 @@ def test_blocked_approach_stops_before_the_chassis_speed_floor_and_holds():
         assert tick(farther, frame).values == [0.0] * 6
 
 
+@pytest.mark.parametrize(("stop_distance", "target_range", "clearance", "expected_gap"), [
+    (.60, 2.0, 1.28, .38),
+    (1.45, 1.60, 1.28, .15),
+    (.60, 2.0, .90, 0.),
+    (1.60, 1.60, 1.28, 0.),
+    (.60, 2.0, .94, 0.),  # only 4 cm left, below the gait's forward floor
+])
+def test_local_no_route_approach_stops_at_the_stricter_boundary(
+        monkeypatch, stop_distance, target_range, clearance, expected_gap):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, stop_distance_m=stop_distance,
+               obstacle_stop_m=.60, max_depth_age_ms=800, watchdog_ms=600, floor_vx=.04)
+    state = _state(motion_source="measured")
+    state.active_scan.attempted = True
+    odom = {"vx": 0., "vy": 0., "wz": 0.}
+    tried = []
+    local_translation = P._local_translation
+
+    def plan(depth, config, state, odom, ahead, side):
+        tried.append(side)
+        return local_translation(depth, config, state, odom, ahead, side)
+
+    monkeypatch.setattr(P, "_local_translation", plan)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (clearance, 1.))
+    occupied = np.isclose(local_path.FORWARD, round(clearance / .05) * .05)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (~occupied, occupied))
+    depth = dict(_scene(2.), ground=occupied, frame_id=1000)
+
+    decision = P._avoid(.60, 0., 0., depth, cfg, P.APPROACHING, "", state,
+                        target_distance=target_range, odom=odom)
+
+    assert sorted(tried) == [-1., 1.]
+    expected = expected_gap / (2.25 if stop_distance == .60 else 1.45)
+    assert decision[0] == pytest.approx(expected)
+    assert decision[1:4] == (0., 0., P.AVOIDING)
+    if expected_gap:
+        assert "低速接近" in decision[4]
+        if stop_distance == .60:
+            # Feeding back the first advance should yield a second slower advance.
+            state.commanded = (decision[0], 0., 0.)
+            odom["vx"] = decision[0]
+            ahead = clearance - .1 * decision[0]
+            monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (ahead, 1.))
+            following = P._avoid(.60, 0., 0., dict(depth, frame_id=1100), cfg,
+                                 P.APPROACHING, "", state, target_distance=target_range, odom=odom)
+            assert 0. < following[0] < decision[0]
+
+
+def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forward_sweep(monkeypatch):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, stop_distance_m=.6)
+    state = _state(motion_source="command")
+    scan = state.active_scan
+    scan.phase, scan.directions = "evaluate", (1., -1.)
+    scan.receipt_only = scan.command_only = scan.attempted = scan.issued_yaw = True
+    scan.side_frame = 1000
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(P, "_local_translation", lambda *args: None)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.28, 1.))
+    monkeypatch.setattr(local_path, "observe", lambda *args: (~occupied, occupied))
+
+    def tick(frame):
+        depth = dict(_scene(2.), ground=occupied, frame_id=frame)
+        return P._avoid(.60, 0., 0., depth, cfg, P.APPROACHING, "", state,
+                        target_distance=2., may_scan=True)
+
+    assert tick(1000)[:3] == (0., 0., 0.)
+    assert scan.active and scan.directions == (-1.,)
+    scan.phase, scan.side_frame = "evaluate", 1100
+    assert tick(1100)[0] > 0.
+    assert not scan.active and not scan.locked
+    occupied[local_path.START[0] + 5, local_path.START[1]] = True
+    assert tick(1200)[:3] == (0., 0., 0.)
+
+
 def test_near_sidestep_holds_forward_when_the_obstacle_leaves_view():
     cfg = _cfg(stop_distance_m=0.6)
     near = _scene(4.0, [(0.25, 0.6, 0.3)])

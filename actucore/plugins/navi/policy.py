@@ -1731,6 +1731,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                        or ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance))
     stop = config.obstacle_stop_m
     slow = config.slow_distance_m
+    depth_age_s = config.depth_age_limit_ms / 1000
     if foreground:
         # Reserve the distance travelled in one observation freshness window.
         motion = planar_feedback(odom) if config.local_planning else None
@@ -1738,7 +1739,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             measured_vx = motion[0]
         last_vx = state.commanded[0] if state is not None else 0.0
         speed = max(0.0, measured_vx or 0.0, last_vx)
-        stop = min(slow, stop + speed * config.depth_age_limit_ms / 1000)
+        stop = min(slow, stop + speed * depth_age_s)
     near = ahead is not None and ahead <= stop
     approaching = ahead is not None and ahead < slow
     scale = 1.0
@@ -1751,6 +1752,24 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     local_command = None
     scan = state.active_scan if config.local_planning and state is not None else None
     if near or (foreground and approaching):
+        brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
+        horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        approach = 0.
+        if (foreground and aligned and depth.get("map") is not None
+                and target_distance is not None and brake_at < ahead < slow):
+            limit = (ahead - brake_at) / horizon_s
+            floor = config.floor_vx
+            if config.local_planning:
+                # Include the new command in the travel reserve used on the next tick.
+                stationary_line = config.obstacle_stop_m + BLOCKED_APPROACH_BUFFER_M
+                limit = min(limit, (target_distance - config.stop_distance_m) / horizon_s,
+                            (ahead - stationary_line) / (horizon_s + depth_age_s))
+                if config.floor_vx_moving is not None:
+                    floor = config.floor_vx_moving
+            speed = min(vx * scale, config.vx_max, limit)
+            if speed > 0 and speed >= floor:
+                approach = speed
+
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
@@ -1780,7 +1799,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             if local_command is None and transitioning:
                 return 0.0, 0.0, 0.0, AVOIDING, LocalHold.TRANSITION.value
             if scan is not None and scan.ready:
-                if local_command is not None:
+                if local_command is not None or (not near and len(scan.directions) <= 1):
                     scan.finish()
                 elif not near and scan.try_other_side():
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：尝试另一侧"
@@ -1795,8 +1814,25 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 if (scan is not None and may_scan and foreground and not near and config.use_lateral
                         and config.floor_wz <= yaw_rate and yaw_rate > 0 and scan.begin(order)):
                     return 0.0, 0.0, 0.0, AVOIDING, "主动观察：停车后观察较空旷的一侧"
-                if state.motion_source != "command" and planar_feedback(odom) is None:
+                feedback = planar_feedback(odom)
+                if state.motion_source != "command" and feedback is None:
                     return 0.0, 0.0, 0.0, AVOIDING, "缺少可用的速度或连续位姿，局部规划和主动观察暂停"
+                if approach and scan is not None and not (scan.active or scan.locked):
+                    geometry = config.scan_geometry if "scan_grid" in planning_depth else config.local_geometry
+                    motion = feedback if feedback is not None else state.command_tail
+                    velocities = (motion, state.commanded)
+                    if (geometry is not None and depth.get("ground") is not None
+                            and depth.get("frame_id") is not None
+                            and all(abs(vy) <= STILL_LINEAR and abs(wz) <= STILL_YAW
+                                    and abs(vx) <= approach + .02 for vx, vy, wz in velocities)):
+                        grid = state.local_plan.grid_for(planning_depth, geometry)
+                        if local_path.transition_clear(grid, geometry, keep, horizon_s,
+                                                       (motion[:2], state.commanded[:2], (approach, 0.))):
+                            state.recovery = None
+                            state.view_detour = None
+                            state.avoidance_yaw_override = True
+                            return (approach, 0., 0., AVOIDING,
+                                    f"两侧无可执行避让路线；低速接近（障碍停车线 {brake_at:.2f} m）")
                 if state is not None and state.view_detour is not None:
                     return 0.0, 0.0, 0.0, AVOIDING, LocalHold.PREFIX.value
                 return 0.0, 0.0, 0.0, AVOIDING, "局部规划未找到可执行的避让路线；停下"
@@ -1812,20 +1848,11 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 left, right = (_side_label(rooms[s][0], config) for s in (-1.0, 1.0))
                 blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
                            f"（左 {left}，右 {right}）")
-                brake_at = min(slow, stop + BLOCKED_APPROACH_BUFFER_M)
-                if (foreground and aligned and depth.get("map") is not None
-                        and target_distance is not None
-                        and (state is None or state.recovery is None)
-                        and brake_at < ahead < slow):
-                    horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
-                    limit = (ahead - brake_at) / horizon_s
-                    approach = min(vx * scale, config.vx_max, limit)
-                    # Stay within the limit even when the gait has a speed floor.
-                    if approach > 0.0 and approach >= config.floor_vx:
-                        if state is not None:
-                            state.escape_side = 0.0
-                        return (approach, 0.0, 0.0, AVOIDING,
-                                f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
+                if approach and (state is None or state.recovery is None):
+                    if state is not None:
+                        state.escape_side = 0.0
+                    return (approach, 0.0, 0.0, AVOIDING,
+                            f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
                 if state is not None:
                     state.escape_side = 0.0
                     state.recovery = ClearanceRecovery()
