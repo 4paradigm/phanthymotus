@@ -237,8 +237,8 @@ def test_stalled_optional_projection_does_not_block_scan_mapping(calibrated_node
         send(n)
         assert entered.wait(1)
         assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1, timeout=.6)
-        assert n.status()['rgb_preparation']['first_map_budget_ms'] == 250
-        assert 'exceeded 250 ms' in n.status()['rgb_input']['reason']
+        assert n.status()['rgb_preparation']['first_map_budget_ms'] == 400
+        assert 'exceeded 400 ms' in n.status()['rgb_input']['reason']
         n._measurement_clock_ns = lambda: 1_100_000_000
         send(n, 1100)
         assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2, timeout=.2)
@@ -900,6 +900,29 @@ def test_new_map_retains_first_scan_with_its_slow_visual_anchor(calibrated_node,
     root = published(n, '/sensor_data')[0].raw_messages[0]
     assert root.left.data and root.right.data and root.laser_scan.data
     assert root.left.header.stamp == root.header.stamp
+
+
+@pytest.mark.parametrize('has_root', [False, True])
+def test_measured_rgb_anchor_waits_for_tianyi_projection_latency(calibrated_node, held_projection, has_root):
+    n = calibrated_node
+    if has_root:
+        send(n, 1000)
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    sent = int(has_root)
+    ms = 1100 if has_root else 1000
+    entered, release = held_projection
+    image(n, ms)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    send(n, ms)
+    assert entered.wait(1)
+    # The field probe measured about 290ms p95. Keep this observation
+    # associated with its own prepared RGB-D at that latency.
+    assert not _wait_until(lambda: n.status()['forwarded_clouds'] > sent, timeout=.29)
+    release.set()
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == sent+1)
+    envelope = published(n, '/sensor_data')[0].raw_messages[-1]
+    assert envelope.left.data and envelope.right.data and envelope.laser_scan.data
+    assert envelope.left.header.stamp == envelope.header.stamp
 
 
 @pytest.mark.parametrize('first_visual_unconfirmed', [False, True])

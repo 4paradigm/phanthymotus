@@ -268,29 +268,23 @@ public:
                 }
                 return accepted;
             };
-            if(images && map.getLocalOptimizedPoses().size()==1)
+            const auto *last=images?map.getMemory()->getLastWorkingSignature():nullptr;
+            if(last && map.getLocalOptimizedPoses().count(last->id()) &&
+               !hasVisualGeometry(last->getWords3()) && hasVisualGeometry(data.keypoints3D()))
             {
-                const auto *root=map.getMemory()->getSignature(map.getLocalOptimizedPoses().begin()->first);
-                const auto &points=data.keypoints3D();
-                if(root && root->getWords3().size()<static_cast<size_t>(minInliers_) &&
-                   std::count_if(points.begin(),points.end(),[](const cv::Point3f & p) {
-                       return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
-                   })>=minInliers_)
+                // Retain a visual anchor after scan-only keyframes, even if
+                // the first usable image arrives while the robot is stationary.
+                rtabmap::ParametersMap restore;
+                for(const auto *key:{"RGBD/LinearUpdate","RGBD/AngularUpdate"})
                 {
-                    // A scan-only root cannot support a visual closure. Keep
-                    // the first measured visual anchor even while stationary.
-                    rtabmap::ParametersMap restore;
-                    for(const auto *key:{"RGBD/LinearUpdate","RGBD/AngularUpdate"})
-                    {
-                        const auto value=map.getParameters().find(key);
-                        restore[key]=value==map.getParameters().end()?
-                            rtabmap::Parameters::getDefaultParameters().at(key):value->second;
-                    }
-                    map.parseParameters({{"RGBD/LinearUpdate","0"},{"RGBD/AngularUpdate","0"}});
-                    const bool accepted=processExternal();
-                    map.parseParameters(restore);
-                    return accepted;
+                    const auto value=map.getParameters().find(key);
+                    restore[key]=value==map.getParameters().end()?
+                        rtabmap::Parameters::getDefaultParameters().at(key):value->second;
                 }
+                map.parseParameters({{"RGBD/LinearUpdate","0"},{"RGBD/AngularUpdate","0"}});
+                const bool accepted=processExternal();
+                map.parseParameters(restore);
+                return accepted;
             }
             return processExternal();
         }
@@ -432,6 +426,13 @@ public:
 private:
     using ExternalRun=std::array<unsigned char,16>;
     static constexpr double maxExternalScanGap_=6.;
+
+    bool hasVisualGeometry(const std::vector<cv::Point3f> & points) const
+    {
+        return std::count_if(points.begin(),points.end(),[](const cv::Point3f & p) {
+            return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+        })>=minInliers_;
+    }
 
     static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns)
     {

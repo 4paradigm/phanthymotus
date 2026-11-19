@@ -41,10 +41,11 @@ int main(int argc, char **argv)
     const bool externalContinuity=continuityOutage || mode=="external_continuity" || mode=="external_continuity_new_run" ||
         mode=="external_continuity_untagged" || mode=="external_continuity_stale";
     const bool stationaryAnchor=mode=="stationary_visual_anchor";
+    const bool refreshAnchor=mode=="refresh_visual_anchor";
     const bool nativeRecovery=mode=="recovery" || mode=="recovery_gap" || mode=="recovery_event" ||
         mode=="scan_mask" || imuPrediction || voHandoff || firstVisualSeed || mode=="finalize_cache" || mode=="history_without_cache" || mode=="fallback_cov" || mode=="fallback_lost" ||
         mode=="fallback_unpaired" || mode=="resume" || mode=="rgb" || mode=="ltm" ||
-        rejectedColdQuery || delayedExternal || neighborRetry || externalContinuity || continuityVisual || stationaryAnchor;
+        rejectedColdQuery || delayedExternal || neighborRetry || externalContinuity || continuityVisual || stationaryAnchor || refreshAnchor;
     rtabmap::ParametersMap p;
     // The same core parameters as mapping_parameters(); do not tune matching thresholds.
     p["Reg/Strategy"]="1"; p["Icp/Strategy"]="0"; p["Optimizer/Strategy"]="0";
@@ -89,8 +90,9 @@ int main(int argc, char **argv)
     {
         if(mode!="recovery" && mode!="recovery_gap" && mode!="recovery_event" && mode!="resume" && !hasPose) break;
         if(phase=="depth_gap") continue; // Source interruption: no metric observation.
-        const int sourceFrame=stationaryAnchor?0:i;
+        const int sourceFrame=stationaryAnchor?0:(refreshAnchor && i>=3?2:i);
         if(stationaryAnchor) externalX=truthX=0.f;
+        if(refreshAnchor && i>=3) { externalX=previousExternalX; truthX=previousTruthX; }
         cv::Mat rgb=cv::imread(root+"/"+std::to_string(sourceFrame)+".jpg");
         cv::Mat depth=cv::imread(root+"/"+std::to_string(sourceFrame)+".png", cv::IMREAD_UNCHANGED);
         if(rgb.empty() || depth.empty()) throw std::runtime_error("missing scene frame");
@@ -135,7 +137,7 @@ int main(int argc, char **argv)
         const bool gap=mode=="recovery_gap" && phase=="external_reset" && !gapInjected;
         const bool resetGap=mode=="recovery_gap" && phase=="continuous_reset" && !resetGapInjected;
         const bool noImages=neighborRetry || (externalContinuity && !(outage && mode=="external_continuity_outage_rgb")) ||
-            (stationaryAnchor && i==0) ||
+            (stationaryAnchor && i==0) || (refreshAnchor && i>=1 && i<=3) ||
             (delayedExternal && !delayedRgb && i>=1) || mode=="no_rgb" || mode=="history_without_cache" ||
             (mode=="vo_handoff_gap" && i==3) ||
             (phase=="rgb_gap" && !visualFault) || phase=="external_rgb_gap" ||
@@ -220,24 +222,34 @@ int main(int argc, char **argv)
                  <<",\"scan_proximity\":"<<stat(rtabmap::Statistics::kProximitySpace_detections_added_icp_multi())
                  <<",\"processing_ms\":"<<elapsed<<"}\n";
         evidence.flush();
-        if(stationaryAnchor && i==1)
+        if(refreshAnchor && i==3)
+        {
+            const auto *last=map.getMemory()->getLastWorkingSignature();
+            if(!accepted || map.getLocalOptimizedPoses().size()!=3 || !last || last->id()!=3 || s.refImageId()!=4)
+                throw std::runtime_error("the same-pose scan must be filtered before the next RGB-D anchor");
+        }
+        const int anchorFrame=refreshAnchor?4:1;
+        const int anchorId=anchorFrame+1;
+        const int neighborId=refreshAnchor?3:1;
+        const size_t anchoredNodes=refreshAnchor?4:2;
+        if((stationaryAnchor || refreshAnchor) && i==anchorFrame)
         {
             const auto *signature=map.getMemory()->getSignature(map.getLastLocationId());
             if(!accepted || recovery.odom().isNull() ||
-               map.getLocalOptimizedPoses().size()!=2 || !signature || signature->getWords3().size()<20 ||
-               !signature->hasLink(1,rtabmap::Link::kNeighbor))
-                throw std::runtime_error("a measured stationary visual observation must anchor a scan-only root");
+               map.getLocalOptimizedPoses().size()!=anchoredNodes ||
+               !signature || signature->getWords3().size()<20 || !signature->hasLink(neighborId,rtabmap::Link::kNeighbor))
+                throw std::runtime_error("a measured stationary RGB-D observation must form a connected visual anchor after scan-only mapping");
         }
-        if(stationaryAnchor && i==2)
+        if((stationaryAnchor || refreshAnchor) && i==anchorFrame+1)
         {
-            if(map.getLocalOptimizedPoses().size()!=2)
+            if(map.getLocalOptimizedPoses().size()!=anchoredNodes)
                 throw std::runtime_error("stationary frames must use regular keyframe gating after a visual anchor");
             map.close();
             rtabmap::Rtabmap reopened; reopened.init(p,output+".db");
-            const auto *anchor=reopened.getMemory()->getSignature(2);
-            if(reopened.getLocalOptimizedPoses().size()!=2 || !anchor || anchor->getWords3().size()<20 ||
-               !anchor->hasLink(1,rtabmap::Link::kNeighbor))
-                throw std::runtime_error("the first visual anchor must stay linked after reopening");
+            const auto *anchor=reopened.getMemory()->getSignature(anchorId);
+            if(reopened.getLocalOptimizedPoses().size()!=anchoredNodes ||
+               !anchor || anchor->getWords3().size()<20 || !anchor->hasLink(neighborId,rtabmap::Link::kNeighbor))
+                throw std::runtime_error("the visual anchor must stay linked after reopening");
             reopened.close(false);
             return 0;
         }

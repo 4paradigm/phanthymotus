@@ -82,7 +82,10 @@ from .pointcloud_normalization import decode_cloud, normalize_cloud
 _MAP_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST, depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 _RGB_WAIT_MS = 20
-_FIRST_MAP_RGB_WAIT_MS = 250
+# A measured observation can become a durable visual anchor. Keep its own
+# projection long enough for the measured Tianyi latency (~290 ms p95).
+_MEASURED_RGB_WAIT_MS = 400
+_FIRST_MAP_RGB_WAIT_MS = _MEASURED_RGB_WAIT_MS
 # Allow one default RTAB-Map detection period for native startup and a usable root.
 _MAP_ROOT_WINDOW_S = 1.
 _NATIVE_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
@@ -664,7 +667,7 @@ class RtabmapNode(Node):
         if self._root_deadline is None:
             self._root_deadline = (time.monotonic() + _MAP_ROOT_WINDOW_S
                 if self._restored_map is None and pose is not None and self._rgb.info()['received'] else 0.)
-        budget_ms = _RGB_WAIT_MS
+        budget_ms = _MEASURED_RGB_WAIT_MS if pose is not None else _RGB_WAIT_MS
         if not self._root_wait_done.is_set() and time.monotonic() < self._root_deadline:
             budget_ms = _FIRST_MAP_RGB_WAIT_MS
         try:
@@ -997,7 +1000,8 @@ class RtabmapNode(Node):
             queued, stopped, forwarded, dropped = len(self._queue), self._stopped(), self._forwarded, self._dropped
             motion_pending = len(self._motion_waiting)
             samples = list(self._rgb_preparation_ms)
-            rgb_preparation = dict(budget_ms=_RGB_WAIT_MS, first_map_budget_ms=_FIRST_MAP_RGB_WAIT_MS,
+            rgb_preparation = dict(budget_ms=_RGB_WAIT_MS, measured_budget_ms=_MEASURED_RGB_WAIT_MS,
+                first_map_budget_ms=_FIRST_MAP_RGB_WAIT_MS,
                 timeouts=self._rgb_timeouts,
                 published_images=self._rgb_published, sample_count=len(samples),
                 p95_ms=float(np.percentile(samples, 95)) if samples else None,
