@@ -328,6 +328,44 @@ def test_ground_fit_recovers_floor_beside_a_box_that_reaches_the_bottom():
     assert _corridor(frame, intrinsics=camera, ground=ground)[0] == pytest.approx(.6)
 
 
+@pytest.mark.parametrize("occlusion", [slice(None, 220), slice(420, None)])
+def test_ground_fit_uses_the_center_and_visible_side_beside_a_box(occlusion):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[270:, occlusion] = .71
+    camera = HorizontalIntrinsics(640, 315, 337)
+    ground = D.ground_mask(frame, camera, (480, 420, 243.2))
+
+    assert ground is not None and ground[420, 320]
+    assert not ground[270:, occlusion].any()
+    assert _corridor(frame, intrinsics=camera, ground=ground)[0] == pytest.approx(.71)
+
+
+def test_ground_fit_accepts_floor_around_a_wider_center_box():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[270:, 225:415] = .6
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+
+    assert ground is not None
+    assert ground[420, 120] and ground[420, 520]
+    assert not ground[270:, 225:415].any()
+
+
+def test_ground_fit_keeps_sparse_missing_pixels_unclassified():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    missing = np.s_[408:, 40:600:16]
+    frame[missing] = np.nan
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+
+    assert ground is not None and ground[420, 320]
+    assert not ground[missing].any()
+
+
 def test_ground_mask_keeps_a_surface_two_centimetres_above_the_floor():
     from plugins.navi.camera import HorizontalIntrinsics
 
