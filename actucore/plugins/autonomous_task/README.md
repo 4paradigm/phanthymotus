@@ -6,6 +6,8 @@
 
 三个 `image/jpeg` 输入口分别为头部、左腕、右腕。任一路都可省略，执行视觉任务至少要接一路。卡片只在决策和复核时取图。已接入的每一路都必须在本轮提供新的 JPEG。TRON2 的 `camera`、`camera_left`、`camera_right` 可直接连接。其他安装方式可用上游声明的相机 ID 或配置项 `head_topic`、`left_wrist_topic`、`right_wrist_topic` 将已连接的话题映射到物理位置。
 
+模型看不清局部时，可以通过 `observe` 指定原图区域。下一轮会同时提供带有来源帧编号的原分辨率裁剪和新采集的全景。每次最多查看两个视角，每项任务最多请求四次裁剪。
+
 在卡片配置中填写 `base_url`、`key`、`model_name`。服务需提供支持图像与函数调用的 Responses API。`arm_mode` 默认为 `left`，也可选 `right` 或 `both`。设置通过画布保存，或在部署环境的 ActuCore YAML 中提供。仅在需要留存实验图像时设置卡片 YAML 的 `record_dir`，卡片按任务分别写入模型实际看到的 JPEG、逐步反馈和终态。
 
 ## 调用

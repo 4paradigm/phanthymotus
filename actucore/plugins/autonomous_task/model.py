@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+import hashlib
+import io
 import json
 import math
 import urllib.error
@@ -83,7 +85,21 @@ or you cannot identify the object or establish clearance, keep the gripper
 still and return observe or failed with the reason. Otherwise you may explicitly
 select one offered closing command and describe the visual evidence for it.
 Closing is optional. When no tool is offered, only observe or failed is available.
+If the jaws are visibly empty, both fingers have clearance above the support,
+the closing path is clear of hands and obstacles, and that independent closure
+would allow re-opening and positioning for the task, you may choose it even
+when the target is not aligned. An empty closure establishes no grasp.
 An unresolved gripper condition cannot establish completion."""
+
+_CROP_REQUEST = """
+If local detail in a CURRENT full view would help, request one read-only
+observation with optional regions, as text JSON:
+{"status":"observe","reason":"...","regions":[{"camera":"head","bbox":[0.2,0.3,0.5,0.6]}]}.
+Choose your own box for each of up to two different currently supplied cameras,
+using [left,top,right,bottom] normalized to 0–1. Next turn you will see those
+original pixels at native resolution alongside fresh full views. Crops show
+the earlier observation and cannot reveal hidden surfaces. Use the new full
+views to establish current conditions. A region request issues no motion."""
 
 _REVIEW = """
 This is a read-only verification after settling. No motion tools are available.
@@ -163,6 +179,41 @@ def _check_arguments(name, args):
         raise ValueError("Absolute target requires a unit quaternion in xyzw order")
 
 
+def _crop_regions(images, regions, step):
+    from PIL import Image
+
+    if not isinstance(regions, list) or not 1 <= len(regions) <= 2:
+        raise ValueError("Request one region per camera, at most two")
+    crops = []
+    seen = set()
+    for region in regions:
+        if not isinstance(region, dict) or region.keys() != {"camera", "bbox"}:
+            raise ValueError("A region needs camera and bbox")
+        camera, bbox = region["camera"], region["bbox"]
+        if not isinstance(camera, str) or camera not in images or camera in seen:
+            raise ValueError("Each region must use a different wired camera")
+        seen.add(camera)
+        if (not isinstance(bbox, list) or len(bbox) != 4
+                or not all(_number(n) and 0 <= n <= 1 for n in bbox)
+                or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]):
+            raise ValueError("Expected a normalized [left,top,right,bottom] box")
+        jpeg = images[camera]
+        with Image.open(io.BytesIO(jpeg), formats=["JPEG"]) as original:
+            w, h = original.size
+            if w*h > 16*1024*1024:
+                raise ValueError("Source JPEG exceeds 16 megapixels")
+            box = (math.floor(w*bbox[0]), math.floor(h*bbox[1]), math.ceil(w*bbox[2]), math.ceil(h*bbox[3]))
+            cw, ch = box[2]-box[0], box[3]-box[1]
+            if min(cw, ch) < 16 or max(cw, ch) > 2048 or cw*ch > 1024*1024:
+                raise ValueError("Crop must be 16–2048 pixels per side and at most one megapixel")
+            buffer = io.BytesIO()
+            original.crop(box).save(buffer, format="PNG")
+        meta = {"camera": camera, "source_observation": step, "source_dimensions": [w, h],
+                "source_sha256": hashlib.sha256(jpeg).hexdigest(), "bbox_pixels": list(box)}
+        crops.append((meta, buffer.getvalue()))
+    return crops
+
+
 def _decision(response, allowed):
     if not isinstance(response, dict) or response.get("status") != "completed" or response.get("error"):
         raise ValueError("Model response did not complete")
@@ -199,11 +250,13 @@ def _decision(response, allowed):
         result = json.loads(note)
     except ValueError:
         raise ValueError("Expected an action or a JSON status with visual evidence") from None
-    if not (isinstance(result, dict) and set(result) == {"status", "reason"}
-            and result["status"] in ("done", "observe", "failed")
-            and isinstance(result["reason"], str) and result["reason"].strip()):
+    if not (isinstance(result, dict) and result.get("status") in ("done", "observe", "failed")
+            and isinstance(result.get("reason"), str) and result["reason"].strip()):
         raise ValueError("Invalid model status or missing evidence")
-    return result["status"], {"reason": result["reason"]}, result["reason"]
+    status = result.pop("status")
+    if result.keys() != {"reason"} and not (status == "observe" and result.keys() == {"reason", "regions"}):
+        raise ValueError("Unexpected model status fields")
+    return status, result, result["reason"]
 
 
 class TransientModelError(RuntimeError):
@@ -229,6 +282,8 @@ class Model:
         self._previous_state = {}
         self._grasp = {}
         self._used_close_handover_ids = set()
+        self._remaining_crop_requests = 4
+        self._pending_crops = []
         self._step = 0
         self.last_note = ""
         self.last_model = None
@@ -317,6 +372,11 @@ class Model:
         }, ensure_ascii=False, allow_nan=False)}]
         for index, frames in previous + [current]:
             phase = "CURRENT" if index == self._step else "HISTORICAL"
+            if index == self._step:
+                for meta, png in self._pending_crops:
+                    content.append({"type": "input_text", "text": "HISTORICAL native crop " + json.dumps(meta)})
+                    url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+                    content.append({"type": "input_image", "image_url": url, "detail": "high"})
             for camera, jpeg in frames.items():
                 content.append({"type": "input_text", "text": f"{phase} observation {index}: {camera} RGB"})
                 image_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
@@ -328,6 +388,8 @@ class Model:
                 handovers[side] = action_id
         close_only = None
         instructions = _INSTRUCTIONS
+        if self._remaining_crop_requests:
+            instructions += _CROP_REQUEST + f" Remaining region requests: {self._remaining_crop_requests}."
         if handovers:
             instructions += _CLOSE_HANDOVER
             close_only = {side for side, action_id in handovers.items()
@@ -350,6 +412,17 @@ class Model:
             raise ValueError("Response model does not match configured model_name")
         self.last_model = model
         name, args, self.last_note = _decision(result, {tool["name"] for tool in tools})
+        self._pending_crops = []
+        if name == "observe" and "regions" in args:
+            if self._remaining_crop_requests:
+                self._remaining_crop_requests -= 1
+                try:
+                    self._pending_crops = _crop_regions(images, args["regions"], self._step)
+                    args["crops"] = [meta for meta, _ in self._pending_crops]
+                except (ValueError, OSError, ImportError) as exc:
+                    args["crop_error"] = f"Unable to crop this observation: {exc}"
+            else:
+                args["crop_error"] = "Region request budget spent; use the fresh full views"
         if handovers and name not in ("observe", "failed"):
             if name == "done" or args.get("opening_mm") != 0:
                 raise ValueError("Guarded gripper handover requires a new nominal zero close, observe or failed")
