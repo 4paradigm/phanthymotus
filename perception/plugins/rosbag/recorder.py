@@ -117,6 +117,7 @@ class Recorder:
                 self._duration = time.monotonic() - self._started
                 self._started = None
             self._state = "error"
+            self._reason = "unexpected_exit"
             self._message = f"Recorder exited unexpectedly (code {code}); bag may be incomplete"
 
     def _watch(self, process, stop_event):

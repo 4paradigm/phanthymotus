@@ -118,6 +118,7 @@ def test_unexpected_exit_is_reported_by_info(harness):
     harness.process.returncode = 2
     result = harness.recorder.info()
     assert result["state"] == "error"
+    assert result["stop_reason"] == "unexpected_exit"
     assert "code 2" in result["message"]
     assert "incomplete" in result["message"]
 
