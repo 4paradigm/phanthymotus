@@ -1327,7 +1327,11 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config', 'end_live'}
-            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
+            # Public go_live is signed by authenticated Canvas. Never replay an
+            # unsigned config before forwarding it to the Bumi Driver.
+            skip_auto_config = action in _SYSTEM_ACTIONS_NO_CONFIG or (
+                req.tool == 'live_stream' and action == 'go_live')
+            if action and not skip_auto_config:
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
 

@@ -332,6 +332,8 @@ def _config_field_paths(ref_of: dict) -> list:
             continue
         sensitive, local_only = _must_clear_props(_tool_schema(mcps.get(mcp_id, {}), tool_name))
         pkey = f'{ref}:{tool_name}:{instance_id}' if instance_id else f'{ref}:{tool_name}'
+        if tool_name == 'live_stream':
+            sensitive.add('rtmp_url')  # Fail closed if Driver schema unavailable.
         for prop in value:
             out.append({
                 'path':       f'{pkey}:{prop}',
@@ -400,6 +402,8 @@ def _pack_canvas(ref_of: dict, extra_redact: set) -> tuple[dict, list]:
 
         sensitive, local_only = _must_clear_props(_tool_schema(mcps.get(mcp_id, {}), tool_name))
         packed = {}
+        if tool_name == 'live_stream':
+            sensitive.add('rtmp_url')  # Never export RTMP keys without metadata.
         for prop, val in value.items():
             path = f'{pkey}:{prop}'
             if prop in sensitive or prop in local_only or path in extra_redact:
