@@ -262,6 +262,36 @@ def test_measured_chassis_without_rgb_marks_origin_and_dense_run(node, legacy_fi
     assert markers[1][24:] != markers[2][24:]
 
 
+@pytest.mark.parametrize('quality', [
+    {'observation': {'schema': 'motus.observation/1', 'observation_stamp_ns': 1_100_000_000,
+                     'normalized_clock_id': 'another-label'}},
+    {'measurement': {'mapping': {'verified': False}}},
+    {'stamp_source': None, 'stamp_ns': None},
+], ids=['clock-label', 'unverified-mapping', 'missing-stamp-provenance'])
+def test_chassis_pose_with_uncertain_timing_reaches_native_without_a_continuity_token(node, quality):
+    import zlib
+    from test_pointcloud_slam_stream import chassis
+
+    observations = [(1000, 0., 'old', {}), (1100, .04, 'old', quality),
+                    (1200, 0., 'reset', {'stamp_source': None})]
+    for count, (ms, x, segment, extra) in enumerate(observations, start=1):
+        sample = chassis(ms, x, segment)
+        sample['vendor']['motus_slam'].update(extra)
+        node._odom(NS(data=json.dumps(sample)))
+        node._cloud(cloud(ms * 1_000_000))
+        assert _wait_until(lambda: node.status()['forwarded_clouds'] == count)
+
+    poses = [msg.pose.pose for msg in published(node, '/odom')[0].raw_messages]
+    assert [(p.position.x, p.orientation.w) for p in poses] == [(0., 1.), (.04, 1.), (0., 1.)]
+    markers = [zlib.decompress(bytes(msg.user_data)[:-12])
+               for msg in published(node, '/sensor_data')[0].raw_messages]
+    first, uncertain, reset = markers
+    assert all(len(marker) == 40 and marker.startswith(b'MOTUSCH1') for marker in markers)
+    assert first[8:24] == uncertain[8:24] != reset[8:24]
+    assert first[24:] != bytes(16)
+    assert uncertain[24:] == reset[24:] == bytes(16)
+
+
 def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
     send(node)
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)

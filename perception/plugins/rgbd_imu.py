@@ -61,6 +61,32 @@ def rotation_from_quaternion(q):
                      [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
 
 
+def interpolate_orientation(history, image_stamp_ns):
+    """Interpolate the shortest arc within a prevalidated orientation history."""
+    previous = None
+    for stamp, quaternion in history:
+        if stamp == image_stamp_ns:
+            return quaternion.tolist()
+        if stamp > image_stamp_ns:
+            if previous is None:
+                return None
+            before, a = previous
+            ratio = (image_stamp_ns-before) / (stamp-before)
+            b = quaternion
+            dot = float(a @ b)
+            if dot < 0.:
+                b, dot = -b, -dot  # q and -q have the same rotation.
+            dot = min(1., max(0., dot))
+            if dot > .9995:
+                result = (1.-ratio)*a + ratio*b
+            else:
+                angle = np.arccos(dot)
+                result = (np.sin((1.-ratio)*angle)*a + np.sin(ratio*angle)*b) / np.sin(angle)
+            return (result / np.linalg.norm(result)).tolist()
+        previous = stamp, quaternion
+    return None  # No extrapolation beyond the last measured capture.
+
+
 class ImuAttitude:
     """Relative-heading gyro integration with bounded gravity tilt correction.
 
@@ -164,31 +190,10 @@ class ImuAttitude:
         """
         if self.state != 'active' or not self.orientation_history or type(image_stamp_ns) is not int:
             return None
-        previous = None
         history = self.orientation_history
         if calibrated:
             history = islice(history, len(history)-self.rotation_run_length, None)
-        for stamp, quaternion in history:
-            if stamp == image_stamp_ns:
-                return quaternion.tolist()
-            if stamp > image_stamp_ns:
-                if previous is None:
-                    return None
-                before, a = previous
-                ratio = (image_stamp_ns-before) / (stamp-before)
-                b = quaternion
-                dot = float(a @ b)
-                if dot < 0.:
-                    b, dot = -b, -dot  # q and -q have the same rotation.
-                dot = min(1., max(0., dot))
-                if dot > .9995:
-                    result = (1.-ratio)*a + ratio*b
-                else:
-                    angle = np.arccos(dot)
-                    result = (np.sin((1.-ratio)*angle)*a + np.sin(ratio*angle)*b) / np.sin(angle)
-                return (result / np.linalg.norm(result)).tolist()
-            previous = stamp, quaternion
-        return None  # No extrapolation beyond the last measured capture.
+        return interpolate_orientation(history, image_stamp_ns)
 
     def info(self, now_ns):
         return {'enabled': True, 'status': self.status(now_ns), 'reason': self.reason,

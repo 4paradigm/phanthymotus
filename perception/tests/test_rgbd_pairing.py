@@ -1,5 +1,6 @@
 from dataclasses import replace
 from types import SimpleNamespace as NS
+import pytest
 from plugins.spatial_time import TimePolicy
 from plugins.rgbd_pairing import RgbdPairer
 
@@ -138,6 +139,62 @@ def test_different_capture_clocks_use_bounded_common_receipts():
     assert pair.method == 'receipt_estimated' and pair.skew_ns == 123
     assert pair.color_time.time_basis == pair.depth_time.time_basis == 'receipt_estimated'
     assert pair.color_context is near and pair.depth_context is b
+
+
+@pytest.mark.parametrize('clock_id', ['depth_clock', ''])
+def test_close_numeric_capture_stamps_pair_despite_clock_labels_and_delayed_ingress(clock_id):
+    pairer = RgbdPairer()
+    first = replace(context(capture='7'), mapping_verified=True, mapping_offset_ns=1)
+    second = replace(context(1_001_000_000, capture='7'), normalized_clock_id=clock_id,
+                     ingress_realtime_ns=first.ingress_realtime_ns+80_000_000,
+                     ingress_monotonic_ns=first.ingress_monotonic_ns+80_000_000)
+
+    assert pairer.push('color', msg(), first) is None
+    pair = pairer.push('depth', msg(), second)
+
+    assert pair is not None
+    assert pair.method == 'nearest_capture_estimated' and pair.skew_ns == 1_000_000
+    assert pair[0][0] == first.observation_stamp_ns
+    assert pair[1][0] == second.observation_stamp_ns
+    assert pair.color_context is first and pair.depth_context is second
+    assert pair.color_time.time_basis == pair.depth_time.time_basis == 'capture_estimated'
+    estimated_clock = pair.color_time.normalized_clock_id
+    assert estimated_clock == pair.depth_time.normalized_clock_id
+    assert estimated_clock not in (first.normalized_clock_id, second.normalized_clock_id, first.ingress_clock_id)
+    assert pair.color_time.parent_observation_ids == (first.observation_id,)
+    assert pair.depth_time.parent_observation_ids == (second.observation_id,)
+    assert not pair.color_time.mapping_verified and pair.color_time.mapping_offset_ns is None
+    assert pair.color_time.source_capture_id is None and pair.depth_time.source_capture_id is None
+
+    # The same estimated timeline applies when the other stream arrives first.
+    pairer.push('depth', msg(), second)
+    assert pairer.push('color', msg(), first).depth_time.normalized_clock_id == estimated_clock
+
+
+def test_declared_common_capture_clock_precedes_estimated_numeric_alignment():
+    pairer = RgbdPairer()
+    declared = context()
+    closer = replace(context(1_012_000_000), normalized_clock_id='other')
+    pairer.push('color', msg(), declared)
+    pairer.push('color', msg(), closer)
+
+    pair = pairer.push('depth', msg(), context(1_012_000_000))
+
+    assert pair.color_context is declared and pair.method == 'nearest_capture'
+
+
+def test_close_numeric_capture_precedes_receipt_fallback():
+    pairer = RgbdPairer()
+    aligned = replace(context(), normalized_clock_id='other')
+    receipt = context(1_080_000_000, receipt=True)
+    pairer.push('color', msg(), aligned)
+    pairer.push('color', msg(), receipt)
+
+    depth = replace(context(1_001_000_000), ingress_realtime_ns=receipt.ingress_realtime_ns,
+                    ingress_monotonic_ns=receipt.ingress_monotonic_ns)
+    pair = pairer.push('depth', msg(), depth)
+
+    assert pair.color_context is aligned and pair.method == 'nearest_capture_estimated'
 
 
 def test_unscoped_capture_ids_do_not_override_closer_observation():

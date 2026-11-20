@@ -102,12 +102,15 @@ def test_chassis_gap_and_jump_do_not_certify_interpolated_pose(second):
     assert middle is None
 
 
-def test_cloud_between_measured_chassis_origins_has_no_interpolated_pose():
+@pytest.mark.parametrize('stamp_source', ['measurement', None])
+def test_cloud_between_declared_chassis_origins_has_no_interpolated_pose(stamp_source):
     unposed = []
     s = stream(on_unlocalized_frame=lambda stamp, *args: unposed.append(stamp))
     s.odom(chassis(1000, 2.4, 'old'), now=1.)
     s.cloud(1_100_000_000, 'camera', [[0., 0., 1.]], now=1.1)
-    s.odom(chassis(1200, 0., 'reset'), now=1.2)
+    reset = chassis(1200, 0., 'reset')
+    reset['vendor']['motus_slam']['stamp_source'] = stamp_source
+    s.odom(reset, now=1.2)
     assert not s.accepted
     assert unposed == [1_100_000_000]
 
@@ -141,6 +144,25 @@ def test_chassis_timing_contradiction_keeps_numeric_pose_without_continuity(meta
     s.odom(sample, now=1.1)
     s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=1.1)
     assert s.accepted[0].pose.position == (.03, 0., 0.)
+    assert s.accepted[0].pose.external_continuity is None
+
+
+@pytest.mark.parametrize('quality', [
+    None,
+    {'clock_id': 'another-label', 'stamp_source': 'receipt_estimated'},
+    {'measurement': {'mapping': {'verified': False}}},
+])
+def test_static_cloud_brackets_numeric_poses_without_matching_provenance(quality):
+    s = stream(on_unlocalized_frame=lambda *args: pytest.fail('cloud lost its numeric pose'))
+    s.odom(odom(1000), now=1.)
+    s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=1.1)
+    later = odom(1200, .2)
+    if quality is None:
+        del later['vendor']
+    else:
+        later['vendor']['motus_slam'].update(quality)
+    s.odom(later, now=1.3)
+    assert s.accepted[0].pose.position == pytest.approx((.1, 0., 0.))
     assert s.accepted[0].pose.external_continuity is None
 
 

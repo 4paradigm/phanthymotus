@@ -11,6 +11,8 @@ TRACKING_RESET_S = 5.
 
 
 def assistance_mode(calibration):
+    if calibration.get('controller_rotation') and not calibration.get('short_term_compensation'):
+        return 'controller_rotation'
     if not calibration.get('imu_topic'):
         return 'visual_only'
     if calibration.get('short_term_compensation'):

@@ -531,12 +531,14 @@ def estimator_parameters(calibration, segment):
               'Odom/ResetCountdown': '0', 'Odom/Strategy': '1' if optical else '0',
               'Vis/CorType': '1' if optical else '0',
               'Vis/MaxFeatures': str(max_features)}
-    if not optical and not (calibration.get('imu_topic') and not calibration.get('short_term_compensation')):
+    native_imu = (calibration.get('imu_topic') and not calibration.get('short_term_compensation') and
+                  not association_enabled(calibration))
+    if not optical and not native_imu:
         params['motus_matched_landmarks'] = True
     if optical:
         params.update({'Vis/CorFlowWinSize': '16', 'Vis/CorFlowMaxLevel': '3',
                        'Vis/CorFlowIterations': '30', 'Vis/CorFlowPyramidWithGuess': 'true'})
-    if calibration.get('imu_topic') and not calibration.get('short_term_compensation'):
+    if native_imu:
         params.update(wait_imu_to_init=True, **{'Odom/GuessSmoothingDelay': '0'})
     else:
         # Camera-start map axes: optical forward/right/down become +X/-Y/-Z.
@@ -786,12 +788,18 @@ class RgbdSession:
         self.contexts_by_stamp = OrderedDict()
         calibration = observation_calibration(calibration, self.time_policy.clock_id)
         self.assistance_unavailable = None
+        controller = calibration.get('controller_rotation')
+        if (controller is not None and (calibration.get('time_basis') != 'source_capture' or
+                                        controller['clock_id'] != calibration['clock_id'])):
+            calibration.pop('controller_rotation')
+            self.assistance_unavailable = 'controller rotation alignment does not match the camera capture clock'
         if association_enabled(calibration):
             binary = require_runtime()
             try:
                 require_rotation_hint_runtime(binary)
             except RuntimeError as error:
                 calibration['inertial_association'] = False
+                calibration.pop('controller_rotation', None)
                 self.assistance_unavailable = str(error)
         self.calibration, self.executor, self.topic = calibration, executor, topic
         self.publish_output = publish_output
@@ -815,7 +823,8 @@ class RgbdSession:
         self.mounts = (CaptureMounts(calibration['body_mount'], calibration['frame_id'], calibration['clock_id'])
                        if calibration.get('body_mount') else None)
         self.imu = (self.fusion.imu if self.fusion else
-                    ImuAttitude(calibration['frame_id'], calibration['clock_id']) if calibration.get('imu_topic') else None)
+                    ImuAttitude(calibration['frame_id'], calibration['clock_id'])
+                    if calibration.get('imu_topic') and not association_enabled(calibration) else None)
         self.auxiliary_probe = (AuxiliaryHealthProbe(calibration['frame_id'], calibration['clock_id'],
             require_translation=bool(self.requested_calibration.get('short_term_compensation')))
             if self.requested_calibration.get('imu_topic')
@@ -871,7 +880,11 @@ class RgbdSession:
                 qos_profile_sensor_data)
             self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
             self.rotation_hints = RotationHints(calibration, self.node, self.segment, qos_profile_sensor_data)
-            if start_with_rotation_only:
+            controller = calibration.get('controller_rotation')
+            if controller is not None:
+                self.node.create_subscription(String, controller['topic'], self._controller_imu,
+                                              qos_profile_sensor_data)
+            if start_with_rotation_only and self.fusion is not None:
                 # Use the existing optional-hint fallback before processing any captures.
                 self.fusion.fault('recovering visual tracking before retrying ESKF')
                 self._check_fusion(time.time_ns())
@@ -1084,8 +1097,9 @@ class RgbdSession:
             if (mode['degraded'] and self.gate.state == 'lost' and
                     self.gate.loss_kind in ('visual', 'relocalization')):
                 # Healthy IMU packets cannot fix a failed visual frontend or map rejoin.
-                calibration = (dict(source, _start_with_rotation_only=True) if self.rotation_hints.enabled
-                               else visual_calibration(source))
+                calibration = dict(source) if self.rotation_hints.enabled else visual_calibration(source)
+                if self.rotation_hints.enabled and calibration.get('short_term_compensation'):
+                    calibration['_start_with_rotation_only'] = True
                 return dict(action='restart', calibration=calibration, reason=self.gate.reason)
             health = self._auxiliary_info(now_ns, now_s)
             if (mode['degraded'] and health.get('status') == 'ready' and
@@ -1141,6 +1155,16 @@ class RgbdSession:
                 self.imu_pending.popleft()
             self.imu_pending.append(msg)
 
+    def _controller_imu(self, msg):
+        with self.lock:
+            if self.stop_event.is_set():
+                return
+            try:
+                packet = json.loads(msg.data)
+            except (ValueError, TypeError, AttributeError):
+                return
+            self.rotation_hints.observe_controller(packet, time.time_ns())
+
     def _drain_imu(self):
         # Caller owns the estimator lock; ingress only touches its own queue.
         if not hasattr(self, 'imu_pending'):
@@ -1160,6 +1184,11 @@ class RgbdSession:
                 return
             try:
                 packet = json.loads(msg.data)
+                if (isinstance(packet, dict) and packet.get('schema') == 'motus.imu/1' and
+                        'quaternion' in packet):
+                    self.rotation_hints.observe_controller(packet, time.time_ns(), aligned=True)
+                    if 'angular_velocity' not in packet and 'linear_acceleration' not in packet:
+                        return  # An orientation-only packet is an optional hint, not a fusion input.
                 if self._probing_auxiliary():
                     self.auxiliary_probe.observe(packet, time.time_ns(), time.monotonic())
                 if self.gate.state == 'lost' or self.imu is None:
@@ -1263,7 +1292,14 @@ class RgbdSession:
                     for message, ctx in ((color, pair.color_time), (depth, pair.depth_time)):
                         message.header.stamp.sec, message.header.stamp.nanosec = divmod(ctx.observation_stamp_ns, 10**9)
                 capture_stamp = native_capture_stamp(color, depth)
+                capture_clock = None
+                estimated_capture = False
                 if isinstance(pair, RgbdPair):
+                    if (pair.color_time.time_basis == pair.depth_time.time_basis == 'source_capture' and
+                            pair.color_time.normalized_clock_id == pair.depth_time.normalized_clock_id):
+                        capture_clock = pair.color_time.normalized_clock_id
+                    estimated_capture = (pair.color_time.time_basis == 'capture_estimated' or
+                                         pair.depth_time.time_basis == 'capture_estimated')
                     selected = pair.color_time if capture_stamp == pair.color_time.observation_stamp_ns else pair.depth_time
                     other=pair.depth_time if selected is pair.color_time else pair.color_time
                     selected=replace(selected,observation_id=uuid.uuid4().hex,
@@ -1316,6 +1352,13 @@ class RgbdSession:
                 if hasattr(self,'stage_times'):
                     with self.lock:self.stage_times['decode'].append(max(0,time.monotonic_ns()-decode_started))
                 wait_started=time.monotonic_ns()
+                if estimated_capture:
+                    with self.lock:
+                        if self._fusing():
+                            self.fusion.fault('RGB-D capture clocks are unverified for ESKF')
+                            self._check_fusion(time.time_ns())
+                        elif self.fusion is None and self.imu is not None:
+                            self.gate.fault('RGB-D capture clocks are unverified for native IMU', 'imu')
                 covered=self._wait_for_imu(capture_stamp, deadline=imu_deadline)
                 if hasattr(self,'stage_times'):
                     with self.lock:self.stage_times['imu_wait'].append(max(0,time.monotonic_ns()-wait_started))
@@ -1353,7 +1396,8 @@ class RgbdSession:
                         while len(self.quality_by_stamp) > 32:
                             self.quality_by_stamp.popitem(last=False)
                         if getattr(self, 'rotation_hints', None) is not None:
-                            self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns())
+                            self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns(),
+                                available=not estimated_capture, capture_clock=capture_clock)
                         probe_deadline = getattr(self.gate, 'relocalization_deadline_mono', None)
                         if probe_deadline is not None:
                             # A dropped best-effort probe has no acknowledgement.
@@ -1407,7 +1451,8 @@ class RgbdSession:
                             f'{np.rad2deg(offset[1]):.1f} deg)', 'fusion')
             return
         hints = getattr(self, 'rotation_hints', None)
-        mode = 'visual' if hints and hints.enabled else 'visual_only'
+        mode = ('controller_rotation' if self.calibration.get('controller_rotation') else
+                'visual' if hints and hints.enabled else 'visual_only')
         self.fallback = dict(mode=mode, reason=reason, since_ns=now,
                              fused_visual_offset_m=None if offset is None else round(offset[0], 4),
                              fused_visual_offset_deg=None if offset is None else round(float(np.rad2deg(offset[1])), 2))
@@ -1504,7 +1549,7 @@ class RgbdSession:
             slam = sample['vendor']['motus_slam']
             slam.update(profile='motus_slam/2', observation=context.to_dict(), clock_id=context.normalized_clock_id)
             if slam['status'] == 'tracking':
-                slam['stamp_source'] = 'measurement' if context.time_basis == 'source_capture' else 'receipt_estimated'
+                slam['stamp_source'] = 'measurement' if context.time_basis == 'source_capture' else context.time_basis
             sample['vendor']['association'] = dict(id=pair.association_id, method=pair.method, skew_ns=pair.skew_ns,
                 inputs=[pair.color_context.to_dict(), pair.depth_context.to_dict()])
         quality = getattr(self, 'quality_by_stamp', {}).get(stamp, QualityReport())
@@ -1716,7 +1761,7 @@ class RgbdSession:
         context=getattr(self,'published_context',None)
         if context is None:return {}
         result=dict(observation=context.to_dict())
-        if context.time_basis=='receipt_estimated':
+        if context.time_basis in ('receipt_estimated', 'capture_estimated'):
             from .spatial_contract import input_declaration
             result['input_metadata']=[input_declaration(self.topic,'pose',self.calibration['frame_id'],context)]
         return result

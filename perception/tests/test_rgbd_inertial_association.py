@@ -160,6 +160,74 @@ def test_private_hint_publishes_identity_at_exact_capture_without_assimilating_i
     assert report['native_applied'] is None  # DDS delivery/native selection is not observed here.
 
 
+def controller_profile(**changes):
+    profile = dict(topic='/body/orientation', clock_id='capture-clock', calibration_id='verified-mount',
+                   camera_from_body=[.5, -.5, .5, .5], read_time_offset_ns=-5_000_000)
+    profile.update(changes)
+    return profile
+
+
+def controller_packet(stamp, quaternion, **fields):
+    return dict(dict(stamp_ns=stamp, quaternion=quaternion, timestamp_source='read_completion'), **fields)
+
+
+def test_controller_rotation_works_without_eskf_and_uses_calibrated_camera_basis(hint_node):
+    from plugins.rgbd_association import RotationHints
+    from plugins.rgbd_odometry_runtime import estimator_parameters
+    node, _, messages = hint_node
+    config = association_config(imu_topic=None, short_term_compensation=False,
+                                inertial_association=False, controller_rotation=controller_profile())
+    hints = RotationHints(config, node, 'segment-a', object())
+    stamp = 1_000_000_000
+    hints.observe_controller(controller_packet(stamp+5_000_000, [0., 0., 0., 1.]), stamp+5_000_000)
+    end = stamp+65_000_000
+    hints.observe_controller(controller_packet(end, [0., 0., np.sin(.05), np.cos(.05)]), end)
+    assert not hints.offer(None, stamp, end, capture_clock='another-camera')
+    assert not hints.offer(None, stamp+65_000_000, end, capture_clock='capture-clock')
+    assert hints.offer(None, stamp+30_000_000, end, capture_clock='capture-clock')
+    msg, = messages
+    q = msg.quaternion
+    mount = rotation_from_quaternion(controller_profile()['camera_from_body'])
+    expected = rotation_from_quaternion([0., 0., np.sin(.025), np.cos(.025)]) @ mount.T
+    np.testing.assert_allclose(rotation_from_quaternion([q.x,q.y,q.z,q.w]), expected, atol=1e-12)
+    assert msg.header.stamp.nanosec == 30_000_000
+    assert hints.info()['last_hint_source'] == 'controller_rotation'
+    params = estimator_parameters(config, 'segment-a')
+    assert params['motus_rotation_hint'] is True and params['wait_imu_to_init'] is False
+
+
+def test_controller_rotation_does_not_mix_absolute_origins_across_a_gap(hint_node):
+    from plugins.rgbd_association import RotationHints
+    node, _, messages = hint_node
+    hints = RotationHints(association_config(controller_rotation=controller_profile(read_time_offset_ns=0)),
+                          node, 'segment-a', object())
+    t = 1_000_000_000
+    hints.observe_controller(controller_packet(t, [0., 0., 0., 1.]), t)
+    assert hints.offer(observed_pair(), t, t, capture_clock='capture-clock')
+    reset = t+150_000_000
+    hints.observe_controller(controller_packet(reset, [0., 0., .6, .8]), reset)
+    assert not hints.offer(None, reset, reset, capture_clock='capture-clock')
+    assert len(messages) == 1
+    ready = t+751_000_000
+    hints.observe_controller(controller_packet(ready, [0., 0., .6, .8]), ready)
+    assert hints.offer(None, ready, ready, capture_clock='capture-clock')
+
+
+@pytest.mark.parametrize('fields', [{'quaternion': [0., 0., 0., 7.]},
+                                    {'timestamp_source': 'unknown'},
+                                    {'stamp_ns': 1_900_000_000}])
+def test_malformed_controller_samples_leave_legacy_capture_hint_available(hint_node, fields):
+    from plugins.rgbd_association import RotationHints
+    node, _, messages = hint_node
+    hints = RotationHints(association_config(controller_rotation=controller_profile()), node, 's', object())
+    now = 1_100_000_000
+    p = controller_packet(1_055_000_000, [0., 0., 0., 1.])
+    p.update(fields)
+    hints.observe_controller(p, now)
+    assert hints.offer(observed_pair(), 1_050_000_000, now, capture_clock='capture-clock')
+    assert len(messages) == 1 and hints.info()['last_hint_source'] == 'gyro_capture'
+
+
 def test_receipt_hint_keeps_selected_mode_and_does_not_gate_on_names(hint_node):
     from plugins.rgbd_association import RotationHints
     node,_,messages=hint_node
@@ -229,8 +297,8 @@ def test_runtime_parameter_mode_keeps_optional_hint_separate_from_legacy_imu():
 
 @pytest.fixture
 def hint_session(sessions, hint_node, monkeypatch, tmp_path):
+    from plugins.rgbd_odometry import RgbdOdometryPlugin
     from plugins import rgbd_odometry_runtime as runtime
-    from plugins.rgbd_odometry_contract import validate_start_inputs
     from test_rgbd_odometry_contract import declarations
     from test_rgbd_odometry_recovery import assisted_runtime
     from vision_stubs import _FakeExecutor
@@ -245,17 +313,19 @@ def hint_session(sessions, hint_node, monkeypatch, tmp_path):
         commands.append(command)
         return spawn(command, **kwargs)
     monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
-    calibration = validate_start_inputs(declarations(), ['/rgb', '/depth', '/imu'], True)
-    calibration.update(short_term_compensation=True, inertial_association=True)
-    session = runtime.RgbdSession(calibration, _FakeExecutor(), '/association/state/odom')
+    card = RgbdOdometryPlugin({}, _FakeExecutor())
+    result = card.dispatch('rgbd_odometry', dict(action='start', camera_info=declarations(),
+        input_topics=['/rgb', '/depth', '/nvidia_desktop/camera/rgbd/imu']))
+    assert result['state'] == 'running', result
+    session = card.instances['default'][0]
     try:
         yield session, sessions[1], commands
     finally:
         session.process.returncode = 0
-        session.close()
+        card.shutdown()
 
 
-def test_real_session_wires_private_hint_and_conservative_fusion(hint_session):
+def test_camera_imu_input_enables_native_rotation_hint_by_default(hint_session):
     import json
     from pathlib import Path
     session, _, commands = hint_session
@@ -270,6 +340,26 @@ def test_real_session_wires_private_hint_and_conservative_fusion(hint_session):
     session._watchdog()
     sample = json.loads(session.publisher.messages[-1])
     assert sample['vendor']['inertial_association']['native_applied'] is None
+
+
+@pytest.mark.parametrize('extra,expected', [({}, True), ({'clock_id': 'another-clock'}, False),
+                                          ({'camera_from_body': [1., 0.]}, False)])
+def test_connected_imu_uses_controller_quaternion_without_card_config(hint_session, extra, expected):
+    import json
+    session, now, _ = hint_session
+    for stamp in (now[0]-10_000_000, now[0]+10_000_000):
+        imu = dict(schema='motus.imu/1', stamp_ns=stamp, clock_id='camera-global',
+                   quaternion=[0., 0., 0., 1.], camera_from_body=[0.5, -0.5, 0.5, 0.5])
+        imu.update(extra)
+        session._imu(NS(data=json.dumps(imu)))
+    messages = []
+    session.rotation_hints.publisher.publish = messages.append
+    assert session.rotation_hints.offer(session.imu, now[0], now[0], capture_clock='camera-global') is expected
+    if expected:
+        q = messages[0].quaternion
+        np.testing.assert_allclose([q.x, q.y, q.z, q.w], [-.5, .5, -.5, .5])
+        assert session.rotation_hints.info()['last_hint_source'] == 'controller_rotation'
+    assert session.gate.state != 'lost'
 
 
 def test_visual_restart_preserves_optional_rotation_without_restarting_fusion(hint_session):
@@ -422,6 +512,7 @@ def test_recorded_odometry_includes_native_counters_without_an_info_request(hint
 
     session, now, _ = hint_session
     session.log.write(b'rotation_hint: frames=60 selected=49 supplied=38 rejected=0 late=0 evicted=0\n')
+    now[0] += 1_000_000_000  # Advance beyond the startup status log cache.
     sample = make_sample('initializing', now[0], session.segment, session.calibration['clock_id'])
     session._publish(sample)
     association = json.loads(session.publisher.messages[-1])['vendor']['inertial_association']

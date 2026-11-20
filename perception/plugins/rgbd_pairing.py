@@ -1,6 +1,6 @@
 """Bounded RGB-D association without inventing a common capture identity."""
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import uuid
 
 from .spatial_time import receipt_association
@@ -33,6 +33,7 @@ class RgbdPairer:
         self.queues = {k: deque() for k in ('color', 'depth')}
         self.max_pending, self.max_bytes = max_pending, max_bytes
         self.max_skew_ns, self.max_wait_ns = max_skew_ns, max_wait_ns
+        self.estimated_capture_clock_id = 'rgbd_capture_estimated/' + uuid.uuid4().hex
         self.sequence = 0
         self.dropped = 0
         self.dropped_by_side = dict(color=0, depth=0)
@@ -52,22 +53,22 @@ class RgbdPairer:
         self.dropped_by_side[kind] += 1
 
     def _candidate(self, first, second):
-        if (first.time_basis == second.time_basis == 'source_capture' and
-                first.normalized_clock_id and first.normalized_clock_id == second.normalized_clock_id):
+        if first.time_basis == second.time_basis == 'source_capture':
             skew = abs(first.observation_stamp_ns - second.observation_stamp_ns)
-            identity = (first.source_capture_id and (first.source_epoch or first.source_id) and
-                        first.source_capture_id == second.source_capture_id and
-                        first.source_epoch == second.source_epoch and first.source_id == second.source_id)
-            priority, method = (0, 'capture_id') if identity else (1, 'nearest_capture')
-        elif first.ingress_clock_id and first.ingress_clock_id == second.ingress_clock_id:
-            if abs(first.ingress_monotonic_ns - second.ingress_monotonic_ns) > self.max_skew_ns:
-                return None
+            if first.normalized_clock_id and first.normalized_clock_id == second.normalized_clock_id:
+                if skew > self.max_skew_ns:
+                    return None
+                identity = (first.source_capture_id and (first.source_epoch or first.source_id) and
+                            first.source_capture_id == second.source_capture_id and
+                            first.source_epoch == second.source_epoch and first.source_id == second.source_id)
+                return (0, skew, 'capture_id') if identity else (1, skew, 'nearest_capture')
+            if skew <= self.max_skew_ns:
+                return 2, skew, 'nearest_capture_estimated'
+        if (first.ingress_clock_id and first.ingress_clock_id == second.ingress_clock_id and
+                abs(first.ingress_monotonic_ns - second.ingress_monotonic_ns) <= self.max_skew_ns):
             skew = abs(first.ingress_realtime_ns - second.ingress_realtime_ns)
-            priority, method = 2, 'receipt_estimated'
-        else:
-            return None
-        if skew <= self.max_skew_ns:
-            return priority, skew, method
+            if skew <= self.max_skew_ns:
+                return 3, skew, 'receipt_estimated'
 
     def push(self, kind, message, context):
         if kind not in self.queues or type(getattr(context, 'observation_stamp_ns', None)) is not int:
@@ -116,5 +117,16 @@ class RgbdPairer:
         color_time, depth_time = a, b
         if method == 'receipt_estimated':
             color_time, depth_time = receipt_association(a), receipt_association(b)
+        elif method == 'nearest_capture_estimated':
+            # Retain capture values for visual processing on an unverified timeline.
+            color_time, depth_time = (
+                replace(ctx, observation_id=uuid.uuid4().hex,
+                        normalized_clock_id=self.estimated_capture_clock_id, time_basis='capture_estimated',
+                        source_capture_id=None, mapping_source=None, mapping_version=None,
+                        mapping_offset_ns=None, mapping_verified=False, uncertainty_ns=None,
+                        parent_observation_ids=(ctx.observation_id,),
+                        transformations=ctx.transformations+('numeric_capture_alignment',))
+                for ctx in (a, b)
+            )
         self.last_skew_ns = skew
         return RgbdPair(cm, dm, a, b, uuid.uuid4().hex, method, skew, color_time, depth_time)

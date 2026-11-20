@@ -82,8 +82,8 @@ def make_sample(status, stamp_ns, segment, clock, pose=None, *, reason=None, con
     if context is not None:
         quality = sample['vendor']['motus_slam']
         quality.update(profile='motus_slam/2', observation=context.to_dict())
-        if valid and context.time_basis == 'receipt_estimated':
-            quality['stamp_source'] = 'receipt_estimated'
+        if valid and context.time_basis != 'source_capture':
+            quality['stamp_source'] = context.time_basis
     if valid:
         validate_tracking_pose(sample)
     return sample

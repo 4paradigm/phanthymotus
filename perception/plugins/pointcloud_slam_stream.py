@@ -152,6 +152,7 @@ class SlamStream:
         self._drain(now, measurement_now_ns)
 
     def _track_measured_run(self, sample, pose, context):
+        """Preserve declared chassis origins and certify continuity separately."""
         vendor = sample.get('vendor')
         quality = vendor.get('motus_slam') if isinstance(vendor, dict) else None
         chassis = (isinstance(quality, dict) and quality.get('pose_source') == 'chassis_odometry' and
@@ -160,9 +161,8 @@ class SlamStream:
                   self._witnessed_visual(vendor, pose, context))
         origin = (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id,
                   quality.get('source_topic') if chassis else vendor.get('source') if visual else None)
-        if (not (chassis or visual) or not isinstance(quality, dict) or quality.get('status') != 'tracking' or
-                quality.get('stamp_source') != 'measurement' or quality.get('stamp_ns') != pose.stamp_ns or
-                pose.stamp_ns <= 0 or not all(isinstance(value, str) and value for value in origin)):
+        if (not isinstance(quality, dict) or not (chassis or visual) or
+                not all(isinstance(value, str) and value for value in origin)):
             self._measured_run = None
             return pose
         observation = pose.observation
@@ -171,21 +171,25 @@ class SlamStream:
         mapping = measurement.get('mapping')
         reference = quality.get('clock_reference')
         fusion = vendor.get('fusion')
-        if ((observation is not None and
-             (observation.time_basis != 'source_capture' or
-              observation.normalized_clock_id not in ('', pose.clock_id) or
-              (observation.mapping_offset_ns is not None and not observation.mapping_verified))) or
+        origin += (measurement.get('clock_epoch'), measurement.get('source_generation'),
+                   measurement.get('source_clock'), reference.get('domain_id') if isinstance(reference, dict) else None,
+                   observation.source_id if observation is not None else None,
+                   observation.source_epoch if observation is not None else None, chassis)
+        if (quality.get('status') != 'tracking' or quality.get('stamp_source') != 'measurement' or
+                quality.get('stamp_ns') != pose.stamp_ns or pose.stamp_ns <= 0 or
+                (observation is not None and
+                 (observation.time_basis != 'source_capture' or
+                  observation.normalized_clock_id not in ('', pose.clock_id) or
+                  (observation.mapping_offset_ns is not None and not observation.mapping_verified))) or
                 measurement.get('stamp_ns', pose.stamp_ns) != pose.stamp_ns or
                 measurement.get('clock_id', pose.clock_id) != pose.clock_id or
                 measurement.get('frame_id', pose.frame_id) != pose.frame_id or
                 (isinstance(mapping, dict) and mapping.get('verified') is False) or
                 (isinstance(fusion, dict) and fusion.get('mapping_allowed') is False)):
             self._measured_run = None
-            return pose
-        origin += (measurement.get('clock_epoch'), measurement.get('source_generation'),
-                   measurement.get('source_clock'), reference.get('domain_id') if isinstance(reference, dict) else None,
-                   observation.source_id if observation is not None else None,
-                   observation.source_epoch if observation is not None else None, chassis)
+            # Native still needs the gauge identity to check this numeric pose.
+            # Without a run token it verifies geometry before extending the map.
+            return replace(pose, chassis_origin=origin) if chassis else pose
         token = None
         if self._measured_run is not None:
             last_origin, previous = self._measured_run

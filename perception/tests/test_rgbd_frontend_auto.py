@@ -56,7 +56,7 @@ def frontend(card):
 
 def test_automatic_selection_starts_with_pinned_default(auto):
     card, args, *_ = auto
-    assert card.get_tools()[0]['configSchema']['properties'] == {}
+    assert set(card.get_tools()[0]['configSchema']['properties']) == {'controller_rotation'}
     result = start(card, args)
     assert result['config']['visual_frontend'] == 'auto'
     session = card.instances['one'][0]

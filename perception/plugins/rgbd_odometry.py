@@ -7,6 +7,7 @@ import time
 from copy import deepcopy
 
 from .rgbd_odometry_contract import start_topics, validate_start_inputs
+from .rgbd_association import validate_controller_rotation
 from .rgbd_odometry_runtime import RgbdSession, require_runtime
 from .rgbd_recovery import ASSISTANCE_RETRY_S, TRACKING_RESET_S, assistance_mode
 from utils.ros_lifecycle import dispose_node
@@ -14,7 +15,7 @@ from utils.ros_lifecycle import dispose_node
 
 _INTERFACE = {'schema': 'motus.odom/1', 'slam_pose': {'available': True, 'profile': 'motus_slam/1',
     'supported_profiles': ['motus_slam/1', 'motus_slam/2'],
-    'time_bases': ['source_capture', 'receipt_estimated']}}
+    'time_bases': ['source_capture', 'capture_estimated', 'receipt_estimated']}}
 _FRONTENDS = ('f2m_feature', 'f2f_optical_flow')
 # Engineering limits, not tuned on hardware. A switch needs a
 # visual-kind loss with fresh inputs, then waits out a cooldown; after two
@@ -32,6 +33,7 @@ class RgbdOdometryPlugin:
         self.lock = threading.RLock()
         self.recovery = {}
         self.frontends = {}
+        self.controller_profiles = {}
         self.retiring = {}
         self.recovery_node = self.recovery_timer = None
         self.closed = False
@@ -213,7 +215,16 @@ class RgbdOdometryPlugin:
                  'description': 'RGB-D 视觉里程计：彩色和实测深度估计相机位姿，接入相机 IMU 自动启用辅助',
                  'inputSchema': {'type': 'object', 'properties': {
                      'action': {'type': 'string', 'enum': ['start', 'stop', 'info']}}},
-                 'configSchema': {'type': 'object', 'properties': {}},
+                 'configSchema': {'type': 'object', 'properties': {'controller_rotation': {
+                     'type': ['object', 'null'], 'scope': 'instance', 'title': '控制器旋转先验',
+                     'description': '旧版原始控制器话题的读时对齐与相机外参覆盖。只用于视觉配准初值。',
+                     'properties': {'topic': {'type': 'string'}, 'clock_id': {'type': 'string'},
+                                    'calibration_id': {'type': 'string'},
+                                    'camera_from_body': {'type': 'array', 'items': {'type': 'number'},
+                                                         'minItems': 4, 'maxItems': 4},
+                                    'read_time_offset_ns': {'type': 'integer'}},
+                     'required': ['topic', 'clock_id', 'calibration_id', 'camera_from_body',
+                                  'read_time_offset_ns']}}},
                  'topic_in': [{'format': 'image/jpeg'}, {'format': 'image/depth-zlib'},
                               {'format': 'sensor/imu', 'optional': True}],
                  'topic_out': self._outputs('default'), 'odom_interface': _INTERFACE}]
@@ -234,15 +245,25 @@ class RgbdOdometryPlugin:
         with self.lock:
             current = self.instances.get(instance)
             try:
-                topics = current[2] if current and action != 'stop' else []
+                topics = start_topics(args) if action == 'start' else None
                 if action == 'start':
-                    topics = start_topics(args)
-                enabled = isinstance(topics, list) and len(topics) == 3
+                    enabled = isinstance(topics, list) and len(topics) == 3
+                else:
+                    enabled = bool(current and action != 'stop' and
+                                   any(port['format'] == 'sensor/imu' for port in current[2]))
                 # Saved canvases may still send config or old start options.
                 settings = dict(visual_frontend='auto', max_features=1000, imu_assisted=enabled,
                                 short_term_compensation=enabled, depth_geometry=enabled,
                                 inertial_association=enabled)
+                profile = self.controller_profiles.get(instance)
                 if action == 'config':
+                    if 'controller_rotation' in args:
+                        profile = validate_controller_rotation(args['controller_rotation'])
+                        if profile is None:
+                            self.controller_profiles.pop(instance, None)
+                        else:
+                            self.controller_profiles[instance] = profile
+                    settings['controller_rotation'] = deepcopy(profile)
                     return {'state': 'configured', 'config': settings}
                 if action == 'start':
                     if self.closed:
@@ -254,16 +275,22 @@ class RgbdOdometryPlugin:
                     except ValueError as error:
                         logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
                         raise
+                    if 'controller_rotation' in args:
+                        profile = validate_controller_rotation(args['controller_rotation'])
+                    if profile is not None:
+                        if profile['topic'] in topics:
+                            raise ValueError('controller rotation topic must be distinct from RGB-D and IMU inputs')
+                        settings['controller_rotation'] = deepcopy(profile)
                     calibration.update(settings, visual_frontend=_FRONTENDS[0])
                     calibration['input_declarations'] = deepcopy(args.get('camera_info') or {})
                     image_topics = [calibration[k + '_topic'] for k in ('color', 'depth')]
                     geometry = {topic: {key: args['camera_info'][topic].get(key)
                                         for key in ('width', 'height', 'K', 'D')}
                                 for topic in image_topics}
-                    signature = json.dumps([image_topics, calibration.get('imu_topic'), geometry],
+                    signature = json.dumps([image_topics, calibration.get('imu_topic'), geometry, profile],
                                            sort_keys=True)
                     if current and current[1] != signature:
-                        raise ValueError('stop RGB-D odometry before changing its input geometry')
+                        raise ValueError('stop RGB-D odometry before changing its input geometry or rotation alignment')
                     if not current:
                         require_runtime()
                         self._ensure_supervisor()
@@ -273,6 +300,9 @@ class RgbdOdometryPlugin:
                             bindings.append({'topic': calibration['imu_topic'], 'format': 'sensor/imu'})
                         current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic'],
                             **({'input_registry': self._input_registry} if self._input_registry else {})), signature, bindings)
+                        controller = getattr(current[0], 'calibration', {}).get('controller_rotation')
+                        if controller is not None:
+                            bindings.append({'topic': controller['topic'], 'format': 'data/json'})
                         self.instances[instance] = current
                         self.recovery[instance] = dict(lost_since=None, last_attempt=None,
                             attempts=0, restarts=0, previous_segment=None, reason=None, error=None,
@@ -286,6 +316,10 @@ class RgbdOdometryPlugin:
                     current = None
                 elif action != 'info':
                     raise ValueError('unknown RGB-D odometry action')
+                if current:
+                    active_profile = getattr(current[0], 'requested_calibration', {}).get('controller_rotation')
+                    if active_profile is not None:
+                        settings['controller_rotation'] = deepcopy(active_profile)
                 return {**(current[0].info() if current else {'state': 'idle'}),
                         'topic_out': self._outputs(instance), 'odom_interface': _INTERFACE,
                         'topic_in': current[2] if current else [],
@@ -293,7 +327,10 @@ class RgbdOdometryPlugin:
                         'frontend': self._frontend_info(instance),
                         'config': settings}
             except (ValueError, RuntimeError, ImportError, LookupError) as error:
-                return {'state': 'error', 'message': str(error)}
+                result = {'state': 'error', 'message': str(error)}
+                if action == 'config':
+                    result['adapter_ok'] = False
+                return result
 
     def shutdown(self):
         with self.lock:

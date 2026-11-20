@@ -24,7 +24,7 @@ def test_wiring_overrides_legacy_flags_and_gates_fusion(card, legacy, imu, fusio
     assert ('imu_topic' in c) is imu
     assert result['config']['imu_assisted'] is imu
     assert len(result['topic_in']) == len(topics)
-    assert card.get_tools()[0]['configSchema']['properties'] == {}
+    assert set(card.get_tools()[0]['configSchema']['properties']) == {'controller_rotation'}
 
 
 def test_rewiring_requires_stop_and_preserves_other_instance(card):

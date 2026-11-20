@@ -82,7 +82,7 @@ def test_compact_schema_publishes_automatic_policy_and_original_odom_link(sessio
     assert tool['inputSchema']['properties']['action']['enum'] == ['start', 'stop', 'info']
     settings = dict(imu_assisted=False, short_term_compensation=False, depth_geometry=False,
                     inertial_association=False, visual_frontend='auto', max_features=1000)
-    assert tool['configSchema']['properties'] == {}
+    assert set(tool['configSchema']['properties']) == {'controller_rotation'}
     result = card.dispatch('rgbd_odometry', dict(action='start', instance_id='one',
         input_topics=['/rgb', '/depth'], camera_info=declarations()))
     session = card.instances['one'][0]
@@ -100,6 +100,66 @@ def test_compact_schema_publishes_automatic_policy_and_original_odom_link(sessio
         assert card.dispatch('rgbd_odometry', dict(action='info', instance_id='one'))['topic_out'] == result['topic_out']
     finally:
         card.shutdown()
+
+
+@pytest.mark.parametrize('clock_matches', [True, False])
+def test_card_config_wires_controller_prior_without_a_fusion_input(sessions, monkeypatch, clock_matches):
+    _, now, _ = sessions
+    monkeypatch.setattr(runtime, 'require_rotation_hint_runtime', lambda path: None)
+    monkeypatch.setitem(sys.modules, 'geometry_msgs.msg', NS(QuaternionStamped=object))
+    card = card_module.RgbdOdometryPlugin({}, _FakeExecutor())
+    profile = dict(topic='/raw_body_imu', clock_id='camera-global' if clock_matches else 'previous-clock',
+                   calibration_id='bench-mount',
+                   camera_from_body=[0., 0., 0., 1.], read_time_offset_ns=0)
+    assert card.get_tools()[0]['configSchema']['properties']['controller_rotation']['scope'] == 'instance'
+    configured = card.dispatch('rgbd_odometry', dict(
+        action='config', instance_id='vo', controller_rotation=profile))
+    assert configured['state'] == 'configured'
+    result = card.dispatch('rgbd_odometry', dict(action='start', instance_id='vo',
+        input_topics=['/rgb', '/depth'], camera_info=declarations()))
+    assert result['state'] == 'running', result
+    session = card.instances['vo'][0]
+    try:
+        assert session.fusion is session.imu is None
+        status = card.dispatch('rgbd_odometry', dict(action='info', instance_id='vo'))
+        assert status['config']['imu_assisted'] is status['config']['short_term_compensation'] is False
+        prior = next((s for s in session.node.subscriptions if s.topic == profile['topic']), None)
+        if clock_matches:
+            assert result['mode']['effective'] == 'controller_rotation'
+            assert result['topic_in'][-1] == {'topic': '/raw_body_imu', 'format': 'data/json'}
+            prior.callback(NS(data=json.dumps(dict(stamp_ns=now[0], timestamp_source='read_completion',
+                                                   quaternion=[0., 0., 0., 1.]))))
+            assert len(session.rotation_hints.controller_history) == 1
+        else:
+            assert result['mode']['effective'] == 'visual_only'
+            assert result['mode']['degraded'] is True
+            assert prior is None
+            assert all(binding['topic'] != profile['topic'] for binding in result['topic_in'])
+        session._publish(make_sample('recovering', now[0], session.segment, 'camera-global'))
+        sample = json.loads(session.publisher.messages[-1])
+        assert sample['pose'] is None
+    finally:
+        session.process.returncode = 0
+        card.shutdown()
+
+
+def test_numeric_capture_alignment_keeps_estimated_time_on_the_exported_pose(sessions):
+    from plugins.spatial_time import TimePolicy
+    create, now, _ = sessions
+    session = create()
+    at = 1_000_000_000
+    context = TimePolicy('ingress').select(dict(
+        stamp_ns=at, clock_id='rgbd_capture_estimated/run', time_basis='capture_estimated'), now[0], 1)
+    session.contexts_by_stamp[at] = (context, NS(association_id='pair', method='nearest_capture_estimated',
+                                               skew_ns=0, color_context=context, depth_context=context))
+    tracking(session, [0., 0., 0.], at)
+    public = json.loads(session.publisher.messages[-1])
+    assert public['pose'] is not None
+    slam = public['vendor']['motus_slam']
+    assert slam['stamp_source'] == 'capture_estimated'
+    assert slam['observation']['mapping_verified'] is False
+    declaration, = session._time_metadata()['input_metadata']
+    assert declaration['stamp_source'] == 'capture_estimated'
 
 
 def test_bumi_shaped_summary_uses_camera_pose_and_segment_displacement(sessions):

@@ -16,7 +16,7 @@ def input_declaration(topic, kind, frame, context, *, metadata_topic=None):
         mapping_version=context.mapping_version, mapping_source=context.mapping_source,
         clock_id=context.normalized_clock_id, time_basis=context.time_basis,
         ingress_clock_id=context.ingress_clock_id,
-        stamp_source='measurement' if context.time_basis=='source_capture' else 'receipt_estimated',
+        stamp_source='measurement' if context.time_basis=='source_capture' else context.time_basis,
         observation_schema='motus.observation/1', clock_accuracy_verified=context.mapping_verified)
     if kind=='pose':value.update(child_frame_id=frame)
     else:value.update(frame_id=frame, cloud_semantics='depth_frame', observation_model='pinhole',
