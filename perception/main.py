@@ -76,9 +76,19 @@ _LOG_ARG_CHARS = 500
 REGISTER_ALIVE_INTERVAL_S = 1800.0
 
 
+def _log_payload(value):
+    """Keep session capabilities out of request and response diagnostics."""
+    if isinstance(value, dict):
+        return {key: "<redacted>" if key == "session_token" else _log_payload(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_log_payload(item) for item in value]
+    return value
+
+
 def _brief(obj) -> str:
     """One-line, length-capped repr for logging an MCP payload."""
-    text = repr(obj)
+    text = repr(_log_payload(obj))
     if len(text) <= _LOG_ARG_CHARS:
         return text
     return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
@@ -256,6 +266,15 @@ class PerceptionBundle:
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
+
+        if plugins_cfg.get("tabletop_roi_goal_verifier", {}).get("enabled", False):
+            try:
+                from plugins.tabletop_roi_goal_verifier import TabletopROIGoalVerifierPlugin
+                self._plugins.append(TabletopROIGoalVerifierPlugin(
+                    plugins_cfg["tabletop_roi_goal_verifier"], executor))
+                log.info("TabletopROIGoalVerifierPlugin loaded")
+            except Exception:
+                log.error("TabletopROIGoalVerifierPlugin failed to load", exc_info=True)
 
         if plugins_cfg.get("barcode", {}).get("enabled", False):
             from plugins.barcode import BarcodeScanPlugin
@@ -562,7 +581,7 @@ def make_handler():
                             if music_call:
                                 log.info("[mcp] phanthy_music result received (payload omitted)")
                             else:
-                                log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                                log.info(f"[mcp] tools/call result: {json.dumps(_log_payload(result))[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
