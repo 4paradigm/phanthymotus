@@ -694,9 +694,49 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
+# Xiaoyou uses its own CPython 3.10 frontend. The JP5 ROS interpreter stays CP38.
+ARG ENABLE_XIAOYOU_TTS=1
+RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
+      set -eu; \
+      case "${JP_VERSION}" in \
+        511) \
+          echo '[build] Xiaoyou JP5 frontend: fetching pinned ModelScope asset'; \
+          stage="$(mktemp -d)"; \
+          trap 'rm -rf -- "$stage"' EXIT; \
+          python3 -B -c 'import sys; from pathlib import Path; from plugins.xiaoyou_tts.runtime.model_bundle import _download; _download(sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4])' \
+            'https://modelscope.cn/api/v1/models/lanxijiang/xiaoyou01/repo?Revision=25121ed0cca2593caff42d1068612f5259b3e1ac&FilePath=xiaoyou-jp511-frontend-cp310-20261119-v1.tar.gz' \
+            "$stage/frontend.tar.gz" 171397980 6f1e4c26b7abbc79cfd9fadb86a4f9ce37307b34c0b15fb5ed67e779b470a33c; \
+          mkdir /opt/xiaoyou-tts; \
+          tar -xzf "$stage/frontend.tar.gz" --strip-components=1 --no-same-owner -C /opt/xiaoyou-tts; \
+          echo '[build] Xiaoyou JP5 frontend: checking native imports'; \
+          /opt/xiaoyou-tts/bin/python3 -IB -c 'import sys; from importlib.metadata import version; sys.modules["torch"] = None; import en_core_web_sm, numpy; from misaki import en, espeak, zh; assert sys.version_info[:3] == (3, 10, 22); assert numpy.__version__ == "1.26.4" and version("misaki") == "0.9.4" and version("en-core-web-sm") == "3.8.0"'; \
+          ;; \
+        61) \
+          python3 -m venv --without-pip --system-site-packages /opt/xiaoyou-tts; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" pip==26.3; \
+          /opt/xiaoyou-tts/bin/python3 -m pip --isolated --disable-pip-version-check install \
+            --no-cache-dir --ignore-installed -i "${PYPI_MIRROR}" \
+            -r /work/plugins/xiaoyou_tts/requirements.jetson.txt; \
+          ;; \
+      esac; \
+    fi
+
+# Darvin startup must be selected explicitly for benchmark images.
+ARG XIAOYOU_TTS_DARVIN=0
+ENV XIAOYOU_TTS_DARVIN=${XIAOYOU_TTS_DARVIN}
+ENV XIAOYOU_TTS_IMAGE_JP=${JP_VERSION}
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     if [ \"${XIAOYOU_TTS_DARVIN}\" = 1 ] && [[ \"${XIAOYOU_TTS_IMAGE_JP}\" = 511 || \"${XIAOYOU_TTS_IMAGE_JP}\" = 61 ]] && [ -z \"${CONFIG_PATH:-}\" ] \
+         && [ -n \"${MCP_PORT:-}\" ] && [ -n \"${WS_PORT:-}\" ]; then \
+         export CONFIG_PATH=/tmp/xiaoyou-darvin.json XIAOYOU01_TTS_BENCHMARK=1; \
+         if [ -z \"${FASTRTPS_DEFAULT_PROFILES_FILE:-}${FASTDDS_DEFAULT_PROFILES_FILE:-}\" ]; then \
+             export FASTRTPS_DEFAULT_PROFILES_FILE=/work/plugins/xiaoyou_tts/resources/fastdds_darvin.xml; \
+         fi; \
+         printf '{\"mcp_port\":%s,\"ws_port\":%s,\"plugins\":{\"tts\":{\"enabled\":true,\"engine\":\"xiaoyou-zh-en\"},\"audio_mixer\":{\"enabled\":false},\"echo_cancellation\":{\"enabled\":false}}}\\n' \
+             \"${MCP_PORT:-15720}\" \"${WS_PORT:-15721}\" > \"${CONFIG_PATH}\"; \
+     fi && exec python3 /work/main.py"]
