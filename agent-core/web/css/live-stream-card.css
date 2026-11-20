@@ -1,0 +1,67 @@
+/* Live-stream wizard: scoped entirely to the live_stream Canvas card. */
+.canvas-card.live-stream-card { width: 338px; max-width: calc(100vw - 36px); }
+.canvas-card.live-stream-card .canvas-card-body-wrap { overflow: visible; }
+.canvas-card.live-stream-card .canvas-card-driver { display: none; }
+.canvas-card.live-stream-card .canvas-card-instance-cfg-btn,
+.canvas-card.live-stream-card .canvas-card-info-btn { display: none; }
+.ls-card-host { padding: 0 10px 10px; }
+.ls-panel {
+  display: flex; flex-direction: column; gap: 9px;
+  max-height: min(480px, calc(100vh - 170px));
+  overflow-y: auto; overscroll-behavior: contain;
+  padding: 8px 2px 5px;
+  font-family: var(--font-ui); color: var(--text);
+}
+.ls-heading { color: var(--text-muted); font-size: 14px; }
+.ls-title { font-size: 18px; line-height: 1.5; font-weight: 650; }
+.ls-progress { color: var(--text-muted); font-size: 14px; }
+.ls-meter { height: 5px; width: 100%; background: var(--bg-input); border-radius: 10px; overflow: hidden; }
+.ls-meter-fill { height: 100%; background: var(--accent); border-radius: inherit; transition: width 150ms ease; }
+.ls-platforms { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.ls-choices { display: flex; flex-direction: column; gap: 7px; }
+.ls-btn {
+  width: 100%; min-height: 42px; border: 1px solid var(--border-med);
+  background: var(--bg-card); color: var(--text); border-radius: 9px;
+  padding: 9px 12px; font-size: 15px; font-family: inherit;
+  line-height: 1.4; cursor: pointer; text-align: center; font-weight: 550;
+}
+.ls-btn:focus-visible, .ls-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ls-btn:disabled { cursor: wait; opacity: .6; }
+.ls-btn.selected { border: 2px solid var(--accent); background: var(--accent-dim); }
+.ls-btn.ls-primary { background: var(--accent); border-color: var(--accent); color: white; }
+.ls-btn.ls-secondary { background: var(--bg-input); }
+.ls-btn.ls-back, .ls-btn.ls-text { border: none; background: transparent; color: var(--text-muted); }
+.ls-btn.ls-danger { background: var(--red); border-color: var(--red); color: white; }
+.ls-link { color: var(--blue); text-decoration: underline; font-size: 15px; font-weight: 600; }
+.ls-hint, .ls-guide-detail, .ls-help, .ls-warning, .ls-error, .ls-notice {
+  font-size: 15px; line-height: 1.6; overflow-wrap: anywhere;
+}
+.ls-hint { color: var(--text-muted); }
+.ls-guide-detail { background: var(--bg-input); border-radius: 8px; padding: 9px; }
+.ls-label { color: var(--text); font-size: 15px; font-weight: 650; }
+.ls-input {
+  width: 100%; height: 40px; border: 1px solid var(--border-med);
+  border-radius: 7px; background: var(--bg-card); color: var(--text);
+  padding: 8px; font: inherit; font-size: 15px; user-select: text;
+}
+.ls-help { background: var(--yellow-bg); border-radius: 8px; padding: 9px; }
+.ls-warning { background: var(--yellow-bg); border-radius: 8px; padding: 9px; }
+.ls-error { background: var(--red-bg); color: var(--red); border-radius: 8px; padding: 9px; }
+.ls-notice { background: var(--green-bg); color: var(--green); border-radius: 8px; padding: 9px; }
+.ls-check { background: var(--bg-input); padding: 8px; border-radius: 7px; font-size: 15px; }
+.ls-stats { display: grid; grid-template-columns: 1fr; gap: 6px; font-size: 15px; }
+.ls-stats span { display: flex; justify-content: space-between; }
+
+/* The RTMP configuration screen mirrors the two fields on Xiaohongshu.
+   No instructional fine print, compact toggles, or undersized controls. */
+.ls-panel.ls-config { gap: 14px; padding: 12px 2px 8px; }
+.ls-config .ls-title { font-size: 19px; line-height: 1.4; font-weight: 700; margin-bottom: 5px; }
+.ls-config .ls-label { font-size: 16px; line-height: 1.5; font-weight: 650; }
+.ls-config .ls-input {
+  height: 50px; min-height: 50px; font-size: 16px;
+  padding: 12px; border-radius: 9px;
+}
+.ls-config .ls-input::placeholder { font-size: 16px; }
+.ls-config .ls-btn { min-height: 50px; font-size: 16px; font-weight: 650; }
+.ls-config .ls-error, .ls-config .ls-notice { font-size: 15px; }
+.ls-config .ls-back { min-height: 44px; color: var(--text); }

@@ -445,6 +445,7 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
 
 async def _save_live_stream_instance(mcp_id: str, instance_id: str, body: Any):
     """Only acknowledge a live-stream secret after the Driver accepted it."""
+    from live_stream_auth import sign_live_stream_action
     from api.mcp_manage import MCPCallRequest, mcp_call_tool
     from tool_config import find_tool, plan_config_calls
 
@@ -457,7 +458,11 @@ async def _save_live_stream_instance(mcp_id: str, instance_id: str, body: Any):
             status_code=422, content={"code": 422, "message": "直播 Card 配置字段未注册"})
     for cfg, extra in calls:
         try:
-            req = MCPCallRequest(tool="live_stream", arguments={"action": "config", **cfg, **extra})
+            # A user-initiated save may authorize one start, including the same key.
+            # Automatic config replay does not supply authorize_start.
+            proof = sign_live_stream_action('config', body['rtmp_url'])
+            req = MCPCallRequest(tool="live_stream", arguments={"action": "config", **cfg, **extra,
+                                                                 "authorize_start": True, "operator_proof": proof})
             response = await mcp_call_tool(mcp_id, req, timeout_s=8)
         except Exception:
             response = {"code": 503}
@@ -469,15 +474,83 @@ async def _save_live_stream_instance(mcp_id: str, instance_id: str, body: Any):
                     "message": str(message)[:240] or "机器人未确认配置，未保存；请检查 Driver 状态"})
     content = response.get("data") or []
     ready = False
+    acknowledged = False
     if isinstance(content, list) and content and isinstance(content[0], dict):
         try:
-            ready = bool(json.loads(content[0].get("text", "{}")).get("ready_to_go_live"))
+            outcome = json.loads(content[0].get("text", "{}"))
+            acknowledged = outcome.get("ok") is True and outcome.get("configured") is True
+            ready = bool(outcome.get("ready_to_go_live"))
         except (ValueError, TypeError, AttributeError):
             pass
+    if not acknowledged:
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422,
+                "message": "机器人未确认配置，未保存。请检查直播信息和设备连接。"})
     config.main[tool_config_key(mcp_id, "live_stream", instance_id)] = body
     _broadcast({"type": "tool_config_updated", "payload": {
         "mcp_id": mcp_id, "tool": "live_stream", "instance_id": instance_id}})
     return {"code": 200, "applied": True, "ready_to_go_live": ready}
+
+@router.post('/tool-config/{mcp_id}/live_stream/{instance_id}/go-live')
+async def go_live_from_canvas(mcp_id: str, instance_id: str):
+    """Only the authenticated Canvas API may sign and dispatch public go_live."""
+    from api.mcp_manage import MCPCallRequest, mcp_call_tool
+    from live_stream_auth import sign_live_stream_action
+
+    saved = config.main.get(tool_config_key(mcp_id, "live_stream", instance_id), None)
+    if not isinstance(saved, dict) or not isinstance(saved.get("rtmp_url"), str):
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422, "message": "请先保存本场直播信息"})
+    try:
+        req = MCPCallRequest(tool="live_stream", arguments={
+            "action": "go_live",
+            "operator_proof": sign_live_stream_action("go_live", saved["rtmp_url"]),
+        })
+        response = await mcp_call_tool(mcp_id, req, timeout_s=12)
+        content = response.get("data") or []
+        if response.get("code") != 200 or not isinstance(content, list) or not content:
+            raise ValueError("Driver unavailable")
+        state = json.loads(content[0].get("text", "{}"))
+        if (not isinstance(state, dict) or state.get("ok") is False
+                or state.get("error_code") or state.get("state") not in ("starting", "streaming")):
+            raise ValueError("Driver refused broadcast")
+        # Return only the public lifecycle fields; never return RTMP URLs or proofs.
+        return {"code": 200, "state": state["state"]}
+    except Exception:
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422,
+                "message": "机器人未能开始推流，请检查摄像头、麦克风与本场授权"})
+
+
+@router.post('/tool-config/{mcp_id}/live_stream/{instance_id}/authorize-start')
+async def authorize_saved_live_stream_start(mcp_id: str, instance_id: str):
+    """Only an explicit operator action may re-arm a stored streaming credential."""
+    from live_stream_auth import sign_live_stream_action
+    from api.mcp_manage import MCPCallRequest, mcp_call_tool
+
+    stored = config.main.get(tool_config_key(mcp_id, "live_stream", instance_id), None)
+    if not isinstance(stored, dict) or not isinstance(stored.get("rtmp_url"), str):
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422, "message": "尚未保存推流信息"})
+    try:
+        req = MCPCallRequest(tool="live_stream", arguments={
+            "action": "config", "rtmp_url": stored["rtmp_url"],
+            "instance_id": instance_id, "authorize_start": True,
+            "operator_proof": sign_live_stream_action('config', stored['rtmp_url'])})
+        response = await mcp_call_tool(mcp_id, req, timeout_s=8)
+        content = response.get("data") or []
+        if response.get("code") != 200 or not isinstance(content, list) or not content:
+            raise ValueError("Driver unavailable")
+        outcome = json.loads(content[0].get("text", "{}"))
+        if (outcome.get("ok") is not True or outcome.get("configured") is not True
+                or outcome.get("ready_to_go_live") is not True):
+            raise ValueError("Driver rejected authorization")
+    except Exception:
+        # Never expose credentials or low-level errors in API responses.
+        return fastapi.responses.JSONResponse(
+            status_code=422, content={"code": 422, "message": "无法授权开播，请检查设备状态或重新获取本场推流码"})
+    return {"code": 200, "ready_to_go_live": True}
+
 
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
