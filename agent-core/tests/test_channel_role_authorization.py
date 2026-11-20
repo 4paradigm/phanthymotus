@@ -72,6 +72,19 @@ class ViewerRoleAuthorizationTest(unittest.TestCase):
         self.assertEqual(collector._split_by_authorization([malformed, operator]),
                          [[malformed], [operator]])
 
+    def test_chat_only_policy_and_roles_are_both_preserved_when_batching(self):
+        ordinary = _human_payload('operator', msgid='ordinary')
+        chat_only_viewer = _human_payload('viewer', msgid='viewer')
+        chat_only_operator = _human_payload('operator', msgid='operator')
+        chat_only_viewer['_chat_only_key'] = ('feishu_test', 'g1')
+        chat_only_operator['_chat_only_key'] = ('feishu_test', 'g1')
+        batches = collector._split_by_authorization(
+            [ordinary, chat_only_operator, chat_only_viewer])
+        self.assertEqual(batches, [[ordinary], [chat_only_operator], [chat_only_viewer]])
+        self.assertNotIn('_chat_only_channel', collector._build_trigger(batches[0], True))
+        self.assertEqual(collector._build_trigger(batches[1], True)['_chat_only_channel'], 'feishu_test')
+        self.assertTrue(collector._build_trigger(batches[2], True)['_viewer_channel_event'])
+
     def test_bot_sender_does_not_count_as_a_human_viewer(self):
         bot_payload = {
             'source': 'dds:/channel/request/feishu_test',

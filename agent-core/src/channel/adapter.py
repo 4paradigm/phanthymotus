@@ -88,6 +88,7 @@ class OutboundMessage:
     # 长连接型平台（如 WeCom）回复必须回带该消息回调的 req_id，适配器
     # 据此从 msgid → req_id 映射里精确取值，避免同一会话连发多条时回错消息。
     source_message_id: str = ''
+    reply_to_message_id: str = ''
 
 
 # 收到消息时的回调签名

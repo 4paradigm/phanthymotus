@@ -2,7 +2,10 @@
  * channels.js — Channel management panel (Telegram/Slack configuration + user management).
  */
 
+import { openQQOnboarding } from './qq-onboarding.js';
+
 let _overlay, _channelList, _addBtn;
+let _closeQQ;
 let _channels = [];
 let _usersList;
 
@@ -31,6 +34,7 @@ function _open() {
 }
 
 function _close() {
+  _closeQQ?.();
   _overlay.classList.add('hidden');
 }
 
@@ -53,7 +57,7 @@ function _renderChannels(channels) {
     _channelList.innerHTML = `
       <div class="channel-empty">
         <p>No channels configured</p>
-        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a Telegram, Slack, or Feishu bot to enable remote messaging control</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a bot to receive and reply to messages</p>
       </div>`;
     return;
   }
@@ -76,6 +80,11 @@ function _renderChannels(channels) {
           <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
             Trusted Bots: ${(ch.trusted_bots || []).length}
           </button>` : ''}
+        ${ch.platform === 'qq' ? `
+          <button class="btn-ghost btn-sm" data-channel-action="qq-group">
+            群聊 @：${ch.group_enabled ? '已开启' : '已关闭'}
+          </button>
+          <span class="channel-users-hint">${ch.canvas_ready ? 'Canvas 已就绪' : 'Canvas 待就绪'}</span>` : ''}
         <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
         <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" data-channel-action="delete">Delete</button>
@@ -87,6 +96,7 @@ function _renderChannels(channels) {
 // ── Add channel form ──────────────────────────────────────────────────────────
 
 function _showAddForm() {
+  if (document.getElementById('channel-add-form')) return;
   const formHtml = `
     <div class="channel-add-form" id="channel-add-form">
       <div class="channel-form-row">
@@ -97,6 +107,7 @@ function _showAddForm() {
           <option value="feishu">Feishu (飞书)</option>
           <option value="lan">LAN (机器人之间)</option>
           <option value="wecom">WeCom (企业微信)</option>
+          <option value="qq">QQ</option>
         </select>
       </div>
       <div class="channel-form-row">
@@ -174,7 +185,20 @@ function _showAddForm() {
     document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan || isWecom);
   }
 
-  platformSel.addEventListener('change', updateFormFields);
+  platformSel.addEventListener('change', () => {
+    if (platformSel.value !== 'qq') {
+      updateFormFields();
+      return;
+    }
+    form.replaceChildren();
+    _addBtn.disabled = true;
+    _closeQQ = openQQOnboarding(form, () => {
+      _closeQQ = null;
+      _addBtn.disabled = false;
+      form.remove();
+      _loadChannels();
+    });
+  });
   updateFormFields();
 
   document.getElementById('channel-form-submit').addEventListener('click', () => _submitAdd(form));
@@ -262,11 +286,29 @@ function _handleChannelAction(e) {
   if (!channel) return;
 
   switch (btn.dataset.channelAction) {
+    case 'qq-group': _setQQGroup(channel, btn); break;
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
     case 'trusted-bots': _showTrustedBots(channel, item); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
-    case 'delete':     _channelDelete(channel.id); break;
+    case 'delete':     _confirmChannelDelete(channel, item, btn); break;
+  }
+}
+
+async function _setQQGroup(channel, btn) {
+  btn.disabled = true;
+  try {
+    const response = await fetch('/api/channel/qq/' + encodeURIComponent(channel.id) + '/group', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ group_enabled: !channel.group_enabled }),
+    });
+    if (!response.ok) throw new Error();
+    await _loadChannels();
+  } catch {
+    alert('QQ 群聊设置未能更新，请稍后重试。');
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -440,18 +482,44 @@ async function _channelRestart(id, btn) {
   }
 }
 
-async function _channelDelete(id) {
-  if (!confirm(`Delete channel "${id}"?`)) return;
-  try {
-    const res = await fetch(`/api/channel/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
-      alert(j.detail || `Delete failed (${res.status})`);
+function _confirmChannelDelete(channel, item, trigger) {
+  item.insertAdjacentHTML('beforeend', `
+    <div class="channel-delete-confirm">
+      <p>${channel.platform === 'qq' ? '删除此渠道及本地连接凭证？' : '删除此渠道？'}</p>
+      <p class="channel-item-error" role="alert" hidden></p>
+      <div class="channel-form-actions">
+        <button class="btn-ghost btn-sm" type="button" data-delete-cancel>取消</button>
+        <button class="btn-danger btn-sm" type="button" data-delete-confirm>确认删除</button>
+      </div>
+    </div>`);
+  const panel = item.lastElementChild;
+  const cancel = panel.querySelector('[data-delete-cancel]');
+  const confirm = panel.querySelector('[data-delete-confirm]');
+  const error = panel.querySelector('[role=alert]');
+  trigger.disabled = true;
+  cancel.focus();
+  cancel.onclick = () => {
+    panel.remove();
+    trigger.disabled = false;
+    trigger.focus();
+  };
+  confirm.onclick = async () => {
+    cancel.disabled = confirm.disabled = true;
+    error.hidden = true;
+    try {
+      const res = await fetch(`/api/channel/${encodeURIComponent(channel.id)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(typeof data.detail === 'string' ? data.detail : `删除失败（${res.status}）`);
+      }
+      await _loadChannels();
+    } catch (e) {
+      error.textContent = e.message;
+      error.hidden = false;
+    } finally {
+      cancel.disabled = confirm.disabled = false;
     }
-    _loadChannels();
-  } catch (e) {
-    alert('Delete failed: ' + e.message);
-  }
+  };
 }
 
 // ── Users (ACL role management) ─────────────────────────────────────────────

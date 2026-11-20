@@ -17,6 +17,8 @@ dependencies = [
     "wecom-aibot-python-sdk>=1.0.2",
     "python-telegram-bot>=21.0",
     "slack-sdk>=3.27",
+    "qqbot-agent-sdk==1.2.2",
+    "qrcode>=7.4.2",
     "zeroconf>=0.136.0",
     "bleak>=0.21.0",
 ]

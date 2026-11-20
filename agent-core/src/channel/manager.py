@@ -18,7 +18,7 @@ from contextvars import ContextVar
 
 import config
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
-from channel import acl
+from channel import acl, chat_only
 
 
 # ── Channel Config 持久化 ────────────────────────────────────────────────────
@@ -138,7 +138,8 @@ def get_channel_config(channel_id: str) -> dict | None:
 
 def add_channel_config(channel_id: str, platform: str, cfg: dict,
                        enabled: bool = False, bot_to_bot_enabled: bool = False,
-                       trusted_bots: list[dict] | None = None) -> dict:
+                       trusted_bots: list[dict] | None = None,
+                       chat_only: bool = False) -> dict:
     configs = _get_channel_configs()
     # 检查 ID 唯一
     if any(c['id'] == channel_id for c in configs):
@@ -149,6 +150,7 @@ def add_channel_config(channel_id: str, platform: str, cfg: dict,
         'enabled': enabled,
         'bot_to_bot_enabled': bot_to_bot_enabled if supports_bot_to_bot(platform) else False,
         'trusted_bots': normalize_trusted_bots(trusted_bots) if uses_trusted_bots(platform) else [],
+        'chat_only': bool(chat_only),
         'config': cfg,
         'status': 'disconnected',
         'updated_at': time.time(),
@@ -170,7 +172,8 @@ def update_channel_config(channel_id: str, **updates) -> dict | None:
             if not supports_bot_to_bot(target_platform):
                 updates['bot_to_bot_enabled'] = False
             for k, v in updates.items():
-                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots'):
+                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots',
+                         'chat_only'):
                     ch[k] = v
             ch['updated_at'] = time.time()
             _save_channel_configs(configs)
@@ -237,6 +240,8 @@ class ChannelManager:
         self._retry_backoff: dict[str, float] = {}       # channel_id → 当前退避秒数
         self._inactive_logged: set[str] = set()
         self._trusted_bot_messages: dict[str, dict] = {}
+        self._chat_only_pending: dict[tuple[str, str, str], tuple[str, str]] = {}
+        self._starting: set[str] = set()
         self._mention_rate: dict[tuple, list[float]] = {}
 
     def _trusted_bot_id(self, msg: InboundMessage) -> str:
@@ -536,9 +541,13 @@ class ChannelManager:
             await self._push_error(msg)
         _update_status(channel_id, 'error')
 
-        if adapter is not None and not adapter.should_auto_reconnect():
+        if adapter is not None and not getattr(adapter, 'should_auto_reconnect', lambda: True)():
             return
 
+        if channel_id in self._starting or (adapter and getattr(adapter, 'reconnecting', False)):
+            return
+        # Keep retrying after a long outage. The delay is capped, not the number
+        # of attempts; stopping forever would require a manual restart after Wi-Fi returns.
         # 指数退避重连（30s → 60s → … → 300s）
         now = time.time()
         if now < self._retry_at.get(channel_id, 0):
@@ -621,6 +630,16 @@ class ChannelManager:
             on_message=self._on_inbound_message,
         )
 
+        if getattr(cls, 'SINGLE_SESSION', False):
+            if channel_id in self._starting:
+                return
+            self._starting.add(channel_id)
+            try:
+                await self._start_chat_adapter(adapter, ch_cfg)
+            finally:
+                self._starting.discard(channel_id)
+            return
+
         for attempt in range(retries):
             try:
                 await adapter.start()
@@ -640,6 +659,22 @@ class ChannelManager:
                     self._health[channel_id] = (False, str(e))
                     _update_status(channel_id, 'error')
 
+    async def _start_chat_adapter(self, adapter, channel):
+        channel_id = channel['id']
+        try:
+            await adapter.start()
+        except Exception as exc:
+            self._health[channel_id] = (False, str(exc))
+            _update_status(channel_id, 'error')
+            return
+        current = get_channel_config(channel_id)
+        if not current or not current.get('enabled') or current['config'] != channel['config']:
+            await adapter.stop()
+            return
+        self._adapters[channel_id] = adapter
+        self._health[channel_id] = (True, '')
+        _update_status(channel_id, 'connected')
+
     async def _push_error(self, message: str):
         """Push error to frontend activity stream."""
         try:
@@ -658,6 +693,8 @@ class ChannelManager:
             if value.get('channel_id') != channel_id
         }
         # Stop existing
+        if channel_id in self._starting:
+            return
         if channel_id in self._adapters:
             await self._adapters[channel_id].stop()
             del self._adapters[channel_id]
@@ -665,6 +702,14 @@ class ChannelManager:
         ch_cfg = get_channel_config(channel_id)
         if ch_cfg and ch_cfg.get('enabled'):
             await self._start_adapter(ch_cfg, retries=retries)
+
+    def consume_chat_input(self, topic: str, text: str,
+                           channel_id: str, chat_id: str, message_id: str) -> bool:
+        key = (channel_id, chat_id, message_id)
+        if self._chat_only_pending.get(key) != (topic, text):
+            return False
+        self._chat_only_pending.pop(key)
+        return True
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
@@ -681,11 +726,22 @@ class ChannelManager:
                 print(f'[channel] {msg.channel_id} message discarded: no channel_request card '
                       f'on the canvas is configured for this channel')
             return
+        private_chat = chat_only.enabled(get_channel_config(msg.channel_id))
+        if private_chat:
+            from channel.qq_canvas import input_ready
+            if not input_ready(msg.channel_id):
+                if msg.channel_id not in self._inactive_logged:
+                    self._inactive_logged.add(msg.channel_id)
+                    print(f'[channel] {msg.channel_id} message discarded: '
+                          'robot project stopped or Canvas input is not ready')
+                return
         self._inactive_logged.discard(msg.channel_id)
 
         is_bot = msg.sender_type in ('bot', 'app')
         trusted_bot_id = self._trusted_bot_id(msg) if is_bot else ''
-        if is_bot:
+        if private_chat:
+            user = {'role': 'viewer'}
+        elif is_bot:
             # Bot 不写入人员 ACL；只有精确匹配配置的可信 Bot 继承普通输入权限。
             user = {'role': 'operator' if trusted_bot_id else 'viewer'}
         else:
@@ -755,9 +811,16 @@ class ChannelManager:
         }
         if files:
             payload['files'] = files
+        if private_chat:
+            payload['chat_only'] = True
         if trusted_bot_id:
             self._record_trusted_bot_message(payload)
-        await publish_to_topic(topic, json.dumps(payload, ensure_ascii=False))
+        body = json.dumps(payload, ensure_ascii=False)
+        if private_chat:
+            self._chat_only_pending[(msg.channel_id, msg.chat_id, msg.message_id)] = (topic, body)
+            if len(self._chat_only_pending) > 256:
+                self._chat_only_pending.pop(next(iter(self._chat_only_pending)))
+        await publish_to_topic(topic, body)
 
         # 5. Broadcast to frontend activity stream
         from api.motus_stream import push_event
@@ -916,6 +979,7 @@ class ChannelManager:
                 # 触发事件的 message_id：长连接型平台（WeCom）据此精确找回
                 # 该次回调的 req_id，而不是靠 chat_id 猜「最近一条」。
                 source_message_id=source_message_id,
+                reply_to_message_id=ctx.get('message_id', ''),
             ))
             parts = []
             if text:
@@ -992,6 +1056,7 @@ class ChannelManager:
 
     def get_status(self) -> list[dict]:
         """获取所有 channel 的状态。"""
+        from channel.qq_canvas import input_ready
         result = []
         for ch_cfg in _get_channel_configs():
             channel_id = ch_cfg['id']
@@ -1000,9 +1065,13 @@ class ChannelManager:
             result.append({
                 'id': channel_id,
                 'platform': ch_cfg['platform'],
+                **({'group_enabled': ch_cfg['config'].get('group_enabled', False),
+                    'canvas_ready': input_ready(channel_id)}
+                   if ch_cfg['platform'] == 'qq' else {}),
                 'enabled': ch_cfg.get('enabled', False),
                 'bot_to_bot_enabled': ch_cfg.get('bot_to_bot_enabled', False),
                 'trusted_bots': ch_cfg.get('trusted_bots', []),
+                'chat_only': chat_only.enabled(ch_cfg),
                 'status': adapter.status() if adapter else 'disconnected',
                 'health_error': '' if not health or health[0] else health[1],
                 'active_input': channel_id in self.active_input_channels,

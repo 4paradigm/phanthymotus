@@ -211,7 +211,8 @@ def _env_dynamic() -> str:
     # 活跃任务
     import task_store
     import time as _time
-    active = task_store.active_tasks()
+    import schedules
+    active = [t for t in task_store.active_tasks() if not schedules.is_schedule(t)]
     tasks_section = ''
     if active:
         task_lines = []
@@ -222,7 +223,9 @@ def _env_dynamic() -> str:
                 return f'{int(seconds / 60)}min'
             return f'{seconds / 3600:.1f}h'
 
-        now = _time.time()
+        # 不能叫 `now`：那是上面格式化好的 status 时间，覆盖了 <status time=…> 就变成一个
+        # epoch 数字 —— 只要有活跃任务就会出现。
+        now_ts = _time.time()
         for t in active:
             # `age` 而不是 `elapsed`。
             #
@@ -232,14 +235,22 @@ def _env_dynamic() -> str:
             #
             # 同时给出距上次进展多久：那才是"这件事最近一次动是什么时候"，也是唯一
             # 适合用来判断"是不是卡住了"的数。
-            age = _span(now - t.created_at)
+            age = _span(now_ts - t.created_at)
             last = getattr(t, 'updated_at', None) or t.created_at
-            since = _span(now - last)
+            since = _span(now_ts - last)
             task_lines.append(
                 f'  <task id="{t.id}" status="{t.status}" age="{age}" '
                 f'last_progress="{since}前">{t.goal}'
                 f'{" — " + t.progress if t.progress else ""}</task>')
         tasks_section = f'<active_tasks>\n' + '\n'.join(task_lines) + '\n</active_tasks>\n'
+
+    # 定时事项单列：它们不是"正在做、没做完"的事，混进 active_tasks 模型会去催进度或 task_done。
+    schedule_items = schedules.active()
+    if schedule_items:
+        tasks_section += '<schedules>\n' + '\n'.join(
+            f'  <schedule id="{t.id}" when="{schedules.describe(t.metadata["schedule"])}" '
+            f'next="{schedules.fmt(schedules.next_fire(t.metadata["schedule"]))}">{t.goal}</schedule>'
+            for t in schedule_items) + '\n</schedules>\n'
 
     # 不再显示 active_subagents — bg subagent 结论通过 memory_recall 按需检索，
     # 用户任务 subagent 完成后会发精简通知。

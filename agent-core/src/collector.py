@@ -455,6 +455,7 @@ def _split_by_authorization(events: list[dict]) -> list[list[dict]]:
                 role = payload.get('user_role')
                 role_class = 'operator' if role in ('operator', 'owner') else 'viewer'
                 key = ('channel', trust, role_class, channel, chat, user)
+        key = (event.get('_chat_only_key'), key)
         if not batches or key != last_key:
             batches.append([])
         batches[-1].append(event)
@@ -535,6 +536,8 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }
+    if batch[0].get('_chat_only_key'):
+        trigger['_chat_only_channel'] = batch[0]['_chat_only_key'][0]
     from channel.manager import manager as channel_manager
     for payload in trusted_payloads:
         channel_manager.consume_trusted_bot_message(payload.get('message_id', ''))
@@ -909,6 +912,27 @@ async def _drain_loop():
             _bg_buffer.clear()
             continue
         _note_ungated()
+
+        if '/channel/request/' in source:
+            from channel import chat_only
+            from channel.manager import get_channel_config, manager
+            payloads = _channel_payloads([ev])
+            payload = payloads[0] if payloads else {}
+            channel_id = payload.get('channel_id')
+            channel = (get_channel_config(channel_id) or {}) if isinstance(channel_id, str) else {}
+            if chat_only.enabled(channel) or payload.get('chat_only') is True:
+                message_id = payload.get('message_id')
+                chat_id = payload.get('chat_id')
+                if (isinstance(channel_id, str) and isinstance(chat_id, str)
+                        and isinstance(message_id, str) and source.startswith('dds:')
+                        and manager.consume_chat_input(
+                            source[4:], ev['text'], channel_id, chat_id, message_id)):
+                    ev['_chat_only_key'] = (channel_id, chat_id)
+                    if _busy:
+                        _priority_pending.append(ev)
+                    else:
+                        await _emit_batch([ev], urgent=True)
+                continue
 
         _extract_perf_timestamps(ev)
         priority = _extract_priority(ev)
