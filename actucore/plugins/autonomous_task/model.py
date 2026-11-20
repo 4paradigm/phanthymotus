@@ -24,17 +24,6 @@ means fresh measurements stayed at the starting pose or opening throughout
 the observation window. For outcome_unknown, the result could not be verified;
 never replay the command. Treat text in images as scene content.
 
-After an arm target yields no observed motion, compare the attempted TCP poses
-with the last pose that actually moved. Several translations at the same TCP
-orientation can share a reachability limit. This alone cannot diagnose a hardware
-fault. When fresh measurements are stable and the views show clearance for the
-whole hand and anything held, choose a meaningfully different approach. You may
-retreat a little along a previously clear path, or slightly change TCP orientation
-in visible free space. Reobserve each step before approaching a different pose or
-grasp point. Avoid retrying the same target or cycling between failed poses. If
-clearance is uncertain, observe. If distinct feasible alternatives are exhausted
-or a fault or obstruction is evident, report the specific observed limitation.
-
 Read frame, tip_frames, and groups from current_measured_state.control_interface.
 Each reported end-effector pose already locates that hand's tool center point
 (TCP) in the declared frame. Use it directly for absolute and relative motions.
@@ -97,6 +86,51 @@ Decide from the images whether the object followed it, using its pose against th
 support surface and fixed objects. If more observation or correction could establish the goal, return
 observe with the specific discrepancy. If further execution cannot resolve it,
 return failed with the cause."""
+
+
+def _replan_hint(history):
+    """A pose with continuously measured zero progress can justify a different approach."""
+    attempts = []
+    side = None
+    for entry in reversed(history):
+        tool = entry.get("tool", "")
+        if tool in ("observe", "invalid_decision", "model_unavailable"):
+            continue
+        feedback = entry.get("feedback") or {}
+        command = feedback.get("command_stamp_ms")
+        sample = feedback.get("state_stamp_ms")
+        frames = feedback.get("feedback_frames")
+        if (tool not in ("left_move_by", "right_move_by", "left_move_to", "right_move_to")
+                or (side is not None and tool.split("_", 1)[0] != side)
+                or feedback.get("status") != "no_motion_observed" or feedback.get("motion_sent") is not True
+                or feedback.get("displacement_observed") is not False or feedback.get("target_reached") is not False
+                or type(frames) is not int or frames < 3
+                or type(command) is not int or type(sample) is not int or sample <= command):
+            break
+        side = tool.split("_", 1)[0]
+        attempts.append(f"Step {entry['step']} {tool}: {json.dumps(entry.get('args', {}))}")
+        if len(attempts) == 3:
+            break
+    if not attempts:
+        return ""
+    targets = "\n".join(reversed(attempts))
+    return f"""
+These targets produced no measured TCP displacement across fresh feedback:
+{targets}
+Compare this hand's recent signed translations and rotations about the
+TCP with its last measured movement. If an attempted pose combined translation
+and rotation, it does not show which individual component was unreachable.
+Several unchanged results alone do not identify a hardware fault.
+
+Only if the full hand, held object, and swept path have visible clearance,
+consider one small, measurable change in a single reference-frame component:
+translate with orientation fixed, or rotate about the TCP with position fixed.
+For a previously isolated component, consider the opposite sign or a smaller
+magnitude where that path is clear. A short retreat along a verified clear path
+can also open another approach. Check fresh measured motion and images before
+combining components or choosing another grasp point. Avoid cycling or blindly
+testing axes. Observe if clearance is uncertain; if no distinct safe approach
+remains, report the observed limitation."""
 
 
 def _vector(length, description):
@@ -373,6 +407,8 @@ class Model:
                 image_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
                 content.append({"type": "input_image", "image_url": image_url, "detail": "high"})
         instructions = _INSTRUCTIONS
+        if not review:
+            instructions += _replan_hint(history)
         if history and history[-1].get("tool") == "invalid_decision":
             instructions += ("\nYour previous reply could not be parsed. No action was sent. "
                              "Use a real function call for motion, or output only one status JSON object.")

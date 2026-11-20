@@ -378,17 +378,45 @@ def test_model_receives_unmoved_targets_and_can_select_a_new_approach_orientatio
     tcp = {"position_m": [.4, .2, .1], "quaternion_xyzw": [0, 0, 0, 1]}
     state = measured(arms={"left": {"eef": tcp, "gripper": {"opening_mm": 30}}})
     history = [{"step": step, "tool": "left_move_by",
-                "args": {"translation_m": delta, "rotation_vector_rad": [0, 0, 0]},
+                "args": {"translation_m": delta, "rotation_vector_rad": rotation},
                 "feedback": {"status": "no_motion_observed", "actual": tcp, "target_reached": False,
-                             "motion_sent": True, "displacement_observed": False}}
-               for step, delta in enumerate(([.02, 0, 0], [0, .015, 0]), 1)]
-    new_pose = {"translation_m": [0, 0, 0], "rotation_vector_rad": [0, .04, 0]}
+                             "motion_sent": True, "displacement_observed": False, "feedback_frames": 26,
+                             "command_stamp_ms": 1000 * step, "state_stamp_ms": 1000 * step + 250}}
+               for step, (delta, rotation) in enumerate([
+                   ([.02, 0, 0], [0, .08, 0]), ([0, 0, 0], [0, .06, 0])], 1)]
+    history.append({"step": 3, "tool": "observe"})  # More images, same physical outcome.
+    new_pose = {"translation_m": [0, 0, 0], "rotation_vector_rad": [0, -.03, 0]}
     def send(payload):
         context = json.loads(payload["input"][0]["content"][0]["text"])
         assert context["actual_action_history"] == history
         assert context["current_measured_state"] == state
-        assert "slightly change TCP orientation" in payload["instructions"]
+        for entry in history[:2]:
+            assert f"Step {entry['step']} left_move_by: {json.dumps(entry['args'])}" in payload["instructions"]
+        assert "opposite sign or a smaller" in payload["instructions"]
         assert "outcome_unknown" in payload["instructions"]
         return reply(call("left_move_by", new_pose))
     monkeypatch.setattr(model, "_post", send)
     assert model.decide("approach", ["left"], {"head": b"current"}, state, history) == ("left_move_by", new_pose)
+
+
+@pytest.mark.parametrize("tool,update,review", [
+    ("left_set_gripper", {}, False),
+    ("left_move_to", {"status": "outcome_unknown"}, False),
+    ("left_move_by", {"motion_sent": False}, False),
+    ("left_move_by", {"feedback_frames": 1}, False),
+    ("left_move_by", {"state_stamp_ms": 1000}, False),
+    ("left_move_by", {"status": "completed", "displacement_observed": True}, False),
+    ("left_move_by", {}, True),
+])
+def test_pose_recovery_hint_requires_a_verified_unmoved_pose_and_an_action_turn(monkeypatch, model, tool, update, review):
+    feedback = {"status": "no_motion_observed", "target_reached": False, "motion_sent": True,
+                "displacement_observed": False, "feedback_frames": 20, "command_stamp_ms": 1000,
+                "state_stamp_ms": 5000}
+    history = [{"step": 1, "tool": "left_move_by", "feedback": feedback},
+               {"step": 2, "tool": tool, "feedback": {**feedback, **update}}]
+    def send(payload):
+        assert "opposite sign or a smaller" not in payload["instructions"]
+        return reply(message('{"status":"observe","reason":"继续确认净空"}'))
+    monkeypatch.setattr(model, "_post", send)
+    decide = model.review if review else model.decide
+    assert decide("inspect", ["left"], {"head": b"fresh"}, measured(), history)[0] == "observe"
