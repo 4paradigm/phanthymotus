@@ -319,8 +319,10 @@ def test_pinned_rtabmap_frontend_strategy_is_real(frontend, strategy, cor_type):
     if frontend == 'f2f_optical_flow':
         assert parameters['Vis/CorFlowWinSize'] == '16'
         assert parameters['Vis/CorFlowMaxLevel'] == '3'
+        assert parameters['Vis/CorFlowPyramidWithGuess'] == 'true'
     else:
         assert 'Vis/CorFlowWinSize' not in parameters
+        assert 'Vis/CorFlowPyramidWithGuess' not in parameters
 
 
 def test_default_rtabmap_frontend_preserves_feature_matching():

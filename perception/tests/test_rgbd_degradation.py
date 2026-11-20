@@ -516,6 +516,35 @@ def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
     assert s.gate.pause_context.budget_ns == 1_900*MS
 
 
+@pytest.mark.parametrize('first_half', [None, 'pose', 'info'])
+def test_visual_startup_uses_pending_native_measurement_at_handoff(fused, first_half):
+    make, now, _ = fused
+    s = make()
+    probe = s.observations.startup_gate
+    for stamp in (1_000*MS, 1_100*MS, 1_200*MS):
+        probe.input(stamp)
+        probe.accept(*native(s, stamp), stamp+20*MS)
+    assert probe.state == 'tracking' and s.fusion.last_tracking is None
+
+    stamp = 1_300*MS
+    now[0] = stamp+20*MS
+    s.gate.input(stamp)
+    s.observations.add_frame(stamp, None, None, now[0])
+    parts = dict(zip(('pose', 'info'), native(s, stamp)))
+    if first_half:
+        s._result(first_half, parts[first_half])
+    s.fusion.fault('ESKF awaits low-motion initialization')
+    s._check_fusion(now[0])
+    for kind, msg in parts.items():
+        if kind != first_half:
+            s._result(kind, msg)
+    assert s.gate.last_pose is not None and s.gate.last_pose[0] == stamp
+    assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
+    published = len(s.publisher.messages)
+    feed(s, now, stamp)
+    assert len(s.publisher.messages) == published
+
+
 def test_fallback_does_not_count_cancelled_fusion_captures(fused):
     make, now, _ = fused
     s = make()

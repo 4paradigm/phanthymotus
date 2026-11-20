@@ -535,7 +535,7 @@ def estimator_parameters(calibration, segment):
         params['motus_matched_landmarks'] = True
     if optical:
         params.update({'Vis/CorFlowWinSize': '16', 'Vis/CorFlowMaxLevel': '3',
-                       'Vis/CorFlowIterations': '30'})
+                       'Vis/CorFlowIterations': '30', 'Vis/CorFlowPyramidWithGuess': 'true'})
     if calibration.get('imu_topic') and not calibration.get('short_term_compensation'):
         params.update(wait_imu_to_init=True, **{'Odom/GuessSmoothingDelay': '0'})
     else:
@@ -1397,7 +1397,6 @@ class RgbdSession:
             # unsuccessful fusion warmup, never one window per weak frame.
             self.visual_initialization_started = self.mode_changed_at
         self.observations.counts['cancelled_on_fallback'] += len(self.observations.frames)
-        self.observations.frames.clear()
         gate = self.gate
         # Keep the native timing evidence for subsequent recovery phases.
         if self.fusion.result_period_ns is not None:
@@ -1413,6 +1412,15 @@ class RgbdSession:
             gate.good, gate.last_result_stamp = 2, probe.last_stamp
             gate.last_result_received = probe.last_result_received
             gate.uncertain_seed = (probe.last_pose, gate._matched_points(probe.anchor_info))
+            # Before the first fused pose, outstanding native measurements
+            # still use the verified visual world. Keep their exact-stamp join
+            # slots, including a pose or diagnostic that has already arrived.
+            for stamp, entry in self.observations.frames.items():
+                incomplete = 'pose' not in entry or 'info' not in entry
+                if incomplete and stamp > probe.last_result_stamp and now <= entry['deadline']:
+                    for kind, results in self.results.items():
+                        results[stamp] = entry.get(kind)
+        self.observations.frames.clear()
         self.observations.startup_gate = None
         if self.fusion.last_tracking is not None:
             # Something was published: resuming is a bounded recovery.
@@ -1605,8 +1613,9 @@ class RgbdSession:
                     self._check_fusion(time.time_ns())
                 return
             stamp, now = stamp_ns(msg), time.time_ns()
-            if getattr(self, 'fallback', None) is not None and stamp <= self.observations.last_added:
-                # In-flight fusion captures were canceled at the handoff.
+            if (getattr(self, 'fallback', None) is not None and stamp <= self.observations.last_added
+                    and stamp not in self.results[kind]):
+                # Only incomplete native measurements retained at startup can finish here.
                 return
             if (kind == 'info' and msg.lost and
                     stamp > max(self.gate.last_stamp, self.gate.last_result_stamp) and
@@ -1619,7 +1628,7 @@ class RgbdSession:
             self.results[kind][stamp] = msg
             while len(self.results[kind]) > 20:
                 self.results[kind].popitem(last=False)
-            if all(stamp in values for values in self.results.values()):
+            if all(values.get(stamp) is not None for values in self.results.values()):
                 pose, info = (self.results[k].pop(stamp) for k in ('pose', 'info'))
                 now = time.time_ns()
                 sample = self.gate.accept(pose, info, now) if self._imu_frame_ready(stamp, now) else None
