@@ -1438,6 +1438,32 @@ html, body {
   margin: 0 4px;
 }
 
+.canvas-clear-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.canvas-clear-btn:hover:not(:disabled) {
+  background: var(--red-bg);
+  color: var(--red);
+}
+.canvas-clear-btn:disabled {
+  opacity: .45;
+  cursor: default;
+}
+@media (pointer: coarse) {
+  .canvas-clear-btn { min-height: 44px; }
+}
+
 /* ── Canvas Top Control (智能控制 button) ─────────────────────────────── */
 .canvas-top-control {
   position: absolute;
@@ -6823,6 +6849,18 @@ html, body {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
     right: 12px;
     z-index: 50;
+  }
+  /* Keep the clear action above the zoom controls, away from the editor bar. */
+  .canvas-clear-sep { display: none; }
+  .canvas-clear-btn {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
   }
 
   /* Bottom-left, opposite the zoom controls — not top-left, which is the
