@@ -30,12 +30,10 @@ _TRUSTED_BOT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 _FEISHU_CHAT_ID_RE = re.compile(r'oc_[A-Za-z0-9]+')
 _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 
-# 单个 chat 自己的最近往来回顾——独立于全局共享的 `self._turns`（event/llm.py）。
-# agent-core 的对话历史是进程级单例，不区分 channel/chat_id/user；飞书本身也不
-# 替应用保留多轮上下文语义。没有这一层，两个人几乎同时私聊/群聊时，模型看到的
-# 历史会把不同人的对话混在一起，可能把 A 的上下文答给 B。
+# 单个会话的最近往来。飞书回合用这一份作为对话历史。
 _CHAT_HISTORY_LIMIT = 12
 _CHAT_HISTORY_TEXT_MAX = 500
+_FEISHU_RESET_COMMANDS = frozenset(('/clear', '清除上下文'))
 
 # Bot-to-Bot 主动发起（trusted_bot_id 路径）的粗粒度频率熔断。PR #134 的设计里
 # 明确没有轮次/时间熔断，靠双方"是否还有具体任务"自觉停止——这里加一层兜底，
@@ -281,22 +279,39 @@ class ChannelManager:
         return True
 
     # ── Per-chat context recap ───────────────────────────────────────────────
-    #
-    # 独立于 event/llm.py 里进程级共享的 `self._turns`：那条历史线不区分
-    # channel/chat_id/user，这里额外维护"这个会话自己的最近往来"，随 trigger
-    # 一起喂给模型，降低不同会话上下文被混用的风险（详见模块顶部注释）。
 
-    def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
-                              user_label: str = ''):
-        if not channel_id or not chat_id or not text:
-            return
+    def _chat_history_state(self, channel_id: str, chat_id: str) -> tuple[dict, dict, dict]:
         all_history = config.main.get('channel_chat_history', {})
         if not isinstance(all_history, dict):
             all_history = {}
-        channel_history = all_history.get(channel_id, {})
+        channel_history = all_history.get(channel_id)
         if not isinstance(channel_history, dict):
             channel_history = {}
-        entries = channel_history.get(chat_id, [])
+        state = channel_history.get(chat_id)
+        if isinstance(state, list):  # 升级前直接保存消息列表
+            state = {'entries': state}
+        elif not isinstance(state, dict):
+            state = {}
+        return all_history, channel_history, state
+
+    def chat_generation(self, channel_id: str, chat_id: str) -> int:
+        _, _, state = self._chat_history_state(channel_id, chat_id)
+        return state.get('generation', 0)
+
+    def _clear_chat_history(self, channel_id: str, chat_id: str):
+        all_history, channel_history, state = self._chat_history_state(channel_id, chat_id)
+        channel_history[chat_id] = {'generation': state.get('generation', 0) + 1, 'entries': []}
+        all_history[channel_id] = channel_history
+        config.main['channel_chat_history'] = all_history
+
+    def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
+                              user_label: str = '', source_generation: int | None = None):
+        if not channel_id or not chat_id or not text:
+            return
+        all_history, channel_history, state = self._chat_history_state(channel_id, chat_id)
+        if source_generation is not None and source_generation != state.get('generation', 0):
+            return  # 清除前触发的回复即使稍后发送成功，也不带入新上下文
+        entries = state.get('entries')
         if not isinstance(entries, list):
             entries = []
         entries = entries + [{
@@ -305,20 +320,15 @@ class ChannelManager:
             'user_label': user_label,
             'ts': time.time(),
         }]
-        channel_history[chat_id] = entries[-_CHAT_HISTORY_LIMIT:]
+        channel_history[chat_id] = {**state, 'entries': entries[-_CHAT_HISTORY_LIMIT:]}
         all_history[channel_id] = channel_history
         config.main['channel_chat_history'] = all_history
 
     def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6) -> list[dict]:
         """Return this chat's own recent exchanges (oldest first), independent of the
         shared global turn history."""
-        all_history = config.main.get('channel_chat_history', {})
-        if not isinstance(all_history, dict):
-            return []
-        channel_history = all_history.get(channel_id, {})
-        if not isinstance(channel_history, dict):
-            return []
-        entries = channel_history.get(chat_id, [])
+        _, _, state = self._chat_history_state(channel_id, chat_id)
+        entries = state.get('entries')
         if not isinstance(entries, list):
             return []
         valid = [e for e in entries if isinstance(e, dict) and isinstance(e.get('text'), str)]
@@ -335,7 +345,8 @@ class ChannelManager:
 
     def _set_last_context(self, channel_id: str, chat_id: str, user_id: str, *,
                           message_id: str = '', sender_type: str = 'user',
-                          chat_type: str = '', expect_reply: bool | None = None):
+                          chat_type: str = '', expect_reply: bool | None = None,
+                          context_generation: int = 0):
         """Persist conversation context for a channel.
 
         带 ts —— 「最近一次会话」必须靠时间戳判断：dict 就地更新不改插入顺序，
@@ -348,6 +359,7 @@ class ChannelManager:
             'sender_type': sender_type,
             'chat_type': chat_type,
             'expect_reply': expect_reply,
+            'context_generation': context_generation,
             'ts': time.time(),
         }
         ctx = self._get_last_context()
@@ -697,6 +709,21 @@ class ChannelManager:
 
     # ── Inbound ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_feishu_reset(msg: InboundMessage) -> bool:
+        if (msg.platform != 'feishu' or msg.sender_type != 'user'
+                or not msg.chat_id or msg.attachments):
+            return False
+        text = msg.text.strip()
+        if msg.chat_type == 'group':
+            return any(
+                mention.get('is_self') and mention.get('key')
+                and text.startswith(mention['key'])
+                and text[len(mention['key']):].strip() in _FEISHU_RESET_COMMANDS
+                for mention in msg.mentions
+            )
+        return text.strip() in _FEISHU_RESET_COMMANDS
+
     async def _on_inbound_message(self, msg: InboundMessage):
         """Handle incoming platform message."""
         # Sync active channels from canvas
@@ -753,13 +780,26 @@ class ChannelManager:
             if not allowed:
                 return  # 静默丢弃
 
+        if self._is_feishu_reset(msg):
+            self._clear_chat_history(msg.channel_id, msg.chat_id)
+            adapter = self._adapters.get(msg.channel_id)
+            if adapter:
+                await adapter.send_message(OutboundMessage(
+                    chat_id=msg.chat_id, text='已清除当前会话的上下文。'
+                ))
+            return
+
         # 4. Store last conversation context for reply routing (persisted)
+        context_generation = (
+            self.chat_generation(msg.channel_id, msg.chat_id) if msg.platform == 'feishu' else 0
+        )
         self._set_last_context(
             msg.channel_id, msg.chat_id, msg.user_id,
             message_id=msg.message_id,
             sender_type=msg.sender_type,
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
+            context_generation=context_generation,
         )
         self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
                                    user_label=msg.display_name or msg.user_id)
@@ -787,6 +827,8 @@ class ChannelManager:
             payload['files'] = files
         if private_chat:
             payload['chat_only'] = True
+        if msg.platform == 'feishu':
+            payload['context_generation'] = context_generation
         if trusted_bot_id:
             self._record_trusted_bot_message(payload)
         body = json.dumps(payload, ensure_ascii=False)
@@ -963,7 +1005,8 @@ class ChannelManager:
             if not mention_open_id:
                 # Bot-to-bot mentions aren't this chat's own human-facing conversation —
                 # keep the recap scoped to the human/channel side of the exchange.
-                self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
+                self._record_chat_exchange(channel_id, chat_id, 'assistant', text,
+                                           source_generation=ctx.get('context_generation', 0))
             return result
         except PartialSendError as e:
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍

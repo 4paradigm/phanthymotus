@@ -638,7 +638,8 @@ class FeishuAdapter(ChannelAdapter):
                     expect_reply = True
 
             mentions = [
-                {**mention, 'is_self': mention.get('open_id') == self._bot_open_id}
+                {**mention, 'is_self': bool(self._bot_open_id)
+                 and mention.get('open_id') == self._bot_open_id}
                 for mention in raw.get('mentions', [])
             ]
 

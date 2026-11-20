@@ -1933,7 +1933,7 @@ class Event:
             reconsider_ev = asyncio.Event()
             collector.set_reconsider_event(reconsider_ev)
             collector.set_turn_priority(1 if ev.get('_urgent') else 0)
-            collector.set_busy(True)
+            collector.set_busy(True, trigger=ev)
             # Publish this turn's cancel signal so tools that block for a long time
             # can honour it. peer_delegate holds an HTTP connection for the remote
             # task's whole duration, and the checks below only run between rounds.
@@ -2285,6 +2285,9 @@ class Event:
         if chat_only_turn:
             reconsider_event = None
         tool_restricted = chat_only_turn or bot_restricted or viewer_restricted
+        feishu_turn = bool(trigger_event.get('_feishu_chat'))
+        use_shared_history = not (bot_restricted or feishu_turn)
+        narration_start = len(_pending_narration_feedback) if feishu_turn else 0
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2480,7 +2483,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = [] if bot_restricted else self._build_history()
+            history = self._build_history() if use_shared_history else []
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(_scrub(turn_messages))
 
@@ -2570,7 +2573,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2 and not bot_restricted:
+                    if use_shared_history and len(self._turns) > 2:
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -2996,9 +2999,9 @@ class Event:
             # 汇报的回灌在这里排空 —— 和 steering 同一个安全点。定时器可能在
             # assistant(tool_calls) 已入列、tool 结果还没入列的窗口触发，那时当场 append
             # 会造出 provider 会拒的消息序列。
-            while _pending_narration_feedback:
+            while len(_pending_narration_feedback) > narration_start:
                 turn_messages.append(
-                    _narration_feedback_message(_pending_narration_feedback.pop(0)))
+                    _narration_feedback_message(_pending_narration_feedback.pop(narration_start)))
 
             # 消息已经进 turn_messages 了，这次 reconsider 的目的达成 —— 不清的话下一次
             # client.call 会立刻抛 RoundReconsider 再 drain 一次空队列，白烧一次请求。
@@ -3038,7 +3041,8 @@ class Event:
             await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
-        await self._maybe_compress()
+        if not feishu_turn:
+            await self._maybe_compress()
 
         # 发布决策到 /decision_core DDS topic
         import ros2_bridge
