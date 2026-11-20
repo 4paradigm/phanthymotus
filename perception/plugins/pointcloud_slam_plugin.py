@@ -370,6 +370,8 @@ class PointCloudSlamPlugin:
         if rgb_topic is not None:
             from .pointcloud_slam_rgb import validate_rgb_camera
             cameras = args.get('camera_infos')
+            if legacy and 'camera_infos' not in args:
+                cameras = args.get('camera_info')
             camera = cameras.get(rgb_topic) if isinstance(cameras, dict) else None
             self._rgb_input = {'topic': rgb_topic, 'camera_info': deepcopy(camera)}
             try:

@@ -1070,14 +1070,21 @@ def test_unconnected_rgb_declaration_does_not_enable_image_mode_and_restart_clea
     assert_rgb_port(card)
 
 
-def test_legacy_discovery_can_prepare_the_connected_optional_rgb(card, monkeypatch):
+@pytest.mark.parametrize('declaration_key', ['camera_info', 'camera_infos'])
+def test_legacy_discovery_can_prepare_the_connected_optional_rgb(card, monkeypatch, declaration_key):
     monkeypatch.setattr(module, 'discover_input_bindings', lambda topics: {
         '/pose': 'state/odom', '/cloud': 'sensor/pointcloud2', '/rgb': 'image/jpeg'})
-    args = rgb_arguments(rgb_camera())
+    camera = rgb_camera()
+    args = rgb_arguments()
+    args[declaration_key] = {'/rgb': camera}
     del args['input_bindings']
     assert card.dispatch('pointcloud_slam', args)['state'] == 'ready'
-    assert call(card, 'info')['input_compatibility']['mode'] == 'legacy_core'
+    info = call(card, 'info')
+    assert info['input_compatibility']['mode'] == 'legacy_core'
+    assert info['rgb_input_status'] == 'ready'
     assert_rgb_port(card, '/rgb')
+    assert call(card, 'start_mapping', map_name='Legacy RGB')['state'] == 'running'
+    assert card._session_settings['rgb_input'] == {'topic': '/rgb', 'camera_info': camera}
 
 
 @pytest.mark.parametrize('extra', [
