@@ -1,5 +1,6 @@
 /** text.js — Renders streaming text output */
 import { decodeNestedJson, plainValue, escapeHtml } from './json-util.js';
+import { isBatteryStatus, batteryEntries } from './battery-view.js';
 
 export const TextRenderer = {
   name: 'text',
@@ -24,6 +25,18 @@ export const TextRenderer = {
       const str = new TextDecoder().decode(buffer);
       const json = JSON.parse(str);
       if (json.type === 'ping' || json.type === 'meta') return;
+      if (isBatteryStatus(json)) {
+        const time = new Date().toLocaleTimeString();
+        const entries = batteryEntries(json).map(entry =>
+          `${_formatJson(entry.values)}<details><summary>Details</summary>${_formatJson(entry.details)}</details>`
+        ).join('');
+        const row = document.createElement('div');
+        row.className = 'log-entry';
+        row.innerHTML = `<span class="log-time">${time}</span><span class="log-msg" style="color:var(--text-muted);font-size:12px;white-space:pre-wrap">${entries}</span>`;
+        _appendBatteryLog(this._textEl, row);
+        return;
+      }
+
       if (json.text) {
         const p = document.createElement('p');
         p.className = 'asr-line';
@@ -85,6 +98,25 @@ export const TextRenderer = {
 
 /** How much of one value is shown inline; the rest is on the tooltip. */
 const VALUE_MAX = 200;
+
+function _appendBatteryLog(container, row) {
+  // Keep the historical frame being inspected visible while new frames arrive.
+  const expanded = container.querySelector('details[open]');
+  const anchorTop = expanded?.getBoundingClientRect().top;
+  container.appendChild(row);
+  while (container.children.length > 50) {
+    // Preserve open records, even when they are the oldest. If all 50 are open,
+    // discard the new closed record until the user closes one.
+    const closed = Array.from(container.children).find(child => !child.querySelector('details[open]'));
+    if (!closed) break;
+    container.removeChild(closed);
+  }
+  if (expanded) {
+    container.scrollTop += expanded.getBoundingClientRect().top - anchorTop;
+  } else {
+    container.scrollTop = container.scrollHeight;
+  }
+}
 
 function _formatJson(obj) {
   // Decode first: a field carrying a JSON *string* was previously rendered

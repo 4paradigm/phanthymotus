@@ -1,0 +1,12 @@
+{
+  "name": "motus-helios-renderer-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "0.9.12",
+    "three": "0.164.1"
+  }
+}

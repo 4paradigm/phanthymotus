@@ -1,0 +1,35 @@
+name: Helios renderer regressions
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/helios-renderers.yml
+      - agent-core/web/index.html
+      - agent-core/web/js/canvas.js
+      - agent-core/web/js/detail-panel.js
+      - agent-core/web/js/renderers/**
+      - agent-core/web/js/tests/helios/**
+  push:
+    branches: [feat/helios-cards]
+    paths:
+      - .github/workflows/helios-renderers.yml
+      - agent-core/web/**
+
+permissions:
+  contents: read
+
+jobs:
+  renderers:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-core/web/js/tests/helios
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: agent-core/web/js/tests/helios/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test

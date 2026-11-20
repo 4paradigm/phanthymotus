@@ -1,5 +1,5 @@
 /**
- * skeleton.js — 3D skeleton renderer for Unitree G1 humanoid robot.
+ * skeleton.js — 3D URDF skeleton renderer for robot joint state.
  * Fetches URDF model from driver via MCP tool, parses kinematic chain,
  * and renders a real-time 3D skeleton driven by joint state data.
  */
@@ -51,6 +51,10 @@ export const SkeletonRenderer = {
   _mcpId: null,
 
   mount(container, mcpId) {
+    this._heliosUpperBody = null;
+    this._lastData = null;
+    this._needsFit = true;
+    this._userViewChanged = false;
     this._mcpId = mcpId;
     this._joints = {};
     this._links = {};
@@ -87,6 +91,7 @@ export const SkeletonRenderer = {
     this._controls.target.set(0, 0.4, 0);
     this._controls.enableDamping = true;
     this._controls.dampingFactor = 0.1;
+    this._controls.addEventListener('start', () => { this._userViewChanged = true; });
     this._controls.update();
 
     // Lighting
@@ -99,9 +104,11 @@ export const SkeletonRenderer = {
     const grid = new THREE.GridHelper(2, 20, 0x444444, 0x333333);
     grid.position.y = -0.65;
     this._scene.add(grid);
+    this._grid = grid;
   },
 
   async _loadModel(mcpId) {
+    const mountedElement = this._el;
     if (!mcpId || mcpId === 'dashboard') {
       this._buildFallbackSkeleton();
       return;
@@ -113,12 +120,15 @@ export const SkeletonRenderer = {
         body: JSON.stringify({ tool: 'model', arguments: {} }),
       });
       const json = await res.json();
+      if (this._el !== mountedElement || !this._scene) return;
       // API returns { code, data } where data is the content array
       const content = json.data?.[0]?.text ?? json.result?.content?.[0]?.text;
       if (!content) { this._buildFallbackSkeleton(); return; }
       const data = JSON.parse(content);
       if (data.urdf) {
         this._parseAndBuild(data.urdf);
+        if (this._lastData) this._applyState(this._lastData);
+        this._fitModel();
       } else if (data.type === 'quadruped') {
         this._buildQuadrupedSkeleton(data);
       } else {
@@ -133,6 +143,16 @@ export const SkeletonRenderer = {
   _parseAndBuild(urdfXml) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(urdfXml, 'text/xml');
+    // Simplify this model's display only; keep every kinematic frame.
+    const isHelios = doc.querySelector('robot')?.getAttribute('name') === 'Rokae_Robot_2.1_AR5_v1.1';
+    const hiddenSensorLinks = new Set(isHelios ? [
+      'ChestRGBD_link', 'HeadRGBD_link', 'RGB1_link', 'RGB2_link', 'RGB3_link',
+    ] : []);
+    const symbolicJoints = new Set(isHelios ? [
+      'left_fixed', 'right_fixed', 'left_joint_2', 'right_joint_2',
+      'head_joint_1', 'head_joint_2',
+    ] : []);
+    this._heliosUpperBody = null;
 
     // Parse links and joints
     const linkNodes = doc.querySelectorAll('link');
@@ -214,7 +234,9 @@ export const SkeletonRenderer = {
         jointGroup.position.set(j.origin.x, j.origin.y, j.origin.z);
 
         // Apply base RPY rotation (static offset)
-        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'XYZ');
+        // URDF fixed-axis RPY means Rz(yaw) * Ry(pitch) * Rx(roll).
+        // Three.js intrinsic ZYX gives that order; XYZ tilts compound origins.
+        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'ZYX');
         jointGroup.rotation.copy(euler);
 
         parentObj.add(jointGroup);
@@ -232,7 +254,8 @@ export const SkeletonRenderer = {
         this._links[j.childLink] = childGroup;
 
         // Add visual geometry (bone segment) for revolute joints and significant fixed joints
-        if (j.type === 'revolute' || j.type === 'fixed') {
+        if (!hiddenSensorLinks.has(j.childLink) && !symbolicJoints.has(j.name)
+            && (j.type === 'revolute' || j.type === 'fixed')) {
           this._addBoneVisual(jointGroup, j);
         }
 
@@ -242,6 +265,7 @@ export const SkeletonRenderer = {
 
     // Add joint spheres for revolute joints
     for (const [name, obj] of Object.entries(this._joints)) {
+      if (isHelios && ['head_joint_1', 'head_joint_2', 'left_joint_1', 'right_joint_1'].includes(name)) continue;
       const isHand = name.includes('hand');
       const radius = isHand ? 0.006 : 0.012;
       const sphere = new THREE.Mesh(
@@ -254,7 +278,7 @@ export const SkeletonRenderer = {
     // Add endpoint spheres for leaf links (links with no children, e.g. feet)
     const parentLinks = new Set(joints.map(j => j.childLink));
     for (const [name, obj] of Object.entries(this._links)) {
-      if (name === rootLinkName) continue;
+      if (name === rootLinkName || hiddenSensorLinks.has(name)) continue;
       const hasChildren = joints.some(j => j.parentLink === name);
       if (!hasChildren) {
         const sphere = new THREE.Mesh(
@@ -265,7 +289,55 @@ export const SkeletonRenderer = {
       }
     }
 
+    if (isHelios) this._buildHeliosUpperBody();
     this._loaded = true;
+  },
+
+  _buildHeliosUpperBody() {
+    // Symbolic torso/shoulders, separate from the untouched URDF kinematic tree.
+    const group = new THREE.Group();
+    this._links.body_link_4.add(group);
+    const bone = () => {
+      const geometry = new THREE.CylinderGeometry(0.008, 0.008, 1, 6);
+      geometry.translate(0, 0.5, 0);
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({ color: 0xaabbcc }));
+      group.add(mesh);return mesh;
+    };
+    const dot = radius => new THREE.Mesh(new THREE.SphereGeometry(radius, 8, 8),
+      new THREE.MeshPhongMaterial({ color: 0x00ccff, emissive: 0x003344 }));
+    const shoulder = dot(0.015);group.add(shoulder);
+    const headFrame = new THREE.Group();group.add(headFrame);
+    const neck = bone();group.remove(neck);headFrame.add(neck);
+    neck.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 1));
+    neck.scale.y = 0.10;
+    const head = dot(0.04);head.position.z = 0.10;headFrame.add(head);
+    this._heliosUpperBody = { group, shoulder, headFrame, head, neck,
+      shoulderLine: bone(), spine: bone() };
+    this._updateHeliosUpperBody();
+  },
+
+  _updateHeliosUpperBody() {
+    const view = this._heliosUpperBody;
+    if (!view) return;
+    this._rootGroup.updateWorldMatrix(true, true);
+    const local = link => view.group.worldToLocal(link.getWorldPosition(new THREE.Vector3()));
+    const left = local(this._links.left_link_2);
+    const right = local(this._links.right_link_2);
+    const center = left.clone().add(right).multiplyScalar(0.5);
+    const segment = (mesh, from, to) => {
+      const direction = to.clone().sub(from);
+      const length = direction.length();
+      mesh.visible = length > 0.0001;
+      mesh.position.copy(from);mesh.scale.y = length;
+      if (mesh.visible) mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+    };
+    segment(view.shoulderLine, left, right);
+    segment(view.spine, new THREE.Vector3(), center);
+    view.shoulder.position.copy(center);
+    view.headFrame.position.copy(center);
+    // Both head angles drive the symbol, relative to the real torso orientation.
+    view.headFrame.quaternion.copy(view.group.getWorldQuaternion(new THREE.Quaternion())).invert()
+      .multiply(this._links.head_link_2.getWorldQuaternion(new THREE.Quaternion()));
   },
 
   _addBoneVisual(jointGroup, joint) {
@@ -500,37 +572,54 @@ export const SkeletonRenderer = {
   },
 
   onData(buffer, fmt) {
-    if (!this._loaded) return;
     try {
       const text = new TextDecoder().decode(buffer);
       const data = JSON.parse(text);
-
-      // Apply pelvis orientation from IMU quaternion
-      if (data.imu_quat && this._pelvisGroup) {
-        const [w, x, y, z] = data.imu_quat;
-        this._pelvisGroup.quaternion.set(x, y, z, w);
-      }
-
-      const joints = data.joints;
-      if (!Array.isArray(joints)) return;
-
-      for (const j of joints) {
-        // Prefer name-based matching (R1 sends joint names), fallback to index map (G1)
-        const jointName = j.name || (j.idx < MOTOR_INDEX_MAP.length ? MOTOR_INDEX_MAP[j.idx] : null);
-        if (!jointName) continue;
-        const obj = this._joints[jointName];
-        if (!obj) continue;
-
-        const angle = j.q;
-        const axis = obj.userData.axis;
-        if (!axis) continue;
-
-        // Apply rotation around the joint axis from identity
-        obj.quaternion.setFromAxisAngle(axis, angle);
-      }
+      this._lastData = data;
+      this._applyState(data);
     } catch (e) {
       // Silently ignore parse errors (graceful degradation)
     }
+  },
+
+  _applyState(data) {
+    if (!this._loaded) return;
+    if (data.imu_quat && this._pelvisGroup) {
+      const [w, x, y, z] = data.imu_quat;
+      this._pelvisGroup.quaternion.set(x, y, z, w);
+    }
+    if (!Array.isArray(data.joints)) return;
+    for (const j of data.joints) {
+      const name = j.name || (j.idx < MOTOR_INDEX_MAP.length ? MOTOR_INDEX_MAP[j.idx] : null);
+      const obj = this._joints[name];
+      if (!obj?.userData.axis || !Number.isFinite(j.q)) continue;
+      obj.quaternion.setFromAxisAngle(obj.userData.axis, j.q);
+    }
+    this._updateHeliosUpperBody();
+    if (data.joints.length && this._needsFit) {
+      this._fitModel();
+      this._needsFit = false;
+    }
+  },
+
+  _fitModel() {
+    if (!this._rootGroup || !this._camera || !this._controls) return;
+    this._rootGroup.updateWorldMatrix(true, true);
+    const bounds = new THREE.Box3().setFromObject(this._rootGroup);
+    if (bounds.isEmpty()) return;
+    const center = bounds.getCenter(new THREE.Vector3());
+    const size = bounds.getSize(new THREE.Vector3());
+    const radius = Math.max(size.length() / 2, 0.1);
+    const vertical = THREE.MathUtils.degToRad(this._camera.fov / 2);
+    const horizontal = Math.atan(Math.tan(vertical) * this._camera.aspect);
+    const distance = radius / Math.sin(Math.min(vertical, horizontal)) * 1.15;
+    this._controls.target.copy(center);
+    this._camera.position.copy(center).addScaledVector(new THREE.Vector3(1, 0.5, 1.3).normalize(), distance);
+    this._camera.near = Math.max(distance / 1000, 0.001);
+    this._camera.far = Math.max(distance * 10, 50);
+    this._camera.updateProjectionMatrix();
+    this._controls.update();
+    if (this._grid) this._grid.position.y = bounds.min.y - 0.03;
   },
 
   _animate() {
@@ -542,15 +631,21 @@ export const SkeletonRenderer = {
 
   _resize() {
     if (!this._el || !this._threeRenderer) return;
-    const w = this._el.clientWidth;
-    const h = this._el.clientHeight;
+    const target = this._el;
+    const w = target.clientWidth;
+    const h = target.clientHeight;
     if (w === 0 || h === 0) return;
     this._camera.aspect = w / h;
     this._camera.updateProjectionMatrix();
     this._threeRenderer.setSize(w, h);
+    // A wide initial fit is too close after narrowing the panel. Refit until
+    // the user takes control; later layout changes must preserve their view.
+    if (this._loaded && !this._userViewChanged) this._fitModel();
   },
 
   unmount() {
+    this._heliosUpperBody = null;
+    this._lastData = null;
     if (this._raf) cancelAnimationFrame(this._raf);
     this._ro?.disconnect();
     this._controls?.dispose();
@@ -568,6 +663,9 @@ export const SkeletonRenderer = {
       });
     }
     this._el?.remove();
+    this._grid = null;
+    this._rootGroup = null;
+    this._pelvisGroup = null;
     this._scene = null;
     this._camera = null;
     this._threeRenderer = null;
