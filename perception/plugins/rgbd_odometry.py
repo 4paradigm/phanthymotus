@@ -79,6 +79,11 @@ class RgbdOdometryPlugin:
                         continue
                     if info['status'] == 'lost' and state['lost_since'] is None:
                         state['lost_since'] = now
+                        # A published run interrupted by missing camera input
+                        # succeeded. Retry when both inputs return; a failed
+                        # launch still earns its own backoff below.
+                        if info['loss_kind'] == 'input' and session.first_tracking_at is not None:
+                            state.update(failure_streak=0, next_attempt=None, backoff_s=1.5)
                     if ((not restoring and now-state['lost_since'] < .8) or
                             (state['next_attempt'] is not None and now < state['next_attempt']) or
                             (restoring and state['mode_retry_after'] is not None and now < state['mode_retry_after']) or

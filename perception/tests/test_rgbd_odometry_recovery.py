@@ -279,3 +279,23 @@ def test_worker_start_failure_cleans_native_process_and_node_before_retry(recove
     else:
         assert len(processes) == 1 and not processes[0].running
     assert 'cannot start native callback worker' in card.recovery['one']['error']
+
+
+@pytest.mark.parametrize('published,kind,replace', [
+    (True, 'input', True), (False, 'input', False), (True, 'visual', False)])
+def test_fresh_input_after_a_published_run_does_not_inherit_failed_start_backoff(
+        recovery, published, kind, replace):
+    card, _, now, seconds = recovery
+    session = card.instances['one'][0]
+    session.process.returncode = 0
+    session.first_tracking_at = seconds[0]-1 if published else None
+    state = card.recovery['one']
+    state.update(failure_streak=5, next_attempt=seconds[0]+30, backoff_s=30.)
+    session.gate.fault('test outage', kind)
+    card._recover()
+    seconds[0] += 1.
+    card._recover()
+    assert card.instances['one'][0] is session
+    images(session, now[0])
+    card._recover()
+    assert (card.instances['one'][0] is not session) == replace
