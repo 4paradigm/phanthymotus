@@ -1,4 +1,4 @@
-"""Canvas ports remain stable across lifecycle and metric publishing settings."""
+"""Canvas ports remain stable across the card lifecycle."""
 import struct
 import types
 
@@ -56,7 +56,7 @@ def test_idle_invalid_input_does_not_advertise_guessed_topics(inputs):
     assert not executor.nodes
 
 
-def test_stop_and_rewire_rederive_idle_ports_and_preserve_metric_config():
+def test_stop_and_rewire_rederive_idle_ports_and_ignore_legacy_metric_config():
     plugin, _ = _plugin({'metric_cloud': True})
     plugin.dispatch('pointcloud', {'action': 'config', 'instance_id': 'card', 'metric_cloud': False})
     try:
@@ -67,19 +67,17 @@ def test_stop_and_rewire_rederive_idle_ports_and_preserve_metric_config():
             '/new/pointcloud', '/new/pointcloud_summary', '/new/pointcloud_metric']
         empty = plugin.dispatch('pointcloud', {'action': 'info', 'instance_id': 'card', 'input_topic': ''})
         assert len(empty['topic_out']) == 3 and all(not p.get('topic') for p in empty['topic_out'])
-        # Visible ports no longer reveal the toggle; starting without metric
-        # calibration must still respect this card's override of the global True.
         restarted = plugin.dispatch('pointcloud', {
             'action': 'start', 'instance_id': 'card', 'input_topic': '/new'})
         assert restarted['state'] == 'running'
         running = plugin.dispatch('pointcloud', {'action': 'info', 'instance_id': 'card'})
-        assert running['instances']['card']['metric_cloud'] is None
+        assert running['instances']['card']['metric_cloud']['published'] == 0
     finally:
         plugin.shutdown()
 
 
 @pytest.mark.parametrize('instance_id', ['', 'card'])
-def test_disabled_metric_port_is_visible_without_publishing_or_metric_metadata(instance_id):
+def test_metric_cloud_and_metadata_are_enabled_without_opt_in(instance_id):
     plugin, executor = _plugin()
     try:
         result = plugin.dispatch('pointcloud', {
@@ -95,9 +93,9 @@ def test_disabled_metric_port_is_visible_without_publishing_or_metric_metadata(i
             {'topic': '/depth/pointcloud_summary', 'format': 'data/json'},
             {'topic': '/depth/pointcloud_metric', 'format': 'sensor/pointcloud2'},
         ]
-        assert info['instances']['card']['metric_cloud'] is None
-        assert 'input_metadata' not in info
-        assert all(c['format'] != 'sensor/pointcloud2' for c in info.get('camera_info', []))
+        assert info['instances']['card']['metric_cloud']['published'] == 0
+        assert info['input_metadata'][0]['frame_metadata_topic'] == '/depth/pointcloud_metric/metadata'
+        assert any(c['format'] == 'sensor/pointcloud2' for c in info['camera_info'])
 
         node = executor.nodes[0]
         msg = _FakeImage(data=struct.pack('<H', 2000), encoding='16UC1',
@@ -105,26 +103,46 @@ def test_disabled_metric_port_is_visible_without_publishing_or_metric_metadata(i
         msg.header.frame_id = 'optical'
         msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
         node._emit_depth(msg)
-        assert [p.topic for p in node.publishers] == [
-            '/depth/pointcloud', '/depth/pointcloud_summary']
-        assert all(p.raw_messages for p in node.publishers)
-        assert not any(s.topic == '/depth/evidence' for s in node.subscriptions)
+        assert {p.topic for p in node.publishers if p.raw_messages} == {
+            '/depth/pointcloud', '/depth/pointcloud_summary', '/depth/pointcloud_metric'}
+        assert any(s.topic == '/depth/evidence' for s in node.subscriptions)
     finally:
         plugin.shutdown()
 
 
-def test_metric_toggle_preserves_ports_across_config_restart():
+@pytest.mark.parametrize('new_fx', [3.0, None])
+def test_running_metric_output_rejects_changed_calibration(new_fx):
     plugin, executor = _plugin()
+    original = metric_z16_declaration(1)
+    revised = {**original, 'K': [new_fx, *original['K'][1:]] if new_fx is not None else None}
+    start = {'instance_id': 'card', 'input_topic': '/depth'}
+    try:
+        assert plugin.dispatch('start', {**start, 'camera_info': [original]})['state'] == 'running'
+        node = executor.nodes[0]
+        result = plugin.dispatch('start', {**start, 'camera_info': [revised]})
+        assert result['state'] == 'error'
+        assert executor.nodes == [node]
+        info = plugin.dispatch('info', {'instance_id': 'card'})
+        metric = next(c for c in info['camera_info'] if c['format'] == 'sensor/pointcloud2')
+        assert metric['K'] == original['K']
+    finally:
+        plugin.shutdown()
+
+
+def test_legacy_metric_toggle_cannot_disable_publishing_or_restart_card():
+    plugin, executor = _plugin({'metric_cloud': False})
     expected = [
         {'topic': '/depth/pointcloud', 'format': 'sensor/pointcloud'},
         {'topic': '/depth/pointcloud_summary', 'format': 'data/json'},
         {'topic': '/depth/pointcloud_metric', 'format': 'sensor/pointcloud2'},
     ]
     try:
-        for enabled in (True, False, True):
+        assert 'metric_cloud' not in plugin.get_tools()[0]['configSchema']['properties']
+        for enabled in (False, True):
             config = plugin.dispatch('pointcloud', {
                 'action': 'config', 'instance_id': 'card', 'metric_cloud': enabled})
             assert config['status'] == 'configured'
+            assert 'metric_cloud' not in config['config']
             idle = plugin.dispatch('pointcloud', {
                 'action': 'info', 'instance_id': 'card', 'input_topic': '/depth'})
             assert idle['state'] == 'idle' and idle['topic_out'] == expected
@@ -136,8 +154,18 @@ def test_metric_toggle_preserves_ports_across_config_restart():
             assert result['state'] == 'running'
             running = plugin.dispatch('pointcloud', {'action': 'info', 'instance_id': 'card'})
             assert running['topic_out'] == expected
-            metric_publishers = [p for p in executor.nodes[0].publishers
+            node = executor.nodes[0]
+            metric_publishers = [p for p in node.publishers
                                  if p.topic == '/depth/pointcloud_metric']
-            assert len(metric_publishers) == int(enabled)
+            assert len(metric_publishers) == 1
+            plugin.dispatch('pointcloud', {
+                'action': 'config', 'instance_id': 'card', 'metric_cloud': not enabled})
+            assert executor.nodes == [node]
+            msg = _FakeImage(data=struct.pack('<H', 2000), encoding='16UC1',
+                             width=1, height=1, step=2)
+            msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+            node._emit_depth(msg)
+            assert len(metric_publishers[0].raw_messages) == 1
+            plugin.dispatch('pointcloud', {'action': 'stop', 'instance_id': 'card'})
     finally:
         plugin.shutdown()

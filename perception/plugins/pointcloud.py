@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Depth-only pointcloud card: one Z16/zlib input, display and optional metric output.
+"""Depth-only pointcloud card: one Z16/zlib input, display and metric output.
 
 Camera parameters come from upstream camera_info. Display output retains its
 approximate field-of-view fallback; metric output requires finite numeric intrinsics.
@@ -69,7 +69,7 @@ TOOLS = [
         "multiInstance": True,
         "description": (
             "点云 — 一路深度图（image/depth-z16 或 image/depth-zlib）反投影为 3D 点云。"
-            "输出点云包（sensor/pointcloud）与摘要（data/json）"
+            "输出点云包（sensor/pointcloud）、摘要（data/json）和计算点云（sensor/pointcloud2）"
         ),
         "inputSchema": {
             "type": "object",
@@ -108,8 +108,6 @@ TOOLS = [
                 "max_points": {"type": "integer", "description": "每帧最多点数（上限 40000，由渲染器决定）", "default": 20000, "scope": "instance"},
                 "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
-                "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
-                                 "description": "启用计算输出（PointCloud2 输出口始终显示）；使用有限数值内参，深度约定为毫米光轴距离"},
             },
         },
         "topic_in": [
@@ -119,7 +117,7 @@ TOOLS = [
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
             {"format": "data/json", "desc": "点数/范围/三区最近障碍摘要"},
-            {"format": "sensor/pointcloud2", "desc": "米制计算点云（启用计算输出后发布，带采集时间和物理坐标系）"},
+            {"format": "sensor/pointcloud2", "desc": "米制计算点云（使用有效内参，携带观测时间戳和输入坐标系）"},
         ],
     }
 ]
@@ -211,10 +209,9 @@ class _PointCloudNode(Node):
         self._cloud_topic, self._summary_topic = output_topics_for(input_topic)
         self._cloud_pub = self.create_publisher(UInt8MultiArray, self._cloud_topic, _PUB_QOS)
         self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
-        self._metric_cloud_enabled = False
         self._input_format = None
         self._metric_cloud_topic = (input_topic or "/perception") + "/pointcloud_metric"
-        self._metric_cloud_pub = None
+        self._metric_cloud_pub = self.create_publisher(PointCloud2, self._metric_cloud_topic, _PUB_QOS)
         self._metric_metadata_topic = self._metric_cloud_topic + "/metadata"
         self._metric_metadata_source_topic = None
         self._metric_metadata_pub = None
@@ -426,8 +423,7 @@ class _PointCloudNode(Node):
     def _emit_depth(self, msg, context=None):
         depth_m, enc = _decode_depth_message(msg, getattr(self, "_input_dimensions", None))
         if depth_m is None:
-            if self._metric_cloud_enabled:
-                self._metric_skip('invalid_depth')
+            self._metric_skip('invalid_depth')
             return
         h, w = depth_m.shape[:2]
         fx, fy, cx, cy = self._pinhole_for(w, h)
@@ -435,10 +431,10 @@ class _PointCloudNode(Node):
         xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
                                  self._min_depth_m, self._max_depth_m)
         self._publish(xyz)
-        if self._metric_cloud_enabled and ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
+        if ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
                 (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
             self._publish_metric(xyz, msg, w, h, context, depth_m=depth_m)
-        elif self._metric_cloud_enabled:
+        else:
             self._metric_skip('unsupported_encoding')
 
     def _metric_skip(self, reason):
@@ -602,7 +598,6 @@ class PointCloudPerceptionPlugin:
         self._input_registry = input_registry
         self._namespace = namespace
         self._executor = executor
-        self._plugin_cfg = dict(plugin_cfg or {})
         self._fps = int(plugin_cfg.get("fps", 2))
         self._max_points = max(100, min(MAX_POINTS, int(plugin_cfg.get("max_points", 20000))))
         self._min_depth_m = float(plugin_cfg.get("min_depth_m", 0.1))
@@ -678,9 +673,6 @@ class PointCloudPerceptionPlugin:
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
             node._applied_config = effective
-            node._metric_cloud_enabled = effective['metric_cloud']
-            if node._metric_cloud_enabled:
-                node._metric_cloud_pub = node.create_publisher(PointCloud2, node._metric_cloud_topic, _PUB_QOS)
             with self._nodes_lock:
                 upstream = self._upstream_camera.get(node_key) or {}
             if all(type(upstream.get(k)) is int and 0 < upstream[k] <= 4096 for k in ('width', 'height')):
@@ -690,11 +682,9 @@ class PointCloudPerceptionPlugin:
             node._input_declaration = upstream
             node._input_format = upstream.get("format") or declaration.get("format")
             metadata_topic = declaration.get("frame_metadata_topic")
-            if node._metric_cloud_enabled and isinstance(metadata_topic, str) and metadata_topic:
+            if calibration and isinstance(metadata_topic, str) and metadata_topic:
                 node._metric_metadata_source_topic = metadata_topic
-                node._metric_metadata_pub = node.create_publisher(
-                    String, node._metric_metadata_topic, _PUB_QOS)
-            if node._metric_cloud_enabled and self._input_registry is not None and node._metric_metadata_pub is None:
+            if calibration and (node._metric_metadata_source_topic or self._input_registry is not None):
                 node._metric_metadata_pub = node.create_publisher(String, node._metric_metadata_topic, _PUB_QOS)
             K = upstream.get("K")
             if isinstance(K, (list, tuple)) and len(K) == 9:
@@ -757,7 +747,6 @@ class PointCloudPerceptionPlugin:
             'max_points': max(100, min(MAX_POINTS, int(cfg.get('max_points', self._max_points)))),
             'min_depth_m': float(cfg.get('min_depth_m', self._min_depth_m)),
             'max_depth_m': float(cfg.get('max_depth_m', self._max_depth_m)),
-            'metric_cloud': cfg.get('metric_cloud', self._plugin_cfg.get('metric_cloud', False)) is True,
         }
 
     def _validate_ranges(self, cfg: dict) -> Optional[str]:
@@ -800,7 +789,6 @@ class PointCloudPerceptionPlugin:
             if instance_id:
                 nodes = {instance_id: nodes[instance_id]} if instance_id in nodes else {}
             if not nodes:
-                # Ports describe capabilities even when metric publishing is off.
                 # Before start, derive paths only from this card's validated input.
                 topics_out = [{"format": "sensor/pointcloud"}, {"format": "data/json"},
                               {"format": "sensor/pointcloud2"}]
@@ -829,7 +817,7 @@ class PointCloudPerceptionPlugin:
                     # 标定来源：声明层（驱动型号级出厂标定）还是用户配置 ——
                     # 出云错了排查方向完全不同。
                     "calibration_source": getattr(node, "_calibration_source", None),
-                    "metric_cloud": node._metric_status() if node._metric_cloud_enabled else None,
+                    "metric_cloud": node._metric_status(),
                 }
                 for key, node in nodes.items()
             }
@@ -886,7 +874,8 @@ class PointCloudPerceptionPlugin:
             from plugins.camera_info import inherit
             metadata_out = []
             for key, metric_node in nodes.items():
-                if not metric_node._metric_cloud_enabled or (instance_id in nodes and key != instance_id):
+                c = metric_node._calibration
+                if not c or (instance_id in nodes and key != instance_id):
                     continue
                 with self._nodes_lock:
                     upstream = self._upstream_camera.get(key)
@@ -902,7 +891,6 @@ class PointCloudPerceptionPlugin:
                                        format="sensor/pointcloud2", length_unit="m",
                                        frame_metadata_topic=metric_node._metric_metadata_topic)
                     metadata_out.append(declaration)
-                c = metric_node._calibration
                 declaration = inherit(upstream, topic=metric_node._metric_cloud_topic,
                     fmt="sensor/pointcloud2", stage="perception/pointcloud",
                     width=c['width'], height=c['height'])
@@ -921,27 +909,22 @@ class PointCloudPerceptionPlugin:
         elif action == "start":
             try:
                 input_topic = self._resolve_input(args)
-                calibration = None
             except ValueError as error:
                 return {"state": "error", "message": str(error)}
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
-            icfg = self._instance_configs.get(node_key, {})
-            metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
-            if metric_enabled:
-                from plugins.camera_info import for_topic as _camera_for_topic
-                declared = _camera_for_topic(args.get("camera_info"), input_topic)
-                fmt = declared.get("format")
+            from plugins.camera_info import for_topic
+            declared = for_topic(args.get("camera_info"), input_topic)
+            calibration = None
+            width, height = declared.get("width"), declared.get("height")
+            if (declared.get("format") in ("image/depth-z16", "image/depth-zlib") and
+                    all(type(v) is int and 0 < v <= 4096 for v in (width, height))):
                 try:
                     matrix = np.asarray(declared.get("K"), dtype=float).reshape(3, 3)
-                    dimensions = [declared.get(k) for k in ("width", "height")]
-                    if (fmt not in ("image/depth-z16", "image/depth-zlib") or
-                            not np.isfinite(matrix).all() or matrix[0, 0] == 0 or matrix[1, 1] == 0 or
-                            any(type(v) is not int or not 0 < v <= 4096 for v in dimensions)):
-                        raise ValueError
+                    if np.isfinite(matrix).all() and matrix[0, 0] != 0 and matrix[1, 1] != 0:
+                        calibration = dict(fx=matrix[0, 0], fy=matrix[1, 1], cx=matrix[0, 2],
+                                           cy=matrix[1, 2], width=width, height=height)
                 except (TypeError, ValueError):
-                    return {"state": "error", "message": "metric_cloud requires depth encoding, finite intrinsics and positive image dimensions"}
-                calibration = dict(fx=matrix[0, 0], fy=matrix[1, 1], cx=matrix[0, 2], cy=matrix[1, 2],
-                                   width=dimensions[0], height=dimensions[1])
+                    pass
             declarations = args.get("input_metadata")
             if 'input_metadata' in args and (not isinstance(declarations, dict) or
                     (input_topic in declarations and
@@ -955,15 +938,10 @@ class PointCloudPerceptionPlugin:
                                  declaration.get('frame_metadata_topic') !=
                                  self._upstream_input_metadata.get(node_key, {}).get('frame_metadata_topic')):
                     return {'state': 'error', 'message': 'stop the pointcloud instance before changing its input or metadata topic'}
+                if existing and existing._calibration != (calibration or {}):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its camera calibration'}
                 self._upstream_input_metadata[node_key] = declaration
-            if input_topic:
-                from plugins.camera_info import for_topic as _camera_for_topic
-
-                declarations = args.get("camera_info")
-                with self._nodes_lock:
-                    self._upstream_camera[node_key] = _camera_for_topic(
-                        declarations, input_topic)
-            with self._nodes_lock:
+                self._upstream_camera[node_key] = declared
                 running = self._nodes.get(node_key)
             if running is None:
                 try:
@@ -987,7 +965,7 @@ class PointCloudPerceptionPlugin:
             return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
 
         elif action == "config":
-            # 仅接收当前卡片支持的配置；旧画布保存的手动标定键直接忽略。
+            # 仅接收当前卡片支持的配置，忽略旧画布保存的标定和计算输出开关。
             cfg = {k: v for k, v in args.items()
                    if k in TOOLS[0]['configSchema']['properties'] and v is not None and v != ""}
             with self._nodes_lock:
@@ -1018,8 +996,6 @@ class PointCloudPerceptionPlugin:
                 self._min_depth_m = float(cfg["min_depth_m"])
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
-            if "metric_cloud" in cfg:
-                self._plugin_cfg["metric_cloud"] = cfg["metric_cloud"]
             return {"status": "configured", "config": cfg}
 
         return None

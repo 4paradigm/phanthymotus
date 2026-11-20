@@ -161,19 +161,33 @@ def test_metric_start_accepts_numeric_depth_without_metric_labels():
     plugin.shutdown()
 
 
-def test_metric_cloud_does_not_start_with_inferred_intrinsics():
-    plugin, executor = _plugin({"metric_cloud": True})
-    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
-    assert result["state"] == "error"
-    assert not executor.nodes
-
-
-def test_global_config_can_enable_metric_cloud():
+def test_display_remains_available_without_metric_intrinsics():
     plugin, executor = _plugin()
-    plugin.dispatch("pointcloud", {"action": "config", "metric_cloud": True})
+    result = plugin.dispatch("start", {"input_topic": "/depth",
+        "camera_info": {"/depth": {"format": "image/depth-z16"}}})
+    assert result["state"] == "running"
+    node = executor.nodes[0]
+    try:
+        msg = _FakeImage(data=struct.pack("<H", 2000), encoding="16UC1",
+                         width=1, height=1, step=2)
+        node._emit_depth(msg)
+        assert _cloud_pub(node).messages
+        metric = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
+        assert not metric.messages
+        info = plugin.dispatch("info", {"instance_id": "/depth"})
+        assert info["instances"]["/depth"]["metric_cloud"]["last_skip_reason"] == "calibration_mismatch"
+        assert all(c["format"] != "sensor/pointcloud2" for c in info.get("camera_info", []))
+    finally:
+        plugin.shutdown()
+
+
+def test_legacy_global_config_cannot_disable_metric_cloud():
+    plugin, executor = _plugin()
+    config = plugin.dispatch("pointcloud", {"action": "config", "metric_cloud": False})
+    assert config["config"] == {}
     result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
     assert result["state"] == "running"
-    assert executor.nodes[0]._metric_cloud_enabled
+    assert any(p.topic == "/depth/pointcloud_metric" for p in executor.nodes[0].publishers)
     executor.nodes[0].stop()
 
 
@@ -519,12 +533,15 @@ def test_start_rejects_explicit_mode_without_any_input(mode):
 
 
 @pytest.mark.parametrize('index,bad', [(0, 0), (0, float('nan')), (0, 'abc'), (4, float('inf')), (2, float('nan')), (5, float('inf')), (8, float('inf'))])
-def test_metric_start_rejects_invalid_driver_intrinsics(index, bad):
+def test_metric_output_rejects_invalid_driver_intrinsics(index, bad):
     decl = metric_z16_declaration()
     decl['K'][index] = bad
-    plugin, executor = _plugin({'metric_cloud': True})
-    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [decl]})['state'] == 'error'
-    assert not executor.nodes
+    plugin, executor = _plugin()
+    try:
+        assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [decl]})['state'] == 'running'
+        assert not executor.nodes[0]._calibration
+    finally:
+        plugin.shutdown()
 
 
 # ── review 第 17 轮：实例 config 校验 / shutdown / 数值范围 ─────────────────
@@ -754,7 +771,7 @@ def test_start_records_upstream_declaration_and_info_carries_it():
                                           "input_topic": "/cam/rgb"})
     entries = info["camera_info"]
     assert [e["topic"] for e in entries] == [
-        "/cam/rgb/pointcloud", "/cam/rgb/pointcloud_summary"]
+        "/cam/rgb/pointcloud", "/cam/rgb/pointcloud_summary", "/cam/rgb/pointcloud_metric"]
     assert all(e["schema"] == "motus.camera/1" for e in entries)
     assert all(e["pipeline"][-1] == "perception/pointcloud" for e in entries)
     # 点云不裁剪不缩放（抽稀只丢点不丢视场）：K 与 half_fov_rad 原样继承
@@ -833,9 +850,6 @@ def test_display_fallback_uses_declared_fov_without_claiming_metric_calibration(
     assert fy == pytest.approx(fx)
     assert plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/cam/rgb']['calibration_source'] == 'declared-fov-approximate'
     node.stop()
-    metric, _ = _plugin({'metric_cloud': True})
-    assert metric.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
-        'input_topic': '/cam/rgb', 'camera_info': [declaration]})['state'] == 'error'
 
 
 def test_invalid_upstream_k_does_not_override_usable_fov():
@@ -1043,8 +1057,11 @@ def test_measured_z16_uses_driver_parameters_despite_saved_manual_calibration():
 def test_saved_manual_calibration_cannot_enable_metric_output_without_driver_parameters():
     plugin, executor = _plugin({'metric_cloud': True, 'calibration': {
         'fx': 2., 'fy': 2., 'cx': 0., 'cy': 0., 'width': 1, 'height': 1}})
-    assert plugin.dispatch('start', {'input_topic': '/depth'})['state'] == 'error'
-    assert not executor.nodes
+    try:
+        assert plugin.dispatch('start', {'input_topic': '/depth'})['state'] == 'running'
+        assert not executor.nodes[0]._calibration
+    finally:
+        plugin.shutdown()
 
 
 @pytest.mark.parametrize('old', [
@@ -1075,13 +1092,12 @@ def test_metric_z16_accepts_source_units_and_capture_labels(field, bad):
 
 
 @pytest.mark.parametrize('field,bad', [('D', [.1, 0, 0, 0]), ('width', 0), ('height', None)])
-def test_metric_ignores_distortion_labels_but_rejects_missing_image_dimensions(field, bad):
+def test_metric_ignores_distortion_labels_but_requires_image_dimensions(field, bad):
     declaration = metric_z16_declaration()
     declaration[field] = bad
     plugin, executor = _plugin({'metric_cloud': True})
-    expected = 'running' if field == 'D' else 'error'
-    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == expected
-    assert bool(executor.nodes) == (expected == 'running')
+    assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'running'
+    assert bool(executor.nodes[0]._calibration) == (field == 'D')
     plugin.shutdown()
 
 
