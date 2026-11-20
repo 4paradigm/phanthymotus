@@ -91,6 +91,10 @@ class ActiveScan:
     attempted: bool = False
     exhausted: bool = False
     locked: bool = False
+    interrupted_frame: int = 0
+    interrupted_source_frame: int | None = None
+    interrupted_odom_ms: int = 0
+    interrupt_reason: str = ""
     directions: tuple = ()
     turn_angle: float = ANGLE
     start_ms: int = 0
@@ -601,7 +605,10 @@ class ActiveScan:
             return ScanCommand(reason="主动观察：停车，等待制动窗口")
         error = self.directions[0] * self.turn_angle - self.timed_heading
         if yaw_limits is not None:
-            yaw_rate = min(yaw_rate, yaw_limits[0 if error > 0. else 1])
+            turn_direction = self.turn_yaw if self.timed_turn_s else error
+            yaw_rate = min(yaw_rate, yaw_limits[0 if turn_direction > 0. else 1])
+        if self.timed_turn_s and abs(self.turn_yaw) > yaw_rate:
+            return self.interrupt("主动观察：底盘转向限速已变化，停车")
         if not self.timed_turn_s:
             if abs(error) <= ANGLE_TOLERANCE:
                 self.side_frame = self.current_frame
@@ -688,8 +695,12 @@ class ActiveScan:
         return ScanCommand(reason=reason)
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):
-        if self.active:
-            self.locked |= self.issued_yaw
+        if self.active and (self.issued_yaw or self.locked):
+            self.locked = True
+            self.interrupted_frame = self.views[-1][0] if self.views else self.current_frame
+            self.interrupted_source_frame = self.source_frame
+            self.interrupted_odom_ms = self.poses[-1][0] if self.poses else 0
+            self.interrupt_reason = reason
         self.phase = "idle"
         self.retry_after_hold = False
         self.turn_until_ms = 0
@@ -697,6 +708,7 @@ class ActiveScan:
         return ScanCommand(reason=reason)
 
     def invalidate(self):
+        stop = self.interrupt()
         self.current_frame = 0
         self.pending_depth = None
         self._pending_projection = None
@@ -708,7 +720,13 @@ class ActiveScan:
         self.pose_origin = None
         self.pose_feedback_since_ms = 0
         self.turn_stop_ms = None
-        return self.interrupt()
+        return stop
+
+    def has_feedback_after_interruption(self):
+        return (self.current_frame > self.interrupted_frame and bool(self.poses)
+                and self.poses[-1][0] > self.interrupted_odom_ms
+                and (self.interrupted_source_frame is None or (
+                    self.source_frame is not None and self.source_frame > self.interrupted_source_frame)))
 
     def note_clear_path(self, frame):
         if self.locked or not frame or not (self.attempted or self.result_frame):

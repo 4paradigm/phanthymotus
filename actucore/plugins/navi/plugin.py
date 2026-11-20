@@ -2,7 +2,7 @@
 
 Three wires in (what is there, how far away it is, and optionally how fast we
 are actually going) and one command stream out. The card's own job is small:
-negotiate once at start, then run `policy.step` on a timer and publish what it
+negotiate at start, then run `policy.step` on a timer and publish what it
 returns. All of the behaviour is in `policy.py`, all of the geometry in
 `depth.py`, and both are ROS-free so they can be tested without a robot.
 
@@ -139,6 +139,7 @@ class NaviPlugin:
         # other plugin here that holds per-instance state.
         self._lock = threading.RLock()
         self._descriptor: dict = {}
+        self._descriptor_changed = False
         self._node = None
         self._publisher = None
         self._timer = None
@@ -985,8 +986,30 @@ class NaviPlugin:
                 return self._error(f"配置 {key} 无效：{error}")
 
         with self._lock:
-            if self._starting and changed:
+            refresh = "control_interface" in args
+            if self._starting and (changed or refresh):
                 return self._error("卡片正在启动，暂不能修改参数")
+            descriptor = self._descriptor
+            if refresh:
+                if not self._running:
+                    return {"status": "idle"}
+                descriptor = args["control_interface"]
+                if (not self._descriptor or not isinstance(descriptor, dict)
+                        or {key: value for key, value in self._descriptor.items() if key != "limits"}
+                        != {key: value for key, value in descriptor.items() if key != "limits"}):
+                    return self._error("下游动作空间已变更，请重新启动 Navi")
+                limits = descriptor.get("limits")
+                if not isinstance(limits, dict) or any(
+                        not isinstance(limits.get(key), (tuple, list))
+                        or len(limits[key]) != ACTION_DIM
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               for value in limits[key])
+                        for key in ("lower", "upper", "min_magnitude", "min_magnitude_moving",
+                                    "max_delta_per_step")
+                        if key in ("lower", "upper") or key in limits):
+                    return self._error("下游速度限制无效")
+                if any(lo > hi for lo, hi in zip(limits["lower"], limits["upper"])):
+                    return self._error("下游速度限制无效")
             # Stage a complete replacement so the policy never observes half
             # of a config request. Copy effective geometry adopted from the
             # camera/chassis; rebuilding from YAML would discard that reading.
@@ -995,15 +1018,15 @@ class NaviPlugin:
             except (TypeError, ValueError, OverflowError) as error:
                 return self._error(f"配置无效：{error}")
             notes = self._limit_notes
-            if self._running and changed:
+            if self._running and (changed or refresh):
                 # Restore requested ceilings before adoption, including those
                 # unchanged by this request. Otherwise an already-clamped
                 # ceiling loses its explanatory note on the next gain change.
-                for key in ("vx_max", "vy_max", "wz_max", "search_rate"):
+                for key in ("vx_max", "vy_max", "wz_max", "search_rate", "use_lateral"):
                     setattr(candidate, key, changed.get(
                         key, self._cfg.get(
                             key, policy_mod.Config.__dataclass_fields__[key].default)))
-                notes = policy_mod.adopt_limits(candidate, self._descriptor)
+                notes = policy_mod.adopt_limits(candidate, descriptor)
             if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
                    for key in ("stop_distance_m",
                                "stop_tolerance_m", "slow_distance_m")):
@@ -1013,9 +1036,14 @@ class NaviPlugin:
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
+            if refresh and descriptor != self._descriptor:
+                self._descriptor = descriptor
+                self._descriptor_changed = True
             result = {"status": "configured", "config": changed,
                       "effective_config": {key: getattr(candidate, key)
                                            for key in changed}}
+            if refresh:
+                result["control_interface_updated"] = True
             if ignored:
                 result["ignored_parameters"] = ignored
             return result
@@ -1066,6 +1094,7 @@ class NaviPlugin:
                            "side_clearance_m": self._config.side_clearance_m,
                            "local_planning": self._config.local_planning,
                            "local_geometry_ready": self._config.local_geometry is not None},
+                "downstream_limits": self._descriptor.get("limits") or {},
                 "published": self._published,
                 "gains": {
                     "forward": {"base": self._config.k_fwd,
@@ -1834,12 +1863,12 @@ class NaviPlugin:
         # "joint6" when it is the yaw rate, and the reader concludes the robot
         # is driving six joints.
         #
-        # Every N commands rather than every one: the descriptor is a hundred
-        # numbers and a constant — it cannot change after negotiation — so
-        # carrying it at 10 Hz would multiply the command stream for nothing.
+        # Every N commands and immediately after a limit refresh. Carrying
+        # the entire declaration at 10 Hz would multiply the command stream.
         # The first command always carries it, so a panel opened at any time has
         # names straight away instead of waiting out a cycle.
-        if self._seq % _DESCRIPTOR_EVERY == 1:
+        if self._descriptor_changed or self._seq % _DESCRIPTOR_EVERY == 1:
+            self._descriptor_changed = False
             # With a downstream, echo its descriptor — real limits are what
             # give the panel's range bars a scale. Without one, still carry the
             # axis names: the order is the protocol's, not anyone's to ask.

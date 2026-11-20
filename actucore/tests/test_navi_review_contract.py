@@ -228,6 +228,21 @@ def test_runtime_bounds_remain_configurable_and_driver_clamped():
         card._stop()
 
 
+def test_target_search_obeys_a_runtime_yaw_cap():
+    card = _card()
+    try:
+        start_card(card, limits={
+            "lower": [-.6, -.4, 0, 0, 0, -.4],
+            "upper": [.6, .4, 0, 0, 0, .4],
+        })
+        assert card._config.search_rate == pytest.approx(.4)
+        assert card._config_action({"wz_max": .25})["status"] == "configured"
+        state = P.State(target="person", missing_frames=10)
+        assert P._search(card._config, state, .1).values[5] == pytest.approx(-.25)
+    finally:
+        card._stop()
+
+
 @pytest.mark.parametrize("args", [
     {"wz_max": True}, {"search_rate": -0.1}, {"vx_max": float("nan")},
     {"use_lateral": "false"},

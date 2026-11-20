@@ -75,7 +75,7 @@ def driver(monkeypatch):
     premise being tested — and reports no `topic_out`, because a card that
     consumes commands publishes none.
     """
-    starts, infos = {}, []
+    starts, infos, configs = {}, [], []
     # Cards whose device is not answering — a test adds to this to simulate a
     # container that is restarting when the project starts.
     offline: set = set()
@@ -89,6 +89,7 @@ def driver(monkeypatch):
         'card-dup-a': [{'topic': '/dup', 'format': 'data/json'}],
         'card-dup-b': [{'topic': '/dup', 'format': 'data/json'}],
     }
+    reject_config = set()
 
     async def _call(mcp_id, req, timeout_s=None):
         # **`timeout_s` 要收下并断言，不能只是吞掉。** 一个把出问题的那个参数
@@ -102,6 +103,16 @@ def driver(monkeypatch):
         if action == 'start':
             starts[card_id] = args
             return {'code': 200, 'data': {'state': 'running'}}
+        if action == 'config' and req.tool == 'loco_servo':
+            configs.append(args)
+            if card_id in reject_config:
+                return {'code': 200, 'data': {'ok': False, 'message': 'wz_limit exceeds hardware cap'}}
+            old = descriptors[card_id]
+            limit = args['wz_limit']
+            descriptors[card_id] = {**old, 'limits': {
+                'lower': [-1.] * 5 + [-limit], 'upper': [1.] * 5 + [limit],
+            }}
+            return {'code': 200, 'data': {'ok': True}}
         if action == 'info':
             infos.append(card_id)
             if card_id in offline:
@@ -144,8 +155,8 @@ def driver(monkeypatch):
                       ('api.inspection', inspection), ('channel.manager', chan)):
         monkeypatch.setitem(sys.modules, name, mod)
 
-    return types.SimpleNamespace(starts=starts, events=events, infos=infos,
-                                 offline=offline)
+    return types.SimpleNamespace(starts=starts, events=events, infos=infos, configs=configs,
+                                 offline=offline, descriptors=descriptors, reject_config=reject_config)
 
 
 def _run(layout) -> bool:
@@ -179,6 +190,34 @@ def test_the_arms_action_space_reaches_the_vla_card_on_start(driver):
     _run(layout)
 
     assert driver.starts[VLA]['control_interface'] == ARM_DESCRIPTOR
+
+
+@pytest.mark.parametrize('outcome', ['accepted', 'rejected', 'stale schema'])
+def test_navi_start_reads_the_configured_loco_servo_yaw_bounds(driver, monkeypatch, outcome):
+    navi, servo = _card('navi', 'navi'), _card('drive', 'loco_servo')
+    driver.descriptors[servo['id']] = {
+        'control_interface': 'motus.control/1', 'mode': 'twist', 'dof': 6,
+        'limits': {'upper': [1.] * 6, 'lower': [-1.] * 6},
+    }
+    if outcome == 'rejected':
+        driver.reject_config.add(servo['id'])
+    config.main[f"tool_config:{servo['mcpId']}:loco_servo:{servo['id']}"] = {
+        'wz_limit': 30. if outcome == 'rejected' else .52,
+    }
+    monkeypatch.setattr(config_api, 'find_tool', lambda *_: {
+        'configSchema': {'properties': {} if outcome == 'stale schema' else {'wz_limit': {'scope': 'instance'}}},
+    })
+    layout = {
+        'cards': [navi, servo],
+        'connections': [_conn(navi['id'], servo['id'], 'control/velocity', '/actucore/navi/cmd')],
+    }
+    assert _run(layout) is (outcome == 'accepted')
+    if outcome == 'accepted':
+        assert driver.starts[navi['id']]['control_interface']['limits']['upper'][5] == .52
+    else:
+        assert navi['id'] not in driver.starts
+        message = "未声明已保存的转向配置项 wz_limit" if outcome == 'stale schema' else 'wz_limit exceeds hardware cap'
+        assert any(message in event['message'] for event in _errors(driver.events))
 
 
 def test_it_is_asked_before_the_consumer_has_started(driver):

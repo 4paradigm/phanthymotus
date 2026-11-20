@@ -8,6 +8,21 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+
+test('the config dialog reports a driver refusal or a post-save sync warning', async () => {
+  const source = readFileSync(new URL('./sidebar.js', import.meta.url), 'utf8');
+  const code = source.match(/async function _checkConfigSave\(response\) \{[\s\S]*?\n\}/)[0];
+  const seen = [];
+  const check = runInNewContext(`${code}\n_checkConfigSave`, { alert: text => seen.push(text) });
+  await assert.rejects(
+    check({ ok: false, status: 422, json: async () => ({ detail: 'wz_limit exceeds hardware cap' }) }),
+    /wz_limit exceeds hardware cap/,
+  );
+  await check({ ok: true, json: async () => ({ warning: 'Navi 同步失败' }) });
+  assert.deepStrictEqual(seen, ['Navi 同步失败']);
+});
 
 /** Mirrors the rule in sidebar.js: shared keys, resolved saved-then-default. */
 function sharedContext(props, sharedSaved) {

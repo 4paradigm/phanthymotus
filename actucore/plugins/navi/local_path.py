@@ -14,6 +14,8 @@ UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
 STEPS = CARDINAL_STEPS + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 RESOLUTION = .05
+MIN_OBSTACLE_HEIGHT_M = .02
+APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M = .05
 START = (10, 28)
 SHAPE = (77, 57)
 RIGHT, FORWARD = np.meshgrid((np.arange(SHAPE[1]) - START[1]) * RESOLUTION,
@@ -184,6 +186,11 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     if not .02 < top <= 2.5:
         return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
     heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if geometry.free_space_validated else ()
+    # On a verified floor return, require the ray to clear the far edge of
+    # this cell at the probe height. A fixed two-cell optical gap would reject
+    # valid near-floor rays simply because of their grazing angle.
+    depth_slope = rotation[:2, 2] - rotation[2, 2] * normal[:2] / normal[2]
+    floor_margin = resolution / 2 * max(1., abs(depth_slope).sum())
     for height_m in heights:
         camera_points = (np.stack((forward, -right, floor_z + height_m), axis=-1)
                          - origin) @ rotation
@@ -193,12 +200,14 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         cols = np.rint(fx * camera_points[..., 0] / denom + cx).astype(int)
         rows = np.rint(fy * camera_points[..., 1] / denom + cy).astype(int)
         in_image = free & front & (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
-        distances = frame[rows[in_image], cols[in_image]]
+        pixels = (rows[in_image], cols[in_image])
+        distances = frame[pixels]
+        margin = np.where(ground[pixels], floor_margin, 2 * resolution)
         free[~in_image] = False
-        free[in_image] = np.isfinite(distances) & (distances > z[in_image] + 2 * resolution)
+        free[in_image] = np.isfinite(distances) & (distances > z[in_image] + margin)
 
     above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
-    hits = np.isfinite(frame) & ~ground & (above_floor >= .02)
+    hits = np.isfinite(frame) & ~ground & (above_floor >= MIN_OBSTACLE_HEIGHT_M)
     if max_hit_depth is not None:
         hits &= frame <= max_hit_depth
     if geometry.height is not None:
@@ -208,9 +217,16 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     hit_col = np.rint((-body_points[:, 1] - right[0, 0]) / resolution).astype(int)
     in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
                & (hit_col >= 0) & (hit_col < right.shape[1]))
+    cells = (hit_row[in_grid], hit_col[in_grid])
+    raised = above_floor[hits][in_grid] >= geometry.min_obstacle_height
     counts = np.zeros(right.shape, dtype=int)
-    np.add.at(counts, (hit_row[in_grid], hit_col[in_grid]), 1)
-    return free, counts >= 3
+    np.add.at(counts, cells, raised)
+    if geometry.min_obstacle_height > MIN_OBSTACLE_HEIGHT_M:
+        uncertain = np.zeros(right.shape, dtype=int)
+        np.add.at(uncertain, cells, ~raised)
+        free &= uncertain < 3
+    occupied = counts >= 3
+    return free & ~occupied, occupied
 
 
 @dataclass(frozen=True)
@@ -222,6 +238,7 @@ class Geometry:
     rear: float
     height: float | None
     free_space_validated: bool = True
+    min_obstacle_height: float = MIN_OBSTACLE_HEIGHT_M
 
 
 def camera_square(horizontal, vertical, half_width, *, half_length=None):
@@ -233,7 +250,10 @@ def camera_square(horizontal, vertical, half_width, *, half_length=None):
                      [0., -1., 0., 0.], [0., 0., 0., 1.]])
     extent = (half_length if type(half_length) in (int, float)
               and math.isfinite(half_length) and half_length > 0 else half_width)
-    return Geometry(horizontal, vertical, axes, extent, extent, None)
+    # The uncalibrated camera approximation can put a few centimetres of
+    # floor residual into obstacle cells. Keep those cells unknown.
+    return Geometry(horizontal, vertical, axes, extent, extent, None,
+                    min_obstacle_height=APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M)
 
 
 def body_square(geometry, vendor):
@@ -347,7 +367,7 @@ def route_obstacles(grid, geometry, half_width):
     return _blocked_cells(_route_grid(grid), START, _footprint_cells(geometry, half_width))
 
 
-def transition_clear(grid, geometry, half_width, horizon_s, velocities):
+def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, padding=0.):
     """Check measured obstacles in the swept rectangle of the velocity ramps."""
     occupied = grid[1]
     forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
@@ -355,7 +375,7 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities):
     front = geometry.front + max(0., *forward)
     left = -half_width + min(0., *right)
     right_edge = half_width + max(0., *right)
-    half = RESOLUTION / 2
+    half = RESOLUTION / 2 + padding
     swept = ((FORWARD + half > rear) & (FORWARD - half < front)
              & (RIGHT + half > left) & (RIGHT - half < right_edge))
     return not (swept & occupied).any()

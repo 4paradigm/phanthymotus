@@ -8,6 +8,55 @@ from plugins.navi import local_path as replay
 DECLARED_SPEEDS = ((0., .6), (0., .4))
 
 
+@pytest.mark.parametrize("surface,clear", [("floor", True), ("missing", False), ("foreground", False)])
+def test_near_ground_returns_clear_only_probes_with_valid_floor_evidence(surface, clear):
+    horizontal = HorizontalIntrinsics(640, 420, 319.5)
+    vertical = (480, 420, 239.5)
+    geometry = replay.camera_square(horizontal, vertical, .20)
+    tangent = (np.arange(480) - 239.5) / 420
+    floor = .42 / np.maximum(tangent, .001)
+    frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+    if surface != "floor":
+        frame[371:378, 310:330] = np.nan if surface == "missing" else 1.055
+    ground = ground_mask(frame, horizontal, vertical)
+    assert ground is not None
+
+    free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
+                                    replay.RESOLUTION, ground)
+    center_col = replay.START[1]
+    row = replay.START[0] + round(1. / replay.RESOLUTION)
+    assert bool(free[row, center_col]) is clear
+    assert not occupied[row, center_col]
+    # The lowest probe at 0.55 m remains below the image.
+    blind = replay.START[0] + round(.55 / replay.RESOLUTION)
+    assert not free[blind, center_col] and not occupied[blind, center_col]
+
+
+@pytest.mark.parametrize("height,calibrated,blocked", [
+    (.022, False, False), (.043, False, False), (.08, False, True), (.043, True, True),
+])
+def test_camera_grid_distinguishes_near_floor_depth_noise_from_a_low_obstacle(height, calibrated, blocked):
+    horizontal = HorizontalIntrinsics(640, 315, 337)
+    vertical = (480, 420, 243)
+    geometry = replay.camera_square(horizontal, vertical, .20)
+    if calibrated:
+        geometry = replay.body_square(geometry, {"body_from_optical": geometry.base_from_optical})
+    tangent = (np.arange(480) - 243) / 420
+    floor = np.minimum(.42 / np.maximum(tangent - .02, .001), 4.)
+    frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+    patch = np.s_[411:423, 320:345]
+    frame[patch] *= (.42 - height) / .42
+    ground = ground_mask(frame, horizontal, vertical)
+    assert ground is not None and not ground[patch].any()
+
+    free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
+                                    replay.RESOLUTION, ground)
+    center = (abs(replay.RIGHT) <= .05) & (replay.FORWARD > .75) & (replay.FORWARD < 1.12)
+    assert bool((occupied & center).any()) is blocked
+    if not blocked:
+        assert (~free & ~occupied & center).any()
+
+
 def test_grid_can_make_a_complete_right_detour_with_confirmed_space():
     grid = np.full((34, 33), replay.FREE, dtype=np.int8)
     grid[10:16, 12:19] = replay.OCCUPIED

@@ -672,6 +672,14 @@ function _readConfigValue(input, def) {
   return raw;
 }
 
+async function _checkConfigSave(response) {
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(typeof data?.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+  }
+  if (data?.warning) alert(data.warning);
+}
+
 /** Check if a configSchema has any instance-scope fields. */
 /**
  * A <select> listing the browser's media input devices of one kind.
@@ -1159,10 +1167,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
-      if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
-        return;
-      }
+      await _checkConfigSave(resp);
     } catch (err) {
       alert('配置保存失败: ' + err.message);
       console.error('[config] save failed:', err);
@@ -1515,10 +1520,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        if (!resp.ok) {
-          alert(`配置保存失败 (HTTP ${resp.status})`);
-          return;
-        }
+        await _checkConfigSave(resp);
       } catch (err) {
         alert('配置保存失败: ' + err.message);
         console.error('[config] save failed:', url, err);

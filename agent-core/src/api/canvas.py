@@ -8,6 +8,7 @@ Includes editor lock: only one session can edit at a time.
 """
 
 import asyncio
+from contextlib import nullcontext
 import json
 import time
 import fastapi
@@ -19,6 +20,8 @@ import config
 router = fastapi.APIRouter(prefix='/canvas', tags=['canvas'])
 
 _TOOL_CONFIG_PREFIX = 'tool_config:'
+_LOCO_YAW_FIELDS = frozenset({'wz_limit', 'angular_acceleration'})
+_loco_config_locks: dict[str, asyncio.Lock] = {}
 
 # ── Editor Lock State (in-memory, resets on restart) ─────────────────────────
 #
@@ -180,19 +183,49 @@ def current_editor() -> Optional[str]:
     return _editor_session
 
 
-def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
-                      instance_id: str = '') -> None:
-    """Push a saved config down to the MCP plugin (fire-and-forget).
+async def _refresh_navi_limits(mcp_id: str, instance_id: str) -> None:
+    from api.config import payload_of
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
-    Shared by the tool-config endpoints below and by api/solutions.py when a
-    solution is applied, so both paths send the exact same `action: config`
-    call shape.
+    layout = config.main.get('canvas_layout') or {}
+    cards = layout.get('cards') or []
+    links = [link for link in layout.get('connections') or []
+             if link.get('format') == 'control/velocity']
+    drivers = {card['id'] for card in cards if card.get('id') and
+               card.get('mcpId') == mcp_id and card.get('toolName') == 'loco_servo' and
+               (not instance_id or card['id'] == instance_id)}
+    failures = []
+    for card in cards:
+        if card.get('toolName') != 'navi' or not card.get('mcpId') or not card.get('id'):
+            continue
+        destinations = {link.get('toCardId') for link in links
+                        if link.get('fromCardId') == card['id']}
+        if len(destinations) != 1 or not destinations <= drivers:
+            continue
+        driver_id = next(iter(destinations))
+        info = await mcp_call_tool(mcp_id, MCPCallRequest(
+            tool='loco_servo', arguments={'action': 'info', 'instance_id': driver_id},
+        ), timeout_s=10.0)
+        descriptor = payload_of(info).get('control_interface')
+        if not isinstance(descriptor, dict) or descriptor.get('control_interface') != 'motus.control/1':
+            detail = info.get('message') or '没有可用的速度声明'
+            failures.append(f'读取 loco_servo {driver_id} 失败：{detail}')
+            continue
+        result = await mcp_call_tool(card['mcpId'], MCPCallRequest(
+            tool='navi', arguments={'action': 'config', 'instance_id': card['id'],
+                                    'control_interface': descriptor},
+        ), timeout_s=10.0)
+        applied = payload_of(result)
+        if not applied.get('control_interface_updated') and applied.get('status') != 'idle':
+            detail = applied.get('message') or result.get('message') or '没有确认'
+            failures.append(f"Navi {card['id']} 未采用新声明：{detail}")
+    if failures:
+        raise RuntimeError('；'.join(failures))
 
-    The body is partitioned by declared scope — shared settings are sent
-    without instance_id even when saved under an instance key, because plugins
-    holding one engine per process reject shared keys addressed to a single
-    instance. See split_config_by_scope for why unknown keys are dropped.
-    """
+
+async def _apply_tool_config(mcp_id: str, tool_name: str, body: Any, instance_id: str,
+                             *, confirm_save: bool = False) -> str:
+    from api.config import payload_of
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from tool_config import find_tool, plan_config_calls
 
@@ -203,30 +236,70 @@ def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
     else:
         calls = plan_config_calls(tool_obj, cfg, {}, '')
 
-    async def _apply():
+    sent_yaw_fields = {key for values, _ in calls for key in values} & _LOCO_YAW_FIELDS
+    update_yaw = tool_name == 'loco_servo' and bool(sent_yaw_fields)
+    if confirm_save:
+        missing_yaw = (cfg.keys() & _LOCO_YAW_FIELDS) - sent_yaw_fields
+        if missing_yaw:
+            raise fastapi.HTTPException(
+                status_code=503, detail=f"当前驱动未声明转向配置项 {'、'.join(sorted(missing_yaw))}")
+        # S10 exposes one servo. Keep related limits in one physical config
+        # transaction even when cached metadata groups their scopes differently.
+        settings = {key: value for values, _ in calls for key, value in values.items()}
+        calls = [(settings, {'instance_id': instance_id} if instance_id else {})]
+
+    lock = _loco_config_locks.setdefault(mcp_id, asyncio.Lock()) if update_yaw else nullcontext()
+    async with lock:
+        refresh_limits = False
         for cfg_body, extra_args in calls:
             try:
                 req = MCPCallRequest(tool=tool_name,
                                      arguments={'action': 'config', **cfg_body, **extra_args})
-                await mcp_call_tool(mcp_id, req)
-            except Exception:
-                pass
+                result = (await mcp_call_tool(mcp_id, req, timeout_s=10.0) if confirm_save
+                          else await mcp_call_tool(mcp_id, req))
+            except Exception as error:
+                if confirm_save:
+                    detail = error.detail if isinstance(error, fastapi.HTTPException) else str(error)
+                    raise fastapi.HTTPException(status_code=503, detail=f'loco_servo 无法确认配置：{detail}')
+                continue
+            if update_yaw:
+                settings = payload_of(result)
+                if settings.get('ok') is True:
+                    refresh_limits = True
+                else:
+                    detail = settings.get('message') or result.get('message') or '没有确认'
+                    if confirm_save:
+                        status = 422 if settings.get('ok') is False else 503
+                        raise fastapi.HTTPException(status_code=status, detail=f'loco_servo：{detail}')
+                    print(f'[canvas] {tool_name} did not adopt yaw settings: {detail}')
+        if confirm_save:
+            # The acknowledgement precedes persistence so rejected settings
+            # are not picked up by the next project start.
+            config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
+        warning = ''
+        if refresh_limits:
+            try:
+                await _refresh_navi_limits(mcp_id, instance_id)
+            except Exception as error:
+                warning = f'loco_servo 已采用配置，Navi 同步失败：{error}'
+                print(f'[canvas] {warning}')
 
-        # Read instance topics only after the config calls have finished; the
-        # save endpoint returns before this background task applies them.
+        # Read instance topics only after the config calls have finished.
         if calls:
             _broadcast({'type': 'tool_config_updated', 'payload': {
                 'mcp_id': mcp_id, 'tool': tool_name, 'instance_id': instance_id,
             }})
+        return warning
 
+
+def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
+                      instance_id: str = '') -> None:
+    """Apply a saved config asynchronously for solutions and ordinary cards."""
     try:
-        asyncio.create_task(_apply())
+        asyncio.get_running_loop()
     except RuntimeError:
-        # No running loop (called from a sync context outside a request). The
-        # config row is already persisted, and mcp_manage._restore_saved_configs
-        # re-sends it when the device next comes online — so skipping the live
-        # push here degrades timing, not correctness.
-        pass
+        return
+    asyncio.create_task(_apply_tool_config(mcp_id, tool_name, body, instance_id))
 
 
 def tool_config_key(mcp_id: str, tool_name: str, instance_id: str = '') -> str:
@@ -416,8 +489,15 @@ async def get_all_tool_configs():
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
-    config.main[tool_config_key(mcp_id, tool_name)] = body
-    apply_tool_config(mcp_id, tool_name, body)
+    return await _save_tool_config(mcp_id, tool_name, body)
+
+
+async def _save_tool_config(mcp_id: str, tool_name: str, body: Any, instance_id: str = ''):
+    if tool_name == 'loco_servo' and isinstance(body, dict) and _LOCO_YAW_FIELDS & body.keys():
+        warning = await _apply_tool_config(mcp_id, tool_name, body, instance_id, confirm_save=True)
+        return {'code': 200, 'warning': warning} if warning else {'code': 200}
+    config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
+    apply_tool_config(mcp_id, tool_name, body, instance_id)
     return {'code': 200}
 
 
@@ -446,9 +526,7 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
-    config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
-    apply_tool_config(mcp_id, tool_name, body, instance_id)
-    return {'code': 200}
+    return await _save_tool_config(mcp_id, tool_name, body, instance_id)
 
 
 @router.delete('/tool-config/{mcp_id}/{tool_name}/{instance_id}')

@@ -1922,8 +1922,8 @@ def test_local_avoidance_executes_lateral_candidates_with_progress(monkeypatch, 
         1.45 if lateral_offset_m > 0. else 1.35 if lateral_offset_m < 0. else 1.1, 1.))
     monkeypatch.setattr(P, "_local_translation", lambda depth, config, state, odom, ahead, side:
                         (0., -.03 * side))
-    free = np.ones(local_path.SHAPE, dtype=bool)
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    occupied = np.isclose(local_path.FORWARD, 1.10) & (abs(local_path.RIGHT) <= .10)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~occupied, occupied))
     scene = _scene(2.4)
     decisions = []
     for stamp in range(1000, 2400, 200):
@@ -2698,7 +2698,9 @@ def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch,
                              measured_range_m=4., observed=True)
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
     free = np.ones(local_path.SHAPE, dtype=bool)
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    obstacle = np.isclose(local_path.FORWARD, round(front / .05) * .05) & np.isclose(local_path.RIGHT, .25)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (
+        (free, ~free) if state.active_scan.pose[2] < -.30 else (~free, obstacle)))
 
     def clearance(_, _config, lateral_offset_m=0.):
         if lateral_offset_m < 0.:
@@ -2888,10 +2890,9 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
                              observed=True, measured_range_m=3.5)
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
     free = np.ones(local_path.SHAPE, dtype=bool)
-    occupied = ~free
+    obstacle = np.isclose(local_path.FORWARD, 1.10) & np.isclose(local_path.RIGHT, .30)
     if blocked_sweep:
-        occupied[local_path.START[0] + 5, local_path.START[1] + 7] = True
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
+        obstacle[local_path.START[0] + 5, local_path.START[1] + 7] = True
 
     def clearance(_, _config, lateral_offset_m=0.):
         if lateral_offset_m:
@@ -2900,6 +2901,8 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
         return (2.15 if 4. <= heading <= 8. else 1.10), .96
 
     monkeypatch.setattr(P, "_clearance", clearance)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (
+        (free, ~free) if clearance(None, None)[0] == 2.15 else (~free, obstacle)))
     frame = np.ones((4, 4))
     previous = [0.] * 6
     last_turn = None
@@ -3019,6 +3022,60 @@ def test_local_obstacle_beyond_slowdown_starts_a_detour_with_five_centimetre_mar
                       target_distance=3., target_bearing=0., may_scan=True)
     assert result[:3] == (0., 0., 0.)
     assert scan.route_segment and scan.phase == "brake"
+
+
+@pytest.mark.parametrize("reported_hit,projected_hit,distance,detour", [
+    (1.10, 1.10, 1.31, False), (.72, .72, 1.31, True), (1.10, 2.80, 2.60, False),
+])
+def test_local_avoidance_checks_the_path_to_the_target_stop_point(
+        monkeypatch, reported_hit, projected_hit, distance, detour):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336),
+                                        (480, 420, 243), .20, half_length=.23)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+                  stop_distance_m=.80, use_lateral=False, watchdog_ms=600)
+    state = _state(motion_source="measured")
+    depth = dict(frame_id=1000, map=np.ones((8, 8)), ground=np.ones((8, 8), dtype=bool))
+    odom = dict(vx=.14, vy=0., wz=0.)
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    occupied = (abs(local_path.RIGHT) <= .15) & np.isclose(
+        local_path.FORWARD, round(projected_hit / .05) * .05)
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, np.zeros_like(occupied), occupied))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (reported_hit, 1.))
+
+    move = P._avoid(.18, 0., .04, depth, config, P.APPROACHING, "target", state,
+                    odom=odom, target_distance=distance, target_bearing=-.062, may_scan=True)
+
+    assert (move[0] == 0.) is detour
+    assert scan.active is detour
+
+
+def test_goal_corridor_also_checks_the_current_turning_motion(monkeypatch):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336),
+                                        (480, 420, 243), .20, half_length=.23)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+                  stop_distance_m=.80, use_lateral=False, watchdog_ms=600, max_depth_age_ms=800)
+    state = _state(motion_source="measured", commanded=(.306, 0., -.15))
+    depth = dict(frame_id=1000, map=np.ones((8, 8)), ground=np.ones((8, 8), dtype=bool))
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    occupied = np.isclose(local_path.FORWARD, .70) & np.isclose(local_path.RIGHT, -.15)
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, np.zeros_like(occupied), occupied))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.10, 1.))
+
+    move = P._avoid(.306, 0., -.15, depth, config, P.APPROACHING, "target", state,
+                    odom=dict(vx=.306, vy=0., wz=-.15), target_distance=1.31,
+                    target_bearing=.20, may_scan=True)
+
+    assert move[:3] == (0., 0., 0.)
 
 
 @pytest.mark.parametrize("band", ["free", "unknown", "occupied"])
@@ -4173,6 +4230,49 @@ def test_losing_feedback_during_a_turn_preserves_the_scan_lock(monkeypatch):
         assert tick(frame).values == [0.] * 6
     assert state.active_scan.locked and state.active_scan.attempted
     assert not state.active_scan.active
+
+
+def test_interrupted_observation_resumes_tracking_only_with_a_new_clear_view(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    state = _state(motion_source="measured")
+    track = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True,
+                            observed=True, measured_range_m=2.)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2., 1.))
+    blocked = np.isclose(local_path.FORWARD, .75) & (abs(local_path.RIGHT) <= .20)
+    clear = np.zeros_like(blocked)
+    occupied = clear
+    monkeypatch.setattr(active_scan, "observe", lambda *args, **kwargs: (~occupied, occupied))
+    frame = np.ones((8, 8))
+
+    def tick(now, received, wz=0., *, source=None, odom_received=None):
+        return P.step(detections=_detections(),
+                      depth=dict(map=frame, ground=frame.astype(bool), frame_id=received,
+                                 source_frame_id=received if source is None else source, control_ms=now),
+                      odom=dict(vx=0., vy=0., wz=wz,
+                                received_ms=now if odom_received is None else odom_received),
+                      config=cfg, state=state, dt=.1)
+
+    tick(1000, 1000)
+    scan = state.active_scan
+    scan.phase, scan.attempted, scan.issued_yaw = "turn", True, True
+    scan.interrupt("转向无进展，停车")
+    assert tick(1100, 1000).values == [0.] * 6
+    scan.invalidate()
+    assert tick(1120, 1120, source=1000, odom_received=1000).values == [0.] * 6
+    assert tick(1140, 1140, odom_received=1000).values == [0.] * 6
+    assert tick(1200, 1200, wz=.20).values == [0.] * 6
+    occupied = blocked
+    assert tick(1300, 1300).values == [0.] * 6
+    occupied = clear
+    decision = tick(1400, 1400)
+    assert decision.status == P.APPROACHING
+    assert decision.values[0] > 0. and not scan.locked
 
 
 def test_command_only_cannot_reuse_a_frozen_depth_frame(monkeypatch):

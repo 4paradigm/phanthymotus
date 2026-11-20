@@ -41,6 +41,47 @@ def _card(**cfg):
     return NaviPlugin(cfg, executor=None)
 
 
+def test_runtime_driver_declaration_updates_yaw_without_restarting(monkeypatch):
+    card = _card()
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(
+        card, "_node", _FakeNode({"/camera/depth": ["sensor_msgs/msg/CompressedImage"]})))
+
+    def descriptor(limit, delta):
+        return _descriptor(limits={
+            "lower": [-.60, -.40, 0., 0., 0., -limit],
+            "upper": [.60, .40, 0., 0., 0., limit],
+            "max_delta_per_step": [.03, .03, 1e-6, 1e-6, 1e-6, delta],
+        })
+
+    try:
+        assert card.dispatch("navi", {"action": "start", "control_interface": descriptor(1., .1),
+                                      "input_topics": ["/camera/objects", "/camera/depth"]})["state"] == "running"
+        original_state = card._state
+        card._command_message([0.] * 6, 1., 1000)
+        fast_ramp = descriptor(1., 3.)
+        assert card.dispatch("navi", {"action": "config",
+                                      "control_interface": fast_ramp})["control_interface_updated"]
+        info = card.dispatch("navi", {"action": "info"})
+        assert info["config"]["wz_max"] == pytest.approx(1.)
+        assert info["downstream_limits"]["max_delta_per_step"][5] == 3.
+        assert card._command_message([0.] * 6, 1., 1000)["control_interface"] == fast_ramp
+        updated = descriptor(.52, 3.)
+        assert card.dispatch("navi", {"action": "config", "control_interface": updated})["status"] == "configured"
+        info = card.dispatch("navi", {"action": "info"})
+        assert info["config"]["wz_max"] == pytest.approx(.52)
+        assert info["config"]["search_rate"] == pytest.approx(.52)
+        assert card._state is original_state
+        assert card._command_message([0.] * 6, 1., 1000)["control_interface"] == updated
+
+        bad = card.dispatch("navi", {"action": "config", "control_interface": descriptor(.7, float("inf"))})
+        assert bad["state"] == "error"
+        assert card.dispatch("navi", {"action": "info"})["config"]["wz_max"] == pytest.approx(.52)
+        assert card.dispatch("navi", {"action": "config", "control_interface": descriptor(1., 3.)})["status"] == "configured"
+        assert card.dispatch("navi", {"action": "info"})["config"]["wz_max"] == pytest.approx(1.)
+    finally:
+        card._stop()
+
+
 # ── refusing to start ────────────────────────────────────────────────────────
 
 def test_no_downstream_card_is_not_a_reason_to_refuse():
@@ -240,7 +281,9 @@ def test_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypa
         2.6 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else
         2.6 if card._state.active_scan.pose[2] < -.30 else .90, 1.0))
     free = np.ones(local_path.SHAPE, dtype=bool)
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    obstacle = np.isclose(local_path.FORWARD, .90) & np.isclose(local_path.RIGHT, .25)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (
+        (~free, obstacle) if now[0] == 100_000 else (free, ~free)))
     def tick(stamp, yaw_odometry=0, fresh=True):
         now[0] = stamp
         card._objects = {"objects": []}
@@ -337,8 +380,10 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
         2.4 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else
         2.4 if heading > .30 else .90, 1.0))
     visible = np.ones(local_path.SHAPE, dtype=bool) if sweep_observed else local_path.FORWARD > 0
-    monkeypatch.setattr(active_scan, "observe",
-                        lambda *args: (visible, np.zeros_like(visible)))
+    obstacle = np.isclose(local_path.FORWARD, .90) & np.isclose(local_path.RIGHT, .25)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (
+        (np.zeros_like(visible), obstacle) if now[0] == 100_000
+        else (visible, np.zeros_like(visible))))
     heading = 0.
 
     def tick(stamp, yaw=0., fresh=True):

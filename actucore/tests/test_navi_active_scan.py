@@ -398,6 +398,23 @@ def test_command_only_scan_evaluates_when_the_timed_turn_finishes(monkeypatch, l
     assert len(look.views) == 1 and not look.poses
 
 
+def test_running_command_only_turn_stops_when_the_downstream_cap_is_lowered(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1.,))
+    for stamp in range(1100, 1700, 100):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        command = look.command(geometry, .31, .8, 300)
+        if command.yaw:
+            break
+    assert abs(command.yaw) > .35
+
+    look.observe_single(_depth(stamp + 100), geometry, 800, stamp + 100)
+    command = look.command(geometry, .31, .8, 300, yaw_limits=(.35, .8))
+    assert command.yaw == 0.
+    assert not look.active
+
+
 @pytest.mark.parametrize("blocked", [False, True])
 def test_command_only_scan_checks_obstacles_with_unseen_rear(monkeypatch, blocked):
     look, geometry, free, occupied = _setup(monkeypatch)

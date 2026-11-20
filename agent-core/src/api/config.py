@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 import config
 import aiohttp
-from tool_config import find_tool
+from tool_config import find_tool, plan_config_calls
 import openai as openai_lib
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
@@ -961,7 +961,7 @@ async def _do_start_project_impl():
                     out[topic] = entry
         return out
 
-    async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
+    async def _downstream_descriptor(card: dict) -> tuple[dict, str]:
         """The action space of whatever this card's `control/*` output feeds.
 
         Returns `(descriptor, error)`; both empty when the card drives nothing.
@@ -972,12 +972,9 @@ async def _do_start_project_impl():
         *consumer*, which has not started yet and, for a card that streams
         motion, deliberately will not start itself.
 
-        That works because a descriptor is a **declaration, not runtime state**:
-        a driver's command card answers `info()` with the same action space
-        whether or not it is running. Asking early is therefore not a race, it
-        is reading a constant — and asking at all is what lets a VLA card refuse
-        to start when the model's output does not fit the arm, instead of
-        discovering it one command at a time at 30 Hz.
+        A driver's command card declares its action space even while idle.
+        Saved loco_servo limits must reach the driver before this first read
+        because the normal config replay on its own start would run too late.
 
         Only connections whose port format is `control/*` are asked, so this
         costs one extra `info()` per command link and nothing at all on a canvas
@@ -985,7 +982,7 @@ async def _do_start_project_impl():
         """
         descriptors, sources, unreachable = [], [], []
         for conn in connections:
-            if conn.get('fromCardId') != card_id:
+            if conn.get('fromCardId') != card.get('id', ''):
                 continue
             if not str(conn.get('format') or '').startswith('control/'):
                 continue
@@ -996,9 +993,27 @@ async def _do_start_project_impl():
             if not mcp_id or not tool_name:
                 continue
             try:
+                target_id = target.get('id', '')
+                if card.get('toolName') == 'navi' and tool_name == 'loco_servo':
+                    saved_key = f'tool_config:{mcp_id}:{tool_name}'
+                    shared = config.main.get(saved_key) or {}
+                    instance = config.main.get(f'{saved_key}:{target_id}') or {}
+                    calls = plan_config_calls(find_tool(mcp_id, tool_name), shared, instance, target_id)
+                    requested = {key: value for body, _ in calls for key, value in body.items()}
+                    yaw_fields = {'wz_limit', 'angular_acceleration'} & (shared.keys() | instance.keys())
+                    if missing := yaw_fields - requested.keys():
+                        return {}, f"下游卡片 {tool_name} 未声明已保存的转向配置项 {'、'.join(sorted(missing))}"
+                    if yaw_fields:
+                        result = await mcp_call_tool(mcp_id, MCPCallRequest(
+                            tool=tool_name, arguments={'action': 'config', **requested, 'instance_id': target_id},
+                        ), timeout_s=INFO_TIMEOUT_S)
+                        settings = payload_of(result)
+                        if result.get('code') != 200 or settings.get('ok') is not True:
+                            message = settings.get('message') or result.get('message') or '没有确认'
+                            return {}, f'下游卡片 {tool_name} 未应用保存的配置：{message}'
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
                     tool=tool_name,
-                    arguments={'action': 'info', 'instance_id': target.get('id', '')},
+                    arguments={'action': 'info', 'instance_id': target_id},
                 ), timeout_s=INFO_TIMEOUT_S)
                 # Answering without a descriptor and not answering at all are
                 # different facts, and only the second is a fault: most cards
@@ -1028,7 +1043,7 @@ async def _do_start_project_impl():
                             f'在线、是否刚重启。')
             return {}, ''
         if _descriptor_conflict(descriptors):
-            return {}, (f'{card_id} 的控制输出接到了动作空间不一致的卡片：'
+            return {}, (f'{card.get("id", "")} 的控制输出接到了动作空间不一致的卡片：'
                         f'{", ".join(sources)}。一路指令流无法同时满足两种动作空间，'
                         f'请分开连线')
         return descriptors[0], ''
@@ -1075,7 +1090,7 @@ async def _do_start_project_impl():
             errors.append(f'{tool_name} ({card.get("id", "")})')
             continue
 
-        descriptor, descriptor_error = await _downstream_descriptor(card.get('id', ''))
+        descriptor, descriptor_error = await _downstream_descriptor(card)
         if descriptor_error:
             tool_name = card.get('toolName', '')
             print(f'[start-project] {tool_name}: {descriptor_error}')
