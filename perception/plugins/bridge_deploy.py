@@ -4,7 +4,8 @@ import json
 import hashlib
 import re
 import subprocess
-import shutil
+import secrets
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -51,9 +52,8 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     known = Path('/run/ql-printer-auth/known_hosts')
     if not key.is_file() or not known.is_file():
         raise ValueError('SSH 私钥或已核对的 known_hosts 缺失')
-    token = str(args.get('token', ''))
-    if len(token) < 24:
-        raise ValueError('初始化需要至少 24 位访问令牌；升级请填写现有令牌')
+    token = str(args.get('token') or '')
+    supplied_token = token
 
     names = ['bridge_core.py', 'http_server.py', 'edge_backend.py', 'run_bridge.py',
              'login_edge.py', 'bridge_watchdog.ps1', 'remote_start_bridge.ps1',
@@ -84,16 +84,45 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
         "-o", f"UserKnownHostsFile={known}",
     ]
 
-    def run(command, **kwargs):
+    def run(command, *, sensitive=False, **kwargs):
         try:
             result = subprocess.run(command, capture_output=True, timeout=900)
         except subprocess.TimeoutExpired:
             raise RuntimeError('初始化步骤超时：' + command[0]) from None
         if result.returncode:
-            detail = (result.stderr or result.stdout).decode('utf-8', errors='replace')
-            detail = detail.replace(token, '[REDACTED]')[-1200:]
+            detail = 'SSH 配置读取失败，请检查管理员权限及现有桥接配置' if sensitive else (result.stderr or result.stdout).decode('utf-8', errors='replace')
+            for secret in (supplied_token, token):
+                if secret:
+                    detail = detail.replace(secret, '[REDACTED]')
+            detail = detail[-1200:]
             raise RuntimeError('初始化 %s 失败（退出码 %s）：%s' % (command[0], result.returncode, detail))
         return result
+
+    # Read an existing secret only through the already authorized, host-verified
+    # admin SSH connection. Never rotate another robot's working bridge token.
+    probe = "$ErrorActionPreference='Stop';\n" + (package_root / 'bridge_config.ps1').read_text(encoding='utf-8-sig')
+    probe += "\ntry { $info = Get-BridgeTokenInfo; $json = $info | ConvertTo-Json -Compress; Write-Output ('BRIDGE_CONFIG:' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))); exit 0 } catch { Write-Error 'Bridge configuration preflight failed'; exit 1 }"
+    encoded_probe = base64.b64encode(probe.encode('utf-16le')).decode('ascii')
+    response = run(ssh_base_args + [f'{user}@{host}',
+        'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded_probe], sensitive=True)
+    try:
+        markers = [line.partition(b':')[2] for line in response.stdout.splitlines() if line.startswith(b'BRIDGE_CONFIG:')]
+        if len(markers) != 1:
+            raise ValueError()
+        info = json.loads(base64.b64decode(markers[0], validate=True))
+        if not isinstance(info, dict) or type(info.get('installed')) is not bool:
+            raise ValueError()
+        if info['installed']:
+            existing_token = info.get('token')
+            if not isinstance(existing_token, str) or len(existing_token) < 24 or any(c.isspace() for c in existing_token):
+                raise ValueError()
+            token = existing_token
+        else:
+            token = token or secrets.token_urlsafe(32)
+    except (ValueError, TypeError, UnicodeError):
+        raise RuntimeError('无法读取前台桥接配置，请检查管理员 SSH 权限及强制命令设置') from None
+    if len(token) < 24 or any(c.isspace() for c in token):
+        raise ValueError('自定义访问令牌需至少 24 位且不能包含空白；留空可自动生成')
 
     prepare = "$ErrorActionPreference='Stop'; if (!(Test-Path 'D:/')) { throw 'D drive missing' }; New-Item -ItemType Directory -Force -Path 'D:/ParadigmVisitorBridge/upload' | Out-Null; Add-Content -LiteralPath 'D:/ParadigmVisitorBridge/bootstrap.log' -Value 'Upload preparation ready'; Write-Output 'UPLOAD_READY'"
     encoded = base64.b64encode(prepare.encode('utf-16le')).decode('ascii')
@@ -108,53 +137,35 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     if b'UPLOAD_READY' not in prepared.stdout:
         raise RuntimeError('SSH 未执行上传准备命令；请检查公钥是否仍绑定强制启动命令')
 
-    local_chunk_dir = Path("/tmp/ql_bridge_chunks")
-    local_chunk_dir.mkdir(parents=True, exist_ok=True)
-    man = {"files": [], "chunk_size": CHUNK_SIZE}
+    # Also remove the credential-bearing payload if upload/bootstrap fails.
+    with tempfile.TemporaryDirectory(prefix='ql_bridge_chunks_') as directory:
+        local_chunk_dir = Path(directory)
+        man = {"files": [], "chunk_size": CHUNK_SIZE}
+        core_payload = {"token": token, "core_files": {}}
+        for n in names:
+            core_payload["core_files"][n] = base64.b64encode((package_root / n).read_bytes()).decode()
+        core_manifest_path = local_chunk_dir / "core.json"
+        core_manifest_path.write_text(json.dumps(core_payload, ensure_ascii=False), encoding='utf-8')
+        run(scp_base_args + [str(core_manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}/core.json"])
 
-    # 上传小的核心脚本文件
-    core_payload = {"token": token, "core_files": {}}
-    for n in names:
-        fpath = package_root / n
-        core_payload["core_files"][n] = base64.b64encode(fpath.read_bytes()).decode()
-    core_manifest_path = local_chunk_dir / "core.json"
-    with open(core_manifest_path, "w", encoding="utf-8") as f:
-        json.dump(core_payload, f, ensure_ascii=False)
-    run(scp_base_args + [str(core_manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}/core.json"])
+        for name, digest in manifest.items():
+            src_file = offline / name
+            if sha256_file(src_file) != digest:
+                raise ValueError('离线安装包校验失败')
+            chunk_cnt = split_file(src_file, local_chunk_dir)
+            for i in range(chunk_cnt):
+                chunk_name = f"{name}.{i:04d}.chunk"
+                run(scp_base_args + [str(local_chunk_dir / chunk_name), f"{user}@{host}:{REMOTE_CHUNK_DIR}/{chunk_name}"])
+            man["files"].append({"name": name, "sha256": digest, "chunk_count": chunk_cnt})
 
-    # 分片上传离线包
-    for name, digest in manifest.items():
-        if not re.fullmatch(r'[A-Za-z0-9_.-]+\.(exe|whl)', name):
-            raise ValueError('Invalid offline asset name')
-        src_file = offline / name
-        if sha256_file(src_file) != digest:
-            raise ValueError('离线安装包校验失败')
-        chunk_cnt = split_file(src_file, local_chunk_dir)
-        for i in range(chunk_cnt):
-            chunk_name = f"{name}.{i:04d}.chunk"
-            run(scp_base_args + [str(local_chunk_dir / chunk_name), f"{user}@{host}:{REMOTE_CHUNK_DIR}/{chunk_name}"])
-        man["files"].append({"name": name, "sha256": digest, "chunk_count": chunk_cnt})
-
-    # 上传分片清单
-    manifest_path = local_chunk_dir / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(man, f, ensure_ascii=False)
-    run(scp_base_args + [str(manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}/manifest.json"])
-
-    # 上传bootstrap.ps1
-    bootstrap_src = package_root / "bootstrap.ps1"
-    run(scp_base_args + [str(bootstrap_src), f"{user}@{host}:{REMOTE_BOOTSTRAP}"])
-
-    # 远程执行bootstrap
-    result = run(
-        ssh_base_args + [
-            f"{user}@{host}",
-            f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {REMOTE_BOOTSTRAP}"
-        ],
-        capture_output=True, timeout=900
-    )
-
-    shutil.rmtree(local_chunk_dir, ignore_errors=True)
+        manifest_path = local_chunk_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(man), encoding='utf-8')
+        run(scp_base_args + [str(manifest_path), f"{user}@{host}:{REMOTE_CHUNK_DIR}/manifest.json"])
+        for script in ('bridge_config.ps1', 'bootstrap.ps1'):
+            run(scp_base_args + [str(package_root / script), f'{user}@{host}:{REMOTE_CHUNK_DIR}/{script}'])
+        result = run(ssh_base_args + [f"{user}@{host}",
+            f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {REMOTE_BOOTSTRAP}"])
     if result.returncode or b'BRIDGE_BOOTSTRAP_OK' not in result.stdout:
         raise RuntimeError('安装未返回成功标记，请检查 D:\\ParadigmVisitorBridge\\bootstrap.log')
-    return {'status': 'installed', 'hint': '桥接已安装并启动。请保存配置、刷新打印机；首次使用需登录访客网站。'}
+    return {'status': 'installed', 'token': token, 'bridge_url': args['bridge_url'],
+            'hint': '桥接已安装并启动。请选择打印机并保存；首次使用需登录访客网站。'}

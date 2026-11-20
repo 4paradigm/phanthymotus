@@ -61,9 +61,65 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertTrue(props["bridge_url"]["x-sensitive"])
         self.assertEqual(props["timeout_s"]["default"], 8)
         self.assertEqual(props["print_timeout_s"]["default"], 60)
-        self.assertFalse(props["remote_start_enabled"]["default"])
+        self.assertTrue(props["remote_start_enabled"]["default"])
         self.assertEqual(props["remote_start_port"]["default"], 22)
-        self.assertEqual(definition["configSchema"]["required"], ["bridge_url", "token"])
+        self.assertEqual(definition["configSchema"]["required"], ["bridge_url"])
+
+    def test_operator_can_enter_only_frontdesk_ip(self):
+        card = QLPrinterPlugin({"bridge_url": "10.100.10.14"})
+        self.assertEqual(card._cfg["bridge_url"], "http://10.100.10.14:8765")
+        self.assertFalse(card._cfg["remote_start_enabled"])
+
+        result = card.dispatch("config", {"bridge_url": "192.168.1.20"})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(card._cfg["bridge_url"], "http://192.168.1.20:8765")
+
+    def test_address_validation_is_consistent_for_setup_and_discovery(self):
+        for address in ("user:password@192.168.1.2", "http://host:bad", "host:99999", "host/path", "a b", "http://[broken"):
+            for action in ("config", "initialize", "printers"):
+                with self.subTest(address=address, action=action):
+                    self.assertEqual(self.call(action, bridge_url=address)["status"], "error")
+        for address, expected in (("192.168.1.2:8765", "http://192.168.1.2:8765"),
+                                  ("::1", "http://[::1]:8765"),
+                                  ("https://example.com/", "https://example.com")):
+            self.assertEqual(self.call("config", bridge_url=address)["status"], "ok")
+            self.assertEqual(self.card._cfg["bridge_url"], expected)
+
+    def test_discovery_does_not_send_old_token_to_new_computer(self):
+        with patch("plugins.ql_printer.BridgeClient") as client:
+            self.assertEqual(self.call("printers", bridge_url="192.168.1.20")["code"], "not_configured")
+            self.assertEqual(self.call("printers", token="")["code"], "not_configured")
+            client.assert_not_called()
+
+    def test_initialization_result_is_bound_to_its_job(self):
+        from plugins import bridge_deploy
+        finished = threading.Event()
+        release = threading.Event()
+        def deploy(config):
+            self.assertEqual(config["bridge_url"], "http://192.168.1.20:8765")
+            self.assertEqual(config["token"], "")
+            release.wait(3)
+            finished.set()
+            return {"status": "installed", "token": "secret-from-authorized-ssh", "bridge_url": config["bridge_url"]}
+        with patch.object(bridge_deploy, "deploy", side_effect=deploy):
+            started = self.call("initialize", bridge_url="192.168.1.20")
+            try:
+                self.assertEqual(started["status"], "installing")
+                self.assertEqual(self.call("initialize", bridge_url="192.168.1.21")["code"], "installing")
+                self.assertEqual(self.call("initialize_status", deployment_id="other")["code"], "unknown_deployment")
+            finally:
+                release.set()
+            self.assertTrue(finished.wait(3))
+            for _ in range(100):
+                state = self.call("initialize_status", deployment_id=started["deployment_id"])
+                if state["status"] != "installing":
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(state["status"], "installed")
+            self.assertEqual(state["token"], "secret-from-authorized-ssh")
+            self.assertNotIn("token", self.call("initialize_status"))
+            self.assertNotIn("deployment_id", self.call("initialize_status"))
+            self.assertEqual(self.card._cfg["bridge_url"], self.url)  # Save remains explicit.
 
     def test_print_timeout_defaults_to_60_seconds_and_is_clamped(self):
         self.assertEqual(self.card._cfg["print_timeout_s"], 60)

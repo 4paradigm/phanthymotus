@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import base64
+import ipaddress
 import os
 import re
 import subprocess
@@ -37,6 +38,40 @@ def tool(name, kind, description, schema):
 TOOL_NAME = "Visitor_Badge_Printer"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def _normalize_bridge_url(value: object) -> str:
+    """Accept the operator-facing computer IP as well as the legacy URL."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        if any(c.isspace() for c in raw):
+            raise ValueError()
+        explicit_scheme = "://" in raw
+        if not explicit_scheme:
+            try:
+                if ipaddress.ip_address(raw).version == 6:
+                    raw = f"[{raw}]"
+            except ValueError:
+                pass
+        parsed = urllib.parse.urlsplit(raw if explicit_scheme else f"http://{raw}")
+        host = parsed.hostname or ""
+        port = parsed.port  # Validates numeric range as well.
+        if parsed.scheme not in ("http", "https") or not host or parsed.username is not None or parsed.password is not None:
+            raise ValueError()
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment or not re.fullmatch(r"[A-Za-z0-9_.:%-]+", host):
+            raise ValueError()
+        if port == 0:
+            raise ValueError()
+        netloc = f"[{host}]" if ":" in host else host
+        if port is not None:
+            netloc += f":{port}"
+        elif not explicit_scheme:
+            netloc += ":8765"
+        return f"{parsed.scheme}://{netloc}"
+    except ValueError:
+        raise ValueError("前台电脑地址应填写 IP 或 http://IP:端口，不能包含账号、路径或无效端口") from None
 
 
 class BridgeError(Exception):
@@ -152,10 +187,14 @@ class QLPrinterPlugin:
         self._lock = threading.Lock()
         self._cfg = {
             "printer_name": str(plugin_config.get("printer_name", "") or ""),
-            "bridge_url": str(plugin_config.get("bridge_url", "") or ""),
+            "bridge_url": _normalize_bridge_url(plugin_config.get("bridge_url", "")),
             "token": str(plugin_config.get("token", "") or ""),
             "timeout_s": float(plugin_config.get("timeout_s", 8)),
             "print_timeout_s": float(plugin_config.get("print_timeout_s", 60)),
+            # Runtime stays conservative until the card is saved or
+            # initialized.  The UI default is enabled, and initialization also
+            # enables it explicitly, while old headless configurations keep
+            # their previous no-SSH behaviour.
             "remote_start_enabled": bool(plugin_config.get("remote_start_enabled", False)),
             "remote_start_user": str(plugin_config.get("remote_start_user", "4paradigm") or "4paradigm"),
             "remote_start_port": int(plugin_config.get("remote_start_port", 22)),
@@ -196,11 +235,12 @@ class QLPrinterPlugin:
             "remote_start_user": {"type": "string"},
             "remote_start_port": {"type": "integer"},
             "remote_start_key_path": {"type": "string"},
+            "deployment_id": {"type": "string"},
         }
         actions["config"][0].append("printer_name")
         actions["printers"] = (["bridge_url", "token"], "读取目标电脑已安装的打印机")
         actions["initialize"] = (["bridge_url", "token", "remote_start_user", "remote_start_port", "remote_start_key_path"], "通过管理员 SSH 初始化目标电脑，仅在安装设置时使用")
-        actions["initialize_status"] = ([], "读取初始化进度")
+        actions["initialize_status"] = (["deployment_id"], "读取本次初始化进度")
         definition = tool(
             TOOL_NAME,
             "actuator",
@@ -219,10 +259,12 @@ class QLPrinterPlugin:
                 # can finish the whole setup from the card in one place.
                 "printer_name": {"type": "string", "title": "目标打印机", "scope": "instance", "format": "bridge-printer"},
                 "bridge_url": {
-                    "type": "string", "title": "桥接服务地址", "scope": "shared", "x-sensitive": True,
+                    "type": "string", "title": "前台电脑 IP", "scope": "shared", "x-sensitive": True,
+                    "description": "例如 10.100.10.14",
                 },
                 "token": {
                     "type": "string", "title": "访问令牌", "scope": "shared", "format": "password",
+                    "advanced": True,
                 },
                 "timeout_s": {
                     "type": "number", "title": "查询超时（秒）", "scope": "shared",
@@ -234,11 +276,11 @@ class QLPrinterPlugin:
                 },
                 "remote_start_enabled": {
                     "type": "boolean", "title": "机器人远程启动桥接", "scope": "shared",
-                    "default": False, "advanced": True,
+                    "default": True, "advanced": True,
                 },
                 "remote_start_user": {
                     "type": "string", "title": "前台 SSH 用户", "scope": "shared",
-                    "default": "4paradigm", "advanced": True,
+                    "default": "4paradigm",
                 },
                 "remote_start_port": {
                     "type": "integer", "title": "前台 SSH 端口", "scope": "shared",
@@ -249,7 +291,7 @@ class QLPrinterPlugin:
                     "default": "/run/ql-printer-auth/frontdesk_bridge_ed25519", "advanced": True,
                 },
             },
-            "required": ["bridge_url", "token"],
+            "required": ["bridge_url"],
         }
         return definition
 
@@ -277,7 +319,7 @@ class QLPrinterPlugin:
             return self._config(args)
         handlers = {
             "initialize": self._initialize,
-            "initialize_status": lambda args: dict(self._deploy_state),
+            "initialize_status": self._initialize_status,
             "printers": self._printers,
             "list": self._list,
             # Keep old saved canvas actions working during rollout; find is no
@@ -293,6 +335,8 @@ class QLPrinterPlugin:
             return {"status": "error", "code": "not_configured", "error": "卡片还没配置桥接服务地址，请在卡片配置里填写"}
         try:
             return handler(args)
+        except ValueError as exc:
+            return {"status": "error", "code": "bad_args", "error": str(exc)}
         except BridgeError as exc:
             print(f"[QL_printer] {action} failed: {exc.code}", flush=True)
             return {"status": "error", "code": exc.code, "error": str(exc)}
@@ -310,12 +354,10 @@ class QLPrinterPlugin:
         if "printer_name" in args:
             update["printer_name"] = str(args["printer_name"] or "").strip()
         if "bridge_url" in args:
-            url = str(args["bridge_url"] or "").strip()
-            if url:
-                parsed = urllib.parse.urlparse(url)
-                if parsed.scheme not in ("http", "https") or not parsed.hostname:
-                    return {"status": "error", "adapter_ok": False,
-                            "error": "桥接服务地址要写成 http://IP:端口 的形式"}
+            try:
+                url = _normalize_bridge_url(args["bridge_url"])
+            except ValueError as exc:
+                return {"status": "error", "adapter_ok": False, "error": str(exc)}
             update["bridge_url"] = url
         if "token" in args:
             update["token"] = str(args["token"] or "")
@@ -379,7 +421,7 @@ class QLPrinterPlugin:
         ]
         try:
             completed = subprocess.run(
-                command, capture_output=True, text=True, timeout=10, check=False
+                command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return {"status": "error", "code": "remote_start_failed", "error": f"机器人无法远程启动前台桥接：{exc}"}
@@ -396,10 +438,17 @@ class QLPrinterPlugin:
     def _initialize(self, args: dict) -> dict:
         with self._lock:
             if self._deploy_state.get("status") == "installing":
-                return dict(self._deploy_state)
+                return {"status": "error", "code": "installing", "error": "已有初始化任务正在运行，请等待完成后重试"}
             config = dict(self._cfg)
             config.update({k: v for k, v in args.items() if k in config})
-            self._deploy_state = {"status": "installing"}
+            config["bridge_url"] = _normalize_bridge_url(config.get("bridge_url"))
+            if not config["bridge_url"]:
+                raise ValueError("请填写前台电脑 IP")
+            if "token" not in args and config["bridge_url"] != self._cfg["bridge_url"]:
+                config["token"] = ""
+            config["remote_start_enabled"] = True
+            deployment_id = uuid.uuid4().hex
+            self._deploy_state = {"status": "installing", "deployment_id": deployment_id}
         def work():
             try:
                 from .bridge_deploy import deploy
@@ -408,13 +457,32 @@ class QLPrinterPlugin:
                 detail = str(exc).replace(str(config.get('token') or '\0'), '[REDACTED]')
                 result = {"status": "error", "error": "初始化失败：" + detail[:1600]}
             with self._lock:
-                self._deploy_state = result
+                self._deploy_state = {**result, "deployment_id": deployment_id}
         threading.Thread(target=work, daemon=True).start()
-        return {"status": "installing"}
+        return {"status": "installing", "deployment_id": deployment_id}
+
+    def _initialize_status(self, args: dict) -> dict:
+        with self._lock:
+            state = dict(self._deploy_state)
+        requested = args.get("deployment_id")
+        if requested and requested != state.get("deployment_id"):
+            return {"status": "error", "code": "unknown_deployment", "error": "初始化任务已变化，请重新打开配置"}
+        if not requested:
+            # Legacy status polling can show progress, but cannot discover the
+            # credential of another configuration dialog's installation.
+            state.pop("token", None)
+            state.pop("deployment_id", None)
+        return state
 
     def _printers(self, args: dict) -> dict:
         # Use unsaved dialog connection values without changing runtime config.
-        client = BridgeClient(str(args.get("bridge_url") or self._cfg["bridge_url"]), str(args.get("token") or self._cfg["token"]), 20)
+        with self._lock:
+            cfg = dict(self._cfg)
+        url = _normalize_bridge_url(args.get("bridge_url", cfg["bridge_url"]))
+        token = str(args.get("token", cfg["token"] if url == cfg["bridge_url"] else "") or "")
+        if not url or not token:
+            return {"status": "error", "code": "not_configured", "error": "请先填写电脑 IP 并安装或连接前台桥接"}
+        client = BridgeClient(url, token, 20)
         return client.request("POST", "/printers", body={})
 
     def _daily_visits(self) -> tuple[str, list[dict]]:

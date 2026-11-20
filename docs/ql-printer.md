@@ -6,8 +6,12 @@ this perception release and network access to the Windows bridge can use it.
 It does not make this Jetson image compatible with every CPU/platform: each
 robot must use a supported platform build.
 
-Configure bridge_url, token, timeout_s (8) and print_timeout_s (60) in the
-canvas. `list` takes no visitor fields and returns every unadmitted visitor for
+The everyday card form only asks for the frontdesk computer IP, Windows SSH
+user and target printer. It derives the bridge URL on port 8765, generates a
+token for a clean installation, reads existing tokens through authorized SSH on
+upgrade, and uses the standard timeouts, SSH port and container key path.
+Non-standard values remain under advanced settings for troubleshooting. `list` takes no visitor
+fields and returns every unadmitted visitor for
 the current local date without exposing bridge tickets. `print` accepts name
 and host, matches exactly one entry from that daily list, and retains the bridge
 ticket/idempotency protocol internally. Ambiguous, admitted and departed visits
@@ -15,8 +19,9 @@ are rejected.
 
 ## Optional remote startup
 
-Enable remote_start_enabled and configure the SSH user and port. The Windows
-restricted authorized key must invoke the existing bridge scheduled task.
+Remote startup is enabled after initialization. Configure the Windows SSH user;
+the standard port is 22. Initialization requires administrator SSH command
+execution, not a key restricted to a forced startup command.
 Windows must remain powered on with the interactive user logged in.
 
 The published perception service template mounts a dedicated host secret

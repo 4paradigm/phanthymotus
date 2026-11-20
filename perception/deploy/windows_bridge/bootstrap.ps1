@@ -4,6 +4,7 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator SSH required' }
 
 $chunkDir = "D:\ParadigmVisitorBridge\upload"
+. (Join-Path $chunkDir 'bridge_config.ps1')
 $corePath = Join-Path $chunkDir "core.json"
 $manifestPath = Join-Path $chunkDir "manifest.json"
 if (!(Test-Path $corePath) -or !(Test-Path $manifestPath)) {
@@ -23,12 +24,7 @@ try {
     $taskName = 'Paradigm Visitor Bridge Watchdog'
     $oldTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     $oldTaskXml = if ($oldTask) { Export-ScheduledTask -TaskName $taskName } else { $null }
-    $install = Join-Path $root 'app'
-    if ($oldTask) {
-        $working = $oldTask.Actions | Select-Object -First 1 -ExpandProperty WorkingDirectory
-        if (!$working -or !(Test-Path (Join-Path $working 'run_bridge.py'))) { throw 'Existing task directory cannot be resolved' }
-        $install = $working
-    }
+    $install = Get-BridgeInstallDirectory
     New-Item -ItemType Directory -Force -Path $install | Out-Null
     $cfgPath = Join-Path $install 'config.json'
     if (Test-Path $cfgPath) {
