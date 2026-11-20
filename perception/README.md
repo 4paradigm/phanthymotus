@@ -641,12 +641,14 @@ variable before starting Perception to prefer another mirror; it is optional.
 ## TTS Engines
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
-`config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
+`config.yaml`) selects the voice. Engine names usually follow **`<model>-<languages>`** —
 the same shape `asr_model` uses (`x-asr-zh-en`, `parakeet-en`, `sensevoice-small`),
 because the dashboard renders the raw enum string, so these two dropdowns sit side
 by side in front of the same operator. Language codes, not country codes: `zh`, not
 `cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
 and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
+The `-trt` suffix distinguishes the Jetson Kokoro variant from the original
+`kokoro-multi` option.
 
 | `tts_engine` | model | languages | runtime | model dir |
 |---|---|---|---|---|
@@ -730,9 +732,21 @@ The Jetson Perception image includes the dependencies in
 `kokoro-multi-trt` through the existing TTS card. Selecting the engine loads one
 FP32 TensorRT model and one voice for `zh`, `en`, `ja`, `ru`, `de`,
 `fr`, `es`, and `th`. Set `kokoro_trt_language` to `auto` for per-request
-language detection, or choose one of those language codes. In `config.yaml`,
-select `engine: kokoro-multi-trt` and set `language` if needed. The engine
-uses GPU inference and `speaker_id: 0`.
+language detection, or choose one of those language codes. The engine uses GPU
+inference and `speaker_id: 0`.
+
+When configuring the engine in `config.yaml`, update these fields under
+`plugins.tts`. Setting `model_dir: null` replaces the VITS2 path and selects
+the JetPack-specific Kokoro cache.
+
+```yaml
+engine: kokoro-multi-trt
+language: auto
+model_dir: null
+```
+
+If you used TensorRT through the `kokoro-multi` entry in an earlier PR test
+image, select `kokoro-multi-trt` on that card after updating the image.
 
 The JetPack 5.1.1 and 6.1 plans are different. On first load, Perception
 downloads the pinned archive for the image's JetPack version from ModelScope,
