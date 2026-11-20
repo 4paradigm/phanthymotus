@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from plugins.autonomous_task.cameras import CameraInputs, camera_ports, resolve_cameras
+from plugins.autonomous_task.cameras import CameraInputs, camera_ports, resolve_inputs
 
 
 HEAD = "/limx_tron2/camera"
@@ -18,24 +18,29 @@ RIGHT = "/limx_tron2/camera_right"
 
 
 def test_ports_and_binding_are_independent_of_order_and_missing_wires():
-    assert resolve_cameras({}, {"head_topic": "/another/head"}) == {}
-    assert resolve_cameras({"input_topic": RIGHT}, {}) == {"right_wrist": RIGHT}
-    bound = resolve_cameras({"input_topic": LEFT, "input_topics": [LEFT, HEAD]}, {})
-    assert bound == {"head": HEAD, "left_wrist": LEFT}
+    state = "/test/state/eef"
+    cfg = {"head_topic": HEAD, "left_wrist_topic": LEFT}
+    assert resolve_inputs({"input_topic": state}, cfg) == (state, {})
+    wired, bound = resolve_inputs({"input_topics": [LEFT, state, HEAD], "input_topic": LEFT}, cfg)
+    assert wired == state and bound == {"head": HEAD, "left_wrist": LEFT}
     assert [p.get("topic") for p in camera_ports(bound)] == [HEAD, LEFT, None]
     assert all(p["format"] == "image/jpeg" for p in camera_ports())
 
 
 def test_generic_topics_require_a_declared_or_configured_mount():
-    args = {"input_topics": ["/a", "/b"],
+    args = {"input_topics": ["/a", "/robot/measure", "/b"],
             "camera_info": {"/a": {"id": "fixture/right_wrist", "format": "image/jpeg"}}}
-    assert resolve_cameras(args, {"head_topic": "/b"}) == {"head": "/b", "right_wrist": "/a"}
-    with pytest.raises(ValueError, match="Unknown camera role for /b"):
-        resolve_cameras(args, {})
+    assert resolve_inputs(args, {"head_topic": "/b"}) == (
+        "/robot/measure", {"head": "/b", "right_wrist": "/a"})
+    with pytest.raises(ValueError, match="ambiguous"):
+        resolve_inputs(args, {})
+    with pytest.raises(ValueError, match="not connected"):
+        resolve_inputs(args, {"state_topic": "/unwired"})
     with pytest.raises(ValueError, match="Conflicting"):
-        resolve_cameras({"input_topic": LEFT}, {"right_wrist_topic": LEFT})
-    with pytest.raises(ValueError, match="Two topics"):
-        resolve_cameras({"input_topics": [HEAD, "/b"]}, {"head_topic": "/b"})
+        resolve_inputs(args, {"head_topic": "/a", "state_topic": "/robot/measure"})
+    with pytest.raises(ValueError, match="Unknown camera role for /b"):
+        resolve_inputs(args, {"state_topic": "/robot/measure"})
+
 
 
 class Node:

@@ -11,22 +11,18 @@ import time
 import uuid
 import urllib.request
 from collections import OrderedDict
-from contextlib import closing
 from pathlib import Path
 
-from .cameras import CameraInputs, camera_ports, resolve_cameras
-from .model import Model, TransientModelError
+from .cameras import CameraInputs, camera_ports, resolve_inputs
+from .eef import EefEndpoint, EefInterface
+from .model import InvalidDecisionError, Model, TransientModelError
 
 log = logging.getLogger(__name__)
 _MODES = {"left": ("left",), "right": ("right",), "both": ("left", "right")}
 _FIELDS = ("base_url", "key", "model_name", "arm_mode",
-           "head_topic", "left_wrist_topic", "right_wrist_topic")
-_OUTPUTS = {
-    "arm": {"topic": "/actucore/autonomous_task/arm", "format": "data/json",
-            "desc": "已执行的末端位姿命令（含手臂、基座系、实参与回执）"},
-    "gripper": {"topic": "/actucore/autonomous_task/gripper", "format": "data/json",
-                "desc": "已执行的夹爪开口命令（含手臂、毫米与回执）"},
-}
+           "head_topic", "left_wrist_topic", "right_wrist_topic",
+           "state_topic", "control_topic", "frame_description")
+_CONTROL_TOPIC = "/actucore/autonomous_task/control/eef"
 _TIME_LIMIT = 3600
 _STEP_LIMIT = 100
 
@@ -56,10 +52,23 @@ class AutonomousTaskPlugin:
         self._node = None
         self._cameras = None
         self._binding = {}
-        self._publishers = {}
+        self._eef = None
+        self._interface = None
+        self._stopping = False
         self._runs = OrderedDict()
         self._active = None
         self._cancel = None
+
+    def _ports(self, binding=None):
+        binding = binding or {}
+        state = {"format": "state/eef", "desc": "驱动实测 TCP 位姿和夹爪开口"}
+        if "eef_state" in binding:
+            state["topic"] = binding["eef_state"]
+        return camera_ports(binding) + [state]
+
+    def _output(self):
+        return [{"format": "control/eef", "topic": self._cfg.get("control_topic") or _CONTROL_TOPIC,
+                 "desc": "完整的绝对 TCP 位姿与夹爪开口目标"}]
 
     def get_tools(self):
         config = {key: {"type": "string", "scope": "instance",
@@ -69,6 +78,9 @@ class AutonomousTaskPlugin:
         config["arm_mode"].update(enum=list(_MODES), default=self._cfg.get("arm_mode", "left"))
         for role in ("head", "left_wrist", "right_wrist"):
             config[role + "_topic"]["description"] = f"自定义相机话题匹配到 {role}（可选）"
+        config["state_topic"]["description"] = "指定已接线的 state/eef 话题（可选）"
+        config["control_topic"].update(default=self._output()[0]["topic"], description="control/eef 输出话题")
+        config["frame_description"]["description"] = "平台已知的基座轴与相机方向约定（可选）"
         actions = {
             "submit": {"params": ["instruction", "arm_mode", "request_id"],
                        "description": "提交自然语言桌面任务。异步返回 action_id，以 status 查询。"},
@@ -77,7 +89,7 @@ class AutonomousTaskPlugin:
         }
         return [{"name": "task", "type": "processor", "multiInstance": False,
                  "description": "自主桌面操作。根据接入的 RGB、夹爪和手臂状态逐步决策与复核。",
-                 "topic_in": camera_ports(), "topic_out": list(_OUTPUTS.values()),
+                 "topic_in": self._ports(), "topic_out": self._output(),
                  "configSchema": {"type": "object", "properties": config},
                  "inputSchema": {
                      "type": "object", "required": ["action"],
@@ -90,7 +102,7 @@ class AutonomousTaskPlugin:
                      "x-action-params": actions, "x-is-dangerous": True,
                      "x-hooks": {"on_interrupt_all": {"action": "cancel"},
                                  "on_interrupt_motion": {"action": "cancel"}},
-                     "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r"],
+                     "x-resource": ["arm_l", "arm_r", "gripper_l", "gripper_r"],
                      "x-completion": {"actions": ["submit"], "timeout": _TIME_LIMIT + 240}}}]
 
     def dispatch(self, name, args):
@@ -98,9 +110,9 @@ class AutonomousTaskPlugin:
         with self._lock:
             try:
                 if action == "info":
-                    return {"state": "running" if self._node else "idle",
-                            "topic_in": camera_ports(self._binding if args.get("instance_id") else None),
-                            "topic_out": list(_OUTPUTS.values()), "inputs": dict(self._binding),
+                    return {"state": "stopping" if self._stopping else "running" if self._node else "idle",
+                            "topic_in": self._ports(self._binding if args.get("instance_id") else None),
+                            "topic_out": self._output(), "inputs": dict(self._binding),
                             "configured": all(self._cfg.get(k) for k in ("base_url", "key", "model_name")),
                             "arm_mode": self._cfg.get("arm_mode", "left"), "active_task": self._active}
                 if action == "config":
@@ -111,9 +123,11 @@ class AutonomousTaskPlugin:
                         raise ValueError("配置项必须为字符串")
                     if changes.get("arm_mode", "left") not in _MODES:
                         raise ValueError("arm_mode 需要是 left、right 或 both")
+                    if any(k.endswith("_topic") and v and not v.startswith("/") for k, v in changes.items()):
+                        raise ValueError("话题名必须为绝对 ROS 话题名")
                     if self._node and any(k.endswith("_topic") and v != self._cfg.get(k, "")
                                           for k, v in changes.items()):
-                        raise ValueError("修改相机映射前请停止卡片")
+                        raise ValueError("修改接线前请停止卡片")
                     self._cfg.update(changes)
                     return self.dispatch("info", {})
                 if action == "start":
@@ -121,6 +135,9 @@ class AutonomousTaskPlugin:
                 if action == "stop":
                     if self._cancel:
                         self._cancel.set()
+                        self._stopping = True
+                        self._runs[self._active]["state"] = "cancelling"
+                        return {"state": "stopping", "pending_task": self._active}
                     self._close()
                     return {"state": "idle", "pending_task": self._active}
                 if action == "submit":
@@ -139,22 +156,26 @@ class AutonomousTaskPlugin:
 
     def _start(self, args):
         from rclpy.node import Node
-        from std_msgs.msg import String
 
-        binding = resolve_cameras(args, self._cfg)
+        if self._stopping:
+            raise ValueError("仍在等待上次任务结束")
+        state_topic, cameras = resolve_inputs(args, self._cfg)
+        control_topic = self._output()[0]["topic"]
+        if control_topic in (state_topic, *cameras.values()):
+            raise ValueError("控制输出不能与输入共用话题")
+        interface = EefInterface(args.get("control_interface"))
+        binding = {**cameras, "eef_state": state_topic}
         if self._node:
-            if binding != self._binding:
+            if binding != self._binding or interface.descriptor != self._interface.descriptor:
                 raise ValueError("卡片已运行，请先停止再更换接线")
             return self.dispatch("info", args | {"action": "info"})
-        if self._active:
-            raise ValueError("仍在等待上次任务结束")
         self._node = Node("autonomous_task")
         try:
-            self._cameras = CameraInputs(self._node, binding)
-            self._publishers = {k: self._node.create_publisher(String, v["topic"], 10)
-                                for k, v in _OUTPUTS.items()}
+            self._cameras = CameraInputs(self._node, cameras)
+            self._eef = EefEndpoint(self._node, state_topic, control_topic, interface)
             self._executor.add_node(self._node)
             self._binding = binding
+            self._interface = interface
         except Exception:
             self._close()
             raise
@@ -163,11 +184,14 @@ class AutonomousTaskPlugin:
     def _close(self):
         if self._cameras:
             self._cameras.close()
+        if self._eef:
+            self._eef.close()
         if self._node:
             self._executor.remove_node(self._node)
             self._node.destroy_node()
-        self._node = self._cameras = None
-        self._binding, self._publishers = {}, {}
+        self._node = self._cameras = self._eef = self._interface = None
+        self._binding = {}
+        self._stopping = False
 
     def _submit(self, args):
         instruction = args.get("instruction")
@@ -185,8 +209,10 @@ class AutonomousTaskPlugin:
                     return self._status(run["action_id"])
         if self._active:
             raise ValueError(f"任务 {self._active} 正在执行")
-        if not self._cameras or not self._binding:
+        if not self._eef or not any(role in self._binding for role in ("head", "left_wrist", "right_wrist")):
             raise ValueError("请启动卡片并接入至少一路 RGB；头部、左腕、右腕均可选")
+        if any(side not in self._interface.tip_frames for side in _MODES[mode]):
+            raise ValueError(f"下游控制接口不支持 {mode} 模式")
         model = Model(*(self._cfg.get(k, "") for k in ("base_url", "key", "model_name")))
         action_id = "autonomous_task_" + uuid.uuid4().hex
         run = {"action_id": action_id, "request_id": request_id, "instruction": instruction,
@@ -196,7 +222,7 @@ class AutonomousTaskPlugin:
             self._runs.popitem(last=False)
         self._runs[action_id] = run
         self._active, self._cancel = action_id, threading.Event()
-        threading.Thread(target=self._work, args=(run, model, self._cameras, self._cancel),
+        threading.Thread(target=self._work, args=(run, model, self._eef, self._cameras, self._cancel),
                          name="autonomous_task", daemon=True).start()
         return self._status(action_id)
 
@@ -219,19 +245,16 @@ class AutonomousTaskPlugin:
             out["history"] = list(task["history"])
         return out
 
-    def _work(self, run, model, cameras, cancel):
+    def _work(self, run, model, eef, cameras, cancel):
         action_id = run["action_id"]
         path = None
         status = "failed"
         reason = "任务未完成"
         try:
-            from .tron2 import Tron2
-
             if self._cfg.get("record_dir"):
                 path = Path(self._cfg["record_dir"]) / action_id
                 path.mkdir(parents=True, mode=0o700)
-            with closing(Tron2(self._cfg)) as driver:
-                status, reason = self._loop(run, model, driver, cameras, cancel, path)
+            status, reason = self._loop(run, model, eef, cameras, cancel, path)
         except Exception as error:
             reason = f"{type(error).__name__}: {error}"
             log.warning("%s step %d: %s", action_id, run["step"], reason)
@@ -240,6 +263,8 @@ class AutonomousTaskPlugin:
                 status, reason = "cancelled", f"已停止后续决策。最后反馈：{reason}"
             run.update(state=status, phase="finished", reason=reason, finished_at=time.time())
             self._active = self._cancel = None
+            if self._stopping:
+                self._close()
         try:
             if path:
                 pending = path / "result.tmp"
@@ -252,6 +277,7 @@ class AutonomousTaskPlugin:
         arms = _MODES[run["arm_mode"]]
         review = False
         inference_failures = 0
+        invalid_decisions = 0
         deadline = time.monotonic() + _TIME_LIMIT
 
         def check():
@@ -268,7 +294,9 @@ class AutonomousTaskPlugin:
                 cancel.wait(3)
                 check()
             images = cameras.snapshot(cancel)
-            state = driver.observe(arms)
+            state = driver.observe(arms, cancel)
+            if self._cfg.get("frame_description"):
+                state["frame_description"] = self._cfg["frame_description"]
             if path:
                 for role, jpeg in images.items():
                     (path / f"{step:03d}-{role}.jpg").write_bytes(jpeg)
@@ -278,6 +306,14 @@ class AutonomousTaskPlugin:
             decide = model.review if review else model.decide
             try:
                 name, args = decide(run["instruction"], arms, images, state, run["history"])
+            except InvalidDecisionError as error:
+                invalid_decisions += 1
+                self._record(run, path, {"step": step, "review": review, "tool": "invalid_decision",
+                                         "note": error.visible_output, "model": model.last_model,
+                                         "feedback": {"motion_sent": False, "reason": str(error)}}, state)
+                if invalid_decisions >= 3:
+                    return "failed", f"连续三次未得到可执行动作或明确任务状态：{error}"
+                continue
             except TransientModelError as error:
                 inference_failures += 1
                 self._record(run, path, {"step": step, "review": review,
@@ -287,7 +323,7 @@ class AutonomousTaskPlugin:
                     return "failed", f"连续三次推理没有获得响应：{error}"
                 cancel.wait(2 * inference_failures)
                 continue
-            inference_failures = 0
+            inference_failures = invalid_decisions = 0
             record = {"step": step, "review": review, "tool": name, "args": args,
                       "note": model.last_note, "model": model.last_model}
             check()
@@ -304,10 +340,10 @@ class AutonomousTaskPlugin:
                     self._record(run, path, record, state)
                     raise
                 record["feedback"] = result
-                if result["motion_sent"] and result["status"] == "completed":
-                    self._publish(run["action_id"], step, name, args, result)
             self._record(run, path, record, state)
             check()
+            if record.get("feedback", {}).get("status") == "outcome_unknown":
+                return "failed", record["feedback"]["reason"]
             if name == "failed":
                 return "failed", args["reason"]
             if name == "done" and review:
@@ -321,13 +357,3 @@ class AutonomousTaskPlugin:
         if path:
             with (path / "steps.jsonl").open("a") as trace:
                 trace.write(json.dumps({**record, "before": state}, ensure_ascii=False) + "\n")
-
-    def _publish(self, action_id, step, name, args, feedback):
-        from std_msgs.msg import String
-        message = String()
-        message.data = json.dumps({"action_id": action_id, "step": step, "tool": name,
-                                   "arguments": args, "feedback": feedback, "executed_at": time.time()})
-        with self._lock:
-            publisher = self._publishers.get("gripper" if name.endswith("_set_gripper") else "arm")
-            if publisher:
-                publisher.publish(message)

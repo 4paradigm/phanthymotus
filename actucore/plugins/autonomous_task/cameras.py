@@ -8,18 +8,12 @@ from functools import partial
 
 _LABELS = {"head": "头部", "left_wrist": "左腕", "right_wrist": "右腕"}
 
-# Agent Core passes the upstream topics, not the target port indices. Only
-# the TRON2 driver gives these three otherwise-unspecific names this meaning.
-_TRON2_TOPICS = {
-    "/limx_tron2/camera": "head",
-    "/limx_tron2/camera_left": "left_wrist",
-    "/limx_tron2/camera_right": "right_wrist",
-}
-_FRAME_ROLES = {
-    "tron2_head_camera": "head",
-    "tron2_left_wrist_camera": "left_wrist",
-    "tron2_right_wrist_camera": "right_wrist",
-}
+def _mount(identifier):
+    name = str(identifier or "").rsplit("/", 1)[-1]
+    for role in _LABELS:
+        if name in (role, role + "_camera") or name.endswith("_" + role + "_camera"):
+            return role
+    return None
 
 
 def camera_ports(binding=None):
@@ -30,17 +24,38 @@ def camera_ports(binding=None):
             for role, label in _LABELS.items()]
 
 
-def resolve_cameras(args, cfg):
-    """Join only connected topics to their physical roles, independent of order."""
+def resolve_inputs(args, cfg):
+    """Agent Core supplies connected topics without their destination port indices."""
     topics = args.get("input_topics") or []
     if not isinstance(topics, (list, tuple)):
-        raise ValueError("input_topics must be a list of RGB topics")
+        raise ValueError("input_topics must be a list of topic names")
     topics = list(topics)
     if args.get("input_topic"):
         topics.append(args["input_topic"])
+    if any(not isinstance(t, str) or not t.startswith("/") for t in topics):
+        raise ValueError("Expected absolute ROS input topic names")
+    topics = list(dict.fromkeys(topics))
     declarations = args.get("camera_info") or {}
     if not isinstance(declarations, dict):
         raise ValueError("camera_info must be keyed by input topic")
+    state = cfg.get("state_topic")
+    if state:
+        if state not in topics:
+            raise ValueError(f"Configured state/eef topic {state} is not connected")
+    else:
+        camera_topics = {cfg.get(role + "_topic") for role in _LABELS}
+        candidates = [t for t in topics if t not in camera_topics and t not in declarations]
+        named = [t for t in candidates if t.endswith("/state/eef")]
+        if len(named or candidates) != 1:
+            raise ValueError("Connect one state/eef input; configure state_topic for ambiguous wiring")
+        state, = named or candidates
+    if state in declarations or any(cfg.get(role + "_topic") == state for role in _LABELS):
+        raise ValueError("A camera and state/eef cannot share the same input topic")
+    return state, resolve_cameras([t for t in topics if t != state], declarations, cfg)
+
+
+def resolve_cameras(topics, declarations, cfg):
+    """Use only explicit mappings and declared mount identities to bind views."""
     bound = {}
     for topic in topics:
         if not isinstance(topic, str) or not topic.startswith("/"):
@@ -51,15 +66,9 @@ def resolve_cameras(args, cfg):
         if declaration.get("format") not in (None, "", "image/jpeg"):
             raise ValueError(f"{topic} does not publish image/jpeg")
         roles = {role for role in _LABELS if cfg.get(f"{role}_topic") == topic}
-        if topic in _TRON2_TOPICS:
-            roles.add(_TRON2_TOPICS[topic])
-        # A camera ID survives topic remapping. Accept a named mount but
-        # never assume that e.g. an arbitrary 'camera_left' is a wrist camera.
-        camera_id = str(declaration.get("id") or "").rsplit("/", 1)[-1]
-        if camera_id in _LABELS:
-            roles.add(camera_id)
-        elif camera_id in _FRAME_ROLES:
-            roles.add(_FRAME_ROLES[camera_id])
+        mount = _mount(declaration.get("id"))
+        if mount:
+            roles.add(mount)
         if not roles:
             raise ValueError(f"Unknown camera role for {topic}; set head_topic, "
                              "left_wrist_topic or right_wrist_topic to the wired topic")
@@ -98,7 +107,7 @@ class CameraInputs:
                 return
             stamp = message.header.stamp
             stamp_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
-            observed_role = _FRAME_ROLES.get(message.header.frame_id)
+            observed_role = _mount(message.header.frame_id)
             if observed_role and observed_role != role:
                 self._errors[role] = f"frame_id identifies {observed_role}"
             elif not self._after_ns < stamp_ns <= self._node.get_clock().now().nanoseconds:
