@@ -426,11 +426,91 @@ def _zip(parts) -> bytes:
     return buffer.getvalue()
 
 
+def build_xlsx_place_in_cell(rows, pictures) -> bytes:
+    """A workbook in Excel 365's "Place in cell" format, as Excel writes it.
+
+    `rows`: lists of cells, where a cell is a str (shared string), ("num", raw)
+    for a numeric cell written verbatim (e.g. "1.1010119900101101E+17", which is
+    how Excel stores an 18-digit ID typed into a General cell), or ("pic", n)
+    for picture n (0-based index into `pictures`, a list of (name, bytes)).
+
+    The picture cell is an error value `#VALUE!` with `vm="n+1"`; the link to
+    the image goes through metadata.xml and xl/richData/*, exactly the part
+    layout of a real file sent to Q5 from Feishu (数据名单.xlsx, 2026-11-20).
+    """
+    shared: list = []
+    sheet_rows = []
+    for row_index, row in enumerate(rows, 1):
+        cells = []
+        for col_index, value in enumerate(row, 1):
+            ref = "%s%d" % (_column_letter(col_index), row_index)
+            if isinstance(value, tuple) and value[0] == "pic":
+                cells.append('<c r="%s" t="e" vm="%d"><v>#VALUE!</v></c>' % (ref, value[1] + 1))
+            elif isinstance(value, tuple) and value[0] == "num":
+                cells.append('<c r="%s"><v>%s</v></c>' % (ref, value[1]))
+            elif isinstance(value, str):
+                if value not in shared:
+                    shared.append(value)
+                cells.append('<c r="%s" t="s"><v>%d</v></c>' % (ref, shared.index(value)))
+            else:
+                cells.append('<c r="%s"><v>%s</v></c>' % (ref, value))
+        sheet_rows.append('<row r="%d">%s</row>' % (row_index, "".join(cells)))
+    count = len(pictures)
+    rd = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"
+    parts = {
+        "[Content_Types].xml": _HEADER + '<Types xmlns="%s"><Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/></Types>' % _CT,
+        "_rels/.rels": _HEADER + '<Relationships xmlns="%s"><Relationship Id="rId1" '
+        'Type="%s/officeDocument" Target="xl/workbook.xml"/></Relationships>' % (_PKG_REL, _REL),
+        "xl/workbook.xml": _HEADER + '<workbook xmlns="%s" xmlns:r="%s"><sheets>'
+        '<sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>' % (_MAIN, _REL),
+        "xl/_rels/workbook.xml.rels": _HEADER + '<Relationships xmlns="%s">'
+        '<Relationship Id="rId1" Type="%s/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="%s/sharedStrings" Target="sharedStrings.xml"/>'
+        '</Relationships>' % (_PKG_REL, _REL, _REL),
+        "xl/worksheets/sheet1.xml": _HEADER + '<worksheet xmlns="%s"><sheetData>%s'
+        '</sheetData></worksheet>' % (_MAIN, "".join(sheet_rows)),
+        "xl/sharedStrings.xml": _HEADER + '<sst xmlns="%s">%s</sst>' % (
+            _MAIN, "".join("<si><t>%s</t></si>" % _escape(text) for text in shared)),
+        "xl/metadata.xml": _HEADER + (
+            '<metadata xmlns="%s" xmlns:xlrd="%s"><metadataTypes count="1">'
+            '<metadataType name="XLRICHVALUE" minSupportedVersion="120000"/></metadataTypes>'
+            '<futureMetadata name="XLRICHVALUE" count="%d">%s</futureMetadata>'
+            '<valueMetadata count="%d">%s</valueMetadata></metadata>' % (
+                _MAIN, rd, count,
+                "".join('<bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}">'
+                        '<xlrd:rvb i="%d"/></ext></extLst></bk>' % index
+                        for index in range(count)),
+                count, "".join('<bk><rc t="1" v="%d"/></bk>' % index for index in range(count)))),
+        "xl/richData/rdrichvaluestructure.xml": _HEADER + (
+            '<rvStructures xmlns="%s" count="1"><s t="_localImage">'
+            '<k n="_rvRel:LocalImageIdentifier" t="i"/><k n="CalcOrigin" t="i"/></s>'
+            '</rvStructures>' % rd),
+        "xl/richData/rdrichvalue.xml": _HEADER + '<rvData xmlns="%s" count="%d">%s</rvData>' % (
+            rd, count, "".join('<rv s="0"><v>%d</v><v>5</v></rv>' % index
+                               for index in range(count))),
+        "xl/richData/richValueRel.xml": _HEADER + (
+            '<richValueRels xmlns="http://schemas.microsoft.com/office/spreadsheetml/2022/'
+            'richvaluerel" xmlns:r="%s">%s</richValueRels>' % (
+                _REL, "".join('<rel r:id="rId%d"/>' % (index + 1) for index in range(count)))),
+        # Excel lists these relationships out of order; the reader must go by Id.
+        "xl/richData/_rels/richValueRel.xml.rels": _HEADER + '<Relationships xmlns="%s">%s'
+        '</Relationships>' % (_PKG_REL, "".join(
+            '<Relationship Id="rId%d" Type="%s/image" Target="../media/%s"/>'
+            % (index + 1, _REL, pictures[index][0]) for index in reversed(range(count)))),
+    }
+    for name, blob in pictures:
+        parts["xl/media/%s" % name] = blob
+    return _zip(parts)
+
+
 __all__ = [
     "EMF_BYTES",
     "PNG_BYTES",
     "build_docx",
     "build_xlsx",
+    "build_xlsx_place_in_cell",
     "dispimg",
     "num",
     "paragraph",

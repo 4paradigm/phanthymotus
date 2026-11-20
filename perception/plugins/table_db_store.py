@@ -351,6 +351,67 @@ class TableStore:
                             "columns": [column.describe() for column in columns]})
             return out
 
+    def overview(self, db: str) -> List[dict]:
+        """Tables with columns, live rows, attached files and last change."""
+        with self._read(db) as conn:
+            if conn is None:
+                return []
+            out = []
+            for tid, name, created in conn.execute(
+                    "SELECT id, name, created_at FROM _tables ORDER BY id").fetchall():
+                columns = self._meta(conn, name)[1]
+                live = ' WHERE _deleted_at IS NULL'
+                rows, updated = conn.execute(
+                    'SELECT COUNT(*), MAX(_updated_at) FROM "t_%d"%s' % (tid, live)).fetchone()
+                files = 0
+                for column in columns:
+                    if column.type == FILE:
+                        files += conn.execute('SELECT COUNT("%s") FROM "t_%d"%s' % (
+                            column.phys, tid, live)).fetchone()[0]
+                out.append({"table": name, "rows": rows, "files": files,
+                            "columns": [column.describe() for column in columns],
+                            "created_at": created, "updated_at": updated or created})
+            return out
+
+    def db_bytes(self, db: str) -> int:
+        path = self.db_path(db)
+        return sum(os.path.getsize(part) for part in (path, path + "-wal")
+                   if os.path.exists(part))
+
+    def drop_table(self, db: str, table: str) -> dict:
+        """Remove a table, its metadata and any file no other row still uses."""
+        with self._write(db) as conn:
+            tid, columns = self._meta(conn, table)
+            rows = conn.execute('SELECT COUNT(*) FROM "t_%d" WHERE _deleted_at IS NULL'
+                                % tid).fetchone()[0]
+            file_ids: List[int] = []
+            for column in columns:
+                if column.type == FILE:
+                    file_ids += [row[0] for row in conn.execute(
+                        'SELECT "%s" FROM "t_%d" WHERE "%s" IS NOT NULL'
+                        % (column.phys, tid, column.phys))]
+            conn.execute('DROP TABLE "t_%d"' % tid)
+            conn.execute("DELETE FROM _columns WHERE table_id=?", (tid,))
+            conn.execute("DELETE FROM _tables WHERE id=?", (tid,))
+            for start in range(0, len(file_ids), MAX_IN_VALUES):
+                chunk = file_ids[start:start + MAX_IN_VALUES]
+                conn.execute("DELETE FROM _files WHERE id IN (%s)" % ",".join("?" * len(chunk)),
+                             chunk)
+            conn.execute("DELETE FROM _blobs WHERE sha256 NOT IN (SELECT sha256 FROM _files)")
+            # Forget the requests that wrote this table: replaying "imported 5"
+            # for a table that no longer exists would tell a skill its re-import
+            # succeeded when nothing was written.
+            stale = []
+            for request_id, result in conn.execute("SELECT request_id, result FROM _requests"):
+                try:
+                    if json.loads(result).get("table") == table:
+                        stale.append(request_id)
+                except ValueError:
+                    continue
+            for request_id in stale:
+                conn.execute("DELETE FROM _requests WHERE request_id=?", (request_id,))
+            return {"rows": rows, "files": len(file_ids)}
+
     def quick_check(self, db: str) -> str:
         with self._read(db) as conn:
             if conn is None:

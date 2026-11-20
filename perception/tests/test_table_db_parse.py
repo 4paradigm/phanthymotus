@@ -557,3 +557,39 @@ def test_emf_picture_is_reported_by_the_reader_as_media():
     sheet = parse_document(data, "stamp.docx").tables[0]
 
     assert sheet.rows[0][2].media == "word/media/stamp.emf"
+
+
+# ── numbers as Excel shows them ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw,shown,lossy", [
+    ("1.1010119900101101E+17", "110101199001011000", True),   # 18-digit ID typed as a number
+    ("13800138000", "13800138000", False),                     # 11-digit phone: exact
+    ("12.0", "12", False),
+    ("3.5", "3.5", False),
+    ("1E+3", "1000", False),
+    ("abc", "abc", False),
+])
+def test_numbers_read_as_excel_shows_them(raw, shown, lossy):
+    from plugins.table_db_parse import _plain_number
+
+    assert _plain_number(raw) == (shown, lossy)
+
+
+def test_lossy_long_numbers_are_reported_in_notes():
+    data = build_xlsx(rows=[[xs("身份证号")], [num("1.1010119900101101E+17")]])
+    document = parse_document(data, "ids.xlsx")
+
+    assert document.tables[0].rows[1][1].text == "110101199001011000"
+    assert any("A2" in note and "15" in note for note in document.notes)
+
+
+def test_excel365_place_in_cell_picture_is_media_not_value_error():
+    from ooxml_fixtures import build_xlsx_place_in_cell
+
+    data = build_xlsx_place_in_cell(
+        [["姓名", "照片"], ["张三", ("pic", 0)], ["李四", ("pic", 1)]],
+        [("a.jpeg", PNG_BYTES), ("b.png", PNG_BYTES)])
+    sheet = parse_document(data, "365.xlsx").tables[0]
+
+    assert sheet.rows[1][2].media == "xl/media/a.jpeg" and sheet.rows[1][2].text == ""
+    assert sheet.rows[2][2].media == "xl/media/b.png"

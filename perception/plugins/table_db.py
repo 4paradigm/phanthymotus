@@ -104,11 +104,41 @@ _MIME_BY_MAGIC = (
     (b"ID3", "audio/mpeg", ".mp3"),
 )
 
-_TABLE_DESC = "表名（1–64 字，可中文，不能以 _ 开头）"
-_DB_DESC = "库名，默认 default。建议填你的 skill slug，不同 skill 数据互不干扰"
-_WHERE_DESC = ('筛选：{"列":"值"} 等于；{"列":["值1","值2"]} 等于其一；{"列":null} 为空；'
+# The canvas renders this schema as ONE form: an `action` dropdown, one field
+# per property (in this order), and a single ▶ 执行 button. Fields not listed in
+# the selected action's `params` are hidden. What that means for this schema
+# (agent-core/web/js/canvas.js, _buildCardEl / _executeCard):
+#
+# * Field labels are the property keys; the placeholder is the first 40
+#   characters of `description` — so every description *starts* with an example.
+# * Object / array fields are plain text boxes and arrive as JSON strings;
+#   dispatch() parses them (`_JSON_PARAMS`).
+# * Per-action `required` is not checked by the canvas; dispatch() checks it and
+#   says which field to fill, instead of failing on a None deep inside.
+# * Dropdowns always send a value, so no enum here may change the meaning of an
+#   action that does not list it (`mode` is read by import only).
+# * `oneOf` titles become the dropdown labels.
+
+_TABLE_DESC = "表名，例 名单。不知道有哪些表？先选 show 执行"
+_DB_DESC = "库名，例 q5-exam-helper；不填 = default。建议填 skill 的 slug"
+_WHERE_DESC = ('例 {"姓名":"张三"}；{"状态":["借出","逾期"]} 等于其一；{"归还时间":null} 为空；'
                '多个键同时满足；可用 "_id"')
-_REQ_DESC = "可选的请求编号（≤128 字）。同一编号重试返回上次结果，不会重复写入"
+_REQ_DESC = "例 import-名单-1；可选。同一编号重试返回上次结果，不会重复写入"
+
+ACTION_TITLES = [
+    ("show", "📋 show：查看所有库、表和列（先点这个）"),
+    ("query", "🔍 query：查询记录"),
+    ("stats", "🔢 stats：计数 / 分组计数"),
+    ("import", "📥 import：导入 Excel/CSV 表格"),
+    ("create", "🆕 create：建空表"),
+    ("append", "➕ append：新增记录"),
+    ("update", "✏️ update：按 _id 修改"),
+    ("delete", "🗑️ delete：按 _id 删除一条"),
+    ("attach_file", "📎 attach_file：给记录挂文件"),
+    ("get_file", "📤 get_file：取出文件（得到路径）"),
+    ("export_files", "👤 export_files：导出姓名+照片（录人脸）"),
+    ("drop_table", "⚠️ drop_table：删除整张表"),
+]
 
 TOOLS: List[Dict[str, Any]] = [{
     "name": PREFIX,
@@ -118,66 +148,79 @@ TOOLS: List[Dict[str, Any]] = [{
         "表格数据库：每个 skill 用自己的表保存条目，可导入飞书发来的 Excel/CSV（含图片），"
         "运行中增删改查、分组计数。列只有 text（文字）和 file（图片/PDF/音频等非文字）。"
         "编号 _id 和计数由本卡保证，不要自己读写 JSON 文件。只存取，不判断业务含义。"
+        "不知道库名和表名时先调 show。"
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "stop", "info", "create", "import", "append", "query",
-                         "update", "delete", "stats", "attach_file", "get_file",
-                         "export_files"],
+                "enum": ["start", "stop", "info"] + [name for name, _ in ACTION_TITLES],
+                "oneOf": [{"const": name, "title": title} for name, title in ACTION_TITLES],
                 "description": "Action to perform",
             },
             "db": {"type": "string", "description": _DB_DESC},
             "table": {"type": "string", "description": _TABLE_DESC},
+            "path": {
+                "type": "string",
+                "format": "file",
+                "uploadTo": "mcp",
+                "description": "要导入的表格或要挂的文件。飞书发来的文件直接填消息里的 files[].path",
+            },
+            "where": {"type": "object", "description": _WHERE_DESC},
+            "_id": {"type": "integer", "description": "例 3。记录编号，来自 query / append 的返回"},
+            "set": {"type": "object",
+                    "description": '例 {"状态":"已归还"}。要修改的文字列；值为 null 表示清空'},
+            "records": {
+                "type": "array", "items": {"type": "object"},
+                "description": '例 [{"姓名":"张三","状态":"借出"}]。按列名填值，只填文字列，一次 ≤500 条',
+            },
             "columns": {
                 "type": "array",
                 "items": {"type": "object", "properties": {
                     "name": {"type": "string"},
                     "type": {"type": "string", "enum": ["text", "file"]}}},
-                "description": '列定义，如 [{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]',
+                "description": ('例 [{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]；'
+                                '也可写 姓名,照片:file'),
             },
-            "path": {
-                "type": "string",
-                "format": "file",
-                "uploadTo": "mcp",
-                "description": "文件路径。飞书发来的文件直接填消息里的 files[].path",
+            "group_by": {"type": "string", "description": "例 借用人。按这一列分组计数；不填只给总数"},
+            "column": {"type": "string", "description": "例 照片。文件列（type=file）的列名"},
+            "name_column": {"type": "string", "description": "例 姓名。姓名所在的文字列"},
+            "profile_columns": {
+                "type": "array", "items": {"type": "string"},
+                "description": '例 准考证号,身份证号。一起导出的文字列（写进人脸档案）',
             },
+            "file_id": {"type": "string", "description": "例 f_3。文件编号，来自 query 返回的文件列"},
             "mode": {
                 "type": "string",
                 "enum": ["create", "append"],
+                "oneOf": [{"const": "create", "title": "create：建新表"},
+                          {"const": "append", "title": "append：追加到已有表"}],
                 "description": "create（默认）= 按表头建新表；append = 追加到已有表（列名要对得上）",
             },
             "header_row": {
                 "type": "integer", "minimum": 0,
-                "description": "表头在 Excel 第几行（自动识别错了才填）；0 = 没有表头",
+                "description": "例 2。表头在 Excel 第几行（自动识别错了才填）；0 = 没有表头",
             },
             "dry_run": {"type": "boolean",
-                        "description": "true = 只检查并预览，不写库。先给用户看，确认后再正式导入"},
+                        "description": "填 true = 只检查并预览，不写库；不填 = 正式导入"},
             "request_id": {"type": "string", "description": _REQ_DESC},
-            "records": {
-                "type": "array", "items": {"type": "object"},
-                "description": '要新增的记录，按列名填值（只填文字列），如 [{"姓名":"张三","状态":"借出"}]',
-            },
-            "where": {"type": "object", "description": _WHERE_DESC},
-            "offset": {"type": "integer", "minimum": 0, "description": "跳过几条，默认 0"},
+            "confirm": {"type": "string",
+                        "description": "再输入一遍要删除的表名，确认删除整张表（不可恢复）"},
+            "offset": {"type": "integer", "minimum": 0, "description": "例 0。跳过几条，默认 0"},
             "limit": {"type": "integer", "minimum": 1,
-                      "description": "最多返回几条，默认 20，上限 200"},
-            "_id": {"type": "integer", "description": "记录编号（来自 query / append 的返回）"},
-            "set": {"type": "object",
-                    "description": '要修改的文字列，如 {"状态":"已归还"}；值为 null 表示清空'},
-            "group_by": {"type": "string", "description": "分组列名；不填只返回总数"},
-            "column": {"type": "string", "description": "文件列（type=file）的列名"},
-            "file_id": {"type": "string", "description": "文件编号，如 f_42（来自 query 的返回）"},
-            "name_column": {"type": "string", "description": "姓名所在的文字列"},
-            "profile_columns": {
-                "type": "array", "items": {"type": "string"},
-                "description": "一起导出的其它文字列（写进人脸档案 profile）",
-            },
+                      "description": "例 20。最多返回几条，默认 20，上限 200"},
         },
         "required": ["action"],
         "x-action-params": {
+            "show": {
+                "params": ["db"],
+                "required": [],
+                "description": (
+                    "查看本机所有库（db）、每个库里的表、每张表的列（text/file）、行数和文件数。"
+                    "不知道库名表名时先调它；db 填了就只看这个库。"
+                ),
+            },
             "create": {
                 "params": ["db", "table", "columns"],
                 "required": ["table", "columns"],
@@ -189,7 +232,7 @@ TOOLS: List[Dict[str, Any]] = [{
                 "required": ["table", "path"],
                 "description": (
                     "导入表格文件（xlsx/csv，兼容 Word 里的表格；单元格里的图片自动存成 file 列）。"
-                    "整批成功或整批不写。返回识别出的列、导入条数、空行、前 3 条样例。"
+                    "整批成功或整批不写。返回识别出的列、导入条数、前 3 条样例。"
                     "建议先 dry_run=true 给用户确认。"
                 ),
             },
@@ -243,10 +286,22 @@ TOOLS: List[Dict[str, Any]] = [{
                     "没有文件或没有姓名的行在 skipped 里；一次最多 200 条。"
                 ),
             },
+            "drop_table": {
+                "params": ["db", "table", "confirm"],
+                "required": ["table", "confirm"],
+                "description": (
+                    "删除整张表及其文件（不可恢复）。confirm 必须再填一遍表名。"
+                    "只在用户明确要求删除或重新导入时使用。"
+                ),
+            },
             "info": {"params": ["db"], "description": "诊断：库列表、表、上限、库完整性。"},
         },
     },
 }]
+
+# Object / array parameters the canvas sends as text. A model sends real JSON;
+# both are accepted. profile_columns also takes "a,b,c".
+_JSON_PARAMS = ("where", "set", "records", "columns", "profile_columns")
 
 
 class TableDbPlugin:
@@ -294,6 +349,7 @@ class TableDbPlugin:
         args = args if isinstance(args, dict) else {}
         action = args.get("action") if name == PREFIX else name
         handlers = {
+            "show": self._do_show, "drop_table": self._do_drop_table,
             "create": self._do_create, "import": self._do_import,
             "append": self._do_append, "query": self._do_query,
             "update": self._do_update, "delete": self._do_delete,
@@ -309,7 +365,48 @@ class TableDbPlugin:
             return None
         with self._counter_lock:
             self._calls += 1
-        return self._safe(handler, args)
+        return self._safe(lambda given: handler(self._prepare(action, given)), args)
+
+    @staticmethod
+    def _prepare(action: str, args: dict) -> dict:
+        """Normalise one call's arguments the same way for model and canvas.
+
+        * Blank strings count as "not given" (a canvas field left empty).
+        * Object/array params given as text are parsed as JSON; a bad JSON text
+          is a bad_request naming the field and the parse error.
+        * The action's required params are checked here, so a missing `table`
+          answers "fill in table (try show)" rather than a None further down.
+        """
+        out = {key: value for key, value in args.items()
+               if not (isinstance(value, str) and not value.strip())}
+        for key in _JSON_PARAMS:
+            value = out.get(key)
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if key in ("profile_columns", "columns") and not text.startswith(("[", "{")):
+                out[key] = [part.strip() for part in re.split(r"[,，、]", text)
+                            if part.strip()]
+                if key == "columns":
+                    out[key] = [{"name": part.split(":")[0].strip(),
+                                 "type": (part.split(":")[1].strip() if ":" in part else "text")}
+                                for part in out[key]]
+                continue
+            try:
+                out[key] = json.loads(text)
+            except ValueError as error:
+                raise bad_request("%s 不是合法的 JSON（%s）。例：%s" % (
+                    key, error, {"where": '{"姓名":"张三"}', "set": '{"状态":"已归还"}',
+                                 "records": '[{"姓名":"张三"}]',
+                                 "columns": '[{"name":"姓名","type":"text"}]',
+                                 "profile_columns": '["准考证号"]'}[key]), column=key)
+        spec = TOOLS[0]["inputSchema"]["x-action-params"].get(action, {})
+        missing = [key for key in spec.get("required", []) if key not in out]
+        if missing:
+            hint = "；不知道库名或表名就先执行 show" if "table" in missing else ""
+            raise TableDbError("bad_request", "%s 需要填写：%s%s" % (
+                action, "、".join(missing), hint), missing=missing)
+        return out
 
     def _safe(self, handler, args: dict) -> dict:
         """The outermost guard: no exception ever leaves the card."""
@@ -408,6 +505,42 @@ class TableDbPlugin:
             raise TableDbError("too_large", "文件 %d 字节，超过上限 %d" % (size, max_bytes))
         with open(resolved, "rb") as handle:
             return handle.read(), os.path.basename(resolved)
+
+    # ── show / drop_table ────────────────────────────────────────────────────
+
+    def _do_show(self, args: dict) -> dict:
+        """Every library, its tables, their columns and sizes — the "where am I"."""
+        wanted = check_db_name(args["db"]) if args.get("db") else None
+        names = self._store.databases()
+        if wanted and wanted not in names:
+            return {"ok": True, "databases": [], "detail": (
+                "没有库 %s。现有的库：%s" % (wanted, "、".join(names) or "（无）"))}
+        databases = []
+        for name in ([wanted] if wanted else names):
+            tables = self._store.overview(name)
+            databases.append({"db": name, "tables": tables,
+                              "bytes": self._store.db_bytes(name),
+                              "file": self._store.db_path(name)})
+        reply: Dict[str, Any] = {"ok": True, "count": len(databases),
+                                 "databases": databases}
+        if not databases:
+            reply["detail"] = ("还没有任何库。用 import 导入一个表格，或 create 建表；"
+                               "db 不填就是 default")
+        else:
+            first_db = databases[0]
+            first = next((item for item in first_db["tables"]), None)
+            if first:
+                reply["next"] = ('查询示例：action=query, db=%s, table=%s'
+                                 % (first_db["db"], first["table"]))
+        return reply
+
+    def _do_drop_table(self, args: dict) -> dict:
+        db, table = self._db_table(args)
+        if str(args.get("confirm") or "").strip() != table:
+            raise bad_request("confirm 要再填一遍表名「%s」才会删除（防止误删）" % table)
+        removed = self._store.drop_table(db, table)
+        return {"ok": True, "db": db, "table": table, "dropped": True,
+                "rows": removed["rows"], "files": removed["files"]}
 
     # ── create ───────────────────────────────────────────────────────────────
 

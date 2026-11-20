@@ -4608,8 +4608,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 
 > 模型要看得到这张卡，必须在画布上把决策卡的「连接执行器」连到它（与其它卡相同）。
 
-| 动作 | 参数（都要 `table`，`db` 可选） | 返回 |
+| 动作 | 参数（除 `show` 外都要 `table`，`db` 可选） | 返回 |
 |---|---|---|
+| `show` | `db`（可选） | 所有库 → 表 → 列、行数、文件数（画布上默认选中，先点它） |
 | `create` | `columns: [{"name","type":"text|file"}]` | 列定义 |
 | `import` | `path`（飞书文件填 `files[].path`）、`mode`（create/append）、`header_row`、`dry_run`、`request_id` | 识别出的列、`imported`、`files`、空行、前 3 条样例 |
 | `append` | `records`（≤500 条，只写文字列）、`request_id` | `ids` |
@@ -4620,6 +4621,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 | `attach_file` | `_id`、`column`、`path` | 文件信息 |
 | `get_file` | `file_id` | 本容器内的临时路径（24 小时），可直接作为 face / ocr / vop 的 `image_path` |
 | `export_files` | `column`、`name_column`、`profile_columns`、`where` | 目录（文件 + manifest.json），交给 `face_recognition.register_by_corpus` |
+| `drop_table` | `confirm`（再填一遍表名） | 删除整张表及其文件 |
+
+画布卡片是一张表单：一个 action 下拉框（带中文标题）、各个参数格子和一个「▶ 执行」按钮。
+对象和数组参数可以填 JSON 文本，必填项由卡片检查；漏填时返回 `bad_request` 并带 `missing`。
+导入支持三种图片放法：WPS `DISPIMG`、浮动图片、Excel 365「放在单元格中」。
 
 **存储方式**
 - 列只有两种：`text`（文字），以及 `file`（图片、PDF、音频等非文字内容）。

@@ -44,12 +44,13 @@
 
 ---
 
-## 三、10 个动作
+## 三、12 个动作
 
-每个动作都要传 `table`；`db` 可选，默认 `default`，**建议一律传你的 skill slug**。
+除 `show` 外，每个动作都要传 `table`；`db` 可选，默认 `default`，**建议一律传你的 skill slug**。
 
 | 动作 | 参数 | 返回 |
 |---|---|---|
+| `show` | `db`（可选） | 所有库、每个库里的表、列类型、行数和文件数。**不知道库名、表名时先调它** |
 | `create` | `columns`：`[{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]` | 列定义 |
 | `import` | `path`：飞书文件直接填 `files[].path`<br>`mode`：`create`（默认）或 `append`<br>`header_row`：表头在第几行（自动识别错了才填）<br>`dry_run`：`true` 表示只检查不写<br>`request_id`：重试安全 | `columns`、`rows`、`imported`、`files`、`skipped_rows`（空行），以及 3 条 `sample` |
 | `append` | `records`：`[{...}]`（不超过 500 条，只写文字列）<br>`request_id` | `ids` |
@@ -60,6 +61,14 @@
 | `attach_file` | `_id`、`column`（文件列）、`path` | 文件信息（会替换原来的文件） |
 | `get_file` | `file_id` | `path`：本容器里的临时文件，24 小时有效 |
 | `export_files` | `column`（文件列）、`name_column`、`profile_columns`、`where` | `dir`：照片加 `manifest.json`，交给 `face_recognition.register_by_corpus` |
+| `drop_table` | `confirm`：再填一遍表名 | 删除整张表及其文件（不可恢复），用于重新导入 |
+
+**图片的三种放法都支持**：WPS 的嵌入单元格图片（`DISPIMG`）、浮动图片（按锚点归到对应行）、Excel 365 的「放在单元格中」图片（rich data）。
+超过 15 位、却按数字存储的号码（常见于身份证号），Excel 本身只保存了 15 位有效数字，后面几位已经丢失；导入时会在 `warnings` 里提醒，请用户把这一列改为文本格式后重新填写。
+
+**在画布上直接测试**：卡片上只有一个 action 下拉框、各个参数格子和一个「▶ 执行」按钮。
+对象和数组类型的格子要填 JSON 文本（例如 `{"姓名":"张三"}`），`columns` 和 `profile_columns` 也可以写成 `姓名,照片:file`。
+漏填必填项时，会返回 `bad_request` 并带上 `missing`。
 
 **`where` 只有三种写法**：
 - `{"列":"值"}`：等于；

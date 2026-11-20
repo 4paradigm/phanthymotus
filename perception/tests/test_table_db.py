@@ -371,6 +371,101 @@ def test_export_files_builds_a_face_corpus(tmp_path):
                  name_column="姓名")["reason"] == "bad_request"
 
 
+# ── show / drop_table / canvas-style input ───────────────────────────────────
+
+def test_show_lists_every_library_and_table(tmp_path):
+    card = _card(tmp_path)
+    assert card.dispatch("table_db", {"action": "show"})["databases"] == []
+
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    _call(card, "create", table="签到", columns=["姓名"], db="other")
+    reply = card.dispatch("table_db", {"action": "show"})
+
+    assert reply["ok"] is True and reply["count"] == 2
+    by_db = {item["db"]: item for item in reply["databases"]}
+    roster = by_db["t"]["tables"][0]
+    assert roster["table"] == "名单" and roster["rows"] == 3 and roster["files"] == 2
+    assert {"name": "照片", "type": "file"} in roster["columns"]
+    assert by_db["other"]["tables"][0]["table"] == "签到"
+    assert "query" in reply["next"]
+    only = card.dispatch("table_db", {"action": "show", "db": "other"})
+    assert [item["db"] for item in only["databases"]] == ["other"]
+    assert card.dispatch("table_db", {"action": "show", "db": "nope"})["databases"] == []
+
+
+def test_missing_required_field_says_which_and_points_at_show(tmp_path):
+    card = _card(tmp_path)
+    # Exactly what the canvas sent: an empty table field is simply absent, and
+    # the always-filled `mode` dropdown and instance_id come along.
+    reply = card.dispatch("table_db", {"action": "query", "mode": "create",
+                                       "instance_id": "card-x", "table": "  "})
+    assert reply["ok"] is False and reply["reason"] == "bad_request"
+    assert reply["missing"] == ["table"] and "show" in reply["detail"]
+
+
+def test_canvas_json_text_fields_are_parsed(tmp_path):
+    card = _card(tmp_path)
+    created = card.dispatch("table_db", {"action": "create", "db": "t", "table": "台账",
+                                         "columns": "借用人,物品,照片:file"})
+    assert created["columns"][2] == {"name": "照片", "type": "file"}
+    _call(card, "append", table="台账", records='[{"借用人":"张三","物品":"万用表"}]')
+    found = _call(card, "query", table="台账", where='{"借用人":"张三"}')
+    assert found["total"] == 1
+    assert _call(card, "update", table="台账", _id="1", set='{"物品":"电钻"}')["ok"] is True
+    bad = _call(card, "query", table="台账", where="{借用人:张三}")
+    assert bad["reason"] == "bad_request" and bad["column"] == "where" and "JSON" in bad["detail"]
+    assert _call(card, "import", table="x", path=_write(tmp_path, "r.xlsx", ROSTER),
+                 dry_run="true")["dry_run"] is True
+
+
+def test_drop_table_needs_confirmation_and_frees_files(tmp_path):
+    import sqlite3
+
+    card = _card(tmp_path)
+    path = _write(tmp_path, "r.xlsx", ROSTER)
+    _call(card, "import", table="名单", path=path, request_id="imp-1")
+    assert _call(card, "drop_table", table="名单", confirm="名")["reason"] == "bad_request"
+
+    dropped = _call(card, "drop_table", table="名单", confirm="名单")
+    assert dropped["dropped"] is True and dropped["rows"] == 3 and dropped["files"] == 2
+    assert _call(card, "query", table="名单")["reason"] == "unknown_table"
+    conn = sqlite3.connect(str(tmp_path / "db" / "t.db"))
+    assert conn.execute("SELECT COUNT(*) FROM _blobs").fetchone()[0] == 0
+    conn.close()
+    # Re-importing after a drop with the SAME request_id (what a skill that
+    # derives it from the file name does) really imports — the old result is
+    # not replayed as if the rows still existed.
+    again = _call(card, "import", table="名单", path=path, request_id="imp-1")
+    assert again["imported"] == 3 and not again.get("replayed")
+    assert _call(card, "stats", table="名单")["total"] == 3
+
+
+# ── the real Feishu roster (数据名单.xlsx, 2026-11-20) ─────────────────────────
+
+def test_import_excel365_place_in_cell_pictures_and_long_ids(tmp_path):
+    """The file that failed on the robot: pictures placed *in* cells (Excel 365,
+    shown as #VALUE! to an old reader) and 18-digit IDs typed as numbers."""
+    from ooxml_fixtures import build_xlsx_place_in_cell
+
+    data = build_xlsx_place_in_cell([
+        ["姓名", "身份证号", "准考证号", "照片"],
+        ["游宇辰", ("num", "1.1010119900101101E+17"), "ZK2026001", ("pic", 0)],
+        ["刘简恺", ("num", "1.10101199202022E+17"), "ZK2026002", ("pic", 1)],
+    ], [("image1.jpeg", PNG_BYTES), ("image2.jpeg", PNG_B)])
+    card = _card(tmp_path)
+    reply = _call(card, "import", table="名单", path=_write(tmp_path, "数据名单.xlsx", data))
+
+    assert reply["ok"] is True and reply["imported"] == 2 and reply["files"] == 2
+    assert {"name": "照片", "type": "file"} in reply["columns"]
+    first = reply["sample"][0]
+    assert "#VALUE!" not in json.dumps(reply, ensure_ascii=False)
+    assert first["身份证号"] == "110101199001011000"            # not 1.10...E+17
+    assert any("15 位" in note for note in reply["warnings"])
+    got = _call(card, "get_file", table="名单", file_id=reply["sample"][1]["照片"]["file_id"])
+    with open(got["path"], "rb") as handle:
+        assert handle.read() == PNG_B                          # row 3 got picture 2
+
+
 # ── robustness ───────────────────────────────────────────────────────────────
 
 def test_data_survives_a_restart(tmp_path):
@@ -442,16 +537,29 @@ def test_schema_declares_actions_params_and_required():
     visible = [action for action in schema["properties"]["action"]["enum"]
                if action not in ("start", "stop", "info")]
 
-    assert visible == ["create", "import", "append", "query", "update", "delete", "stats",
-                       "attach_file", "get_file", "export_files"]
+    # `show` first: it is what the canvas dropdown selects when the card opens.
+    assert visible == ["show", "query", "stats", "import", "create", "append", "update",
+                       "delete", "attach_file", "get_file", "export_files", "drop_table"]
+    titles = {item["const"] for item in schema["properties"]["action"]["oneOf"]}
+    assert titles == set(visible)
+    assert split["show"]["required"] == []
     for action in visible:
         spec = split[action]
-        assert "table" in spec["params"] and "table" in spec["required"]
+        if action != "show":
+            assert "table" in spec["params"] and "table" in spec["required"]
         for param in spec["params"]:
             assert param in schema["properties"], (action, param)
         assert set(spec["required"]) <= set(spec["params"])
     # agent-core pushes a file to this container only for `format: file` params.
     assert schema["properties"]["path"]["format"] == "file"
+
+
+def test_every_field_placeholder_starts_with_something_useful():
+    """The canvas shows only the first 40 characters of a description."""
+    props = TOOLS[0]["inputSchema"]["properties"]
+    for key in ("where", "set", "records", "columns", "_id", "file_id", "table"):
+        head = props[key]["description"][:40]
+        assert "例" in head or "show" in head, (key, head)
 
 
 def test_schema_is_valid_json_schema():

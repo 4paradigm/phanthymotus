@@ -66,6 +66,7 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
@@ -154,6 +155,7 @@ class Cell:
 
     text: str = ""
     media: str = ""          # e.g. "word/media/image1.png" — inside the archive
+    lossy: bool = False      # a long number Excel stored with only 15 digits
 
 
 @dataclass
@@ -848,7 +850,21 @@ def _xlsx_sheets(zf: zipfile.ZipFile, names) -> List[Tuple[str, str, bool]]:
 
 def _read_xlsx_cell(element, shared: List[str], cell_images: Dict[str, str],
                     date_styles: Dict[int, bool], date1904: bool,
-                    max_chars: int) -> Optional[Cell]:
+                    max_chars: int, rich_images: Optional[Dict[int, str]] = None
+                    ) -> Optional[Cell]:
+    # Excel 365 "Place in cell" picture: the cell is an error value (#VALUE!)
+    # carrying `vm="N"`, and N leads through metadata.xml to an image in
+    # xl/richData. Checked first, because its <v> text is a placeholder that
+    # would otherwise be read as the cell's content.
+    vm = _attr(element, "vm")
+    if vm and rich_images:
+        try:
+            media = rich_images.get(int(vm), "")
+        except ValueError:
+            media = ""
+        if media:
+            return Cell(text="", media=media)
+
     formula = _child(element, "f")
     if formula is not None and "DISPIMG" in (formula.text or ""):
         match = _DISPIMG.search(formula.text or "")
@@ -875,6 +891,7 @@ def _read_xlsx_cell(element, shared: List[str], cell_images: Dict[str, str],
             text = raw
         else:
             text = raw.strip()
+            converted_date = False
             if text and date_styles:
                 try:
                     style = int(_attr(element, "s") or 0)
@@ -889,21 +906,145 @@ def _read_xlsx_cell(element, shared: List[str], cell_images: Dict[str, str],
                         converted = _serial_to_text(serial, date1904)
                         if converted:
                             text = converted
+                            converted_date = True
+            if text and not converted_date:
+                text, lossy = _plain_number(text)
+                if lossy:
+                    return Cell(text=text[:max_chars] if max_chars > 0 else text, lossy=True)
     if not text:
         return Cell(text="", media="")
     return Cell(text=text[:max_chars] if max_chars > 0 else text)
+
+
+def _plain_number(text: str) -> Tuple[str, bool]:
+    """A numeric cell as Excel displays it: no exponent, no trailing `.0`.
+
+    Excel keeps 15 significant digits, so an 18-digit ID typed into a number
+    cell is stored as `1.1010119900101101E+17` and its last digits are already
+    gone from the file. Formatting to 15 significant digits gives what the
+    user sees in Excel (`110101199001011000`) instead of an exponent or an
+    invented tail; the second value says digits were lost, so the caller can
+    warn instead of storing a wrong ID silently.
+    """
+    if not re.match(r"^-?\d+(\.\d+)?([eE][-+]?\d+)?$", text):
+        return text, False
+    if "e" not in text.lower() and not text.endswith(".0"):
+        return text, False
+    try:
+        value = float(text)
+    except ValueError:
+        return text, False
+    if not math.isfinite(value) or value != int(value):
+        return text, False
+    integral = abs(int(value))
+    sign = "-" if value < 0 else ""
+    if integral < 10 ** 15:
+        return sign + str(integral), False
+    digits = "%.15g" % integral                     # what Excel keeps
+    # Decimal, not float: float("1.10101199001011e+17") is not exactly
+    # representable and would come back as ...011008.
+    rendered = sign + str(int(Decimal(digits)))
+    return rendered, True
+
+
+def _rich_images(zf: zipfile.ZipFile, names) -> Dict[int, str]:
+    """Excel 365 "Place in cell" pictures: cell `vm` index -> media path.
+
+    The chain, all 0-based except `vm`:
+
+        cell vm=N  ->  metadata.xml valueMetadata/bk[N-1]/rc(t, v)
+                   ->  futureMetadata "XLRICHVALUE" bk[v] / rvb i
+                   ->  richData/rdrichvalue.xml rv[i]  (structure s, values)
+                   ->  value at the `_rvRel:LocalImageIdentifier` key
+                   ->  richData/richValueRel.xml rel[k] r:id
+                   ->  richData/_rels/richValueRel.xml.rels -> ../media/imageK
+
+    Any missing link degrades to "vm N is rich value N-1", which is what Excel
+    writes when every rich value is a picture. Returns {} for a workbook with
+    no rich data, so the common case costs one membership test.
+    """
+    values_part = next((name for name in ("xl/richData/rdrichvalue.xml",)
+                        if name in names), "")
+    rel_part = "xl/richData/richValueRel.xml"
+    if not values_part or rel_part not in names:
+        return {}
+    try:
+        rel_ids = [_rid(element) for element in _iter_named(
+            _parse_xml(zf.read(rel_part), rel_part), "rel")]
+        targets = _rels(zf, rel_part)
+        base = posixpath.dirname(rel_part)
+        rel_media = [_resolve(base, targets.get(rid, "")) for rid in rel_ids]
+
+        structures: List[List[str]] = []
+        structure_part = "xl/richData/rdrichvaluestructure.xml"
+        if structure_part in names:
+            for item in _iter_named(_parse_xml(zf.read(structure_part), structure_part), "s"):
+                structures.append([_attr(key, "n") for key in _children(item, "k")])
+
+        rich_values: List[str] = []
+        for item in _iter_named(_parse_xml(zf.read(values_part), values_part), "rv"):
+            values = [child.text or "" for child in _children(item, "v")]
+            try:
+                keys = structures[int(_attr(item, "s") or 0)]
+            except (ValueError, IndexError):
+                keys = []
+            position = next((index for index, key in enumerate(keys)
+                             if key == "_rvRel:LocalImageIdentifier"), 0)
+            media = ""
+            try:
+                media = rel_media[int(values[position])]
+            except (ValueError, IndexError):
+                media = ""
+            rich_values.append(media)
+
+        cell_to_value: List[int] = []
+        if "xl/metadata.xml" in names:
+            root = _parse_xml(zf.read("xl/metadata.xml"), "xl/metadata.xml")
+            type_names = [_attr(item, "name") for item in _iter_named(root, "metadataType")]
+            future: Dict[str, List[int]] = {}
+            for block in _iter_named(root, "futureMetadata"):
+                indices = []
+                for bk in _children(block, "bk"):
+                    rvb = next(iter(_iter_named(bk, "rvb")), None)
+                    try:
+                        indices.append(int(_attr(rvb, "i")) if rvb is not None else -1)
+                    except ValueError:
+                        indices.append(-1)
+                future[_attr(block, "name")] = indices
+            for block in _iter_named(root, "valueMetadata"):
+                for bk in _children(block, "bk"):
+                    rc = _child(bk, "rc")
+                    value = -1
+                    if rc is not None:
+                        try:
+                            kind = type_names[int(_attr(rc, "t")) - 1]
+                            value = future.get(kind, [])[int(_attr(rc, "v"))]
+                        except (ValueError, IndexError):
+                            value = -1
+                    cell_to_value.append(value)
+    except (KeyError, ParseError):
+        return {}
+
+    out: Dict[int, str] = {}
+    count = len(cell_to_value) or len(rich_values)
+    for vm in range(1, count + 1):
+        index = cell_to_value[vm - 1] if cell_to_value else vm - 1
+        if 0 <= index < len(rich_values) and rich_values[index]:
+            out[vm] = rich_values[index]
+    return out
 
 
 def _read_worksheet(zf: zipfile.ZipFile, part: str, name: str, limits: Limits,
                     row_budget: int, shared: List[str],
                     cell_images: Dict[str, str], date_styles: Dict[int, bool],
                     date1904: bool, hidden: bool,
-                    notes: List[str]) -> Table:
+                    notes: List[str], rich_images: Optional[Dict[int, str]] = None) -> Table:
     root = _parse_xml(zf.read(part), part)
     rows: Dict[int, Dict[int, Cell]] = {}
     truncated = False
     max_chars = max(0, min(limits.max_text_chars, MAX_TEXT_CHARS))
     max_cols = max(1, limits.max_columns)
+    lossy: List[str] = []
 
     for element in _iter_named(root, "c"):
         sheet_row, column = _cell_position(_attr(element, "r"))
@@ -916,10 +1057,18 @@ def _read_worksheet(zf: zipfile.ZipFile, part: str, name: str, limits: Limits,
             truncated = True
             continue
         cell = _read_xlsx_cell(element, shared, cell_images, date_styles,
-                               date1904, max_chars)
+                               date1904, max_chars, rich_images)
         if cell is None or (not cell.text and not cell.media):
             continue
+        if cell.lossy:
+            lossy.append(_attr(element, "r"))
         rows.setdefault(sheet_row, {})[column] = cell
+
+    if lossy:
+        notes.append(
+            "工作表 %r 有 %d 个超过 15 位的数字（%s%s）在 Excel 里存成了数值，第 15 位之后已经"
+            "丢失、显示为 0（身份证号常见）。请把这一列设为「文本」格式、重新填写后再导入"
+            % (name, len(lossy), "、".join(lossy[:5]), " 等" if len(lossy) > 5 else ""))
 
     # Pictures anchored to a cell. Kept separate from the cell loop because the
     # drawing part is a sibling of the sheet's cells, not of any one cell.
@@ -995,6 +1144,7 @@ def read_xlsx(data: bytes, limits: Limits) -> Document:
     names = set(zf.namelist())
     shared = _shared_strings(zf, names)
     cell_images = _cell_images(zf, names)
+    rich_images = _rich_images(zf, names)
     date_styles = _date_styles(zf, names)
     date1904 = _date1904(zf, names)
 
@@ -1011,7 +1161,8 @@ def read_xlsx(data: bytes, limits: Limits) -> Document:
             notes.append("已达到本卡的总行数上限，后面的工作表没有读")
             break
         table = _read_worksheet(zf, part, sheet_name, limits, budget, shared,
-                                cell_images, date_styles, date1904, hidden, notes)
+                                cell_images, date_styles, date1904, hidden, notes,
+                                rich_images)
         budget -= len(table.rows)
         tables.append(table)
 
