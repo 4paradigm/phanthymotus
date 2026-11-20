@@ -272,6 +272,12 @@ class PlanCache:
 
     def translation(self, observation, geometry, half_width, ahead, side, max_age_ms,
                     watchdog_ms=300, *, velocity_limits, allow_forward=True):
+        detour = self.route(observation, geometry, half_width, ahead, side, max_age_ms,
+                            watchdog_ms, velocity_limits=velocity_limits, allow_forward=allow_forward)
+        return detour.command if detour is not None else None
+
+    def route(self, observation, geometry, half_width, ahead, side, max_age_ms,
+              watchdog_ms=300, *, velocity_limits=None, allow_forward=True):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
@@ -288,8 +294,7 @@ class PlanCache:
                 watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward,
                 velocity_limits=velocity_limits, target=observation.get("stop_target"),
                 projected_grid=self.grid_for(observation, geometry))
-        detour = self.plans[side]
-        return detour.command if detour is not None else None
+        return self.plans[side]
 
 
 def transition_clear(grid, geometry, half_width, horizon_s, velocities):
@@ -309,12 +314,24 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities):
     return not (swept & occupied).any()
 
 
+def segment_clear(occupied, geometry, half_width, angle, length):
+    """Check a straight segment with the footprint already facing its heading."""
+    cos, sin = math.cos(angle), math.sin(angle)
+    f, r = FORWARD[occupied], RIGHT[occupied]
+    forward, right = f * cos + r * sin, -f * sin + r * cos
+    cell = RESOLUTION / math.sqrt(2)
+    return not ((forward >= -geometry.rear - cell)
+                & (forward <= length + geometry.front + cell)
+                & (abs(right) <= half_width + cell)).any()
+
+
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True,
                          target=None, projected_grid=None):
-    (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
-    if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
-        return None
+    if velocity_limits is not None:
+        (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
+        if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
+            return None
     resolution = RESOLUTION
     row_zero, col_zero = START
     right, forward = RIGHT, FORWARD
@@ -359,7 +376,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         allowed[row_zero + 1, col_zero] = False
     # A one-cell diagonal needs equal forward and lateral speeds. A longer
     # straight shortcut may still be executable at a different ratio.
-    steps = STEPS if max(floor_vx, floor_vy) <= min(max_vx, max_vy) else CARDINAL_STEPS
+    steps = (STEPS if velocity_limits is None or max(floor_vx, floor_vy) <= min(max_vx, max_vy)
+             else CARDINAL_STEPS)
     path, target_cells = None, None
     if target is not None:
         optical_forward, optical_right, stop, tolerance = target
@@ -404,6 +422,17 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         path = [(row_zero, col_zero + offset) for offset in range(int(openings[-1]) + 1)]
     if path is None or len(path) < 2:
         return None
+
+    def detour(path, first, command):
+        if reposition:
+            path = path[:first + 1]
+        points = ((0., 0.),) + tuple(((row - row_zero) * resolution, side * (col - col_zero) * resolution)
+                                     for row, col in path[first:])
+        return Detour(command, points, geometry)
+
+    if velocity_limits is None:
+        return detour(path, len(path) - 1 if reposition else 1, None)
+
     # The straight command must stay within the checked path prefix through
     # the observation window, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
@@ -438,13 +467,6 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
             return vx, -side * vy
         return None
-
-    def detour(path, first, command):
-        if reposition:
-            path = path[:first + 1]
-        points = ((0., 0.),) + tuple(((row - row_zero) * resolution, side * (col - col_zero) * resolution)
-                                     for row, col in path[first:])
-        return Detour(command, points, geometry)
 
     cardinal = None
     for i in range(len(path) - 1, 0, -1):

@@ -2848,6 +2848,72 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
     pytest.fail("No straight segment was released through the measured opening")
 
 
+@pytest.mark.parametrize("blocked_in_new_view", [False, True])
+def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_motion(
+        monkeypatch, blocked_in_new_view):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
+                  half_width_m=.275, clearance_margin_m=.10, vy_max=0.)
+    state = _state(motion_source="measured")
+    target = SimpleNamespace(bearing_rad=0., range_m=4., range_known=True,
+                             observed=True, measured_range_m=4.)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
+    occupied = np.isclose(local_path.FORWARD, .90) & (np.abs(local_path.RIGHT) <= .12)
+    new_view = np.zeros_like(occupied)
+    new_view[local_path.START[0] + 6, local_path.START[1]] = blocked_in_new_view
+
+    def observe(*args):
+        grid = new_view if state.active_scan.ready else occupied
+        return ~grid, grid
+
+    monkeypatch.setattr(active_scan, "observe", observe)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.90, .98))
+    frame = np.ones((4, 4))
+
+    def tick(stamp, last, frame_id=None):
+        return P.step(detections=_detections(),
+                      depth=dict(map=frame, frame_id=frame_id or stamp, ground=frame.astype(bool)),
+                      odom=dict(vx=last[0], vy=0., wz=last[5], received_ms=stamp),
+                      config=config, state=state, dt=.1)
+
+    decision = tick(1000, [0.] * 6)
+    assert decision.values == [0.] * 6
+    assert state.view_detour is not None
+    scan = state.active_scan
+    forward, right = state.view_detour.points[1]
+    assert scan.directions[0] * scan.turn_angle == pytest.approx(math.atan2(right, forward))
+    assert scan.advance_m == pytest.approx(math.hypot(forward, right))
+    previous = decision.values
+    last_turn = None
+    straight = False
+    for stamp in range(1100, 9500, 100):
+        decision = tick(stamp, previous)
+        previous = decision.values
+        assert previous is not None and previous[1] == 0.
+        if previous[5]:
+            assert previous[0] == 0.
+            last_turn = stamp
+        if blocked_in_new_view:
+            assert previous[0] == 0.
+            if "路线首段的直行走廊被挡住" in decision.reason:
+                assert last_turn is not None
+                return
+        elif previous[0]:
+            assert decision.reason == "主动观察：转稳后直行"
+            assert last_turn is not None and stamp - last_turn >= active_scan.SETTLE_MS
+            straight = True
+        elif "直行段结束" in decision.reason:
+            assert straight
+            assert "等待直行结束后的新深度" in tick(stamp + 100, previous, frame_id=stamp).reason
+            return
+    pytest.fail("The segment neither completed nor held for the newly observed obstruction")
+
+
 def test_close_obstacle_in_the_new_view_requires_another_turn_before_advancing(monkeypatch):
     from plugins.navi.local_path import Geometry
 
@@ -3364,6 +3430,86 @@ def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monke
     observation[0] = track
     tick()
     assert state.goal_anchor is None
+
+
+@pytest.mark.parametrize("blocked, predicted", [(False, 1.6), (True, 1.6), (False, 3.1)])
+def test_anchored_reacquisition_can_turn_but_checks_sweep_and_prediction_budget(
+        monkeypatch, blocked, predicted):
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="command", goal_anchor=P.DetourGoal(2., 1., predicted_m=predicted))
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    occupied = ~free
+    occupied[local_path.START] = blocked
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
+    frame = np.ones((4, 4))
+    depth = dict(map=frame, ground=frame.astype(bool), frame_id=1000)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+    decision = P.step(detections=None, depth=depth, odom=None, config=config, state=state, dt=.1)
+
+    assert decision.values[:5] == [0.] * 5
+    assert (decision.values[5] > 0.) is (not blocked and predicted < 3.)
+    assert not state.arrived and state.goal_anchor is not None
+
+
+def test_command_only_scan_keeps_fresh_depth_when_detections_lapse(monkeypatch):
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="command", goal_anchor=P.DetourGoal(2., 0.))
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    frame = np.ones((4, 4))
+
+    def depth(stamp):
+        return dict(map=frame, ground=frame.astype(bool), frame_id=stamp)
+
+    scan = state.active_scan
+    scan.observe_single(depth(1000), geometry, 800, 1000)
+    assert scan.begin((1., -1.))
+    for stamp in range(1100, 2000, 100):
+        decision = P.step(detections=_detections(), depth=depth(stamp), odom=None,
+                          config=config, state=state, dt=.1)
+        if decision.values[5]:
+            break
+    assert scan.issued_yaw
+    decision = P.step(detections=None, depth=depth(stamp + 100), odom=None,
+                      config=config, state=state, dt=.1)
+    assert scan.current_frame == stamp + 100
+    assert scan.active and not scan.locked
+    assert decision.values[:5] == [0.] * 5
+
+
+def test_command_only_straight_segment_can_exceed_the_slowdown_distance(monkeypatch):
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, slow_distance_m=1.5)
+    anchor = P.DetourGoal(4., 0.)
+    state = _state(motion_source="command", goal_anchor=anchor)
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+    scan = state.active_scan
+    scan.receipt_only = scan.command_only = scan.attempted = True
+    scan.phase = "evaluate"
+    scan.advance_m = 1.969
+    frame = np.ones((4, 4))
+
+    for stamp in range(1000, 18000, 100):
+        decision = P.step(detections=None,
+                          depth=dict(map=frame, frame_id=stamp, ground=frame.astype(bool)),
+                          odom=None, config=config, state=state, dt=.1)
+        assert "推算已达上限" not in decision.reason
+        assert state.goal_anchor is anchor
+        if not scan.active:
+            assert scan.advance_commanded_m >= scan.advance_m
+            assert config.slow_distance_m < anchor.predicted_m < P.MAX_PREDICTED_DETOUR_TRAVEL_M
+            return
+    pytest.fail("The straight segment did not complete")
 
 
 def test_command_only_stops_before_switching_from_turn_to_translation(monkeypatch):

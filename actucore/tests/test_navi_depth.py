@@ -523,6 +523,22 @@ def test_floor_in_a_narrow_offset_strip_passes_only_with_far_support(mirror, rai
         assert not ground[:, 292:].any()
 
 
+@pytest.mark.parametrize("mirror", [False, True])
+def test_floor_strip_at_the_edge_of_the_depth_image(mirror):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[:, 108:] = .85
+    if mirror:
+        frame = frame[:, ::-1]
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+    assert ground is not None
+    if mirror:
+        ground = ground[:, ::-1]
+    assert ground[408:, 40:108].all()
+    assert not ground[:, 108:].any()
+
+
 def test_a_broad_raised_platform_does_not_replace_the_floor():
     from plugins.navi.camera import HorizontalIntrinsics
 

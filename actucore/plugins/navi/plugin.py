@@ -1663,7 +1663,8 @@ class NaviPlugin:
             values = decision.values = [0.] * ACTION_DIM
             decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
         now_ms = int(now * 1000)
-        obs_ms = objects_ms or now_ms
+        obs_ms = (now_ms if objects is None and self._state.goal_anchor is not None
+                  else objects_ms or now_ms)
         if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
                 or scan.locked or was_searching) and not any(values):
             # A hold applies now, even when the last input is about to expire.

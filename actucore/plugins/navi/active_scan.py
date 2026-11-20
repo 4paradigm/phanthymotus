@@ -61,6 +61,7 @@ class ActiveScan:
     _pending_projection: tuple | None = None
     side_frame: int = 0
     advance_m: float | None = None
+    route_segment: bool = False
     advance_origin: tuple | None = None
     advance_commanded_m: float = 0.
     result_frame: int = 0
@@ -81,6 +82,7 @@ class ActiveScan:
     timed_phase_s: float = 0.
     timed_total_s: float = 0.
     timed_turn_s: float = 0.
+    timed_heading: float = 0.
 
     @property
     def active(self):
@@ -284,11 +286,12 @@ class ActiveScan:
             free |= confirmed
         return free & ~occupied, occupied
 
-    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE):
+    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE, route_segment=False):
         if self.attempted or not self.current_frame:
             return False
         self.directions = directions
         self.turn_angle = turn_angle
+        self.route_segment = route_segment
         self.advance_m, self.advance_origin, self.advance_commanded_m = advance_m, None, 0.
         self.attempted = True
         self.phase = "brake"
@@ -296,6 +299,7 @@ class ActiveScan:
         self.start_ms = self.single_control_ms if self.command_only else self.poses[-1][0]
         self.still_since = self.start_ms
         self.timed_phase_s = self.timed_total_s = self.timed_turn_s = 0.
+        self.timed_heading = 0.
         return True
 
     def try_other_side(self):
@@ -310,16 +314,20 @@ class ActiveScan:
         return self.active
 
     def finish(self):
-        self.result_frame = self.side_frame
+        self.result_frame = self.current_frame if self.route_segment else self.side_frame
+        if self.route_segment:
+            self.attempted = False
         self.phase = "idle"
 
     def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
-                min_yaw_rate=0., now_ms=None, tick_s=.1):
+                min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None):
         if not self.active or self.ready:
             return ScanCommand()
         if self.command_only:
+            if previous_yaw is not None and self.timed_turn_s:
+                self.timed_heading -= previous_yaw * min(tick_s, watchdog_ms / 1000)
             return self._timed_command(geometry, half_width, yaw_rate, watchdog_ms,
-                                       obs_age_ms, min_yaw_rate, tick_s)
+                                       obs_age_ms, min_yaw_rate, tick_s, previous_yaw is not None)
         stamp = self.poses[-1][0]
         speed = math.hypot(*self.motion[:2])
         if not self.current_frame:
@@ -359,7 +367,7 @@ class ActiveScan:
         if speed > STILL_LINEAR:
             return self.interrupt("主动观察：检测到平移，停车")
         if (abs(self.motion[2]) > yaw_rate + .10
-                or abs(self.pose[2] - self.origin[2]) > ANGLE + 2 * ANGLE_TOLERANCE):
+                or abs(self.pose[2] - self.origin[2]) > max(ANGLE, self.turn_angle) + 2 * ANGLE_TOLERANCE):
             return self.interrupt("主动观察：转速或转角超出限制，停车")
         if (self.receipt_only and self.phase == "turn" and self.issued_yaw
                 and stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS
@@ -458,7 +466,7 @@ class ActiveScan:
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
     def _timed_command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms,
-                       min_yaw, tick_s):
+                       min_yaw, tick_s, tracks_commands):
         self.timed_total_s += tick_s
         self.timed_phase_s += tick_s
         if not self.current_frame or self.timed_total_s * 1000 > 2 * SCAN_TIMEOUT_MS:
@@ -480,32 +488,44 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：收到新视角，准备重新规划")
             return ScanCommand(reason="主动观察：停车等待新的独立深度帧")
 
+        error = self.directions[0] * self.turn_angle - self.timed_heading
         if not self.timed_turn_s:
+            if abs(error) <= ANGLE_TOLERANCE:
+                self.phase = "settle"
+                self.timed_phase_s = 0.
+                self.settle_ms = self.single_control_ms
+                self.settle_frames = self.settle_frame = 0
+                return ScanCommand(reason="主动观察：保持朝向，停车等待新深度")
             if yaw_rate <= 0. or yaw_rate < min_yaw:
                 return self.interrupt("主动观察：底盘无可用转速，停车")
-            duration = max(POSE_TURN_BURST_MS / 1000, ANGLE / yaw_rate)
+            duration = max(POSE_TURN_BURST_MS / 1000, abs(error) / yaw_rate)
             if tick_s > 0.:
                 duration = math.ceil(duration / tick_s) * tick_s
             if min_yaw:
-                duration = min(duration, ANGLE / min_yaw)
+                duration = min(duration, abs(error) / min_yaw)
+            if duration <= 0.:
+                return self.interrupt("主动观察：无可执行转向，停车")
             self.timed_turn_s = duration
-            self.turn_yaw = min(yaw_rate, ANGLE / duration)
+            self.turn_yaw = math.copysign(min(yaw_rate, abs(error) / duration), error)
             self.timed_phase_s = 0.
         if self.timed_phase_s + tick_s > self.timed_turn_s + 1e-9:
+            if tracks_commands and abs(error) > ANGLE_TOLERANCE:
+                return self.interrupt("主动观察：转向指令未完成，停车")
             self.phase = "settle"
             self.timed_phase_s = 0.
             self.settle_ms = self.single_control_ms
             self.settle_frames = self.settle_frame = 0
             return ScanCommand(reason="主动观察：定时转向结束，停车")
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
-        sweep = self.directions[0] * (ANGLE + (self.turn_yaw + .10) * horizon)
-        if (self.turn_yaw <= 0. or self.turn_yaw < min_yaw or not self.clear_sweep(
+        rate = abs(self.turn_yaw)
+        sweep = math.copysign(abs(error) + (rate + .10) * horizon, self.turn_yaw)
+        if (rate <= 0. or rate < min_yaw or not self.clear_sweep(
                 geometry, half_width, sweep, STILL_LINEAR * horizon)):
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
-        return ScanCommand(-self.directions[0] * self.turn_yaw, "主动观察：有界短转向")
+        return ScanCommand(-self.turn_yaw, "主动观察：有界短转向")
 
     def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
         # Rotate the rectangle in small increments and include cell diagonal
@@ -563,7 +583,7 @@ class ActiveScan:
         return self.interrupt()
 
     def note_clear_path(self, frame):
-        if self.locked or not self.attempted or not frame or frame <= self.clear_frame:
+        if self.locked or not (self.attempted or self.result_frame) or not frame or frame <= self.clear_frame:
             return
         self.clear_frame = frame
         self.clear_frames += 1

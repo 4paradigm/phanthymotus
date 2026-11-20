@@ -198,6 +198,28 @@ def test_command_only_scan_checks_obstacles_with_unseen_rear(monkeypatch, blocke
     assert look.active is (not blocked)
 
 
+@pytest.mark.parametrize("first", [-1., 1.])
+def test_command_only_scan_turns_to_the_far_side_of_its_original_heading(monkeypatch, first):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((first, -first))
+    yaw = heading = 0.
+    switched = False
+    for stamp in range(1100, 17000, 100):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        heading += yaw * .1
+        yaw = look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33,
+                           previous_yaw=yaw).yaw
+        if look.ready and not switched:
+            assert math.degrees(heading) == pytest.approx(-first * 20., abs=2.)
+            assert look.try_other_side()
+            switched = True
+        elif look.ready:
+            assert math.degrees(heading) == pytest.approx(first * 20., abs=2.)
+            return
+    pytest.fail("The other heading was never observed")
+
+
 def test_command_only_scan_uses_capture_time_for_post_stop_frames(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
     look.observe_single(_depth(1000), geometry, 800, 1000)

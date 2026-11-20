@@ -366,7 +366,10 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
 
     # An oblique view can leave a narrower floor strip away from the centre.
     # Keep the same near/far checks and retain all depth outside the strip.
-    for start in range(1, count - narrow, max(1, narrow // 8)):
+    if count <= narrow:
+        return None
+    last = count - narrow
+    for start in (0, *range(1, last, max(1, narrow // 8)), last):
         ground = fit(all_points, visible_span=(start, start + narrow),
                      check_below=True, window_halves=True)
         if ground is not None:

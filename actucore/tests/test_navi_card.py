@@ -213,7 +213,7 @@ def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypa
     assert tick(100_900) is None
 
 
-@pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("interrupt", [None, "depth", "detections"])
 def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch, interrupt):
     from types import SimpleNamespace
 
@@ -261,7 +261,14 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
     assert left["values"] == [0., 0., 0., 0., 0., .25]
     if interrupt:
         now[0] = 100_250
-        card._objects_ms = 99_000
+        if interrupt == "detections":
+            card._objects_ms = 99_000
+            continued = card.next_command()
+            assert continued["values"] == left["values"]
+            assert continued["obs_stamp_ms"] == 100_150
+            assert card._state.active_scan.active and not card._state.active_scan.locked
+            return
+        card._depth_ms = 99_000
         stop = card.next_command()
         assert stop["values"] == [0.] * 6
         assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_250
