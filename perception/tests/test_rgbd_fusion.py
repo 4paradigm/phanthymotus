@@ -369,3 +369,54 @@ def test_imu_interpolation_needs_measured_support_at_both_visual_boundaries(side
         fusion.samples.append((t+offset, np.zeros(3), np.array([0., 0., G])))
     for offset in (0, 375_000_000, 750_000_000):
         assert not fusion._initialize(t+offset, pose())
+
+
+def test_frame_and_watchdog_predictions_require_imu_coverage_back_to_measured_anchor():
+    c, anchor = warmed()
+    # Largest IMU interval recorded in the latest Tianyi CDR.
+    after_gap = anchor + 240_235_008
+    c.observe_imu(source(after_gap), after_gap)
+    at_frame = c.observe_frame(after_gap, *images(), None, after_gap)
+    end = after_gap + 20_000_000
+    c.observe_imu(source(end), end)
+    for sample in (at_frame, c.watchdog_output(end)):
+        assert sample['pose'] is None
+        assert sample['vendor']['fusion']['prediction'] is None
+
+
+@pytest.mark.parametrize('change', [
+    {'clock_id': 'unrelated-clock'}, {'stamp_source': 'read_completion'},
+    {'camera_frame_id': 'another-camera'}, {'accel_stamp_ns': 1_000_000},
+    {'epoch': 'restarted'},
+])
+def test_inertial_prediction_cannot_cross_incomparable_or_discontinuous_samples(change):
+    c, anchor = warmed()
+    t = anchor + 10_000_000
+    c.observe_imu(source(t, **change), t)
+    t += 10_000_000
+    c.observe_imu(source(t), t)
+    out = c.observe_frame(t, *images(), None, t)
+    assert out['pose'] is None and out['vendor']['fusion']['prediction'] is None
+
+
+@pytest.mark.parametrize('missing', ['source_id', 'epoch'])
+def test_prediction_needs_identifiable_measurements(missing):
+    c = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    for stamp in (1_000_000_000, 1_020_000_000):
+        packet = source(stamp)
+        del packet[missing]
+        c.observe_imu(packet, stamp)
+    assert not c._imu_covers(1_000_000_000, 1_020_000_000)
+
+
+@pytest.mark.parametrize('change', [
+    {'camera_from_accel_translation': [.02, 0., 0.]},
+    {'camera_from_gyro': [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]},
+    {'calibration_id': 'recalibrated'},
+])
+def test_new_calibration_does_not_extend_an_old_prediction_anchor(change):
+    c, anchor = warmed()
+    end = anchor + 20_000_000
+    c.observe_imu(source(end, **change), end)
+    out = c.observe_frame(end, *images(), None, end)
+    assert out['vendor']['fusion']['prediction'] is None

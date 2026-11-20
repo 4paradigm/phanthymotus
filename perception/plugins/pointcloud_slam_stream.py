@@ -139,7 +139,10 @@ class SlamStream:
             poses = {p.stamp_ns: p for p in self._poses}
         poses[pose.stamp_ns] = pose
         self._poses = deque(sorted(poses.values(), key=lambda p: p.stamp_ns)[-512:], maxlen=512)
-        self._last_received = now if received is None else received
+        # Derived VO retains the camera ingress time. A fresh registration is
+        # evidence of a live pose producer when its result actually arrives.
+        fresh_visual = self._live_visual_run and received is not None and 0 <= now-received <= self.max_age_s
+        self._last_received = now if received is None or fresh_visual else received
         self._odom_state = 'coasting' if pose.prediction_anchor_ns is not None else 'tracking'
         self._drain(now, measurement_now_ns)
 
@@ -198,7 +201,8 @@ class SlamStream:
         self._suspended_run = None
         # This token is carried only through an observed, bounded source run.
         # A new token requires independent registration in the native map.
-        pose = replace(pose, external_continuity=token or uuid.uuid4().bytes)
+        pose = replace(pose, external_continuity=token or uuid.uuid4().bytes,
+                       chassis_origin=origin if chassis else None)
         self._measured_run = origin, pose
         return pose
 
@@ -328,6 +332,9 @@ class SlamStream:
         while self._pending:
             pending = self._pending.popleft()
             stamp, cloud, received, context = pending
+            if can_localize and self._live_visual_run and now-received > self.max_age_s:
+                self._dropped_pending += 1
+                continue
             try:
                 if not self._poses or stamp > self._poses[-1].stamp_ns or stamp < self._poses[0].stamp_ns:
                     if can_localize and (not self._poses or now-received >= scan_wait_s):

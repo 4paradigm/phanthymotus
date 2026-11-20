@@ -290,7 +290,8 @@ def test_visual_restart_preserves_optional_rotation_without_restarting_fusion(hi
         assert restarted.geometry_worker is None
         assert restarted._wait_for_imu(now[0])
         for stamp in (now[0]-10_000_000, now[0]+10_000_000):
-            restarted._imu(NS(data=json.dumps(packet(stamp))))
+            restarted._imu(NS(data=json.dumps(packet(stamp, camera_frame_id=restarted.imu.frame,
+                                                       clock_id=restarted.imu.clock))))
         offered = []
         restarted.rotation_hints.publisher.publish = offered.append
         assert restarted.rotation_hints.offer(restarted.imu, now[0], now[0])
@@ -413,3 +414,54 @@ def test_session_status_reports_native_hint_counters_from_the_estimator_log(hint
     session._hint_statistics = None
     report = session.info()['inertial_association']
     assert report['native_applied']['supplied'] == 38 and report['native_applied']['frames'] == 60
+
+
+def test_recorded_odometry_includes_native_counters_without_an_info_request(hint_session):
+    import json
+    from plugins.rgbd_odometry_contract import make_sample
+
+    session, now, _ = hint_session
+    session.log.write(b'rotation_hint: frames=60 selected=49 supplied=38 rejected=0 late=0 evicted=0\n')
+    sample = make_sample('initializing', now[0], session.segment, session.calibration['clock_id'])
+    session._publish(sample)
+    association = json.loads(session.publisher.messages[-1])['vendor']['inertial_association']
+    assert not association['offered_for_frame']
+    assert association['native_applied']['supplied'] == 38
+    assert association['native_applied']['frames'] == 60
+
+
+@pytest.mark.parametrize('change,step', [
+    ({}, 100_000_001), ({'epoch': 'boot2'}, 10_000_000),
+    ({'camera_from_gyro': [[0,-1,0],[1,0,0],[0,0,1]]}, 10_000_000),
+    ({'clock_id': 'other'}, 10_000_000), ({'source_id': ''}, 10_000_000),
+])
+def test_transport_never_pairs_oriented_images_across_an_uncovered_imu_run(hint_node, change, step):
+    from plugins.rgbd_association import RotationHints
+    node, _, messages = hint_node
+    hints = RotationHints(association_config(), node, 'segment-a', object())
+    attitude = ImuAttitude('optical', 'capture-clock')
+    first = 1_000_000_000
+    attitude.observe(packet(first), first)
+    assert hints.offer(attitude, first, first)
+    other = first + step
+    attitude.observe(packet(other, **change), other)
+    assert not hints.offer(attitude, first + step // 2, other)
+    assert not hints.offer(attitude, other, other)
+    # A skipped image might fail registration, leaving the old native anchor.
+    for stamp in range(other + 10_000_000, first+800_000_000, 10_000_000):
+        attitude.observe(packet(stamp, **change), stamp)
+    valid = change.get('clock_id', 'capture-clock') == 'capture-clock' and change.get('source_id', 'camera')
+    assert hints.offer(attitude, stamp, stamp) == bool(valid)
+    assert len(messages) == 1 + bool(valid)
+
+
+def test_hint_after_clock_rewind_reads_only_the_new_imu_run(hint_node):
+    from plugins.rgbd_association import RotationHints
+    node, _, messages = hint_node
+    hints = RotationHints(association_config(), node, 'segment-a', object())
+    start = 1_000_000_000
+    attitude = observed_pair(start)
+    attitude.observe(packet(start, epoch='restarted', angular_velocity=[0.,0.,0.]),start)
+    assert hints.offer(attitude,start,start)
+    q = messages[-1].quaternion
+    np.testing.assert_allclose([q.x,q.y,q.z,q.w], attitude.quaternion)

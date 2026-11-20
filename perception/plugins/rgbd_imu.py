@@ -1,14 +1,26 @@
 """Numeric IMU input; producer conventions are documented, not admission gates."""
 from collections import deque
 from copy import deepcopy
+from functools import lru_cache
+from itertools import islice
 
 import numpy as np
+
+MAX_IMU_GAP_NS = 100_000_000
+
+
+@lru_cache(maxsize=16)
+def _proper_rotation(matrix_bytes):
+    r = np.frombuffer(matrix_bytes, dtype=float).reshape(3, 3)
+    return np.allclose(r.T @ r, np.eye(3), atol=1e-5) and abs(np.linalg.det(r)-1.) <= 1e-5
 
 
 def _rotation(value):
     r = np.asarray(value, dtype=float)
     if r.shape != (3, 3) or not np.isfinite(r).all():
         raise ValueError('camera/IMU rotation must contain a finite 3x3 matrix')
+    if not _proper_rotation(r.tobytes()):
+        raise ValueError('camera/IMU rotation must be a proper orthonormal rotation')
     return r
 
 
@@ -54,6 +66,9 @@ class ImuAttitude:
         self.history = deque(maxlen=512)
         self.orientation_history = deque(maxlen=512)
         self.provenance = {}
+        self.rotation_source = None
+        self.rotation_run_length = 0
+        self.rotation_generation = 0
 
     def fault(self, reason):
         self.state, self.reason = 'lost', self.reason if self.state == 'lost' else str(reason)
@@ -72,6 +87,18 @@ class ImuAttitude:
             angular = rotations[0] @ _vector(packet.get('angular_velocity'))
             acceleration = rotations[1] @ _vector(packet.get('linear_acceleration'))
             dt = (stamp - self.last_stamp) / 1e9 if self.history else 0.
+            source_id, epoch = packet.get('source_id'), packet.get('epoch')
+            source = None
+            if (isinstance(source_id, str) and source_id.strip() and isinstance(epoch, str) and epoch.strip()
+                    and packet.get('stamp_source') == 'measurement' and packet.get('clock_id') == self.clock
+                    and packet.get('camera_frame_id') == self.frame and abs(stamp-accel_stamp) <= MAX_IMU_GAP_NS):
+                source = (source_id, epoch, packet.get('calibration_id'), rotations[0].tobytes(), rotations[1].tobytes())
+            if source is None or source != self.rotation_source or not 0 < stamp-self.last_stamp <= MAX_IMU_GAP_NS:
+                self.rotation_generation += 1
+                self.rotation_run_length = 0
+            if source is not None:
+                self.rotation_run_length = min(self.rotation_run_length+1, self.orientation_history.maxlen)
+            self.rotation_source = source
             self.last_stamp, self.last_accel = stamp, accel_stamp
             self.provenance = {key: deepcopy(packet.get(key)) for key in (
                 'source_id', 'epoch', 'rotation_source', 'translation_source', 'calibration_id',
@@ -110,7 +137,7 @@ class ImuAttitude:
         return (self.status(now_ns) == 'active' and bool(self.history) and
                 self.history[0] <= image_stamp_ns <= self.history[-1])
 
-    def orientation_at(self, image_stamp_ns, now_ns):
+    def orientation_at(self, image_stamp_ns, now_ns, *, calibrated=False):
         """Snapshot an actual capture bracket; never propagate or revive a filter.
 
         The caller holds its session lock. Absolute nanoseconds stay integers;
@@ -121,7 +148,10 @@ class ImuAttitude:
         if self.state != 'active' or not self.orientation_history or type(image_stamp_ns) is not int:
             return None
         previous = None
-        for stamp, quaternion in self.orientation_history:
+        history = self.orientation_history
+        if calibrated:
+            history = islice(history, len(history)-self.rotation_run_length, None)
+        for stamp, quaternion in history:
             if stamp == image_stamp_ns:
                 return quaternion.tolist()
             if stamp > image_stamp_ns:

@@ -101,8 +101,29 @@ public:
             visualLossStamp_=0.; visualAlignment_.reset(); visualInliers_=0;
             state_=Searching; odom_.setNull(); return false;
         }
-        const auto externalRun=takeExternalRun(data);
-        const auto originPacket=takePayload(data,"MOTUSOR1",24);
+        const auto chassis=takePayload(data,"MOTUSCH1",40);
+        if(!chassis.empty()) sawChassis_=true;
+        if(!takePayload(data,"MOTUSRAW",8).empty())
+        {
+            // Legacy scan-only inputs have no declared gauge. Once this stream
+            // declares one, an unmarked pose cannot move the established map.
+            if(sawChassis_ || external.isNull())
+            {
+                state_=Searching; odom_.setNull(); return false;
+            }
+            state_=External; odom_=external;
+            const bool accepted=map.process(data,external,covariance,velocity,statistics);
+            if(accepted) rememberScan(map,data);
+            return accepted;
+        }
+        auto externalRun=takeExternalRun(data);
+        if(!chassis.empty())
+        {
+            ExternalRun run;
+            std::memcpy(run.data(),chassis.data+24,run.size());
+            if(run!=ExternalRun{}) externalRun=run;
+        }
+        const auto originPacket=chassis.empty()?takePayload(data,"MOTUSOR1",24):chassis;
         const bool declaresOrigin=!originPacket.empty() && !external.isNull();
         bool sameOrigin=false;
         if(declaresOrigin)
@@ -110,18 +131,19 @@ public:
             ExternalRun origin;
             std::memcpy(origin.data(),originPacket.data+8,origin.size());
             sameOrigin=externalOrigin_ && origin==*externalOrigin_;
-            if(externalOrigin_ && !sameOrigin && !map.getLocalOptimizedPoses().empty())
+            if((externalOrigin_ || !chassis.empty()) && !sameOrigin && !map.getLocalOptimizedPoses().empty())
             {
                 // A pose in a new gauge is a query until its scan establishes
                 // the map-to-odometry transform.
                 state_=Searching; odom_.setNull(); visualInliers_=0;
                 waiting_=true;
-                if(!relocalizeScan(map,data,statistics)) return false;
+                if(!relocalizeScan(map,data,statistics,externalRun && !chassis.empty())) return false;
                 rtabmap::OdometryInfo info;
                 finishLocalization(map,data,external,rtabmap::Transform(),info,false,false,{});
-                externalRun_.reset();
+                externalRun_=externalRun;
                 previousExternal_=external;
                 previousExternalStamp_=data.stamp();
+                initialized_=true;
                 externalOrigin_=origin;
                 return true;
             }
@@ -140,8 +162,9 @@ public:
         const bool witnessedGap=externalRun_ && externalAge>0. && externalAge<=maxWitnessedGap_;
         // A continuously measured stream can outlive slow scan delivery.
         // Apply the longer scan gap only before any unverified outage.
-        const double scanGap=witnessedRun && !waiting_ && !missing_?maxLiveScanGap_:maxExternalScanGap_;
-        const bool continuousExternal=(witnessedRun || sameOrigin) &&
+        const double scanGap=witnessedRun && !waiting_ && !missing_?
+            (chassis.empty()?maxLiveScanGap_:externalAge):maxExternalScanGap_;
+        const bool continuousExternal=(witnessedRun || (chassis.empty() && sameOrigin)) &&
             (!waiting_ || recentOutage || (witnessedRun && witnessedGap)) &&
             !localizationMode_ && continuousMotion(external,data.stamp(),scanGap);
         const bool waitForChassis=external.isNull() && (externalRun_ || externalOrigin_) && !localizationMode_ &&
@@ -561,7 +584,7 @@ private:
     }
 
     bool relocalizeScan(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
-                        const std::map<std::string,float> & statistics)
+                        const std::map<std::string,float> & statistics,bool chassisReset=false)
     {
         auto poses=map.getLocalOptimizedPoses();
         if(poses.empty() || data.laserScanRaw().empty()) return false;
@@ -581,9 +604,32 @@ private:
         {
             result=rtabmap::RegistrationInfo();
             const auto relative=inertialIcp_->computeTransformation(reference,data,guess,&result);
-            // A small matching patch cannot establish alignment on its own.
             if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
-               !(result.icpInliersRatio>=minScanRelocalizationOverlap_) || !validCovariance(result.covariance))
+               !validCovariance(result.covariance)) return rtabmap::Transform();
+            if(result.icpInliersRatio>=minScanRelocalizationOverlap_) return relative;
+            // A recent chassis reset at a stationary viewpoint may have partial
+            // overlap. Require a reciprocal match and a second measured scan
+            // distinct from the stored keyframe, all agreeing in the old gauge.
+            const auto identity=rtabmap::Transform::getIdentity();
+            const auto *keyframe=map.getMemory()->getSignature(scanMapAnchor_);
+            const bool secondCapture=chassisReset && keyframe && scanAnchor_ && !scanAnchor_->recovered &&
+                !keyframe->getPose().isNull() && !scanAnchor_->pose.isNull() &&
+                scanAnchor_->scan.stamp()>keyframe->getStamp() && data.stamp()>scanAnchor_->scan.stamp() &&
+                data.stamp()-scanAnchor_->scan.stamp()<=maxLiveScanGap_;
+            const auto supported=[&](const rtabmap::RegistrationInfo & info){
+                return info.icpCorrespondences>=1000 && info.icpInliersRatio>=.20f &&
+                    info.icpStructuralComplexity>=.02 && validCovariance(info.covariance);
+            };
+            const auto near=[&](const rtabmap::Transform & t,double meters,double degrees){
+                return !t.isNull() && t.getNorm()<=meters && t.getAngle(identity)<=degrees*CV_PI/180.;
+            };
+            if(!secondCapture || !supported(result) || !near(relative,.05,3.)) return rtabmap::Transform();
+            rtabmap::RegistrationInfo reverseInfo,secondInfo;
+            const auto reverse=inertialIcp_->computeTransformation(data,reference,identity,&reverseInfo);
+            if(reverse.isNull() || !supported(reverseInfo) || !near(relative*reverse,.01,1.))
+                return rtabmap::Transform();
+            const auto second=inertialIcp_->computeTransformation(scanAnchor_->scan,data,identity,&secondInfo);
+            if(second.isNull() || !supported(secondInfo) || !near(relative.inverse()*keyframe->getPose().inverse()*scanAnchor_->pose*second,.02,1.))
                 return rtabmap::Transform();
             return relative;
         };
@@ -887,6 +933,7 @@ private:
     std::optional<ScanMapGuess> scanMapGuess_;
     bool retryExternalNeighbor_=false;
     std::optional<ExternalRun> externalRun_, externalOrigin_;
+    bool sawChassis_=false;
     rtabmap::Transform previousExternal_;
     double previousExternalStamp_=0.;
     double chassisOutageStart_=0.;

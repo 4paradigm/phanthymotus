@@ -88,9 +88,9 @@ def test_delayed_chassis_delivery_can_leave_an_unposed_scan_inside_a_certified_r
 
 
 @pytest.mark.parametrize('second', [
-    chassis(1200, 2.), chassis(1800), chassis(1200, segment='new-origin')
+    chassis(1200, 2.), chassis(1800)
 ])
-def test_chassis_gap_jump_and_new_origin_do_not_certify_interpolated_pose(second):
+def test_chassis_gap_and_jump_do_not_certify_interpolated_pose(second):
     s = stream()
     s.odom(chassis(1000), now=1.)
     s.cloud(1_000_000_000, 'camera', [[0, 0, 1]], now=1.)
@@ -100,6 +100,16 @@ def test_chassis_gap_jump_and_new_origin_do_not_certify_interpolated_pose(second
     old, middle, new = (frame.pose.external_continuity for frame in s.accepted)
     assert len(old) == len(new) == 16 and old != new
     assert middle is None
+
+
+def test_cloud_between_measured_chassis_origins_has_no_interpolated_pose():
+    unposed = []
+    s = stream(on_unlocalized_frame=lambda stamp, *args: unposed.append(stamp))
+    s.odom(chassis(1000, 2.4, 'old'), now=1.)
+    s.cloud(1_100_000_000, 'camera', [[0., 0., 1.]], now=1.1)
+    s.odom(chassis(1200, 0., 'reset'), now=1.2)
+    assert not s.accepted
+    assert unposed == [1_100_000_000]
 
 
 def test_missing_or_non_chassis_pose_cannot_extend_the_measured_run():
@@ -214,29 +224,49 @@ def test_unpaired_scan_does_not_interrupt_live_visual_pose_run():
     assert unposed == [3_300_000_000]
 
 
-def test_live_visual_run_pairs_cloud_when_right_bracket_arrives_70ms_after_standard_wait():
+@pytest.mark.parametrize('right_arrival, expected', [(2.569, True), (3.001, False)])
+def test_live_visual_run_waits_for_measured_bracket_within_cloud_lifetime(right_arrival, expected):
     unposed = []
     s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: unposed.append(stamp))
     s.ingress_clock_id = 'local'
 
-    def receive(ms, now, x):
+    def receive(ms, now, x, ingress):
         sample, parent = measured_rgbd(ms, x)
         context = replace(parent, observation_id=f'pose-{ms}',
                           parent_observation_ids=(parent.observation_id,),
                           transformations=parent.transformations+('rgbd_odometry',))
-        s.odom(sample, now=now, context=context)
+        s.odom(sample, now=now, received=ingress, context=context)
 
     # Relative capture and receipt intervals from the first Tianyi outage.
-    receive(900, .9, 0.)
+    receive(900, .9, 0., .2)
     s.cloud(900_000_000, 'camera', [[0, 0, 1]], now=.91)
     s.cloud(1_734_000_000, 'camera', [[0, 0, 1]], now=1.)
-    receive(1000, 1.209, 0.)
+    receive(1000, 1.209, 0., .36)
     s.poll(now=2.501)
-    receive(2402, 2.569, .5)
+    receive(2402, right_arrival, .5, 2.05)
     assert not unposed
+    if not expected:
+        assert len(s.accepted) == 1
+        return
     first, resumed = s.accepted
     assert first.pose.external_continuity == resumed.pose.external_continuity
     assert resumed.pose.position[0] == pytest.approx(.5 * 734 / 1402)
+
+
+def test_stale_visual_result_does_not_extend_pose_liveness():
+    unposed = []
+    s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: unposed.append(stamp))
+    s.ingress_clock_id = 'local'
+    _witnessed(s, 1000, 0.)
+    s.cloud(1_200_000_000, 'camera', [[0, 0, 1]], now=2.2)
+    assert not unposed and s.pending_count == 1
+    sample, parent = measured_rgbd(1300, .05)
+    context = replace(parent, observation_id='late-result',
+                      parent_observation_ids=(parent.observation_id,),
+                      transformations=parent.transformations+('rgbd_odometry',))
+    s.odom(sample, now=2.3, received=.2, context=context)
+    assert unposed == [1_200_000_000]
+    assert len(s.accepted) == 1
 
 
 def relocalized(anchor_ms, **changes):

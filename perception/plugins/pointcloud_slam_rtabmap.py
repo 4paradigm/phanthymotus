@@ -122,6 +122,10 @@ class RtabmapProcess:
             marker = executable.parents[2] / 'share/rtabmap_slam/motus_scan_origin_recovery_v1'
             if not marker.is_file() or marker.read_text().strip() != 'motus_scan_origin_recovery/1':
                 raise RuntimeError('RTAB-Map scan origin recovery unavailable: rebuild the pinned native overlay')
+        if self._executable is None and self._settings.get('chassis_origin_recovery'):
+            marker = executable.parents[2] / 'share/rtabmap_slam/motus_chassis_origin_recovery_v1'
+            if not marker.is_file() or marker.read_text().strip() != 'motus_chassis_origin_recovery/1':
+                raise RuntimeError('RTAB-Map chassis origin recovery unavailable: rebuild the pinned native overlay')
         return executable
 
     def start(self):

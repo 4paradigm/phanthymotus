@@ -25,7 +25,9 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     const bool witnessedOutage=mode=="witnessed_scan_late_handoff" || weakWitnessedBridge ||
         longWitnessedGap || expiredWitnessedGap || sparseLiveRun;
     const bool weakBridge=mode=="scan_origin_weak_bridge";
-    const bool originChange=mode=="scan_origin_change" || weakBridge;
+    const bool mixedChassis=mode=="chassis_legacy_transition";
+    const bool chassis=mode=="chassis_origin_change" || mixedChassis;
+    const bool originChange=mode=="scan_origin_change" || chassis || weakBridge;
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
     if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
     parameters["RGBD/LinearUpdate"]="0.03";
@@ -41,7 +43,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         for(int v=0;v<depth.rows;++v) for(int u=0;u<depth.cols;++u)
         {
             const float z=depth.at<unsigned short>(v,u)/1000.f;
-            if(z>0) scan.at<cv::Vec3f>(0,count++)={(u-depth.cols/2.f)*z/f-x+(noOverlap?20.f:0.f),
+            if(z>0) scan.at<cv::Vec3f>(0,count++)={(u-depth.cols/2.f)*z/f-x+(noOverlap?(chassis && origin==3?40.f:20.f):0.f),
                                                  (v-depth.rows/2.f)*z/f,z};
         }
         const rtabmap::CameraModel camera(f,f,depth.cols/2.,depth.rows/2.,rtabmap::Transform::getIdentity(),0.,depth.size());
@@ -59,10 +61,17 @@ static void testScanRelocalization(const std::string &root, const std::string &o
             std::memcpy(hint.data+8,values,sizeof(values));
             data.setUserData(rtabmap::compressData2(hint),true);
         }
-        if(origin)
+        if(mixedChassis && origin==1)
         {
-            cv::Mat packet(1,24,CV_8UC1,cv::Scalar::all(0));
-            std::memcpy(packet.data,witnessedOutage?"MOTUSOD1":"MOTUSOR1",8);
+            cv::Mat legacy(1,8,CV_8UC1);
+            std::memcpy(legacy.data,"MOTUSRAW",8);
+            data.setUserData(rtabmap::compressData2(legacy),true);
+        }
+        else if(origin)
+        {
+            cv::Mat packet(1,chassis?40:24,CV_8UC1,cv::Scalar::all(0));
+            if(chassis) std::fill_n(packet.data+24,16,origin+10);
+            std::memcpy(packet.data,chassis?"MOTUSCH1":witnessedOutage?"MOTUSOD1":"MOTUSOR1",8);
             std::fill_n(packet.data+8,16,origin);
             data.setUserData(rtabmap::compressData2(packet),true);
         }
@@ -140,18 +149,21 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     if(originChange)
     {
         const auto old=map.getLocalOptimizedPoses();
+        if(mixedChassis && (frame(1.75,.18f,true,true,false,false,3) || !recovery.odom().isNull() ||
+           frame(1.8,.25f,true,false,false,false,1) || map.getLocalOptimizedPoses()!=old))
+            throw std::runtime_error("neither an unrelated first chassis origin nor a later unmarked pose can move the old graph");
         if(!frame(2.,.18f,true,false,false,false,2) ||
            recovery.state()!=motus::VisualRecovery::Localized || recovery.recoveryAnchor()!=anchor ||
            recovery.odom().isNull() || std::abs(recovery.odom().x()-.18f)>.025f ||
            map.getLocalOptimizedPoses().size()!=old.size()+1)
             throw std::runtime_error("a new scan-only origin must reconnect by geometry before its pose can enter the map");
         const int closure=recovery.recoveryNode();
-        if(!frame(2.5,.27f,true,false,false,false,2) ||
+        if(!frame(chassis?20.:2.5,.27f,true,chassis,false,false,2) ||
            recovery.state()!=motus::VisualRecovery::External || std::abs(recovery.odom().x()-.27f)>.025f ||
            map.getLocalOptimizedPoses().size()!=old.size()+2)
             throw std::runtime_error("realigned scan-only odometry did not grow the original map");
         const auto grown=map.getLocalOptimizedPoses();
-        if(frame(3.,.27f,true,true,false,false,3) || !recovery.odom().isNull() ||
+        if(frame(chassis?20.5:3.,.27f,true,true,false,false,3) || !recovery.odom().isNull() ||
            recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses()!=grown)
             throw std::runtime_error("an unrelated scan with a different origin must leave the accepted graph intact");
         map.close();
@@ -311,7 +323,7 @@ int main(int argc, char **argv)
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
     if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
-       mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" ||
+       mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" || mode=="chassis_origin_change" || mode=="chassis_legacy_transition" ||
        mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" ||
        mode=="witnessed_scan_late_handoff" || mode=="witnessed_scan_weak_bridge" ||
        mode=="witnessed_scan_long_gap" || mode=="witnessed_scan_expired_gap" ||

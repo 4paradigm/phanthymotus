@@ -24,6 +24,7 @@ class PoseSample:
     observation_parents: tuple = ()
     prediction_anchor_ns: int = None
     external_continuity: bytes = None
+    chassis_origin: tuple = None
 
     @property
     def stamp_ns(self):

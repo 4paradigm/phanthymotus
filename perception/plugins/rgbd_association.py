@@ -33,7 +33,7 @@ class RotationHints:
         self.frame, self.clock = calibration['frame_id'], calibration['clock_id']
         self.offered = self.skipped = 0
         self.offered_stamps = deque(maxlen=64)
-        self.last_offered_stamp_ns = self.last_skip_reason = None
+        self.last_offered_stamp_ns = self.last_skip_reason = self.last_offered_generation = None
         self.publisher = None
         if self.enabled:
             from geometry_msgs.msg import QuaternionStamped
@@ -48,7 +48,13 @@ class RotationHints:
             return self._skip('assisted mode is unavailable')
         if attitude is None:
             return self._skip('IMU orientation is unavailable')
-        quaternion = attitude.orientation_at(stamp_ns, now_ns)
+        # Native can retain a successful image across intervening failed registrations.
+        # Its anchor expires after 750 ms, even if all skipped images failed.
+        if (type(stamp_ns) is int and self.last_offered_stamp_ns is not None
+                and self.last_offered_generation != attitude.rotation_generation
+                and stamp_ns-self.last_offered_stamp_ns <= 750_000_000):
+            return self._skip('previous native hint may precede current IMU coverage')
+        quaternion = attitude.orientation_at(stamp_ns, now_ns, calibrated=True)
         if quaternion is None:
             return self._skip('capture has no valid IMU orientation bracket')
         message = self.message_type()
@@ -62,6 +68,7 @@ class RotationHints:
             return self._skip('hint transport unavailable')
         self.offered += 1
         self.offered_stamps.append(stamp_ns)
+        self.last_offered_generation = attitude.rotation_generation
         self.last_offered_stamp_ns, self.last_skip_reason = stamp_ns, None
         return True
 

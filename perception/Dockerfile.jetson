@@ -766,6 +766,7 @@ RUN set -e; \
     mkdir -p /opt/rtabmap_ros/share/rtabmap_slam; \
     printf '%s\n' 'motus_visual_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_visual_recovery_v1; \
     printf '%s\n' 'motus_scan_origin_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_scan_origin_recovery_v1; \
+    printf '%s\n' 'motus_chassis_origin_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_chassis_origin_recovery_v1; \
     cd /work; rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh
 
 # ── Application code ───────────────────────────────────────────────

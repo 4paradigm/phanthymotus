@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import numpy as np
 
-from .rgbd_imu import ImuAttitude, _vector, rotation_from_quaternion, translation_extrinsics
+from .rgbd_imu import MAX_IMU_GAP_NS, ImuAttitude, _vector, rotation_from_quaternion, translation_extrinsics
 from .rgbd_odometry_contract import SIGMA_LIMIT_M, make_sample
 
 MAX_FRAME_AGE_NS = 1_000_000_000
@@ -247,7 +247,6 @@ class InertialFilter:
 
 
 INERTIAL_LIMIT_NS = 1_000_000_000
-MAX_IMU_GAP_NS = 100_000_000
 MAX_BRIDGE_NS = 2_000_000_000
 FRAME_SILENCE_NS = 500_000_000
 # Off-lock registration has its own bounded wait after visual resolution.
@@ -267,6 +266,7 @@ class ShortTermFusion:
         self.segment, self.frame, self.clock = segment, frame, clock
         self.imu = ImuAttitude(frame, clock)
         self.samples = deque(maxlen=1024)
+        self.imu_coverage = deque(maxlen=self.samples.maxlen)
         self.warmup = deque(maxlen=30)
         self.filter = None
         self.lever = self.translations = None
@@ -324,7 +324,16 @@ class ShortTermFusion:
             if self.filter is not None:
                 self.filter.lever = self.lever.copy()
             if sample is not None:
-                self.samples.append((sample['stamp_ns'], np.array(sample['angular_velocity']),
+                stamp = sample['stamp_ns']
+                source = None
+                if self.imu.rotation_source is not None:
+                    source = (self.imu.rotation_generation, tuple(translations))
+                    if self.imu_coverage and source == self.imu_coverage[-1][1]:
+                        source = self.imu_coverage[-1][1]
+                if self.imu_coverage and stamp <= self.imu_coverage[-1][0]:
+                    self.imu_coverage.clear()
+                self.imu_coverage.append((stamp, source))
+                self.samples.append((stamp, np.array(sample['angular_velocity']),
                                      np.array(sample['linear_acceleration'])))
         except (ValueError, TypeError, KeyError) as error:
             self.fault(error)
@@ -432,6 +441,21 @@ class ShortTermFusion:
         if estimate.stamp != stamp:
             raise ValueError('IMU history has a propagation gap')
 
+    def _imu_covers(self, start, end):
+        """Check the measured bracket at each end and every gap between them."""
+        if start > end:
+            return False
+        right = source = None
+        for stamp, identity in reversed(self.imu_coverage):
+            if stamp >= end:
+                source = identity
+            elif right is None or source is None or identity != source or not 0 < right-stamp <= MAX_IMU_GAP_NS:
+                return False
+            if stamp <= start:
+                return identity is not None
+            right = stamp
+        return False
+
     def _stationary_update(self, stamp, measured_pose, ref_stamp, reference_pose):
         dt = (stamp-ref_stamp)/1e9
         if not .1 <= dt <= 1.:
@@ -445,8 +469,7 @@ class ShortTermFusion:
         if np.linalg.norm(p-ref_p) > min(.008, .02*dt) or np.linalg.norm(log_rotation(ref_r.T@r)) > .01:
             return False
         samples = [s for s in self.samples if ref_stamp <= s[0] <= stamp]
-        times = [ref_stamp, *(s[0] for s in samples), stamp]
-        if len(samples) < 5 or max(np.diff(times)) > MAX_IMU_GAP_NS:
+        if len(samples) < 5 or not self._imu_covers(ref_stamp, stamp):
             return False
         gravity_force = -r.T@self.filter.g
         if any(np.linalg.norm(w-self.filter.bg) > .045 or
@@ -574,7 +597,8 @@ class ShortTermFusion:
         ref_p, ref_r = pose_values(ref_pose)
         p, r = pose_values(self.filter.camera_pose())
         initial = np.eye(4)
-        initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
+        if self._imu_covers(ref_stamp, stamp):
+            initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
         # Only a verified observation of this exact capture may authorize mapping.
         # Keep the visual reference and its original one-second lifetime.
         self.quality['geometry'] = dict(attempted=True, accepted=False, reason='registration_rejected')
@@ -716,8 +740,7 @@ class ShortTermFusion:
             return self.output(stamp, allow_prediction=False)
         if latest == self.filter.stamp:
             return self.output(stamp)
-        times = [s[0] for s in self.samples if s[0] >= self.filter.stamp]
-        if max(np.diff([self.filter.stamp, *times])) > MAX_IMU_GAP_NS:
+        if not self._imu_covers(self.last_tracking[0], latest):
             return self.output(stamp, allow_prediction=False)
         estimate = deepcopy(self.filter)
         try:
@@ -737,13 +760,13 @@ class ShortTermFusion:
         sample['vendor']['fusion'] = self.info(stamp)
         fusion = sample['vendor']['fusion']
         fusion['prediction'] = None
-        if pose is not None and allow_prediction and self.state in ('coasting', 'recovering'):
+        if (pose is not None and allow_prediction and self.state in ('coasting', 'recovering') and
+                self.last_tracking is not None and self._imu_covers(self.last_tracking[0], estimate.stamp)):
             covariance = np.asarray(pose['covariance']).reshape(6, 6)[:3, :3]
             fusion['prediction_stamp_ns'] = estimate.stamp
             if np.linalg.eigvalsh(covariance).max() <= SIGMA_LIMIT_M**2:
                 fusion['prediction'] = pose
-                if self.last_tracking is not None:
-                    fusion['prediction_anchor_ns'] = self.last_tracking[0]
+                fusion['prediction_anchor_ns'] = self.last_tracking[0]
         return sample
 
     def info(self, now_ns, *, history=False):

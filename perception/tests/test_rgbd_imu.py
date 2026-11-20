@@ -432,3 +432,11 @@ def test_nontracking_output_keeps_selected_imu_mode_and_health(monkeypatch):
     obj._publish(make_sample('lost',1_010_000_000,'run','capture-clock',reason='IMU source reset'))
     state=json.loads(messages[0].data)['vendor']['imu_assistance']
     assert state['enabled'] is True and state['status']=='lost'
+
+
+@pytest.mark.parametrize('rotation', [np.diag([1., 1., -1.]), np.diag([1., .5, 1.])])
+def test_nonrigid_camera_extrinsic_cannot_supply_orientation(rotation):
+    attitude = aid()
+    with pytest.raises(ValueError, match='rotation'):
+        attitude.observe(packet(camera_from_gyro=rotation.tolist()), 1_000_000_000)
+    assert attitude.orientation_at(1_000_000_000, 1_000_000_000) is None

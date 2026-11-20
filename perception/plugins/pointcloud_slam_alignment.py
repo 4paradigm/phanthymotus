@@ -49,6 +49,9 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
             if stamp_ns > cloud_stamp_ns:
                 if previous is None:
                     break
+                if (previous.chassis_origin is not None and sample.chassis_origin is not None and
+                        previous.chassis_origin != sample.chassis_origin):
+                    raise ValueError('cannot interpolate across chassis odometry origins')
                 prediction = previous.prediction_anchor_ns or sample.prediction_anchor_ns
                 if prediction is not None and (stamp_ns-previous.stamp_ns > max_gap_ms*1_000_000 or
                         cloud_stamp_ns <= prediction):
@@ -64,6 +67,7 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                                   _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id,
                                   sample.pose_reference, None, cloud_stamp_ns,
                                   tuple(c for c in (previous.observation,sample.observation) if c is not None),
-                                  prediction, continuity)
+                                  prediction, continuity,
+                                  sample.chassis_origin if sample.chassis_origin == previous.chassis_origin else None)
             previous = sample
     raise ValueError('no numeric pose at cloud timestamp')

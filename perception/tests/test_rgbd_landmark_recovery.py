@@ -10,7 +10,7 @@ from test_rgbd_odometry_status import sessions  # noqa: F401
 
 
 def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=False,
-           variance=.001, kind=0, matches=0):
+           variance=.001, kind=0, matches=0, narrow_ids=()):
     msg, info = messages(stamp)
     msg.pose.covariance[0] = variance
     msg.pose.pose.position.x = x
@@ -19,7 +19,7 @@ def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=F
     info.type, info.lost, info.inliers = kind, lost, 0 if lost else len(ids)
     info.matches = matches
     info.local_map_keys = info.word_inliers = list(ids)
-    info.local_map_values = [NS(x=float(i % 5) + world_shift, y=float(i // 5), z=1.) for i in ids]
+    info.local_map_values = [NS(x=float(i % 5) + world_shift, y=float(i // 5)*(.001 if i in narrow_ids else 1.), z=1.) for i in ids]
     gate.input(stamp)
     return gate.accept(msg, info, stamp)
 
@@ -456,3 +456,82 @@ def test_moving_relocalization_requires_consecutive_measurements_to_agree():
     gate.status(3_000_000_000)
     for i, x in enumerate((.4, -.4, .4)):
         assert visual(gate, 3_200_000_000+i*120_000_000, x=x, variance=.2) is None
+
+
+@pytest.mark.parametrize('final_old,shift,jump,variance,accepted', [
+    (38, 0., 0., .001, True), (19, 0., 0., .001, False), (38, 1., 0., .001, False),
+    (38, 0., 3., .001, False), (38, 0., 0., .055, False),
+])
+def test_recovery_confirms_turn_against_recent_trusted_views(final_old, shift, jump, variance, accepted):
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        visual(gate, stamp, ids=range(100))
+    # The most recent trusted view has rotated away from the old features.
+    assert visual(gate, 1_500_000_000, ids=range(100, 190))
+    assert gate.status(3_100_000_000) == 'recovering'
+    assert visual(gate, 3_200_000_000, ids=[*range(17), *range(200, 280)]) is None
+    assert visual(gate, 3_450_000_000, ids=[*range(11), *range(240, 330)]) is None
+    result = visual(gate, 3_700_000_000, ids=[*range(final_old), *range(290, 400)],
+                    world_shift=shift, x=jump, variance=variance)
+    assert (result is not None) is accepted
+    if result:
+        assert result['vendor']['relocalization']['shared_landmarks'] == final_old
+        assert result['vendor']['relocalization']['anchor_stamp_ns'] == 1_500_000_000
+
+
+def test_partial_old_support_requires_a_direct_old_world_match_on_the_publishing_frame():
+    gate = anchored()
+    assert gate.status(3_000_000_000) == 'recovering'
+    assert visual(gate, 3_100_000_000, ids=[*range(11), *range(30, 90)]) is None
+    assert visual(gate, 3_300_000_000, ids=[*range(24), *range(30, 90)]) is None
+    # These are genuine inliers shared with the preceding capture but none
+    # appeared in an accepted pose before the interruption.
+    assert visual(gate, 3_500_000_000, ids=range(30, 90)) is None
+    assert gate.state == 'recovering'
+
+
+@pytest.mark.parametrize('kind,shift,shared', [(0, 0., 24), (0, 2., 0), (1, 0., 0)])
+def test_short_pause_reports_only_direct_matches_to_the_last_published_pose(kind, shift, shared):
+    gate = anchored()
+    gate.degrade('visual covariance exceeds tracking bounds', 1_300_000_000)
+    for stamp in (1_400_000_000, 1_500_000_000):
+        assert visual(gate, stamp, kind=kind, world_shift=shift) is None
+    result = visual(gate, 1_600_000_000, kind=kind, world_shift=shift)
+    proof = result['vendor'].get('relocalization')
+    if shared:
+        assert proof['anchor_stamp_ns'] == 1_200_000_000
+        assert proof['shared_landmarks'] == shared
+    else:
+        assert proof is None
+    assert 'relocalization' not in visual(gate, 1_700_000_000, kind=kind, world_shift=shift)['vendor']
+
+
+@pytest.mark.parametrize('spread', [0., .001])
+def test_short_pause_does_not_claim_a_map_anchor_from_concentrated_inliers(spread):
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    def measured(stamp):
+        msg, info = messages(stamp)
+        info.type, info.inliers = 0, 20
+        info.local_map_keys = info.word_inliers = list(range(20))
+        info.local_map_values = [NS(x=i*.02, y=(i % 2)*spread, z=1.) for i in range(20)]
+        gate.input(stamp)
+        return gate.accept(msg, info, stamp)
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        measured(stamp)
+    gate.degrade('visual covariance exceeds tracking bounds', 1_300_000_000)
+    for stamp in (1_400_000_000, 1_500_000_000, 1_600_000_000):
+        result = measured(stamp)
+    assert result['pose'] and 'relocalization' not in result['vendor']
+
+
+@pytest.mark.parametrize('narrow_ids', [range(17), range(20, 60)])
+def test_partial_recovery_needs_spread_in_early_matches_and_publishing_matches(narrow_ids):
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        visual(gate, stamp, ids=range(100), narrow_ids=narrow_ids)
+    assert visual(gate, 1_500_000_000, ids=range(100, 190))
+    assert gate.status(3_100_000_000) == 'recovering'
+    for stamp in (3_200_000_000, 3_450_000_000):
+        assert visual(gate, stamp, ids=[*range(17), *range(200, 270)], narrow_ids=narrow_ids) is None
+    assert visual(gate, 3_700_000_000, ids=[*range(20, 60), *range(220, 300)],
+                  narrow_ids=narrow_ids) is None

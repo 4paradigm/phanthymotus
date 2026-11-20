@@ -134,9 +134,9 @@ class RtabmapNode(Node):
         from nav_msgs.msg import Odometry
         from geometry_msgs.msg import TransformStamped
         from tf2_msgs.msg import TFMessage
-        from rtabmap_msgs.msg import Info, MapGraph
+        from rtabmap_msgs.msg import Info, MapGraph, SensorData
         self._Odometry, self._TransformStamped, self._TFMessage = Odometry, TransformStamped, TFMessage
-        self._Info, self._MapGraph = Info, MapGraph
+        self._Info, self._MapGraph, self._SensorData = Info, MapGraph, SensorData
         self._settings = deepcopy(settings)
         self._settings.update((input_contract or {}).get('settings', {}))
         self._rgb = None
@@ -152,11 +152,11 @@ class RtabmapNode(Node):
         rgb_connected = self._settings.get('rgb_input') is not None
         self._scan_origin_recovery = (not rgb_connected and odom_topic.startswith('/rgbd_odometry/')
                                       and odom_topic.endswith('/state/odom'))
-        self._settings['scan_origin_recovery'] = self._scan_origin_recovery
-        self._native_envelope = rgb_connected or self._scan_origin_recovery
-        if self._native_envelope:
-            from rtabmap_msgs.msg import SensorData
-            self._SensorData = SensorData
+        # A remapped stream may start with a legacy pose and declare its chassis
+        # origin later. Keep one native subscription and database across that change.
+        self._settings['chassis_origin_recovery'] = True
+        self._settings['scan_origin_recovery'] = not rgb_connected
+        self._raw_scan_input = not rgb_connected and not self._scan_origin_recovery
         if rgb_connected:
             from .pointcloud_slam_rgb import RgbLoopInput
             self._rgb = RgbLoopInput(self._settings['rgb_input'], self._settings,
@@ -218,7 +218,7 @@ class RtabmapNode(Node):
                 extrinsic_mode=self._settings.get('extrinsic_mode', 'static'),
                 input_contract=input_contract, on_frame=self._queue_frame,
                 on_observation=self._observe_motion if self._motion is not None else None,
-                on_unlocalized_frame=self._queue_frame if self._native_envelope else None,
+                on_unlocalized_frame=None if self._raw_scan_input else self._queue_frame,
                 on_pose_loss=self._retire_pose_work)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
@@ -386,7 +386,9 @@ class RtabmapNode(Node):
             raise ValueError('cloud original ingress context expired')
         received, observation, depth = ingress
         predicted = pose is not None and pose.prediction_anchor_ns is not None
-        if predicted and (not self._native_envelope or self._active is None):
+        if pose is not None and pose.chassis_origin is not None:
+            self.stream.on_unlocalized_frame = self._queue_frame
+        if predicted and (self.stream.on_unlocalized_frame is None or self._active is None):
             self._rgb_reservations.pop(stamp, None)
             self._dropped += 1
             return
@@ -502,8 +504,7 @@ class RtabmapNode(Node):
             self._active = segment
         segment['odom_pub'] = self.create_publisher(self._Odometry, namespace + '/odom', _NATIVE_QOS)
         segment['cloud_pub'] = self.create_publisher(
-            self._SensorData if self._native_envelope else PointCloud2,
-            namespace + ('/sensor_data' if self._native_envelope else '/scan_cloud'), _NATIVE_QOS)
+            self._SensorData, namespace + '/sensor_data', _NATIVE_QOS)
         segment['tf_pub'] = self.create_publisher(self._TFMessage,
             namespace + ('/tf' if self.stream.extrinsic_mode == 'dynamic' else '/tf_static'),
             _NATIVE_QOS if self.stream.extrinsic_mode == 'dynamic' else _MAP_QOS)
@@ -587,8 +588,7 @@ class RtabmapNode(Node):
         observation = item[6] if len(item) > 6 else None
         rgb_deadline = item[7] if len(item) > 7 else time.monotonic()
         depth = item[8] if len(item) > 8 else None
-        native, rgb_generation = (self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline, depth)
-                                  if self._native_envelope else (cloud, None))
+        native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline, depth)
         if predicted:
             # The standard odometry input stays null. Even an older native
             # runtime cannot mistake this private hint for a tracking pose.
@@ -605,13 +605,18 @@ class RtabmapNode(Node):
             if pose is not None and not self.stream._poses:
                 return
             token = self.stream.continuity_token
-            if self._native_envelope and measured is not None:
+            if measured is not None:
                 # Optional preparation can outlive the source run of a queued pose.
                 run = token if token is not None and measured.external_continuity == token else None
-                if self._scan_origin_recovery:
+                if measured.chassis_origin is not None:
+                    origin = hashlib.blake2b(json.dumps(measured.chassis_origin).encode(), digest_size=16).digest()
+                    payload = b'MOTUSCH1' + origin + (run or bytes(16))
+                elif self._scan_origin_recovery:
                     identity = (measured.segment_id, measured.frame_id)
                     origin = hashlib.blake2b(json.dumps(identity).encode(), digest_size=16).digest()
                     payload = b'MOTUSOR1' + origin
+                elif self._raw_scan_input and run is None:
+                    payload = b'MOTUSRAW'
                 else:
                     payload = b'MOTUSOD1' + run if run else None
                 if payload:
@@ -676,16 +681,24 @@ class RtabmapNode(Node):
         # This card has no IMU input. Geometry message defaults may be identity;
         # the native IMU converter uses a null local transform to mean absent.
         data.imu_local_transform.rotation.w = 0.
-        # The native converter requires the scan enum to match its actual PCL
-        # layout. Carry explicit XYZ geometry without changing the input cloud.
         data.laser_scan = deepcopy(cloud)
-        data.laser_scan.fields = [PointField(name=name, offset=i*4, datatype=7, count=1)
-                                 for i, name in enumerate(('x', 'y', 'z'))]
-        data.laser_scan.width, data.laser_scan.height = len(points), 1
-        data.laser_scan.point_step, data.laser_scan.row_step = 12, len(points)*12
-        data.laser_scan.is_bigendian, data.laser_scan.is_dense = False, True
-        data.laser_scan.data = array('B', np.ascontiguousarray(points, dtype='<f4').tobytes())
-        data.laser_scan_format, data.laser_scan_max_pts, data.laser_scan_max_range = 5, 0, 0.
+        if self._raw_scan_input:
+            # Match pinned util3d::laserScanFromPointCloud's XYZ format while
+            # preserving intensity, normals, colors and vendor fields on the wire.
+            fields = {field.name: field.datatype for field in cloud.fields}
+            normals = any(name in fields for name in ('normal_x', 'normal_y', 'normal_z'))
+            intensity = fields.get('intensity') == PointField.FLOAT32
+            color = 'rgb' in fields or 'rgba' in fields
+            data.laser_scan_format = 5 + 3 * normals + (1 if intensity else 2 if color else 0)
+        else:
+            data.laser_scan.fields = [PointField(name=name, offset=i*4, datatype=7, count=1)
+                                     for i, name in enumerate(('x', 'y', 'z'))]
+            data.laser_scan.width, data.laser_scan.height = len(points), 1
+            data.laser_scan.point_step, data.laser_scan.row_step = 12, len(points)*12
+            data.laser_scan.is_bigendian, data.laser_scan.is_dense = False, True
+            data.laser_scan.data = array('B', np.ascontiguousarray(points, dtype='<f4').tobytes())
+            data.laser_scan_format = 5
+        data.laser_scan_max_pts, data.laser_scan_max_range = 0, 0.
         data.laser_scan_local_transform = self._native_transform(matrix)
         self._rgb_mode, self._rgb_reason = 'pointcloud', self._rgb_subscription_error
         if pose is not None and pose.prediction_anchor_ns is not None:

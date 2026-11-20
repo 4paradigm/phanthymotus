@@ -112,7 +112,9 @@ def test_native_pair_preserves_all_point_fields_bytes_and_exact_nanosecond_stamp
     node._cloud(raw)
     node._odom(NS(data=json.dumps(odom(1200, x=2))))
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
-    forwarded = published(node, '/scan_cloud')[0].raw_messages[-1]
+    native = published(node, '/sensor_data')[0].raw_messages[-1]
+    assert native.laser_scan_format == 6  # Pinned RTAB-Map XYZ plus float intensity.
+    forwarded = native.laser_scan
     pose = published(node, '/odom')[0].raw_messages[-1]
     assert forwarded.data == original.data
     assert [vars(f) for f in forwarded.fields] == [vars(f) for f in original.fields]
@@ -143,7 +145,7 @@ def test_native_pointcloud_normalizes_big_endian_and_padded_rows_before_publish(
     node._cloud(bad)
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
     assert len(NativeProcess.instances) == 1
-    forwarded = published(node, '/scan_cloud')[0].raw_messages[-1]
+    forwarded = published(node, '/sensor_data')[0].raw_messages[-1].laser_scan
     assert forwarded.is_bigendian is False
     assert forwarded.row_step == forwarded.width * forwarded.point_step
 
@@ -193,6 +195,31 @@ def test_scan_only_rgbd_odom_labels_the_origin_on_each_native_envelope(tmp_path,
     finally:
         n.close()
         n.destroy_node()
+
+
+@pytest.mark.parametrize('legacy_first', [False, True])
+def test_measured_chassis_without_rgb_marks_origin_and_dense_run(node, legacy_first):
+    import zlib
+    from test_pointcloud_slam_stream import chassis
+    if legacy_first:
+        send(node, 900, 'legacy')
+        assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    for i, segment in enumerate(('old', 'old', 'reset')):
+        ms = 1000 + i * 100
+        node._measurement_clock_ns = lambda t=ms: t * 1_000_000
+        node._odom(NS(data=json.dumps(chassis(ms, segment=segment))))
+        node._cloud(cloud(ms * 1_000_000))
+        assert _wait_until(lambda: node.status()['forwarded_clouds'] == i + 1 + legacy_first)
+
+    native = published(node, '/sensor_data')
+    assert len(native) == 1
+    markers = [zlib.decompress(bytes(m.user_data)[:-12]) for m in native[0].raw_messages]
+    if legacy_first:
+        assert markers.pop(0) == b'MOTUSRAW'
+    assert all(len(marker) == 40 and marker.startswith(b'MOTUSCH1') for marker in markers)
+    assert markers[0] == markers[1]
+    assert markers[1][8:24] != markers[2][8:24]
+    assert markers[1][24:] != markers[2][24:]
 
 
 def test_mapping_snapshot_uses_actual_native_frame_and_optimized_pose(node):
@@ -362,7 +389,7 @@ def test_freeze_during_slow_native_start_is_immediate_and_cannot_resume(tmp_path
     finally:
         release.set(); n.close()
     assert n.status()['forwarded_clouds'] == 0
-    assert all(not p.raw_messages for p in published(n, '/scan_cloud'))
+    assert all(not p.raw_messages for p in published(n, '/sensor_data'))
     assert n.status()['capture_stopped'] is True
 
 
@@ -442,7 +469,7 @@ def test_admitted_clouds_forward_while_newer_clouds_wait_for_metadata(
         assert status['unmatched_clouds'] == 0
         assert status['accepted_clouds'] > 0
         assert status['forwarded_clouds'] == status['accepted_clouds']
-        forwarded = published(n, '/scan_cloud')[0].raw_messages
+        forwarded = published(n, '/sensor_data')[0].raw_messages
         assert len(forwarded) == status['forwarded_clouds']
         assert forwarded[0].header.stamp.sec == 1
         assert forwarded[0].header.stamp.nanosec == 0

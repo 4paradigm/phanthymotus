@@ -76,8 +76,8 @@ def test_native_envelope_marks_only_continuous_measured_chassis_poses(rgb_node):
     first, second, other = published(n, '/sensor_data')[0].raw_messages
     for message in (first, second):
         wire = bytes(message.user_data)
-        assert struct.unpack('<iii', wire[-12:]) == (1, 24, 0)
-        assert zlib.decompress(wire[:-12]).startswith(b'MOTUSOD1')
+        assert struct.unpack('<iii', wire[-12:]) == (1, 40, 0)
+        assert zlib.decompress(wire[:-12]).startswith(b'MOTUSCH1')
     assert bytes(first.user_data) == bytes(second.user_data)
     assert not getattr(other, 'user_data', None)
 
