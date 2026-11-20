@@ -164,10 +164,15 @@ def optical_ground_plane(frame, geometry, ground):
     return np.array([-a, 1., -b]), c
 
 
-def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None):
+def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
+            require_valid_floor=False):
+    def no_floor():
+        if not require_valid_floor:
+            return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
+
     plane = optical_ground_plane(frame, geometry, ground)
     if plane is None:
-        return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
+        return no_floor()
     height, width = frame.shape
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     u = (np.arange(width) - cx) / fx
@@ -178,13 +183,13 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     rotation, origin = transform[:3, :3], transform[:3, 3]
     normal = rotation @ optical_normal
     if abs(normal[2]) < .5 * np.linalg.norm(normal):
-        return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
+        return no_floor()
     floor_z = (c + normal @ origin - normal[0]*forward + normal[1]*right) / normal[2]
     # Check several heights below the declared top of the moving envelope.
     free = np.full(right.shape, geometry.free_space_validated, dtype=bool)
     top = geometry.height if geometry.height is not None else abs(c / normal[2])
     if not .02 < top <= 2.5:
-        return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
+        return no_floor()
     heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if geometry.free_space_validated else ()
     # On a verified floor return, require the ray to clear the far edge of
     # this cell at the probe height. A fixed two-cell optical gap would reject

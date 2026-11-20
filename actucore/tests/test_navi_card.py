@@ -195,8 +195,12 @@ def test_lifecycle_stops_previous_motion_with_long_watchdog(monkeypatch, action)
     assert not any(card._state.commanded)
 
 
-@pytest.mark.parametrize("stop", ["expiry", "gap", "duplicate", "angle", "translation", "depth", "pause"])
+@pytest.mark.parametrize("stop", ["expiry", "gap", "duplicate", "angle", "translation", "obstacle", "depth", "pause"])
 def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypatch, stop):
+    import numpy as np
+    from plugins.navi.active_scan import CheckedTurnSweep, SHAPE, START
+    from plugins.navi.local_path import Geometry
+
     card = _card()
     card._running = True
     card._publisher = object()
@@ -222,6 +226,11 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
     scan.turn_angle, scan.turn_yaw = .25, .6
     scan.poses.append((1000, scan.pose, 0.))
     scan.odom_source = 1000
+    occupied = np.zeros(SHAPE, dtype=bool)
+    if stop == "obstacle":
+        occupied[START[0] + 12, START[1]] = True
+    geometry = Geometry(None, None, np.eye(4), .23, .23, None)
+    scan.turn_sweep = CheckedTurnSweep(geometry, .33, 1.15, occupied, scan.pose)
     card._state.commanded = (0., 0., .6)
     card._velocity_history.append((1000, 1000, (0., 0., 0.)))
     entered = threading.Event()
@@ -255,24 +264,32 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
             assert stopped.wait(1)
         else:
             now = {"expiry": 1400, "gap": 1360, "duplicate": 1360,
-                   "angle": 1320, "translation": 1200, "depth": 1200}[stop]
+                   "angle": 1320, "translation": 1200, "obstacle": 1200, "depth": 1200}[stop]
             if stop == "angle":
                 card._velocity_history.append((now, now, (0., 0., 1.)))
-            elif stop == "translation":
+            elif stop in ("translation", "obstacle"):
                 card._velocity_history.append((now, now, (.30, 0., .4)))
             elif stop == "duplicate":
                 card._velocity_history.append((now, 1100, (0., 0., .4)))
             elif stop == "depth":
                 card._depth_ground = None
             card._dispatch_command()
-        assert len(published) == 3 and published[-1]["values"] == [0.] * 6
+        if stop == "translation":
+            assert published[-1]["values"][5] == .6
+            assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1400
+            now = 1400
+            card._dispatch_command()
+        expected = 4 if stop == "translation" else 3
+        assert len(published) == expected and published[-1]["values"] == [0.] * 6
+        if stop == "obstacle":
+            assert "扫掠区有障碍" in card._output_stop[1]
     finally:
         release.set()
         planner.join(2)
         if pauser is not None:
             pauser.join(2)
     card._dispatch_command()
-    assert len(published) == 3
+    assert len(published) == expected
 
 
 @pytest.mark.parametrize("explicit_stop", [False, True])
@@ -305,6 +322,61 @@ def test_velocity_timer_does_not_repeat_a_translation_or_extend_its_observations
     now = 1250
     card._dispatch_command()
     assert len(published) == 2 and published[1]["values"] == [0.] * 6
+
+
+@pytest.mark.parametrize("case", [
+    "clear", "unknown", "obstacle", "duplicate", "old_target", "old_odom", "invalid_floor",
+    "expires_again",
+])
+def test_late_local_translation_rechecks_new_depth_without_restamping_target(monkeypatch, case):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=800, watchdog_ms=600)
+    card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    card._descriptor = {"rate": {"max_obs_age_ms": 800}}
+    card._ttl_ms = 400
+    card._state.avoidance_yaw_override = True
+    card._state.view_detour = local_path.Detour((.25, -.05), (), card._config.local_geometry)
+    card._state.active_scan.receipt_only = card._state.active_scan.buffered_odom = True
+    now = 100_000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    ground = np.ones((4, 4), dtype=bool)
+    old = dict(map=ground, ground=ground, frame_id=99_100, source_frame_id=100)
+    new = dict(old, frame_id=99_920, source_frame_id=100 if case == "duplicate" else 101)
+    odom = dict(vx=0., vy=0., wz=0., received_ms=99_980)
+    if case == "old_odom":
+        odom["stamp_ms"] = 99_740
+    target_ms = 99_450 if case == "old_target" else 99_850
+    snapshots = iter([({"objects": []}, old, odom, target_ms), ({"objects": []}, new, odom, 99_990)])
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **kwargs: next(snapshots))
+    candidate = policy.Decision([.25, -.05, 0., 0., 0., 0.], policy.AVOIDING,
+                                "局部规划：沿避障路线行进", distance_m=2.)
+    monkeypatch.setattr(policy, "step", lambda **kwargs: candidate)
+
+    def observe(*args, require_valid_floor):
+        nonlocal now
+        assert require_valid_floor
+        if case == "invalid_floor":
+            return None
+        occupied = np.zeros(local_path.SHAPE, dtype=bool)
+        if case == "obstacle":
+            occupied[local_path.START[0] + 7, local_path.START[1]] = True
+        if case == "expires_again":
+            now += 300
+        return occupied.copy() if case == "unknown" else ~occupied, occupied
+
+    monkeypatch.setattr(local_path, "observe", observe)
+    command = card.next_command()
+    if case in ("clear", "unknown"):
+        assert command["values"] == candidate.values
+        assert command["obs_stamp_ms"] == target_ms
+        assert command["stamp_ms"] + command["ttl_ms"] == 100_230
+    else:
+        assert command["values"] == [0.] * 6
+        if case == "obstacle":
+            assert "新深度复检发现扫掠区有障碍" in card._last_decision.reason
 
 
 @pytest.mark.parametrize("status", ["searching", "failed"])

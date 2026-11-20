@@ -1766,6 +1766,58 @@ class NaviPlugin:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom, objects_ms
 
+    def _recheck_late_translation(self, decision, previous_twist, depth, objects_ms, max_age, now_ms):
+        """Recheck one local velocity against a newer frame without rerunning path search."""
+        from . import local_path
+
+        config, state = self._config, self._state
+        scan, geometry = state.active_scan, config.local_geometry
+        target_deadline = objects_ms + min(max_age, config.max_obs_age_ms)
+        if (decision.status != policy_mod.AVOIDING or not state.avoidance_yaw_override
+                or state.view_detour is None or state.view_detour.geometry is not geometry or decision.values[5]
+                or scan.active or scan.locked or scan.result_frame or scan.obstacles.cells
+                or not scan.receipt_only or not scan.buffered_odom or config.scan_geometry is not None
+                or geometry is None or depth.get("body_mount_required")
+                or decision.distance_m is None or not objects_ms <= now_ms < target_deadline):
+            return None
+
+        _, latest, odom, _ = self._observation_snapshot(with_capture_timing=True)
+        source = depth.get("source_frame_id")
+        if (latest is None or latest["frame_id"] <= depth["frame_id"]
+                or (source is not None and (latest.get("source_frame_id") or 0) <= source)
+                or latest.get("capture_invalid") or latest.get("body_mount_required")
+                or latest.get("map") is None or latest.get("ground") is None):
+            return None
+        depth_ms = latest.get("capture_ms") or latest["frame_id"]
+        measured = odom_mod.planar_feedback(odom)
+        odom_ms = (odom or {}).get("received_ms")
+        if odom_ms is not None:
+            odom_ms = min(odom_ms, odom.get("stamp_ms", odom_ms))
+        if (measured is None or odom_ms is None
+                or max(abs(measured[2]), abs(previous_twist[2])) > .02):
+            return None
+        obs_ms = min(objects_ms, depth_ms, odom_ms)
+        deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
+                           odom_ms + min(self._odom_max_age_ms, policy_mod.ODOM_GAP_MS),
+                           obs_ms + max_age))
+        if now_ms >= deadline:
+            return None
+        horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        velocities = measured[:2], previous_twist[:2], tuple(decision.values[:2])
+        speed = max(math.hypot(*velocity) for velocity in velocities)
+        if speed * (horizon + (now_ms - objects_ms) / 1000) > decision.distance_m - config.stop_distance_m:
+            return None
+        keepout = policy_mod._keepout_m(config)
+        turn = max(abs(measured[2]), abs(previous_twist[2])) * horizon
+        padding = (math.hypot(max(geometry.front, geometry.rear), keepout)
+                   + speed * horizon / 2) * turn
+        grid = local_path.observe(latest["map"], geometry, local_path.RIGHT, local_path.FORWARD,
+                                  local_path.RESOLUTION, latest["ground"], require_valid_floor=True)
+        if grid is None:
+            return None
+        clear = local_path.transition_clear(grid, geometry, keepout, horizon, velocities, padding=padding)
+        return obs_ms, deadline, clear
+
     def next_command(self):
         """One tick of the policy, as a message or None.
 
@@ -1848,6 +1900,22 @@ class NaviPlugin:
         max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
         stale = (self._config.local_planning and any(values)
                  and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms)
+        recheck_deadline = None
+        recheck_blocked = False
+        if (stale and objects is not None and depth is not None and values == decision.values
+                and obs_ms == (depth.get("capture_ms") or depth.get("frame_id"))):
+            refreshed = self._recheck_late_translation(
+                decision, previous_twist, depth, objects_ms, max_age, now_ms)
+            now = time.time()
+            now_ms = int(now * 1000)
+            if refreshed is not None and refreshed[0] <= now_ms < refreshed[1]:
+                checked_obs_ms, checked_deadline, clear = refreshed
+                if clear:
+                    obs_ms, recheck_deadline = checked_obs_ms, checked_deadline
+                    decision.reason = f"{decision.reason}，已用新深度复检"
+                    stale = False
+                else:
+                    recheck_blocked = True
         buffered_turn = values[5] and scan.turn_until_ms and scan.buffered_turn
         if buffered_turn and not stale and type(max_age) in (int, float) and 0 < max_age < math.inf:
             scan.turn_until_ms = min(scan.turn_until_ms, int(obs_ms + max_age))
@@ -1864,6 +1932,8 @@ class NaviPlugin:
                 scan.turn_until_ms = 0
                 scan.turn_stop_ms = now_ms
                 status, reason = policy_mod.AVOIDING, "主动观察：转向指令窗口已到期，停车等待新反馈"
+            elif recheck_blocked:
+                status, reason = policy_mod.AVOIDING, "局部规划：新深度复检发现扫掠区有障碍，停车等候重规划"
             else:
                 status = policy_mod.BLIND
                 reason = f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车"
@@ -1884,6 +1954,8 @@ class NaviPlugin:
         if values[0] <= .05:
             self._state.moving_for_s = 0.
         message = self._command_message(values, now, obs_ms)
+        if recheck_deadline is not None:
+            message["ttl_ms"] = min(message["ttl_ms"], recheck_deadline - now_ms)
         if values[5] and scan.turn_until_ms:
             message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
             if buffered_turn:
@@ -2032,7 +2104,8 @@ class NaviPlugin:
                 expires_ms = min(expires_ms, int(message["obs_stamp_ms"] + max_age))
             scan = self._state.active_scan
             turn = None
-            if scan.buffered_turn and scan.poses and message["values"][5] and not any(message["values"][:5]):
+            if (scan.buffered_turn and scan.turn_sweep is not None and scan.poses
+                    and message["values"][5] and not any(message["values"][:5])):
                 # Only the copied integration state belongs to the publisher.
                 turn = replace(scan, poses=deque((scan.poses[-1],), maxlen=scan.poses.maxlen))
                 if scan.current_frame:

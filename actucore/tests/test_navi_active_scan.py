@@ -202,12 +202,12 @@ def test_measured_turn_deadline_stops_and_waits_for_new_feedback(monkeypatch):
 
 
 @pytest.mark.parametrize("case", [
-    "continuous", "gap", "batched_gap", "duplicate", "translation", "transient", "expired",
+    "continuous", "gap", "batched_gap", "duplicate", "translation", "obstacle", "expired",
 ])
 def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(monkeypatch, case):
     from plugins.navi import plugin
 
-    look, geometry, _, _ = _setup(monkeypatch)
+    look, geometry, _, occupied = _setup(monkeypatch)
     card = plugin.NaviPlugin({"local_planning": True}, executor=None)
     now = 1000
     monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
@@ -241,7 +241,7 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
     elif case == "batched_gap":
         sample(1300, wz=.10, source=1500)
     else:
-        sample(1300, vx={"translation": .25, "transient": .10}.get(case, 0.), wz=.10)
+        sample(1300, vx=.25 if case in ("translation", "obstacle") else 0., wz=.10)
         sample(1420, wz=.10, source=1300 if case == "duplicate" else None)
     sample(1620 if case == "expired" else 1500, wz=.10, source=1300 if case == "duplicate" else None)
     hold = update()
@@ -249,14 +249,18 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
         assert hold is None
         assert look.pose[2] == pytest.approx(-.030)
         assert command().yaw > 0.
-    elif case == "transient":
+    elif case in ("translation", "obstacle"):
         assert hold is None and command().yaw > 0.
-        sample(1550, vx=.18, wz=.10)
-        sample(1650, vx=.18, wz=.10)
-        sample(1750, vx=.18, wz=.10)
-        hold = update()
-        assert look.phase == "brake_for_replan" and hold.yaw == 0.
-        assert "检测到平移" in hold.reason
+        if case == "obstacle":
+            occupied[scan.START[0] + 14, scan.START[1]] = True
+        for stamp in (1550, 1650, 1750):
+            sample(stamp, vx=.30, wz=.10)
+        assert update() is None
+        result = command()
+        if case == "obstacle":
+            assert result.yaw == 0. and "扫掠区有障碍" in result.reason
+        else:
+            assert result.yaw > 0. and look.pose[0] > .05
     elif case == "expired":
         assert hold is None
         assert command().yaw == 0.
@@ -268,7 +272,7 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
         assert look.locked
     else:
         assert look.phase == "brake_for_replan" and hold.yaw == 0.
-        assert ("检测到平移" if case == "translation" else "间隔过长") in hold.reason
+        assert "间隔过长" in hold.reason
 
 
 @pytest.mark.parametrize(("rate_hz", "expiry"), [
@@ -553,7 +557,7 @@ def test_drift_before_first_yaw_can_replan_with_the_current_depth(monkeypatch, a
     assert look.begin((-1., 1.))
 
 
-def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkeypatch):
+def test_receipt_only_scan_keeps_turning_when_translation_has_no_collision(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
 
     def tick(stamp, vx=0., vy=0., yaw=0.):
@@ -565,19 +569,19 @@ def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkey
     assert look.begin((1., -1.))
     assert tick(1050).yaw == 0.
     assert tick(1150).yaw < 0.
-    assert tick(1250, vx=.113, vy=-.014, yaw=-.204).yaw == 0.
+    assert tick(1250, vx=.113, vy=-.014, yaw=-.204).yaw < 0.
     assert look.active and not look.locked
-    assert tick(1400, vx=-.006, vy=-.035).yaw == 0.
-    assert not look.active and not look.locked and look.attempted
+    assert tick(1400, vx=-.006, vy=-.035).yaw < 0.
+    assert look.active and not look.locked and look.attempted
 
 
-@pytest.mark.parametrize("interruption", ["translation", "gap"])
+@pytest.mark.parametrize("interruption", ["depth", "gap"])
 def test_interrupted_turn_can_replan_once_with_the_current_view(monkeypatch, interruption):
     look, geometry, _, _ = _setup(monkeypatch)
 
-    def tick(stamp, source, vx=0.):
-        hold = look.update(dict(_depth(stamp), source_frame_id=source),
-                           dict(_odom(stamp), received_ms=stamp, vx=vx),
+    def tick(stamp, source, *, depth=True):
+        observation = dict(_depth(stamp), source_frame_id=source) if depth else None
+        hold = look.update(observation, dict(_odom(stamp), received_ms=stamp),
                            geometry, receipt_only=True)
         return hold or look.command(geometry, .33, 1., 600)
 
@@ -586,18 +590,18 @@ def test_interrupted_turn_can_replan_once_with_the_current_view(monkeypatch, int
     assert tick(1100, 11).yaw == 0.
     assert tick(1200, 12).yaw > 0.
     stopped = 1550 if interruption == "gap" else 1300
-    assert tick(stopped, 13, vx=.1 if interruption == "translation" else 0.).yaw == 0.
+    assert tick(stopped, 13, depth=interruption != "depth").yaw == 0.
     assert look.phase == "brake_for_replan" and look.attempted
     assert tick(stopped + 100, 12 if interruption == "gap" else 13).replanned_turn
     assert not look.active and not look.attempted and look.advance_m is None
     assert look.begin((-1.,), advance_m=1.5, route_segment=True)
     assert tick(stopped + 200, 17).yaw == 0.
     assert tick(stopped + 300, 18).yaw > 0.
-    assert tick(stopped + 400, 19, vx=.1).yaw == 0.
+    assert tick(stopped + 400, 19, depth=False).yaw == 0.
     final = tick(stopped + 500, 20)
     assert final.yaw == 0.
-    assert "再次中断" in final.reason and "检测到平移" in final.reason
-    assert ("间隔过长" if interruption == "gap" else "检测到平移") in final.reason
+    assert "再次中断" in final.reason and "深度暂不可用" in final.reason
+    assert ("间隔过长" if interruption == "gap" else "深度暂不可用") in final.reason
     assert look.locked and not look.begin((-1.,))
 
 

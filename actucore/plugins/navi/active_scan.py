@@ -8,7 +8,7 @@ import math
 
 import numpy as np
 
-from .local_path import observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
+from .local_path import Geometry, observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
@@ -21,7 +21,6 @@ SCAN_TIMEOUT_MS = 8000
 TURN_BURST_MS = 400
 TURN_PROGRESS_WINDOW_MS = 1500
 TURN_PROGRESS_MIN_RAD = math.radians(3)
-TURN_DRIFT_LIMIT_M = RESOLUTION
 
 
 @dataclass(frozen=True)
@@ -29,6 +28,15 @@ class ScanCommand:
     yaw: float = 0.
     reason: str = "主动观察：停车等候"
     replanned_turn: bool = False
+
+
+@dataclass(frozen=True)
+class CheckedTurnSweep:
+    geometry: Geometry
+    half_width: float
+    horizon: float
+    occupied: np.ndarray
+    pose: tuple
 
 
 @dataclass
@@ -132,7 +140,7 @@ class ActiveScan:
     turn_stop_ms: int | None = None
     turn_until_ms: int = 0
     turn_feedback_ms: int = 0
-    turn_drift_m: float = 0.
+    turn_sweep: CheckedTurnSweep | None = None
     turn_yaw: float = 0.
     command_only: bool = False
     single_control_ms: int = 0
@@ -282,27 +290,13 @@ class ActiveScan:
                 return self._hold_for_feedback_gap()
             intervals.append((velocity, (received - last_stamp) / 1000))
             last_stamp, last_source, last_motion = received, identity, velocity
-        excessive_translation = False
-        previous_speed = math.hypot(*self.motion[:2])
         for velocity, dt in intervals:
             self._integrate_motion(velocity, dt)
-            speed = math.hypot(*velocity[:2])
-            if self.phase == "turn":
-                if self.buffered_turn and self.issued_yaw:
-                    # Charge the whole sample interval at the larger of the
-                    # two speeds, so batched spikes cannot go unaccounted for.
-                    peak = max(speed, previous_speed)
-                    if peak > STILL_LINEAR:
-                        self.turn_drift_m += peak * dt
-                    excessive_translation |= (speed * ODOM_GAP_MS / 1000 > TURN_DRIFT_LIMIT_M
-                                              or self.turn_drift_m >= TURN_DRIFT_LIMIT_M)
-                else:
-                    excessive_translation |= speed > STILL_LINEAR
-            previous_speed = speed
         if intervals:
             self.poses.append((last_stamp, self.pose, last_motion[2]))
             self.odom_source, self.motion = last_source, last_motion
-        if excessive_translation:
+        if self.phase == "turn" and not self.issued_yaw and any(
+                math.hypot(vx, vy) > STILL_LINEAR for (vx, vy, _), _ in intervals):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
 
     def _hold_for_feedback_gap(self):
@@ -323,9 +317,6 @@ class ActiveScan:
                 return hold.reason, True
         if now_ms - self.poses[-1][0] > ODOM_GAP_MS:
             return "主动观察：运动反馈间隔过长，停车后重规划", True
-        if (math.hypot(*motion[:2]) * ODOM_GAP_MS / 1000 > TURN_DRIFT_LIMIT_M
-                or (self.origin_set and math.dist(self.pose[:2], self.origin[:2]) > .18)):
-            return "主动观察：检测到平移，停车后重规划", True
         error = self.origin[2] + self.directions[0] * self.turn_angle - self.pose[2]
         if abs(motion[2]) > max_yaw + .10:
             return "主动观察：转速超出限制，停车后重规划", True
@@ -333,6 +324,14 @@ class ActiveScan:
             return "主动观察：达到转角，停车等待速度反馈", False
         if motion[2] * math.copysign(1., error) > STILL_YAW:
             return "主动观察：等待反向转动停止", False
+        checked = self.turn_sweep
+        rate = max(abs(self.turn_yaw), abs(motion[2]))
+        sweep = math.copysign(abs(error) + (rate + .10) * checked.horizon, error)
+        translation = self._turn_translation(checked.horizon, motion)
+        translation += math.dist(self.pose[:2], checked.pose[:2])
+        if not self.clear_sweep(checked.geometry, checked.half_width, sweep, translation,
+                                occupied=checked.occupied, start_angle=self.pose[2] - checked.pose[2]):
+            return "主动观察：转身扫掠区有障碍，停车后重规划", True
         return None
 
     def _update_latest(self, depth, geometry, stamp, max_depth_age_ms):
@@ -467,6 +466,7 @@ class ActiveScan:
             self.exhausted = False
         self.phase = "brake"
         self.origin_set = False
+        self.turn_sweep = None
         self.start_ms = self.single_control_ms if self.command_only else self.poses[-1][0]
         self.still_since = self.start_ms
         self.timed_phase_s = self.timed_total_s = self.timed_turn_s = 0.
@@ -523,17 +523,16 @@ class ActiveScan:
                 self.origin, self.origin_set = self.pose, True
             self.still_since = stamp
             self.turn_start_heading = self.pose[2]
-            self.turn_drift_m = 0.
             self.phase = "turn"
             return ScanCommand(reason="主动观察：确认底盘已停稳")
         # A released straight segment legitimately leaves the turn origin. A
         # replan hold after it must settle and replan, not lock on that travel.
-        if (self.origin_set and self.advance_origin is None
+        turning = self.issued_yaw and self.phase in ("turn", "return")
+        if (not turning and self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
-        turning_with_drift_check = self.buffered_turn and self.issued_yaw
         if (self.receipt_only and speed > STILL_LINEAR and self.phase != "brake_for_replan"
-                and not turning_with_drift_check):
+                and not turning):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
         if self.phase == "brake_for_replan":
             if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
@@ -561,7 +560,7 @@ class ActiveScan:
             self.phase = "idle"
             self.issued_yaw = False
             return ScanCommand(reason="主动观察：已停稳，重新规划", replanned_turn=interrupted_turn)
-        if speed > STILL_LINEAR and not turning_with_drift_check:
+        if speed > STILL_LINEAR and not turning:
             return self.interrupt("主动观察：检测到平移，停车")
         if (abs(self.motion[2]) > yaw_rate + .10
                 or abs(self.pose[2] - self.origin[2]) > max(ANGLE, self.turn_angle) + 2 * ANGLE_TOLERANCE):
@@ -643,6 +642,8 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
+        if self.buffered_turn:
+            self.turn_sweep = CheckedTurnSweep(geometry, half_width, horizon, occupied, self.pose)
         if bounded_turn:
             if not self.turn_until_ms or renew:
                 self.turn_until_ms = control_ms + duration_ms
@@ -706,10 +707,14 @@ class ActiveScan:
     def turn_obstacles(self):
         return self.grid()[1] | self.views[-1][3]
 
-    def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied):
-        translation = STILL_LINEAR * horizon
+    def _turn_translation(self, horizon, motion):
+        translation = max(STILL_LINEAR, math.hypot(*motion[:2])) * horizon
         if self.receipt_only and self.buffered_odom and self.pose_origin is None:
-            translation = max(translation, TURN_DRIFT_LIMIT_M, math.hypot(*self.motion[:2]) * horizon)
+            translation = max(translation, RESOLUTION)
+        return translation
+
+    def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied):
+        translation = self._turn_translation(horizon, self.motion)
 
         def clear_sweep(rate):
             turn_rate = max(rate, abs(self.motion[2]))
@@ -730,7 +735,7 @@ class ActiveScan:
                         limit = candidate
         return yaw_rate
 
-    def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
+    def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None, start_angle=0.):
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)
@@ -738,8 +743,11 @@ class ActiveScan:
         slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
         if occupied is None:
             occupied = self.turn_obstacles()
-        occupied_forward, occupied_right = FORWARD[occupied], RIGHT[occupied]
-        for angle in np.linspace(0., sweep, samples):
+        nearby = occupied & (FORWARD**2 + RIGHT**2 <= (radius + slack)**2)
+        if not nearby.any():
+            return True
+        occupied_forward, occupied_right = FORWARD[nearby], RIGHT[nearby]
+        for angle in np.linspace(start_angle, start_angle + sweep, samples):
             c, s = math.cos(angle), math.sin(angle)
             forward = occupied_forward * c + occupied_right * s
             right = -occupied_forward * s + occupied_right * c
