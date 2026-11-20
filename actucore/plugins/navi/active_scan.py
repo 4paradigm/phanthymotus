@@ -539,23 +539,8 @@ class ActiveScan:
         _, occupied = self.grid()
         occupied = occupied | self.views[-1][3]
 
-        def clear_sweep(rate):
-            turn_rate = max(rate, abs(self.motion[2]))
-            sweep = math.copysign(abs(error) + (turn_rate + .10) * horizon, error)
-            return self.clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon,
-                                    occupied=occupied)
-
-        if not clear_sweep(yaw_rate):
-            limit = yaw_rate
-            yaw_rate = 0.
-            if clear_sweep(min_yaw_rate):
-                yaw_rate = min_yaw_rate
-                for _ in range(5):
-                    candidate = (yaw_rate + limit) / 2
-                    if clear_sweep(candidate):
-                        yaw_rate = candidate
-                    else:
-                        limit = candidate
+        yaw_rate = self.checked_turn_rate(geometry, half_width, error, yaw_rate, min_yaw_rate,
+                                          horizon, occupied)
         if not yaw_rate:
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
@@ -630,6 +615,26 @@ class ActiveScan:
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
         return ScanCommand(-self.turn_yaw, "主动观察：有界短转向")
+
+    def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied):
+        def clear_sweep(rate):
+            turn_rate = max(rate, abs(self.motion[2]))
+            sweep = math.copysign(abs(error) + (turn_rate + .10) * horizon, error)
+            return self.clear_sweep(geometry, half_width, sweep, STILL_LINEAR * horizon,
+                                    occupied=occupied)
+
+        if not clear_sweep(yaw_rate):
+            limit = yaw_rate
+            yaw_rate = 0.
+            if clear_sweep(min_yaw_rate):
+                yaw_rate = min_yaw_rate
+                for _ in range(5):
+                    candidate = (yaw_rate + limit) / 2
+                    if clear_sweep(candidate):
+                        yaw_rate = candidate
+                    else:
+                        limit = candidate
+        return yaw_rate
 
     def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None):
         # Rotate the rectangle in small increments and include cell diagonal

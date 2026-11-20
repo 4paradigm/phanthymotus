@@ -1852,6 +1852,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             if plan is not None:
                 yield plan
 
+    horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
+    turn_occupied = occupied | scan.views[-1][3]
     for plan in candidates():
         for index in range(len(plan.points) - 1, 0, -1):
             forward, right = plan.points[index]
@@ -1868,6 +1870,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             if (local_path.segment_clear(occupied, geometry, keep, angle, length,
                                          heading_tolerance=ANGLE_TOLERANCE if angle else 0.)
                     and scan.clear_sweep(geometry, keep, angle, 0., occupied=occupied)
+                    and (scan.command_only or abs(angle) <= ANGLE_TOLERANCE or scan.checked_turn_rate(
+                        geometry, keep, angle, _scan_yaw_rate(config), config.floor_wz, horizon, turn_occupied))
                     and scan.begin((math.copysign(1., angle),), advance_m=length,
                                    turn_angle=abs(angle), route_segment=True, reroute=reroute)):
                 state.view_detour = local_path.Detour(None, (plan.points[0], *plan.points[index:]), geometry)

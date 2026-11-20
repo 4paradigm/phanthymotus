@@ -2960,6 +2960,33 @@ def test_detour_first_leg_passes_the_obstacle_at_the_permitted_heading_error(sid
                                     heading - side * active_scan.ANGLE_TOLERANCE, scan.advance_m)
 
 
+def test_detour_first_turn_can_execute_with_the_braking_reserve():
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243),
+                                        .20, half_length=.23)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+                  max_depth_age_ms=800, watchdog_ms=600)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only = True
+    scan.current_frame = 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    # A centre obstacle and a close return at the left front corner. The
+    # preferred right turn clips the corner once braking travel is included.
+    occupied = ((np.isclose(local_path.FORWARD, .75) & (np.abs(local_path.RIGHT) < .11)) |
+                (np.isclose(local_path.FORWARD, .35) & np.isclose(local_path.RIGHT, -.30)))
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    frame = np.ones((8, 8))
+    observation = dict(frame_id=1000, map=frame, ground=frame.astype(bool))
+
+    assert P._start_detour_segment(observation, config, state, geometry, .75, (1., -1.), 3., 0.)
+    assert scan.command(geometry, .30, 1., 600, 800).yaw == 0.
+    scan.poses.append((1100, scan.pose, 0.))
+    assert scan.command(geometry, .30, 1., 600, 800).yaw > 0.
+
+
 def test_initial_route_points_at_measured_opening_between_offset_jambs():
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
