@@ -404,7 +404,7 @@ def test_native_registration_diagnostics_are_capture_stamped_and_bounded(monkeyp
 
 
 @pytest.mark.parametrize('size', [(640, 480), (3, 2)])
-@pytest.mark.parametrize('mode', ['visual', 'assisted', 'fusion'])
+@pytest.mark.parametrize('mode', ['visual', 'assisted', 'fusion', 'recovering'])
 @pytest.mark.parametrize('color_offset_ns', [-800_000, 0, 800_000])
 def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monkeypatch, mode, color_offset_ns, size):
     from array import array
@@ -456,8 +456,20 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     monkeypatch.setitem(sys.modules, 'rtabmap_msgs.msg', NS(RGBDImage=NS))
     monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_001_000_123)
     published = []
-    def publish(msg): published.append(msg); obj.stop_event.set()
+    def publish(msg):
+        published.append(msg)
+        if mode != 'recovering':
+            obj.stop_event.set()
     obj.rgbd = NS(publish=publish, get_subscription_count=lambda: 1)
+    if mode == 'recovering':
+        # Drop this probe's diagnostic. The worker still owes the old map
+        # another real frame before the frozen verification deadline.
+        obj.gate.result_period_ns = 120_000_000
+        obj.gate.processing_p95_ns = 350_000_000
+        obj.gate.relocalization_deadline_mono = 3_000_000_000
+        monkeypatch.setattr(runtime.time, 'monotonic_ns', lambda: 1_000_000_000)
+        waits = []
+        obj.probe_ack = NS(clear=lambda: None, wait=waits.append)
     if mode == 'assisted':
         from test_rgbd_imu import aid, packet
         obj.imu = aid()
@@ -485,6 +497,8 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     obj._work()
     assert obj.gate.state != 'lost', obj.gate.reason
     assert len(published) == obj.counts['pairs'] == 1
+    if mode == 'recovering':
+        assert waits == [pytest.approx(.35)]
     assert obj.counts['dropped_pairs'] == 0
     native_stamp = max(color_stamp, 1_000_000_123)
     assert coverage_stamps == [native_stamp]

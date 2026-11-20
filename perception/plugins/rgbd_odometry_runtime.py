@@ -1341,6 +1341,13 @@ class RgbdSession:
                             self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns())
                         probe_deadline = getattr(self.gate, 'relocalization_deadline_mono', None)
                         if probe_deadline is not None:
+                            # A dropped best-effort probe has no acknowledgement.
+                            # Allow for measured delivery latency before trying the next capture.
+                            period = self.gate.result_period_ns or self.gate.input_period_ns
+                            if period:
+                                reply_ns = max(period, self.gate.processing_p95_ns or 0,
+                                               self.gate.native_processing_p95_ns or 0)
+                                probe_deadline = min(probe_deadline, time.monotonic_ns() + reply_ns)
                             self.probe_stamp = capture_stamp
                             self.probe_ack.clear()
                         self.rgbd.publish(out)
