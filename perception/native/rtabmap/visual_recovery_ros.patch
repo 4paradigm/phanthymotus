@@ -33,7 +33,7 @@
  	// Init RTAB-Map
  	rtabmap_.init(parameters_, databasePath_);
 +	if(this->declare_parameter("motus_visual_recovery", false))
-+		visualRecovery_.reset(new motus::VisualRecovery(parameters_));
++		visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->declare_parameter("motus_rgbd_image_recovery", false)));
  
  	if(rtabmap_.getMemory())
  	{
@@ -105,7 +105,7 @@
  {
  	RCLCPP_INFO(this->get_logger(), "rtabmap: Reset");
  	rtabmap_.resetMemory();
-+	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_));
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->get_parameter("motus_rgbd_image_recovery").as_bool()));
  
  	lastPoseMutex_.lock();
  	lastPoseCovariance_ = cv::Mat();
@@ -113,7 +113,7 @@
  
  	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database...");
  	rtabmap_.init(parameters_, databasePath_);
-+	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_));
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->get_parameter("motus_rgbd_image_recovery").as_bool()));
  	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database... done!");
  
  	if(rtabmap_.getMemory())
@@ -121,7 +121,7 @@
  
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory...");
  	rtabmap_.init(parameters_, databasePath_);
-+	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_));
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->get_parameter("motus_rgbd_image_recovery").as_bool()));
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory... done!");
  }
  

@@ -133,11 +133,11 @@ def rgb_camera():
 
 
 @pytest.fixture
-def calibrated_node(tmp_path, monkeypatch):
+def calibrated_node(tmp_path, monkeypatch, request):
     import plugins.pointcloud_slam_ros as ros
     monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
     NativeProcess.instances = []
-    n = ros.RtabmapNode('/o', '/c', settings(rgb_input={'topic': '/rgb', 'camera_info': rgb_camera()}),
+    n = ros.RtabmapNode(getattr(request, 'param', '/o'), '/c', settings(rgb_input={'topic': '/rgb', 'camera_info': rgb_camera()}),
                         session_dir=tmp_path / 'session')
     n._receipt_clock = lambda: 1.
     n._measurement_clock_ns = lambda: 1_000_000_000
@@ -642,6 +642,46 @@ def test_pose_less_async_projection_uses_measured_local_motion_without_global_po
     assert len(NativeProcess.instances)==1
 
 
+@pytest.mark.parametrize('calibrated_node', ['/rgbd_odometry/test/state/odom', '/o'], indirect=True)
+@pytest.mark.parametrize('chassis', [False, True])
+def test_searching_rgb_query_waits_for_next_measured_scan(calibrated_node, chassis):
+    from test_pointcloud_slam_stream import odom
+
+    n = calibrated_node
+    send(n)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    if chassis:
+        from test_pointcloud_slam_stream import chassis as chassis_sample
+        n._odom(NS(data=json.dumps(chassis_sample(1050))))
+        n._cloud(cloud(1_050_000_000))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+    before = n.status()['forwarded_clouds']
+    n._active['native_recovery'] = {'state': 'searching'}
+    timeline = _local_motion(n)
+    _motion_result(timeline, 1_100_000_000, 0.)
+    missing = odom(1100)
+    missing['pose'] = None
+    n._odom(NS(data=json.dumps(missing)))
+    image(n, 1101)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda: len(n._motion_waiting) == 1)
+    # The second 2 Hz scan brackets an image captured just after the first.
+    if chassis or n._odom_topic == '/o':
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] > before, timeout=1.)
+        assert not published(n, '/sensor_data')[0].raw_messages[-1].left.data
+        return
+    assert not _wait_until(lambda: n.status()['forwarded_clouds'] > before, timeout=.55)
+    _motion_result(timeline, 1_600_000_000, .5)
+    n._wake.set()
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+    data = published(n, '/sensor_data')[0].raw_messages[-1]
+    assert data.left.header.stamp.nanosec == 101_000_000
+    assert data.laser_scan.header.stamp.nanosec == 100_000_000
+    assert data.local_transform[0].translation.x == pytest.approx(.001)
+    assert published(n, '/odom')[0].raw_messages[-1].pose.pose.orientation.w == 0.
+
+
 def test_async_lost_observation_waits_boundedly_for_actual_motion_result(calibrated_node):
     from test_pointcloud_slam_stream import odom
     n=calibrated_node
@@ -934,7 +974,8 @@ def held_projection(monkeypatch):
     release.set()
 
 
-def test_searching_forwards_a_scan_even_if_rgb_preparation_stays_blocked(calibrated_node, held_projection):
+@pytest.mark.parametrize("rgb_skew_ms", [0, 1])
+def test_searching_forwards_a_scan_even_if_rgb_preparation_stays_blocked(calibrated_node, held_projection, rgb_skew_ms):
     from test_pointcloud_slam_stream import odom
 
     n = calibrated_node
@@ -947,7 +988,11 @@ def test_searching_forwards_a_scan_even_if_rgb_preparation_stays_blocked(calibra
         'Motus/VisualInliers/'], stats_values=[1., 0., 0.]), n._active)
     entered, release = held_projection
     try:
-        image(n, 1100)
+        if rgb_skew_ms:
+            timeline = _local_motion(n)
+            _motion_result(timeline, 1_100_000_000, 0.)
+            _motion_result(timeline, 1_200_000_000, .1)
+        image(n, 1100 + rgb_skew_ms)
         assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
         n._cloud(cloud(1_100_000_000))
         assert entered.wait(1.)

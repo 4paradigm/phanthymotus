@@ -26,10 +26,10 @@ class VisualRecovery
 
 public:
     enum State { External=0, Searching=1, Localized=2, VisualTracking=3, InertialRegistration=4, ScanTracking=5 };
-    explicit VisualRecovery(const rtabmap::ParametersMap & parameters):
+    explicit VisualRecovery(const rtabmap::ParametersMap & parameters, bool rgbdImageRecovery=false):
         neighborIcp_(parameters), state_(External), missing_(false), waiting_(false), aligned_(false),
         localizationMode_(false), relocalizations_(0), visualInliers_(0), imageMode_(false), initialized_(false),
-        recoveryNode_(0), recoveryAnchor_(0), recoveryInliers_(0)
+        recoveryNode_(0), recoveryAnchor_(0), recoveryInliers_(0), rgbdImageRecovery_(rgbdImageRecovery)
     {
         auto p=parameters;
         p["Reg/Strategy"]="0"; // OdometryF2M visual geometry, not scan-only ICP.
@@ -470,7 +470,31 @@ public:
         // is no previous localization node. Keep the last accepted graph.
         const auto previousPoses=map.getLocalOptimizedPoses();
         const auto previousLinks=map.getLocalConstraints();
-        const bool processed=map.process(data,rtabmap::Transform(),covariance,std::vector<float>(),statistics);
+        const auto processQuery=[&](){return map.process(data,rtabmap::Transform(),covariance,std::vector<float>(),statistics);};
+        bool processed;
+        if(rgbdImageRecovery_ && !sawChassis_)
+        {
+            // Archived words can be incompatible with the query even when both
+            // retained RGB-D views register. Recompute only for localization so
+            // mapping continues to retain 3D words and descriptors on new nodes.
+            const auto & parameters=map.getParameters();
+            const auto key=rtabmap::Parameters::kRGBDLoopClosureReextractFeatures();
+            const auto option=parameters.find(key);
+            const rtabmap::ParametersMap restore{{key,option==parameters.end()?
+                rtabmap::Parameters::getDefaultParameters().at(key):option->second}};
+            map.parseParameters({{key,"true"}});
+            try
+            {
+                processed=processQuery();
+            }
+            catch(...)
+            {
+                map.parseParameters(restore);
+                throw;
+            }
+            map.parseParameters(restore);
+        }
+        else processed=processQuery();
         const auto &stats=map.getStatistics();
         // Native loop id is emitted only after registration and graph validation.
         // Proximity and appearance hypotheses alone cannot authorize recovery.
@@ -933,6 +957,7 @@ private:
     std::optional<ScanMapGuess> scanMapGuess_;
     bool retryExternalNeighbor_=false;
     std::optional<ExternalRun> externalRun_, externalOrigin_;
+    bool rgbdImageRecovery_;
     bool sawChassis_=false;
     rtabmap::Transform previousExternal_;
     double previousExternalStamp_=0.;

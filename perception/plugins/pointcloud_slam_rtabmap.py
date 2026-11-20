@@ -73,6 +73,8 @@ def mapping_parameters(database_path, namespace, settings):
                            'RGBD/LoopCovLimited': 'true',
                            'RGBD/ProximityOdomGuess': 'false',
                            'Grid/RangeMax': '0'})
+    if settings.get('rgbd_image_recovery'):
+        parameters['motus_rgbd_image_recovery'] = True
     parameters.update(native_overrides(settings.get('native_parameters', {})))
     return parameters
 

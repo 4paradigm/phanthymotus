@@ -82,6 +82,7 @@ from .pointcloud_normalization import decode_cloud, normalize_cloud
 _MAP_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST, depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 _RGB_WAIT_MS = 20
+_RGB_RESERVATION_SKEW_NS = 20_000_000
 # A measured observation can become a durable visual anchor. Keep its own
 # projection long enough for the measured Tianyi latency (~290 ms p95).
 _MEASURED_RGB_WAIT_MS = 400
@@ -150,8 +151,9 @@ class RtabmapNode(Node):
         # The built-in RGB-D odometer can restart in a new coordinate frame.
         # Scan geometry must verify the new origin even without an RGB wire.
         rgb_connected = self._settings.get('rgb_input') is not None
-        self._scan_origin_recovery = (not rgb_connected and odom_topic.startswith('/rgbd_odometry/')
-                                      and odom_topic.endswith('/state/odom'))
+        generic_visual = odom_topic.startswith('/rgbd_odometry/') and odom_topic.endswith('/state/odom')
+        self._scan_origin_recovery = not rgb_connected and generic_visual
+        self._settings['rgbd_image_recovery'] = rgb_connected and generic_visual
         # A remapped stream may start with a legacy pose and declare its chassis
         # origin later. Keep one native subscription and database across that change.
         self._settings['chassis_origin_recovery'] = True
@@ -361,7 +363,9 @@ class RtabmapNode(Node):
                     self._cloud_ingress[key] = (received, context, depth)
                     while len(self._cloud_ingress) > self.stream.max_pending*3:self._cloud_ingress.popitem(last=False)
                     if self._rgb is not None:
-                        rgb = self._rgb.take(stamp, self._measurement_clock_ns(), exact=True)
+                        searching = self._searching_rgbd()
+                        rgb = self._rgb.take(stamp, self._measurement_clock_ns(),
+                            exact=not searching, max_skew_ns=_RGB_RESERVATION_SKEW_NS if searching else None)
                         if rgb is not None:
                             # Own this image with its waiting cloud, independently
                             # of the decoder's rolling cache and runtime backlog.
@@ -379,6 +383,10 @@ class RtabmapNode(Node):
                 self.stream.last_error = str(error)
         self._wake.set()
 
+    def _searching_rgbd(self):
+        return (self._settings['rgbd_image_recovery'] and self._active is not None and
+                self._active['native_recovery']['state'] == 'searching')
+
     def _queue_frame(self, stamp, cloud, pose, matrix, context):
         key = (stamp,cloud.header.frame_id,hashlib.sha256(cloud.data).hexdigest())
         ingress = self._cloud_ingress.pop(key, None)
@@ -387,6 +395,7 @@ class RtabmapNode(Node):
         received, observation, depth = ingress
         predicted = pose is not None and pose.prediction_anchor_ns is not None
         if pose is not None and pose.chassis_origin is not None:
+            self._settings['rgbd_image_recovery'] = False
             self.stream.on_unlocalized_frame = self._queue_frame
         if predicted and (self.stream.on_unlocalized_frame is None or self._active is None):
             self._rgb_reservations.pop(stamp, None)
@@ -405,6 +414,13 @@ class RtabmapNode(Node):
         self._admission_seq += 1
         # Allow the existing measured-pose wait and one bounded late result.
         rgb_deadline = time.monotonic() + (2 if pose is not None else 1) * _MEASURED_RGB_WAIT_MS / 1000.
+        rgb = self._rgb_reservations.get(stamp)
+        if (pose is None and rgb is not None and 0 < abs(rgb[0]-stamp) <= _RGB_RESERVATION_SKEW_NS and
+                self._searching_rgbd()):
+            # A following scan can bracket the image. Its original ingress
+            # time limits the wait, even if other clouds arrive meanwhile.
+            remaining = self.stream.max_age_s - (self._receipt_clock() - received)
+            rgb_deadline = max(rgb_deadline, time.monotonic() + remaining)
         self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation, rgb_deadline, depth))
         if pose is not None:
             # A usable newer observation supersedes optional unlocalized work;
@@ -729,7 +745,7 @@ class RtabmapNode(Node):
                     raise MotionPending('completed RGB preparation is waiting for its observation')
             if task is None or ready and task[0] != key:
                 future = Future()
-                self._rgb_task = (key, future, cloud)
+                self._rgb_task = (key, future, cloud, time.monotonic())
 
                 def prepare():
                     started = time.perf_counter()
@@ -775,6 +791,8 @@ class RtabmapNode(Node):
                 self._rgb_timeouts += 1
             with self._result_lock:
                 searching = self._active is not None and self._active['native_recovery']['state'] == 'searching'
+            if self._settings['rgbd_image_recovery'] and self._rgb_task[0] == key and pose is None:
+                rgb_deadline = min(rgb_deadline, self._rgb_task[3] + _MEASURED_RGB_WAIT_MS / 1000.)
             if time.monotonic() < rgb_deadline and (pose is None or (searching and self._rgb_task[0] == key)):
                 # Give a late image one bounded chance to accompany its scan.
                 raise MotionPending('optional RGB preparation is pending within the bounded worker')
@@ -881,13 +899,16 @@ class RtabmapNode(Node):
                             item = pending[ready]
                             del pending[ready]
                             break
+                waiting_for_rgb = False
                 if item is None:
-                    pending = self._queue if self._queue else self._motion_waiting
+                    waiting_for_rgb = bool(self._motion_waiting and self._motion_waiting[0][0] in self._rgb_reservations and
+                        self._searching_rgbd())
+                    pending = self._motion_waiting if waiting_for_rgb or not self._queue else self._queue
                     item = pending.popleft() if pending and not self._stopped() else None
                 if item is not None and self._retire_overtaken(item):
                     item = None
                 generation = self._motion_generation
-                if self._queue:
+                if self._queue and not waiting_for_rgb:
                     self._wake.set()
             if item is None:
                 continue

@@ -232,7 +232,7 @@ class RgbLoopInput:
                     self._decoding_stamp = None
                     self._condition.notify_all()
 
-    def take(self, cloud_stamp, now_ns, *, exact=False, wait_s=0.):
+    def take(self, cloud_stamp, now_ns, *, exact=False, wait_s=0., max_skew_ns=None):
         with self._condition:
             if wait_s > 0:
                 # Only wait for an already received matching JPEG. This is a
@@ -252,6 +252,8 @@ class RgbLoopInput:
                 self._fallback('no decoded RGB available')
                 return None
             selected = min(candidates, key=lambda item: abs(item[0]-cloud_stamp))
+            if max_skew_ns is not None and abs(selected[0]-cloud_stamp)>max_skew_ns:
+                return None
             self._used_stamp = selected[0]
             selected_index = min(range(len(self._frames)), key=lambda i: abs(self._frames[i][0]-cloud_stamp))
             del self._frames[selected_index]
