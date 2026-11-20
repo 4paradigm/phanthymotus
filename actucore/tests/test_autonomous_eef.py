@@ -21,11 +21,12 @@ def descriptor(sides=("left", "right")):
                        (("eef", 0, 7, "m+quat_xyzw"), ("gripper", 7, 1, "m"))]}
 
 
-def robot(sides=("left", "right")):
+def robot(sides=("left", "right"), **interface_fields):
     node = Mock()
     pub = node.create_publisher.return_value
     pub.get_subscription_count.return_value = 1
-    endpoint = eef.EefEndpoint(node, "/state", "/control", eef.EefInterface(descriptor(sides)))
+    interface = eef.EefInterface({**descriptor(sides), **interface_fields})
+    endpoint = eef.EefEndpoint(node, "/state", "/control", interface)
     return endpoint, node, pub
 
 
@@ -129,7 +130,7 @@ def test_relative_rotation_about_tcp_uses_base_axes_and_measured_other_arm():
 
 
 def test_gripper_no_motion_is_not_success_and_error_is_reported():
-    endpoint, _, pub = robot()
+    endpoint, _, pub = robot(pose_tolerance={"position_m": .01, "orientation_rad": .1})
     start = full()
     result = drive(endpoint, "right_set_gripper", {"opening_mm": 3}, start, [start]*30)
     assert pub.publish.call_count == 1
@@ -138,6 +139,36 @@ def test_gripper_no_motion_is_not_success_and_error_is_reported():
     assert not result["target_reached"] and not result["displacement_observed"]
     assert result["requested_opening_mm"] == 3 and result["actual"]["opening_mm"] == 0
     assert result["feedback_frames"] >= 20
+
+
+@pytest.mark.parametrize("field,position_error,angle_error,reached", [
+    ({}, .0009, .009, True),
+    ({}, .0011, .009, False),
+    ({}, .0009, .015, False),  # Older descriptions also use the 0.01 rad completion limit.
+    ({"pose_tolerance": {"position_m": .002, "orientation_rad": .03}}, .0015, .025, True),
+    ({"pose_tolerance": {"position_m": .002, "orientation_rad": .03}}, .0021, .025, False),
+    ({"pose_tolerance": {"position_m": .002, "orientation_rad": .03}}, .0015, .031, False),
+])
+def test_settled_pose_uses_downstream_completion_tolerances(field, position_error, angle_error, reached):
+    endpoint, _, _ = robot(**field)
+    start = full()
+    actual = list(start)
+    actual[0] += .02 - position_error
+    actual[3:7] = [0., math.sin(angle_error / 2), 0., math.cos(angle_error / 2)]
+    result = drive(endpoint, "left_move_by", {"translation_m": [.02, 0, 0], "rotation_vector_rad": [0, 0, 0]},
+                   start, [actual] * 30)
+    assert result["target_reached"] is reached and result["displacement_observed"]
+    assert result["position_error_m"] == pytest.approx(position_error)
+    assert result["angle_error_rad"] == pytest.approx(angle_error)
+
+
+@pytest.mark.parametrize("tolerance", [None, {"position_m": .001},
+                         {"position_m": True, "orientation_rad": .01},
+                         {"position_m": .001, "orientation_rad": float("nan")},
+                         {"position_m": -.01, "orientation_rad": .01}])
+def test_malformed_pose_tolerance_fails_at_wiring(tolerance):
+    with pytest.raises(ValueError, match="pose_tolerance"):
+        robot(pose_tolerance=tolerance)
 
 
 def test_slow_start_and_short_close_keep_clamping_force_on_next_step():

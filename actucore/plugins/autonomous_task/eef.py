@@ -62,6 +62,12 @@ class EefInterface:
                 or not all(isinstance(v, str) and v.strip() for v in tips.values())):
             raise ValueError("Expected named left and/or right TCP tip_frames")
         self.tip_frames = dict(tips)
+        tolerance = descriptor.get("pose_tolerance", {"position_m": .001, "orientation_rad": .01})
+        if (not isinstance(tolerance, dict)
+                or not all(_number(tolerance.get(k)) and tolerance[k] >= 0
+                           for k in ("position_m", "orientation_rad"))):
+            raise ValueError("pose_tolerance requires finite nonnegative position_m and orientation_rad")
+        self.pose_tolerance = (tolerance["position_m"], tolerance["orientation_rad"])
         self.opening_m = tuple(_vector(descriptor.get("opening_m"), 2))
         if not 0 <= self.opening_m[0] < self.opening_m[1]:
             raise ValueError("Invalid gripper opening_m range")
@@ -300,6 +306,8 @@ class EefEndpoint:
     def _feedback(self, key, command_stamp, start, goal):
         side, kind = key
         sl = self.interface.offsets[key]
+        # The jaw's opening tolerance is independent of Cartesian pose accuracy.
+        tolerance = self.interface.pose_tolerance if kind == "eef" else (.001, 0.)
         after = anchor_stamp = command_stamp
         anchor = start
         count = steady_frames = 0
@@ -314,7 +322,7 @@ class EefEndpoint:
             after, actual = stamp, values[sl]
             count += 1
             moved |= not _near(actual, start, .0005, .006)
-            reached = _near(actual, goal, .001, .02)
+            reached = _near(actual, goal, *tolerance)
             if count == 1 or gap > 600 or not _near(actual, anchor, .00035, .004):
                 anchor, anchor_stamp, steady_frames = actual, stamp, 0
             steady_frames += 1
