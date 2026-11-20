@@ -9,7 +9,13 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前提供 `vla` 与 `navi` 卡片，均默认开启。** `enabled` 只决定卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+**当前提供 `vla`、`navi` 与 `motion` 卡片，均默认开启。** `enabled` 只决定卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+
+`motion` 在主画布的内嵌工作台中管理动作数据、SuperMimic 训练、评测和模型导出，
+与 Driver 仓库的 `simulator/mujoco` 卡片连接同一个独立 GPU 服务。仅打开卡片不会启动训练。
+服务器连接和完整操作顺序见 [SuperMimic 使用指南](../docs/supermimic/USER_GUIDE_ZH.md)，
+实现边界和验证方法见 [审阅指南](../docs/supermimic/REVIEW_GUIDE_ZH.md)，
+服务部署/API 见 [motion_service/README.md](motion_service/README.md)。
 
 ## `vla` 卡片
 

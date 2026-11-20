@@ -1,0 +1,13 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>/* @include design.css */
+/* @include workbench-v4.css */</style></head><body class="simulation-workbench">
+<header><span class="muted">MuJoCo</span><span class="grow"></span><span id="targetName" class="muted">未连接</span><button id="connection" class="small">连接</button></header>
+<main><section id="sessionsView" class="tab sessions-view"><div class="page-heading"><div><span class="eyebrow">MuJoCo</span><h2>调试会话</h2></div><button id="refreshSessions" class="small">刷新</button></div><div class="session-overview"><div id="sessionList" class="session-list"></div><aside class="new-session panel stack"><h3>新建场景</h3><label>机器人<select id="profile"></select></label><label>策略<select id="model"></select></label><label id="modeField">控制方式<select id="controlMode"><option value="pd_hold">保持姿态</option><option value="free_physics">自由物理</option></select></label><div id="modelBinding" class="muted"></div><button id="create" class="primary" disabled>创建并打开</button></aside></div></section>
+<!-- @include simulation-view.html -->
+</main><footer id="appStatus" role="status" aria-live="polite">正在连接</footer>
+<dialog id="settings"><div class="stack"><div class="row"><h2 class="grow">连接服务器</h2><button id="closeSettings" class="small" aria-label="关闭">✕</button></div><div id="connectionCurrent" class="muted"></div><label>已准备环境<select id="environmentRef"><option value="">选择环境</option></select></label><button id="useEnvironment" class="primary" disabled>连接此环境</button><details id="manualConnection"><summary>手动连接服务</summary><div class="stack"><label>服务地址<input id="endpoint" type="url" autocomplete="off"></label><label>访问凭证<input id="apiKey" type="password" autocomplete="new-password"></label><span id="keyState" class="muted"></span><button id="saveConnection">保存连接</button></div></details><button id="checkConnection">测试当前连接</button><div id="health" class="muted"></div></div></dialog>
+<script>
+'use strict';
+/* @include connections.js */
+/* @include simulation.js */
+/* @include simulation-shell.js */
+</script></body></html>

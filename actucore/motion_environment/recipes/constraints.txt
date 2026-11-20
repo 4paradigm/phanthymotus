@@ -1,0 +1,10 @@
+# Compatibility-critical versions verified with this official G1 asset bundle.
+torch==2.14.1+cu126
+warp-lang==1.18.0+cu12
+mujoco==3.16.0
+mujoco-warp==3.16.0
+mjviser==0.0.16
+rsl-rl-lib==5.5.2
+onnxruntime==1.23.2
+# mjviser 0.0.16 requires Pillow >= 12.3.0.
+Pillow==12.3.0
