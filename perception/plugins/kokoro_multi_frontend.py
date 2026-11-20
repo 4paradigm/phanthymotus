@@ -98,12 +98,12 @@ _NUMBER = re.compile(r"(?<![A-Za-z0-9_.])" + _NUM + r"(?![A-Za-z0-9_]|\.[A-Za-z0
 _CODE = re.compile(r"(?<![A-Za-z0-9_.])(?:[A-Z]+\d[A-Z0-9]*|\d+[A-Z][A-Z0-9]*)"
                    r"(?:[-_][A-Z0-9]+)*(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])")
 _FORMULA_LIKE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:[+\-−][ \t]*)?[A-Za-z\u0370-\u03ff0-9_().]+"
-    r"(?:[²³][A-Za-z\u0370-\u03ff0-9_().]*|"
-    r"[ \t]*[+\-−‑×·*/÷^=<>≤≥≠≈][ \t]*[+\-−]?[ \t]*[A-Za-z\u0370-\u03ff0-9_().]*)+"
+    r"(?<![A-Za-z0-9_])(?:[+\-−][ \t]*)?[A-Za-z\u0370-\u03ff0-9_().√]+"
+    r"(?:[²³][A-Za-z\u0370-\u03ff0-9_().√]*|"
+    r"[ \t]*[+\-−‑×·*/÷^=<>≤≥≠≈][ \t]*[+\-−]?[ \t]*[A-Za-z\u0370-\u03ff0-9_().√]*)+"
     r"|(?<![A-Za-z0-9_])[A-Za-z]+[ \t]*\([A-Za-z\u0370-\u03ff0-9_().+\-−‑×·*/÷^²³ \t]+\)"
 )
-_TOKEN = re.compile(_NUM + r"|[A-Za-z]+|π|[()+\-−×·*÷/^²³=<>≤≥≠≈]")
+_TOKEN = re.compile(_NUM + r"|[A-Za-z]+|π|[()+\-−×·*÷/^²³=<>≤≥≠≈√]")
 _COMMA_LANGUAGES = {"de", "fr", "es", "ru"}
 _RU_UNIT_ALIASES = {
     "ГБ": "GB", "мс": "ms", "ms": "ms", "кВт": "kW", "Вт": "W",
@@ -124,6 +124,13 @@ _IDENTIFIER_CUES = {
     "fr": r"code de vérification(?: fictif)?|numéro de commande",
     "es": r"código de verificación(?: ficticio)?|número de pedido",
     "th": r"รหัสยืนยัน(?:สมมติ)?(?:ของคุณ)?|หมายเลขคำสั่งซื้อ",
+}
+_ORDER_CUES = {"zh": r"订单", "fr": r"commande", "es": r"pedido", "de": r"Bestellung"}
+_LEADING_ZERO_CODE_CUES = {"fr": r"code", "es": r"código", "de": r"Code"}
+_ALPHANUMERIC_CODE_CUES = {
+    "zh": r"编号|代号|编码|验证码|型号", "en": r"code|identifier|model(?: number)?",
+    "ja": r"コード|識別子|型番", "ru": r"код|модель", "de": r"Code|Modell",
+    "fr": r"code|modèle", "es": r"código|modelo", "th": r"รหัส|รุ่น",
 }
 
 _lexicon_path = None
@@ -363,8 +370,23 @@ def _quantity(value, unit, language, cfg, genitive_decimal=False):
     forms = (["милли" + form for form in cfg["units"]["second"]["ru"]]
              if language == "ru" and unit == "ms" else cfg["units"][unit][language])
     unit_words = _unit_form(forms, value, language)
+    if unit in {"m²", "m³"} and language == "ru" and re.search(r"[.,]", value):
+        unit_words = unit_words.replace("квадратных", "квадратного").replace("кубических", "кубического")
+    if (unit in {"m²", "m³", "m/s", "km/h", "MB", "MB/s", "Mbps", "Gbps", "°C", "°F"} and language == "fr" and
+            abs(Decimal(value.replace("−", "-").replace(",", "."))) < 2):
+        unit_words = forms[0]
     template = cfg.get("quantity_templates", {}).get(unit, {}).get(language)
     return template.format(number=words, unit=unit_words) if template else _join([words, unit_words], language)
+
+
+def _ja_month_day(month, day):
+    months = ("いち", "に", "さん", "し", "ご", "ろく", "しち", "はち", "く", "じゅう", "じゅういち", "じゅうに")
+    days = ("ついたち", "ふつか", "みっか", "よっか", "いつか", "むいか", "なのか", "ようか", "ここのか", "とおか",
+            "じゅういちにち", "じゅうににち", "じゅうさんにち", "じゅうよっか", "じゅうごにち", "じゅうろくにち",
+            "じゅうしちにち", "じゅうはちにち", "じゅうくにち", "二十日", "にじゅういちにち", "にじゅうににち",
+            "にじゅうさんにち", "にじゅうよっか", "にじゅうごにち", "にじゅうろくにち", "にじゅうしちにち",
+            "にじゅうはちにち", "にじゅうくにち", "さんじゅうにち", "さんじゅういちにち")
+    return f"{months[month-1]}がつ {days[day-1]}"
 
 
 def _date(raw, language, cfg, *, german_dative=False, russian_accusative=False):
@@ -373,7 +395,7 @@ def _date(raw, language, cfg, *, german_dative=False, russian_accusative=False):
     if language == "zh":
         return f"{_digits(str(year), language, cfg)}年{_integer(month, language)}月{_integer(day, language)}日"
     if language == "ja":
-        return f"{_integer(year, language)}年{_integer(month, language)}月{_integer(day, language)}日"
+        return f"{_integer(year, language)}年 {_ja_month_day(month, day)}"
     if language == "ru":
         d = _integer(day, language, to="ordinal", gender="neuter",
                      case="accusative" if russian_accusative else "genitive")
@@ -420,6 +442,8 @@ def _clock(raw, duration, language, cfg):
             result += ("零" if 0 < minute < 10 else "") + _integer(minute, language) + "分" if minute or len(values) == 3 else "整"
     elif language == "de":
         result = ("ein" if hour == 1 else _integer(hour, language)) + " Uhr" + (" " + _integer(minute, language) if minute else "")
+    elif language == "fr" and minute == 0 and len(values) == 2:
+        result = {0: "minuit", 12: "midi"}.get(hour) or _quantity(str(hour), "hour", language, cfg)
     elif language == "th":
         result = _integer(hour, language) + "นาฬิกา" + (_integer(minute, language) + "นาที" if minute else "")
     else:
@@ -441,11 +465,21 @@ class _MathParser:
         self.pos += 1
         if token in {"+", "-", "−"}:
             node = ("unary", token, self.expression(30))
+        elif token == "√":
+            argument = self.expression(30)
+            node = ("function", "sqrt", argument[1] if argument[0] == "group" else argument)
         elif token == "(":
             node = ("group", self.expression())
             if self.pos >= len(self.tokens) or self.tokens[self.pos] != ")":
                 raise ValueError("unbalanced parentheses")
             self.pos += 1
+        elif token.lower() in {"f", "g", "h", "sin", "cos", "tan", "log", "ln", "sqrt"} and self.pos < len(self.tokens) and self.tokens[self.pos] == "(":
+            self.pos += 1
+            argument = self.expression()
+            if self.pos >= len(self.tokens) or self.tokens[self.pos] != ")":
+                raise ValueError("unbalanced function argument")
+            self.pos += 1
+            node = ("function", token.lower(), argument)
         elif re.fullmatch(_NUM, token) or re.fullmatch("[A-Za-z]{1,3}|π", token):
             node = ("atom", token)
         else:
@@ -489,6 +523,13 @@ def _speak_math(node, language, cfg):
         return _number(atom, language, cfg) if atom[0].isdigit() else _join([letters.get(c.lower(), c) for c in atom], language)
     if kind == "group":
         return _join([words["left"], _speak_math(node[1], language, cfg), words["right"]], language)
+    if kind == "function":
+        names = cfg.get("math_function_words", {}).get(language, {})
+        if len(node[1]) > 1 and node[1] not in names:
+            raise ValueError("function pronunciation is not configured")
+        name = names.get(node[1], cfg["letters"][language].get(node[1], node[1]))
+        return _join([name, words["left"],
+                      _speak_math(node[2], language, cfg), words["right"]], language)
     if kind == "unary":
         operand = _speak_math(node[2], language, cfg)
         if node[2][0] in {"binary", "relation"}:
@@ -663,6 +704,61 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
             add(label.start() if label else match.start(), match.end(), "iso_date",
                 lambda m=match, d=dative, a=accusative: _date(
                     m.group(), language, cfg, german_dative=d, russian_accusative=a))
+    # Numeric dates are only interpreted with an explicit calendar cue.  In
+    # English a day/month pair below 13 is ambiguous without a locale.
+    date_cues = {
+        "en": r"\b(?:date(?:\s+is)?|dated|on)",
+        "de": r"\b(?:datum(?:\s+ist)?|am)",
+        "fr": r"\b(?:date(?:\s+est)?(?:\s+le)?|le)",
+        "es": r"\b(?:fecha(?:\s+es)?(?:\s+el)?|el)",
+        "ru": r"(?:дата|датой|на|от)",
+        "ja": r"(?:日付(?:は|が|：|:)?|日時(?:は|が|：|:)?)",
+        "th": r"วันที่",
+    }
+    pattern = r"(?<![A-Za-z0-9_./-])(?P<a>\d{1,4})(?P<sep>[/.])(?P<b>\d{1,2})(?P=sep)(?P<c>\d{1,4})(?![A-Za-z0-9_]|[./-]\d)"
+    if language in date_cues:
+        for match in re.finditer(pattern, text):
+            prefix = text[max(0, match.start()-40):match.start()]
+            calendar_prefix = re.search(date_cues[language] + r"[ \t:：]*$", prefix, re.I)
+            suffix = text[match.end():]
+            calendar_suffix = (
+                language == "ja" and len(match["a"]) == 4 and
+                re.match(r"(?:に|の|から|まで|は)", suffix)
+            ) or (
+                language == "th" and len(match["c"]) == 4 and
+                re.match(r"[ \t]*(?:เป็น|ตรงกับ)[ \t]*วัน(?:จันทร์|อังคาร|พุธ|พฤหัสบดี|ศุกร์|เสาร์|อาทิตย์)", suffix)
+            )
+            if not calendar_prefix and not calendar_suffix:
+                continue
+            if has_explicit_math_context(text, match.start()):
+                continue
+            local = _context(text, match.start(), match.end())
+            if any(cue in local for cue in ("พ.ศ.", "佛历", "佛曆", "buddhist")):
+                add(match.start(), match.end(), "calendar_requires_context", lambda m=match: m.group())
+                continue
+            a, b, c = match.group("a", "b", "c")
+            if len(a) == 4 and len(c) <= 2:
+                year, month, day = a, b, c
+            elif len(c) == 4 and len(a) <= 2 and language != "ja":
+                if language == "en" and int(a) <= 12 and int(b) <= 12:
+                    add(match.start(), match.end(), "ambiguous_date_format", lambda m=match: m.group())
+                    continue
+                year, month, day = (c, a, b) if language == "en" else (c, b, a)
+            else:
+                add(match.start(), match.end(), "ambiguous_date_format", lambda m=match: m.group())
+                continue
+            raw = f"{year}-{month}-{day}"
+            try:
+                date(int(year), int(month), int(day))
+            except ValueError:
+                add(match.start(), match.end(), "invalid_date", lambda m=match: m.group())
+                continue
+            dative = language == "de" and bool(re.search(r"\bam\s*$", prefix, re.I))
+            accusative = language == "ru" and bool(re.search(r"\bна\s*$", prefix, re.I))
+            label = re.search(r"วันที่[ \t]*$", prefix) if language == "th" else None
+            start = match.start() - len(prefix) + label.start() if label else match.start()
+            add(start, match.end(), "calendar_date", lambda value=raw, d=dative, a=accusative:
+                _date(value, language, cfg, german_dative=d, russian_accusative=a))
     if language == "de":
         for match in re.finditer(r"\bam\s+(?P<day>\d{1,2})\.(?P<month>\d{1,2})\."
                                  r"(?P<year>\d{4})(?![A-Za-z0-9_]|\.\d)", text, re.I):
@@ -682,6 +778,31 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
                 date(y, month, int(m["day"]))
                 return m["month"] + " " + _integer(int(m["day"]), "en", to="ordinal")
             add(match.start(), match.end(), "english_named_date", named_date)
+    if language == "ja":
+        date_number = r"(?:\d{1,2}|[一二三四五六七八九十]{1,3})"
+        for match in re.finditer(r"(?<![A-Za-z0-9_.])(?P<month>" + date_number +
+                                 r")月[ \t]*(?P<day>" + date_number + r")日(?!間|後|前|目|分)", text):
+            prefix = text[max(0, match.start()-12):match.start()]
+            year = re.search(r"(?<!\d)(\d{4})年[ \t]*$", prefix)
+            def japanese_date(m=match, y=int(year[1]) if year else 2000):
+                def value(raw):
+                    return int(raw) if raw.isdecimal() else next(
+                        (n for n in range(1, 32) if _ja_integer(n) == raw), 0)
+                month, day = value(m["month"]), value(m["day"])
+                date(y, month, day)
+                return " " + _ja_month_day(month, day) + " "
+            add(match.start(), match.end(), "japanese_month_day", japanese_date)
+    # Protect complete unit-shaped identifiers before shared numeric rules can
+    # claim just their numeric or single-letter prefix.
+    if cfg.get("contextual_units"):
+        for match in _unit_pattern(language).finditer(text):
+            unit = cfg["unit_symbol_aliases"].get(match["u"], match["u"])
+            prefix = text[max(0, match.start()-64):match.start()]
+            if (unit in cfg["contextual_units"] and
+                    (identifier_prefix.search(prefix) or re.search(
+                        r"(?:" + _ALPHANUMERIC_CODE_CUES[language] + r")[ \t:：#=]*$", prefix, re.I))):
+                add(match.start(), match.end(), "quantity_or_identifier_requires_context",
+                    lambda m=match: m.group())
     if language in {"zh", "en"} and re.search(r"\d", text):
         def read_number(value, lang):
             return _number(value, lang.lower(), cfg)
@@ -757,7 +878,11 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
             if any(re.search(r"(?<!\w)" + re.escape(cue) + r"(?!\w)", prefix, re.I)
                    for cue in cfg["duration_cues"]["fr"]):
                 continue
-            if re.search(r"(?<!\w)(?:à|de|entre|vers|dès|jusqu['’]à|horaire(?: est)?|heure(?: est)?)[ \t:]*$", prefix, re.I):
+            clock_prefix = re.search(r"(?<!\w)(?:à|de|entre|vers|dès|jusqu['’]à|horaire(?: est)?|heure(?: est)?)[ \t:]*$", prefix, re.I)
+            coordinated_clock = (re.search(r"\b(?:et|ou)[ \t]*$", prefix, re.I)
+                                 and _FR_CLOCK.search(prefix)
+                                 and any(note.startswith("notation:french_clock:") for note in notes))
+            if clock_prefix or coordinated_clock:
                 add(match.start(), match.end(), "french_clock",
                     lambda m=match: _clock(m["h"] + ":" + m["m"], False, "fr", cfg))
     if language == "ja":
@@ -782,6 +907,19 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
         unit = cfg["unit_symbol_aliases"].get(match["u"], match["u"])
         if language == "ru":
             unit = _RU_UNIT_ALIASES.get(unit, unit)
+        contextual = cfg.get("contextual_units", {}).get(unit)
+        if contextual:
+            context = _context(text, match.start(), match.end())
+            cues = contextual.get(language, ())
+            has_cue = any(re.search(r"(?<!\w)" + re.escape(cue) + r"(?!\w)", context, re.I)
+                          if cue.isascii() else cue.lower() in context for cue in cues)
+            prefix = text[max(0, match.start()-64):match.start()]
+            identifier = re.search(r"(?:" + _ALPHANUMERIC_CODE_CUES[language] +
+                                   r")[ \t:：#=]*$", prefix, re.I)
+            if (not has_cue or has_explicit_math_context(text, match.start()) or
+                    identifier or identifier_prefix.search(prefix) or
+                    text[match.end():].lstrip(" \t").startswith(tuple("=<>≤≥≠≈+−-×*/÷^"))):
+                continue
         # Keep single-letter operands in algebra on the existing math path.
         if len(unit) == 1 and any(start <= match.start() and match.end() <= end for start, end in formula_ranges):
             continue
@@ -843,6 +981,33 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
                 lambda v=value, p=prefix: _digits(v, language, cfg)
                 if v.isdigit() and identifier_prefix.search(p) else _number(v, language, cfg))
 
+    code_prefix = re.compile(r"(?:" + _ALPHANUMERIC_CODE_CUES[language] +
+                             r")[ \t:：#=]*$", re.I)
+    for match in re.finditer(r"√[ \t]*[A-Za-z0-9]+(?![A-Za-z0-9_])", text):
+        if code_prefix.search(text[max(0, match.start()-64):match.start()]):
+            add(match.start(), match.end(), "quantity_or_identifier_requires_context", lambda m=match: m.group())
+    mantissa = r"\d+(?:[.,]\d+)?" if language in _COMMA_LANGUAGES else r"\d+(?:\.\d+)?"
+    scientific = re.compile(r"(?<![A-Za-z0-9_.,])(?P<n>[+\-−]?" + mantissa +
+                            r"[eE][+\-]?\d{1,3})(?![A-Za-z0-9_]|\.\d|,\d)")
+    for match in scientific.finditer(text):
+        prefix = text[max(0, match.start()-64):match.start()]
+        suffix = text[match.end():].lstrip(" \t")
+        if (identifier_prefix.search(prefix) or code_prefix.search(prefix) or
+                re.search(r"(?:version|versión|versione|バージョン|版本|версия|เวอร์ชัน)[ \t:：]*$", prefix, re.I) or
+                re.search(r"(?:√|\b(?:f|g|h|sin|cos|tan|log|ln|sqrt))[ \t]*\([ \t]*$", prefix, re.I) or
+                prefix.rstrip(" \t").endswith(tuple("=<>≤≥≠≈+−-×*/÷^")) or
+                suffix.startswith(tuple("=<>≤≥≠≈+−-×*/÷^"))):
+            continue
+        add(match.start(), match.end(), "scientific_number",
+            lambda value=match["n"]: _number(value, language, cfg))
+    for match in re.finditer(r"(?<![A-Za-z0-9_])(?P<letter>[A-Za-z])-(?P<digits>\d+)(?P<suffix>[A-Za-z]?)(?![A-Za-z0-9_]|\.\d)", text):
+        prefix = text[max(0, match.start()-64):match.start()]
+        if code_prefix.search(prefix):
+            add(match.start(), match.end(), "alphanumeric_code", lambda m=match: _join([
+                cfg["letters"][language][m["letter"].lower()], cfg["operator_words"][language]["dash"],
+                _digits(m["digits"], language, cfg),
+                *([cfg["letters"][language][m["suffix"].lower()]] if m["suffix"] else [])], language))
+
     for match in _AMBIGUOUS_PAIR.finditer(text):
         context = _context(text, match.start(), match.end())
         if not any(cue in context for cue in cfg["math_cues"][language]) and not any(op in context for op in "=<>≤≥≠≈"):
@@ -873,15 +1038,16 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
             if overlaps(start, end):
                 continue
             raw = text[start:end]
-        mathematical = any(op in raw for op in "=<>≤≥≠≈^²³×·*/÷") or any(
+        mathematical = any(op in raw for op in "=<>≤≥≠≈^²³×·*/÷√") or any(
             cue in _context(text, start, end) for cue in cfg["math_cues"][language])
         parsed = raw.replace("‑", "-") if mathematical else raw
         matches = list(token_pattern.finditer(parsed))
         values = [m.group().replace(",", ".") if language in _COMMA_LANGUAGES else m.group() for m in matches]
         covered = token_pattern.sub("", parsed).strip()
-        strong = any(v in _RELATIONS or v in {"^", "²", "³", "×", "·", "*", "÷"} for v in values)
+        strong = any(v in _RELATIONS or v in {"^", "²", "³", "×", "·", "*", "÷", "√"} for v in values)
         strong |= bool(re.fullmatch(r"[A-Za-z][ \t]*\+[ \t]*[A-Za-z]", parsed))
         strong |= any(v.isdigit() or (language in _COMMA_LANGUAGES and re.fullmatch(_NUM, v)) for v in values) and any(v in {"+", "-", "−"} for v in values)
+        strong |= any("e" in v.lower() and re.fullmatch(_NUM, v) for v in values) and any(v in {"+", "-", "−"} for v in values)
         strong |= any(cue in _context(text, start, end) for cue in cfg["math_cues"][language])
         try:
             if covered or not strong:
@@ -909,11 +1075,12 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
             if text[tokens[last-1].end():end_token.start()].strip() or overlaps(end_token.start(), end_token.end()):
                 break
             values = [t.group().replace(",", ".") if language in _COMMA_LANGUAGES else t.group() for t in tokens[first:last+1]]
-            if not any(v in _RELATIONS or v in {"^", "²", "³", "+", "-", "−", "×", "·", "*", "÷", "/"} for v in values):
+            if not any(v in _RELATIONS or v in {"^", "²", "³", "+", "-", "−", "×", "·", "*", "÷", "/", "√"} for v in values):
                 continue
             # A bare a-b or 3/4 is also a label/date/fraction: require context.
-            strong = any(v in _RELATIONS or v in {"^", "²", "³", "×", "·", "*", "÷"} for v in values)
+            strong = any(v in _RELATIONS or v in {"^", "²", "³", "×", "·", "*", "÷", "√"} for v in values)
             strong |= any(v.isdigit() or (language in _COMMA_LANGUAGES and re.fullmatch(_NUM, v)) for v in values) and any(v in {"+", "-", "−"} for v in values)
+            strong |= any("e" in v.lower() and re.fullmatch(_NUM, v) for v in values) and any(v in {"+", "-", "−"} for v in values)
             strong |= any(cue in _context(text, token.start(), end_token.end()) for cue in cfg["math_cues"][language])
             if not strong:
                 continue
@@ -950,10 +1117,18 @@ def normalize_notation(text: str, language: str, *, lexical_spans=()) -> tuple[s
         prefix = text[max(0, match.start()-64):match.start()]
         phone = language == "zh" and re.fullmatch(r"\d{7,15}", match.group()) and re.search(
             r"(?:联系电话|电话号码|手机号码|手机号|电话)(?:为|是)?[ \t:：]*$", prefix)
+        order = (language in _ORDER_CUES and re.fullmatch(r"\d{10,}", match.group()) and
+                 re.search(r"(?<![A-Za-z0-9_])(?:" + _ORDER_CUES[language] +
+                           r")[ \t:：#=]*$", prefix, re.I) and
+                 not re.match(r"[ \t]*(?:元|万元|亿元|€|\$|euros?\b|dólares?\b|dollars?\b)",
+                              text[match.end():], re.I))
+        zero_code = (language in _LEADING_ZERO_CODE_CUES and re.fullmatch(r"0\d+", match.group()) and
+                     re.search(r"(?<![A-Za-z0-9_])(?:" + _LEADING_ZERO_CODE_CUES[language] +
+                               r")[ \t:：#=]*$", prefix, re.I))
         if language not in _COMMA_LANGUAGES and re.search(r"\d,$", prefix) and text[match.end():].startswith("."):
             # Preserve an unsupported comma-number fragment rather than just its tail.
             add(match.start(), match.end(), "ambiguous_comma_fragment", lambda m=match: m.group())
-        elif match.group().isdigit() and (phone or identifier_prefix.search(prefix)):
+        elif match.group().isdigit() and (phone or order or zero_code or identifier_prefix.search(prefix)):
             add(match.start(), match.end(), "identifier_digits", lambda m=match: _digits(m.group(), language, cfg))
         elif (language == "de" and re.fullmatch(r"\d+\.\d+", match.group())
               and re.search(r"\b(?:Raum|Zimmer)[ \t]*$", prefix, re.I)):
