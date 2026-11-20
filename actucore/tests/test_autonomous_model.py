@@ -372,3 +372,23 @@ def test_published_gripper_target_without_measured_motion_stays_unverified(monke
     context = json.loads(sent[-1]["input"][0]["content"][0]["text"])
     assert name == "observe" and context["actual_action_history"] == history
     assert context["measured_event_observations"] == []
+
+
+def test_model_receives_unmoved_targets_and_can_select_a_new_approach_orientation(monkeypatch, model):
+    tcp = {"position_m": [.4, .2, .1], "quaternion_xyzw": [0, 0, 0, 1]}
+    state = measured(arms={"left": {"eef": tcp, "gripper": {"opening_mm": 30}}})
+    history = [{"step": step, "tool": "left_move_by",
+                "args": {"translation_m": delta, "rotation_vector_rad": [0, 0, 0]},
+                "feedback": {"status": "no_motion_observed", "actual": tcp, "target_reached": False,
+                             "motion_sent": True, "displacement_observed": False}}
+               for step, delta in enumerate(([.02, 0, 0], [0, .015, 0]), 1)]
+    new_pose = {"translation_m": [0, 0, 0], "rotation_vector_rad": [0, .04, 0]}
+    def send(payload):
+        context = json.loads(payload["input"][0]["content"][0]["text"])
+        assert context["actual_action_history"] == history
+        assert context["current_measured_state"] == state
+        assert "slightly change TCP orientation" in payload["instructions"]
+        assert "outcome_unknown" in payload["instructions"]
+        return reply(call("left_move_by", new_pose))
+    monkeypatch.setattr(model, "_post", send)
+    assert model.decide("approach", ["left"], {"head": b"current"}, state, history) == ("left_move_by", new_pose)

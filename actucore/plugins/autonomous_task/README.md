@@ -38,7 +38,7 @@ TRON2 左臂实验接入 `camera`、`camera_left` 和 `/limx_tron2/state/eef`，
 | `move_by` | `translation_m`、`rotation_vector_rad` | 从本轮实测 TCP 出发，沿参考系轴平移，以 TCP 自身为中心按参考系旋转向量转动 |
 | `set_gripper` | `opening_mm` | 夹爪的名义开口（毫米），工具可用范围由下游声明 |
 
-相对目标按 `p' = p + Δp`、`R' = Exp(Δr) · R` 合成。模型推理期间手的位置发生明显变化时，卡片重新观测。卡片将一次相对决策限制在 10 厘米和 30 度内，实际限速、逆解和硬件下发由执行卡处理。工具使用观测中的 `eef_frame` 和 `reference_label`。例如 TRON2 的左右 TCP 分别是 `L_ee_link` 和 `R_ee_link`，两者都在 `base_Link` 中表达。当前反馈可以直接作为绝对目标。迁移旧版 TRON2 记录的 grasper 绝对位姿时，需要做一次参考点换算，`p_tcp = p_grasper + R_grasper × [-0.0021, 0, -0.1313] m`，四元数相同。
+相对目标按 `p' = p + Δp`、`R' = Exp(Δr) · R` 合成。模型推理期间手的位置发生明显变化时，卡片重新观测。卡片将一次相对决策限制在 10 厘米和 30 度内，实际限速、逆解和硬件下发由执行卡处理。工具使用观测中的 `eef_frame` 和 `reference_label`。`axes_in_reference` 给出 TCP 局部三根轴在参考系中的方向，可与实例声明的夹爪安装约定结合。例如 TRON2 的左右 TCP 分别是 `L_ee_link` 和 `R_ee_link`，两者都在 `base_Link` 中表达。当前反馈可以直接作为绝对目标。迁移旧版 TRON2 记录的 grasper 绝对位姿时，需要做一次参考点换算，`p_tcp = p_grasper + R_grasper × [-0.0021, 0, -0.1313] m`，四元数相同。
 
 对于 TRON2，`state/eef` 和 `control/eef` 两端都是 ROS 2 的 `std_msgs/String`，内容为带 `schema`、`frame`、`stamp_ms`、`values` 的 JSON。`tron2.eef/1` 的 16 项依次为左 TCP 的 xyz 和 xyzw、左开口、右 TCP 的 xyz 和 xyzw、右开口。线上位置和开口都使用米。每条指令生成递增的 Unix 毫秒时间戳。单臂操作也发送完整目标，保持静止的分组取自最新实测值。
 

@@ -90,6 +90,20 @@ def test_state_drops_invalid_duplicate_and_expired_measurements():
         endpoint.observe(["left"])
 
 
+def test_observed_tcp_axes_follow_measured_quaternion():
+    endpoint, _, _ = robot()
+    pose = full()
+    sine = math.sqrt(.5)
+    pose[3:7] = [0., 0., sine, sine]  # Quarter turn about reference Z.
+    endpoint._latest = Mock(return_value=(eef._now_ms(), pose, [pose]))
+    measured = endpoint.observe(["left"])["arms"]["left"]["eef"]
+    axes = measured["axes_in_reference"]
+    assert measured["frame"] == "world"
+    assert axes["x"] == pytest.approx([0., 1., 0.])
+    assert axes["y"] == pytest.approx([-1., 0., 0.])
+    assert axes["z"] == pytest.approx([0., 0., 1.])
+
+
 def test_relative_rotation_about_tcp_uses_base_axes_and_measured_other_arm():
     endpoint, _, pub = robot()
     start = full()

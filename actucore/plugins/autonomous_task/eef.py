@@ -115,8 +115,13 @@ class EefInterface:
         if kind == "gripper":
             return {"opening_mm": values[0] * 1000.}
         tip = self.tip_frames[side]
+        x, y, z, w = _unit(values[3:])
+        # Columns of the TCP-to-reference rotation matrix, in reference-frame xyz.
+        axes = {"x": [1 - 2*(y*y + z*z), 2*(x*y + w*z), 2*(x*z - w*y)],
+                "y": [2*(x*y - w*z), 1 - 2*(x*x + z*z), 2*(y*z + w*x)],
+                "z": [2*(x*z + w*y), 2*(y*z - w*x), 1 - 2*(x*x + y*y)]}
         return {"frame": self.frame, "eef_frame": tip, "reference_label": f"TCP {tip} in {self.frame}",
-                "position_m": values[:3], "quaternion_xyzw": values[3:]}
+                "position_m": values[:3], "quaternion_xyzw": values[3:], "axes_in_reference": axes}
 
 
 def _now_ms():
