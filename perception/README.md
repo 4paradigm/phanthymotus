@@ -8,6 +8,40 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## ROS 2 bag recorder
+
+The `rosbag_recorder` Card records ROS 2 topics with the ROS 2 Humble
+`ros2 bag record` command. The Card is enabled by default and included in the
+resource-center card list. The Jetson image build requires the Humble desktop
+base to provide the recording command, rosbag2 Python bindings, and a
+registered SQLite writer; it fails rather than publishing an image if the
+check fails. The check verifies the inherited runtime; it does not install it.
+
+Add the Card to a project and configure the topic names before starting the
+project. Project start begins recording; project stop ends it and waits for the
+recorder to finish writing. The Card reports recording status and errors. This
+Card does not play bags.
+
+The default `plugins.rosbag_recorder.output_root` is `/models/rosbags`.
+The supplied deployment mounts `/opt/embodied/models` at `/models`, so bags
+are stored on the host under `/opt/embodied/models/rosbags`. Ensure this
+directory is writable and has enough free space, or configure another
+**persistently mounted** output root. Recording data may use substantial disk
+space; adjust the configured duration and free-space limits for the device.
+
+For images built outside this Dockerfile, verify the recording command and
+SQLite writer in the target image. A startup error does not mean recording has
+begun.
+The recorder follows the repository's robot deployment contract: use
+`ROS_DOMAIN_ID=42`, `rmw_fastrtps_cpp`, and the shared loopback-only Fast DDS
+profile at `/opt/phanthy-motus/dds-local.xml`. The Perception container uses
+host networking to participate in the robot's local ROS graph; this profile
+does not expose DDS topics from other machines. The recorder also needs
+compatible message types and QoS. Camera or vendor data that is not published
+as a ROS 2 topic cannot be recorded by this Card. Verify on the target robot
+that the resulting bag contains the intended messages; process startup alone
+does not prove message delivery.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

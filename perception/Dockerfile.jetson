@@ -694,9 +694,17 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
+# The Humble desktop base must provide rosbag2. Check the final ROS environment
+# before publishing an image advertising the recorder card. JetPack ROS is
+# source-built, so ROS apt packages are not interchangeable with this base.
+RUN bash -c 'source /opt/ros/humble/install/setup.bash && \
+    source /ros_ws/install/setup.bash && \
+    ros2 bag record --help >/dev/null && \
+    python3 -c "import rosbag2_py; assert \"sqlite3\" in rosbag2_py.get_registered_writers(), \"rosbag2 SQLite writer is unavailable\""'
+
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     exec python3 /work/main.py"]
