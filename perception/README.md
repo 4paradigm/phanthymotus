@@ -8,6 +8,33 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## ROS 2 bag recorder
+
+The `rosbag_recorder` Card records ROS 2 topics with the ROS 2 Humble
+`ros2 bag record` command. Add the Card to a project and configure the topic
+names before starting the project. Project start begins recording; project
+stop ends it and waits for the recorder to finish writing. The Card reports
+recording status and errors. This Card does not play bags.
+
+The default `plugins.rosbag_recorder.output_root` is `/models/rosbags`.
+The supplied deployment mounts `/opt/embodied/models` at `/models`, so bags
+are stored on the host under `/opt/embodied/models/rosbags`. Ensure this
+directory is writable and has enough free space, or configure another
+**persistently mounted** output root. Recording data may use substantial disk
+space; adjust the configured duration and free-space limits for the device.
+
+Before using the Card, check that the actual Perception image contains the
+Humble `ros2` CLI, rosbag2 and its SQLite storage plugin (for example, run
+`ros2 bag record --help` inside the sourced image). The Jetson base image is
+not guaranteed to contain them. Missing dependencies must be installed in the
+image before recording; a startup error does not mean recording has begun.
+The recorder must see the target ROS graph using compatible ROS domain, DDS
+network settings, message types and QoS. The default deployment's Domain 42
+and Fast DDS configuration are examples, not universal settings. Camera or
+vendor data that is not published as a ROS 2 topic cannot be recorded by this
+Card. Verify on the target robot that the resulting bag contains the intended
+messages; process startup alone does not prove message delivery.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

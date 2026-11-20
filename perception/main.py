@@ -10,6 +10,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
+  rosbag_recorder  ROS 2 topic 录制
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
@@ -232,6 +233,11 @@ class PerceptionBundle:
             from plugins.measure import MeasurePlugin
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
+
+        if plugins_cfg.get("rosbag_recorder", {}).get("enabled", False):
+            from plugins.rosbag import RosbagRecorderPlugin
+            self._plugins.append(RosbagRecorderPlugin(plugins_cfg["rosbag_recorder"], executor))
+            log.info("RosbagRecorderPlugin loaded")
 
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket

@@ -129,6 +129,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"tts\", \"type\": \"processor\"},
                     {\"name\": \"vop\", \"type\": \"processor\"},
                     {\"name\": \"visual_depth\", \"type\": \"processor\"},
+                    {\"name\": \"rosbag_recorder\", \"type\": \"processor\"},
                     {\"name\": \"ocr\", \"type\": \"processor\"},
                     {\"name\": \"face_recognition\", \"type\": \"processor\"},
                     {\"name\": \"soundevent\", \"type\": \"processor\"},
