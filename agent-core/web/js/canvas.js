@@ -57,13 +57,18 @@ let _allMcps    = [];
 const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
+let _clearing = false;
 
 /**
  * Ensure current session holds the edit lock, auto-claiming it if free.
  * Returns true if editing may proceed, false if the canvas is occupied by
  * another session (in which case a toast + locked UI state is shown).
  */
-async function _ensureEdit() {
+async function _ensureEdit({ forClear = false } = {}) {
+  if (_clearing && !forClear) {
+    _showToast('正在清空画布，请稍候');
+    return false;
+  }
   if (_isEditor) return true;
   try {
     const resp = await fetch('/api/canvas/claim-edit', {
@@ -76,7 +81,7 @@ async function _ensureEdit() {
       _currentEditor = _sessionId;
       _updateEditorUI();
       _showToast('已自动获取编辑权限');
-      return true;
+      return !_clearing || forClear;
     }
     _currentEditor = data.editor || null;
     _updateEditorUI();
@@ -145,10 +150,14 @@ export function cardsForTool(mcpId, toolName) {
 }
 
 /** Why editing is refused right now, or '' when it is allowed. */
-function _editLockReason() {
+function _projectEditLockReason() {
   if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';
   if (_projectRunning) return '请停止智能控制后修改';
   return '';
+}
+
+function _editLockReason() {
+  return _clearing ? '正在清空画布，请稍候' : _projectEditLockReason();
 }
 
 /**
@@ -808,7 +817,10 @@ function _setupControlButtons() {
     _viewportChanged();
   });
 
+  document.getElementById('canvas-clear')?.addEventListener('click', _clearCanvas);
+
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
+    if (_clearing) { _showToast('正在清空画布，请稍候'); return; }
     if (_projectRunning) { _stopProject(); return; }
     // _projectRunning only flips true once the start fetch resolves, so a
     // second click during that async window used to fire a second concurrent
@@ -1004,6 +1016,63 @@ async function _removeCard(id) {
   // Cancel any pending debounced save, then save immediately with updated state
   clearTimeout(_saveTimer);
   _saveLayout();
+}
+
+async function _clearCanvas() {
+  if (!_cards.length || _refuseEdit()) return;
+  if (!confirm('确定清空画布上的所有卡片和连线吗？已安装的技能不会被删除。')) return;
+
+  _clearing = true;
+  _syncEmptyState();
+  try {
+    if (!(await _ensureEdit({ forClear: true }))) return;
+    // An earlier autosave must finish before the empty layout is sent, or a
+    // delayed write can put the deleted cards back on the server.
+    clearTimeout(_saveTimer);
+    let waitTimer;
+    const settled = await Promise.race([
+      Promise.all([..._pendingLayoutSaves]).then(() => true),
+      new Promise(resolve => { waitTimer = setTimeout(() => resolve(false), 15000); }),
+    ]);
+    clearTimeout(waitTimer);
+    if (!settled) { _showToast('等待画布保存超时，请检查网络后重试'); return; }
+    const stateKnown = await Promise.race([
+      _syncProjectState(),
+      new Promise(resolve => { waitTimer = setTimeout(() => resolve(false), 15000); }),
+    ]);
+    clearTimeout(waitTimer);
+    if (!stateKnown) {
+      _showToast('无法确认运行状态，请检查网络后重试');
+      return;
+    }
+    const reason = _projectEditLockReason();
+    if (reason) { _showToast(reason); return; }
+    if (!_isEditor) { _showToast('编辑权已释放，请重试'); return; }
+
+    if (!(await _writeLayout([], [], [], { timeout: 15000 }))) {
+      await _reloadLayout();
+      _showToast('未能确认画布是否清空，请检查网络后重试');
+      return;
+    }
+
+    // The server stops the removed instances as part of the layout write.
+    // Browser-owned sources need to be stopped in this tab as well.
+    for (const card of _cards) {
+      if (card.toolName === 'remote_camera') stopCameraStream();
+      if (card.toolName === 'remote_mic') stopMicStream();
+      card.el.remove();
+    }
+    _cards = [];
+    _connections = [];
+    _execConnections = [];
+    _syncGeometryObservers();
+    _scheduleRedraw();
+    _syncEmptyState();
+    _showToast('画布已清空');
+  } finally {
+    _clearing = false;
+    _syncEmptyState();
+  }
 }
 
 // ── Card rendering ────────────────────────────────────────────────────────────
@@ -3080,13 +3149,15 @@ function _makeDraggable(el, cardData) {
 // ── Layout persistence ────────────────────────────────────────────────────────
 
 let _saveTimer = null;
+const _pendingLayoutSaves = new Set();
 function _debouncedSave() {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(_saveLayout, 400);
 }
 
-async function _saveLayout() {
-  if (!_isEditor) return;  // only the current editor may persist; system-triggered saves must not auto-claim
+function _saveLayout() {
+  // System-triggered saves must not auto-claim, or race the clear operation.
+  if (!_isEditor || _clearing) return Promise.resolve(false);
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -3098,26 +3169,41 @@ async function _saveLayout() {
     topicOut:   c.topicOut || [],
     topicOutFrom: c.topicOutFrom,
   }));
-  try {
-    const resp = await fetch('/api/canvas/layout', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
-    });
-    if (resp.status === 403) {
-      // Lost edit permission — reload layout from server
-      _isEditor = false;
-      _updateEditorUI();
-      await _reloadLayout();
-    }
-  } catch { /* silent */ }
+  return _writeLayout(cards, _connections, _execConnections);
+}
+
+function _writeLayout(cards, connections, execConnections, { timeout = 0 } = {}) {
+  const pending = (async () => {
+    const controller = timeout ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
+    try {
+      const resp = await fetch('/api/canvas/layout', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ cards, connections, execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
+        signal: controller?.signal,
+      });
+      if (resp.status === 403) {
+        // Lost edit permission — reload layout from server
+        _isEditor = false;
+        _updateEditorUI();
+        await _reloadLayout();
+      }
+      return resp.ok;
+    } catch { return false; }
+    finally { if (timer) clearTimeout(timer); }
+  })();
+  _pendingLayoutSaves.add(pending);
+  pending.then(() => _pendingLayoutSaves.delete(pending));
+  return pending;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _syncEmptyState() {
-  if (!_emptyEl) return;
-  _emptyEl.style.display = _cards.length === 0 ? '' : 'none';
+  if (_emptyEl) _emptyEl.style.display = _cards.length === 0 ? '' : 'none';
+  const clearBtn = document.getElementById('canvas-clear');
+  if (clearBtn) clearBtn.disabled = _cards.length === 0 || _clearing;
 }
 
 function _esc(s) {

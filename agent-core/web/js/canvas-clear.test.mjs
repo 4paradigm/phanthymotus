@@ -1,0 +1,146 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+
+// Exercise the actual canvas handlers with a small DOM and controllable network.
+const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
+function section(start, end) {
+  const from = source.indexOf(start);
+  const to = source.indexOf(end, from);
+  assert.ok(from >= 0 && to > from, `missing canvas section: ${start}`);
+  return source.slice(from, to);
+}
+const handlers = [
+  section('async function _ensureEdit(', '// Thin wrapper'),
+  section('function _projectEditLockReason()', '/** Same question without'),
+  section('async function _clearCanvas()', '// ── Card rendering'),
+  section('let _saveTimer = null;', '// ── Helpers'),
+  section('function _syncEmptyState()', 'function _esc('),
+].join('\n');
+
+function fixture({ confirmed = true, editor = true, running = false, known = true } = {}) {
+  const removed = [], toasts = [], calls = [], stopped = [];
+  const clearButton = { disabled: false };
+  const cards = ['sensor', 'remote_mic', 'remote_camera'].map((toolName, i) => ({
+    id: `card-${i}`, mcpId: 'device', toolName, driverName: 'Device', x: i, y: i,
+    el: { remove: () => removed.push(toolName) },
+  }));
+  let confirms = 0, reloads = 0;
+  const ctx = {
+    _cards: cards,
+    _connections: [{ fromCardId: 'card-0', toCardId: 'card-1' }],
+    _execConnections: [{ fromCardId: 'card-1', toCardId: 'card-2' }],
+    _isEditor: editor, _currentEditor: editor ? 'this-tab' : null,
+    _sessionId: 'this-tab', _projectRunning: running, _projectStateKnown: known,
+    _clearing: false, _zoom: 1.2, _tx: 10, _ty: 20, _emptyEl: { style: {} },
+    document: { getElementById: id => id === 'canvas-clear' ? clearButton : null },
+    confirm: () => { confirms++; return confirmed; },
+    fetch: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+    _showToast: message => toasts.push(message),
+    _logActivity() {}, _updateEditorUI() {}, _syncGeometryObservers() {}, _scheduleRedraw() {},
+    _reloadLayout: async () => { reloads++; },
+    _syncProjectState: async () => true,
+    stopMicStream: () => stopped.push('mic'),
+    stopCameraStream: () => stopped.push('camera'),
+    setTimeout, clearTimeout, AbortController,
+  };
+  const api = runInNewContext(`${handlers}\n({ _clearCanvas, _saveLayout, _ensureEdit })`, ctx);
+  return { ctx, api, removed, toasts, calls, stopped, clearButton,
+    confirms: () => confirms, reloads: () => reloads };
+}
+
+test('cancel leaves the shared layout untouched and does not claim the edit lock', async () => {
+  const f = fixture({ confirmed: false, editor: false });
+  await f.api._clearCanvas();
+  assert.equal(f.confirms(), 1);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.ctx._cards.length, 3);
+  assert.deepEqual(f.removed, []);
+});
+
+test('clear saves one empty layout, removes all cards and stops browser sources', async () => {
+  const f = fixture();
+  await f.api._clearCanvas();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].url, '/api/canvas/layout');
+  assert.deepEqual(f.calls[0].body, {
+    cards: [], connections: [], execConnections: [],
+    transform: { zoom: 1.2, tx: 10, ty: 20 }, session_id: 'this-tab',
+  });
+  assert.deepEqual(f.removed, ['sensor', 'remote_mic', 'remote_camera']);
+  assert.deepEqual(f.stopped, ['mic', 'camera']);
+  assert.equal(f.ctx._cards.length, 0);
+  assert.equal(f.ctx._connections.length, 0);
+  assert.equal(f.ctx._execConnections.length, 0);
+  assert.equal(f.clearButton.disabled, true);
+  assert.ok(f.toasts.includes('画布已清空'));
+});
+
+test('unknown or running project state refuses to clear before confirmation', async () => {
+  for (const options of [{ running: true }, { known: false }]) {
+    const f = fixture(options);
+    await f.api._clearCanvas();
+    assert.equal(f.confirms(), 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.ctx._cards.length, 3);
+    assert.notEqual(f.toasts.length, 0);
+  }
+});
+
+test('another editor prevents deletion', async () => {
+  const f = fixture({ editor: false });
+  f.ctx.fetch = async (url, options) => {
+    f.calls.push({ url, body: JSON.parse(options.body) });
+    return { ok: false, status: 423, json: async () => ({ editor: 'another-tab' }) };
+  };
+  await f.api._clearCanvas();
+  assert.deepEqual(f.calls.map(c => c.url), ['/api/canvas/claim-edit']);
+  assert.equal(f.ctx._cards.length, 3);
+  assert.deepEqual(f.removed, []);
+  assert.equal(f.clearButton.disabled, false);
+});
+
+test('a failed layout write keeps the cards visible and reports an uncertain result', async () => {
+  const f = fixture();
+  f.ctx.fetch = async () => { throw new Error('offline'); };
+  await f.api._clearCanvas();
+  assert.equal(f.ctx._cards.length, 3);
+  assert.deepEqual(f.removed, []);
+  assert.equal(f.reloads(), 1);
+  assert.match(f.toasts.at(-1), /未能确认/);
+  assert.equal(f.clearButton.disabled, false);
+});
+
+test('clear waits for a previous autosave before writing the empty layout', async () => {
+  const f = fixture();
+  let finishFirst;
+  f.ctx.fetch = (url, options) => {
+    f.calls.push({ url, body: JSON.parse(options.body) });
+    if (f.calls.length === 1) return new Promise(resolve => { finishFirst = resolve; });
+    return Promise.resolve({ ok: true, status: 200 });
+  };
+  const earlierSave = f.api._saveLayout();
+  const clearing = f.api._clearCanvas();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.clearButton.disabled, true);
+  assert.equal(await f.api._ensureEdit(), false);
+  finishFirst({ ok: true, status: 200 });
+  await Promise.all([earlierSave, clearing]);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[0].body.cards.length, 3);
+  assert.equal(f.calls[1].body.cards.length, 0);
+});
+
+test('a project that starts during clear preparation prevents the layout write', async () => {
+  const f = fixture();
+  f.ctx._syncProjectState = async () => { f.ctx._projectRunning = true; return true; };
+  await f.api._clearCanvas();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.ctx._cards.length, 3);
+  assert.match(f.toasts.at(-1), /停止智能控制/);
+});
