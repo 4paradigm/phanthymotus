@@ -287,7 +287,7 @@ class PlanCache:
         if frame is None or ground is None or geometry is None:
             return None
         key = (frame, round(ahead, 2), half_width, max_age_ms, watchdog_ms, observation.get("scan_revision"),
-               allow_forward, velocity_limits, observation.get("stop_target"))
+               allow_forward, velocity_limits, observation.get("stop_target"), observation.get("body_half_width"))
         if self.key != key:
             self.key = key
             self.plans.clear()
@@ -297,13 +297,23 @@ class PlanCache:
                 observation["map"], ground, geometry, half_width, ahead, side, max_age_ms,
                 watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward,
                 velocity_limits=velocity_limits, target=observation.get("stop_target"),
-                projected_grid=self.grid_for(observation, geometry))
+                projected_grid=self.grid_for(observation, geometry),
+                body_half_width=observation.get("body_half_width"))
         return self.plans[side]
 
 
-def transition_clear(grid, geometry, half_width, horizon_s, velocities):
+def motion_obstacles(grid, geometry, body_half_width):
+    free, occupied = grid
+    # The robot already occupies its own footprint. Only new space requires
+    # positive clearance evidence, and observed hits always take priority.
+    body = ((FORWARD >= -geometry.rear) & (FORWARD <= geometry.front)
+            & (abs(RIGHT) <= body_half_width))
+    return occupied | (~free & ~body)
+
+
+def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, body_half_width=None):
     """Check the swept rectangle for independent forward and lateral ramps."""
-    _, occupied = grid
+    occupied = grid[1] if body_half_width is None else motion_obstacles(grid, geometry, body_half_width)
     forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
     rear = -geometry.rear + min(0., *forward)
     front = geometry.front + max(0., *forward)
@@ -378,7 +388,7 @@ def opening_route(frame, occupied, geometry, half_width, plane, target):
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True,
-                         target=None, projected_grid=None):
+                         target=None, projected_grid=None, body_half_width=None):
     if velocity_limits is not None:
         (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
         if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
@@ -391,10 +401,13 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     grid_input = observed_grid if observed_grid is not None else projected_grid
     if grid_input is None:
         grid_input = observe(frame, geometry, right, forward, resolution, ground)
-    _, occupied = grid_input
+    free, occupied = grid_input
+    blocked = occupied if body_half_width is None else motion_obstacles(grid_input, geometry, body_half_width)
     if side < 0:
+        free = free[:, ::-1] if free is not None else None
         occupied = occupied[:, ::-1]
-    grid = np.where(occupied, OCCUPIED, UNKNOWN)
+        blocked = blocked[:, ::-1]
+    grid = np.where(blocked, OCCUPIED, FREE)
     plane = ahead * geometry.base_from_optical[0, 2] + geometry.base_from_optical[0, 3]
     obstacle = (occupied & (abs(right) <= half_width) & (abs(forward - plane) <= .10))
     if not obstacle.any():
@@ -417,7 +430,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # Check every footprint against observed obstacles. The search can reach
     # the passing lane at any column outside the obstacle, and rejoin on any
     # clear centerline cell at or beyond the original rejoin distance.
-    footprint_clear = allowed_centers(grid, start, half_cells, allow_unknown=True)
+    footprint_clear = allowed_centers(grid, start, half_cells)
     allowed = footprint_clear.copy()
     allowed[:row_zero, :] = False
     allowed[:, :col_zero] = False
@@ -461,6 +474,16 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         last_goal_col = allowed.shape[1] - 1
         path = shortest_path(allowed, start, goal, later_goal=True,
                              last_goal_col=last_goal_col, steps=steps)
+    if path is None and body_half_width is not None:
+        # Stop at an observed foothold in front of an occluded continuation.
+        # The next centre would clear observed obstacles but needs more data.
+        collision_clear = allowed_centers(np.where(occupied, OCCUPIED, FREE), start, half_cells)
+        frontier = np.zeros_like(allowed)
+        frontier[:-1] = allowed[:-1] & collision_clear[1:] & ~footprint_clear[1:]
+        frontier[:row_zero + 2] = False
+        if frontier.any():
+            target_cells = frontier
+            path = shortest_path(allowed, start, goal, steps=steps, target_cells=frontier)
     reposition = path is None
     if reposition:
         # A reachable lateral position with more room lets the next frame replan.
@@ -491,8 +514,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     half_cell = resolution / 2
     f0, f1 = forward - half_cell, forward + half_cell
     r0, r1 = right - half_cell, right + half_cell
-    occupied_bounds = (f0[occupied] - geometry.front, f1[occupied] + geometry.rear,
-                       r0[occupied] - half_width, r1[occupied] + half_width)
+    occupied_bounds = (f0[blocked] - geometry.front, f1[blocked] + geometry.rear,
+                       r0[blocked] - half_width, r1[blocked] + half_width)
     def command_to(point):
         row, col = point
         dr, dc = row - row_zero, col - col_zero
@@ -513,7 +536,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
         if (partial or target_cells is not None) and vx and vy and not transition_clear(
-                (None, occupied), geometry, half_width, horizon_s, ((vx, -vy),)):
+                (free, occupied), geometry, half_width, horizon_s, ((vx, -vy),),
+                body_half_width=body_half_width):
             return None
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
             return vx, -side * vy

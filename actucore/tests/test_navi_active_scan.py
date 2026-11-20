@@ -1,4 +1,6 @@
+import json
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -199,6 +201,115 @@ def test_measured_turn_deadline_stops_and_waits_for_new_feedback(monkeypatch):
     assert tick(2150, 2140, 18) == 0.  # a repeated sample cannot release the stop
     assert tick(2200, 2200, 19, wz=-.08) == 0.
     assert tick(2300, 2300, 20) > 0.
+
+
+@pytest.mark.parametrize("case", [
+    "continuous", "gap", "batched_gap", "duplicate", "translation", "expired",
+])
+def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(monkeypatch, case):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = plugin.NaviPlugin({"local_planning": True}, executor=None)
+    now = 1000
+    monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
+
+    def sample(stamp, vx=0., wz=0., source=None):
+        nonlocal now
+        now = stamp
+        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=stamp if source is None else source,
+                       twist=[vx, 0., None, None, None, wz])
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+
+    def update():
+        odom = card._observation_snapshot(with_capture_timing=True)[2]
+        return look.update(dict(_depth(now), control_ms=now), odom, geometry, receipt_only=True)
+
+    def command():
+        return look.command(geometry, .33, 1., 600)
+
+    sample(1000)
+    assert update() is None
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    sample(1100)
+    assert update() is None and command().yaw == 0.
+    sample(1200)
+    assert update() is None and command().yaw > 0.
+
+    # Drive the callbacks between two control ticks, including a transient
+    # excursion that has already ended by the time the planner takes a snapshot.
+    if case == "gap":
+        sample(1490, wz=.10)
+    elif case == "batched_gap":
+        sample(1300, wz=.10, source=1500)
+    else:
+        sample(1300, vx=.1 if case == "translation" else 0., wz=.10)
+        sample(1420, wz=.10, source=1300 if case == "duplicate" else None)
+    sample(1620 if case == "expired" else 1500, wz=.10, source=1300 if case == "duplicate" else None)
+    hold = update()
+    if case == "continuous":
+        assert hold is None
+        assert look.pose[2] == pytest.approx(-.030)
+        assert command().yaw > 0.
+    elif case == "expired":
+        assert hold is None
+        assert command().yaw == 0.
+        assert look.turn_stop_ms == 1620 and look.turn_until_ms == 0
+    elif case == "duplicate":
+        assert hold is None and look.poses[-1][0] == 1300
+        sample(1600, wz=.10, source=1300)
+        assert update().yaw == 0.
+        assert look.locked
+    else:
+        assert look.phase == "brake_for_replan" and hold.yaw == 0.
+        assert ("检测到平移" if case == "translation" else "间隔过长") in hold.reason
+
+
+@pytest.mark.parametrize("rate_hz", [10., 2.])
+def test_card_uses_configured_period_only_to_start_a_turn_burst(monkeypatch, rate_hz):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1.}, executor=None)
+    card._config.local_geometry = geometry
+    card._rate_hz = rate_hz
+    card._ttl_ms = 400
+    card._state.target = "person"
+    card._state.active_scan = look
+    now = 100_000
+    history = []
+
+    def snapshot(**kwargs):
+        odom = dict(_odom(now), received_ms=now, source_sample_id=now, velocity_history=tuple(history))
+        return {"objects": []}, dict(_depth(now), control_ms=now), odom, now
+
+    def tick(stamp):
+        nonlocal now
+        for sample in range(now + 100, stamp, 100):
+            history.append((sample, sample, (0., 0., 0.)))
+        now = stamp
+        history.append((now, now, (0., 0., 0.)))
+        return card.next_command()
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: now / 1000)
+    monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
+    _, depth, odom, _ = snapshot()
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=1.9, route_segment=True)
+    assert tick(100_100)["values"] == [0.] * 6
+
+    first = tick(100_550)  # 450 ms since the last tick, even with fresh odometry.
+    if rate_hz == 2.:
+        assert first["values"] == [0.] * 6
+        return
+
+    assert first["values"][5] > 0. and first["ttl_ms"] == 400
+    assert look.turn_until_ms == 100_950
+    # The 150 ms left would fit the nominal 100 ms period, but not the
+    # preceding 250 ms tick. Renewal keeps the existing conservative check.
+    assert tick(100_800)["values"] == [0.] * 6
+    assert look.turn_stop_ms == 100_800 and look.turn_until_ms == 0
 
 
 @pytest.mark.parametrize("expiry", ["first_yaw", "renewal", "snapshot"])
@@ -409,6 +520,39 @@ def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkey
     assert not look.active and not look.locked and look.attempted
 
 
+@pytest.mark.parametrize("interruption", ["translation", "gap"])
+@pytest.mark.parametrize("early_source", [14, 15])
+def test_interrupted_turn_can_replan_once_from_a_distinct_settled_view(monkeypatch, interruption, early_source):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, source, vx=0.):
+        hold = look.update(dict(_depth(stamp), source_frame_id=source),
+                           dict(_odom(stamp), received_ms=stamp, vx=vx),
+                           geometry, receipt_only=True)
+        return hold or look.command(geometry, .33, 1., 600)
+
+    tick(1000, 10)
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    assert tick(1100, 11).yaw == 0.
+    assert tick(1200, 12).yaw > 0.
+    stopped = 1550 if interruption == "gap" else 1300
+    assert tick(stopped, 13, vx=.1 if interruption == "translation" else 0.).yaw == 0.
+    assert tick(stopped + 100, 14).yaw == 0.
+    assert tick(stopped + 150, early_source).yaw == 0.
+    assert tick(stopped + 250, early_source).yaw == 0.
+    assert look.phase == "brake_for_replan" and look.attempted
+
+    assert tick(stopped + 300, 16).yaw == 0.
+    assert not look.active and not look.attempted and look.advance_m is None
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    assert tick(stopped + 400, 17).yaw == 0.
+    assert tick(stopped + 500, 18).yaw > 0.
+    assert tick(stopped + 600, 19, vx=.1).yaw == 0.
+    assert tick(stopped + 700, 20).yaw == 0.
+    assert tick(stopped + 850, 21).yaw == 0.
+    assert look.locked and not look.begin((-1.,))
+
+
 def test_receipt_scan_with_no_yaw_progress_replans_before_standing_bias_locks_it(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
 
@@ -456,6 +600,30 @@ def test_receipt_scan_stops_then_replans_after_temporary_input_loss(monkeypatch,
         assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
     assert not look.attempted and not look.has_result and not look.active and not look.locked
     assert look.begin((-1., 1.))
+
+
+@pytest.mark.parametrize(("motion", "reason"), [
+    ((-.0028, -.0353, -.2373), "仍在转动，停车后重规划"),
+    ((.0936, -.0349, .0753), "检测到平移，停车后重规划"),
+])
+def test_receipt_scan_distinguishes_rotation_from_translation_while_stopping(monkeypatch, motion, reason):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, motion=(0., 0., 0.)):
+        vx, vy, wz = motion
+        return look.update(_depth(stamp), dict(vx=vx, vy=vy, wz=wz, received_ms=stamp),
+                           geometry, receipt_only=True)
+
+    update(1000)
+    assert look.begin((1.,))
+    assert look.command(geometry, .33, 1., 600).yaw == 0.
+    assert update(1358).yaw == 0.
+
+    assert update(1444, motion) is None
+    hold = look.command(geometry, .33, 1., 600)
+    assert hold.yaw == 0.
+    assert look.phase == "brake_for_replan"
+    assert hold.reason == f"主动观察：{reason}"
 
 
 @pytest.mark.parametrize("released", [True, False])
@@ -659,6 +827,26 @@ def test_receipt_only_scan_rejects_a_republished_depth_frame(monkeypatch):
                 {**_odom(1550), "received_ms": 1550}, geometry, receipt_only=True)
     assert look.current_frame == 0
     assert not look.active and look.locked
+
+
+def test_observed_turn_waits_for_independent_depth_after_settling(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, source):
+        look.update(dict(_depth(stamp), source_frame_id=source),
+                    dict(_odom(stamp), received_ms=stamp), geometry, receipt_only=True)
+        return look.command(geometry, .25, 1., 600, body_half_width=.20)
+
+    tick(1000, 10)
+    assert look.begin((-1.,), advance_m=1.)
+    assert tick(1100, 11).yaw == 0.
+    look.pose = (0., 0., -look.turn_angle)
+    assert tick(1200, 12).yaw == 0.
+    assert tick(1250, 13).yaw == 0.  # Distinct frame during the settling interval.
+    assert tick(1350, 13).yaw == 0.  # Republishing it does not refresh the view.
+    assert not look.ready
+    assert tick(1400, 14).yaw == 0.
+    assert look.ready
 
 
 def test_receipt_stamp_cannot_extend_the_life_of_repeated_odometry(monkeypatch):

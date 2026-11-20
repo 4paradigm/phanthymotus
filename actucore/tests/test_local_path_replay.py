@@ -32,6 +32,30 @@ def test_a_diagonal_step_checks_the_intermediate_sweep():
     assert replay.shortest_path(allowed, (3, 3), (4, 4)) is None
 
 
+@pytest.mark.parametrize("observed", [False, True])
+def test_observed_detour_cannot_route_through_an_unknown_band(observed):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    occupied = (abs(replay.RIGHT) <= .10) & np.isclose(replay.FORWARD, .90)
+    free = ~occupied
+    if not observed:
+        free &= replay.FORWARD >= .30
+    route = replay._checked_translation(None, None, geometry, .25, .90, 1., 500, 600,
+                                        velocity_limits=None, observed_grid=(free, occupied),
+                                        body_half_width=.20)
+    assert (route is not None) is observed
+
+
+def test_observed_detour_can_stop_at_a_known_prefix_before_occlusion():
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    occupied = (abs(replay.RIGHT) <= .10) & np.isclose(replay.FORWARD, 1.40)
+    free = (replay.FORWARD <= 1.) & ~occupied
+    route = replay._checked_translation(None, None, geometry, .25, 1.40, 1., 500, 600,
+                                        velocity_limits=None, observed_grid=(free, occupied),
+                                        body_half_width=.20)
+    assert route is not None
+    assert .1 <= route.points[-1][0] <= 1. - geometry.front + 1e-9
+
+
 def test_front_depth_can_execute_a_detour_with_an_unmeasured_prefix():
     horizontal = HorizontalIntrinsics(640, 315, 337)
     vertical = (480, 420, 243)

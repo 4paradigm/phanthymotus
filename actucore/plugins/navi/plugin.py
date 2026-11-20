@@ -203,6 +203,7 @@ class NaviPlugin:
         self._odom_ms = 0
         self._odom_received_ms = 0
         self._odom_source_ms = None
+        self._velocity_history = deque(maxlen=32)
         self._motion_pose = None
         self._pose_feedback = None
         self._odom_stamp_verified = False
@@ -503,6 +504,7 @@ class NaviPlugin:
             self._odom_ms = 0
             self._odom_received_ms = 0
             self._odom_source_ms = None
+            self._velocity_history.clear()
             self._motion_pose = None
             self._pose_feedback = None
             self._odom_stamp_verified = False
@@ -1511,6 +1513,8 @@ class NaviPlugin:
                 self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
                                         and not isinstance(stamp, bool)
                                         and math.isfinite(stamp) and stamp > 0 else None)
+                self._velocity_history.append((now, self._odom_source_ms,
+                                               odom_mod.planar_feedback(self._odom)))
                 pose = odom_mod.planar_pose(payload, self._odom_source_ms)
                 previous = self._motion_pose
                 if pose is None or pose != previous:
@@ -1667,6 +1671,8 @@ class NaviPlugin:
                     odom = {**odom, "received_ms": received_ms}
                     if self._odom_source_ms is not None:
                         odom["source_sample_id"] = self._odom_source_ms
+                    if not uses_pose and self._velocity_history:
+                        odom["velocity_history"] = tuple(self._velocity_history)
                 if not uses_pose and self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom, objects_ms
@@ -1678,7 +1684,8 @@ class NaviPlugin:
         numbers and the two timestamps — is testable without a node.
         """
         tick = time.monotonic()
-        dt = tick - self._last_tick if self._last_tick else 1.0 / self._rate_hz
+        control_period_s = 1.0 / self._rate_hz
+        dt = tick - self._last_tick if self._last_tick else control_period_s
         self._last_tick = tick
 
         objects, depth, odom, objects_ms = self._observation_snapshot(
@@ -1693,7 +1700,7 @@ class NaviPlugin:
                          and self._last_decision.status == policy_mod.SEARCHING)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
-                                   dt=dt)
+                                   dt=dt, control_period_s=control_period_s)
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
@@ -1833,13 +1840,24 @@ class NaviPlugin:
         return list(moving)
 
     def _tick(self):
+        entered = time.monotonic()
         with self._lock:
             if self._publisher is None or not self._running or self._paused:
                 return
             try:
+                started = time.monotonic()
+                previous = self._last_tick
                 message = self.next_command()
+                decided = time.monotonic()
                 if message is not None:
                     self._publish_command(message)
+                finished = time.monotonic()
+                period = 1.0 / self._rate_hz
+                interval = self._last_tick - previous if previous else 0.
+                if self._config.local_planning and (interval > 2 * period or finished - entered > period):
+                    log.info("navi slow tick: interval=%.1f ms lock=%.1f ms decision=%.1f ms publish=%.1f ms seq=%s",
+                             interval * 1000, (started - entered) * 1000, (decided - started) * 1000,
+                             (finished - decided) * 1000, message["seq"] if message is not None else None)
             except Exception as error:                        # noqa: BLE001
                 self._last_error = f"{type(error).__name__}: {error}"
                 log.warning("navi tick failed: %s", error)

@@ -1671,7 +1671,7 @@ def test_command_only_active_observation_uses_camera_geometry_without_extrinsics
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.9, 1.))
     monkeypatch.setattr(P, "_local_translation", lambda *args: None)
-    free = local_path.FORWARD > 0.
+    free = (abs(local_path.RIGHT) <= .60) & (abs(local_path.FORWARD) <= .60)
     monkeypatch.setattr(active_scan, "observe", lambda *args: (free, np.zeros_like(free)))
     frame = np.ones((4, 4))
 
@@ -1902,7 +1902,7 @@ def test_a_standard_doorway_reads_as_passable():
     比任何一扇门都宽。于是门框永远算在正前方，clearance 读到门平面而不是门洞。
     """
     true_fov = 0.888
-    config = _cfg(half_fov_rad=true_fov)
+    config = _cfg(clearance_margin_m=.10, half_fov_rad=true_fov)
     # 必须用机器人自己声明的 footprint。Config 的兜底半宽 0.35 加上余量要求
     # **1.0 m 净宽**，而标准门只有 0.8~0.9 m —— 也就是说没有 footprint 声明的底盘
     # 本来就过不了门，而且过不去的理由跟视场角无关。R1 声明的是 0.179。
@@ -2655,7 +2655,7 @@ def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch,
     previous = [0.] * 6
     last_turn = None
     for stamp in range(1000, 9000, 100):
-        depth = dict(map=frame, frame_id=stamp, ground=frame.astype(bool))
+        depth = dict(map=frame, frame_id=stamp, source_frame_id=stamp, ground=frame.astype(bool))
         feedback = dict(vx=previous[0], vy=0., wz=previous[5], received_ms=stamp)
         decision = P.step(detections=_detections(), depth=depth, odom=feedback,
                           config=config, state=state, dt=.1)
@@ -2741,7 +2741,7 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
     seen = []
     recovery_turns = []
     for stamp in range(1000, 30000, 100):
-        depth = dict(map=frame, frame_id=stamp, ground=frame.astype(bool))
+        depth = dict(map=frame, frame_id=stamp, source_frame_id=stamp, ground=frame.astype(bool))
         feedback = dict(vx=previous[0], vy=0., wz=previous[5], received_ms=stamp)
         if (straight_started is not None and gap is None and robot[0] >= .35
                 and (recovery_changes_scene or fault in ("depth_gap", "odom_gap"))):
@@ -2848,7 +2848,7 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
     last_turn = None
     for stamp in range(1000, 4000, 100):
         decision = P.step(detections=_detections(),
-                          depth=dict(map=frame, frame_id=stamp, ground=frame.astype(bool)),
+                          depth=dict(map=frame, frame_id=stamp, source_frame_id=stamp, ground=frame.astype(bool)),
                           odom=dict(vx=previous[0], vy=0., wz=previous[5], received_ms=stamp),
                           config=config, state=state, dt=.1)
         previous = decision.values
@@ -2897,7 +2897,8 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
 
     def tick(stamp, last, frame_id=None):
         return P.step(detections=_detections(),
-                      depth=dict(map=frame, frame_id=frame_id or stamp, ground=frame.astype(bool)),
+                      depth=dict(map=frame, frame_id=frame_id or stamp, source_frame_id=frame_id or stamp,
+                                 ground=frame.astype(bool)),
                       odom=dict(vx=last[0], vy=0., wz=last[5], received_ms=stamp),
                       config=config, state=state, dt=.1)
 
@@ -2934,6 +2935,51 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     pytest.fail("The segment neither completed nor held for the newly observed obstruction")
 
 
+def test_local_obstacle_beyond_slowdown_starts_a_detour_with_five_centimetre_margins(monkeypatch):
+    from plugins.navi import local_path
+
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243), .20)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20)
+    assert P._keepout_m(config) == pytest.approx(.25)
+    state = _state(motion_source="measured")
+    view = dict(frame_id=1000, map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool))
+    occupied = (abs(local_path.RIGHT) <= .10) & np.isclose(local_path.FORWARD, 2.)
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2., 1.))
+
+    result = P._avoid(.2, 0., 0., view, config, P.APPROACHING, "", state,
+                      target_distance=3., target_bearing=0., may_scan=True)
+    assert result[:3] == (0., 0., 0.)
+    assert scan.route_segment and scan.phase == "brake"
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_post_turn_drive_requires_observed_swept_space(unknown):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .20, .20, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    view = dict(frame_id=1200, source_frame_id=1200, map=np.ones((4, 4)),
+                ground=np.ones((4, 4), dtype=bool))
+    scan.receipt_only, scan.current_frame, scan.side_frame = True, 1200, 1200
+    scan.source_frame, scan.settle_start_source = 1200, 1000
+    scan.phase, scan.route_segment, scan.advance_m = "evaluate", True, .60
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    if unknown:
+        free &= ~np.isclose(local_path.FORWARD, .35)
+    scan.views.append((1200, scan.pose, free, np.zeros_like(free)))
+    feedback = dict(vx=0., vy=0., wz=0.)
+    result = P._advance_after_scan(view, config, state, feedback, None, 1., .60, 3., .1)
+    assert (result[0] > 0.) is not unknown
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 def test_detour_first_leg_passes_the_obstacle_at_the_permitted_heading_error(side):
     from plugins.navi import active_scan, local_path
@@ -2966,7 +3012,7 @@ def test_detour_first_turn_can_execute_with_the_braking_reserve():
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243),
                                         .20, half_length=.23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20, clearance_margin_m=.10,
                   max_depth_age_ms=800, watchdog_ms=600)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -3297,7 +3343,7 @@ def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obsta
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 600, 320), (480, 600, 240), .21)
     cfg = _cfg(lost_frames=1, local_planning=True, local_geometry=geometry,
-               half_width_m=.21, obstacle_stop_m=.60, search_rate=.60)
+               half_width_m=.21, clearance_margin_m=.10, obstacle_stop_m=.60, search_rate=.60)
     depth = dict(_scene(3.0, [(0., ahead, .5)]), frame_id=1000)
     depth["ground"] = np.zeros_like(depth["map"], dtype=bool)
     depth["ground"][0, 0] = True

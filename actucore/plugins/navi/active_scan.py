@@ -8,7 +8,7 @@ import math
 
 import numpy as np
 
-from .local_path import observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
+from .local_path import motion_obstacles, observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
@@ -29,6 +29,7 @@ TURN_PROGRESS_MIN_RAD = math.radians(3)
 class ScanCommand:
     yaw: float = 0.
     reason: str = "主动观察：停车等候"
+    replanned_turn: bool = False
 
 
 @dataclass
@@ -103,6 +104,7 @@ class ActiveScan:
     settle_frame: int = 0
     settle_frames: int = 0
     retry_after_hold: bool = False
+    turn_replan_used: bool = False
     issued_yaw: bool = False
     pose: tuple = (0., 0., 0.)
     motion: tuple = (0., 0., 0.)
@@ -170,31 +172,28 @@ class ActiveScan:
                            or (body_pose is not None and body_pose.frame != self.pose_origin.frame)):
             self.invalidate()
         source = (odom or {}).get("source_sample_id") if self.receipt_only else None
-        if source is not None and self.odom_source is not None and self.poses:
-            if source < self.odom_source:
-                return self.invalidate()
-            if source == self.odom_source:
-                previous = self.poses[-1][0]
-                if not 0 <= stamp - previous <= ODOM_GAP_MS:
-                    return self.invalidate()
-                stamp = previous
         if self.poses:
             previous = self.poses[-1][0]
-            if not 0 <= stamp - previous <= ODOM_GAP_MS:
-                if self.receipt_only and self.active and stamp > previous:
-                    # A slow control tick can skip valid odometry samples.
-                    # Brake instead of integrating motion over the gap.
-                    self.poses.clear()
-                    return self.hold_for_replan("主动观察：运动反馈间隔过长，停车后重规划")
-                self.invalidate()
-            elif stamp > previous and body_pose is None:
-                dt = (stamp - previous) / 1000
-                vx, vy, wz = motion
-                forward, right, heading = self.pose
-                mid = heading - .5 * wz * dt
-                self.pose = (forward + dt * (vx * math.cos(mid) + vy * math.sin(mid)),
-                             right + dt * (vx * math.sin(mid) - vy * math.cos(mid)),
-                             heading - dt * wz)
+            if (self.receipt_only and self.active and body_pose is None and stamp > previous
+                    and odom.get("velocity_history")):
+                hold = self._integrate_receipt_motion(odom["velocity_history"], stamp, source, motion)
+                if hold is not None:
+                    return hold
+                stamp, source, motion = self.poses[-1][0], self.odom_source, self.motion
+            else:
+                if source is not None and self.odom_source is not None:
+                    if source < self.odom_source:
+                        return self.invalidate()
+                    if source == self.odom_source:
+                        if not 0 <= stamp - previous <= ODOM_GAP_MS:
+                            return self.invalidate()
+                        stamp = previous
+                if not 0 <= stamp - previous <= ODOM_GAP_MS:
+                    if self.receipt_only and self.active and stamp > previous:
+                        return self._hold_for_feedback_gap()
+                    self.invalidate()
+                elif stamp > previous and body_pose is None:
+                    self._integrate_motion(motion, (stamp - previous) / 1000)
         if body_pose is not None:
             self.pose_origin = self.pose_origin or body_pose
             forward, left, yaw = body_pose.relative_to(self.pose_origin)
@@ -241,6 +240,59 @@ class ActiveScan:
         if not stable_heading:
             free = np.zeros_like(free)
         self.views.append((capture, pose, free, occupied))
+
+    def _integrate_motion(self, motion, dt):
+        vx, vy, wz = motion
+        forward, right, heading = self.pose
+        mid = heading - .5 * wz * dt
+        self.pose = (forward + dt * (vx * math.cos(mid) + vy * math.sin(mid)),
+                     right + dt * (vx * math.sin(mid) - vy * math.cos(mid)),
+                     heading - dt * wz)
+
+    def _integrate_receipt_motion(self, history, stamp, source, motion):
+        # The control timer may run late while odometry is still arriving.
+        # Validate the entire sample sequence before integrating any of it.
+        previous = self.poses[-1][0]
+        samples = [sample for sample in history if previous < sample[0] <= stamp]
+        if not samples or samples[-1][0] != stamp:
+            samples.append((stamp, source, motion))
+        last_stamp, last_source, last_motion = previous, self.odom_source, self.motion
+        intervals = []
+        for received, identity, velocity in samples:
+            if velocity is None:
+                self.poses.clear()
+                return self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
+            if identity is not None and last_source is not None:
+                if identity < last_source:
+                    return self.invalidate()
+                if identity == last_source:
+                    if received - last_stamp > ODOM_GAP_MS:
+                        return self.invalidate()
+                    continue
+                # Both identities are producer stamp_ms values. Their elapsed
+                # time also detects outages hidden by delivery in a batch.
+                if identity - last_source > ODOM_GAP_MS:
+                    return self._hold_for_feedback_gap()
+            if not 0 < received - last_stamp <= ODOM_GAP_MS:
+                return self._hold_for_feedback_gap()
+            intervals.append((velocity, (received - last_stamp) / 1000))
+            last_stamp, last_source, last_motion = received, identity, velocity
+        for velocity, dt in intervals:
+            self._integrate_motion(velocity, dt)
+        if intervals:
+            self.poses.append((last_stamp, self.pose, last_motion[2]))
+            self.odom_source, self.motion = last_source, last_motion
+        if self.settle_ms is not None and any(
+                math.hypot(vx, vy) > STILL_LINEAR or abs(wz) > STILL_YAW
+                for (vx, vy, wz), _ in intervals):
+            self.settle_ms = self.settle_start_source = None
+        if self.phase == "turn" and any(
+                math.hypot(vx, vy) > STILL_LINEAR for (vx, vy, _), _ in intervals):
+            return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
+
+    def _hold_for_feedback_gap(self):
+        self.poses.clear()
+        return self.hold_for_replan("主动观察：运动反馈间隔过长，停车后重规划")
 
     def _update_latest(self, depth, geometry, stamp, max_depth_age_ms):
         # Receipt times establish liveness and the stopped waiting interval.
@@ -395,20 +447,24 @@ class ActiveScan:
 
     def finish(self):
         self.result_frame = self.current_frame if self.route_segment else self.side_frame
+        if self.advance_origin is not None:
+            self.turn_replan_used = False
         if self.route_segment:
             self.attempted = False
             self.rerouted = False
         self.phase = "idle"
 
     def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
-                min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None):
+                min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None, control_period_s=None,
+                body_half_width=None):
         if not self.active or self.ready:
             return ScanCommand()
         if self.command_only:
             if previous_yaw is not None and self.timed_turn_s:
                 self.timed_heading -= previous_yaw * min(tick_s, watchdog_ms / 1000)
             return self._timed_command(geometry, half_width, yaw_rate, watchdog_ms,
-                                       obs_age_ms, min_yaw_rate, tick_s, previous_yaw is not None)
+                                       obs_age_ms, min_yaw_rate, tick_s, previous_yaw is not None,
+                                       body_half_width)
         stamp = self.poses[-1][0]
         speed = math.hypot(*self.motion[:2])
         if not self.current_frame:
@@ -428,11 +484,13 @@ class ActiveScan:
         if (self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
-        if (self.receipt_only and speed > STILL_LINEAR) or self.phase == "brake_for_replan":
-            self.phase = "brake_for_replan"
+        if self.receipt_only and speed > STILL_LINEAR and self.phase != "brake_for_replan":
+            return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
+        if self.phase == "brake_for_replan":
             if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
                 self.settle_ms = None
-                return ScanCommand(reason="主动观察：检测到平移，停车后重规划")
+                motion = "检测到平移" if speed > STILL_LINEAR else "仍在转动"
+                return ScanCommand(reason=f"主动观察：{motion}，停车后重规划")
             if self.settle_ms is None:
                 self.settle_ms = stamp
                 self.settle_start_source = self.source_frame
@@ -447,17 +505,30 @@ class ActiveScan:
                             and self.source_frame > self.settle_start_source)
             fresh_depth = not self.receipt_only or fresh_source
             released_route = self.route_segment and self.advance_origin is not None
+            interrupted_turn = (self.receipt_only and self.issued_yaw and self.advance_m is not None
+                                and self.advance_origin is None)
+            if interrupted_turn:
+                if self.turn_replan_used:
+                    return self.interrupt("主动观察：转向重试后再次中断；保持停车")
+                if not fresh_source or self.current_frame <= self.settle_ms + SETTLE_MS:
+                    if self.settle_start_source is None:
+                        self.settle_start_source = self.source_frame
+                    return ScanCommand(reason="主动观察：等待停稳后的独立新深度")
+                self.turn_replan_used = True
+                self.route_segment = False
+                self.advance_m = None
+                self.side_frame = self.result_frame = 0
             if released_route and not self.retry_after_hold and not fresh_depth:
                 if self.settle_start_source is None:
                     self.settle_start_source = self.source_frame
                 return ScanCommand(reason="主动观察：等待停稳后的观测")
-            if self.retry_after_hold or (fresh_depth and (not self.issued_yaw or released_route)):
+            if interrupted_turn or self.retry_after_hold or (fresh_depth and (not self.issued_yaw or released_route)):
                 self.attempted = False
                 self.retry_after_hold = False
             self.phase = "idle"
             self.issued_yaw = False
             self.settle_ms = None
-            return ScanCommand(reason="主动观察：已停稳，重新规划")
+            return ScanCommand(reason="主动观察：已停稳，重新规划", replanned_turn=interrupted_turn)
         if speed > STILL_LINEAR:
             return self.interrupt("主动观察：检测到平移，停车")
         if (abs(self.motion[2]) > yaw_rate + .10
@@ -499,6 +570,12 @@ class ActiveScan:
                 self.settle_ms = stamp
             if stamp - self.settle_ms < SETTLE_MS or self.current_frame <= self.settle_ms:
                 return ScanCommand(reason="主动观察：等待转稳后的新深度")
+            if body_half_width is not None and self.receipt_only:
+                if self.settle_start_source is None:
+                    self.settle_start_source = self.source_frame
+                if (self.source_frame is None or self.source_frame <= self.settle_start_source
+                        or self.current_frame <= self.settle_ms + SETTLE_MS):
+                    return ScanCommand(reason="主动观察：等待转稳后的独立新深度")
             self.settle_ms = None
             if returning:
                 self.issued_yaw = False
@@ -525,26 +602,29 @@ class ActiveScan:
             return ScanCommand(reason="主动观察：等待反向转动停止")
 
         if bounded_turn:
+            minimum_s = tick_s
             if self.turn_until_ms:
                 duration_ms = self.turn_until_ms - control_ms
                 yaw_rate = min(yaw_rate, abs(self.turn_yaw))
             else:
+                # A late tick has not consumed any of this new window.
+                if control_period_s is not None:
+                    minimum_s = control_period_s
                 duration_ms = TURN_BURST_MS
                 yaw_rate = min(yaw_rate, max(min_yaw_rate, abs(error) * 1000 / duration_ms))
                 duration_ms = min(duration_ms, int((abs(error) + 2 * ANGLE_TOLERANCE) * 1000 / yaw_rate))
-            if duration_ms < max(1, int(tick_s * 1000)):
+            if duration_ms < max(1, int(minimum_s * 1000)):
                 self.turn_until_ms = 0
                 self.turn_stop_ms = control_ms
                 return ScanCommand(reason=wait_reason)
-        _, occupied = self.grid()
-        occupied = occupied | self.views[-1][3]
+        occupied = self.turn_obstacles(geometry, body_half_width)
 
         yaw_rate = self.checked_turn_rate(geometry, half_width, error, yaw_rate, min_yaw_rate,
                                           horizon, occupied)
         if not yaw_rate:
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
-            return self.interrupt("主动观察：转身扫掠区有障碍，停车")
+            return self.interrupt("主动观察：转身扫掠区有障碍或缺少净空观测，停车")
         self.issued_yaw = True
         if bounded_turn:
             if not self.turn_until_ms:
@@ -555,7 +635,7 @@ class ActiveScan:
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
     def _timed_command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms,
-                       min_yaw, tick_s, tracks_commands):
+                       min_yaw, tick_s, tracks_commands, body_half_width):
         self.timed_total_s += tick_s
         self.timed_phase_s += tick_s
         if not self.current_frame or self.timed_total_s * 1000 > 2 * SCAN_TIMEOUT_MS:
@@ -568,7 +648,9 @@ class ActiveScan:
         if self.phase == "settle":
             after = self.settle_ms + RECEIPT_SETTLE_MS
             captured = self.single_capture_ms or self.current_frame
-            if captured > after and self.current_frame > self.settle_frame:
+            identified = (body_half_width is None or self.source_frame is not None
+                          or self.single_capture_ms is not None)
+            if identified and captured > after and self.current_frame > self.settle_frame:
                 self.settle_frame = self.current_frame
                 self.settle_frames += 1
             if self.timed_phase_s * 1000 >= RECEIPT_SETTLE_MS and self.settle_frames >= 3:
@@ -609,12 +691,18 @@ class ActiveScan:
         rate = abs(self.turn_yaw)
         sweep = math.copysign(abs(error) + (rate + .10) * horizon, self.turn_yaw)
         if (rate <= 0. or rate < min_yaw or not self.clear_sweep(
-                geometry, half_width, sweep, STILL_LINEAR * horizon)):
+                geometry, half_width, sweep, STILL_LINEAR * horizon,
+                occupied=self.turn_obstacles(geometry, body_half_width))):
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
-            return self.interrupt("主动观察：转身扫掠区有障碍，停车")
+            return self.interrupt("主动观察：转身扫掠区有障碍或缺少净空观测，停车")
         self.issued_yaw = True
         return ScanCommand(-self.turn_yaw, "主动观察：有界短转向")
+
+    def turn_obstacles(self, geometry, body_half_width):
+        grid = self.grid()
+        occupied = grid[1] if body_half_width is None else motion_obstacles(grid, geometry, body_half_width)
+        return occupied | self.views[-1][3]
 
     def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied):
         def clear_sweep(rate):
@@ -646,7 +734,8 @@ class ActiveScan:
             _, occupied = self.grid()
             occupied = occupied | self.views[-1][3]
         occupied_forward, occupied_right = FORWARD[occupied], RIGHT[occupied]
-        # An area outside this view is unknown. Only observed hits can block a turn.
+        # The mask can also include unknown cells where the caller requires
+        # observed clearance for the swept area.
         for angle in np.linspace(0., sweep, samples):
             c, s = math.cos(angle), math.sin(angle)
             forward = occupied_forward * c + occupied_right * s
@@ -702,5 +791,6 @@ class ActiveScan:
             self.rerouted = False
             self.attempted = False
             self.issued_yaw = False
+            self.turn_replan_used = False
             self.clear_frames = 0
             self.result_frame = 0
