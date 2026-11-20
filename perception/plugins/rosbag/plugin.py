@@ -33,6 +33,9 @@ class RosbagRecorderPlugin:
                 "type": "object",
                 "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "config"]}},
                 "required": ["action"],
+                # Graceful SIGINT (15s) plus a bounded kill/reap (5s) can
+                # legitimately outlast the platform's normal stop deadline.
+                "x-stop": {"timeout_s": 25},
                 "x-action-params": {
                     "info": {"params": [], "description": "查看录制状态与最近一次录制结果"},
                     "config": {"params": [], "description": "更新录制配置"},

@@ -70,7 +70,13 @@ class Recorder:
                     raise ValueError("limits must be non-negative")
                 self._root.mkdir(parents=True, exist_ok=True)
                 if shutil.disk_usage(self._root).free < min_free:
-                    return self._error("Insufficient free space for recording")
+                    self._state = "error"
+                    self._message = "Insufficient free space for recording"
+                    self._path = None
+                    self._topics = list(dict.fromkeys(topics))
+                    self._duration = 0.0
+                    self._reason = ""
+                    return self._snapshot()
                 # The rosbag CLI requires a path which does not already exist.
                 path = self._root / (time.strftime("bag_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:12])
                 command = [self._executable, "bag", "record", "-o", str(path), *topics]
@@ -81,6 +87,10 @@ class Recorder:
             except (OSError, TypeError, ValueError, OverflowError) as exc:
                 self._state = "error"
                 self._message = f"Could not start ROS bag recorder: {exc}"
+                self._path = None
+                self._topics = list(dict.fromkeys(topics))
+                self._duration = 0.0
+                self._reason = ""
                 return self._snapshot()
             self._process = process
             self._path = path

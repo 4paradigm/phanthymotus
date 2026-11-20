@@ -65,6 +65,12 @@ def _metadata(result):
     (path / "metadata.yaml").write_text("rosbag2_bagfile_information: {}\n", encoding="utf-8")
 
 
+def test_card_declares_bounded_stop_deadline(tmp_path):
+    card = card_module.RosbagRecorderPlugin({"output_root": str(tmp_path)})
+    tool = card.get_tools()[0]
+    assert tool["inputSchema"]["x-stop"]["timeout_s"] == 25
+
+
 def test_records_requested_topics_and_closes_on_sigint(harness):
     started = harness.recorder.start(["/camera/image", "/imu"])
     assert started["state"] == "recording"
@@ -87,6 +93,24 @@ def test_missing_ros2_executable_is_reported(harness):
     result = harness.recorder.start(["/imu"])
     assert result["state"] == "error"
     assert "ros2 not found" in result["message"]
+
+
+def test_start_error_does_not_report_a_previous_bag(harness):
+    started = harness.recorder.start(["/old"])
+    _metadata(started)
+    harness.clock.now += 3
+    assert harness.recorder.stop()["state"] == "completed"
+    harness.popen.side_effect = FileNotFoundError("ros2 not found")
+
+    result = harness.recorder.start(["/new"])
+
+    assert result["state"] == "error"
+    assert "ros2 not found" in result["message"]
+    assert result["path"] is None
+    assert result["topics"] == ["/new"]
+    assert result["duration_sec"] == 0
+    assert result["stop_reason"] is None
+    assert harness.recorder.info() == result
 
 
 def test_unexpected_exit_is_reported_by_info(harness):
@@ -147,7 +171,35 @@ def test_disk_space_preflight_refuses_to_start(harness):
     result = harness.recorder.start(["/imu"], min_free_bytes=100)
     assert result["state"] == "error"
     assert "free space" in result["message"]
+    assert harness.recorder.info() == result
     harness.popen.assert_not_called()
+
+
+def test_disk_preflight_error_does_not_report_a_previous_bag(harness):
+    started = harness.recorder.start(["/old"])
+    _metadata(started)
+    assert harness.recorder.stop()["state"] == "completed"
+    harness.disk.free = 99
+
+    result = harness.recorder.start(["/new"], min_free_bytes=100)
+
+    assert result["state"] == "error"
+    assert result["path"] is None
+    assert result["topics"] == ["/new"]
+    assert result["stop_reason"] is None
+    assert harness.recorder.info() == result
+
+
+def test_duplicate_start_does_not_replace_running_state(harness):
+    started = harness.recorder.start(["/imu"])
+    refused = harness.recorder.start(["/other"])
+
+    assert refused["state"] == "error"
+    info = harness.recorder.info()
+    assert info["state"] == "recording"
+    assert info["path"] == started["path"]
+    assert info["topics"] == ["/imu"]
+    harness.popen.assert_called_once()
 
 
 def test_bad_configuration_does_not_start_with_previous_topics(tmp_path, monkeypatch):
