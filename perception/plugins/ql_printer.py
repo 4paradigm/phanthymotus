@@ -93,6 +93,19 @@ class BridgeClient:
                 raise BridgeError(message, str(payload.get("code") or f"http_{exc.code}"))
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 reason = getattr(exc, "reason", exc)
+                timed_out = (
+                    isinstance(reason, TimeoutError)
+                    or getattr(reason, "errno", None) in (110, 10060)
+                    or "timed out" in str(reason).lower()
+                )
+                if timed_out:
+                    message = (
+                        "前台桥接请求超时，尚未收到结果；不能据此判断桥接未启动。"
+                        "请检查前台专用 Edge 是否已登录访客网站、页面是否加载完成，以及网络连接。"
+                    )
+                    if path == "/print_tag":
+                        message += "打印结果尚不确定，请先核对打印机和访客状态，不要立即重复打印。"
+                    raise BridgeError(message, "request_timeout") from exc
                 refused = getattr(reason, "errno", None) in (111, 10061) or "refused" in str(reason).lower()
                 if attempt == 0 and refused and retry_refused:
                     # The Windows watchdog may be starting the bridge. A

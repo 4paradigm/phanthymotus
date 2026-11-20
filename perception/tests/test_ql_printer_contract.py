@@ -155,7 +155,9 @@ class VisitorBadgeTest(unittest.TestCase):
         self.server.server_close()
         self.server = None
         result = self.call("list")
-        self.assertEqual(result["code"], "unreachable")
+        # Closed ports can be rejected immediately or time out depending on
+        # the host network stack. Neither outcome proves a login failure.
+        self.assertIn(result["code"], {"unreachable", "request_timeout"})
 
     def test_remote_start_runs_ssh_before_query_when_bridge_is_down(self):
         self.card._cfg.update({
