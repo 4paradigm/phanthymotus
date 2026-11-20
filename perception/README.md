@@ -641,12 +641,14 @@ variable before starting Perception to prefer another mirror; it is optional.
 ## TTS Engines
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
-`config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
+`config.yaml`) selects the voice. Engine names usually follow **`<model>-<languages>`** —
 the same shape `asr_model` uses (`x-asr-zh-en`, `parakeet-en`, `sensevoice-small`),
 because the dashboard renders the raw enum string, so these two dropdowns sit side
 by side in front of the same operator. Language codes, not country codes: `zh`, not
 `cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
 and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
+The `-trt` suffix distinguishes the Jetson Kokoro variant from the original
+`kokoro-multi` option.
 
 | `tts_engine` | model | languages | runtime | model dir |
 |---|---|---|---|---|
@@ -654,6 +656,7 @@ and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
 | `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
 | `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
 | `kokoro-multi` | Kokoro-82M v1.0 | 英 / 中 / 日 / 西 / 法 / 意 / 葡 / 印地, code-switching | ONNX Runtime | `/models/kokoro-multi/<device>` |
+| `kokoro-multi-trt` | Kokoro Multi | 中 / 英 / 日 / 俄 / 德 / 法 / 西 / 泰 | TensorRT on JetPack 5.1.1 and 6.1 | `/models/kokoro-multi-trt-jp511` or `/models/kokoro-multi-trt` |
 
 `vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
 `plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
@@ -721,6 +724,51 @@ Known limitation, sherpa's FSTs rather than this code: `电话13800138000` becom
 `一百三十八亿零一十三万八千` — `phone-zh.fst` does not match a bare number, so
 `number-zh.fst` reads it as a quantity. And a bare `2026.` with no `年` reads as
 `二千零二十六`; the year form needs the context character.
+
+### `kokoro-multi-trt` on JetPack
+
+The Jetson Perception image includes the dependencies in
+`plugins/requirements.kokoro-multi.txt` so that an operator can switch to
+`kokoro-multi-trt` through the existing TTS card. Selecting the engine loads one
+FP32 TensorRT model and one voice for `zh`, `en`, `ja`, `ru`, `de`,
+`fr`, `es`, and `th`. Set `kokoro_trt_language` to `auto` for per-request
+language detection, or choose one of those language codes. The device and
+speaker fields show the options supported by the current release: GPU and
+speaker ID `0`.
+
+When configuring the engine in `config.yaml`, update these fields under
+`plugins.tts`. Setting `model_dir: null` replaces the VITS2 path and selects
+the JetPack-specific Kokoro cache.
+
+```yaml
+engine: kokoro-multi-trt
+language: auto
+model_dir: null
+```
+
+If you used TensorRT through the `kokoro-multi` entry in an earlier PR test
+image, select `kokoro-multi-trt` on that card after updating the image.
+
+The JetPack 5.1.1 and 6.1 plans are different. On first load, Perception
+downloads the pinned archive for the image's JetPack version from ModelScope,
+verifies its size and SHA-256, then extracts it under
+`/models/kokoro-multi-trt-jp511` or `/models/kokoro-multi-trt`, respectively.
+The archive includes the frontend data and the English spaCy model. Download
+and extraction progress appear in the TTS card. A verified installation is
+reused on subsequent starts.
+
+Normal Perception startup retains its configured plugins. For the standalone
+benchmark launcher, set both `KOKORO_MULTI_ENABLE=1` and
+`KOKORO_MULTI_BENCHMARK=1`. Benchmark mode selects the TTS-only configuration
+and unpaced output. Both variables default to `0`.
+
+The frontend dependencies are installed in the shared Jetson image because
+the card supports switching engines at runtime. They increase image size.
+The model archive and its frontend data are downloaded separately at runtime.
+For the JP5 PR image `release.261119.97e2878-jetson-jp5.11`, the dependency
+installation layer is 112,603,396 bytes compressed. This layer also includes
+the pinned NumPy installation, so its size is not the incremental cost of
+Kokoro dependencies alone.
 
 ### `kokoro-multi`, the multilingual voice
 

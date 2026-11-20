@@ -694,9 +694,27 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
+# Kokoro Multi frontend dependencies for both JetPack Python ABIs.
+RUN . /etc/jetpack.env && \
+    pip3 uninstall -y phonemizer && \
+    pip3 install --no-cache-dir -i "${PYPI_MIRROR}" "numpy==${NUMPY_VERSION}" \
+      -r /work/plugins/requirements.kokoro-multi.txt && \
+    python3 -c "import numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; import misaki, spacy, phonemizer, fugashi, langid"
+ARG KOKORO_MULTI_BENCHMARK=0
+# The JP5 Darvin image only runs TTS. Avoid loading Torch in its CPU frontend.
+RUN if [ "${JP_VERSION}" = "511" ] && [ "${KOKORO_MULTI_BENCHMARK}" = "1" ]; then \
+      pip3 uninstall -y torch torchvision torchaudio; \
+    fi
+ENV KOKORO_MULTI_BUILT_FOR_JP=${JP_VERSION}
+ENV KOKORO_MULTI_ENABLE=${KOKORO_MULTI_BENCHMARK} \
+    KOKORO_MULTI_BENCHMARK=${KOKORO_MULTI_BENCHMARK}
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     if [ \"${KOKORO_MULTI_ENABLE}\" = \"1\" ]; then \
+       exec python3 -c 'from plugins.kokoro_multi_tts import main; main()'; \
+     else \
+       exec python3 /work/main.py; \
+     fi"]
