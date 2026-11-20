@@ -73,7 +73,7 @@ def test_receipt_only_projects_only_the_latest_requested_frame(monkeypatch, comm
     assert len(projected) == 1 and projected[0] is newer
 
 
-def test_active_scan_turns_right_and_waits_for_post_turn_depth(monkeypatch):
+def test_active_scan_turns_right_and_can_return_using_the_current_view(monkeypatch):
     lookout, geometry, _, blocked = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)
     assert lookout.begin((1., -1.))
@@ -84,24 +84,22 @@ def test_active_scan_turns_right_and_waits_for_post_turn_depth(monkeypatch):
     assert result.yaw == 0
     assert math.degrees(lookout.pose[2]) == pytest.approx(20., abs=2.)
     assert _tick(lookout, geometry, 2500, capture=2450).yaw == 0
-    assert _tick(lookout, geometry, 2650, capture=2450).yaw == 0
     assert not lookout.ready
+    assert lookout.phase == "return" and lookout.side_frame == 2450
     blocked[30, 38] = True
-    assert _tick(lookout, geometry, 2700).yaw == 0
-    assert _tick(lookout, geometry, 2750).yaw > 0
+    assert _tick(lookout, geometry, 2600).yaw > 0
     blocked[30, 38] = False
-    for stamp in range(2850, 4150, 100):
+    for stamp in range(2700, 4000, 100):
         result = _tick(lookout, geometry, stamp, .25)
     assert result.yaw == 0
-    _tick(lookout, geometry, 4150)
-    _tick(lookout, geometry, 4300)
+    _tick(lookout, geometry, 4000)
     assert lookout.ready
     _, occupied = lookout.grid()
     assert occupied.any()
     assert not occupied[30, 38]  # the side observation was reprojected
     assert lookout.try_other_side()
-    assert _tick(lookout, geometry, 4400).yaw == 0
-    assert _tick(lookout, geometry, 4500).yaw > 0
+    assert _tick(lookout, geometry, 4100).yaw == 0
+    assert _tick(lookout, geometry, 4200).yaw > 0
 
 
 def test_active_scan_holds_an_occupied_sweep(monkeypatch):
@@ -374,7 +372,7 @@ def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(m
 
 
 @pytest.mark.parametrize("lose_depth, yaw_limit", [(False, .83), (False, .60), (True, .83)])
-def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth, yaw_limit):
+def test_command_only_scan_evaluates_when_the_timed_turn_finishes(monkeypatch, lose_depth, yaw_limit):
     look, geometry, _, _ = _setup(monkeypatch)
     look.observe_single(_depth(1000), geometry, 800, 1000)
     assert look.begin((1., -1.))
@@ -396,7 +394,7 @@ def test_command_only_scan_waits_for_a_new_settled_view(monkeypatch, lose_depth,
     nonzero = [rate for rate in rates if rate]
     assert all(-yaw_limit <= rate <= -.33 for rate in nonzero)
     assert math.degrees(-sum(nonzero) * .1) == pytest.approx(20., abs=2.)
-    assert look.ready and look.current_frame > first_turn + scan.RECEIPT_SETTLE_MS
+    assert look.ready and stamp == first_turn + 100 * len(nonzero)
     assert len(look.views) == 1 and not look.poses
 
 
@@ -440,20 +438,15 @@ def test_command_only_scan_turns_to_the_far_side_of_its_original_heading(monkeyp
     pytest.fail("The other heading was never observed")
 
 
-def test_command_only_scan_uses_capture_time_for_post_stop_frames(monkeypatch):
+def test_command_only_scan_reuses_the_current_view_after_turning(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
     look.observe_single(_depth(1000), geometry, 800, 1000)
     assert look.begin((1.,))
-    look.phase, look.settle_ms = "settle", 1000
-    look.timed_phase_s = scan.RECEIPT_SETTLE_MS / 1000
-    for stamp in (4501, 4600, 4700):
-        look.observe_single(dict(_depth(stamp), capture_ms=4400), geometry, 800, stamp)
-        assert look.command(geometry, .31, .83, 300).yaw == 0.
-    assert not look.ready and look.settle_frames == 0
-    for stamp in (4800, 4900, 5000):
-        look.observe_single(_depth(stamp), geometry, 800, stamp)
-        assert look.command(geometry, .31, .83, 300).yaw == 0.
-    assert look.ready
+    look.phase = "turn"
+    look.timed_heading = look.turn_angle
+    look.observe_single(_depth(1000), geometry, 800, 1100)
+    assert look.command(geometry, .31, .83, 300).yaw == 0.
+    assert look.ready and look.side_frame == 1000
 
 
 def test_scan_rejects_unexpected_yaw_rate(monkeypatch):
@@ -477,11 +470,8 @@ def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(
     assert lookout.locked
 
 
-@pytest.mark.parametrize(("at_stop", "after_stop", "may_replan"), [
-    (1250, 1400, True), (1250, 1250, False), (None, 1400, False), (0, 1400, False),
-])
-def test_drift_before_first_yaw_can_replan_only_from_fresh_stopped_depth(
-        monkeypatch, at_stop, after_stop, may_replan):
+@pytest.mark.parametrize("at_stop", [1250, 1050, None, 0])
+def test_drift_before_first_yaw_can_replan_with_the_current_depth(monkeypatch, at_stop):
     look, geometry, _, _ = _setup(monkeypatch)
 
     def tick(stamp, source, vx=0.):
@@ -494,10 +484,9 @@ def test_drift_before_first_yaw_can_replan_only_from_fresh_stopped_depth(
     assert look.begin((1., -1.))
     assert tick(1050, 1050).yaw == 0.
     assert tick(1150, 1050, vx=.12).yaw == 0.
-    assert tick(1250, at_stop).yaw == 0.
-    assert tick(1400, after_stop).yaw == 0.
+    assert "重新规划" in tick(1250, at_stop).reason
     assert not look.issued_yaw
-    assert look.begin((-1., 1.)) is may_replan
+    assert look.begin((-1., 1.))
 
 
 def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkeypatch):
@@ -515,14 +504,11 @@ def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkey
     assert tick(1250, vx=.113, vy=-.014, yaw=-.204).yaw == 0.
     assert look.active and not look.locked
     assert tick(1400, vx=-.006, vy=-.035).yaw == 0.
-    assert look.active
-    assert tick(1550, vx=-.006, vy=-.035).yaw == 0.
     assert not look.active and not look.locked and look.attempted
 
 
 @pytest.mark.parametrize("interruption", ["translation", "gap"])
-@pytest.mark.parametrize("early_source", [14, 15])
-def test_interrupted_turn_can_replan_once_from_a_distinct_settled_view(monkeypatch, interruption, early_source):
+def test_interrupted_turn_can_replan_once_with_the_current_view(monkeypatch, interruption):
     look, geometry, _, _ = _setup(monkeypatch)
 
     def tick(stamp, source, vx=0.):
@@ -537,19 +523,14 @@ def test_interrupted_turn_can_replan_once_from_a_distinct_settled_view(monkeypat
     assert tick(1200, 12).yaw > 0.
     stopped = 1550 if interruption == "gap" else 1300
     assert tick(stopped, 13, vx=.1 if interruption == "translation" else 0.).yaw == 0.
-    assert tick(stopped + 100, 14).yaw == 0.
-    assert tick(stopped + 150, early_source).yaw == 0.
-    assert tick(stopped + 250, early_source).yaw == 0.
     assert look.phase == "brake_for_replan" and look.attempted
-
-    assert tick(stopped + 300, 16).yaw == 0.
+    assert tick(stopped + 100, 12 if interruption == "gap" else 13).replanned_turn
     assert not look.active and not look.attempted and look.advance_m is None
     assert look.begin((-1.,), advance_m=1.5, route_segment=True)
-    assert tick(stopped + 400, 17).yaw == 0.
-    assert tick(stopped + 500, 18).yaw > 0.
-    assert tick(stopped + 600, 19, vx=.1).yaw == 0.
-    assert tick(stopped + 700, 20).yaw == 0.
-    assert tick(stopped + 850, 21).yaw == 0.
+    assert tick(stopped + 200, 17).yaw == 0.
+    assert tick(stopped + 300, 18).yaw > 0.
+    assert tick(stopped + 400, 19, vx=.1).yaw == 0.
+    assert tick(stopped + 500, 20).yaw == 0.
     assert look.locked and not look.begin((-1.,))
 
 
@@ -630,8 +611,8 @@ def test_receipt_scan_distinguishes_rotation_from_translation_while_stopping(mon
 def test_receipt_scan_replan_after_travel_locks_only_before_a_released_straight_segment(
         monkeypatch, released):
     """Tianyi 2.0, 2026-11-20 06:06:59: depth paused for 2.3 s while the scan's
-    straight segment had already covered 0.62 m. The replan hold must settle and
-    replan from the new view. Drift of the same size with no released segment
+    straight segment had already covered 0.62 m. The replan hold must use
+    the current view once feedback is available. Drift without a released segment
     is still an unexplained translation and keeps locking."""
     look, geometry, _, _ = _setup(monkeypatch)
 
@@ -663,17 +644,7 @@ def test_receipt_scan_replan_after_travel_locks_only_before_a_released_straight_
     if not released:
         assert not look.active and look.locked
         return
-    assert look.active and not look.locked
-    assert look.attempted
-    # Fresh motion feedback alone cannot release the scan. The last depth
-    # frame was taken before the settled observation window.
-    look.update(_depth(7700), {**_odom(7850), "received_ms": 7850},
-                geometry, receipt_only=True, max_depth_age_ms=800)
-    assert "等待停稳后的观测" in look.command(geometry, .33, 1., 600, 800).reason
-    assert look.active and look.attempted
-    update(7900)
-    replan = look.command(geometry, .33, 1., 600, 800)
-    assert replan.yaw == 0. and "重新规划" in replan.reason
+    assert "重新规划" in first.reason
     assert not look.active and not look.locked and not look.issued_yaw and not look.attempted
 
 
@@ -695,9 +666,6 @@ def test_receipt_scan_retries_if_input_lapses_while_braking_before_first_turn(mo
     assert look.phase == "brake_for_replan" and look.attempted
 
     update(2000)
-    assert look.command(geometry, .33, 1., 600).yaw == 0.
-    assert look.active and look.attempted
-    update(2200)
     assert "已停稳，重新规划" in look.command(geometry, .33, 1., 600).reason
     assert not look.locked
     assert look.begin((-1., 1.))
@@ -752,7 +720,8 @@ def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
 
 
 @pytest.mark.parametrize("half_width", [.23, .35])
-def test_receipt_only_scan_turns_with_only_front_depth(half_width):
+@pytest.mark.parametrize("route_segment", [False, True])
+def test_receipt_only_scan_turns_with_only_front_depth(half_width, route_segment):
     horizontal = HorizontalIntrinsics(640, 315, 337)
     vertical = (480, 420, 243)
     geometry = camera_square(horizontal, vertical, half_width)
@@ -767,21 +736,21 @@ def test_receipt_only_scan_turns_with_only_front_depth(half_width):
         look.update({"map": image, "ground": ground, "frame_id": stamp},
                     {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
         if stamp == 1000:
-            assert look.begin((1., -1.))
-        result = look.command(geometry, half_width + .10, .18, 600)
+            assert look.begin((1.,), advance_m=1., route_segment=route_segment)
+        result = look.command(geometry, half_width + .05, .18, 600)
     assert result.yaw == -.18
 
 
 @pytest.mark.parametrize("initial_hit", [False, True])
 def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkeypatch, initial_hit):
     look, geometry, _, occupied = _setup(monkeypatch)
-    occupied[10, 28] = initial_hit
+    occupied[scan.START[0], scan.START[1] + 5] = initial_hit  # Hits in the 5 cm side margin count.
     for stamp in (1000, 1050, 1150):
         look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
                     geometry, receipt_only=True)
         if stamp == 1000:
             assert look.begin((1.,))
-        result = look.command(geometry, .33, .18, 600)
+        result = look.command(geometry, .25, .18, 600)
     assert (result.yaw < 0) is (not initial_hit)
 
 
@@ -829,24 +798,21 @@ def test_receipt_only_scan_rejects_a_republished_depth_frame(monkeypatch):
     assert not look.active and look.locked
 
 
-def test_observed_turn_waits_for_independent_depth_after_settling(monkeypatch):
+def test_observed_turn_can_use_the_current_depth_after_turning(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
 
     def tick(stamp, source):
         look.update(dict(_depth(stamp), source_frame_id=source),
                     dict(_odom(stamp), received_ms=stamp), geometry, receipt_only=True)
-        return look.command(geometry, .25, 1., 600, body_half_width=.20)
+        return look.command(geometry, .25, 1., 600)
 
     tick(1000, 10)
     assert look.begin((-1.,), advance_m=1.)
     assert tick(1100, 11).yaw == 0.
     look.pose = (0., 0., -look.turn_angle)
-    assert tick(1200, 12).yaw == 0.
-    assert tick(1250, 13).yaw == 0.  # Distinct frame during the settling interval.
-    assert tick(1350, 13).yaw == 0.  # Republishing it does not refresh the view.
-    assert not look.ready
-    assert tick(1400, 14).yaw == 0.
+    assert tick(1200, 11).yaw == 0.
     assert look.ready
+    assert look.side_frame == 1100
 
 
 def test_receipt_stamp_cannot_extend_the_life_of_repeated_odometry(monkeypatch):

@@ -440,32 +440,6 @@ class Gate:
 
 
 @dataclass
-class ClearanceRecovery:
-    """Confirm a route on three distinct depth updates, then ramp translation."""
-    route: str = ""
-    frames: int = 0
-    last_frame: object = None
-
-    def scale(self, route, depth, max_age_ms):
-        frame = depth.get("source_frame_id", depth.get("frame_id"))
-        if frame is None:
-            # Pure-policy callers can supply an unstamped depth map.
-            frame = depth["map"] if depth.get("map") is not None else depth
-            fresh = frame is not self.last_frame
-        else:
-            previous = self.last_frame
-            fresh = not isinstance(previous, int) or frame != previous
-            if isinstance(previous, int) and not 0 <= frame - previous <= max_age_ms:
-                self.frames = 0
-        if route != self.route:
-            self.route, self.frames = route, 0
-        if fresh:
-            self.frames += 1
-        self.last_frame = frame
-        return min(1.0, max(0, self.frames - 2) / 3.0)
-
-
-@dataclass
 class DetourGoal:
     """Last trusted target point, transported by ego motion during a detour."""
     x: float
@@ -513,7 +487,7 @@ class State:
     view_detour: Detour | None = None
     goal_anchor: DetourGoal | None = None
     active_scan: ActiveScan = field(default_factory=ActiveScan)
-    recovery: ClearanceRecovery | None = None
+    recovery: bool = False
     # What the corridor read on the last tick. Kept so the debug overlay can
     # draw the number the decision was made from, rather than measuring the
     # depth map a second time and risking a picture that disagrees with the
@@ -1114,7 +1088,7 @@ def _wait_for_detour_goal(state, config, track, odom):
 
 
 def _reacquire_detour_goal(depth, config, state, raw_yaw, bearing, dt):
-    if (state.goal_anchor is not None and state.last_coverage >= config.coverage_min
+    if (state.goal_anchor is not None
             and (state.last_clearance is None or state.last_clearance >= config.slow_distance_m)):
         yaw = _finalise_yaw(raw_yaw, False, bearing, config, state, dt)
         if yaw:
@@ -1240,35 +1214,26 @@ def _decide(detections, depth, odom, config: Config, state: State,
             return Decision(_twist(0, 0, 0), AVOIDING,
                             update.reason if update else "主动观察中断；停车等待新导航指令")
         if update is not None and (scan.active or scan.result_frame):
-            scan.clear_frames = 0
             return Decision(_twist(0, 0, 0), AVOIDING, update.reason)
-        if scan.route_segment and scan.result_frame and not scan.active:
-            if scan.current_frame <= scan.result_frame:
-                return Decision(_twist(0., 0., 0.), AVOIDING, "主动观察：等待直行结束后的新深度")
         if scan.active and not scan.ready:
             command = scan.command(geometry, _keepout_m(config),
                                    _scan_yaw_rate(config), config.watchdog_ms,
                                    config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
                                    now_ms=(odom or {}).get("control_ms"), tick_s=dt,
-                                   previous_yaw=state.commanded[2], control_period_s=control_period_s,
-                                   body_half_width=config.half_width_m)
+                                   previous_yaw=state.commanded[2], control_period_s=control_period_s)
             if command.replanned_turn:
                 state.view_detour = None
             return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and anchor is None and (track is None or not track.observed):
-            scan.clear_frames = 0
             return Decision(_twist(0, 0, 0), AVOIDING, "主动观察：等待重新确认导航目标")
 
     if depth is None or (detections is None and anchor is None):
-        if state.recovery is not None:
-            state.recovery = ClearanceRecovery()
         if stale_capture:
             return Decision(_twist(0., 0., 0.), BLIND, "深度采集时间已过期或无效；保持停车")
         if invalid_depth:
-            state.recovery = ClearanceRecovery()
+            state.recovery = True
             state.escape_side = 0.0
             state.side_better_frames = 0
-            state.active_scan.clear_frames = 0
             return Decision(_twist(0., 0., 0.), AVOIDING, "深度图没有有效测距，看不清；保持停车")
         missing = "vop / depth"
         if detections is not None:
@@ -1719,10 +1684,10 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
     has_sweep = can_plan and geometry is not None and bool(scan.current_frame)
     if not has_sweep:
         if requested_yaw is None and ahead is not None and ahead <= config.obstacle_stop_m:
-            state.recovery = ClearanceRecovery()
+            state.recovery = True
             return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
         if requested_yaw is not None or (can_plan and config.local_geometry is not None):
-            return "原地搜索：等待可检查转身扫掠范围的新深度"
+            return "原地搜索：等待可用深度"
     if can_plan:
         direction = state.last_seen_side if requested_yaw is None else -math.copysign(1., requested_yaw)
         if (requested_yaw is None and not state.searching_for_s
@@ -1748,20 +1713,15 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
             if not scan.clear_sweep(geometry, half_width, direction * sweep, slack):
                 if (requested_yaw is not None or max(abs(motion[2]), abs(state.commanded[2])) > STILL_YAW
                         or not scan.clear_sweep(geometry, half_width, -direction * sweep, slack)):
-                    state.recovery = ClearanceRecovery()
+                    state.recovery = True
                     return "原地搜索：转身扫掠范围有障碍，停车"
                 direction = -direction
                 state.searched_rad = 0.
         state.last_seen_side = direction
-    if state.recovery is not None:
-        if config.local_planning:
-            state.recovery = None
-            return None
-        if ahead is not None and ahead < config.slow_distance_m:
-            state.recovery = ClearanceRecovery()
-            return "近障停车，等待足够的深度观测"
-        if state.recovery.scale("turn", depth, config.depth_age_limit_ms) <= 0:
-            return "近障停车，等待连续新深度确认可转向"
+    if state.recovery:
+        if not config.local_planning and ahead is not None and ahead < config.slow_distance_m:
+            return "近障停车，等待前方净空"
+        state.recovery = False
     return None
 
 
@@ -1814,7 +1774,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     scan = state.active_scan
     grid = scan.grid()
     _, occupied = grid
-    blocked = local_path.motion_obstacles(grid, geometry, config.half_width_m)
+    blocked = local_path.route_obstacles(grid, geometry, config.half_width_m)
     observation = dict(depth, projected_grid=grid, body_half_width=config.half_width_m)
     if not scan.receipt_only:
         observation.update(scan_grid=grid, scan_revision=scan.poses[-1][0])
@@ -1857,7 +1817,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                 yield plan
 
     horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
-    turn_occupied = blocked | scan.views[-1][3]
+    turn_occupied = occupied | scan.views[-1][3]
     for plan in candidates():
         for index in range(len(plan.points) - 1, 0, -1):
             forward, right = plan.points[index]
@@ -1968,7 +1928,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     side = 0.0
     local_command = None
     if scan is not None and scan.ready and scan.advance_m is not None:
-        return _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt,
+        return _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance, dt,
                                    target_bearing=target_bearing if may_scan else None)
     observed_obstacle = False
     if (scan is not None and geometry is not None and scan.current_frame and scan.views
@@ -2005,7 +1965,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             order = _local_side_order(rooms, config, state,
                                       depth.get("source_frame_id", depth.get("frame_id")))
             if scan is not None:
-                scan.clear_frames = 0
                 yaw_rate = _scan_yaw_rate(config)
                 geometry = (config.scan_geometry or config.local_geometry
                             if scan.receipt_only else config.scan_geometry)
@@ -2028,8 +1987,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     if (not scan.command_only and
                             all(room is not None and room < slow for room, _ in rooms.values())):
                         # A nearby opening can require only small alignment.
-                        # This preview ranks the heading; the settled view
-                        # still has to pass the normal straight-corridor checks.
+                        # This preview ranks the heading; the drive still
+                        # checks the corridor for measured obstacles.
                         alignment = math.radians(6)
                         for direction in order:
                             offset = direction * ahead * math.tan(alignment)
@@ -2080,7 +2039,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 if state is not None:
                     state.escape_side = 0.0
                     state.side_better_frames = 0
-                    state.recovery = ClearanceRecovery()
+                    state.recovery = True
                 feedback = planar_feedback(odom)
                 if state.motion_source != "command" and feedback is None:
                     return 0.0, 0.0, 0.0, AVOIDING, "缺少可用的速度或连续位姿，局部规划和主动观察暂停"
@@ -2096,9 +2055,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                     and abs(vx) <= safe_speed for vx, vy, wz in velocities)):
                         grid = state.local_plan.grid_for(planning_depth, geometry)
                         if local_path.transition_clear(grid, geometry, keep, horizon_s,
-                                                       (motion[:2], state.commanded[:2], (approach, 0.)),
-                                                       body_half_width=config.half_width_m):
-                            state.recovery = None
+                                                       (motion[:2], state.commanded[:2], (approach, 0.))):
+                            state.recovery = False
                             state.view_detour = None
                             state.avoidance_yaw_override = True
                             return (approach, 0., 0., AVOIDING,
@@ -2118,14 +2076,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 left, right = (_side_label(rooms[s][0], config) for s in (-1.0, 1.0))
                 blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
                            f"（左 {left}，右 {right}）")
-                if approach and (state is None or state.recovery is None):
+                if approach and (state is None or not state.recovery):
                     if state is not None:
                         state.escape_side = 0.0
                     return (approach, 0.0, 0.0, AVOIDING,
                             f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
                 if state is not None:
                     state.escape_side = 0.0
-                    state.recovery = ClearanceRecovery()
+                    state.recovery = True
                 return 0.0, 0.0, 0.0, AVOIDING, f"{blocked}；停下"
 
     elif scan is not None:
@@ -2142,10 +2100,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             scan.note_clear_path(scan.current_frame)
             if coverage >= config.coverage_min and not scan.result_frame:
                 state.side_stall_s.clear()
-        else:
-            scan.clear_frames = 0
         if scan.result_frame:
-            return 0.0, 0.0, 0.0, AVOIDING, "主动观察：等待连续新深度确认前方可恢复"
+            return 0.0, 0.0, 0.0, AVOIDING, "主动观察：前方走廊尚不可通行"
 
     vx = _scaled(vx, scale, config.floor_vx, config.vx_max)
     vy = _scaled(vy, scale, config.floor_vy, config.vy_max)
@@ -2177,47 +2133,25 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         status, reason = AVOIDING, f"走廊内 {ahead:.2f} m 处有障碍，朝{direction}侧避让"
         if not vy and not wz:
             if state is not None:
-                state.recovery = ClearanceRecovery()
+                state.recovery = True
             return 0.0, 0.0, 0.0, AVOIDING, "当前控制限制下无法转向避让；停下"
 
-    side_route = "right" if side > 0 else "left"
-    if near and not config.local_planning:
-        side_route += "-in-place"
-        if state is not None and state.recovery is None:
-            # Advancing after the turn requires new frames.
-            state.recovery = ClearanceRecovery(route=side_route, frames=5)
-    if state is not None and state.recovery is not None:
-        if side:
-            route = side_route
-        elif ahead is None or ahead > stop + FORWARD_CLEARANCE_MARGIN_M:
-            route = "forward"
-        else:
-            state.recovery = ClearanceRecovery()
+    if state is not None and state.recovery:
+        if not side and ahead is not None and ahead <= stop + FORWARD_CLEARANCE_MARGIN_M:
             return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待通道有足够余量"
-        if route != state.recovery.route and not near:
+        if not near:
             state.blocked_for_s = 0.0
-        if config.local_planning:
-            state.recovery = None
-            return vx, vy, wz, status, reason
-        gain = state.recovery.scale(route, depth, config.depth_age_limit_ms)
-        if gain == 0:
-            return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待连续新深度帧确认通道"
-        vx = _scaled(vx, gain, config.floor_vx, config.vx_max)
-        vy = _scaled(vy, gain, config.floor_vy, config.vy_max)
-        wz *= gain
-        if gain == 1 and not near:
-            state.recovery = None
+        state.recovery = False
     return vx, vy, wz, status, reason
 
 
-def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt, *,
+def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance, dt, *,
                         target_bearing=None):
     scan = state.active_scan
     geometry = (config.scan_geometry or config.local_geometry
                 if scan.receipt_only else config.scan_geometry)
     state.avoidance_yaw_override = True
-    if (geometry is None or not scan.current_frame or depth.get("ground") is None
-            or target_distance is None or coverage < config.coverage_min):
+    if geometry is None or not scan.current_frame or depth.get("ground") is None or target_distance is None:
         return 0., 0., 0., AVOIDING, "主动观察：等候可用的前进观测"
 
     motion = state.command_tail if scan.command_only else planar_feedback(odom)
@@ -2228,16 +2162,13 @@ def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, targe
 
     if scan.advance_origin is None:
         grid = scan.grid()
-        blocked = local_path.motion_obstacles(grid, geometry, config.half_width_m)
         keep = _keepout_m(config)
-        corridor_clear = (local_path.segment_clear(blocked, geometry, keep, 0., scan.advance_m)
-                          and local_path.transition_clear(
-                              grid, geometry, keep, 1., ((scan.advance_m, 0.),),
-                              body_half_width=config.half_width_m))
+        corridor_clear = (local_path.segment_clear(grid[1], geometry, keep, 0., scan.advance_m)
+                          and local_path.transition_clear(grid, geometry, keep, 1., ((scan.advance_m, 0.),)))
         if not scan.route_segment and ahead is not None and ahead < config.slow_distance_m:
             corridor_clear = False
         if not corridor_clear:
-            if (not scan.rerouted and not scan.command_only and scan.has_settled_route_view(depth)
+            if (not scan.rerouted and not scan.command_only and scan.matches_route_view(depth)
                     and ahead is not None and target_bearing is not None
                     and all(math.hypot(vx, vy) <= STILL_LINEAR for vx, vy, _ in (motion, previous))):
                 rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep) for s in (-1., 1.)}
@@ -2277,8 +2208,7 @@ def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, targe
             return 0., 0., 0., AVOIDING, "主动观察：直行余量不足，停车后重规划"
         return 0., 0., 0., AVOIDING, "主动观察：停车距离不足"
     if not local_path.transition_clear(scan.grid(), geometry, _keepout_m(config), horizon,
-                                       (motion[:2], previous[:2], (speed, 0.)),
-                                       body_half_width=config.half_width_m):
+                                       (motion[:2], previous[:2], (speed, 0.))):
         if scan.advance_origin is None and scan.try_other_side():
             return 0., 0., 0., AVOIDING, "主动观察：尝试另一侧"
         return 0., 0., 0., AVOIDING, "主动观察：直行扫掠区有障碍"
@@ -2345,8 +2275,7 @@ def _local_translation(depth, config, state, odom, ahead, side):
 
         def clear(scale):
             return local_path.transition_clear(grid, geometry, keepout, horizon_s,
-                                               (measured[:2], previous, (vx * scale, vy * scale)),
-                                               body_half_width=depth.get("body_half_width"))
+                                               (measured[:2], previous, (vx * scale, vy * scale)))
 
         if not clear(1.):
             low = max(floor_x / abs(vx) if vx else 0., floor_y / abs(vy) if vy else 0.,

@@ -2511,7 +2511,7 @@ def test_steer_early_only_for_an_obstacle_between_robot_and_target():
     assert target.values[1] == target.values[5] == 0
 
 
-def test_brake_before_box_and_resume_only_on_successive_new_clear_frames():
+def test_brake_before_box_and_resume_on_the_current_clear_observation():
     cfg = _cfg(stop_distance_m=0.6)
     blocked = _scene(3.0, [(0.0, 0.66, 0.65)])
     clear = _scene(3.0)
@@ -2523,12 +2523,9 @@ def test_brake_before_box_and_resume_only_on_successive_new_clear_frames():
 
     assert tick(blocked, 0.34).values[:2] == [0.0, 0.0]
     first = dict(clear, frame_id=1)
-    for _ in range(6):
-        assert tick(first).values[:2] == [0.0, 0.0]
+    assert tick(first).values[0] > 0.
     assert tick(None).status == P.BLIND
-    speeds = [tick(dict(clear, frame_id=i)).values[0] for i in range(2, 7)]
-    assert speeds[:2] == [0.0, 0.0]
-    assert 0 < speeds[2] < speeds[3] < speeds[4]
+    assert tick(first).values[0] > 0.
 
 
 def test_box_blocking_both_routes_allows_only_a_slow_straight_approach():
@@ -2666,7 +2663,7 @@ def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch,
             assert previous[5] > 0.
             last_turn = stamp
         if previous[0]:
-            assert last_turn is not None and stamp - last_turn >= active_scan.SETTLE_MS
+            assert last_turn is not None and stamp > last_turn
             break
     else:
         pytest.fail("The settled scan did not release a straight segment")
@@ -2862,7 +2859,7 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
             last_turn = stamp
         if previous[0]:
             assert decision.reason == "主动观察：转稳后直行"
-            assert last_turn is not None and stamp - last_turn >= active_scan.SETTLE_MS
+            assert last_turn is not None and stamp > last_turn
             assert 4. <= -math.degrees(state.active_scan.pose[2]) <= 8.
             return
     pytest.fail("No straight segment was released through the measured opening")
@@ -2926,11 +2923,11 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
                 return
         elif previous[0]:
             assert decision.reason == "主动观察：转稳后直行"
-            assert last_turn is not None and stamp - last_turn >= active_scan.SETTLE_MS
+            assert last_turn is not None and stamp > last_turn
             straight = True
         elif "直行段结束" in decision.reason:
             assert straight
-            assert "等待直行结束后的新深度" in tick(stamp + 100, previous, frame_id=stamp).reason
+            assert "等待直行结束后的新深度" not in tick(stamp + 100, previous, frame_id=stamp).reason
             return
     pytest.fail("The segment neither completed nor held for the newly observed obstruction")
 
@@ -2958,8 +2955,8 @@ def test_local_obstacle_beyond_slowdown_starts_a_detour_with_five_centimetre_mar
     assert scan.route_segment and scan.phase == "brake"
 
 
-@pytest.mark.parametrize("unknown", [False, True])
-def test_post_turn_drive_requires_observed_swept_space(unknown):
+@pytest.mark.parametrize("band", ["free", "unknown", "occupied"])
+def test_post_turn_drive_checks_obstacles_without_requiring_coverage(monkeypatch, band):
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .20, .20, None)
@@ -2969,15 +2966,18 @@ def test_post_turn_drive_requires_observed_swept_space(unknown):
     view = dict(frame_id=1200, source_frame_id=1200, map=np.ones((4, 4)),
                 ground=np.ones((4, 4), dtype=bool))
     scan.receipt_only, scan.current_frame, scan.side_frame = True, 1200, 1200
-    scan.source_frame, scan.settle_start_source = 1200, 1000
+    scan.source_frame = 1200
     scan.phase, scan.route_segment, scan.advance_m = "evaluate", True, .60
     free = np.ones(local_path.SHAPE, dtype=bool)
-    if unknown:
-        free &= ~np.isclose(local_path.FORWARD, .35)
-    scan.views.append((1200, scan.pose, free, np.zeros_like(free)))
+    strip = np.isclose(local_path.FORWARD, .35)
+    if band != "free":
+        free &= ~strip
+    scan.views.append((1200, scan.pose, free, strip if band == "occupied" else np.zeros_like(free)))
     feedback = dict(vx=0., vy=0., wz=0.)
-    result = P._advance_after_scan(view, config, state, feedback, None, 1., .60, 3., .1)
-    assert (result[0] > 0.) is not unknown
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (None, .1 if band == "unknown" else 1.))
+    result = P._avoid(.2, 0., 0., view, config, P.APPROACHING, "", state,
+                      target_distance=3., odom=feedback, dt=.1)
+    assert (result[0] > 0.) is (band != "occupied")
 
 
 @pytest.mark.parametrize("side", [-1., 1.])
@@ -3072,8 +3072,8 @@ def test_centering_requires_two_observed_jambs_and_returns_beyond_the_opening(sc
     assert local_path.opening_route(frame, occupied, geometry, .375, 1., target) is None
 
 
-@pytest.mark.parametrize("source_at_stop", [1100, None])
-def test_shortened_obstacle_braking_room_replans_an_executing_segment_from_stopped_depth(source_at_stop):
+@pytest.mark.parametrize("source_at_stop", [1000, 1100, None])
+def test_shortened_obstacle_braking_room_replans_from_the_current_depth(source_at_stop):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -3093,16 +3093,12 @@ def test_shortened_obstacle_braking_room_replans_an_executing_segment_from_stopp
         return obs, odom
 
     view, motion = update(1000, 1000, .15)
-    result = P._advance_after_scan(view, config, state, motion, .79, 1., .72, 3.5, .1,
+    result = P._advance_after_scan(view, config, state, motion, .79, .72, 3.5, .1,
                                    target_bearing=.1)
     assert result[:3] == (0., 0., 0.)
     assert scan.phase == "brake_for_replan"
-    for stamp, source in ((1100, source_at_stop), (1300, 1100)):
-        update(stamp, source, 0.)
-        assert scan.command(geometry, .375, 1., 500).yaw == 0.
-        assert scan.active and scan.attempted
-    update(1400, 1400, 0.)
-    assert scan.command(geometry, .375, 1., 500).yaw == 0.
+    update(1100, source_at_stop, 0.)
+    assert "重新规划" in scan.command(geometry, .375, 1., 500).reason
     assert not scan.active and not scan.attempted
 
 
@@ -3135,16 +3131,16 @@ def test_synchronized_reroute_requires_the_evaluated_capture():
     from plugins.navi.active_scan import ActiveScan
 
     scan = ActiveScan(side_frame=1200, current_frame=1300)
-    assert scan.has_settled_route_view({"capture_ms": 1300})
-    assert not scan.has_settled_route_view({"capture_ms": 1200})
-    assert not scan.has_settled_route_view({"frame_id": 1300})
+    assert scan.matches_route_view({"capture_ms": 1300})
+    assert not scan.matches_route_view({"capture_ms": 1200})
+    assert not scan.matches_route_view({"frame_id": 1300})
 
 
 @pytest.mark.parametrize(("identity", "second_corridor_clear"), [
     ("fresh", False), ("fresh", True), ("missing", False), ("repeated", False),
     ("missing_midway", False), ("missing_initial", False), ("mismatched", False), ("gap_after_reroute", False),
 ])
-def test_settled_blocked_route_replans_once_from_current_heading(monkeypatch, identity, second_corridor_clear):
+def test_blocked_route_replans_once_from_current_heading(monkeypatch, identity, second_corridor_clear):
     from plugins.navi import active_scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -3162,7 +3158,7 @@ def test_settled_blocked_route_replans_once_from_current_heading(monkeypatch, id
         obs = dict(map=frame, ground=frame.astype(bool), frame_id=stamp, control_ms=stamp)
         if (identity != "missing" and not (identity == "missing_midway" and stamp == 1100)
                 and not (identity == "missing_initial" and stamp == 1000)):
-            obs["source_frame_id"] = 900 if identity == "repeated" else stamp - 100
+            obs["source_frame_id"] = 900 if identity == "repeated" and stamp <= 1200 else stamp - 100
         odom = dict(vx=0., vy=0., wz=yaw, received_ms=stamp)
         scan.update(obs, odom, geometry, receipt_only=True)
         return obs, odom
@@ -3175,9 +3171,6 @@ def test_settled_blocked_route_replans_once_from_current_heading(monkeypatch, id
     for stamp in (1000, 1100, 1200):
         obs, odom = update(stamp, 0.)
         assert scan.command(geometry, .375, 1., 500, 800, now_ms=stamp).yaw == 0.
-    if identity == "repeated":
-        assert not scan.ready
-        return
     assert scan.ready
 
     def avoid(obs, odom):
@@ -3189,7 +3182,7 @@ def test_settled_blocked_route_replans_once_from_current_heading(monkeypatch, id
     if identity == "mismatched":
         obs = dict(obs, source_frame_id=99999)
     assert avoid(obs, odom)[:3] == (0., 0., 0.)
-    if identity not in ("fresh", "gap_after_reroute"):
+    if identity == "mismatched":
         assert not scan.active and scan.locked
         return
     assert scan.phase == "brake" and scan.directions == (1.,)
@@ -3219,7 +3212,7 @@ def test_settled_blocked_route_replans_once_from_current_heading(monkeypatch, id
             assert yaw < 0.
             last_turn = stamp
     assert scan.ready and scan.origin[2] == pytest.approx(-.4)
-    assert last_turn is not None and scan.side_frame >= last_turn + active_scan.SETTLE_MS
+    assert last_turn is not None and scan.side_frame > last_turn
     if second_corridor_clear:
         occupied[:] = False
     obs, odom = update(stamp + 100, 0.)
@@ -3244,13 +3237,13 @@ def test_close_obstacle_in_the_new_view_requires_another_turn_before_advancing(m
     depth = {"ground": np.ones((4, 4), dtype=bool)}
     odom = {"vx": 0., "vy": 0., "wz": 0.}
 
-    first = P._advance_after_scan(depth, config, state, odom, .59, 1., .60, 3., .1)
+    first = P._advance_after_scan(depth, config, state, odom, .59, .60, 3., .1)
     assert first[:3] == (0., 0., 0.)
     assert scan.phase == "brake" and scan.directions == (1.,)
     assert scan.advance_origin is None
 
     scan.phase = "evaluate"
-    second = P._advance_after_scan(depth, config, state, odom, .59, 1., .60, 3., .1)
+    second = P._advance_after_scan(depth, config, state, odom, .59, .60, 3., .1)
     assert second[:3] == (0., 0., 0.)
     assert not scan.active
 
@@ -3285,7 +3278,7 @@ def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forw
     assert tick(1200)[:3] == (0., 0., 0.)
 
 
-def test_near_turn_holds_forward_when_the_obstacle_leaves_view():
+def test_near_turn_stops_forward_until_the_current_corridor_is_clear():
     cfg = _cfg(stop_distance_m=0.6)
     near = _scene(4.0, [(0.25, 0.6, 0.3)])
     clear = _scene(4.0)
@@ -3299,26 +3292,20 @@ def test_near_turn_holds_forward_when_the_obstacle_leaves_view():
         turn = tick(near, frame_id)
         assert turn.values[:2] == [0., 0.]
         assert turn.values[5] > 0.
-    assert tick(clear, 300).values == [0.0] * 6
-    assert tick(clear, 400).values == [0.0] * 6
-    assert tick(clear, 500).values[0] > 0
+    assert tick(clear, 300).values[0] > 0.
 
 
-def test_clear_frames_after_a_stop_allow_searching_for_a_lost_target():
+def test_a_clear_observation_after_a_stop_allows_searching_for_a_lost_target():
     cfg = _cfg(stop_distance_m=0.6, lost_frames=1)
     blocked = _scene(3.0, [(0.0, 0.85, 0.65)])
     state = seed(_state(), _detections(_obj()), blocked, cfg)
     stopped = _step(detections=_detections(_obj()), depth=blocked, state=state, config=cfg)
     assert stopped.values == [0.0] * 6
     state.tracker = P.Tracker()
-    for frame_id in (100, 200, 300):
-        decision = _step(detections=_detections(), state=state, config=cfg,
-                         depth=dict(_scene(3.0), frame_id=frame_id))
-        assert decision.values[:2] == [0.0, 0.0]
-        if frame_id < 300:
-            assert decision.values[5] == 0
-        else:
-            assert decision.status == P.SEARCHING and decision.values[5] != 0
+    decision = _step(detections=_detections(), state=state, config=cfg,
+                     depth=dict(_scene(3.0), frame_id=100))
+    assert decision.values[:2] == [0.0, 0.0]
+    assert decision.status == P.SEARCHING and decision.values[5] != 0
 
 
 def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
@@ -3521,7 +3508,7 @@ def test_local_planner_requires_distinct_frames_before_switching_for_more_space(
 
 def test_local_recovery_uses_the_current_checked_speed_without_waiting_for_frames(monkeypatch):
     cfg = _cfg(local_planning=True, floor_vx=.04, floor_vy=.04)
-    state = _state(escape_side=1., recovery=P.ClearanceRecovery("right", 2, 100))
+    state = _state(escape_side=1., recovery=True)
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
         2.1 if lateral_offset_m > 0 else 2.0 if lateral_offset_m < 0 else .9, 1.0))
     monkeypatch.setattr(P, "_local_translation", lambda *args: (.063, 0.))
@@ -3531,7 +3518,7 @@ def test_local_recovery_uses_the_current_checked_speed_without_waiting_for_frame
                         P.AVOIDING, "", state, target_distance=2.8)[:3]
 
     assert step(200) == (.063, 0., 0.)
-    assert state.recovery is None
+    assert not state.recovery
 
 
 def test_local_detour_reuses_receipt_only_projection_for_the_same_geometry(monkeypatch):
@@ -3597,7 +3584,7 @@ def test_local_transition_checks_independent_axis_ramp(monkeypatch, occupied, kn
     row, col = local_path.START
     grid_occupied[row + 7, col - 6] = occupied
     grid_free[row + 7, col - 6] = known
-    depth = {"scan_grid": (grid_free, grid_occupied)}
+    depth = {"scan_grid": (grid_free, grid_occupied), "body_half_width": .20}
     monkeypatch.setattr(state.local_plan, "translation", lambda *args, **kwargs: (.25, -.10))
     odom = {"vx": .16, "vy": 0., "wz": 0.}
     expected = P.LocalHold.TRANSITION if occupied else (.25, -.10)
@@ -3606,13 +3593,12 @@ def test_local_transition_checks_independent_axis_ramp(monkeypatch, occupied, kn
 
 def test_blocked_transition_keeps_current_detour_and_recovery(monkeypatch):
     cfg = _cfg(local_planning=True)
-    recovery = P.ClearanceRecovery("right", 4, 100)
-    state = _state(escape_side=1., recovery=recovery)
+    state = _state(escape_side=1., recovery=True)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.9, 1.))
     monkeypatch.setattr(P, "_local_translation", lambda *args: P.LocalHold.TRANSITION)
     decision = P._avoid(.2, 0., 0., {}, cfg, P.APPROACHING, "", state, target_distance=2.)
     assert decision[:3] == (0., 0., 0.)
-    assert state.escape_side == 1. and state.recovery is recovery
+    assert state.escape_side == 1. and state.recovery
     assert not state.active_scan.attempted
 
 
@@ -3688,8 +3674,7 @@ def test_scan_replan_requires_a_fresh_range_from_the_original_track(monkeypatch,
     assert tick(1000).values == [0.] * 6
     assert state.active_scan.active and state.goal_anchor is not None
     state.active_scan.hold_for_replan("input gap")
-    assert tick(1100).values == [0.] * 6
-    assert "已停稳，重新规划" in tick(1300).reason
+    assert "已停稳，重新规划" in tick(1100).reason
     clearance = 2.1
     if not same_track:
         observation = SimpleNamespace(**vars(track))
@@ -3763,7 +3748,7 @@ def test_anchored_reacquisition_can_turn_but_checks_sweep_and_prediction_budget(
     monkeypatch.setattr(active_scan, "observe", lambda *args: (free & ~occupied, occupied))
     frame = np.ones((4, 4))
     depth = dict(map=frame, ground=frame.astype(bool), frame_id=1000)
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, .1))
     decision = P.step(detections=None, depth=depth, odom=None, config=config, state=state, dt=.1)
 
     assert decision.values[:5] == [0.] * 5

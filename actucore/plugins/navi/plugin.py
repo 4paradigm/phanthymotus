@@ -551,7 +551,7 @@ class NaviPlugin:
             self._config.scan_geometry = body_square(self._config.local_geometry,
                                                      depth_decl.get("vendor"))
             if self._config.scan_geometry is None:
-                self._camera_notes.append("主动观察使用相机坐标系的底盘近似，仅用转稳后的单视角重规划")
+                self._camera_notes.append("主动观察使用相机坐标系的底盘近似，按最新有效单视角规划")
         self._config.local_planning = bool(
             binding.get("depth_map") and (binding.get("odom") or self._config.local_geometry is not None))
         if self._config.local_geometry is not None:
@@ -679,7 +679,7 @@ class NaviPlugin:
             if self._depth_vertical is None:
                 self._camera_notes.append("深度图缺少完整针孔内参，沿用原始深度判断障碍")
             if not self._depth_stamp_verified:
-                self._camera_notes.append("深度采集时间未验证，主动观察用转稳后的单视角重规划")
+                self._camera_notes.append("深度采集时间未验证，主动观察按最新有效单视角规划")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,

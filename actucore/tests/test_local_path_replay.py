@@ -32,6 +32,16 @@ def test_a_diagonal_step_checks_the_intermediate_sweep():
     assert replay.shortest_path(allowed, (3, 3), (4, 4)) is None
 
 
+def test_velocity_ramp_checks_hits_up_to_the_edge_of_the_grid():
+    geometry = replay.Geometry(None, None, np.eye(4), .20, .20, None)
+    free = np.zeros(replay.SHAPE, dtype=bool)
+    occupied = np.zeros_like(free)
+    velocities = ((-.30, 0.),)
+    assert replay.transition_clear((free, occupied), geometry, .25, 1.45, velocities)
+    occupied[0, replay.START[1]] = True
+    assert not replay.transition_clear((free, occupied), geometry, .25, 1.45, velocities)
+
+
 @pytest.mark.parametrize("observed", [False, True])
 def test_observed_detour_cannot_route_through_an_unknown_band(observed):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)

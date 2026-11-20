@@ -302,7 +302,7 @@ class PlanCache:
         return self.plans[side]
 
 
-def motion_obstacles(grid, geometry, body_half_width):
+def route_obstacles(grid, geometry, body_half_width):
     free, occupied = grid
     # The robot already occupies its own footprint. Only new space requires
     # positive clearance evidence, and observed hits always take priority.
@@ -311,18 +311,15 @@ def motion_obstacles(grid, geometry, body_half_width):
     return occupied | (~free & ~body)
 
 
-def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, body_half_width=None):
-    """Check the swept rectangle for independent forward and lateral ramps."""
-    occupied = grid[1] if body_half_width is None else motion_obstacles(grid, geometry, body_half_width)
+def transition_clear(grid, geometry, half_width, horizon_s, velocities):
+    """Check measured obstacles in the swept rectangle of the velocity ramps."""
+    occupied = grid[1]
     forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
     rear = -geometry.rear + min(0., *forward)
     front = geometry.front + max(0., *forward)
     left = -half_width + min(0., *right)
     right_edge = half_width + max(0., *right)
     half = RESOLUTION / 2
-    if (rear < FORWARD[0, 0] - half or front > FORWARD[-1, 0] + half
-            or left < RIGHT[0, 0] - half or right_edge > RIGHT[0, -1] + half):
-        return False
     swept = ((FORWARD + half > rear) & (FORWARD - half < front)
              & (RIGHT + half > left) & (RIGHT - half < right_edge))
     return not (swept & occupied).any()
@@ -402,7 +399,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if grid_input is None:
         grid_input = observe(frame, geometry, right, forward, resolution, ground)
     free, occupied = grid_input
-    blocked = occupied if body_half_width is None else motion_obstacles(grid_input, geometry, body_half_width)
+    blocked = occupied if body_half_width is None else route_obstacles(grid_input, geometry, body_half_width)
     if side < 0:
         free = free[:, ::-1] if free is not None else None
         occupied = occupied[:, ::-1]
@@ -510,7 +507,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # The straight command must stay within the checked path prefix through
     # the observation window, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
-    # Expand observed obstacle cells by the footprint in centre coordinates.
+    # Expand blocked route cells by the footprint in centre coordinates.
     half_cell = resolution / 2
     f0, f1 = forward - half_cell, forward + half_cell
     r0, r1 = right - half_cell, right + half_cell
@@ -528,16 +525,14 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
             closest = min(length, max(0., df * target_f + dx * target_r))
             if math.hypot(target_f - closest * df, target_r - closest * dx) < stop:
                 return None
-        # Look ahead along the path only while a straight shortcut is clear
-        # of measured obstacles. This preserves the chosen detour's progress.
+        # Look ahead only while the shortcut is within the traversable route grid.
         if _ray_entry(df, dx, occupied_bounds) <= length:
             return None
         speed = min(length / horizon_s,
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
         if (partial or target_cells is not None) and vx and vy and not transition_clear(
-                (free, occupied), geometry, half_width, horizon_s, ((vx, -vy),),
-                body_half_width=body_half_width):
+                (free, occupied), geometry, half_width, horizon_s, ((vx, -vy),)):
             return None
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
             return vx, -side * vy

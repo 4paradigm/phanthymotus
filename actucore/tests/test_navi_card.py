@@ -214,7 +214,7 @@ def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypa
 
 
 @pytest.mark.parametrize("interrupt", [None, "depth", "detections"])
-def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch, interrupt):
+def test_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypatch, interrupt):
     from types import SimpleNamespace
 
     import numpy as np
@@ -279,14 +279,12 @@ def test_card_scans_the_clearer_side_then_replans_with_a_fresh_view(monkeypatch,
         command = tick(stamp, .25)
     assert command["values"] == [0.] * 6
     assert tick(101_550, fresh=False)["values"] == [0.] * 6
-    assert tick(101_700, fresh=False)["values"] == [0.] * 6
-    assert tick(101_750)["values"] == [0.] * 6
-    command = tick(101_850)
+    command = tick(101_700, fresh=False)
     assert command["values"][0] > 0.
     assert command["values"][1:] == [0.] * 5
-    assert command["obs_stamp_ms"] == 101_850
+    assert command["obs_stamp_ms"] == 101_450
     card._odom_stamp_verified = False
-    assert tick(101_950)["values"] == [0.] * 6
+    assert tick(101_800)["values"] == [0.] * 6
 
 
 def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
@@ -377,29 +375,19 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
         assert tick(100_250)["values"] == [0.] * 6
         command = tick(100_350)
     assert command["values"][:5] == [0.] * 5
-    if not sweep_observed:
-        assert command["values"][5] == 0.
-        assert all(tick(now[0] + 100)["values"] == [0.] * 6 for _ in range(8))
-        return
     assert command["values"][5] == .4
     yaw = command["values"][5]
     stamp = now[0]
     for _ in range(25):
         stamp += 100
         yaw = tick(stamp, yaw)["values"][5]
-        if yaw == 0 and card._state.active_scan.settle_ms is not None:
+        if card._state.active_scan.ready:
             break
     else:
         pytest.fail("scan never reached the angular target")
     assert math.degrees(heading) == pytest.approx(20., abs=2.)
-    stamp += 100
-    assert tick(stamp)["values"] == [0.] * 6
     assert card._state.active_scan.advance_origin is None
-    for _ in range(8):
-        stamp += 100
-        command = tick(stamp)
-        if command["values"][0] > 0:
-            break
+    command = tick(stamp + 100, fresh=False)
     assert command["values"][0] > 0
     assert command["values"][1:] == [0.] * 5
 
