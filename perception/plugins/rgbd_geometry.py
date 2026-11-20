@@ -351,7 +351,12 @@ def observation_quality(color, depth):
                    and image.shape[0] >= 3 and image.shape[1] >= 3
                    and (image.ndim == 2 or image.shape[2] in (3, 4)))
     if valid_image:
-        gray = image.astype(float) if image.ndim == 2 else image[..., :3].mean(axis=2)
+        if image.ndim == 2:
+            gray = image.astype(float)
+        else:
+            channel_sum = np.add(image[..., 0], image[..., 1], dtype=np.uint16)
+            channel_sum += image[..., 2]
+            gray = channel_sum / 3.
         contrast = float(gray.std())
         laplacian = (gray[2:, 1:-1]+gray[:-2, 1:-1]+gray[1:-1, 2:]
                      + gray[1:-1, :-2]-4*gray[1:-1, 1:-1])

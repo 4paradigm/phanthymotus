@@ -15,6 +15,7 @@ class Fusion:
         self.segment, self.frame = 'run', 'camera_optical'
         self.frames, self.reason = [], None
         self.samples = [(10_000_000_000, None, None)]
+        self.filter = None
     def fault(self, reason, kind='fusion'):
         self.reason = reason
     def observe_frame(self, stamp, color, depth, visual, now, reason=None, arrival_ns=None):
@@ -156,6 +157,81 @@ def test_join_reports_imu_coverage_timeout_separately_from_missing_visual():
     frames.drain(1_510_000_000)
     assert fusion.frames[0][1] is not None
     assert frames.counts['imu_uncovered'] == frames.counts['deadline_expired'] == 1
+
+
+@pytest.mark.parametrize('imu_resumes', ['same_capture', 'after_grace', 'next_capture', 'never'])
+def test_uncovered_native_result_does_not_end_running_fusion_before_watchdog(imu_resumes):
+    from test_rgbd_fusion import images, source, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    captures.native_delays.extend([25_000_000] * 4)
+    color, depth = images()
+    gap = anchor + 50_000_000
+    pose, info = messages(gap)
+    pose.child_frame_id = fusion.frame
+    captures.add_frame(gap, color, depth, gap + 10_000_000)
+    assert captures.result('pose', pose, gap + 20_000_000) == []
+    assert captures.result('info', info, gap + 20_000_000) == []
+    deadline = captures.frames[gap]['deadline']
+    assert captures.drain(deadline) == []
+    assert gap in captures.frames  # a complete visual result can wait for late IMU
+    if imu_resumes in ('same_capture', 'after_grace'):
+        now = deadline + (60_000_000 if imu_resumes == 'same_capture' else 160_000_000)
+        for stamp in range(anchor + 5_000_000, gap + 1, 5_000_000):
+            fusion.observe_imu(source(stamp), now)
+        outputs = captures.drain(now)
+        if imu_resumes == 'after_grace':
+            assert outputs == []
+            assert fusion.filter.stamp == anchor
+            assert not captures.frames
+            return
+        sample, = outputs
+        assert sample['pose'] is not None
+        assert sample['vendor']['fusion']['last_visual_ns'] == gap
+        return
+
+    deadline += 150_000_000
+    assert captures.drain(deadline) == []
+    assert captures.counts['imu_uncovered'] == 1
+    assert captures.result('info', info, deadline + 1) == []
+    assert captures.counts['info_after_deadline'] == 1
+    assert fusion.filter.stamp == anchor
+    assert fusion.status(deadline) == 'tracking'
+
+    if imu_resumes == 'never':
+        lost = fusion.watchdog_output(anchor + 1_010_000_000)
+        assert fusion.state == 'lost'
+        assert lost['pose'] is None
+        assert lost['vendor']['fusion']['prediction'] is None
+        return
+
+    next_stamp = anchor + 200_000_000
+    for stamp in range(anchor + 5_000_000, next_stamp + 1, 5_000_000):
+        fusion.observe_imu(source(stamp), deadline + 5_000_000)
+    pose, info = messages(next_stamp)
+    pose.child_frame_id = fusion.frame
+    captures.add_frame(next_stamp, color, depth, deadline + 10_000_000)
+    assert captures.result('pose', pose, deadline + 20_000_000) == []
+    sample, = captures.result('info', info, deadline + 20_000_000)
+    assert sample['pose'] is not None
+    assert sample['vendor']['motus_slam']['segment_id'] == fusion.segment
+    assert sample['vendor']['fusion']['last_visual_ns'] == next_stamp
+
+
+def test_late_imu_wait_cannot_extend_visual_capture_age_limit():
+    fusion = Fusion()
+    fusion.filter = object()
+    fusion.samples = []
+    fusion.input_period_ns = 400_000_000
+    captures = CaptureObservations(fusion)
+    stamp = 1_000_000_000
+    captures.add_frame(stamp, None, None, stamp + 900_000_000)
+    pose, info = messages(stamp)
+    captures.result('pose', pose, stamp + 1_490_000_000)
+    captures.result('info', info, stamp + 1_490_000_000)
+    assert captures.drain(stamp + 1_500_000_000) == []
+    assert not captures.frames and not fusion.frames
 
 
 def test_repeated_frame_fails_closed():

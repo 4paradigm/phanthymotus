@@ -591,6 +591,7 @@ def registration_report(sample, frontend, native=None, *, depth_enabled=False):
 class CaptureObservations:
     """Bounded exact-stamp joins with capture-order delivery and late-result discard."""
     MAX_IN_FLIGHT = 8
+    IMU_JOIN_GRACE_NS = 150_000_000
 
     def __init__(self, fusion, startup_gate=None):
         self.fusion = fusion
@@ -701,7 +702,15 @@ class CaptureObservations:
                 continue
             ready = ('pose' in entry and 'info' in entry) or getattr(entry.get('info'), 'lost', False)
             coverage = bool(self.fusion.samples) and self.fusion.samples[-1][0] >= stamp
-            if (not ready or not coverage) and now < entry['deadline']:
+            if ('imu_deadline' not in entry and not coverage and self.fusion.filter is not None and
+                    'pose' in entry and 'info' in entry and not entry['info'].lost):
+                entry['imu_deadline'] = min(entry['deadline'] + self.IMU_JOIN_GRACE_NS,
+                                            stamp + MAX_VISUAL_RESULT_AGE_NS)
+            deadline = entry.get('imu_deadline', entry['deadline'])
+            if 'imu_deadline' in entry and now > deadline:
+                # A late drain cannot establish that coverage was ready by the deadline.
+                coverage = False
+            if (not ready or not coverage) and now < deadline:
                 break
             self.frames.pop(stamp)
             if not ready or not coverage:
@@ -721,6 +730,12 @@ class CaptureObservations:
                 # An older submitted frame is useful only with a matching
                 # measured correction and IMU coverage at its original stamp.
                 self.counts['stale_capture'] += 1
+                if ready:
+                    self.expired.append(stamp)
+                continue
+            if not coverage and self.fusion.filter is not None:
+                # Do not propagate an initialized estimate without the right
+                # IMU bracket. The watchdog still bounds time without correction.
                 if ready:
                     self.expired.append(stamp)
                 continue

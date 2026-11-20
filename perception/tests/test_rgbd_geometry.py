@@ -172,6 +172,19 @@ def test_texture_is_usable_but_weak_images_and_missing_depth_increase_weight():
     assert missing['depth_fraction'] == 0
 
 
+@pytest.mark.parametrize('channels', [3, 4])
+def test_color_quality_uses_full_precision_channel_mean(channels):
+    rng = np.random.default_rng(9)
+    image = rng.integers(95, 256, (24, 32, channels), dtype=np.uint8)[:, ::2]
+    depth = np.full(image.shape[:2], 1500, np.uint16)
+    gray = image[..., :3].mean(axis=2)
+    laplacian = (gray[2:, 1:-1] + gray[:-2, 1:-1] + gray[1:-1, 2:]
+                 + gray[1:-1, :-2] - 4 * gray[1:-1, 1:-1])
+    quality = observation_quality(image, depth)
+    assert quality['contrast'] == gray.std()
+    assert quality['sharpness'] == laplacian.var()
+
+
 @pytest.mark.parametrize('depth', [np.full((10,), 1000, np.uint16),
                                   np.full((40, 50), 1000, np.uint16),
                                   np.full((240, 320), 1000., float)])
