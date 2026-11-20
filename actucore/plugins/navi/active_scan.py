@@ -760,7 +760,9 @@ class ActiveScan:
     def hold_for_replan(self, reason, *, retry_scan=True):
         if self.phase != "brake_for_replan":
             self.retry_after_hold = retry_scan
-            self.replan_cause = reason.removeprefix("主动观察：").removesuffix("，停车后重规划")
+            prefix, suffix = "主动观察：", "，停车后重规划"
+            cause = reason[len(prefix):] if reason.startswith(prefix) else reason
+            self.replan_cause = cause[:-len(suffix)] if cause.endswith(suffix) else cause
         self.phase = "brake_for_replan"
         self.current_frame = 0
         self.turn_until_ms = 0
