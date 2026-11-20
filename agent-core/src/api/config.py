@@ -662,7 +662,9 @@ async def _do_start_project_impl():
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
                                  control_interface: dict = None,
-                                 camera_info: dict = None):
+                                 camera_info: dict = None,
+                                 slam_inputs: dict = None,
+                                 source_metadata: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -714,6 +716,16 @@ async def _do_start_project_impl():
             # frame, and reports in `info().degraded` what it had to assume when
             # a source declared nothing.
             args['camera_info'] = camera_info
+
+        if slam_inputs is not None:
+            # Consumers get exactly the metadata for their connected ports.
+            # Preserve an empty map so the consumer can report missing startup
+            # declarations and apply its own runtime discovery policy.
+            args.update(slam_inputs)
+        elif source_metadata:
+            # Depth -> pointcloud can propagate provenance without changing
+            # the contract for ordinary older or display-only cards.
+            args['input_metadata'] = source_metadata
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -961,6 +973,51 @@ async def _do_start_project_impl():
                     out[topic] = entry
         return out
 
+    def _requires_slam_metadata(card: dict) -> bool:
+        """Opt-in from the consumer schema; retain support for older SLAM tools."""
+        mcp_id, tool_name = card.get('mcpId'), card.get('toolName')
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != mcp_id:
+                continue
+            for tool in mcp.get('tools') or []:
+                if (isinstance(tool, dict) and tool.get('name') == tool_name
+                        and (tool.get('inputSchema') or {}).get('x-slam-input-contract')
+                        == 'motus.slam_input/1'):
+                    return True
+        # A saved canvas can outlive its cached tool schema. This name is the
+        # generic consumer, not a robot preset, and must never silently fall
+        # back to unaudited runtime guesses.
+        return tool_name == 'pointcloud_slam'
+
+    def _consumer_input_ports(card: dict) -> list:
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != card.get('mcpId'):
+                continue
+            for tool in mcp.get('tools') or []:
+                if isinstance(tool, dict) and tool.get('name') == card.get('toolName'):
+                    return tool.get('topic_in') or []
+        return []
+
+    def _upstream_slam_inputs(card_id: str, input_ports: list) -> dict:
+        from api.slam_metadata import collect_slam_inputs
+        inbound = [c for c in connections if c.get('toCardId') == card_id]
+        return collect_slam_inputs(inbound, resolved_info, _topic_of_connection, input_ports=input_ports)
+
+    def _requires_source_metadata(card: dict) -> bool:
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != card.get('mcpId'):
+                continue
+            for tool in mcp.get('tools') or []:
+                if (isinstance(tool, dict) and tool.get('name') == card.get('toolName')
+                        and (tool.get('inputSchema') or {}).get('x-input-metadata-consumer') is True):
+                    return True
+        return card.get('toolName') == 'pointcloud'
+
+    def _upstream_source_metadata(card_id: str) -> dict:
+        from api.slam_metadata import collect_connected_metadata
+        inbound = [c for c in connections if c.get('toCardId') == card_id]
+        return collect_connected_metadata(inbound, resolved_info, _topic_of_connection)
+
     async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
         """The action space of whatever this card's `control/*` output feeds.
 
@@ -1060,6 +1117,12 @@ async def _do_start_project_impl():
     # input_topic exactly as the old "sources first" phase gave it.
     for card in all_ordered:
         input_topic, input_topics, unresolved = _resolve_input_topics(card.get('id', ''))
+        slam_consumer = _requires_slam_metadata(card)
+        input_ports = _consumer_input_ports(card) if slam_consumer else []
+        if slam_consumer:
+            from api.slam_metadata import is_optional_rgb_connection
+            unresolved = [conn for conn in unresolved
+                          if not is_optional_rgb_connection(conn, input_ports)]
         if unresolved:
             # Starting it anyway is what made this class of bug invisible: the
             # card comes up subscribed to nothing and reports 已就绪. Fail it
@@ -1086,9 +1149,47 @@ async def _do_start_project_impl():
             errors.append(f'{tool_name} ({card.get("id", "")})')
             continue
 
+        slam_inputs = None
+        if slam_consumer:
+            try:
+                slam_inputs = _upstream_slam_inputs(card.get('id', ''), input_ports)
+                # Unavailable optional RGB wires are diagnosed but not passed as
+                # subscriptions. Required inputs retain their strict routing.
+                topics = list(slam_inputs['input_bindings'])
+                input_topic = topics[0] if len(topics) == 1 else ''
+                input_topics = topics if len(topics) > 1 else []
+            except ValueError as error:
+                tool_name = card.get('toolName', '')
+                message = f'SLAM 输入路由失败: {error}'
+                # Keep producer/canvas-controlled text on one bounded log line.
+                # The event below retains the full diagnostic for the UI.
+                log_detail = repr(f'{tool_name}: {message}'[:1024])
+                print(f'[start-project] {log_detail[:1024]}')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
+                    'status': 'error', 'message': message,
+                }})
+                errors.append(f'{tool_name} ({card.get("id", "")})')
+                continue
+
+        source_metadata = None
+        if slam_inputs is None and _requires_source_metadata(card):
+            try:
+                source_metadata = _upstream_source_metadata(card.get('id', ''))
+            except ValueError as error:
+                tool_name = card.get('toolName', '')
+                message = f'上游采集元数据冲突: {error}'
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': card.get('mcpId', ''), 'card_id': card.get('id', ''),
+                    'status': 'error', 'message': message,
+                }})
+                errors.append(f'{tool_name} ({card.get("id", "")})')
+                continue
+
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
-                                 camera_info=_upstream_camera_info(card.get('id', '')))
+                                 camera_info=_upstream_camera_info(card.get('id', '')),
+                                 slam_inputs=slam_inputs, source_metadata=source_metadata)
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:

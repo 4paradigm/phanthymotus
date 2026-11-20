@@ -113,8 +113,18 @@ def _commit_perf_span(span_data: dict) -> None:
 
 
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
-    """Start primary ROS2 subscription only if not already active."""
+    """Start a dashboard subscription only for types the bridge can relay."""
     key = f'__primary__#{topic}'
+
+    if fmt == 'sensor/pointcloud2':
+        # A native PointCloud2 must remain registered for canvas connections,
+        # but the inspection WebSocket has no PointCloud2 serializer/renderer.
+        # Do not create a std_msgs/String subscription on the native ROS topic.
+        # Clean up an older String subscription if its producer changed format.
+        _active_primary_subs.discard(topic)
+        ros2_bridge.unsubscribe(key)
+        _last_frame.pop(topic, None)
+        return
 
     if topic in _active_primary_subs:
         return  # already subscribed

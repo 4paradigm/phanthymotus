@@ -8,6 +8,77 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## Depth-only pointcloud card
+
+`pointcloud` takes exactly one `image/depth-z16` (millimetre Image) or
+`image/depth-zlib` (CompressedImage) input. It backprojects depth into the
+existing display cloud/summary and optional metric PointCloud2 outputs.
+It no longer loads a mono depth model or performs stereo matching; RGB inputs
+and multiple connected depth streams are rejected. To display estimated depth,
+connect the separate `visual_depth` output. Metric output still requires measured
+depth, driver intrinsics and capture-time declarations; estimated depth is not
+promoted to a metric measurement. Saved single-input `auto`/`depth` starts remain
+compatible, while saved `mono`/`stereo` starts require rewiring to a depth source.
+
+## Spatial SLAM Input Contract
+
+The generic `pointcloud_slam` card requires native
+`sensor_msgs/msg/PointCloud2` and tracking `motus.odom/1` with the
+`motus_slam/1` pose profile. The canonical
+[driver-author protocol](https://github.com/Nidhogg2002/phanthymotus-driver/blob/feat/unified-odom-driver/docs/spatial_slam_input.md)
+specifies timing, frame, mounting, `motus.slam_input/1` declarations and
+`motus.slam_frame/1` per-frame provenance. This repository keeps a
+pure-Python runtime copy in `plugins/pointcloud_slam_contract.py` and
+consumer-specific guidance in [SLAM_INPUT_CONTRACT.md](SLAM_INPUT_CONTRACT.md).
+On Tianyi's single `state/odom` interface, top-level `stamp_ms` and `twist`
+carry REST speed feedback at receipt time; the diagnostic SLAM pose has its own
+`pose.stamp_ms`. The `motus_slam/1` reader selects that explicit pose time,
+checks `vendor.motus_slam.stamp_ns` and supplied measurement evidence against
+it, and uses top-level time only for legacy packets without `pose.stamp_ms`.
+Repeated REST updates do not refresh identical diagnostic poses or their ingress
+age. Lost SLAM quality still blocks mapping even when measured speed is healthy.
+Deploy this reader with the companion Driver change; older readers reject split
+times through their precise-time mismatch check. The separate `motus_slam/2`
+observation contract retains its existing time-consistency requirements.
+
+The implementation must not infer calibrated mounting or verified
+cross-sensor clocks from a robot model or nearby timestamps.
+
+## Native Jetson packaging and historical size measurements
+
+Point-cloud SLAM requires the pinned RTAB-Map executables,
+linked against each image's existing ROS, OpenCV/PCL and Python ABI (JP5.11:
+Python 3.8; JP6.1: Python 3.10). The Dockerfile therefore builds native sources;
+this is an intentional deployment dependency, not a Python fallback. ROS source
+archives have pinned SHA-256 checks before extraction. Updating a source commit
+also requires reviewing and updating its archive hash. These hashes detect changed
+bytes; they are not upstream signatures. The core uses Git's pinned object graph.
+
+Registry manifest/config measurements on 2026-11-14 for the images built from
+PR371 commit 73627d1 (including its separate RGB-D card) show the following compressed layer bytes. “Before/after native” sums
+layers immediately before/after the RTAB-Map dependency/source/build block in
+the same image; it is not a comparison with a separately rebuilt main image.
+
+| Image tag | Before native | After native | Native block added | Whole image |
+|---|---:|---:|---:|---:|
+| release.261113.def9614-jetson-jp5.11 | 6,744,706,780 | 6,794,902,526 | 50,195,746 | 6,796,695,094 |
+| release.261113.a87c881-jetson-jp6.1 | 8,105,238,860 | 8,127,018,472 | 21,779,612 | 8,128,988,407 |
+
+The dependency-install layers add 1,095,185 and 1,248,405 compressed bytes
+respectively: most listed development dependencies already exist in the earlier
+image layers. Installed libraries/headers and native overlays remain in the final
+image; deleting them in a later layer would not reclaim their download size.
+Source/build layers also remain in image history despite later workspace cleanup.
+The build already disables unused GUI, camera SDK and optimization backends.
+
+A multi-stage build could omit additional source/build intermediates, but copying
+only executables is insufficient: the ROS overlay, Python bindings, shared
+libraries and their ABI-matched runtime dependencies must remain. Removing tools
+inherited from the common base requires a separate base/runtime split. This PR
+retains the existing cached build layout with the measured growth above; it does
+not claim zero image growth or a measured cold-build time. These manifest sizes
+are compressed transfer sizes, not unpacked disk usage or newly rebuilt images.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
@@ -4596,3 +4667,104 @@ autoload on, **176 passed** with it off.
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
 ```
+
+### Standalone SLAM synchronization with PR #371 (2026-11-16)
+
+This branch includes the pointcloud, external-odometry SLAM and shared spatial
+input changes through PR #371 commit `08da8650`. It does not include the RGB-D
+odometry card, image pairing/visual estimation, IMU/ESKF/depth assistance,
+rotation-hint patches or the native `rtabmap_odom` package.
+
+Pointcloud keeps its output ports visible before startup and when metric output
+is disabled. A shared bounded input registry preserves the original ingress
+context across depth projection and SLAM, with isolated consumer queues. The
+`motus.observation/1`, `motus.slam_input/2` and `motus.slam_frame/2` contracts
+retain source/epoch, geometry and mapping identity and exact payload association.
+Receipt estimates remain explicitly approximate; they cannot authorize exact
+capture-time body mounts. The original Driver v1 contract stays unchanged.
+
+External chassis poses using `chassis_clock_request_interval_slew` version `2`
+can update only their integer offset within one segment, with verified declared
+uncertainty no greater than 50 ms and offset changes bounded to 1% of source
+elapsed time. Compatible late samples are dropped without retiring the segment;
+rewritten timestamps and changed identities/mapping versions remain barriers.
+
+A connected cloud's declared body-mount sidecar is forwarded by Core and joined
+at the exact capture timestamp. Different source clock names are accepted only
+through a resolved common host clock reference; observation/header timestamps
+must agree. Missing or stale TF never uses a held/latest transform. Estimated
+mount provenance and unknown physical accuracy remain explicit. The generic
+capture cache is in `plugins/spatial_mount.py`; `plugins/spatial_pose.py` builds
+validated sample envelopes without estimating poses or asserting camera origin.
+These replace dependencies on the visual-odometry modules in the source branch.
+
+Map admission requires tracking poses and usable finite points. Producer pause
+budgets use `clamp(4 * period + processing P95, 1 s, 3 s)` when timing
+evidence is available, otherwise 1 s. They retain their original deadline and
+cannot be extended by repeated messages. PointCloud2 normalization validates original bytes before converting
+noncanonical XYZ layouts, keeping source and output digests distinct. Native
+progress, segment lifecycle and unknown covariance are reported explicitly;
+suspected stalls do not automatically restart the backend or merge unknown map
+origins. Deployment-only `pointcloud_slam.native_parameters` accepts finite,
+nonnegative `RGBD/LinearUpdate` and `RGBD/AngularUpdate`; `{}` keeps native defaults.
+Live and saved mapping previews preserve the latest heading/status flags.
+
+The standalone native build, package selection and existing dependency footprint
+are retained. Source-branch robot tests do not constitute deployment or motion
+accuracy validation of this extracted PR.
+
+The display-only depth cloud shares mapping's forward/left/up preview convention
+and default viewpoint. Metric PointCloud2 and map heading are unchanged; this is
+not a robot-specific mounting declaration. Metric output requires explicit
+measured-depth provenance even with optical-Z semantics. Each native mapping
+child receives a private buffered DDS profile. Missing/directory-mounted DDS
+profiles fail with an actionable configuration error and no unisolated fallback.
+Native input discovery allows up to 30 seconds during startup, while capture
+freshness and stop-event handling remain enforced. No dependencies were added.
+
+
+### Optional RGB loop closure
+
+The SLAM card always exposes three input ports, in order: `state/odom`,
+`sensor/pointcloud2`, and optional `image/jpeg`. Existing saved cards retain their
+first two wire indices and gain the RGB port. RGB is not a visual-odometry input;
+poses still come from the connected odometry source.
+
+Without RGB, the existing scan-only native pipeline remains unchanged. With an
+RGB wire, each admitted scan uses an exact-stamped native `SensorData` envelope.
+A valid image enables appearance-based place recognition and visual initialization
+of candidate transforms; native ICP still verifies registration using measured
+scan geometry. Sparse feature depth is projected from measured scan points,
+with nearest optical Z and zero holes, never inferred or hole-filled depth.
+The native process, odometry interface and map segment do not change when RGB
+fails or recovers. Pointcloud proximity matching remains enabled.
+
+RGB must provide rectified pinhole `motus.camera/1` calibration, its original
+capture clock and the same registered optical frame as the cloud. Images are
+matched within 50 ms and rejected beyond 500 ms old or 50 ms future. A dynamic
+mount requires the exact RGB-capture certificate; cloud-time mounting is not
+substituted. The camera model includes the motion between the RGB and scan
+capture poses without changing the original RGB timestamp. No robot model,
+installation matrix or additional hardware configuration is added.
+
+Missing/unresolved RGB, invalid calibration, stale/future images, decode errors,
+missing pose/mount evidence or failed optional preparation automatically omit
+the images and continue pointcloud registration. JPEG decoding is independent;
+only one optional projection task may be in flight, and the mapping worker
+waits at most 20 ms for its own result before forwarding the scan alone. Faults
+invalidate in-flight imagery before publication. Fresh usable images resume
+image processing automatically. Calibration declarations are adopted at project
+start; fixing a missing/invalid declaration requires a project restart to adopt
+new evidence, while the current map can continue in pointcloud mode.
+
+`info().input_status.loop_closure_mode` reports `image` or `pointcloud` for the
+last forwarded frame; `rgb_input` reports availability and the fallback reason.
+`image` means usable visual evidence was forwarded, not that a loop was accepted.
+Required pointcloud/odometry checks remain strict. Neither tracking nor a detected
+loop establishes physical mapping accuracy.
+
+The standalone synthetic native check is:
+`ROS_DOMAIN_ID=149 python3 tools/rtabmap_rgb_loop_smoke.py --timeout 90`.
+It uses temporary databases and synthetic inputs only, checks native updates
+through image/fallback/recovery and saved visual evidence, and does not prove
+real-route loop closure or moving-robot accuracy.
