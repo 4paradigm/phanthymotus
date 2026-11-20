@@ -106,6 +106,7 @@ export const SkeletonRenderer = {
       this._buildFallbackSkeleton();
       return;
     }
+    const scene = this._scene;
     try {
       const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
         method: 'POST',
@@ -113,6 +114,8 @@ export const SkeletonRenderer = {
         body: JSON.stringify({ tool: 'model', arguments: {} }),
       });
       const json = await res.json();
+      // The preview may have closed while the model was loading.
+      if (this._scene !== scene) return;
       // API returns { code, data } where data is the content array
       const content = json.data?.[0]?.text ?? json.result?.content?.[0]?.text;
       if (!content) { this._buildFallbackSkeleton(); return; }
@@ -125,6 +128,7 @@ export const SkeletonRenderer = {
         this._buildFallbackSkeleton();
       }
     } catch (e) {
+      if (this._scene !== scene) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
       this._buildFallbackSkeleton();
     }
