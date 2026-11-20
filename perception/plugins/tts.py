@@ -2507,15 +2507,24 @@ class TTSPlugin:
         props["tts_engine"]["enum"].append(KOKORO_TRT_ENGINE)
         props["tts_engine"]["description"] += (
             " Additional Jetson option: kokoro-multi-trt (eight-language TensorRT, GPU).")
-        for field, (_, schema) in _KOKORO_TRT_CARD_FIELDS.items():
-            props[field] = {
-                **schema, "scope": "shared",
-                "x-show-when": {"tts_engine": [KOKORO_TRT_ENGINE]},
-                "x-keep-when-hidden": True,
-            }
         props["speaker_id"]["x-hide-when"] = {"tts_engine": [KOKORO_TRT_ENGINE]}
         for key in ("tts_language", "device", "speaker_id"):
             props[key]["x-keep-when-hidden"] = True
+
+        # The card renders in schema order. Put each TRT field by its counterpart.
+        trt_fields = {setting: (field, schema)
+                      for field, (setting, schema) in _KOKORO_TRT_CARD_FIELDS.items()}
+        ordered_props = {}
+        for key, prop in props.items():
+            ordered_props[key] = prop
+            if key in trt_fields:
+                field, schema = trt_fields[key]
+                ordered_props[field] = {
+                    **schema, "scope": "shared",
+                    "x-show-when": {"tts_engine": [KOKORO_TRT_ENGINE]},
+                    "x-keep-when-hidden": True,
+                }
+        tools[0]["configSchema"]["properties"] = ordered_props
         return tools
 
     # ── dispatch ────────────────────────────────────────────────────────
