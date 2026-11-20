@@ -50,7 +50,7 @@ export const SkeletonRenderer = {
   _loaded: false,
   _mcpId: null,
 
-  mount(container, mcpId) {
+  mount(container, mcpId, topicPath) {
     this._mcpId = mcpId;
     this._joints = {};
     this._links = {};
@@ -60,7 +60,7 @@ export const SkeletonRenderer = {
     container.appendChild(this._el);
 
     this._initThree();
-    this._loadModel(mcpId);
+    this._loadModel(mcpId, topicPath);
     this._animate();
 
     this._ro = new ResizeObserver(() => this._resize());
@@ -101,7 +101,7 @@ export const SkeletonRenderer = {
     this._scene.add(grid);
   },
 
-  async _loadModel(mcpId) {
+  async _loadModel(mcpId, topicPath) {
     if (!mcpId || mcpId === 'dashboard') {
       this._buildFallbackSkeleton();
       return;
@@ -110,7 +110,10 @@ export const SkeletonRenderer = {
       const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tool: 'model', arguments: {} }),
+        // The panel's topic identifies the card that is asking. One driver can
+        // serve several cards (e.g. left and right hand), each with its own
+        // model; without it every panel gets the same URDF.
+        body: JSON.stringify({ tool: 'model', arguments: topicPath ? { topic: topicPath } : {} }),
       });
       const json = await res.json();
       // API returns { code, data } where data is the content array
