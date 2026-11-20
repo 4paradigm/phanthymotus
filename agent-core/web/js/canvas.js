@@ -12,6 +12,7 @@
  */
 
 import { showToast } from './toast.js';
+import { openUsbPairing, supportsUsbPairing } from './usb-pairing.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -1420,7 +1421,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (!(await _ensureEdit())) return;
-        await _executeCard(el, mcpId, toolName);
+        await _executeCard(el, mcpId, toolName, id);
       });
     }
 
@@ -1479,6 +1480,20 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  if (supportsUsbPairing(mcp) && toolName === 'glove_teleop') {
+    const footer = el.querySelector('.canvas-card-footer') || el.querySelector('.canvas-card-body-wrap');
+    const pairButton = document.createElement('button');
+    pairButton.type = 'button';
+    pairButton.className = 'canvas-view-btn canvas-usb-pairing-btn';
+    pairButton.textContent = 'USB 设备配对';
+    pairButton.addEventListener('click', async event => {
+      event.stopPropagation();
+      if (!(await _ensureEdit())) return;
+      await openUsbPairing(mcpId, { ensureEdit: _ensureEdit,
+        onComplete: () => showToast('USB 配对已保存，请重新开始预览并标定') });
+    });
+    footer?.appendChild(pairButton);
+  }
   return el;
 }
 
@@ -2691,7 +2706,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
       const parsed = _parseMcpCallResult(await resp.json());
       const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
       if (liveTopic) {
-        showTopicDetail(liveTopic.topic, liveTopic.format || '');
+        showTopicDetail(liveTopic.topic, liveTopic.format || '', mcpId);
         return;
       }
     } catch (e) {
@@ -2707,7 +2722,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
     return;
   }
-  showTopicDetail(candidate.topic, candidate.format || '');
+  showTopicDetail(candidate.topic, candidate.format || '', mcpId);
 }
 
 /**
