@@ -167,9 +167,14 @@ def camera_id(declaration: dict) -> str:
 
 
 def mount_topic(vendor):
-    """Resolve the dynamic transform only from the bound depth camera's declaration."""
+    """Use a body mount only when its camera also declares a pose-pairing clock."""
     mount = vendor.get("body_mount")
-    if (not isinstance(mount, dict) or mount.get("schema") != "motus.camera_mount/1"
+    clock = vendor.get("clock_reference")
+    if (not isinstance(clock, dict) or not clock.get("domain_id")
+            or clock.get("clock_id") != "host_realtime"
+            or clock.get("timestamp_basis") != "host_realtime"
+            or vendor.get("timestamp_semantics") != "source_capture_mapped"
+            or not isinstance(mount, dict) or mount.get("schema") != "motus.camera_mount/1"
             or mount.get("mode") != "dynamic" or mount.get("length_unit") != "m"
             or mount.get("parent_frame") not in ("base_link", "base_footprint", "body")
             or mount.get("transform_direction") != "body_from_camera"

@@ -2142,11 +2142,11 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
-@pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl",
-                         [(50, None, True, 600, 400), (700, 800, True, 250, 250),
-                          (50, None, False, 600, 400)])
+@pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl,bumi_mount",
+                         [(50, None, True, 600, 400, False), (700, 800, True, 250, 250, False),
+                          (50, None, False, 600, 400, False), (50, None, True, 600, 400, True)])
 def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
-                                                          with_odom, ttl_cap, expected_ttl):
+                                                          with_odom, ttl_cap, expected_ttl, bumi_mount):
     import numpy as np
     from plugins.navi import local_path, policy
 
@@ -2160,6 +2160,14 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         input_topics.append(odom_topic)
     declaration = _decl(_DEPTH_TOPIC, id="demo/camera_front", distortion_model="pinhole",
                         K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
+    if bumi_mount:
+        declaration["vendor"] = dict(
+            frame_id="ubuntu_rgb_optical", clock_id="realsense_capture/epoch/global_time",
+            timestamp_semantics="source_capture_mapped", clock_mapping_verified=False,
+            body_mount=dict(schema="motus.camera_mount/1", topic="/ubuntu/camera/rgbd/body_mount",
+                            mode="dynamic", length_unit="m", parent_frame="base_link",
+                            child_frame="ubuntu_rgb_optical", transform_direction="body_from_camera",
+                            epoch="epoch", version="capture_tf_v1", status="unavailable"))
     reply = card.dispatch("navi", {
         "action": "start", "input_topics": input_topics,
         "control_interface": _descriptor(footprint={"half_width": 0.23, "half_length": 0.25},
@@ -2202,7 +2210,10 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     for index in range(6):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
-    assert command["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0]
+    assert command["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0], card._last_decision.reason
+    if bumi_mount:
+        assert "body_mount" not in reply["inputs"]
+        assert "body_mount_required" not in card.observation(with_capture_timing=True)[1]
     assert command["ttl_ms"] == expected_ttl
     expected_limit = depth_limit_ms or 500
     assert attempted[:2] == [(-1.0, .28, expected_limit, 600), (1.0, .28, expected_limit, 600)]
@@ -2234,11 +2245,14 @@ def test_dynamic_body_mount_is_bound_to_the_depth_camera_and_exact_capture(monke
                  version="v1", epoch="s1", parent_frame="base_link", child_frame="optical",
                  transform_direction="body_from_camera", length_unit="m", accuracy_validated=False)
     vendor = dict(body_mount=mount, clock_id="head", frame_id="optical",
-                  clock_reference=dict(clock_id="host_realtime", timestamp_basis="host_realtime"))
+                  timestamp_semantics="source_capture_mapped",
+                  clock_reference=dict(clock_id="host_realtime", timestamp_basis="host_realtime",
+                                       domain_id="boot1"))
     declarations = {_DEPTH_TOPIC: _decl(_DEPTH_TOPIC, format="image/depth-zlib", vendor=vendor)}
     binding, error = card._bind_inputs(node, [_DEPTH_TOPIC, _OBJECTS_TOPIC], declarations)
     assert not error
     assert card._adopt_camera(declarations, binding) == ""
+    card._binding = binding
     callbacks = [cb for _, topic, cb, *_ in node.subscription_details if topic == mount["topic"]]
     assert len(callbacks) == 1
     stamp = 123_000_000_123

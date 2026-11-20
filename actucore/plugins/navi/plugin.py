@@ -597,7 +597,7 @@ class NaviPlugin:
         self._adopt_odom_interface(interface, bound_topic=binding.get("odom"))
         if (self._timer is not None and self._config.local_planning and self._config.odom_expected
                 and self._config.local_geometry is not None and self._config.scan_geometry is None
-                and "body_mount" not in self._depth_vendor):
+                and not binding.get("body_mount")):
             try:
                 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
@@ -1719,7 +1719,7 @@ class NaviPlugin:
                 if with_capture_timing:
                     depth["control_ms"] = now
                     ns = self._depth_source_ns
-                    if "body_mount" in self._depth_vendor:
+                    if self._binding.get("body_mount"):
                         depth["body_mount_required"] = True
                     if ns is not None:
                         depth["source_stamp_ns"] = ns
