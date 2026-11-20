@@ -44,12 +44,24 @@ AXES = ("vx", "vy", "vz", "wx", "wy", "wz")
 BODY_FRAME = "body"
 
 
-def planar_feedback(odom):
+def planar_axes(odom):
     """Use measured axes first, filling missing axes with recent pose deltas."""
     sample = odom or {}
-    estimated = sample.get("pose_feedback", (None, None, None))
-    motion = tuple(value if value is not None and math.isfinite(value) else fallback
-                   for value, fallback in zip((sample.get(axis) for axis in ("vx", "vy", "wz")), estimated))
+    estimated = sample.get("pose_feedback") or (None, None, None)
+
+    def valid(value):
+        try:
+            return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value))
+        except OverflowError:
+            return False
+
+    return tuple(value if valid(value) else fallback if valid(fallback) else None
+                 for value, fallback in zip((sample.get(axis) for axis in ("vx", "vy", "wz")), estimated))
+
+
+def planar_feedback(odom):
+    motion = planar_axes(odom)
     return motion if all(v is not None for v in motion) else None
 
 

@@ -42,6 +42,16 @@ def test_velocity_ramp_checks_hits_up_to_the_edge_of_the_grid():
     assert not replay.transition_clear((free, occupied), geometry, .25, 1.45, velocities)
 
 
+def test_search_prefers_a_clearer_path_when_distance_costs_are_close():
+    allowed = np.ones((5, 7), dtype=bool)
+    allowed[2, 3] = False
+    clearance_cost = np.zeros_like(allowed, dtype=float)
+    clearance_cost[:2, 1:6] = .2
+    path = replay.shortest_path(allowed, (2, 0), (2, 6), cell_cost=clearance_cost)
+    assert (3, 3) in path
+    assert not any(row < 2 for row, _ in path)
+
+
 @pytest.mark.parametrize("observed", [False, True])
 def test_observed_detour_cannot_route_through_an_unknown_band(observed):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
@@ -64,6 +74,44 @@ def test_observed_detour_can_stop_at_a_known_prefix_before_occlusion():
                                         body_half_width=.20)
     assert route is not None
     assert .1 <= route.points[-1][0] <= 1. - geometry.front + 1e-9
+
+
+@pytest.mark.parametrize("initial_hit", [False, True])
+def test_current_discrete_envelope_can_contain_unknown_but_not_occupied(initial_hit):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    occupied = (abs(replay.RIGHT) <= .10) & np.isclose(replay.FORWARD, .90)
+    occupied[replay.START[0] - 5, replay.START[1]] = initial_hit
+    free = (replay.FORWARD > -.249) & ~occupied
+    route = replay._checked_translation(None, None, geometry, .28, .90, 1., 500, 600,
+                                        velocity_limits=None, observed_grid=(free, occupied),
+                                        body_half_width=.23)
+    assert (route is not None) is not initial_hit
+
+
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_partial_route_selects_the_reachable_point_toward_the_original_target(side):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    wall = np.isclose(replay.FORWARD, 1.15)
+    route = replay._checked_translation(None, None, geometry, .28, 1.15, side, 500, 600,
+                                        velocity_limits=None, observed_grid=(~wall, wall),
+                                        body_half_width=.23, target=(2.4, side * .95, .60, .05),
+                                        closest=True)
+    assert route is not None
+    forward, right = route.points[-1]
+    assert forward == pytest.approx(.85)
+    assert right == pytest.approx(side * .95)
+
+
+def test_partial_endpoint_has_a_prefix_above_the_declared_velocity_floor():
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    wall = np.isclose(replay.FORWARD, .35)
+    route = replay._checked_translation(None, None, geometry, .28, .35, 1., 500, 600,
+                                        velocity_limits=((0., .35), (.30, .40)), allow_forward=False,
+                                        observed_grid=(~wall, wall), body_half_width=.23,
+                                        target=(1.8, .35, .6, .05), closest=True)
+    assert route is not None and route.command is not None
+    assert route.command[0] == 0. and -.4 <= route.command[1] <= -.30
+    assert route.points[1] == pytest.approx((0., .35))
 
 
 def test_front_depth_can_execute_a_detour_with_an_unmeasured_prefix():

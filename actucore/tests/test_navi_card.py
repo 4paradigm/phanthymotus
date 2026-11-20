@@ -403,6 +403,53 @@ def test_card_retains_the_outbound_twist_for_unmeasured_ego_prediction(monkeypat
     assert card._state.commanded == (.2, 0., 0.)
 
 
+def test_resume_does_not_include_the_paused_duration_in_the_first_tick(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._running = True
+    now, ticks = [1.], []
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now[0])
+
+    def step(**inputs):
+        ticks.append(inputs["dt"])
+        return policy.Decision(None, policy.BLIND)
+
+    monkeypatch.setattr(policy, "step", step)
+    card.next_command()
+    assert card._halt(True)["state"] == "paused"
+    now[0] = 21.1
+    assert card._halt(False)["state"] == "running"
+    card.next_command()
+    assert ticks == pytest.approx([.1, .1])
+
+
+def test_partial_result_reaches_acp_and_is_consumed_once(monkeypatch):
+    import threading
+
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._state.target = "person"
+    card._state.partial_result = dict(outcome="partial", target_reached=False,
+                                      reachability_scope="observed_local", remaining_distance_m=1.4,
+                                      best_verified_distance_m=1.4)
+    card._acp_action_id = "navi_original"
+    card._last_decision = policy.Decision(None, policy.FAILED, "locally blocked", distance_m=1.4)
+    delivered, calls = threading.Event(), []
+
+    def post(*args):
+        calls.append(args)
+        delivered.set()
+
+    monkeypatch.setattr(card, "_post_acp", post)
+    card._maybe_complete()
+    assert delivered.wait(1.)
+    card._maybe_complete()
+    assert len(calls) == 1 and not card._acp_action_id
+    action, status, result = calls[0]
+    assert (action, status, result["target"]) == ("navi_original", "failed", "person")
+    assert all(result[key] == value for key, value in card._state.partial_result.items())
+
+
 def test_local_avoidance_accepts_only_recent_continuous_pose_without_twist(monkeypatch):
     import numpy as np
     from types import SimpleNamespace

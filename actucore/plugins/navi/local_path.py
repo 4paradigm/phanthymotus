@@ -4,6 +4,7 @@ from __future__ import annotations
 import heapq
 import math
 from dataclasses import dataclass, field
+from functools import partial
 
 import numpy as np
 
@@ -25,10 +26,17 @@ def footprint_region(center, half_cells):
     return np.s_[row-(rear[0] if rear else front):row+front+1, col-dc:col+dc+1]
 
 
-def allowed_centers(grid, start, half_cells, allow_unknown=False):
+def _blocked_cells(grid, start, half_cells, allow_unknown=False):
     blocked = grid == OCCUPIED if allow_unknown else grid != FREE
     area = footprint_region(start, half_cells)
+    # The starting envelope is already occupied by the robot. Preserve
+    # measured hits there, and require evidence for cells entered later.
     blocked[area] = grid[area] == OCCUPIED
+    return blocked
+
+
+def allowed_centers(grid, start, half_cells, allow_unknown=False):
+    blocked = _blocked_cells(grid, start, half_cells, allow_unknown)
     front, dc, *back = half_cells
     rear = back[0] if back else front
     rows, cols = front + rear + 1, 2*dc + 1
@@ -39,7 +47,7 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
 
 
 def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS,
-                  target_cells=None):
+                  target_cells=None, target_cost=None, cell_cost=None):
     if not allowed[start]:
         return None
     if target_cells is None:
@@ -56,6 +64,8 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
         goal_col, last_col = int(cols.min()), int(cols.max())
 
     def distance_to_goals(point):
+        if target_cost is not None:
+            return 0.
         row, col = point
         return math.hypot(max(goal_row - row, row - last_row, 0),
                           max(goal_col - col, col - last_col, 0))
@@ -63,21 +73,32 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
     queue = [(distance_to_goals(start), 0.0, start)]
     cost = {start: 0.0}
     parents = {}
+    best, best_score = None, (math.inf, math.inf)
+
+    def path_to(point):
+        path = [point]
+        while point != start:
+            point = parents[point]
+            path.append(point)
+        return path[::-1]
+
     # Scalar access in the inner A* loop is cheaper on Python lists.
     traversable = allowed.tolist()
     row_count, col_count = allowed.shape
+    costs = cell_cost.tolist() if cell_cost is not None else [[0.] * col_count] * row_count
     moves = [(dr, dc, math.hypot(dr, dc)) for dr, dc in steps]
     while queue:
         _, walked, current = heapq.heappop(queue)
         row, col = current
-        if (goal_col <= col <= last_col and goal_row <= row <= last_row
-                and (target_cells is None or target_cells[current])):
-            route = [current]
-            while route[-1] != start:
-                route.append(parents[route[-1]])
-            return route[::-1]
         if walked > cost[current]:
             continue
+        if (goal_col <= col <= last_col and goal_row <= row <= last_row
+                and (target_cells is None or target_cells[current])):
+            if target_cost is None:
+                return path_to(current)
+            score = (target_cost[current], walked)
+            if score < best_score:
+                best, best_score = current, score
         for dr, dc, step_cost in moves:
             next_row, next_col = row + dr, col + dc
             if not (0 <= next_row < row_count and 0 <= next_col < col_count):
@@ -88,12 +109,12 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
                     and traversable[row][next_col]):
                 continue
             nxt = (next_row, next_col)
-            distance = walked + step_cost
+            distance = walked + step_cost * (1. + costs[next_row][next_col])
             if distance < cost.get(nxt, math.inf):
                 cost[nxt] = distance
                 parents[nxt] = current
                 heapq.heappush(queue, (distance + distance_to_goals(nxt), distance, nxt))
-    return None
+    return path_to(best) if best is not None else None
 
 
 def plan_right(grid, start, right, goal, half_cells, allow_unknown=False):
@@ -249,6 +270,11 @@ class Detour:
     geometry: Geometry
 
 
+def target_in_grid(geometry, forward, right):
+    f, left = geometry.base_from_optical[:2] @ (right, 0., forward, 1.)
+    return float(f), -float(left)
+
+
 @dataclass
 class PlanCache:
     key: tuple | None = None
@@ -275,19 +301,22 @@ class PlanCache:
         return self.grid
 
     def translation(self, observation, geometry, half_width, ahead, side, max_age_ms,
-                    watchdog_ms=300, *, velocity_limits, allow_forward=True):
+                    watchdog_ms=300, *, velocity_limits, allow_forward=True, allow_return=True):
         detour = self.route(observation, geometry, half_width, ahead, side, max_age_ms,
-                            watchdog_ms, velocity_limits=velocity_limits, allow_forward=allow_forward)
+                            watchdog_ms, velocity_limits=velocity_limits, allow_forward=allow_forward,
+                            allow_return=allow_return)
         return detour.command if detour is not None else None
 
     def route(self, observation, geometry, half_width, ahead, side, max_age_ms,
-              watchdog_ms=300, *, velocity_limits=None, allow_forward=True):
+              watchdog_ms=300, *, velocity_limits=None, allow_forward=True, allow_return=True):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
             return None
         key = (frame, round(ahead, 2), half_width, max_age_ms, watchdog_ms, observation.get("scan_revision"),
-               allow_forward, velocity_limits, observation.get("stop_target"), observation.get("body_half_width"))
+               allow_forward, allow_return, velocity_limits, observation.get("stop_target"),
+               observation.get("body_half_width"), observation.get("closest"),
+               observation.get("preferred_heading"))
         if self.key != key:
             self.key = key
             self.plans.clear()
@@ -295,20 +324,27 @@ class PlanCache:
             scan_grid = observation.get("scan_grid")
             self.plans[side] = _checked_translation(
                 observation["map"], ground, geometry, half_width, ahead, side, max_age_ms,
-                watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward,
+                watchdog_ms, observed_grid=scan_grid, allow_forward=allow_forward, allow_return=allow_return,
                 velocity_limits=velocity_limits, target=observation.get("stop_target"),
                 projected_grid=self.grid_for(observation, geometry),
-                body_half_width=observation.get("body_half_width"))
+                body_half_width=observation.get("body_half_width"),
+                closest=observation.get("closest", False),
+                preferred_heading=observation.get("preferred_heading"))
         return self.plans[side]
 
 
-def route_obstacles(grid, geometry, body_half_width):
+def _route_grid(grid):
     free, occupied = grid
-    # The robot already occupies its own footprint. Only new space requires
-    # positive clearance evidence, and observed hits always take priority.
-    body = ((FORWARD >= -geometry.rear) & (FORWARD <= geometry.front)
-            & (abs(RIGHT) <= body_half_width))
-    return occupied | (~free & ~body)
+    return np.where(occupied, OCCUPIED, np.where(free, FREE, UNKNOWN))
+
+
+def _footprint_cells(geometry, half_width):
+    return tuple(math.floor(half / RESOLUTION + .5)
+                 for half in (geometry.front, half_width, geometry.rear))
+
+
+def route_obstacles(grid, geometry, half_width):
+    return _blocked_cells(_route_grid(grid), START, _footprint_cells(geometry, half_width))
 
 
 def transition_clear(grid, geometry, half_width, horizon_s, velocities):
@@ -384,8 +420,9 @@ def opening_route(frame, occupied, geometry, half_width, plane, target):
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
-                         watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True,
-                         target=None, projected_grid=None, body_half_width=None):
+                         watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True, allow_return=True,
+                         target=None, projected_grid=None, body_half_width=None, closest=False,
+                         preferred_heading=None):
     if velocity_limits is not None:
         (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
         if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
@@ -399,12 +436,11 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if grid_input is None:
         grid_input = observe(frame, geometry, right, forward, resolution, ground)
     free, occupied = grid_input
-    blocked = occupied if body_half_width is None else route_obstacles(grid_input, geometry, body_half_width)
     if side < 0:
         free = free[:, ::-1] if free is not None else None
         occupied = occupied[:, ::-1]
-        blocked = blocked[:, ::-1]
-    grid = np.where(blocked, OCCUPIED, FREE)
+    grid = (np.where(occupied, OCCUPIED, FREE) if body_half_width is None
+            else _route_grid((free, occupied)))
     plane = ahead * geometry.base_from_optical[0, 2] + geometry.base_from_optical[0, 3]
     obstacle = (occupied & (abs(right) <= half_width) & (abs(forward - plane) <= .10))
     if not obstacle.any():
@@ -420,14 +456,21 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     goal = index(plane + geometry.rear + .25, 0)
     if not (row_zero <= via[0] < goal[0] < grid.shape[0] and via[1] < grid.shape[1]):
         return None
-    half_cells = tuple(math.floor(half / resolution + .5)
-                       for half in (geometry.front, half_width, geometry.rear))
+    half_cells = _footprint_cells(geometry, half_width)
     if half_cells[2] > row_zero or half_cells[1] > col_zero:
         return None
     # Check every footprint against observed obstacles. The search can reach
     # the passing lane at any column outside the obstacle, and rejoin on any
     # clear centerline cell at or beyond the original rejoin distance.
     footprint_clear = allowed_centers(grid, start, half_cells)
+    # Slightly prefer centres away from the edge of the hard clearance mask.
+    # This never makes a disallowed centre traversable.
+    cell_cost = None
+    if body_half_width is not None and (velocity_limits is not None or closest):
+        padded = np.pad(~footprint_clear, 1, constant_values=True)
+        cell_cost = .05 * (padded[:-2, 1:-1].astype(float) + padded[2:, 1:-1]
+                           + padded[1:-1, :-2] + padded[1:-1, 2:])
+    find_path = partial(shortest_path, cell_cost=cell_cost)
     allowed = footprint_clear.copy()
     allowed[:row_zero, :] = False
     allowed[:, :col_zero] = False
@@ -437,40 +480,43 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         allowed[row_zero + 1, col_zero] = False
     # A one-cell diagonal needs equal forward and lateral speeds. A longer
     # straight shortcut may still be executable at a different ratio.
-    steps = (STEPS if velocity_limits is None or max(floor_vx, floor_vy) <= min(max_vx, max_vy)
-             else CARDINAL_STEPS)
+    cardinal_steps = CARDINAL_STEPS if allow_return else tuple(step for step in CARDINAL_STEPS if step[1] >= 0)
+    steps = cardinal_steps
+    if velocity_limits is None or max(floor_vx, floor_vy) <= min(max_vx, max_vy):
+        steps = STEPS if allow_return else tuple(step for step in STEPS if step[1] >= 0)
     path, target_cells = None, None
     if target is not None:
         optical_forward, optical_right, stop, tolerance = target
-        # Translate the fixed-heading chassis by the same amount as the camera.
-        rotate = geometry.base_from_optical[:2, :3]
-        target_f, target_r = rotate @ (optical_right, 0., optical_forward)
-        target_r *= -side
+        target_f, target_r = target_in_grid(geometry, optical_forward, optical_right)
+        target_r *= side
         ranges = np.hypot(forward - target_f, right - target_r)
         allowed &= ranges >= stop
         if target_f - stop <= forward[goal[0], 0]:
             target_cells = ranges <= stop + max(tolerance, resolution / math.sqrt(2))
-            path = shortest_path(allowed, start, goal, steps=steps, target_cells=target_cells)
+            path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells)
+        if path is None and closest:
+            target_cells = ranges < ranges[start] - resolution / 2
+            path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells, target_cost=ranges)
+            if path is None:
+                return None
     if path is None:
         target_cells = None
         # A fused view can confirm space to bend before the passing lane.
         lane_min = via[1] if observed_grid is None else col_zero + 1
         allowed[via[0]:goal[0], :lane_min] = False
-        path = shortest_path(allowed, start, goal, later_goal=True, steps=steps)
+        path = find_path(allowed, start, goal, later_goal=True, steps=steps)
     last_goal_col = None
     if path is None:
         # Keep advancing on the open side if the original line stays blocked.
         goal = (goal[0], col_zero + 1)
         last_goal_col = allowed.shape[1] - 1
-        path = shortest_path(allowed, start, goal, later_goal=True,
-                             last_goal_col=last_goal_col, steps=steps)
-    partial = path is None
-    if partial:
+        path = find_path(allowed, start, goal, later_goal=True, last_goal_col=last_goal_col, steps=steps)
+    partial_route = path is None
+    if partial_route:
         # Replan from the passing lane when the current grid has no clear exit.
         goal = via
         last_goal_col = allowed.shape[1] - 1
-        path = shortest_path(allowed, start, goal, later_goal=True,
-                             last_goal_col=last_goal_col, steps=steps)
+        path = find_path(allowed, start, goal, later_goal=True, last_goal_col=last_goal_col, steps=steps)
     if path is None and body_half_width is not None:
         # Stop at an observed foothold in front of an occluded continuation.
         # The next centre would clear observed obstacles but needs more data.
@@ -480,7 +526,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         frontier[:row_zero + 2] = False
         if frontier.any():
             target_cells = frontier
-            path = shortest_path(allowed, start, goal, steps=steps, target_cells=frontier)
+            path = find_path(allowed, start, goal, steps=steps, target_cells=frontier)
     reposition = path is None
     if reposition:
         # A reachable lateral position with more room lets the next frame replan.
@@ -508,6 +554,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # the observation window, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
     # Expand blocked route cells by the footprint in centre coordinates.
+    blocked = _blocked_cells(grid, start, half_cells)
     half_cell = resolution / 2
     f0, f1 = forward - half_cell, forward + half_cell
     r0, r1 = right - half_cell, right + half_cell
@@ -531,21 +578,32 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         speed = min(length / horizon_s,
                     max_vx / df if df else math.inf, max_vy / dx if dx else math.inf)
         vx, vy = speed * df, speed * dx
-        if (partial or target_cells is not None) and vx and vy and not transition_clear(
+        if (partial_route or target_cells is not None) and vx and vy and not transition_clear(
                 (free, occupied), geometry, half_width, horizon_s, ((vx, -vy),)):
             return None
         if speed > 0 and (not df or vx >= floor_vx) and (not dx or vy >= floor_vy):
             return vx, -side * vy
         return None
 
-    cardinal = None
+    cardinal, diagonal, continuous = None, None, None
     for i in range(len(path) - 1, 0, -1):
         command = command_to(path[i])
         if command is not None:
-            if all(command):
-                return detour(path, i, command)
-            if cardinal is None:
+            if all(command) and diagonal is None:
+                diagonal = detour(path, i, command)
+                if preferred_heading is None:
+                    return diagonal
+            elif not all(command) and cardinal is None:
                 cardinal = detour(path, i, command)
+            if preferred_heading is not None and continuous is None:
+                heading = math.atan2(-command[1], command[0])
+                if abs(math.remainder(heading - preferred_heading, math.tau)) <= math.radians(8):
+                    continuous = detour(path, i, command)
+    candidate = diagonal or cardinal
+    if continuous is not None and math.hypot(*continuous.command) >= .8 * math.hypot(*candidate.command):
+        return continuous
+    if diagonal is not None:
+        return diagonal
     # Prefer an initial lateral stretch of three cells when there is room.
     # A single cell can produce a repeatedly selected but ineffective step.
     lead_cells = max(3, math.ceil(floor_vy * horizon_s / resolution))
@@ -561,15 +619,27 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     first_forward_col = col_zero + lead_cells
     if first_forward_col < allowed.shape[1]:
         allowed[row_zero + 1, :first_forward_col] = False
-        side_path = shortest_path(allowed, start, goal, later_goal=True,
-                                  last_goal_col=last_goal_col, steps=CARDINAL_STEPS,
-                                  target_cells=target_cells)
+        side_path = find_path(allowed, start, goal, later_goal=True, last_goal_col=last_goal_col,
+                              steps=cardinal_steps, target_cells=target_cells)
         if side_path is not None:
             first_turn = next((i - 1 for i, (row, _) in enumerate(side_path) if row != row_zero),
                               len(side_path) - 1)
             command = command_to(side_path[first_turn])
             if command is not None:
                 return detour(side_path, first_turn, command)
+
+    if closest and target is not None and cardinal is None:
+        # The geometrically closest route can have an initial shortcut below
+        # a chassis velocity floor. Try directly executable alternatives in
+        # the same bounded command horizon before reporting no progress.
+        max_row = row_zero + (math.floor(max_vx * horizon_s / resolution) if allow_forward else 0)
+        max_col = col_zero + math.floor(max_vy * horizon_s / resolution)
+        improved = allowed[:max_row + 1, :max_col + 1] & (
+            ranges[:max_row + 1, :max_col + 1] < ranges[start] - resolution / 2)
+        for point in sorted(zip(*np.nonzero(improved)), key=lambda p: ranges[p]):
+            command = command_to(point)
+            if command is not None:
+                return detour((start, point), 1, command)
     return cardinal or detour(path, 1, None)
 
 

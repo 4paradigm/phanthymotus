@@ -153,6 +153,7 @@ class NaviPlugin:
         self._last_error = ""
         self._last_decision = None
         self._last_tick = 0.0
+        self._command_window = (0., 0.)
 
         self._config = policy_mod.Config(**{
             k: v for k, v in self._cfg.items()
@@ -486,6 +487,8 @@ class NaviPlugin:
             self._paused = False
             self._last_error = ""
             self._state = policy_mod.State()
+            self._last_tick = 0.
+            self._command_window = (0., 0.)
             self._running = True
 
         with self._obs_lock:
@@ -809,6 +812,9 @@ class NaviPlugin:
             obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State(target=target)
             self._state.active_scan.obstacles = obstacles
+            self._last_decision = None
+            self._last_tick = 0.
+            self._command_window = (0., 0.)
             self._paused = False
             # **The card mints this, agent-core does not supply it.** The ACP
             # contract runs the other way from what it looks like: an async tool
@@ -892,6 +898,11 @@ class NaviPlugin:
             if halted:
                 self._publish_stop_if_moving()
                 self._state.active_scan.invalidate()
+                self._state.commanded = (0., 0., 0.)
+            if self._paused != bool(halted):
+                self._last_tick = 0.
+                self._command_window = (0., 0.)
+                self._state.moving_for_s = 0.
             self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
@@ -1685,12 +1696,16 @@ class NaviPlugin:
         """
         tick = time.monotonic()
         control_period_s = 1.0 / self._rate_hz
-        dt = tick - self._last_tick if self._last_tick else control_period_s
+        previous_tick = self._last_tick
+        dt = tick - previous_tick if previous_tick else control_period_s
         self._last_tick = tick
+        started, deadline = self._command_window
+        coverage = max(0., min(tick, deadline) - max(previous_tick or tick, started))
 
         objects, depth, odom, objects_ms = self._observation_snapshot(
             with_capture_timing=self._config.local_planning)
-        was_moving = any(self._state.commanded)
+        previous_twist = self._state.commanded
+        was_moving = any(previous_twist)
         previous_scan = self._state.active_scan
         issued_yaw = previous_scan.issued_yaw
         previous_turn_stop_ms = previous_scan.turn_stop_ms
@@ -1700,7 +1715,8 @@ class NaviPlugin:
                          and self._last_decision.status == policy_mod.SEARCHING)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
-                                   dt=dt, control_period_s=control_period_s)
+                                   dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
+                                   command_interrupted=bool(deadline and tick > deadline))
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
@@ -1710,7 +1726,10 @@ class NaviPlugin:
             # hold its last motion command under the longer watchdog.
             if (self._config.watchdog_ms <= 300
                     and not (scan_guarded or was_searching or command_only)) or not was_moving:
+                if deadline > tick:
+                    self._state.commanded = previous_twist
                 return None
+            self._command_window = (0., 0.)
             decision.values = [0.0] * ACTION_DIM
             return self._command_message(decision.values, now, int(now * 1000))
 
@@ -1775,9 +1794,16 @@ class NaviPlugin:
             # Bracket the outgoing stop, including time spent planning it.
             scan.turn_stop_ms = now_ms
         self._state.commanded = (values[0], values[1], values[5])
+        if values[0] <= .05:
+            self._state.moving_for_s = 0.
         message = self._command_message(values, now, obs_ms)
         if values[5] and scan.turn_until_ms:
             message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
+        if any(values):
+            issued = time.monotonic()
+            self._command_window = (issued, issued + min(message["ttl_ms"], self._config.watchdog_ms) / 1000)
+        else:
+            self._command_window = (0., 0.)
         return message
 
     def _command_message(self, values, now, obs_ms):
@@ -1859,6 +1885,8 @@ class NaviPlugin:
                              interval * 1000, (started - entered) * 1000, (decided - started) * 1000,
                              (finished - decided) * 1000, message["seq"] if message is not None else None)
             except Exception as error:                        # noqa: BLE001
+                self._command_window = (0., 0.)
+                self._state.moving_for_s = 0.
                 self._last_error = f"{type(error).__name__}: {error}"
                 log.warning("navi tick failed: %s", error)
                 return
@@ -2081,24 +2109,18 @@ class NaviPlugin:
         action that failed sits open until the ACP timeout, holding the barrier
         and telling nobody why.
         """
-        decision = self._last_decision
-        if decision is None:
-            return
-        if decision.status == policy_mod.ARRIVED:
-            status = "completed"
-        elif decision.status == policy_mod.FAILED:
-            status = "failed"
-        else:
-            return
-
         with self._lock:
+            decision = self._last_decision
+            if decision is None or decision.status not in (policy_mod.ARRIVED, policy_mod.FAILED):
+                return
+            status = "completed" if decision.status == policy_mod.ARRIVED else "failed"
             action_id, self._acp_action_id = self._acp_action_id, ""
-        if not action_id:
-            return
-
-        result = {"status": decision.status, "reason": decision.reason,
-                  "target": self._state.target,
-                  "distance_m": decision.distance_m}
+            if not action_id:
+                return
+            result = {"status": decision.status, "reason": decision.reason,
+                      "target": self._state.target, "distance_m": decision.distance_m}
+            if status == "failed" and self._state.partial_result is not None:
+                result.update(self._state.partial_result)
         threading.Thread(target=self._post_acp, args=(action_id, status, result),
                          daemon=True, name="navi_acp").start()
 

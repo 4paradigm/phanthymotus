@@ -182,6 +182,10 @@ def test_search_rate_is_executable_and_sweep_uses_emitted_speed(floor, cap, requ
     else:
         output = P.apply_deadband(decision.values, limits["min_magnitude"])
         assert abs(output[5]) == expected
+        assert state.searched_rad == 0.
+        state.commanded = (0., 0., output[5])
+        state.command_dt_s = .1
+        P._search(config, state, .1)
         assert state.searched_rad == pytest.approx(expected * 0.1)
 
 

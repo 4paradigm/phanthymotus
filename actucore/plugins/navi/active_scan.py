@@ -89,6 +89,7 @@ class ActiveScan:
     historical_hits: np.ndarray | None = None
     phase: str = "idle"
     attempted: bool = False
+    exhausted: bool = False
     locked: bool = False
     directions: tuple = ()
     turn_angle: float = ANGLE
@@ -406,6 +407,8 @@ class ActiveScan:
         self.route_segment = route_segment
         self.advance_m, self.advance_origin, self.advance_commanded_m = advance_m, None, 0.
         self.attempted = True
+        if not reroute:
+            self.exhausted = False
         self.phase = "brake"
         self.origin_set = False
         self.start_ms = self.single_control_ms if self.command_only else self.poses[-1][0]
@@ -422,27 +425,36 @@ class ActiveScan:
             self.still_since = self.single_control_ms if self.command_only else self.poses[-1][0]
             self.timed_phase_s = self.timed_turn_s = 0.
         else:
-            self.interrupt()
+            self.exhaust()
         return self.active
+
+    def exhaust(self):
+        """Finish a normal search whose candidate corridors were blocked."""
+        self.issued_yaw = False
+        self.interrupt()
+        self.attempted = self.exhausted = True
+        self.result_frame = 0
 
     def finish(self):
         self.result_frame = self.current_frame if self.route_segment else self.side_frame
-        if self.advance_origin is not None:
+        if self.advance_origin is not None and not self.exhausted:
             self.turn_replan_used = False
         if self.route_segment:
-            self.attempted = False
+            self.attempted = self.exhausted
             self.rerouted = False
         self.phase = "idle"
 
     def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
-                min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None, control_period_s=None):
+                min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None, control_period_s=None,
+                previous_command_s=None, yaw_limits=None):
         if not self.active or self.ready:
             return ScanCommand()
         if self.command_only:
             if previous_yaw is not None and self.timed_turn_s:
-                self.timed_heading -= previous_yaw * min(tick_s, watchdog_ms / 1000)
+                covered = min(tick_s, watchdog_ms / 1000) if previous_command_s is None else previous_command_s
+                self.timed_heading -= previous_yaw * covered
             return self._timed_command(geometry, half_width, yaw_rate, watchdog_ms,
-                                       obs_age_ms, min_yaw_rate, tick_s, previous_yaw is not None)
+                                       obs_age_ms, min_yaw_rate, tick_s, previous_yaw is not None, yaw_limits)
         stamp = self.poses[-1][0]
         speed = math.hypot(*self.motion[:2])
         if not self.current_frame:
@@ -536,6 +548,8 @@ class ActiveScan:
 
         # Budget tracking latency and the watchdog, including a sink poll.
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
+        if yaw_limits is not None:
+            yaw_rate = min(yaw_rate, yaw_limits[0 if error > 0. else 1])
         if not geometry.front > 0 or not geometry.rear > 0 or not yaw_rate > 0 or yaw_rate < min_yaw_rate:
             return self.interrupt()
         if self.motion[2] * math.copysign(1., error) > STILL_YAW:
@@ -575,7 +589,7 @@ class ActiveScan:
         return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
 
     def _timed_command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms,
-                       min_yaw, tick_s, tracks_commands):
+                       min_yaw, tick_s, tracks_commands, yaw_limits):
         self.timed_total_s += tick_s
         self.timed_phase_s += tick_s
         if not self.current_frame or self.timed_total_s * 1000 > 2 * SCAN_TIMEOUT_MS:
@@ -586,6 +600,8 @@ class ActiveScan:
                 self.timed_phase_s = 0.
             return ScanCommand(reason="主动观察：停车，等待制动窗口")
         error = self.directions[0] * self.turn_angle - self.timed_heading
+        if yaw_limits is not None:
+            yaw_rate = min(yaw_rate, yaw_limits[0 if error > 0. else 1])
         if not self.timed_turn_s:
             if abs(error) <= ANGLE_TOLERANCE:
                 self.side_frame = self.current_frame
@@ -699,6 +715,7 @@ class ActiveScan:
             return
         self.rerouted = False
         self.attempted = False
+        self.exhausted = False
         self.issued_yaw = False
         self.turn_replan_used = False
         self.result_frame = 0
