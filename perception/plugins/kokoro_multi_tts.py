@@ -14,7 +14,7 @@ from time import monotonic
 
 import numpy as np
 
-from plugins.tts import PCM_FRAME_S, TTSAdapter
+from plugins.tts import KOKORO_TRT_ENGINE, PCM_FRAME_S, TTSAdapter
 from utils.resample import downsample_24k_to_16k
 from .kokoro_multi_frontend import (
     Frontend, LANGUAGES, ReadingSession, sentence_phoneme_chunks,
@@ -525,7 +525,7 @@ def prepare_model(model_dir, on_status=None):
             "KOKORO_MULTI_ASSET_SHA256 and KOKORO_MULTI_ASSET_SIZE"
         )
     model_dir = require_models_subpath(os.environ.get("KOKORO_MULTI_MODEL_DIR", model_dir or cache))
-    progress_cb, stage_cb = fetch_status(on_status, "kokoro-multi")
+    progress_cb, stage_cb = fetch_status(on_status, KOKORO_TRT_ENGINE)
     ensure_verified_archive(
         f"kokoro-multi-jp{jp}", model_dir, url, {"sha256": sha256, "size": size},
         progress_cb=progress_cb, stage_cb=stage_cb)
@@ -541,7 +541,7 @@ def prepare_config():
     benchmark = os.environ.get("KOKORO_MULTI_BENCHMARK", "0") == "1"
     tts = {
         "enabled": True,
-        "engine": "kokoro-multi",
+        "engine": KOKORO_TRT_ENGINE,
         "backend": "trt",
         "benchmark": benchmark,
         "device": "gpu",

@@ -4,8 +4,8 @@ plugins/tts.py — the TTS tool contract and its inference engines.
 
 Engines are named `<model>-<languages>`, the same shape `asr_model` uses:
 `vits2-zh-en` (TensorRT), `matcha-zh-en` (Matcha-icefall), `mms-th` (MMS VITS)
-and `kokoro-multi` (TensorRT on supported Jetson images, with legacy sherpa-onnx
-configuration supported).
+and `kokoro-multi` (Kokoro-82M v1.0 with sherpa-onnx). Supported Jetson images
+also offer `kokoro-multi-trt` (eight-language TensorRT).
 """
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ TOOLS = [
                 # value, which would force a reading on every test speak instead of auto.
                 "reading_language": {
                     "type": "string",
-                    "description": "Optional, action=speak, vits2-zh-en or kokoro-multi. Leave empty: "
+                    "description": "Optional, action=speak, vits2-zh-en or kokoro-multi-trt. Leave empty: "
                                    "the default, auto, reads numbers, dates, units and "
                                    "symbols to match the sentence around them, which is "
                                    "right for normal replies. Set a supported code only when the "
@@ -1350,11 +1350,13 @@ def _validate_kokoro_manifest(model_dir: str) -> dict:
     return manifest
 
 
-_KOKORO_MULTI_LANGUAGES = ("zh", "en", "ja", "ru", "de", "fr", "es", "th")
+KOKORO_TRT_ENGINE = "kokoro-multi-trt"
+_KOKORO_TRT_LANGUAGES = ("zh", "en", "ja", "ru", "de", "fr", "es", "th")
+_KOKORO_TRT_LANGUAGE_KEY = "kokoro_trt_language"
 
 
-def _is_kokoro_multi_backend(engine, backend):
-    return engine == 'kokoro-multi' and str(backend).lower() == 'trt'
+def _kokoro_trt_available():
+    return os.environ.get("KOKORO_MULTI_BUILT_FOR_JP") in ("511", "61")
 
 
 def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
@@ -1371,7 +1373,7 @@ def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
         cfg.get('device') or ENGINE_DEVICE_DEFAULTS.get(engine),
         cfg.get('hw_provider'),
     )
-    if _is_kokoro_multi_backend(engine, cfg.get('backend')):
+    if engine == KOKORO_TRT_ENGINE:
         from plugins.kokoro_multi_tts import KokoroMultiTTSAdapter, prepare_model
         return KokoroMultiTTSAdapter(
             prepare_model(cfg.get('model_dir'), on_status=on_status), speaker_id, speed, device,
@@ -2349,7 +2351,7 @@ class TTSPlugin:
         # to the configured engine; every other engine gets its own default.
         self._configured_engine = engine
         self._configured_model_dir = self._cfg.get("model_dir") or ""
-        if _is_kokoro_multi_backend(engine, self._cfg.get("backend")):
+        if engine == KOKORO_TRT_ENGINE:
             # Let MCP serve `info` while the pinned archive downloads and unpacks.
             self._building = engine
             self._build_async(engine)
@@ -2377,7 +2379,8 @@ class TTSPlugin:
         # everything downstream — _build, ENGINE_MODEL_DIRS, the `engine` field in
         # info — sees only the current name.
         engine = ENGINE_ALIASES.get(engine, engine)
-        if engine not in TTS_ENGINES:
+        if engine not in TTS_ENGINES and not (
+                engine == KOKORO_TRT_ENGINE and _kokoro_trt_available()):
             raise ValueError(f"Unsupported TTS engine: {engine}")
         return engine
 
@@ -2386,26 +2389,20 @@ class TTSPlugin:
             return self._configured_model_dir
         return ENGINE_MODEL_DIRS[engine]
 
-    def _uses_kokoro_trt(self, engine: str) -> bool:
-        # Preserve legacy configurations without a TensorRT backend. The
-        # standard Jetson configuration declares TRT and ships Kokoro's plans
-        # loader for its JetPack, so selecting Kokoro can use that backend too.
-        return (_is_kokoro_multi_backend(engine, self._cfg.get("backend"))
-                and (engine == self._configured_engine
-                     or os.environ.get("KOKORO_MULTI_BUILT_FOR_JP") in ("511", "61")))
-
     def _build(self, engine: str):
         cfg = dict(self._cfg)
         cfg["engine"] = engine
-        # Like model_dir, a configured backend belongs to its original engine.
-        # The Jetson Kokoro switch resolves its own TensorRT configuration below.
         if engine != self._configured_engine:
             cfg.pop("backend", None)
-        if self._uses_kokoro_trt(engine):
-            if engine != self._configured_engine:
-                cfg.update(backend="trt", model_dir=None, device="gpu", speaker_id=0, language="auto")
-            else:
-                cfg["model_dir"] = self._configured_model_dir or None
+        if engine == KOKORO_TRT_ENGINE:
+            configured = engine == self._configured_engine
+            cfg.update(
+                model_dir=(self._configured_model_dir or None) if configured else None,
+                device="gpu",
+                speaker_id=0,
+                tts_language=cfg.get(_KOKORO_TRT_LANGUAGE_KEY)
+                or (cfg.get("language") if configured else "auto"),
+            )
             impl = SherpaOnnxTTSPlugin(cfg, self._executor, on_status=self._report_kokoro_load_status)
         else:
             cfg["model_dir"] = self._model_dir_for(engine)
@@ -2425,7 +2422,7 @@ class TTSPlugin:
 
     def _report_kokoro_load_status(self, text: str) -> None:
         with self._lock:
-            if self._building == "kokoro-multi":
+            if self._building == KOKORO_TRT_ENGINE:
                 self._load_status = text
 
     def _build_vits2(self, cfg: dict):
@@ -2491,23 +2488,24 @@ class TTSPlugin:
         threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
 
     def get_tools(self) -> list:
-        with self._lock:
-            active_trt = self._uses_kokoro_trt(self._engine)
-            kokoro_trt_available = self._uses_kokoro_trt("kokoro-multi")
-        if not kokoro_trt_available:
+        if not _kokoro_trt_available():
             return TOOLS
         from copy import deepcopy
         tools = deepcopy(TOOLS)
         props = tools[0]["configSchema"]["properties"]
-        props["tts_language"].update(
-            enum=["auto", *_KOKORO_MULTI_LANGUAGES], default="auto",
-            description="Kokoro Multi pronunciation language; auto detects each utterance")
-        if active_trt:
-            props["speaker_id"]["description"] = (
-                "Kokoro Multi supports speaker_id 0 only; voices come from the pinned release")
-            props["device"].update(
-                enum=["gpu"], default="gpu",
-                description="Kokoro Multi FP32 TensorRT runs on GPU")
+        props["tts_engine"]["enum"].append(KOKORO_TRT_ENGINE)
+        props["tts_engine"]["description"] += (
+            " Additional Jetson option: kokoro-multi-trt (eight-language TensorRT, GPU).")
+        props[_KOKORO_TRT_LANGUAGE_KEY] = {
+            "type": "string", "enum": ["auto", *_KOKORO_TRT_LANGUAGES],
+            "default": "auto", "scope": "shared",
+            "description": "Pronunciation language for kokoro-multi-trt. Auto detects each utterance.",
+            "x-show-when": {"tts_engine": [KOKORO_TRT_ENGINE]},
+            "x-keep-when-hidden": True,
+        }
+        props["speaker_id"]["x-hide-when"] = {"tts_engine": [KOKORO_TRT_ENGINE]}
+        for key in ("tts_language", "device", "speaker_id"):
+            props[key]["x-keep-when-hidden"] = True
         return tools
 
     # ── dispatch ────────────────────────────────────────────────────────
@@ -2519,10 +2517,9 @@ class TTSPlugin:
         if action == "support_language":
             with self._lock:
                 engine = self._engine
-                kokoro_trt = self._uses_kokoro_trt(engine)
-            if kokoro_trt:
-                return {"engine": engine, "languages": list(_KOKORO_MULTI_LANGUAGES)}
-            return {"engine": engine, "languages": list(ENGINE_LANGUAGES[engine])}
+            languages = (_KOKORO_TRT_LANGUAGES if engine == KOKORO_TRT_ENGINE
+                         else ENGINE_LANGUAGES[engine])
+            return {"engine": engine, "languages": list(languages)}
 
         with self._lock:
             impl = self._impl
@@ -2615,12 +2612,17 @@ class TTSPlugin:
         requested_engine = self._select_engine(requested) if requested else None
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
+        trt_language = forwarded.pop(_KOKORO_TRT_LANGUAGE_KEY, None)
         with self._lock:
-            if self._uses_kokoro_trt(requested_engine or self._engine):
-                # The card can submit fields from its previous engine's form.
-                forwarded.pop("device", None)
-                forwarded.pop("speaker_id", None)
+            kokoro_trt = (requested_engine or self._engine) == KOKORO_TRT_ENGINE
+            if trt_language:
+                self._cfg[_KOKORO_TRT_LANGUAGE_KEY] = trt_language
+            if kokoro_trt:
+                for key in ("device", "speaker_id", "tts_language"):
+                    forwarded.pop(key, None)
             self._cfg.update({key: forwarded[key] for key in SHARED_CONFIG_KEYS if key in forwarded})
+        if kokoro_trt and trt_language:
+            forwarded["tts_language"] = trt_language
 
         if requested_engine:
             engine = requested_engine
