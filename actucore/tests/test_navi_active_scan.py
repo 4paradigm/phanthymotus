@@ -202,7 +202,7 @@ def test_measured_turn_deadline_stops_and_waits_for_new_feedback(monkeypatch):
 
 
 @pytest.mark.parametrize("case", [
-    "continuous", "gap", "batched_gap", "duplicate", "translation", "expired",
+    "continuous", "gap", "batched_gap", "duplicate", "translation", "transient", "expired",
 ])
 def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(monkeypatch, case):
     from plugins.navi import plugin
@@ -241,7 +241,7 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
     elif case == "batched_gap":
         sample(1300, wz=.10, source=1500)
     else:
-        sample(1300, vx=.1 if case == "translation" else 0., wz=.10)
+        sample(1300, vx={"translation": .25, "transient": .10}.get(case, 0.), wz=.10)
         sample(1420, wz=.10, source=1300 if case == "duplicate" else None)
     sample(1620 if case == "expired" else 1500, wz=.10, source=1300 if case == "duplicate" else None)
     hold = update()
@@ -249,6 +249,14 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
         assert hold is None
         assert look.pose[2] == pytest.approx(-.030)
         assert command().yaw > 0.
+    elif case == "transient":
+        assert hold is None and command().yaw > 0.
+        sample(1550, vx=.18, wz=.10)
+        sample(1650, vx=.18, wz=.10)
+        sample(1750, vx=.18, wz=.10)
+        hold = update()
+        assert look.phase == "brake_for_replan" and hold.yaw == 0.
+        assert "检测到平移" in hold.reason
     elif case == "expired":
         assert hold is None
         assert command().yaw == 0.
@@ -263,35 +271,42 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
         assert ("检测到平移" if case == "translation" else "间隔过长") in hold.reason
 
 
-@pytest.mark.parametrize("rate_hz", [10., 2.])
-def test_card_uses_configured_period_only_to_start_a_turn_burst(monkeypatch, rate_hz):
+@pytest.mark.parametrize(("rate_hz", "expiry"), [
+    (10., "tick"), (10., "publication"), (10., "observation"), (2., "tick"),
+])
+def test_card_renews_a_short_turn_with_continuous_velocity_feedback(monkeypatch, rate_hz, expiry):
     from plugins.navi import plugin
 
     look, geometry, _, _ = _setup(monkeypatch)
     card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1.}, executor=None)
     card._config.local_geometry = geometry
+    card._descriptor = {"rate": {"max_obs_age_ms": 600}}
     card._rate_hz = rate_hz
     card._ttl_ms = 400
     card._state.target = "person"
     card._state.active_scan = look
     now = 100_000
+    publish_delay = 0
+    depth_at = now
     history = []
 
     def snapshot(**kwargs):
         odom = dict(_odom(now), received_ms=now, source_sample_id=now, velocity_history=tuple(history))
-        return {"objects": []}, dict(_depth(now), control_ms=now), odom, now
+        return {"objects": []}, dict(_depth(depth_at), control_ms=now), odom, now
 
-    def tick(stamp):
-        nonlocal now
+    def tick(stamp, *, lag=0, depth_stamp=None):
+        nonlocal now, publish_delay, depth_at
         for sample in range(now + 100, stamp, 100):
             history.append((sample, sample, (0., 0., 0.)))
         now = stamp
+        publish_delay = lag
+        depth_at = stamp if depth_stamp is None else depth_stamp
         history.append((now, now, (0., 0., 0.)))
         return card.next_command()
 
     monkeypatch.setattr(card, "_observation_snapshot", snapshot)
     monkeypatch.setattr(plugin.time, "monotonic", lambda: now / 1000)
-    monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(plugin.time, "time", lambda: (now + publish_delay) / 1000)
     _, depth, odom, _ = snapshot()
     look.update(depth, odom, geometry, receipt_only=True)
     assert look.begin((-1.,), advance_m=1.9, route_segment=True)
@@ -304,10 +319,42 @@ def test_card_uses_configured_period_only_to_start_a_turn_burst(monkeypatch, rat
 
     assert first["values"][5] > 0. and first["ttl_ms"] == 400
     assert look.turn_until_ms == 100_950
-    # The 150 ms left would fit the nominal 100 ms period, but not the
-    # preceding 250 ms tick. Renewal keeps the existing conservative check.
-    assert tick(100_800)["values"] == [0.] * 6
-    assert look.turn_stop_ms == 100_800 and look.turn_until_ms == 0
+    # A slow planner can still renew the command using buffered fresh feedback.
+    next_message = tick(100_800)
+    assert next_message["values"][5] > 0. and next_message["ttl_ms"] == 400
+    if expiry == "observation":
+        # A still-valid frame can expire before the normal command lease.
+        next_message = tick(101_050, depth_stamp=100_600)
+        assert next_message["values"][5] > 0. and next_message["ttl_ms"] == 150
+        stop = tick(101_250)
+    else:
+        next_message = tick(101_050)
+        assert next_message["values"][5] > 0. and next_message["ttl_ms"] == 400
+        stop = tick(101_300, lag=200) if expiry == "publication" else tick(101_500)
+    assert stop["values"] == [0.] * 6
+    assert look.turn_stop_ms == stop["stamp_ms"] and look.turn_until_ms == 0
+
+
+def test_buffered_turn_reaches_evaluation_with_slew_limited_feedback(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, wz=0., vx=0., depth_stamp=None):
+        odom = dict(_odom(stamp, wz), vx=vx, received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=((stamp, stamp, (vx, 0., wz)),))
+        hold = look.update(dict(_depth(depth_stamp or stamp), control_ms=stamp),
+                           odom, geometry, receipt_only=True, max_depth_age_ms=800)
+        return hold or look.command(geometry, .33, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw > 0.
+    for i in range(1, 8):
+        assert tick(1150 + 100 * i, wz=i / 10, vx=.09 if i == 2 else 0.).yaw > 0.
+    assert tick(1950, wz=.69).yaw == 0.
+    for stamp in range(2050, 2651, 100):
+        assert tick(stamp, depth_stamp=1950).yaw == 0.
+    assert look.ready and look.side_frame == 1950
 
 
 @pytest.mark.parametrize("expiry", ["first_yaw", "renewal", "snapshot"])
@@ -547,7 +594,10 @@ def test_interrupted_turn_can_replan_once_with_the_current_view(monkeypatch, int
     assert tick(stopped + 200, 17).yaw == 0.
     assert tick(stopped + 300, 18).yaw > 0.
     assert tick(stopped + 400, 19, vx=.1).yaw == 0.
-    assert tick(stopped + 500, 20).yaw == 0.
+    final = tick(stopped + 500, 20)
+    assert final.yaw == 0.
+    assert "再次中断" in final.reason and "检测到平移" in final.reason
+    assert ("间隔过长" if interruption == "gap" else "检测到平移") in final.reason
     assert look.locked and not look.begin((-1.,))
 
 

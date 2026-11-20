@@ -32,6 +32,7 @@ an answer, so this one does, and pushes the ACP callback when it gets there.
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import logging
 import math
@@ -39,7 +40,7 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
@@ -47,6 +48,7 @@ from . import camera as camera_mod
 from . import depth as depth_mod
 from . import odom as odom_mod
 from . import policy as policy_mod
+from .active_scan import ActiveScan
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,15 @@ TOPIC_FORMAT = "control/velocity"
 
 # How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
+
+
+@dataclass
+class _ScheduledCommand:
+    message: dict
+    expires_ms: int
+    expires_at: float
+    turn: ActiveScan | None
+    sent: bool = False
 
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
@@ -143,6 +154,7 @@ class NaviPlugin:
         self._node = None
         self._publisher = None
         self._timer = None
+        self._command_timer = None
         self._running = False
         self._starting = False
         self._start_cancelled = False
@@ -155,6 +167,14 @@ class NaviPlugin:
         self._last_decision = None
         self._last_tick = 0.0
         self._command_window = (0., 0.)
+        # The velocity timer never takes the planner's lock.
+        self._output_lock = threading.RLock()
+        self._scheduled_command = None
+        self._output_epoch = 0
+        self._output_blocked = False
+        self._output_stop = None
+        self._wire_seq = 0
+        self._wire_moving = False
 
         self._config = policy_mod.Config(**{
             k: v for k, v in self._cfg.items()
@@ -187,7 +207,6 @@ class NaviPlugin:
         # A deque rather than a list: this is written every frame on the hot
         # path and has to be bounded — a card left running for an hour should
         # not be holding thirty thousand frames of detections.
-        from collections import deque
         self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
         self._depth_ground = None
@@ -576,6 +595,20 @@ class NaviPlugin:
         if interface is None:
             interface = args.get("odom_interface")
         self._adopt_odom_interface(interface, bound_topic=binding.get("odom"))
+        if (self._timer is not None and self._config.local_planning and self._config.odom_expected
+                and self._config.local_geometry is not None and self._config.scan_geometry is None
+                and "body_mount" not in self._depth_vendor):
+            try:
+                from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+
+                with self._output_lock:
+                    self._output_blocked = self._wire_moving = False
+                    self._wire_seq = 0
+                    self._command_timer = self._node.create_timer(
+                        1.0 / rate, self._dispatch_command, callback_group=MutuallyExclusiveCallbackGroup())
+            except Exception as error:                        # noqa: BLE001
+                self._unwind()
+                return self._error(f"速度发布定时器启动失败：{error}")
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
@@ -817,6 +850,8 @@ class NaviPlugin:
             self._last_tick = 0.
             self._command_window = (0., 0.)
             self._paused = False
+            with self._output_lock:
+                self._output_blocked = False
             # **The card mints this, agent-core does not supply it.** The ACP
             # contract runs the other way from what it looks like: an async tool
             # returns an `action_id` in its reply, agent-core parses it out and
@@ -875,6 +910,7 @@ class NaviPlugin:
                    for k in keys)
 
     def _stop_navigation(self):
+        self._cancel_scheduled_motion(block=True)
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
@@ -891,6 +927,8 @@ class NaviPlugin:
         return {"state": "running", "message": "已停止导航，卡片仍在运行"}
 
     def _halt(self, halted: bool):
+        if halted:
+            self._cancel_scheduled_motion(block=True)
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
@@ -906,10 +944,14 @@ class NaviPlugin:
                 self._state.moving_for_s = 0.
             self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
+            if not halted:
+                with self._output_lock:
+                    self._output_blocked = False
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
 
     def _stop(self, *, cancel_start=True):
+        self._cancel_scheduled_motion(block=True)
         with self._lock:
             if self._starting and cancel_start:
                 self._start_cancelled = True
@@ -920,15 +962,18 @@ class NaviPlugin:
             self._paused = False
             node, self._node = self._node, None
             timer, self._timer = self._timer, None
-            self._publisher = None
+            with self._output_lock:
+                command_timer, self._command_timer = self._command_timer, None
+                self._publisher = None
 
         self._cancel_pending_depth_bind(node)
-        if timer is not None and node is not None:
-            try:
-                node.destroy_timer(timer)
-            except Exception:                                 # noqa: BLE001
-                pass
         if node is not None:
+            for active_timer in (timer, command_timer):
+                if active_timer is not None:
+                    try:
+                        node.destroy_timer(active_timer)
+                    except Exception:                         # noqa: BLE001
+                        pass
             try:
                 if self._executor is not None:
                     self._executor.remove_node(node)
@@ -1033,6 +1078,10 @@ class NaviPlugin:
                 # A successful gain/boundary change starts a fresh schedule;
                 # tracker state and unrelated navigation counters stay intact.
                 self._state.adaptive_fwd_scale = 1.0
+            if changed or (refresh and descriptor != self._descriptor):
+                if self._command_timer is not None:
+                    self._publish_stop_if_moving()
+                    self._command_window = (0., 0.)
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
@@ -1738,6 +1787,7 @@ class NaviPlugin:
         previous_scan = self._state.active_scan
         issued_yaw = previous_scan.issued_yaw
         previous_turn_stop_ms = previous_scan.turn_stop_ms
+        previous_turn_deadline = previous_scan.turn_until_ms
         idle_for_s = self._state.idle_for_s
         scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
         was_searching = (self._config.local_planning and self._last_decision is not None
@@ -1798,7 +1848,15 @@ class NaviPlugin:
         max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
         stale = (self._config.local_planning and any(values)
                  and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms)
+        buffered_turn = values[5] and scan.turn_until_ms and scan.buffered_turn
+        if buffered_turn and not stale and type(max_age) in (int, float) and 0 < max_age < math.inf:
+            scan.turn_until_ms = min(scan.turn_until_ms, int(obs_ms + max_age))
         expired_turn = values[5] and scan.turn_until_ms and now_ms >= scan.turn_until_ms
+        if buffered_turn:
+            # A renewed command may not bridge an expiry that happened while
+            # the planner was running, even with a fresh feedback snapshot.
+            expired_turn = expired_turn or (scan is previous_scan and previous_turn_deadline
+                                            and now_ms >= previous_turn_deadline)
         if expired_turn or stale:
             if scan is not previous_scan or not issued_yaw:
                 scan.issued_yaw = False
@@ -1828,6 +1886,8 @@ class NaviPlugin:
         message = self._command_message(values, now, obs_ms)
         if values[5] and scan.turn_until_ms:
             message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
+            if buffered_turn:
+                scan.turn_until_ms = now_ms + message["ttl_ms"]
         if any(values):
             issued = time.monotonic()
             self._command_window = (issued, issued + min(message["ttl_ms"], self._config.watchdog_ms) / 1000)
@@ -1897,14 +1957,30 @@ class NaviPlugin:
     def _tick(self):
         entered = time.monotonic()
         with self._lock:
-            if self._publisher is None or not self._running or self._paused:
+            if self._publisher is None or not self._running or self._paused or self._starting:
                 return
             try:
+                with self._output_lock:
+                    epoch = self._output_epoch
+                    stop, self._output_stop = self._output_stop, None
+                if stop is not None:
+                    stamp, reason, replan = stop
+                    self._command_window = (0., 0.)
+                    self._state.commanded = (0., 0., 0.)
+                    self._state.commanded_vx = 0.
+                    scan = self._state.active_scan
+                    if replan and scan.active and scan.receipt_only and not scan.command_only:
+                        scan.hold_for_replan(reason)
+                    elif scan.buffered_turn:
+                        scan.turn_until_ms, scan.turn_stop_ms = 0, stamp
                 started = time.monotonic()
                 previous = self._last_tick
                 message = self.next_command()
                 decided = time.monotonic()
-                if message is not None:
+                if self._command_timer is not None:
+                    if not self._stage_command(message, epoch):
+                        return
+                elif message is not None:
                     self._publish_command(message)
                 finished = time.monotonic()
                 period = 1.0 / self._rate_hz
@@ -1914,6 +1990,7 @@ class NaviPlugin:
                              interval * 1000, (started - entered) * 1000, (decided - started) * 1000,
                              (finished - decided) * 1000, message["seq"] if message is not None else None)
             except Exception as error:                        # noqa: BLE001
+                self._cancel_scheduled_motion()
                 self._command_window = (0., 0.)
                 self._state.moving_for_s = 0.
                 self._last_error = f"{type(error).__name__}: {error}"
@@ -1928,6 +2005,114 @@ class NaviPlugin:
 
         self._maybe_complete()
 
+    def _stage_command(self, message, epoch):
+        """Hand the publisher one checked result. New work replaces old work."""
+        with self._output_lock:
+            if epoch != self._output_epoch or self._output_blocked:
+                return False
+            if message is None:
+                if self._scheduled_command is not None:
+                    self._cancel_scheduled_motion()
+                return True
+            now_ms = int(time.time() * 1000)
+            now = time.monotonic()
+            if not any(message["values"]):
+                self._scheduled_command = None
+                self._send_scheduled(dict(message, obs_stamp_ms=now_ms), now_ms, self._ttl_ms)
+                return True
+            previous = self._scheduled_command
+            if (previous is not None and previous.turn is not None and previous.sent
+                    and (now >= previous.expires_at or now_ms >= previous.expires_ms)):
+                self._cancel_scheduled_motion(
+                    stop=(now_ms, "主动观察：转向指令窗口已到期", False))
+                return False
+            expires_ms = message["stamp_ms"] + message["ttl_ms"]
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+            if type(max_age) in (int, float) and 0 < max_age < math.inf:
+                expires_ms = min(expires_ms, int(message["obs_stamp_ms"] + max_age))
+            scan = self._state.active_scan
+            turn = None
+            if scan.buffered_turn and scan.poses and message["values"][5] and not any(message["values"][:5]):
+                # Only the copied integration state belongs to the publisher.
+                turn = replace(scan, poses=deque((scan.poses[-1],), maxlen=scan.poses.maxlen))
+                if scan.current_frame:
+                    expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
+            expires_at = now + max(0, min(message["ttl_ms"], expires_ms - now_ms)) / 1000
+            self._scheduled_command = _ScheduledCommand(message, expires_ms, expires_at, turn)
+            if turn is None:
+                # A new checked planar command can take effect immediately.
+                # Only guarded turns are paced and repeated by the timer.
+                self._dispatch_command()
+            return True
+
+    def _dispatch_command(self):
+        with self._output_lock:
+            if not self._running or self._publisher is None:
+                return
+            now_ms = int(time.time() * 1000)
+            work = self._scheduled_command
+            if work is None:
+                if self._wire_moving:
+                    self._send_scheduled(None, now_ms, self._ttl_ms)
+                return
+            if self._output_blocked or self._paused:
+                return
+            remaining_ms = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
+            stop = None
+            if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+                stop = ("速度指令窗口已到期", False)
+            elif work.turn is not None:
+                with self._obs_lock:
+                    history = tuple(self._velocity_history)
+                    depth_ok = (self._depth_ground is not None
+                                and 0 <= now_ms - self._depth_ms <= self._config.depth_age_limit_ms)
+                if depth_ok:
+                    stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
+                else:
+                    stop = ("主动观察：深度暂不可用，停车后重规划", True)
+            if stop is not None:
+                self._cancel_scheduled_motion(stop=(now_ms, *stop))
+                return
+            # A turn has a feedback guard. Other motions are sent once and
+            # stay on their originally checked timing and observation budget.
+            if not work.sent or work.turn is not None:
+                message = work.message
+                if work.sent and "control_interface" in message:
+                    message = message.copy()
+                    del message["control_interface"]
+                work.sent = self._send_scheduled(message, now_ms, remaining_ms) or work.sent
+
+    def _send_scheduled(self, message, now_ms, ttl_ms):
+        """Serialize wire sequence numbers for plan results and checked repeats."""
+        self._wire_seq = max(self._wire_seq + 1, message["seq"] if message is not None else 0)
+        if message is None:
+            packet = build_message(seq=self._wire_seq, values=[0.] * ACTION_DIM, mode=CONTROL_MODE,
+                                   dof=ACTION_DIM, source=f"mcp__actucore__{self.PREFIX}",
+                                   stamp_ms=now_ms, obs_stamp_ms=now_ms, ttl_ms=ttl_ms,
+                                   priority=int(self._cfg.get("priority", 50)))
+        else:
+            packet = dict(message, seq=self._wire_seq, stamp_ms=now_ms, ttl_ms=ttl_ms)
+        try:
+            self._publish_command(packet)
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi velocity publish failed: %s", error)
+            return False
+        self._wire_moving = any(packet["values"])
+        return True
+
+    def _cancel_scheduled_motion(self, *, block=False, stop=None):
+        with self._output_lock:
+            if self._command_timer is None:
+                return
+            self._output_epoch += 1
+            self._output_blocked |= block
+            self._output_stop = stop
+            self._scheduled_command = None
+            if stop is not None:
+                log.info("navi velocity hold: %s", stop[1])
+            if self._wire_moving and self._publisher is not None:
+                self._send_scheduled(None, int(time.time() * 1000), self._ttl_ms)
+
     def _publish_command(self, message):
         from std_msgs.msg import String
 
@@ -1937,6 +2122,11 @@ class NaviPlugin:
         self._published += 1
 
     def _publish_stop_if_moving(self):
+        if self._command_timer is not None:
+            self._cancel_scheduled_motion()
+            self._state.commanded = (0., 0., 0.)
+            self._state.commanded_vx = 0.
+            return
         scan = self._state.active_scan
         if ((self._config.watchdog_ms <= 300 and not (scan.active or scan.result_frame))
                 or self._publisher is None

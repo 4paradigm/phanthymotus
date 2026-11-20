@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -192,6 +193,118 @@ def test_lifecycle_stops_previous_motion_with_long_watchdog(monkeypatch, action)
     assert published[0]["values"] == [0.0] * 6
     assert published[0]["obs_stamp_ms"] == published[0]["stamp_ms"] == 123_000
     assert not any(card._state.commanded)
+
+
+@pytest.mark.parametrize("stop", ["expiry", "gap", "duplicate", "angle", "translation", "depth", "pause"])
+def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypatch, stop):
+    card = _card()
+    card._running = True
+    card._publisher = object()
+    card._command_timer = object()
+    card._config.watchdog_ms = 600
+    card._ttl_ms = 400
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    published = []
+    stopped = threading.Event()
+
+    def publish(packet):
+        published.append(packet)
+        if not any(packet["values"]):
+            stopped.set()
+
+    monkeypatch.setattr(card, "_publish_command", publish)
+    card._depth_ms, card._depth_ground = 1000, object()
+    scan = card._state.active_scan
+    scan.receipt_only = scan.buffered_odom = scan.issued_yaw = True
+    scan.phase, scan.advance_m, scan.directions = "turn", 1., (-1.,)
+    scan.turn_angle, scan.turn_yaw = .25, .6
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.odom_source = 1000
+    card._state.commanded = (0., 0., .6)
+    card._velocity_history.append((1000, 1000, (0., 0., 0.)))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def plan():
+        if now > 1000:
+            entered.set()
+            assert release.wait(2)
+        return card._command_message([0.] * 5 + [.6], now / 1000, 950)
+
+    monkeypatch.setattr(card, "next_command", plan)
+    card._tick()
+    card._dispatch_command()
+    assert published[-1]["values"][5] == .6
+    now = 1100
+    card._velocity_history.append((now, now, (0., 0., .4)))
+    planner = threading.Thread(target=card._tick)
+    planner.start()
+    pauser = None
+    try:
+        assert entered.wait(1)
+        card._dispatch_command()
+        assert [m["values"][5] for m in published] == [.6, .6]
+        assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1400
+        assert all(m["obs_stamp_ms"] == 950 for m in published)
+        assert published[1]["seq"] > published[0]["seq"]
+        if stop == "pause":
+            pauser = threading.Thread(target=card._halt, args=(True,))
+            pauser.start()
+            assert stopped.wait(1)
+        else:
+            now = {"expiry": 1400, "gap": 1360, "duplicate": 1360,
+                   "angle": 1320, "translation": 1200, "depth": 1200}[stop]
+            if stop == "angle":
+                card._velocity_history.append((now, now, (0., 0., 1.)))
+            elif stop == "translation":
+                card._velocity_history.append((now, now, (.30, 0., .4)))
+            elif stop == "duplicate":
+                card._velocity_history.append((now, 1100, (0., 0., .4)))
+            elif stop == "depth":
+                card._depth_ground = None
+            card._dispatch_command()
+        assert len(published) == 3 and published[-1]["values"] == [0.] * 6
+    finally:
+        release.set()
+        planner.join(2)
+        if pauser is not None:
+            pauser.join(2)
+    card._dispatch_command()
+    assert len(published) == 3
+
+
+@pytest.mark.parametrize("explicit_stop", [False, True])
+def test_velocity_timer_does_not_repeat_a_translation_or_extend_its_observations(monkeypatch, explicit_stop):
+    card = _card()
+    card._running = True
+    card._publisher = object()
+    card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 400}}
+    card._ttl_ms = 400
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append)
+    motion = card._command_message([.15] + [0.] * 5, 1., 850)
+    card._stage_command(motion, card._output_epoch)
+    assert len(published) == 1
+    now = 1050
+    card._dispatch_command()
+    assert published[0]["values"][0] == .15
+    assert published[0]["obs_stamp_ms"] == 850
+    assert published[0]["stamp_ms"] + published[0]["ttl_ms"] == 1250
+    now = 1150
+    card._dispatch_command()
+    assert len(published) == 1
+    if explicit_stop:
+        card._stage_command(card._command_message([0.] * 6, now / 1000, now), card._output_epoch)
+        assert len(published) == 2
+    now = 1250
+    card._dispatch_command()
+    assert len(published) == 2 and published[1]["values"] == [0.] * 6
 
 
 @pytest.mark.parametrize("status", ["searching", "failed"])
@@ -668,6 +781,43 @@ class _FakeNode:
     def destroy_node(self):
         self.destroyed = True
         self.timers.clear()
+
+
+def test_camera_only_geometry_starts_separate_planning_and_velocity_timers(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    class Node(_FakeNode):
+        def create_timer(self, period, callback, *, callback_group):
+            self.timers.append((period, callback, callback_group))
+            return self.timers[-1]
+
+        def create_publisher(self, *args):
+            return object()
+
+    node = Node()
+    monkeypatch.setitem(sys.modules, "rclpy.node", SimpleNamespace(Node=lambda name: node))
+    monkeypatch.setitem(sys.modules, "rclpy.callback_groups",
+                        SimpleNamespace(MutuallyExclusiveCallbackGroup=object))
+    executor = SimpleNamespace(add_node=lambda node: None, remove_node=lambda node: None)
+    card = NaviPlugin({"view_hz": 0.}, executor=executor)
+    monkeypatch.setattr(card, "_bind_inputs", lambda *args: ({"depth_map": "/depth", "odom": "/odom"}, ""))
+
+    def camera(*args):
+        card._config.depth_intrinsics = HorizontalIntrinsics(640, 315, 337)
+        card._depth_vertical = (480, 420, 243)
+        return ""
+
+    monkeypatch.setattr(card, "_adopt_camera", camera)
+    args = {"control_interface": _descriptor(footprint={"half_width": .20})}
+    try:
+        assert card._start(args)["state"] == "running"
+        assert [timer[0] for timer in node.timers] == [.1, .1]
+        assert [timer[1] for timer in node.timers] == [card._tick, card._dispatch_command]
+        assert node.timers[0][2] is not node.timers[1][2]
+    finally:
+        card._stop()
+    assert node.destroyed and card._command_timer is None
 
 
 def _bind(topics, graph=None):

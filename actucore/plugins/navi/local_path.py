@@ -336,7 +336,7 @@ class PlanCache:
         key = (frame, round(ahead, 2), half_width, max_age_ms, watchdog_ms, observation.get("scan_revision"),
                allow_forward, allow_return, velocity_limits, observation.get("stop_target"),
                observation.get("body_half_width"), observation.get("closest"),
-               observation.get("preferred_heading"))
+               observation.get("preferred_heading"), observation.get("allow_unknown", False))
         if self.key != key:
             self.key = key
             self.plans.clear()
@@ -349,7 +349,8 @@ class PlanCache:
                 projected_grid=self.grid_for(observation, geometry),
                 body_half_width=observation.get("body_half_width"),
                 closest=observation.get("closest", False),
-                preferred_heading=observation.get("preferred_heading"))
+                preferred_heading=observation.get("preferred_heading"),
+                allow_unknown=observation.get("allow_unknown", False))
         return self.plans[side]
 
 
@@ -363,8 +364,14 @@ def _footprint_cells(geometry, half_width):
                  for half in (geometry.front, half_width, geometry.rear))
 
 
-def route_obstacles(grid, geometry, half_width):
-    return _blocked_cells(_route_grid(grid), START, _footprint_cells(geometry, half_width))
+def route_obstacles(grid, geometry, half_width, *, allow_unknown=False):
+    return _blocked_cells(_route_grid(grid), START, _footprint_cells(geometry, half_width), allow_unknown)
+
+
+def observed_waypoint(free, forward, right):
+    row = START[0] + round(forward / RESOLUTION)
+    col = START[1] + round(right / RESOLUTION)
+    return 0 <= row < free.shape[0] and 0 <= col < free.shape[1] and bool(free[row, col])
 
 
 def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, padding=0.):
@@ -442,7 +449,7 @@ def opening_route(frame, occupied, geometry, half_width, plane, target):
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True, allow_return=True,
                          target=None, projected_grid=None, body_half_width=None, closest=False,
-                         preferred_heading=None):
+                         preferred_heading=None, allow_unknown=False):
     if velocity_limits is not None:
         (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
         if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
@@ -456,6 +463,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if grid_input is None:
         grid_input = observe(frame, geometry, right, forward, resolution, ground)
     free, occupied = grid_input
+    if allow_unknown and (free is None or not free.any()):
+        return None
     if side < 0:
         free = free[:, ::-1] if free is not None else None
         occupied = occupied[:, ::-1]
@@ -482,7 +491,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # Check every footprint against observed obstacles. The search can reach
     # the passing lane at any column outside the obstacle, and rejoin on any
     # clear centerline cell at or beyond the original rejoin distance.
-    footprint_clear = allowed_centers(grid, start, half_cells)
+    footprint_clear = allowed_centers(grid, start, half_cells, allow_unknown)
     # Slightly prefer centres away from the edge of the hard clearance mask.
     # This never makes a disallowed centre traversable.
     cell_cost = None
@@ -513,9 +522,13 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         allowed &= ranges >= stop
         if target_f - stop <= forward[goal[0], 0]:
             target_cells = ranges <= stop + max(tolerance, resolution / math.sqrt(2))
+            if allow_unknown:
+                target_cells &= free
             path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells)
         if path is None and closest:
             target_cells = ranges < ranges[start] - resolution / 2
+            if allow_unknown:
+                target_cells &= free
             path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells, target_cost=ranges)
             if path is None:
                 return None
@@ -537,7 +550,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         goal = via
         last_goal_col = allowed.shape[1] - 1
         path = find_path(allowed, start, goal, later_goal=True, last_goal_col=last_goal_col, steps=steps)
-    if path is None and body_half_width is not None:
+    if path is None and body_half_width is not None and not allow_unknown:
         # Stop at an observed foothold in front of an occluded continuation.
         # The next centre would clear observed obstacles but needs more data.
         collision_clear = allowed_centers(np.where(occupied, OCCUPIED, FREE), start, half_cells)
@@ -547,6 +560,22 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         if frontier.any():
             target_cells = frontier
             path = find_path(allowed, start, goal, steps=steps, target_cells=frontier)
+    if allow_unknown:
+        # A route may cross unknown cells, but its executable part must end
+        # at an observed centre. Replan from there with the next camera view.
+        end = next((i for i in range(len(path) - 1, 0, -1) if free[path[i]]), 0) if path else 0
+        if end:
+            path = path[:end + 1]
+        else:
+            target_cells = np.zeros_like(allowed)
+            target_cells[row_zero + 2:, via[1]:] = free[row_zero + 2:, via[1]:]
+            path = find_path(allowed, start, via, steps=steps, target_cells=target_cells)
+            if path is None:
+                return None
+        # A different first motion may be needed by the chassis. Keep any
+        # alternate search aimed at the same observed endpoint.
+        target_cells = np.zeros_like(allowed)
+        target_cells[path[-1]] = True
     reposition = path is None
     if reposition:
         # A reachable lateral position with more room lets the next frame replan.
@@ -574,13 +603,15 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     # the observation window, watchdog and sink poll.
     horizon_s = (max_age_ms + watchdog_ms + 50) / 1000
     # Expand blocked route cells by the footprint in centre coordinates.
-    blocked = _blocked_cells(grid, start, half_cells)
+    blocked = _blocked_cells(grid, start, half_cells, allow_unknown)
     half_cell = resolution / 2
     f0, f1 = forward - half_cell, forward + half_cell
     r0, r1 = right - half_cell, right + half_cell
     occupied_bounds = (f0[blocked] - geometry.front, f1[blocked] + geometry.rear,
                        r0[blocked] - half_width, r1[blocked] + half_width)
     def command_to(point):
+        if allow_unknown and not free[point]:
+            return None
         row, col = point
         dr, dc = row - row_zero, col - col_zero
         if dr and not allow_forward:

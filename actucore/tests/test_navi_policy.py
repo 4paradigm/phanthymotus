@@ -2670,6 +2670,47 @@ def test_local_no_route_approach_stops_at_the_stricter_boundary(
             assert 0. < following[0] < decision[0]
 
 
+@pytest.mark.parametrize("case", ["clear_prefix", "blocked_prefix", "detour_found"])
+def test_local_planning_uses_checked_forward_prefix_before_observing(monkeypatch, case):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    config = _cfg(local_planning=True, local_geometry=geometry, stop_distance_m=.60,
+                  obstacle_stop_m=.60, max_depth_age_ms=800, watchdog_ms=600)
+    state = _state(motion_source="measured")
+    look = state.active_scan
+    look.receipt_only = look.buffered_odom = True
+    look.current_frame = 1000
+    look.poses.append((1000, look.pose, 0.))
+    occupied = np.isclose(local_path.FORWARD, 1.15) & np.isclose(local_path.RIGHT, .20)
+    occupied |= np.isclose(local_path.FORWARD, 1.75) & (local_path.RIGHT == 0.)
+    if case == "blocked_prefix":
+        occupied |= np.isclose(local_path.FORWARD, .35) & (local_path.RIGHT == 0.)
+    look.views.append((1000, look.pose, ~occupied, occupied))
+    frame = _scene(2.)
+    frame.update(ground=np.ones_like(frame["map"], dtype=bool), frame_id=1000)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.76, 1.))
+    monkeypatch.setattr(P, "_local_translation", lambda *args: None)
+    routes_tried = []
+
+    def plan(*args, **kwargs):
+        routes_tried.append(True)
+        return case == "detour_found" and look.begin((-1.,), advance_m=1., route_segment=True)
+
+    monkeypatch.setattr(P, "_start_detour_segment", plan)
+    decision = P._avoid(.5, 0., -.12, frame, config, P.APPROACHING, "", state,
+                        target_distance=1.93, target_bearing=.15, may_scan=True,
+                        odom={"vx": 0., "vy": -.034, "wz": 0.})
+    assert routes_tried
+    if case == "clear_prefix":
+        assert decision[:3] == (.15, 0., 0.)
+        assert not look.active
+    else:
+        assert decision[:3] == (0., 0., 0.)
+        assert look.active and look.route_segment == (case == "detour_found")
+
+
 @pytest.mark.parametrize("use_lateral", [True, False])
 def test_shared_search_prefers_the_observed_open_side_if_forward_is_blocked(monkeypatch, use_lateral):
     config = _cfg(local_planning=True, use_lateral=use_lateral, lost_frames=1)
@@ -2929,8 +2970,9 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
 
 
 @pytest.mark.parametrize("blocked_in_new_view", [False, True])
+@pytest.mark.parametrize("camera_fallback", [False, True])
 def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_motion(
-        monkeypatch, blocked_in_new_view):
+        monkeypatch, blocked_in_new_view, camera_fallback):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
 
@@ -2953,7 +2995,10 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
         nonlocal reached_view
         reached_view |= state.active_scan.ready
         grid = new_view if reached_view else occupied
-        return ~grid, grid
+        free = ~grid
+        if camera_fallback and not reached_view:
+            free &= local_path.FORWARD >= .45
+        return free, grid
 
     monkeypatch.setattr(active_scan, "observe", observe)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (
@@ -2961,10 +3006,13 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     frame = np.ones((4, 4))
 
     def tick(stamp, last, frame_id=None):
+        odom = dict(vx=last[0], vy=0., wz=last[5], received_ms=stamp)
+        if camera_fallback:
+            odom.update(source_sample_id=stamp, velocity_history=((stamp, stamp, (last[0], 0., last[5])),))
         return P.step(detections=_detections(),
                       depth=dict(map=frame, frame_id=frame_id or stamp, source_frame_id=frame_id or stamp,
                                  ground=frame.astype(bool)),
-                      odom=dict(vx=last[0], vy=0., wz=last[5], received_ms=stamp),
+                      odom=odom,
                       config=config, state=state, dt=.1)
 
     decision = tick(1000, [0.] * 6)

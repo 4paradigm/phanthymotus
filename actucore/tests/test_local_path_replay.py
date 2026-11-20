@@ -125,6 +125,35 @@ def test_observed_detour_can_stop_at_a_known_prefix_before_occlusion():
     assert .1 <= route.points[-1][0] <= 1. - geometry.front + 1e-9
 
 
+@pytest.mark.parametrize("case", ["open_side", "wall", "unobserved"])
+@pytest.mark.parametrize("execute", [False, True])
+def test_camera_route_can_sweep_unknown_cells_towards_an_observed_waypoint(case, execute):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    occupied = (abs(replay.RIGHT) <= .10) & np.isclose(replay.FORWARD, .90)
+    if case == "wall":
+        occupied |= np.isclose(replay.FORWARD, .30)
+    free = ((replay.FORWARD >= .30) & (replay.FORWARD <= 1.20)
+            & (replay.RIGHT >= .45) & (replay.RIGHT <= .80) & ~occupied)
+    if case == "unobserved":
+        free[:] = False
+    route = replay._checked_translation(None, None, geometry, .25, .90, 1., 500, 600,
+                                        velocity_limits=DECLARED_SPEEDS if execute else None,
+                                        observed_grid=(free, occupied),
+                                        body_half_width=.20, allow_unknown=True)
+    if case != "open_side":
+        assert route is None
+        return
+    assert route is not None
+    if execute:
+        assert route.command and replay.transition_clear((free, occupied), geometry, .25, 1.15, (route.command,))
+    forward, right = route.points[-1]
+    assert .30 <= forward <= 1.20 and .45 <= right <= .80
+    allowed = replay.allowed_centers(replay._route_grid((free, occupied)), replay.START,
+                                     (4, 5, 4), allow_unknown=True)
+    assert all(allowed[
+        replay.START[0] + round(f / .05), replay.START[1] + round(r / .05)] for f, r in route.points)
+
+
 @pytest.mark.parametrize("initial_hit", [False, True])
 def test_current_discrete_envelope_can_contain_unknown_but_not_occupied(initial_hit):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
