@@ -206,6 +206,10 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     positions = np.nonzero(valid)[1]
     all_points = np.ones(len(z), dtype=bool)
 
+    def on_ground(distance):
+        # Be stricter above the plane to retain low obstacles.
+        return (distance >= -0.020) & (distance <= _GROUND_TOLERANCE_M)
+
     def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None, check_below=False,
             window_halves=False):
         start, end = visible_span or (0, seed.shape[1])
@@ -240,14 +244,16 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         elif any(thirds[third].mean() < 0.65 for third in near_thirds):
             return None
 
-        distance = (v[:, None] - a * u[None, :] - b) * depth_m - c
-        # Be stricter above the plane to retain low obstacles.
-        ground = (distance >= -0.020) & (distance <= _GROUND_TOLERANCE_M)
+        def residual(rows, cols):
+            return (v[rows, None] - a * u[None, cols] - b) * depth_m[rows, cols] - c
+
         # Verify the fit farther into the scene to reject a raised platform
-        # occupying most of the bottom band.
+        # occupying most of the bottom band. Only project the sampled columns
+        # until a candidate passes the checks.
         far_end = 0.78 if visible_span is not None else 0.7375
         far_start = int(height * 0.69)
-        farther = ground[far_start:int(height * far_end), columns]
+        sampled = residual(slice(far_start, None), columns)
+        farther = on_ground(sampled[:int(height * far_end) - far_start])
         far_thirds = np.array_split(farther, 3, axis=1)
         verified = near_thirds if visible_span is not None else (0, 1, 2)
         if window_halves:
@@ -262,37 +268,41 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         if one_far_side or near_thirds is None or check_below:
             # Veto a substantial measured surface below the proposed floor.
             # This rejects a raised platform even if its top fits one patch.
-            below = distance[far_start:, columns] > 2 * _GROUND_TOLERANCE_M
+            below = sampled > 2 * _GROUND_TOLERANCE_M
             if end - start == narrow and below[:, start:end].mean() >= .12:
                 return None
             if any(third.mean() >= 0.12 for third in np.array_split(below, 3, axis=1)):
                 return None
+        keep_columns = None
         if visible_span is not None:
             # Each excluded side must show a foreground occlusion. Returns
             # below the candidate can reveal a raised platform.
             occlusion_margin = 2 * _GROUND_TOLERANCE_M
             for excluded in (slice(0, start), slice(end, seed.shape[1])):
-                residual = distance[bottom, columns][:, excluded]
-                if not residual.size:
+                side = sampled[bottom.start - far_start::bottom.step, excluded]
+                if not side.size:
                     continue
                 observed = valid[:, excluded]
-                foreground = observed & (residual < -occlusion_margin)
-                below = observed & (residual > occlusion_margin)
+                foreground = observed & (side < -occlusion_margin)
+                below = observed & (side > occlusion_margin)
                 if foreground.mean() < 0.2 or below.mean() >= 0.2:
                     return None
             # The occluded sides did not verify this plane. Keep their returns
             # available to obstacle detection even if they touch the plane.
+            keep_columns = np.ones(width, dtype=bool)
             if start:
-                ground[:, :columns.start + start * columns.step] = False
+                keep_columns[:columns.start + start * columns.step] = False
             if end < seed.shape[1]:
-                ground[:, columns.start + end * columns.step:] = False
+                keep_columns[columns.start + end * columns.step:] = False
             if end - start == narrow:
                 # The edge of a narrow window can still include a jamb.
                 # A return where the jamb crosses the plane is not floor.
-                verified_columns = ground[bottom].mean(axis=0) >= .65
-                if not verified_columns.any():
+                keep_columns &= on_ground(residual(bottom, slice(None))).mean(axis=0) >= .65
+                if not keep_columns.any():
                     return None
-                ground[:, ~verified_columns] = False
+        ground = on_ground(residual(slice(None), slice(None)))
+        if keep_columns is not None:
+            ground[:, ~keep_columns] = False
         return ground
 
     ground = fit(all_points)

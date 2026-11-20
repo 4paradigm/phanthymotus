@@ -1627,6 +1627,7 @@ class NaviPlugin:
         was_moving = any(self._state.commanded)
         previous_scan = self._state.active_scan
         issued_yaw = previous_scan.issued_yaw
+        previous_turn_stop_ms = previous_scan.turn_stop_ms
         idle_for_s = self._state.idle_for_s
         scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
         was_searching = (self._config.local_planning and self._last_decision is not None
@@ -1681,24 +1682,37 @@ class NaviPlugin:
                 if scan.current_frame:
                     obs_ms = min(obs_ms, scan.current_frame)
         max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
-        if (self._config.local_planning and any(values)
-                and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms):
+        stale = (self._config.local_planning and any(values)
+                 and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms)
+        expired_turn = values[5] and scan.turn_until_ms and now_ms >= scan.turn_until_ms
+        if expired_turn or stale:
             if scan is not previous_scan or not issued_yaw:
                 scan.issued_yaw = False
-            if scan.active and scan.receipt_only and not scan.command_only:
-                scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
+            if expired_turn:
+                scan.turn_until_ms = 0
+                scan.turn_stop_ms = now_ms
+                status, reason = policy_mod.AVOIDING, "主动观察：转向指令窗口已到期，停车等待新反馈"
+            else:
+                status = policy_mod.BLIND
+                reason = f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车"
+                if scan.active and scan.receipt_only and not scan.command_only:
+                    scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
             self._state.idle_for_s = idle_for_s
             self._state.adaptive_fwd_scale = 1.
             self._state.moving_for_s = 0.
             values = [0.] * ACTION_DIM
-            hold = policy_mod.Decision(
-                values, policy_mod.BLIND,
-                f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车",
-                distance_m=decision.distance_m, bearing=decision.bearing)
+            hold = policy_mod.Decision(values, status, reason,
+                                       distance_m=decision.distance_m, bearing=decision.bearing)
             self._last_decision = policy_mod._account_idle(hold, self._state, self._config, dt)
             obs_ms = now_ms
+        if scan.turn_stop_ms is not None and scan.turn_stop_ms != previous_turn_stop_ms:
+            # Bracket the outgoing stop, including time spent planning it.
+            scan.turn_stop_ms = now_ms
         self._state.commanded = (values[0], values[1], values[5])
-        return self._command_message(values, now, obs_ms)
+        message = self._command_message(values, now, obs_ms)
+        if values[5] and scan.turn_until_ms:
+            message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
+        return message
 
     def _command_message(self, values, now, obs_ms):
         """Build one guarded normal-navigation command."""

@@ -1602,12 +1602,12 @@ def test_search_turn_checks_occupied_cells_with_unseen_sides(monkeypatch, blocke
 
 
 @pytest.mark.parametrize(("distance", "age_ms", "status"), [
-    (3.0, 0, P.SEARCHING),
+    (3.0, 0, P.AVOIDING),
     (0.4, 0, P.AVOIDING),
     (np.nan, 0, P.AVOIDING),
     (3.0, 801, P.BLIND),
 ])
-def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, status):
+def test_local_search_waits_for_a_checkable_sweep_grid(distance, age_ms, status):
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
@@ -1619,7 +1619,27 @@ def test_search_without_a_sweep_grid_uses_live_front_depth(distance, age_ms, sta
                       config=cfg, state=state, dt=.1)
 
     assert decision.status == status
-    assert bool(decision.values and decision.values[5]) == (status == P.SEARCHING)
+    assert not any(decision.values or ())
+
+
+def test_search_near_stop_keeps_clearance_reserve_after_target_reappears():
+    from plugins.navi.local_path import Geometry
+
+    config = _cfg(local_planning=True, local_geometry=Geometry(None, None, np.eye(4), .275, .275, None),
+                  obstacle_stop_m=.6, stop_distance_m=.6, stop_tolerance_m=.05, lost_frames=1)
+    state = _state()
+    target = _obj(x=0., y=-.65, bbox=[.40, .03, .60, .25])
+    for index, distance in enumerate((.40, .40, .40, .72, .72)):
+        stamp = 1000 + index * 100
+        frame = np.full((48, 64), distance, dtype=np.float32)
+        frame[1:15, 24:40] = .72
+        decision = P.step(detections=_detections(target) if index else _detections(),
+                          depth=dict(map=frame, frame_id=stamp, control_ms=stamp),
+                          odom=dict(vx=0., vy=0., wz=0., received_ms=stamp),
+                          config=config, state=state, dt=.1)
+    assert decision.distance_m == pytest.approx(.72)
+    assert decision.values == [0.] * 6
+    assert "足够余量" in decision.reason
 
 
 def test_search_can_turn_to_the_other_side_when_the_last_seen_side_is_blocked(monkeypatch):
@@ -2912,6 +2932,106 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
             assert "等待直行结束后的新深度" in tick(stamp + 100, previous, frame_id=stamp).reason
             return
     pytest.fail("The segment neither completed nor held for the newly observed obstruction")
+
+
+def test_synchronized_reroute_requires_the_evaluated_capture():
+    from plugins.navi.active_scan import ActiveScan
+
+    scan = ActiveScan(side_frame=1200, current_frame=1300)
+    assert scan.has_settled_route_view({"capture_ms": 1300})
+    assert not scan.has_settled_route_view({"capture_ms": 1200})
+    assert not scan.has_settled_route_view({"frame_id": 1300})
+
+
+@pytest.mark.parametrize(("identity", "second_corridor_clear"), [
+    ("fresh", False), ("fresh", True), ("missing", False), ("repeated", False),
+    ("missing_midway", False), ("missing_initial", False), ("mismatched", False), ("gap_after_reroute", False),
+])
+def test_settled_blocked_route_replans_once_from_current_heading(monkeypatch, identity, second_corridor_clear):
+    from plugins.navi import active_scan, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 493, 318), (480, 493, 229), .275)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275,
+                  clearance_margin_m=.10, use_lateral=False)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    occupied = np.isclose(local_path.FORWARD, 1.) & (local_path.RIGHT <= .10)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~occupied, occupied))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1., .99))
+    frame = np.ones((4, 4))
+
+    def update(stamp, yaw):
+        obs = dict(map=frame, ground=frame.astype(bool), frame_id=stamp, control_ms=stamp)
+        if (identity != "missing" and not (identity == "missing_midway" and stamp == 1100)
+                and not (identity == "missing_initial" and stamp == 1000)):
+            obs["source_frame_id"] = 900 if identity == "repeated" else stamp - 100
+        odom = dict(vx=0., vy=0., wz=yaw, received_ms=stamp)
+        scan.update(obs, odom, geometry, receipt_only=True)
+        return obs, odom
+
+    update(1000, 0.)
+    scan.phase = "turn"
+    scan.attempted = scan.issued_yaw = scan.route_segment = scan.origin_set = True
+    scan.advance_m, scan.directions, scan.turn_angle = 1.90, (-1.,), .4
+    scan.pose = (0., 0., -.4)  # Current orientation after the initial left turn.
+    for stamp in (1000, 1100, 1200):
+        obs, odom = update(stamp, 0.)
+        assert scan.command(geometry, .375, 1., 500, 800, now_ms=stamp).yaw == 0.
+    if identity == "repeated":
+        assert not scan.ready
+        return
+    assert scan.ready
+
+    def avoid(obs, odom):
+        return P._avoid(.15, 0., 0., obs, config, P.APPROACHING, "", state,
+                        target_distance=4.4, target_bearing=.5, odom=odom, may_scan=True, dt=.1)
+
+    assert avoid(obs, None)[:3] == (0., 0., 0.)
+    assert scan.ready
+    if identity == "mismatched":
+        obs = dict(obs, source_frame_id=99999)
+    assert avoid(obs, odom)[:3] == (0., 0., 0.)
+    if identity not in ("fresh", "gap_after_reroute"):
+        assert not scan.active and scan.locked
+        return
+    assert scan.phase == "brake" and scan.directions == (1.,)
+    assert not scan.locked and scan.advance_origin is None
+    if identity == "gap_after_reroute":
+        for stamp in range(1300, 5000, 100):
+            obs, odom = update(stamp, 0.)  # The chassis has made no progress.
+            if stamp in (1800, 2800, 3800):
+                scan.update(None, odom, geometry, receipt_only=True)
+            elif not scan.locked:
+                if scan.active:
+                    yaw = scan.command(geometry, .375, 1., 500, 800, now_ms=stamp).yaw
+                    assert stamp < 1800 or yaw == 0.
+                else:
+                    assert avoid(obs, odom)[:3] == (0., 0., 0.)
+        assert scan.locked
+        return
+    yaw = 0.
+    last_turn = None
+    for stamp in range(1300, 11000, 100):
+        obs, odom = update(stamp, yaw)
+        if scan.ready:
+            break
+        cmd = scan.command(geometry, .375, 1., 500, 800, now_ms=stamp)
+        yaw = cmd.yaw
+        if yaw:
+            assert yaw < 0.
+            last_turn = stamp
+    assert scan.ready and scan.origin[2] == pytest.approx(-.4)
+    assert last_turn is not None and scan.side_frame >= last_turn + active_scan.SETTLE_MS
+    if second_corridor_clear:
+        occupied[:] = False
+    obs, odom = update(stamp + 100, 0.)
+    decision = avoid(obs, odom)
+    if second_corridor_clear:
+        assert decision[0] > 0. and decision[1:3] == (0., 0.)
+    else:
+        assert decision[:3] == (0., 0., 0.)
+        assert not scan.active and scan.locked
 
 
 def test_close_obstacle_in_the_new_view_requires_another_turn_before_advancing(monkeypatch):

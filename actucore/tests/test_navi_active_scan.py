@@ -113,33 +113,142 @@ def test_active_scan_holds_an_occupied_sweep(monkeypatch):
     assert not lookout.begin((1., -1.))
 
 
+@pytest.mark.parametrize("feedback", ["pose", "receipt_twist", "aligned_twist"])
 @pytest.mark.parametrize("start_delay_ms", [0, 250])
-def test_pose_only_scan_converges_with_delayed_pose_and_chassis(monkeypatch, start_delay_ms):
+def test_scan_converges_with_delayed_feedback_and_chassis(monkeypatch, start_delay_ms, feedback):
     lookout, geometry, _, _ = _setup(monkeypatch)
     history = {stamp: 0. for stamp in range(99_600, 100_000, 100)}
     yaw, rate, turn_start = 0., 0., None
+    measured_twist = feedback != "pose"
+    angle = math.atan2(.45, 1.85) if measured_twist else scan.ANGLE
     for stamp in range(100_000, 115_000, 100):
         if turn_start is not None:
             moving_ms = min(100, max(0, stamp - turn_start - start_delay_ms))
             yaw += rate * moving_ms / 1000
         history[stamp] = yaw
         measured = stamp - 300
-        pose = PlanarPose(measured, ("odom", "body"), 0., 0., history[measured])
         rate_at_measurement = (history[measured] - history[measured - 100]) / .1
-        lookout.update(_depth(stamp), {
-            "received_ms": stamp, "source_sample_id": measured, "motion_pose": pose,
-            "pose_feedback": (0., 0., rate_at_measurement), "pose_feedback_since_ms": measured - 100,
-        }, geometry, receipt_only=True)
+        odom = {"received_ms": stamp, "source_sample_id": measured, "stamp_ms": measured}
+        if measured_twist:
+            odom.update(vx=0., vy=0., wz=rate_at_measurement)
+        else:
+            pose = PlanarPose(measured, ("odom", "body"), 0., 0., history[measured])
+            odom.update(motion_pose=pose, pose_feedback=(0., 0., rate_at_measurement),
+                        pose_feedback_since_ms=measured - 100)
+        depth = dict(_depth(stamp), control_ms=stamp, capture_ms=measured)
+        lookout.update(depth, odom, geometry, receipt_only=feedback != "aligned_twist")
         if stamp == 100_000:
-            assert lookout.begin((-1., 1.))
-        rate = lookout.command(geometry, .31, .83, 300, min_yaw_rate=.33, now_ms=stamp).yaw
+            assert lookout.begin((-1., 1.), advance_m=1.9 if measured_twist else None, turn_angle=angle)
+        rate = lookout.command(geometry, .31, 1. if measured_twist else .83, 300,
+                               min_yaw_rate=0. if measured_twist else .33, now_ms=stamp).yaw
         turn_start = (turn_start if turn_start is not None else stamp) if rate else None
-        assert abs(yaw) <= math.radians(22.)
+        assert abs(yaw) <= angle + scan.ANGLE_TOLERANCE
         if lookout.ready:
             break
 
     assert lookout.ready
-    assert math.degrees(yaw) == pytest.approx(20., abs=2.)
+    assert yaw == pytest.approx(angle, abs=scan.ANGLE_TOLERANCE)
+
+
+@pytest.mark.parametrize("stalled", [False, True])
+def test_slow_measured_turn_excludes_stop_waits_from_stall_window(monkeypatch, stalled):
+    look, geometry, _, _ = _setup(monkeypatch)
+    rate = 0.
+    start = None
+    angle = math.radians(6)
+    for stamp in range(1000, 11000, 100):
+        # At low speed this chassis needs 200 ms to start each burst.
+        measured = rate if start is not None and stamp - start > 200 and not stalled else 0.
+        look.update(_depth(stamp), {**_odom(stamp, measured), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((-1.,), advance_m=1., turn_angle=angle)
+        result = look.command(geometry, .375, .1, 500, 800, now_ms=stamp)
+        rate = result.yaw
+        start = (start if start is not None else stamp) if rate else None
+        if look.ready or "转向无实测进展" in result.reason:
+            break
+    if stalled:
+        assert "转向无实测进展" in result.reason
+    else:
+        assert look.ready
+        assert -look.pose[2] == pytest.approx(angle, abs=scan.ANGLE_TOLERANCE)
+
+
+def test_measured_turn_deadline_stops_and_waits_for_new_feedback(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(now, received, source, wz=0.):
+        look.update(dict(_depth(now), control_ms=now),
+                    {"vx": 0., "vy": 0., "wz": wz, "received_ms": received,
+                     "source_sample_id": source}, geometry, receipt_only=True)
+        return look.command(geometry, .375, 1., 500, 800).yaw
+
+    tick(1000, 1000, 10)
+    assert look.begin((-1.,), advance_m=1.9, turn_angle=math.radians(14))
+    assert tick(1100, 1100, 11) == 0.
+    assert tick(1200, 1200, 12) > 0.
+    assert tick(1400, 1400, 13) > 0.
+    assert tick(1500, 1500, 14) > 0.
+    assert tick(1600, 1580, 14) == 0.  # deadline on the control clock, repeated input
+    assert tick(1650, 1640, 14) == 0.
+    assert tick(1700, 1680, 15) == 0.
+    assert tick(1800, 1800, 16, wz=.12) == 0.  # in-flight rotation after braking
+    assert tick(1900, 1900, 17, wz=-.08) == 0.
+    assert tick(2050, 2050, 18) == 0.
+    assert tick(2150, 2140, 18) == 0.  # a repeated sample cannot release the stop
+    assert tick(2200, 2200, 19, wz=-.08) == 0.
+    assert tick(2300, 2300, 20) > 0.
+
+
+@pytest.mark.parametrize("expiry", ["first_yaw", "renewal", "snapshot"])
+def test_card_finishing_a_turn_command_after_its_deadline_sends_stop(monkeypatch, expiry):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1.}, executor=None)
+    card._config.local_geometry = geometry
+    card._config.watchdog_ms = 500
+    card._descriptor = {"rate": {"max_obs_age_ms": 600}}
+    card._ttl_ms = 400
+    card._state.target = "person"
+    card._state.active_scan = look
+    now = 100_000
+    lag = 0
+
+    def snapshot(**kwargs):
+        return ({"objects": []}, dict(_depth(now), control_ms=now),
+                dict(_odom(now), received_ms=now, source_sample_id=now), now)
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: now / 1000)
+    monkeypatch.setattr(plugin.time, "time", lambda: (now + lag) / 1000)
+    _, depth, odom, _ = snapshot()
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=1.9, turn_angle=math.radians(14), route_segment=True)
+    now += 100
+    assert card.next_command()["values"] == [0.] * 6
+    now += 100
+    if expiry == "first_yaw":
+        lag = 450
+    else:
+        assert card.next_command()["values"][5] > 0.
+        now += 200
+        lag = 50
+        renewal = card.next_command()
+        assert renewal["values"][5] > 0.
+        assert renewal["stamp_ms"] + renewal["ttl_ms"] <= look.turn_until_ms
+        now = 100_600 if expiry == "snapshot" else 100_500
+        lag = 100_650 - now
+    stop = card.next_command()
+    assert stop["values"] == [0.] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_650
+    assert look.turn_stop_ms == stop["stamp_ms"] and look.turn_until_ms == 0
+    assert look.issued_yaw == (expiry != "first_yaw")
+    assert not any(card._state.commanded)
+    # A later clock with the same velocity sample cannot reopen the burst.
+    assert look.command(geometry, .375, 1., 500, 800, now_ms=101_200).yaw == 0.
+    assert look.turn_stop_ms == stop["stamp_ms"]
 
 
 def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(monkeypatch):

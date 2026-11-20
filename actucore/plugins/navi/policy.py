@@ -1691,11 +1691,12 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
                 if scan.receipt_only or command_only else config.scan_geometry)
     can_plan = config.local_planning and config.search_rate > 0
     has_sweep = can_plan and geometry is not None and bool(scan.current_frame)
-    if requested_yaw is not None and not has_sweep:
-        return "原地搜索：等待可检查转身扫掠范围的新深度"
-    if not has_sweep and ahead is not None and ahead <= config.obstacle_stop_m:
-        state.recovery = ClearanceRecovery()
-        return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
+    if not has_sweep:
+        if requested_yaw is None and ahead is not None and ahead <= config.obstacle_stop_m:
+            state.recovery = ClearanceRecovery()
+            return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
+        if requested_yaw is not None or (can_plan and config.local_geometry is not None):
+            return "原地搜索：等待可检查转身扫掠范围的新深度"
     if can_plan:
         direction = state.last_seen_side if requested_yaw is None else -math.copysign(1., requested_yaw)
         if (requested_yaw is None and not state.searching_for_s
@@ -1782,7 +1783,8 @@ def _local_velocity_limits(config, side):
     return (floor_x, config.vx_max), (floor_y, limit_y)
 
 
-def _start_detour_segment(depth, config, state, geometry, ahead, directions, target_distance, target_bearing):
+def _start_detour_segment(depth, config, state, geometry, ahead, directions, target_distance, target_bearing,
+                          *, reroute=False):
     scan = state.active_scan
     grid = scan.grid()
     _, occupied = grid
@@ -1818,7 +1820,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             if (local_path.segment_clear(occupied, geometry, keep, angle, length)
                     and scan.clear_sweep(geometry, keep, angle, 0., occupied=occupied)
                     and scan.begin((math.copysign(1., angle),), advance_m=length,
-                                   turn_angle=abs(angle), route_segment=True)):
+                                   turn_angle=abs(angle), route_segment=True, reroute=reroute)):
                 state.view_detour = local_path.Detour(None, (plan.points[0], *plan.points[index:]), geometry)
                 return True
     return False
@@ -1860,7 +1862,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     local_command = None
     scan = state.active_scan if config.local_planning and state is not None else None
     if scan is not None and scan.ready and scan.advance_m is not None:
-        return _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt)
+        return _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt,
+                                   target_bearing=target_bearing if may_scan else None)
     if near or (foreground and approaching):
         stationary_line = config.obstacle_stop_m + LOCAL_BLOCKED_APPROACH_BUFFER_M
         brake_at = min(slow, max(stop, stationary_line) if config.local_planning
@@ -2085,7 +2088,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     return vx, vy, wz, status, reason
 
 
-def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt):
+def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt, *,
+                        target_bearing=None):
     scan = state.active_scan
     geometry = (config.scan_geometry or config.local_geometry
                 if scan.receipt_only else config.scan_geometry)
@@ -2102,7 +2106,17 @@ def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, targe
 
     if scan.advance_origin is None:
         if scan.route_segment:
-            if not local_path.segment_clear(scan.grid()[1], geometry, _keepout_m(config), 0., scan.advance_m):
+            keep = _keepout_m(config)
+            if not local_path.segment_clear(scan.grid()[1], geometry, keep, 0., scan.advance_m):
+                if (not scan.rerouted and not scan.command_only and scan.has_settled_route_view(depth)
+                        and ahead is not None and target_bearing is not None
+                        and all(math.hypot(vx, vy) <= STILL_LINEAR for vx, vy, _ in (motion, previous))):
+                    rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep) for s in (-1., 1.)}
+                    frame = depth.get("source_frame_id", depth.get("frame_id"))
+                    order = _local_side_order(rooms, config, state, frame)
+                    if _start_detour_segment(depth, config, state, geometry, ahead, order, target_distance,
+                                             target_bearing, reroute=True):
+                        return 0., 0., 0., AVOIDING, "主动观察：原直行走廊被挡，停车对准新路线首段"
                 scan.interrupt()
                 return 0., 0., 0., AVOIDING, "主动观察：路线首段的直行走廊被挡住"
         elif ahead is not None and ahead < config.slow_distance_m:

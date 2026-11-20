@@ -20,7 +20,7 @@ RECEIPT_SETTLE_MS = 3500
 ODOM_GAP_MS = 250
 MAP_AGE_MS = 2500
 SCAN_TIMEOUT_MS = 8000
-POSE_TURN_BURST_MS = 400
+TURN_BURST_MS = 400
 TURN_PROGRESS_WINDOW_MS = 1500
 TURN_PROGRESS_MIN_RAD = math.radians(3)
 
@@ -46,6 +46,7 @@ class ActiveScan:
     still_since: int = 0
     turn_start_heading: float = 0.
     settle_ms: int | None = None
+    settle_start_source: int | None = None
     settle_frame: int = 0
     settle_frames: int = 0
     retry_after_hold: bool = False
@@ -62,6 +63,7 @@ class ActiveScan:
     side_frame: int = 0
     advance_m: float | None = None
     route_segment: bool = False
+    rerouted: bool = False
     advance_origin: tuple | None = None
     advance_commanded_m: float = 0.
     result_frame: int = 0
@@ -70,6 +72,7 @@ class ActiveScan:
     odom_source: int | None = None
     pose_origin: PlanarPose | None = None
     pose_feedback_since_ms: int = 0
+    control_ms: int = 0
     turn_stop_ms: int | None = None
     turn_until_ms: int = 0
     turn_yaw: float = 0.
@@ -102,6 +105,7 @@ class ActiveScan:
             self.invalidate()
             self.receipt_only = receipt_only
         stamp = (odom or {}).get("received_ms" if self.receipt_only else "stamp_ms")
+        self.control_ms = (depth or {}).get("control_ms") or 0
         capture = (depth or {}).get("capture_ms")
         motion = planar_feedback(odom)
         if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
@@ -190,6 +194,10 @@ class ActiveScan:
         # The original header, when present, only identifies repeated frames.
         frame = (depth or {}).get("frame_id")
         source = (depth or {}).get("source_frame_id")
+        if type(source) is not int or source <= 0:
+            self.settle_start_source = None
+        elif self.phase == "turn" and self.settle_ms is None:
+            self.settle_start_source = source
         if source is not None and self.source_frame is not None and self.views:
             if source < self.source_frame:
                 return self.invalidate()
@@ -286,9 +294,22 @@ class ActiveScan:
             free |= confirmed
         return free & ~occupied, occupied
 
-    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE, route_segment=False):
-        if self.attempted or not self.current_frame:
+    def has_settled_route_view(self, depth):
+        """Match the projected view to a verified capture or advancing post-stop source ID."""
+        if not 0 < self.side_frame <= self.current_frame:
             return False
+        if not self.receipt_only:
+            return self.current_frame == depth.get("capture_ms")
+        source = depth.get("source_frame_id")
+        return (type(source) is int and source == self.source_frame
+                and self.settle_start_source is not None and source > self.settle_start_source)
+
+    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE, route_segment=False, reroute=False):
+        if not self.current_frame or (self.attempted and not reroute) or (reroute and self.rerouted):
+            return False
+        if reroute:
+            self.rerouted = True
+            self.side_frame = 0
         self.directions = directions
         self.turn_angle = turn_angle
         self.route_segment = route_segment
@@ -317,6 +338,7 @@ class ActiveScan:
         self.result_frame = self.current_frame if self.route_segment else self.side_frame
         if self.route_segment:
             self.attempted = False
+            self.rerouted = False
         self.phase = "idle"
 
     def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
@@ -358,6 +380,9 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：等待停稳后的观测")
             # Fresh inputs can re-open a scan interrupted by a gap. Keep the
             # attempt consumed after measured drift or a turn without progress.
+            if self.rerouted and self.advance_origin is None:
+                self.locked = True
+                return self.interrupt("主动观察：替代路线尚未前进，停车等待新导航指令")
             if self.retry_after_hold:
                 self.attempted = False
                 self.retry_after_hold = False
@@ -369,20 +394,25 @@ class ActiveScan:
         if (abs(self.motion[2]) > yaw_rate + .10
                 or abs(self.pose[2] - self.origin[2]) > max(ANGLE, self.turn_angle) + 2 * ANGLE_TOLERANCE):
             return self.interrupt("主动观察：转速或转角超出限制，停车")
-        if (self.receipt_only and self.phase == "turn" and self.issued_yaw
-                and stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS
-                and abs(self.pose[2] - self.turn_start_heading) < TURN_PROGRESS_MIN_RAD):
-            return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划", retry_scan=False)
-
-        # Pose feedback can lag several ticks. Run a bounded burst, then wait
-        # for measurements that bracket its explicit stop.
-        control_ms = now_ms or stamp
+        # Short route turns also use bounded bursts when only delayed velocity
+        # feedback is available. Stop on the control clock even on a repeated sample.
+        bounded_turn = self.pose_origin is not None or self.advance_m is not None
+        control_ms = now_ms or self.control_ms or stamp
+        wait_reason = "主动观察：停转等待新位姿" if self.pose_origin is not None else "主动观察：停转等待新速度反馈"
         if self.turn_until_ms and control_ms >= self.turn_until_ms:
             self.turn_stop_ms = control_ms
             self.turn_until_ms = 0
+            return ScanCommand(reason=wait_reason)
         if self.turn_stop_ms is not None:
-            if self.pose_feedback_since_ms < self.turn_stop_ms or abs(self.motion[2]) > STILL_YAW:
-                return ScanCommand(reason="主动观察：停转等待新位姿")
+            # A stopped velocity alone can precede the chassis response. Allow
+            # the prior command to expire, then require a new stopped sample.
+            fresh = (self.pose_feedback_since_ms >= self.turn_stop_ms if self.pose_origin is not None
+                     else stamp > self.turn_stop_ms + watchdog_ms)
+            if not fresh or abs(self.motion[2]) > STILL_YAW:
+                return ScanCommand(reason=wait_reason)
+            if self.pose_origin is None:
+                # The chassis was commanded to stop during this interval.
+                self.still_since += stamp - self.turn_stop_ms
             self.turn_stop_ms = None
 
         returning = self.phase == "return"
@@ -391,7 +421,7 @@ class ActiveScan:
         if self.turn_until_ms and (abs(error) <= ANGLE_TOLERANCE or self.turn_yaw * error > 0):
             self.turn_stop_ms = control_ms
             self.turn_until_ms = 0
-            return ScanCommand(reason="主动观察：停转等待新位姿")
+            return ScanCommand(reason=wait_reason)
         if abs(error) <= ANGLE_TOLERANCE:
             if abs(self.motion[2]) > STILL_YAW:
                 self.settle_ms = None
@@ -405,9 +435,16 @@ class ActiveScan:
                 self.issued_yaw = False
             else:
                 self.side_frame = self.current_frame
+                if self.source_frame == self.settle_start_source:
+                    self.settle_start_source = None
             self.phase = "evaluate" if returning or self.receipt_only or self.advance_m is not None else "return"
             return ScanCommand(reason="主动观察：已记录新视角")
         self.settle_ms = None
+        if (self.receipt_only and self.phase == "turn" and self.issued_yaw
+                and stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS
+                and abs(self.pose[2] - self.turn_start_heading) < TURN_PROGRESS_MIN_RAD):
+            return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划", retry_scan=False)
+
         if stamp - self.still_since < SETTLE_MS // 2:
             return ScanCommand(reason="主动观察：确认底盘已停稳")
 
@@ -418,20 +455,18 @@ class ActiveScan:
         if self.motion[2] * math.copysign(1., error) > STILL_YAW:
             return ScanCommand(reason="主动观察：等待反向转动停止")
 
-        if self.pose_origin is not None:
+        if bounded_turn:
             if self.turn_until_ms:
                 duration_ms = self.turn_until_ms - control_ms
                 yaw_rate = min(yaw_rate, abs(self.turn_yaw))
             else:
-                duration_ms = POSE_TURN_BURST_MS
+                duration_ms = TURN_BURST_MS
                 yaw_rate = min(yaw_rate, max(min_yaw_rate, abs(error) * 1000 / duration_ms))
                 duration_ms = min(duration_ms, int((abs(error) + 2 * ANGLE_TOLERANCE) * 1000 / yaw_rate))
             if duration_ms < max(1, int(tick_s * 1000)):
                 self.turn_until_ms = 0
                 self.turn_stop_ms = control_ms
-                return ScanCommand(reason="主动观察：停转等待新位姿")
-        elif self.advance_m is not None and tick_s > 0.:
-            yaw_rate = min(yaw_rate, max(min_yaw_rate, abs(error) / tick_s))
+                return ScanCommand(reason=wait_reason)
         _, occupied = self.grid()
         occupied = occupied | self.views[-1][3]
 
@@ -457,7 +492,7 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
-        if self.pose_origin is not None:
+        if bounded_turn:
             if not self.turn_until_ms:
                 self.turn_until_ms = control_ms + duration_ms
             self.turn_yaw = -math.copysign(yaw_rate, error)
@@ -498,7 +533,7 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：保持朝向，停车等待新深度")
             if yaw_rate <= 0. or yaw_rate < min_yaw:
                 return self.interrupt("主动观察：底盘无可用转速，停车")
-            duration = max(POSE_TURN_BURST_MS / 1000, abs(error) / yaw_rate)
+            duration = max(TURN_BURST_MS / 1000, abs(error) / yaw_rate)
             if tick_s > 0.:
                 duration = math.ceil(duration / tick_s) * tick_s
             if min_yaw:
@@ -552,6 +587,7 @@ class ActiveScan:
         if self.phase != "brake_for_replan":
             self.retry_after_hold = retry_scan
         self.phase = "brake_for_replan"
+        self.settle_start_source = None
         self.current_frame = 0
         self.settle_ms = None
         self.turn_until_ms = 0
@@ -562,6 +598,7 @@ class ActiveScan:
         if self.active:
             self.locked |= self.issued_yaw
         self.phase = "idle"
+        self.settle_start_source = None
         self.retry_after_hold = False
         self.turn_until_ms = 0
         self.turn_stop_ms = None
@@ -588,6 +625,7 @@ class ActiveScan:
         self.clear_frame = frame
         self.clear_frames += 1
         if self.clear_frames >= 3:
+            self.rerouted = False
             self.attempted = False
             self.issued_yaw = False
             self.clear_frames = 0
