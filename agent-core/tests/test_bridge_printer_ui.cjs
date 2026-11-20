@@ -20,9 +20,11 @@ class Element {
 
 function fixture(fetch) {
   const fields = {};
-  const initial = {bridge_url: '10.100.10.14', remote_start_user: 'operator'};
+  const initial = {bridge_url: '10.100.10.14', remote_start_user: 'operator',
+    remote_start_password: 'secret', remote_start_port: '22', visitor_page_url: ''};
   for (const [key, value] of Object.entries(initial)) { fields[key] = Object.assign(new Element(), {value, dataset: {key}}); }
   const props = Object.fromEntries(Object.keys(fields).map(key => [key, {scope: 'shared', type: key === 'remote_start_enabled' ? 'boolean' : 'string'}]));
+  props.visitor_page_url = {scope: 'instance'};
   props.printer_name = {scope: 'instance'};
   const body = new Element();
   body.querySelector = selector => fields[selector.match(/data-key="([^"]+)"/)[1]];
@@ -50,7 +52,7 @@ test('initialization verifies SSH and persists connection before printer selecti
     const args = payload.arguments;
     if (args.action === 'initialize') return response({status: 'installing', deployment_id: 'job-1'});
     if (args.action === 'initialize_status') return response({status: 'installed', deployment_id: 'job-1', bridge_url: 'ssh://10.100.10.14'});
-    return response({printers: [{name: 'Brother'}]});
+    return response({printers: [{name: 'Brother'}], pages: []});
   });
   const install = f.controls.controls[0].onclick();
   await new Promise(resolve => setImmediate(resolve));
@@ -59,7 +61,7 @@ test('initialization verifies SSH and persists connection before printer selecti
   assert.equal(requests.find(r => r.payload.arguments?.action === 'initialize_status').payload.arguments.deployment_id, 'job-1');
   const saved = requests.find(r => !r.payload.arguments).payload;
   assert.equal(saved.token, undefined);
-  assert.equal(saved.bridge_url, 'ssh://10.100.10.14');
+  assert.equal(saved.bridge_url, '10.100.10.14');
   assert.equal(saved.printer_name, undefined);
   assert.equal(f.controls.input.value, 'Brother');
 });

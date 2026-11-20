@@ -28,7 +28,10 @@ class VisitorBadgeTest(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.card = QLPrinterPlugin({})
-        cfg = self.card.dispatch("config", {"bridge_url": self.url, "remote_start_user": "operator"})
+        cfg = self.card.dispatch("config", {"bridge_url": self.url, "remote_start_user": "operator",
+                                              "remote_start_password": "secret",
+                                              "visitor_page_url": "https://visitor.test/#/list",
+                                              "printer_name": "Brother"})
         self.assertTrue(cfg["adapter_ok"])
         # Exercise the card contract against the existing mock business API;
         # SSH framing itself has dedicated tests below.
@@ -62,8 +65,9 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(props["printer_name"]["scope"], "instance")
         self.assertEqual(props["printer_name"]["format"], "bridge-printer")
         self.assertNotIn("token", props)
-        self.assertEqual(set(props), {"printer_name", "bridge_url", "remote_start_user"})
-        self.assertEqual(definition["configSchema"]["required"], ["bridge_url", "remote_start_user"])
+        self.assertIn("remote_start_password", props)
+        self.assertIn("visitor_page_url", props)
+        self.assertIn("remote_start_password", definition["configSchema"]["required"])
 
     def test_operator_can_enter_only_frontdesk_ip(self):
         card = QLPrinterPlugin({"bridge_url": "10.100.10.14"})

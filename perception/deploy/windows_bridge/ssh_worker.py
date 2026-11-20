@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from bridge_core import BridgeFailure, BridgeStore, VisitorBridge
 from edge_backend import EdgeVisitorBackend
@@ -25,7 +26,20 @@ def _run_job(bridge: VisitorBridge, backend: EdgeVisitorBackend, job: dict) -> d
     if action == "health":
         return {"state": "running", "transport": "ssh"}
     if action == "printers":
-        return backend.list_printers()
+        result = backend.list_printers()
+        pages_path = Path(backend.data_dir) / "edge-pages.json"
+        try:
+            pages = json.loads(pages_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            pages = []
+        result["pages"] = pages if isinstance(pages, list) else []
+        return result
+    selected_url = str(body.get("visitor_page_url") or "").strip()
+    parsed = urlsplit(selected_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise BridgeFailure("visitor_page_required", "请在卡片配置中选择已登录并能看到访客列表的网页")
+    backend.list_url = selected_url
+    backend.query_url = f"{parsed.scheme}://{parsed.netloc}/smart-admin-api/visitInfo/page/query"
     if action == "list":
         return bridge.list_visits()
     if action == "print":

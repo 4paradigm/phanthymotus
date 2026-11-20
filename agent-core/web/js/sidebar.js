@@ -966,7 +966,8 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
   const read = k => bodyEl.querySelector(`[data-key="${k}"]`)?.value.trim() || '';
   const alive = () => initialize.isConnected && !overlay.classList.contains('hidden');
   const automaticSsh = !props.bridge_url && !props.remote_start_user;
-  const connection = () => automaticSsh ? ['visitor-frontdesk'] : ['bridge_url', 'remote_start_user'].map(read);
+  const connectionKeys = ['bridge_url', 'remote_start_user', 'remote_start_password', 'remote_start_port'];
+  const connection = () => automaticSsh ? ['visitor-frontdesk'] : connectionKeys.map(read);
   const identity = () => JSON.stringify(connection());
   const call = async args => {
     const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
@@ -991,10 +992,10 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
   const loadPrinters = async (silent = false) => {
     const version = ++generation;
     const address = connection();
-    const [bridge_url, remote_start_user] = automaticSsh ? ['', ''] : address;
+    const [bridge_url, remote_start_user, remote_start_password, remote_start_port] = automaticSsh ? ['', ''] : address;
     const current = () => alive() && version === generation &&
       JSON.stringify(connection()) === JSON.stringify(address);
-    if (!automaticSsh && (!bridge_url || !remote_start_user)) {
+    if (!automaticSsh && (!bridge_url || !remote_start_user || !remote_start_password)) {
       showPending('连接后选择打印机');
       input.disabled = installing;
       return;
@@ -1002,7 +1003,8 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
     input.disabled = true;
     showPending('正在读取打印机…');
     try {
-      const result = await call(automaticSsh ? {action: 'printers'} : {action: 'printers', bridge_url, remote_start_user});
+      const result = await call(automaticSsh ? {action: 'printers'} : {action: 'printers', bridge_url, remote_start_user,
+        remote_start_password, remote_start_port});
       if (!current()) return;
       if (!Array.isArray(result.printers)) throw new Error(result.error || '未返回打印机列表，请先准备前台电脑');
       input.replaceChildren(new Option('请选择打印机', ''));
@@ -1013,6 +1015,14 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
         input.add(new Option(selected + '（未在此电脑找到）', selected));
       }
       input.value = selected;
+      const pageInput = bodyEl.querySelector('[data-key="visitor_page_url"]');
+      if (pageInput && Array.isArray(result.pages)) {
+        const savedPage = pageInput.value;
+        pageInput.replaceChildren(new Option('请选择已登录且能看到访客列表的网页', ''));
+        for (const page of result.pages) pageInput.add(new Option(`${page.title || '访客网页'} — ${page.url}`, page.url));
+        if (savedPage && !result.pages.some(page => page.url === savedPage)) pageInput.add(new Option(`${savedPage}（当前未打开）`, savedPage));
+        pageInput.value = savedPage;
+      }
     } catch (error) {
       if (!current()) return;
       showPending('暂时无法读取打印机');
@@ -1027,9 +1037,10 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
     const originalIdentity = identity();
     const unchanged = () => alive() && identity() === originalIdentity;
     const args = automaticSsh ? {action: 'initialize'} : {action: 'initialize', bridge_url: read('bridge_url'),
-      remote_start_user: read('remote_start_user')};
-    if (!automaticSsh && (!args.bridge_url || !args.remote_start_user)) {
-      progress.textContent = '请填写前台电脑 IP 和 Windows 用户名';
+      remote_start_user: read('remote_start_user'), remote_start_password: read('remote_start_password'),
+      remote_start_port: read('remote_start_port')};
+    if (!automaticSsh && (!args.bridge_url || !args.remote_start_user || !args.remote_start_password)) {
+      progress.textContent = '请填写前台电脑 IP、Windows 用户名和密码';
       return;
     }
     installing = true;
@@ -1060,7 +1071,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
           sharedValues[field.dataset.key] = _readConfigValue(field, def);
         }
       }
-      if (!automaticSsh) sharedValues.bridge_url = result.bridge_url || args.bridge_url;
+      if (!automaticSsh) sharedValues.bridge_url = args.bridge_url;
       const savedIdentity = identity();
       pairedIdentity = savedIdentity;
       // Persist the verified SSH connection now. The selected printer is
@@ -1072,7 +1083,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       if (!response.ok) throw new Error('安装成功，但连接配置未保存，请点击“保存”后重试');
       _toolConfigs[cacheKey] = sharedValues;
       if (!alive() || identity() !== savedIdentity) return;
-      progress.textContent = '前台电脑已通过 SSH 准备完成。请选择打印机并保存；首次使用需登录访客网站。';
+      progress.textContent = 'Edge 已打开：请登录访客网站并确认能看到访客列表，然后关闭 Edge，再选择网页和打印机并保存。';
       await loadPrinters();
     } catch (error) {
       if (alive() && (unchanged() || identity() === pairedIdentity)) progress.textContent = error.message;
@@ -1095,7 +1106,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       bodyEl.removeEventListener('input', onInput);
       return;
     }
-    if (automaticSsh || !['bridge_url', 'remote_start_user'].includes(event.target.dataset.key)) return;
+    if (automaticSsh || !connectionKeys.includes(event.target.dataset.key)) return;
     generation++;
     clearTimeout(reloadTimer);
     if (read('bridge_url') !== lastAddress) {
@@ -1121,7 +1132,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
 function _configEntries(props, toolName) {
   const entries = Object.entries(props);
   if (!['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) return entries;
-  const order = ['bridge_url', 'remote_start_user', 'printer_name'];
+  const order = ['bridge_url', 'remote_start_user', 'remote_start_password', 'visitor_page_url', 'printer_name'];
   const rank = ([key, def]) => def.advanced ? 100 : (order.includes(key) ? order.indexOf(key) : 50);
   return entries.sort((a, b) => rank(a) - rank(b));
 }
@@ -1159,7 +1170,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
   for (const [key, def] of _configEntries(props, toolName)) {
     // Skip instance-scope fields only if there are also shared fields
-    if (hasSharedFields && def.scope === 'instance' && !(visitorPrinter && def.format === 'bridge-printer')) continue;
+    if (hasSharedFields && def.scope === 'instance' &&
+        !(visitorPrinter && ['bridge-printer', 'edge-page'].includes(def.format))) continue;
     const fieldWrapper = document.createElement('div');
     fieldWrapper.className = 'tool-config-field';
     if (def['x-show-when']) fieldWrapper.dataset.showWhen = JSON.stringify(def['x-show-when']);
@@ -1217,6 +1229,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'edge-page' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.add(new Option(savedValues[key] || '准备前台电脑后选择', savedValues[key] || ''));
     } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
       const printer = _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved: savedValues[key]});
       input = printer.input;
@@ -1596,6 +1613,11 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'edge-page' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.add(new Option(vals[key] || '准备前台电脑后选择', vals[key] || ''));
     } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
       const printer = _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved: vals[key]});
       input = printer.input;

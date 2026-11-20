@@ -8,8 +8,7 @@
   "success_statuses": ["已入场"],
   "edge": {
     "profile_dir": "data/edge-profile",
-    "list_url": "https://p-visitor.4paradigm.com/#/VisitorInfo/visitorinfo-list",
-    "query_url": "https://p-visitor.4paradigm.com/smart-admin-api/visitInfo/page/query",
+    "list_url": "about:blank",
     "query_endpoint_contains": "/visitInfo/page/query",
     "headless": false,
     "kiosk_printing": true,

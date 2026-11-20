@@ -30,7 +30,7 @@ class DeployTests(unittest.TestCase):
                      'config.example.json', 'README.txt', 'bootstrap_ssh.ps1']:
             (self.root / name).write_text('# package', encoding='utf-8')
         self.args = dict(bridge_url='ssh://192.168.1.2', remote_start_user='operator',
-                         remote_start_key_path='/secret/key')
+                         remote_start_password='secret')
         self.uploaded_core = None
         self.patch_key = patch.object(Path, 'is_file', return_value=True)
         self.patch_key.start()
@@ -59,8 +59,8 @@ class DeployTests(unittest.TestCase):
         for call in run.call_args_list:
             command = call.args[0]
             self.assertIn(command[0], {'ssh', 'scp'})
-            self.assertIn('StrictHostKeyChecking=yes', command)
-            self.assertIn('BatchMode=yes', command)
+            self.assertIn('StrictHostKeyChecking=accept-new', command)
+            self.assertNotIn('secret', command)
 
     def test_corrupt_asset_is_rejected_before_ssh(self):
         (self.root / 'offline' / 'test.whl').write_bytes(b'corrupt')

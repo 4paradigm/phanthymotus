@@ -2,6 +2,7 @@
 import base64
 import json
 import hashlib
+import os
 import re
 import subprocess
 import tempfile
@@ -44,10 +45,9 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
     port = int(args.get('remote_start_port', 22))
     if not 1 <= port <= 65535:
         raise ValueError('SSH 端口无效')
-    key = Path(args.get('remote_start_key_path', ''))
-    known = Path('/run/ql-printer-auth/known_hosts')
-    if not key.is_file() or not known.is_file():
-        raise ValueError('SSH 私钥或已核对的 known_hosts 缺失')
+    password = str(args.get('remote_start_password') or '')
+    if not password:
+        raise ValueError('请填写 Windows SSH 密码')
     if url.scheme != 'ssh' or url.port not in (None, 22) or url.path not in ('', '/'):
         raise ValueError('前台电脑地址无效')
     if not re.fullmatch(r'[A-Za-z0-9_.:-]+', host) or not re.fullmatch(r'[A-Za-z0-9_.-]+', user):
@@ -68,24 +68,35 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
         if sha256_file(offline / name) != digest:
             raise ValueError('离线安装包校验失败')
 
+    known = '/tmp/visitor-printer-known-hosts'
     ssh_base_args = [
         "ssh", "-F", config_arg, "-T",
-        "-i", str(key), "-p", str(port),
-        "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes",
+        "-p", str(port), "-o", "PubkeyAuthentication=no",
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
+        "-o", "NumberOfPasswordPrompts=1", "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={known}",
     ]
     scp_base_args = [
         "scp", "-F", config_arg,
-        "-i", str(key), "-P", str(port),
-        "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=yes",
+        "-P", str(port), "-o", "PubkeyAuthentication=no",
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
+        "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={known}",
     ]
 
+    askpass = tempfile.NamedTemporaryFile('w', prefix='visitor-deploy-askpass-', suffix='.sh', delete=False)
+    askpass.write('#!/bin/sh\nprintf "%s\\n" "$VISITOR_SSH_PASSWORD"\n')
+    askpass.close()
+    os.chmod(askpass.name, 0o700)
+    env = os.environ.copy()
+    env.update({'DISPLAY': 'visitor-ssh', 'SSH_ASKPASS': askpass.name,
+                'SSH_ASKPASS_REQUIRE': 'force', 'VISITOR_SSH_PASSWORD': password})
+
     def run(command, **kwargs):
         try:
-            result = subprocess.run(command, capture_output=True, timeout=900)
+            result = subprocess.run(command, capture_output=True, timeout=900,
+                                    stdin=subprocess.DEVNULL, env=env, start_new_session=True)
         except subprocess.TimeoutExpired:
             raise RuntimeError('初始化步骤超时：' + command[0]) from None
         if result.returncode:
@@ -94,46 +105,40 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
             raise RuntimeError('初始化 %s 失败（退出码 %s）：%s' % (command[0], result.returncode, detail))
         return result
 
-    prepare = "$ErrorActionPreference='Stop'; if (!(Test-Path 'D:/')) { throw 'D drive missing' }; New-Item -ItemType Directory -Force -Path 'D:/ParadigmVisitorAutomation/upload' | Out-Null; Write-Output 'UPLOAD_READY'"
-    encoded = base64.b64encode(prepare.encode('utf-16le')).decode('ascii')
-    # Encode PowerShell to prevent cmd.exe from interpreting its pipeline.
-    prepared = run(
-        ssh_base_args + [
-            target,
-            'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded
-        ],
-        check=True
-    )
-    if b'UPLOAD_READY' not in prepared.stdout:
-        raise RuntimeError('SSH 未执行上传准备命令；请检查公钥是否仍绑定强制启动命令')
+    try:
+        prepare = "$ErrorActionPreference='Stop'; if (!(Test-Path 'D:/')) { throw 'D drive missing' }; New-Item -ItemType Directory -Force -Path 'D:/ParadigmVisitorAutomation/upload' | Out-Null; Write-Output 'UPLOAD_READY'"
+        encoded = base64.b64encode(prepare.encode('utf-16le')).decode('ascii')
+        prepared = run(ssh_base_args + [target, 'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded])
+        if b'UPLOAD_READY' not in prepared.stdout:
+            raise RuntimeError('SSH 未执行上传准备命令，请确认该 Windows 账户具有管理员权限')
 
-    with tempfile.TemporaryDirectory(prefix='visitor_ssh_chunks_') as directory:
-        local_chunk_dir = Path(directory)
-        man = {"files": [], "chunk_size": CHUNK_SIZE}
-        core_payload = {"core_files": {}}
-        for n in names:
-            core_payload["core_files"][n] = base64.b64encode((package_root / n).read_bytes()).decode()
-        core_manifest_path = local_chunk_dir / "core.json"
-        core_manifest_path.write_text(json.dumps(core_payload, ensure_ascii=False), encoding='utf-8')
-        run(scp_base_args + [str(core_manifest_path), f"{target}:{REMOTE_CHUNK_DIR}/core.json"])
-
-        for name, digest in manifest.items():
-            src_file = offline / name
-            if sha256_file(src_file) != digest:
-                raise ValueError('离线安装包校验失败')
-            chunk_cnt = split_file(src_file, local_chunk_dir)
-            for i in range(chunk_cnt):
-                chunk_name = f"{name}.{i:04d}.chunk"
-                run(scp_base_args + [str(local_chunk_dir / chunk_name), f"{target}:{REMOTE_CHUNK_DIR}/{chunk_name}"])
-            man["files"].append({"name": name, "sha256": digest, "chunk_count": chunk_cnt})
-
-        manifest_path = local_chunk_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(man), encoding='utf-8')
-        run(scp_base_args + [str(manifest_path), f"{target}:{REMOTE_CHUNK_DIR}/manifest.json"])
-        for script in ('bootstrap_ssh.ps1',):
-            run(scp_base_args + [str(package_root / script), f'{target}:{REMOTE_CHUNK_DIR}/{script}'])
-        result = run(ssh_base_args + [target,
-            f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {REMOTE_BOOTSTRAP}"])
+        with tempfile.TemporaryDirectory(prefix='visitor_ssh_chunks_') as directory:
+            local_chunk_dir = Path(directory)
+            man = {"files": [], "chunk_size": CHUNK_SIZE}
+            core_payload = {"core_files": {}}
+            for n in names:
+                core_payload["core_files"][n] = base64.b64encode((package_root / n).read_bytes()).decode()
+            core_manifest_path = local_chunk_dir / "core.json"
+            core_manifest_path.write_text(json.dumps(core_payload, ensure_ascii=False), encoding='utf-8')
+            run(scp_base_args + [str(core_manifest_path), f"{target}:{REMOTE_CHUNK_DIR}/core.json"])
+            for name, digest in manifest.items():
+                src_file = offline / name
+                chunk_cnt = split_file(src_file, local_chunk_dir)
+                for i in range(chunk_cnt):
+                    chunk_name = f"{name}.{i:04d}.chunk"
+                    run(scp_base_args + [str(local_chunk_dir / chunk_name), f"{target}:{REMOTE_CHUNK_DIR}/{chunk_name}"])
+                man["files"].append({"name": name, "sha256": digest, "chunk_count": chunk_cnt})
+            manifest_path = local_chunk_dir / "manifest.json"
+            manifest_path.write_text(json.dumps(man), encoding='utf-8')
+            run(scp_base_args + [str(manifest_path), f"{target}:{REMOTE_CHUNK_DIR}/manifest.json"])
+            run(scp_base_args + [str(package_root / 'bootstrap_ssh.ps1'), f'{target}:{REMOTE_CHUNK_DIR}/bootstrap_ssh.ps1'])
+            result = run(ssh_base_args + [target,
+                f"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {REMOTE_BOOTSTRAP}"])
+    finally:
+        try:
+            os.unlink(askpass.name)
+        except OSError:
+            pass
     if result.returncode or b'SSH_AUTOMATION_OK' not in result.stdout:
         raise RuntimeError('安装未返回成功标记，请检查 D:\\ParadigmVisitorAutomation\\install.log')
     return {'status': 'installed', 'bridge_url': raw_url,

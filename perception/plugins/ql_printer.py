@@ -17,6 +17,7 @@ import ipaddress
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -169,70 +170,57 @@ class SSHBridgeClient:
 
     MARKER = "VISITOR_RESULT:"
 
-    def __init__(self, host: str = "", user: str = "", key_path: str = "/run/ql-printer-auth/frontdesk_bridge_ed25519",
+    def __init__(self, host: str = "", user: str = "", password: str = "",
                  port: int = 22, timeout_s: float = 60):
         self.host = host
         self.user = user
-        self.key_path = key_path
+        self.password = password
         self.port = int(port)
         self.timeout_s = float(timeout_s)
-        self.known_hosts = "/run/ql-printer-auth/known_hosts"
+        self.known_hosts = "/tmp/visitor-printer-known_hosts"
 
     def _connection(self) -> tuple[str, str]:
         if self.host and self.user:
             return "/dev/null", f"{self.user}@{self.host}"
-        config = "/run/ql-printer-auth/config"
-        if os.path.isfile(config):
-            return config, "visitor-frontdesk"
-        try:
-            lines = open(self.known_hosts, encoding="utf-8").read().splitlines()
-        except OSError as exc:
-            raise BridgeError("机器人缺少 known_hosts，无法识别前台电脑", "ssh_not_configured") from exc
-        hosts: set[str] = set()
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            field = line.split(None, 1)[0]
-            for host in field.split(","):
-                if host.startswith("|"):
-                    continue
-                if host.startswith("[") and "]:" in host:
-                    host = host[1:host.index("]:")]
-                hosts.add(host)
-        if len(hosts) != 1:
-            raise BridgeError(
-                "无法从 known_hosts 唯一识别前台电脑；请在密钥目录提供 SSH config（Host visitor-frontdesk）",
-                "ssh_target_ambiguous",
-            )
-        # Standard deployments use this Windows account. Non-standard users
-        # are declared once in the optional SSH config, never on every card.
-        return "/dev/null", f"4paradigm@{next(iter(hosts))}"
+        raise BridgeError("请填写前台电脑 IP 和 Windows 用户名", "ssh_not_configured")
 
     def _ssh(self, script: str, timeout_s: float | None = None) -> subprocess.CompletedProcess:
-        if not os.path.isfile(self.key_path) or not os.path.isfile(self.known_hosts):
-            raise BridgeError("机器人缺少 SSH 私钥或 known_hosts 挂载", "ssh_not_configured")
+        if not self.password:
+            raise BridgeError("请填写 Windows SSH 密码", "ssh_not_configured")
         ssh_config, target = self._connection()
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-        command = [
-            "ssh", "-F", ssh_config, "-T", "-i", self.key_path,
-            "-p", str(self.port), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes",
-            "-o", f"UserKnownHostsFile={self.known_hosts}", target,
-            "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded,
-        ]
+        askpass = tempfile.NamedTemporaryFile("w", prefix="visitor-askpass-", suffix=".sh", delete=False)
         try:
-            return subprocess.run(
-                command, capture_output=True, timeout=timeout_s or self.timeout_s,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise BridgeError(
-                "SSH 请求超时；若刚执行打印，请先核对打印机和访客状态，不要立即重复打印",
-                "request_timeout",
-            ) from exc
-        except OSError as exc:
-            raise BridgeError(f"无法运行 SSH：{exc}", "ssh_failed") from exc
+            askpass.write('#!/bin/sh\nprintf "%s\\n" "$VISITOR_SSH_PASSWORD"\n')
+            askpass.close()
+            os.chmod(askpass.name, 0o700)
+            command = [
+                "ssh", "-F", ssh_config, "-T", "-p", str(self.port),
+                "-o", "PubkeyAuthentication=no", "-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "NumberOfPasswordPrompts=1", "-o", "ConnectTimeout=8",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={self.known_hosts}",
+                target, "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded,
+            ]
+            env = os.environ.copy()
+            env.update({"DISPLAY": "visitor-ssh", "SSH_ASKPASS": askpass.name,
+                        "SSH_ASKPASS_REQUIRE": "force", "VISITOR_SSH_PASSWORD": self.password})
+            try:
+                return subprocess.run(
+                    command, capture_output=True, timeout=timeout_s or self.timeout_s,
+                    check=False, stdin=subprocess.DEVNULL, env=env, start_new_session=True,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise BridgeError(
+                    "SSH 请求超时；若刚执行打印，请先核对打印机和访客状态，不要立即重复打印",
+                    "request_timeout",
+                ) from exc
+            except OSError as exc:
+                raise BridgeError(f"无法运行 SSH：{exc}", "ssh_failed") from exc
+        finally:
+            try:
+                os.unlink(askpass.name)
+            except OSError:
+                pass
 
     def request(self, method: str, path: str, *, body: dict | None = None,
                 timeout_s: float | None = None) -> dict:
@@ -321,12 +309,8 @@ class QLPrinterPlugin:
             "print_timeout_s": float(plugin_config.get("print_timeout_s", 120)),
             "remote_start_user": str(plugin_config.get("remote_start_user", "4paradigm") or "4paradigm"),
             "remote_start_port": int(plugin_config.get("remote_start_port", 22)),
-            "remote_start_key_path": str(
-                plugin_config.get(
-                    "remote_start_key_path",
-                    "/run/ql-printer-auth/frontdesk_bridge_ed25519",
-                )
-            ),
+            "remote_start_password": str(plugin_config.get("remote_start_password", "") or ""),
+            "visitor_page_url": str(plugin_config.get("visitor_page_url", "") or ""),
         }
         self._direct_request_ids: dict[tuple[str, str, str, str], str] = {}
         self._deploy_state = {"status": "idle"}
@@ -337,7 +321,7 @@ class QLPrinterPlugin:
             "start": ([], "启动卡片"),
             "stop": ([], "停止卡片"),
             "info": ([], "查看卡片配置是否完整"),
-            "config": (["bridge_url", "remote_start_user", "printer_name"], "保存前台 SSH 配置"),
+            "config": (["bridge_url", "remote_start_user", "remote_start_password", "visitor_page_url", "printer_name"], "保存前台 SSH 配置"),
             "list": ([], "列出今天全部未入场访客，供打印前核对姓名、被访人、时间和手机号后四位"),
             "print": (["name", "host"], "从今天未入场访客列表中按姓名和被访人唯一匹配并打印；ticket 和防重复编号由卡片内部处理"),
         }
@@ -355,12 +339,13 @@ class QLPrinterPlugin:
             "print_timeout_s": {"type": "number"},
             "remote_start_user": {"type": "string"},
             "remote_start_port": {"type": "integer"},
-            "remote_start_key_path": {"type": "string"},
+            "remote_start_password": {"type": "string"},
+            "visitor_page_url": {"type": "string"},
             "deployment_id": {"type": "string"},
         }
         actions["config"][0].append("printer_name")
-        actions["printers"] = (["bridge_url", "remote_start_user"], "通过 SSH 读取目标电脑已安装的打印机")
-        actions["initialize"] = (["bridge_url", "remote_start_user"], "通过 SSH 准备目标电脑，仅在安装设置时使用")
+        actions["printers"] = (["bridge_url", "remote_start_user", "remote_start_password"], "通过 SSH 读取目标电脑的网页和打印机")
+        actions["initialize"] = (["bridge_url", "remote_start_user", "remote_start_password"], "通过 SSH 准备目标电脑，仅在安装设置时使用")
         actions["initialize_status"] = (["deployment_id"], "读取本次初始化进度")
         definition = tool(
             TOOL_NAME,
@@ -387,8 +372,21 @@ class QLPrinterPlugin:
                     "type": "string", "title": "Windows SSH 用户名", "scope": "shared",
                     "default": "4paradigm",
                 },
+                "remote_start_password": {
+                    "type": "string", "title": "Windows SSH 密码", "scope": "shared",
+                    "format": "password", "x-sensitive": True,
+                },
+                "remote_start_port": {
+                    "type": "integer", "title": "SSH 端口", "scope": "shared",
+                    "default": 22, "advanced": True,
+                },
+                "visitor_page_url": {
+                    "type": "string", "title": "已登录的访客网页", "scope": "instance",
+                    "format": "edge-page",
+                    "description": "一定选择已经登录、并且能看到访客列表的网页",
+                },
             },
-            "required": ["bridge_url", "remote_start_user"],
+            "required": ["bridge_url", "remote_start_user", "remote_start_password", "visitor_page_url", "printer_name"],
         }
         return definition
 
@@ -439,7 +437,9 @@ class QLPrinterPlugin:
             return {"status": "error", "code": exc.code, "error": str(exc)}
 
     def _configured(self) -> bool:
-        return bool(self._cfg["bridge_url"] and self._cfg["remote_start_user"])
+        return bool(self._cfg["bridge_url"] and self._cfg["remote_start_user"] and
+                    self._cfg["remote_start_password"] and self._cfg["visitor_page_url"] and
+                    self._cfg["printer_name"])
 
     def _client(self, cfg: dict | None = None) -> SSHBridgeClient:
         with self._lock:
@@ -449,7 +449,7 @@ class QLPrinterPlugin:
         parsed = urllib.parse.urlparse(effective["bridge_url"])
         return SSHBridgeClient(
             parsed.hostname or "", effective["remote_start_user"],
-            effective["remote_start_key_path"], effective["remote_start_port"],
+            effective["remote_start_password"], effective["remote_start_port"],
             effective["print_timeout_s"],
         )
 
@@ -465,8 +465,10 @@ class QLPrinterPlugin:
             update["bridge_url"] = url
         if "remote_start_user" in args:
             update["remote_start_user"] = str(args["remote_start_user"] or "").strip()
-        if "remote_start_key_path" in args:
-            update["remote_start_key_path"] = str(args["remote_start_key_path"] or "").strip()
+        if "remote_start_password" in args:
+            update["remote_start_password"] = str(args["remote_start_password"] or "")
+        if "visitor_page_url" in args:
+            update["visitor_page_url"] = str(args["visitor_page_url"] or "").strip()
         if "remote_start_port" in args and args["remote_start_port"] not in (None, ""):
             try:
                 update["remote_start_port"] = min(65535, max(1, int(args["remote_start_port"])))
@@ -500,7 +502,10 @@ class QLPrinterPlugin:
                 from .bridge_deploy import deploy
                 result = deploy(config)
             except Exception as exc:
-                detail = str(exc).replace(str(config.get('token') or '\0'), '[REDACTED]')
+                secret = str(config.get('remote_start_password') or '')
+                detail = str(exc)
+                if secret:
+                    detail = detail.replace(secret, '[REDACTED]')
                 result = {"status": "error", "error": "初始化失败：" + detail[:1600]}
             with self._lock:
                 self._deploy_state = {**result, "deployment_id": deployment_id}
@@ -526,13 +531,16 @@ class QLPrinterPlugin:
             cfg = dict(self._cfg)
         url = _normalize_bridge_url(args.get("bridge_url", cfg["bridge_url"]))
         user = str(args.get("remote_start_user", cfg["remote_start_user"]) or "").strip()
-        if not url or not user:
-            return {"status": "error", "code": "not_configured", "error": "请填写前台电脑 IP 和 Windows SSH 用户名"}
-        client = self._client({"bridge_url": url, "remote_start_user": user})
+        password = str(args.get("remote_start_password", cfg["remote_start_password"]) or "")
+        port = args.get("remote_start_port", cfg["remote_start_port"])
+        if not url or not user or not password:
+            return {"status": "error", "code": "not_configured", "error": "请填写前台电脑 IP、Windows 用户名和密码"}
+        client = self._client({"bridge_url": url, "remote_start_user": user,
+                               "remote_start_password": password, "remote_start_port": port})
         return client.request("POST", "/printers", body={})
 
     def _daily_visits(self) -> tuple[str, list[dict]]:
-        payload = self._client().request("POST", "/list_visits", body={})
+        payload = self._client().request("POST", "/list_visits", body={"visitor_page_url": self._cfg["visitor_page_url"]})
         visits = [_visit(v) for v in payload.get("visits") or [] if isinstance(v, dict)]
         visits = [v for v in visits if v["ticket"]]
         return str(payload.get("date") or ""), visits
@@ -558,7 +566,8 @@ class QLPrinterPlugin:
         payload = self._client().request(
             "POST",
             "/print_tag",
-            body={"ticket": ticket, "request_id": request_id, "printer_name": self._cfg["printer_name"]},
+            body={"ticket": ticket, "request_id": request_id, "printer_name": self._cfg["printer_name"],
+                  "visitor_page_url": self._cfg["visitor_page_url"]},
             timeout_s=print_timeout_s,
         )
         if payload.get("ok") is True:

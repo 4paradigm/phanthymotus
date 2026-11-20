@@ -7,13 +7,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SERVICE_FILE = ROOT / "perception" / "deploy" / "service.yml"
 
 
-def test_service_template_mounts_robot_specific_printer_credentials_read_only():
+def test_service_template_does_not_require_robot_specific_printer_credentials():
     service_document = yaml.safe_load(SERVICE_FILE.read_text(encoding="utf-8"))
     perception = service_document["perception"]
-    assert (
-        "/opt/phanthy-motus/secrets/ql_printer:"
-        "/run/ql-printer-auth:ro"
-    ) in perception["volumes"]
+    assert not any("ql_printer" in volume for volume in perception["volumes"])
 
 
 def test_documentation_does_not_tell_operators_to_commit_private_keys():
