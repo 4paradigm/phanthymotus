@@ -3,7 +3,8 @@
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
 `echo_cancellation` echo handling), vision (`vop` object detection, `visual_depth`
 monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
-`barcode` QR/条码扫码).
+`barcode` QR/条码扫码), and data (`table_db`: a table store skills share —
+spreadsheet import, CRUD and counts on SQLite).
 Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
@@ -4595,4 +4596,47 @@ autoload on, **176 passed** with it off.
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
+```
+
+## `table_db` 卡片
+
+给所有 skill 共用的**表格数据库**。skill 指定自己的库（`db`，建议用 skill slug）和表名，就能：
+- 把飞书发来的 xlsx / csv（兼容 Word 里的表格，单元格可以有图片）一次导入；
+- 在运行中增删改查、分组计数。
+
+编号 `_id` 和计数由卡片保证，不再让模型读写 JSON 文件。卡片只负责存取，不判断业务含义，也不调用其他卡片。
+
+> 模型要看得到这张卡，必须在画布上把决策卡的「连接执行器」连到它（与其它卡相同）。
+
+| 动作 | 参数（都要 `table`，`db` 可选） | 返回 |
+|---|---|---|
+| `create` | `columns: [{"name","type":"text|file"}]` | 列定义 |
+| `import` | `path`（飞书文件填 `files[].path`）、`mode`（create/append）、`header_row`、`dry_run`、`request_id` | 识别出的列、`imported`、`files`、空行、前 3 条样例 |
+| `append` | `records`（≤500 条，只写文字列）、`request_id` | `ids` |
+| `query` | `where`、`offset`、`limit`（≤200） | `total`、`has_more`、`records` |
+| `update` | `_id`、`set` | 修改后的记录 |
+| `delete` | `_id` | 软删除 |
+| `stats` | `where`、`group_by` | `total`、`groups` |
+| `attach_file` | `_id`、`column`、`path` | 文件信息 |
+| `get_file` | `file_id` | 本容器内的临时路径（24 小时），可直接作为 face / ocr / vop 的 `image_path` |
+| `export_files` | `column`、`name_column`、`profile_columns`、`where` | 目录（文件 + manifest.json），交给 `face_recognition.register_by_corpus` |
+
+**存储方式**
+- 列只有两种：`text`（文字），以及 `file`（图片、PDF、音频等非文字内容）。
+- `file` 以 BLOB 存在同一个 SQLite 文件里，相同内容只存一份；记录中显示为 `{file_id, name, mime, size}`。
+- 记录和文件在同一个事务里提交或回滚，所以一个库就是一个文件，复制即备份。
+
+**失败返回**：统一为 `{"ok":false,"reason","detail","row"?,"column"?,"written":0}`，写入整批回滚。
+
+**错误码**
+`bad_request`、`unknown_table`、`table_exists`、`unknown_column`、`not_found`、`invalid_header`、
+`invalid_value`、`legacy_format`、`unsupported_format`、`unreadable`、`empty`、`too_large`、
+`request_conflict`、`busy`、`internal_error`。
+
+**防注入**：用户给的表名、列名只作为数据存在元数据表里，物理表名和列名由卡片生成，所有值都通过参数绑定传入。
+
+**存放位置**：数据在 `/models/table_db/<db>.db`，`/models` 是宿主机目录，所以重启或重新部署都不会丢。各项上限在 `config.yaml` 的 `plugins.table_db` 下配置。
+
+```Bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_table_db*.py -q
 ```

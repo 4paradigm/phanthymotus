@@ -12,6 +12,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
+  table_db         表格数据库（导入 xlsx/csv，增删改查与计数，SQLite，只用标准库）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
@@ -265,6 +266,15 @@ class PerceptionBundle:
             # plugin that fails to load and silently disappears.
             self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
             log.info("BarcodeScanPlugin loaded")
+
+        # Standard library only (sqlite3 + zipfile): nothing to download, so the
+        # constructor cannot fail on a machine without extra wheels. Lives here,
+        # not in agent-core, because the files it hands out must be readable by
+        # face_recognition / ocr / vop under this container's /models.
+        if plugins_cfg.get("table_db", {}).get("enabled", False):
+            from plugins.table_db import TableDbPlugin
+            self._plugins.append(TableDbPlugin(plugins_cfg.get("table_db", {}), executor))
+            log.info("TableDbPlugin loaded")
 
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin
