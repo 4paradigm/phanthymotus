@@ -164,3 +164,43 @@ def camera_id(declaration: dict) -> str:
     if not isinstance(declaration, dict):
         return ""
     return str(declaration.get("id") or "")
+
+
+def mount_topic(vendor):
+    """Resolve the dynamic transform only from the bound depth camera's declaration."""
+    mount = vendor.get("body_mount")
+    if (not isinstance(mount, dict) or mount.get("schema") != "motus.camera_mount/1"
+            or mount.get("mode") != "dynamic" or mount.get("length_unit") != "m"
+            or mount.get("parent_frame") not in ("base_link", "base_footprint", "body")
+            or mount.get("transform_direction") != "body_from_camera"
+            or mount.get("child_frame") != vendor.get("frame_id")
+            or not all(isinstance(value, str) and value for value in
+                       (mount.get("topic"), mount.get("epoch"), mount.get("version"),
+                        vendor.get("frame_id"), vendor.get("clock_id")))):
+        return None
+    return mount["topic"]
+
+
+def capture_mount(vendor, sample):
+    """Read a rigid body-from-camera transform for one identified measurement."""
+    import numpy as np
+
+    if not mount_topic(vendor):
+        return None
+    declared = vendor["body_mount"]
+    if (sample.get("status") != "available" or sample.get("stamp_source") != "measurement"
+            or sample.get("clock_id") != vendor["clock_id"]
+            or any(sample.get(key) != declared[key] for key in
+                   ("schema", "mode", "length_unit", "transform_direction", "parent_frame",
+                    "child_frame", "epoch", "version"))):
+        return None
+    try:
+        mat = np.asarray(sample.get("matrix"), dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (mat.shape != (4, 4) or not np.isfinite(mat).all()
+            or not np.allclose(mat[3], (0, 0, 0, 1), atol=1e-6)
+            or not np.allclose(mat[:3, :3].T @ mat[:3, :3], np.eye(3), atol=1e-5)
+            or not math.isclose(np.linalg.det(mat[:3, :3]), 1., abs_tol=1e-5)):
+        return None
+    return mat, declared.get("accuracy_validated") is True and sample.get("accuracy_validated") is True

@@ -32,9 +32,62 @@ class ScanCommand:
 
 
 @dataclass
+class ObservedObstacles:
+    """Occupied cells from an observed foreground obstacle, in one odometry frame."""
+    frame: tuple | None = None
+    cells: set = field(default_factory=set)
+    last_source: int = 0
+
+    def remember(self, pose, occupied):
+        if not occupied.any():
+            return
+        self.frame = pose.frame
+        forward, left = FORWARD[occupied], -RIGHT[occupied]
+        c, s = math.cos(pose.yaw), math.sin(pose.yaw)
+        x = pose.x + c * forward - s * left
+        y = pose.y + s * forward + c * left
+        self.cells.update(zip(np.rint(x / RESOLUTION).astype(int),
+                              np.rint(y / RESOLUTION).astype(int)))
+
+    def project(self, pose, observed_free=None):
+        if not self.cells or pose is None or pose.frame != self.frame:
+            return None
+        cells = np.array(list(self.cells))
+        x, y = (cells * RESOLUTION - (pose.x, pose.y)).T
+        # Keep hazards near the robot even while they are behind the optical view.
+        nearby = np.hypot(x, y) <= math.hypot(FORWARD.max(), RIGHT.max()) + RESOLUTION
+        if not nearby.all():
+            self.cells = set(map(tuple, cells[nearby]))
+            cells, x, y = cells[nearby], x[nearby], y[nearby]
+        c, s = math.cos(pose.yaw), math.sin(pose.yaw)
+        row = (x * c + y * s) / RESOLUTION + START[0]
+        col = (x * s - y * c) / RESOLUTION + START[1]
+        indices = []
+        cleared = np.full(len(x), observed_free is not None, dtype=bool)
+        # Reproject conservatively across cell boundaries.
+        for r in (np.floor(row), np.ceil(row)):
+            for k in (np.floor(col), np.ceil(col)):
+                inside = (r >= 0) & (r < SHAPE[0]) & (k >= 0) & (k < SHAPE[1])
+                r, k = r.astype(int), k.astype(int)
+                indices.append((r, k, inside))
+                if observed_free is not None:
+                    cleared &= inside
+                    cleared[inside] &= observed_free[r[inside], k[inside]]
+        if cleared.any():
+            self.cells.difference_update(map(tuple, cells[cleared]))
+        hits = np.zeros(SHAPE, dtype=bool)
+        for r, k, inside in indices:
+            keep = inside & ~cleared
+            hits[r[keep], k[keep]] = True
+        return hits
+
+
+@dataclass
 class ActiveScan:
     """Reuse recent front views around one obstacle, with measured body motion."""
 
+    obstacles: ObservedObstacles = field(default_factory=ObservedObstacles)
+    historical_hits: np.ndarray | None = None
     phase: str = "idle"
     attempted: bool = False
     locked: bool = False
@@ -260,6 +313,12 @@ class ActiveScan:
         return None
 
     def grid(self):
+        free, hits = self.observed_grid()
+        if self.historical_hits is None:
+            return free, hits
+        return free & ~self.historical_hits, hits | self.historical_hits
+
+    def observed_grid(self):
         """Reproject nearby views. Occupation wins, and free cells need support."""
         if self.receipt_only:
             frame, pose, free, occupied = self.views[-1]
@@ -369,25 +428,35 @@ class ActiveScan:
         if (self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
-        if self.receipt_only and (speed > STILL_LINEAR or self.phase == "brake_for_replan"):
+        if (self.receipt_only and speed > STILL_LINEAR) or self.phase == "brake_for_replan":
             self.phase = "brake_for_replan"
             if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
                 self.settle_ms = None
                 return ScanCommand(reason="主动观察：检测到平移，停车后重规划")
             if self.settle_ms is None:
                 self.settle_ms = stamp
+                self.settle_start_source = self.source_frame
             if stamp - self.settle_ms < SETTLE_MS or self.current_frame <= self.settle_ms:
                 return ScanCommand(reason="主动观察：等待停稳后的观测")
-            # Fresh inputs can re-open a scan interrupted by a gap. Keep the
-            # attempt consumed after measured drift or a turn without progress.
             if self.rerouted and self.advance_origin is None:
                 self.locked = True
                 return self.interrupt("主动观察：替代路线尚未前进，停车等待新导航指令")
-            if self.retry_after_hold:
+            # Residual braking motion before the first yaw never executed the
+            # planned turn. Replan only with a distinct depth after settling.
+            fresh_source = (self.settle_start_source is not None and self.source_frame is not None
+                            and self.source_frame > self.settle_start_source)
+            fresh_depth = not self.receipt_only or fresh_source
+            released_route = self.route_segment and self.advance_origin is not None
+            if released_route and not self.retry_after_hold and not fresh_depth:
+                if self.settle_start_source is None:
+                    self.settle_start_source = self.source_frame
+                return ScanCommand(reason="主动观察：等待停稳后的观测")
+            if self.retry_after_hold or (fresh_depth and (not self.issued_yaw or released_route)):
                 self.attempted = False
                 self.retry_after_hold = False
             self.phase = "idle"
             self.issued_yaw = False
+            self.settle_ms = None
             return ScanCommand(reason="主动观察：已停稳，重新规划")
         if speed > STILL_LINEAR:
             return self.interrupt("主动观察：检测到平移，停车")

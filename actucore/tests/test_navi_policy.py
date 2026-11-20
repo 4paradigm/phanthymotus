@@ -2934,6 +2934,130 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     pytest.fail("The segment neither completed nor held for the newly observed obstruction")
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_detour_first_leg_passes_the_obstacle_at_the_permitted_heading_error(side):
+    from plugins.navi import active_scan, local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275, clearance_margin_m=.1)
+    state = _state()
+    scan = state.active_scan
+    scan.receipt_only = True
+    occupied = np.isclose(local_path.FORWARD, 1.7) & (side * local_path.RIGHT >= -.25) & (side * local_path.RIGHT <= -.05)
+    scan.current_frame = 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    observation = dict(frame_id=1000, map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool))
+    assert P._start_detour_segment(observation, config, state, geometry, 1.7, (side,), 5., .16 * side)
+    forward, right = state.view_detour.points[1]
+    assert forward >= 1.7 and side * right > 0
+    heading = math.atan2(right, forward)
+    # The hardware may settle two degrees short. A newly projected occupied cell
+    # can also move laterally by one grid cell when the grid axes rotate.
+    assert local_path.segment_clear(occupied, geometry, .375 + local_path.RESOLUTION,
+                                    heading - side * active_scan.ANGLE_TOLERANCE, scan.advance_m)
+
+
+def test_initial_route_points_at_measured_opening_between_offset_jambs():
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(320, 247, 159.5), (240, 247, 115), .275)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275, clearance_margin_m=.10)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    occupied = (np.isclose(local_path.FORWARD, 1.) &
+                ((local_path.RIGHT <= -.349) | (local_path.RIGHT >= .549)))
+    scan.current_frame = 1000
+    scan.receipt_only = True
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    rays = (np.arange(320) - 159.5) / 247
+    frame = np.broadcast_to(np.where((rays < -.35) | (rays > .55), 1., 4.), (240, 320))
+    observation = dict(frame_id=1000, map=frame, ground=np.ones_like(frame, dtype=bool))
+
+    assert P._start_detour_segment(observation, config, state, geometry, 1., (1., -1.), 4., 0.)
+    assert scan.directions[0] * scan.turn_angle == pytest.approx(math.atan2(.1, 1.))
+    assert scan.advance_m > .3
+
+
+@pytest.mark.parametrize("scene", ["too_narrow", "one_jamb", "missing_rays", "near_returns", "target_outside"])
+def test_centering_requires_two_observed_jambs_and_returns_beyond_the_opening(scene):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(320, 247, 159.5), (240, 247, 115), .275)
+    left = local_path.RIGHT <= -.349
+    right = local_path.RIGHT >= (.299 if scene == "too_narrow" else .549)
+    occupied = np.isclose(local_path.FORWARD, 1.) & (left if scene == "one_jamb" else left | right)
+    frame = np.full((240, 320), 4.)
+    if scene in ("missing_rays", "near_returns"):
+        frame[:, 154:168] = np.nan if scene == "missing_rays" else .9
+    target = (4., -3.) if scene == "target_outside" else (4., 0.)
+    assert local_path.opening_route(frame, occupied, geometry, .375, 1., target) is None
+
+
+@pytest.mark.parametrize("source_at_stop", [1100, None])
+def test_shortened_obstacle_braking_room_replans_an_executing_segment_from_stopped_depth(source_at_stop):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 493, 318), (480, 493, 229), .275)
+    config = _cfg(local_planning=True, local_geometry=geometry)
+    state = _state(motion_source="measured", commanded=(.15, 0., 0.))
+    scan = state.active_scan
+    scan.phase, scan.receipt_only, scan.route_segment = "evaluate", True, True
+    scan.attempted = scan.issued_yaw = True
+    scan.advance_origin, scan.advance_m, scan.pose = (0., 0., 0.), 1.55, (.96, 0., 0.)
+    frame = np.ones((4, 4))
+
+    def update(stamp, source, vx):
+        obs = dict(map=frame, ground=frame.astype(bool), frame_id=stamp, source_frame_id=source)
+        odom = dict(vx=vx, vy=0., wz=0., received_ms=stamp)
+        scan.update(obs, odom, geometry, receipt_only=True, max_depth_age_ms=800)
+        return obs, odom
+
+    view, motion = update(1000, 1000, .15)
+    result = P._advance_after_scan(view, config, state, motion, .79, 1., .72, 3.5, .1,
+                                   target_bearing=.1)
+    assert result[:3] == (0., 0., 0.)
+    assert scan.phase == "brake_for_replan"
+    for stamp, source in ((1100, source_at_stop), (1300, 1100)):
+        update(stamp, source, 0.)
+        assert scan.command(geometry, .375, 1., 500).yaw == 0.
+        assert scan.active and scan.attempted
+    update(1400, 1400, 0.)
+    assert scan.command(geometry, .375, 1., 500).yaw == 0.
+    assert not scan.active and not scan.attempted
+
+
+@pytest.mark.parametrize("post_side", [-1., 1.])
+@pytest.mark.parametrize("range_offset,expected", [(.004, -1.), (.35, 1.)])
+def test_similar_side_ranges_prefer_the_side_away_from_the_measured_post(monkeypatch, post_side, range_offset, expected):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275, clearance_margin_m=.10)
+    state = _state()
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    columns = post_side * local_path.RIGHT
+    occupied = np.isclose(local_path.FORWARD, 1.4) & (columns >= .2) & (columns <= .4)
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    monkeypatch.setattr(P, "_clearance", lambda obs, cfg, lateral_offset_m=0.:
+                        ((4.9 + math.copysign(range_offset, lateral_offset_m * post_side))
+                         if lateral_offset_m else 1.4, .52))
+    obs = dict(frame_id=1000, map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool))
+    P._avoid(.25, 0., 0., obs, config, P.APPROACHING, "", state, target_distance=4.9,
+             target_bearing=.16 * post_side, may_scan=True)
+    assert scan.route_segment and scan.directions == (expected * post_side,)
+
+
 def test_synchronized_reroute_requires_the_evaluated_capture():
     from plugins.navi.active_scan import ActiveScan
 
@@ -3720,3 +3844,98 @@ def test_command_only_cannot_reuse_a_frozen_depth_frame(monkeypatch):
     assert tick(1801, 100).status == P.BLIND
     assert tick(1802, 99).status == P.BLIND
     assert tick(1803, 101).values[0] > 0.
+
+
+def test_visible_foreground_triggers_detour_before_slowdown_then_survives_blind_view(monkeypatch):
+    from plugins.navi.odom import PlanarPose
+    from plugins.navi import active_scan, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
+    cfg = _cfg(scan_geometry=geom, local_geometry=geom, local_planning=True, use_lateral=False, slow_distance_m=1.5)
+    state = _state()
+    scan = state.active_scan
+    visible = np.zeros(local_path.SHAPE, dtype=bool)
+    hits = visible.copy()
+    hits[local_path.START[0]+38, local_path.START[1]] = True
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (visible.copy(), hits.copy()))
+    monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0.: (depth["ahead"], .95))
+    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (visible.copy(), hits.copy()))
+    image = np.ones((48, 64))
+
+    def tick(stamp, distance, x, frame="room"):
+        pose = PlanarPose(stamp, (frame,), x, 0., 0.)
+        odom = dict(vx=0., vy=0., wz=0., received_ms=stamp, obstacle_pose=pose)
+        obs = dict(map=image, ground=image.astype(bool), frame_id=stamp, source_frame_id=stamp,
+                   ahead=distance, obstacle_capture_pose=pose)
+        scan.update(obs, odom, geom, receipt_only=True)
+        return P._avoid(.3, 0., 0., obs, cfg, P.APPROACHING, "target", state,
+                        target_distance=3., target_bearing=0., odom=odom, may_scan=True)
+
+    command = tick(1000, 1.90, 0.)
+    assert command[0] == 0 and scan.active
+    # An interrupted observation returned to idle after braking on the robot.
+    scan.interrupt()
+    hits[:] = False
+    assert tick(2000, 2.70, .35)[0] == 0
+    assert tick(3000, 2.70, .35, frame="new segment")[0] == 0
+
+
+def test_no_cold_approach_when_depth_has_no_ground_for_local_geometry():
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+    geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
+    cfg = _cfg(local_planning=True, local_geometry=geom)
+    decision = P._avoid(.3, 0., 0., {"map": np.full((48, 64), 3.), "frame_id": 1200,
+                                         "body_mount_required": True}, cfg,
+                        P.APPROACHING, "", _state(), target_distance=3., may_scan=True)
+    assert decision[:3] == (0., 0., 0.)
+
+
+def test_dynamic_head_facing_sideways_does_not_authorize_forward_navigation():
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.odom import PlanarPose
+
+    geo = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
+    cfg = _cfg(local_planning=True, local_geometry=geo)
+    pose = PlanarPose(1200, ("odom",), 0., 0., 0.)
+    lateral = geo.base_from_optical.copy()
+    lateral[:2] = np.array([[0., -1.], [1., 0.]]) @ lateral[:2]
+    depth = dict(map=np.full((48,64), 3.), ground=np.ones((48,64), dtype=bool),
+                 frame_id=1200, source_frame_id=1200, body_mount_required=True,
+                 body_from_optical=lateral, obstacle_capture_pose=pose)
+    feedback = dict(vx=0., vy=0., wz=0., received_ms=1200, obstacle_pose=pose)
+    result = P.step(detections=_detections(_obj()), depth=depth, odom=feedback,
+                    state=_state(), config=cfg, dt=.1)
+    assert result.values == [0.] * 6 and "朝向" in result.reason
+
+
+def test_foreground_in_bottom_of_depth_image_is_remembered_before_it_disappears(monkeypatch):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.odom import PlanarPose
+
+    geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
+    cfg = _cfg(local_planning=True, local_geometry=geom, scan_geometry=geom)
+    state = _state()
+    scan = state.active_scan
+    pose = PlanarPose(1100, ("room",), 0., 0., 0.)
+    img = np.full((48, 64), 4.8)
+    img[-4:, 28:36] = 1.4
+    ground = np.zeros_like(img, dtype=bool)
+    ground[-5:, :24] = True
+    depth = dict(map=img, ground=ground, frame_id=1100, source_frame_id=1100, obstacle_capture_pose=pose)
+    feedback = dict(obstacle_pose=pose, received_ms=1100, vx=0., vy=0., wz=0.)
+    scan.update(depth, feedback, geom, receipt_only=True)
+    # Isolate the real control path after a confirmed full-frame projected hit.
+    # The centre-band clearance excludes the bottom of the image.
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (4.8, 1.))
+    hit = (abs(local_path.RIGHT) < .06) & (abs(local_path.FORWARD-1.4) < .03)
+    # A second measured obstruction must survive the first one leaving the corridor.
+    hit |= (abs(local_path.RIGHT) < .06) & (abs(local_path.FORWARD-1.9) < .03)
+    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~hit, hit))
+    decision = P._avoid(.3, 0., 0., depth, cfg, P.APPROACHING, "", state, target_distance=4.8,
+                        target_bearing=0., may_scan=True, odom=feedback)
+    assert decision[0] == 0. and scan.obstacles.cells
+    assert scan.obstacles.project(pose)[local_path.START[0]+38, local_path.START[1]]

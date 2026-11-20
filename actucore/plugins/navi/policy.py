@@ -59,14 +59,14 @@ protects an interrupted command stream.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 import numpy as np
 
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
-from .active_scan import ANGLE, ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
+from .active_scan import ANGLE, ANGLE_TOLERANCE, ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
 from .track import Track, Tracker
 from . import local_path
 from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
@@ -978,6 +978,12 @@ def _band_of(bearing: float) -> str:
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
     state.view_detour = None
+    if (config.local_planning and config.local_geometry is not None and (depth or {}).get("body_mount_required")
+            and depth.get("body_from_optical") is not None):
+        # The exposure, not the current head angle, defines the body-frame grid.
+        geometry = replace(config.local_geometry, base_from_optical=depth["body_from_optical"],
+                           free_space_validated=depth.get("mount_accuracy_validated") is True)
+        config = replace(config, scan_geometry=geometry, local_geometry=geometry)
     decision = _decide(detections, depth, odom, config, state, dt)
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
@@ -1181,7 +1187,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 hold = previous_scan.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
                 return Decision(_twist(0, 0, 0), AVOIDING, hold.reason)
             previous_scan.invalidate()
-            state.active_scan = ActiveScan(attempted=previous_scan.attempted, locked=previous_scan.locked)
+            state.active_scan = ActiveScan(attempted=previous_scan.attempted, locked=previous_scan.locked,
+                                           obstacles=previous_scan.obstacles)
             if needs_guard:
                 state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
         state.motion_source = source
@@ -1198,6 +1205,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 state.command_tail = (0., 0., 0.)
 
         scan = state.active_scan
+        obstacle_pose = (odom or {}).get("obstacle_pose")
+        if not (depth or {}).get("body_mount_required"):
+            obstacle_pose = obstacle_pose or (odom or {}).get("motion_pose")
+        scan.historical_hits = scan.obstacles.project(obstacle_pose)
+        if scan.obstacles.cells and scan.historical_hits is None:
+            return Decision(_twist(0., 0., 0.), AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车")
+        if (depth or {}).get("body_mount_required") and (
+                depth.get("body_from_optical") is None or depth.get("obstacle_capture_pose") is None
+                or obstacle_pose is None or depth["obstacle_capture_pose"].frame != obstacle_pose.frame):
+            if scan.active and not scan.command_only:
+                scan.hold_for_replan("主动观察：等候深度、外参与位姿配对")
+            return Decision(_twist(0., 0., 0.), AVOIDING, "等候同一深度帧的相机外参与底盘位姿")
+        if (depth or {}).get("body_mount_required") and config.local_geometry.base_from_optical[0, 2] < .75:
+            if scan.active and not scan.command_only:
+                scan.hold_for_replan("主动观察：等候头部恢复前向观测")
+            return Decision(_twist(0., 0., 0.), AVOIDING, "相机朝向未覆盖车体前方，停车")
         was_scanning = scan.active
         can_align = (config.scan_geometry is not None and (depth or {}).get("capture_ms")
                      and (odom or {}).get("stamp_ms"))
@@ -1784,7 +1807,7 @@ def _local_velocity_limits(config, side):
 
 
 def _start_detour_segment(depth, config, state, geometry, ahead, directions, target_distance, target_bearing,
-                          *, reroute=False):
+                          *, reroute=False, rooms=None):
     scan = state.active_scan
     grid = scan.grid()
     _, occupied = grid
@@ -1800,11 +1823,36 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
         target_f, target_left = geometry.base_from_optical[:2, :3] @ (right, 0., forward)
         target = (target_f, -target_left)
     keep = _keepout_m(config)
-    for side in directions:
-        plan = state.local_plan.route(observation, geometry, keep, ahead, side,
-                                      config.depth_age_limit_ms, config.watchdog_ms)
-        if plan is None:
-            continue
+    # Prefer an A* passing lane with enough room for the turn to settle.
+    # A tight passage may still have a feasible shorter leg at the normal width.
+    plane = ahead * geometry.base_from_optical[0, 2] + geometry.base_from_optical[0, 3]
+    turning_room = local_path.RESOLUTION + max(0., plane) * math.tan(ANGLE_TOLERANCE)
+    if rooms and not state.escape_side and not reroute:
+        left, right = rooms[-1.], rooms[1.]
+        if (min(left[1], right[1]) >= config.coverage_min and left[0] is not None and right[0] is not None
+                and min(left[0], right[0]) >= config.side_clearance_m
+                and abs(left[0] - right[0]) < SIDE_SWITCH_ADVANTAGE_M):
+            # A low off-centre post can miss both image-side depth bands.
+            # Rank its measured body-grid position before insignificant range differences.
+            side = directions[0]
+            across = RIGHT[occupied & (abs(FORWARD - plane) <= .10) & (abs(RIGHT) <= keep)]
+            if across.size and np.all(side * across > local_path.RESOLUTION / 2):
+                directions = tuple(reversed(directions))
+
+    def candidates():
+        opening = local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target)
+        if opening is not None:
+            yield opening
+        for side in directions:
+            plan = state.local_plan.route(observation, geometry, keep + turning_room, ahead, side,
+                                          config.depth_age_limit_ms, config.watchdog_ms)
+            if plan is None:
+                plan = state.local_plan.route(observation, geometry, keep, ahead, side,
+                                              config.depth_age_limit_ms, config.watchdog_ms)
+            if plan is not None:
+                yield plan
+
+    for plan in candidates():
         for index in range(len(plan.points) - 1, 0, -1):
             forward, right = plan.points[index]
             if forward <= 0.:
@@ -1817,13 +1865,48 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                 along = min(length, max(0., target[0] * f + target[1] * r))
                 if math.hypot(target[0] - along * f, target[1] - along * r) < config.stop_distance_m:
                     continue
-            if (local_path.segment_clear(occupied, geometry, keep, angle, length)
+            if (local_path.segment_clear(occupied, geometry, keep, angle, length,
+                                         heading_tolerance=ANGLE_TOLERANCE if angle else 0.)
                     and scan.clear_sweep(geometry, keep, angle, 0., occupied=occupied)
                     and scan.begin((math.copysign(1., angle),), advance_m=length,
                                    turn_angle=abs(angle), route_segment=True, reroute=reroute)):
                 state.view_detour = local_path.Detour(None, (plan.points[0], *plan.points[index:]), geometry)
                 return True
     return False
+
+
+def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan):
+    lookahead = FORWARD[-1, 0] - geometry.rear - .25
+    corridor = (abs(RIGHT) <= _keepout_m(config)) & (FORWARD >= 0.) & (FORWARD <= lookahead)
+    transform = geometry.base_from_optical
+    memory = scan.obstacles
+    source = depth.get("source_stamp_ns") or depth.get("source_frame_id") or depth.get("capture_ms")
+    max_depth = target_distance - FORWARD_CLEARANCE_MARGIN_M if target_distance is not None else None
+    verified = (not scan.receipt_only and geometry.free_space_validated
+                and geometry is config.scan_geometry and scan.current_frame == depth.get("capture_ms"))
+    capture_pose = depth.get("obstacle_capture_pose")
+    if (capture_pose is None and not depth.get("body_mount_required")
+            and pose.stamp_ms == depth.get("capture_ms")):
+        capture_pose = pose
+    if (geometry is config.scan_geometry and scan.current_frame and type(source) is int
+            and depth.get("ground") is not None and depth.get("map") is not None
+            and source > memory.last_source and capture_pose is not None
+            and capture_pose.frame == pose.frame and (may_scan or (verified and memory.cells))):
+        # Use the actual exposure, never a fused grid at a later robot pose.
+        free, hits = local_path.observe(depth["map"], geometry, RIGHT, FORWARD,
+                                        local_path.RESOLUTION, depth["ground"],
+                                        max_hit_depth=max_depth)
+        memory.last_source = source
+        if verified and memory.cells:
+            memory.project(capture_pose, observed_free=free)
+        if may_scan and (hits & corridor).any():
+            memory.remember(capture_pose, hits & (FORWARD >= 0.) & (FORWARD <= lookahead))
+    scan.historical_hits = memory.project(pose)
+    if scan.historical_hits is not None:
+        blocked = corridor & scan.historical_hits
+        if blocked.any():
+            return max(0., (float(FORWARD[blocked].min()) - transform[0, 3]) / transform[0, 2])
+    return None
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
@@ -1839,6 +1922,22 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     foreground = (ahead is not None
                   and (target_distance is None or depth.get("map") is None
                        or ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance))
+    scan = state.active_scan if config.local_planning and state is not None else None
+    geometry = config.scan_geometry or config.local_geometry
+    pose = (odom or {}).get("obstacle_pose") or (odom or {}).get("motion_pose")
+    if (scan is not None and geometry is not None and depth.get("map") is not None
+            and (depth.get("body_mount_required") or pose is not None or scan.obstacles.cells)
+            and depth.get("ground") is None and (vx or vy)):
+        return 0., 0., 0., AVOIDING, "缺少地面观测，停车等待可检查的走廊"
+    plan_obstacle = False
+    if scan is not None and geometry is not None and pose is not None:
+        if scan.obstacles.cells and scan.obstacles.frame != pose.frame:
+            return 0., 0., 0., AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车"
+        remembered = _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan)
+        if remembered is not None:
+            ahead = remembered if ahead is None else min(ahead, remembered)
+            foreground = plan_obstacle = True
+            state.last_clearance = ahead
     stop = config.obstacle_stop_m
     slow = config.slow_distance_m
     depth_age_s = config.depth_age_limit_ms / 1000
@@ -1860,17 +1959,16 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
 
     side = 0.0
     local_command = None
-    scan = state.active_scan if config.local_planning and state is not None else None
     if scan is not None and scan.ready and scan.advance_m is not None:
         return _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, target_distance, dt,
                                    target_bearing=target_bearing if may_scan else None)
-    if near or (foreground and approaching):
+    if near or plan_obstacle or (foreground and approaching):
         stationary_line = config.obstacle_stop_m + LOCAL_BLOCKED_APPROACH_BUFFER_M
         brake_at = min(slow, max(stop, stationary_line) if config.local_planning
                        else stop + BLOCKED_APPROACH_BUFFER_M)
         horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
         approach = 0.
-        if (foreground and aligned and depth.get("map") is not None
+        if (not plan_obstacle and foreground and aligned and depth.get("map") is not None
                 and target_distance is not None and brake_at < ahead < slow):
             limit = (ahead - brake_at) / horizon_s
             floor = config.floor_vx
@@ -1900,7 +1998,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         and config.floor_wz <= yaw_rate and yaw_rate > 0
                         and scan.current_frame and not scan.attempted):
                     if _start_detour_segment(depth, config, state, geometry, ahead, order,
-                                             target_distance, target_bearing):
+                                             target_distance, target_bearing, rooms=rooms):
                         return 0., 0., 0., AVOIDING, "局部规划：停车对准路线首段"
                     turn_angle = ANGLE
                     if (not scan.command_only and
@@ -2119,7 +2217,9 @@ def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, targe
                         return 0., 0., 0., AVOIDING, "主动观察：原直行走廊被挡，停车对准新路线首段"
                 scan.interrupt()
                 return 0., 0., 0., AVOIDING, "主动观察：路线首段的直行走廊被挡住"
-        elif ahead is not None and ahead < config.slow_distance_m:
+        elif ((ahead is not None and ahead < config.slow_distance_m)
+              or (scan.historical_hits is not None and not local_path.segment_clear(
+                  scan.historical_hits, geometry, _keepout_m(config), 0., scan.advance_m))):
             if scan.try_other_side():
                 return 0., 0., 0., AVOIDING, "主动观察：尝试另一侧"
             scan.interrupt()
@@ -2143,6 +2243,10 @@ def _advance_after_scan(depth, config, state, odom, ahead, coverage, stop, targe
     floor = config.floor_vx_moving if config.floor_vx_moving is not None else config.floor_vx
     speed = min(config.vx_max, max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS), room / horizon)
     if speed <= 0. or speed < floor or max(motion[0], previous[0]) * horizon > room:
+        if (scan.route_segment and scan.advance_origin is not None and not scan.command_only
+                and ahead is not None and ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance):
+            scan.hold_for_replan("主动观察：直行余量不足，停车后重规划", retry_scan=False)
+            return 0., 0., 0., AVOIDING, "主动观察：直行余量不足，停车后重规划"
         return 0., 0., 0., AVOIDING, "主动观察：停车距离不足"
     if not local_path.transition_clear(scan.grid(), geometry, _keepout_m(config), horizon,
                                        (motion[:2], previous[:2], (speed, 0.))):

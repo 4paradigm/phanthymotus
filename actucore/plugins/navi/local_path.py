@@ -141,7 +141,7 @@ def optical_ground_plane(frame, geometry, ground):
     return np.array([-a, 1., -b]), c
 
 
-def observe(frame, geometry, right, forward, resolution, ground):
+def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None):
     plane = optical_ground_plane(frame, geometry, ground)
     if plane is None:
         return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
@@ -158,11 +158,12 @@ def observe(frame, geometry, right, forward, resolution, ground):
         return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
     floor_z = (c + normal @ origin - normal[0]*forward + normal[1]*right) / normal[2]
     # Check several heights below the declared top of the moving envelope.
-    free = np.ones(right.shape, dtype=bool)
+    free = np.full(right.shape, geometry.free_space_validated, dtype=bool)
     top = geometry.height if geometry.height is not None else abs(c / normal[2])
     if not .02 < top <= 2.5:
         return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
-    for height_m in np.linspace(.02, top, max(4, math.ceil(top/.08))):
+    heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if geometry.free_space_validated else ()
+    for height_m in heights:
         camera_points = (np.stack((forward, -right, floor_z + height_m), axis=-1)
                          - origin) @ rotation
         z = camera_points[..., 2]
@@ -177,6 +178,8 @@ def observe(frame, geometry, right, forward, resolution, ground):
 
     above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
     hits = np.isfinite(frame) & ~ground & (above_floor >= .02)
+    if max_hit_depth is not None:
+        hits &= frame <= max_hit_depth
     if geometry.height is not None:
         hits &= above_floor <= geometry.height + .05
     body_points = np.column_stack((x[hits], y[hits], frame[hits])) @ rotation.T + origin
@@ -197,6 +200,7 @@ class Geometry:
     front: float
     rear: float
     height: float | None
+    free_space_validated: bool = True
 
 
 def camera_square(horizontal, vertical, half_width, *, half_length=None):
@@ -282,7 +286,7 @@ class PlanCache:
         ground = observation.get("ground")
         if frame is None or ground is None or geometry is None:
             return None
-        key = (frame, round(ahead, 2), max_age_ms, watchdog_ms, observation.get("scan_revision"),
+        key = (frame, round(ahead, 2), half_width, max_age_ms, watchdog_ms, observation.get("scan_revision"),
                allow_forward, velocity_limits, observation.get("stop_target"))
         if self.key != key:
             self.key = key
@@ -314,15 +318,62 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities):
     return not (swept & occupied).any()
 
 
-def segment_clear(occupied, geometry, half_width, angle, length):
+def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
     """Check a straight segment with the footprint already facing its heading."""
     cos, sin = math.cos(angle), math.sin(angle)
     f, r = FORWARD[occupied], RIGHT[occupied]
     forward, right = f * cos + r * sin, -f * sin + r * cos
     cell = RESOLUTION / math.sqrt(2)
+    if heading_tolerance:
+        # Rotating a cell through the settling tolerance moves it by at most
+        # this chord. A fresh grid can also round it into the next cell.
+        cell += 2 * np.hypot(f, r) * math.sin(heading_tolerance / 2) + RESOLUTION
     return not ((forward >= -geometry.rear - cell)
                 & (forward <= length + geometry.front + cell)
                 & (abs(right) <= half_width + cell)).any()
+
+
+def opening_route(frame, occupied, geometry, half_width, plane, target):
+    """Aim toward a measured opening straddling the forward axis."""
+    if (plane <= geometry.front or target is None or target[0] <= plane
+            or geometry.horizontal is None or geometry.vertical is None or geometry.base_from_optical[0, 2] <= 0.):
+        return None
+    band = occupied & (abs(FORWARD - plane) <= .10)
+    cols = np.flatnonzero(band.any(axis=0))
+    left, right = cols[cols < START[1]], cols[cols > START[1]]
+    if (band[:, START[1]].any() or left.size < 2 or right.size < 2
+            or left[-2] != left[-1] - 1 or right[1] != right[0] + 1):
+        return None
+    lo, hi = RIGHT[0, [left[-1], right[0]]]
+    if (hi - lo - RESOLUTION < 2 * half_width or min(-lo, hi) > half_width + RESOLUTION
+            or not lo < target[1] * plane / target[0] < hi):
+        return None
+
+    middle = (hi + lo) / 2
+    # Confirm optical returns beyond the jambs across the proposed width.
+    # These rays select a heading; they do not clear the driving envelope.
+    height, width = frame.shape
+    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
+    transform = geometry.base_from_optical
+    origin = transform[:3, 3]
+    f = np.full(math.ceil(2 * half_width / RESOLUTION) + 1, plane)
+    r = np.linspace(middle - half_width, middle + half_width, f.size)
+    z = origin[2] + (plane - origin[0]) * transform[2, 2] / transform[0, 2]
+    optical = (np.column_stack((f, -r, np.full_like(f, z))) - origin) @ transform[:3, :3]
+    if np.any(optical[:, 2] <= 0):
+        return None
+    u = np.rint(cx + fx * optical[:, 0] / optical[:, 2]).astype(int)
+    v = np.rint(cy + fy * optical[:, 1] / optical[:, 2]).astype(int)
+    if np.any((u < 0) | (u >= width) | (v < 0) | (v >= height)):
+        return None
+    measured = frame[v, u]
+    if not np.all(np.isfinite(measured) & (measured > optical[:, 2] + 2 * RESOLUTION)):
+        return None
+    # The caller takes the longest safe prefix and checks it again after turning.
+    end = min(plane + geometry.rear + .25, FORWARD[-1, 0] - geometry.front)
+    points = tuple((forward, forward * middle / plane)
+                   for forward in np.arange(0., end + 1e-9, RESOLUTION))
+    return Detour(None, points, geometry)
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,

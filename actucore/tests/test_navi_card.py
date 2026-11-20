@@ -1914,3 +1914,104 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         resumed = card.next_command()
         assert resumed["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0]
         assert resumed["obs_stamp_ms"] == depth_stamp
+
+
+def test_dynamic_body_mount_is_bound_to_the_depth_camera_and_exact_capture(monkeypatch):
+    from types import SimpleNamespace
+    import numpy as np
+
+    now = [123.1]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0])
+    card, node = _card(), _FakeNode()
+    mount = dict(schema="motus.camera_mount/1", topic="/rgbd/mount", mode="dynamic",
+                 version="v1", epoch="s1", parent_frame="base_link", child_frame="optical",
+                 transform_direction="body_from_camera", length_unit="m", accuracy_validated=False)
+    vendor = dict(body_mount=mount, clock_id="head", frame_id="optical",
+                  clock_reference=dict(clock_id="host_realtime", timestamp_basis="host_realtime"))
+    declarations = {_DEPTH_TOPIC: _decl(_DEPTH_TOPIC, format="image/depth-zlib", vendor=vendor)}
+    binding, error = card._bind_inputs(node, [_DEPTH_TOPIC, _OBJECTS_TOPIC], declarations)
+    assert not error
+    assert card._adopt_camera(declarations, binding) == ""
+    callbacks = [cb for _, topic, cb, *_ in node.subscription_details if topic == mount["topic"]]
+    assert len(callbacks) == 1
+    stamp = 123_000_000_123
+    matrix = [[0., 0., 1., .07], [-1., 0., 0., 0.], [0., -1., 0., 1.44], [0., 0., 0., 1.]]
+    sample = dict(mount, status="available", stamp_ns=stamp, clock_id="head",
+                  stamp_source="measurement", matrix=matrix, accuracy_validated=True)
+    def deliver(**changes):
+        callbacks[0](SimpleNamespace(data=json.dumps(dict(sample, **changes))))
+    def observation():
+        return card._observation_snapshot(with_capture_timing=True)[1]
+    message = SimpleNamespace(data=b"valid", header=SimpleNamespace(
+        stamp=SimpleNamespace(sec=123, nanosec=123), frame_id="optical"))
+    monkeypatch.setattr(navi_plugin.depth_mod, "decode", lambda _: np.ones((12, 16)))
+    card._on_depth_map(message)
+    assert observation()["body_mount_required"]
+    assert observation()["source_stamp_ns"] == stamp
+    assert "body_from_optical" not in observation()
+    for change in (dict(stamp_ns=stamp+1), dict(clock_id="other"), dict(version="v2"),
+                   dict(epoch="s2"), dict(child_frame="another_camera"), dict(parent_frame="map"),
+                   dict(transform_direction="camera_from_body"), dict(stamp_source="received"),
+                   dict(status="unavailable"), dict(matrix=np.zeros((4, 4)).tolist())):
+        deliver(**change)
+        assert "body_from_optical" not in observation(), change
+    deliver()
+    np.testing.assert_array_equal(observation()["body_from_optical"], matrix)
+    assert observation()["mount_accuracy_validated"] is False
+    deliver(status="unavailable")
+    assert "body_from_optical" not in observation()
+    deliver()
+    message.header.frame_id = "other_camera"
+    card._on_depth_map(message)
+    assert "body_from_optical" not in observation()
+    now[0] += 2.
+    message.header.frame_id = "optical"
+    card._on_depth_map(message)
+    deliver()
+    assert "body_from_optical" not in observation()
+
+
+def test_obstacle_pose_uses_same_clock_measurements_on_both_sides_of_capture(monkeypatch):
+    from types import SimpleNamespace
+    import numpy as np
+
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 10.2)
+    clock = dict(clock_id="host_realtime", timestamp_basis="host_realtime", domain_id="boot1")
+    declaration = _decl(_DEPTH_TOPIC, vendor=dict(clock_reference=clock,
+                        timestamp_semantics="source_capture_mapped"))
+    card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding())
+    card._set_depth_map(np.ones((8, 8)), source_stamp_ns=10_060_000_000, capture_ms=10_060)
+    def pose(stamp, x, domain="boot1", segment="run", measured_frame="odom", child="base_link", epoch="clock-1"):
+        measurement = dict(stamp_ns=stamp*10**6, clock_id="host_realtime",
+                           clock_epoch=epoch, frame_id=measured_frame, mapping={"verified": True})
+        slam = dict(stamp_source="measurement", status="tracking", segment_id=segment,
+                    clock_reference=dict(clock, domain_id=domain), measurement=measurement)
+        data = dict(schema="motus.odom/1", frame="body", stamp_ms=10_197,
+                    twist=[1., 0., None, None, None, 0.],
+                    pose=dict(stamp_ms=stamp, frame_id="odom", child_frame_id=child,
+                              position=[x, 0., 0.], quaternion=[0., 0., 0., 1.]),
+                    vendor=dict(motus_slam=slam))
+        card._on_string("odom", SimpleNamespace(data=json.dumps(data)))
+    def snapshot():
+        return card._observation_snapshot(with_capture_timing=True)[1:3]
+    pose(10000, 0.)
+    assert "obstacle_capture_pose" not in snapshot()[0]
+    pose(10120, .12)
+    depth, odom = snapshot()
+    assert depth["obstacle_capture_pose"].x == pytest.approx(.06)
+    assert depth["obstacle_capture_pose"].stamp_ms == 10060
+    assert odom["obstacle_pose"].stamp_ms == 10120
+    pose(10040, -1.)
+    assert snapshot()[1]["obstacle_pose"].stamp_ms == 10120
+    assert snapshot()[0]["obstacle_capture_pose"].x == pytest.approx(.06)
+    pose(10130, .13, domain="other")
+    assert "obstacle_capture_pose" not in snapshot()[0]
+    assert "obstacle_pose" not in snapshot()[1]
+    pose(10140, .14, segment="new")
+    assert "obstacle_capture_pose" not in snapshot()[0]
+    pose(10150, .15, measured_frame="map")
+    assert "obstacle_pose" not in snapshot()[1]
+    declaration["vendor"]["body_mount"] = dict(parent_frame="base_link")
+    pose(10160, .16, child="base_footprint")
+    assert "obstacle_pose" not in snapshot()[1]

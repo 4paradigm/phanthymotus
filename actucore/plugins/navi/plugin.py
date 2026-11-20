@@ -43,6 +43,7 @@ from dataclasses import replace
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
+from . import camera as camera_mod
 from . import depth as depth_mod
 from . import odom as odom_mod
 from . import policy as policy_mod
@@ -193,6 +194,10 @@ class NaviPlugin:
         self._depth_ms = 0
         self._depth_capture_ms = None
         self._depth_source_ms = None
+        self._depth_source_ns = None
+        self._depth_vendor = {}
+        self._mounts = {}
+        self._obstacle_poses = deque(maxlen=32)
         self._depth_stamp_verified = False
         self._odom = None
         self._odom_ms = 0
@@ -490,6 +495,10 @@ class NaviPlugin:
             self._depth_ms = 0
             self._depth_capture_ms = None
             self._depth_source_ms = None
+            self._depth_source_ns = None
+            self._depth_vendor = {}
+            self._mounts.clear()
+            self._obstacle_poses.clear()
             self._odom = None
             self._odom_ms = 0
             self._odom_received_ms = 0
@@ -653,6 +662,7 @@ class NaviPlugin:
         depth_topic = binding.get("depth_map") or binding.get("depth_summary")
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
         vendor = depth_decl.get("vendor")
+        self._depth_vendor = vendor if binding.get("depth_map") and isinstance(vendor, dict) else {}
         self._depth_stamp_verified = isinstance(vendor, dict) and (
             vendor.get("hardware_capture_timestamp_available") is True
             and vendor.get("source_stamp_preserved") is True
@@ -794,7 +804,9 @@ class NaviPlugin:
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
             self._publish_stop_if_moving()
+            obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State(target=target)
+            self._state.active_scan.obstacles = obstacles
             self._paused = False
             # **The card mints this, agent-core does not supply it.** The ACP
             # contract runs the other way from what it looks like: an async tool
@@ -860,7 +872,9 @@ class NaviPlugin:
             action_id, self._acp_action_id = self._acp_action_id, ""
             target = self._state.target
             self._publish_stop_if_moving()
+            obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State()
+            self._state.active_scan.obstacles = obstacles
             if action_id:
                 result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
                 threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
@@ -1346,6 +1360,11 @@ class NaviPlugin:
                 self._depth_bind_topic = topic
                 self._depth_bind_deadline = time.monotonic() + _DEPTH_TYPE_WAIT_S
                 self._depth_bind_timer = node.create_timer(0.1, retry_depth)
+            vendor = camera_mod.for_topic(declarations, topic).get("vendor")
+            mount = camera_mod.mount_topic(vendor) if isinstance(vendor, dict) else None
+            if mount:
+                bound["body_mount"] = mount
+                node.create_subscription(String, mount, lambda msg: self._on_string("body_mount", msg), qos)
         if bound["image"]:
             # Kept as bytes and decoded only when a frame is drawn: the camera
             # runs at 15 fps and the overlay at 5, so decoding on arrival would
@@ -1454,7 +1473,26 @@ class NaviPlugin:
             elif role == "depth_summary":
                 self._depth_bands = depth_mod.bands_from_summary(payload)
                 self._depth_ms = now
+            elif role == "body_mount":
+                stamp = payload.get("stamp_ns")
+                if type(stamp) is int and stamp > 0:
+                    self._mounts[stamp] = camera_mod.capture_mount(self._depth_vendor, payload)
+                    if len(self._mounts) > 32:
+                        self._mounts.pop(next(iter(self._mounts)))
             elif role == "odom":
+                sample = odom_mod.measured_obstacle_pose(payload, self._depth_vendor)
+                history = self._obstacle_poses
+                if sample is None:
+                    history.clear()
+                elif not history:
+                    history.append(sample)
+                elif sample[0] > history[-1][0]:
+                    if (sample[1].frame != history[-1][1].frame or
+                            sample[0] - history[-1][0] > policy_mod.ODOM_GAP_MS * 10**6):
+                        history.clear()
+                    history.append(sample)
+                elif sample[0] == history[-1][0] and sample != history[-1]:
+                    history.clear()
                 # All three axes the policy uses, not just `vx`. The stuck
                 # detector only ever wanted forward speed, but the tracker
                 # compensates its prediction for the robot's whole twist —
@@ -1503,7 +1541,7 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
-    def _set_depth_map(self, depth, *, capture_ms=None):
+    def _set_depth_map(self, depth, *, capture_ms=None, source_stamp_ns=None, source_frame=None):
         received_ms = int(time.time() * 1000)
         horizontal = self._config.depth_intrinsics
         vertical = self._depth_vertical
@@ -1516,6 +1554,8 @@ class NaviPlugin:
             self._depth_ground = ground
             self._depth_bands = bands
             self._depth_ms = received_ms
+            self._depth_source_ns = (source_stamp_ns if not source_frame or
+                                     source_frame == self._depth_vendor.get("frame_id") else None)
             self._depth_source_ms = capture_ms or None
             self._depth_capture_ms = (
                 capture_ms if capture_ms and self._depth_stamp_verified
@@ -1532,8 +1572,9 @@ class NaviPlugin:
                 self._last_error = f"深度图解码失败：{error}"
             return
         stamp = getattr(getattr(message, "header", None), "stamp", None)
-        capture_ms = stamp.sec * 1000 + stamp.nanosec // 1_000_000 if stamp is not None else None
-        self._set_depth_map(depth, capture_ms=capture_ms)
+        ns = stamp.sec * 10**9 + stamp.nanosec if stamp is not None else None
+        self._set_depth_map(depth, capture_ms=ns // 10**6 if ns else None, source_stamp_ns=ns,
+                            source_frame=getattr(getattr(message, "header", None), "frame_id", None))
 
     def _open_publisher(self):
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -1584,6 +1625,20 @@ class NaviPlugin:
             if depth is not None:
                 if with_capture_timing:
                     depth["control_ms"] = now
+                    ns = self._depth_source_ns
+                    if "body_mount" in self._depth_vendor:
+                        depth["body_mount_required"] = True
+                    if ns is not None:
+                        depth["source_stamp_ns"] = ns
+                        if 0 <= now - ns // 10**6 <= depth_age:
+                            clock = self._depth_vendor.get("clock_reference") or {}
+                            mount = self._mounts.get(ns)
+                            if (mount is not None and isinstance(clock, dict)
+                                    and clock.get("clock_id") == clock.get("timestamp_basis") == "host_realtime"):
+                                depth["body_from_optical"], depth["mount_accuracy_validated"] = mount
+                            capture_pose = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
+                            if capture_pose is not None:
+                                depth["obstacle_capture_pose"] = capture_pose
                 if self._depth_source_ms is not None:
                     depth["source_frame_id"] = self._depth_source_ms
                 capture = self._depth_capture_ms
@@ -1599,6 +1654,10 @@ class NaviPlugin:
                 uses_pose = (odom_mod.planar_feedback(odom) is None and self._pose_feedback is not None
                              and pose is not None and
                              0 <= now - pose.stamp_ms <= min(max_age, self._odom_max_age_ms))
+                if self._obstacle_poses:
+                    measured = self._obstacle_poses[-1][1]
+                    if 0 <= now - measured.stamp_ms <= policy_mod.ODOM_GAP_MS:
+                        odom = {**odom, "obstacle_pose": measured}
                 if uses_pose:
                     since_ms, rates = self._pose_feedback
                     odom = {**odom, "motion_pose": pose, "pose_feedback": rates,

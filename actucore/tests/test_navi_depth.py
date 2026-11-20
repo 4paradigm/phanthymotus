@@ -539,6 +539,59 @@ def test_floor_strip_at_the_edge_of_the_depth_image(mirror):
     assert not ground[:, 108:].any()
 
 
+@pytest.mark.parametrize("mirror", [False, True])
+@pytest.mark.parametrize("raised", [False, True])
+def test_partial_far_floor_support_in_a_doorway_edge_strip(mirror, raised):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    frame = _floor_scene()
+    frame[:, :452] = .7
+    # The near floor spans the outer quarter. Its outermost rays cannot see
+    # the far floor, while the inner part still sees it beyond the jamb.
+    frame[320:390, 564:] = .7
+    if raised:
+        frame[392:, 452:] *= .34 / .42
+    if mirror:
+        frame = frame[:, ::-1]
+
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 315, 337), (480, 420, 243.2))
+
+    if ground is not None and mirror:
+        ground = ground[:, ::-1]
+    if raised:
+        assert ground is None or not ground[408:, 452:].any()
+    else:
+        assert ground is not None
+        assert ground[420, 500] and ground[420, 580]
+        assert not ground[:, :452].any()
+        assert not ground[320:390, 564:].any()
+
+
+@pytest.mark.parametrize("scene", ["wall", "raised_platform", "missing_background"])
+@pytest.mark.parametrize("wall_near", [3.14, 2.80])
+def test_broad_near_floor_ending_at_an_oblique_back_wall(scene, wall_near):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    # At this high mount, the back wall occludes most of the older far band.
+    ray = (np.arange(480)[:, None] - 229) / 492 + .16
+    floor = 1.45 / np.maximum(ray, .001)
+    wall = np.linspace(wall_near, wall_near + .4, 640)[None, :]
+    frame = np.minimum(floor, wall)
+    if scene == "missing_background":
+        frame[330:385] = np.nan
+    elif scene == "raised_platform":
+        frame[355:] = np.minimum(1.27 / ray[355:], wall)
+        # Lower floor remains visible beyond the near platform.
+        frame[331:355, :320] = floor[331:355]
+
+    ground = D.ground_mask(frame, HorizontalIntrinsics(640, 492, 319.5), (480, 492, 229))
+    if scene == "wall":
+        assert ground is not None and ground[408:].all()
+        assert not ground[300:325].any()
+    else:
+        assert ground is None or not ground[408:].any()
+
+
 def test_a_broad_raised_platform_does_not_replace_the_floor():
     from plugins.navi.camera import HorizontalIntrinsics
 

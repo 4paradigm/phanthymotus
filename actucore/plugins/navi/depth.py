@@ -192,6 +192,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     seed = depth_m[bottom, columns]
     count = seed.shape[1]
     narrow = max(2, count // 8)
+    quarter = max(narrow, count // 4)
     valid = np.isfinite(seed) & (seed > 0.10) & (seed < 4.0)
     if valid.mean() < 0.6:
         return None
@@ -210,8 +211,8 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         # Be stricter above the plane to retain low obstacles.
         return (distance >= -0.020) & (distance <= _GROUND_TOLERANCE_M)
 
-    def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None, check_below=False,
-            window_halves=False):
+    def fit(inliers, *, near_thirds=(0, 1, 2), visible_span=None,
+            window_halves=False, near_wall=False):
         start, end = visible_span or (0, seed.shape[1])
         visible = (positions >= start) & (positions < end)
         min_inliers = 0.6 * seed.shape[0] * (end - start)
@@ -253,7 +254,22 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         far_end = 0.78 if visible_span is not None else 0.7375
         far_start = int(height * 0.69)
         sampled = residual(slice(far_start, None), columns)
-        farther = on_ground(sampled[:int(height * far_end) - far_start])
+        far_count = int(height * far_end) - far_start
+        if near_wall:
+            # A close back wall can hide the original verification band.
+            # Require measured foreground or floor throughout that occluded
+            # region, then verify a disjoint strip of the original height
+            # immediately above the near fit.
+            end_row = bottom.start - far_start
+            if not 0 < far_count < end_row:
+                return None
+            upper = sampled[:end_row - far_count]
+            explained = np.isfinite(upper) & ((upper < -2 * _GROUND_TOLERANCE_M) | on_ground(upper))
+            if any(part.mean() < .80 for part in np.array_split(explained, 3, axis=1)):
+                return None
+            farther = on_ground(sampled[end_row - far_count:end_row])
+        else:
+            farther = on_ground(sampled[:far_count])
         far_thirds = np.array_split(farther, 3, axis=1)
         verified = near_thirds if visible_span is not None else (0, 1, 2)
         if window_halves:
@@ -265,14 +281,13 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
         one_far_side = sum(support >= 0.06 for support in far_support) < 2
         if one_far_side and max(far_support) < 0.35:
             return None
-        if one_far_side or near_thirds is None or check_below:
-            # Veto a substantial measured surface below the proposed floor.
-            # This rejects a raised platform even if its top fits one patch.
-            below = sampled > 2 * _GROUND_TOLERANCE_M
-            if end - start == narrow and below[:, start:end].mean() >= .12:
-                return None
-            if any(third.mean() >= 0.12 for third in np.array_split(below, 3, axis=1)):
-                return None
+        # Veto a substantial measured surface below the proposed floor.
+        # This rejects a raised platform even if its top fits one patch.
+        below = sampled > 2 * _GROUND_TOLERANCE_M
+        if end - start <= quarter and below[:, start:end].mean() >= .12:
+            return None
+        if any(third.mean() >= 0.12 for third in np.array_split(below, 3, axis=1)):
+            return None
         keep_columns = None
         if visible_span is not None:
             # Each excluded side must show a foreground occlusion. Returns
@@ -294,7 +309,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
                 keep_columns[:columns.start + start * columns.step] = False
             if end < seed.shape[1]:
                 keep_columns[columns.start + end * columns.step:] = False
-            if end - start == narrow:
+            if end - start <= quarter:
                 # The edge of a narrow window can still include a jamb.
                 # A return where the jamb crosses the plane is not floor.
                 keep_columns &= on_ground(residual(bottom, slice(None))).mean(axis=0) >= .65
@@ -353,7 +368,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     # Mixed centre returns can bias a fit even when the outer third is clear.
     # Verify the centre and the visible side, including a check for lower surfaces.
     for (near_thirds, span), edge in zip(visible_spans, (left, right)):
-        ground = fit(edge, near_thirds=near_thirds, visible_span=span, check_below=True)
+        ground = fit(edge, near_thirds=near_thirds, visible_span=span)
         if ground is not None:
             return ground
 
@@ -362,7 +377,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     # all returns on the occluded side available to obstacle detection.
     visible = 2 * count // 5
     for edge, span in ((left, (0, visible)), (right, (count - visible, count))):
-        ground = fit(edge, visible_span=span, check_below=True, window_halves=True)
+        ground = fit(edge, visible_span=span, window_halves=True)
         if ground is not None:
             return ground
 
@@ -370,7 +385,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     # middle. Apply the same support checks and require occlusion on both sides.
     start = (count - visible) // 2
     ground = fit(all_points, visible_span=(start, start + visible),
-                 check_below=True, window_halves=True)
+                 window_halves=True)
     if ground is not None:
         return ground
 
@@ -381,10 +396,18 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
     last = count - narrow
     for start in (0, *range(1, last, max(1, narrow // 8)), last):
         ground = fit(all_points, visible_span=(start, start + narrow),
-                     check_below=True, window_halves=True)
+                     window_halves=True)
         if ground is not None:
             return ground
-    return None
+
+    # Far floor can be visible on the inner part of an edge strip while its
+    # outer rays are occluded. Validate both halves across the whole strip.
+    for start in (0, count - quarter):
+        ground = fit(all_points, visible_span=(start, start + quarter),
+                     window_halves=True)
+        if ground is not None:
+            return ground
+    return fit(all_points, near_wall=True)
 
 
 def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,

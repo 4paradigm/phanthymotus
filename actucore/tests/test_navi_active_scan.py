@@ -366,6 +366,29 @@ def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(
     assert lookout.locked
 
 
+@pytest.mark.parametrize(("at_stop", "after_stop", "may_replan"), [
+    (1250, 1400, True), (1250, 1250, False), (None, 1400, False), (0, 1400, False),
+])
+def test_drift_before_first_yaw_can_replan_only_from_fresh_stopped_depth(
+        monkeypatch, at_stop, after_stop, may_replan):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, source, vx=0.):
+        look.update(dict(_depth(stamp), source_frame_id=source),
+                    {**_odom(stamp), "received_ms": stamp, "vx": vx},
+                    geometry, receipt_only=True)
+        return look.command(geometry, .375, 1., 500)
+
+    tick(1000, 1000)
+    assert look.begin((1., -1.))
+    assert tick(1050, 1050).yaw == 0.
+    assert tick(1150, 1050, vx=.12).yaw == 0.
+    assert tick(1250, at_stop).yaw == 0.
+    assert tick(1400, after_stop).yaw == 0.
+    assert not look.issued_yaw
+    assert look.begin((-1., 1.)) is may_replan
+
+
 def test_receipt_only_scan_replans_after_measured_translation_has_settled(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
 
@@ -655,3 +678,20 @@ def test_receipt_stamp_cannot_extend_the_life_of_repeated_odometry(monkeypatch):
     update(1350, 3)
     update(1450, 3)
     assert not look.active and look.locked
+
+
+def test_obstacle_evidence_survives_unknown_then_clears_only_on_measured_free_cells():
+    origin = PlanarPose(1000, ('room',), 0., 0., 0.)
+    moved = PlanarPose(1200, ('room',), .50, 0., 0.)
+    memory = scan.ObservedObstacles()
+    occupied = np.zeros(scan.SHAPE, dtype=bool)
+    occupied[scan.START[0] + 30, scan.START[1]] = True
+    memory.remember(origin, occupied)
+    reprojected = memory.project(moved)
+    assert reprojected[scan.START[0] + 20, scan.START[1]]
+    assert memory.project(PlanarPose(1250, ('room',), .50, 0., math.pi / 2))[
+        scan.START[0], scan.START[1] + 20]
+    assert memory.project(PlanarPose(1300, ('new',), 0., 0., 0.)) is None
+    assert memory.project(moved, observed_free=np.zeros_like(occupied)).any()
+    assert not memory.project(moved, observed_free=reprojected.copy()).any()
+    assert not memory.cells
