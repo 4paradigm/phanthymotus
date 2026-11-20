@@ -19,7 +19,11 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     const bool partialOverlap=mode=="partial_scan_relocalize";
     const bool afterMotion=mode=="scan_relocalize_after_motion";
     const bool weakWitnessedBridge=mode=="witnessed_scan_weak_bridge";
-    const bool witnessedOutage=mode=="witnessed_scan_late_handoff" || weakWitnessedBridge;
+    const bool longWitnessedGap=mode=="witnessed_scan_long_gap";
+    const bool expiredWitnessedGap=mode=="witnessed_scan_expired_gap";
+    const bool sparseLiveRun=mode=="witnessed_scan_sparse_live";
+    const bool witnessedOutage=mode=="witnessed_scan_late_handoff" || weakWitnessedBridge ||
+        longWitnessedGap || expiredWitnessedGap || sparseLiveRun;
     const bool weakBridge=mode=="scan_origin_weak_bridge";
     const bool originChange=mode=="scan_origin_change" || weakBridge;
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
@@ -71,13 +75,44 @@ static void testScanRelocalization(const std::string &root, const std::string &o
        !frame(1.5,.12f,true,false,false,false,startingToken))
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto anchor=map.getLastLocationId();
+    if(sparseLiveRun)
+    {
+        const auto old=map.getLocalOptimizedPoses();
+        if(!frame(11.05,.31f,true,true,false,false,1) || recovery.odom().isNull() ||
+           recovery.state()!=motus::VisualRecovery::External || map.getLocalOptimizedPoses().size()!=old.size()+1)
+            throw std::runtime_error("a witnessed live run must preserve mapping across a sparse scan gap");
+        const auto grown=map.getLocalOptimizedPoses();
+        if(frame(26.55,.36f,true,false,false,false,1) || !recovery.odom().isNull() ||
+           map.getLocalOptimizedPoses()!=grown)
+            throw std::runtime_error("a sparse live run remains bounded even with its original token");
+        map.close();
+        rtabmap::Rtabmap reopened;
+        reopened.init(parameters,output+".db");
+        if(reopened.getLocalOptimizedPoses()!=grown)
+            throw std::runtime_error("sparse live mapping must persist the original grown graph");
+        reopened.close(false);
+        return;
+    }
     if(witnessedOutage)
     {
         const auto old=map.getLocalOptimizedPoses();
         if(frame(2.,.19f,false,!weakWitnessedBridge) || !recovery.odom().isNull() ||
            recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses()!=old)
             throw std::runtime_error("an unverified scan cannot replace the last measured motion during a witnessed outage");
-        if(!frame(5.65,.31f,true,true,false,false,1) ||
+        if(expiredWitnessedGap)
+        {
+            // Past the native scan-gap bound a run token alone cannot resume
+            // the gauge; the unverifiable scan leaves the map untouched.
+            if(frame(7.1,.31f,true,true,false,false,1) || !recovery.odom().isNull() ||
+               recovery.state()!=motus::VisualRecovery::Searching || map.getLocalOptimizedPoses()!=old)
+                throw std::runtime_error("an expired witnessed run must not resume without geometry");
+            map.close();
+            return;
+        }
+        // The visual runtime may hold its segment 4.5 s after the last published
+        // pose; the sparse native scan cadence can add up to a second.
+        const double resume=longWitnessedGap?6.95:5.65;
+        if(!frame(resume,.31f,true,true,false,false,1) ||
            recovery.state()!=motus::VisualRecovery::External || recovery.odom().isNull() ||
            std::abs(recovery.odom().x()-.31f)>1e-5f || map.getLocalOptimizedPoses().size()!=old.size()+1)
             throw std::runtime_error("the same observed run must resume after a sparse scan gap without RGB");
@@ -278,7 +313,9 @@ int main(int argc, char **argv)
     if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
        mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" ||
        mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" ||
-       mode=="witnessed_scan_late_handoff" || mode=="witnessed_scan_weak_bridge")
+       mode=="witnessed_scan_late_handoff" || mode=="witnessed_scan_weak_bridge" ||
+       mode=="witnessed_scan_long_gap" || mode=="witnessed_scan_expired_gap" ||
+       mode=="witnessed_scan_sparse_live")
     {
         p["RGBD/NeighborLinkRefining"]="false";
         testScanRelocalization(root,output,p,mode);

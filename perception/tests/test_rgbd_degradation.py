@@ -505,7 +505,8 @@ def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
         assert (last(s)['pose'] is not None) == (k == 7)
     assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
     assert last(s)['vendor']['relocalization'] == dict(method='native_f2m_landmarks',
-                                                     anchor_stamp_ns=anchor, shared_landmarks=24)
+                                                     anchor_stamp_ns=anchor, shared_landmarks=24,
+                                                     outage_s=3.85, extended=False)
     assert s.gate.state == 'tracking'
 
     # Fresh results replace inherited timing for later pauses.

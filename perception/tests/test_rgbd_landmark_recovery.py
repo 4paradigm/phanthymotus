@@ -9,13 +9,15 @@ from test_rgbd_odometry import messages
 from test_rgbd_odometry_status import sessions  # noqa: F401
 
 
-def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=False, variance=.001, kind=0):
+def visual(gate, stamp, *, ids=range(24), x=0., angle=0., world_shift=0., lost=False,
+           variance=.001, kind=0, matches=0):
     msg, info = messages(stamp)
     msg.pose.covariance[0] = variance
     msg.pose.pose.position.x = x
     msg.pose.pose.orientation.z = math.sin(math.radians(angle)/2)
     msg.pose.pose.orientation.w = math.cos(math.radians(angle)/2)
     info.type, info.lost, info.inliers = kind, lost, 0 if lost else len(ids)
+    info.matches = matches
     info.local_map_keys = info.word_inliers = list(ids)
     info.local_map_values = [NS(x=float(i % 5) + world_shift, y=float(i // 5), z=1.) for i in ids]
     gate.input(stamp)
@@ -28,6 +30,43 @@ def anchored():
         sample = visual(g, 1_000_000_000 + i*100_000_000)
     assert sample is not None
     return g
+
+
+@pytest.mark.parametrize('variance,matches,x,accepted', [
+    (.048, 500, .15, True),
+    (.063, 500, .15, False),
+    (.048, 900, .15, False),
+    (.048, 500, 1.50, False),
+])
+def test_optical_flow_keeps_supported_measured_tracking_at_moderate_uncertainty(
+        variance, matches, x, accepted):
+    g = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        visual(g, stamp, kind=1, ids=range(220), matches=500)
+    result = visual(g, 1_500_000_000, kind=1, ids=range(220), matches=matches,
+                    variance=variance, x=x)
+    assert (result is not None) is accepted
+    if result:
+        assert result['pose']['covariance'][0] == variance
+        assert result['vendor']['visual_uncertainty']['method'] == 'native_f2f_optical_flow'
+
+
+@pytest.mark.parametrize('world_shift,accepted', [(0., True), (1., False)])
+def test_well_supported_f2m_turn_can_use_recent_accepted_landmarks(world_shift, accepted):
+    g = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        visual(g, stamp, ids=range(85))
+    assert visual(g, 1_330_000_000, ids=range(85, 172)) is not None
+    # As in Tianyi, the previous frame shares just 14 points with the
+    # current measurement, but 74 more were accepted one frame earlier.
+    ids = [*range(74), *range(85, 99), *range(172, 241)]
+    result = visual(g, 1_597_000_000, ids=ids, x=.20, angle=5.9,
+                    variance=.079, world_shift=world_shift)
+    assert (result is not None) is accepted
+    if result:
+        assert result['pose']['covariance'][0] == .079
+        assert result['vendor']['visual_uncertainty']['shared_landmarks'] == 88
+
 
 
 def test_same_f2m_landmarks_can_relocalize_after_silence_without_any_gap_pose():
@@ -214,8 +253,98 @@ def test_failed_registration_to_old_map_restarts_without_switching_new_view_fron
     gate.status(3_000_000_000)
     for i in range(3):
         assert visual(gate, 5_000_000_000+i*100_000_000, lost=True) is None
-    assert gate.status(6_001_000_000) == 'lost'
+    # The frozen window expires, but native still answers fresh captures from
+    # the same F2M map: wait within the bounded extension before restarting.
+    assert gate.status(6_001_000_000) == 'recovering'
+    assert gate.relocalization_extended
+    assert gate.status(6_800_000_000) == 'lost'
     assert gate.state == 'lost' and gate.loss_kind == 'relocalization'
+
+
+def test_extended_landmark_window_needs_live_native_results_and_fresh_captures():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    gate.input(5_000_000_000)
+    assert visual(gate, 5_000_000_000, lost=True) is None
+    # Native stops answering: the frozen deadline is final.
+    for stamp in (5_500_000_000, 5_900_000_000):
+        gate.input(stamp)
+    assert gate.status(6_600_000_000) == 'lost' and gate.loss_kind == 'relocalization'
+
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(3):
+        assert visual(gate, 5_000_000_000+i*100_000_000, lost=True) is None
+    assert gate.status(6_001_000_000) == 'recovering'
+    # Captures stop: nothing new can be registered, so the extension ends.
+    assert gate.status(6_800_000_000) == 'lost'
+
+
+def test_extended_landmark_window_relocalizes_a_late_native_reregistration():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    # Native keeps reporting lost for 4.1 s after the anchor (1.2 s), then
+    # re-registers against its retained local map with the old 3-D landmarks.
+    for i in range(9):
+        assert visual(gate, 3_100_000_000+i*270_000_000, lost=True) is None
+    assert gate.state == 'recovering' and gate.relocalization_extended
+    assert visual(gate, 5_400_000_000, x=.05) is None
+    assert visual(gate, 5_550_000_000, x=.06) is None
+    result = visual(gate, 5_690_000_000, x=.07)
+    assert result['vendor']['motus_slam']['segment_id'] == 'run'
+    assert result['vendor']['relocalization']['extended'] is True
+    assert result['vendor']['relocalization']['shared_landmarks'] == 24
+    assert result['vendor']['relocalization']['outage_s'] == 4.49
+
+
+@pytest.mark.parametrize('late_ns', [0, 1])
+def test_extended_landmark_window_only_publishes_within_slam_capture_bound(late_ns):
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(10):
+        assert visual(gate, 3_100_000_000+i*270_000_000, lost=True) is None
+    assert gate.relocalization_extended
+    assert visual(gate, 5_560_000_000, x=.05) is None
+    assert visual(gate, 5_620_000_000, x=.06) is None
+    result = visual(gate, 5_700_000_000 + late_ns, x=.07)
+    assert (result is not None) == (late_ns == 0)
+    assert gate.state == ('lost' if late_ns else 'tracking')
+
+
+def test_extended_landmark_window_cannot_outlive_the_slam_witnessed_gap():
+    gate = anchored()
+    gate.status(3_000_000_000)
+    stamps = [4_600_000_000+i*270_000_000 for i in range(16)]
+    for stamp in stamps:
+        visual(gate, stamp, lost=True)
+        if gate.state == 'lost':
+            break
+    # Anchor at 1.2 s: results past 5.7 s of capture time can no longer rejoin.
+    assert gate.state == 'lost' and gate.loss_kind == 'relocalization'
+    assert stamp <= 1_200_000_000 + 4_500_000_000 + 1_000_000_000 + 270_000_000
+
+
+def test_strong_old_landmarks_allow_travel_across_the_extended_window():
+    gate = EstimateGate('run', 'camera_optical', 'camera-clock')
+    for stamp in (1_000_000_000, 1_100_000_000, 1_200_000_000):
+        visual(gate, stamp, ids=range(48))
+    gate.status(3_000_000_000)
+    for i in range(9):
+        assert visual(gate, 3_100_000_000+i*270_000_000, lost=True) is None
+    # Walked 1.2 m in 4.4 s: beyond a one-second travel cap, inside 4.5 s.
+    assert visual(gate, 5_600_000_000, x=1.2, ids=range(48)) is None
+    result = visual(gate, 5_690_000_000, x=1.25, ids=range(48))
+    assert result['pose']['position'][0] == 1.25
+    assert result['vendor']['relocalization']['shared_landmarks'] == 48
+    # Few old landmarks keep the one-second cap.
+    gate = anchored()
+    gate.status(3_000_000_000)
+    for i in range(10):
+        assert visual(gate, 3_100_000_000+i*270_000_000, lost=True) is None
+    assert visual(gate, 5_600_000_000, x=1.2) is None
+    assert visual(gate, 5_870_000_000, x=1.25) is None
+    assert visual(gate, 6_140_000_000, x=1.3) is None
+    assert gate.state != 'tracking'
 
 
 def test_burst_keeps_two_measured_pairs_only_during_relocalization(sessions):

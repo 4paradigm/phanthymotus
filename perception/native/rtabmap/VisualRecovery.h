@@ -134,10 +134,16 @@ public:
         // Dense verified poses can keep arriving between sparse native scans.
         // Keep the aligned run across a short scan outage, measured from its
         // last accepted external pose. A declared origin alone is weaker.
-        const bool witnessedGap=externalRun_ && externalAge>0. && externalAge<=4.5;
+        // The gateway carries the run token through a visual pause only when
+        // the runtime measured the same F2M landmarks within 4.5 s of its last
+        // pose; allow the sparse native scan cadence on top of that bound.
+        const bool witnessedGap=externalRun_ && externalAge>0. && externalAge<=maxWitnessedGap_;
+        // A continuously measured stream can outlive slow scan delivery.
+        // Apply the longer scan gap only before any unverified outage.
+        const double scanGap=witnessedRun && !waiting_ && !missing_?maxLiveScanGap_:maxExternalScanGap_;
         const bool continuousExternal=(witnessedRun || sameOrigin) &&
             (!waiting_ || recentOutage || (witnessedRun && witnessedGap)) &&
-            !localizationMode_ && continuousMotion(external,data.stamp());
+            !localizationMode_ && continuousMotion(external,data.stamp(),scanGap);
         const bool waitForChassis=external.isNull() && (externalRun_ || externalOrigin_) && !localizationMode_ &&
             externalAge>0. && externalAge<=maxExternalScanGap_ &&
             (!chassisOutageStart_ || recentOutage || witnessedGap) &&
@@ -654,6 +660,8 @@ private:
         }
     }
     static constexpr double maxExternalScanGap_=6.;
+    static constexpr double maxWitnessedGap_=5.5;
+    static constexpr double maxLiveScanGap_=15.;
     static constexpr float minScanRelocalizationOverlap_=.30f;
 
     struct VisualAlignment
@@ -720,11 +728,11 @@ private:
         return token;
     }
 
-    bool continuousMotion(const rtabmap::Transform & external, double stamp) const
+    bool continuousMotion(const rtabmap::Transform & external, double stamp, double maxGap) const
     {
         const double dt=stamp-previousExternalStamp_;
         // The gateway witnesses the dense source between accepted native scans.
-        if(external.isNull() || !(dt>0. && dt<=maxExternalScanGap_) || !cv::checkRange(external.dataMatrix()))
+        if(external.isNull() || !(dt>0. && dt<=maxGap) || !cv::checkRange(external.dataMatrix()))
             return false;
         return plausibleMotion(previousExternal_.inverse()*external,dt);
     }

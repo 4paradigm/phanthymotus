@@ -1,6 +1,7 @@
 """Optional rotation hints for the pinned native visual registration frontend."""
 from collections import deque
 from pathlib import Path
+import re
 
 
 def association_enabled(calibration):
@@ -69,10 +70,35 @@ class RotationHints:
         self.last_skip_reason = reason
         return False
 
-    def info(self, stamp_ns=None):
+    def info(self, stamp_ns=None, *, native=None):
         return dict(enabled=self.enabled, offered=self.offered, skipped=self.skipped,
                     offered_for_frame=stamp_ns in self.offered_stamps if stamp_ns is not None else None,
                     last_offered_stamp_ns=self.last_offered_stamp_ns,
-                    last_skip_reason=self.last_skip_reason, native_applied=None,
+                    last_skip_reason=self.last_skip_reason, native_applied=native,
                     role='rotation_initial_guess',
                     correlated_visual_updates=self.enabled)
+
+
+_NATIVE_STATS = re.compile(rb'rotation_hint: frames=(\d+) selected=(\d+) supplied=(\d+) '
+                           rb'rejected=(\d+) late=(\d+) evicted=(\d+)')
+
+
+def native_hint_statistics(log_path, *, tail=16384):
+    """Last native hint counters from the estimator log; None until native reports.
+
+    The patched native node logs these every 60 frames. `supplied` counts
+    registrations whose search/PnP guess used the measured rotation.
+    """
+    try:
+        with open(log_path, 'rb') as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell()-tail))
+            chunk = handle.read()
+    except (OSError, TypeError, ValueError):
+        return None
+    matches = _NATIVE_STATS.findall(chunk)
+    if not matches:
+        return None
+    frames, selected, supplied, rejected, late, evicted = (int(v) for v in matches[-1])
+    return dict(frames=frames, selected=selected, supplied=supplied, rejected=rejected,
+                late=late, evicted=evicted, supplied_fraction=round(supplied/frames, 3) if frames else None)

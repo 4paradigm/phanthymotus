@@ -38,6 +38,8 @@ class SlamStream:
         self._poses = deque(maxlen=512)
         self._pose_anchor = None
         self._measured_run = None
+        self._suspended_run = None
+        self._last_admitted_run = None
         self._pending = deque()
         self._last_received = None
         self._last_cloud_received = None
@@ -59,11 +61,21 @@ class SlamStream:
     def continuity_token(self):
         return self._measured_run[1].external_continuity if self._measured_run is not None else None
 
+    @property
+    def _live_visual_run(self):
+        # The last origin field records whether the measured run is chassis.
+        return (self._measured_run is not None and not self._measured_run[0][-1] and
+                self.continuity_token == self._last_admitted_run)
+
     def _lose(self, now):
         """Retire unavailable poses and offer the latest fresh scan for registration."""
         latest = max(self._pending, key=lambda item: item[0], default=None)
         self._poses.clear()
         self._pose_anchor = None
+        if self._measured_run is not None:
+            # The run may resume only through the visual runtime's measured
+            # relocalization against this exact last admitted pose.
+            self._suspended_run = self._measured_run
         self._measured_run = None
         self._pending.clear()
         self._last_received = None
@@ -74,6 +86,12 @@ class SlamStream:
             self._offer_unlocalized(latest, now)
 
     def _offer_unlocalized(self, pending, now):
+        if self._live_visual_run:
+            # A live, witnessed VO run can still lack a bracket for one scan.
+            # Skip that scan without sending a false pose outage to RTAB-Map.
+            # A real outage clears the run before offering scans for recovery.
+            self._dropped_pending += 1
+            return
         stamp, cloud, received, context = pending
         if now-received <= self.max_age_s:
             try:
@@ -175,11 +193,36 @@ class SlamStream:
                     (0 < dt <= max_interval and distance <= .1 + 1.5*dt and
                      angle <= math.radians(10) + 2.5*dt)):
                 token = previous.external_continuity
+        elif self._suspended_run is not None and visual:
+            token = self._resume_suspended_run(origin, pose, vendor)
+        self._suspended_run = None
         # This token is carried only through an observed, bounded source run.
         # A new token requires independent registration in the native map.
         pose = replace(pose, external_continuity=token or uuid.uuid4().bytes)
         self._measured_run = origin, pose
         return pose
+
+    # The visual runtime keeps a paused segment open while native F2M still
+    # re-registers to its retained local map, bounded by this same gap.
+    RELOCALIZATION_MAX_S = 4.5
+
+    def _resume_suspended_run(self, origin, pose, vendor):
+        """Carry the old token only when VO proved the same F2M gauge after a pause."""
+        last_origin, previous = self._suspended_run
+        proof = vendor.get('relocalization')
+        if last_origin != origin or not isinstance(proof, dict):
+            return None
+        anchor, shared = proof.get('anchor_stamp_ns'), proof.get('shared_landmarks')
+        dt = (pose.stamp_ns - previous.stamp_ns) / 1e9
+        distance = math.dist(pose.position, previous.position)
+        dot = abs(sum(a*b for a, b in zip(pose.quaternion, previous.quaternion)))
+        angle = 2*math.acos(min(1., dot))
+        if (proof.get('method') != 'native_f2m_landmarks' or type(shared) is not int or shared < 20 or
+                type(anchor) is not int or not previous.stamp_ns <= anchor <= previous.stamp_ns + 1_500_000_000 or
+                not 0 < dt <= self.RELOCALIZATION_MAX_S or
+                distance > .15 + 1.5*dt or angle > math.radians(10) + 2.5*dt):
+            return None
+        return previous.external_continuity
 
     def _witnessed_visual(self, vendor, pose, context):
         observation, report = pose.observation, vendor.get('registration')
@@ -271,6 +314,7 @@ class SlamStream:
         can_localize = self.on_unlocalized_frame is not None
         # Give late visual results a bounded opportunity to pair with the scan.
         wait_s = min(1.5, self.max_age_s)
+        scan_wait_s = self.max_age_s if self._live_visual_run else wait_s
         if can_localize and self._last_received is not None and now-self._last_received >= wait_s:
             self._lose(now)
             return
@@ -286,7 +330,7 @@ class SlamStream:
             stamp, cloud, received, context = pending
             try:
                 if not self._poses or stamp > self._poses[-1].stamp_ns or stamp < self._poses[0].stamp_ns:
-                    if can_localize and (not self._poses or now-received >= wait_s):
+                    if can_localize and (not self._poses or now-received >= scan_wait_s):
                         self._offer_unlocalized(pending, now)
                     else:
                         remaining.append(pending)
@@ -302,6 +346,7 @@ class SlamStream:
                     continue
                 self.on_frame(stamp, cloud, pose, matrix.copy(), deepcopy(context))
                 if pose.prediction_anchor_ns is None:
+                    self._last_admitted_run = pose.external_continuity
                     self._segments[pose.segment_id] = (pose.frame_id, pose.child_frame_id, pose.clock_id, pose.pose_reference)
                     self._admitted += 1
             except ValueError as error:

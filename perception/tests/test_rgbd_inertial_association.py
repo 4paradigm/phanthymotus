@@ -387,3 +387,29 @@ def test_malformed_imu_during_rotation_fallback_does_not_supply_an_old_hint(hint
     session._imu(NS(data='invalid json'))
     assert session.imu.orientation_at(stamp, now[0]) is None
     assert session.gate.state != 'lost'
+
+
+def test_native_hint_statistics_come_from_the_last_native_report(tmp_path):
+    from plugins.rgbd_association import native_hint_statistics
+
+    log = tmp_path / 'estimator.log'
+    assert native_hint_statistics(log) is None
+    log.write_bytes(b'[INFO] [1.0] [seg.rgbd_odometry]: motus_rotation_hint api=1: optional\n')
+    assert native_hint_statistics(log) is None
+    log.write_bytes(log.read_bytes() +
+                    b'[INFO] [2.0] [seg.rgbd_odometry]: rotation_hint: frames=60 selected=49 supplied=38 '
+                    b'rejected=0 late=0 evicted=0\n' + b'x'*100 +
+                    b'\n[INFO] [3.0] [seg.rgbd_odometry]: rotation_hint: frames=120 selected=100 supplied=80 '
+                    b'rejected=1 late=2 evicted=3\n')
+    assert native_hint_statistics(log) == dict(frames=120, selected=100, supplied=80, rejected=1,
+                                               late=2, evicted=3, supplied_fraction=.667)
+
+
+def test_session_status_reports_native_hint_counters_from_the_estimator_log(hint_session):
+    session, _, _ = hint_session
+    assert session.info()['inertial_association']['native_applied'] is None
+    session.log.write(b'[INFO] [2.0] [x.rgbd_odometry]: rotation_hint: frames=60 selected=49 supplied=38 '
+                      b'rejected=0 late=0 evicted=0\n')
+    session._hint_statistics = None
+    report = session.info()['inertial_association']
+    assert report['native_applied']['supplied'] == 38 and report['native_applied']['frames'] == 60

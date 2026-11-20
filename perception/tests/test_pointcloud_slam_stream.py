@@ -184,6 +184,130 @@ def test_witnessed_vo_retains_token_across_brief_capture_gap(gap_ms, x):
     assert first and resumed == first
 
 
+def _witnessed(s, ms, x, **extra):
+    sample, parent = measured_rgbd(ms, x)
+    sample['vendor'].update(extra)
+    context = replace(parent, observation_id=f'derived-{ms}',
+                      parent_observation_ids=(parent.observation_id,),
+                      transformations=parent.transformations+('rgbd_odometry',))
+    s.odom(sample, now=ms/1000, context=context)
+    s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
+
+
+def test_unpaired_scan_does_not_interrupt_live_visual_pose_run():
+    unposed = []
+    s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: unposed.append(stamp))
+    s.ingress_clock_id = 'local'
+    _witnessed(s, 1000, 0.)
+    # One scan's capture is ahead of the live pose stream. Its bounded wait
+    # expires while independently measured poses from the old run still arrive.
+    s.cloud(3_200_000_000, 'camera', [[0, 0, 1]], now=1.1)
+    _witnessed(s, 2100, .03)
+    s.poll(now=3.11)
+    assert not unposed
+    assert s.status(now=3.11)['dropped_pending'] == 1
+    first, latest = (frame.pose.external_continuity for frame in s.accepted)
+    assert first and first == latest
+    # A real pose outage must still hand an available scan to geometry.
+    s.cloud(3_300_000_000, 'camera', [[0, 0, 1]], now=3.2)
+    s.poll(now=3.61)
+    assert unposed == [3_300_000_000]
+
+
+def test_live_visual_run_pairs_cloud_when_right_bracket_arrives_70ms_after_standard_wait():
+    unposed = []
+    s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: unposed.append(stamp))
+    s.ingress_clock_id = 'local'
+
+    def receive(ms, now, x):
+        sample, parent = measured_rgbd(ms, x)
+        context = replace(parent, observation_id=f'pose-{ms}',
+                          parent_observation_ids=(parent.observation_id,),
+                          transformations=parent.transformations+('rgbd_odometry',))
+        s.odom(sample, now=now, context=context)
+
+    # Relative capture and receipt intervals from the first Tianyi outage.
+    receive(900, .9, 0.)
+    s.cloud(900_000_000, 'camera', [[0, 0, 1]], now=.91)
+    s.cloud(1_734_000_000, 'camera', [[0, 0, 1]], now=1.)
+    receive(1000, 1.209, 0.)
+    s.poll(now=2.501)
+    receive(2402, 2.569, .5)
+    assert not unposed
+    first, resumed = s.accepted
+    assert first.pose.external_continuity == resumed.pose.external_continuity
+    assert resumed.pose.position[0] == pytest.approx(.5 * 734 / 1402)
+
+
+def relocalized(anchor_ms, **changes):
+    proof = dict(method='native_f2m_landmarks', anchor_stamp_ns=anchor_ms*1_000_000,
+                 shared_landmarks=44, outage_s=4.2, extended=True)
+    proof.update(changes)
+    return dict(relocalization=proof)
+
+
+def test_measured_f2m_relocalization_resumes_the_suspended_token_after_a_pause():
+    s = stream()
+    s.ingress_clock_id = 'local'
+    _witnessed(s, 1000, 0.)
+    _witnessed(s, 1200, .05)
+    for ms in (1500, 2600, 3900):
+        s.odom(dict(odom(ms, status='recovering'), pose=None), now=ms/1000)
+    assert s.continuity_token is None
+    _witnessed(s, 5400, .12, **relocalized(1200))
+    _witnessed(s, 5700, .14)
+    tokens = [frame.pose.external_continuity for frame in s.accepted]
+    assert tokens[0] and tokens == [tokens[0]]*4
+
+
+@pytest.mark.parametrize('changes', [
+    dict(method='other'), dict(shared_landmarks=19), dict(anchor_stamp_ns=1_100_000_000),
+    dict(anchor_stamp_ns=2_800_000_000)])
+def test_unverified_or_misanchored_relocalization_starts_a_new_token(changes):
+    s = stream()
+    s.ingress_clock_id = 'local'
+    _witnessed(s, 1000, 0.)
+    _witnessed(s, 1200, .05)
+    s.odom(dict(odom(1500, status='recovering'), pose=None), now=1.5)
+    _witnessed(s, 5400, .12, **relocalized(1200, **changes))
+    first, same, resumed = [frame.pose.external_continuity for frame in s.accepted]
+    assert first and same == first and resumed != first
+
+
+@pytest.mark.parametrize('ms,x', [(5701, .12), (5400, 7.), (3000, .1)])
+def test_relocalization_outside_the_witnessed_gap_or_motion_bound_starts_a_new_token(ms, x):
+    s = stream()
+    s.ingress_clock_id = 'local'
+    _witnessed(s, 1000, 0.)
+    _witnessed(s, 1200, .05)
+    s.odom(dict(odom(1500, status='recovering'), pose=None), now=1.5)
+    if ms == 3000:
+        # A new segment origin can never carry the suspended token.
+        sample, parent = measured_rgbd(ms, x, segment='b')
+        sample['vendor'].update(relocalized(1200))
+        context = replace(parent, observation_id=f'derived-{ms}',
+                          parent_observation_ids=(parent.observation_id,),
+                          transformations=parent.transformations+('rgbd_odometry',))
+        s.odom(sample, now=ms/1000, context=context)
+        s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
+    else:
+        _witnessed(s, ms, x, **relocalized(1200))
+    first, same, resumed = [frame.pose.external_continuity for frame in s.accepted]
+    assert first and same == first and resumed != first
+
+
+def test_suspended_token_is_consumed_by_the_first_measured_pose_only():
+    s = stream()
+    s.ingress_clock_id = 'local'
+    _witnessed(s, 1000, 0.)
+    s.odom(dict(odom(1500, status='recovering'), pose=None), now=1.5)
+    _witnessed(s, 3000, .05)  # resumed without proof: new token
+    s.odom(dict(odom(3200, status='recovering'), pose=None), now=3.2)
+    _witnessed(s, 4000, .06, **relocalized(1000))  # proof names the first run, not the second
+    first, second, third = [frame.pose.external_continuity for frame in s.accepted]
+    assert len({first, second, third}) == 3
+
+
 @pytest.mark.parametrize('sigma,accepted', [(.24, True), (.25, True), (.251, False)])
 def test_inertial_prediction_is_only_a_bounded_hint_in_the_accepted_origin(sigma, accepted):
     s = stream()

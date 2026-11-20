@@ -102,7 +102,9 @@ def test_landmark_timeout_switches_only_for_repeated_native_loss(auto, native_lo
     for i in range(3):
         assert visual(gate, 5_000_000_000 + i*100_000_000, lost=native_lost,
                       ids=range(24, 48)) is None
-    assert gate.status(6_001_000_000) == 'lost'
+    # Native still answers, so the bounded extension runs before restart.
+    assert gate.status(6_001_000_000) == 'recovering'
+    assert gate.status(6_800_000_000) == 'lost'
     assert gate.loss_kind == 'relocalization'
     _, selected = card._next_frontend('one', session, {'loss_kind': gate.loss_kind}, seconds[0])
     assert selected == switch
