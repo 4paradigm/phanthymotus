@@ -1269,34 +1269,34 @@ VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision"
 # rejected by every jp6.1 robot. The version is in the path so the mismatch is
 # visible without deserializing anything.
 #
-# Every pin below was taken from the copy downloaded back out of COS, not from
-# the file that was uploaded — the point of the pin is to catch a bad transfer,
-# and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE / KOKORO.)
-#
-# vocab.json is byte-identical across both families; the two bundles carry
-# their own copy anyway so a family is one self-contained download.
+# VOP B6 uses separate Orin engines for JP5/JP6 and a shared 220-class
+# vocabulary. Public release downloads are verified by size and SHA256.
+_VOP_MODEL_BASE = (
+    "https://www.modelscope.ai/models/ZhuojuLi/vop-b6-coverage20-20261111"
+    "/resolve/d0478bfa17caab7f2dc573a819341a16c4a9ad95"
+)
 _VOP_VOCAB = {
-    "size": 1969,
-    "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b",
+    "size": 3046,
+    "sha256": "a9086a8ad5290a3c6b14e3b73512d4e4a63c9031f4a20d944bb0d7e8a352132f",
 }
 
 VOP_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
+        "base_url": f"{_VOP_MODEL_BASE}/jp61",
         "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 24780908,
-                "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
+            "yoloe-26m-det.engine": {
+                "size": 46355418,
+                "sha256": "874d7df20427a2e0ac2bbd0c864697f77fd470225e810f2475430686b85ee154",
             },
             "vocab.json": _VOP_VOCAB,
         },
     },
     "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
+        "base_url": f"{_VOP_MODEL_BASE}/jp511",
         "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 23742701,
-                "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe",
+            "yoloe-26m-det.engine": {
+                "size": 45513063,
+                "sha256": "81701df5bf33ceb93a271f9b464ffae9e21c49da751176d97b9a6996f1dc01f6",
             },
             "vocab.json": _VOP_VOCAB,
         },
