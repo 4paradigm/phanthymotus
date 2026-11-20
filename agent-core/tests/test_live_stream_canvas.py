@@ -93,6 +93,59 @@ def test_refused_config_does_not_persist(monkeypatch, tmp_path):
     assert url not in response.body.decode()
 
 
+def test_driver_error_never_echoes_submitted_stream_address(monkeypatch):
+    address = "rtmp://example.invalid/live/canary-placeholder"
+    state = {}
+    monkeypatch.setattr(canvas.config, "main", state)
+    monkeypatch.setattr(live_stream_auth, "sign_live_stream_action",
+                        lambda action, _url: "test-proof:" + action)
+    import tool_config
+    monkeypatch.setattr(tool_config, "find_tool", lambda *_: {"name": "live_stream"})
+    monkeypatch.setattr(tool_config, "plan_config_calls", lambda *_: [
+        ({"rtmp_url": address}, {})
+    ])
+
+    async def reject(*_args, **_kwargs):
+        return {"code": 400, "message": "Invalid RTMP URL: " + address}
+
+    monkeypatch.setattr(mcp_manage, "mcp_call_tool", reject)
+    response = asyncio.run(canvas._save_live_stream_instance(
+        "mcp-qa", "card-a", {"rtmp_url": address}))
+    assert response.status_code == 422
+    assert address not in response.body.decode()
+    assert "canary-placeholder" not in response.body.decode()
+    assert state == {}
+
+
+def test_multiple_driver_config_calls_all_must_acknowledge(monkeypatch):
+    address = "rtmp://example.invalid/live/canary-placeholder"
+    state = {}
+    monkeypatch.setattr(canvas.config, "main", state)
+    monkeypatch.setattr(live_stream_auth, "sign_live_stream_action",
+                        lambda action, _url: "test-proof:" + action)
+    import tool_config
+    monkeypatch.setattr(tool_config, "find_tool", lambda *_: {"name": "live_stream"})
+    monkeypatch.setattr(tool_config, "plan_config_calls", lambda *_: [
+        ({"rtmp_url": address}, {"instance_id": "card-a"}),
+        ({"rtmp_url": address}, {"instance_id": "card-a"}),
+    ])
+    observed = []
+
+    async def respond(*_args, **_kwargs):
+        observed.append("called")
+        if len(observed) == 1:
+            return _result(ok=False, configured=False, message="failure " + address)
+        return _result(ok=True, configured=True, ready_to_go_live=True)
+
+    monkeypatch.setattr(mcp_manage, "mcp_call_tool", respond)
+    response = asyncio.run(canvas._save_live_stream_instance(
+        "mcp-qa", "card-a", {"rtmp_url": address}))
+    assert response.status_code == 422
+    assert address not in response.body.decode()
+    assert state == {}
+    assert len(observed) == 1
+
+
 def test_signed_go_live_reaches_driver_without_unsigned_config(monkeypatch):
     monkeypatch.setattr(mcp_manage, "_get_mcp_list", lambda: [{
         "id": "mcp-qa", "url": "http://test-driver/mcp",

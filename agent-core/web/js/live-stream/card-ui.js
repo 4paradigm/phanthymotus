@@ -47,7 +47,6 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
             button(item.name, 'platform:' + id, 'ls-platform' + (id === state.platform ? ' selected' : ''))
           ).join('')}
         </div>
-        <p class="ls-hint">其他直播平台后续接入。</p>
         ${button('下一步', 'to-readiness', 'ls-primary')}`;
     } else if (state.phase === 'readiness') {
       body = `<div class="ls-title">你现在准备到哪一步了？</div>
@@ -97,10 +96,7 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
           ${back('input-back')}`;
     } else if (state.phase === 'review') {
       body = `<div class="ls-title">即将开始直播</div>
-        <div class="ls-check">✓ 直播地址已通过格式检查</div>
-        <div class="ls-check">✓ 机器人已接受本场配置</div>
-        <div class="ls-check">○ 摄像头和麦克风将在开播时检查</div>
-        <p class="ls-warning">点击下一步会尝试公开机器人拍摄的画面和声音。若平台还有“进入直播”操作，也需要在那里确认。</p>
+        <div class="ls-check">✓ 直播信息已保存</div>
         ${button('确认开始直播', 'start', 'ls-primary', state.busy)}
         ${back('to-input')}`;
     } else if (state.phase === 'live') {
@@ -112,7 +108,6 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
           <span>视频帧 <b data-stat="frames"></b></span>
           <span>音频块 <b data-stat="audio"></b></span>
         </div>
-        <p class="ls-warning">机器人显示“正在推流”不等于平台已正式开播。请按平台提示完成「开始直播」操作，再在观众端检查画面和声音。</p>
         ${button('结束直播', 'stop', 'ls-danger', state.busy)}`;
     }
     root.innerHTML = `<div class="ls-panel${state.phase === 'input' ? ' ls-config' : ''}">
@@ -187,11 +182,11 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
       } else if (state.phase === 'live') {
         state.ready = false;
         move('platform');
-        state.notice = 'Bumi 已停止推流，请到直播平台确认直播间也已结束。';
+        state.notice = '推流已停止';
         render();
       } else if (state.phase === 'review' && !result.ready_to_go_live) {
         state.ready = Boolean(result.configured);
-        state.notice = '直播信息仍已保存，确认开播时会重新授权。';
+        state.notice = '';
         render();
       }
     } catch {
@@ -295,7 +290,7 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
         if (result.state === 'idle') {
           state.ready = false;
           move('platform');
-          state.notice = 'Bumi 已停止推流，请在平台确认直播间已结束。';
+          state.notice = '推流已停止';
           render();
         } else move('live');
       }

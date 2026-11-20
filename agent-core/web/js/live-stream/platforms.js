@@ -40,35 +40,35 @@ export const GUIDES = Object.freeze({
   xiaohongshu: {
     new: [
       { stage: '普通直播', title: '打开小红书主播中心', detail: '在手机小红书 App 登录本人账号，进入「创作者中心 → 主播中心 → 去开播 → 开始直播」。', place: '手机 App' },
-      { stage: '普通直播', title: '准备首次直播封面和标题', detail: '在直播准备页面按提示上传封面、填写标题。有些直播准备页面可能要求两张封面；请以当前页面的要求为准。', place: '手机 App' },
-      { stage: '普通直播', title: '完成实名认证', detail: '按手机提示完成实名认证及平台要求的其他资格核验，不能跳过审核。', place: '手机 App' },
+      { stage: '普通直播', title: '准备首次直播封面和标题', detail: '上传直播封面，填写标题。', place: '手机 App' },
+      { stage: '普通直播', title: '完成实名认证', detail: '按提示完成实名认证。', place: '手机 App' },
       { stage: '普通直播', title: '完成一次真正的手机直播', detail: '点击「开始直播」，按提示同意协议并进入直播。确认开播成功后，再正常「结束直播」。', place: '手机 App' },
     ],
     permission: [
       { stage: 'OBS 权限', title: '用同一账号打开 OBS 官方网页', detail: '在电脑浏览器打开小红书 OBS 页面，用刚才成功手机开播的同一个账号扫码或手机验证登录。', url: 'https://www.xiaohongshu.com/zhibo/obs', place: '电脑网页' },
       { stage: 'OBS 权限', title: '申请 OBS 开播权限', detail: '如页面显示「暂无 OBS 开播权限」，点击「申请」。成功开通后会进入直播助手下载页面，可直接继续下载。', url: 'https://www.xiaohongshu.com/zhibo/obs', place: '电脑网页' },
-      { stage: '电脑助手', title: '下载小红书直播助手', detail: '申请成功后，直接在跳转的官方页面下载并安装小红书直播助手，不必返回 OBS 页面重复确认。Bumi 直推不需要安装 OBS。', url: 'https://www.xiaohongshu.com/zhibo/robs', place: '电脑' },
+      { stage: '电脑助手', title: '下载小红书直播助手', detail: '在跳转的官方页面下载安装小红书直播助手。', url: 'https://www.xiaohongshu.com/zhibo/robs', place: '电脑' },
       { stage: '电脑助手', title: '扫码登录电脑直播助手', detail: '打开小红书电脑直播助手，用刚才申请权限的同一账号扫码登录。', place: '电脑直播助手' },
     ],
     find: [
-      { stage: '本场推流', title: '切换到「三方推流」', detail: '在电脑直播助手左上角模式菜单选择「三方推流」（不是「常规模式」或「嘉宾模式」）。', place: '电脑直播助手' },
-      { stage: '本场推流', title: '设置本场直播封面和标题', detail: '点击「去设置」，填写本场直播标题、按页面要求上传封面并保存。官方界面明确提示：完成这一步后才能获取服务器和直播推流码。', place: '电脑直播助手' },
-      { stage: '本场推流', title: '复制本场服务器和推流码', detail: '保存后，分别复制「服务器地址」和「直播推流码」，返回 Bumi 粘贴。不要公开密钥，也不要把验证码发给聊天机器人。', place: '电脑直播助手' },
+      { stage: '本场推流', title: '切换到「三方推流」', detail: '在电脑直播助手左上角选择「三方推流」。', place: '电脑直播助手' },
+      { stage: '本场推流', title: '设置本场直播封面和标题', detail: '点击「去设置」，填写标题和封面并保存。', place: '电脑直播助手' },
+      { stage: '本场推流', title: '复制本场服务器和推流码', detail: '复制「服务器地址」和「直播推流码」，回到 Bumi 分别粘贴。', place: '电脑直播助手' },
     ],
   },
   huya: {
     new: [
-      { stage: '账号准备', title: '登录虎牙', detail: '打开虎牙官网，点击右上角登录。已有账号就直接登录，不必重复注册。', url: 'https://www.huya.com/', linkText: '打开虎牙登录页面', place: '电脑网页' },
-      { stage: '账号准备', title: '完成主播实名认证', detail: '打开虎牙主播认证页面，按提示绑定手机号、填写身份信息并完成实名认证。已经认证的账号可跳过。', url: 'https://i.huya.com/index.php?m=ProfileAuth', linkText: '直达主播认证页面', helpUrl: 'https://help.huya.com/165', place: '电脑网页' },
+      { stage: '账号准备', title: '登录虎牙', detail: '打开虎牙官网，点击右上角登录。', url: 'https://www.huya.com/', linkText: '打开虎牙登录页面', place: '电脑网页' },
+      { stage: '账号准备', title: '完成主播实名认证', detail: '进入认证页面，按提示完成实名认证。', url: 'https://i.huya.com/index.php?m=ProfileAuth', linkText: '直达主播认证页面', helpUrl: 'https://help.huya.com/165', place: '电脑网页' },
     ],
     permission: [
       { stage: '账号准备', title: '完成主播实名认证', detail: '主播尚未认证时，在虎牙个人认证页面完成认证；认证后再去主播设置获取远程推流地址。', url: 'https://i.huya.com/index.php?m=ProfileAuth', linkText: '直达主播认证页面', helpUrl: 'https://help.huya.com/165', place: '电脑网页' },
     ],
     find: [
       { stage: '远程推流', title: '打开主播设置', detail: '直接进入虎牙主播设置。若页面要求登录，请登录刚才完成认证的同一账号。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '直达虎牙主播设置', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
-      { stage: '远程推流', title: '选择「开通远程推流」', detail: '在主播设置页面找到「开通远程推流」或「普通/VR 远程推流」选项。无需安装 OBS。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '打开远程推流设置', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
+      { stage: '远程推流', title: '选择「开通远程推流」', detail: '在主播设置中找到「普通/VR 远程推流」，点击「开通远程推流」。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '打开远程推流设置', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
       { stage: '本场直播', title: '填写直播分类和标题', detail: '选择本场直播品类，再选择「普通直播」，按虎牙页面提示填写直播标题。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '进入直播设置页面', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
-      { stage: '本场直播', title: '获取并复制完整 RTMP 地址', detail: '确认 Bumi 已准备好后，点击「获取推流地址并开播」，复制虎牙提供的完整 RTMP 地址，然后粘贴到 Bumi。注意：此按钮可能已启动虎牙平台侧直播。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '前往获取推流地址', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
+      { stage: '本场直播', title: '获取并复制完整 RTMP 地址', detail: '点击「获取推流地址并开播」，复制完整 RTMP 地址，粘贴到 Bumi。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '前往获取推流地址', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
     ],
   },
 });

@@ -456,6 +456,7 @@ async def _save_live_stream_instance(mcp_id: str, instance_id: str, body: Any):
     if not calls:
         return fastapi.responses.JSONResponse(
             status_code=422, content={"code": 422, "message": "直播 Card 配置字段未注册"})
+    ready = True
     for cfg, extra in calls:
         try:
             # A user-initiated save may authorize one start, including the same key.
@@ -468,24 +469,27 @@ async def _save_live_stream_instance(mcp_id: str, instance_id: str, body: Any):
             response = {"code": 503}
         if response.get("code") != 200:
             # Never return the supplied secret or low-level exception details.
-            message = response.get("message", "") if response.get("code") == 400 else ""
+            # Never return Driver-supplied messages: they may contain the RTMP key.
             return fastapi.responses.JSONResponse(
                 status_code=422, content={"code": 422,
-                    "message": str(message)[:240] or "机器人未确认配置，未保存；请检查 Driver 状态"})
-    content = response.get("data") or []
-    ready = False
-    acknowledged = False
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        try:
-            outcome = json.loads(content[0].get("text", "{}"))
-            acknowledged = outcome.get("ok") is True and outcome.get("configured") is True
-            ready = bool(outcome.get("ready_to_go_live"))
-        except (ValueError, TypeError, AttributeError):
-            pass
-    if not acknowledged:
-        return fastapi.responses.JSONResponse(
-            status_code=422, content={"code": 422,
-                "message": "机器人未确认配置，未保存。请检查直播信息和设备连接。"})
+                    "message": "保存失败，请检查直播信息或机器人连接"})
+        content = response.get("data") or []
+        call_ready = False
+        acknowledged = False
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            try:
+                outcome = json.loads(content[0].get("text", "{}"))
+                acknowledged = (isinstance(outcome, dict)
+                                and outcome.get("ok") is True
+                                and outcome.get("configured") is True)
+                call_ready = acknowledged and outcome.get("ready_to_go_live") is True
+            except (ValueError, TypeError, AttributeError):
+                pass
+        if not acknowledged:
+            return fastapi.responses.JSONResponse(
+                status_code=422, content={"code": 422,
+                    "message": "保存失败，请检查直播信息或机器人连接"})
+        ready = ready and call_ready
     config.main[tool_config_key(mcp_id, "live_stream", instance_id)] = body
     _broadcast({"type": "tool_config_updated", "payload": {
         "mcp_id": mcp_id, "tool": "live_stream", "instance_id": instance_id}})
