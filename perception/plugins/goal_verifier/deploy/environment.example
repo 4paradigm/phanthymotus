@@ -1,0 +1,8 @@
+# All paths and IDs belong to YOUR isolated visual service. No CAN/owner flags.
+GOAL_CONFIG=/absolute/own/run/config.json
+GOAL_PYTHON=/absolute/own/venv/bin/python
+GOAL_PORT=15785
+PYTHONDONTWRITEBYTECODE=1
+# Before launching the visual-only process, source your existing ROS environment
+# if using ros_image/ros_normalized. The profile contains the verified domain_id.
+# No AGENT_CORE_URL heartbeat: registration is an explicit separate CLI action.

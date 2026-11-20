@@ -233,6 +233,18 @@ class PerceptionBundle:
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
 
+        if plugins_cfg.get("piper_object_goal_verifier", {}).get("enabled", False):
+            try:
+                from plugins.goal_verifier import GoalVerifierPlugin
+                from plugins.goal_verifier.exchange import FrameExchange
+                goal = GoalVerifierPlugin(plugins_cfg["piper_object_goal_verifier"], executor)
+                goal.image_exchange = FrameExchange(plugins_cfg["piper_object_goal_verifier"].get(
+                    "frame_base_url", f"http://127.0.0.1:{cfg.get('mcp_port', 15720)}"))
+                self._plugins.append(goal)
+                log.info("PiPER GoalVerifierPlugin loaded")
+            except Exception:
+                log.error("PiPER GoalVerifierPlugin failed to load", exc_info=True)
+
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["pose"].get("namespace", "").strip()
@@ -311,6 +323,12 @@ class PerceptionBundle:
                 return plugin, full_name[len(prefix) + 1:]
         return None, ""
 
+    def goal_frame(self, path):
+        for plugin in self._plugins:
+            if plugin.PREFIX == "piper_object_goal_verifier" and plugin.image_exchange:
+                return plugin.image_exchange.get(path)
+        return None
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -376,6 +394,18 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if self.path.startswith('/piper-goal-frame/'):
+                data = _bundle.goal_frame(self.path)
+                if data is None:
+                    self._send(404, '{"error":"frame expired or unknown"}')
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path in ("/vad/test", "/tts/test"):
                 self._send(405, '{"error":"Use POST"}')
                 return
@@ -534,10 +564,13 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
+                    private_goal_call = name == 'piper_object_goal_verifier'
                     music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
                   or name == 'audio_mixer' or name.startswith('audio_mixer_'))
                     if not is_info:
-                        if music_call:
+                        if private_goal_call:
+                            log.info('[mcp] piper_object_goal_verifier call (payload omitted)')
+                        elif music_call:
                             log.info("[mcp] tools/call: phanthy_music (payload omitted)")
                         else:
                             log.info(f"[mcp] tools/call: {name}({_brief(args)})")
@@ -559,7 +592,9 @@ def make_handler():
                             err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            if music_call:
+                            if private_goal_call:
+                                log.info('[mcp] piper_object_goal_verifier result (payload omitted)')
+                            elif music_call:
                                 log.info("[mcp] phanthy_music result received (payload omitted)")
                             else:
                                 log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")

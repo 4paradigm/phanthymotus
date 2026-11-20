@@ -1,0 +1,49 @@
+<!doctype html><html lang="zh"><meta charset="utf-8">
+<style>
+body{font:14px system-ui;background:#162230;color:#e7edf5;padding:18px;margin:0}h2{margin:0 0 8px}main{display:grid;grid-template-columns:350px 1fr;gap:18px}label{display:block;margin:10px 0}input,select,button,textarea{font:inherit;background:#263b50;color:inherit;border:1px solid #647d96;border-radius:4px;padding:7px}input{width:100px}input.long{width:250px}textarea{width:94%;height:95px}button{cursor:pointer;margin:4px}canvas{max-width:100%;background:#0e1721;border:1px solid #50667b}pre{white-space:pre-wrap;overflow:auto;max-height:360px}.PASS{color:#70e8a0}.FAIL{color:#ffa39a}.INCONCLUSIVE{color:#ffda80}.note{color:#b8c9d9;font-size:12px}#result{font-size:24px}
+</style>
+<h2>PiPER 物体目标达成验证</h2><p class="note">只读视觉结果；适用于推动、抓放及人工移动。图像距离不是物理距离。页面不会发送机械臂指令。</p>
+<main><section>
+<label>视觉来源 <select id="source"></select></label><button id="start">启动视觉订阅</button><button id="observe">读取并选择物体</button>
+<label>检测目标 <select id="detection"></select></label>
+<label>类别 <input id="class" class="long"></label><label>颜色（可选） <input id="color"></label>
+<label>任务标识 <input id="task" class="long" value="piper-object-operation"></label>
+<label>目标坐标 <select id="units"><option value="normalized">归一化图像 [0,1]</option><option value="pixels">像素</option><option value="plane_mm">已测量 PiPER 平面 mm</option></select></label>
+<label>坐标系 <input id="frame" class="long"></label>
+<label>区域 <select id="shape"><option value="circle">圆</option><option value="rectangle">矩形</option></select></label>
+<label>圆中心 x,y 或矩形 xmin,ymin,xmax,ymax <input id="region" class="long" value="0.75,0.5"></label>
+<label>圆半径 <input id="radius" type="number" value="0.08" step="0.01"> 容差 <input id="tolerance" type="number" value="0" step="0.01"></label>
+<label>最低可靠度 <input id="confidence" type="number" value="0.7" step="0.05"> 最大图像位移 <input id="displacement" type="number" value="0.35" step="0.05"></label>
+<button id="session">1. 创建独立会话</button><button id="before">2. 记录操作前状态</button>
+<p class="note">操作完成后再点下面的标记；验证只接受此标记之后采集的图像。人工移动用于无机械臂验收，不冒充机械臂执行。</p>
+<button id="mark">3. 标记操作已完成</button><button id="after">4. 获取新观测并验证</button>
+<button id="reset">重置会话</button><button id="export">导出证据 JSON</button><button id="stop">停用视觉 / 退役会话</button>
+</section><section><div id="binding" class="note"></div><div id="result">尚未验证</div><canvas id="view" width="620" height="390"></canvas><p id="measurement" class="note"></p><pre id="state"></pre>
+<details id="export-panel"><summary>证据 JSON（全选复制保存；也可使用 CLI 导出）</summary><textarea id="export-data" readonly aria-label="会话证据JSON"></textarea></details>
+<details><summary>标准观测导入（外部视觉接口或明确标记测试数据）</summary><textarea id="observation" aria-label="规范观测JSON"></textarea><button id="submit">提交规范观测</button><p class="note">不补造检测、身份或采集时间。真实/回放/合成来源由观测声明，默认拒绝测试数据。</p></details>
+</section></main>
+<script>
+(()=>{'use strict';let port,n=0,session=null,marker=null,lastObservation=null;const waiting=new Map(),el=id=>document.getElementById(id),v=id=>el(id).value;
+function call(args){return new Promise((resolve,reject)=>{const id=String(++n);waiting.set(id,{resolve,reject});port.postMessage({id,method:'call',args});});}
+const rid=()=>crypto.randomUUID();const identity=()=>{if(!session)throw Error('先创建会话');return {session_id:session.session_id,session_token:session.session_token};};
+function show(data){el('state').textContent=JSON.stringify(data,null,2);if(data.result){el('result').textContent=data.result+' · '+(data.message||data.code);el('result').className=data.result;}if(data.state==='error')throw Error(data.code+': '+data.message);return data;}
+function clearResult(){el('result').textContent='尚未验证';el('result').className='';}
+function goal(){const values=v('region').split(',').map(Number);const g={units:v('units'),frame_id:v('frame'),shape:v('shape'),tolerance:Number(v('tolerance'))};if(g.shape==='circle'){g.center=values;g.radius=Number(v('radius'));}else g.bounds=values;return g;}
+function draw(o){const c=el('view'),ctx=c.getContext('2d');ctx.clearRect(0,0,c.width,c.height);if(!o)return;const sx=c.width/o.image_size[0],sy=c.height/o.image_size[1];ctx.strokeStyle='#60c7ff';ctx.fillStyle='#e7edf5';ctx.font='13px sans-serif';for(const x of o.objects){const b=x.bbox;ctx.strokeRect(b[0]*sx,b[1]*sy,(b[2]-b[0])*sx,(b[3]-b[1])*sy);ctx.fillText(x.detection_id+' '+x.class_name+' '+(x.color||''),b[0]*sx,Math.max(15,b[1]*sy));}const g=session?.goal||goal();if(g.units==='plane_mm')return;const mx=g.units==='normalized'?c.width:sx,my=g.units==='normalized'?c.height:sy;ctx.strokeStyle='#71e4a0';ctx.beginPath();if(g.shape==='circle')ctx.ellipse(g.center[0]*mx,g.center[1]*my,g.radius*mx,g.radius*my,0,0,Math.PI*2);else ctx.rect(g.bounds[0]*mx,g.bounds[1]*my,(g.bounds[2]-g.bounds[0])*mx,(g.bounds[3]-g.bounds[1])*my);ctx.stroke();}
+async function previewImage(o,cached){const r=cached||await call({action:'get_preview',source_id:o.source_id,observation_id:o.observation_id});draw(o);if(!r.preview)return;const pic=new Image();await new Promise((resolve,reject)=>{pic.onload=resolve;pic.onerror=()=>reject(Error('关联图像缩略图解码失败'));pic.src='data:image/jpeg;base64,'+r.preview.jpeg_base64;});const canvas=el('view'),ctx=canvas.getContext('2d');ctx.globalCompositeOperation='destination-over';ctx.drawImage(pic,0,0,canvas.width,canvas.height);ctx.globalCompositeOperation='source-over';el('measurement').textContent='历史关联帧 '+o.observation_id+' · 采集 '+o.captured_at+' · '+o.provenance+'；缩略图仅供查看';}
+function bind(id,fn){el(id).onclick=async()=>{el(id).disabled=true;try{return await fn();}catch(e){el('state').textContent='错误：'+e.message;el('result').textContent='INCONCLUSIVE';el('result').className='INCONCLUSIVE';}finally{el(id).disabled=false;}};}
+bind('start',async()=>show(await call({action:'start'})));
+bind('observe',async()=>{const r=show(await call({action:'observe',source_id:v('source')}));lastObservation=r.observation;el('frame').value=lastObservation.frame_id;el('detection').innerHTML='';for(const x of lastObservation.objects){const opt=document.createElement('option');opt.value=x.detection_id;opt.textContent=x.class_name+' '+(x.color||'')+' #'+x.detection_id;el('detection').append(opt);}el('detection').onchange();await previewImage(lastObservation);return r;});
+el('detection').onchange=()=>{const x=lastObservation?.objects.find(x=>x.detection_id===v('detection'));if(x){el('class').value=x.class_name;el('color').value=x.color||'';}};
+bind('session',async()=>{const selector={class_name:v('class')};if(v('color'))selector.color=v('color');const matches=(lastObservation?.objects||[]).filter(x=>x.class_name===selector.class_name&&(!selector.color||x.color===selector.color));let pinned=null;if(v('detection')&&matches.length>1){selector.detection_id=v('detection');selector.observation_id=lastObservation.observation_id;pinned=lastObservation;}if(session)await call({action:'close_session',request_id:rid(),...identity()});session=show(await call({action:'start_session',request_id:rid(),task_id:v('task'),source_id:v('source'),selector,goal:goal(),min_confidence:Number(v('confidence')),max_displacement_norm:Number(v('displacement'))}));session.pinned=pinned;marker=null;clearResult();draw(lastObservation);return session;});
+bind('before',async()=>show(await call({action:'capture_before',request_id:rid(),...identity(),...(session.pinned?{observation:session.pinned}:{})})));
+bind('mark',async()=>{marker=show(await call({action:'mark_operation_complete',request_id:rid(),...identity()}));clearResult();return marker;});
+bind('after',async()=>{if(!marker)throw Error('先标记操作已完成');const r=show(await call({action:'verify_after',request_id:rid(),...identity(),marker_id:marker.marker_id}));if(r.after_observation_id){const p=await call({action:'get_preview',source_id:v('source'),observation_id:r.after_observation_id});if(p.preview)await previewImage(p.preview.observation,p);else draw(null);}el('measurement').textContent=JSON.stringify({units:r.units,before:r.before_position,after:r.after_position,delta:r.displacement,target_error:r.target_error,observations:[r.before_observation_id,r.after_observation_id]});return r;});
+bind('reset',async()=>{session=show(await call({action:'reset_session',request_id:rid(),...identity()}));marker=null;clearResult();return session;});
+bind('export',async()=>{const r=show(await call({action:'export_session',...identity()}));el('export-data').value=JSON.stringify(r,null,2);el('export-panel').open=true;el('export-data').focus();el('export-data').select();return r;});
+bind('submit',async()=>show(await call({action:'submit_observation',observation:JSON.parse(v('observation'))})));
+bind('stop',async()=>{const r=show(await call({action:'stop'}));session=marker=null;clearResult();return r;});
+for(const name of ['source','class','color','units','frame','shape','region','radius','tolerance','confidence','displacement'])el(name).onchange=()=>{if(session){session=null;marker=null;clearResult();el('state').textContent='配置变化，请建立新会话和操作前基准。';}draw(lastObservation);};
+window.addEventListener('message',e=>{if(e.data?.protocol!=='motus.workbench/1'||!e.ports[0]||port)return;port=e.ports[0];port.onmessage=event=>{const r=event.data,w=waiting.get(r.id);if(w){waiting.delete(r.id);r.error?w.reject(Error(r.error)):w.resolve(r.result);}};port.start();call({action:'info'}).then(info=>{show(info);el('binding').textContent='PiPER '+info.piper_id+' · '+info.api_version+' · 无运动能力';for(const s of info.sources){const o=document.createElement('option');o.value=s.source_id;o.textContent=s.source_id+' / '+s.camera_id;el('source').append(o);}}).catch(e=>el('state').textContent=e.message);});
+})();
+</script></html>
