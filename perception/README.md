@@ -11,10 +11,16 @@ the local TTS engines run on TensorRT.
 ## ROS 2 bag recorder
 
 The `rosbag_recorder` Card records ROS 2 topics with the ROS 2 Humble
-`ros2 bag record` command. Add the Card to a project and configure the topic
-names before starting the project. Project start begins recording; project
-stop ends it and waits for the recorder to finish writing. The Card reports
-recording status and errors. This Card does not play bags.
+`ros2 bag record` command. The Card is enabled by default and included in the
+resource-center card list. The Jetson image build requires the Humble desktop
+base to provide the recording command, rosbag2 Python bindings, and a
+registered SQLite writer; it fails rather than publishing an image if the
+check fails. The check verifies the inherited runtime; it does not install it.
+
+Add the Card to a project and configure the topic names before starting the
+project. Project start begins recording; project stop ends it and waits for the
+recorder to finish writing. The Card reports recording status and errors. This
+Card does not play bags.
 
 The default `plugins.rosbag_recorder.output_root` is `/models/rosbags`.
 The supplied deployment mounts `/opt/embodied/models` at `/models`, so bags
@@ -23,17 +29,18 @@ directory is writable and has enough free space, or configure another
 **persistently mounted** output root. Recording data may use substantial disk
 space; adjust the configured duration and free-space limits for the device.
 
-Before using the Card, check that the actual Perception image contains the
-Humble `ros2` CLI, rosbag2 and its SQLite storage plugin (for example, run
-`ros2 bag record --help` inside the sourced image). The Jetson base image is
-not guaranteed to contain them. Missing dependencies must be installed in the
-image before recording; a startup error does not mean recording has begun.
-The recorder must see the target ROS graph using compatible ROS domain, DDS
-network settings, message types and QoS. The default deployment's Domain 42
-and Fast DDS configuration are examples, not universal settings. Camera or
-vendor data that is not published as a ROS 2 topic cannot be recorded by this
-Card. Verify on the target robot that the resulting bag contains the intended
-messages; process startup alone does not prove message delivery.
+For images built outside this Dockerfile, verify the recording command and
+SQLite writer in the target image. A startup error does not mean recording has
+begun.
+The recorder follows the repository's robot deployment contract: use
+`ROS_DOMAIN_ID=42`, `rmw_fastrtps_cpp`, and the shared loopback-only Fast DDS
+profile at `/opt/phanthy-motus/dds-local.xml`. The Perception container uses
+host networking to participate in the robot's local ROS graph; this profile
+does not expose DDS topics from other machines. The recorder also needs
+compatible message types and QoS. Camera or vendor data that is not published
+as a ROS 2 topic cannot be recorded by this Card. Verify on the target robot
+that the resulting bag contains the intended messages; process startup alone
+does not prove message delivery.
 
 ## Audio Requirements for ASR
 
