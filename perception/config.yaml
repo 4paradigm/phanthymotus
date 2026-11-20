@@ -710,3 +710,31 @@ plugins:
     # 没有 camera_info 时的兜底；留空 = 不猜，只输出距离。
     half_fov_rad: null
     half_fov_v_rad: null
+
+  # ROS 2 节点图查询卡片：读所有节点/话题的发布订阅关系，输出文字拓扑给决策中心，
+  # 并提供一个自包含网页给人工调试。没有输入口，只有一路 data/json 输出。
+  #
+  # 端口访问：默认只绑定 127.0.0.1，所以机器人端口不对外开放时，卡片介绍里的
+  # http://127.0.0.1:<port>/ 需要在本机先建 SSH 隧道；卡片会把完整 ssh -L 命令
+  # 写在 info/description 里。部署在反代或已开放端口时，把 public_base_url 设成
+  # 浏览器能直接打开的地址（如 https://robot.example/graph/），就不需要隧道。
+  # bind_host 改成 0.0.0.0 可让局域网直连，但页面没有鉴权，只建议在可信网络使用。
+  ros2_node_graph:
+    enabled: true
+    port: 15730
+    bind_host: 127.0.0.1
+    public_base_url: ""
+    # ssh_host 留空 = 自动探测本机局域网 IP；ssh_port 按机器人实际 SSH 端口改。
+    ssh_host: ""
+    ssh_port: 2222
+    ssh_user: noetix
+    ssh_local_port: 0          # 0 = 与本机网页端口相同
+    publish_interval_s: 5.0    # 内容不变时不会每次重发，只按 heartbeat_s 发心跳
+    heartbeat_s: 30.0
+    include_system_topics: false
+    exclude_topics: []
+    exclude_namespaces: []
+    max_nodes: 120
+    max_topics: 200
+    max_flows: 60
+    summary_max_chars: 4000    # data/json 摘要上限，避免灌满 LLM 上下文
