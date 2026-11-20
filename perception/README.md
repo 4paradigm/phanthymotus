@@ -732,8 +732,9 @@ The Jetson Perception image includes the dependencies in
 `kokoro-multi-trt` through the existing TTS card. Selecting the engine loads one
 FP32 TensorRT model and one voice for `zh`, `en`, `ja`, `ru`, `de`,
 `fr`, `es`, and `th`. Set `kokoro_trt_language` to `auto` for per-request
-language detection, or choose one of those language codes. The engine uses GPU
-inference and `speaker_id: 0`.
+language detection, or choose one of those language codes. The device and
+speaker fields show the options supported by the current release: GPU and
+speaker ID `0`.
 
 When configuring the engine in `config.yaml`, update these fields under
 `plugins.tts`. Setting `model_dir: null` replaces the VITS2 path and selects

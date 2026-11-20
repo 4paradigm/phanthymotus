@@ -1352,7 +1352,20 @@ def _validate_kokoro_manifest(model_dir: str) -> dict:
 
 KOKORO_TRT_ENGINE = "kokoro-multi-trt"
 _KOKORO_TRT_LANGUAGES = ("zh", "en", "ja", "ru", "de", "fr", "es", "th")
-_KOKORO_TRT_LANGUAGE_KEY = "kokoro_trt_language"
+_KOKORO_TRT_CARD_FIELDS = {
+    "kokoro_trt_device": ("device", {
+        "type": "string", "enum": ["gpu"], "default": "gpu",
+        "title": "Inference device",
+    }),
+    "kokoro_trt_speaker_id": ("speaker_id", {
+        "type": "integer", "enum": [0], "default": 0,
+        "title": "Speaker ID",
+    }),
+    "kokoro_trt_language": ("tts_language", {
+        "type": "string", "enum": ["auto", *_KOKORO_TRT_LANGUAGES], "default": "auto",
+        "description": "Pronunciation language for kokoro-multi-trt. Auto detects each utterance.",
+    }),
+}
 
 
 def _kokoro_trt_available():
@@ -2396,13 +2409,11 @@ class TTSPlugin:
             cfg.pop("backend", None)
         if engine == KOKORO_TRT_ENGINE:
             configured = engine == self._configured_engine
-            cfg.update(
-                model_dir=(self._configured_model_dir or None) if configured else None,
-                device="gpu",
-                speaker_id=0,
-                tts_language=cfg.get(_KOKORO_TRT_LANGUAGE_KEY)
-                or (cfg.get("language") if configured else "auto"),
-            )
+            cfg["model_dir"] = (self._configured_model_dir or None) if configured else None
+            for field, (setting, schema) in _KOKORO_TRT_CARD_FIELDS.items():
+                cfg[setting] = cfg.get(field, schema["default"])
+            if configured and "kokoro_trt_language" not in cfg:
+                cfg["tts_language"] = cfg.get("language") or cfg["tts_language"]
             impl = SherpaOnnxTTSPlugin(cfg, self._executor, on_status=self._report_kokoro_load_status)
         else:
             cfg["model_dir"] = self._model_dir_for(engine)
@@ -2496,13 +2507,12 @@ class TTSPlugin:
         props["tts_engine"]["enum"].append(KOKORO_TRT_ENGINE)
         props["tts_engine"]["description"] += (
             " Additional Jetson option: kokoro-multi-trt (eight-language TensorRT, GPU).")
-        props[_KOKORO_TRT_LANGUAGE_KEY] = {
-            "type": "string", "enum": ["auto", *_KOKORO_TRT_LANGUAGES],
-            "default": "auto", "scope": "shared",
-            "description": "Pronunciation language for kokoro-multi-trt. Auto detects each utterance.",
-            "x-show-when": {"tts_engine": [KOKORO_TRT_ENGINE]},
-            "x-keep-when-hidden": True,
-        }
+        for field, (_, schema) in _KOKORO_TRT_CARD_FIELDS.items():
+            props[field] = {
+                **schema, "scope": "shared",
+                "x-show-when": {"tts_engine": [KOKORO_TRT_ENGINE]},
+                "x-keep-when-hidden": True,
+            }
         props["speaker_id"]["x-hide-when"] = {"tts_engine": [KOKORO_TRT_ENGINE]}
         for key in ("tts_language", "device", "speaker_id"):
             props[key]["x-keep-when-hidden"] = True
@@ -2612,17 +2622,18 @@ class TTSPlugin:
         requested_engine = self._select_engine(requested) if requested else None
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
-        trt_language = forwarded.pop(_KOKORO_TRT_LANGUAGE_KEY, None)
+        trt_config = {field: forwarded.pop(field) for field in _KOKORO_TRT_CARD_FIELDS
+                      if field in forwarded}
         with self._lock:
             kokoro_trt = (requested_engine or self._engine) == KOKORO_TRT_ENGINE
-            if trt_language:
-                self._cfg[_KOKORO_TRT_LANGUAGE_KEY] = trt_language
+            self._cfg.update(trt_config)
             if kokoro_trt:
-                for key in ("device", "speaker_id", "tts_language"):
-                    forwarded.pop(key, None)
+                for setting, _ in _KOKORO_TRT_CARD_FIELDS.values():
+                    forwarded.pop(setting, None)
             self._cfg.update({key: forwarded[key] for key in SHARED_CONFIG_KEYS if key in forwarded})
-        if kokoro_trt and trt_language:
-            forwarded["tts_language"] = trt_language
+        if kokoro_trt:
+            forwarded.update({_KOKORO_TRT_CARD_FIELDS[field][0]: value
+                              for field, value in trt_config.items()})
 
         if requested_engine:
             engine = requested_engine
