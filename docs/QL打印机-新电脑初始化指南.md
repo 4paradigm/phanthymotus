@@ -87,7 +87,7 @@
 - 前台电脑使用 Windows x64，安装 Microsoft Edge，并保持操作员登录 Windows。不要注销用户。
 - 安装打印机驱动、连接打印机，在 Windows 中完成一次测试打印，并设好标签纸尺寸、方向和打印质量。
 - 前台电脑与机器人网络互通。新版镜像已在构建时打包 Python 和 Windows 依赖，前台从机器人接收并离线安装；访客网站仍需网络访问。
-- 机器人部署支持本功能的 core 和 perception；JetPack 镜像须匹配机器人。管理员需将 SSH 私钥及 known_hosts 挂载到 perception 的 `/run/ql-printer-auth`，只读挂载即可。
+- 机器人部署支持本功能的 core 和 perception；JetPack 镜像须匹配机器人。新版 perception 部署模板会自动把宿主机 `/opt/phanthy-motus/secrets/ql_printer` 只读挂载到容器 `/run/ql-printer-auth`。每台机器人仍需单独生成自己的 SSH 密钥和 `known_hosts`，这些秘密文件不进入镜像或 Git 仓库。
 - 此功能适用于现有范式访客网站；更换其他访客系统需要适配。打印机会被设为该 Windows 用户的默认打印机，不会自动恢复原默认值。
 
 ## 2. 在前台电脑开启 SSH（人工首次操作）
@@ -161,13 +161,13 @@ sudo ssh -F /dev/null -T -i /opt/phanthy-motus/secrets/ql_printer/frontdesk_brid
 
 返回 Windows 用户身份才算通过。若返回 `STARTED`，密钥仍被限制为只能启动，不能安装。不要继续点初始化。
 
-管理员在机器人 perception 服务中配置目录挂载：
+新版 perception 镜像的标准服务模板已包含以下目录挂载，不需要在每台机器人上手工编辑 `docker-compose.yml`：
 
 ```yaml
 - /opt/phanthy-motus/secrets/ql_printer:/run/ql-printer-auth:ro
 ```
 
-重建对应服务后，检查容器内两个文件可读。容器名称依实际部署填写，例如 `embodied-perception`：
+通过部署控制台重新部署 perception 后，配置会自动合并到宿主机 compose。检查容器内两个文件可读。容器名称依实际部署填写，例如 `embodied-perception`：
 
 ```bash
 docker exec embodied-perception sh -lc 'test -r /run/ql-printer-auth/frontdesk_bridge_ed25519 && test -r /run/ql-printer-auth/known_hosts && echo SSH_READY'

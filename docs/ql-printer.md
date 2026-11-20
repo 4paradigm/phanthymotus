@@ -19,24 +19,29 @@ Enable remote_start_enabled and configure the SSH user and port. The Windows
 restricted authorized key must invoke the existing bridge scheduled task.
 Windows must remain powered on with the interactive user logged in.
 
-Mount a dedicated host secret directory into the perception container:
+The published perception service template mounts a dedicated host secret
+directory into the same container path on every robot:
 
 ```yaml
 volumes:
   - /opt/phanthy-motus/secrets/ql_printer:/run/ql-printer-auth:ro
 ```
 
-It must contain `frontdesk_bridge_ed25519` (private key, readable only by the
+Do not manually edit a generated `docker-compose.yml`; deploying a perception
+image containing this service template merges the mount into the host compose.
+The host directory must contain `frontdesk_bridge_ed25519` (private key, readable only by the
 service identity) and `known_hosts`. Verify the Windows host fingerprint before
 installing known_hosts. Host checking is strict; no first-contact trust prompt
 or automatic host-key acceptance occurs. Keys are never included in the image.
-Existing U1 credentials can be securely provisioned into this dedicated
-directory on that same robot; another robot should receive its own authorized
-key. Do not place private keys in this repository.
+Each robot receives its own key with the same filename, so the card path remains
+`/run/ql-printer-auth/frontdesk_bridge_ed25519` on every robot. Add each robot's
+public key to the frontdesk Windows authorization file. Do not place private
+keys in this repository.
 
 ## Migration sequence
 
-1. Build/deploy the perception release and configure the optional secret mount.
+1. Provision this robot's secret directory, then deploy the perception release;
+   its service template applies the mount automatically.
 2. Verify tools/list advertises QL_printer with type actuator in perception.
 3. Stop the canvas project. Disable QL_printer in the U1 driver configuration
    (`QL_printer.enabled: false`) and restart that driver. Do not remove other

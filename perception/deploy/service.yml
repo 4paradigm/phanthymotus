@@ -22,6 +22,10 @@ perception:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
+    # Visitor_Badge_Printer uses one stable in-container path on every robot.
+    # The host directory contains robot-specific SSH credentials and is never
+    # baked into or committed with the image.
+    - /opt/phanthy-motus/secrets/ql_printer:/run/ql-printer-auth:ro
     # DDS profile 只读挂载。必须与其它 DDS 容器加载同一份，
     # 否则本容器会与本机其余部分失联。
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
