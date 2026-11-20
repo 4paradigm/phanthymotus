@@ -125,6 +125,7 @@ public:
         }
         const auto originPacket=chassis.empty()?takePayload(data,"MOTUSOR1",24):chassis;
         const bool declaresOrigin=!originPacket.empty() && !external.isNull();
+        const bool images=!data.imageRaw().empty() && !data.depthOrRightRaw().empty();
         bool sameOrigin=false;
         if(declaresOrigin)
         {
@@ -133,13 +134,24 @@ public:
             sameOrigin=externalOrigin_ && origin==*externalOrigin_;
             if((externalOrigin_ || !chassis.empty()) && !sameOrigin && !map.getLocalOptimizedPoses().empty())
             {
-                // A pose in a new gauge is a query until its scan establishes
-                // the map-to-odometry transform.
+                // A new odometry gauge needs an independent map constraint.
                 state_=Searching; odom_.setNull(); visualInliers_=0;
                 waiting_=true;
-                if(!relocalizeScan(map,data,statistics,externalRun && !chassis.empty())) return false;
+                const bool scanLocalized=relocalizeScan(map,data,statistics,externalRun && !chassis.empty());
+                if(!scanLocalized)
+                {
+                    if(!images) return false;
+                    const auto previousScanAnchor=scanAnchor_;
+                    const auto result=relocalizeImages(map,data,covariance,statistics);
+                    if(result!=ImageQueryResult::Localized)
+                    {
+                        // A rejected query must preserve the last measured scan witness.
+                        scanAnchor_=previousScanAnchor;
+                        return result==ImageQueryResult::Unverified;
+                    }
+                }
                 rtabmap::OdometryInfo info;
-                finishLocalization(map,data,external,rtabmap::Transform(),info,false,false,{});
+                finishLocalization(map,data,external,rtabmap::Transform(),info,false,!scanLocalized,{});
                 externalRun_=externalRun;
                 previousExternal_=external;
                 previousExternalStamp_=data.stamp();
@@ -186,7 +198,6 @@ public:
         }
         rtabmap::OdometryInfo info;
         rtabmap::Transform visual;
-        const bool images=!data.imageRaw().empty() && !data.depthOrRightRaw().empty();
         if(!initialized_)
         {
             waiting_=!map.getLocalOptimizedPoses().empty() ||
@@ -465,6 +476,21 @@ public:
             return true;
         };
         if(!images) return recoverGeometry();
+        const auto queryResult=relocalizeImages(map,data,covariance,statistics);
+        if(queryResult==ImageQueryResult::Rejected) return false;
+        if(queryResult!=ImageQueryResult::Localized)
+            return recoverGeometry() || queryResult==ImageQueryResult::Unverified;
+        finishLocalization(map,data,external,visual,info,tracked,images,externalRun);
+        return true;
+    }
+
+private:
+    enum class ImageQueryResult { NotProcessed, Unverified, Rejected, Localized };
+
+    ImageQueryResult relocalizeImages(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
+                                     const cv::Mat & covariance,
+                                     const std::map<std::string,float> & statistics)
+    {
         beginLocalization(map);
         // Failed localization can clear RTAB-Map's optimized cache when there
         // is no previous localization node. Keep the last accepted graph.
@@ -504,7 +530,7 @@ public:
            !validCovariance(stats.localizationCovariance()) || map.getLastLocalizationPose().isNull())
         {
             map.setOptimizedPoses(previousPoses,previousLinks);
-            return recoverGeometry() || processed;
+            return processed?ImageQueryResult::Unverified:ImageQueryResult::NotProcessed;
         }
 
         const int anchor=stats.loopClosureId(), query=stats.refImageId();
@@ -529,16 +555,14 @@ public:
         if(!measured.isValid() || poses.find(anchor)==poses.end())
         {
             map.setOptimizedPoses(previousPoses,previousLinks);
-            return recoverGeometry() || processed;
+            return ImageQueryResult::Unverified;
         }
         if(!promote(map,data,measured,location,locCovariance,statistics,poses,links,previousPoses,previousLinks))
-            return false;
+            return ImageQueryResult::Rejected;
         recoveryInliers_=localizationInliers;
-        finishLocalization(map,data,external,visual,info,tracked,images,externalRun);
-        return true;
+        return ImageQueryResult::Localized;
     }
 
-private:
     void beginLocalization(rtabmap::Rtabmap & map)
     {
         if(localizationMode_) return;

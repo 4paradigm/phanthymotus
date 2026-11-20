@@ -26,11 +26,13 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         longWitnessedGap || expiredWitnessedGap || sparseLiveRun;
     const bool weakBridge=mode=="scan_origin_weak_bridge";
     const bool mixedChassis=mode=="chassis_legacy_transition";
-    const bool chassis=mode=="chassis_origin_change" || mixedChassis;
+    const bool partialReset=mode=="chassis_partial_reset_after_rgb_query";
+    const bool chassis=mode=="chassis_origin_change" || mixedChassis || partialReset;
     const bool originChange=mode=="scan_origin_change" || chassis || weakBridge;
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
     if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
     parameters["RGBD/LinearUpdate"]="0.03";
+    if(partialReset) parameters["RGBD/ProximityBySpace"]="false";
     rtabmap::Rtabmap map;
     map.init(parameters,output+".db");
     motus::VisualRecovery recovery(parameters);
@@ -51,7 +53,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
                                  blackImage?depth:cv::Mat(),camera,0,stamp);
         // A valid partial observation can occupy fewer than half of the scan's expected points.
         const int maxPoints=(weakBridge || weakWitnessedBridge) && stamp==2.?6*count:
-            partialOverlap && stamp==7.?2*count:0;
+            partialReset?4*count:partialOverlap && stamp==7.?2*count:0;
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),maxPoints,0.f,rtabmap::LaserScan::kXYZ));
         if(badGuess)
         {
@@ -84,6 +86,26 @@ static void testScanRelocalization(const std::string &root, const std::string &o
        !frame(1.5,.12f,true,false,false,false,startingToken))
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto anchor=map.getLastLocationId();
+    if(partialReset)
+    {
+        const auto old=map.getLocalOptimizedPoses();
+        if(!frame(1.75,.12f,true,false,false,false,1) || map.getLocalOptimizedPoses()!=old)
+            throw std::runtime_error("a second measured same-view scan must be distinct from its stored keyframe");
+        frame(2.,.12f,true,true,true,false,2);
+        if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+           map.getLocalOptimizedPoses()!=old)
+            throw std::runtime_error("rejected new-origin RGB-D query must preserve the old graph");
+        if(!frame(2.5,.135f,true,false,false,false,2) ||
+           recovery.state()!=motus::VisualRecovery::Localized || recovery.recoveryAnchor()!=anchor ||
+           recovery.odom().isNull() || std::abs(recovery.odom().x()-.135f)>.025f ||
+           map.getLocalOptimizedPoses().size()!=old.size()+1)
+            throw std::runtime_error("failed RGB-D query erased the independent witness for a partial chassis scan");
+        const auto overlap=map.getStatistics().data().at("Motus/ScanRelocalizationOverlap/");
+        if(overlap<.2f || overlap>=.3f)
+            throw std::runtime_error("fixture must require the reciprocal and second scan witnesses");
+        std::cout<<"witnessed chassis scan overlap="<<overlap<<std::endl;
+        return;
+    }
     if(sparseLiveRun)
     {
         const auto old=map.getLocalOptimizedPoses();
@@ -267,6 +289,88 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     std::cout<<"reopened nodes="<<grown.size()<<" persisted scan edge="<<anchor<<"->"<<node<<std::endl;
 }
 
+static void testChassisRgbdResume(const std::string & root, const std::string & output,
+                                  rtabmap::ParametersMap parameters)
+{
+    // The last keyframe has no scan overlap with the revisited first view.
+    // A new chassis origin is deliberately far from the original map gauge.
+    parameters["RGBD/NeighborLinkRefining"]="false";
+    parameters["RGBD/LoopCovLimited"]="true";
+    parameters["RGBD/ProximityOdomGuess"]="false";
+    const cv::Mat rgb=cv::imread(root+"/0.jpg");
+    const cv::Mat depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
+    const cv::Mat nextRgb=cv::imread(root+"/1.jpg");
+    const cv::Mat nextDepth=cv::imread(root+"/1.png",cv::IMREAD_UNCHANGED);
+    if(rgb.empty() || depth.empty() || nextRgb.empty() || nextDepth.empty())
+        throw std::runtime_error("missing RGB-D resume fixture");
+    constexpr float f=260.f;
+    const auto transform=[](float x){return rtabmap::Transform(x,0,0,0,0,0);};
+    const rtabmap::CameraModel camera(f,f,rgb.cols/2.,rgb.rows/2.,transform(0),0.,rgb.size());
+    const cv::Mat covariance=cv::Mat::eye(6,6,CV_64F)*.01;
+    const auto observation=[&](double stamp, const cv::Mat & color, const cv::Mat & metricDepth,
+                               float scanOffset=0.f)
+    {
+        cv::Mat projectedDepth;
+        metricDepth.convertTo(projectedDepth,CV_32F,.001);
+        cv::Mat scan(1,metricDepth.total(),CV_32FC3);
+        int count=0;
+        for(int v=0;v<projectedDepth.rows;++v)
+            for(int u=0;u<projectedDepth.cols;++u)
+            {
+                const auto z=projectedDepth.at<float>(v,u);
+                if(z>0.f) scan.at<cv::Vec3f>(0,count++)={(u-rgb.cols/2.f)*z/f+scanOffset,(v-rgb.rows/2.f)*z/f,z};
+            }
+        rtabmap::SensorData data(color,projectedDepth,camera,0,stamp);
+        data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),0,0.f,rtabmap::LaserScan::kXYZ));
+        return data;
+    };
+    rtabmap::Rtabmap map;
+    map.init(parameters,output+".db");
+    if(!map.process(observation(1.,rgb,depth),transform(0),covariance))
+        throw std::runtime_error("failed to save the old RGB-D anchor");
+    const int anchor=map.getLastLocationId();
+    if(!map.process(observation(2.,cv::Mat::zeros(rgb.size(),rgb.type()),depth,20.f),transform(20),covariance))
+        throw std::runtime_error("failed to save a distant terminal keyframe");
+    const auto old=map.getLocalOptimizedPoses();
+    if(old.size()!=2 || map.getLastLocationId()==anchor)
+        throw std::runtime_error("test requires a connected map ending at a distant keyframe");
+    map.close();
+    map.init(parameters,output+".db");
+    motus::VisualRecovery recovery(parameters);
+    const auto chassis=[&](rtabmap::SensorData data,float pose)
+    {
+        cv::Mat marker(1,40,CV_8UC1,cv::Scalar::all(1));
+        std::memcpy(marker.data,"MOTUSCH1",8);
+        data.setUserData(rtabmap::compressData2(marker),true);
+        return recovery.process(map,data,transform(pose),covariance);
+    };
+    // Valid-looking color and a different metric surface cannot bind the origin.
+    chassis(observation(3.,rgb,cv::Mat(depth.size(),CV_16UC1,cv::Scalar(12000))),100.f);
+    if(recovery.state()!=motus::VisualRecovery::Searching || !recovery.odom().isNull() ||
+       map.getLocalOptimizedPoses()!=old || recovery.relocalizations()!=0)
+        throw std::runtime_error("a geometrically incorrect RGB-D query changed the old map");
+    if(!chassis(observation(4.,rgb,depth),100.f) || recovery.state()!=motus::VisualRecovery::Localized ||
+       recovery.recoveryAnchor()!=anchor || recovery.recoveryInliers()<20 ||
+       recovery.odom().isNull() || std::abs(recovery.odom().x())>.03f)
+        throw std::runtime_error("a new chassis origin must query the earlier RGB-D anchor after terminal ICP fails");
+    const int closure=recovery.recoveryNode();
+    const int inliers=recovery.recoveryInliers();
+    if(!chassis(observation(4.5,nextRgb,nextDepth),100.18f) || recovery.state()!=motus::VisualRecovery::External ||
+       std::abs(recovery.odom().x()-.18f)>.03f)
+        throw std::runtime_error("the new measured run is not aligned to the verified anchor");
+    const auto grown=map.getLocalOptimizedPoses();
+    if(grown.size()!=old.size()+2 || !grown.count(anchor))
+        throw std::runtime_error("the original map must grow after binding the verified origin");
+    map.close();
+    map.init(parameters,output+".db");
+    const auto *signature=map.getMemory()->getSignature(closure);
+    if(map.getLocalOptimizedPoses()!=grown || !signature || !signature->hasLink(anchor,rtabmap::Link::kGlobalClosure))
+        throw std::runtime_error("the old root, continuation, and visual closure must survive reopening");
+    map.close(false);
+    std::cout<<"reopened nodes="<<grown.size()<<" persisted visual edge="<<anchor<<"->"<<closure
+             <<" inliers="<<inliers<<std::endl;
+}
+
 int main(int argc, char **argv)
 {
     if(argc != 4 && argc != 5) return 2;
@@ -322,9 +426,14 @@ int main(int argc, char **argv)
     p["RGBD/ProximityPathMaxNeighbors"]="1"; p["Kp/MaxFeatures"]="500";
     p["Mem/BadSignaturesIgnored"]="false"; p["Grid/RangeMax"]="0";
     p["Rtabmap/MemoryThr"]=mode=="ltm"?"20":"300"; p["Rtabmap/TimeThr"]="3000";
+    if(mode=="chassis_rgbd_resume")
+    {
+        testChassisRgbdResume(root,output,p);
+        return 0;
+    }
     if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
        mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" || mode=="chassis_origin_change" || mode=="chassis_legacy_transition" ||
-       mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" ||
+       mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" || mode=="chassis_partial_reset_after_rgb_query" ||
        mode=="witnessed_scan_late_handoff" || mode=="witnessed_scan_weak_bridge" ||
        mode=="witnessed_scan_long_gap" || mode=="witnessed_scan_expired_gap" ||
        mode=="witnessed_scan_sparse_live")

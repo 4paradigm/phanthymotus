@@ -619,6 +619,72 @@ def _motion_result(timeline,stamp,x):
     timeline.observe('pose',pose);timeline.observe('info',info)
 
 
+def _send_witnessed_pose(node, registry, ms, x, segment):
+    from test_pointcloud_slam_stream import measured_rgbd
+
+    sample, parent = measured_rgbd(ms, x, segment, registry.clock_id)
+    message = NS(data=json.dumps(sample))
+    node._odom(message, registry.register_derived(node._odom_topic, message, parent, 'rgbd_odometry'))
+
+
+def test_rgbd_gateway_uses_a_query_for_a_scan_between_witnessed_origins(calibrated_node):
+    import zlib
+    from plugins.spatial_input import InputAdapterRegistry
+
+    n = calibrated_node
+    registry = InputAdapterRegistry()
+    n._input_registry = registry
+    n.stream.ingress_clock_id = registry.clock_id
+
+    _send_witnessed_pose(n, registry, 1000, 4., 'before-reset')
+    n._cloud(cloud(1_000_000_000))
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    image(n, 1100)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    n._cloud(cloud(1_100_000_000))
+    _send_witnessed_pose(n, registry, 1200, 0., 'after-reset')
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+
+    root, query = published(n, '/sensor_data')[0].raw_messages
+    assert zlib.decompress(bytes(root.user_data)[:-12]).startswith(b'MOTUSOD1')
+    assert query.left.data and query.right.data and query.laser_scan.data
+    assert not getattr(query, 'user_data', None)
+    assert published(n, '/odom')[0].raw_messages[-1].pose.pose.orientation.w == 0.
+
+
+@pytest.mark.parametrize('has_measured_motion', [False, True])
+def test_rgb_projection_across_witnessed_origin_reset_needs_independent_motion(
+        calibrated_node, has_measured_motion):
+    from plugins.spatial_input import InputAdapterRegistry
+
+    n = calibrated_node
+    registry = InputAdapterRegistry()
+    n._input_registry = registry
+    n.stream.ingress_clock_id = registry.clock_id
+    timeline = _local_motion(n)
+    if has_measured_motion:
+        _motion_result(timeline, 1_100_000_000, 0.)
+        _motion_result(timeline, 1_200_000_000, .1)
+
+    _send_witnessed_pose(n, registry, 1000, 0., 'before-reset')
+    n._cloud(cloud(1_000_000_000))
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    _send_witnessed_pose(n, registry, 1100, 0., 'before-reset')
+    _send_witnessed_pose(n, registry, 1101, .25, 'after-reset')
+    image(n, 1101)
+    assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    n._cloud(cloud(1_100_000_000))
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+
+    native = published(n, '/sensor_data')[0].raw_messages[-1]
+    assert native.laser_scan.data
+    if has_measured_motion:
+        assert native.left.data
+        assert native.local_transform[0].translation.x == pytest.approx(.001)
+    else:
+        assert not native.left.data
+
+
 def test_pose_less_async_projection_uses_measured_local_motion_without_global_pose(calibrated_node):
     from test_pointcloud_slam_stream import odom
     n=calibrated_node
@@ -680,6 +746,47 @@ def test_searching_rgb_query_waits_for_next_measured_scan(calibrated_node, chass
     assert data.laser_scan.header.stamp.nanosec == 100_000_000
     assert data.local_transform[0].translation.x == pytest.approx(.001)
     assert published(n, '/odom')[0].raw_messages[-1].pose.pose.orientation.w == 0.
+
+
+@pytest.mark.parametrize('calibrated_node', ['/rgbd_odometry/test/state/odom'], indirect=True)
+@pytest.mark.parametrize('motion_arrives', [True, False])
+def test_searching_rgb_decoded_after_cloud_admission_waits_for_measured_motion(calibrated_node, motion_arrives):
+    from test_pointcloud_slam_stream import odom
+
+    n = calibrated_node
+    n.stream.max_age_s = 1.
+    send(n)
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+    n._active['native_recovery'] = {'state': 'searching'}
+    timeline = _local_motion(n)
+    _motion_result(timeline, 1_100_000_000, 0.)
+    missing = odom(1100)
+    missing['pose'] = None
+    n._odom(NS(data=json.dumps(missing)))
+
+    # The gateway worker can only run after the cloud has entered the queue.
+    # Release it with a decoded image that was unavailable during admission.
+    with n._lock:
+        n._cloud(cloud(1_100_000_000))
+        assert n._queue and 1_100_000_000 not in n._rgb_reservations
+        image(n, 1101)
+        assert _wait_until(lambda: n._rgb.info()['decoded'] == 1)
+    assert _wait_until(lambda: len(n._motion_waiting) == 1)
+    assert not _wait_until(lambda: n.status()['forwarded_clouds'] > 1, timeout=.55)
+
+    if motion_arrives:
+        _motion_result(timeline, 1_600_000_000, .5)
+        n._wake.set()
+    assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2, timeout=.8)
+    data = published(n, '/sensor_data')[0].raw_messages[-1]
+    assert data.laser_scan.header.stamp.nanosec == 100_000_000
+    assert published(n, '/odom')[0].raw_messages[-1].pose.pose.orientation.w == 0.
+    if motion_arrives:
+        assert data.left.header.stamp.nanosec == 101_000_000
+        assert data.local_transform[0].translation.x == pytest.approx(.001)
+    else:
+        assert not data.left.data
+        assert 1_100_000_000 not in n._rgb_reservations and not n._motion_waiting
 
 
 def test_async_lost_observation_waits_boundedly_for_actual_motion_result(calibrated_node):

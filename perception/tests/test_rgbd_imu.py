@@ -434,9 +434,24 @@ def test_nontracking_output_keeps_selected_imu_mode_and_health(monkeypatch):
     assert state['enabled'] is True and state['status']=='lost'
 
 
-@pytest.mark.parametrize('rotation', [np.diag([1., 1., -1.]), np.diag([1., .5, 1.])])
+def test_four_decimal_mount_rotation_preserves_si_magnitudes():
+    attitude = aid()
+    s = np.sqrt(.5)
+    rounded = [[.7071, -.7071, 0.], [.7071, .7071, 0.], [0., 0., 1.]]
+    result = attitude.observe(packet(camera_from_gyro=rounded, camera_from_accel=rounded,
+                                     angular_velocity=[1., 0., 0.], linear_acceleration=[0., 1., 0.]),
+                              1_000_000_000)
+    np.testing.assert_allclose(result['angular_velocity'], [s, s, 0.], atol=1e-10)
+    np.testing.assert_allclose(result['linear_acceleration'], [-s, s, 0.], atol=1e-10)
+    assert attitude.orientation_at(1_000_000_000, 1_000_000_000, calibrated=True) is not None
+
+
+@pytest.mark.parametrize('rotation', [
+    np.diag([1., 1., -1.]), np.diag([1., .5, 1.]), np.diag([1., .999, 1.]),
+    [[1., .01, 0.], [0., 1., 0.], [0., 0., 1.]],
+])
 def test_nonrigid_camera_extrinsic_cannot_supply_orientation(rotation):
     attitude = aid()
     with pytest.raises(ValueError, match='rotation'):
-        attitude.observe(packet(camera_from_gyro=rotation.tolist()), 1_000_000_000)
+        attitude.observe(packet(camera_from_gyro=np.asarray(rotation).tolist()), 1_000_000_000)
     assert attitude.orientation_at(1_000_000_000, 1_000_000_000) is None

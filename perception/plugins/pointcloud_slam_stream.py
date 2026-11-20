@@ -17,7 +17,8 @@ class SlamStream:
                  max_gap_ms, max_age_s, max_pending, max_cloud_points,
                  on_frame, max_measurement_age_ms=None,
                  max_future_skew_ms=None, input_contract=None, extrinsic_mode='static',
-                 on_unlocalized_frame=None, on_observation=None, on_pose_loss=None):
+                 on_unlocalized_frame=None, on_observation=None, on_pose_loss=None,
+                 scan_origin_recovery=False):
         if any(type(v) is not int or v <= 0 for v in (max_pending, max_cloud_points)):
             raise ValueError('positive bounded capacities required')
         self.max_measurement_age_ms = max_measurement_age_ms
@@ -33,6 +34,7 @@ class SlamStream:
         self.on_unlocalized_frame = on_unlocalized_frame
         self.on_observation = on_observation
         self.on_pose_loss = on_pose_loss
+        self._scan_origin_recovery = scan_origin_recovery
         self._segments = OrderedDict()
         self._admitted = 0
         self._poses = deque(maxlen=512)
@@ -129,6 +131,9 @@ class SlamStream:
                 return
         if pose.prediction_anchor_ns is None:
             pose = self._track_measured_run(sample, pose, context)
+            if self._scan_origin_recovery and pose.declared_origin is None:
+                # Scan-only built-in VO declares this same identity on the native wire.
+                pose = replace(pose, visual_origin=(pose.segment_id, pose.frame_id))
             if self._pose_anchor is None or pose.stamp_ns >= self._pose_anchor.stamp_ns:
                 self._pose_anchor = pose
             # Confirmed corrections supersede hypotheses beyond their capture.
@@ -202,7 +207,8 @@ class SlamStream:
         # This token is carried only through an observed, bounded source run.
         # A new token requires independent registration in the native map.
         pose = replace(pose, external_continuity=token or uuid.uuid4().bytes,
-                       chassis_origin=origin if chassis else None)
+                       chassis_origin=origin if chassis else None,
+                       visual_origin=(pose.segment_id, pose.frame_id) if visual else None)
         self._measured_run = origin, pose
         return pose
 

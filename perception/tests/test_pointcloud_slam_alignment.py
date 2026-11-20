@@ -1,5 +1,7 @@
 """Time alignment must never bridge missing tracking or a reset."""
 import math
+from dataclasses import replace
+
 import pytest
 
 from plugins.pointcloud_slam_alignment import align_pose
@@ -16,6 +18,22 @@ def test_interpolates_translation_and_rotation_at_cloud_measurement_time():
     result = align_pose([first, second], 1_100_000_000, max_gap_ms=250)
     assert result.position == pytest.approx((1., 0., 0.))
     assert result.quaternion == pytest.approx((0., 0., math.sqrt(.5), math.sqrt(.5)))
+
+
+def test_unmarked_segment_and_frame_labels_do_not_block_interpolation():
+    before = pose(1000, x=4)
+    after = pose(1200, segment='another-label', frame='another-frame')
+    result = align_pose([before, after], 1_100_000_000, max_gap_ms=250)
+    assert result.position == pytest.approx((2., 0., 0.))
+
+
+def test_same_visual_origin_keeps_numeric_pose_when_the_run_token_changes():
+    origin = ('s', 'odom')
+    before = replace(pose(1000, x=4), visual_origin=origin, external_continuity=b'first')
+    after = replace(pose(1200), visual_origin=origin, external_continuity=b'second')
+    result = align_pose([before, after], 1_100_000_000, max_gap_ms=250)
+    assert result.position == pytest.approx((2., 0., 0.))
+    assert result.visual_origin == origin and result.external_continuity is None
 
 
 def test_exact_sample_does_not_require_neighboring_pose():

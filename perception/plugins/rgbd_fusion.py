@@ -326,13 +326,13 @@ class ShortTermFusion:
             if sample is not None:
                 stamp = sample['stamp_ns']
                 source = None
-                if self.imu.rotation_source is not None:
-                    source = (self.imu.rotation_generation, tuple(translations))
+                if self.imu.capture_source is not None:
+                    source = (self.imu.capture_source, tuple(translations))
                     if self.imu_coverage and source == self.imu_coverage[-1][1]:
                         source = self.imu_coverage[-1][1]
                 if self.imu_coverage and stamp <= self.imu_coverage[-1][0]:
                     self.imu_coverage.clear()
-                self.imu_coverage.append((stamp, source))
+                self.imu_coverage.append((stamp, source, self.imu.rotation_source is not None))
                 self.samples.append((stamp, np.array(sample['angular_velocity']),
                                      np.array(sample['linear_acceleration'])))
         except (ValueError, TypeError, KeyError) as error:
@@ -441,12 +441,14 @@ class ShortTermFusion:
         if estimate.stamp != stamp:
             raise ValueError('IMU history has a propagation gap')
 
-    def _imu_covers(self, start, end):
-        """Check the measured bracket at each end and every gap between them."""
+    def _imu_covers(self, start, end, *, require_epoch=True):
+        """Check the capture bracket and source continuity for the whole interval."""
         if start > end:
             return False
         right = source = None
-        for stamp, identity in reversed(self.imu_coverage):
+        for stamp, identity, has_epoch in reversed(self.imu_coverage):
+            if require_epoch and not has_epoch:
+                identity = None
             if stamp >= end:
                 source = identity
             elif right is None or source is None or identity != source or not 0 < right-stamp <= MAX_IMU_GAP_NS:
@@ -469,7 +471,8 @@ class ShortTermFusion:
         if np.linalg.norm(p-ref_p) > min(.008, .02*dt) or np.linalg.norm(log_rotation(ref_r.T@r)) > .01:
             return False
         samples = [s for s in self.samples if ref_stamp <= s[0] <= stamp]
-        if len(samples) < 5 or not self._imu_covers(ref_stamp, stamp):
+        # The measured visual pair establishes stationarity; the IMU corroborates it.
+        if len(samples) < 5 or not self._imu_covers(ref_stamp, stamp, require_epoch=False):
             return False
         gravity_force = -r.T@self.filter.g
         if any(np.linalg.norm(w-self.filter.bg) > .045 or
@@ -597,7 +600,7 @@ class ShortTermFusion:
         ref_p, ref_r = pose_values(ref_pose)
         p, r = pose_values(self.filter.camera_pose())
         initial = np.eye(4)
-        if self._imu_covers(ref_stamp, stamp):
+        if self._imu_covers(ref_stamp, stamp, require_epoch=False):
             initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
         # Only a verified observation of this exact capture may authorize mapping.
         # Keep the visual reference and its original one-second lifetime.

@@ -62,14 +62,14 @@ def source(t, **changes):
     return packet(t, **values)
 
 
-def warmed(monkeypatch_without_zupt=None):
+def warmed(monkeypatch_without_zupt=None, *, imu=source):
     c = ShortTermFusion('run', 'optical', 'capture-clock', K)
     if monkeypatch_without_zupt is not None:
         monkeypatch_without_zupt.setattr(c, '_stationary_update', lambda *_: False)
     color, depth = images()
     for i in range(141):
         t = 1_000_000_000+i*5_000_000
-        c.observe_imu(source(t), t+1_000_000)
+        c.observe_imu(imu(t), t+1_000_000)
         if i%20 == 0:
             sample = c.observe_frame(t, color, depth, pose(), t+1_000_000)
     assert c.status(t+1_000_000) == 'tracking'
@@ -407,6 +407,50 @@ def test_prediction_needs_identifiable_measurements(missing):
         del packet[missing]
         c.observe_imu(packet, stamp)
     assert not c._imu_covers(1_000_000_000, 1_020_000_000)
+
+
+def test_measurement_without_epoch_can_aid_fusion_without_exporting_inertial_prediction(monkeypatch):
+    def no_epoch(stamp):
+        sample = source(stamp)
+        del sample['epoch']
+        return sample
+
+    c, anchor = warmed(imu=no_epoch)
+    assert c.zero_velocity_updates > 0
+    c.filter.v[0] = .03
+    initial_poses = []
+
+    class Geometry:
+        def register(self, depth, reference, initial):
+            initial_poses.append(initial.copy())
+            return None
+
+    monkeypatch.setattr(c, 'geometry', Geometry())
+    for i in range(1, 41):
+        stamp = anchor + i*5_000_000
+        c.observe_imu(no_epoch(stamp), stamp)
+    out = c.observe_frame(stamp, *images(), None, stamp)
+    assert len(initial_poses) == 1
+    assert initial_poses[0][0, 3] == pytest.approx(.006)
+    assert out['pose'] is None
+    assert out['vendor']['fusion']['prediction'] is None
+
+
+@pytest.mark.parametrize('change', [
+    {'source_id': None},
+    {'epoch': 'restarted'},
+    {'clock_id': 'other-clock'},
+    {'clock_mapping': {'verified': False}},
+    {'stamp_source': 'read_completion'},
+    {'gyro_frame_id': 'different-axes'},
+    {'camera_from_accel_translation': [.02, 0., 0.]},
+])
+def test_internal_stationarity_rejects_imu_provenance_changes(change):
+    c, anchor = warmed()
+    for i in range(1, 41):
+        stamp = anchor + i*5_000_000
+        c.observe_imu(source(stamp, **(change if i == 20 else {})), stamp)
+    assert not c._stationary_update(stamp, pose(), anchor, pose())
 
 
 @pytest.mark.parametrize('change', [

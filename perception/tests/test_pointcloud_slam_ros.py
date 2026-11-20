@@ -197,6 +197,46 @@ def test_scan_only_rgbd_odom_labels_the_origin_on_each_native_envelope(tmp_path,
         n.destroy_node()
 
 
+@pytest.mark.parametrize('chassis_after_reset', [False, True])
+def test_scan_only_rgbd_reset_keeps_intermediate_scan_without_a_pose(tmp_path, monkeypatch, chassis_after_reset):
+    import zlib
+    import plugins.pointcloud_slam_ros as ros
+    from test_pointcloud_slam_stream import chassis
+
+    NativeProcess.instances = []
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    n = ros.RtabmapNode('/rgbd_odometry/test/state/odom', '/c', settings(),
+                        session_dir=tmp_path / 'session')
+    n.start()
+    try:
+        n._odom(NS(data=json.dumps(odom(1000, x=4, segment='old'))))
+        n._cloud(cloud(1_000_000_000))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+
+        n._cloud(cloud(1_100_000_000))
+        resumed_pose = chassis if chassis_after_reset else odom
+        n._odom(NS(data=json.dumps(resumed_pose(1200, x=0, segment='new'))))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+        n._cloud(cloud(1_200_000_000))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 3)
+
+        first, query, resumed = published(n, '/sensor_data')[0].raw_messages
+        assert query.laser_scan.data and query.header.stamp.nanosec == 100_000_000
+        assert not getattr(query, 'user_data', None)
+        poses = [msg.pose.pose for msg in published(n, '/odom')[0].raw_messages]
+        assert poses[0].position.x == 4. and poses[0].orientation.w == 1.
+        assert poses[1].orientation.w == 0.
+        assert poses[2].position.x == 0. and poses[2].orientation.w == 1.
+        markers = [zlib.decompress(bytes(msg.user_data)[:-12]) for msg in (first, resumed)]
+        assert markers[0].startswith(b'MOTUSOR1')
+        assert markers[1].startswith(b'MOTUSCH1' if chassis_after_reset else b'MOTUSOR1')
+        assert markers[0] != markers[1]
+        assert len(NativeProcess.instances) == 1
+    finally:
+        n.close()
+        n.destroy_node()
+
+
 @pytest.mark.parametrize('legacy_first', [False, True])
 def test_measured_chassis_without_rgb_marks_origin_and_dense_run(node, legacy_first):
     import zlib

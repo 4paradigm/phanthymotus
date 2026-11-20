@@ -1,4 +1,4 @@
-"""Interpolate supplied pose numbers at cloud timestamps without metadata policy."""
+"""Interpolate supplied pose numbers at cloud timestamps within known coordinate origins."""
 import math
 
 from .pointcloud_slam_odom import PoseSample
@@ -21,8 +21,13 @@ def _slerp(a, b, ratio):
     return tuple(left * x + right * y for x, y in zip(a, b))
 
 
+def crosses_origin(a, b):
+    first, second = a.declared_origin, b.declared_origin
+    return first is not None and second is not None and first != second
+
+
 def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
-    """Interpolate numeric timestamps; labels and policy gaps do not gate poses.
+    """Interpolate numeric timestamps without crossing declared origins.
 
     None remains an absence barrier. Within each available run, samples can
     arrive out of order and the last value for a duplicate timestamp is used.
@@ -49,9 +54,8 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
             if stamp_ns > cloud_stamp_ns:
                 if previous is None:
                     break
-                if (previous.chassis_origin is not None and sample.chassis_origin is not None and
-                        previous.chassis_origin != sample.chassis_origin):
-                    raise ValueError('cannot interpolate across chassis odometry origins')
+                if crosses_origin(previous, sample):
+                    raise ValueError('cannot interpolate across declared odometry origins')
                 prediction = previous.prediction_anchor_ns or sample.prediction_anchor_ns
                 if prediction is not None and (stamp_ns-previous.stamp_ns > max_gap_ms*1_000_000 or
                         cloud_stamp_ns <= prediction):
@@ -68,6 +72,7 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                                   sample.pose_reference, None, cloud_stamp_ns,
                                   tuple(c for c in (previous.observation,sample.observation) if c is not None),
                                   prediction, continuity,
-                                  sample.chassis_origin if sample.chassis_origin == previous.chassis_origin else None)
+                                  sample.chassis_origin if sample.chassis_origin == previous.chassis_origin else None,
+                                  sample.visual_origin if sample.visual_origin == previous.visual_origin else None)
             previous = sample
     raise ValueError('no numeric pose at cloud timestamp')

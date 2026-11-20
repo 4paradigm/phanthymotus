@@ -25,6 +25,15 @@ class PoseSample:
     prediction_anchor_ns: int = None
     external_continuity: bytes = None
     chassis_origin: tuple = None
+    visual_origin: tuple = None
+
+    @property
+    def declared_origin(self):
+        if self.chassis_origin is not None:
+            return 'chassis', self.chassis_origin
+        if self.visual_origin is not None:
+            return 'visual', self.visual_origin
+        return None
 
     @property
     def stamp_ns(self):

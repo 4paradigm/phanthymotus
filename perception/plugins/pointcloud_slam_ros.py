@@ -221,7 +221,7 @@ class RtabmapNode(Node):
                 input_contract=input_contract, on_frame=self._queue_frame,
                 on_observation=self._observe_motion if self._motion is not None else None,
                 on_unlocalized_frame=None if self._raw_scan_input else self._queue_frame,
-                on_pose_loss=self._retire_pose_work)
+                on_pose_loss=self._retire_pose_work, scan_origin_recovery=self._scan_origin_recovery)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
             if self._settings.get('capture_mount'):
@@ -412,16 +412,12 @@ class RtabmapNode(Node):
             self._queue.popleft()
             self._dropped += 1
         self._admission_seq += 1
-        # Allow the existing measured-pose wait and one bounded late result.
-        rgb_deadline = time.monotonic() + (2 if pose is not None else 1) * _MEASURED_RGB_WAIT_MS / 1000.
-        rgb = self._rgb_reservations.get(stamp)
-        if (pose is None and rgb is not None and 0 < abs(rgb[0]-stamp) <= _RGB_RESERVATION_SKEW_NS and
-                self._searching_rgbd()):
-            # A following scan can bracket the image. Its original ingress
-            # time limits the wait, even if other clouds arrive meanwhile.
-            remaining = self.stream.max_age_s - (self._receipt_clock() - received)
-            rgb_deadline = max(rgb_deadline, time.monotonic() + remaining)
-        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation, rgb_deadline, depth))
+        # Fix both deadlines at admission so retries cannot extend the wait.
+        now = time.monotonic()
+        rgb_deadline = now + (2 if pose is not None else 1) * _MEASURED_RGB_WAIT_MS / 1000.
+        motion_deadline = now + self.stream.max_age_s - (self._receipt_clock() - received)
+        self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation,
+                            (rgb_deadline, motion_deadline), depth))
         if pose is not None:
             # A usable newer observation supersedes optional unlocalized work;
             # never replay a delayed frame into an already advanced native map.
@@ -602,9 +598,9 @@ class RtabmapNode(Node):
             odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
         observation = item[6] if len(item) > 6 else None
-        rgb_deadline = item[7] if len(item) > 7 else time.monotonic()
+        deadlines = item[7] if len(item) > 7 else (0., 0.)
         depth = item[8] if len(item) > 8 else None
-        native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation, observation, rgb_deadline, depth)
+        native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation, observation, deadlines, depth)
         if predicted:
             # The standard odometry input stays null. Even an older native
             # runtime cannot mistake this private hint for a tracking pose.
@@ -628,8 +624,7 @@ class RtabmapNode(Node):
                     origin = hashlib.blake2b(json.dumps(measured.chassis_origin).encode(), digest_size=16).digest()
                     payload = b'MOTUSCH1' + origin + (run or bytes(16))
                 elif self._scan_origin_recovery:
-                    identity = (measured.segment_id, measured.frame_id)
-                    origin = hashlib.blake2b(json.dumps(identity).encode(), digest_size=16).digest()
+                    origin = hashlib.blake2b(json.dumps(measured.visual_origin).encode(), digest_size=16).digest()
                     payload = b'MOTUSOR1' + origin
                 elif self._raw_scan_input and run is None:
                     payload = b'MOTUSRAW'
@@ -686,12 +681,13 @@ class RtabmapNode(Node):
             self._wake.wait(remaining)
         return False  # One bounded fallback scan when RGB-D never becomes usable.
 
-    def _sensor_data(self, cloud, pose, matrix, motion_generation=None, observation=None, rgb_deadline=0.,
+    def _sensor_data(self, cloud, pose, matrix, motion_generation=None, observation=None, deadlines=(0., 0.),
                      measured_depth=None):
         """Scan is mandatory; optional source-timed imagery may fail independently."""
         if motion_generation is None:
             motion_generation = self._motion_generation
         stamp, _, points = decode_cloud(cloud, max_points=self.stream.max_cloud_points)
+        rgb_deadline, motion_deadline = deadlines
         data = self._SensorData()
         data.header = deepcopy(cloud.header)
         # This card has no IMU input. Geometry message defaults may be identity;
@@ -780,9 +776,14 @@ class RtabmapNode(Node):
         except MotionPending as error:
             if self._rgb_task is not None and self._rgb_task[0] == key:
                 self._rgb_task = None
-            if pose is None and time.monotonic() < rgb_deadline:
-                raise
             with self._lock:
+                rgb = self._rgb_reservations.get(stamp)
+                if rgb is not None and 0 < abs(rgb[0]-stamp) <= _RGB_RESERVATION_SKEW_NS and self._searching_rgbd():
+                    # A decoded image can come from ingress or from the worker.
+                    # A following scan may bracket it within the original ingress window.
+                    rgb_deadline = max(rgb_deadline, motion_deadline)
+                if pose is None and time.monotonic() < rgb_deadline:
+                    raise
                 self._rgb_reservations.pop(stamp, None)
                 self._motion_mounts.pop(stamp, None)
             self._rgb_reason = str(error)
@@ -803,7 +804,7 @@ class RtabmapNode(Node):
 
     def _rgb_attachment(self, header, stamp, pose, matrix, points, motion_generation=None, measured_depth=None):
         from sensor_msgs.msg import Image, CameraInfo
-        from .pointcloud_slam_alignment import align_pose
+        from .pointcloud_slam_alignment import align_pose, crosses_origin
         from .pointcloud_slam_rgb import project_depth, project_measured_depth
         now_ns = self._measurement_clock_ns()
         with self._lock:
@@ -843,6 +844,8 @@ class RtabmapNode(Node):
         else:
             try:
                 rgb_pose = align_pose(poses, rgb_stamp, max_gap_ms=self.stream.max_gap_ms)
+                if crosses_origin(pose, rgb_pose):
+                    raise ValueError('cannot compensate RGB motion across declared odometry origins')
                 local = np.linalg.inv(pose_matrix(pose)) @ pose_matrix(rgb_pose) @ mount
             except ValueError:
                 if self._motion is None:raise

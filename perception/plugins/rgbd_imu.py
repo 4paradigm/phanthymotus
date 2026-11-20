@@ -12,16 +12,26 @@ MAX_IMU_GAP_NS = 100_000_000
 @lru_cache(maxsize=16)
 def _proper_rotation(matrix_bytes):
     r = np.frombuffer(matrix_bytes, dtype=float).reshape(3, 3)
-    return np.allclose(r.T @ r, np.eye(3), atol=1e-5) and abs(np.linalg.det(r)-1.) <= 1e-5
+    if np.any(np.abs(r) > 1.0002) or np.linalg.det(r) <= 0.:
+        return None
+    if np.allclose(r.T @ r, np.eye(3), atol=1e-12, rtol=0.):
+        return r
+    # Four decimal places can introduce up to 1.5e-4 of Frobenius error.
+    left, _, right = np.linalg.svd(r)
+    projected = left @ right
+    if np.linalg.norm(r-projected) <= 2e-4:
+        return projected
+    return None
 
 
 def _rotation(value):
     r = np.asarray(value, dtype=float)
     if r.shape != (3, 3) or not np.isfinite(r).all():
         raise ValueError('camera/IMU rotation must contain a finite 3x3 matrix')
-    if not _proper_rotation(r.tobytes()):
+    proper = _proper_rotation(r.tobytes())
+    if proper is None:
         raise ValueError('camera/IMU rotation must be a proper orthonormal rotation')
-    return r
+    return proper
 
 
 def _vector(value):
@@ -66,6 +76,7 @@ class ImuAttitude:
         self.history = deque(maxlen=512)
         self.orientation_history = deque(maxlen=512)
         self.provenance = {}
+        self.capture_source = None
         self.rotation_source = None
         self.rotation_run_length = 0
         self.rotation_generation = 0
@@ -88,11 +99,17 @@ class ImuAttitude:
             acceleration = rotations[1] @ _vector(packet.get('linear_acceleration'))
             dt = (stamp - self.last_stamp) / 1e9 if self.history else 0.
             source_id, epoch = packet.get('source_id'), packet.get('epoch')
-            source = None
-            if (isinstance(source_id, str) and source_id.strip() and isinstance(epoch, str) and epoch.strip()
+            mapping = packet.get('clock_mapping')
+            self.capture_source = None
+            if (isinstance(source_id, str) and source_id.strip() and (epoch is None or isinstance(epoch, str))
                     and packet.get('stamp_source') == 'measurement' and packet.get('clock_id') == self.clock
+                    and not (isinstance(mapping, dict) and mapping.get('verified') is False)
                     and packet.get('camera_frame_id') == self.frame and abs(stamp-accel_stamp) <= MAX_IMU_GAP_NS):
-                source = (source_id, epoch, packet.get('calibration_id'), rotations[0].tobytes(), rotations[1].tobytes())
+                self.capture_source = (source_id, epoch, packet.get('calibration_id'),
+                                       packet.get('gyro_frame_id'), packet.get('accel_frame_id'),
+                                       rotations[0].tobytes(), rotations[1].tobytes())
+            # Native capture-time rotation hints still require an identified run.
+            source = self.capture_source if isinstance(epoch, str) and epoch.strip() else None
             if source is None or source != self.rotation_source or not 0 < stamp-self.last_stamp <= MAX_IMU_GAP_NS:
                 self.rotation_generation += 1
                 self.rotation_run_length = 0
