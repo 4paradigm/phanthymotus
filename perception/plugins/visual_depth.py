@@ -69,7 +69,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from plugins.image_input import BadInput, load_image_bytes
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 log = logging.getLogger(__name__)
 
@@ -985,6 +985,10 @@ class _DepthNode(Node):
                      f"→ {self._depth_topic}, {self._summary_topic}")
             return self._state("running")
 
+    @property
+    def worker_alive(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
     def stop(self) -> dict:
         # Worker only — the subscription is destroyed by destroy_node() after
         # the node leaves the executor. Destroying it here races the executor's
@@ -994,6 +998,9 @@ class _DepthNode(Node):
         with self._lifecycle_lock:
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
+            if self._worker and self._worker.is_alive():
+                self._running = False
+                return {"state": "stopping", "reason": "worker_pending"}
             self._worker = None
             self._running = False
             log.info(f"[visual_depth] stopped: {self._input_topic or '(no topic, on-demand)'}")
@@ -1174,6 +1181,8 @@ class VideoDepthPerceptionPlugin:
         # Guards _nodes / _instance_configs; never held across a node start,
         # stop, or a model load.
         self._nodes_lock = threading.RLock()
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._nodes_lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
 
     def _backend_calibration_cfg(self, cfg):
         """Drop a YOLO camera preset under DepthART, and say so.
@@ -1355,15 +1364,11 @@ class VideoDepthPerceptionPlugin:
                        width=DEPTH_WIDTH, height=DEPTH_HEIGHT)
         return out, ""
 
-    def _start_node(self, node_key: str, input_topic: Optional[str]):
-        """Register before starting, so a concurrent stop can always cancel it."""
-        with self._nodes_lock:
-            if self._closing:
-                return
-            if node_key in self._nodes:
-                return
+    def _start_node(self, node_key, input_topic, request=None):
+        request = request or self._lifecycle.current(node_key)
+        def create():
             icfg = self._instance_configs.get(node_key, {})
-            node = _DepthNode(
+            return _DepthNode(
                 input_topic or None, self._camera_model(
                     self._model, lambda: self._camera_declaration(node_key)),
                 fps=int(icfg.get("fps", self._fps)),
@@ -1385,46 +1390,30 @@ class VideoDepthPerceptionPlugin:
                 barrel_scale=int(icfg.get("lens_barrel_scale",
                                           self._barrel_scale)),
             )
-            self._executor.add_node(node)
-            self._nodes[node_key] = node
-        node.start()
-        log.info(f"[visual_depth] node started (background): "
-                 f"{input_topic or '(no topic, on-demand)'}")
+        return self._lifecycle.start(node_key, request, create, self._lifecycle.retire_node)
 
-    def _retire_node(self, node_key: str) -> Optional[dict]:
-        with self._nodes_lock:
-            node = self._nodes.pop(node_key, None)
-        if node is None:
-            return None
-        with self._nodes_lock:
-            # Goes with the node. Leaving it behind would let a re-wired card
-            # answer `info()` with the optics of a camera it is no longer fed by,
-            # which is a worse answer than no answer.
-            self._upstream_camera.pop(node_key, None)
-        node.request_stop()
-        result = node.stop()
-        # remove-then-destroy: the node must leave the executor before its
-        # handles are destroyed, and it must be destroyed rather than merely
-        # removed or the publishers and the ROS node name leak.
-        dispose_node(self._executor, node, label=f"visual_depth/{node_key}")
+    def _retire_node(self, node_key: str) -> dict:
+        result = self._lifecycle.stop(node_key)
+        if result["state"] == "idle":
+            with self._nodes_lock:
+                self._upstream_camera.pop(node_key, None)
         return result
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> dict:
         """Release nodes and GPU resources before ROS/interpreter teardown."""
-        if self._backend != "depthart":
-            return
         with self._nodes_lock:
-            self._closing = True
-        # A loader already holding this lock finishes before its model is closed.
-        # _start_node refuses the loader's subsequent node creation while closing.
+            self._closing = self._backend == "depthart"
+        # Cancellation includes loading requests and already-draining resources.
+        # A native worker or failed ROS teardown keeps its model alive for a
+        # later shutdown/stop retry; network/project deadlines do not prove exit.
+        result = self._lifecycle.shutdown()
+        if result["state"] != "idle":
+            return result
         with self._model_lock:
-            with self._nodes_lock:
-                keys = list(self._nodes)
-            for key in keys:
-                self._retire_node(key)
-            if self._model is not None:
+            if self._backend == "depthart" and self._model is not None:
                 model, self._model = self._model, None
                 model.close()
+        return {"state": "idle"}
 
     # ── one-shot depth measurement ───────────────────────────────────────────
 
@@ -1679,7 +1668,8 @@ class VideoDepthPerceptionPlugin:
             raise ValueError("Depth model is busy; wait until loading finishes")
         try:
             with self._nodes_lock:
-                if self._nodes or self._model_loading or self._closing:
+                if (self._nodes or self._model_loading or self._closing
+                        or self._lifecycle.closing or self._lifecycle.status()):
                     raise ValueError("Stop all depth instances and wait for loading to finish before switching models")
                 if self._model is not None:
                     self._model.close()
@@ -1722,7 +1712,19 @@ class VideoDepthPerceptionPlugin:
         finally:
             self._model_lock.release()
 
-    def dispatch(self, name: str, args: dict) -> dict | None:
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
+
+    def _dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)
         instance_id = args.get("instance_id", "")
 
@@ -1838,6 +1840,19 @@ class VideoDepthPerceptionPlugin:
             # recognize_by_url. It just has nothing to subscribe to.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
 
+            # DepthART deliberately requires an explicit stop before changing
+            # its camera binding. Validate before begin() can retire the old
+            # generation as part of the generic topic-replacement path.
+            with self._nodes_lock:
+                active = self._nodes.get(node_key)
+                if (self._backend == "depthart" and active is not None
+                        and (active._input_topic or None) != (input_topic or None)):
+                    return {"state": "error", "message": "Input topic differs from the running instance; stop before rebinding"}
+
+            request, blocked = self._lifecycle.begin(node_key, input_topic)
+            if blocked:
+                return blocked
+
             declaration = upstream_camera
             if input_topic:
                 from plugins.camera_info import for_topic as _camera_for_topic
@@ -1862,7 +1877,7 @@ class VideoDepthPerceptionPlugin:
                             self._request_camera({"camera_info": declaration}, node_key)
                         except ValueError as error:
                             return {"state": "error", "message": str(error)}
-                    return running.start()
+                    return self._start_node(node_key, input_topic, request)
                 # Only a new/stopped DepthART instance establishes a binding.
                 # Preserve YOLO's existing declaration-update behavior.
                 if input_topic or (self._backend == "depthart" and declaration is not None):
@@ -1885,7 +1900,8 @@ class VideoDepthPerceptionPlugin:
                         try:
                             self._ensure_model()
                             self._model_load_status = None
-                            self._start_node(node_key, input_topic)
+                            for pending_key, pending_request in self._lifecycle.pending():
+                                self._start_node(pending_key, pending_request.topic, pending_request)
                         except Exception as e:
                             self._model_load_error = str(e)
                             log.error(f"[visual_depth] engine load failed: {e}", exc_info=True)
@@ -1895,21 +1911,22 @@ class VideoDepthPerceptionPlugin:
                     threading.Thread(target=_bg_start, daemon=True, name="visual_depth_model_load").start()
                     return {"state": "loading", "input": input_topic,
                             "message": "Engine loading in background, will start automatically"}
-                self._start_node(node_key, input_topic)
+                self._start_node(node_key, input_topic, request)
                 with self._nodes_lock:
                     running = self._nodes.get(node_key)
                 if running is None:
                     return {"state": "idle", "input": input_topic}
-            return running.start()
+            return self._start_node(node_key, input_topic, request)
 
         elif action == "stop":
             if instance_id:
                 result = self._retire_node(instance_id)
                 return result if result is not None else {"state": "idle"}
-            with self._nodes_lock:
-                keys = list(self._nodes.keys())
-            results = [key for key in keys if self._retire_node(key) is not None]
-            return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
+            result = self._lifecycle.stop()
+            if result["state"] == "idle":
+                with self._nodes_lock:
+                    self._upstream_camera.clear()
+            return result
 
         elif action == "config":
             cfg = {k: v for k, v in args.items()

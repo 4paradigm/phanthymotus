@@ -3209,6 +3209,94 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
+### VOP instance lifecycle and ROS resource ownership
+
+Every distinct start operation receives a per-instance `generation`. Repeating
+an identical pending/running request is idempotent; changing the input/config,
+retrying a failure, or starting after stop creates a new generation. The request
+owns a snapshot of its configuration and camera binding. Stop invalidates pending
+requests even before a ROS node exists. One tracked, shared model loader may
+finish filling the model cache after cancellation, but it starts only requests
+that are still current.
+
+Generation checks surround construction, executor registration, node startup and
+completion. Per-instance operation locks serialize ROS work; the global registry
+lock is never held across model loading, ROS initialization or worker joins.
+Retirement is irreversible on the node itself. A delayed start or a cached object
+reference cannot revive a retired/destroyed node; a replacement uses a new node,
+ROS node name.
+
+`info.instances` retains lifecycle records with `state`, `error`, `generation`
+and the existing configuration/topic/counter fields. States are `idle`,
+`starting`, `running`, `failed`, `stopping`; root `state=loading` is retained while
+an active request waits for the model. `model_state`/`model_error` describe the
+shared engine independently, so a cancelled instance can be `idle` while the
+cache is still loading. Overall state reflects instance states, not dictionary
+non-emptiness. `info(instance_id=...)` reports that instance's state at the root;
+only an unscoped query aggregates all instances. A missing instance is idle.
+Failed/error info also carries a root `error` reason for lifecycle consumers;
+per-instance diagnostics remain available in `instances`.
+
+Info snapshots the camera declaration with the generation and node binding,
+reads node status outside the global registry lock, and retries the entire
+snapshot if a lifecycle change occurred. It never joins old node status to
+a newly read camera ID, resolution or calibration.
+
+
+Stop returns `stopping` while startup unwinds or an already executing inference
+finishes. Native/GPU calls cannot be forcibly terminated by a Python event.
+Retiring nodes remain tracked (`draining_streams` in info), publish nothing, and
+are removed from the executor before ROS destruction once their worker exits.
+Each instance has at most one effective cleanup task; repeated stop requests
+wake that task rather than allocate additional waiting threads. A permanently
+blocked native call remains visibly stopping; container/process recovery may
+then be required.
+
+`cleanup_pending` identifies that task. `cleanup_errors` lists task or resource
+cleanup failures; each draining resource also reports `cleanup_removed`,
+`cleanup_destroyed`, and `cleanup_error`. Failed teardown stays owned and reports
+failed instead of idle. A subsequent stop retries unfinished stages, without
+removing an already detached node again. Failure to create/start the task clears
+the task slot so another stop can retry. Cleanup failure is not retried in a
+tight automatic loop.
+
+The shared `dispose_node` helper returns caller-owned `NodeDisposal` progress.
+rclpy Humble's removal/destruction APIs normally return `None`; removal is also
+checked through `Executor.get_nodes()` when available, and explicit `False`
+from an adapter is a failure. Removal failure prevents destruction. The destroyed
+flag records successful completion of the ROS destroy API, not proof that all
+native deferred destruction has physically finished. Every caller must retain
+incomplete progress together with the resource and surface a non-idle state;
+ignoring the result after deleting the node record loses the retry owner.
+Concurrent calls sharing a progress object serialize its stages, so successful
+removal/destruction is not repeated.
+
+OCR, Pose, Face, SoundEvent, Barcode, Visual Depth and Echo Cancellation use
+`NodeLifecycle` for this ownership contract. A constructed candidate is owned
+before executor registration is attempted; retirement transfers it into the
+plugin's `_draining_nodes` before removing the active record. Failed detach or
+destroy returns `failed` with cleanup stage diagnostics. A running native worker
+or cancelled construction/registration that is unwinding returns `stopping`.
+Both states prevent replacement startup. Another explicit `stop` retries the
+unfinished stage and returns `idle` only when resources are released. No cleanup
+retry threads or timing sleeps are introduced for these seven plugins.
+
+Requests carry an identity and generation through model loading, construction,
+registration and start. Stop invalidates the request before attempting its
+per-instance operation lock; a blocked start cleans its own candidate when it
+unwinds. An expired request or old stop cannot replace or retire a newer node.
+Info exposes cleanup failures for the requested instance and for stop-all;
+an idle peer cannot hide unfinished cleanup. Model-changing configuration must
+stop old resources before releasing their engine. Visual Depth shutdown also
+retains the engine when worker exit or ROS disposal remains unverified. All
+seven plugins expose the existing bundle's shutdown hook, which cancels pending
+creation, prevents subsequent starts and allows repeated cleanup attempts.
+DepthART still requires an explicit stop before changing a live camera binding.
+
+VOP retains its existing generation/draining/reaper implementation and shares
+only the staged `NodeDisposal` primitive. None of these lifecycle fields changes
+the streamed detection payload or supplies image-source provenance.
+
 ### vop's streamed payload: `publish_bbox` and `publish_color`
 
 Two knobs govern what one detected object costs on the topic. **They affect the
