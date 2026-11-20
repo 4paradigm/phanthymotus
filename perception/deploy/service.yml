@@ -22,7 +22,7 @@ perception:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
-    # Visitor_Badge_Printer uses one stable in-container path on every robot.
+    # Visitor_Badge_Printer uses this private SSH identity for all frontdesk communication.
     # The host directory contains robot-specific SSH credentials and is never
     # baked into or committed with the image.
     - /opt/phanthy-motus/secrets/ql_printer:/run/ql-printer-auth:ro

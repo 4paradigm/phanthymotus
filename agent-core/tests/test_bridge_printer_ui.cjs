@@ -20,8 +20,7 @@ class Element {
 
 function fixture(fetch) {
   const fields = {};
-  const initial = {bridge_url: '10.100.10.14', remote_start_user: 'operator', remote_start_port: '22',
-    remote_start_key_path: '/run/ql-printer-auth/frontdesk_bridge_ed25519', token: '', remote_start_enabled: 'false'};
+  const initial = {bridge_url: '10.100.10.14', remote_start_user: 'operator'};
   for (const [key, value] of Object.entries(initial)) { fields[key] = Object.assign(new Element(), {value, dataset: {key}}); }
   const props = Object.fromEntries(Object.keys(fields).map(key => [key, {scope: 'shared', type: key === 'remote_start_enabled' ? 'boolean' : 'string'}]));
   props.printer_name = {scope: 'instance'};
@@ -43,32 +42,30 @@ function fixture(fetch) {
 
 const response = result => ({ok: true, json: async () => ({code: 200, data: result})});
 
-test('initialization pairs automatically and persists token before printer selection', async () => {
+test('initialization verifies SSH and persists connection before printer selection', async () => {
   const requests = [];
   const f = fixture(async (url, opts) => {
     const payload = JSON.parse(opts.body); requests.push({url, payload});
     if (opts.method === 'PUT') return {ok: true};
     const args = payload.arguments;
     if (args.action === 'initialize') return response({status: 'installing', deployment_id: 'job-1'});
-    if (args.action === 'initialize_status') return response({status: 'installed', deployment_id: 'job-1', token: 'generated-or-existing', bridge_url: 'http://10.100.10.14:8765'});
+    if (args.action === 'initialize_status') return response({status: 'installed', deployment_id: 'job-1', bridge_url: 'ssh://10.100.10.14'});
     return response({printers: [{name: 'Brother'}]});
   });
   const install = f.controls.controls[0].onclick();
   await new Promise(resolve => setImmediate(resolve));
   await f.flush(); await install;
-  assert.equal(requests.find(r => r.payload.arguments?.action === 'initialize').payload.arguments.token, '');
+  assert.equal(requests.find(r => r.payload.arguments?.action === 'initialize').payload.arguments.token, undefined);
   assert.equal(requests.find(r => r.payload.arguments?.action === 'initialize_status').payload.arguments.deployment_id, 'job-1');
   const saved = requests.find(r => !r.payload.arguments).payload;
-  assert.equal(saved.token, 'generated-or-existing');
-  assert.equal(saved.remote_start_enabled, true);
-  assert.equal(saved.bridge_url, 'http://10.100.10.14:8765');
+  assert.equal(saved.token, undefined);
+  assert.equal(saved.bridge_url, 'ssh://10.100.10.14');
   assert.equal(saved.printer_name, undefined);
   assert.equal(f.controls.input.value, 'Brother');
 });
 
 test('printer lookup failure retains the previously selected printer', async () => {
   const f = fixture(async () => { throw new Error('network unavailable'); });
-  f.fields.token.value = 'existing';
   await f.flush();
   assert.equal(f.controls.input.value, 'Brother');
   assert.equal(f.controls.input.disabled, false);
@@ -84,51 +81,45 @@ test('changing computer while initialization is pending cannot persist old crede
   const install = f.controls.controls[0].onclick();
   await new Promise(resolve => setImmediate(resolve));
   f.fields.bridge_url.value = '10.100.10.20';
-  finish(response({status: 'installed', token: 'old-computer-secret'}));
+  finish(response({status: 'installed'}));
   await install;
   assert.equal(writes.length, 0);
-  assert.equal(f.fields.token.value, '');
 });
 
 test('stale printer lookup cannot overwrite the new computer selection', async () => {
   let finish;
   const f = fixture(async () => new Promise(resolve => { finish = resolve; }));
-  f.fields.token.value = 'existing';
   await f.flush();
   f.fields.bridge_url.value = '10.100.10.20';
   f.body.listeners.input({target: f.fields.bridge_url});
-  assert.equal(f.fields.token.value, '');
   finish(response({printers: [{name: 'Old computer printer'}]}));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(f.controls.input.value, '');
   assert.equal(f.controls.input.children.some(option => option.value === 'Old computer printer'), false);
 });
 
-test('mismatched installation job never saves another job token', async () => {
+test('mismatched installation job never saves another job result', async () => {
   const writes = [];
   const f = fixture(async (url, opts) => {
     if (opts.method === 'PUT') { writes.push(opts); return {ok: true}; }
     const args = JSON.parse(opts.body).arguments;
     if (args.action === 'initialize') return response({status: 'installing', deployment_id: 'expected-job'});
-    return response({status: 'installed', deployment_id: 'other-job', token: 'unrelated-secret'});
+    return response({status: 'installed', deployment_id: 'other-job'});
   });
   const install = f.controls.controls[0].onclick();
   await new Promise(resolve => setImmediate(resolve));
   await f.flush(); await install;
   assert.equal(writes.length, 0);
-  assert.equal(f.fields.token.value, '');
   assert.match(f.controls.controls[1].textContent, /初始化结果不匹配/);
 });
 
-test('editing address clears credentials and does not query the new computer before pairing', async () => {
+test('editing address refreshes printers through the new SSH target', async () => {
   const requests = [];
   const f = fixture(async (url, opts) => { requests.push(JSON.parse(opts.body).arguments); return response({printers: []}); });
-  f.fields.token.value = 'old-computer-token';
   await f.flush();
   requests.length = 0;
   f.fields.bridge_url.value = '10.100.10.99';
   f.body.listeners.input({target: f.fields.bridge_url});
   await f.flush();
-  assert.equal(f.fields.token.value, '');
-  assert.equal(requests.length, 0);
+  assert.equal(requests.some(args => args?.action === 'printers' && args.bridge_url === '10.100.10.99'), true);
 });

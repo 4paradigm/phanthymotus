@@ -419,10 +419,8 @@ plugins:
   QL_printer:
     enabled: true
     bridge_url: ""
-    token: ""
     timeout_s: 8
-    print_timeout_s: 60
-    remote_start_enabled: false
+    print_timeout_s: 120
     remote_start_user: "4paradigm"
     remote_start_port: 22
     remote_start_key_path: "/run/ql-printer-auth/frontdesk_bridge_ed25519"

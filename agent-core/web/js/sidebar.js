@@ -954,20 +954,20 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
   input.className = 'tool-config-input';
   input.dataset.key = key;
   let selected = saved || '';
-  input.add(new Option(selected || '安装后选择打印机', selected));
+  input.add(new Option(selected || '连接后选择打印机', selected));
 
   const initialize = document.createElement('button');
   initialize.type = 'button';
-  initialize.textContent = '安装或升级前台桥接';
+  initialize.textContent = '准备前台电脑';
   initialize.className = 'ql-printer-init-button';
   const progress = document.createElement('div');
   progress.className = 'ql-printer-progress';
   progress.setAttribute('aria-live', 'polite');
   const read = k => bodyEl.querySelector(`[data-key="${k}"]`)?.value.trim() || '';
   const alive = () => initialize.isConnected && !overlay.classList.contains('hidden');
-  const connection = () => ['bridge_url', 'token'].map(read);
-  const identity = () => JSON.stringify(
-    ['bridge_url', 'remote_start_user', 'remote_start_port', 'remote_start_key_path', 'token'].map(read));
+  const automaticSsh = !props.bridge_url && !props.remote_start_user;
+  const connection = () => automaticSsh ? ['visitor-frontdesk'] : ['bridge_url', 'remote_start_user'].map(read);
+  const identity = () => JSON.stringify(connection());
   const call = async args => {
     const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -978,7 +978,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
     const blocks = Array.isArray(envelope.data) ? envelope.data : envelope.data?.content;
     const text = blocks?.find(b => b.type === 'text')?.text;
     const result = text ? JSON.parse(text) : envelope.data;
-    if (!result || typeof result !== 'object') throw new Error('桥接返回了无法读取的结果');
+    if (!result || typeof result !== 'object') throw new Error('前台电脑返回了无法读取的结果');
     return result;
   };
 
@@ -991,20 +991,20 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
   const loadPrinters = async (silent = false) => {
     const version = ++generation;
     const address = connection();
-    const [bridge_url, token] = address;
+    const [bridge_url, remote_start_user] = automaticSsh ? ['', ''] : address;
     const current = () => alive() && version === generation &&
       JSON.stringify(connection()) === JSON.stringify(address);
-    if (!bridge_url || !token) {
-      showPending('安装后选择打印机');
+    if (!automaticSsh && (!bridge_url || !remote_start_user)) {
+      showPending('连接后选择打印机');
       input.disabled = installing;
       return;
     }
     input.disabled = true;
     showPending('正在读取打印机…');
     try {
-      const result = await call({action: 'printers', bridge_url, token});
+      const result = await call(automaticSsh ? {action: 'printers'} : {action: 'printers', bridge_url, remote_start_user});
       if (!current()) return;
-      if (!Array.isArray(result.printers)) throw new Error(result.error || '未返回打印机列表，请安装或升级桥接');
+      if (!Array.isArray(result.printers)) throw new Error(result.error || '未返回打印机列表，请先准备前台电脑');
       input.replaceChildren(new Option('请选择打印机', ''));
       for (const p of result.printers) {
         input.add(new Option(p.name + (p.default ? '（系统默认）' : '') + (p.offline ? '（离线）' : ''), p.name));
@@ -1026,10 +1026,9 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
     if (!(await ensureEdit()) || !alive() || installing) return;
     const originalIdentity = identity();
     const unchanged = () => alive() && identity() === originalIdentity;
-    const args = {action: 'initialize', bridge_url: read('bridge_url'), token: read('token'),
-      remote_start_user: read('remote_start_user'), remote_start_port: Number(read('remote_start_port') || 22),
-      remote_start_key_path: read('remote_start_key_path') || '/run/ql-printer-auth/frontdesk_bridge_ed25519'};
-    if (!args.bridge_url || !args.remote_start_user) {
+    const args = automaticSsh ? {action: 'initialize'} : {action: 'initialize', bridge_url: read('bridge_url'),
+      remote_start_user: read('remote_start_user')};
+    if (!automaticSsh && (!args.bridge_url || !args.remote_start_user)) {
       progress.textContent = '请填写前台电脑 IP 和 Windows 用户名';
       return;
     }
@@ -1053,11 +1052,6 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       if (!unchanged()) return;
       if (result.status !== 'installed') throw new Error(result.error || '初始化未成功');
       if (!deploymentId || result.deployment_id !== deploymentId) throw new Error('初始化结果不匹配，请重新连接前台电脑');
-      if (!result.token) throw new Error('桥接已安装，但未返回配对信息，请升级 perception 后重试');
-      bodyEl.querySelector('[data-key="token"]').value = result.token;
-      const enabled = bodyEl.querySelector('[data-key="remote_start_enabled"]');
-      if (enabled) enabled.value = 'true';
-      const normalizedAddress = result.bridge_url || args.bridge_url;
       const cacheKey = `${mcpId}:${toolName}`;
       const sharedValues = {...(_toolConfigs[cacheKey] || {})};
       for (const field of bodyEl.querySelectorAll('[data-key]')) {
@@ -1066,13 +1060,11 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
           sharedValues[field.dataset.key] = _readConfigValue(field, def);
         }
       }
-      sharedValues.bridge_url = normalizedAddress;
-      sharedValues.token = result.token;
-      sharedValues.remote_start_enabled = true;
+      if (!automaticSsh) sharedValues.bridge_url = result.bridge_url || args.bridge_url;
       const savedIdentity = identity();
       pairedIdentity = savedIdentity;
-      // Persist the pairing now so closing after installation cannot lose the
-      // generated token. The selected printer is still committed by Save.
+      // Persist the verified SSH connection now. The selected printer is
+      // still committed by Save.
       const response = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
         method: 'PUT', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(sharedValues),
@@ -1080,7 +1072,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       if (!response.ok) throw new Error('安装成功，但连接配置未保存，请点击“保存”后重试');
       _toolConfigs[cacheKey] = sharedValues;
       if (!alive() || identity() !== savedIdentity) return;
-      progress.textContent = '桥接已就绪，连接配置已保存。请选择打印机并保存；首次使用需登录访客网站。';
+      progress.textContent = '前台电脑已通过 SSH 准备完成。请选择打印机并保存；首次使用需登录访客网站。';
       await loadPrinters();
     } catch (error) {
       if (alive() && (unchanged() || identity() === pairedIdentity)) progress.textContent = error.message;
@@ -1089,8 +1081,8 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       if (alive()) {
         initialize.disabled = false;
         input.disabled = false;
-        if (identity() !== originalIdentity && !read('token')) {
-          progress.textContent = '配置已修改，请重新点击安装或升级。';
+        if (identity() !== originalIdentity) {
+          progress.textContent = '连接信息已修改，请重新准备前台电脑。';
         }
       }
     }
@@ -1103,20 +1095,16 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       bodyEl.removeEventListener('input', onInput);
       return;
     }
-    if (!['bridge_url', 'token', 'remote_start_user', 'remote_start_port', 'remote_start_key_path'].includes(event.target.dataset.key)) return;
+    if (automaticSsh || !['bridge_url', 'remote_start_user'].includes(event.target.dataset.key)) return;
     generation++;
     clearTimeout(reloadTimer);
     if (read('bridge_url') !== lastAddress) {
       selected = '';
       lastAddress = read('bridge_url');
-      // A saved bearer token belongs to the old computer. Never send it to a
-      // newly entered address; pairing retrieves that computer's own token.
-      const token = bodyEl.querySelector('[data-key="token"]');
-      if (token) token.value = '';
     }
-    showPending('安装后选择打印机');
+    showPending('连接后选择打印机');
     if (installing) {
-      progress.textContent = '配置已修改；正在进行的安装仍使用原配置，完成后请重新初始化。';
+      progress.textContent = '配置已修改；正在进行的准备仍使用原配置，完成后请重新连接。';
       return;
     }
     reloadTimer = setTimeout(() => { if (alive()) loadPrinters(true); }, 500);
@@ -1676,7 +1664,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
     // Advanced shared settings belong in the same collapsed expert section as
     // advanced instance settings.  Previously the shared branch won first,
-    // which flattened every SSH/token detail into the everyday card form.
+    // which flattened every SSH detail into the everyday card form.
     const host = def.advanced ? advancedHost() : (isShared ? sharedHost : bodyEl);
     host.appendChild(label);
     host.appendChild(input);

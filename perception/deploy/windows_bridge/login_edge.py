@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 
 def main():
     parser = argparse.ArgumentParser(description="首次登录前台访客平台")
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--automatic", action="store_true")
     args = parser.parse_args()
     config_path = Path(args.config).resolve()
     config = json.loads(config_path.read_text(encoding="utf-8-sig"))
@@ -30,7 +32,23 @@ def main():
         print("它只负责关闭浏览器自动添加的日期、网址和页码。")
         print("现场已确认 Logo、二维码不依赖背景图形；自动打印会等待页面内容渲染完成。")
         print("Brother 的纸张尺寸、纵向、缩放和边距仍需在 Windows 打印首选项中核对一次。")
-        input("完成后回到此窗口，按回车保存登录状态并退出：")
+        if args.automatic:
+            # The scheduled task has no console input. Keep the visible Edge
+            # open until login redirects back to the visitor site, then let
+            # Playwright close cleanly so the profile can be reused by jobs.
+            deadline = time.monotonic() + 15 * 60
+            saw_login = "login" in page.url.lower()
+            while time.monotonic() < deadline:
+                page.wait_for_timeout(1000)
+                current = page.url.lower()
+                saw_login = saw_login or "login" in current
+                if saw_login and "login" not in current and "p-visitor.4paradigm.com" in current:
+                    page.wait_for_timeout(3000)
+                    break
+                if not saw_login and "p-visitor.4paradigm.com" in current:
+                    break
+        else:
+            input("完成后回到此窗口，按回车保存登录状态并退出：")
         context.close()
 
 

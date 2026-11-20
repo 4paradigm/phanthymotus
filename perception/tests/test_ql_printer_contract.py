@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import sys
 import threading
 import unittest
@@ -14,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from plugins.ql_printer import QLPrinterPlugin  # noqa: E402
+from plugins.ql_printer import BridgeClient, QLPrinterPlugin, SSHBridgeClient  # noqa: E402
 from ql_printer_mock_bridge import MockBridge  # noqa: E402
 
 TOKEN = "test-token"
@@ -27,8 +28,11 @@ class VisitorBadgeTest(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.card = QLPrinterPlugin({})
-        cfg = self.card.dispatch("config", {"bridge_url": self.url, "token": TOKEN})
+        cfg = self.card.dispatch("config", {"bridge_url": self.url, "remote_start_user": "operator"})
         self.assertTrue(cfg["adapter_ok"])
+        # Exercise the card contract against the existing mock business API;
+        # SSH framing itself has dedicated tests below.
+        self.card._client = lambda cfg=None: BridgeClient(self.url, TOKEN, 8)
 
     def tearDown(self):
         if self.server is not None:
@@ -57,50 +61,40 @@ class VisitorBadgeTest(unittest.TestCase):
         props = definition["configSchema"]["properties"]
         self.assertEqual(props["printer_name"]["scope"], "instance")
         self.assertEqual(props["printer_name"]["format"], "bridge-printer")
-        self.assertEqual(props["token"]["format"], "password")
-        self.assertTrue(props["bridge_url"]["x-sensitive"])
-        self.assertEqual(props["timeout_s"]["default"], 8)
-        self.assertEqual(props["print_timeout_s"]["default"], 60)
-        self.assertTrue(props["remote_start_enabled"]["default"])
-        self.assertEqual(props["remote_start_port"]["default"], 22)
-        self.assertEqual(definition["configSchema"]["required"], ["bridge_url"])
+        self.assertNotIn("token", props)
+        self.assertEqual(set(props), {"printer_name", "bridge_url", "remote_start_user"})
+        self.assertEqual(definition["configSchema"]["required"], ["bridge_url", "remote_start_user"])
 
     def test_operator_can_enter_only_frontdesk_ip(self):
         card = QLPrinterPlugin({"bridge_url": "10.100.10.14"})
-        self.assertEqual(card._cfg["bridge_url"], "http://10.100.10.14:8765")
-        self.assertFalse(card._cfg["remote_start_enabled"])
-
+        self.assertEqual(card._cfg["bridge_url"], "ssh://10.100.10.14")
         result = card.dispatch("config", {"bridge_url": "192.168.1.20"})
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(card._cfg["bridge_url"], "http://192.168.1.20:8765")
+        self.assertEqual(card._cfg["bridge_url"], "ssh://192.168.1.20")
 
     def test_address_validation_is_consistent_for_setup_and_discovery(self):
         for address in ("user:password@192.168.1.2", "http://host:bad", "host:99999", "host/path", "a b", "http://[broken"):
             for action in ("config", "initialize", "printers"):
                 with self.subTest(address=address, action=action):
                     self.assertEqual(self.call(action, bridge_url=address)["status"], "error")
-        for address, expected in (("192.168.1.2:8765", "http://192.168.1.2:8765"),
-                                  ("::1", "http://[::1]:8765"),
-                                  ("https://example.com/", "https://example.com")):
+        for address, expected in (("192.168.1.2", "ssh://192.168.1.2"),
+                                  ("::1", "ssh://[::1]"),
+                                  ("https://example.com/", "ssh://example.com")):
             self.assertEqual(self.call("config", bridge_url=address)["status"], "ok")
             self.assertEqual(self.card._cfg["bridge_url"], expected)
 
-    def test_discovery_does_not_send_old_token_to_new_computer(self):
-        with patch("plugins.ql_printer.BridgeClient") as client:
-            self.assertEqual(self.call("printers", bridge_url="192.168.1.20")["code"], "not_configured")
-            self.assertEqual(self.call("printers", token="")["code"], "not_configured")
-            client.assert_not_called()
+    def test_discovery_requires_ssh_identity(self):
+        self.assertEqual(self.call("printers", bridge_url="192.168.1.20", remote_start_user="")["code"], "not_configured")
 
     def test_initialization_result_is_bound_to_its_job(self):
         from plugins import bridge_deploy
         finished = threading.Event()
         release = threading.Event()
         def deploy(config):
-            self.assertEqual(config["bridge_url"], "http://192.168.1.20:8765")
-            self.assertEqual(config["token"], "")
+            self.assertEqual(config["bridge_url"], "ssh://192.168.1.20")
             release.wait(3)
             finished.set()
-            return {"status": "installed", "token": "secret-from-authorized-ssh", "bridge_url": config["bridge_url"]}
+            return {"status": "installed", "bridge_url": config["bridge_url"]}
         with patch.object(bridge_deploy, "deploy", side_effect=deploy):
             started = self.call("initialize", bridge_url="192.168.1.20")
             try:
@@ -116,13 +110,12 @@ class VisitorBadgeTest(unittest.TestCase):
                     break
                 threading.Event().wait(0.01)
             self.assertEqual(state["status"], "installed")
-            self.assertEqual(state["token"], "secret-from-authorized-ssh")
             self.assertNotIn("token", self.call("initialize_status"))
             self.assertNotIn("deployment_id", self.call("initialize_status"))
-            self.assertEqual(self.card._cfg["bridge_url"], self.url)  # Save remains explicit.
+            self.assertEqual(self.card._cfg["bridge_url"], "ssh://127.0.0.1")  # Save remains explicit.
 
-    def test_print_timeout_defaults_to_60_seconds_and_is_clamped(self):
-        self.assertEqual(self.card._cfg["print_timeout_s"], 60)
+    def test_print_timeout_covers_on_demand_browser_job_and_is_clamped(self):
+        self.assertEqual(self.card._cfg["print_timeout_s"], 120)
         self.card.dispatch("config", {"print_timeout_s": 999})
         self.assertEqual(self.card._cfg["print_timeout_s"], 120)
         self.card.dispatch("config", {"print_timeout_s": 3})
@@ -203,10 +196,7 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(result["code"], "printer_not_ready")
         self.assertIn("缺纸", result["error"])
 
-    def test_wrong_token_and_bridge_down(self):
-        self.card.dispatch("config", {"token": "wrong"})
-        self.assertEqual(self.call("list")["code"], "unauthorized")
-        self.card.dispatch("config", {"token": TOKEN, "timeout_s": 2})
+    def test_business_endpoint_down_is_reported(self):
         self.server.shutdown()
         self.server.server_close()
         self.server = None
@@ -215,24 +205,18 @@ class VisitorBadgeTest(unittest.TestCase):
         # the host network stack. Neither outcome proves a login failure.
         self.assertIn(result["code"], {"unreachable", "request_timeout"})
 
-    def test_remote_start_runs_ssh_before_query_when_bridge_is_down(self):
-        self.card._cfg.update({
-            "remote_start_enabled": True,
-            "remote_start_user": "4paradigm",
-            "remote_start_port": 22,
-            "remote_start_key_path": "/run/test-key",
-        })
-        with patch.object(self.card, "_bridge_is_healthy", side_effect=[False, True]), patch(
-            "plugins.ql_printer.os.path.isfile", return_value=True
-        ), patch(
-            "plugins.ql_printer.subprocess.run",
-            return_value=CompletedProcess([], 0, stdout="STARTED", stderr=""),
-        ) as run, patch("plugins.ql_printer.time.sleep"):
-            result = self.call("list")
-        self.assertEqual(result["status"], "listed")
+    def test_ssh_is_the_only_remote_transport(self):
+        client = SSHBridgeClient("10.100.10.14", "4paradigm", "/run/test-key")
+        payload = base64.b64encode(json.dumps({"state": "running"}).encode()).decode()
+        completed = CompletedProcess([], 0, stdout=("VISITOR_RESULT:" + payload + "\n").encode(), stderr=b"")
+        with patch("plugins.ql_printer.os.path.isfile", return_value=True), patch(
+            "plugins.ql_printer.subprocess.run", return_value=completed
+        ) as run:
+            self.assertEqual(client.request("GET", "/health")["state"], "running")
         command = run.call_args.args[0]
         self.assertEqual(command[0], "ssh")
-        self.assertIn("4paradigm@127.0.0.1", command)
+        self.assertIn("4paradigm@10.100.10.14", command)
+        self.assertNotIn("curl", command)
 
     def test_unknown_action(self):
         self.assertEqual(self.call("explode")["code"], "bad_action")
