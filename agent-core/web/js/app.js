@@ -5,7 +5,8 @@
 
 import { getToken, setToken, verifyToken, consumeTokenFromUrl } from './auth.js';
 import { initSidebar, renderSidebar } from './sidebar.js';
-import { initCanvas, updateCanvasMcps } from './canvas.js';
+import { initCanvas, updateCanvasMcps, ensureEdit } from './canvas.js';
+import { attachLiveStreamCards } from './live-stream/attach.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
 import { startDeploy } from './deploy-progress.js';
 import { connectMotus } from './motus-stream.js';
@@ -84,6 +85,8 @@ async function main() {
   renderSidebar(_allMcps, _topicStatuses);
   updateCanvasMcps(_allMcps);
 
+  const liveCards = attachLiveStreamCards(() => _allMcps, ensureEdit);
+
   // Poll every 10s
   setInterval(async () => {
     const fresh = await _fetchMcps();
@@ -95,6 +98,7 @@ async function main() {
       }
     }
     _allMcps = fresh;
+    liveCards.sync?.();
     await fetchTopicStatuses();
     renderSidebar(_allMcps, _topicStatuses);
     updateCanvasMcps(_allMcps);

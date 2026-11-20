@@ -1515,9 +1515,13 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        if (!resp.ok) {
-          alert(`配置保存失败 (HTTP ${resp.status})`);
+        const applied = await resp.json().catch(() => ({}));
+        if (!resp.ok || applied.code !== 200) {
+          alert(applied.message || `配置保存失败 (HTTP ${resp.status})`);
           return;
+        }
+        if (toolName === 'live_stream' && applied.ready_to_go_live === false) {
+          alert('地址已保存，但这不是新的开播授权。请从直播平台获取新的推流码，再保存并执行 go_live。');
         }
       } catch (err) {
         alert('配置保存失败: ' + err.message);
