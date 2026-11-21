@@ -95,8 +95,7 @@ def test_active_scan_turns_right_and_can_return_using_the_current_view(monkeypat
     _tick(lookout, geometry, 4000)
     assert lookout.ready
     _, occupied = lookout.grid()
-    assert occupied.any()
-    assert not occupied[30, 38]  # the side observation was reprojected
+    assert not occupied.any()  # Later views confirmed the earlier obstacle cell was free.
     assert lookout.try_other_side()
     assert _tick(lookout, geometry, 4100).yaw == 0
     assert _tick(lookout, geometry, 4200).yaw > 0
@@ -888,28 +887,60 @@ def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(mon
     assert lookout.command(geometry, .33, .25, 600).yaw > 0
 
 
+def test_calibrated_view_fusion_is_reused_until_pose_changes_or_a_view_expires():
+    look = scan.ActiveScan()
+    hits = np.isclose(scan.FORWARD, 1.) & np.isclose(scan.RIGHT, 0.)
+    look.views.append((1000, look.pose, ~hits, hits))
+    look.poses.append((1100, look.pose, 0.))
+    _, occupied = look.observed_grid()
+    assert occupied.any()
+    assert look.observed_grid()[1] is occupied
+    look.poses.append((1200, look.pose, 0.))
+    assert look.observed_grid()[1] is occupied
+
+    look.pose = (.05, 0., 0.)
+    _, shifted = look.observed_grid()
+    assert not np.array_equal(shifted, occupied)
+    look.poses.append((1001 + scan.MAP_AGE_MS, look.pose, 0.))
+    assert not look.observed_grid()[1].any()
+
+
+def test_recent_grid_fusion_only_replaces_occupied_with_new_observed_free():
+    look = scan.ActiveScan()
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    cell = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    look.views.append((1000, look.pose, empty, cell))
+    look.views.append((1100, look.pose, empty, empty))
+    look.poses.append((1100, look.pose, 0.))
+    assert np.array_equal(look.observed_grid()[1], cell)
+
+    look.views.append((1200, look.pose, cell, empty))
+    look.poses.append((1200, look.pose, 0.))
+    free, occupied = look.observed_grid()
+    assert np.array_equal(free, cell)
+    assert not occupied.any()
+
+    look.views.append((1300, look.pose, empty, cell))
+    look.poses.append((1300, look.pose, 0.))
+    free, occupied = look.observed_grid()
+    assert not free.any()
+    assert np.array_equal(occupied, cell)
+
+
 def test_scan_allows_an_unobserved_rear_sweep(monkeypatch):
     lookout, geometry, visible, _ = _setup(monkeypatch)
     visible[:] = scan.FORWARD > 0
     _tick(lookout, geometry, 1000)
-    assert lookout.clear_sweep(geometry, .33, scan.ANGLE, 0.)
-    assert lookout.clear_sweep(geometry, .33, -scan.ANGLE, 0.)
+    assert lookout.clear_sweep(geometry, .33, 0.)
 
 
 def test_s10_search_sweep_is_checked_against_hits_not_the_rear_grid_extent():
     geometry = camera_square(object(), (480, 420, 243), .23)
     occupied = np.zeros_like(scan.RIGHT, dtype=bool)
-    horizon = (600 + 800 + 50) / 1000
-    sweep = (.60 + .10) * horizon
     lookout = scan.ActiveScan()
-
-    for direction in (-1, 1):
-        assert lookout.clear_sweep(geometry, .33, direction * sweep,
-                                   scan.STILL_LINEAR * horizon, occupied=occupied)
+    assert lookout.clear_sweep(geometry, .23, 0., occupied=occupied)
     occupied[scan.START[0] + 6, scan.START[1]] = True
-    for direction in (-1, 1):
-        assert not lookout.clear_sweep(geometry, .33, direction * sweep,
-                                       scan.STILL_LINEAR * horizon, occupied=occupied)
+    assert not lookout.clear_sweep(geometry, .23, 0., occupied=occupied)
 
 
 def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
@@ -939,8 +970,7 @@ def test_front_camera_checks_the_body_behind_the_plan_origin():
 
     occupied = np.isclose(grid.FORWARD, -.50) & np.isclose(grid.RIGHT, .25)
     look = scan.ActiveScan()
-    assert look.clear_sweep(geometry, .25, 0., 0., occupied=occupied)
-    assert not look.clear_sweep(geometry, .25, .7, 0., occupied=occupied)
+    assert not look.clear_sweep(geometry, .20, 0., occupied=occupied)
 
 
 @pytest.mark.parametrize("half_width", [.23, .35])
@@ -961,7 +991,7 @@ def test_receipt_only_scan_turns_with_only_front_depth(half_width, route_segment
                     {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
         if stamp == 1000:
             assert look.begin((1.,), advance_m=1., route_segment=route_segment)
-        result = look.command(geometry, half_width + .05, .18, 600)
+        result = look.command(geometry, half_width, .18, 600)
     assert result.yaw == -.18
 
 
@@ -978,20 +1008,41 @@ def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkey
     assert (result.yaw < 0) is (not initial_hit)
 
 
-@pytest.mark.parametrize("floor", [0., .5])
-def test_scan_uses_the_fastest_executable_rate_supported_by_the_sweep(monkeypatch, floor):
+@pytest.mark.parametrize("blocked", [False, True])
+def test_scan_checks_the_circular_footprint_at_the_requested_rate(monkeypatch, blocked):
     look, geometry, _, occupied = _setup(monkeypatch)
-    occupied[scan.START[0] + 3, scan.START[1] - 9] = True
+    offset = 8 if blocked else 11
+    occupied[scan.START[0] + 3, scan.START[1] - offset] = True
     for stamp in (1000, 1050, 1150):
         look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
                     geometry, receipt_only=True)
         if stamp == 1000:
             assert look.begin((1.,))
-        result = look.command(geometry, .33, 1., 600, min_yaw_rate=floor)
-    if floor:
-        assert result.yaw == 0.
-    else:
-        assert -.5 < result.yaw < -.2
+        result = look.command(geometry, .33, 1., 600)
+    assert result.yaw == (0. if blocked else -1.)
+
+
+@pytest.mark.parametrize("at_front", [False, True])
+def test_dynamic_sweep_uses_the_body_diagonal_plus_five_centimetres_on_each_end(at_front):
+    from plugins.navi import local_path
+
+    front, rear = (0., .55) if at_front else (.275, .275)
+    geometry = Geometry(None, None, np.eye(4), front, rear, None)
+    center = -.275 if at_front else 0.
+    shape = local_path.SHAPE
+    envelope = local_path.motion_sweep_hits(np.ones(shape, dtype=bool), geometry, .275,
+                                           1.75, ((0., 0., 1.),))
+    radius = math.hypot(.275, .275) + .05
+    half_cell = local_path.RESOLUTION / 2
+    df = np.maximum(0., abs(local_path.FORWARD - center) - half_cell)
+    dr = np.maximum(0., abs(local_path.RIGHT) - half_cell)
+    expected = df**2 + dr**2 <= radius**2
+    assert np.array_equal(envelope, expected)
+    forward = local_path.motion_sweep_hits(np.ones(shape, dtype=bool), geometry, .275,
+                                          1., ((.25, 0., 0.),))
+    assert forward.sum() > envelope.sum()
+    assert np.array_equal(forward & (local_path.FORWARD < center),
+                          envelope & (local_path.FORWARD < center))
 
 
 def test_sweep_stops_for_an_occupied_cell_that_straddles_the_footprint(monkeypatch):
@@ -1071,7 +1122,11 @@ def test_obstacle_evidence_survives_unknown_then_clears_only_on_measured_free_ce
         scan.START[0], scan.START[1] + 20]
     assert memory.project(PlanarPose(1300, ('new',), 0., 0., 0.)) is None
     assert memory.project(moved, observed_free=np.zeros_like(occupied)).any()
-    assert not memory.project(moved, observed_free=reprojected.copy()).any()
+    out_of_range = PlanarPose(1400, origin.frame, 10., 0., 0.)
+    assert not memory.project(out_of_range, observed_free=~occupied).any()
+    revisited = PlanarPose(1500, origin.frame, moved.x, moved.y, moved.yaw)
+    assert np.array_equal(memory.project(revisited), reprojected)
+    assert not memory.project(revisited, observed_free=reprojected.copy()).any()
     assert not memory.cells
 
 
@@ -1138,8 +1193,7 @@ def test_completed_view_prevents_repeated_observation_but_allows_route_alignment
     assert look.begin((1.,), advance_m=.8, route_segment=True)
 
 
-@pytest.mark.parametrize("release", ["passed", "confirmed_free"])
-def test_camera_near_obstacle_follows_relative_pose_through_a_blind_frame(release):
+def test_camera_near_obstacle_follows_relative_pose_through_a_blind_frame():
     from plugins.navi.odom import PlanarPose
 
     look = scan.ActiveScan(receipt_only=True)
@@ -1155,7 +1209,8 @@ def test_camera_near_obstacle_follows_relative_pose_through_a_blind_frame(releas
         depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
         look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=True)
 
-    view(1000, 0., 0., 0., empty, obstacle)
+    for stamp in (1000, 1010, 1020):
+        view(stamp, 0., 0., 0., empty, obstacle)
     view(1100, .30, 0., 0., empty, empty)
     free, occupied = look.grid()
     assert occupied[scan.START[0] + 10, scan.START[1]]
@@ -1165,13 +1220,169 @@ def test_camera_near_obstacle_follows_relative_pose_through_a_blind_frame(releas
     view(1200, .30, 0., math.pi, empty, empty)
     assert look.near_obstacles.cells
 
-    if release == "passed":
-        view(1300, 1.35, -.40, 0., empty, empty)
-    else:
-        newly_clear = np.isclose(scan.FORWARD, .50) & (abs(scan.RIGHT) < .1)
-        view(1300, .30, 0., 0., newly_clear, empty)
+    view(1300, 3.35, -.40, 0., empty, empty)
+    assert not look.grid()[1].any()
+    assert look.near_obstacles.cells
+    view(1400, .30, 0., 0., empty, empty)
+    assert look.grid()[1][scan.START[0] + 10, scan.START[1]]
+
+    newly_clear = np.isclose(scan.FORWARD, .50) & (abs(scan.RIGHT) < .1)
+    view(1500, .30, 0., 0., newly_clear, empty)
     assert not look.grid()[1].any()
     assert not look.near_obstacles.cells
+
+
+def test_camera_near_obstacle_bootstraps_from_velocity_only_with_received_depth(monkeypatch):
+    look, geometry, free, hits = _setup(monkeypatch)
+    free[:] = False
+    hits[scan.START[0] + 16, scan.START[1]] = True
+    for stamp in (980, 990, 1000):
+        frame = dict(_depth(stamp), source_frame_id=124_000 + stamp)
+        first_odom = dict(_odom(stamp), received_ms=stamp, vx=.25)
+        look.update(frame, first_odom, geometry, receipt_only=True)
+        look.update_near_obstacles(frame, geometry, None, .30, 1.5, approaching=True)
+    assert look.near_obstacles.cells
+
+    hits = hits.copy()
+    hits[:] = False
+    monkeypatch.setattr(scan, "observe", lambda *args: (free, hits))
+    new_frame = dict(_depth(1200), source_frame_id=125_200)
+    new_odom = dict(_odom(1200), received_ms=1200, vx=.25)
+    look.update(new_frame, new_odom, geometry, receipt_only=True)
+    look.update_near_obstacles(new_frame, geometry, None, .30, 1.5, approaching=True)
+    assert look.grid()[1][scan.START[0] + 15, scan.START[1]]
+
+    # A repeated frame cannot clear the remembered obstacle.
+    clear = np.ones_like(hits)
+    monkeypatch.setattr(scan, "observe", lambda *args: (clear, hits))
+    repeat = dict(new_frame, frame_id=1250)
+    look.update(repeat, dict(_odom(1250), received_ms=1250), geometry, receipt_only=True)
+    look.update_near_obstacles(repeat, geometry, None, .30, 1.5, approaching=True)
+    assert look.near_obstacles.cells
+
+    newer = dict(_depth(1300), source_frame_id=125_300)
+    look.update(newer, dict(_odom(1300), received_ms=1300), geometry, receipt_only=True)
+    look.update_near_obstacles(newer, geometry, None, .30, 1.5, approaching=True)
+    assert not look.near_obstacles.cells
+
+
+def test_measured_free_survives_unknown_and_is_replaced_by_a_new_obstacle():
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    row, col = scan.START
+    first = empty.copy()
+    first[row + 16, col] = True
+    closer = empty.copy()
+    closer[row + 10, col] = True
+
+    def view(stamp, x, free, occupied):
+        pose = PlanarPose(stamp, ("odom", "body"), x, 0., 0.)
+        look.current_frame = stamp
+        look.views.clear()
+        look.views.append((stamp, look.pose, free, occupied))
+        depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=False)
+        return look.grid()
+
+    assert view(1000, 0., first, empty)[0][row + 16, col]
+    free, occupied = view(1100, .30, empty, empty)
+    assert free[row + 10, col]
+    assert not occupied.any()
+    assert not view(1200, 4.50, empty, empty)[0].any()
+    assert view(1300, .30, empty, empty)[0][row + 10, col]
+
+    free, occupied = view(1400, .30, empty, closer)
+    assert occupied[row + 10, col]
+    assert not free[row + 10, col]
+    # One hit and a repeated source are insufficient for memory.
+    view(1400, .30, empty, closer)
+    assert not look.near_obstacles.has_occupied
+    assert view(1500, .30, empty, empty)[0][row + 10, col]
+    for index in range(scan.FREE_TO_OCCUPIED_SAMPLES):
+        view(1600 + 100 * index, .30, empty, closer)
+        assert look.near_obstacles.has_occupied == (index + 1 == scan.FREE_TO_OCCUPIED_SAMPLES)
+    free, occupied = view(3000, .30, empty, empty)
+    assert occupied[row + 10, col]
+    assert not free[row + 10, col]
+
+    free, occupied = view(3100, .30, closer, empty)
+    assert free[row + 10, col]
+    assert not occupied.any()
+
+
+def test_camera_window_invalidates_far_free_without_storing_a_near_obstacle():
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25, at_front=True)
+    close = np.isclose(scan.FORWARD, .85) & np.isclose(scan.RIGHT, 0.)
+    far = np.isclose(scan.FORWARD, 1.60) & np.isclose(scan.RIGHT, 0.)
+    cells = close | far
+    empty = np.zeros_like(cells)
+
+    def view(stamp, free, occupied):
+        pose = PlanarPose(stamp, ("odom", "body"), 0., 0., 0.)
+        look.current_frame = stamp
+        look.views.clear()
+        look.views.append((stamp, look.pose, free, occupied))
+        depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.5, approaching=False)
+        return look.grid()
+
+    view(1000, cells, empty)
+    for index in range(scan.FREE_TO_OCCUPIED_SAMPLES):
+        _, occupied = view(1100 + 100 * index, empty, cells)
+        assert (occupied & cells).sum() == 2  # Both hits still matter in the current view.
+    free, occupied = view(2000, empty, empty)
+    assert np.array_equal(occupied, close)
+    assert not (free & cells).any()
+
+    free, occupied = view(2100, cells, empty)
+    assert np.array_equal(free, cells)
+    assert not occupied.any()
+
+
+def test_one_aligned_free_observation_clears_memory_unless_view_still_hits():
+    origin = PlanarPose(1000, ("odom", "body"), 0., 0., 0.)
+    newer = PlanarPose(1100, origin.frame, .026, 0., 0.)
+    first = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    free_center = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
+    memory = scan.ObservedObstacles()
+    memory.remember(origin, first)
+    memory.remember_view(newer, free_center, first)
+    assert memory.has_occupied
+    memory.remember_view(newer, free_center, np.zeros_like(first))
+    assert not memory.has_occupied
+    assert memory.project_free(newer).any()
+
+
+def test_free_memory_cleans_far_cells_and_keeps_the_window_bounded():
+    memory = scan.ObservedObstacles()
+    origin = PlanarPose(1000, ("odom", "body"), 0., 0., 0.)
+    free = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    memory.remember_view(origin, free, np.zeros_like(free))
+    shape = memory.free_cells.shape
+    assert np.array_equal(memory.project_free(origin), free)
+    far = PlanarPose(1200, origin.frame, 20., 0., 0.)
+    assert not memory.project_free(far).any()
+    assert memory.free_cells.shape == shape
+    assert not memory.project_free(origin).any()
+
+
+def test_new_obstacles_in_remembered_free_cells_are_evicted_with_the_window():
+    memory = scan.ObservedObstacles()
+    origin = PlanarPose(1000, ("odom", "body"), 0., 0., 0.)
+    far = PlanarPose(3000, origin.frame, 20., 0., 0.)
+    cell = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    closer = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
+    empty = np.zeros_like(cell)
+    memory.remember_view(origin, cell, empty)
+    for index in range(scan.FREE_TO_OCCUPIED_SAMPLES):
+        ahead = PlanarPose(1100 + 100 * index, origin.frame, .05, 0., 0.)
+        memory.remember_view(ahead, empty, closer)
+    assert np.array_equal(memory.project(ahead), closer)
+    assert not memory.cells
+    memory.project_free(far)
+    assert memory.project(ahead) is None
 
 
 def test_camera_near_obstacle_can_use_continuous_relative_odometry_during_pose_gap():
@@ -1182,11 +1393,13 @@ def test_camera_near_obstacle_can_use_continuous_relative_odometry_during_pose_g
     empty = np.zeros(scan.SHAPE, dtype=bool)
     obstacle = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
     initial = PlanarPose(1000, ("local", "body"), 10., 2., math.pi / 2)
-    look.current_frame = 1000
-    look.poses.append((1000, look.pose, 0.))
-    look.views.append((1000, look.pose, empty, obstacle))
-    look.update_near_obstacles(dict(frame_id=1000, obstacle_capture_pose=initial),
-                               geometry, initial, .3, 1.5, approaching=True)
+    for stamp in (1000, 1010, 1020):
+        capture = PlanarPose(stamp, initial.frame, initial.x, initial.y, initial.yaw)
+        look.current_frame = stamp
+        look.poses.append((stamp, look.pose, 0.))
+        look.views.append((stamp, look.pose, empty, obstacle))
+        look.update_near_obstacles(dict(frame_id=stamp, obstacle_capture_pose=capture),
+                                   geometry, capture, .3, 1.5, approaching=True)
 
     look.pose = (.30, 0., 0.)
     look.poses.append((1100, look.pose, 0.))
@@ -1230,3 +1443,24 @@ def test_observed_heading_survives_scan_reset_in_the_same_odometry_frame():
     assert not look._already_observed(look.pose, .35)
     look.observation_pose = PlanarPose(1300, ("new-odom", "base"), 1., 2., 0.)
     assert not look._already_observed(look.pose, .35)
+
+
+def test_front_camera_near_memory_rotates_about_the_base_centre():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25, at_front=True)
+    free = np.zeros(scan.SHAPE, dtype=bool)
+    obstacle = np.isclose(scan.FORWARD, .50) & np.isclose(scan.RIGHT, 0.)
+    capture = PlanarPose(1000, ("odom", "base"), 0., 0., 0.)
+    for stamp in (1000, 1010, 1020):
+        capture = PlanarPose(stamp, capture.frame, 0., 0., 0.)
+        look.current_frame = stamp
+        look.views.append((stamp, look.pose, free, obstacle))
+        look.update_near_obstacles(dict(frame_id=stamp, obstacle_capture_pose=capture),
+                                   geometry, capture, .30, 1.50, approaching=True)
+
+    turned = PlanarPose(1100, capture.frame, 0., 0., math.pi / 2)
+    look.update_near_obstacles(None, geometry, turned, .30, 1.50, approaching=False)
+    assert look.near_hits[scan.START[0] - 5, scan.START[1] + 15]
+    assert not look.near_hits[scan.START[0], scan.START[1] + 10]

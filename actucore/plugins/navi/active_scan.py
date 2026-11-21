@@ -9,7 +9,8 @@ import math
 import numpy as np
 
 from .depth import has_valid_returns
-from .local_path import Geometry, observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
+from .local_path import (FORWARD, FREE, OCCUPIED, RESOLUTION, RIGHT, SHAPE, START, UNKNOWN,
+                         Geometry, motion_sweep_hits, observe, project_observation)
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
@@ -19,6 +20,11 @@ SCAN_ODOM_LINEAR_TOLERANCE_MPS = .08
 STILL_YAW = .04
 ODOM_GAP_MS = 250
 MAP_AGE_MS = 2500
+FREE_MEMORY_RADIUS_CELLS = round(6. / RESOLUTION)
+FREE_MEMORY_SHIFT_CELLS = round(1. / RESOLUTION)
+OCCUPANCY_MEMORY_SAMPLES = 3
+FREE_TO_OCCUPIED_SAMPLES = 6
+CAMERA_OCCUPANCY_MEMORY_RANGE_M = 1.25
 SCAN_TIMEOUT_MS = 8000
 TURN_BURST_MS = 400
 TURN_PROGRESS_WINDOW_MS = 2000
@@ -46,72 +52,173 @@ class CheckedTurnSweep:
 
 @dataclass
 class ObservedObstacles:
-    """Occupied cells from an observed foreground obstacle, in one odometry frame."""
+    """Remember measured cells in one odometry frame."""
     frame: tuple | None = None
     cells: set = field(default_factory=set)
     last_source: int = 0
-    approach_axes: dict = field(default_factory=dict)
+    free_cells: np.ndarray | None = field(default=None, repr=False, compare=False)
+    free_center: tuple[int, int] = (0, 0)
+    hit_votes: np.ndarray | None = field(default=None, repr=False, compare=False)
 
-    def remember(self, pose, occupied, *, track_passage=False):
-        if not occupied.any():
+    @property
+    def has_cells(self):
+        return bool(self.cells) or self.free_cells is not None
+
+    @property
+    def has_occupied(self):
+        return bool(self.cells) or (self.free_cells is not None and (self.free_cells == OCCUPIED).any())
+
+    @staticmethod
+    def _world_coordinates(pose, mask):
+        forward, right = FORWARD[mask], RIGHT[mask]
+        c, s = math.cos(pose.yaw), math.sin(pose.yaw)
+        return ((pose.x + c * forward + s * right) / RESOLUTION,
+                (pose.y + s * forward - c * right) / RESOLUTION)
+
+    @staticmethod
+    def _world_cells(pose, mask):
+        return np.rint(ObservedObstacles._world_coordinates(pose, mask)).astype(int).T
+
+    def _free_window(self, pose):
+        # Keep a fixed world-aligned window, recentering only after a metre
+        # of movement so a control tick never scans the traversed route.
+        center = tuple(round(value / RESOLUTION) for value in (pose.x, pose.y))
+        shift = tuple(new - old for new, old in zip(center, self.free_center))
+        radius = FREE_MEMORY_RADIUS_CELLS
+        size = 2 * radius + 1
+        if self.free_cells is None:
+            self.free_cells = np.zeros((size, size), dtype=np.uint8)
+            self.hit_votes = np.zeros_like(self.free_cells)
+            self.free_center = center
+        elif max(map(abs, shift)) >= FREE_MEMORY_SHIFT_CELLS:
+            moved = np.zeros_like(self.free_cells)
+            votes = np.zeros_like(self.hit_votes)
+            if max(map(abs, shift)) < size:
+                old = tuple(slice(max(0, d), size + min(0, d)) for d in shift)
+                new = tuple(slice(max(0, -d), size + min(0, -d)) for d in shift)
+                moved[new] = self.free_cells[old]
+                votes[new] = self.hit_votes[old]
+            self.free_cells, self.hit_votes, self.free_center = moved, votes, center
+        return self.free_cells, np.array(self.free_center) - radius
+
+    def remember(self, pose, occupied):
+        if not occupied.any() or (self.has_cells and self.frame != pose.frame):
             return
         self.frame = pose.frame
-        forward, left = FORWARD[occupied], -RIGHT[occupied]
-        c, s = math.cos(pose.yaw), math.sin(pose.yaw)
-        x = pose.x + c * forward - s * left
-        y = pose.y + s * forward + c * left
-        cells = list(zip(np.rint(x / RESOLUTION).astype(int), np.rint(y / RESOLUTION).astype(int)))
-        self.cells.update(cells)
-        if track_passage:
-            for cell, dx, dy in zip(cells, x - pose.x, y - pose.y):
-                distance = math.hypot(dx, dy)
-                if distance:
-                    self.approach_axes.setdefault(cell, (dx / distance, dy / distance))
+        cells = self._world_cells(pose, occupied)
+        self.cells.update(map(tuple, cells))
+        if self.free_cells is not None:
+            window, origin = self._free_window(pose)
+            window[tuple((cells - origin).T)] = UNKNOWN
 
-    def project(self, pose, observed_free=None, *, passed_clearance=None):
-        if not self.cells or pose is None or pose.frame != self.frame:
+    def remember_view(self, pose, free, occupied, *, remember_occupied=None, rolling_range=None):
+        if self.has_cells and self.frame != pose.frame:
+            return
+        confirmed = free & ~occupied
+        if self.has_occupied and confirmed.any():
+            self.project(pose, observed_free=confirmed, observed_occupied=occupied)
+        if self.free_cells is None and not confirmed.any() and remember_occupied is None:
+            return
+
+        self.frame = pose.frame
+        window, origin = self._free_window(pose)
+        hits = self._world_cells(pose, occupied)
+        free_indices = tuple((self._world_cells(pose, confirmed) - origin).T)
+        window[free_indices] = np.where(window[free_indices] == OCCUPIED, OCCUPIED, FREE)
+        candidates = hits[window[tuple((hits - origin).T)] == FREE]
+        if candidates.size:
+            row, col = self._local_coordinates(pose, candidates)
+            observed = np.ones(len(candidates), dtype=bool)
+            # A cell touched only at an edge blocks this view, but does
+            # not establish an aligned observation for future poses.
+            for r in (np.floor(row), np.ceil(row)):
+                for c in (np.floor(col), np.ceil(col)):
+                    inside = (r >= 0) & (r < SHAPE[0]) & (c >= 0) & (c < SHAPE[1])
+                    observed &= inside
+                    observed[inside] &= occupied[r[inside].astype(int), c[inside].astype(int)]
+            candidates = candidates[observed]
+        recent = tuple((candidates - origin).T)
+        samples = FREE_TO_OCCUPIED_SAMPLES
+        recent_votes = np.minimum(self.hit_votes[recent] + 1, samples)
+        selected = (self._world_cells(pose, remember_occupied) if remember_occupied is not None
+                    else np.empty((0, 2), dtype=int))
+        long_term = tuple((selected - origin).T)
+        long_term_votes = np.minimum(self.hit_votes[long_term] + 1, OCCUPANCY_MEMORY_SAMPLES)
+        self.hit_votes.fill(0)
+        self.hit_votes[recent] = recent_votes
+        self.hit_votes[long_term] = long_term_votes
+        confirmed_hits = candidates[recent_votes == samples]
+        remembered = OCCUPIED
+        if rolling_range is not None:
+            # Distant returns can disprove old free space. Persisting them as
+            # blind-spot obstacles would accumulate the room as the base moves.
+            offsets = confirmed_hits * RESOLUTION - (pose.x, pose.y)
+            nearby = np.linalg.norm(offsets, axis=1) <= rolling_range
+            remembered = np.where(nearby, OCCUPIED, UNKNOWN)
+        window[tuple((confirmed_hits - origin).T)] = remembered
+        retained = selected[long_term_votes == OCCUPANCY_MEMORY_SAMPLES]
+        self.cells.update(map(tuple, retained))
+        window[tuple((retained - origin).T)] = UNKNOWN
+
+    def project_free(self, pose):
+        if self.free_cells is None or pose is None or pose.frame != self.frame:
             return None
-        keys = list(self.cells)
-        cells = np.array(keys)
+        window, origin = self._free_window(pose)
+        x, y = self._world_coordinates(pose, np.s_[:, :])
+        cols, rows = np.rint(x).astype(int) - origin[0], np.rint(y).astype(int) - origin[1]
+        return window[cols, rows] == FREE
+
+    @staticmethod
+    def _local_coordinates(pose, cells):
         x, y = (cells * RESOLUTION - (pose.x, pose.y)).T
-        if passed_clearance is None:
-            keep = np.hypot(x, y) <= math.hypot(FORWARD.max(), RIGHT.max()) + RESOLUTION
-        else:
-            # Use travel along the original sightline. Turning in place does
-            # not count as passing an obstacle.
-            forward, left = np.asarray([self.approach_axes.get(cell, (0., 0.)) for cell in keys]).T
-            keep = x * forward + y * left >= -passed_clearance
-        if not keep.all():
-            self._discard(cells[~keep])
-            cells, x, y = cells[keep], x[keep], y[keep]
         c, s = math.cos(pose.yaw), math.sin(pose.yaw)
         row = (x * c + y * s) / RESOLUTION + START[0]
         col = (x * s - y * c) / RESOLUTION + START[1]
-        if passed_clearance is not None:
-            row, col = np.round(row, 7), np.round(col, 7)
+        return np.round(row, 7), np.round(col, 7)
+
+    def project(self, pose, observed_free=None, *, observed_occupied=None):
+        if not self.has_cells or pose is None or pose.frame != self.frame:
+            return None
+        cells = np.asarray(list(self.cells), dtype=int).reshape(-1, 2)
+        window = None
+        if self.free_cells is not None:
+            window, origin = self._free_window(pose)
+            local = np.argwhere(window == OCCUPIED)
+            if local.size:
+                cells = np.concatenate((cells, local + origin))
+        if not cells.size:
+            return None
+        x, y = (cells * RESOLUTION - (pose.x, pose.y)).T
+        # The local grid has finite bounds. Points outside it are kept in
+        # the odometry map and can become relevant again when revisited.
+        nearby = np.hypot(x, y) <= math.hypot(FORWARD.max(), RIGHT.max()) + RESOLUTION
+        cells = cells[nearby]
+        row, col = self._local_coordinates(pose, cells)
         indices = []
-        cleared = np.full(len(x), observed_free is not None, dtype=bool)
-        # Reproject conservatively across cell boundaries.
+        cleared = np.zeros(len(cells), dtype=bool)
+        conflicting_hit = np.zeros(len(cells), dtype=bool)
+        # A free observation anywhere in the cell's projected support can
+        # clear its memory when the same exposure shows no overlapping hit.
         for r in (np.floor(row), np.ceil(row)):
             for k in (np.floor(col), np.ceil(col)):
                 inside = (r >= 0) & (r < SHAPE[0]) & (k >= 0) & (k < SHAPE[1])
                 r, k = r.astype(int), k.astype(int)
                 indices.append((r, k, inside))
                 if observed_free is not None:
-                    cleared &= inside
-                    cleared[inside] &= observed_free[r[inside], k[inside]]
+                    cleared[inside] |= observed_free[r[inside], k[inside]]
+                if observed_occupied is not None:
+                    conflicting_hit[inside] |= observed_occupied[r[inside], k[inside]]
+        cleared &= ~conflicting_hit
         if cleared.any():
-            self._discard(cells[cleared])
+            cleared_cells = cells[cleared]
+            self.cells.difference_update(map(tuple, cleared_cells))
+            if window is not None:
+                window[tuple((cleared_cells - origin).T)] = FREE
         hits = np.zeros(SHAPE, dtype=bool)
         for r, k, inside in indices:
             keep = inside & ~cleared
             hits[r[keep], k[keep]] = True
         return hits
-
-    def _discard(self, cells):
-        for key in map(tuple, cells):
-            self.cells.discard(key)
-            self.approach_axes.pop(key, None)
 
 
 @dataclass
@@ -120,8 +227,10 @@ class ActiveScan:
 
     obstacles: ObservedObstacles = field(default_factory=ObservedObstacles)
     historical_hits: np.ndarray | None = None
+    historical_free: np.ndarray | None = None
     near_obstacles: ObservedObstacles = field(default_factory=ObservedObstacles)
     near_hits: np.ndarray | None = None
+    near_free: np.ndarray | None = None
     near_revision: int = 0
     near_odom_reference: tuple | None = None
     phase: str = "idle"
@@ -150,6 +259,7 @@ class ActiveScan:
     current_frame: int = 0
     pending_depth: dict | None = None
     _pending_projection: tuple | None = None
+    _fused_view: tuple | None = None
     side_frame: int = 0
     advance_m: float | None = None
     route_segment: bool = False
@@ -221,7 +331,8 @@ class ActiveScan:
         if self.poses:
             previous = self.poses[-1][0]
             gap = self.max_feedback_gap_ms if self.receipt_only and body_pose is None else ODOM_GAP_MS
-            if self.receipt_only and (self.active or follow_leg) and body_pose is None and stamp > previous and history:
+            if (self.receipt_only and (self.active or follow_leg or self.near_obstacles.has_cells)
+                    and body_pose is None and stamp > previous and history):
                 hold = self._integrate_receipt_motion(history, stamp, source, motion)
                 if hold is not None:
                     return hold
@@ -282,7 +393,7 @@ class ActiveScan:
         if pose is None:
             self.current_frame = 0
             return self.interrupt()
-        free, occupied = observe(depth["map"], geometry, RIGHT, FORWARD, RESOLUTION, ground)
+        free, occupied = self._project_view(depth, geometry)
         self.views.append((capture, pose, free, occupied))
 
     def _integrate_motion(self, motion, dt):
@@ -320,15 +431,15 @@ class ActiveScan:
                     return self._hold_for_feedback_gap()
             if not 0 < received - last_stamp <= self.max_feedback_gap_ms:
                 return self._hold_for_feedback_gap()
-            intervals.append((velocity, (received - last_stamp) / 1000))
+            intervals.append((received, velocity, (received - last_stamp) / 1000))
             last_stamp, last_source, last_motion = received, identity, velocity
-        for velocity, dt in intervals:
+        for received, velocity, dt in intervals:
             self._integrate_motion(velocity, dt)
+            self.poses.append((received, self.pose, velocity[2]))
         if intervals:
-            self.poses.append((last_stamp, self.pose, last_motion[2]))
             self.odom_source, self.motion = last_source, last_motion
         if self.phase == "turn" and not self.issued_yaw and any(
-                math.hypot(vx, vy) > self.odom_linear_tolerance_mps for (vx, vy, _), _ in intervals):
+                math.hypot(vx, vy) > self.odom_linear_tolerance_mps for _, (vx, vy, _), _ in intervals):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
 
     def _hold_for_feedback_gap(self):
@@ -367,12 +478,9 @@ class ActiveScan:
         if motion[2] * math.copysign(1., error) > STILL_YAW:
             return "主动观察：等待反向转动停止", False
         checked = self.turn_sweep
-        rate = max(abs(self.turn_yaw), abs(motion[2]))
-        sweep = math.copysign(abs(error) + (rate + .10) * checked.horizon, error)
         translation = max(checked.minimum_translation, self._turn_translation(checked.horizon, motion))
         translation += math.dist(self.pose[:2], checked.pose[:2])
-        if not self.clear_sweep(checked.geometry, checked.half_width, sweep, translation,
-                                occupied=checked.occupied, start_angle=self.pose[2] - checked.pose[2]):
+        if not self.clear_sweep(checked.geometry, checked.half_width, translation, occupied=checked.occupied):
             return "主动观察：转身扫掠区有障碍，停车后重规划", True
         return None
 
@@ -411,7 +519,7 @@ class ActiveScan:
             return
         # Only the latest receipt-time view can contribute to the grid.
         # Project it when a turn or local plan needs it.
-        self._pending_projection = (depth["map"], geometry, ground)
+        self._pending_projection = (depth, geometry)
         self.source_frame = source
         self.views.clear()
         self.views.append((frame, self.pose, None, None))
@@ -453,11 +561,16 @@ class ActiveScan:
 
     def _near_pose(self, pose):
         memory = self.near_obstacles
-        if pose is not None and (not memory.cells or pose.frame == memory.frame):
+        if pose is not None and (not memory.has_cells or pose.frame == memory.frame):
             self.near_odom_reference = (self.motion_frame, self.pose, pose)
             return pose
+        if not self.poses or self.command_only:
+            return None
+        relative_frame = ("navi_relative", self.motion_frame)
+        if not memory.has_cells or memory.frame == relative_frame:
+            return self._relative_near_pose(self.poses[-1][0], self.pose)
         reference = self.near_odom_reference
-        if not self.poses or self.command_only or reference is None or reference[0] is not self.motion_frame:
+        if reference is None or reference[0] is not self.motion_frame:
             return None
         # Continue in the same local frame with measured relative motion when
         # the separately sampled body pose is late.
@@ -468,30 +581,50 @@ class ActiveScan:
         return PlanarPose(self.poses[-1][0], anchor.frame, anchor.x + c * df + s * dr,
                           anchor.y + s * df - c * dr, anchor.yaw + start[2] - self.pose[2])
 
+    def _relative_near_pose(self, stamp, coords):
+        forward, right, yaw = coords
+        return PlanarPose(stamp, ("navi_relative", self.motion_frame), forward, -right, -yaw)
+
+    @staticmethod
+    def _footprint_origin(pose, geometry):
+        # Camera-relative cells start at the chassis front in fallback mode.
+        if geometry.front != 0.:
+            return pose
+        offset = geometry.half_length
+        return replace(pose, x=pose.x + offset * math.cos(pose.yaw),
+                       y=pose.y + offset * math.sin(pose.yaw))
+
     def update_near_obstacles(self, depth, geometry, pose, half_width, lookahead, *, approaching):
         memory = self.near_obstacles
-        if not memory.cells and not approaching:
-            self.near_hits = None
-            return
         pose = self._near_pose(pose)
         if pose is None:
-            # Keep checking the last projection until relative odometry resumes.
+            self.near_free = None
+            # Keep checking the last occupied projection until odometry resumes.
             return
         capture = (depth or {}).get("obstacle_capture_pose")
-        source = (depth or {}).get("source_stamp_ns") or self.current_frame
-        radius = math.hypot(max(geometry.front, geometry.rear), half_width) + RESOLUTION
-        if (capture is not None and capture.frame == pose.frame and self.views
-                and source > memory.last_source and self.matches_route_view(depth)):
-            free, occupied = self.observed_grid()
-            memory.last_source = source
-            memory.project(capture, observed_free=free, passed_clearance=radius)
-            if approaching:
-                front = occupied & (FORWARD > 0.) & (FORWARD <= lookahead) & (abs(RIGHT) <= half_width)
-                if front.any():
-                    nearest = FORWARD[front].min()
-                    memory.remember(capture, front & (FORWARD <= nearest + 2 * RESOLUTION),
-                                    track_passage=True)
-        hits = memory.project(pose, passed_clearance=radius)
+        if (self.views and self.current_frame > memory.last_source
+                and depth is not None and self.matches_route_view(depth)):
+            if pose.frame == ("navi_relative", self.motion_frame):
+                # With velocity-only odometry, use capture time when it can
+                # be paired, or the same host receipt timeline as odometry.
+                stamp = depth.get("capture_ms") or self.current_frame
+                coords = self._pose_at(stamp)
+                capture = self._relative_near_pose(stamp, coords) if coords is not None else None
+            if capture is not None and capture.frame == pose.frame:
+                free, occupied = self.observed_grid()
+                capture = self._footprint_origin(capture, geometry)
+                memory.last_source = self.current_frame
+                selected = None
+                if approaching:
+                    front = occupied & (FORWARD > 0.) & (FORWARD <= lookahead) & (abs(RIGHT) <= half_width)
+                    if front.any():
+                        nearest = FORWARD[front].min()
+                        selected = front & (FORWARD <= nearest + 2 * RESOLUTION)
+                memory.remember_view(capture, free, occupied, remember_occupied=selected,
+                                     rolling_range=CAMERA_OCCUPANCY_MEMORY_RANGE_M)
+        origin = self._footprint_origin(pose, geometry)
+        hits = memory.project(origin)
+        self.near_free = memory.project_free(origin)
         self.near_hits = hits if hits is not None and hits.any() else None
         self.near_revision = pose.stamp_ms
 
@@ -506,27 +639,44 @@ class ActiveScan:
     def grid(self):
         free, hits = self.observed_grid()
         remembered = self.remembered_hits
-        if remembered is None:
-            return free, hits
-        return free & ~remembered, hits | remembered
+        if self.near_free is not None:
+            free = free | self.near_free
+        if self.historical_free is not None:
+            free = free | self.historical_free
+        if remembered is not None:
+            hits = hits | remembered
+        return free & ~hits, hits
+
+    @staticmethod
+    def _project_view(depth, geometry):
+        if depth.get("grid_projection") is not None:
+            return project_observation(depth, geometry)
+        return observe(depth["map"], geometry, RIGHT, FORWARD, RESOLUTION, depth.get("ground"))
 
     def observed_grid(self):
         """Reproject nearby views. Occupation wins, and free cells need support."""
         if self.receipt_only:
             frame, pose, free, occupied = self.views[-1]
             if self._pending_projection is not None:
-                depth, geometry, ground = self._pending_projection
-                free, occupied = observe(depth, geometry, RIGHT, FORWARD, RESOLUTION, ground)
+                depth, geometry = self._pending_projection
+                free, occupied = self._project_view(depth, geometry)
                 self.views[-1] = (frame, pose, free, occupied)
                 self._pending_projection = None
             return free, occupied
+        stamp = self.poses[-1][0]
+        latest = self.views[-1] if self.views else None
+        if self._fused_view is not None:
+            last_view, pose, fused_at, expires, grid = self._fused_view
+            if latest is last_view and self.pose == pose and fused_at <= stamp < expires:
+                return grid
         free = np.zeros(SHAPE, dtype=bool)
         occupied = np.zeros_like(free)
-        stamp = self.poses[-1][0]
+        expires = math.inf
         forward, right, yaw = self.pose
         for capture, (before_f, before_r, before_yaw), view_free, view_occupied in self.views:
             if stamp - capture > MAP_AGE_MS:
                 continue
+            expires = min(expires, capture + MAP_AGE_MS + 1)
             df, dr = forward - before_f, right - before_r
             offset_f = df * math.cos(before_yaw) + dr * math.sin(before_yaw)
             offset_r = -df * math.sin(before_yaw) + dr * math.cos(before_yaw)
@@ -535,15 +685,19 @@ class ActiveScan:
             col = (FORWARD * math.sin(delta) + RIGHT * math.cos(delta) + offset_r) / RESOLUTION + START[1]
             row, col = np.round(row, 7), np.round(col, 7)
             confirmed = np.ones_like(free)
+            projected_hits = np.zeros_like(occupied)
             for y in (np.floor(row), np.ceil(row)):
                 for x in (np.floor(col), np.ceil(col)):
                     valid = (y >= 0) & (y < SHAPE[0]) & (x >= 0) & (x < SHAPE[1])
                     indices = (y.clip(0, SHAPE[0] - 1).astype(int),
                                x.clip(0, SHAPE[1] - 1).astype(int))
                     confirmed &= valid & view_free[indices]
-                    occupied |= valid & view_occupied[indices]
-            free |= confirmed
-        return free & ~occupied, occupied
+                    projected_hits |= valid & view_occupied[indices]
+            occupied = (occupied & ~confirmed) | projected_hits
+            free = (free | confirmed) & ~projected_hits
+        grid = free & ~occupied, occupied
+        self._fused_view = (latest, self.pose, stamp, expires, grid)
+        return grid
 
     def matches_route_view(self, depth):
         """Match the route's depth image to the projected observation."""
@@ -782,9 +936,8 @@ class ActiveScan:
 
         # The old forward command can still be executing when the yaw request arrives.
         minimum_translation = previous_linear * horizon if rolling_start else 0.
-        yaw_rate = self.checked_turn_rate(geometry, half_width, error, yaw_rate, min_yaw_rate,
-                                          horizon, occupied, minimum_translation=minimum_translation)
-        if not yaw_rate:
+        translation = max(minimum_translation, self._turn_translation(horizon, self.motion))
+        if not self.clear_sweep(geometry, half_width, translation, occupied=occupied):
             if rolling_start:
                 self.phase = "brake"
                 self.origin_set = False
@@ -851,9 +1004,8 @@ class ActiveScan:
             return ScanCommand(reason="主动观察：定时转向结束，评估路线")
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
         rate = abs(self.turn_yaw)
-        sweep = math.copysign(abs(error) + (rate + .10) * horizon, self.turn_yaw)
         if (rate <= 0. or rate < min_yaw or not self.clear_sweep(
-                geometry, half_width, sweep, STILL_LINEAR * horizon)):
+                geometry, half_width, STILL_LINEAR * horizon)):
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
@@ -864,58 +1016,16 @@ class ActiveScan:
         return self.grid()[1] | self.views[-1][3]
 
     def _turn_translation(self, horizon, motion):
-        translation = max(STILL_LINEAR, math.hypot(*motion[:2])) * horizon
-        if self.receipt_only and self.buffered_odom and self.pose_origin is None:
+        translation = math.hypot(*motion[:2]) * horizon
+        if self.receipt_only and self.buffered_odom and self.pose_origin is None and translation:
             translation = max(translation, RESOLUTION)
         return translation
 
-    def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied,
-                          *, minimum_translation=0.):
-        translation = max(minimum_translation, self._turn_translation(horizon, self.motion))
-
-        def clear_sweep(rate):
-            turn_rate = max(rate, abs(self.motion[2]))
-            sweep = math.copysign(abs(error) + (turn_rate + .10) * horizon, error)
-            return self.clear_sweep(geometry, half_width, sweep, translation,
-                                    occupied=occupied)
-
-        if not clear_sweep(yaw_rate):
-            limit = yaw_rate
-            yaw_rate = 0.
-            if clear_sweep(min_yaw_rate):
-                yaw_rate = min_yaw_rate
-                for _ in range(5):
-                    candidate = (yaw_rate + limit) / 2
-                    if clear_sweep(candidate):
-                        yaw_rate = candidate
-                    else:
-                        limit = candidate
-        return yaw_rate
-
-    def clear_sweep(self, geometry, half_width, sweep, translation, *, occupied=None, start_angle=0.):
-        # Rotate the rectangle in small increments and include cell diagonal
-        # plus the greatest displacement between successive angular samples.
-        samples = max(2, math.ceil(abs(sweep) / .04) + 1)
-        # Body-frame geometry already uses the chassis origin. In the
-        # front-camera approximation the yaw pivot is half a body length back.
-        pivot_offset = geometry.half_length if geometry.front == 0. else 0.
-        radius = math.hypot(max(geometry.front + pivot_offset, geometry.rear - pivot_offset), half_width)
-        slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
+    def clear_sweep(self, geometry, half_width, translation, *, occupied=None):
         if occupied is None:
             occupied = self.turn_obstacles()
-        nearby = occupied & ((FORWARD + pivot_offset)**2 + RIGHT**2 <= (radius + slack)**2)
-        if not nearby.any():
-            return True
-        occupied_forward, occupied_right = FORWARD[nearby] + pivot_offset, RIGHT[nearby]
-        for angle in np.linspace(start_angle, start_angle + sweep, samples):
-            c, s = math.cos(angle), math.sin(angle)
-            forward = occupied_forward * c + occupied_right * s - pivot_offset
-            right = -occupied_forward * s + occupied_right * c
-            outside_f = np.maximum(0., np.maximum(-geometry.rear - forward, forward - geometry.front))
-            outside_r = np.maximum(0., abs(right) - half_width)
-            if (outside_f**2 + outside_r**2 <= slack**2).any():
-                return False
-        return True
+        return not motion_sweep_hits(occupied, geometry, half_width, 0., ((0., 0., 0.),),
+                                     padding=translation).any()
 
     def pause_for_depth(self, stop_ms):
         if not self.buffered_turn or not self.issued_yaw:
@@ -953,7 +1063,8 @@ class ActiveScan:
         self.motion_frame = object()
         self.current_frame = 0
         self.pending_depth = None
-        self._pending_projection = None
+        self._pending_projection = self._fused_view = None
+        self.historical_free = self.near_free = None
         self.source_frame = None
         self.odom_source = None
         self.poses.clear()

@@ -616,6 +616,40 @@ def test_outside_seed_does_not_use_an_off_center_raised_platform_as_floor():
     assert ground is None or not ground[raised].any()
 
 
+@pytest.mark.parametrize("has_floor", [False, True])
+def test_grid_classifies_measured_cells_without_requiring_ground_or_vertical_probes(monkeypatch, has_floor):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geom = local_path.camera_square(HorizontalIntrinsics(640, 420, 320),
+                                    (480, 420, 243), .20, at_front=True)
+    image = np.full((480, 640), np.nan, dtype=np.float32)
+    image[:, 100:200] = np.linspace(.70, 2.30, 480, dtype=np.float32)[:, None]
+    image[:, 300:340] = 1.4
+    ground = None
+    if has_floor:
+        ground = np.zeros_like(image, dtype=bool)
+        ground[:, 100:200] = True
+        monkeypatch.setattr(local_path, "optical_ground_plane",
+                            lambda *_: (np.array([0., 1., 0.]), .42))
+
+    grid_args = geom, local_path.RIGHT, local_path.FORWARD, local_path.RESOLUTION
+    free, occupied = local_path.observe(image, *grid_args, ground)
+    row, col = local_path.START
+    assert free.any()
+    assert occupied[row + 28, col]
+    assert not (free & occupied).any()
+    rows, cols = np.nonzero(np.isfinite(image))
+    measured_depth = image[rows, cols].astype(float)
+    measured_right = measured_depth * (cols - 320) / 420
+    cell_rows = row + np.rint(measured_depth / local_path.RESOLUTION).astype(int)
+    cell_cols = col + np.rint(measured_right / local_path.RESOLUTION).astype(int)
+    visible = np.zeros_like(free)
+    visible[cell_rows, cell_cols] = True
+    assert np.array_equal(free | occupied, visible)
+    assert not local_path.observe(image, *grid_args, ground, check_free_space=False)[0].any()
+
+
 def test_floor_only_corridor_reports_its_observed_free_extent():
     from plugins.navi.camera import HorizontalIntrinsics
 

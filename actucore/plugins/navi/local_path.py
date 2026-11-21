@@ -5,11 +5,11 @@ import heapq
 import math
 from dataclasses import dataclass, field
 from functools import partial
+from threading import Lock
 
 import numpy as np
 
 from .camera import HorizontalIntrinsics
-from .depth import has_valid_returns
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
@@ -190,7 +190,8 @@ def _floorless_hits(frame):
 
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
             require_valid_depth=False, check_free_space=True):
-    if geometry.horizontal is None or geometry.vertical is None or not has_valid_returns(frame):
+    valid = np.isfinite(frame) & (frame > 0.) if frame is not None else None
+    if geometry.horizontal is None or geometry.vertical is None or valid is None or not valid.any():
         if require_valid_depth:
             return None
         empty = np.zeros(right.shape, dtype=bool)
@@ -201,67 +202,32 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     u = (np.arange(width) - cx) / fx
     v = (np.arange(height) - cy) / fy
     x, y = u * frame, v[:, None] * frame
+    above_floor = None
     if plane is not None:
         optical_normal, c = plane
         normal = geometry.base_from_optical[:3, :3] @ optical_normal
         if abs(normal[2]) >= .5 * np.linalg.norm(normal):
             top = geometry.height if geometry.height is not None else abs(c / normal[2])
             if .02 < top <= 2.5:
-                return _observe_with_floor(frame, geometry, right, forward, resolution, ground,
-                                           x, y, optical_normal, c, normal, top,
-                                           max_hit_depth, check_free_space)
-    hits = _floorless_hits(frame)
+                above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
+    if above_floor is None:
+        hits = valid & _floorless_hits(frame)
+    else:
+        hits = valid & ~ground & (above_floor >= MIN_OBSTACLE_HEIGHT_M)
+        if geometry.height is not None:
+            hits &= above_floor <= geometry.height + .05
     if max_hit_depth is not None:
-        hits &= frame <= max_hit_depth
-    return _project_hits(geometry, right, forward, resolution, x[hits], y[hits], frame[hits])
+        valid &= frame <= max_hit_depth
+        hits &= valid
+    samples = valid if check_free_space else hits
+    return _project_observed(geometry, right, forward, resolution, x[samples], y[samples], frame[samples],
+                             hits[samples], check_free_space=check_free_space,
+                             heights=above_floor[samples] if above_floor is not None else None)
 
 
-def _observe_with_floor(frame, geometry, right, forward, resolution, ground,
-                        x, y, optical_normal, c, normal, top, max_hit_depth, check_free_space):
-    height, width = frame.shape
-    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
+def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
+                      check_free_space, heights):
     transform = geometry.base_from_optical
-    rotation, origin = transform[:3, :3], transform[:3, 3]
-    floor_z = (c + normal @ origin - normal[0]*forward + normal[1]*right) / normal[2]
-    # Check several heights below the declared top of the moving envelope.
-    check_free_space = check_free_space and geometry.free_space_validated
-    free = np.full(right.shape, check_free_space, dtype=bool)
-    heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if check_free_space else ()
-    # On a verified floor return, require the ray to clear the far edge of
-    # this cell at the probe height. A fixed two-cell optical gap would reject
-    # valid near-floor rays simply because of their grazing angle.
-    depth_slope = rotation[:2, 2] - rotation[2, 2] * normal[:2] / normal[2]
-    floor_margin = resolution / 2 * max(1., abs(depth_slope).sum())
-    for height_m in heights:
-        camera_points = (np.stack((forward, -right, floor_z + height_m), axis=-1)
-                         - origin) @ rotation
-        z = camera_points[..., 2]
-        front = z > 0
-        denom = np.where(front, z, 1.0)
-        cols = np.rint(fx * camera_points[..., 0] / denom + cx).astype(int)
-        rows = np.rint(fy * camera_points[..., 1] / denom + cy).astype(int)
-        in_image = free & front & (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
-        pixels = (rows[in_image], cols[in_image])
-        distances = frame[pixels]
-        margin = np.where(ground[pixels], floor_margin, 2 * resolution)
-        free[~in_image] = False
-        free[in_image] = np.isfinite(distances) & (distances > z[in_image] + margin)
-
-    above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
-    hits = np.isfinite(frame) & ~ground & (above_floor >= MIN_OBSTACLE_HEIGHT_M)
-    if max_hit_depth is not None:
-        hits &= frame <= max_hit_depth
-    if geometry.height is not None:
-        hits &= above_floor <= geometry.height + .05
-    return _project_hits(geometry, right, forward, resolution, x[hits], y[hits], frame[hits],
-                         free=free, heights=above_floor[hits])
-
-
-def _project_hits(geometry, right, forward, resolution, x, y, z, *, free=None, heights=None):
-    if free is None:
-        free = np.zeros(right.shape, dtype=bool)
-    transform = geometry.base_from_optical
-    # Only forward and lateral coordinates contribute to cell indices.
     body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
     body_l = x * transform[1, 0] + y * transform[1, 1] + z * transform[1, 2] + transform[1, 3]
     hit_row = np.rint((body_f - forward[0, 0]) / resolution).astype(int)
@@ -269,17 +235,13 @@ def _project_hits(geometry, right, forward, resolution, x, y, z, *, free=None, h
     in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
                & (hit_col >= 0) & (hit_col < right.shape[1]))
     cells = (hit_row[in_grid], hit_col[in_grid])
+    raised = hits[in_grid]
     if heights is not None:
         heights = heights[in_grid]
-    raised = np.ones(cells[0].shape, dtype=bool) if heights is None else heights >= geometry.min_obstacle_height
+        raised &= heights >= geometry.min_obstacle_height
     cell_ids = cells[0] * right.shape[1] + cells[1]
     counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
-    if heights is not None and geometry.min_obstacle_height > MIN_OBSTACLE_HEIGHT_M:
-        uncertain = np.bincount(cell_ids[~raised], minlength=right.size).reshape(right.shape)
-        free &= uncertain < 3
     occupied = counts >= 3
-    # Clearing a suspect hit does not provide evidence of free space.
-    free &= ~occupied
     neighbors = _neighbor_count(occupied)
     ends = occupied & (neighbors == 1)
     small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
@@ -296,6 +258,12 @@ def _project_hits(geometry, right, forward, resolution, x, y, z, *, free=None, h
             np.maximum.at(highest, sparse_cells, heights[sparse_hits])
             np.minimum.at(lowest, sparse_cells, heights[sparse_hits])
             occupied &= ~(small & ((highest < .05) | (weak & (highest - lowest < .05))))
+    # Only metric returns establish visibility. Unseen gaps, blind regions,
+    # and cells behind the last measured surface retain the unknown state.
+    free = np.zeros(right.shape, dtype=bool)
+    if check_free_space:
+        free[cells] = True
+        free &= ~occupied
     return free, occupied
 
 
@@ -370,6 +338,50 @@ def target_in_grid(geometry, forward, right):
     return float(f), -float(left)
 
 
+class DepthProjection:
+    """Keep raw projections for one received frame, shared by both timers."""
+
+    def __init__(self, frame, ground):
+        self.frame, self.ground = frame, ground
+        self._lock = Lock()
+        self._grids = {}
+
+    def grid_for(self, geometry, *, require_valid_depth, check_free_space):
+        geometry_key = (geometry.horizontal, geometry.vertical, geometry.front, geometry.height,
+                        geometry.min_obstacle_height, geometry.base_from_optical.tobytes())
+        key = (geometry_key, check_free_space)
+        with self._lock:
+            # The free-space query only changes free cells. Its occupied mask
+            # can also serve the command timer's occupancy-only checks.
+            full = (geometry_key, True)
+            if full in self._grids:
+                key = full
+            cached = key in self._grids
+            grid = self._grids.get(key)
+        if not cached:
+            # The command timer can check occupancy while planning computes
+            # free space for the same image.
+            projected = observe(self.frame, geometry, RIGHT, FORWARD, RESOLUTION, self.ground,
+                                require_valid_depth=True, check_free_space=check_free_space)
+            with self._lock:
+                if key not in self._grids and len(self._grids) == 4:
+                    del self._grids[next(iter(self._grids))]
+                grid = self._grids.setdefault(key, projected)
+        if grid is None and not require_valid_depth:
+            empty = np.zeros(SHAPE, dtype=bool)
+            return empty, empty.copy()
+        return grid
+
+
+def project_observation(observation, geometry, *, require_valid_depth=False, check_free_space=True):
+    projection = observation.get("grid_projection")
+    if projection is not None:
+        return projection.grid_for(geometry, require_valid_depth=require_valid_depth,
+                                   check_free_space=check_free_space)
+    return observe(observation["map"], geometry, RIGHT, FORWARD, RESOLUTION, observation.get("ground"),
+                   require_valid_depth=require_valid_depth, check_free_space=check_free_space)
+
+
 @dataclass
 class PlanCache:
     key: tuple | None = None
@@ -388,6 +400,8 @@ class PlanCache:
         project_scan_view = observation.get("project_scan_view")
         if project_scan_view is not None:
             return project_scan_view()
+        if observation.get("grid_projection") is not None:
+            return project_observation(observation, geometry)
         frame = observation["frame_id"]
         if self.grid_frame != frame or self.grid_geometry is not geometry:
             self.grid = observe(observation["map"], geometry, RIGHT, FORWARD,
@@ -468,13 +482,25 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, paddi
 
 
 def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0.):
-    """Bound footprint rotation and the departure from a straight velocity ramp."""
+    """Sweep a circle centered on the chassis through its possible translations."""
+    rows, cols = np.nonzero(occupied)
+    center = (geometry.front - geometry.rear) / 2
+    radius = math.hypot(geometry.half_length, half_width) + .05
+    # Independently ramped components can reach any center in these bounds.
+    # Account for bending of the center's path while turning and translating.
+    forward, right = zip(*((vx * horizon, -vy * horizon) for vx, vy, _ in velocities))
     turn = max(abs(yaw) for _, _, yaw in velocities) * horizon
-    speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
-    radius = math.hypot(max(geometry.front, geometry.rear), half_width)
-    padding += radius * min(2., turn) + speed * horizon * min(2., turn / 2)
-    return _transition_hits(occupied, geometry, half_width, horizon,
-                            tuple(v[:2] for v in velocities), padding)
+    travel = math.hypot(max(map(abs, forward)), max(map(abs, right)))
+    slack = padding + travel * min(2., turn / 2)
+    f, r = FORWARD[rows, cols] - center, RIGHT[rows, cols]
+    # Use the nearest point of each occupied cell against the circle.
+    half_cell = RESOLUTION / 2
+    df = np.maximum(0., np.maximum(min(0., *forward) - f, f - max(0., *forward)) - half_cell)
+    dr = np.maximum(0., np.maximum(min(0., *right) - r, r - max(0., *right)) - half_cell)
+    hits = df**2 + dr**2 <= (radius + slack)**2
+    result = np.zeros_like(occupied)
+    result[rows[hits], cols[hits]] = True
+    return result
 
 
 def motion_sweep_clear(grid, geometry, half_width, horizon, velocities):

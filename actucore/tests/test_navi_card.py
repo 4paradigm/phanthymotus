@@ -2188,6 +2188,60 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
     assert policy._clearance(observation, card._config)[0] == 0.55
 
 
+def test_projected_depth_grid_is_shared_by_scanning_planning_and_execution(monkeypatch):
+    from dataclasses import replace
+
+    import numpy as np
+    from plugins.navi import active_scan, local_path
+
+    card = _card()
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336.65, 0, 420, 243, 0, 0, 1])
+    assert card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding()) == ""
+    geometry = local_path.camera_square(card._config.depth_intrinsics, card._depth_vertical,
+                                        .25, at_front=True)
+    frame = np.full((24, 32), 2.0, dtype=np.float32)
+    project = local_path.observe
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return project(*args, **kwargs)
+
+    monkeypatch.setattr(local_path, "observe", counted)
+    monkeypatch.setattr(active_scan, "observe", counted)
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    card._set_depth_map(frame, received_ms=122_900)
+    first = card.observation()[1]
+    scan = active_scan.ActiveScan()
+    scan.observe_single(first, geometry, 500, 123_000)
+    free, occupied = scan.observed_grid()
+    second = card.observation()[1]
+    cache = local_path.PlanCache()
+    assert cache.grid_for(second, geometry)[0] is free
+    assert local_path.project_observation(second, replace(geometry, base_from_optical=
+                                          geometry.base_from_optical.copy()),
+                                          require_valid_depth=True, check_free_space=False)[1] is occupied
+    assert len(calls) == 1
+
+    shifted = geometry.base_from_optical.copy()
+    shifted[0, 3] = .10
+    local_path.project_observation(second, replace(geometry, base_from_optical=shifted))
+    assert len(calls) == 2
+    card._set_depth_map(np.full_like(frame, .60), received_ms=122_950)
+    newer = card.observation()[1]
+    _, new_occupied = local_path.project_observation(newer, geometry, require_valid_depth=True,
+                                                    check_free_space=False)
+    assert not np.array_equal(new_occupied, occupied)
+    assert len(calls) == 3
+
+    card._set_depth_map(np.full_like(frame, np.nan), received_ms=122_980)
+    invalid = card.observation()[1]
+    assert not cache.grid_for(invalid, geometry)[1].any()
+    assert local_path.project_observation(invalid, geometry, require_valid_depth=True,
+                                          check_free_space=False) is None
+
+
 @pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl,bumi_mount",
                          [(50, None, True, 600, 400, False), (700, 800, True, 250, 250, False),
                           (50, None, False, 600, 400, False), (50, None, True, 600, 400, True)])
@@ -2588,7 +2642,14 @@ def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkey
                                             source_sample_id=source), 970
 
     occupied = np.zeros(local_path.SHAPE, dtype=bool)
-    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~occupied, occupied))
+    scan = card._state.active_scan
+    scan.receipt_only, scan.current_frame, scan.source_frame = True, 950, 700
+    scan.views.append((950, scan.pose, ~occupied, occupied))
+    projections = []
+    def project(*args, **kwargs):
+        projections.append(True)
+        return ~occupied, occupied
+    monkeypatch.setattr(local_path, "observe", project)
     monkeypatch.setattr(card, "_observation_snapshot", snapshot)
     monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
         [.15, 0., 0., 0., 0., 0.], policy.APPROACHING, "target at 3 m", distance_m=3.))
@@ -2600,6 +2661,7 @@ def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkey
     now = 1100  # Early enough to recheck before the old command expires.
     card._dispatch_command()
     assert len(published) == (2 if new_feedback else 1)
+    assert not projections
     if new_feedback:
         assert published[-1]["obs_stamp_ms"] == 700
         assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1350

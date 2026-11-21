@@ -1704,20 +1704,18 @@ def test_search_near_stop_keeps_clearance_reserve_after_target_reappears():
     assert "足够余量" in decision.reason
 
 
-def test_search_can_turn_to_the_other_side_when_the_last_seen_side_is_blocked(monkeypatch):
+def test_search_holds_when_the_circular_sweep_is_blocked(monkeypatch):
     from plugins.navi.local_path import Geometry
 
     geometry = Geometry(None, None, np.eye(4), .23, .23, None)
     config = _cfg(local_planning=True, local_geometry=geometry)
     state = _state(motion_source="command", last_seen_side=1., searched_rad=1.)
     state.active_scan.current_frame = 1000
-    monkeypatch.setattr(state.active_scan, "clear_sweep",
-                        lambda _geometry, _keepout, sweep, _slack: sweep < 0.)
-
-    assert P._search_turn_stop(_depth(), config, state) is None
-    assert state.last_seen_side == -1.
-    assert state.searched_rad == 0.
-    assert P._search(config, state, .1).values is None  # short-occlusion dwell still applies
+    for direction in (-1., 1.):
+        state.last_seen_side = direction
+        monkeypatch.setattr(state.active_scan, "clear_sweep", lambda *_: False)
+        assert "转身扫掠范围有障碍" in P._search_turn_stop(_depth(), config, state)
+        assert state.last_seen_side == direction
 
 
 def test_command_only_active_observation_uses_camera_geometry_without_extrinsics(monkeypatch):
@@ -2808,8 +2806,8 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
 
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target())
     free = np.ones(local_path.SHAPE, dtype=bool)
-    # Posts 0.35 m ahead at +-0.40 m: inside both 20 degree turn sweeps.
-    posts = np.isclose(local_path.FORWARD, .35) & (np.abs(np.abs(local_path.RIGHT) - .40) < .03)
+    # Posts 0.30 m ahead at +-0.35 m enter the circular turn sweep.
+    posts = np.isclose(local_path.FORWARD, .30) & (np.abs(np.abs(local_path.RIGHT) - .35) < .03)
     recovery_changes_scene = fault.startswith("recovery_")
     after_gap = False
 
@@ -3199,8 +3197,7 @@ def test_detour_first_turn_can_execute_with_the_braking_reserve():
     scan.receipt_only = True
     scan.current_frame = 1000
     scan.poses.append((1000, scan.pose, 0.))
-    # A centre obstacle and a close return at the left front corner. The
-    # preferred right turn clips the corner once braking travel is included.
+    # A centre obstacle and a close left return outside the stationary circle.
     occupied = ((np.isclose(local_path.FORWARD, .75) & (np.abs(local_path.RIGHT) < .11)) |
                 (np.isclose(local_path.FORWARD, .35) & np.isclose(local_path.RIGHT, -.30)))
     scan.views.append((1000, scan.pose, ~occupied, occupied))
@@ -3208,9 +3205,9 @@ def test_detour_first_turn_can_execute_with_the_braking_reserve():
     observation = dict(frame_id=1000, map=frame, ground=frame.astype(bool))
 
     assert P._start_detour_segment(observation, config, state, geometry, .75, (1., -1.), 3., 0.)
-    assert scan.command(geometry, .30, 1., 600, 800).yaw == 0.
+    assert scan.command(geometry, config.half_width_m, 1., 600, 800).yaw == 0.
     scan.poses.append((1100, scan.pose, 0.))
-    assert scan.command(geometry, .30, 1., 600, 800).yaw > 0.
+    assert scan.command(geometry, config.half_width_m, 1., 600, 800).yaw < 0.
 
 
 def test_initial_route_points_at_measured_opening_between_offset_jambs():
@@ -3497,10 +3494,10 @@ def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
 @pytest.mark.parametrize(("ahead", "side_obstacles", "expected_yaw"), [
     (.80, (), -.60),
     (.60, (), -.60),
-    (.60, (.40,), .60),
-    (.60, (.40, -.40), 0.),
-    (2.0, (.40,), .60),
-    (2.0, (.40, -.40), 0.),
+    (.60, (.40,), -.60),
+    (.60, (.30,), 0.),
+    (2.0, (-.40,), -.60),
+    (2.0, (-.30,), 0.),
 ])
 def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obstacles, expected_yaw):
     from plugins.navi import active_scan as scan, local_path
@@ -3514,8 +3511,7 @@ def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obsta
     depth["ground"][0, 0] = True
     occupied = np.isclose(scan.FORWARD, ahead) & np.isclose(scan.RIGHT, 0.)
     for right in side_obstacles:
-        # Beyond the stationary envelope and outside the front corridor, but
-        # inside the right-turn sweep once the 10 cm margin is included.
+        # Hit either inside or outside the same circle used for both turns.
         occupied |= np.isclose(scan.FORWARD, .15) & np.isclose(scan.RIGHT, right)
     monkeypatch.setattr(scan, "observe", lambda *args: (np.zeros_like(occupied), occupied))
     odom = {"vx": 0., "vy": 0., "wz": 0., "received_ms": 1000}
@@ -3658,8 +3654,14 @@ def test_remembered_wall_allows_the_same_checked_approach(monkeypatch, remember)
     scan.current_frame = 1000
     scan.poses.append((1000, scan.pose, 0.))
     scan.views.append((1000, scan.pose, ~wall, wall))
-    command = P._avoid(.6, 0., 0., depth, config, P.APPROACHING, "", state,
-                       target_distance=3., target_bearing=0., odom=odom, may_scan=True)
+    for stamp in (1000, 1010, 1020):
+        scan.current_frame = stamp
+        pose = PlanarPose(stamp, pose.frame, 0., 0., 0.)
+        depth.update(frame_id=stamp, capture_ms=stamp)
+        if remember:
+            depth["obstacle_capture_pose"] = odom["obstacle_pose"] = pose
+        command = P._avoid(.6, 0., 0., depth, config, P.APPROACHING, "", state,
+                           target_distance=3., target_bearing=0., odom=odom, may_scan=True)
     assert bool(scan.obstacles.cells) is remember
     assert command[:3] == (.15, 0., 0.)
 
@@ -3706,10 +3708,13 @@ def test_memory_can_use_the_command_only_scan_without_a_motion_pose_history(monk
     pose = PlanarPose(1000, ("map", "body"), 0., 0., 0.)
     depth = dict(map=frame, ground=frame.astype(bool), frame_id=1000, capture_ms=1000,
                  obstacle_capture_pose=pose)
-    state.active_scan.observe_single(depth, geometry, 500, 1000)
-    decision = P._avoid(.3, 0., 0., depth, config, P.APPROACHING, "", state,
-                        target_distance=3., target_bearing=0., may_scan=True,
-                        odom={"obstacle_pose": pose})
+    for stamp in (1000, 1010, 1020):
+        pose = PlanarPose(stamp, pose.frame, 0., 0., 0.)
+        depth.update(frame_id=stamp, capture_ms=stamp, obstacle_capture_pose=pose)
+        state.active_scan.observe_single(depth, geometry, 500, stamp)
+        decision = P._avoid(.3, 0., 0., depth, config, P.APPROACHING, "", state,
+                            target_distance=3., target_bearing=0., may_scan=True,
+                            odom={"obstacle_pose": pose})
     assert not state.active_scan.poses and state.active_scan.obstacles.cells
     assert decision[:3] == (.15, 0., 0.)
 
@@ -4381,7 +4386,8 @@ def test_visible_foreground_triggers_detour_before_slowdown_then_survives_blind_
         return P._avoid(.3, 0., 0., obs, cfg, P.APPROACHING, "target", state,
                         target_distance=3., target_bearing=0., odom=odom, may_scan=True)
 
-    command = tick(1000, 1.90, 0.)
+    for stamp in (1000, 1010, 1020):
+        command = tick(stamp, 1.90, 0.)
     assert command[0] == .15 and command[1] == 0. and command[2]
     assert not scan.active and scan.historical_hits.any()
     # The saved hit survives when the original obstacle leaves the view.
@@ -4474,7 +4480,15 @@ def test_foreground_in_bottom_of_depth_image_is_remembered_before_it_disappears(
     monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~hit, hit))
     decision = P._avoid(.3, 0., 0., depth, cfg, P.APPROACHING, "", state, target_distance=4.8,
                         target_bearing=0., may_scan=True, odom=feedback)
-    assert decision[3] == P.AVOIDING and scan.obstacles.cells
+    assert decision[3] == P.AVOIDING and not scan.obstacles.cells
+    for stamp in (1110, 1120):
+        pose = PlanarPose(stamp, pose.frame, 0., 0., 0.)
+        depth.update(frame_id=stamp, source_frame_id=stamp, obstacle_capture_pose=pose)
+        feedback.update(obstacle_pose=pose, received_ms=stamp)
+        scan.update(depth, feedback, geom, receipt_only=True)
+        decision = P._avoid(.3, 0., 0., depth, cfg, P.APPROACHING, "", state,
+                            target_distance=4.8, target_bearing=0., may_scan=True, odom=feedback)
+    assert scan.obstacles.cells
     if decision[0]:
         assert decision[1] and decision[2] == 0.
         assert local_path.transition_clear((~hit, hit), geom, P._keepout_m(cfg),
@@ -4573,7 +4587,7 @@ def test_checked_approach_can_move_while_turning(monkeypatch, arc_blocked):
     state.active_scan.attempted = True
     blocked = np.isclose(local_path.FORWARD, .95)
     if arc_blocked:
-        blocked[local_path.START[0], local_path.START[1] + 6] = True
+        blocked[local_path.START[0] + 7, local_path.START[1] + 6] = True
     ground = np.ones((4, 4), dtype=bool)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.95, 1.))
     monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~blocked, blocked))
@@ -4957,8 +4971,7 @@ def test_off_axis_remembered_door_jamb_allows_a_checked_prefix(monkeypatch, late
     decision = P._avoid(.2, 0., .3, view, config, P.APPROACHING, "", state,
                         target_distance=2.5, target_bearing=.10, may_scan=True,
                         odom=dict(vx=.20, vy=0., wz=0.))
-    assert decision[0] > 0 and decision[1] == 0. and abs(decision[2]) < .3
-    assert state.checked_prefix
+    assert decision[:3] == (.2, 0., .3)
 
 
 def test_view_received_during_interrupted_observation_is_remembered_without_paired_pose(monkeypatch):
@@ -5026,7 +5039,36 @@ def test_person_arrival_uses_confirmed_front_surface_at_configured_standoff():
                           odom=None, config=config, state=state, dt=.1)
         assert not any(decision.values or ())
         assert decision.status != P.ARRIVED
+        if stamp == 100:
+            state.active_scan.attempted = True
+            state.active_scan.phase = "brake"
+    assert not state.active_scan.active and not state.active_scan.attempted
     decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=300),
                       odom=None, config=config, state=state, dt=.1)
     assert decision.status == P.ARRIVED and not any(decision.values)
     assert decision.distance_m == pytest.approx(.60, abs=.002)
+
+
+def test_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monkeypatch):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    grid = P.local_path
+    geometry = grid.camera_square(HorizontalIntrinsics(640, 492., 318.),
+                                  (480, 492., 229.), .275, at_front=True)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry,
+                  half_width_m=.275, max_depth_age_ms=1200, watchdog_ms=500, vx_max=.30)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    empty = np.zeros(grid.SHAPE, dtype=bool)
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, empty, empty))
+    scan.near_hits = ((grid.FORWARD >= .4) & (grid.FORWARD <= .71)
+                      & (grid.RIGHT >= .25) & (grid.RIGHT <= .40))
+    monkeypatch.setattr(grid.PlanCache, "route", lambda *args, **kwargs: None)
+    monkeypatch.setattr(grid, "opening_route", lambda *args, **kwargs: None)
+
+    assert P._start_detour_segment(dict(frame_id=1000, map=np.ones((4, 4))),
+                                   config, state, geometry, .45, (1., -1.), 2.8, -.06)
+    assert scan.directions == (-1.,)
+    assert scan.advance_m == pytest.approx(.65)

@@ -77,6 +77,7 @@ class _ForwardCheck:
     feedback_ms: int | None
     remembered: object
     remembered_ms: int
+    occupied: object = None
 
 
 @dataclass
@@ -234,6 +235,7 @@ class NaviPlugin:
         self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
         self._depth_ground = None
+        self._depth_projection = None
         self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
@@ -537,6 +539,7 @@ class NaviPlugin:
         with self._obs_lock:
             self._depth_map = None
             self._depth_ground = None
+            self._depth_projection = None
             self._depth_vertical = None
             self._depth_bands = {}
             self._depth_ms = 0
@@ -1670,6 +1673,7 @@ class NaviPlugin:
         with self._obs_lock:
             self._depth_map = depth
             self._depth_ground = ground
+            self._depth_projection = local_path.DepthProjection(depth, ground)
             self._depth_bands = bands
             self._depth_ms = received_ms
             expected_frame = self._depth_vendor.get("frame_id")
@@ -1742,6 +1746,8 @@ class NaviPlugin:
             if depth is not None and self._depth_ground is not None:
                 depth["ground"] = self._depth_ground
             if depth is not None:
+                if self._depth_projection is not None and self._depth_projection.frame is depth["map"]:
+                    depth["grid_projection"] = self._depth_projection
                 if with_capture_timing:
                     depth["control_ms"] = now
                     ns = self._depth_source_ns
@@ -1815,15 +1821,20 @@ class NaviPlugin:
         elif depth.get("body_mount_required") and state.use_body_mount is not False:
             return None
         remembered = scan.remembered_hits
-        if remembered is None and (scan.obstacles.cells or scan.near_obstacles.cells):
+        if remembered is None and (scan.obstacles.has_occupied or scan.near_obstacles.has_occupied):
             return None
         memory_ms = scan.control_ms or depth.get("control_ms") or depth["frame_id"]
         if scan.near_hits is not None and scan.near_revision:
             memory_ms = min(memory_ms, scan.near_revision)
+        occupied = None
+        if (mount_frame is None and scan.receipt_only and scan.views and
+                geometry is config.local_geometry and scan.views[-1][0] == depth["frame_id"]
+                and scan.matches_route_view(depth)):
+            occupied = scan.views[-1][3]
         return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
                              objects_ms, decision.distance_m, previous_twist, mount_frame,
                              (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
-                             remembered, memory_ms)
+                             remembered, memory_ms, occupied)
 
     def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False):
         """Try the short motion against current depth and feedback without retiming either."""
@@ -1877,22 +1888,22 @@ class NaviPlugin:
         speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
         if speed * (horizon + (now_ms - check.target_ms) / 1000) > check.distance_m - config.stop_distance_m:
             return None
-        keepout = policy_mod._keepout_m(config)
-        grid = local_path.observe(depth["map"], geometry, local_path.RIGHT, local_path.FORWARD,
-                                  local_path.RESOLUTION, depth.get("ground"), require_valid_depth=True,
-                                  check_free_space=False)
-        if grid is None:
-            return None
-        radius = math.hypot(max(geometry.front, geometry.rear), keepout)
-        travel_rate = max(math.hypot(vx, vy) + radius * abs(yaw) for vx, vy, yaw in velocities)
-        clear = not local_path.motion_sweep_hits(grid[1], geometry, keepout, horizon, velocities,
-                                                 padding=travel_rate * (now_ms - depth_ms) / 1000).any()
+        half_width = config.half_width_m
+        occupied = check.occupied if same_depth and check.mount_frame is None else None
+        if occupied is None:
+            grid = local_path.project_observation(depth, geometry, require_valid_depth=True,
+                                                  check_free_space=False)
+            if grid is None:
+                return None
+            occupied = grid[1]
+        clear = not local_path.motion_sweep_hits(occupied, geometry, half_width, horizon, velocities,
+                                                 padding=speed * (now_ms - depth_ms) / 1000).any()
         if clear and check.remembered is not None:
             age = max(0, now_ms - check.remembered_ms) / 1000
-            clear = not local_path.motion_sweep_hits(check.remembered, geometry, keepout, horizon,
-                                                     velocities, padding=travel_rate * age).any()
+            clear = not local_path.motion_sweep_hits(check.remembered, geometry, half_width, horizon,
+                                                     velocities, padding=speed * age).any()
         newer = replace(check, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
-                        feedback_source=feedback_source, feedback_ms=odom_ms)
+                        feedback_source=feedback_source, feedback_ms=odom_ms, occupied=occupied)
         return obs_ms, deadline, clear, newer
 
     def next_command(self):
@@ -2270,6 +2281,7 @@ class NaviPlugin:
         with self._obs_lock:
             history = tuple(self._velocity_history)
             frame, ground = self._depth_map, self._depth_ground
+            projection = self._depth_projection
             received, captured = self._depth_ms, self._depth_capture_ms
             source = self._depth_source_ms
             odom_ms = self._odom_ms
@@ -2289,9 +2301,9 @@ class NaviPlugin:
         if not 0 <= now_ms - depth_ms < config.depth_age_limit_ms or not depth_mod.has_valid_returns(frame):
             return "局部规划：深度暂不可用，停车后重规划", True
         if (work.depth_grid is None or work.depth_grid[:2] != (source, depth_ms)):
-            grid = local_path.observe(frame, leg.geometry, local_path.RIGHT, local_path.FORWARD,
-                                      local_path.RESOLUTION, ground, require_valid_depth=True,
-                                      check_free_space=False)
+            observation = {"map": frame, "ground": ground, "grid_projection": projection}
+            grid = local_path.project_observation(observation, leg.geometry, require_valid_depth=True,
+                                                  check_free_space=False)
             work.depth_grid = (source, depth_ms, grid)
         command = tuple(work.message["values"][:2])
         brake_horizon = (config.watchdog_ms + 50) / 1000
