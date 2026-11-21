@@ -1,0 +1,34 @@
+# Validated pure venv: Linux x86_64, CPython3.11, 2026-11-17.
+# Optional offline MP environment only; do not apply to shared Core/ROS.
+absl-py==2.5.1
+attrs==26.1.0
+cffi==2.1.1
+coloredlogs==15.0.1
+contourpy==1.3.3
+cycler==0.12.1
+flatbuffers==25.12.19
+fonttools==4.68.0
+humanfriendly==10.0
+jax==0.4.35
+jaxlib==0.4.35
+kiwisolver==1.5.1
+matplotlib==3.9.4
+mediapipe==0.10.21
+ml_dtypes==0.5.4
+mpmath==1.3.0
+numpy==1.26.4
+onnxruntime==1.23.2
+opencv-contrib-python==4.11.0.86
+opt_einsum==3.4.0
+packaging==26.3
+pillow==13.0.0
+protobuf==4.25.9
+psutil==7.1.3
+pycparser==3.12
+pyparsing==3.3.3
+python-dateutil==4.0.0
+scipy==1.17.1
+sentencepiece==0.2.3
+sounddevice==0.5.6
+sympy==1.14.0
+tzdata==2026.6
