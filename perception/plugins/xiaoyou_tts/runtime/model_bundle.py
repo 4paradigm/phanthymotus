@@ -21,20 +21,14 @@ from urllib.request import Request, urlopen
 SOURCE_SHA = 'a46bd6826d1074b93bc7a17379966d88005cd248136acd24aab4b6883e689bb0'
 
 FRONTEND_FILE = 'frontend/phonemizer.py'
-FRONTEND_SHA = '4d992c0b727e066c39de02fe0f53dc7d564b0347323225685320b4f7360ddbc3'
+FRONTEND_SHA = '4714130118c0ba6203d3d654e7485f2a467401c60c8c1ad4dc0fb2820f3ed9f6'
 _RELEASE_FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7ce1db0dc5'
 
 NORMALIZATION_REVISION = '01yuewen-contextual-polyphones-compact-20261118'
 
 NORMALIZATION_MODULE_SHAS = {
-    'frontend/numbers.py': '2c9042a1a8aae90c8ef755a079198e5b0220d6f7fc43c5d54aa885d8d165b75d',
+    'frontend/numbers.py': '1bc10c534d2f4509e93ae9044428c2157f2a243f9d1d19855a0da3f763474927',
 }
-_SHARED_FRONTEND_SHAS = {
-    'vits2_tts_trt/frontend/number_context.py': 'bc36994de1693f6e6993a5610a1ddb4245af3103134355bc05cff6db549c39c3',
-    'vits2_tts_trt/frontend/math_units.py': 'a612a5759ac981fb32911a921b79656cb2ac2d3ba4170a4ef1cfd982ab8a8ec0',
-    'vits2_tts_trt/frontend/numeric_formats.py': 'cb3fe35c3ba29fe697368ba54b37a7fda82f4ed15aa31a65e55a0562858d974f',
-}
-
 # The immutable model manifest records the source from its original export.
 # The installed frontend is verified against the current hashes above.
 _RELEASE_NORMALIZATION_MODULE_SHAS = {
@@ -167,12 +161,12 @@ def validate_frontend_files(front, directory):
         raise ValueError('Xiaoyou frontend metadata differs from the fixed source contract')
     root = Path(directory).resolve()
     files = {FRONTEND_FILE: FRONTEND_SHA, **NORMALIZATION_MODULE_SHAS}
-    for package_root, sources in ((root, files), (root.parent, _SHARED_FRONTEND_SHAS)):
-        for name, expected in sources.items():
-            path = package_root / name
-            if (path.is_symlink() or not path.is_file()
-                    or package_root not in path.resolve().parents or sha(path) != expected):
-                raise ValueError('Xiaoyou frontend source missing, linked or SHA-mismatched: ' + name)
+    # Shared V4 helpers are provided by the application revision.
+    for name, expected in files.items():
+        path = root / name
+        if (path.is_symlink() or not path.is_file()
+                or root not in path.resolve().parents or sha(path) != expected):
+            raise ValueError('Xiaoyou frontend source missing, linked or SHA-mismatched: ' + name)
     return dict(files)
 
 

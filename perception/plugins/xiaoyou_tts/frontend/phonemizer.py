@@ -23,6 +23,10 @@ import subprocess
 import sys
 import time
 
+import regex
+
+from plugins.vits2_tts_trt.frontend.special_text import read_numeric_literal
+
 from . import numbers as numeric
 from ..runtime.model_bundle import FRONTEND_FILE, NORMALIZATION_MODULE_SHAS, TERMS_FILE, detect_jetpack_major
 
@@ -30,6 +34,11 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _LATIN_WORD = r"(?:[0-9]+(?=[A-Za-z]))?[A-Za-z][A-Za-z0-9_'’\-]*"
 _LATIN = re.compile(_LATIN_WORD + r"(?:[ \t]+" + _LATIN_WORD + r")*")
 _HAN = re.compile(r'[\u3400-\u9fff]')
+_EMOJI = regex.compile(
+    r'(?P<key>[0-9#*])\ufe0f?\u20e3'
+    r'|(?=\p{Emoji_Presentation}|\p{Extended_Pictographic}(?:[\ufe0f\u200d]|\p{Emoji_Modifier}))\X'
+    r'|[♥☀☺☹]\ufe0e?'
+)
 
 _VERSION_NUMBER = r'[0-9]+(?:\.[0-9]+){0,3}'
 _VERSION_LEFT = r'(?<![A-Za-z0-9_./\\-])'
@@ -45,8 +54,9 @@ _VERSION = re.compile(
     + _VERSION_RIGHT, re.I)
 _VERSION_URL = re.compile(r'(?:https?://|ftp://|www\.)[^\s<>，。；！？]+', re.I)
 
-def _version_spans(normalized, start, end):
+def _version_spans(normalized, start, end, addresses=()):
     excluded = [m.span() for m in _VERSION_URL.finditer(normalized)]
+    excluded.extend(addresses)
     result = []
     for match in _VERSION.finditer(normalized):
         if any(a < match.end() and match.start() < b for a, b in excluded):
@@ -90,8 +100,7 @@ def _filename_reading(value, language):
     rendered = []
     for part in parts:
         if part.isdigit():
-            rendered.append(('' if language == 'zh' else ' ').join(
-                numeric.speak_number(digit, language, True) for digit in part))
+            rendered.append(read_numeric_literal(part, language))
         else:
             rendered.append(separators.get(part, part))
     result = ' '.join(rendered)
@@ -180,7 +189,7 @@ def _complete_word(source, start, end):
 class EnglishLexiconExtension:
     """Load compact terms['english_lexicon'] once, then use whole-word hashes.
 
-    Integration: bind_native(g2p.lexicon) after G2P construction; wrap every
+    Integration: bind_native(g2p.lexicon, default_context) after G2P construction; wrap every
     G2P.__call__ in scope(raw_text, existing_source_span); call apply_overrides
     after existing CUDA/SageAIOS/case-canonical handling in tokenize; install
     wrap_fallback(original_espeak) as G2P.fallback. Every missing/unsafe offset
@@ -200,7 +209,7 @@ class EnglishLexiconExtension:
             raise ValueError('Invalid native English delegate inventory')
         self._reserved = frozenset(word.casefold() for word in (*reserved_casefold, *native_delegates))
         self._context_words = frozenset()
-        self._native_lexicon = None
+        self._native_reading = None
         self._scope = ContextVar('xiaoyou_english_lexicon_' + str(id(self)), default=None)
         self._layers = []
         self._phrases = {}
@@ -300,7 +309,7 @@ class EnglishLexiconExtension:
             raise ValueError('English lexicon phonemes are outside the model vocabulary')
         return phones
 
-    def bind_native(self, lexicon):
+    def bind_native(self, lexicon, default_context):
         # Preserve all native context/POS dictionaries, even explicit broad
         # source entries such as AA/BA/CIS/ISO that would otherwise shadow them.
         gold = getattr(lexicon, 'golds', None)
@@ -308,7 +317,9 @@ class EnglishLexiconExtension:
             raise TypeError('Expected native Misaki English Lexicon.golds')
         self._context_words = frozenset(word.casefold() for word, value in gold.items()
                                          if isinstance(value, dict))
-        self._native_lexicon = lexicon if callable(lexicon) else None
+        # The probe checks availability or equivalence only. The actual G2P
+        # pass supplies the sentence context when producing native readings.
+        self._native_reading = (lambda token: lexicon(token, default_context)[0]) if callable(lexicon) else None
 
     @contextmanager
     def scope(self, text, source_span=None):
@@ -376,11 +387,11 @@ class EnglishLexiconExtension:
         return None
 
     def _matches_native_reading(self, tokens, phones):
-        if self._native_lexicon is None:
+        if self._native_reading is None:
             return False
         native = []
         for token in tokens:
-            value, _ = self._native_lexicon(token, None)
+            value = self._native_reading(token)
             if value is None:
                 return False
             native.append(value)
@@ -480,10 +491,9 @@ class EnglishLexiconExtension:
                 # A spelling from another model's broad inventory is evidence
                 # of a name, not evidence that Kokoro pronounces it wrongly.
                 # Use it only for a proved complete native lexical miss.
-                if len(group) != 1 or self._native_lexicon is None:
+                if len(group) != 1 or self._native_reading is None:
                     continue
-                native, _ = self._native_lexicon(group[0], None)
-                if native is not None:
+                if self._native_reading(group[0]) is not None:
                     continue
                 phones = self._lookup(surface)
             if phones is None:
@@ -531,7 +541,51 @@ FOUR_WORD_RULE_ID = 'xiaoyou-v6-four-lexical-contexts-20261110-v1'
 
 _WORD_READINGS = {'重来': 'chong2', '重试': 'chong2', '数清': 'shu3', '长椅': 'chang2'}
 
-def _find_existing_relisten_interventions(text: str) -> list[dict]:
+def _native_segments(zh, text):
+    """Yield Misaki's unmodified Han words and their exact input offsets."""
+    for match in _SEGMENTS.finditer(text):
+        segment = match.group()
+        words = []
+        if '\u4E00' <= segment[0] <= '\u9FFF':
+            tokens = zh.jieba.lcut(segment, cut_all=False)
+            if ''.join(tokens) != segment:
+                raise RuntimeError('Native jieba words do not reproduce the full Chinese segment')
+            cursor = match.start()
+            for word in tokens:
+                end = cursor + len(word)
+                words.append((word, cursor, end))
+                cursor = end
+        yield segment, words
+
+
+def _render_native_zh(zh, prepared, fixes):
+    """Replay the native word renderer, replacing only authorized syllables."""
+    rendered = []
+    applied = set()
+    for segment, words in _native_segments(zh, prepared):
+        if not words:
+            rendered.append(segment)
+            continue
+        outputs = []
+        for word, start, end in words:
+            positions = [position for position in fixes if start <= position < end]
+            if not positions:
+                outputs.append(zh.ZHG2P.word2ipa(word))
+                continue
+            pinyins = zh.lazy_pinyin(word, style=zh.Style.TONE3, neutral_tone_with_five=True)
+            if len(pinyins) != len(word):
+                raise RuntimeError('Cannot establish a one-syllable-per-character word offset')
+            for position in positions:
+                pinyins[position - start] = fixes[position]
+                applied.add(position)
+            outputs.append(''.join(zh.ZHG2P.py2ipa(py) for py in pinyins))
+        rendered.append(' '.join(outputs))
+    if applied != set(fixes):
+        raise RuntimeError('Not all word-scoped overrides were applied')
+    return ''.join(rendered).replace(chr(815), '')
+
+
+def _find_existing_relisten_interventions(text: str, tokens: list[dict]) -> list[dict]:
     """Return exact code-point offsets in the supplied complete Chinese span.
 
     Offsets refer to the original two-character word, not a fuzzy match or a
@@ -541,20 +595,8 @@ def _find_existing_relisten_interventions(text: str) -> list[dict]:
     matches = list(_RELISTEN.finditer(text))
     if not matches:
         return []
-    from misaki import zh
-    eligible_words = set()
-    for segment_match in _SEGMENTS.finditer(text):
-        segment = segment_match.group()
-        if not '\u4E00' <= segment[0] <= '\u9FFF':
-            continue
-        words = zh.jieba.lcut(segment, cut_all=False)
-        if ''.join(words) != segment:
-            raise RuntimeError('Cannot establish native word boundaries')
-        cursor = segment_match.start()
-        for word in words:
-            if word == '重听':
-                eligible_words.add((cursor, cursor + len(word)))
-            cursor += len(word)
+    eligible_words = {(token['start'], token['end']) for token in tokens
+                      if token['surface'] == '重听'}
     return [
         {
             'rule_id': RULE_ID,
@@ -572,26 +614,15 @@ def _find_existing_relisten_interventions(text: str) -> list[dict]:
 def _native_tokens(text):
     """Full unchanged native words with raw-text offsets and Chinese-span IDs."""
     from misaki import zh
-    tokens = []
-    for segment_index, segment_match in enumerate(_SEGMENTS.finditer(text)):
-        segment = segment_match.group()
-        if not '\u4E00' <= segment[0] <= '\u9FFF':
-            continue
-        words = zh.jieba.lcut(segment, cut_all=False)
-        if ''.join(words) != segment:
-            raise RuntimeError('Cannot establish full native token offsets')
-        cursor = segment_match.start()
-        for word in words:
-            tokens.append({'surface': word, 'start': cursor, 'end': cursor + len(word),
-                           'segment': segment_index})
-            cursor += len(word)
-    return tokens
+    return [{'surface': word, 'start': start, 'end': end, 'segment': index}
+            for index, (_, words) in enumerate(_native_segments(zh, text))
+            for word, start, end in words]
 
 def find_context_interventions(text: str) -> list[dict]:
     if not re.search(r'重听|重来|重试|数清|长椅', text):
         return []
-    interventions = _find_existing_relisten_interventions(text)
     tokens = _native_tokens(text)
+    interventions = _find_existing_relisten_interventions(text, tokens)
 
     def add(surface, position, consumed, pattern):
         if text[position:position + len(surface)] != surface:
@@ -663,49 +694,12 @@ class ContextualZHG2P:
         return getattr(self.upstream, name)
 
     def _render(self, prepared: str, fixes: dict[int, str]) -> str:
-        zh = self._native
-        rendered = []
-        applied = set()
         authorized = {item['start']: item['pinyin_override_at_start']
                       for item in find_context_interventions(prepared)} if fixes else {}
-        if any(authorized.get(position) != pinyin for position, pinyin in fixes.items()):
+        if any(position not in authorized or authorized[position] != pinyin
+               or prepared[position] not in ('重', '数', '长') for position, pinyin in fixes.items()):
             raise RuntimeError('An override is not authorized at that exact native context offset')
-        for segment_match in _SEGMENTS.finditer(prepared):
-            segment = segment_match.group()
-            if not '\u4E00' <= segment[0] <= '\u9FFF':
-                rendered.append(segment)
-                continue
-            # Same tokenizer, cut mode, word order and inter-word spaces as
-            # Misaki 0.9.4 ZHG2P.legacy_call.  No add_word/load_dict calls.
-            words = zh.jieba.lcut(segment, cut_all=False)
-            if ''.join(words) != segment:
-                raise RuntimeError('Native jieba offsets do not reproduce the full Chinese segment')
-            word_outputs = []
-            cursor = segment_match.start()
-            for word in words:
-                positions = [p for p in fixes if cursor <= p < cursor + len(word)]
-                if not positions:
-                    word_outputs.append(zh.ZHG2P.word2ipa(word))
-                else:
-                    if any(not cursor <= position < cursor + len(word) for position in positions):
-                        raise RuntimeError('The override is outside the complete native token')
-                    # Identical per-word pinyin API/arguments used by
-                    # ZHG2P.word2ipa; replace only the context-bound syllable.
-                    pinyins = zh.lazy_pinyin(word, style=zh.Style.TONE3,
-                                            neutral_tone_with_five=True)
-                    if len(pinyins) != len(word):
-                        raise RuntimeError('Cannot establish a one-syllable-per-character word offset')
-                    for position in positions:
-                        if prepared[position] not in ('重', '数', '长'):
-                            raise RuntimeError('Context override target character changed')
-                        pinyins[position - cursor] = fixes[position]
-                        applied.add(position)
-                    word_outputs.append(''.join(zh.ZHG2P.py2ipa(py) for py in pinyins))
-                cursor += len(word)
-            rendered.append(' '.join(word_outputs))
-        if applied != set(fixes):
-            raise RuntimeError('Not all word-scoped overrides were applied')
-        return ''.join(rendered).replace(chr(815), '')
+        return _render_native_zh(self._native, prepared, fixes)
 
     def __call__(self, text, en_callable=None):
         # Normal input takes the untouched upstream implementation directly.
@@ -898,14 +892,7 @@ class PolyphoneContextG2P:
         return self._call(span,en_callable=en_callable,bound_targets=targets,expected_prepared=prepared)
 
     def _words(self,prepared):
-        words=[]
-        for segment in _SEGMENTS.finditer(prepared):
-            if not '\u4E00'<=segment.group()[0]<='\u9FFF':continue
-            tokens=self._native.jieba.lcut(segment.group(),cut_all=False)
-            if ''.join(tokens)!=segment.group():raise RuntimeError('Native token offsets do not reproduce the Chinese span')
-            cursor=segment.start()
-            for word in tokens:words.append((word,cursor,cursor+len(word)));cursor+=len(word)
-        return words
+        return [word for _, words in _native_segments(self._native, prepared) for word in words]
 
     def _phrase_targets(self,text,words,protected_spans=()):
         """Match only complete consecutive native words using the compiled trie."""
@@ -960,25 +947,7 @@ class PolyphoneContextG2P:
         return {item['start']:item['pinyin_override_at_start']for item in finder(prepared)}
 
     def _render(self,prepared,fixes):
-        zh=self._native;rendered=[];applied=set()
-        for segment in _SEGMENTS.finditer(prepared):
-            value=segment.group()
-            if not '\u4E00'<=value[0]<='\u9FFF':rendered.append(value);continue
-            words=zh.jieba.lcut(value,cut_all=False)
-            if ''.join(words)!=value:raise RuntimeError('Cannot reproduce native word boundaries')
-            outputs=[];cursor=segment.start()
-            for word in words:
-                positions=[p for p in fixes if cursor<=p<cursor+len(word)]
-                if not positions:outputs.append(zh.ZHG2P.word2ipa(word))
-                else:
-                    pinyins=zh.lazy_pinyin(word,style=zh.Style.TONE3,neutral_tone_with_five=True)
-                    if len(pinyins)!=len(word):raise RuntimeError('Cannot establish exact one-syllable character offsets')
-                    for position in positions:pinyins[position-cursor]=fixes[position];applied.add(position)
-                    outputs.append(''.join(zh.ZHG2P.py2ipa(py)for py in pinyins))
-                cursor+=len(word)
-            rendered.append(' '.join(outputs))
-        if applied!=set(fixes):raise RuntimeError('Not all exact syllable offsets were applied')
-        return ''.join(rendered).replace(chr(815),'')
+        return _render_native_zh(self._native, prepared, fixes)
 
     def __call__(self,text,en_callable=None):
         return self._call(text,en_callable=en_callable)
@@ -1062,6 +1031,7 @@ class Frontend:
             reserved_casefold=set(case_terms) | {word.casefold() for word in required})
         class ExactTermG2P(en.G2P):
             _source_span = ContextVar('xiaoyou_english_source_span', default=None)
+            _spell_letters = ContextVar('xiaoyou_english_spell_letters', default=False)
 
             def __call__(self, text, *args, **kwargs):
                 with extension.scope(text, self._source_span.get()):
@@ -1074,14 +1044,16 @@ class Frontend:
                 finally:
                     self._source_span.reset(source_token)
 
-            def call_literal(self, normalized, start, end, reading):
-                # Keep the ORIGINAL filename scope while speaking its generated
+            def call_literal(self, normalized, start, end, reading, *, spell_letters=False):
+                # Keep the ORIGINAL literal scope while speaking its generated
                 # structure. Existing source-span guards reject casefold term
                 # aliases inside it; canonical required readings stay native.
                 source_token = self._source_span.set((normalized, start, end, _protected_term_spans(normalized)))
+                spelling_token = self._spell_letters.set(spell_letters)
                 try:
                     return self(reading)
                 finally:
+                    self._spell_letters.reset(spelling_token)
                     self._source_span.reset(source_token)
 
             def tokenize(self, text, tokens, features):
@@ -1091,12 +1063,15 @@ class Frontend:
                 # Explicit user phonemes remain authoritative.
                 cursor = 0
                 source_span = self._source_span.get()
+                spell_letters = self._spell_letters.get()
                 for index, token in enumerate(native_tokens):
                     local_start = text.find(token.text, cursor)
                     local_end = local_start + len(token.text)
                     cursor = max(cursor, local_end)
                     # Keep the four original user/native readings unchanged.
                     phones = required.get(token.text)
+                    if spell_letters and len(token.text) == 1 and 'A' <= token.text <= 'Z':
+                        phones = self.lexicon.golds[token.text]
                     record = case_terms.get(token.text.casefold()) if token.text.isascii() else None
                     if phones is None and record is not None and token.text != record['canonical'] and local_start >= 0:
                         source, a, b = text, local_start, local_end
@@ -1123,7 +1098,7 @@ class Frontend:
 
         self.en = ExactTermG2P(trf=False, british=False,
                               fallback=extension.wrap_fallback(espeak.EspeakFallback(british=False)), unk='❓')
-        extension.bind_native(self.en.lexicon)
+        extension.bind_native(self.en.lexicon, en.TokenContext())
         self.english_lexicon = extension
         self.zh = PolyphoneContextG2P(
             ContextualZHG2P(zh.ZHG2P(version=None, unk='❓')),
@@ -1164,7 +1139,11 @@ class Frontend:
         # Their numbers are rendered only in phonemize_normalized, with the
         # complete original normalized offsets retained for scoped Chinese G2P.
         if not isinstance(text,str):return numeric.normalize_context(text,language,auto_fallback=auto_fallback)
-        versions=_version_spans(text,0,len(text))
+        # Strip decorative graphemes before calculating any protected spans.
+        # A separating space keeps adjacent words and numbers distinct.
+        text = _EMOJI.sub(lambda match: match['key'] or ' ', text)
+        addresses=tuple(numeric.address_ranges(text,include_absolute_paths=True))
+        versions=_version_spans(text,0,len(text),addresses)
         if not versions:return numeric.normalize_context(text,language,auto_fallback=auto_fallback)
         parts=[];mapping=[];cursor=0
         for a,b,value in versions:
@@ -1225,42 +1204,62 @@ class Frontend:
         version_language=language if normalization_language is None else normalization_language
         if version_language not in ('auto','mixed','zh','en'):raise ValueError('Unsupported version language')
         numeric._validate_auto_fallback(auto_fallback)
+        addresses=tuple(numeric.address_ranges(normalized,include_absolute_paths=True))
+        events=[]
+        for a,b in addresses:
+            if a<start<b or a<end<b:
+                raise ValueError('Semantic span splits a complete address')
+            if start<=a<b<=end:events.append((a,b,normalized[a:b],'address'))
         filenames=[]
         for a,b in numeric.filename_spans(normalized):
+            if any(lo<b and a<hi for lo,hi in addresses):
+                continue
             if a<start<b or a<end<b:
                 raise ValueError('Semantic span splits a complete filename')
             if start<=a<b<=end:filenames.append((a,b,normalized[a:b]))
-        versions=[item for item in _version_spans(normalized,start,end)
+        versions=[item for item in _version_spans(normalized,start,end,addresses)
                   if not any(a<item[1] and item[0]<b for a,b,_ in filenames)]
-        filename_readings=[]
-        events=sorted([(a,b,value,'version')for a,b,value in versions]+
-                      [(a,b,value,'filename')for a,b,value in filenames])
-        if events:
-            result=[]
+        filename_readings=[];address_readings=[]
+        events.extend((a,b,value,'version') for a,b,value in versions)
+        events.extend((a,b,value,'filename') for a,b,value in filenames)
+        english_only = not _HAN.search(span) and language in ('auto', 'mixed', 'en')
+        if english_only and not events:
+            phonemes = self.en.call_span(normalized, start, end)[0]
+        else:
+            result = []
+
+            def plain(a, b):
+                if not normalized[a:b].strip():
+                    return
+                if english_only:
+                    result.append(self.en.call_span(normalized, a, b)[0])
+                    return
+                cursor = a
+                for latin_start, latin_end in self._english_spans(normalized, a, b):
+                    if normalized[cursor:latin_start].strip():
+                        result.append(self.zh.call_span(normalized, cursor, latin_start)[0])
+                        interventions.extend(self.zh.last_interventions)
+                    result.append(self.en.call_span(normalized, latin_start, latin_end)[0])
+                    cursor = latin_end
+                if normalized[cursor:b].strip():
+                    result.append(self.zh.call_span(normalized, cursor, b)[0])
+                    interventions.extend(self.zh.last_interventions)
+
             with self.zh.full_context(normalized, protected_spans=_protected_term_spans(normalized)):
-                def plain(a,b):
-                    if a==b or not normalized[a:b].strip():return
-                    if not _HAN.search(span) and language in ('auto','mixed','en'):
-                        result.append(self.en.call_span(normalized,a,b)[0]);return
-                    cursor=a
-                    for latin_start,latin_end in self._english_spans(normalized,a,b):
-                        if cursor<latin_start and normalized[cursor:latin_start].strip():
-                            result.append(self.zh.call_span(normalized,cursor,latin_start)[0]);interventions.extend(self.zh.last_interventions)
-                        result.append(self.en.call_span(normalized,latin_start,latin_end)[0]);cursor=latin_end
-                    if cursor<b and normalized[cursor:b].strip():
-                        result.append(self.zh.call_span(normalized,cursor,b)[0]);interventions.extend(self.zh.last_interventions)
                 cursor=start
-                for a,b,value,kind in events:
+                for a,b,value,kind in sorted(events):
                     plain(cursor,a)
-                    lang=_version_language(normalized,a,version_language,auto_fallback)
+                    fallback=(auto_fallback or 'zh') if kind=='address' else auto_fallback
+                    lang=_version_language(normalized,a,version_language,fallback)
                     if kind=='version':
                         reading=_version_reading(value,lang)
                         result.append(self.zh(reading)[0] if lang=='zh' else self.en(reading)[0])
                         version_readings.append({'source_span':[a,b],'source_text':value,'components':value.split('.'),'language':lang,'reading':reading,'rule':'explicit_version_components_preserve_dots_and_leading_zeros'})
                     else:
-                        reading=_filename_reading(value,lang)
+                        is_address=kind=='address'
+                        reading=numeric.read_address(value,lang.upper()) if is_address else _filename_reading(value,lang)
                         if lang=='en':
-                            result.append(self.en.call_literal(normalized,a,b,reading)[0])
+                            result.append(self.en.call_literal(normalized,a,b,reading,spell_letters=is_address)[0])
                         else:
                             # Generated words get their own exact Chinese scope;
                             # the article and every original offset stay intact.
@@ -1269,27 +1268,17 @@ class Frontend:
                                 for match in _LATIN.finditer(reading):
                                     if local<match.start() and reading[local:match.start()].strip():
                                         result.append(self.zh.call_span(reading,local,match.start())[0])
-                                    result.append(self.en.call_literal(normalized,a,b,match.group())[0])
+                                    result.append(self.en.call_literal(normalized,a,b,match.group(),spell_letters=is_address)[0])
                                     local=match.end()
                                 if local<len(reading) and reading[local:].strip():
                                     result.append(self.zh.call_span(reading,local,len(reading))[0])
-                        filename_readings.append({'source_span':[a,b],'source_text':value,'language':lang,
-                            'reading':reading,'rule':'whole_filename_digit_identity_and_explicit_separators'})
+                        record={'source_span':[a,b],'source_text':value,'language':lang,'reading':reading}
+                        if is_address:
+                            address_readings.append(record)
+                        else:
+                            filename_readings.append(dict(record,rule='whole_filename_digit_identity_and_explicit_separators'))
                     cursor=b
                 plain(cursor,end)
-            phonemes=' '.join(result)
-        elif not _HAN.search(span) and language in ('auto','mixed','en'):
-            phonemes=self.en.call_span(normalized,start,end)[0]
-        else:
-            result=[]
-            with self.zh.full_context(normalized, protected_spans=_protected_term_spans(normalized)):
-                cursor=start
-                for latin_start,latin_end in self._english_spans(normalized,start,end):
-                    if cursor<latin_start and normalized[cursor:latin_start].strip():
-                        result.append(self.zh.call_span(normalized,cursor,latin_start)[0]);interventions.extend(self.zh.last_interventions)
-                    result.append(self.en.call_span(normalized,latin_start,latin_end)[0]);cursor=latin_end
-                if cursor<end and normalized[cursor:end].strip():
-                    result.append(self.zh.call_span(normalized,cursor,end)[0]);interventions.extend(self.zh.last_interventions)
             phonemes=' '.join(result)
         phonemes=re.sub(r'\s+',' ',phonemes).strip();unknown=sorted(set(phonemes)-set(self.vocab))
         if unknown:raise ValueError(f'Unknown phoneme symbols: {unknown!r}')
@@ -1298,6 +1287,8 @@ class Frontend:
         self.last_plan={'text':span,'normalization_language':version_language,'normalized_text':normalized,
                         'normalized_span':[start,end],'phonemes':phonemes,'token_ids':ids,
                         'interventions':interventions,'version_readings':version_readings,'filename_readings':filename_readings,'auto_fallback':auto_fallback,'normalization_already_applied':True}
+        if address_readings:
+            self.last_plan['address_readings']=address_readings
         return phonemes,ids
 
     def __call__(self,text,language='auto',*,normalization_language=None,auto_fallback=None):

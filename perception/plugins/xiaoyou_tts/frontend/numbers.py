@@ -7,27 +7,32 @@ import ipaddress
 import re
 import unicodedata
 
-from plugins.vits2_tts_trt.frontend.math_units import _OPERATORS as SHARED_OPERATORS, _UNITS as SHARED_UNITS
-from plugins.vits2_tts_trt.frontend.number_context import find_calendar_spans
+from plugins.vits2_tts_trt.frontend.math_units import (
+    _NUMBER as _V4_NUMBER, _OPERATORS as SHARED_OPERATORS, _UNIT_END,
+    _UNITS as SHARED_UNITS, _comparison_prefix, has_explicit_math_context,
+)
+from plugins.vits2_tts_trt.frontend.number_context import (
+    _DASH, _DAYS, _DIGITS, _IDENTIFIER_CONTRAST, _ID_CUED, _ID_OWNER_CUED, _MONTHS,
+    _NUMBERED_ID, _TRAILING_FOUR_DIGITS, _ZH_TRAILING_FOUR_DIGITS,
+    _digits, _identifier, protected_identifier_ranges,
+)
+from plugins.vits2_tts_trt.frontend.special_text import (
+    _ADDRESSES, _EMAIL, _SYMBOLS, _URL, read_numeric_literal, verbalize_chinese_number,
+)
 
 
 class NormalizationError(ValueError):
     pass
 
-_DIGITS_ZH = '零一二三四五六七八九'
-_SMALL_EN = ('zero one two three four five six seven eight nine ten eleven twelve '
-             'thirteen fourteen fifteen sixteen seventeen eighteen nineteen').split()
+_SMALL_EN = _DIGITS['EN'] + 'ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen'.split()
 _TENS_EN = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety']
-_MONTHS = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
-           'September', 'October', 'November', 'December']
-_DAY_ORDINAL = {1:'first',2:'second',3:'third',4:'fourth',5:'fifth',6:'sixth',7:'seventh',
- 8:'eighth',9:'ninth',10:'tenth',11:'eleventh',12:'twelfth',13:'thirteenth',14:'fourteenth',
- 15:'fifteenth',16:'sixteenth',17:'seventeenth',18:'eighteenth',19:'nineteenth',20:'twentieth',
- 21:'twenty first',22:'twenty second',23:'twenty third',24:'twenty fourth',25:'twenty fifth',
- 26:'twenty sixth',27:'twenty seventh',28:'twenty eighth',29:'twenty ninth',30:'thirtieth',31:'thirty first'}
 _PLAIN_NUMBER = r'[+\-−]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)'
 _PLAIN_LEFT = r'(?<![A-Za-z0-9_./+=\-])'
 _PLAIN_RIGHT = r'(?![A-Za-z0-9_]|\.\d|,\d)'
+_COMPARISON = r'==|!=|<=|>=|[=<>≤≥≠]'
+_SUBTRACTION_COMPARISON = re.compile(
+    r'[ \t]*(?:\)[ \t]*)?(?:' + _COMPARISON + r')[ \t]*'
+    r'(?=[+\-−]?(?:[0-9]|\.[0-9]|[A-Za-z](?![A-Za-z0-9_])))')
 _HTTP = r'(?<![A-Za-z0-9_])HTTP(?:/(?:1\.0|1\.1|2|3))?'
 _HTTP_LABELS = (
     _HTTP + r'[ \t]*(?:(?:接口|请求|响应)[ \t]*)?(?:返回|报错|提示|显示)(?:[ \t]*(?:状态码|错误码|错误代码))?',
@@ -50,32 +55,11 @@ _HTTP_CODE = re.compile(
 )
 
 
-def _zh_group(n):
-    out = []; zero = False
-    for power, suffix in ((1000,'千'),(100,'百'),(10,'十'),(1,'')):
-        digit, n = divmod(n, power)
-        if digit:
-            if zero and out: out.append('零')
-            if not (digit == 1 and power == 10 and not out): out.append(_DIGITS_ZH[digit])
-            out.append(suffix); zero = False
-        elif out and n: zero = True
-    return ''.join(out)
-
-
 def _zh_int(n):
-    if n == 0: return '零'
-    if n < 0: return '负' + _zh_int(-n)
-    if n >= 10**16: raise NormalizationError('Typed numeric value exceeds supported16 digits')
-    parts = []; previous = False; zero = False
-    for base, suffix in ((10**12,'兆'),(10**8,'亿'),(10**4,'万'),(1,'')):
-        group, n = divmod(n, base)
-        if group:
-            if previous and (zero or group < 1000): parts.append('零')
-            chunk = _zh_group(group)
-            if previous and 10 <= group < 20: chunk = '一' + chunk
-            parts.append(chunk + suffix); previous = True; zero = False
-        elif previous and n: zero = True
-    return ''.join(parts)
+    if abs(n) >= 10**16:
+        raise NormalizationError('Typed numeric value exceeds supported16 digits')
+    # Xiao's quantities use 兆 at 10^12. Its formulas retain 万亿.
+    return verbalize_chinese_number(str(n)).replace('万亿', '兆')
 
 
 def _en_int(n):
@@ -108,13 +92,12 @@ def speak_number(value, language='zh', digit_by_digit=False):
     """Read a parsed number only; callers must first identify its typed context."""
     language = 'en' if language == 'en' else 'zh'
     sign, integer, fraction = _parse_number(value)
-    words = _SMALL_EN if language == 'en' else _DIGITS_ZH
     if digit_by_digit:
-        whole = (' ' if language == 'en' else '').join(words[int(ch)] for ch in integer)
-    else: whole = _en_int(int(integer)) if language == 'en' else _zh_int(int(integer))
+        whole = _digits(integer, language.upper())
+    else:
+        whole = _en_int(int(integer)) if language == 'en' else _zh_int(int(integer))
     if fraction is not None:
-        tail = (' ' if language == 'en' else '').join(words[int(ch)] for ch in fraction)
-        whole += (' point ' if language == 'en' else '点') + tail
+        whole += (' point ' if language == 'en' else '点') + _digits(fraction, language.upper())
     if sign: whole = ({'en':{'+':'plus ','-':'minus '},'zh':{'+':'正','-':'负'}}[language][sign]) + whole
     return whole
 
@@ -160,6 +143,8 @@ def protect_identifiers(text):
     # Alphanumeric version/model identifiers, excluding adjacent currency codes.
     for match in re.finditer(r'(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_.\-]*[A-Za-z0-9_]',text):
         word = match.group()
+        if re.fullmatch(r'[A-Za-z]-[0-9]+', word) and _SUBTRACTION_COMPARISON.match(text, match.end()):
+            continue
         if any(ch.isdigit() for ch in word) and not re.match(r'(?i)^(?:CNY|RMB|USD|EUR)\d|^UTC-\d',word) and not(word=='cm2' and re.search(r'\d\s*$',text[:match.start()])):
             spans.append(match.span())
     # Preserve valid bare IPv6 addresses; ordinary clock triples are not IPv6.
@@ -189,7 +174,7 @@ def _read_date(year,month,day,language):
     year,month,day = int(year),int(month),int(day)
     try: date(year,month,day)
     except ValueError as error: raise NormalizationError('Invalid calendar date') from error
-    if language == 'en': return _MONTHS[month] + ' ' + _DAY_ORDINAL[day] + ' ' + _en_int(year)
+    if language == 'en': return _MONTHS[month] + ' ' + _DAYS[day] + ' ' + _en_int(year)
     return speak_number(str(year),'zh',True) + '年' + _zh_int(month) + '月' + _zh_int(day) + '日'
 
 
@@ -250,11 +235,9 @@ def _normalize_protected_http_codes(protected, mapping, language):
     def read(match):
         lang = context_language(match.string, match.start(), match.end(), language)
         label, code = match['label'], match['code']
-        if lang == 'en':
-            if label and label[-1].isalnum():
-                label += ' '
-            return label + ' '.join(_SMALL_EN[int(digit)] for digit in code)
-        return label + ''.join(_DIGITS_ZH[int(digit)] for digit in code)
+        if lang == 'en' and label and label[-1].isalnum():
+            label += ' '
+        return label + _digits(code, lang.upper())
 
     return _HTTP_CODE.sub(read, protected)
 
@@ -267,7 +250,8 @@ def normalize_general(text,language='auto'):
     def lang(match):return context_language(match.string,match.start(),match.end(),language)
     # Full calendar/date spans precede any arithmetic or generic NFKC handling.
     iso=re.compile(_PLAIN_LEFT+r'(?P<y>\d{4})(?P<sep>[-/])(?P<m>\d{1,2})(?P=sep)(?P<d>\d{1,2})(?![A-Za-z0-9_/\-])')
-    protected=iso.sub(lambda m:_read_date(m['y'],m['m'],m['d'],lang(m)),protected)
+    protected=iso.sub(lambda m: m.group() if has_explicit_math_context(m.string, m.start())
+                      else _read_date(m['y'],m['m'],m['d'],lang(m)),protected)
     chinese=re.compile(_PLAIN_LEFT+r'(?P<y>\d{4})\s*年\s*(?P<m>\d{1,2})\s*月\s*(?P<d>\d{1,2})\s*[日号]')
     protected=chinese.sub(lambda m:_read_date(m['y'],m['m'],m['d'],lang(m)),protected)
     # UTC offsets are typed timezones, not arithmetic or ordinary clocks.
@@ -360,6 +344,11 @@ class NumericNormalizationError(ValueError):
 
 # A prose comma is not part of the number; internal commas remain validated.
 _NUMBER=r'[+\-−]?(?:[0-9](?:[0-9,]*[0-9])?(?:\.[0-9]+)?|\.[0-9]+)'
+_SCIENTIFIC = r'(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)[eE][+\-−]?[0-9]+'
+_SIGNED_SCIENTIFIC = re.compile(r'[+\-−]?' + _SCIENTIFIC)
+_OPAQUE_SCIENTIFIC_COMPARISON = re.compile(
+    r'(?<=\ue001)[ \t]*(?P<op>' + _COMPARISON + r')[ \t]*(?='
+    + _SIGNED_SCIENTIFIC.pattern + r'(?![A-Za-z0-9_]))')
 _LEFT=r'(?<![A-Za-z0-9_./+\-=])'
 _RIGHT=r'(?![A-Za-z0-9_]|\.[0-9]|,[0-9])'
 _DATE=re.compile(_LEFT+r'(?P<y>[0-9]{4})(?P<sep>[-/])(?P<m>[0-9]{1,2})(?P=sep)(?P<d>[0-9]{1,2})(?![A-Za-z0-9_/\-])')
@@ -393,7 +382,9 @@ _EXTRA_UNITS={
 # Case is semantic: milli m and mega M, byte B and bit b remain distinct.
 # Only numeric quantities admit the explicit nonstandard kJ spelling aliases.
 _EXTRA_UNITS.update({
- **{name: SHARED_UNITS[name] for name in ('mW', 'kW', '°F', 'µs', 'μs', 'mm', 'km', 'm³', 'km/h')},
+ **{name: SHARED_UNITS[name] for name in (
+  'mW', 'kW', '°F', 'µs', 'μs', 'µm', 'μm', 'µW', 'μW', 'mm', 'km', 'm³', 'km/h', 'dB',
+ )},
  'J':('焦耳','joule','joules'), 'mJ':('毫焦','millijoule','millijoules'),
  'kJ':('千焦','kilojoule','kilojoules'), 'MJ':('兆焦','megajoule','megajoules'),
  'GJ':('吉焦','gigajoule','gigajoules'),
@@ -419,6 +410,8 @@ _EXTRA_UNITS.update({
  'Pa':('帕','pascal','pascals'), 'kPa':('千帕','kilopascal','kilopascals'),
  'MPa':('兆帕','megapascal','megapascals'),
  'L':('升','liter','liters'), 'mL':('毫升','milliliter','milliliters'),
+ 'mg/L':('毫克每升','milligram per liter','milligrams per liter'),
+ 'mg/mL':('毫克每毫升','milligram per milliliter','milligrams per milliliter'),
  'KB':('千字节','kilobyte','kilobytes'),
  'kb':('千比特','kilobit','kilobits'),
 })
@@ -426,7 +419,10 @@ _UNIT_ALIASES={'kj':'kJ','Kj':'kJ','KJ':'kJ'}
 for _alias,_canonical in _UNIT_ALIASES.items():
  _EXTRA_UNITS[_alias]=_EXTRA_UNITS[_canonical]
 
-_UNIT_NAMES = '|'.join(re.escape(name) for name in sorted(_UNITS.keys() | _EXTRA_UNITS.keys(), key=lambda name: (-len(name), name)))
+_UNIT_NAMES = '|'.join(
+    re.escape(name).replace('/', r'[ \t]*/[ \t]*')
+    for name in sorted(_UNITS.keys() | _EXTRA_UNITS.keys(), key=lambda name: (-len(name), name))
+)
 _METRIC_FIELD = re.compile(
     _METRIC_COMPARISON.pattern + _NUMBER + r'(?:[ \t]*(?:' + _UNIT_NAMES + r')(?![A-Za-z0-9_]))?', re.I)
 
@@ -449,7 +445,7 @@ _GPU_MODEL=re.compile(r'(?<![A-Za-z0-9_./\\-])(?P<family>RTX|GTX)[ \t]*(?P<model
 _MD_RIGHT=r'(?![A-Za-z0-9_/\\-]|\.[A-Za-z0-9_.])'
 _MD_FIELD=re.compile(r'(?P<label>日期[ \t]*(?:(?:为|是|[:：])[ \t]*)?)(?P<m>[0-9]{1,2})/(?P<d>[0-9]{1,2})'+_MD_RIGHT)
 _MD_EVENT=re.compile(r'(?P<label>(?:改到|定于|安排在|定在)[ \t]*)(?P<m>[0-9]{1,2})/(?P<d>[0-9]{1,2})'+_MD_RIGHT+r'(?=[ \t]*(?:举行|召开|开幕|开始|进行))')
-_EN_MD_CALENDAR=re.compile(r'(?<![A-Za-z0-9_])(?:date[ \t]*(?:(?:is|was|[:=])[ \t]*)?|(?:scheduled[ \t]+(?:for|on)|(?:meeting|event|appointment)[ \t]+(?:is[ \t]+)?on)[ \t]+)[0-9]{1,2}/[0-9]{1,2}'+_MD_RIGHT,re.I)
+_EN_MD_CALENDAR=re.compile(r'(?<![A-Za-z0-9_])(?:date[ \t]*(?:(?:is|was|[:=])[ \t]*)?|(?:scheduled[ \t]+(?:for|on)|(?:meeting|event|appointment)[ \t]+(?:is[ \t]+)?on|^[ \t]*on)[ \t]+)[0-9]{1,2}/[0-9]{1,2}'+_MD_RIGHT,re.I)
 
 # Keep model-specific unit aliases ahead of calendar inference.
 _CALENDAR_UNITS = set(_EXTRA_UNITS)
@@ -459,15 +455,318 @@ _CALENDAR_EXTRA_QUANTITY = re.compile(
     r'[ \t]*(?:' + '|'.join(map(re.escape, sorted(_CALENDAR_UNITS))) + r')(?![A-Za-z0-9_])', re.I)
 
 
-def _read_calendar_fields(text, language):
+def _replace_spans(text, spans):
     pieces = []
     cursor = 0
-    for start, end, spoken in find_calendar_spans(
-            text, language, lambda value, lang: speak_number(value, lang.lower()),
-            extra_quantity=_CALENDAR_EXTRA_QUANTITY):
+    for start, end, spoken in spans:
         pieces.extend((text[cursor:start], spoken))
         cursor = end
     return ''.join((*pieces, text[cursor:])) if pieces else text
+
+
+_DATE_POINT = (
+    r"[0-9]{4}(?:\.[0-9]{1,2}\.[0-9]{1,2}|/[0-9]{1,2}/[0-9]{1,2}|-[0-9]{1,2}-[0-9]{1,2})"
+    r"|[0-9]{1,2}[./][0-9]{1,2}"
+)
+
+
+def _calendar_pattern(last_point):
+    return re.compile(
+        rf"(?<![A-Za-z0-9_./\\+\-=])(?P<first>{_DATE_POINT})"
+        rf"(?:[ \t]*(?:[{_DASH}—~～]|到|至|\bto\b)[ \t]*(?P<last>{last_point}))?"
+        rf"(?![A-Za-z0-9_/\\]|\.[A-Za-z0-9_.]|[{_DASH}—][0-9])", re.I,
+    )
+
+
+_CALENDAR_FIELD = _calendar_pattern(_DATE_POINT + r"|[0-9]{1,2}-[0-9]{1,2}")
+_CALENDAR_CUE = re.compile(
+    r"(?:假期|放假|休假|假日|日程|日期|元旦|(?:会议|预约|活动|考试)(?:日期|时间|安排在|定于)|"
+    r"\b(?:dates?|deadline|holiday|vacation)\b)"
+    r"(?:[ \t:：（(]|大概率|预计|可能|安排|从|在|是|为|开始|结束|范围|\b(?:is|are|from|on|runs?)\b)*$", re.I,
+)
+_DOTTED_DATE_CUE = re.compile(
+    r"(?:今天|明天|昨天|后天|前天)[ \t]*(?:是|为)?[ \t]*$"
+    r"|(?:定于|安排在|计划在)[ \t]*$"
+    r"|\b(?:today|tomorrow|yesterday|release|launch)[ \t]+"
+    r"(?:is|was|for|on|on the)[ \t]*$",
+    re.I,
+)
+# Recognize dates in event and deadline prose using local cues.
+_CALENDAR_ZH_EVENT = re.compile(
+    r"(?:会议|预约|活动|考试|直播|演出|比赛|发布会|展会)[ \t]*"
+    r"(?:时间(?:是|为)?|定于|安排在|改到|改为|定在|延期至|提前到|推迟到|(?:将)?[于在])[ \t]*$"
+)
+_CALENDAR_EN_EVENT = re.compile(
+    r"\b(?:(?:we|they|you|I|he|she)[ \t]+(?:(?:will|shall)[ \t]+)?"
+    r"(?:returns?|arrives?|departs?|resumes?)[ \t]+on|"
+    r"scheduled[ \t]+(?:for|on)|"
+    r"(?:meetings?|appointments?|events?|sessions?|flights?|interviews?)[ \t]+"
+    r"(?:(?:is|are|starts?|begins?)[ \t]+)?on|(?:archive[sd]?|archiving)[ \t]+on)[ \t]+$",
+    re.I,
+)
+_CALENDAR_SHORT_EN_LABEL = re.compile(r"\b(?:dates?|deadline)[ \t]*(?:(?:is|was|:)[ \t]*)?$", re.I)
+_CALENDAR_LEADING_ON = re.compile(r"^[ \t]*on[ \t]+$", re.I)
+_CALENDAR_SHORT_ZH_LABEL = re.compile(r"(?:日期|生日)[ \t]*(?:(?:是|为|[:：])[ \t]*)?$")
+_CALENDAR_DEADLINE = re.compile(r"(?:于|在|截至|截止(?:到|至)?)[ \t]*$")
+_CALENDAR_DEADLINE_TAIL = re.compile(r"[ \t]*前[ \t]*(?:提交|递交|上交|交付|报名|缴费|付款|报到|完成|办完)")
+_CALENDAR_ZH_EVENT_TAIL = re.compile(r"[ \t]*(?:举行|召开|开幕|开始|进行|上午|下午|早上|晚上)")
+_CALENDAR_ZH_ACTION_TAIL = re.compile(r"[ \t]*(?:入职|离职|出生|报到|注册|入学)")
+_CALENDAR_WEEKDAY_LEFT = re.compile(r"(?:星期|周|礼拜)[一二三四五六日天][ \t]*$")
+_CALENDAR_BIRTHDAY_TAIL = re.compile(r"[ \t]*(?:是|为)[ \t]*(?:(?:我|你|他|她|您)的)?(?:生日|诞辰)")
+_CALENDAR_CLOSED = re.compile(
+    r"""[ \t]*(?:[)）\]】"'”’」』][ \t]*)*(?:$|[。！？!?;；,，\r\n]|\.(?![A-Za-z0-9_]))"""
+)
+_CALENDAR_EN_CLOCK_TAIL = re.compile(
+    r"[ \t]+at[ \t]+(?P<h>\d{1,2}):(?P<m>\d{2})(?::(?P<s>\d{2}))?"
+    r"(?:[ \t]*(?P<period>[ap]\.?m\.?))?(?![A-Za-z0-9_:]|[./]\d|[%％‰])", re.I
+)
+_CALENDAR_NONDAY_TAIL = re.compile(
+    r"[ \t]*(?:的|版(?:本)?|折|(?i:\b(?:of|is a (?:fraction|ratio|decimal|version|identifier))\b))"
+)
+_CALENDAR_NONDATE_CUE = re.compile(
+    r"(?:版本(?:号)?|版号|型号|机型|编号|金额|数量|温度|比例|计算|算式|公式|"
+    r"\b(?:versions?|models?|builds?|calculate|equation|formula)\b)"
+    r"(?:[ \t:：=]|为|是|从|范围|\b(?:is|are|from|range)\b)*$", re.I,
+)
+_CALENDAR_QUANTITY = re.compile(
+    r"[ \t]*(?:天(?!气)|周(?![一二三四五六日天])|个月|小时|分钟|秒|[%％元℃℉]|版本(?:号)?|"
+    r"个|条|台|份|项|次|人|件|张|页|套|本|组|公里|人民币|美元|欧元|"
+    r"(?:days?|weeks?|hours?|minutes?|seconds?|months?|years?|versions?|builds?|items?|records?|requests?|devices?|people|times?|rows?)\b|"
+    + "(?:" + "|".join(map(re.escape, sorted(set(SHARED_UNITS).union(
+        reading for labels in SHARED_UNITS.values() for reading in labels)))) + r")(?![A-Za-z0-9_]))", re.I,
+)
+_HOLIDAY_DURATION = re.compile(r"[ \t]*(?:连休|放假|休假)[ \t]*[0-9一二三四五六七八九十两]+[ \t]*天")
+_WEEKDAY = re.compile(r"[ \t]*(?:是[ \t]*)?(?:星期|周|礼拜)[一二三四五六日天](?![0-9一二三四五六七八九十])")
+_ADJACENT_MATH = "=+×÷*/^≥≤≠<>|"
+
+def _english_calendar_tail(text, extra_quantity):
+    if _CALENDAR_CLOSED.match(text):
+        return True
+    clock = _CALENDAR_EN_CLOCK_TAIL.match(text)
+    if clock is None:
+        return False
+    tail = text[clock.end():]
+    if _CALENDAR_QUANTITY.match(tail) or (extra_quantity is not None and extra_quantity.match(tail)):
+        return False
+    hour = int(clock["h"])
+    valid_hour = 1 <= hour <= 12 if clock["period"] else hour <= 23
+    return valid_hour and int(clock["m"]) < 60 and int(clock["s"] or "0") < 60
+
+
+def _calendar_fields(text, extra_quantity):
+    """Yield calendar offsets and validated endpoints before arithmetic claims them."""
+    identifiers = None
+    for match in _CALENDAR_FIELD.finditer(text):
+        first, last = match["first"], match["last"]
+        left = text[max(0, match.start() - 64):match.start()]
+        right = text[match.end():]
+        parts = [int(part) for part in re.split(r"[./-]", first)]
+        has_year = len(parts) == 3
+        weekday = (
+            last is None and first.count(".") == 1
+            and (_WEEKDAY.match(right)
+                 or (_CALENDAR_WEEKDAY_LEFT.search(left) and _CALENDAR_BIRTHDAY_TAIL.match(right)))
+        )
+        zh_event = _CALENDAR_ZH_EVENT.search(left)
+        en_event = _CALENDAR_EN_EVENT.search(left) or _CALENDAR_LEADING_ON.fullmatch(text, 0, match.start())
+        date_preposition = _CALENDAR_DEADLINE.search(left)
+        deadline = date_preposition and _CALENDAR_DEADLINE_TAIL.match(right)
+        short_context = False
+        if not has_year and last is None and not _CALENDAR_NONDAY_TAIL.match(right):
+            if en_event or _CALENDAR_SHORT_EN_LABEL.search(left):
+                month, day = parts
+                if "/" in first:
+                    # With no written year or locale, only an unambiguous order is usable.
+                    if month > 12 >= day:
+                        parts = [day, month]
+                    short_context = month == day or month > 12 or day > 12
+                else:
+                    short_context = _english_calendar_tail(right, extra_quantity)
+            elif "/" in first:
+                short_context = (_CALENDAR_SHORT_ZH_LABEL.search(left) or deadline
+                                 or (zh_event and (_CALENDAR_ZH_EVENT_TAIL.match(right)
+                                                   or _CALENDAR_CLOSED.match(right))))
+        if last is None and first.count(".") != 2 and not (weekday or short_context):
+            continue
+        if (_CALENDAR_NONDATE_CUE.search(left) or _CALENDAR_QUANTITY.match(right)
+                or (extra_quantity is not None and extra_quantity.match(right))
+                or has_explicit_math_context(left, len(left))
+                or (left.rstrip()[-1:] or " ") in _ADJACENT_MATH
+                or (right.lstrip()[:1] or " ") in _ADJACENT_MATH
+                or re.match(rf"[ \t]*[{_DASH}—][ \t]*[0-9]", right)):
+            continue
+        cue = _CALENDAR_CUE.search(left)
+        if identifiers is None:
+            identifiers = tuple(protected_identifier_ranges(text))
+        if any(start < match.end() and end > match.start() for start, end in identifiers):
+            continue
+        if last is not None and last.count("-") == 1 and not (cue and has_year):
+            continue  # A short hyphenated endpoint requires a calendar cue and a year.
+        # A full dotted date needs an event, deadline, or a standalone date context.
+        dotted_prose = (
+            last is None and first.count(".") == 2
+            and (zh_event or en_event or deadline or _DOTTED_DATE_CUE.search(left)
+                 or (date_preposition and _CALENDAR_ZH_ACTION_TAIL.match(right))
+                 or (not text[:match.start()].strip(' \t\r\n([（【"“')
+                     and (_WEEKDAY.match(right.lstrip(" \t(（"))
+                          or not text[match.end():].strip(' \t\r\n.)]）】"”。,，!?！？;；'))))
+        )
+        if (cue is None and not (weekday or dotted_prose or short_context)
+                and (last is None or (not has_year and not _HOLIDAY_DURATION.match(right)))):
+            continue
+        year, month, day = parts if has_year else (2000, *parts)
+        try:
+            start = date(year, month, day)
+            endpoints = [(start, has_year)]
+            if last is not None:
+                tail = [int(part) for part in re.split(r"[./-]", last)]
+                end_has_year = len(tail) == 3
+                if end_has_year and not has_year:
+                    continue
+                end = date(*(tail if end_has_year else (year + (tail[0] < month), *tail)))
+                if end < start:
+                    continue
+                endpoints.append((end, end_has_year))
+        except ValueError:
+            continue
+        yield match.start(), match.end(), endpoints
+
+
+def _calendar_spans(text, language, verbalize_number, *, extra_quantity=None):
+    """Read additional calendar forms for callers that opt into them."""
+    language = language.upper()
+    zh = language == "ZH"
+
+    def speak(value, has_year):
+        if zh:
+            year = _digits(f"{value.year:04d}", language) + "年" if has_year else ""
+            return year + verbalize_number(str(value.month), language) + "月" + verbalize_number(str(value.day), language) + "日"
+        words = f"{_MONTHS[value.month]} {_DAYS[value.day]}"
+        return words + " " + verbalize_number(str(value.year), language) if has_year else words
+
+    for start, end, endpoints in _calendar_fields(text, extra_quantity):
+        if zh or endpoints[0][1] or len(endpoints) == 1:
+            yield start, end, ("至" if zh else " to ").join(speak(*part) for part in endpoints)
+
+_PHONE_CUED = re.compile(
+    rf"(?:客服电话|联系电话|电话号码|手机号(?:码)?|手机|电话|热线|"
+    rf"(?i:\b(?:phone|tel|telephone|mobile)))"
+    rf"[ \t]*(?:号码|(?i:number)\b)?[ \t]*(?:是|为|(?i:is))?[ \t]*[:：]?[ \t]*"
+    rf"(?P<number>1[3-9][0-9]{{9}}|[48]00[ \t]*[{_DASH}][ \t]*[0-9]{{3}}"
+    rf"[ \t]*[{_DASH}][ \t]*[0-9]{{4}}|\d{{2,4}}[ \t]*[{_DASH}][ \t]*\d{{7,8}})"
+    rf"(?![A-Za-z0-9_]|\.\d)"
+)
+_IDENTIFIER_SLASH_TAIL = re.compile(r'(?:/[0-9]+)+(?![A-Za-z0-9_/]|\.[A-Za-z0-9])')
+
+def _identifier_spans(text, language):
+    """Read explicitly labelled identifiers with their original digit sequence."""
+    language = language.upper()
+    spans = []
+
+    def add(start, end, spoken):
+        if not any(start < b and end > a for a, b, _ in spans):
+            spans.append((start, end, spoken))
+
+    def add_identifier_contrast(match):
+        value = match["value"]
+        if not value.isdecimal():
+            return
+        alternative = _IDENTIFIER_CONTRAST.match(text, match.end("value"))
+        # A digit-width change is ambiguous without a repeated field label.
+        if alternative is not None and len(alternative["value"]) == len(value):
+            add(alternative.start("value"), alternative.end("value"),
+                _digits(alternative["value"], language))
+
+    # An explicit field label takes priority over date/phone/unit shapes:
+    # order ID 12A is an identifier, not twelve amperes.
+    for pattern in (_TRAILING_FOUR_DIGITS, _ZH_TRAILING_FOUR_DIGITS):
+        for match in pattern.finditer(text):
+            add(match.start("value"), match.end("value"), _digits(match["value"], language))
+            add_identifier_contrast(match)
+    for match in _ID_CUED.finditer(text):
+        if any(c.isdigit() for c in match["value"]):
+            add(match.start("value"), match.end("value"), _identifier(match["value"], language))
+            add_identifier_contrast(match)
+    for match in _ID_OWNER_CUED.finditer(text):
+        if any(c.isdigit() for c in match["value"]):
+            add(match.start("value"), match.end("value"), _identifier(match["value"], language))
+            add_identifier_contrast(match)
+    for match in _NUMBERED_ID.finditer(text):
+        add(match.start(), match.end(), "N O " + _digits(match["value"], language))
+        add_identifier_contrast(match)
+    return sorted(spans)
+
+def _phone_spans(text, language):
+    for match in _PHONE_CUED.finditer(text):
+        groups = re.split(rf"\s*[{_DASH}]\s*", match["number"])
+        yield (*match.span("number"), ", ".join(_digits(group, language.upper()) for group in groups))
+
+ANGLE_UNIT = r"°(?![ \t]*[CcFf]\b|[ \t]*[0-9′″])"
+ANGLE_READINGS = ("度", "degree", "degrees")
+_PERCENT_AND_ANGLE = re.compile(
+    rf"(?<![A-Za-z0-9_.])(?P<uncertainty>±[ \t]*)?(?P<number>[+−-]?{_V4_NUMBER})[ \t]*"
+    rf"(?P<unit>%|{ANGLE_UNIT}){_UNIT_END}"
+)
+
+def _spoken_measure_span(match, language, verbalize_number):
+    zh = language.lower().startswith("zh")
+    value, unit = match["number"], match["unit"]
+    if unit == "°":
+        number = verbalize_number(value, language)
+        singular = abs(Decimal(value.replace("−", "-").replace(",", ""))) == 1
+        spoken = number + ("" if zh else " ") + ANGLE_READINGS[0 if zh else 1 if singular else 2]
+    else:
+        number = verbalize_number(value, language)
+        spoken = f"百分之 {number}" if zh else f"{number} percent"
+    if match["uncertainty"]:
+        spoken = ("正负 " if zh else "plus or minus ") + spoken
+    start, spoken = _comparison_prefix(match.string, match.start(), spoken, zh)
+    return start, match.end(), spoken
+
+
+def _percent_and_angle_spans(text, language, verbalize_number):
+    """Yield scoped measurements that need a comparison, uncertainty or degree reading."""
+    for match in _PERCENT_AND_ANGLE.finditer(text):
+        start, end, spoken = _spoken_measure_span(match, language, verbalize_number)
+        if (start < match.start() and start and text[start - 1] in "=<>!"
+                or match["unit"] == "%" and not (match["uncertainty"] or start < match.start())):
+            continue
+        yield start, end, spoken
+
+
+def _read_calendar_fields(text, language):
+    return _replace_spans(text, _calendar_spans(
+        text, language, lambda value, lang: speak_number(value, lang.lower()),
+        extra_quantity=_CALENDAR_EXTRA_QUANTITY))
+
+
+def _read_prose_measures(text, language):
+    if not any(symbol in text for symbol in ('%', '°')):
+        return text
+    spans = list(_percent_and_angle_spans(text, language, speak_number))
+    if not spans:
+        return text
+    # Leave complete expressions such as x >= 99.9% to the formula parser.
+    formulas = [(run[0].start, run[-1].end) for run in _tokens_and_runs(text) if _is_math(run)]
+    replacements = []
+    for start, end, reading in spans:
+        angle = text[end - 1] == '°'
+        number_end = end - 1 if angle else end
+        if any(a < start and number_end <= b for a, b in formulas):
+            if angle:
+                # The tokenizer handles the expression up to the degree sign.
+                suffix = ' ' + reading.rsplit(' ', 1)[-1] if language == 'en' else ANGLE_READINGS[0]
+                replacements.append((end - 1, end, suffix))
+            continue
+        if language == 'en' and start and text[start - 1].isascii() and text[start - 1].isalnum():
+            reading = ' ' + reading
+        replacements.append((start, end, reading))
+    return _replace_spans(text, replacements)
+
+
+# Fold fullwidth ASCII only after protecting literals; preserve superscripts and
+# other mathematical symbols for their typed readers.
+_FULLWIDTH_ASCII = {code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)}
 
 
 # Only standalone ASCII filenames with reviewed file suffixes enter the literal
@@ -485,6 +784,38 @@ _FILENAME_EXCLUDED=re.compile(
  r'|`[^`\n]*`'
  r'|(?<![A-Za-z0-9_])(?:[A-Za-z]:\\|\.{1,2}/|/)[A-Za-z0-9_./\\\-]+'
  r'|(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_.]*\s*=\s*(?:"(?:\\.|[^"\\\n])*"|\x27(?:\\.|[^\x27\\\n])*\x27)',re.I)
+
+_PATH_PART = r"[A-Za-z0-9_.+~%=-]+"
+_ABSOLUTE_PATH = (
+    r"(?:[A-Za-z]:[/\\]" + _PATH_PART + r"(?:[/\\]" + _PATH_PART + r")*"
+    r"|/(?:[A-Za-z_.][A-Za-z0-9_.+~%=-]*/" + _PATH_PART + r"(?:/" + _PATH_PART + r")*"
+    r"|[A-Za-z_.][A-Za-z0-9_.+~%=-]*\.[A-Za-z][A-Za-z0-9_]*))"
+)
+_ADDRESSES_AND_PATHS = re.compile(
+    r"(?<![A-Za-z0-9_./\\])(?:" + _URL + "|" + _EMAIL + "|" + _ABSOLUTE_PATH + ")", re.I)
+
+def address_ranges(text, *, include_absolute_paths=False):
+    """Return the original offsets, excluding punctuation outside each literal."""
+    pattern = _ADDRESSES_AND_PATHS if include_absolute_paths else _ADDRESSES
+    for match in pattern.finditer(text):
+        address = match.group().rstrip(".,;")
+        while address.endswith(")") and address.count(")") > address.count("("):
+            address = address[:-1]
+        while address.endswith("]") and address.count("]") > address.count("["):
+            address = address[:-1]
+        if address:
+            yield match.start(), match.start() + len(address)
+
+def read_address(value, language):
+    """Retain the V4 spelling of addresses and add the Windows path separator."""
+    symbols = {**_SYMBOLS[language], '\\': '反斜杠' if language == 'ZH' else 'backslash'}
+    return ' '.join(
+        char.upper() if char.isascii() and char.isalpha()
+        else _DIGITS[language][int(char)] if char.isascii() and char.isdigit()
+        else symbols[char]
+        for char in value
+    )
+
 
 def filename_spans(text):
  """Return whole bare filename spans; never reinterpret a path/URL/email."""
@@ -537,7 +868,7 @@ def auto_context_language(text,fallback='zh'):
  if not isinstance(text,str):raise TypeError('text must be str')
  if fallback not in ('zh','en'):raise NumericNormalizationError('fallback must be zh/en')
  if len(text)>20000:raise NumericNormalizationError('Input exceeds bounded20000 characters')
- protected,_=_protect(text);found=False
+ protected,_=_protect(text);protected=protected.translate(_FULLWIDTH_ASCII);found=False
  for clause in _clauses(protected):
   carrier=_natural_language(clause)
   if carrier is not None:fallback=carrier;found=True
@@ -555,7 +886,10 @@ def _protect(text):
   while token in text or token in mapping:i+=1;token=_token(i)
   mapping[token]=value;return token
  def stash(match):return stash_value(match.group())
- # Whole URLs must precede the base's partial path/identifier masking.
+ # Keep the same address spans intact for normalization, language routing and G2P.
+ text=_replace_spans(text,[(a,b,stash_value(text[a:b]))
+  for a,b in address_ranges(text,include_absolute_paths=True)])
+ # Preserve other opaque URLs before partial path/identifier masking.
  for pattern in [r'(?<![A-Za-z0-9_./\\])[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:\.[A-Za-z0-9_][A-Za-z0-9_.-]*)+',r'(?:https?://|ftp://|www\.)[^\s<>，。；！？]+',r'(?<![A-Za-z0-9_/])[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}(?![A-Za-z0-9_/])',_ISO_DATETIME.pattern,r'(?<![A-Za-z0-9_])[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+Z\-]+']:
   text=re.sub(pattern,stash,text,flags=re.I)
  # Preserve an entire unimplemented compound unit, never expand just its
@@ -603,10 +937,32 @@ def _clauses(text):
   yield text[previous:m.end()];previous=m.end()
  if previous<len(text):yield text[previous:]
 
+def _read_scientific(value, language):
+    mantissa, exponent = re.split('[eE]', value, maxsplit=1)
+    negative = exponent.startswith(('-', '−'))
+    exponent = speak_number(exponent.lstrip('+−-'), language)
+    coefficient = speak_number(mantissa, language)
+    if language == 'zh':
+        return coefficient + '乘以十的' + ('负' if negative else '') + exponent + '次方'
+    return coefficient + ' times ten to the power of ' + ('negative ' if negative else '') + exponent
+
+
 def _number(value,lang,digits=False):
+ if _SIGNED_SCIENTIFIC.fullmatch(value):
+  return _read_scientific(value, lang)
  # A code-like leading zero must never disappear via integer conversion.
  unsigned=value.lstrip('+-−').replace(',','').split('.')[0]
  return speak_number(value,lang,digits or(len(unsigned)>1 and unsigned.startswith('0')))
+
+def _decimal_identifier_readings(text, language):
+    for start, end, reading in _identifier_spans(text, language):
+        if not text[start:end].isdecimal():
+            continue
+        tail = _IDENTIFIER_SLASH_TAIL.match(text, end)
+        if tail:
+            end = tail.end()
+            reading = read_numeric_literal(text[start:end], language)
+        yield start, end, reading
 
 def _normalize_clause(chunk,lang):
  def iso_datetime(match):
@@ -626,6 +982,8 @@ def _normalize_clause(chunk,lang):
    timezone = ' U T C'
   return f"{match['date']} {clock}{timezone}"
  chunk = _ISO_DATETIME.sub(iso_datetime, chunk)
+ chunk = _replace_spans(chunk, _decimal_identifier_readings(chunk, lang))
+ chunk = _replace_spans(chunk, _phone_spans(chunk, lang))
  def metric_comparison(match):
   if match['percentile'] is not None:
    name = f"P {_number(match['percentile'], lang)}"
@@ -663,7 +1021,9 @@ def _normalize_clause(chunk,lang):
   return m['family']+' '+reading+suffix
  chunk=_GPU_MODEL.sub(gpu_model,chunk)
  def full_date(m):return word_boundary(m,_read_date(m['y'],m['m'],m['d'],lang))
- chunk=_DATE.sub(full_date,chunk);chunk=_ZHDATE.sub(full_date,chunk)
+ chunk=_DATE.sub(lambda m: m.group() if has_explicit_math_context(m.string, m.start())
+                 else full_date(m),chunk)
+ chunk=_ZHDATE.sub(full_date,chunk)
  def ym(m):
   y,month=int(m['y']),int(m['m']);date(y,month,1)
   value=_MONTHS[month]+' '+_en_int(y)if lang=='en'else speak_number(m['y'],'zh',True)+'年'+_zh_int(month)+'月'
@@ -721,11 +1081,11 @@ def _normalize_clause(chunk,lang):
   if re.match('[A-Za-z]',m['u']):return value+' of a '+m['u'].rstrip('s')
   return value+m['space']+m['u']
  chunk=fractions.sub(fraction_read,chunk)
- labels={**_UNITS,**_EXTRA_UNITS};names=_UNIT_NAMES
+ labels={**_UNITS,**_EXTRA_UNITS,'°':ANGLE_READINGS};names=_UNIT_NAMES
  def unit_label(u,value,range_value=False):
   singular=not range_value and abs(Decimal(value.replace('−','-').replace(',','')))==1
-  return labels[u][0 if lang=='zh'else 1 if singular else 2]
- ranges=re.compile(_LEFT+r'(?P<a>'+_NUMBER+r')\s*(?:–|—|~|～|至|到|to\b|-)\s*(?P<b>'+_NUMBER+r')\s*(?P<u>'+names+r'|[%％])(?![A-Za-z0-9_²³^/\\\ue000]|\.[A-Za-z0-9_\ue000]|-[A-Za-z0-9_\ue000])')
+  return labels[re.sub(r'[ \t]+', '', u)][0 if lang=='zh'else 1 if singular else 2]
+ ranges=re.compile(_LEFT+r'(?P<a>'+_NUMBER+r')\s*(?:–|—|~|～|至|到|to\b|-)\s*(?P<b>'+_NUMBER+r')\s*(?P<u>'+names+r'|[%％]|'+ANGLE_UNIT+r')(?![A-Za-z0-9_²³^/\\\ue000]|\.[A-Za-z0-9_\ue000]|-[A-Za-z0-9_\ue000])')
  def range_read(m):
   if _math_adjacent(m.string,m.start(),m.end()):return m.group()
   a,b=_number(m['a'],lang),_number(m['b'],lang);u=m['u']
@@ -735,11 +1095,17 @@ def _normalize_clause(chunk,lang):
  # A bare hyphen stays subtraction unless an explicit range/interval label disambiguates it.
  bare_range=re.compile(r'(?P<label>(?:范围|区间|(?<![A-Za-z0-9_])(?:range|interval)\b)[ \t]*(?:(?:为|是|[:：]|is|of|from)[ \t]*)?)(?P<a>'+_NUMBER+r')[ \t]*(?:–|—|~|～|至|到|to\b|-)[ \t]*(?P<b>'+_NUMBER+r')'+_RIGHT,re.I)
  chunk=bare_range.sub(lambda m:m['label']+_number(m['a'],lang)+(' to 'if lang=='en'else'到')+_number(m['b'],lang),chunk)
- units=re.compile(_LEFT+r'(?P<pm>±\s*)?(?P<n>'+_NUMBER+r')\s*(?P<u>'+names+r')(?![A-Za-z0-9_²³^/\\\ue000]|\.[A-Za-z0-9_\ue000]|-[A-Za-z0-9_\ue000])')
+ comparison = r'(?P<op>' + _COMPARISON + r')[ \t]*'
+ magnitude = _SIGNED_SCIENTIFIC.pattern + '|' + _NUMBER
+ units=re.compile(r'(?:'+comparison+'|'+_LEFT+r')(?P<pm>±\s*)?(?P<n>'+magnitude+r')\s*(?P<u>'+names+r')(?![A-Za-z0-9_²³^/\\\ue000]|\.[A-Za-z0-9_\ue000]|-[A-Za-z0-9_\ue000])')
  def unit_read(m):
   if _math_adjacent(m.string,m.start(),m.end()):return m.group()
   value=_number(m['n'],lang);value=(('plus or minus 'if lang=='en'else'正负')if m['pm']else'')+value
-  return value+(' 'if lang=='en'else'')+unit_label(m['u'],m['n'])
+  spoken = value + (' ' if lang == 'en' else '') + unit_label(m['u'], m['n'])
+  if m['op'] is not None:
+   op = SHARED_OPERATORS[_OPERATOR_ALIASES.get(m['op'], m['op'])][lang == 'en']
+   return word_boundary(m, op + ' ' + spoken)
+  return spoken
  chunk=units.sub(unit_read,chunk)
  def quantity_range_read(match):
   if _math_adjacent(match.string, match.start(), match.end()):
@@ -763,6 +1129,10 @@ def _normalize_clause(chunk,lang):
    if after in ('-','−','%','％') or (after and after in '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ₀₁₂₃₄₅₆₇₈₉₊₋') or _math_adjacent(m.string,m.start('n'),m.end('n')):return m.group()
    return m['label']+word_boundary(m,_number(m['n'],lang))
   chunk=field_integer.sub(named_integer,chunk)
+ chunk = _read_prose_measures(chunk, lang)
+ chunk = _OPAQUE_SCIENTIFIC_COMPARISON.sub(
+     lambda m: ' ' + SHARED_OPERATORS[_OPERATOR_ALIASES.get(m['op'], m['op'])][lang == 'en'] + ' ',
+     chunk)
  # Typed bare decimal/signed values; formulas/tolerances/percentages stay with V6.
  formula_spans=[]
  for ts in _tokens_and_runs(chunk):
@@ -791,7 +1161,8 @@ def normalize_context(text,language='auto',*,auto_fallback=None):
  if len(text)>20000:raise NumericNormalizationError('Input exceeds bounded20000 characters')
  _validate_auto_fallback(auto_fallback)
  protected,mapping=_protect(text)
- fallback=_language(text,language,'zh')if auto_fallback is None else auto_fallback;parts=[]
+ protected=protected.translate(_FULLWIDTH_ASCII)
+ fallback=_language(text.translate(_FULLWIDTH_ASCII),language,'zh')if auto_fallback is None else auto_fallback;parts=[]
  try:
   for clause in _clauses(protected):
    if language in ('zh','en'):lang=language
@@ -817,6 +1188,7 @@ Token = namedtuple('Token', 'kind value start end')
 SUPERSCRIPTS = dict(zip('⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ', '0123456789+-n'))
 SUBSCRIPTS = dict(zip('₀₁₂₃₄₅₆₇₈₉₊₋', '0123456789+-'))
 TOKEN_RE = re.compile(
+    _SCIENTIFIC + r'(?![A-Za-z0-9_])|'
     r'\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?:\d+(?:\.\d+)?|\.\d+)'
     r'|[A-Za-z][A-Za-z0-9_]*|[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ]+|[₀₁₂₃₄₅₆₇₈₉₊₋]+'
     r'|>=|<=|!=|==|[π√+\-−*×÷/^=≥≤≠<>|()@∑∫≈∈%％\[\]{}]')
@@ -833,10 +1205,8 @@ PROTECTED_PATTERNS = [
     re.compile(r'\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b'),
     re.compile(r'\b(?:[A-Za-z][A-Za-z0-9_]+-[A-Za-z0-9_-]+|[A-Za-z]-[A-Za-z][A-Za-z0-9_-]+)\b'),
     re.compile(r'\b[A-Za-z_][A-Za-z0-9_]{1,}\s*(?:==|=)[^，。；;\n]*'),
-    re.compile(r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b'),
     re.compile(r'\b\d{1,2}:\d{2}(?::\d{2})?\b'),
     re.compile(r'\b(?:[vV]\d+(?:\.\d+)+|\d+(?:\.\d+){2,})\b'),
-    re.compile(r'\b\d+(?:\.\d+)?[eE][+-]?\d+\b'),
     re.compile(r'\b(?:kg/m/s|kg/m(?:[²³]|\^[23])?|m/s(?:[²³]|\^[23])?|km/h|cm/s|mg/mL)\b'),
     re.compile(r'\{[^{}\n]*["\'][^{}\n]*\}'),
 ]
@@ -844,6 +1214,8 @@ PROTECTED_PATTERNS = [
 
 def _protected_spans(text):
     spans = [(m.start(), m.end()) for pattern in PROTECTED_PATTERNS for m in pattern.finditer(text)]
+    spans.extend(m.span() for m in _DATE.finditer(text)
+                 if not has_explicit_math_context(text, m.start()))
     # Bare paths require a multi-letter component or more than one slash.
     for m in re.finditer(r'(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+(?![A-Za-z0-9_])', text):
         parts = m.group().split('/')
@@ -883,8 +1255,10 @@ def _tokens_and_runs(text):
                 # A named operand is admitted only for unambiguous multiplication
                 # by a numerical percentage, never a general code assignment.
                 kind = 'VAR'
-            elif re.match(r'\s*\(', text[m.end():]):
-                kind = 'FUNCTION'  # Explicit unknown math functions fail closed.
+            elif (text.startswith('(', m.end())
+                  or (re.match(r'\s*\(', text[m.end():])
+                      and has_explicit_math_context(text, m.start()))):
+                kind = 'FUNCTION'
             else:
                 finish()
                 continue
@@ -920,6 +1294,8 @@ def _tokens_and_runs(text):
 def _is_math(tokens):
     if not any(t.kind in ('NUMBER', 'VAR', 'PI') for t in tokens):
         return False
+    if any(t.kind == 'NUMBER' and _SIGNED_SCIENTIFIC.fullmatch(t.value) for t in tokens):
+        return True
     if any(t.kind in ('SUP', 'SUB', 'ROOT', 'PI') for t in tokens):
         return True
     if any(t.kind == 'FUNCTION' and i+1 < len(tokens) and tokens[i+1].kind == 'LPAREN'
@@ -1062,34 +1438,23 @@ class _Parser:
 
 
 def _formula_zh_int(n):
-    digits = '零一二三四五六七八九'
-    if n == 0:
-        return '零'
     for value, unit in ((1000000000000, '万亿'), (100000000, '亿'), (10000, '万')):
         if n >= value:
             q, r = divmod(n, value)
             return _formula_zh_int(q)+unit+(('零' if r < value//10 else '')+_formula_zh_int(r) if r else '')
-    result, pending = '', False
-    for value, unit in ((1000,'千'),(100,'百'),(10,'十'),(1,'')):
-        q, n = divmod(n, value)
-        if q:
-            if pending:
-                result += '零'
-            result += digits[q]+unit
-            pending = False
-        elif result and n:
-            pending = True
-    return result[1:] if result.startswith('一十') else result
+    return _zh_int(n)
 
 
 def _formula_number(value, language):
+    if _SIGNED_SCIENTIFIC.fullmatch(value):
+        return _read_scientific(value, language)
     if not re.fullmatch(r'(?:\d+(?:\.\d+)?|\.\d+)', value) or len(value) > 32:
         raise MathNormalizationError('Unsupported mathematical numeric literal')
     whole, dot, frac = value.partition('.')
     whole = whole or '0'
     if len(whole) > 18:
         raise MathNormalizationError('Mathematical integer is longer than 18 digits')
-    digits = list('零一二三四五六七八九') if language == 'zh' else 'zero one two three four five six seven eight nine'.split()
+    digits = _DIGITS[language.upper()]
     if len(whole) > 1 and whole.startswith('0'):
         spoken = ' '.join(digits[int(x)] for x in whole)
     else:
@@ -1203,6 +1568,11 @@ _JOINED_SENTENCE_STARTERS = frozenset(('I You We They He She It The A An This Th
 _DOMAIN_SUFFIXES = frozenset('com org net io ai dev app edu gov co uk cn hk xyz info biz me tech today cloud online site'.split())
 
 
+def _spoken_choices(items):
+    variants = sorted(set(items), key=lambda item: (-len(item), item))
+    return '(?:' + '|'.join(re.escape(item).replace(r'\ ', r'[ \t]+') for item in variants) + ')'
+
+
 def _math_patterns():
     """Recognize existing raw/spoken math atoms for boundaries, never render them."""
     gap = r'[ \t]*'
@@ -1222,19 +1592,20 @@ def _math_patterns():
     zh_var = rf'{variable}(?:{gap}下标{gap}{zh_sign}{zh_number})?'
     zh_core = rf'(?:百分之{gap}{zh_sign}{zh_number}|{zh_number}|{zh_var}|派)'
     zh_simple = zh_sign + zh_core
-    zh_op = r'(?:大于等于|小于等于|不等于|等于|乘以|除以|大于|小于|加|减|乘)'
+    zh_op = _spoken_choices((*ZH_OPS.values(), '乘'))
     zh_group = rf'左括号{gap}{zh_simple}(?:{gap}{zh_op}{gap}{zh_simple})*{gap}右括号'
     zh_power = rf'(?:{gap}的(?:平方|立方|绝对值)|{gap}的{gap}{zh_simple}{gap}次方)'
     zh_atom = rf'{zh_sign}(?:(?:根号|正弦|平方根){gap}{zh_simple}|{zh_group}|{zh_core})(?:{zh_power})*'
 
-    digit = r'(?:zero|one|two|three|four|five|six|seven|eight|nine)'
-    word = r'(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion|quadrillion)'
+    digit = _spoken_choices(_DIGITS['EN'])
+    word = _spoken_choices((*_SMALL_EN, *_TENS_EN[2:], 'hundred', 'thousand', 'million',
+                            'billion', 'trillion', 'quadrillion'))
     en_number = rf'{word}(?:[ \t]+{word})*(?:[ \t]+point[ \t]+{digit}(?:[ \t]+{digit})*)?'
     en_sign = r'(?:(?:negative|positive)[ \t]+)?'
     en_var = rf'{variable}(?:[ \t]+subscript[ \t]+{en_sign}{en_number})?'
     en_core = rf'(?:{en_number}(?:[ \t]+percent)?|{en_var}|pi)'
     en_simple = en_sign + en_core
-    en_op = r'(?:greater[ \t]+than[ \t]+or[ \t]+equal[ \t]+to|less[ \t]+than[ \t]+or[ \t]+equal[ \t]+to|does[ \t]+not[ \t]+equal|greater[ \t]+than|less[ \t]+than|divided[ \t]+by|equals|plus|minus|times)'
+    en_op = _spoken_choices(EN_OPS.values())
     en_group = rf'open[ \t]+parenthesis[ \t]+{en_simple}(?:[ \t]+{en_op}[ \t]+{en_simple})*[ \t]+close[ \t]+parenthesis'
     en_power = rf'(?:[ \t]+(?:squared|cubed)|[ \t]+to[ \t]+the[ \t]+power[ \t]+of[ \t]+{en_simple})'
     en_atom = rf'{en_sign}(?:(?:square[ \t]+root[ \t]+of|sine[ \t]+of|the[ \t]+absolute[ \t]+value[ \t]+of)[ \t]+{en_simple}|{en_group}|{en_core})(?:{en_power})*'
@@ -1329,32 +1700,24 @@ def _joined_period_boundary(text, dot):
 def _english_calendar_clock_patterns():
     # Match the exact spoken calendar/clock grammar produced by the current
     # formatter. Only atom boundaries are guarded; surrounding prose stays free.
-    small='zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen'.split()
-    tens='zero ten twenty thirty forty fifty sixty seventy eighty ninety'.split()
-    def number(n):
-        if n<20:return small[n]
-        return tens[n//10]+(' '+small[n%10]if n%10 else'')
-    def choices(items):return '(?:'+'|'.join(re.escape(x).replace(r'\ ',r'[ \t]+')for x in sorted(set(items),key=len,reverse=True))+')'
-    below100=choices(number(n)for n in range(1,100))
-    digit=choices(small[1:10])
-    below1000=rf'(?:{digit}[ \t]+hundred(?:[ \t]+{below100})?|{below100})'
-    year=rf'(?:{digit}[ \t]+thousand(?:[ \t]+{below1000})?|{below1000})'
-    ordinal=choices([
-        'first','second','third','fourth','fifth','sixth','seventh','eighth','ninth','tenth','eleventh','twelfth','thirteenth','fourteenth','fifteenth','sixteenth','seventeenth','eighteenth','nineteenth','twentieth',
-        *('twenty '+x for x in('first','second','third','fourth','fifth','sixth','seventh','eighth','ninth')),'thirtieth','thirty first'])
-    month=choices('January February March April May June July August September October November December'.split())
-    calendar=rf'{month}[ \t]+(?:{ordinal}[ \t]+)?{year}'
-    hour=choices(number(n)for n in range(24))
-    minute=choices(number(n)for n in range(10,60))
-    seconds=choices(number(n)for n in range(60))
-    clock=rf'{hour}[ \t]+(?:oh[ \t]+{choices(small[1:10])}|{minute}|o[ \t]+clock)(?:[ \t]+and[ \t]+{seconds}[ \t]+seconds)?(?:[ \t]+[ap][ \t]+m)?'
+    digit = _spoken_choices(_DIGITS['EN'][1:])
+    below100 = _spoken_choices(_en_int(n) for n in range(1, 100))
+    below1000 = rf'(?:{digit}[ \t]+hundred(?:[ \t]+{below100})?|{below100})'
+    year = rf'(?:{digit}[ \t]+thousand(?:[ \t]+{below1000})?|{below1000})'
+    ordinal = _spoken_choices(_DAYS[1:])
+    month = _spoken_choices(_MONTHS[1:])
+    calendar = rf'{month}[ \t]+(?:{ordinal}[ \t]+)?{year}'
+    hour = _spoken_choices(_en_int(n) for n in range(24))
+    minute = _spoken_choices(_en_int(n) for n in range(10, 60))
+    seconds = _spoken_choices(_en_int(n) for n in range(60))
+    clock = rf'{hour}[ \t]+(?:oh[ \t]+{digit}|{minute}|o[ \t]+clock)(?:[ \t]+and[ \t]+{seconds}[ \t]+seconds)?(?:[ \t]+[ap][ \t]+m)?'
     return tuple(re.compile(r'(?<![A-Za-z0-9_])'+p+r'(?![A-Za-z0-9_])',re.I)for p in(calendar,clock))
 
 _ENGLISH_CALENDAR_CLOCK_PATTERNS=_english_calendar_clock_patterns()
 
 
 def protected_spans(text):
-    """V6 segmentation guards only: no pronunciation replacement/legacy rules."""
+    """Source intervals that must stay intact during V6 segmentation."""
     spans = []
     # These spans protect intact source dates/times only. They do not rewrite
     # text, select a reading, or import any pronunciation lexicon.
@@ -1391,50 +1754,17 @@ def protected_spans(text):
     # Math spans are atomic even if a lower-priority word/whitespace/jieba
     # boundary exists. A too-long complete atom therefore fails closed in
     # safe_split instead of truncating or emitting half an expression.
-    return refined + list(_math_expression_spans(text)) + [(m.start(),m.end())for p in _ENGLISH_CALENDAR_CLOCK_PATTERNS for m in p.finditer(text)]
+    return (refined + list(address_ranges(text, include_absolute_paths=True))
+            + list(_math_expression_spans(text))
+            + [m.span() for p in _ENGLISH_CALENDAR_CLOCK_PATTERNS for m in p.finditer(text)])
 
 
-def safe_boundary(text, end):
-    return not any(start < end < stop for start, stop in protected_spans(text))
+def _safe_boundary(spans, end):
+    return not any(start < end < stop for start, stop in spans)
 
 
 class ProfileLimitError(ValueError):
     """Text is intact, but the verified model profile cannot contain this clause."""
-
-
-def natural_clauses(text):
-    """Natural V6 text slices, protecting numbers/versions and basic initials."""
-    boundaries = {m.end() for m in re.finditer(r'[。！？!?；;\n]+|(?<!\d)[，,：:]|[，,：:](?!\d)', text)}
-    abbreviations = _ABBREVIATIONS
-    for found in re.finditer(r'\.(?=\s+[A-Z]|[A-Z][a-z]+|I(?:\b)|$)', text):
-        if found.end() < len(text) and not text[found.end()].isspace() and not _joined_period_boundary(text, found.start()):
-            continue
-        before = text[:found.start()]
-        word = re.search(r'([A-Za-z]+)$', before)
-        # These are V6 sentence boundaries, not a pronunciation dictionary.
-        if word and (word.group(1).lower() in abbreviations or len(word.group(1)) == 1):
-            continue
-        if re.search(r'(?:\b[A-Za-z]\.)+[A-Za-z]$', before):
-            continue
-        boundaries.add(found.end())
-    pieces, start = [], 0
-    for end in sorted(boundaries):
-        if not safe_boundary(text, end):
-            continue
-        piece = text[start:end]
-        if any(c.isalnum() for c in piece):
-            pieces.append(piece)
-            start = end
-    tail = text[start:]
-    if any(c.isalnum() for c in tail):
-        pieces.append(tail)
-    elif pieces:
-        pieces[-1] += tail
-    elif tail:
-        pieces.append(tail)
-    if ''.join(pieces) != text:
-        raise RuntimeError('Candidate segmentation lost or duplicated source text')
-    yield from pieces
 
 
 def safe_split(text):
@@ -1444,7 +1774,8 @@ def safe_split(text):
     # A comma/colon surrounded by digits is not a source word boundary.
     choices = [x for x in choices if not (x >= 2 and x < len(text)
                 and text[x-1] in ',，:：' and text[x-2].isdigit() and text[x].isdigit())]
-    choices = [x for x in choices if safe_boundary(text, x)]
+    spans = protected_spans(text)
+    choices = [x for x in choices if _safe_boundary(spans, x)]
     if not choices and re.search(r'[\u3400-\u9fff]', text):
         # V6-native text word boundaries, not a pronunciation override/legacy lexicon.
         # Never cut inside an ASCII identifier, date, version or numeric run.
@@ -1457,7 +1788,7 @@ def safe_split(text):
                                 and re.match(r"[A-Za-z0-9_./:'’+-]", text[end]))]
         except ImportError:
             choices = []
-        choices = [x for x in choices if safe_boundary(text, x)]
+        choices = [x for x in choices if _safe_boundary(spans, x)]
     if not choices:
         raise ProfileLimitError('V6 clause exceeds its verified profile without a safe text boundary; nothing was truncated')
     cut = min(choices, key=lambda x: abs(x - len(text) / 2))
@@ -1467,6 +1798,8 @@ def safe_split(text):
 
 # Exact first-sentence boundary policy used by the accepted audition.
 _FIRST_SENTENCE_ABBREVIATIONS = {'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'sr.', 'jr.', 'st.', 'vs.', 'etc.', 'e.g.', 'i.e.', 'no.', 'fig.', 'inc.', 'ltd.', 'dept.', 'approx.', 'a.m.', 'p.m.'}
+_ABBREVIATED_MONTHS = {name[:3].lower() + '.' for name in _MONTHS[1:] if name != 'May'} | {'sept.'}
+_MONTH_DAY_NEXT = re.compile(r'[ \t]+(?:0?[1-9]|[12][0-9]|3[01])(?:st|nd|rd|th)?\b', re.I)
 _FIRST_SENTENCE_CLOSERS = '\"\'”’》」』)]}）】'
 
 
@@ -1474,7 +1807,13 @@ def first_complete_sentence_spans(full):
     """Conservative real punctuation boundary, never token/count based."""
     opens = {'(': ')', '[': ']', '{': '}', '（': '）', '【': '】'}
     stack = []
+    addresses = iter(address_ranges(full, include_absolute_paths=True))
+    address = next(addresses, None)
     for i, char in enumerate(full):
+        if address and i == address[1]:
+            address = next(addresses, None)
+        if address and address[0] <= i < address[1]:
+            continue
         if char in opens:
             stack.append(opens[char]); continue
         if stack and char == stack[-1]:
@@ -1492,6 +1831,7 @@ def first_complete_sentence_spans(full):
             # Known abbreviations, dotted initials and one-letter personal initials.
             found = re.search(r'[A-Za-z][A-Za-z.]*\.$', full[:i+1])
             word = found.group(0) if found else ''
+            if word.lower() in _ABBREVIATED_MONTHS and _MONTH_DAY_NEXT.match(full, i+1): continue
             if word.lower() in _FIRST_SENTENCE_ABBREVIATIONS or re.fullmatch(r'(?:[A-Za-z]\.){2,}', word) or re.fullmatch(r'[A-Z]\.', word): continue
         elif char == '!' and right == '=': continue
         end = i+1
@@ -1564,7 +1904,13 @@ def _fc_top_level_commas(text, delimiters=',，'):
     """Return eligible lexical positions, or None for malformed nesting/quotes."""
     stack = []
     commas = []
+    addresses = iter(address_ranges(text, include_absolute_paths=True))
+    address = next(addresses, None)
     for index, char in enumerate(text):
+        if address and index == address[1]:
+            address = next(addresses, None)
+        if address and address[0] <= index < address[1]:
+            continue
         if stack and stack[-1][1]:
             if char == stack[-1][0] and not _fc_escaped(text, index):
                 stack.pop()
@@ -1624,7 +1970,8 @@ def _fc_unsafe_comma(full, index):
         token = full[start:stop]
         if any(char in token for char in '._/:@?=+#%&~\\'):
             return True
-    return not safe_boundary(full, index) or not safe_boundary(full, index + 1)
+    spans = protected_spans(full)
+    return not (_safe_boundary(spans, index) and _safe_boundary(spans, index + 1))
 
 
 def _fc_extra_boundary_safe(full, index, earlier):
