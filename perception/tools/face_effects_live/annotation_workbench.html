@@ -1,0 +1,99 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>人脸源帧标注复核</title>
+<style>
+body{margin:0;background:#151a21;color:#e7edf5;font:15px system-ui}header{padding:16px 20px;background:#202936}h1{font-size:21px;margin:0 0 8px}p{margin:6px 0;color:#b6c5d8}main{display:grid;grid-template-columns:330px 1fr;gap:16px;padding:16px}label{display:block;margin:12px 0 6px}button,select,input{box-sizing:border-box;font:inherit;padding:7px;border:1px solid #566881;border-radius:4px;background:#263345;color:inherit}select,input[type=text]{width:100%}button{cursor:pointer;margin:4px 2px}button.primary{background:#2e628a}#stage{overflow:auto;height:calc(100vh - 180px);background:#080b10}canvas{display:block;cursor:crosshair}#status{white-space:pre-wrap;padding:10px;border-left:3px solid #64b8da}#points{font:13px monospace;white-space:pre-wrap;color:#b8d3dd}input[type=checkbox]{width:auto}a{color:#95d5f1}.note{font-size:13px}#position{font:13px monospace}aside{max-height:calc(100vh - 165px);overflow:auto}
+</style>
+<header><h1>人脸源帧标注复核</h1><p>只显示本地自然源帧，不运行模型。原始标签只读，修改后下载新的 JSON。</p><p class="note">现有草稿来自助手目视整理，不能当作可靠人工真值。导出默认不声明独立人工验收完成。</p></header>
+<main><aside>
+<label>标注者<input id="reviewer" type="text" maxlength="100" placeholder="填写姓名或可追溯代号"></label>
+<label>源帧<select id="frame"></select></label><button id="prev">上一帧</button><button id="next">下一帧</button>
+<label>人脸<select id="face"></select></label><input id="identity" type="text" placeholder="当前人脸 ID"><button id="rename">修改当前脸 ID</button><button id="add">新增人脸</button>
+<label>编辑对象<select id="point"><option value="0">左侧眼中心（画面坐标）</option><option value="1">右侧眼中心（画面坐标）</option><option value="2">鼻尖</option><option value="3">左侧嘴角</option><option value="4">右侧嘴角</option><option value="box">人脸框：依次点左上、右下</option></select></label>
+<button id="hidden">该点不可见，清除标签</button>
+<label><input id="show" type="checkbox" checked> 显示现有标签</label>
+<label><input id="sync" type="checkbox" checked> 同步同源帧、同 ID 的鼻尖</label>
+<p class="note">同步不会跨时间传播；短时消失、遮挡和侧脸不自动补点。人脸 ID 需逐帧人工确认一致性。</p>
+<label>缩放<select id="zoom"><option value="0.75">75%</option><option value="1">100%</option><option value="1.5">150%</option><option value="2">200%</option></select></label>
+<div id="position"></div><div id="points"></div>
+<button id="review" class="primary">确认已核验本项源帧</button><p id="progress"></p>
+<label><input id="attest" type="checkbox"> 我作为独立人工复核者，已核验全部源帧和标签</label>
+<button id="export" class="primary">下载修改后的 JSON</button><div id="status" role="status">载入本地源帧…</div>
+</aside><section><div id="stage"><canvas id="canvas"></canvas></div></section></main>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),ctx=canvas.getContext('2d');
+let data,labels,items,current=0,faceIndex=0,image=new Image(),pendingBox=null,loadVersion=0,loading=true;
+const reviewed=new Set(),history=[];let draftShown=true;
+const colors=['#69e19e','#e9ca58','#58d5f2','#df9af8','#fa9567'];
+function item(){return items[current]}
+function snapshot(){return labels.clips[item().clip][item().index]}
+function face(){return !loading&&item().kind==='snapshot'?snapshot().faces[faceIndex]:null}
+function note(text){$('status').textContent=text}
+function invalidate(){reviewed.delete(current);progress()}
+function record(action,before,after){history.push({clip:item().clip,frame_id:item().frame_id,kind:item().kind,action,before,after,time:new Date().toISOString()});invalidate()}
+function progress(){$('progress').textContent=`已确认 ${reviewed.size} / ${items.length} 项；仅记录操作者确认，不认证标签精度。`}
+function points(){return loading?[]:item().kind==='nose'?[null,null,labels.nose_burst.nose_xy[item().index],null,null]:face()?.points||[]}
+function redraw(){
+ ctx.clearRect(0,0,canvas.width,canvas.height);if(!image.complete||!image.naturalWidth)return;ctx.drawImage(image,0,0);
+ if($('show').checked){
+  if(face()){const [x,y,w,h]=face().box;ctx.strokeStyle='#8cf0a9';ctx.lineWidth=2;ctx.strokeRect(x,y,w,h);ctx.font='17px monospace';ctx.fillStyle='#8cf0a9';ctx.fillText(face().id,x,Math.max(18,y-5))}
+  points().forEach((p,k)=>{if(!p)return;ctx.strokeStyle=colors[k];ctx.fillStyle=colors[k];ctx.beginPath();ctx.moveTo(p[0]-7,p[1]);ctx.lineTo(p[0]+7,p[1]);ctx.moveTo(p[0],p[1]-7);ctx.lineTo(p[0],p[1]+7);ctx.stroke();ctx.fillText(String(k),p[0]+7,p[1]-7)})
+ }
+ $('points').textContent=$('show').checked?points().map((p,k)=>`${k}: ${p? p.join(', '):'不可见/未标注'}`).join('\n'):'现有标签已隐藏';
+}
+function faces(){
+ $('face').replaceChildren();const list=item().kind==='snapshot'?snapshot().faces:[{id:labels.nose_burst.identity}];
+ list.forEach((f,k)=>$('face').add(new Option(f.id,String(k))));faceIndex=Math.min(faceIndex,Math.max(0,list.length-1));$('face').value=String(faceIndex);
+ $('identity').value=list[faceIndex]?.id||'';for(const id of ['face','add'])$(id).disabled=item().kind==='nose';
+ $('point').value=item().kind==='nose'?'2':$('point').value;
+ $('point').disabled=item().kind==='nose';redraw();
+}
+async function open(index){
+ current=Math.max(0,Math.min(items.length-1,index));$('frame').value=String(current);faceIndex=0;pendingBox=null;
+ loading=true;canvas.style.pointerEvents='none';$('review').disabled=true;
+ const version=++loadVersion,next=new Image();next.src='/frames/'+encodeURIComponent(item().file);
+ try{await next.decode();if(version!==loadVersion)return;image=next;canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;loading=false;canvas.style.pointerEvents='auto';$('review').disabled=false;resize();faces();note(`${item().clip} / frame ${item().frame_id} / ${item().kind}\nSHA256 ${item().image_sha256}`)}catch{if(version===loadVersion){ctx.clearRect(0,0,canvas.width,canvas.height);note('源图载入失败，请核对本地准备目录。')}}
+}
+function resize(){const zoom=Number($('zoom').value);canvas.style.width=canvas.width*zoom+'px';canvas.style.height=canvas.height*zoom+'px';redraw()}
+function setPoint(k,value){
+ if(loading)return;
+ const before=structuredClone(points()[k]??null);
+ if(item().kind==='nose')labels.nose_burst.nose_xy[item().index]=value;
+ else if(face())face().points[k]=value;else return;
+ if(k===2&&$('sync').checked&&labels.nose_burst&&item().clip===labels.nose_burst.clip){
+  const id=face()?.id||labels.nose_burst.identity;
+  if(id===labels.nose_burst.identity){
+   const n=labels.nose_burst.frame_ids.indexOf(item().frame_id);if(n>=0)labels.nose_burst.nose_xy[n]=value;
+   const other=labels.clips[item().clip].find(f=>f.frame_id===item().frame_id)?.faces.find(f=>f.id===id);if(other)other.points[2]=value;
+   items.forEach((f,i)=>{if(f.clip===item().clip&&f.frame_id===item().frame_id)reviewed.delete(i)});
+  }
+ }
+ record('point_'+k,before,value);redraw();
+}
+canvas.onclick=event=>{
+ if(loading)return;
+ const rect=canvas.getBoundingClientRect(),p=[Math.round((event.clientX-rect.left)*canvas.width/rect.width),Math.round((event.clientY-rect.top)*canvas.height/rect.height)];
+ p[0]=Math.max(0,Math.min(canvas.width-1,p[0]));p[1]=Math.max(0,Math.min(canvas.height-1,p[1]));
+ if($('point').value==='box'&&face()){
+  if(!pendingBox){pendingBox=p;note('已记录第一角，请点击另一角。');return}
+  const a=pendingBox;pendingBox=null;const box=[Math.min(a[0],p[0]),Math.min(a[1],p[1]),Math.abs(a[0]-p[0]),Math.abs(a[1]-p[1])];
+  if(box[2]<4||box[3]<4){note('人脸框至少为 4 × 4 像素。');return}record('box',face().box,box);face().box=box;redraw();
+ }else setPoint(Number($('point').value),p);
+};
+canvas.onmousemove=event=>{const r=canvas.getBoundingClientRect();$('position').textContent=`源坐标 x=${Math.round((event.clientX-r.left)*canvas.width/r.width)}, y=${Math.round((event.clientY-r.top)*canvas.height/r.height)}`};
+$('frame').onchange=()=>open(Number($('frame').value));$('prev').onclick=()=>open(current-1);$('next').onclick=()=>open(current+1);
+$('face').onchange=()=>{faceIndex=Number($('face').value);faces()};$('zoom').onchange=resize;
+$('show').onchange=()=>{if($('show').checked)draftShown=true;redraw()};
+$('hidden').onclick=()=>{if($('point').value!=='box')setPoint(Number($('point').value),null)};
+$('rename').onclick=()=>{const id=$('identity').value.trim();if(loading||!id)return;if(item().kind==='nose'){record('nose_sequence_identity',labels.nose_burst.identity,id);labels.nose_burst.identity=id;items.forEach((f,i)=>{if(f.kind==='nose')reviewed.delete(i)});progress();note('鼻轨迹整段 ID 已修改；坐标未跨帧传播。');faces();return}if(!face())return;if(snapshot().faces.some((f,k)=>k!==faceIndex&&f.id===id)){note('同一源帧不能出现重复人脸 ID。');return}record('identity',face().id,id);face().id=id;faces()};
+$('add').onclick=()=>{if(loading||item().kind!=='snapshot')return;const id='new_'+(snapshot().faces.length+1);snapshot().faces.push({id,box:[0,0,40,40],points:[null,null,null,null,null]});faceIndex=snapshot().faces.length-1;record('add_face',null,id);faces()};
+$('review').onclick=()=>{if(loading)return;reviewed.add(current);progress();note('已记录本项确认。修改标签后该项需再次确认。')};
+$('export').onclick=()=>{
+ const reviewer=$('reviewer').value.trim();if(!reviewer){note('请先填写可追溯的标注者代号。');return}
+ const result=structuredClone(labels),complete=reviewed.size===items.length&&$('attest').checked;
+ result.annotator=reviewer;result.independent_human_review=complete;
+ result.annotation_review={tool:'source-only-workbench/1',reviewer_declared:reviewer,input_labels_sha256:data.input_labels_sha256,source_images:Object.fromEntries(items.map(f=>[f.file,f.image_sha256])),reviewed_items:[...reviewed].sort((a,b)=>a-b).map(i=>items[i]),all_items:items.length,completion_attested:$('attest').checked,initial_labels_visible:draftShown,history};
+ result.method='operator source-frame review; completion is an operator declaration, not automated ground truth certification';
+ const blob=new Blob([JSON.stringify(result,null,2)+'\n'],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='face-effects-reviewed-labels.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ note(complete?'已导出全部复核声明；仍需按研究规程独立评估标注误差。':'已导出部分标注；independent_human_review 保持 false。');
+};
+fetch('/api/dataset').then(r=>{if(!r.ok)throw Error();return r.json()}).then(value=>{data=value;labels=structuredClone(data.labels);items=data.items;items.forEach((f,k)=>$('frame').add(new Option(`${f.kind==='nose'?'鼻轨迹':f.clip} #${f.frame_id}`,String(k))));progress();open(0)}).catch(()=>note('数据载入失败。请检查本地工具的参数。'));
+</script></html>

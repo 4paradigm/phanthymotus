@@ -1,0 +1,38 @@
+{
+  "retrieved": "2026-11-16",
+  "models": {
+    "yunet": {
+      "file": "yunet.onnx",
+      "url": "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+      "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+      "bytes": 232589,
+      "license": "MIT",
+      "license_url": "https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE"
+    },
+    "osf0": {
+      "file": "osf0.onnx",
+      "url": "https://raw.githubusercontent.com/emilianavt/OpenSeeFace/master/models/lm_model0_opt.onnx",
+      "sha256": "43c9c58f03701cc15b8423c49b78af348a6397334d348887e0fda59013275c29",
+      "bytes": 1902521,
+      "license": "BSD-2-Clause",
+      "license_url": "https://github.com/emilianavt/OpenSeeFace/blob/master/LICENSE"
+    },
+    "osf3": {
+      "file": "osf3.onnx",
+      "url": "https://raw.githubusercontent.com/emilianavt/OpenSeeFace/master/models/lm_model3_opt.onnx",
+      "sha256": "5aa0ab2594acaf2e1d3916a8de592cffeb1f1a7a7f778cad2f37948bff6549d1",
+      "bytes": 13500226,
+      "license": "BSD-2-Clause",
+      "license_url": "https://github.com/emilianavt/OpenSeeFace/blob/master/LICENSE"
+    },
+    "mediapipe": {
+      "file": "face_landmarker.task",
+      "url": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      "sha256": "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
+      "bytes": 3758596,
+      "license": "Apache-2.0",
+      "license_url": "https://storage.googleapis.com/mediapipe-assets/Model%20Card%20MediaPipe%20Face%20Mesh%20V2.pdf",
+      "retrieved": "2026-11-17"
+    }
+  }
+}

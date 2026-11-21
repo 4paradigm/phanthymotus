@@ -1,0 +1,16 @@
+{
+  "detector_model": "/absolute/model-directory/yunet.onnx",
+  "detector_sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+  "landmark_model": "/absolute/model-directory/osf0.onnx",
+  "landmark_sha256": "43c9c58f03701cc15b8423c49b78af348a6397334d348887e0fda59013275c29",
+  "provider": "cpu",
+  "allow_cpu_fallback": true,
+  "renderer": "cpu",
+  "max_faces": 4,
+  "detect_interval": 1,
+  "detect_side": 640,
+  "detect_upscale": false,
+  "max_age_ms": 250,
+  "source_kind": "ros_compressed",
+  "effects": ["crown", "glasses", "orbit"]
+}
