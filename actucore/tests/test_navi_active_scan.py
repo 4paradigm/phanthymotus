@@ -429,13 +429,33 @@ def test_checked_turn_can_start_without_a_preceding_stop(monkeypatch, blocked_sw
         blocked[scan.START[0] + 6, scan.START[1]] = True
 
     command = look.command(geometry, .33, 1., 500, 600, now_ms=1000,
-                           control_period_s=.1, previous_linear=.2)
+                           control_period_s=.1, previous_linear=.2, forward_limit=.15)
 
     if blocked_sweep:
         assert not command.yaw and look.phase == "brake"
     else:
-        assert command.yaw > 0. and look.phase == "turn"
-        assert look.turn_sweep.minimum_translation == pytest.approx(.23)
+        assert command.vx == .15 and command.yaw > 0. and look.phase == "turn"
+        assert look.turn_sweep.twists[0][0] == .20
+
+
+@pytest.mark.parametrize("obstacle", [(.0, .60), (.55, .0)])
+def test_route_turn_checks_the_direction_of_measured_forward_motion(monkeypatch, obstacle):
+    look, geometry, _, hits = _setup(monkeypatch)
+    at_forward, at_right = obstacle
+    hits[:] = np.isclose(scan.FORWARD, at_forward) & np.isclose(scan.RIGHT, at_right)
+    depth = dict(_depth(1000), control_ms=1000, source_frame_id=900)
+    odom = dict(_odom(1000), vx=.15, received_ms=1000, source_sample_id=1000,
+                velocity_history=((1000, 1000, (.15, 0., 0.)),))
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=.55, turn_angle=.20, route_segment=True)
+
+    command = look.command(geometry, .33, 1., 500, 600, now_ms=1000,
+                           control_period_s=.1, previous_linear=.20, forward_limit=.15)
+
+    if at_right:
+        assert command.vx == .15 and command.yaw > 0.
+    else:
+        assert command.yaw == 0.
 
 
 def test_tianyi_buffered_turn_tolerates_a_short_feedback_gap():
@@ -765,6 +785,27 @@ def test_receipt_scan_allows_two_seconds_for_yaw_progress(monkeypatch):
     tick(3150)
     assert tick(3300).yaw == 0.
     assert not look.active and look.attempted and look.exhausted
+
+
+def test_turn_stall_is_detected_after_initial_measured_progress(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, wz=0.):
+        look.update(_depth(stamp), dict(_odom(stamp, wz), received_ms=stamp),
+                    geometry, receipt_only=True, max_depth_age_ms=800)
+        return look.command(geometry, .30, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((-1.,))
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw > 0.
+    for stamp in (1250, 1350, 1450):
+        assert tick(stamp, .67).yaw > 0.
+    assert -look.pose[2] == pytest.approx(.201)
+    for stamp in range(1550, 3450, 100):
+        assert tick(stamp).yaw > 0.
+    hold = tick(3450)
+    assert hold.yaw == 0. and "转向无实测进展" in hold.reason
 
 
 @pytest.mark.parametrize("missing", ["depth", "odom", "poll_gap"])

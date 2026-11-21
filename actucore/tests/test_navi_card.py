@@ -196,7 +196,8 @@ def test_lifecycle_stops_previous_motion_with_long_watchdog(monkeypatch, action)
 
 
 @pytest.mark.parametrize("stop", [
-    "first_short", "expiry", "gap", "duplicate", "angle", "translation", "obstacle", "depth", "pause",
+    "first_short", "expiry", "gap", "duplicate", "angle", "translation", "obstacle",
+    "rolling_obstacle", "depth", "pause",
 ])
 def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypatch, stop):
     import numpy as np
@@ -231,10 +232,15 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
     occupied = np.zeros(SHAPE, dtype=bool)
     if stop == "obstacle":
         occupied[START[0] + 12, START[1]] = True
+    elif stop == "rolling_obstacle":
+        occupied[START[0] + 14, START[1]] = True
     geometry = Geometry(None, None, np.eye(4), .23, .23, None)
-    scan.turn_sweep = CheckedTurnSweep(geometry, .33, 1.15, occupied, scan.pose)
-    card._state.commanded = (0., 0., .6)
-    card._velocity_history.append((1000, 1000, (0., 0., 0.)))
+    vx = .15 if stop == "rolling_obstacle" else 0.
+    twist = (vx, 0., .6)
+    scan.turn_sweep = CheckedTurnSweep(geometry, .33, 1.15, occupied, scan.pose,
+                                       (twist,) if vx else None, scan.pose)
+    card._state.commanded = twist
+    card._velocity_history.append((1000, 1000, (vx, 0., 0.)))
     if stop == "first_short":
         card._descriptor = {"rate": {"max_obs_age_ms": 155}}
     entered = threading.Event()
@@ -244,10 +250,12 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
         if now > 1000:
             entered.set()
             assert release.wait(2)
-        return card._command_message([0.] * 5 + [.6], now / 1000, 950)
+        return card._command_message([vx, 0., 0., 0., 0., .6], now / 1000, 950)
 
     monkeypatch.setattr(card, "next_command", plan)
     card._tick()
+    if vx:
+        assert card._scheduled_command.turn is not None and not published
     if stop == "first_short":
         now = 1025  # The cadence delay leaves the same 80 ms as the field packet.
         card._dispatch_command()
@@ -259,9 +267,9 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
         assert scan.turn_until_ms == 0 and scan.turn_stop_ms is None
         return
     card._dispatch_command()
-    assert published[-1]["values"][5] == .6
+    assert published[-1]["values"][0] == vx and published[-1]["values"][5] == .6
     now = 1100
-    card._velocity_history.append((now, now, (0., 0., .4)))
+    card._velocity_history.append((now, now, (vx, 0., .4)))
     planner = threading.Thread(target=card._tick)
     planner.start()
     pauser = None
@@ -284,10 +292,11 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
                 assert published[-1]["values"][5] == .6
                 assert published[-1]["ttl_ms"] == 50
             now = {"expiry": 1400, "gap": 1360, "duplicate": 1360,
-                   "angle": 1320, "translation": 1200, "obstacle": 1200, "depth": 1200}[stop]
+                   "angle": 1320, "translation": 1200, "obstacle": 1200,
+                   "rolling_obstacle": 1200, "depth": 1200}[stop]
             if stop == "angle":
                 card._velocity_history.append((now, now, (0., 0., 1.)))
-            elif stop in ("translation", "obstacle"):
+            elif stop in ("translation", "obstacle", "rolling_obstacle"):
                 card._velocity_history.append((now, now, (.30, 0., .4)))
             elif stop == "duplicate":
                 card._velocity_history.append((now, 1100, (0., 0., .4)))
@@ -301,7 +310,7 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
             card._dispatch_command()
         expected = 4 if stop in ("translation", "expiry") else 3
         assert len(published) == expected and published[-1]["values"] == [0.] * 6
-        if stop == "obstacle":
+        if stop in ("obstacle", "rolling_obstacle"):
             assert "扫掠区有障碍" in card._output_stop[1]
     finally:
         release.set()

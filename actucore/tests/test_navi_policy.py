@@ -4659,7 +4659,7 @@ def test_local_plan_dispatches_a_checked_turn_on_the_first_tick_while_approachin
 
     assert state.active_scan.route_segment and state.active_scan.phase == "turn"
     assert state.view_detour is not None
-    assert decision.values[:5] == [0.] * 5 and 0. < abs(decision.values[5]) <= config.wz_max
+    assert decision.values[:5] == [.20, 0., 0., 0., 0.] and 0. < abs(decision.values[5]) <= config.wz_max
 
 
 @pytest.mark.parametrize("ahead, obstacle, moves", [

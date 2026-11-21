@@ -10,7 +10,8 @@ import numpy as np
 
 from .depth import has_valid_returns
 from .local_path import (FORWARD, FREE, OCCUPIED, RESOLUTION, RIGHT, SHAPE, START, UNKNOWN,
-                         Geometry, ObstacleSquares, motion_sweep_hits, observe, occluded_cells, project_observation)
+                         Geometry, ObstacleSquares, motion_sweep_hits, observe, occluded_cells,
+                         project_observation, visible_prefix)
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
@@ -38,6 +39,7 @@ class ScanCommand:
     yaw: float = 0.
     reason: str = "主动观察：停车等候"
     replanned_turn: bool = False
+    vx: float = 0.
 
 
 @dataclass(frozen=True)
@@ -47,7 +49,23 @@ class CheckedTurnSweep:
     horizon: float
     occupied: np.ndarray
     pose: tuple
-    minimum_translation: float = 0.
+    twists: tuple | None = None
+    view_pose: tuple | None = None
+    near_squares: ObstacleSquares | None = None
+
+    def clear_motion(self, pose, motion):
+        velocities = (motion, *self.twists)
+        extent = math.hypot(max(self.geometry.front, self.geometry.rear), self.half_width) + .05
+        extent += self.horizon * max(math.hypot(vx, vy) for vx, vy, _ in velocities)
+
+        def hits(occupied, reference):
+            yaw = abs(math.remainder(pose[2] - reference[2], math.tau))
+            padding = math.dist(pose[:2], reference[:2]) + extent * min(2., yaw)
+            return motion_sweep_hits(occupied, self.geometry, self.half_width, self.horizon,
+                                     velocities, padding=padding, directional=True).any()
+
+        return (not hits(self.occupied, self.view_pose)
+                and (self.near_squares is None or not hits(self.near_squares, self.pose)))
 
 
 @dataclass
@@ -247,7 +265,7 @@ class ActiveScan:
     origin: tuple = (0., 0., 0.)
     origin_set: bool = False
     still_since: int = 0
-    turn_start_heading: float = 0.
+    turn_progress_heading: float = 0.
     retry_after_hold: bool = False
     replan_after_ms: int = 0
     issued_yaw: bool = False
@@ -446,8 +464,10 @@ class ActiveScan:
             self.poses.append((received, self.pose, velocity[2]))
         if intervals:
             self.odom_source, self.motion = last_source, last_motion
+        tolerance = self.odom_linear_tolerance_mps
         if self.phase == "turn" and not self.issued_yaw and any(
-                math.hypot(vx, vy) > self.odom_linear_tolerance_mps for _, (vx, vy, _), _ in intervals):
+                (vx < -tolerance or abs(vy) > tolerance if self.advance_m is not None
+                 else math.hypot(vx, vy) > tolerance) for _, (vx, vy, _), _ in intervals):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
 
     def _hold_for_feedback_gap(self):
@@ -486,9 +506,13 @@ class ActiveScan:
         if motion[2] * math.copysign(1., error) > STILL_YAW:
             return "主动观察：等待反向转动停止", False
         checked = self.turn_sweep
-        translation = max(checked.minimum_translation, self._turn_translation(checked.horizon, motion))
-        translation += math.dist(self.pose[:2], checked.pose[:2])
-        if not self.clear_sweep(checked.geometry, checked.half_width, translation, occupied=checked.occupied):
+        if checked.twists is not None:
+            clear = checked.clear_motion(self.pose, motion)
+        else:
+            translation = self._turn_translation(checked.horizon, motion)
+            translation += math.dist(self.pose[:2], checked.pose[:2])
+            clear = self.clear_sweep(checked.geometry, checked.half_width, translation, occupied=checked.occupied)
+        if not clear:
             return "主动观察：转身扫掠区有障碍，停车后重规划", True
         return None
 
@@ -826,7 +850,8 @@ class ActiveScan:
 
     def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
                 min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None, control_period_s=None,
-                previous_command_s=None, yaw_limits=None, previous_linear=None):
+                previous_command_s=None, yaw_limits=None, previous_linear=None, forward_limit=0.,
+                min_forward_speed=0., min_moving_yaw=0.):
         if not self.active or self.ready:
             return ScanCommand()
         if self.command_only:
@@ -839,25 +864,27 @@ class ActiveScan:
         translating = math.hypot(*self.motion[:2]) > self.odom_linear_tolerance_mps
         if not self.current_frame:
             return self.interrupt("主动观察：观测超时，停车")
-        rolling_start = (self.phase == "brake" and previous_linear is not None
-                         and self.receipt_only and self.buffered_odom and self.pose_origin is None
-                         and self.advance_m is not None and abs(self.motion[2]) <= STILL_YAW
-                         and abs(previous_yaw or 0.) <= STILL_YAW
-                         and max(previous_linear, math.hypot(*self.motion[:2])) > STILL_LINEAR)
+        directional = (previous_linear is not None and self.advance_m is not None
+                       and self.motion[0] >= -self.odom_linear_tolerance_mps
+                       and abs(self.motion[1]) <= self.odom_linear_tolerance_mps)
+        rolling = directional and max(previous_linear, self.motion[0]) > STILL_LINEAR
+        rolling_start = rolling and self.phase == "brake"
         if self.phase == "brake":
-            if ((translating and not rolling_start) or abs(self.motion[2]) > STILL_YAW
+            yaw_to_settle = (self.motion[2] * self.directions[0] > STILL_YAW if rolling_start
+                             else abs(self.motion[2]) > STILL_YAW)
+            if ((translating and not rolling_start) or yaw_to_settle
                     or (self.pose_origin is not None and self.pose_feedback_since_ms < self.still_since)):
                 return ScanCommand(reason="主动观察：等待底盘停稳")
             if not self.origin_set:
                 self.origin, self.origin_set = self.pose, True
             self.still_since = stamp
-            self.turn_start_heading = self.pose[2]
+            self.turn_progress_heading = self.pose[2]
             self.phase = "turn"
             if not rolling_start:
                 return ScanCommand(reason="主动观察：确认底盘已停稳")
         # A released straight segment legitimately leaves the turn origin. A
         # replan hold after it must settle and replan, not lock on that travel.
-        turning = (self.issued_yaw or rolling_start) and self.phase in ("turn", "return")
+        turning = (self.issued_yaw or rolling) and self.phase in ("turn", "return")
         if (self.phase != "brake_for_replan" and (not turning or self.turn_stop_ms is not None)
                 and self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
@@ -925,16 +952,19 @@ class ActiveScan:
                 self.issued_yaw = False
             else:
                 self.side_frame = self.current_frame
+                if self.route_segment and self.advance_m is not None:
+                    self.advance_m = max(0., self.advance_m - math.dist(self.pose[:2], self.origin[:2]))
                 if self.views and self.views[-1][0] == self.current_frame:
                     vantage = self.views[-1][1]
                     if not self._already_observed(vantage, 0.):
                         self.observed_vantages.append(vantage)
             self.phase = "evaluate" if returning or self.receipt_only or self.advance_m is not None else "return"
             return ScanCommand(reason="主动观察：使用当前深度评估路线")
-        if (self.receipt_only and self.phase == "turn" and self.issued_yaw
-                and stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS
-                and abs(self.pose[2] - self.turn_start_heading) < TURN_PROGRESS_MIN_RAD):
-            return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划", retry_scan=False)
+        if self.receipt_only and self.phase == "turn" and self.issued_yaw:
+            if (self.pose[2] - self.turn_progress_heading) * turn_direction >= TURN_PROGRESS_MIN_RAD:
+                self.turn_progress_heading, self.still_since = self.pose[2], stamp
+            elif stamp - self.still_since >= TURN_PROGRESS_WINDOW_MS:
+                return self.hold_for_replan("主动观察：转向无实测进展，停车后重规划", retry_scan=False)
 
         # Budget tracking latency and the watchdog, including a sink poll.
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
@@ -966,12 +996,38 @@ class ActiveScan:
                 self.turn_until_ms = 0
                 self.turn_stop_ms = control_ms
                 return ScanCommand(reason=wait_reason)
-        occupied = self.turn_obstacles()
-
-        # The old forward command can still be executing when the yaw request arrives.
-        minimum_translation = previous_linear * horizon if rolling_start else 0.
-        translation = max(minimum_translation, self._turn_translation(horizon, self.motion))
-        if not self.clear_sweep(geometry, half_width, translation, occupied=occupied):
+        vx = 0.
+        yaw = -math.copysign(yaw_rate, error)
+        if directional:
+            near = self.near_squares
+            occupied = self.grid(include_near=near is None)[1] | self.views[-1][3]
+            view_pose = self.views[-1][1] if self.receipt_only else self.pose
+            checked = CheckedTurnSweep(geometry, half_width, horizon, occupied, self.pose,
+                                        ((previous_linear, 0., previous_yaw or 0.), (0., 0., yaw)),
+                                        view_pose, near)
+            if rolling and self.route_segment and yaw_rate >= min_moving_yaw:
+                remaining = max(0., self.advance_m - math.dist(self.pose[:2], self.origin[:2]))
+                vx = min(max(self.motion[0], previous_linear), forward_limit, remaining / horizon)
+                if vx < min_forward_speed:
+                    vx = 0.
+                if vx and self.occluded_route:
+                    arc = tuple((vx / yaw * math.sin(yaw * t), -vx / yaw * (1. - math.cos(yaw * t)))
+                                for t in np.linspace(0., horizon, 6))
+                    if visible_prefix(arc, self.occlusion(geometry)) < len(arc):
+                        vx = 0.
+                if vx:
+                    candidate = replace(checked, twists=(checked.twists[0], (vx, 0., yaw)))
+                    if candidate.clear_motion(self.pose, self.motion):
+                        checked = candidate
+                    else:
+                        vx = 0.
+            clear = bool(vx) or checked.clear_motion(self.pose, self.motion)
+        else:
+            occupied = self.turn_obstacles()
+            checked = CheckedTurnSweep(geometry, half_width, horizon, occupied, self.pose)
+            clear = self.clear_sweep(geometry, half_width, self._turn_translation(horizon, self.motion),
+                                     occupied=occupied)
+        if not clear:
             if rolling_start:
                 self.phase = "brake"
                 self.origin_set = False
@@ -983,8 +1039,7 @@ class ActiveScan:
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
         if self.buffered_turn:
-            self.turn_sweep = CheckedTurnSweep(geometry, half_width, horizon, occupied, self.pose,
-                                               minimum_translation)
+            self.turn_sweep = checked
         if bounded_turn:
             if not self.turn_until_ms or renew:
                 self.turn_until_ms = control_ms + duration_ms
@@ -992,7 +1047,9 @@ class ActiveScan:
             self.turn_yaw = -math.copysign(yaw_rate, error)
         direction = "右" if error > 0 else "左"
         description = "回到观察前的朝向" if returning else f"向{direction}观察"
-        return ScanCommand(-math.copysign(yaw_rate, error), f"主动观察：{description}")
+        if vx:
+            description = f"边走边转，{description}"
+        return ScanCommand(yaw, f"主动观察：{description}", vx=vx)
 
     def _timed_command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms,
                        min_yaw, tick_s, tracks_commands, yaw_limits):

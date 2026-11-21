@@ -2270,7 +2270,8 @@ class NaviPlugin:
             else:
                 leg = None
             if (scan.buffered_turn and scan.turn_sweep is not None and scan.poses
-                    and message["values"][5] and not any(message["values"][:5])):
+                    and message["values"][5] and not any(message["values"][1:5])
+                    and (not message["values"][0] or scan.turn_sweep.twists is not None)):
                 # Only the copied integration state belongs to the publisher.
                 turn = replace(scan, poses=deque((scan.poses[-1],), maxlen=scan.poses.maxlen))
                 if scan.current_frame:

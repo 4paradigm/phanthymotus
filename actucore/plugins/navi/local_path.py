@@ -646,17 +646,24 @@ def _sweep_circle(geometry, half_width):
     return center, radius
 
 
-def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0.):
+def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0., directional=False):
     """Sweep a circle centered on the chassis through its possible translations."""
     center, radius = _sweep_circle(geometry, half_width)
     # Independently ramped components can reach any center in these bounds.
     # Account for bending of the center's path while turning and translating.
     forward, right = zip(*((vx * horizon, -vy * horizon) for vx, vy, _ in velocities))
     turn = max(abs(yaw) for _, _, yaw in velocities) * horizon
-    travel = math.hypot(max(map(abs, forward)), max(map(abs, right)))
-    radius += padding + travel * min(2., turn / 2)
-    lower = center + min(0., *forward), min(0., *right)
-    upper = center + max(0., *forward), max(0., *right)
+    f_max, r_max = max(map(abs, forward)), max(map(abs, right))
+    bend_f = bend_r = 0.
+    radius += padding
+    if directional and turn <= math.pi / 2:
+        # A rotation by at most 90 degrees can only shrink the component
+        # along each original axis. Bound the cross-axis travel separately.
+        bend_f, bend_r = r_max * turn / 2, f_max * turn / 2
+    else:
+        radius += math.hypot(f_max, r_max) * min(2., turn / 2)
+    lower = center + min(0., *forward) - bend_f, min(0., *right) - bend_r
+    upper = center + max(0., *forward) + bend_f, max(0., *right) + bend_r
     if isinstance(occupied, ObstacleSquares):
         return _square_sweep_hits(occupied, lower, upper, radius)
 

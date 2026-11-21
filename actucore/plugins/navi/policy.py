@@ -1071,14 +1071,14 @@ def step(*, detections, depth, odom, config: Config, state: State,
     scan = state.active_scan
     if (decision.status == AVOIDING and decision.values is not None and not any(decision.values)
             and scan.phase == "brake" and (scan is not scan_before or phase_before != "brake")
-            and scan.receipt_only and scan.buffered_odom and scan.pose_origin is None
+            and scan.poses and not scan.command_only
             and state.goal_anchor is not None
             and max(math.hypot(*state.commanded[:2]), math.hypot(*scan.motion[:2])) > STILL_LINEAR):
         geometry = config.scan_geometry or config.local_geometry
         command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s)
         if command.yaw:
-            decision.values = _twist(0., 0., command.yaw)
-            decision.reason = command.reason
+            decision.values = _twist(command.vx, 0., command.yaw)
+        decision.reason = command.reason
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
         vx, vy, yaw = decision.values[0], decision.values[1], decision.values[5]
@@ -1337,12 +1337,19 @@ def _search_for_target(depth, config, state, dt, odom):
 
 def _observation_command(scan, geometry, config, state, odom, dt, control_period_s):
     yaw_limits = (_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+    vx, vy, yaw = state.commanded
+    previous_linear = vx if vx >= 0. and abs(vy) <= STILL_LINEAR else None
+    anchor = state.goal_anchor
+    horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
+    room = max(0., math.hypot(anchor.x, anchor.y) - config.stop_distance_m) if anchor is not None else 0.
+    (floor, limit), _ = _local_velocity_limits(config, 1.)
     return scan.command(geometry, config.half_width_m, max(yaw_limits), config.watchdog_ms,
                         config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
                         now_ms=(odom or {}).get("control_ms"), tick_s=dt,
-                        previous_yaw=state.commanded[2], control_period_s=control_period_s,
+                        previous_yaw=yaw, control_period_s=control_period_s,
                         previous_command_s=state.command_dt_s, yaw_limits=yaw_limits,
-                        previous_linear=math.hypot(*state.commanded[:2]))
+                        previous_linear=previous_linear, forward_limit=min(limit, room / horizon),
+                        min_forward_speed=floor, min_moving_yaw=config.floor_wz_moving)
 
 
 def _decide(detections, depth, odom, config: Config, state: State,
@@ -1553,7 +1560,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
             command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s)
             if command.replanned_turn:
                 state.view_detour = None
-            return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
+            return Decision(_twist(command.vx, 0, command.yaw), AVOIDING, command.reason)
         if (scan.ready or scan.result_frame) and anchor is None and (track is None or not track.observed):
             scan.finish()
             scan.note_clear_path(scan.current_frame)
