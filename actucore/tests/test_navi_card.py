@@ -2555,3 +2555,45 @@ def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observati
         now = 1150
         card._dispatch_command()
         assert published[-1]["values"] == [0.] * 6
+
+
+@pytest.mark.parametrize("new_feedback", [False, True])
+def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkeypatch, new_feedback):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=1200, max_feedback_gap_ms=350)
+    card._running = True
+    card._publisher = card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 1200}}
+    card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    card._ttl_ms = 250
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    depth = dict(map=np.ones((4, 4)), frame_id=950, capture_ms=700, source_frame_id=700)
+
+    def snapshot(**kwargs):
+        source = now - 5 if new_feedback else 995
+        return {"objects": []}, depth, dict(vx=.1, vy=0., wz=0., received_ms=now - 5,
+                                            source_sample_id=source), 970
+
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~occupied, occupied))
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
+        [.15, 0., 0., 0., 0., 0.], policy.APPROACHING, "target at 3 m", distance_m=3.))
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append)
+
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    assert published[-1]["ttl_ms"] == 250
+    now = 1100  # Early enough to recheck before the old command expires.
+    card._dispatch_command()
+    assert len(published) == (2 if new_feedback else 1)
+    if new_feedback:
+        assert published[-1]["obs_stamp_ms"] == 700
+        assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1350
+    now = 1350 if new_feedback else 1250
+    card._dispatch_command()
+    assert published[-1]["values"] == [0.] * 6

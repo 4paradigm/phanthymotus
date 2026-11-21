@@ -1821,16 +1821,23 @@ class NaviPlugin:
                              (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
                              remembered, memory_ms)
 
-    def _recheck_forward(self, check, values, max_age, now_ms):
-        """Try the same short motion with newer depth and feedback on their own clocks."""
+    def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False):
+        """Try the short motion against current depth and feedback without retiming either."""
         config = self._config
         target_deadline = check.target_ms + min(max_age, config.max_obs_age_ms)
         if not check.target_ms <= now_ms < target_deadline:
             return None
         _, depth, odom, _ = self._observation_snapshot(with_capture_timing=True)
-        if (depth is None or depth["frame_id"] <= check.frame_id
-                or (check.source_id is not None and (depth.get("source_frame_id") or 0) <= check.source_id)
-                or depth.get("capture_invalid") or depth.get("map") is None):
+        if depth is None or depth.get("capture_invalid") or depth.get("map") is None:
+            return None
+        source = depth.get("source_frame_id")
+        feedback = (odom or {}).get("source_sample_id")
+        same_depth = (allow_same_depth and depth["frame_id"] == check.frame_id
+                      and source is not None and source == check.source_id
+                      and feedback is not None and check.feedback_source is not None
+                      and feedback > check.feedback_source)
+        if (not same_depth and (depth["frame_id"] <= check.frame_id
+                                or (check.source_id is not None and (source or 0) <= check.source_id))):
             return None
         geometry = check.geometry
         mount = depth.get("body_from_optical")
@@ -2348,9 +2355,10 @@ class NaviPlugin:
                     stop = ("局部规划：运动反馈已到期，停车后重规划", True)
             renewed = False
             if (stop is None and work.forward_check is not None
-                    and remaining_ms <= math.ceil(1000 / self._rate_hz)):
+                    and remaining_ms <= math.ceil(2000 / self._rate_hz)):
                 max_age = self._descriptor["rate"]["max_obs_age_ms"]
-                checked = self._recheck_forward(work.forward_check, work.message["values"], max_age, now_ms)
+                checked = self._recheck_forward(work.forward_check, work.message["values"],
+                                                max_age, now_ms, allow_same_depth=True)
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))

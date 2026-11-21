@@ -4978,3 +4978,29 @@ def test_view_received_during_interrupted_observation_is_remembered_without_pair
     scan.note_clear_path(1000)
     scan.pose = (0., 0., 0.)
     assert not scan.begin((1.,), turn_angle=.18)
+
+
+def test_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_complete_route(monkeypatch):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    g = P.local_path
+    body = g.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .275)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=body, half_width_m=.275,
+                  max_depth_age_ms=1200, vx_max=.30)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    empty = np.zeros(g.SHAPE, dtype=bool)
+    scan.views.append((1000, scan.pose, empty, empty.copy()))
+    scan.near_hits = (g.FORWARD >= .50) & (g.FORWARD <= .85) & (g.RIGHT >= .29)
+    monkeypatch.setattr(g.PlanCache, "route", lambda *args, **kwargs: None)
+    monkeypatch.setattr(g, "opening_route", lambda *args, **kwargs: None)
+
+    assert P._start_detour_segment(dict(frame_id=1000, map=np.ones((4, 4))), config, state,
+                                   body, .5, (-1., 1.), 3.9, 0.)
+    assert scan.directions == (-1.,)
+    assert scan.advance_m >= .30
+    assert state.view_detour.points[-1][1] < 0.
+    assert g.segment_clear(scan.grid()[1], body, P._keepout_m(config),
+                           -scan.turn_angle, scan.advance_m, heading_tolerance=P.ANGLE_TOLERANCE)

@@ -2155,7 +2155,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     opening = None if closest else local_path.opening_route(depth["map"], occupied, geometry, keep,
                                                             plane, target)
 
-    def candidates():
+    def routes():
         if opening is not None:
             yield opening
         for side in directions:
@@ -2167,17 +2167,30 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             if plan is not None:
                 yield plan
 
+    def candidates():
+        plans = (sorted(routes(), key=lambda plan: _route_rank(plan, optical_target))
+                 if closest and optical_target is not None else routes())
+        for plan in plans:
+            yield plan, True
+        if not config.use_lateral and not scan.command_only and scan.near_hits is not None:
+            # A blocked long route can still have a safe forward prefix after
+            # turning away from a nearby corner. Check the remembered grid too.
+            for degrees in (15, 30, 45, 60):
+                for side in directions:
+                    angle = math.radians(degrees) * side
+                    points = ((0., 0.), *((length * math.cos(angle), length * math.sin(angle))
+                                          for length in (.35, .65)))
+                    yield local_path.Detour(None, points, geometry), False
+
     horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
     turn_occupied = occupied | scan.views[-1][3]
-    plans = (sorted(candidates(), key=lambda plan: _route_rank(plan, optical_target))
-             if closest and optical_target is not None else candidates())
-    for plan in plans:
+    for plan, require_observed in candidates():
         for index in range(len(plan.points) - 1, 0, -1):
             forward, right = plan.points[index]
             # A perpendicular waypoint can be reached by turning before driving.
             if forward < 0. or (forward == 0. and (config.use_lateral or not right)):
                 continue
-            if (depth.get("ground") is not None and geometry.free_space_validated
+            if (require_observed and depth.get("ground") is not None and geometry.free_space_validated
                     and not local_path.observed_waypoint(free, forward, right)):
                 continue
             angle, length = math.atan2(right, forward), math.hypot(forward, right)
