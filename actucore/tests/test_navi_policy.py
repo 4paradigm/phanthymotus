@@ -2437,8 +2437,8 @@ def test_default_has_no_driver_response_override():
 
 
 @pytest.mark.parametrize("bearing", [-0.2, 0.2])
-@pytest.mark.parametrize("measured_wz", [-5.0, -0.2, 0.0, 0.2, 5.0, None])
-def test_driver_response_tracking_is_pure_p_and_ignores_actual_yaw_rate(
+@pytest.mark.parametrize("measured_wz", [-1.0, -0.2, 0.0, 0.2, 1.0, None])
+def test_driver_response_tracking_is_pure_p_within_the_speed_limit(
         bearing, measured_wz, monkeypatch):
     config = _cfg(response_yaw_gain=0.8, use_lateral=False, floor_wz=0.0)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
@@ -2454,7 +2454,7 @@ def test_driver_response_p_command_stays_inside_the_angular_limit(monkeypatch):
     config = _cfg(response_yaw_gain=1.0, use_lateral=False,
                   floor_wz=0.0, wz_max=0.15)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
-    decision = _profiled_frame(config, odom={"wz": 5.0})
+    decision = _profiled_frame(config, odom={"wz": .1})
     assert abs(decision.values[5]) <= config.wz_max
     assert decision.values[5] == pytest.approx(
         max(-config.wz_max, min(config.wz_max, -decision.bearing)))
@@ -4742,3 +4742,60 @@ def test_blind_spot_history_only_blocks_a_motion_that_sweeps_through_it(monkeypa
                       target_distance=3., target_bearing=0.,
                       odom={"vx": 0., "vy": 0., "wz": 0.}, may_scan=True)
     assert (result[0] > 0.) is can_move
+
+
+def test_reobserved_original_target_rechecks_direct_corridor_after_exhaustion(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25, use_lateral=False)
+    track = SimpleNamespace(observed=True, range_known=True, range_m=2.5, measured_range_m=2.7,
+                            bearing_rad=0., last_obs=(2.65, .52))
+    state = _state(motion_source="measured", goal_anchor=P.DetourGoal(2.1, 0., track=track))
+    state.active_scan.attempted = state.active_scan.exhausted = True
+    empty = np.zeros(P.local_path.SHAPE, dtype=bool)
+    table = np.isclose(P.FORWARD, 1.2) & np.isclose(P.RIGHT, .30)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~table, table))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.2, 1.))
+    frame = np.ones((8, 8))
+    decision = P.step(detections=_detections(), depth=dict(map=frame, ground=frame.astype(bool),
+                    frame_id=1000), odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
+                    config=config, state=state, dt=.1)
+    assert decision.values[0] > 0.
+    assert decision.distance_m == pytest.approx(2.7)
+    assert decision.bearing < 0.
+    assert state.goal_anchor is None and not state.active_scan.exhausted
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_lost_detour_target_checks_turn_space_instead_of_old_forward_clearance(monkeypatch, blocked):
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25)
+    state = _state(motion_source="measured", goal_anchor=P.DetourGoal(2., .8), last_clearance=.8)
+    occupancy = np.zeros(P.local_path.SHAPE, dtype=bool)
+    occupancy[P.local_path.START] = blocked
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~occupancy, occupancy))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.8, 1.))
+    frame = np.ones((8, 8))
+    decision = P.step(detections=None, depth=dict(map=frame, ground=frame.astype(bool), frame_id=1000),
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
+                      config=config, state=state, dt=.1)
+    assert decision.values[:5] == [0.] * 5
+    assert (decision.values[5] > 0.) is not blocked
+    assert state.goal_anchor is not None
+
+
+def test_linear_feedback_above_speed_limit_reduces_command_without_failing():
+    cfg = _cfg(vx_max=.30)
+    detection, frame = _detections(_obj()), _scene(3.)
+    state = seed(_state(), detection, frame, cfg)
+    decision = _step(detections=_next_frame(detection), depth=frame, config=cfg, state=state,
+                     odom=dict(vx=.55, vy=0., wz=0.))
+    assert 0. < decision.values[0] < cfg.vx_max
+    assert not state.failed_reason

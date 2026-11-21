@@ -24,6 +24,7 @@ TURN_BURST_MS = 400
 TURN_PROGRESS_WINDOW_MS = 2000
 TURN_PROGRESS_MIN_RAD = math.radians(3)
 DEPTH_RECHECK_HOLD = "主动观察：深度暂不可用，停车等待新深度复检当前路线"
+TURN_SPEED_REDUCTION = "主动观察：实测转速超限，减速后继续"
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,7 @@ class ActiveScan:
     turn_feedback_ms: int = 0
     turn_sweep: CheckedTurnSweep | None = None
     turn_yaw: float = 0.
+    turn_rate_scale: float = 1.
     turn_depth_paused: bool = False
     command_only: bool = False
     single_control_ms: int = 0
@@ -357,7 +359,7 @@ class ActiveScan:
         motion = history[-1][2]
         error = self.origin[2] + self.directions[0] * self.turn_angle - self.pose[2]
         if abs(motion[2]) > max_yaw + .10:
-            return "主动观察：转速超出限制，停车后重规划", True
+            return TURN_SPEED_REDUCTION, False
         if abs(error) <= ANGLE_TOLERANCE or self.turn_yaw * error > 0:
             return "主动观察：达到转角，停车等待速度反馈", False
         if motion[2] * math.copysign(1., error) > STILL_YAW:
@@ -371,6 +373,10 @@ class ActiveScan:
                                 occupied=checked.occupied, start_angle=self.pose[2] - checked.pose[2]):
             return "主动观察：转身扫掠区有障碍，停车后重规划", True
         return None
+
+    def reduce_turn_speed(self, limit, measured):
+        self.turn_rate_scale = min(self.turn_rate_scale, .8, limit / max(limit, abs(measured), 1e-6))
+        self.turn_until_ms = 0
 
     def _update_latest(self, depth, geometry, stamp, max_depth_age_ms):
         # Receipt times establish liveness.
@@ -574,6 +580,7 @@ class ActiveScan:
         self.phase = "brake"
         self.origin_set = False
         self.turn_sweep = None
+        self.turn_rate_scale = 1.
         self.start_ms = self.single_control_ms if self.command_only else self.poses[-1][0]
         self.still_since = self.start_ms
         self.timed_phase_s = self.timed_total_s = self.timed_turn_s = 0.
@@ -672,7 +679,7 @@ class ActiveScan:
         if translating and not turning:
             return self.interrupt("主动观察：检测到平移，停车")
         if abs(self.motion[2]) > yaw_rate + .10:
-            return self.interrupt("主动观察：实测转速超出限制，停车")
+            self.reduce_turn_speed(yaw_rate, self.motion[2])
         # Short route turns also use bounded bursts when only delayed velocity
         # feedback is available. Stop on the control clock even on a repeated sample.
         bounded_turn = self.pose_origin is not None or self.advance_m is not None
@@ -725,6 +732,10 @@ class ActiveScan:
         horizon = (watchdog_ms + obs_age_ms + 50) / 1000
         if yaw_limits is not None:
             yaw_rate = min(yaw_rate, yaw_limits[0 if error > 0. else 1])
+        if 0. < min_yaw_rate <= yaw_rate:
+            yaw_rate = max(min_yaw_rate, yaw_rate * self.turn_rate_scale)
+        else:
+            yaw_rate *= self.turn_rate_scale
         if not geometry.front > 0 or not geometry.rear > 0 or not yaw_rate > 0 or yaw_rate < min_yaw_rate:
             return self.interrupt()
         if self.motion[2] * math.copysign(1., error) > STILL_YAW:
@@ -760,6 +771,8 @@ class ActiveScan:
                 return ScanCommand(reason="主动观察：当前速度下转身扫掠区有障碍，停车")
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
+            if self.turn_rate_scale < 1. and abs(self.motion[2]) > STILL_YAW:
+                return ScanCommand(reason=TURN_SPEED_REDUCTION)
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
         if self.buffered_turn:
@@ -790,7 +803,9 @@ class ActiveScan:
             turn_direction = self.turn_yaw if self.timed_turn_s else error
             yaw_rate = min(yaw_rate, yaw_limits[0 if turn_direction > 0. else 1])
         if self.timed_turn_s and abs(self.turn_yaw) > yaw_rate:
-            return self.interrupt("主动观察：底盘转向限速已变化，停车")
+            if yaw_rate <= 0. or yaw_rate < min_yaw:
+                return ScanCommand(reason=TURN_SPEED_REDUCTION)
+            self.timed_turn_s = self.timed_phase_s = 0.
         if not self.timed_turn_s:
             if abs(error) <= ANGLE_TOLERANCE:
                 self.side_frame = self.current_frame

@@ -589,7 +589,7 @@ def test_command_only_scan_evaluates_when_the_timed_turn_finishes(monkeypatch, l
     assert len(look.views) == 1 and not look.poses
 
 
-def test_running_command_only_turn_stops_when_the_downstream_cap_is_lowered(monkeypatch):
+def test_running_command_only_turn_slows_when_the_downstream_cap_is_lowered(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
     look.observe_single(_depth(1000), geometry, 800, 1000)
     assert look.begin((1.,))
@@ -602,8 +602,8 @@ def test_running_command_only_turn_stops_when_the_downstream_cap_is_lowered(monk
 
     look.observe_single(_depth(stamp + 100), geometry, 800, stamp + 100)
     command = look.command(geometry, .31, .8, 300, yaw_limits=(.35, .8))
-    assert command.yaw == 0.
-    assert not look.active
+    assert -.35 <= command.yaw < 0.
+    assert look.active
 
 
 @pytest.mark.parametrize("blocked", [False, True])
@@ -657,14 +657,14 @@ def test_command_only_scan_reuses_the_current_view_after_turning(monkeypatch):
     assert look.ready and look.side_frame == 1000
 
 
-def test_scan_rejects_unexpected_yaw_rate(monkeypatch):
+def test_scan_slows_for_unexpected_yaw_rate(monkeypatch):
     lookout, geometry, _, _ = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)
     assert lookout.begin((-1., 1.))
     _tick(lookout, geometry, 1050)
     assert _tick(lookout, geometry, 1200).yaw > 0
-    assert _tick(lookout, geometry, 1250, wz=.55).yaw == 0
-    assert lookout.phase == "brake_for_replan"
+    assert 0. < _tick(lookout, geometry, 1250, wz=.55).yaw < .25
+    assert lookout.phase == "turn"
 
 
 def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(monkeypatch):
@@ -1174,3 +1174,25 @@ def test_camera_near_obstacle_can_use_continuous_relative_odometry_during_pose_g
     look.update_near_obstacles(None, geometry, None, .3, 1.5, approaching=False)
     assert look.near_hits[scan.START[0] + 9, scan.START[1]]
     assert look.near_revision == 1100
+
+
+def test_measured_overspeed_keeps_turn_and_reduces_next_burst():
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    clear = np.zeros(scan.SHAPE, dtype=bool)
+    look = scan.ActiveScan(receipt_only=True, current_frame=1200, phase="turn",
+                           origin_set=True, issued_yaw=True, directions=(1.,),
+                           turn_angle=math.radians(70), motion=(0., 0., -1.34), still_since=1000)
+    look.poses.append((1200, look.pose, -1.34))
+    look.views.append((1200, look.pose, clear, clear))
+    result = look.command(geometry, .30, 1., 500, 800)
+    assert -.99 < result.yaw < 0.
+    assert look.phase == "turn"
+
+
+def test_buffered_turn_cancels_only_the_burst_when_feedback_is_overspeed():
+    look = scan.ActiveScan(phase="turn", receipt_only=True, buffered_odom=True, directions=(1.,),
+                           turn_yaw=-.7, turn_angle=.7, advance_m=.8)
+    look.poses.append((1000, look.pose, -1.34))
+    history = ((1000, 1000, (0., 0., -1.34)),)
+    assert look.check_turn_feedback(history, 1000, 1.) == (scan.TURN_SPEED_REDUCTION, False)
+    assert look.active and look.advance_m == .8

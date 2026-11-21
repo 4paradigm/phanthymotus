@@ -49,7 +49,7 @@ from . import depth as depth_mod
 from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
-from .active_scan import ActiveScan, DEPTH_RECHECK_HOLD
+from .active_scan import ActiveScan, DEPTH_RECHECK_HOLD, TURN_SPEED_REDUCTION
 
 log = logging.getLogger(__name__)
 
@@ -2075,6 +2075,10 @@ class NaviPlugin:
                     scan = self._state.active_scan
                     if reason == DEPTH_RECHECK_HOLD and scan.buffered_turn:
                         scan.pause_for_depth(stamp)
+                    elif reason == TURN_SPEED_REDUCTION and scan.buffered_turn:
+                        with self._obs_lock:
+                            measured = self._velocity_history[-1][2] if self._velocity_history else None
+                        scan.reduce_turn_speed(self._config.wz_max, measured[2] if measured else scan.motion[2])
                     elif replan and scan.active and scan.receipt_only and not scan.command_only:
                         scan.hold_for_replan(reason)
                     elif scan.buffered_turn:
