@@ -203,16 +203,9 @@ class VisitorBridge:
                 self._finish(request_id, ticket, result)
                 return result
 
-            status = self.backend.get_status(visit)
-            if status not in self.printable_statuses:
-                result = {
-                    "ok": False,
-                    "code": "status_not_printable",
-                    "error": f"访客当前状态为“{status or '未知'}”，不能打印访客贴",
-                }
-                self._finish(request_id, ticket, result)
-                return result
-
+            # print_visit performs the authoritative status check on the same
+            # page immediately before clicking. Avoid a separate full-page
+            # lookup here; it opened a second Edge search and added latency.
             try:
                 if printer_name:
                     self.backend.print_visit(visit, printer_name=printer_name)
