@@ -879,6 +879,25 @@ html, body {
   cursor: wait;
   opacity: .65;
 }
+.ql-printer-discover-button {
+  width: 100%;
+  min-height: 38px;
+  margin-top: 7px;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter .15s ease, transform .15s ease;
+}
+.ql-printer-discover-button:hover {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+}
 .ql-printer-progress {
   margin-top: 8px;
   min-height: 20px;
