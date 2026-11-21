@@ -386,7 +386,10 @@ class QLPrinterPlugin:
                     "description": "一定选择已经登录、并且能看到访客列表的网页",
                 },
             },
-            "required": ["bridge_url", "remote_start_user", "remote_start_password", "visitor_page_url", "printer_name"],
+            # Connection credentials are required to discover the choices.
+            # The page and printer are selected only after discovery, so they
+            # must not block the initialization button.
+            "required": ["bridge_url", "remote_start_user", "remote_start_password"],
         }
         return definition
 
@@ -438,8 +441,7 @@ class QLPrinterPlugin:
 
     def _configured(self) -> bool:
         return bool(self._cfg["bridge_url"] and self._cfg["remote_start_user"] and
-                    self._cfg["remote_start_password"] and self._cfg["visitor_page_url"] and
-                    self._cfg["printer_name"])
+                    self._cfg["remote_start_password"])
 
     def _client(self, cfg: dict | None = None) -> SSHBridgeClient:
         with self._lock:
@@ -540,6 +542,8 @@ class QLPrinterPlugin:
         return client.request("POST", "/printers", body={})
 
     def _daily_visits(self) -> tuple[str, list[dict]]:
+        if not self._cfg["visitor_page_url"]:
+            raise BridgeError("请先在卡片中选择已登录的访客网页", "visitor_page_required")
         payload = self._client().request("POST", "/list_visits", body={"visitor_page_url": self._cfg["visitor_page_url"]})
         visits = [_visit(v) for v in payload.get("visits") or [] if isinstance(v, dict)]
         visits = [v for v in visits if v["ticket"]]
@@ -554,6 +558,10 @@ class QLPrinterPlugin:
         return {"status": "listed", "date": day, "count": len(public), "visits": public}
 
     def _print_ticket(self, args: dict) -> dict:
+        if not self._cfg["printer_name"]:
+            return {"status": "error", "code": "printer_required", "error": "请先在卡片中选择目标打印机"}
+        if not self._cfg["visitor_page_url"]:
+            return {"status": "error", "code": "visitor_page_required", "error": "请先在卡片中选择已登录的访客网页"}
         ticket = str(args.get("ticket", "")).strip()
         if not ticket or len(ticket) > 512:
             return {"status": "error", "code": "bad_args", "error": "旧版 print 调用缺少短期 ticket"}

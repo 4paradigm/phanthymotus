@@ -67,7 +67,8 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertNotIn("token", props)
         self.assertIn("remote_start_password", props)
         self.assertIn("visitor_page_url", props)
-        self.assertIn("remote_start_password", definition["configSchema"]["required"])
+        self.assertEqual(definition["configSchema"]["required"],
+                         ["bridge_url", "remote_start_user", "remote_start_password"])
 
     def test_operator_can_enter_only_frontdesk_ip(self):
         card = QLPrinterPlugin({"bridge_url": "10.100.10.14"})
