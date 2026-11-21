@@ -609,7 +609,7 @@ def test_speak_without_a_language_reads_by_context(monkeypatch, prepared):
 
     assert _wait_until(lambda: len(prepared) == 3)
     assert [call[1] for call in prepared] == ["auto", "auto", "auto"]
-    assert _installed(plugin).readings == ["", "", ""]
+    assert _wait_until(lambda: _installed(plugin).readings == ["", "", ""])
     assert state["loads"] == 1
 
 

@@ -1,0 +1,1012 @@
+#!/usr/bin/env python3
+"""Depth-only pointcloud card: one integer or floating optical-depth input.
+
+Camera parameters come from upstream camera_info. Display output retains its
+approximate field-of-view fallback; metric output requires finite numeric intrinsics.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import queue
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from sensor_msgs.msg import CompressedImage, Image, PointCloud2, PointField
+from std_msgs.msg import String, UInt8MultiArray
+
+from plugins.camera_geometry import (CameraModel, camera_parameter, decode_depth_zlib, depth_scale,
+                                     zlib_decompress)
+from plugins.pointcloud_math import (
+    MAX_POINTS,
+    backproject_depth, decimation_stride,
+    encode_packet, intrinsics_from_hfov,
+    pinhole_of,
+    summarize_cloud,
+)
+from utils.ros_lifecycle import dispose_node
+
+log = logging.getLogger(__name__)
+
+DEFAULT_CLOUD_TOPIC = "/perception/pointcloud"
+DEFAULT_SUMMARY_TOPIC = "/perception/pointcloud_summary"
+_DEFAULT_INSTANCE = "_default"
+_DEPTH_FORMATS = {
+    "image/depth-zlib": "sensor_msgs/msg/CompressedImage",
+    "image/depth-f32": "sensor_msgs/msg/Image",
+    "image/depth-f32-zlib": "sensor_msgs/msg/CompressedImage",
+}
+
+_LOW_LAT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=2,
+    durability=DurabilityPolicy.VOLATILE,
+)
+_PUB_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+
+def output_topics_for(input_topic: Optional[str]) -> tuple[str, str]:
+    """The one place the two output topics are derived from the input.
+
+    跟随工具命名（{input}/pointcloud），summary 是兄弟而非子路径，
+    同 visual_depth 的教训：两者互不为前缀，下游前缀匹配不会混淆。
+    """
+    if input_topic:
+        return f"{input_topic}/pointcloud", f"{input_topic}/pointcloud_summary"
+    return DEFAULT_CLOUD_TOPIC, DEFAULT_SUMMARY_TOPIC
+
+
+TOOLS = [
+    {
+        "name": "pointcloud",
+        "type": "processor",
+        "multiInstance": True,
+        "description": (
+            "点云 — 一路整型或浮点深度图反投影为 3D 点云。"
+            "输出点云包（sensor/pointcloud）、摘要（data/json）和计算点云（sensor/pointcloud2）"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "stop", "info", "config"],
+                    "description": "Action to perform",
+                },
+                "input_topic": {
+                    "type": "string",
+                    "description": "要订阅的一路深度图话题",
+                },
+                "input_topics": {
+                    "type": "array", "items": {"type": "string"},
+                    "minItems": 1, "maxItems": 1,
+                    "description": "一路深度图话题；与 input_topic 同时提供时必须一致",
+                },
+            },
+            "required": ["action"],
+            "x-input-metadata-consumer": True,
+            "x-action-params": {
+                "start": {
+                    "params": ["input_topic", "input_topics"],
+                    "description": "启动。通过 input_topic 或 input_topics 连接一路深度图",
+                },
+                "stop": {"params": [], "description": "停止点云输出"},
+                "info": {"params": [], "description": "查看状态、模式与输出话题"},
+                "config": {"params": [], "description": "更新实例配置（fps / max_points / 深度范围等），变更后需重启实例生效"},
+            },
+        },
+        "configSchema": {
+            "type": "object",
+            "properties": {
+                "fps": {"type": "integer", "description": "Max output frames per second", "default": 2, "scope": "instance"},
+                "max_points": {"type": "integer", "description": "每帧最多点数（上限 40000，由渲染器决定）", "default": 20000, "scope": "instance"},
+                "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
+                "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
+            },
+        },
+        "topic_in": [
+            {"format": "image/depth-zlib", "desc": "zlib 压缩深度图输入"},
+            {"format": "image/depth-f32", "desc": "32-bit 浮点深度图输入（米）"},
+            {"format": "image/depth-f32-zlib", "desc": "zlib 压缩浮点深度图输入（米）"},
+        ],
+        "topic_out": [
+            {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
+            {"format": "data/json", "desc": "点数/范围/三区最近障碍摘要"},
+            {"format": "sensor/pointcloud2", "desc": "米制计算点云（使用有效内参，携带观测时间戳和输入坐标系）"},
+        ],
+    }
+]
+
+
+# review 第 6 轮：畸形 depth-zlib 帧以前每回调刷一条 warning，2 fps 的坏流
+# 一天十几万行。第 1 条与之后每第 100 条采样记录，解出一帧好数据即复位
+# —— 连续失败是状态，散落的失败是噪声。模块级计数：日志洪峰按进程算。
+_zlib_fail_count = 0
+
+
+def _decode_depth_message(msg, dimensions=None, *, floating=False, scale=.001,
+                          registry=None, observation=None) -> tuple[Optional[np.ndarray], str]:
+    """Decode one depth frame in metres with its original sample validity."""
+    global _zlib_fail_count
+
+    if isinstance(msg, Image):
+        if msg.encoding != "32FC1":
+            return None, msg.encoding
+        if any(type(v) is not int or v <= 0 for v in (msg.width, msg.height, msg.step)):
+            return None, msg.encoding
+        needed = msg.height * msg.step
+        itemsize = 4
+        if (msg.width > 4096 or msg.height > 4096 or needed > 64*1024*1024 or
+                msg.step < msg.width * itemsize or len(msg.data) != needed):
+            return None, msg.encoding
+        dtype = np.dtype(">f4" if msg.is_bigendian else "<f4")
+        depth = np.ndarray((msg.height, msg.width), dtype=dtype,
+                           buffer=bytes(msg.data[:needed]), strides=(msg.step, itemsize))
+        return depth.astype(np.float32) * scale, msg.encoding
+
+    # CompressedImage must identify depth, not a JPEG/PNG image.
+    encoding = str(getattr(msg, "format", "") or "").lower()
+    if "depth" not in encoding or "zlib" not in encoding:
+        return None, encoding
+    width, height = dimensions if dimensions is not None else (640, 480)
+    if any(type(v) is not int or not 0 < v <= 4096 for v in (width, height)):
+        return None, "depth-zlib"
+    try:
+        if registry is None or observation is None:
+            depth = decode_depth_zlib(bytes(msg.data), width, height, floating=floating)
+        else:
+            depth = registry.decode_raw_depth(observation, msg.data, width, height, floating=floating)
+    except Exception as error:
+        _zlib_fail_count += 1
+        if _zlib_fail_count == 1 or _zlib_fail_count % 100 == 0:
+            log.warning(f"[pointcloud] depth-zlib decompress failed"
+                        f"（第 {_zlib_fail_count} 帧）: {str(error)[:200]}")
+        return None, getattr(msg, "format", "depth-zlib")
+    _zlib_fail_count = 0
+    return depth.astype(np.float32) * scale, "depth-zlib"
+
+
+class _PointCloudNode(Node):
+    """One depth subscription and bounded worker per instance."""
+
+    def __init__(self, input_topic: str, calibration,
+                 fps: float, max_points: int, min_depth_m: float,
+                 max_depth_m: float,
+                 node_suffix: str):
+        super().__init__(f"pointcloud_{node_suffix}" if node_suffix else "pointcloud")
+        self._mode = "depth"
+        self._input_topic = input_topic or ''
+        self._calibration = calibration or {}
+        self._camera_model = self._scaled_camera = None
+        self._camera_geometry_error = None
+        self._depth_scale = .001
+        self._fps = fps
+        self._frame_interval = 1.0 / max(fps, 0.1)
+        self._max_points = max_points
+        self._min_depth_m = min_depth_m
+        self._max_depth_m = max_depth_m
+        self._cloud_topic, self._summary_topic = output_topics_for(input_topic)
+        self._cloud_pub = self.create_publisher(UInt8MultiArray, self._cloud_topic, _PUB_QOS)
+        self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
+        self._input_format = None
+        self._metric_cloud_topic = (input_topic or "/perception") + "/pointcloud_metric"
+        self._metric_cloud_pub = self.create_publisher(PointCloud2, self._metric_cloud_topic, _PUB_QOS)
+        self._metric_metadata_topic = self._metric_cloud_topic + "/metadata"
+        self._metric_metadata_source_topic = None
+        self._metric_metadata_pub = None
+        self._metric_metadata_lock = threading.Lock()
+        self._metric_pending_clouds = {}
+        self._metric_pending_metadata = {}
+        self._metric_lock = threading.Lock()
+        self._metric_published = 0
+        self._metric_skipped = {}
+        self._metric_last_skip = None
+
+        self._subs: list = []
+        self._input_registry = None
+        self._input_declaration = {}
+        self._input_leases = []
+        self._input_discovery_timer = None
+        self._input_discovery_errors = 0
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._worker_error_count = 0
+        self._last_emit_time = 0.0
+        self._frame_count = 0
+        self._running = False
+        self._lifecycle_lock = threading.RLock()
+
+    # ── 生命周期（同 visual_depth：request_stop 不拿锁；stop 只收 worker）──
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    def _input_ros_type(self):
+        """Select one ROS transport type, never two subscriptions on one topic.
+
+        Camera declarations take priority. For older producers that supply no
+        format, discover actual publisher endpoint types rather than guessing
+        from the topic name or creating incompatible DDS subscriptions.
+        """
+        if self._input_format:
+            if self._input_format not in _DEPTH_FORMATS:
+                raise ValueError(f"unsupported pointcloud input format: {self._input_format}")
+            return _DEPTH_FORMATS[self._input_format]
+        endpoints = self.get_publishers_info_by_topic(self._input_topic)
+        types = {entry.topic_type for entry in endpoints}
+        supported = set(_DEPTH_FORMATS.values())
+        if types - supported:
+            raise ValueError(f"unsupported pointcloud publisher types on {self._input_topic}: {sorted(types)}")
+        if len(types) > 1:
+            raise ValueError(f"conflicting ROS publisher types on {self._input_topic}: {sorted(types)}")
+        return next(iter(types)) if types else None
+
+    def _attach_input_subscription(self):
+        msg_type = self._input_ros_type()
+        if msg_type is None:
+            return False  # Publisher may appear after canvas startup.
+        raw = msg_type == "sensor_msgs/msg/Image"
+        if self._input_format is None:
+            self._input_format = "image/depth-f32" if raw else "image/depth-zlib"
+            self._depth_scale = depth_scale(dict(self._input_declaration, format=self._input_format))
+        callback = self._depth_image_cb if raw else self._depth_comp_cb
+        if self._input_registry is None:
+            self._subs.append(self.create_subscription(
+                Image if raw else CompressedImage, self._input_topic, callback, _LOW_LAT_QOS))
+        else:
+            self._input_leases.append(self._input_registry.acquire(
+                self._input_topic, Image if raw else CompressedImage,
+                self._input_declaration, callback))
+        log.info("[pointcloud] bound %s to %s", self._input_topic, msg_type)
+        return True
+
+    def _poll_input_subscription(self):
+        # Legacy untyped publishers may come online after the card starts.
+        with self._lifecycle_lock:
+            if self._stop_event.is_set():
+                return
+            try:
+                attached = self._attach_input_subscription()
+            except Exception as error:
+                self._input_discovery_errors += 1
+                if self._input_discovery_errors == 1 or self._input_discovery_errors % 120 == 0:
+                    log.error("[pointcloud] input binding failed: %s", error,
+                              exc_info=self._input_discovery_errors == 1)
+                return
+            if attached:
+                self._input_discovery_errors = 0
+                timer, self._input_discovery_timer = self._input_discovery_timer, None
+                if timer is not None:
+                    self.destroy_timer(timer)
+
+    def start(self) -> dict:
+        with self._lifecycle_lock:
+            if self._running:
+                return self._state("running")
+            self._stop_event.clear()
+            if not self._attach_input_subscription():
+                self._input_discovery_timer = self.create_timer(0.5, self._poll_input_subscription)
+            if self._metric_metadata_source_topic:
+                self._subs.append(self.create_subscription(
+                    String, self._metric_metadata_source_topic, self._metric_metadata_cb, _PUB_QOS))
+            if self._subs or self._input_leases or self._input_discovery_timer is not None:
+                self._worker = threading.Thread(target=self._worker_loop, daemon=True,
+                                                name=f"pointcloud_worker_{self._input_topic}")
+                self._worker.start()
+            self._running = True
+            log.info(f"[pointcloud] started mode={self._mode} "
+                     f"in={self._input_topic or '(none)'}"
+                     f"→ {self._cloud_topic}, {self._summary_topic}")
+            return self._state("running")
+
+    def stop(self) -> dict:
+        # Worker only — subscriptions are destroyed by dispose_node after the
+        # node leaves the executor (InvalidHandle race otherwise; see vop).
+        self._stop_event.set()
+        for lease in self._input_leases:
+            lease.close()
+        with self._lifecycle_lock:
+            timer, self._input_discovery_timer = self._input_discovery_timer, None
+            if timer is not None:
+                self.destroy_timer(timer)
+            if self._worker and self._worker.is_alive():
+                self._worker.join(timeout=3.0)
+                if self._worker.is_alive():
+                    log.warning('[pointcloud] worker still stopping after timeout')
+            self._worker = None
+            self._running = False
+            with self._metric_metadata_lock:
+                self._metric_pending_clouds.clear()
+                self._metric_pending_metadata.clear()
+            return self._state("idle")
+
+    def _state(self, state: str) -> dict:
+        return {
+            "state": state,
+            "mode": self._mode,
+            "input": self._input_topic or None,
+            "cloud_topic": self._cloud_topic,
+            "summary_topic": self._summary_topic,
+        }
+
+    # ── 订阅回调（只做节流和解码入队，重活都在 worker）─────────────────────
+
+    def _throttled(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_emit_time < self._frame_interval:
+            return True
+        self._last_emit_time = now
+        return False
+
+    @staticmethod
+    def _drop_stale(q: queue.Queue, item) -> None:
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _depth_comp_cb(self, msg: CompressedImage, context=None):
+        if self._throttled():
+            return
+        self._drop_stale(self._frame_queue, ("depth_zlib", msg) if context is None else ("depth_zlib", msg, context))
+
+    def _depth_image_cb(self, msg: Image, context=None):
+        if msg.encoding != "32FC1" or self._throttled():
+            return
+        self._drop_stale(self._frame_queue, ("depth_f32", msg) if context is None else ("depth_f32", msg, context))
+
+
+    # ── worker：按模式出云 ─────────────────────────────────────────────────
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                item = self._frame_queue.get(timeout=1.0)
+                _, payload = item[:2]
+                context = item[2] if len(item) == 3 else None
+                if self._stop_event.is_set():
+                    break
+                if context is None:
+                    self._emit_depth(payload)
+                else:
+                    self._emit_depth(payload, context)
+            except queue.Empty:
+                continue
+            except Exception as error:  # noqa: BLE001 — keep the worker alive
+                # review 第 6 轮：以前每帧一条完整 traceback —— 坏标定/坏帧
+                # 把容器日志淹掉。第 1 条带 traceback，之后每第 100 条采样
+                # 且只记有界摘要；一帧处理成功即复位。
+                self._worker_error_count += 1
+                if self._worker_error_count == 1:
+                    log.error(f"[pointcloud] worker error: {error}", exc_info=True)
+                elif self._worker_error_count % 100 == 0:
+                    log.error(f"[pointcloud] worker error"
+                              f"（第 {self._worker_error_count} 帧，连续失败）: "
+                              f"{str(error)[:200]}")
+            else:
+                if self._worker_error_count:
+                    self._worker_error_count = 0
+                    log.info("[pointcloud] worker recovered; error stream cleared")
+
+    # A: 深度图 → 反投影
+    def _emit_depth(self, msg, context=None):
+        floating = self._input_format in ("image/depth-f32", "image/depth-f32-zlib")
+        depth_m, enc = _decode_depth_message(msg, getattr(self, "_input_dimensions", None),
+                                             floating=floating, scale=self._depth_scale,
+                                             registry=self._input_registry, observation=context)
+        if depth_m is None:
+            self._metric_skip('invalid_depth')
+            return
+        h, w = depth_m.shape[:2]
+        fx, fy, cx, cy = self._pinhole_for(w, h)
+        stride = decimation_stride(w, h, self._max_points)
+        geometry = self._camera_model
+        if geometry is not None and (geometry.distorted or geometry.K[0, 1] != 0.):
+            if self._scaled_camera is None or (self._scaled_camera.width, self._scaled_camera.height) != (w, h):
+                self._scaled_camera = geometry.resized(w, h)
+            geometry = self._scaled_camera
+            xyz = geometry.backproject(depth_m, stride, self._min_depth_m, self._max_depth_m)
+        else:
+            geometry = None
+            xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride, self._min_depth_m, self._max_depth_m)
+        self._publish(xyz)
+        if self._camera_geometry_error:
+            self._metric_skip('invalid_camera_geometry')
+        elif enc in ("32FC1", "depth-zlib"):
+            self._publish_metric(xyz, msg, w, h, context, depth_m=depth_m, geometry=geometry)
+        else:
+            self._metric_skip('unsupported_encoding')
+
+    def _metric_skip(self, reason):
+        with self._metric_lock:
+            count = self._metric_skipped.get(reason, 0) + 1
+            self._metric_skipped[reason] = count
+            self._metric_last_skip = reason
+        if count == 1 or count % 100 == 0:
+            log.warning('[pointcloud] metric cloud skipped: %s (%d)', reason, count)
+
+    def _metric_status(self):
+        with self._metric_lock:
+            return {'published': self._metric_published, 'skipped': dict(self._metric_skipped),
+                    'last_skip_reason': self._metric_last_skip}
+
+    def _publish_metric(self, xyz, source, width, height, context=None, *, depth_m=None, geometry=None):
+        if self._stop_event.is_set():
+            return
+        calibration = self._calibration
+        header = getattr(source, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if not xyz.size:
+            self._metric_skip('empty_cloud')
+            return
+        if (not isinstance(calibration, dict) or
+                not all(k in calibration for k in ('fx', 'fy', 'cx', 'cy'))):
+            self._metric_skip('calibration_mismatch')
+            return
+        sec, nanosec = getattr(stamp, 'sec', None), getattr(stamp, 'nanosec', None)
+        if context is not None:
+            header = copy.deepcopy(header)
+            sec, nanosec = divmod(context.observation_stamp_ns, 1_000_000_000)
+            header.stamp.sec, header.stamp.nanosec = sec, nanosec
+        if type(sec) is not int or type(nanosec) is not int or not 0 <= nanosec < 1_000_000_000:
+            self._metric_skip('invalid_capture_stamp')
+            return
+        try:
+            intrinsics = self._pinhole_for(width, height)
+            if not all(np.isfinite(intrinsics)) or any(v == 0 for v in intrinsics[:2]):
+                self._metric_skip('invalid_intrinsics')
+                return
+        except (TypeError, ValueError):
+            self._metric_skip('invalid_intrinsics')
+            return
+        cloud = PointCloud2()
+        cloud.header = header
+        cloud.height, cloud.width = 1, len(xyz)
+        cloud.fields = [PointField(name=name, offset=i * 4, datatype=PointField.FLOAT32, count=1)
+                        for i, name in enumerate(("x", "y", "z"))]
+        cloud.is_bigendian = False
+        cloud.point_step, cloud.row_step = 12, 12 * len(xyz)
+        cloud.is_dense = True
+        cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
+        if context is not None and self._input_registry is not None:
+            self._metric_observation = context
+            self._metric_frame = header.frame_id
+            depth = (depth_m, geometry or intrinsics, self._min_depth_m, self._max_depth_m) if depth_m is not None else None
+            derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context,
+                                                            'depth_projection', depth=depth)
+            if self._metric_metadata_pub is not None and not self._metric_metadata_source_topic:
+                packet = dict(schema='motus.slam_frame/2', observation=derived.to_dict(),
+                              stamp_ns=derived.observation_stamp_ns, clock_id=derived.normalized_clock_id,
+                              frame_id=header.frame_id, data_sha256=hashlib.sha256(cloud.data).hexdigest(),
+                              source_data_sha256=hashlib.sha256(source.data).hexdigest())
+                self._metric_metadata_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
+        self._metric_cloud_pub.publish(cloud)
+        if self._metric_metadata_pub is not None and self._metric_metadata_source_topic:
+            key = (sec * 1_000_000_000 + nanosec, header.frame_id,
+                   hashlib.sha256(bytes(source.data)).hexdigest())
+            self._pair_metric_metadata(key, cloud_digest=hashlib.sha256(cloud.data).hexdigest())
+        with self._metric_lock:
+            self._metric_published += 1
+
+    def _metric_metadata_cb(self, msg):
+        if self._stop_event.is_set():
+            return
+        try:
+            packet = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(packet, dict) or packet.get('schema') != 'motus.slam_frame/1':
+            return
+        stamp, frame, digest = (packet.get(k) for k in ('stamp_ns', 'frame_id', 'data_sha256'))
+        if (type(stamp) is not int or stamp <= 0 or not isinstance(frame, str) or not frame
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(c not in '0123456789abcdef' for c in digest)):
+            return
+        self._pair_metric_metadata((stamp, frame, digest), packet=packet)
+
+    def _pair_metric_metadata(self, key, *, packet=None, cloud_digest=None):
+        # A reset can reuse stamp/frame. Bind evidence to the exact source
+        # payload, then replace its digest with that of the projected cloud.
+        with self._metric_metadata_lock:
+            if self._stop_event.is_set():
+                return
+            if packet is not None:
+                self._metric_pending_metadata.setdefault(key, packet)
+            if cloud_digest is not None:
+                self._metric_pending_clouds.setdefault(key, cloud_digest)
+            if key in self._metric_pending_metadata and key in self._metric_pending_clouds:
+                output = dict(self._metric_pending_metadata.pop(key))
+                output['data_sha256'] = self._metric_pending_clouds.pop(key)
+                msg = String()
+                msg.data = json.dumps(output)
+                self._metric_metadata_pub.publish(msg)
+            for pending in (self._metric_pending_metadata, self._metric_pending_clouds):
+                while len(pending) > 10:
+                    pending.pop(next(iter(pending)))
+
+    def _pinhole_for(self, w: int, h: int) -> tuple:
+        """(fx, fy, cx, cy)：驱动实测参数 → 上游 camera_info 的 K（跨分辨率
+        按 camera_info._rescale_K 缩放）→ hfov 90° 兜底。
+
+        review 指出：上游明明声明了真实内参，反投影却按 90° hfov 硬算，
+        横向坐标系统性偏差。K 是像素单位、分辨率变了必须缩放。
+        """
+        if self._calibration:
+            fx, fy, cx, cy = pinhole_of(self._calibration, w, h)
+            sx, sy = w / self._calibration["width"], h / self._calibration["height"]
+            return fx*sx, fy*sy, cx*sx, cy*sy
+        upstream = getattr(self, "_upstream_intrinsics", None)
+        if upstream:
+            K, src_w, src_h = upstream
+            from plugins.camera_info import _rescale_K
+
+            scaled = _rescale_K(K, (src_w, src_h), (w, h)) if (w, h) != (src_w, src_h) else list(K)
+            if scaled:
+                return (float(scaled[0]), float(scaled[4]),
+                        float(scaled[2]), float(scaled[5]))
+        fov = getattr(self, '_upstream_fov', None)
+        if fov:
+            fx = (w / 2.) / np.tan(fov[0])
+            fy = (h / 2.) / np.tan(fov[1]) if fov[1] is not None else fx
+            return float(fx), float(fy), w / 2., h / 2.
+        if not getattr(self, '_warned_fov_fallback', False):
+            log.warning('[pointcloud] no usable intrinsics or field of view; display uses approximate 90-degree fallback')
+            self._warned_fov_fallback = True
+        return intrinsics_from_hfov(w, h, 90.0)
+
+    def _publish(self, xyz: np.ndarray):
+        if self._stop_event.is_set() or xyz.shape[0] == 0:
+            return
+        self._frame_count += 1
+        msg = UInt8MultiArray()
+        msg.data = encode_packet(xyz)
+        self._cloud_pub.publish(msg)
+
+        summary = summarize_cloud(xyz, self._min_depth_m, self._max_depth_m)
+        summary["timestamp"] = time.time()
+        summary["mode"] = self._mode
+        smsg = String()
+        smsg.data = json.dumps(summary, ensure_ascii=False)
+        self._summary_pub.publish(smsg)
+
+
+class PointCloudPerceptionPlugin:
+    PREFIX = "pointcloud"
+    ALIASES = ()
+
+    def __init__(self, plugin_cfg: dict, namespace: str, executor, *, input_registry=None):
+        self._input_registry = input_registry
+        self._namespace = namespace
+        self._executor = executor
+        self._fps = int(plugin_cfg.get("fps", 2))
+        self._max_points = max(100, min(MAX_POINTS, int(plugin_cfg.get("max_points", 20000))))
+        self._min_depth_m = float(plugin_cfg.get("min_depth_m", 0.1))
+        self._max_depth_m = float(plugin_cfg.get("max_depth_m", 10.0))
+        self._nodes: dict[str, _PointCloudNode] = {}
+        self._instance_configs: dict[str, dict] = {}
+        self._nodes_lock = threading.RLock()
+        self._upstream_camera: dict[str, dict] = {}
+        self._upstream_input_metadata: dict[str, dict] = {}
+
+    def _resolve_input(self, args: dict) -> str:
+        # Keep saved single-input auto/depth calls, but never infer depth from RGB.
+        if args.get("mode") not in (None, "", "auto", "depth"):
+            raise ValueError("点云仅支持一路深度输入，mode 仅兼容 depth/auto")
+        topics = args.get("input_topics")
+        if topics is not None and (not isinstance(topics, list) or len(topics) != 1 or
+                not isinstance(topics[0], str) or not topics[0].strip()):
+            raise ValueError("input_topics 必须只包含一路深度图话题")
+        topic = args.get("input_topic")
+        if topic is not None and (not isinstance(topic, str) or not topic.strip()):
+            raise ValueError("input_topic 必须是非空深度图话题")
+        if topics and topic and topic != topics[0]:
+            raise ValueError("input_topic 与 input_topics 必须是同一路深度图话题")
+        topic = topic or (topics[0] if topics else None)
+        if not topic:
+            raise ValueError("需要一路深度输入：input_topic 或 input_topics")
+        from plugins.camera_info import for_topic
+        declarations = [for_topic(args.get("camera_info"), topic)]
+        metadata = args.get("input_metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get(topic), dict):
+            declarations.append(metadata[topic])
+        for declaration in declarations:
+            if declaration.get("format") is not None and declaration["format"] not in _DEPTH_FORMATS:
+                raise ValueError("点云需要支持的深度图格式")
+        return topic
+
+    def _camera_info(self, instance_id, input_topic, nodes,
+                     cloud_topic: str, summary_topic: str) -> tuple:
+        """`(declarations, note)`：本卡两个输出端口的 motus.camera/1 声明。
+
+        同 visual_depth：点云不裁剪不缩放（抽稀只丢点不丢视场），width/
+        height 原样继承，K 与 half_fov_rad 都不变。note 区分"上游没声明"
+        与"本卡弄丢了"——只有前者该找相机卡片的人。
+        """
+        from plugins.camera_info import inherit
+
+        key = instance_id if instance_id in (nodes or {}) else None
+        if key is None:
+            key = next(iter(nodes), None) if nodes else (input_topic or _DEFAULT_INSTANCE)
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        if not upstream:
+            return [], ("上游相机没有声明 camera_info —— 下游拿不到视场角，"
+                        "横向坐标只能按 90° 兜底反投影。相机卡片补上声明即可，见 "
+                        "phanthymotus-driver/README_dev.md 的 Camera Parameters")
+        # 点云端口：视场与上游一致，只是格式变了；摘要描述的是同一片点云。
+        out = inherit(upstream, topic=cloud_topic, fmt="sensor/pointcloud",
+                      stage="perception/pointcloud")
+        out += inherit(upstream, topic=summary_topic, fmt="data/json",
+                       stage="perception/pointcloud")
+        return out, ""
+
+    def _start_node(self, node_key: str, input_topic: str, calibration):
+        with self._nodes_lock:
+            if node_key in self._nodes:
+                return
+            icfg = self._instance_configs.get(node_key, {})
+            effective = self._effective_config(icfg)
+            upstream = self._upstream_camera.get(node_key) or {}
+            declaration = self._upstream_input_metadata.get(node_key) or {}
+            input_format = upstream.get("format") or declaration.get("format")
+            scale = depth_scale(dict(upstream, format=input_format))
+            node = _PointCloudNode(
+                input_topic, calibration,
+                fps=effective['fps'], max_points=effective['max_points'],
+                min_depth_m=effective['min_depth_m'], max_depth_m=effective['max_depth_m'],
+                node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
+            )
+            node._applied_config = effective
+            if all(type(upstream.get(k)) is int and 0 < upstream[k] <= 4096 for k in ('width', 'height')):
+                node._input_dimensions = (upstream['width'], upstream['height'])
+            node._input_registry = self._input_registry
+            node._input_declaration = upstream
+            node._input_format, node._depth_scale = input_format, scale
+            if calibration:
+                try:
+                    node._camera_model = CameraModel(upstream)
+                except (TypeError, ValueError, OverflowError) as error:
+                    node._camera_geometry_error = str(error)
+            metadata_topic = declaration.get("frame_metadata_topic")
+            if calibration and isinstance(metadata_topic, str) and metadata_topic:
+                node._metric_metadata_source_topic = metadata_topic
+            if calibration and (node._metric_metadata_source_topic or self._input_registry is not None):
+                node._metric_metadata_pub = node.create_publisher(String, node._metric_metadata_topic, _PUB_QOS)
+            K = upstream.get("K")
+            if isinstance(K, (list, tuple)) and len(K) == 9:
+                try:
+                    matrix = np.asarray(K, dtype=float).reshape(3, 3)
+                    dimensions = (upstream.get('width'), upstream.get('height'))
+                    valid = (np.isfinite(matrix).all() and matrix[0, 0] != 0 and matrix[1, 1] != 0
+                             and all(type(v) is int and v > 0 for v in dimensions))
+                    if valid:
+                        node._upstream_intrinsics = (matrix.reshape(-1).tolist(), *dimensions)
+                except (TypeError, ValueError):
+                    pass
+            half_h, half_v = upstream.get('half_fov_rad'), upstream.get('half_fov_v_rad')
+            if (isinstance(half_h, (float, int)) and not isinstance(half_h, bool)
+                    and np.isfinite(half_h) and 0 < half_h < np.pi / 2
+                    and (half_v is None or (isinstance(half_v, (float, int))
+                         and not isinstance(half_v, bool) and np.isfinite(half_v)
+                         and 0 < half_v < np.pi / 2))):
+                node._upstream_fov = (half_h, half_v)
+            node._calibration_source = (
+                'declared-K' if getattr(node, '_upstream_intrinsics', None) else
+                'declared-fov-approximate' if getattr(node, '_upstream_fov', None) else
+                '90-degree-fallback')
+            self._executor.add_node(node)
+            try:
+                node.start()
+            except Exception:
+                dispose_node(self._executor, node, label=f'pointcloud/{node_key}')
+                raise
+            self._nodes[node_key] = node
+        log.info("[pointcloud] depth node started: %s", input_topic)
+
+    def _retire_node(self, node_key: str) -> Optional[dict]:
+        with self._nodes_lock:
+            node = self._nodes.pop(node_key, None)
+        if node is None:
+            return None
+        with self._nodes_lock:
+            # 声明随节点走：留着会让重新接线的卡片拿一个已经不喂它的相机
+            # 的光学参数回答 info()（同 visual_depth 的注释）。
+            self._upstream_camera.pop(node_key, None)
+            self._upstream_input_metadata.pop(node_key, None)
+        node.request_stop()
+        result = node.stop()
+        dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
+        return result
+
+    def shutdown(self) -> None:
+        """Retire workers and subscriptions before ROS teardown."""
+        with self._nodes_lock:
+            for key in list(self._nodes):
+                self._retire_node(key)
+
+    def get_tools(self) -> list:
+        return TOOLS
+
+    def _effective_config(self, cfg: dict) -> dict:
+        return {
+            'fps': int(cfg.get('fps', self._fps)),
+            'max_points': max(100, min(MAX_POINTS, int(cfg.get('max_points', self._max_points)))),
+            'min_depth_m': float(cfg.get('min_depth_m', self._min_depth_m)),
+            'max_depth_m': float(cfg.get('max_depth_m', self._max_depth_m)),
+        }
+
+    def _validate_ranges(self, cfg: dict) -> Optional[str]:
+        """fps / min_depth_m / max_depth_m 的联合校验（review 第 17 轮
+        Issue 3）。单值合法、组合非法（min >= max）以前照收——反投影
+        的 z 截断窗口为空，卡片 running 却一帧云不出；fps<=0 则被静默钳到
+        0.1 fps。校验组合时未给出的一侧取现值，允许分两步把范围从 (0.1, 10)
+        改到 (5, 20) 这类操作。"""
+        fps = cfg.get("fps")
+        min_d = cfg.get("min_depth_m")
+        max_d = cfg.get("max_depth_m")
+        try:
+            if fps is not None:
+                fps = float(fps)
+                if not np.isfinite(fps) or fps <= 0:
+                    raise ValueError(
+                        f"fps 无效（fps={cfg.get('fps')!r}）：需要正的有限值，"
+                        "否则帧间隔被静默钳到 0.1 fps")
+            if min_d is not None:
+                min_d = float(min_d)
+            if max_d is not None:
+                max_d = float(max_d)
+        except (TypeError, ValueError) as error:
+            return f"配置数值异常：{error}"
+        lo = min_d if min_d is not None else self._min_depth_m
+        hi = max_d if max_d is not None else self._max_depth_m
+        if not (np.isfinite(lo) and np.isfinite(hi)) or not (0.0 <= lo < hi <= 1000.0):
+            return (f"深度范围无效（min_depth_m={cfg.get('min_depth_m')!r}, "
+                    f"max_depth_m={cfg.get('max_depth_m')!r}）：需要 0 <= min < max "
+                    "<= 1000（米），否则 z 截断窗口为空、云一帧不出")
+        return None
+
+    def dispatch(self, name: str, args: dict) -> Optional[dict]:
+        action = args.get("action", name)
+        instance_id = args.get("instance_id", "")
+
+        if action == "info":
+            with self._nodes_lock:
+                nodes = dict(self._nodes)
+            if instance_id:
+                nodes = {instance_id: nodes[instance_id]} if instance_id in nodes else {}
+            if not nodes:
+                # Before start, derive paths only from this card's validated input.
+                topics_out = [{"format": "sensor/pointcloud"}, {"format": "data/json"},
+                              {"format": "sensor/pointcloud2"}]
+                info = {"name": "PointCloudPerception", "manufacture": "Embodied",
+                        "model": "depth", "state": "idle", "instances": {},
+                        "topic_in": [], "topic_out": topics_out,
+                        "desc": "3D point cloud from one depth map"}
+                input_topic = None
+                if args.get("input_topic") or args.get("input_topics"):
+                    try:
+                        input_topic = self._resolve_input(args)
+                    except ValueError as error:
+                        return {**info, "state": "error", "message": str(error)}
+                if input_topic:
+                    paths = (*output_topics_for(input_topic), input_topic + "/pointcloud_metric")
+                    for port, topic in zip(topics_out, paths):
+                        port["topic"] = topic
+                return info
+            instances = {
+                key: {
+                    "mode": node._mode,
+                    "input": node._input_topic or None,
+                    "cloud_topic": node._cloud_topic,
+                    "summary_topic": node._summary_topic,
+                    "frame_count": node._frame_count,
+                    # 标定来源：声明层（驱动型号级出厂标定）还是用户配置 ——
+                    # 出云错了排查方向完全不同。
+                    "calibration_source": getattr(node, "_calibration_source", None),
+                    "metric_cloud": node._metric_status(),
+                }
+                for key, node in nodes.items()
+            }
+            topics_in = []
+            selected = [nodes[instance_id]] if instance_id in nodes else nodes.values()
+            for node in selected:
+                if all(t["topic"] != node._input_topic for t in topics_in):
+                    topics_in.append({"topic": node._input_topic,
+                                      "format": node._input_format or "image/depth-zlib"})
+            # 每实例三个输出口；多实例时不再用 output_topics_for(None)
+            # 的默认 /perception/... 话题把下游引向不存在的话题。
+            if instance_id and instance_id in nodes:
+                node = nodes[instance_id]
+                topics_out = [
+                    {"topic": node._cloud_topic, "format": "sensor/pointcloud"},
+                    {"topic": node._summary_topic, "format": "data/json"},
+                    {"topic": node._metric_cloud_topic, "format": "sensor/pointcloud2"},
+                ]
+            else:
+                seen: set[str] = set()
+                topics_out: list[dict[str, str]] = []
+                for node in nodes.values():
+                    outputs = [(node._cloud_topic, "sensor/pointcloud"),
+                               (node._summary_topic, "data/json"),
+                               (node._metric_cloud_topic, "sensor/pointcloud2")]
+                    for topic, fmt in outputs:
+                        if topic and topic not in seen:
+                            seen.add(topic)
+                            topics_out.append({"topic": topic, "format": fmt})
+            topics_out = topics_out if topics_in or nodes else []
+            # 供 _camera_info 的光学参数继承：有实例就用该实例的话题，
+            # 没有就用第一个节点的话题，绝不回退到默认话题。
+            if instance_id and instance_id in nodes:
+                sample = nodes[instance_id]
+            else:
+                sample = next(iter(nodes.values())) if nodes else None
+            cloud_topic = sample._cloud_topic if sample else DEFAULT_CLOUD_TOPIC
+            summary_topic = sample._summary_topic if sample else DEFAULT_SUMMARY_TOPIC
+            info = {
+                "name": "PointCloudPerception", "manufacture": "Embodied",
+                "model": "depth",
+                "state": "running" if instances else "idle",
+                "instances": instances,
+                "topic_in": topics_in,
+                "topic_out": topics_out,
+                "desc": "3D point cloud from one depth map",
+            }
+            # 光学参数往下传（同 visual_depth 的契约）：声明了才带
+            # camera_info，没声明就带 note 说明是谁的问题。
+            camera_out, camera_note = self._camera_info(
+                instance_id,
+                args.get("input_topic") or (args.get("input_topics") or [""])[0] or "",
+                nodes, cloud_topic, summary_topic)
+            from plugins.camera_info import inherit
+            metadata_out = []
+            for key, metric_node in nodes.items():
+                c = metric_node._calibration
+                if not c or (instance_id in nodes and key != instance_id):
+                    continue
+                with self._nodes_lock:
+                    upstream = self._upstream_camera.get(key)
+                    declaration = copy.deepcopy(self._upstream_input_metadata.get(key))
+                observation = getattr(metric_node, '_metric_observation', None)
+                if observation is not None and observation.time_basis=='receipt_estimated':
+                    from .spatial_contract import input_declaration
+                    declaration=input_declaration(metric_node._metric_cloud_topic,'cloud',
+                        metric_node._metric_frame,observation,
+                        metadata_topic=metric_node._metric_metadata_topic)
+                if declaration:
+                    declaration.update(topic=metric_node._metric_cloud_topic, kind="cloud",
+                                       format="sensor/pointcloud2", length_unit="m",
+                                       frame_metadata_topic=metric_node._metric_metadata_topic)
+                    metadata_out.append(declaration)
+                declaration = inherit(upstream, topic=metric_node._metric_cloud_topic,
+                    fmt="sensor/pointcloud2", stage="perception/pointcloud",
+                    width=c['width'], height=c['height'])
+                if declaration:
+                    if metric_node._camera_model is not None:
+                        declaration[0]['K'] = metric_node._camera_model.K.reshape(-1).tolist()
+                    camera_out.extend(declaration)
+            if metadata_out:
+                info["input_metadata"] = metadata_out
+            if camera_out:
+                info["camera_info"] = camera_out
+            if camera_note:
+                info["camera_info_note"] = camera_note
+            return info
+
+        elif action == "start":
+            try:
+                input_topic = self._resolve_input(args)
+            except ValueError as error:
+                return {"state": "error", "message": str(error)}
+            node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+            from plugins.camera_info import for_topic
+            declared = for_topic(args.get("camera_info"), input_topic)
+            calibration = None
+            width, height = declared.get("width"), declared.get("height")
+            if (declared.get("format") in (None, *_DEPTH_FORMATS) and
+                    all(type(v) is int and 0 < v <= 4096 for v in (width, height))):
+                try:
+                    matrix = np.asarray(declared.get("K"), dtype=float).reshape(3, 3)
+                    if np.isfinite(matrix).all() and matrix[0, 0] != 0 and matrix[1, 1] != 0:
+                        calibration = dict(fx=matrix[0, 0], fy=matrix[1, 1], cx=matrix[0, 2],
+                                           cy=matrix[1, 2], width=width, height=height)
+                except (TypeError, ValueError):
+                    pass
+            declarations = args.get("input_metadata")
+            if 'input_metadata' in args and (not isinstance(declarations, dict) or
+                    (input_topic in declarations and
+                     (not isinstance(declarations[input_topic], dict) or not declarations[input_topic]))):
+                return {'state': 'error', 'message': 'input_metadata must map input topics to nonempty declaration objects'}
+            declaration = declarations.get(input_topic) if isinstance(declarations, dict) else None
+            declaration = copy.deepcopy(declaration) if isinstance(declaration, dict) else {}
+            with self._nodes_lock:
+                existing = self._nodes.get(node_key)
+                if existing and (existing._input_topic != (input_topic or '') or
+                                 declaration.get('frame_metadata_topic') !=
+                                 self._upstream_input_metadata.get(node_key, {}).get('frame_metadata_topic')):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its input or metadata topic'}
+                if existing and existing._calibration != (calibration or {}):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its camera calibration'}
+                if existing and any(camera_parameter(declared, k) !=
+                                    camera_parameter(self._upstream_camera.get(node_key, {}), k)
+                                    for k in ('K', 'D', 'distortion_model', 'depth_scale_m', 'format')):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its camera geometry'}
+                self._upstream_input_metadata[node_key] = declaration
+                self._upstream_camera[node_key] = declared
+                running = self._nodes.get(node_key)
+            if running is None:
+                try:
+                    self._start_node(node_key, input_topic, calibration)
+                except Exception as error:
+                    log.error("[pointcloud] unable to bind ROS input topic %s: %s",
+                              input_topic, error, exc_info=True)
+                    return {'state': 'error', 'message': str(error)}
+                with self._nodes_lock:
+                    running = self._nodes.get(node_key)
+                if running is None:
+                    return {"state": "idle", "input": input_topic}
+            return running.start()
+
+        elif action == "stop":
+            with self._nodes_lock:
+                if instance_id:
+                    result = self._retire_node(instance_id)
+                    return result if result is not None else {"state": "idle"}
+                results = [key for key in list(self._nodes) if self._retire_node(key) is not None]
+            return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
+
+        elif action == "config":
+            # 仅接收当前卡片支持的配置，忽略旧画布保存的标定和计算输出开关。
+            cfg = {k: v for k, v in args.items()
+                   if k in TOOLS[0]['configSchema']['properties'] and v is not None and v != ""}
+            with self._nodes_lock:
+                previous = self._instance_configs.get(instance_id, {}) if instance_id else {}
+                merged = {**previous, **cfg}
+                error = self._validate_ranges(merged)
+                try:
+                    effective = self._effective_config(merged)
+                    error = error or self._validate_ranges(effective)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    error = f"配置数值异常：{exc}"
+                if error is not None:
+                    return {"state": "error", "message": error}
+                if instance_id:
+                    self._instance_configs[instance_id] = merged
+                    running = self._nodes.get(instance_id)
+                    # 首次显式保存默认值、重复保存或等效的限幅值均保留运行实例。
+                    changed = running is not None and effective != running._applied_config
+            if instance_id:
+                if changed:
+                    self._retire_node(instance_id)
+                return {"status": "configured", "instance_id": instance_id, "config": merged}
+            if "fps" in cfg:
+                self._fps = int(cfg["fps"])
+            if "max_points" in cfg:
+                self._max_points = max(100, min(MAX_POINTS, int(cfg["max_points"])))
+            if "min_depth_m" in cfg:
+                self._min_depth_m = float(cfg["min_depth_m"])
+            if "max_depth_m" in cfg:
+                self._max_depth_m = float(cfg["max_depth_m"])
+            return {"status": "configured", "config": cfg}
+
+        return None

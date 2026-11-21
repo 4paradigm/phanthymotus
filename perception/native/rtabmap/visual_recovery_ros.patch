@@ -1,0 +1,298 @@
+--- a/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
++++ b/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
+@@ -29,6 +29,9 @@
+ #define COREWRAPPER_H_
+ 
+ #include <rtabmap_slam/visibility.h>
++#include <chrono>
++#include <memory>
++#include "rtabmap_slam/VisualRecovery.h"
+ #include <rclcpp/rclcpp.hpp>
+ 
+ #include <std_srvs/srv/empty.hpp>
+@@ -284,7 +287,7 @@
+ 	void loadParameters(const std::string & configFile, rtabmap::ParametersMap & parameters);
+ 	void saveParameters(const std::string & configFile);
+ 
+-	void publishStats(const rclcpp::Time & stamp);
++	void publishStats(const rclcpp::Time & stamp, bool processed = true);
+ 	void publishCurrentGoal(const rclcpp::Time & stamp);
+ #ifdef WITH_NAV2_MSGS
+ #ifdef NAV_MSGS_FOXY
+@@ -301,10 +304,13 @@
+ 
+ private:
+ 	rtabmap::Rtabmap rtabmap_;
++	std::unique_ptr<motus::VisualRecovery> visualRecovery_;
+ 	bool paused_;
+ 
+ 	UMutex lastPoseMutex_;
+ 	rtabmap::Transform lastPose_;
++	bool pairedSensorOdom_ = false;
++	std::chrono::steady_clock::time_point pairedAdmission_;
+ 	rclcpp::Time lastPoseStamp_;
+ 	std::vector<float> lastPoseVelocity_;
+ 	cv::Mat lastPoseCovariance_;
+--- a/rtabmap_slam/src/CoreWrapper.cpp
++++ b/rtabmap_slam/src/CoreWrapper.cpp
+@@ -28,8 +28,10 @@
+ #include "rtabmap_slam/CoreWrapper.h"
+ 
+ #include <stdio.h>
++#include <cstring>
+ #include <thread>
+ #include <rclcpp/rclcpp.hpp>
++#include <rclcpp/serialization.hpp>
+ 
+ #include <nav_msgs/msg/path.hpp>
+ #include <std_msgs/msg/int32_multi_array.hpp>
+@@ -625,6 +627,9 @@
+ 
+ 	// Init RTAB-Map
+ 	rtabmap_.init(parameters_, databasePath_);
++	if(this->declare_parameter("motus_visual_recovery", false))
++		visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->declare_parameter("motus_rgbd_image_recovery", false)));
++	pairedSensorOdom_ = this->declare_parameter("motus_paired_sensor_odom", false);
+ 
+ 	if(rtabmap_.getMemory())
+ 	{
+@@ -994,6 +999,7 @@
+ 		}
+ 	}
+ 
++	motus::VisualRecovery::finalize(rtabmap_);
+ 	rtabmap_.close();
+ 	printf("rtabmap: Saving database/long-term memory...done! (located at %s, %ld MB)\n", databasePath_.c_str(), UFile::length(databasePath_)/(1024*1024));
+ 
+@@ -1105,7 +1111,9 @@
+ 	if(!paused_)
+ 	{
+ 		Transform odom = rtabmap_conversions::transformFromPoseMsg(odomMsg.pose.pose);
+-		if(!odom.isNull())
++		const bool paired = pairedSensorOdom_ && stamp == rclcpp::Time(odomMsg.header.stamp) &&
++				odomMsg.child_frame_id == frameId_;
++		if(!odom.isNull() && !paired)
+ 		{
+ 			Transform odomTF;
+ 			if(stamp.seconds() != 0.0) {
+@@ -1132,7 +1140,7 @@
+ 
+ 		UScopeMutex lock(lastPoseMutex_);
+ 
+-		if(!lastPose_.isIdentity() && !odom.isNull() && (odom.isIdentity() || (odomMsg.pose.covariance[0] >= BAD_COVARIANCE && odomMsg.twist.covariance[0] >= BAD_COVARIANCE)))
++		if(!visualRecovery_ && !lastPose_.isIdentity() && !odom.isNull() && (odom.isIdentity() || (odomMsg.pose.covariance[0] >= BAD_COVARIANCE && odomMsg.twist.covariance[0] >= BAD_COVARIANCE)))
+ 		{
+ 			UWARN("Odometry is reset (identity pose or high variance (%f) detected). Increment map id!", MAX(odomMsg.pose.covariance[0], odomMsg.twist.covariance[0]));
+ 			triggerNewMapBeforeNextUpdate_ = true;
+@@ -1185,7 +1193,7 @@
+ 			RCLCPP_WARN(this->get_logger(), "A null stamp has been detected in the input topics. Make sure the stamp in all input topics is set.");
+ 			ignoreFrame = true;
+ 		}
+-		if(rate_>0.0f)
++		if(!paired && rate_>0.0f)
+ 		{
+ 			if(previousStamp_.seconds() > 0.0 && stamp.seconds() > previousStamp_.seconds() && stamp.seconds() - previousStamp_.seconds() < 1.0f/rate_)
+ 			{
+@@ -1222,7 +1230,7 @@
+ 
+ 		UScopeMutex lock(lastPoseMutex_);
+ 
+-		if(!lastPose_.isIdentity() && odom.isIdentity())
++		if(!visualRecovery_ && !lastPose_.isIdentity() && odom.isIdentity())
+ 		{
+ 			UWARN("Odometry is reset (identity pose detected). Increment map id!");
+ 			triggerNewMapBeforeNextUpdate_ = true;
+@@ -1881,6 +1889,36 @@
+ 	}
+ }
+ 
++// The private gateway appends same-stamp Odometry CDR and its trailer
++// to the existing compressed recovery bytes in SensorData.user_data.
++static bool unpackPairedOdom(const std::vector<uint8_t> & data,
++        nav_msgs::msg::Odometry & odom, size_t & prefix)
++{
++    constexpr size_t trailer = 10;
++    if(data.size() < trailer || std::memcmp(data.data()+data.size()-8, "MOTUSMP1", 8) != 0)
++        return false;
++    const size_t n = data[data.size()-trailer] | (size_t(data[data.size()-trailer+1]) << 8);
++    if(n == 0 || n > 2048 || n > data.size()-trailer)
++        return false;
++    prefix = data.size()-trailer-n;
++    if(prefix != 0 && prefix <= 12)
++        return false;
++    try
++    {
++        rclcpp::SerializedMessage wire(n);
++        auto & buffer = wire.get_rcl_serialized_message();
++        std::memcpy(buffer.buffer, data.data()+prefix, n);
++        buffer.buffer_length = n;
++        rclcpp::Serialization<nav_msgs::msg::Odometry> codec;
++        codec.deserialize_message(&wire, &odom);
++    }
++    catch(const std::exception &)
++    {
++        return false;
++    }
++    return true;
++}
++
+ void CoreWrapper::commonSensorDataCallback(
+ 		const rtabmap_msgs::msg::SensorData::ConstSharedPtr & sensorDataMsg,
+ 		const nav_msgs::msg::Odometry::ConstSharedPtr & odomMsg,
+@@ -1889,10 +1927,32 @@
+ 	UTimer timerConversion;
+ 	UASSERT(sensorDataMsg.get());
+ 	std::string odomFrameId;
+-	if(odomMsg.get())
+-	{
+-		odomFrameId = odomMsg->header.frame_id;
+-		if(!odomUpdate(*odomMsg, sensorDataMsg->header.stamp))
++	nav_msgs::msg::Odometry pairedOdom;
++	const nav_msgs::msg::Odometry * odom = odomMsg.get();
++	size_t recoveryBytes = 0;
++	const auto arrival = std::chrono::steady_clock::now();
++	if(pairedSensorOdom_)
++	{
++		if(!unpackPairedOdom(sensorDataMsg->user_data, pairedOdom, recoveryBytes) ||
++				pairedOdom.header.stamp != sensorDataMsg->header.stamp ||
++				pairedOdom.child_frame_id != frameId_ || pairedOdom.header.frame_id.empty())
++		{
++			RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Invalid Motus paired sensor/odometry observation");
++			return;
++		}
++		// Bound computation by arrival cadence. The pointcloud card already
++		// rate-limits its deliveries, which can be >0.5 s apart even when
++		// their original captures are closer together.
++		if(previousStamp_.nanoseconds() > 0 &&
++				(rclcpp::Time(pairedOdom.header.stamp) <= previousStamp_ ||
++				 (rate_ > 0 && std::chrono::duration<double>(arrival-pairedAdmission_).count() < 1.0/rate_)))
++			return;
++		odom = &pairedOdom;
++	}
++	if(odom)
++	{
++		odomFrameId = odom->header.frame_id;
++		if(!odomUpdate(*odom, sensorDataMsg->header.stamp))
+ 		{
+ 			return;
+ 		}
+@@ -1912,6 +1972,12 @@
+ 	{
+ 		UScopeMutex lock(lastPoseMutex_);
+ 		syncData_.data = rtabmap_conversions::sensorDataFromROS(*sensorDataMsg);
++		if(pairedSensorOdom_)
++		{
++			const auto & bytes = syncData_.data.userDataCompressed();
++			syncData_.data.setUserData(recoveryBytes ? bytes.colRange(0, int(recoveryBytes)) : cv::Mat(), true);
++			pairedAdmission_ = arrival;
++		}
+ 		syncData_.data.setId(lastPoseIntermediate_?-1:0);
+ 
+ 		OdometryInfo odomInfo;
+@@ -1969,13 +2035,14 @@
+ void CoreWrapper::process(
+ 		const rclcpp::Time & stamp,
+ 		SensorData & data,
+-		const Transform & odom,
++		const Transform & externalOdom,
+ 		const std::vector<float> & odomVelocityIn,
+ 		const std::string & odomFrameId,
+ 		const cv::Mat & odomCovariance,
+ 		const OdometryInfo & odomInfo,
+ 		double timeMsgConversion)
+ {
++	Transform odom=externalOdom;
+ 	UTimer timer;
+ 	if(rtabmap_.isIDsGenerated() || data.id() > 0)
+ 	{
+@@ -2290,7 +2357,20 @@
+ 		}
+ 
+ 		timeMsgConversion += timer.ticks();
+-		if(rtabmap_.process(data, odom, covariance, odomVelocity, externalStats))
++		bool processed;
++		if(visualRecovery_)
++		{
++			processed=visualRecovery_->process(rtabmap_,data,externalOdom,covariance,odomVelocity,externalStats);
++			odom=visualRecovery_->odom();
++		}
++		else processed=rtabmap_.process(data,odom,covariance,odomVelocity,externalStats);
++		if(visualRecovery_ && visualRecovery_->state()==motus::VisualRecovery::Searching)
++		{
++			timeRtabmap = timer.ticks();
++			// Report searching without publishing a temporary graph or pose.
++			this->publishStats(stamp, processed);
++		}
++		else if(processed)
+ 		{
+ 			timeRtabmap = timer.ticks();
+ 			mapToOdomMutex_.lock();
+@@ -3162,6 +3242,7 @@
+ {
+ 	RCLCPP_INFO(this->get_logger(), "rtabmap: Reset");
+ 	rtabmap_.resetMemory();
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->get_parameter("motus_rgbd_image_recovery").as_bool()));
+ 
+ 	lastPoseMutex_.lock();
+ 	lastPoseCovariance_ = cv::Mat();
+@@ -3351,6 +3432,7 @@
+ 
+ 	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database...");
+ 	rtabmap_.init(parameters_, databasePath_);
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->get_parameter("motus_rgbd_image_recovery").as_bool()));
+ 	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database... done!");
+ 
+ 	if(rtabmap_.getMemory())
+@@ -3446,6 +3528,7 @@
+ 
+ 	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory...");
+ 	rtabmap_.init(parameters_, databasePath_);
++	if(visualRecovery_) visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->get_parameter("motus_rgbd_image_recovery").as_bool()));
+ 	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory... done!");
+ }
+ 
+@@ -4493,10 +4576,11 @@
+ 	}
+ }
+ 
+-void CoreWrapper::publishStats(const rclcpp::Time & stamp)
++void CoreWrapper::publishStats(const rclcpp::Time & stamp, bool processed)
+ {
+ 	UDEBUG("Publishing stats...");
+ 	const rtabmap::Statistics & stats = rtabmap_.getStatistics();
++	const bool searching = visualRecovery_ && visualRecovery_->state()==motus::VisualRecovery::Searching;
+ 
+ 	if(infoPub_->get_subscription_count())
+ 	{
+@@ -4505,9 +4589,30 @@
+ 		msg->header.stamp = stamp;
+ 		msg->header.frame_id = mapFrameId_;
+ 
+-		rtabmap_conversions::infoToROS(stats, *msg);
++		if(processed) rtabmap_conversions::infoToROS(stats, *msg);
++		if(searching)
++		{
++			msg->loop_closure_id = 0;
++			msg->proximity_detection_id = 0;
++		}
++		if(visualRecovery_)
++		{
++			msg->stats_keys.push_back("Motus/RecoveryState/");
++			msg->stats_values.push_back(visualRecovery_->state());
++			msg->stats_keys.push_back("Motus/Relocalizations/");
++			msg->stats_values.push_back(visualRecovery_->relocalizations());
++			msg->stats_keys.push_back("Motus/VisualInliers/");
++			msg->stats_values.push_back(visualRecovery_->visualInliers());
++			msg->stats_keys.push_back("Motus/RecoveryNode/");
++			msg->stats_values.push_back(visualRecovery_->recoveryNode());
++			msg->stats_keys.push_back("Motus/RecoveryAnchor/");
++			msg->stats_values.push_back(visualRecovery_->recoveryAnchor());
++			msg->stats_keys.push_back("Motus/RecoveryInliers/");
++			msg->stats_values.push_back(visualRecovery_->recoveryInliers());
++		}
+ 		infoPub_->publish(std::move(msg));
+ 	}
++	if(searching) return;
+ 
+ 	if(mapDataPub_->get_subscription_count())
+ 	{
