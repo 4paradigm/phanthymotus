@@ -591,10 +591,10 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     return status
             return ""
 
-    def print_visit(self, visit: Visit, printer_name=None) -> None:
+    def print_visit(self, visit: Visit, printer_name=None) -> str | None:
         return self._submit("_print_visit_impl", visit, printer_name)
 
-    def _print_visit_impl(self, visit: Visit, printer_name=None) -> None:
+    def _print_visit_impl(self, visit: Visit, printer_name=None) -> str | None:
         with self._lock:
             self._prepare_default_printer(printer_name)
             page, _ = self._search(visit.name, visit.host)
@@ -614,6 +614,14 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     "点击打印后没有得到明确结果；系统不会自动重试，请前台核对打印机和访客状态",
                     uncertain=True,
                 ) from exc
+            try:
+                text = row.inner_text(timeout=1000)
+            except Exception:
+                return None
+            return next(
+                (status for status in ("已入场", "已离场", "未入场") if status in text),
+                None,
+            )
 
     def close(self):
         self._submit("_close_impl")

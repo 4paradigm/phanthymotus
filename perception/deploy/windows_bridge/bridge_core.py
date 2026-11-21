@@ -56,7 +56,7 @@ class VisitorBackend(Protocol):
 
     def get_status(self, visit: Visit) -> str: ...
 
-    def print_visit(self, visit: Visit) -> None: ...
+    def print_visit(self, visit: Visit) -> str | None: ...
 
 
 class BridgeStore:
@@ -208,9 +208,9 @@ class VisitorBridge:
             # lookup here; it opened a second Edge search and added latency.
             try:
                 if printer_name:
-                    self.backend.print_visit(visit, printer_name=printer_name)
+                    after = self.backend.print_visit(visit, printer_name=printer_name)
                 else:
-                    self.backend.print_visit(visit)
+                    after = self.backend.print_visit(visit)
             except BridgeFailure as exc:
                 # A click or network timeout is never retried. Re-read state once;
                 # if the platform already moved to 已入场, the print action won.
@@ -228,15 +228,16 @@ class VisitorBridge:
                 self._finish(request_id, ticket, result)
                 return result
 
-            try:
-                after = self.backend.get_status(visit)
-            except Exception:
-                after = ""
-            if after not in self.success_statuses:
+            # The browser backend reads the resulting status from the same
+            # detail row after clicking print. Re-running login capture and
+            # the visitor search here needlessly reloads Edge and can exceed
+            # the SSH job deadline. A missing row status means the UI accepted
+            # the click but did not expose a status to confirm.
+            if after and after not in self.success_statuses:
                 result = {
                     "ok": False,
                     "code": "status_unconfirmed",
-                    "error": f"打印动作已发出，但访客状态为“{after or '未知'}”；系统不会自动重试，请前台核对",
+                    "error": f"打印动作已发出，但访客状态为“{after}”；系统不会自动重试，请前台核对",
                 }
             else:
                 result = {"ok": True}
