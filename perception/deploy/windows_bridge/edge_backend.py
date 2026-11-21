@@ -357,12 +357,14 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
         return self._page
 
     def _ensure_login(self, page):
-        # 先访问站点根地址做登录状态校验，不再直接访问废弃的旧列表路由
-        page.goto("https://p-visitor.4paradigm.com/", wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_timeout(2000)
-        url = page.url.lower()
-        if "login" in url:
-            raise BridgeFailure("login_required", "访客平台尚未登录，请先运行“登录访客平台”")
+        # Use the operator-selected tab URL.  Navigating to a vendor-specific
+        # root here discarded the selection saved by the card and also broke
+        # deployments whose visitor portal uses a different host/path.
+        if page.url != self.list_url:
+            page.goto(self.list_url, wait_until="domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(1200)
+        if "login" in page.url.lower():
+            raise BridgeFailure("login_required", "访客平台尚未登录，请在前台 Edge 登录后重新选择网页")
         # 监听网页自身的查询请求，从中取得应用层认证头。只保存头名称和值在内存中，绝不写日志。
         captured_request = None
         try:
@@ -370,7 +372,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                 lambda request: self.query_marker in request.url and request.method == "POST",
                 timeout=20_000,
             ) as request_info:
-                page.goto(self.list_url, wait_until="domcontentloaded", timeout=30_000)
+                page.reload(wait_until="domcontentloaded", timeout=30_000)
             captured_request = request_info.value
         except Exception:
             # 部分页面进入列表后不会自动刷新；尝试点击一次查询按钮以触发真实请求。
