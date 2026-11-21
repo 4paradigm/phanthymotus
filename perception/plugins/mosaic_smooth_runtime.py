@@ -13,8 +13,10 @@ import os
 import time
 from dataclasses import dataclass, replace
 
+from utils.model_downloader import (
+    MOSAIC_SMOOTH_MODEL_FILENAME, MOSAIC_SMOOTH_MODEL_FILES,
+)
 
-YUNET_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
 MAX_JPEG_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_SIDE = 2048
 COAST_LIMIT_S = 0.55
@@ -67,15 +69,15 @@ def validate_model(path: str) -> str:
         raise MosaicDemoError("model_path_required")
     if not os.path.isfile(path):
         raise MosaicDemoError("model_missing")
-    size = os.path.getsize(path)
-    if not 10_000 <= size <= 10_000_000:
+    metadata = MOSAIC_SMOOTH_MODEL_FILES[MOSAIC_SMOOTH_MODEL_FILENAME]
+    if os.path.getsize(path) != metadata["size"]:
         raise MosaicDemoError("model_size_mismatch")
     digest_hash = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             digest_hash.update(chunk)
     digest = digest_hash.hexdigest()
-    if digest != YUNET_SHA256:
+    if digest != metadata["sha256"]:
         raise MosaicDemoError("model_sha256_mismatch")
     return path
 

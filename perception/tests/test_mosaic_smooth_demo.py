@@ -20,6 +20,7 @@ from plugins.mosaic_smooth import (
 from plugins.mosaic_smooth_runtime import (
     DemoConfig, MosaicDemoError, SmoothMosaic, validate_model,
 )
+from utils.model_downloader import MOSAIC_SMOOTH_MODEL_FILENAME, MOSAIC_SMOOTH_MODEL_FILES
 
 
 class NoFaceDetector:
@@ -70,9 +71,17 @@ class TestConfig(unittest.TestCase):
 
     def test_model_wrong_digest_is_rejected(self):
         with tempfile.NamedTemporaryFile() as f:
-            f.write(b"invalid-model"*2000)
+            size = MOSAIC_SMOOTH_MODEL_FILES[MOSAIC_SMOOTH_MODEL_FILENAME]["size"]
+            f.write(b"x" * size)
             f.flush()
             with self.assertRaisesRegex(MosaicDemoError,"model_sha256_mismatch"):
+                validate_model(f.name)
+
+    def test_model_wrong_size_is_rejected(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"invalid-model" * 2000)
+            f.flush()
+            with self.assertRaisesRegex(MosaicDemoError, "model_size_mismatch"):
                 validate_model(f.name)
 
     def test_topic_and_instance_isolation(self):

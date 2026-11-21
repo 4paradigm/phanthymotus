@@ -13,6 +13,9 @@ For the multi-instance `privacy_view` JPEG processor, see
 fault behavior, source timestamp requirements, shared SCRFD ownership,
 Canvas/MCP ports, configuration and reproducible offline/live tests.
 
+See [Mosaic Smooth Demo](MOSAIC_SMOOTH_DEMO.md) for the independent, opt-in
+mosaic processor, its consent requirement and verified YuNet setup.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

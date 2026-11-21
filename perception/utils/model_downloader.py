@@ -764,6 +764,39 @@ def ensure_soundevent_model(progress_cb=None) -> str:
     return paths[SOUNDEVENT_MODEL_FILENAME]
 
 
+# ── Mosaic Smooth Demo (OpenCV Zoo YuNet, MIT) ─────────────────────────────
+MOSAIC_SMOOTH_MODEL_DIR = "/models/mosaic_smooth"
+MOSAIC_SMOOTH_MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+MOSAIC_SMOOTH_MODEL_SOURCES = (
+    "https://media.githubusercontent.com/media/opencv/opencv_zoo/"
+    "47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet",
+    "https://huggingface.co/opencv/face_detection_yunet/resolve/"
+    "3cc26e7f1014a5ee5d74a42acee58bafc9d0a310",
+)
+MOSAIC_SMOOTH_MODEL_FILES = {
+    MOSAIC_SMOOTH_MODEL_FILENAME: {
+        "size": 232589,
+        "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    },
+}
+
+
+def ensure_mosaic_smooth_model() -> str:
+    """Provision or reuse the pinned YuNet model in the shared model volume."""
+    model_dir = require_models_subpath(MOSAIC_SMOOTH_MODEL_DIR)
+    legacy_path = os.path.join(model_dir, "yunet.onnx")
+    if _file_matches(legacy_path, MOSAIC_SMOOTH_MODEL_FILES[MOSAIC_SMOOTH_MODEL_FILENAME]):
+        return legacy_path
+
+    # An operator can select a deployment-accessible COS mirror using the
+    # same base URL convention as the other model registrations.
+    sources = os.environ.get("MOSAIC_SMOOTH_MODEL_BASE_URL") or MOSAIC_SMOOTH_MODEL_SOURCES
+    paths = ensure_verified_bundle(
+        "mosaic_smooth/yunet", model_dir, sources, MOSAIC_SMOOTH_MODEL_FILES,
+    )
+    return paths[MOSAIC_SMOOTH_MODEL_FILENAME]
+
+
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
 # The engines are built per TensorRT major and are not portable, so the
 # bundle is chosen from the TensorRT that is importable at runtime. Only the

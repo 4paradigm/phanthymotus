@@ -726,10 +726,10 @@ plugins:
 
   # Opt-in demonstration ONLY. Not a privacy protection control.
   # No need for extra image dependencies: uses existing OpenCV FaceDetectorYN.
-  # The pinned model must be provisioned separately at model_path.
+  # An empty model_path uses the verified /models cache on the first consented start.
   mosaic_smooth_demo:
     enabled: false
-    model_path: /models/mosaic_smooth/yunet.onnx
+    model_path: ""
     consent_acknowledged: false
     output_width: 640
     detect_every_frames: 4

@@ -9,11 +9,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict
 
 from rclpy.node import Node
@@ -23,6 +24,7 @@ from std_msgs.msg import String
 from plugins.mosaic_smooth_runtime import (
     DemoConfig, MosaicDemoError, SmoothMosaic, validate_model, MAX_JPEG_BYTES,
 )
+from utils.model_downloader import ensure_mosaic_smooth_model
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
@@ -30,6 +32,7 @@ from utils.ros_lifecycle import dispose_node
 PREFIX = "mosaic_smooth_demo"
 SCHEMA = "motus.mosaic_smooth_demo/1"
 MAX_INSTANCES = 4
+log = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = {
     "type":"object","additionalProperties":False,
@@ -185,9 +188,9 @@ class _DemoNode(Node):
         result=self.snapshot()
         with self._gate:
             if self._state=="stopping":return
-            self._status_pub.publish(
-                String(data=json.dumps(result,ensure_ascii=False))
-            )
+            msg = String()
+            msg.data = json.dumps(result, ensure_ascii=False)
+            self._status_pub.publish(msg)
 
     def _on_frame(self,msg):
         now_ns=time.time_ns()
@@ -228,8 +231,16 @@ class _DemoNode(Node):
             self._thread.start()
 
     def _run(self):
+        failure_reason = "model_or_runtime_failed"
         try:
-            engine=SmoothMosaic(self.model_path,self.cfg)
+            model_path = self.model_path
+            if model_path is None:
+                failure_reason = "model_download_failed"
+                model_path = ensure_mosaic_smooth_model()
+                failure_reason = "model_or_runtime_failed"
+            if self._stop.is_set():
+                return
+            engine=SmoothMosaic(model_path,self.cfg)
             with self._gate:
                 if not self._stop.is_set():
                     self._state="running"
@@ -275,10 +286,12 @@ class _DemoNode(Node):
                                   else "face_roi_demo")
                     self._publish_status()
         except Exception as exc:
+            log.exception("[%s] %s", PREFIX, failure_reason)
             with self._gate:
-                self._state="error"
-                self._reason="model_or_runtime_failed:"+type(exc).__name__
-                self._errors+=1
+                if not self._stop.is_set():
+                    self._state="error"
+                    self._reason=f"{failure_reason}:{type(exc).__name__}"
+                    self._errors+=1
             self._publish_status()
         finally:
             with self._gate:
@@ -313,13 +326,14 @@ class MosaicSmoothDemoPlugin:
         self._defaults=DemoConfig().updated(
             {k:v for k,v in cfg.items() if k in DemoConfig.__dataclass_fields__}
         )
-        self._model_path=cfg.get("model_path") or os.environ.get(
-            "MOSAIC_SMOOTH_YUNET_MODEL","/models/mosaic_smooth/yunet.onnx"
+        self._model_path = (
+            cfg.get("model_path") or os.environ.get("MOSAIC_SMOOTH_YUNET_MODEL") or None
         )
         self._executor=executor
         self._lock=threading.RLock()
         self._nodes={}
         self._configs={}
+        self._start_errors = OrderedDict()
         self._closed=False
 
     def get_tools(self):
@@ -329,6 +343,11 @@ class MosaicSmoothDemoPlugin:
         dispose_node(self._executor,node,label=PREFIX)
         with self._lock:
             if self._nodes.get(node.key) is node:
+                result = node.snapshot()
+                if result["state"] == "error":
+                    self._start_errors[node.key] = result
+                    if len(self._start_errors) > MAX_INSTANCES:
+                        self._start_errors.popitem(last=False)
                 del self._nodes[node.key]
 
     def dispatch(self,name,args):
@@ -342,7 +361,9 @@ class MosaicSmoothDemoPlugin:
                 with self._lock:
                     node=self._nodes.get(key)
                     cfg=self._configs.get(key,self._defaults)
+                    error = self._start_errors.get(key)
                 if node is not None:return node.snapshot()
+                if error is not None:return copy.deepcopy(error)
                 topic=args.get("input_topic")
                 topic=validate_topic(topic) if topic is not None else None
                 return {
@@ -365,6 +386,7 @@ class MosaicSmoothDemoPlugin:
                     current=self._configs.get(key,self._defaults)
                     result=current.updated(values)
                     self._configs[key]=result
+                    self._start_errors.pop(key, None)
                 return {"state":"configured","config":asdict(result),
                         "privacy_guaranteed":False}
             if action=="start":
@@ -388,7 +410,8 @@ class MosaicSmoothDemoPlugin:
                     if node is None:
                         if len(self._nodes)>=MAX_INSTANCES:
                             raise MosaicDemoError("max_instances_exceeded")
-                        validate_model(self._model_path)
+                        if self._model_path is not None:
+                            validate_model(self._model_path)
                         node=_DemoNode(
                             key,topic,cfg,self._model_path,self._finished
                         )
@@ -397,6 +420,7 @@ class MosaicSmoothDemoPlugin:
                         except Exception:
                             node.destroy_node()
                             raise
+                        self._start_errors.pop(key, None)
                         self._nodes[key]=node
                     node.start()
                 return node.snapshot()
@@ -408,7 +432,10 @@ class MosaicSmoothDemoPlugin:
                     for node in nodes:node.request_stop()
                     if args.get("instance_id"):
                         self._configs.pop(key,None)
-                    else:self._configs.clear()
+                        self._start_errors.pop(key, None)
+                    else:
+                        self._configs.clear()
+                        self._start_errors.clear()
                 for node in nodes:node.join()
                 return {"state":"idle" if not any(
                     node._thread and node._thread.is_alive()
