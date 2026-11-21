@@ -252,7 +252,8 @@ class Tracker:
             track.accepted_detection = False
             track.measured_range_m = None
             track.front_age_s += dt
-            if track.front_age_s > config.max_obs_age_ms / 1000:
+            front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
+            if track.front_age_s > front_limit / 1000:
                 track.front_fix = None
             # Apply the limit before association, even when a late new frame
             # arrives on this tick. It may start a new track after expiry.
@@ -325,7 +326,12 @@ class Tracker:
         point = front_surface(depth["map"], box, intrinsics, depth.get("ground"))
         if point is not None:
             track.front_fix = point
-            track.front_age_s = 0.
+            # Frame reception and processing may already have used part of
+            # the depth budget. Reading this frame again cannot renew it.
+            stamp = depth.get("capture_ms") or depth.get("frame_id")
+            now = depth.get("control_ms")
+            track.front_age_s = (max(0, now - stamp) / 1000
+                                 if type(now) is int and type(stamp) is int else 0.)
             track.measured_range_m = track.range_m
 
     # ── 1. predict: mostly a statement about our own motion ──────────────────

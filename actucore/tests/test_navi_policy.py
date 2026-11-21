@@ -2993,7 +2993,7 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
         return free, grid
 
     # Exercise the turn-and-straight fallback after the prefix candidate fails.
-    monkeypatch.setattr(P, "_checked_forward_prefix", lambda *args: None)
+    monkeypatch.setattr(P, "_checked_forward_prefix", lambda *args, **kwargs: None)
     monkeypatch.setattr(active_scan, "observe", observe)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (
         .30 if blocked_in_new_view and (reached_view or state.active_scan.ready) else .90, .98))
@@ -4800,7 +4800,8 @@ def test_reobserved_original_target_rechecks_direct_corridor_after_exhaustion(mo
     assert state.goal_anchor is None and not state.active_scan.exhausted
 
 
-def test_moved_original_target_updates_goal_during_active_detour(monkeypatch):
+@pytest.mark.parametrize("direct_blocked", [False, True])
+def test_moved_original_target_updates_goal_during_active_detour(monkeypatch, direct_blocked):
     from types import SimpleNamespace
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
@@ -4817,17 +4818,23 @@ def test_moved_original_target_updates_goal_during_active_detour(monkeypatch):
     scan = state.active_scan
     scan.receipt_only, scan.phase, scan.advance_m, scan.attempted = True, "evaluate", 1., True
     scan.advance_origin = scan.pose
+    scan.route_segment = True
     free = np.ones(P.local_path.SHAPE, dtype=bool)
     monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (3.5, 1.))
+    if direct_blocked:
+        monkeypatch.setattr(P, "_target_corridor_clear", lambda *args: False)
     frame = np.full((8, 8), 3.5)
     decision = P.step(detections=_detections(), depth=dict(map=frame, frame_id=1000),
                       odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
                       config=config, state=state, dt=.1)
 
     assert (anchor.x, anchor.y) == pytest.approx(point)
-    assert state.goal_anchor is None and scan.advance_m is None
+    if direct_blocked:
+        assert state.goal_anchor is anchor and scan.advance_m == 1.
+    else:
+        assert state.goal_anchor is None and scan.advance_m is None
     assert decision.values[0] > 0. and decision.distance_m == pytest.approx(distance)
     assert decision.bearing == pytest.approx(angle / config.half_fov_rad)
 
@@ -4898,6 +4905,31 @@ def test_distant_blocked_corridor_releases_a_checked_arc_prefix(monkeypatch):
     assert result[0] > 0. and result[1] == 0. and result[2] != 0.
     assert not scan.active
     assert state.view_detour is not None and len(state.view_detour.points) > 2
+
+
+def test_early_detour_follows_a_checked_passing_lane_instead_of_target_yaw(monkeypatch):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    grid = P.local_path
+    geometry = grid.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    occupied = np.isclose(grid.FORWARD, 1.8) & (abs(grid.RIGHT) <= .10)
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    depth = dict(map=np.ones((4, 4)), ground=None, frame_id=1000, control_ms=1000)
+    waypoint = (1.2, -.40)
+    route = grid.Detour(None, ((0., 0.), waypoint), geometry)
+    monkeypatch.setattr(grid, "opening_route", lambda *args: route)
+
+    result = P._avoid(.25, 0., -.15, depth, config, P.APPROACHING, "", state,
+                      target_distance=3., target_bearing=0., may_scan=True, dt=.1,
+                      odom=dict(vx=.15, vy=0., wz=0.))
+    assert result[0] > 0. and result[2] > 0.
+    assert state.checked_prefix and not scan.active
+    assert state.view_detour.points[-1][1] < 0.
 
 
 def test_side_waypoint_can_be_reached_by_turning_then_driving(monkeypatch):

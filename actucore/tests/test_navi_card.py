@@ -2548,7 +2548,7 @@ def test_selected_turn_route_survives_new_depth_without_a_plan_cache():
 
 
 @pytest.mark.parametrize("next_frame", [
-    "clear", "duplicate", "blocked", "feedback_gap", "duplicate_feedback", "old_target", "check_crosses_expiry",
+    "clear", "duplicate", "blocked", "feedback_gap", "duplicate_feedback", "old_target", "check_crosses_expiry", "refresh_also_expires",
 ])
 @pytest.mark.parametrize("checked_prefix", [False, True])
 def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observation(
@@ -2584,6 +2584,8 @@ def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observati
         nonlocal now
         if next_frame == "check_crosses_expiry":
             now += 55
+        if next_frame == "refresh_also_expires":
+            now += 350
         grid = np.zeros(local_path.SHAPE, dtype=bool)
         if next_frame == "blocked":
             grid[local_path.START[0] + 5, local_path.START[1]] = True
@@ -2608,11 +2610,11 @@ def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observati
     assert published[-1]["ttl_ms"] == initial_ttl
     now = 1100
     card._dispatch_command()
-    if next_frame == "clear":
+    if next_frame in ("clear", "check_crosses_expiry"):
         assert len(published) == 2 and published[-1]["values"][0] == .15
         assert published[-1]["obs_stamp_ms"] == 900
         assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] <= 1445
-    elif next_frame in ("blocked", "check_crosses_expiry"):
+    elif next_frame in ("blocked", "refresh_also_expires"):
         assert published[-1]["values"] == [0.] * 6
     else:
         now = 1150
@@ -2670,7 +2672,10 @@ def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkey
     assert published[-1]["values"] == [0.] * 6
 
 
-def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(monkeypatch):
+@pytest.mark.parametrize("scan_result", [0, 950])
+@pytest.mark.parametrize("new_feedback", [False, True])
+def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(
+        monkeypatch, scan_result, new_feedback):
     import numpy as np
     from plugins.navi import local_path, policy
 
@@ -2682,19 +2687,20 @@ def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(monkeyp
     state = card._state
     scan = state.active_scan
     scan.receipt_only = True
+    scan.result_frame = scan_result
     scan.current_frame, scan.source_frame = 950, 700
     occupied = np.zeros(local_path.SHAPE, dtype=bool)
     scan.views.append((950, scan.pose, ~occupied, occupied))
     depth = dict(map=np.ones((4, 4)), frame_id=950, capture_ms=700, source_frame_id=700)
     snapshots = iter(
         ({"objects": []}, depth, dict(vx=.15, vy=0., wz=0., received_ms=t, source_sample_id=t), 960)
-        for t in (850, 1100)
+        for t in (850, 1150 if new_feedback else 850)
     )
     clock = 1000
 
     def plan(**_):
         nonlocal clock
-        clock = 1150  # Several control beats consumed the old feedback window.
+        clock = 1205  # Planning consumed the original feedback window.
         state.checked_prefix = state.avoidance_yaw_override = True
         state.view_detour = local_path.Detour(None, ((0., 0.), (.15, 0.)), geometry)
         return policy.Decision([.15, 0., 0., 0., 0., 0.], policy.AVOIDING, "checked", distance_m=3.)
@@ -2705,6 +2711,10 @@ def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(monkeyp
     monkeypatch.setattr(policy, "step", plan)
 
     command = card.next_command()
-    assert command["values"][0] == .15
-    assert command["obs_stamp_ms"] == 700
-    assert command["ttl_ms"] == 300
+    if new_feedback:
+        assert command["values"][0] == .15
+        assert command["obs_stamp_ms"] == 700
+        assert command["ttl_ms"] == 255  # The original target observation still expires at 1460.
+    else:
+        assert command["values"] == [0.] * 6
+        assert "运动反馈已到期" in card._last_decision.reason

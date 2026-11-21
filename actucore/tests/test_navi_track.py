@@ -641,3 +641,24 @@ def test_person_front_surface_ignores_a_new_depth_frame_without_a_return():
                   target="person", depth={"map": np.zeros_like(image), "frame_id": 200})
     assert track.measured_range_m is None
     assert track.range_m == pytest.approx(distance)
+
+
+def test_local_front_range_retains_only_the_remaining_depth_freshness_window():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    cfg = _cfg(confirm_hits=1, local_planning=True, max_obs_age_ms=500, max_depth_age_ms=1200,
+               depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    tracker = T.Tracker()
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    depth = dict(map=np.full((60, 80), 2.5), capture_ms=700, frame_id=1000)
+
+    def feed(now, dt):
+        return _feed(tracker, {"timestamp": now, "objects": [person]}, config=cfg,
+                     target="person", depth=dict(depth, control_ms=now), dt=dt)
+
+    feed(1000, .1)
+    seen = feed(1600, .6)
+    assert seen.observed and seen.front_fix is not None
+    assert seen.measured_range_m is None
+    expired = feed(1910, .31)
+    assert expired.observed and expired.front_fix is None

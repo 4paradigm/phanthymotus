@@ -1518,6 +1518,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                  and geometry is not None and geometry.horizontal is not None
                                  and (reobserved_target or (
                                      scan.phase in ("brake", "turn", "return") and not scan.route_segment)))
+        keep_segment = scan.active and scan.route_segment
         if ((refresh_target or reviewing_observation) and update is None
                 and scan.current_frame and scan.matches_route_view(depth)):
             distance, angle = target_fix[:2]
@@ -1532,13 +1533,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                         _scan_yaw_rate(config, 1. if yaw < 0. else -1.)), yaw)
             direct = _target_corridor_clear(depth, config, scan, distance, angle,
                                             (feedback or state.command_tail, state.commanded, (vx, 0., yaw)))
-            if refresh_target or direct:
+            if direct or (refresh_target and not keep_segment):
                 _reset_detour_route(state)
                 was_scanning = False
                 if direct:
                     state.goal_anchor = anchor = None
                 refresh_target = False
-        if refresh_target:
+        # The new target is already stored on the anchor. An executing segment
+        # still has its own fresh sweep and stop-distance checks.
+        if refresh_target and not keep_segment:
             _reset_detour_route(state)
             return Decision(_twist(0., 0., 0.), AVOIDING, "局部规划：已更新目标位置，等待可用的规划观测")
         if was_scanning and not scan.active:
@@ -2079,7 +2082,8 @@ def _route_rank(plan, target):
 
 
 def _start_detour_segment(depth, config, state, geometry, ahead, directions, target_distance, target_bearing,
-                          *, reroute=False, rooms=None, closest=False):
+                          *, reroute=False, rooms=None, closest=False, rolling=None):
+    """Choose a checked moving prefix or prepare a turn-and-drive segment."""
     floor_x, limit_x = _local_velocity_limits(config, 1.)[0]
     if limit_x <= 0. or limit_x < floor_x:
         return False
@@ -2143,7 +2147,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                  if closest and optical_target is not None else routes())
         for plan in plans:
             yield plan, True
-        if not config.use_lateral and not scan.command_only and scan.near_hits is not None:
+        if rolling is None and not config.use_lateral and not scan.command_only and scan.near_hits is not None:
             # A blocked long route can still have a safe forward prefix after
             # turning away from a nearby corner. Check the remembered grid too.
             # Compare both sides before accepting a shorter escape.
@@ -2187,9 +2191,23 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                 along = min(length, max(0., target[0] * f + target[1] * r))
                 if math.hypot(target[0] - along * f, target[1] - along * r) < config.stop_distance_m:
                     continue
-            if (local_path.segment_clear(blocked, geometry, keep, angle, length,
-                                         heading_tolerance=ANGLE_TOLERANCE if angle else 0.)
-                    and (abs(angle) <= ANGLE_TOLERANCE or scan.clear_sweep(
+            if not local_path.segment_clear(blocked, geometry, keep, angle, length,
+                                            heading_tolerance=ANGLE_TOLERANCE if angle else 0.):
+                continue
+            if rolling is not None:
+                if forward <= 0. or abs(angle) <= ANGLE_TOLERANCE:
+                    continue
+                odom, feedback, speed, room = rolling
+                # Turn toward the verified leg while reserving travel at the
+                # measured and commanded speeds over the full safety window.
+                arc = _checked_forward_prefix(
+                    scan, geometry, config, state, odom, feedback, min(speed, length / horizon),
+                    horizon, min(room, length), -angle / horizon, steer_only=True, shadow=shadow)
+                if arc is not None:
+                    state.escape_side = math.copysign(1., angle)
+                    return arc
+                continue
+            if ((abs(angle) <= ANGLE_TOLERANCE or scan.clear_sweep(
                         geometry, config.half_width_m,
                         (STILL_LINEAR * horizon if scan.command_only
                          else scan._turn_translation(horizon, scan.motion)), occupied=turn_occupied))
@@ -2460,17 +2478,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 approach = speed
 
         camera_routes = _camera_frame_routes(config, scan) and pose is None
-        if (camera_routes and approach and may_scan and geometry is not None
-                and not scan.active and not scan.result_frame and scan.views and scan.matches_route_view(depth)):
-            feedback = planar_feedback(odom)
-            if feedback is not None and max(abs(feedback[1]), abs(state.commanded[1])) <= STILL_LINEAR:
-                room = min(ahead - stationary_line, target_distance - config.stop_distance_m)
-                prefix = _checked_forward_prefix(scan, geometry, config, state, odom, feedback,
-                                                 approach, horizon_s, room, wz)
-                if prefix is not None:
-                    state.escape_side = 0.
-                    state.side_better_frames = 0
-                    return prefix
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
@@ -2522,6 +2529,27 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 return 0.0, 0.0, 0.0, AVOIDING, LocalHold.TRANSITION.value
             if scan is not None and local_command is None:
                 feedback = planar_feedback(odom)
+                yaw_rate = max(_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+                geometry = (config.scan_geometry or config.local_geometry
+                            if scan.receipt_only else config.scan_geometry)
+                can_plan = (may_scan and foreground and geometry is not None and scan.current_frame
+                            and yaw_rate > 0. and config.floor_wz <= yaw_rate)
+                retry = scan.exhausted and not scan.rerouted
+                if can_plan and not config.use_lateral and scan.receipt_only and config.scan_geometry is None:
+                    retry = scan.matches_route_view(depth) and scan.retry_route(config.max_obs_age_ms)
+                plan_now = can_plan and (not scan.attempted or retry)
+                if (plan_now and not config.use_lateral and approach and not near and feedback is not None
+                        and (ahead > config.slow_distance_m or feedback[0] > STILL_LINEAR)
+                        and scan.matches_route_view(depth)):
+                    room = min(ahead - brake_at, target_distance - config.stop_distance_m)
+                    travel = max(math.hypot(*feedback[:2]), math.hypot(*state.commanded[:2])) * horizon_s
+                    if travel <= room:
+                        arc = _start_detour_segment(
+                            depth, config, state, geometry, ahead, order, target_distance, target_bearing,
+                            rooms=rooms, reroute=scan.exhausted, closest=scan.exhausted,
+                            rolling=(odom, feedback, approach, room))
+                        if isinstance(arc, tuple):
+                            return arc
                 if (not config.use_lateral and may_scan and aligned and not near and foreground
                         and target_distance is not None and vx > 0. and feedback is not None
                         and geometry is not None and geometry.horizontal is not None
@@ -2536,20 +2564,20 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                                      limited, horizon_s, room, wz, order)
                     if prefix is not None:
                         return prefix
-                yaw_rate = max(_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
-                geometry = (config.scan_geometry or config.local_geometry
-                            if scan.receipt_only else config.scan_geometry)
-                if (may_scan and foreground and geometry is not None
-                        and config.floor_wz <= yaw_rate and yaw_rate > 0
-                        and scan.current_frame):
-                    retry = scan.exhausted and not scan.rerouted
-                    if not config.use_lateral and scan.receipt_only and config.scan_geometry is None:
-                        retry = scan.matches_route_view(depth) and scan.retry_route(config.max_obs_age_ms)
-                    if ((not scan.attempted or retry)
-                            and _start_detour_segment(depth, config, state, geometry, ahead, order,
-                                                     target_distance, target_bearing, rooms=rooms,
-                                                     reroute=scan.exhausted, closest=scan.exhausted)):
-                        return 0., 0., 0., AVOIDING, "局部规划：停车对准路线首段"
+                if (camera_routes and approach and may_scan and geometry is not None and feedback is not None
+                        and max(abs(feedback[1]), abs(state.commanded[1])) <= STILL_LINEAR
+                        and not scan.active and not scan.result_frame and scan.views and scan.matches_route_view(depth)):
+                    room = min(ahead - stationary_line, target_distance - config.stop_distance_m)
+                    prefix = _checked_forward_prefix(scan, geometry, config, state, odom, feedback,
+                                                     approach, horizon_s, room, wz)
+                    if prefix is not None:
+                        state.escape_side = 0.
+                        state.side_better_frames = 0
+                        return prefix
+                if plan_now and _start_detour_segment(
+                        depth, config, state, geometry, ahead, order, target_distance, target_bearing,
+                        rooms=rooms, reroute=scan.exhausted, closest=scan.exhausted):
+                    return 0., 0., 0., AVOIDING, "局部规划：停车对准路线首段"
             if scan is not None and scan.ready:
                 if local_command is not None or (not near and len(scan.directions) <= 1):
                     scan.finish()
@@ -2744,14 +2772,17 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     return vx, vy, wz, status, reason
 
 
-def _checked_forward_prefix(scan, geometry, config, state, odom, motion, vx, horizon, room, yaw, sides=()):
+def _checked_forward_prefix(scan, geometry, config, state, odom, motion, vx, horizon, room, yaw, sides=(), *,
+                            steer_only=False, shadow=None):
     """Choose a short twist and display the arc that it executes."""
     (floor, _), _ = _local_velocity_limits(config, 1.)
     if vx <= 0. or vx < floor:
         return None
     grid = scan.grid(include_near=scan.near_squares is None)
     turns = (yaw, 0.) if yaw else (0.,)
-    if sides:
+    if steer_only:
+        turns = yaw, .5 * yaw
+    elif sides:
         # A wheeled detour can also bend toward the side with more clearance.
         steer = yaw or -sides[0] * .25
         turns = (steer, .5 * steer, -math.copysign(.25, steer), 0.)
@@ -2778,6 +2809,8 @@ def _checked_forward_prefix(scan, geometry, config, state, odom, motion, vx, hor
                                for t in np.linspace(0., horizon, 6))
             else:
                 points = ((0., 0.), (speed * horizon, 0.))
+            if shadow is not None and local_path.visible_prefix(points, shadow) < len(points):
+                continue
             state.view_detour = Detour(None, points, geometry)
             state.checked_prefix = True
             state.avoidance_yaw_override = True

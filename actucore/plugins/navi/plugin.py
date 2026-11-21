@@ -1803,7 +1803,8 @@ class NaviPlugin:
         scan, route = state.active_scan, state.view_detour
         if (not config.local_planning or depth is None or depth.get("map") is None
                 or depth.get("capture_invalid") or not decision.values or decision.values[0] <= 0
-                or decision.distance_m is None or not objects_ms or scan.active or scan.result_frame
+                or decision.distance_m is None or not objects_ms or scan.active
+                or (scan.result_frame and not (scan.receipt_only and state.checked_prefix))
                 or (decision.status != policy_mod.APPROACHING
                     and not (decision.status == policy_mod.AVOIDING and state.avoidance_yaw_override
                              and route is not None))):
@@ -2395,9 +2396,9 @@ class NaviPlugin:
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))
-                if remaining_ms <= 0:
-                    stop = ("速度指令窗口已到期", False)
-                elif checked is not None:
+                # The old window can elapse while a new observation is
+                # being checked. A still-valid new check has its own deadline.
+                if checked is not None and checked[0] <= now_ms < checked[1]:
                     obs_ms, deadline, clear, newer = checked
                     if not clear:
                         stop = ("局部规划：续发前扫掠复检发现障碍", True)
@@ -2408,6 +2409,8 @@ class NaviPlugin:
                         work.expires_ms = now_ms + remaining_ms
                         work.expires_at = time.monotonic() + remaining_ms / 1000
                         renewed = True
+                if stop is None and remaining_ms <= 0:
+                    stop = ("速度指令窗口已到期", False)
             if stop is not None:
                 self._cancel_scheduled_motion(stop=(now_ms, *stop))
                 return
