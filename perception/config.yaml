@@ -723,3 +723,18 @@ plugins:
     # 没有 camera_info 时的兜底；留空 = 不猜，只输出距离。
     half_fov_rad: null
     half_fov_v_rad: null
+
+  # Opt-in demonstration ONLY. Not a privacy protection control.
+  # No need for extra image dependencies: uses existing OpenCV FaceDetectorYN.
+  # The pinned model must be provisioned separately at model_path.
+  mosaic_smooth_demo:
+    enabled: false
+    model_path: /models/mosaic_smooth/yunet.onnx
+    consent_acknowledged: false
+    output_width: 640
+    detect_every_frames: 4
+    confidence_threshold: 0.28
+    max_faces: 6
+    jpeg_quality: 72
+    pixelate_block: 24
+    fallback_block: 40

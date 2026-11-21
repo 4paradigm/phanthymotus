@@ -266,6 +266,17 @@ class PerceptionBundle:
             self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
             log.info("BarcodeScanPlugin loaded")
 
+        # Weak-privacy smooth-mosaic demo is opt-in and separate from privacy_view.
+        # It never autostarts and must not be represented as anonymization.
+        if plugins_cfg.get("mosaic_smooth_demo", {}).get("enabled", False):
+            try:
+                from plugins.mosaic_smooth import MosaicSmoothDemoPlugin
+                self._plugins.append(MosaicSmoothDemoPlugin(
+                    plugins_cfg["mosaic_smooth_demo"], executor))
+                log.info("MosaicSmoothDemoPlugin loaded (demo only)")
+            except Exception:
+                log.error("MosaicSmoothDemoPlugin unavailable; continuing", exc_info=True)
+
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin
             self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
