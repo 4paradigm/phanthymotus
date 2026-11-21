@@ -960,6 +960,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
   initialize.type = 'button';
   initialize.textContent = '准备前台电脑';
   initialize.className = 'ql-printer-init-button';
+  initialize.style.display = 'none';
   const progress = document.createElement('div');
   progress.className = 'ql-printer-progress';
   progress.setAttribute('aria-live', 'polite');
