@@ -1234,6 +1234,12 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.className = 'tool-config-input';
       input.dataset.key = key;
       input.add(new Option(savedValues[key] || '准备前台电脑后选择', savedValues[key] || ''));
+      const discover = document.createElement('button');
+      discover.type = 'button';
+      discover.className = 'ql-printer-discover-button';
+      discover.textContent = '连接并获取打印机和网页';
+      discover.onclick = () => bodyEl.querySelector('.ql-printer-init-button')?.click();
+      extraControls.push(discover);
     } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
       const printer = _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved: savedValues[key]});
       input = printer.input;
@@ -1618,6 +1624,12 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.className = 'tool-config-input';
       input.dataset.key = key;
       input.add(new Option(vals[key] || '准备前台电脑后选择', vals[key] || ''));
+      const discover = document.createElement('button');
+      discover.type = 'button';
+      discover.className = 'ql-printer-discover-button';
+      discover.textContent = '连接并获取打印机和网页';
+      discover.onclick = () => bodyEl.querySelector('.ql-printer-init-button')?.click();
+      extraControls.push(discover);
     } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
       const printer = _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved: vals[key]});
       input = printer.input;
@@ -1694,6 +1706,14 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     if (help) host.appendChild(help);
   }
   if (advancedBox) bodyEl.appendChild(advancedBox);
+
+  // Keep the discovery action visible in the card dialog.  It used to be
+  // attached only beside the printer field, which made it disappear when the
+  // instance layout rendered the page selector first.
+  if (visitorPrinter) {
+    const discover = bodyEl.querySelector('.ql-printer-init-button');
+    if (discover) discover.textContent = '连接并获取打印机和网页';
+  }
 
   if (!hasFields) {
     // Appended, not assigned: replacing innerHTML here would wipe the
