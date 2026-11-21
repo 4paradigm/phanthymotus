@@ -212,17 +212,12 @@ class VisitorBridge:
                 else:
                     after = self.backend.print_visit(visit)
             except BridgeFailure as exc:
-                # A click or network timeout is never retried. Re-read state once;
-                # if the platform already moved to 已入场, the print action won.
+                # A print timeout is ambiguous. Do not start a second Edge
+                # search here: that can reopen the browser, duplicate the
+                # operation, and exceed the SSH job deadline. The operator
+                # must verify the printer before retrying.
                 if exc.uncertain:
-                    try:
-                        after = self.backend.get_status(visit)
-                    except Exception:
-                        after = ""
-                    if after in self.success_statuses:
-                        result = {"ok": True}
-                    else:
-                        result = {"ok": False, "code": exc.code, "error": str(exc)}
+                    result = {"ok": False, "code": exc.code, "error": str(exc)}
                 else:
                     result = {"ok": False, "code": exc.code, "error": str(exc)}
                 self._finish(request_id, ticket, result)

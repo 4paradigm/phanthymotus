@@ -132,7 +132,9 @@ def print_readiness_script(wait_ms: Any = 1500) -> str:
   window.__paradigmPrintState = 'idle';
   window.addEventListener('afterprint', () => {{
     window.__paradigmPrintState = 'complete';
-    if (closeRequested) nativeClose();
+    // Give the automation worker a moment to observe completion before the
+    // portal's requested window.close() tears down the print page.
+    if (closeRequested) setTimeout(nativeClose, 2000);
   }});
 
   window.close = () => {{
@@ -611,16 +613,49 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
             action = row.get_by_text("打印访客贴", exact=True)
             if not action.count():
                 raise BridgeFailure("print_action_missing", "页面上没有找到“打印访客贴”操作")
+            existing_pages = set(self._context.pages)
             try:
                 action.click(timeout=5000)
-                # The page delays window.print() until images and fonts are
-                # ready (up to 6.5 seconds). Wait for the browser's afterprint
-                # event instead of closing Edge after a fixed 3-second sleep.
-                page.wait_for_function(
-                    "window.__paradigmPrintState === 'complete'",
-                    timeout=45_000,
-                )
+                # The portal may open a separate print-preview page. Its own
+                # window.print() runs asynchronously after images/fonts load,
+                # so observe every page in this Edge context rather than only
+                # the visitor-list page.
+                deadline = time.monotonic() + 45
+                printed = False
+                while time.monotonic() < deadline:
+                    pages = [candidate for candidate in self._context.pages if not candidate.is_closed()]
+                    candidates = [candidate for candidate in pages if candidate not in existing_pages]
+                    candidates.append(page)
+                    for candidate in candidates:
+                        try:
+                            state = candidate.evaluate("window.__paradigmPrintState || 'idle'")
+                        except Exception:
+                            continue
+                        if state == "complete":
+                            printed = True
+                            break
+                    if printed:
+                        break
+                    active = next((candidate for candidate in candidates if not candidate.is_closed()), None)
+                    if active is None:
+                        break
+                    active.wait_for_timeout(200)
+                if not printed:
+                    # The portal may already have changed the booking status
+                    # even when its print page did not emit afterprint.
+                    try:
+                        text = row.inner_text(timeout=1000)
+                    except Exception:
+                        text = ""
+                    if "已入场" not in text:
+                        raise BridgeFailure(
+                            "print_outcome_unknown",
+                            "打印页没有报告完成，且访客状态仍未入场；请核对前台打印窗口和打印机后再决定是否重试",
+                            uncertain=True,
+                        )
             except Exception as exc:
+                if isinstance(exc, BridgeFailure):
+                    raise
                 raise BridgeFailure(
                     "print_outcome_unknown",
                     "网页已触发打印，但浏览器未确认打印流程结束；系统不会自动重试，请核对打印机和访客状态",
