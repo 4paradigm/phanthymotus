@@ -10,7 +10,7 @@ import cv2
 import pytest
 from plugins.face_effects_live.contracts import Frame
 from plugins.face_effects_live.engine import Engine
-from plugins.face_effects_live.backends import OpenSeeFace
+from plugins.face_effects_live.backends import OpenSeeFace, YuNet
 from plugins.face_effects_live.render import CPU, GL
 from plugins.face_effects_live.effects import Effects
 from plugins.face_effects_live.sources.capture import FileSource
@@ -46,6 +46,72 @@ def test_real_inference_and_visible_effects(evidence,model):
     finally: engine.close()
 
 
+def test_real_yunet_without_opencv_wrapper(evidence, monkeypatch):
+    image = cv2.imread(str(evidence / "fixtures/grace_hopper.jpg"))
+    assert image is not None
+    single = cv2.resize(image, (320, 384))
+    multiple = np.concatenate([single, single], axis=1)
+    blank = np.zeros_like(multiple)
+    path = evidence / "models/yunet.onnx"
+    expected = None
+    if hasattr(cv2, "FaceDetectorYN"):
+        native = YuNet(path)
+        try:
+            faces = native.detect(multiple)
+            if native.runtime == "opencv":
+                expected = sorted(faces, key=lambda face: face.box[0])
+                assert len(expected) == 2
+        finally:
+            native.close()
+    monkeypatch.delattr(cv2, "FaceDetectorYN", raising=False)
+    engine = Engine(config(evidence))
+    try:
+        engine.process(Frame(single, 0., 0))
+        first = engine.process(Frame(single, .03, 1))
+        engine.process(Frame(multiple, .06, 2))
+        second = engine.process(Frame(multiple, .09, 3))
+        third = engine.process(Frame(blank, .12, 4))
+        assert first.metadata["tracked"] == 1
+        assert second.metadata["tracked"] == 2
+        assert third.metadata["detector_proposals"] == 0
+        assert second.metadata["detector_runtime"] == "onnxruntime-cpu"
+        assert np.count_nonzero(multiple != second.image) > 1000
+        proposals = sorted(engine.detector.detect(multiple), key=lambda face: face.box[0])
+        assert len(proposals) == 2
+        if expected is not None:
+            for ref, actual in zip(expected, proposals):
+                np.testing.assert_allclose(actual.box, ref.box, atol=3)
+                np.testing.assert_allclose(actual.points, ref.points, atol=3)
+        large = cv2.resize(multiple, (1280, 768))
+        scaled = sorted(engine.detector.detect(large), key=lambda face: face.box[0])
+        assert len(scaled) == 2
+        for ref, actual in zip(proposals, scaled):
+            np.testing.assert_allclose(actual.box / 2, ref.box, atol=3)
+            np.testing.assert_allclose(actual.points / 2, ref.points, atol=3)
+    finally:
+        engine.close()
+    assert engine.detector.service is None
+
+
+def test_real_yunet_bad_graph_reports_safe_mcp_status(evidence, tmp_path, monkeypatch):
+    from plugins.face_effects_live import plugin as module
+
+    monkeypatch.delattr(cv2, "FaceDetectorYN", raising=False)
+    monkeypatch.setattr(module, "create_source", lambda *args: PushSource())
+    invalid = tmp_path / "private-model-path.onnx"
+    invalid.write_bytes(b"x" * 2048)
+    plugin = FaceEffectsLivePlugin({"detector_model": str(invalid)})
+    try:
+        start = plugin.dispatch("start", {"source_kind": "file", "source_uri": "unused"})
+        status = plugin.dispatch("info", {})
+        assert not start["ok"] and status["state"] == "error"
+        assert "YuNet ONNX Runtime initialization failed" in status["error"]
+        assert str(invalid) not in status["error"]
+        assert not plugin.instances
+    finally:
+        plugin.shutdown()
+
+
 def test_gpu_provider_strict_failure_and_cpu_fallback(evidence):
     import onnxruntime
     if 'CUDAExecutionProvider' in onnxruntime.get_available_providers(): pytest.skip('requires absent CUDA')
@@ -55,14 +121,15 @@ def test_gpu_provider_strict_failure_and_cpu_fallback(evidence):
     model.close()
 
 
-def test_actual_ort_host_session_isolation_and_restart(evidence):
+def test_actual_ort_host_session_isolation_and_restart(evidence, monkeypatch):
     # The worker belongs to this pytest process, never a shared platform service.
     first = OpenSeeFace(evidence/'models/osf0.onnx')
     second = OpenSeeFace(evidence/'models/osf0.onnx')
     host = first.worker; first_key = first.session_key; second_key = second.session_key
     image = cv2.imread(str(evidence/'fixtures/grace_hopper.jpg'))
-    from plugins.face_effects_live.backends import YuNet
+    monkeypatch.delattr(cv2, "FaceDetectorYN", raising=False)
     detector = YuNet(evidence/'models/yunet.onnx')
+    detector_key = detector.service.key
     try:
         assert host is second.worker and first_key != second_key
         assert host._proc.pid != os.getpid()
@@ -72,12 +139,16 @@ def test_actual_ort_host_session_isolation_and_restart(evidence):
         first.close()
         assert first_key not in host._loaded and second_key in host._loaded and host.alive
         host._proc.terminate(); host._proc.join(timeout=5)
-        after = second.refine(image, proposals)
+        recovered = detector.detect(image)
+        assert len(recovered) == len(proposals)
+        np.testing.assert_array_equal(recovered[0].box, proposals[0].box)
+        after = second.refine(image, recovered)
         assert len(after) == len(before)
         assert np.array_equal(after[0].landmarks, before[0].landmarks)
     finally:
         detector.close(); first.close(); second.close()
-    assert second_key not in host._loaded  # do not terminate other users' sessions
+    assert second_key not in host._loaded
+    assert detector_key not in host._services and host.alive
 
 
 @pytest.mark.parametrize('backend',['osf','hybrid','mediapipe'])

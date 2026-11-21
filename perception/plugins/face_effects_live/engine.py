@@ -191,6 +191,7 @@ class Engine:
                     "landmark_sources": {t.id:t.face.landmark_source for t in tracks},
                     "effects": sorted(self.effects.active), "renderer": self.renderer.name,
                     "render_fallback": self.render_fallback,
+                    "detector_runtime": getattr(self.detector, "runtime", ""),
                     "providers": getattr(self.landmarker or self.detector, "providers", ["opencv-cpu"]),
                     "inference_fallback": getattr(self.landmarker, "fallback_reason", ""),
                     "used_detection": use_detection, "stages": stages,

@@ -320,6 +320,10 @@ class OrtWorker:
         a name: a spawned child cannot be handed a closure, and a name means it imports
         the same implementation rather than a copy. This class still knows nothing about
         what it is hosting.
+
+        A service can request a worker-owned ONNX session with `_ort_session`
+        (model_path, providers and options). Its factory receives `session`
+        in the child, including when the worker rebuilds the service.
         """
         with self._lock:
             self._closed = False
@@ -549,6 +553,27 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
         return [{"name": e.name, "shape": list(e.shape), "type": e.type}
                 for e in entries]
 
+    def _create_session(model_path, providers, options):
+        opts = ort.SessionOptions()
+        if options.get("intra_op_num_threads") is not None:
+            opts.intra_op_num_threads = int(options["intra_op_num_threads"])
+        if options.get("log_severity_level") is not None:
+            opts.log_severity_level = int(options["log_severity_level"])
+        for config_key, config_value in (options.get("session_config") or {}).items():
+            opts.add_session_config_entry(str(config_key), str(config_value))
+        level = options.get("graph_optimization_level")
+        if level:
+            opts.graph_optimization_level = getattr(
+                ort.GraphOptimizationLevel, level)
+        # Positionally aligned with `providers`, e.g.
+        # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
+        # kokoro_direct.py for why Kokoro's Japanese session needs this.
+        provider_options = options.get("provider_options")
+        if provider_options:
+            return ort.InferenceSession(model_path, opts, providers=providers,
+                                        provider_options=provider_options)
+        return ort.InferenceSession(model_path, opts, providers=providers)
+
     while True:
         try:
             command = cmd_q.get()
@@ -561,27 +586,8 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
         try:
             if verb == "load":
                 _, _, key, model_path, providers, options, postprocess = command
-                opts = ort.SessionOptions()
-                if options.get("intra_op_num_threads") is not None:
-                    opts.intra_op_num_threads = int(options["intra_op_num_threads"])
-                if options.get("log_severity_level") is not None:
-                    opts.log_severity_level = int(options["log_severity_level"])
-                for config_key,config_value in (options.get('session_config') or {}).items():
-                    opts.add_session_config_entry(str(config_key),str(config_value))
-                level = options.get("graph_optimization_level")
-                if level:
-                    opts.graph_optimization_level = getattr(
-                        ort.GraphOptimizationLevel, level)
-                # Positionally aligned with `providers`, e.g.
-                # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
-                # kokoro_direct.py for why Kokoro's Japanese session needs this.
-                provider_options = options.get("provider_options")
                 started = time.monotonic()
-                if provider_options:
-                    sess = ort.InferenceSession(model_path, opts, providers=providers,
-                                                provider_options=provider_options)
-                else:
-                    sess = ort.InferenceSession(model_path, opts, providers=providers)
+                sess = _create_session(model_path, providers, options)
                 post = None
                 if postprocess:
                     module = importlib.import_module(postprocess["module"])
@@ -602,7 +608,12 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                 _, _, key, module_name, func_name, kwargs = command
                 module = importlib.import_module(module_name)
                 started = time.monotonic()
-                obj = getattr(module, func_name)(**kwargs)
+                factory = getattr(module, func_name)
+                session_spec = kwargs.pop("_ort_session", None)
+                if session_spec is None:
+                    obj = factory(**kwargs)
+                else:
+                    obj = factory(session=_create_session(**session_spec), **kwargs)
                 services[key] = obj
                 describe = getattr(obj, "describe", None)
                 wlog.info("built service %s from %s.%s in %.2fs",

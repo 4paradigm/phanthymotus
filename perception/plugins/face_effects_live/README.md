@@ -20,9 +20,11 @@ python3 -m venv /your/isolated/face-effects-env
 
 下载只在显式运行fetch工具时发生；哈希、字节数和许可证见`models.json`、`THIRD_PARTY.md`及`licenses/`。已有模型不一致会拒绝覆盖。模型主分支更新也会因SHA变化拒绝；需要人工核查后更新清单，不能跳过哈希。
 
-模型下载工具复用Perception的`utils.model_downloader.ensure_verified_bundle()`和`utils.model_progress.fetch_status()`：下载过程中在终端输出字节进度；下载文件使用`models.json`中锁定的精确大小和SHA-256校验，临时文件与并发锁由共享下载器管理。上游文件名与Card本地别名不同，因此经校验的原文件先缓存在`--output/.verified/<model-name>/`，随后以不覆盖已有文件的硬链接发布为`yunet.onnx`、`osf0.onnx`等名称。已有模型尺寸或哈希不符时直接拒绝，不会覆盖。只有显式调用CLI才会联网；Card运行时不会自动下载。模型源为`models.json`明确列出的HTTPS地址，不假设存在未经确认的COS镜像。
+模型下载工具复用Perception的`utils.model_downloader.ensure_verified_bundle()`和`utils.model_progress.fetch_status()`：下载过程中在终端输出字节进度；下载文件使用`models.json`中锁定的精确大小和SHA-256校验，临时文件与并发锁由共享下载器管理。上游文件名与Card本地别名不同，因此经校验的原文件先缓存在`--output/.verified/<model-name>/`，随后以不覆盖已有文件的硬链接发布为`yunet.onnx`、`osf0.onnx`等名称。已有模型尺寸或哈希不符时直接拒绝，不会覆盖。只有显式调用CLI才会联网；Card运行时不会自动下载。默认模型源为`models.json`列出的 HTTPS 地址。
 
 运行时需保留本仓库通用 `perception/plugins/ort_worker.py`（仅Python/NumPy/ORT，无机器人SDK），并设置示例中的 `PYTHONPATH=perception`。OSF在已有spawn宿主中加载每实例独立session，避免与Perception的sherpa-onnx运行时冲突；关闭实例只释放自身模型，不关闭共享宿主。不要仅复制Card文件夹而漏掉此通用依赖。
+
+YuNet 优先使用可用的 OpenCV `FaceDetectorYN`。缺少接口或 OpenCV 无法执行模型时，使用同一子进程中的独立 ONNX Runtime CPU 会话。该路径支持固定尺寸的 YuNet 2023mar 模型，检测输入长边上限为 640 像素；返回的边框和关键点映射到原始画面。结果元数据中的 `detector_runtime` 报告实际后端。管理员可用 `FACE_EFFECTS_MODEL_BASE_URL` 为显式下载 CLI 指定已有的 HTTPS 镜像目录。镜像需保留清单中的上游文件名和原始字节。
 
 复制`config.example.json`到自己的配置文件，填写实际本地模型路径。不要将占位路径当作设备发现。`landmark_model`删掉可运行轻量A方案；它只有5点，不提供稠密点PnP。`provider=cpu`在没有CUDA时正常工作。`allow_cpu_fallback=false`可严格拒绝加速失效；provider列表不是GPU算子驻留证明。
 

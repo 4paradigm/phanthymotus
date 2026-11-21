@@ -180,7 +180,8 @@ def test_upscale_is_bounded_and_maps_detector_coordinates_back(monkeypatch, tmp_
             return None, np.array([[64, 96, 128, 160, 80, 120, 160, 120, 120, 160, 90, 200, 150, 200, .9]], float)
     detector = Detector()
     import cv2
-    monkeypatch.setattr(cv2.FaceDetectorYN, 'create', lambda *a: detector)
+    from types import SimpleNamespace
+    monkeypatch.setattr(cv2, 'FaceDetectorYN', SimpleNamespace(create=lambda *a: detector), raising=False)
     backend = YuNet(model, max_side=1920, upscale=True)
     actual = backend.detect(np.zeros((240, 320, 3), np.uint8))[0]
     assert detector.size == (640, 480) and actual.box.tolist() == [32, 48, 64, 80]
@@ -202,6 +203,61 @@ def test_compact_heatmap_decode_has_independent_grid_oracle():
     assert coordinates.nbytes+quality.nbytes < 2000
     output[0, 0, 0, 0] = np.nan
     with pytest.raises(ValueError): decode_heatmaps([output])
+
+
+def test_yunet_fallback_decodes_padded_grid_and_maps_clipped_faces(monkeypatch, tmp_path):
+    import cv2
+    from types import SimpleNamespace
+    from plugins import ort_worker
+    from plugins.face_effects_live.backends import YuNet, YuNetError
+    from plugins.yunet_ort import _decode, _SCHEMA
+
+    class Service:
+        dropped = False
+        failed = False
+
+        def describe(self):
+            return {"max_side": 640, "providers": ["CPUExecutionProvider"]}
+
+        def call(self, method, image):
+            assert method == "detect"
+            assert image.shape == (320, 640, 3)
+            if self.failed:
+                raise RuntimeError("private worker details")
+            outputs = {name: np.zeros(shape, np.float32) for name, shape in _SCHEMA.items()}
+            # Two overlapping stride-8 proposals, then a high score in padded rows.
+            for index, obj, dx in ((0, 0.81, 2), (1, 0.64, 1), (40 * 80, 1., 2)):
+                outputs["cls_8"][0, index, 0] = 1
+                outputs["obj_8"][0, index, 0] = obj
+                outputs["bbox_8"][0, index] = [dx, 3, np.log(10), np.log(6)]
+                outputs["kps_8"][0, index] = [-2, 2, 3, 2, 2, 3, -2, 4, 3, 4]
+            return _decode(outputs, 640, 320, 0.7, 4)
+
+        def drop(self):
+            self.dropped = True
+
+    service = Service()
+    worker = SimpleNamespace(service=lambda *args, **kwargs: service)
+    monkeypatch.delattr(cv2, "FaceDetectorYN", raising=False)
+    monkeypatch.setattr(ort_worker, "get_worker", lambda: worker)
+    model = tmp_path / "test.onnx"
+    model.write_bytes(b"x" * 2048)
+    backend = YuNet(model, max_side=1920)
+    try:
+        assert backend.runtime == "onnxruntime-cpu"
+        image = np.zeros((640, 1280, 3), np.uint8)
+        face, = backend.detect(image)
+        np.testing.assert_allclose(face.box, [0, 0, 112, 96], atol=1e-5)
+        np.testing.assert_allclose(face.points[0], [0, 32])
+        assert face.confidence == pytest.approx(.9)
+        with pytest.raises(ValueError, match="BGR"):
+            backend.detect(np.empty((0, 0, 3), np.uint8))
+        service.failed = True
+        with pytest.raises(YuNetError, match="^YuNet ONNX Runtime inference failed$"):
+            backend.detect(image)
+    finally:
+        backend.close()
+    assert service.dropped
 
 
 def test_frozen_benchmark_refuses_mismatched_worker_decoder(tmp_path):

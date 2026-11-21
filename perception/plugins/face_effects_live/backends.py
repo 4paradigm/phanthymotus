@@ -13,6 +13,7 @@ import cv2
 from .contracts import Face
 from .osf_decode import decode_heatmaps
 from .osf_input import prepare_crop
+from plugins.yunet_ort import cpu_session_spec
 
 
 def capabilities():
@@ -21,7 +22,9 @@ def capabilities():
     if ort:
         import onnxruntime
         providers = onnxruntime.get_available_providers()
-    return {"opencv": cv2.__version__, "yunet": hasattr(cv2, "FaceDetectorYN"),
+    native = callable(getattr(getattr(cv2, "FaceDetectorYN", None), "create", None))
+    return {"opencv": cv2.__version__, "yunet": native or "CPUExecutionProvider" in providers,
+            "yunet_opencv": native,
             "onnxruntime": ort, "providers_advertised": providers,
             "moderngl_installed": importlib.util.find_spec("moderngl") is not None,
             "mediapipe_installed": importlib.util.find_spec("mediapipe") is not None,
@@ -37,6 +40,10 @@ def model_path(path, expected_sha=None):
     return str(p)
 
 
+class YuNetError(RuntimeError):
+    """YuNet failures with fixed, safe messages for Card status."""
+
+
 class YuNet:
     def __init__(self, path, max_side=640, max_faces=8, score=0.7, sha256=None, upscale=False):
         self.max_side, self.max_faces = int(max_side), int(max_faces)
@@ -45,34 +52,99 @@ class YuNet:
         self.upscale = upscale
         if not 160 <= self.max_side <= 1920 or not 1 <= self.max_faces <= 8:
             raise ValueError("max_side 160..1920; max_faces 1..8")
-        self.detector = cv2.FaceDetectorYN.create(
-            model_path(path, sha256), "", (320, 320), float(score), 0.3, 5000)
+        try:
+            self.path = model_path(path, sha256)
+        except (OSError, ValueError) as exc:
+            raise YuNetError("YuNet requires a valid local model and matching configured SHA-256") from exc
+        self.score = float(score)
+        if not 0 < self.score <= 1:
+            raise ValueError("YuNet score must be in (0, 1]")
+        self.detector = self.service = None
+        create = getattr(getattr(cv2, "FaceDetectorYN", None), "create", None)
+        if callable(create):
+            try:
+                self.detector = create(self.path, "", (320, 320), self.score, 0.3, 5000)
+            except cv2.error:
+                # Some builds expose the symbol but lack its DNN implementation.
+                pass
+        self.input_limit = self.max_side
+        self.providers = ["opencv-cpu"]
+        self.runtime = "opencv"
+        if self.detector is None:
+            self._start_ort()
+
+    def _start_ort(self):
+        from plugins.ort_worker import get_worker
+
+        worker = get_worker()
+        key = "face_effects_live.yunet." + uuid.uuid4().hex
+        try:
+            self.service = worker.service(
+                key, "plugins.yunet_ort", "YuNetOrtService",
+                threshold=self.score, limit=self.max_faces,
+                _ort_session=cpu_session_spec(self.path),
+            )
+        except Exception as exc:
+            worker.drop(key)
+            raise YuNetError("YuNet ONNX Runtime initialization failed; check CPU provider and 2023mar model") from exc
+        self.detector = None
+        info = self.service.describe()
+        self.input_limit = min(self.max_side, info["max_side"])
+        self.providers = info["providers"]
+        self.runtime = "onnxruntime-cpu"
 
     def detect(self, image):
+        if (not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3
+                or image.dtype != np.uint8 or min(image.shape[:2]) < 2):
+            raise ValueError("YuNet requires a non-empty uint8 BGR image")
         h, w = image.shape[:2]
         # Optional small-face quality profile. Bounded at 2x; never changes the
         # source frame, effect coordinates, or default CPU performance profile.
-        scale = min(2. if self.upscale else 1., self.max_side / max(w, h))
+        scale = min(2. if self.upscale else 1., self.input_limit / max(w, h))
         # YuNet requires multiples of 32 for some model/OpenCV versions.
         sw, sh = max(32, round(w * scale / 32) * 32), max(32, round(h * scale / 32) * 32)
         small = cv2.resize(image, (sw, sh))
-        self.detector.setInputSize((sw, sh))
-        _, rows = self.detector.detect(small)
+        if self.detector is not None:
+            try:
+                self.detector.setInputSize((sw, sh))
+                _, rows = self.detector.detect(small)
+            except cv2.error:
+                self._start_ort()
+                return self.detect(image)
+        elif self.service is not None:
+            try:
+                rows = self.service.call("detect", image=small)
+            except Exception as exc:
+                raise YuNetError("YuNet ONNX Runtime inference failed") from exc
+        else:
+            raise YuNetError("YuNet detector is closed")
         result = []
         if rows is not None:
-            for row in sorted(rows, key=lambda r: -float(r[-1]))[:self.max_faces]:
-                factors = np.array([w / sw, h / sh], dtype=np.float64)
-                box = row[:4].astype(np.float64) * np.tile(factors, 2)
+            factors = np.array([w / sw, h / sh], dtype=np.float64)
+            for row in sorted(rows, key=lambda r: -float(r[-1])):
+                if not np.isfinite(row).all():
+                    continue
+                start = row[:2].astype(np.float64) * factors
+                end = start + row[2:4].astype(np.float64) * factors
+                start = np.clip(start, 0, (w, h))
+                end = np.clip(end, 0, (w, h))
+                box = np.concatenate((start, end - start))
                 points = row[4:14].reshape(5, 2).astype(np.float64) * factors
+                points = np.clip(points, 0, (w - 1, h - 1))
                 points[:2] = points[:2][np.argsort(points[:2, 0])]
                 points[3:] = points[3:][np.argsort(points[3:, 0])]
                 face = Face(box, points, float(row[-1]))
                 if face.valid():
                     result.append(face)
+                    if len(result) == self.max_faces:
+                        break
         return result
 
     def close(self):
         self.detector = None
+        service, self.service = self.service, None
+        if service is not None:
+            service.drop()
 
 
 class OpenSeeFace:

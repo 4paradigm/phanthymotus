@@ -23,10 +23,10 @@ def spec():
     }
 
 
-def fake_downloader(calls):
+def fake_downloader(calls, expected_url="https://example.org/models"):
     def ensure_verified_bundle(name, model_dir, base_url, files, progress_cb=None):
         calls.append((name, base_url, files))
-        assert base_url == "https://example.org/models"
+        assert base_url == expected_url
         assert files == {"upstream-name.onnx": {
             "size": len(MODEL), "sha256": hashlib.sha256(MODEL).hexdigest(),
         }}
@@ -64,6 +64,18 @@ def test_existing_valid_file_is_reused_without_network(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fetch_models, "ensure_verified_bundle", unexpected_download)
     assert fetch_models.fetch_one("yunet", spec(), tmp_path) == target
+
+
+def test_explicit_https_mirror_keeps_original_filenames_and_pins(tmp_path, monkeypatch):
+    calls = []
+    mirror = "https://models.example.org/face-effects"
+    monkeypatch.setenv("FACE_EFFECTS_MODEL_BASE_URL", mirror + "/")
+    monkeypatch.setattr(fetch_models, "ensure_verified_bundle", fake_downloader(calls, mirror))
+    assert fetch_models.fetch_one("yunet", spec(), tmp_path).read_bytes() == MODEL
+    assert len(calls) == 1
+    monkeypatch.setenv("FACE_EFFECTS_MODEL_BASE_URL", "http://models.example.org")
+    with pytest.raises(ValueError, match="HTTPS model base URL"):
+        fetch_models.fetch_one("osf0", {**spec(), "file": "osf0.onnx"}, tmp_path)
 
 
 def test_existing_corrupted_file_is_never_overwritten(tmp_path, monkeypatch):

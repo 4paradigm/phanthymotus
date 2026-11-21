@@ -3,6 +3,7 @@ from collections import deque
 import threading
 import time
 import cv2
+from .backends import YuNetError
 from .engine import Engine
 
 
@@ -71,7 +72,8 @@ class Service:
     def _fail(self, stage, exc):
         # No arbitrary exception strings: capture/SDK errors can contain URLs.
         with self.condition:
-            self.error = f"{stage}: {type(exc).__name__}"
+            detail = str(exc) if isinstance(exc, YuNetError) else type(exc).__name__
+            self.error = f"{stage}: {detail}"
             self.state = "error"
             self.jpeg = self.latest = None
             self.stop_event.set()

@@ -68,11 +68,15 @@ def fetch_one(name: str, spec: dict, root: Path, on_status=None) -> Path:
 
     # The shared verified downloader owns cache locking, retries and progress.
     cache_dir = root / ".verified" / name
+    base_url = os.environ.get("FACE_EFFECTS_MODEL_BASE_URL", url.rsplit("/", 1)[0]).rstrip("/")
+    mirror = urlsplit(base_url)
+    if mirror.scheme != "https" or not mirror.hostname or mirror.username is not None or mirror.query or mirror.fragment:
+        raise ValueError(f"{name}: expected an HTTPS model base URL")
     progress_cb, _ = fetch_status(on_status, name)
     cache_paths = ensure_verified_bundle(
         name=f"face_effects_live_{name}",
         model_dir=str(cache_dir),
-        base_url=url.rsplit("/", 1)[0],
+        base_url=base_url,
         files={remote_filename: {
             "size": int(spec["bytes"]),
             "sha256": spec["sha256"],
