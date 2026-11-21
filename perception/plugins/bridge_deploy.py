@@ -100,8 +100,12 @@ def deploy(args, package_root=Path('/deploy/windows_bridge')):
         except subprocess.TimeoutExpired:
             raise RuntimeError('初始化步骤超时：' + command[0]) from None
         if result.returncode:
-            detail = (result.stderr or result.stdout).decode('utf-8', errors='replace')
-            detail = detail[-1200:]
+            raw = result.stderr or result.stdout
+            text = raw.decode('utf-8', errors='replace')
+            if text and text.count('\ufffd') * 4 > len(text):
+                # zh-CN Windows 输出 GBK 编码错误，UTF-8 解码会得到乱码。
+                text = raw.decode('gbk', errors='replace')
+            detail = ' '.join(text.replace('_x000D__x000A_', ' ').split())[-1200:]
             raise RuntimeError('初始化 %s 失败（退出码 %s）：%s' % (command[0], result.returncode, detail))
         return result
 

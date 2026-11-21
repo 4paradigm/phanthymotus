@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import base64
+import gzip
 import ipaddress
 import os
 import re
@@ -80,6 +81,17 @@ class BridgeError(Exception):
     def __init__(self, message: str, code: str = "bridge_error"):
         super().__init__(message)
         self.code = code
+
+
+def _decode_process_output(data: bytes) -> str:
+    # zh-CN Windows 在 stderr 上输出 GBK 编码的 CLIXML；按 UTF-8 解码会得到
+    # 一片 U+FFFD 乱码，因此当替换字符占比过高时改用 GBK 解释。
+    text = data.decode("utf-8", errors="replace")
+    if text and text.count("\ufffd") * 4 > len(text):
+        text = data.decode("gbk", errors="replace")
+    text = text.replace("_x000D__x000A_", " ")
+    text = re.sub(r"<[^<>\n]{1,120}>", " ", text)
+    return " ".join(text.split())
 
 
 class BridgeClient:
@@ -184,11 +196,15 @@ class SSHBridgeClient:
             return "/dev/null", f"{self.user}@{self.host}"
         raise BridgeError("请填写前台电脑 IP 和 Windows 用户名", "ssh_not_configured")
 
-    def _ssh(self, script: str, timeout_s: float | None = None) -> subprocess.CompletedProcess:
+    def _ssh(self, script: str, timeout_s: float | None = None,
+             pre_encoded: bool = False) -> subprocess.CompletedProcess:
         if not self.password:
             raise BridgeError("请填写 Windows SSH 密码", "ssh_not_configured")
         ssh_config, target = self._connection()
-        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        if pre_encoded:
+            encoded = script
+        else:
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         askpass = tempfile.NamedTemporaryFile("w", prefix="visitor-askpass-", suffix=".sh", delete=False)
         try:
             askpass.write('#!/bin/sh\nprintf "%s\\n" "$VISITOR_SSH_PASSWORD"\n')
@@ -239,17 +255,13 @@ class SSHBridgeClient:
         script = rf"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
-$action = '{action}'
 $task = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction Stop
 $install = $task.Actions | Select-Object -First 1 -ExpandProperty WorkingDirectory
-# The login task and the on-demand worker use the same persistent Edge profile.
-# Ask the login process to close it cleanly before a query or print opens it.
-if ($action -in @('list','print')) {{
+if ('{action}' -in @('list','print')) {{
     $loginTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Login' -ErrorAction SilentlyContinue
     if ($loginTask -and $loginTask.State -eq 'Running') {{
-        $data = Join-Path $install 'data'
-        New-Item -ItemType Directory -Force -Path $data | Out-Null
-        Set-Content -LiteralPath (Join-Path $data 'login.stop') -Value '{job_id}' -Encoding ascii
+        New-Item -ItemType Directory -Force -Path (Join-Path $install 'data') | Out-Null
+        Set-Content -LiteralPath (Join-Path $install 'data\login.stop') -Value '{job_id}' -Encoding ascii
     }}
     for ($wait = 0; $wait -lt 40; $wait++) {{
         $loginTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Login' -ErrorAction SilentlyContinue
@@ -257,69 +269,57 @@ if ($action -in @('list','print')) {{
         Start-Sleep -Milliseconds 250
     }}
     if ($loginTask -and $loginTask.State -eq 'Running') {{
-        throw '登录中的 Edge 尚未正常退出；请关闭前台登录窗口后重试，避免浏览器配置被同时占用'
+        throw '登录中的 Edge 未退出，请关闭前台登录窗口后重试'
     }}
     Remove-Item -LiteralPath (Join-Path $install 'data\login.stop') -Force -ErrorAction SilentlyContinue
 }}
 $jobs = Join-Path $install 'data\jobs'
 New-Item -ItemType Directory -Force -Path $jobs | Out-Null
 $request = Join-Path $jobs '{job_id}.request.json'
-$temporary = $request + '.tmp'
 $result = Join-Path $jobs '{job_id}.result.json'
-[IO.File]::WriteAllBytes($temporary, [Convert]::FromBase64String('{payload}'))
-Move-Item -LiteralPath $temporary -Destination $request -Force
+[IO.File]::WriteAllBytes($request + '.tmp', [Convert]::FromBase64String('{payload}'))
+Move-Item -LiteralPath ($request + '.tmp') -Destination $request -Force
 Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
-# Quick sanity check: within 3 s the task should be Running or at least
-# Queued.  If it is still Ready / Unknown, the start request may have been
-# silently dropped (Interactive session unavailable, etc.) and we restart
-# immediately instead of burning the whole timeout.
-$startedConfirmed = $false
-for ($probe = 0; $probe -lt 6; $probe++) {{
-    $probeTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
-    if ($probeTask -and $probeTask.State -in @('Running','Queued')) {{
-        $startedConfirmed = $true
-        break
-    }}
-    Start-Sleep -Milliseconds 500
-}}
-if (!$startedConfirmed) {{
-    Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
-}}
-$restartCount = 0
+$restarts = 0
 for ($i = 0; $i -lt 220 -and !(Test-Path -LiteralPath $result); $i++) {{
-    # Every ~10 s, verify the task is alive.  With MultipleInstances=Queue,
-    # 'Running' means a worker is up, 'Queued' means another start is
-    # pending.  If the state is Ready (task finished and no queue), restart
-    # it — the previous instance may have exited without seeing this file
-    # because of a race or a startup crash.
-    if ($i -gt 0 -and ($i % 20) -eq 0) {{
-        $currentTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
-        if ($currentTask -and $currentTask.State -notin @('Running','Queued')) {{
+    if ($i -gt 0 -and ($i % 4) -eq 0) {{
+        $t = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
+        if ($t -and $t.State -notin @('Running','Queued')) {{
             Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
-            $restartCount++
+            $restarts++
         }}
     }}
     Start-Sleep -Milliseconds 500
 }}
 if (!(Test-Path -LiteralPath $result)) {{
-    $diagTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
-    $diagState = if ($diagTask) {{ $diagTask.State }} else {{ 'NotFound' }}
-    $diagSentinel = Test-Path -LiteralPath (Join-Path $jobs 'worker.started')
-    $diagLog = ''
-    $logPath = Join-Path $install 'data\worker.log'
-    if (Test-Path -LiteralPath $logPath) {{
-        $diagLog = Get-Content -LiteralPath $logPath -Tail 5 -ErrorAction SilentlyContinue | Out-String
-    }}
-    throw "Visitor automation job timed out (state=$diagState restarts=$restartCount sentinel=$diagSentinel). $diagLog"
+    $t = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
+    $s = if ($t) {{ $t.State }} else {{ 'NotFound' }}
+    $g = Test-Path -LiteralPath (Join-Path $jobs 'worker.started')
+    $l = Get-Content -LiteralPath (Join-Path $install 'data\worker.log') -Tail 3 -ErrorAction SilentlyContinue | Out-String
+    throw "Visitor automation job timed out (state=$s restarts=$restarts sentinel=$g) $l"
 }}
 $bytes = [IO.File]::ReadAllBytes($result)
 Remove-Item -LiteralPath $result -Force -ErrorAction SilentlyContinue
 Write-Output ('{self.MARKER}' + [Convert]::ToBase64String($bytes))
 """
-        result = self._ssh(script, timeout_s)
+        # The plain script exceeds the 8191-char cmd.exe limit once UTF-16LE
+        # and base64 expand it ("命令行太长。").  Ship it gzip-compressed behind
+        # a tiny decompress-and-invoke launcher so the remote command line
+        # stays short regardless of how much logic the script carries.
+        blob = base64.b64encode(gzip.compress(script.encode("utf-8"), 9)).decode("ascii")
+        launcher = (
+            "Add-Type -AssemblyName System.IO.Compression;"
+            "$b=[Convert]::FromBase64String('" + blob + "');"
+            "$m=New-Object IO.MemoryStream(,$b);"
+            "$g=New-Object IO.Compression.GZipStream($m,[IO.Compression.CompressionMode]::Decompress);"
+            "$r=New-Object IO.StreamReader($g,[Text.Encoding]::UTF8);"
+            "Invoke-Expression $r.ReadToEnd()"
+        )
+        encoded_launcher = base64.b64encode(launcher.encode("utf-16le")).decode("ascii")
+        result = self._ssh(encoded_launcher, timeout_s, pre_encoded=True)
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout).decode("utf-8", errors="replace")
-            detail = " ".join(detail.split())[-600:]
+            detail = _decode_process_output(result.stderr or result.stdout)
+            detail = detail[-600:]
             if "Visitor automation job timed out" in detail:
                 # The on-demand worker never produced a result file.
                 # Extract the diagnostic tail the PowerShell script appended.
