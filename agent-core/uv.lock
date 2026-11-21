@@ -495,6 +495,8 @@ dependencies = [
     { name = "qqbot-agent-sdk" },
     { name = "qrcode" },
     { name = "slack-sdk" },
+    { name = "wecom-aibot-python-sdk" },
+    { name = "yarl" },
     { name = "zeroconf" },
 ]
 
@@ -515,6 +517,8 @@ requires-dist = [
     { name = "qqbot-agent-sdk", specifier = "==1.2.2" },
     { name = "qrcode", specifier = ">=7.4.2" },
     { name = "slack-sdk", specifier = ">=3.27" },
+    { name = "wecom-aibot-python-sdk", specifier = ">=1.0.2" },
+    { name = "yarl", specifier = ">=1.17.0,<2" },
     { name = "zeroconf", specifier = ">=0.136.0" },
 ]
 
@@ -692,7 +696,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -2101,6 +2105,39 @@ wheels = [
 ]
 
 [[package]]
+name = "pyee"
+version = "13.0.1"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
+resolution-markers = [
+    "python_full_version == '3.11.*'",
+    "python_full_version < '3.11'",
+]
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/8b/04/e7c1fe4dc78a6fdbfd6c337b1c3732ff543b8a397683ab38378447baa331/pyee-13.0.1.tar.gz", hash = "sha256:0b931f7c14535667ed4c7e0d531716368715e860b988770fc7eb8578d1f67fc8", size = 31655, upload-time = "2026-02-14T21:12:28.044Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/a0/c4/b4d4827c93ef43c01f599ef31453ccc1c132b353284fc6c87d535c233129/pyee-13.0.1-py3-none-any.whl", hash = "sha256:af2f8fede4171ef667dfded53f96e2ed0d6e6bd7ee3bb46437f77e3b57689228", size = 15659, upload-time = "2026-02-14T21:12:26.263Z" },
+]
+
+[[package]]
+name = "pyee"
+version = "16.1.0"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
+resolution-markers = [
+    "python_full_version >= '3.14'",
+    "python_full_version == '3.13.*'",
+    "python_full_version == '3.12.*'",
+]
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ab/bc/8d7e802a90112ce62c6cbcdeb519c79b966c528956054fa43b6c2e5e5993/pyee-16.1.0.tar.gz", hash = "sha256:fe092d3a2a66f0f6a277fb227b078d3d849318da9a9d5d2f6576143236e84e48", size = 138156, upload-time = "2026-11-14T18:06:23.782Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/92/59/21807600b85ab28826c5096772d7ec3cca74c767ef07dc33df5ef3906098/pyee-16.1.0-py3-none-any.whl", hash = "sha256:45aaa35313906a780c539bd640ffba106d86dd63d3fd46b76d718bd611682995", size = 17220, upload-time = "2026-11-14T18:06:22.417Z" },
+]
+
+[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
@@ -3182,6 +3219,23 @@ wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/2b/fb/c492d6daa5ec067c2988ac80c61359ace5c4c674c532985ac5a123436cec/websockets-15.0.1-pp310-pypy310_pp73-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b359ed09954d7c18bbc1680f380c7301f92c60bf924171629c5db97febb12f04", size = 174155, upload-time = "2025-03-05T20:03:25.321Z" },
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/68/a1/dcb68430b1d00b698ae7a7e0194433bce4f07ded185f0ee5fb21e2a2e91e/websockets-15.0.1-pp310-pypy310_pp73-win_amd64.whl", hash = "sha256:cad21560da69f4ce7658ca2cb83138fb4cf695a2ba3e475e0559e05991aa8122", size = 176884, upload-time = "2025-03-05T20:03:27.934Z" },
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/fa/a8/5b41e0da817d64113292ab1f8247140aac61cbf6cfd085d6a0fa77f4984f/websockets-15.0.1-py3-none-any.whl", hash = "sha256:f7a866fbc1e97b5c617ee4116daaa09b722101d4a3c170c787450ba409f9736f", size = 169743, upload-time = "2025-03-05T20:03:39.41Z" },
+]
+
+[[package]]
+name = "wecom-aibot-python-sdk"
+version = "1.0.2"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "certifi" },
+    { name = "cryptography" },
+    { name = "pyee", version = "13.0.1", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }, marker = "python_full_version < '3.12'" },
+    { name = "pyee", version = "16.1.0", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple/" }, marker = "python_full_version >= '3.12'" },
+    { name = "websockets" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/23/b4/df93b46006e5c1900703aefa59004e6d524a4e73ba56ae73bcce24ff4184/wecom_aibot_python_sdk-1.0.2.tar.gz", hash = "sha256:f8cd9920c0b6cb88bf8a50742fca1e834e5c49e06c3ae861d0f128672c17697b", size = 31706, upload-time = "2026-03-23T07:44:53.949Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ee/39/f2fab475f15d5bf596c4fa998ddd321b1400bcc6ae2e73d3e935db939379/wecom_aibot_python_sdk-1.0.2-py3-none-any.whl", hash = "sha256:03df207c72021157506647cd9f4ee51b865a7f37d3b5df7f7af1b1c7e677db84", size = 23228, upload-time = "2026-03-23T07:44:52.555Z" },
 ]
 
 [[package]]

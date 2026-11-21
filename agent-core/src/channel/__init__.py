@@ -35,6 +35,12 @@ def _register_builtin_adapters():
         print(f'[channel] lan adapter unavailable ({e})')
 
     try:
+        from channel.adapters.wecom import WecomAdapter
+        register_adapter('wecom', WecomAdapter)
+    except ImportError as e:
+        print(f'[channel] wecom adapter unavailable ({e})')
+
+    try:
         from channel.adapters.qq_official import QQOfficialAdapter
         register_adapter('qq', QQOfficialAdapter)
     except ImportError:

@@ -106,6 +106,7 @@ function _showAddForm() {
           <option value="slack">Slack</option>
           <option value="feishu">Feishu (飞书)</option>
           <option value="lan">LAN (机器人之间)</option>
+          <option value="wecom">WeCom (企业微信)</option>
           <option value="qq">QQ</option>
         </select>
       </div>
@@ -128,6 +129,14 @@ function _showAddForm() {
       <div class="channel-form-row hidden" id="channel-form-app-secret-row">
         <label>App Secret</label>
         <input type="password" id="channel-form-app-secret" placeholder="App Secret" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-bot-id-row">
+        <label>Bot ID</label>
+        <input type="text" id="channel-form-bot-id" placeholder="API 模式长连接 Bot ID" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-wecom-secret-row">
+        <label>Secret</label>
+        <input type="password" id="channel-form-wecom-secret" placeholder="长连接专用 Secret" />
       </div>
       <div class="channel-form-row hidden" id="channel-form-lan-hint">
         <label>说明</label>
@@ -156,6 +165,7 @@ function _showAddForm() {
     const p = platformSel.value;
     const isSlack = p === 'slack';
     const isFeishu = p === 'feishu';
+    const isWecom = p === 'wecom';
     // lan needs no credentials at all: a peer is trusted because it is in the
     // peers table with a pinned public key (Settings → 多机协同), and every
     // request carries an Ed25519 signature. So every field below is hidden and
@@ -167,10 +177,12 @@ function _showAddForm() {
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
     document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-bot-id-row').classList.toggle('hidden', !isWecom);
+    document.getElementById('channel-form-wecom-secret-row').classList.toggle('hidden', !isWecom);
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
-    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan);
+    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan || isWecom);
   }
 
   platformSel.addEventListener('change', () => {
@@ -203,6 +215,8 @@ async function _submitAdd(formEl) {
   const appToken = document.getElementById('channel-form-app-token')?.value.trim() || '';
   const appId = document.getElementById('channel-form-app-id')?.value.trim() || '';
   const appSecret = document.getElementById('channel-form-app-secret')?.value.trim() || '';
+  const botId = document.getElementById('channel-form-bot-id')?.value.trim() || '';
+  const wecomSecret = document.getElementById('channel-form-wecom-secret')?.value.trim() || '';
   const enabled = document.getElementById('channel-form-enabled').checked;
   const botToBotEnabled = platform === 'feishu'
     && document.getElementById('channel-form-bot-to-bot').checked;
@@ -222,6 +236,10 @@ async function _submitAdd(formEl) {
     if (!appId || !appSecret) { alert('App ID and App Secret are required'); return; }
     config.app_id = appId;
     config.app_secret = appSecret;
+  } else if (platform === 'wecom') {
+    if (!botId || !wecomSecret) { alert('Bot ID and Secret are required'); return; }
+    config.bot_id = botId;
+    config.secret = wecomSecret;
   }
 
   // 进入 loading 状态
@@ -640,6 +658,7 @@ function _platformIcon(platform) {
     case 'slack':    return '◆';
     case 'feishu':   return '飞';
     case 'lan':      return '⇄';
+    case 'wecom':    return '企';
     case 'whatsapp': return '◉';
     default:         return '◇';
   }
