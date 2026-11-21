@@ -8,7 +8,7 @@ import pytest
 from plugins.navi import active_scan as scan
 from plugins.navi.camera import HorizontalIntrinsics
 from plugins.navi.depth import ground_mask
-from plugins.navi.local_path import Geometry, body_square, camera_square
+from plugins.navi.local_path import DepthProjection, Geometry, body_square, camera_square
 from plugins.navi.odom import PlanarPose
 
 
@@ -1380,6 +1380,51 @@ def test_camera_window_invalidates_far_free_without_storing_a_near_obstacle():
     free, occupied = view(2100, cells, empty)
     assert np.array_equal(free, cells)
     assert not occupied.any()
+
+
+@pytest.mark.parametrize("receipt_only", [True, False])
+@pytest.mark.parametrize("weak_returns", ["isolated", "vertical", "mixed_with_floor"])
+def test_projected_weak_depth_keeps_obstacle_until_supported_clearance(receipt_only, weak_returns):
+    look = scan.ActiveScan()
+    geometry = camera_square(HorizontalIntrinsics(80, 60, 40), (60, 90, 5), .25)
+    obstacle = np.full((60, 80), np.nan)
+    obstacle[10:50, 38:42] = .90
+    floor_depth = .42 * 90 / np.maximum(np.arange(60) - 5, 1)
+    floor = np.broadcast_to(floor_depth[:, None], obstacle.shape)
+    weak = floor.copy() if weak_returns == "mixed_with_floor" else np.full_like(obstacle, np.nan)
+    rows = {"isolated": slice(21, 26, 2), "vertical": slice(21, 24),
+            "mixed_with_floor": slice(21, 23)}
+    weak[rows[weak_returns], 40] = .90
+    center = (scan.START[0] + 18, scan.START[1])
+
+    def view(stamp, frame):
+        pose = PlanarPose(stamp, ("odom", "body"), 0., 0., 0.)
+        depth = dict(map=frame, frame_id=stamp, capture_ms=stamp,
+                     grid_projection=DepthProjection(frame, None), obstacle_capture_pose=pose)
+        odom = dict(_odom(stamp), received_ms=stamp)
+        accepted = look.update(depth, odom, geometry, receipt_only=receipt_only) is None
+        assert accepted == np.isfinite(frame).any()
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=True)
+        return look.grid()
+
+    for stamp in (1000, 1100, 1200):
+        assert view(stamp, obstacle)[1][center]
+    assert look.near_obstacles.has_occupied
+    free, occupied = view(1300, weak)
+    assert look.views[-1][2][center]  # The planner can still see the measured cell.
+    assert not look.views[-1][3][center]
+    assert bool(look.observed_grid()[1][center]) is not receipt_only
+    assert occupied[center] and not free[center]
+    assert look.near_obstacles.has_occupied
+    assert not look.near_free[center]
+
+    free, occupied = view(1350, np.full_like(obstacle, np.nan))
+    assert occupied[center] and not free[center]
+
+    free, occupied = view(1400, floor)
+    assert free[center] and not occupied[center]
+    assert not look.near_obstacles.has_occupied
+    assert look.near_free[center]
 
 
 def test_one_aligned_free_observation_clears_memory_unless_view_still_hits():

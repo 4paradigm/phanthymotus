@@ -240,6 +240,19 @@ def _floor_patch_evidence(frame, heights, pixels, intrinsics, optical_normal):
     return floor_above & floor_below, face
 
 
+class DepthGrid(tuple):
+    """Planning visibility and occupancy, with stronger evidence for clearing memory."""
+
+    def __new__(cls, free, occupied, confirmed_free):
+        grid = super().__new__(cls, (free, occupied))
+        grid.confirmed_free = confirmed_free
+        return grid
+
+
+def confirmed_free(grid):
+    return getattr(grid, "confirmed_free", grid[0])
+
+
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
             require_valid_depth=False, check_free_space=True):
     valid = np.isfinite(frame) & (frame > 0.) if frame is not None else None
@@ -273,16 +286,17 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         hits &= valid
     samples = valid if check_free_space else hits
     floor_context = None
+    floor_samples = ground[samples] if above_floor is not None and check_free_space else None
     if above_floor is not None and geometry.min_obstacle_height == APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M:
         floor_context = (frame, above_floor, samples, (fx, cx, fy, cy), optical_normal)
     return _project_observed(geometry, right, forward, resolution, x[samples], y[samples], frame[samples],
                              hits[samples], check_free_space=check_free_space,
                              heights=above_floor[samples] if above_floor is not None else None,
-                             floor_context=floor_context)
+                             floor_context=floor_context, floor_samples=floor_samples)
 
 
 def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
-                      check_free_space, heights, floor_context=None):
+                      check_free_space, heights, floor_context=None, floor_samples=None):
     transform = geometry.base_from_optical
     body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
     body_l = x * transform[1, 0] + y * transform[1, 1] + z * transform[1, 2] + transform[1, 3]
@@ -291,10 +305,11 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
                & (hit_col >= 0) & (hit_col < right.shape[1]))
     cells = (hit_row[in_grid], hit_col[in_grid])
-    raised = hits[in_grid]
+    possible_hits = hits[in_grid]
+    raised = possible_hits
     if heights is not None:
         heights = heights[in_grid]
-        raised &= heights >= geometry.min_obstacle_height
+        raised = possible_hits & (heights >= geometry.min_obstacle_height)
     cell_ids = cells[0] * right.shape[1] + cells[1]
     counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
     occupied = counts >= 3
@@ -338,10 +353,21 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     # Only metric returns establish visibility. Unseen gaps, blind regions,
     # and cells behind the last measured surface retain the unknown state.
     free = np.zeros(right.shape, dtype=bool)
-    if check_free_space:
-        free[cells] = True
-        free &= ~occupied
-    return free, occupied
+    if not check_free_space:
+        return free, occupied
+    free[cells] = True
+    free &= ~occupied
+
+    # Dropping a possible obstacle only changes current occupancy. A fitted
+    # floor needs local support, and floorless clearance needs denser returns.
+    if floor_samples is None:
+        clear_samples, minimum_clear_samples = ~possible_hits, 8
+    else:
+        clear_samples, minimum_clear_samples = floor_samples[in_grid], 3
+    clear_votes = np.bincount(cell_ids[clear_samples], minlength=right.size).reshape(right.shape)
+    clear = clear_votes >= minimum_clear_samples
+    clear[cells[0][possible_hits], cells[1][possible_hits]] = False
+    return DepthGrid(free, occupied, clear)
 
 
 @dataclass(frozen=True)

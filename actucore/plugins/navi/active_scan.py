@@ -10,8 +10,8 @@ import numpy as np
 
 from .depth import has_valid_returns
 from .local_path import (FORWARD, FREE, OCCUPIED, RESOLUTION, RIGHT, SHAPE, START, UNKNOWN,
-                         Geometry, ObstacleSquares, motion_sweep_hits, observe, occluded_cells,
-                         project_observation, visible_prefix)
+                         Geometry, ObstacleSquares, confirmed_free, motion_sweep_hits, observe,
+                         occluded_cells, project_observation, visible_prefix)
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
@@ -129,12 +129,16 @@ class ObservedObstacles:
             window, origin = self._free_window(pose)
             window[tuple((cells - origin).T)] = UNKNOWN
 
-    def remember_view(self, pose, free, occupied, *, remember_occupied=None, rolling_range=None):
+    def remember_view(self, pose, free, occupied, *, remember_occupied=None, rolling_range=None,
+                      clear=None):
         if self.has_cells and self.frame != pose.frame:
             return
-        confirmed = free & ~occupied
+        confirmed = (free if clear is None else clear) & ~occupied
         if self.has_occupied and confirmed.any():
-            self.project(pose, observed_free=confirmed, observed_occupied=occupied)
+            # A weak measurement can still overlap a cell that projects
+            # between grid centers and conflict with adjacent clear evidence.
+            conflicting = occupied | (free & ~confirmed)
+            self.project(pose, observed_free=confirmed, observed_occupied=conflicting)
         if self.free_cells is None and not confirmed.any() and remember_occupied is None:
             return
 
@@ -347,8 +351,10 @@ class ActiveScan:
             if self.receipt_only and self.active and geometry is not None:
                 return self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
             return self.invalidate()
-        body_pose = (odom or {}).get("motion_pose")
         history = odom.get("velocity_history")
+        # Receipt-time turns and checked legs share this velocity history
+        # with the publisher. Pose deltas only supply its missing axes.
+        body_pose = None if receipt_only and history else odom.get("motion_pose")
         self.buffered_odom = bool(history)
         if self.poses and ((body_pose is None) != (self.pose_origin is None)
                            or (body_pose is not None and body_pose.frame != self.pose_origin.frame)):
@@ -419,8 +425,8 @@ class ActiveScan:
         if pose is None:
             self.current_frame = 0
             return self.interrupt()
-        free, occupied = self._project_view(depth, geometry)
-        self.views.append((capture, pose, free, occupied))
+        grid = self._project_view(depth, geometry)
+        self.views.append((capture, pose, *grid, confirmed_free(grid)))
 
     def _integrate_motion(self, motion, dt):
         vx, vy, wz = motion
@@ -643,7 +649,10 @@ class ActiveScan:
                 coords = self._pose_at(stamp)
                 capture = self._relative_near_pose(stamp, coords) if coords is not None else None
             if capture is not None and capture.frame == pose.frame:
-                free, occupied = self.observed_grid()
+                if self._pending_projection is not None:
+                    self.observed_grid()
+                _, _, free, occupied, *evidence = self.views[-1]
+                clear = evidence[0] if evidence else free
                 capture = self._footprint_origin(capture, geometry)
                 memory.last_source = self.current_frame
                 selected = None
@@ -653,7 +662,7 @@ class ActiveScan:
                         nearest = FORWARD[front].min()
                         selected = front & (FORWARD <= nearest + 2 * RESOLUTION)
                 memory.remember_view(capture, free, occupied, remember_occupied=selected,
-                                     rolling_range=CAMERA_OCCUPANCY_MEMORY_RANGE_M)
+                                     rolling_range=CAMERA_OCCUPANCY_MEMORY_RANGE_M, clear=clear)
         origin = self._footprint_origin(pose, geometry)
         hits, self.near_squares = memory.project(origin, include_squares=True)
         self.near_free = memory.project_free(origin)
@@ -702,13 +711,13 @@ class ActiveScan:
     def observed_grid(self):
         """Reproject nearby views. Occupation wins, and free cells need support."""
         if self.receipt_only:
-            frame, pose, free, occupied = self.views[-1]
             if self._pending_projection is not None:
+                frame, pose = self.views[-1][:2]
                 depth, geometry = self._pending_projection
-                free, occupied = self._project_view(depth, geometry)
-                self.views[-1] = (frame, pose, free, occupied)
+                grid = self._project_view(depth, geometry)
+                self.views[-1] = (frame, pose, *grid, confirmed_free(grid))
                 self._pending_projection = None
-            return free, occupied
+            return self.views[-1][2:4]
         stamp = self.poses[-1][0]
         latest = self.views[-1] if self.views else None
         if self._fused_view is not None:
@@ -719,7 +728,7 @@ class ActiveScan:
         occupied = np.zeros_like(free)
         expires = math.inf
         forward, right, yaw = self.pose
-        for capture, (before_f, before_r, before_yaw), view_free, view_occupied in self.views:
+        for capture, (before_f, before_r, before_yaw), view_free, view_occupied, *evidence in self.views:
             if stamp - capture > MAP_AGE_MS:
                 continue
             expires = min(expires, capture + MAP_AGE_MS + 1)
@@ -730,17 +739,20 @@ class ActiveScan:
             row = (FORWARD * math.cos(delta) - RIGHT * math.sin(delta) + offset_f) / RESOLUTION + START[0]
             col = (FORWARD * math.sin(delta) + RIGHT * math.cos(delta) + offset_r) / RESOLUTION + START[1]
             row, col = np.round(row, 7), np.round(col, 7)
+            view_clear = evidence[0] if evidence else view_free
             confirmed = np.ones_like(free)
+            visible = np.ones_like(free)
             projected_hits = np.zeros_like(occupied)
             for y in (np.floor(row), np.ceil(row)):
                 for x in (np.floor(col), np.ceil(col)):
                     valid = (y >= 0) & (y < SHAPE[0]) & (x >= 0) & (x < SHAPE[1])
                     indices = (y.clip(0, SHAPE[0] - 1).astype(int),
                                x.clip(0, SHAPE[1] - 1).astype(int))
-                    confirmed &= valid & view_free[indices]
+                    confirmed &= valid & view_clear[indices]
+                    visible &= valid & view_free[indices]
                     projected_hits |= valid & view_occupied[indices]
             occupied = (occupied & ~confirmed) | projected_hits
-            free = (free | confirmed) & ~projected_hits
+            free = (free | visible) & ~projected_hits
         grid = free & ~occupied, occupied
         self._fused_view = (latest, self.pose, stamp, expires, grid)
         return grid

@@ -434,6 +434,19 @@ def test_approach_finishes_in_tolerance_band_without_creeping_to_nominal_distanc
     assert config.stop_distance_m + 0.08 < sim.relative()[0] <= config.arrival_distance_m + 0.01
 
 
+def test_small_tolerance_can_start_and_finish_a_short_approach():
+    config = _cfg(stop_distance_m=.80, stop_tolerance_m=.01, floor_vx=.05)
+    sim = Sim(range_m=.83, config=config)
+    state = seed(_state(), *sim.observe(), config)
+
+    command = sim.run(state, ticks=1)
+    assert command.values[0] > 0.
+    sim.run(state, ticks=50)
+
+    assert state.arrived
+    assert config.arrival_min_distance_m <= sim.relative()[0] <= config.arrival_distance_m + .001
+
+
 @pytest.mark.parametrize("key", ["stop_distance_m", "stop_tolerance_m"])
 @pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf"), True, None, "bad"])
 def test_arrival_distances_reject_invalid_configuration(key, value):

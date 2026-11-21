@@ -144,6 +144,7 @@ class Track:
     # the object's box-based position, which is steadier through occlusions.
     front_required: bool = False
     front_fix: np.ndarray | None = None
+    front_reference: np.ndarray | None = None  # last trusted fix, even after expiry
     front_box: tuple | None = None
     front_frame_id: int | None = None
     front_age_s: float = 0.
@@ -280,7 +281,7 @@ class Tracker:
         if stamp is not None:
             if stamp in self._detection_stamps:
                 if stamp == self._detection_stamps[-1] and self.track is not None and self.track.observed:
-                    self._update_front(depth, config)
+                    self._update_front(depth, config, dt)
                 return self.track if (self.track and self.track.drivable) else None
             self._detection_stamps.append(stamp)
 
@@ -294,7 +295,7 @@ class Tracker:
                 if matched["name"].lower() == "person" and box and config.depth_intrinsics is not None:
                     self.track.front_required = True
                 self.track.front_box = box if self.track.front_required else None
-                self._update_front(depth, config)
+                self._update_front(depth, config, dt)
             if (self.track.accepted_detection and not self.track.front_required and matched["range_measured"]
                     and depth is not None and depth.get("map") is not None
                     and not depth.get("capture_invalid")):
@@ -308,7 +309,7 @@ class Tracker:
 
         return self.track if (self.track and self.track.drivable) else None
 
-    def _update_front(self, depth, config):
+    def _update_front(self, depth, config, dt):
         """Measure the associated person in the newest usable depth image."""
         from .depth import front_surface
 
@@ -324,15 +325,30 @@ class Tracker:
             return
         track.front_frame_id = frame
         point = front_surface(depth["map"], box, intrinsics, depth.get("ground"))
-        if point is not None:
-            track.front_fix = point
-            # Frame reception and processing may already have used part of
-            # the depth budget. Reading this frame again cannot renew it.
-            stamp = depth.get("capture_ms") or depth.get("frame_id")
-            now = depth.get("control_ms")
-            track.front_age_s = (max(0, now - stamp) / 1000
-                                 if type(now) is int and type(stamp) is int else 0.)
-            track.measured_range_m = track.range_m
+        if point is None:
+            return
+
+        range_m = polar_of(point)[0]
+        if track.front_reference is not None:
+            # A coherent foreground patch can lie inside the person's box.
+            # Require continuity with the last surface or the associated body
+            # position. Failed updates and expiry cannot widen the gate.
+            tolerance = 3.0 * _measurement_std(range_m, config)
+            reach = tolerance
+            if track.front_fix is not None:
+                reach += config.max_target_speed * min(dt, config.max_obs_age_ms / 1000)
+            if (math.hypot(*(point - track.front_reference)) > reach
+                    and (not track.range_known or math.hypot(*(point - track.position)) > tolerance)):
+                return
+
+        track.front_fix = track.front_reference = point
+        # Frame reception and processing may already have used part of
+        # the depth budget. Reading this frame again cannot renew it.
+        stamp = depth.get("capture_ms") or depth.get("frame_id")
+        now = depth.get("control_ms")
+        track.front_age_s = (max(0, now - stamp) / 1000
+                             if type(now) is int and type(stamp) is int else 0.)
+        track.measured_range_m = range_m
 
     # ── 1. predict: mostly a statement about our own motion ──────────────────
 
@@ -360,8 +376,10 @@ class Tracker:
         track.mean = transition @ track.mean + control
         if track.last_obs is not None:
             track.last_obs = rotation @ (track.last_obs - translation)
-        if track.front_fix is not None:
-            track.front_fix = rotation @ (track.front_fix - translation)
+        if track.front_reference is not None:
+            track.front_reference = rotation @ (track.front_reference - translation)
+            if track.front_fix is not None:
+                track.front_fix = track.front_reference
 
         # Process noise: what the *target* might do that we have not modelled.
         #

@@ -467,7 +467,8 @@ class DetourGoal:
     target_missing: bool = False
 
     def advance(self, odom, command, dt, *, approach_command=None):
-        pose = (odom or {}).get("motion_pose")
+        odom = odom or {}
+        pose = None if odom.get("velocity_history") else odom.get("motion_pose")
         axes = planar_axes(odom)
         pose_delta = pose is not None and self.pose is not None and pose.frame == self.pose.frame
         if pose_delta:
@@ -588,6 +589,7 @@ class State:
     commanded: tuple = (0.0, 0.0, 0.0)
     command_dt_s: float = 0.
     motion_source: str = ""
+    motion_pose_frame: tuple | None = None
     feedback_boot_s: float = 0.
     feedback_guard_s: float = 0.
     command_tail: tuple = (0., 0., 0.)
@@ -1257,7 +1259,9 @@ def _remember_detour_goal(state, config, track, odom):
         x, y = track.last_obs
     else:
         return
-    state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"), track=track)
+    odom = odom or {}
+    pose = None if odom.get("velocity_history") else odom.get("motion_pose")
+    state.goal_anchor = DetourGoal(x, y, pose, track=track)
 
 
 def _reset_detour_route(state):
@@ -1352,6 +1356,15 @@ def _observation_command(scan, geometry, config, state, odom, dt, control_period
                         min_forward_speed=floor, min_moving_yaw=config.floor_wz_moving)
 
 
+def _obstacle_reference(odom, depth):
+    odom = odom or {}
+    pose = odom.get("obstacle_pose")
+    if pose is None and not (depth or {}).get("body_mount_required") and (
+            not odom.get("velocity_history") or (depth or {}).get("obstacle_capture_pose") is not None):
+        pose = odom.get("motion_pose")
+    return pose
+
+
 def _decide(detections, depth, odom, config: Config, state: State,
             dt: float, *, control_period_s: float | None) -> Decision:
     """One tick.
@@ -1437,13 +1450,19 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
+        motion_pose = (odom or {}).get("motion_pose")
+        velocity_history = (odom or {}).get("velocity_history")
         source = ("command" if feedback is None else
-                  "pose" if odom.get("motion_pose") is not None else "measured")
+                  "pose" if motion_pose is not None and not velocity_history else "measured")
+        # An absolute-pose reset is relevant only if this controller uses
+        # that reference. Body velocities can continue through a SLAM reset.
+        frame_changed = (source == "pose" and state.motion_pose_frame is not None
+                         and motion_pose.frame != state.motion_pose_frame)
         if source == "command" and config.odom_expected and not state.motion_source:
             state.feedback_boot_s += dt
             if state.feedback_boot_s * 1000 < ODOM_GAP_MS:
                 return Decision(_twist(0, 0, 0), AVOIDING, "等待首个有效运动反馈")
-        if state.motion_source and state.motion_source != source:
+        if state.motion_source and (state.motion_source != source or frame_changed):
             needs_guard = any(state.commanded) or state.active_scan.active
             previous_scan = state.active_scan
             if source == "command" and previous_scan.active and not previous_scan.command_only:
@@ -1458,6 +1477,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if needs_guard:
                 state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
         state.motion_source = source
+        if source == "pose":
+            state.motion_pose_frame = motion_pose.frame
         frame = (depth or {}).get("frame_id") or 0
         if state.feedback_guard_s > 0.:
             state.feedback_guard_s = max(0., state.feedback_guard_s - dt)
@@ -1473,9 +1494,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         scan = state.active_scan
         scan.odom_linear_tolerance_mps = config.scan_odom_linear_tolerance_mps
         scan.max_feedback_gap_ms = config.max_feedback_gap_ms
-        obstacle_pose = (odom or {}).get("obstacle_pose")
-        if not (depth or {}).get("body_mount_required"):
-            obstacle_pose = obstacle_pose or (odom or {}).get("motion_pose")
+        obstacle_pose = _obstacle_reference(odom, depth)
         scan.historical_hits = scan.obstacles.project(obstacle_pose)
         scan.historical_free = scan.obstacles.project_free(obstacle_pose)
         if scan.obstacles.has_occupied and scan.historical_hits is None:
@@ -1691,7 +1710,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # has for the final stretch.
     remaining = 99.0 if distance is None else distance - config.stop_distance_m
     driving = state.fwd_gate.update(
-        remaining, engage=0.05, release=0.0,
+        remaining, engage=min(.05, config.stop_tolerance_m), release=0.0,
         dt=dt, min_dwell_s=config.min_dwell_s)
 
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
@@ -2272,8 +2291,9 @@ def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distanc
                 current = hits
         memory.last_source = source
         if verified:
-            free, occupied = local_path.project_observation(depth, geometry)
-            memory.remember_view(capture_pose, free, occupied, remember_occupied=selected)
+            grid = local_path.project_observation(depth, geometry)
+            memory.remember_view(capture_pose, *grid, remember_occupied=selected,
+                                 clear=local_path.confirmed_free(grid))
             scan.historical_free = memory.project_free(pose)
         elif selected is not None:
             memory.remember_view(capture_pose, np.zeros_like(hits), hits, remember_occupied=selected)
@@ -2345,7 +2365,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     foreground = (ahead is not None
                   and (target_distance is None or depth.get("map") is None
                        or ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance))
-    pose = (odom or {}).get("obstacle_pose") or (odom or {}).get("motion_pose")
+    pose = _obstacle_reference(odom, depth)
     plan_obstacle = False
     if scan is not None and geometry is not None and pose is not None:
         if scan.obstacles.has_occupied and scan.obstacles.frame != pose.frame:

@@ -546,6 +546,59 @@ def test_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypa
     assert tick(101_800)["values"] == [0.] * 6
 
 
+def test_card_keeps_consecutive_motion_when_one_speed_axis_is_missing(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    card = _card(local_planning=True)
+    intrinsics = HorizontalIntrinsics(80, 60., 40.)
+    card._config.local_geometry = camera_square(intrinsics, (60, 60., 30.), .24)
+    card._config.depth_intrinsics = intrinsics
+    card._config.watchdog_ms = 600
+    card._state.target = "person"
+    frame = np.full((60, 80), 3.)
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+
+    def tick(i, segment="current", *, missing_vy=None):
+        nonlocal now
+        now = 1000 + 100 * i
+        if missing_vy is None:
+            missing_vy = i >= 4 and i % 2 == 0
+        payload = {"schema": "motus.odom/1", "frame": "body", "stamp_ms": now,
+                   "twist": [.15, None if missing_vy else 0., 0., 0., 0., 0.],
+                   "pose": {"frame_id": "odom", "child_frame_id": "base_link",
+                            "position": [.012 * i, 0., 0.], "quaternion": [0., 0., 0., 1.]},
+                   "vendor": {"segment_id": segment}}
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+        card._depth_map, card._depth_ms = frame, now
+        card._objects_ms = now
+        card._objects = {"timestamp": i + 1, "objects": [
+            {"name": "person", "position": [0., 0.], "confidence": .99,
+             "bbox_norm": (.20, .10, .80, .90)}]}
+        return card.next_command()
+
+    for i in range(4):
+        command = tick(i)
+    assert command["values"][0] > 0.
+    scan = card._state.active_scan
+    for i in range(4, 12):
+        assert tick(i)["values"][0] > 0.
+        assert card._state.active_scan is scan
+        assert card.observation(with_capture_timing=True)[2]["motion_pose"].stamp_ms == now
+        assert card._velocity_history[-1][2] == (.15, 0., 0.)
+    assert len(scan.poses) > 2 and scan.buffered_odom
+
+    assert tick(12, segment="new_pose", missing_vy=False)["values"][0] > 0.
+    assert card._state.active_scan is scan
+    assert tick(13, segment="reset", missing_vy=True)["values"] == [0.] * 6
+    assert card._velocity_history[-1][2] is None
+
+
 def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
     import numpy as np
 

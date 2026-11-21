@@ -8,8 +8,8 @@ from plugins.navi import local_path as replay
 DECLARED_SPEEDS = ((0., .6), (0., .4))
 
 
-@pytest.mark.parametrize("surface,clear", [("floor", True), ("missing", False), ("foreground", False)])
-def test_near_ground_returns_clear_only_probes_with_valid_floor_evidence(surface, clear):
+@pytest.mark.parametrize("surface", ["floor", "missing", "foreground"])
+def test_near_ground_projection_distinguishes_floor_endpoints_from_missing_or_weak_returns(surface):
     horizontal = HorizontalIntrinsics(640, 420, 319.5)
     vertical = (480, 420, 239.5)
     geometry = replay.camera_square(horizontal, vertical, .20)
@@ -21,15 +21,23 @@ def test_near_ground_returns_clear_only_probes_with_valid_floor_evidence(surface
     ground = ground_mask(frame, horizontal, vertical)
     assert ground is not None
 
-    free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
-                                    replay.RESOLUTION, ground)
+    grid = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION, ground)
+    free, occupied = grid
+    clear = replay.confirmed_free(grid)
     center_col = replay.START[1]
-    row = replay.START[0] + round(1. / replay.RESOLUTION)
-    assert bool(free[row, center_col]) is clear
-    assert not occupied[row, center_col]
-    # The lowest probe at 0.55 m remains below the image.
-    blind = replay.START[0] + round(.55 / replay.RESOLUTION)
-    assert not free[blind, center_col] and not occupied[blind, center_col]
+    # The edited pixels do not replace the measured floor endpoints at 1 m.
+    near = replay.START[0] + 20, center_col
+    assert free[near] and clear[near] and not occupied[near]
+    patched = replay.START[0] + 26, center_col
+    assert bool(free[patched]) is (surface == "floor")
+    assert bool(clear[patched]) is (surface == "floor")
+    assert not occupied[patched]
+    if surface == "foreground":
+        weak = replay.START[0] + 21, center_col
+        assert free[weak] and not clear[weak] and not occupied[weak]
+    # The floor at 0.55 m is below the image.
+    blind = replay.START[0] + 11, center_col
+    assert not free[blind] and not clear[blind] and not occupied[blind]
 
 
 @pytest.mark.parametrize("height,calibrated,blocked", [
@@ -49,12 +57,13 @@ def test_camera_grid_distinguishes_near_floor_depth_noise_from_a_low_obstacle(he
     ground = ground_mask(frame, horizontal, vertical)
     assert ground is not None and not ground[patch].any()
 
-    free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
-                                    replay.RESOLUTION, ground)
+    grid = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION, ground)
+    free, occupied = grid
     center = (abs(replay.RIGHT) <= .05) & (replay.FORWARD > .75) & (replay.FORWARD < 1.12)
     assert bool((occupied & center).any()) is blocked
     if not blocked:
-        assert (~free & ~occupied & center).any()
+        patch_cell = replay.START[0] + 20, replay.START[1]
+        assert free[patch_cell] and not replay.confirmed_free(grid)[patch_cell]
 
 
 def test_grid_can_make_a_complete_right_detour_with_confirmed_space():
@@ -81,13 +90,17 @@ def test_a_diagonal_step_checks_the_intermediate_sweep():
     assert replay.shortest_path(allowed, (3, 3), (4, 4)) is None
 
 
-def test_velocity_ramp_checks_hits_up_to_the_edge_of_the_grid():
+def test_velocity_ramp_checks_hits_up_to_the_edge_of_the_sweep():
     geometry = replay.Geometry(None, None, np.eye(4), .20, .20, None)
     free = np.zeros(replay.SHAPE, dtype=bool)
     occupied = np.zeros_like(free)
     velocities = ((-.30, 0.),)
     assert replay.transition_clear((free, occupied), geometry, .25, 1.45, velocities)
-    occupied[0, replay.START[1]] = True
+    # The rear sweep ends at -0.635 m. It reaches the -0.65 m cell's
+    # front edge at -0.625 m, but not the next cell's at -0.675 m.
+    occupied[replay.START[0] - 14, replay.START[1]] = True
+    assert replay.transition_clear((free, occupied), geometry, .25, 1.45, velocities)
+    occupied[replay.START[0] - 13, replay.START[1]] = True
     assert not replay.transition_clear((free, occupied), geometry, .25, 1.45, velocities)
 
 
@@ -504,14 +517,15 @@ def test_depth_grid_drops_small_noise_and_low_patches(case, occupied_cells):
     else:
         frame[415, 319:322] = .30
     ground = ground_mask(frame, horizontal, vertical)
-    free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
-                                    replay.RESOLUTION, ground)
+    grid = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION, ground)
+    free, occupied = grid
     assert np.count_nonzero(occupied) == occupied_cells
     _, fast = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
                             replay.RESOLUTION, ground, check_free_space=False)
     assert np.array_equal(fast, occupied)
     if occupied_cells == 0:
-        assert not free[replay.START[0] + 18, replay.START[1]]
+        patch_cell = replay.START[0] + 18, replay.START[1]
+        assert free[patch_cell] and not replay.confirmed_free(grid)[patch_cell]
 
 
 def test_depth_without_floor_can_plan_around_a_visible_post():
@@ -524,7 +538,8 @@ def test_depth_without_floor_can_plan_around_a_visible_post():
     post = (abs(replay.RIGHT) <= .05) & np.isclose(replay.FORWARD, 1.)
     assert occupied[post].any()
     assert not occupied[replay.FORWARD < .90].any()
-    assert not free.any()
+    assert free[replay.START[0] + 18, replay.START[1]]
+    assert not free[replay.FORWARD < 0.].any()
     destination = dict(map=depth, frame_id=1000, allow_unknown=True, body_half_width=.20)
     plan = replay.PlanCache().route(destination, geometry, .25, 1., 1., 500, 600)
     assert plan is not None

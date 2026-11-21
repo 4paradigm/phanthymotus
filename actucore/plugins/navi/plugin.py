@@ -1628,8 +1628,6 @@ class NaviPlugin:
                 self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
                                         and not isinstance(stamp, bool)
                                         and math.isfinite(stamp) and stamp > 0 else None)
-                self._velocity_history.append((now, self._odom_source_ms,
-                                               odom_mod.planar_feedback(self._odom)))
                 pose = odom_mod.planar_pose(payload, self._odom_source_ms)
                 previous = self._motion_pose
                 if pose is None or pose != previous:
@@ -1638,6 +1636,15 @@ class NaviPlugin:
                     self._pose_feedback = (previous.stamp_ms, feedback) if feedback is not None else None
                     if pose is None or previous is None or pose.stamp_ms > previous.stamp_ms:
                         self._motion_pose = pose
+                # Pose-only streams keep their absolute pose reference. Once
+                # a stream supplies velocity, keep one continuous history and
+                # fill individual missing axes from fresh pose deltas.
+                if self._velocity_history or any(axis is not None for axis in odom_mod.planar_axes(self._odom)):
+                    feedback_odom = self._odom
+                    if self._fresh_motion_pose(now) is not None and self._pose_feedback is not None:
+                        feedback_odom = {**self._odom, "pose_feedback": self._pose_feedback[1]}
+                    self._velocity_history.append((now, self._odom_source_ms,
+                                                   odom_mod.planar_feedback(feedback_odom)))
                 timing = self._odom_interface.get("timing") or {}
                 vendor = payload.get("vendor")
                 stamp_source = vendor.get("stamp_source", "robot") if isinstance(vendor, dict) else "robot"
@@ -1723,6 +1730,13 @@ class NaviPlugin:
 
     # ── the loop ─────────────────────────────────────────────────────────────
 
+    def _fresh_motion_pose(self, now):
+        pose = self._motion_pose
+        max_age = min(self._config.max_obs_age_ms, self._odom_max_age_ms)
+        if pose is not None and 0 <= now - pose.stamp_ms <= max_age:
+            return pose
+        return None
+
     def observation(self, *, with_capture_timing=False):
         """The three inputs, with anything stale replaced by None.
 
@@ -1774,16 +1788,13 @@ class NaviPlugin:
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
             if with_capture_timing and odom is not None:
-                pose = self._motion_pose
-                uses_pose = (odom_mod.planar_feedback(odom) is None and self._pose_feedback is not None
-                             and pose is not None and
-                             0 <= now - pose.stamp_ms <= min(max_age, self._odom_max_age_ms))
+                pose = self._fresh_motion_pose(now)
                 if self._obstacle_poses:
                     measured = self._obstacle_poses[-1][1]
                     if 0 <= now - measured.stamp_ms <= policy_mod.ODOM_GAP_MS:
                         odom = {**odom, "obstacle_pose": measured}
-                if uses_pose:
-                    since_ms, rates = self._pose_feedback
+                if pose is not None:
+                    since_ms, rates = self._pose_feedback or (pose.stamp_ms, None)
                     odom = {**odom, "motion_pose": pose, "pose_feedback": rates,
                             "pose_feedback_since_ms": since_ms, "control_ms": now}
                 received_ms = self._odom_received_ms or self._odom_ms
@@ -1791,9 +1802,9 @@ class NaviPlugin:
                     odom = {**odom, "received_ms": received_ms}
                     if self._odom_source_ms is not None:
                         odom["source_sample_id"] = self._odom_source_ms
-                    if not uses_pose and self._velocity_history:
+                    if self._velocity_history:
                         odom["velocity_history"] = tuple(self._velocity_history)
-                if not uses_pose and self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
+                if self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom, objects_ms
 
@@ -1989,7 +2000,7 @@ class NaviPlugin:
                 and depth is not None and depth.get("frame_id") is not None):
             obs_ms = min(obs_ms, depth.get("capture_ms") or scan.single_depth_ms or depth["frame_id"])
             motion_pose = (odom or {}).get("motion_pose")
-            if motion_pose is not None:
+            if motion_pose is not None and (scan.pose_origin is not None or not odom.get("velocity_history")):
                 obs_ms = min(obs_ms, motion_pose.stamp_ms)
             if (scan_guarded or checked_search or self._state.checked_prefix) and odom is not None:
                 stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"

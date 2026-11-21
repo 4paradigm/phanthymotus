@@ -626,6 +626,19 @@ def test_person_front_surface_uses_latest_valid_depth_frame():
     assert not result.navigation_range_known
 
 
+@pytest.mark.parametrize("foreground,expected", [(1.03, 3.70), (3.40, 3.40)])
+def test_person_front_surface_rejects_a_separate_near_layer_at_box_bottom(foreground, expected):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.depth import front_surface
+
+    frame = np.full((480, 640), 3.70, dtype=np.float32)
+    frame[171:187, 303:352] = foreground
+    bbox = (284 / 640, 0., 361 / 640, 188 / 480)
+    point = front_surface(frame, bbox, HorizontalIntrinsics(640, 492., 318.))
+
+    assert np.linalg.norm(point) == pytest.approx(expected)
+
+
 def test_person_front_surface_ignores_a_new_depth_frame_without_a_return():
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -641,6 +654,71 @@ def test_person_front_surface_ignores_a_new_depth_frame_without_a_return():
                   target="person", depth={"map": np.zeros_like(image), "frame_id": 200})
     assert track.measured_range_m is None
     assert track.range_m == pytest.approx(distance)
+
+
+@pytest.mark.parametrize("new_detection", [False, True])
+@pytest.mark.parametrize("detouring", [False, True])
+def test_person_foreground_patch_cannot_report_arrival_or_move_detour_goal(new_detection, detouring):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    cfg = _cfg(depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    state = P.State(target="person")
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    image = np.full((60, 80), 3.)
+
+    def step(stamp, frame):
+        return P.step(detections=_stamped(stamp, person), depth=frame,
+                      odom=dict(vx=0., vy=0., wz=0.), config=cfg, state=state, dt=.1)
+
+    for stamp in (100, 200, 300):
+        result = step(stamp, dict(map=image, frame_id=stamp))
+    track = state.tracker.track
+    assert track.observed and result.distance_m == pytest.approx(3.)
+    if detouring:
+        state.goal_anchor = P.DetourGoal(3., 0., track=track)
+
+    image[22:29, 35:45] = .8
+    result = step(400 if new_detection else 300, dict(map=image, frame_id=400))
+    assert result.status != P.ARRIVED
+    assert result.distance_m == pytest.approx(3.)
+    assert track.observed and track.measured_range_m is None
+    if detouring:
+        assert state.goal_anchor.x == pytest.approx(3.)
+        assert state.goal_anchor.verified_range_m is None
+
+
+@pytest.mark.parametrize("intervals", [(.9, .1, .1), (.1,) * 11])
+def test_person_foreground_patch_does_not_become_evidence_after_last_fix_expires(intervals):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    cfg = _cfg(local_planning=True, max_depth_age_ms=800,
+               depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    tracker = T.Tracker()
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    image = np.full((60, 80), 3.)
+
+    def feed(stamp, dt):
+        return _feed(tracker, _stamped(stamp, person), config=cfg, target="person",
+                     depth=dict(map=image, frame_id=stamp), dt=dt)
+
+    for stamp in (100, 200, 300):
+        track = feed(stamp, .1)
+    assert track.observed and track.measured_range_m == pytest.approx(3.)
+
+    image[22:29, 35:45] = 1.6
+    for dt in intervals:
+        stamp += round(dt * 1000)
+        track = feed(stamp, dt)
+        assert track.observed and track.measured_range_m is None
+    assert track.front_fix is None
+
+    # The first plausible fresh return (feet below the box centre) can be
+    # accepted immediately, even if the detector has not published again.
+    image[22:29, 35:45] = 3.
+    image[44:51, 35:45] = 2.8
+    track = _feed(tracker, _stamped(stamp, person), config=cfg, target="person",
+                  depth=dict(map=image, frame_id=stamp + 100))
+    assert track.measured_range_m == pytest.approx(2.8)
 
 
 def test_local_front_range_retains_only_the_remaining_depth_freshness_window():
