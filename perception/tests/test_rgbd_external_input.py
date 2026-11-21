@@ -78,6 +78,50 @@ def test_fusion_queue_keeps_recent_events_and_skips_expired_work(sessions, monke
         stream.close()
 
 
+def test_fusion_batch_publishes_fresh_intermediate_measurements(sessions, monkeypatch):
+    _, now, _ = sessions
+    stream = fusion_input()
+    try:
+        now[0] = 1_250_000_000
+        for at in (0., .08, .16, .24):
+            stream._receive('/external', NS(data=json.dumps(packet(at, at))))
+
+        rebuilds = []
+        rebuild = stream.fuser._rebuild
+
+        def count_rebuild(stamp):
+            rebuilds.append(stamp)
+            rebuild(stamp)
+
+        monkeypatch.setattr(stream.fuser, '_rebuild', count_rebuild)
+        stream._apply_ready(stream._take_ready())
+        packets = [json.loads(msg) for msg in stream.publisher.messages]
+        assert [p['vendor']['motus_slam']['stamp_ns'] for p in packets] == [
+            1_080_000_000, 1_160_000_000, 1_240_000_000]
+        assert [p['pose']['position'][0] for p in packets] == pytest.approx([.08, .16, .24])
+        assert len(rebuilds) == 1
+    finally:
+        stream.close()
+
+
+def test_fusion_backlog_keeps_measured_pose_brackets_without_publishing_stale_poses(sessions, monkeypatch):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    stream = fusion_input()
+    try:
+        for at in (0., .1, 1.6, 1.7, 1.8):
+            stream._receive('/external', NS(data=json.dumps(packet(at, at))))
+        tick[0] = .35
+        now[0] = 2_950_000_000
+        stream._apply_ready(stream._take_ready())
+        stamps = [json.loads(msg)['vendor']['motus_slam']['stamp_ns'] for msg in stream.publisher.messages]
+        assert stamps == [2_700_000_000, 2_800_000_000]
+        assert stream.dropped == 2
+    finally:
+        stream.close()
+
+
 @pytest.mark.parametrize('overflow', [False, True])
 def test_fusion_backlog_preserves_external_pose_reset(sessions, monkeypatch, overflow):
     _, now, _ = sessions

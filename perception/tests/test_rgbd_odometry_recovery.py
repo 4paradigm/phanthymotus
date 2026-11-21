@@ -282,7 +282,8 @@ def test_worker_start_failure_cleans_native_process_and_node_before_retry(recove
 
 
 @pytest.mark.parametrize('published,kind,replace', [
-    (True, 'input', True), (False, 'input', False), (True, 'visual', False)])
+    (True, 'input', True), (False, 'input', False), (True, 'visual', True),
+    (True, 'relocalization', True), (True, 'output', True)])
 def test_fresh_input_after_a_published_run_does_not_inherit_failed_start_backoff(
         recovery, published, kind, replace):
     card, _, now, seconds = recovery
@@ -297,5 +298,41 @@ def test_fresh_input_after_a_published_run_does_not_inherit_failed_start_backoff
     card._recover()
     assert card.instances['one'][0] is session
     images(session, now[0])
+    card._recover()
+    assert (card.instances['one'][0] is not session) == replace
+
+
+@pytest.mark.parametrize('report_age,exit_at,replace', [
+    (None, None, False), (.1, None, True), (2., None, False),
+    (.1, 0., False), (.1, .9, False)])
+def test_only_a_responsive_failed_start_can_shorten_an_existing_retry_deadline(
+        recovery, monkeypatch, report_age, exit_at, replace):
+    card, _, now, seconds = recovery
+    session = card.instances['one'][0]
+    close = session.close
+
+    def finish(**kwargs):
+        session.process.returncode = 0
+        return close(**kwargs)
+
+    monkeypatch.setattr(session, 'close', finish)
+    if report_age is not None:
+        seconds[0] -= report_age
+        session._remember_native(NS(header=NS(stamp=NS(sec=1, nanosec=0)), inliers=3, lost=True))
+        seconds[0] += report_age
+    state = card.recovery['one']
+    state.update(failure_streak=5, last_attempt=seconds[0]-5,
+                 next_attempt=seconds[0]+25, backoff_s=30.)
+    session.gate.fault('startup failed', 'visual')
+    if exit_at == 0.:
+        session.process.returncode = 1
+    images(session, now[0])
+    card._recover()
+    seconds[0] += .9
+    if exit_at == .9:
+        session.process.returncode = 1
+    card._recover()
+    assert card.instances['one'][0] is session
+    seconds[0] += .2
     card._recover()
     assert (card.instances['one'][0] is not session) == replace

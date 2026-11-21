@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 import types
 import zlib
 
@@ -61,6 +62,28 @@ def test_declared_input_format_uses_only_its_ros_message_type(format_name, expec
     assert result['state'] == 'running'
     assert [sub.callback.__name__ for sub in executor.nodes[0].subscriptions] == [expected]
     plugin.dispatch('pointcloud', {'action': 'stop'})
+
+
+def test_pointcloud_emits_latest_depth_after_rate_limit_window(monkeypatch):
+    plugin, executor = _plugin({'fps': 2})
+    assert plugin.dispatch('pointcloud', {
+        'action': 'start', 'input_topic': '/camera/depth',
+        'camera_info': {'/camera/depth': {'format': 'image/depth-zlib'}},
+    })['state'] == 'running'
+    node = executor.nodes[0]
+    emissions = []
+    monkeypatch.setattr(node, '_emit_depth', lambda msg: emissions.append((msg, time.monotonic())))
+    first, skipped, latest = object(), object(), object()
+    try:
+        node._depth_comp_cb(first)
+        assert _wait_until(lambda: len(emissions) == 1)
+        node._depth_comp_cb(skipped)
+        node._depth_comp_cb(latest)
+        assert _wait_until(lambda: len(emissions) == 2, timeout=1.)
+        assert [msg for msg, _ in emissions] == [first, latest]
+        assert emissions[1][1] - emissions[0][1] >= .49
+    finally:
+        plugin.dispatch('pointcloud', {'action': 'stop'})
 
 
 @pytest.mark.parametrize('encoding', ['16UC1', 'mono16'])

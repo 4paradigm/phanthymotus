@@ -686,6 +686,31 @@ def test_native_snapshot_requires_matching_frame_and_capture_stamp(node):
     assert not published(node, '/pointcloud_slam/map')[0].messages
 
 
+@pytest.mark.parametrize('searching', [False, True])
+def test_latest_verified_preview_is_not_lost_at_the_rate_limit(node, searching):
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    node._settings['preview_interval_s'] = .3
+    graph = next(s.callback for s in node.subscriptions if s.topic.endswith('/mapGraph'))
+    output = next(s.callback for s in node.subscriptions if s.topic.endswith('/cloud_map'))
+    messages = published(node, '/pointcloud_slam/map')[0].messages
+    for millis, x in ((0, 1.), (20, 2.), (40, 3.)):
+        graph(NS(header=NS(frame_id='map_a', stamp=NS(sec=1, nanosec=millis*1_000_000)),
+            poses_id=[1], poses=[NS(position=NS(x=x, y=0., z=0.),
+                orientation=NS(x=0., y=0., z=0., w=1.))]))
+        output(cloud(1_000_000_000 + millis*1_000_000, frame='map_a', points=[(x, 2., 3.)]))
+    assert len(messages) == 1
+    if searching:
+        info = next(s.callback for s in node.subscriptions if s.topic.endswith('/info'))
+        info(NS(header=NS(stamp=NS(sec=1, nanosec=500_000_000)), ref_id=0,
+                stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/'],
+                stats_values=[1., 0., 0.]))
+        assert not _wait_until(lambda: len(messages) > 1, timeout=.7)
+        return
+    assert _wait_until(lambda: len(messages) == 2, timeout=1.)
+    assert struct.unpack_from('<f', bytes(messages[-1]))[0] == 3.
+
+
 def test_loss_while_engine_starts_blocks_already_queued_pair(tmp_path, monkeypatch):
     import plugins.pointcloud_slam_ros as ros
     entered, release = threading.Event(), threading.Event()

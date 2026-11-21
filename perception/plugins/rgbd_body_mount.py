@@ -18,6 +18,17 @@ def validate_mount_declaration(value, camera_frame, input_topics=()):
     return result
 
 
+def _awaiting_tf(packet):
+    reason = packet.get('reason')
+    return (packet.get('matrix') is None and packet.get('status') == 'unavailable' and
+            isinstance(reason, str) and 'extrapolation into the future' in reason)
+
+
+def _same_mount_source(packets):
+    return all(len({packet[key] for packet in packets if isinstance(packet.get(key), str)}) <= 1
+               for key in ('epoch', 'clock_id', 'parent_frame', 'child_frame', 'source', 'version', 'mode'))
+
+
 class CaptureMounts:
     """Bounded numeric transforms associated by nearest supplied timestamp."""
     def __init__(self,declaration,camera_frame,clock):
@@ -39,6 +50,10 @@ class CaptureMounts:
             stamp=packet['stamp_ns']
             if packet.get('matrix') is not None:
                 rigid(packet['matrix'])
+            previous = self.packets.get(stamp)
+            if (previous is not None and previous.get('matrix') is not None and
+                    _awaiting_tf(packet) and _same_mount_source((previous, packet))):
+                packet = previous  # A delayed lookup diagnostic cannot undo exact evidence.
             self.last_stamp=stamp
             self.state='available' if packet.get('matrix') is not None else 'unavailable'
             self.reason=packet.get('reason')
@@ -58,14 +73,21 @@ class CaptureMounts:
     def matrix_at(self, stamp):
         """Return an exact transform or interpolate across a short numeric bracket."""
         packet = self.packets.get(stamp)
-        if packet is not None:
+        if packet is not None and not _awaiting_tf(packet):
             return rigid(packet['matrix']) if packet.get('matrix') is not None else None
-        before = max((value for value in self.packets if value < stamp), default=None)
-        after = min((value for value in self.packets if value > stamp), default=None)
-        if before is None or after is None or after-before > 200_000_000:
+        # A premature TF query has no matrix yet. Only numeric endpoints within
+        # the same short bracket can cover it. Other failures remain boundaries.
+        window_ns = 200_000_000
+        nearby = {value: item for value, item in self.packets.items() if abs(value-stamp) <= window_ns}
+        before = max((value for value, item in nearby.items()
+                      if value < stamp and not _awaiting_tf(item)), default=None)
+        after = min((value for value, item in nearby.items()
+                     if value > stamp and not _awaiting_tf(item)), default=None)
+        if before is None or after is None or after-before > window_ns:
             return None
-        endpoints = [self.packets[value].get('matrix') for value in (before, after)]
-        if any(item is None for item in endpoints):
+        endpoints = [nearby[value].get('matrix') for value in (before, after)]
+        bracket = [item for value, item in nearby.items() if before <= value <= after]
+        if any(item is None for item in endpoints) or not _same_mount_source(bracket):
             return None
         a, b = map(rigid, endpoints)
         q = interpolate_orientation([(before, np.asarray(quaternion(a[:3, :3]))),

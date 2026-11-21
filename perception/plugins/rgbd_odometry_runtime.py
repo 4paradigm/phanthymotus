@@ -86,6 +86,7 @@ F2F_TRACKING_MIN_INLIER_RATIO = .4
 # consumer's witnessed-run gap, measured from the last published capture.
 F2M_RELOCALIZATION_MAX_NS = 4_500_000_000
 F2M_RELOCALIZATION_LATENCY_NS = 1_000_000_000
+F2M_BRIDGE_MAX_AGE_NS = 500_000_000
 IMU_STARTUP_GRACE_S = 1.5
 
 
@@ -513,7 +514,37 @@ class EstimateGate:
 
 def estimator_environment(directory):
     """Give only the native child room for fragmented RGBDImage UDP bursts."""
-    return dict(receive_environment(directory), OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
+    env = dict(receive_environment(directory), OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1')
+    if (env.get('ROS_LOCALHOST_ONLY') != '1' or
+            any(env.get(key) for key in ('FASTRTPS_DEFAULT_PROFILES_FILE',
+                                        'FASTDDS_DEFAULT_PROFILES_FILE', 'FASTDDS_BUILTIN_TRANSPORTS')) or
+            any(Path(name).is_file() for name in ('DEFAULT_FASTRTPS_PROFILES.xml',
+                                                 'DEFAULT_FASTDDS_PROFILES.xml'))):
+        return env
+    rmw = env.get('RMW_IMPLEMENTATION')
+    if not rmw:
+        from rclpy.utilities import get_rmw_implementation_identifier
+        rmw = get_rmw_implementation_identifier()
+    if rmw not in ('rmw_fastrtps_cpp', 'rmw_fastrtps_dynamic_cpp'):
+        return env
+    # Humble's generated localhost transport uses the kernel's default
+    # receive buffer. Keep the loopback scope with an explicit UDP profile.
+    profile = Path(directory) / 'native-dds.xml'
+    profile.write_text('''<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <transport_descriptors><transport_descriptor>
+      <transport_id>native_loopback</transport_id><type>UDPv4</type>
+      <receiveBufferSize>1048576</receiveBufferSize>
+      <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
+    </transport_descriptor></transport_descriptors>
+    <participant profile_name="native_loopback" is_default_profile="true"><rtps>
+      <userTransports><transport_id>native_loopback</transport_id></userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps></participant>
+  </profiles>
+</dds>''', encoding='utf-8')
+    env.update(ROS_LOCALHOST_ONLY='0', FASTRTPS_DEFAULT_PROFILES_FILE=str(profile))
+    return env
 
 
 def estimator_parameters(calibration, segment):
@@ -526,8 +557,10 @@ def estimator_parameters(calibration, segment):
     # Pinned RTAB-Map OdometryF2M forcibly replaces Vis/CorType=1 with 0.
     # Optical flow must use F2F (Odom/Strategy=1), never a fake F2M toggle.
     optical = frontend == 'f2f_optical_flow'
+    # The private compressed RGB-D samples can span several DDS fragments.
+    # Match the reliable Python writer, while keeping native IMU best-effort.
     params = {'frame_id': calibration['frame_id'], 'odom_frame_id': segment + '_odom',
-              'publish_tf': False, 'subscribe_rgbd': True, 'qos': 2,
+              'publish_tf': False, 'subscribe_rgbd': True, 'qos': 1, 'qos_imu': 2,
               'topic_queue_size': 2, 'sync_queue_size': 2,
               'Odom/ResetCountdown': '0', 'Odom/Strategy': '1' if optical else '0',
               'Vis/CorType': '1' if optical else '0',
@@ -778,6 +811,24 @@ def observation_calibration(calibration, ingress_clock_id):
     return result
 
 
+class _PendingRgbdPairs(queue.Queue):
+    def offer_tracking_pair(self, pair, now):
+        # Preserve the first queued view across a burst so F2M has a smaller
+        # motion step. Keep the newest view too and replace an aging bridge.
+        with self.not_full:
+            dropped = self._qsize() == self.maxsize
+            if dropped:
+                color, depth = self.queue[0]
+                if now - max(color[0], depth[0]) >= F2M_BRIDGE_MAX_AGE_NS:
+                    self._get()
+                else:
+                    self.queue.pop()
+            self._put(pair)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+            return dropped
+
+
 class RgbdSession:
     def __init__(self, calibration, executor, topic, *, publish_output=True, input_registry=None,
                  requested_calibration=None, mode_transition=None):
@@ -838,7 +889,7 @@ class RgbdSession:
         self.imu_queue_lock = threading.Lock()
         self.imu_pending, self.imu_overflow = deque(), False
         self.pairs = RgbdPairer() if input_registry is not None or 'input_declarations' in calibration else PairBuffer()
-        self.pending = queue.Queue(maxsize=2)
+        self.pending = _PendingRgbdPairs(maxsize=2)
         self.probe_stamp = None
         self.probe_ack = threading.Event()
         self.latest_inputs = {}
@@ -849,6 +900,7 @@ class RgbdSession:
         self.summary_origin = None
         self.last_summary_ns = self.last_summary_state = None
         self.native_reports = 0
+        self.last_native_report_at = None
         self.stop_event = threading.Event()
         self.process = self.worker = None
         self.spin_worker = None
@@ -880,7 +932,8 @@ class RgbdSession:
             self.status_publisher = self.node.create_publisher(
                 String, (topic[:-11] if topic.endswith('/state/odom') else topic) + '/status',
                 qos_profile_sensor_data)
-            self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', qos_profile_sensor_data)
+            native_rgbd_qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE)
+            self.rgbd = self.node.create_publisher(RGBDImage, '/' + self.segment + '/rgbd_image', native_rgbd_qos)
             self.rotation_hints = RotationHints(calibration, self.node, self.segment, qos_profile_sensor_data)
             controller = calibration.get('controller_rotation')
             if controller is not None:
@@ -986,9 +1039,13 @@ class RgbdSession:
                     return
                 if pair:
                     self.gate.input(pair[1][0], now_ns=time.time_ns())
-                    # Keep the two measured successors needed after a slow first
-                    # registration. Normal tracking still takes only the latest.
+                    # Keep two measured successors during relocalization.
                     capacity = 2 if self.gate.relocalization_points is not None else 1
+                    if (capacity == 1 and self.gate.state == 'tracking' and not self._fusing() and
+                            not self.calibration.get('external_candidates') and
+                            self.calibration.get('visual_frontend', 'f2m_feature') == 'f2m_feature'):
+                        self.counts['dropped_pairs'] += self.pending.offer_tracking_pair(pair, now)
+                        return
                     while self.pending.qsize() >= capacity:
                         try:
                             self.pending.get_nowait()
@@ -1354,11 +1411,14 @@ class RgbdSession:
                 # 1.5 MB of raw RGB/depth over best-effort DDS on every frame.
                 out.rgb_compressed = deepcopy(color)
                 png_pixels = depth_image
-                if depth_image.dtype != np.uint16:
+                png_parameters = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+                if depth_image.dtype == np.uint16:
+                    png_parameters.extend([cv2.IMWRITE_PNG_STRATEGY, cv2.IMWRITE_PNG_STRATEGY_RLE])
+                else:
                     # RTAB-Map encodes float depth as four PNG byte channels.
                     png_pixels = np.ascontiguousarray(depth_image, dtype='<f4').view(np.uint8).reshape(
                         color_height, color_width, 4)
-                ok, png = cv2.imencode('.png', png_pixels, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                ok, png = cv2.imencode('.png', png_pixels, png_parameters)
                 if not ok:
                     raise ValueError('RGB-D lossless depth encoding failed')
                 out.depth_compressed = CompressedImage()
@@ -1418,8 +1478,8 @@ class RgbdSession:
                                                       capture_clock=capture_clock)
                         probe_deadline = getattr(self.gate, 'relocalization_deadline_mono', None)
                         if probe_deadline is not None:
-                            # A dropped best-effort probe has no acknowledgement.
-                            # Allow for measured delivery latency before trying the next capture.
+                            # A probe may still produce no native result. Use measured
+                            # delivery latency before trying the next capture.
                             period = self.gate.result_period_ns or self.gate.input_period_ns
                             if period:
                                 reply_ns = max(period, self.gate.processing_p95_ns or 0,
@@ -1683,6 +1743,7 @@ class RgbdSession:
         while len(self.registration_by_stamp) > 32:
             self.registration_by_stamp.popitem(last=False)
         self.native_reports += 1
+        self.last_native_report_at = time.monotonic()
 
     def _result(self, kind, msg):
         with self.lock:

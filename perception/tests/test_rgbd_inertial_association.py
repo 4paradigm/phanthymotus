@@ -429,6 +429,7 @@ def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
         depth_pixels.append(pixels)
         return True, np.frombuffer(b'encoded-depth', np.uint8)
     monkeypatch.setitem(sys.modules, 'cv2', NS(IMREAD_COLOR=1, IMWRITE_PNG_COMPRESSION=16,
+        IMWRITE_PNG_STRATEGY=17, IMWRITE_PNG_STRATEGY_RLE=3,
         imdecode=lambda data, mode: np.zeros((480, 640, 3), np.uint8),
         imencode=encode))
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'CompressedImage', NS)

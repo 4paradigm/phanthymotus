@@ -30,6 +30,33 @@ def wait_for(fn):
     assert fn()
 
 
+def test_slam_pose_input_keeps_a_burst_of_measured_checkpoints():
+    backend = Backend()
+    registry = InputAdapterRegistry(subscribe=backend.subscribe)
+    entered, release = threading.Event(), threading.Event()
+    received = []
+
+    def consume(msg, context):
+        received.append(msg.header.stamp.nanosec)
+        if len(received) == 1:
+            entered.set()
+            release.wait(1)
+
+    lease = registry.acquire('/pose', object, {'format': 'state/odom'}, consume)
+    try:
+        backend.callbacks[0](message())
+        assert entered.wait(1)
+        for stamp in range(1, 13):
+            backend.callbacks[0](message(stamp))
+        release.set()
+        wait_for(lambda: received and received[-1] == 12)
+        assert received == list(range(13))
+        assert lease.status()['dropped'] == 0
+    finally:
+        release.set()
+        registry.close()
+
+
 def test_two_consumers_share_one_ingress_stamp_and_isolated_message():
     b=Backend();r=InputAdapterRegistry(subscribe=b.subscribe);a=[];c=[]
     def mutate(m,ctx):m.header.frame_id='changed';m.data[0]=0;a.append(ctx)

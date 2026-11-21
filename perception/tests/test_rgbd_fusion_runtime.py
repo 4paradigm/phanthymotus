@@ -529,6 +529,7 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
             elapsed[0] += .04  # IMU may arrive while image preparation runs.
         return True, np.frombuffer(png, np.uint8)
     cv2 = NS(IMREAD_COLOR=1, IMWRITE_PNG_COMPRESSION=16,
+             IMWRITE_PNG_STRATEGY=17, IMWRITE_PNG_STRATEGY_RLE=3,
              imdecode=lambda data, mode: np.zeros((height, width, 3), np.uint8), imencode=encode)
     monkeypatch.setitem(sys.modules, 'cv2', cv2)
     depth = np.full((height, width), 1500, np.uint16)
@@ -628,7 +629,9 @@ def test_native_rgbd_worker_preserves_encoder_bytes_in_typed_depth_payload(monke
     assert out.rgb_compressed.header.stamp == color_msg.header.stamp
     assert out.depth_compressed.format == 'png'
     assert bytes(out.depth_compressed.data) == png
-    assert encoded[0][0] == '.png' and encoded[0][2] == [cv2.IMWRITE_PNG_COMPRESSION, 1]
+    assert encoded[0][0] == '.png'
+    assert encoded[0][2] == [cv2.IMWRITE_PNG_COMPRESSION, 1,
+                             cv2.IMWRITE_PNG_STRATEGY, cv2.IMWRITE_PNG_STRATEGY_RLE]
     np.testing.assert_array_equal(encoded[0][1], depth)
 
 

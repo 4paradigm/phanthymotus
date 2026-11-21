@@ -341,14 +341,7 @@ class _PointCloudNode(Node):
             "summary_topic": self._summary_topic,
         }
 
-    # ── 订阅回调（只做节流和解码入队，重活都在 worker）─────────────────────
-
-    def _throttled(self) -> bool:
-        now = time.monotonic()
-        if now - self._last_emit_time < self._frame_interval:
-            return True
-        self._last_emit_time = now
-        return False
+    # ── 订阅回调只保留最新帧，限频和解码由 worker 处理 ────────────────
 
     @staticmethod
     def _drop_stale(q: queue.Queue, item) -> None:
@@ -365,12 +358,10 @@ class _PointCloudNode(Node):
                 pass
 
     def _depth_comp_cb(self, msg: CompressedImage, context=None):
-        if self._throttled():
-            return
         self._drop_stale(self._frame_queue, ("depth_zlib", msg) if context is None else ("depth_zlib", msg, context))
 
     def _depth_image_cb(self, msg: Image, context=None):
-        if msg.encoding != "32FC1" or self._throttled():
+        if msg.encoding != "32FC1":
             return
         self._drop_stale(self._frame_queue, ("depth_f32", msg) if context is None else ("depth_f32", msg, context))
 
@@ -381,10 +372,20 @@ class _PointCloudNode(Node):
         while not self._stop_event.is_set():
             try:
                 item = self._frame_queue.get(timeout=1.0)
+                delay = self._last_emit_time + self._frame_interval - time.monotonic()
+                if delay > 0 and self._stop_event.wait(delay):
+                    break
+                # Preserve a sparse frame that arrived during the rate limit,
+                # and prefer any newer frame that arrived while waiting.
+                try:
+                    item = self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
                 _, payload = item[:2]
                 context = item[2] if len(item) == 3 else None
                 if self._stop_event.is_set():
                     break
+                self._last_emit_time = time.monotonic()
                 if context is None:
                     self._emit_depth(payload)
                 else:

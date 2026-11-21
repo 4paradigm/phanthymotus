@@ -13,6 +13,9 @@ from .camera_geometry import decode_depth_zlib
 from .spatial_time import TimePolicy, FrameContext
 
 
+POSE_QUEUE_DEPTH = 64
+
+
 def _stamp(message):
     header = getattr(message, 'header', None)
     stamp = getattr(header, 'stamp', None)
@@ -41,8 +44,9 @@ def latency_summary(samples):
 
 
 class SubscriptionLease:
-    def __init__(self, registry, stream, consumer):
+    def __init__(self, registry, stream, consumer, max_pending):
         self.registry, self.stream, self.consumer = registry, stream, consumer
+        self._max_pending = max_pending
         self._condition = threading.Condition()
         self._pending = deque()
         self._bytes = self._dropped = self._errors = 0
@@ -60,7 +64,7 @@ class SubscriptionLease:
             if size > self.registry.max_bytes:
                 self._dropped += 1
                 return
-            while self._pending and (len(self._pending) >= self.registry.max_pending or
+            while self._pending and (len(self._pending) >= self._max_pending or
                                      self._bytes + size > self.registry.max_bytes):
                 self._bytes -= self._pending.popleft()[2]
                 self._dropped += 1
@@ -127,10 +131,10 @@ class InputAdapterRegistry:
         # A registry belongs to exactly one executor/ROS context, not all domains.
         self._domain = id(getattr(executor, 'context', executor))
 
-    def _ros_subscribe(self, topic, message_type, callback):
+    def _ros_subscribe(self, topic, message_type, callback, *, pose_input=False):
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from rclpy.node import Node
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         if self._node is None:
             self._node = Node('spatial_input_' + uuid.uuid4().hex[:8],
                               context=getattr(self.executor, 'context', None))
@@ -138,8 +142,10 @@ class InputAdapterRegistry:
         # Humble can leave a callback group busy when a subscription is
         # destroyed between scheduling and taking its message. Keep that
         # group's lifetime scoped to one subscription.
+        qos = (QoSProfile(depth=POSE_QUEUE_DEPTH, reliability=ReliabilityPolicy.BEST_EFFORT)
+               if pose_input else qos_profile_sensor_data)
         subscription = self._node.create_subscription(
-            message_type, topic, callback, qos_profile_sensor_data,
+            message_type, topic, callback, qos,
             callback_group=MutuallyExclusiveCallbackGroup())
         return lambda: self._node.destroy_subscription(subscription)
 
@@ -147,6 +153,7 @@ class InputAdapterRegistry:
         if not isinstance(topic, str) or not topic.strip() or not callable(consumer):
             raise ValueError('topic and consumer required')
         declaration = deepcopy(declaration or {})
+        pose_input = declaration.get('format') == 'state/odom'
         key = (self._domain, topic, message_type)
         with self._lock:
             if self._closed:
@@ -159,13 +166,17 @@ class InputAdapterRegistry:
                               received=0, rejected=0, last_error=None, close=None)
                 self._streams[key] = stream
                 try:
-                    stream['close'] = (self._subscribe or self._ros_subscribe)(
-                        topic, message_type, lambda m: self._receive(stream, m))
+                    callback = lambda msg: self._receive(stream, msg)
+                    if self._subscribe is None:
+                        stream['close'] = self._ros_subscribe(topic, message_type, callback, pose_input=pose_input)
+                    else:
+                        stream['close'] = self._subscribe(topic, message_type, callback)
                 except Exception:
                     del self._streams[key]
                     stream['active'] = False
                     raise
-            lease = SubscriptionLease(self, stream, consumer)
+            max_pending = max(self.max_pending, POSE_QUEUE_DEPTH) if pose_input else self.max_pending
+            lease = SubscriptionLease(self, stream, consumer, max_pending)
             stream['leases'].add(lease)
             return lease
 

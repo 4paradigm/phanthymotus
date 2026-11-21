@@ -149,7 +149,7 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
             probe.create_subscription(String, odom_topic, on_odom, qos_profile_sensor_data)
             probe.create_subscription(PointCloud2, cloud_topic, on_cloud, qos_profile_sensor_data)
         else:
-            leases.append(input_registry.acquire(odom_topic,String,{},on_odom))
+            leases.append(input_registry.acquire(odom_topic,String,{'format': 'state/odom'},on_odom))
             leases.append(input_registry.acquire(cloud_topic,PointCloud2,camera_info or {},on_cloud))
         executor.add_node(probe)
         deadline = time.monotonic() + timeout_s

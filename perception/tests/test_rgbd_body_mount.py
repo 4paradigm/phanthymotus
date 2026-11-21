@@ -40,6 +40,49 @@ def mounts():
     return CaptureMounts(declaration(), 'camera_optical', 'camera-clock')
 
 
+def test_late_future_tf_diagnostic_keeps_exact_numeric_evidence():
+    observer = mounts()
+    stamp = 1_000_000_123
+    transform = np.eye(4); transform[0, 3] = .2
+    observer.observe(packet(stamp, transform), stamp)
+    delayed = packet(stamp, status='unavailable',
+                     reason='Lookup would require extrapolation into the future.')
+    del delayed['matrix']
+    observer.observe(delayed, stamp + 50_000_000)
+    actual = observer.matrix_at(stamp)
+    assert actual is not None
+    np.testing.assert_allclose(actual, transform)
+
+
+@pytest.mark.parametrize('end_offset,diagnostic,source_change,available', [
+    (200_000_000, 'Lookup would require extrapolation into the future.', {}, True),
+    (200_000_001, 'Lookup would require extrapolation into the future.', {}, False),
+    (200_000_000, 'Lookup would require extrapolation into the future.', {'epoch': 'boot2'}, False),
+    (200_000_000, 'Lookup would require extrapolation into the future.', {'source': 'joint_model'}, False),
+    (200_000_000, 'Lookup would require extrapolation into the future.', {'version': 'capture_tf_v2'}, False),
+    (200_000_000, 'Lookup would require extrapolation into the future.', {'mode': 'static'}, False),
+    (200_000_000, 'No connection between body and camera frames', {}, False),
+])
+def test_future_tf_packet_can_use_only_a_short_continuous_numeric_bracket(end_offset, diagnostic, source_change, available):
+    observer = mounts()
+    start, midpoint = 1_000_000_123, 1_100_000_123
+    observer.observe(packet(start), start)
+    pending = packet(midpoint, status='unavailable', reason=diagnostic)
+    del pending['matrix']
+    observer.observe(pending, midpoint)
+    assert observer.matrix_at(midpoint) is None
+    transform = np.array([[0., -1., 0., .2], [1., 0., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]])
+    end = start + end_offset
+    observer.observe(packet(end, transform, **source_change), end)
+    interpolated = observer.matrix_at(midpoint)
+    if available:
+        assert interpolated is not None
+        assert interpolated[:2, 0] == pytest.approx([np.sqrt(.5), np.sqrt(.5)])
+        assert interpolated[0, 3] == pytest.approx(.1)
+    else:
+        assert interpolated is None
+
+
 def test_known_mount_produces_explicit_body_pose_without_relabeling_camera_pose():
     observer = mounts()
     transform = np.eye(4); transform[0, 3] = .2  # camera origin0.2m ahead of body

@@ -30,11 +30,13 @@ from .pointcloud_slam_preview import PREVIEW_TOPIC
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 from .pointcloud_slam_motion import ScanMotion, MotionPending
+from .spatial_input import POSE_QUEUE_DEPTH
 
 
 _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                   history=HistoryPolicy.KEEP_LAST, depth=2,
                   durability=DurabilityPolicy.VOLATILE)
+_POSE_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=POSE_QUEUE_DEPTH)
 log = logging.getLogger(__name__)
 
 
@@ -245,10 +247,12 @@ class RtabmapNode(Node):
             for topic, kind, callback in ((odom_topic, String, self._odom),
                                           (cloud_topic, PointCloud2, self._cloud)):
                 if input_registry is None:
-                    self.create_subscription(kind, topic, callback, _QOS)
+                    self.create_subscription(kind, topic, callback, _POSE_QOS if topic == odom_topic else _QOS)
                 else:
                     declaration = (input_contract or {}).get("inputs", {}).get(topic) or (input_declarations or {}).get(topic, {})
-                    if not declaration and topic==cloud_topic and self._settings.get('time_basis','source_capture')=='source_capture':
+                    if topic == odom_topic:
+                        declaration = dict(declaration, format='state/odom')
+                    elif not declaration and self._settings.get('time_basis','source_capture')=='source_capture':
                         # Existing configured v1 path already requires capture
                         # headers in this clock. New receipt paths declare v2.
                         declaration={'vendor':{'clock_id':self.stream.clock_id,'timestamp_semantics':'source_capture_mapped'}}
@@ -521,7 +525,8 @@ class RtabmapNode(Node):
             graph=None, cloud=None, finalized=False, closing=False,
             native_loop_closures=0, native_proximity_detections=0, native_updates=0,
             native_recovery={'state': 'unavailable'},
-            last_info=None, subscriptions=[], last_preview=0., forwarded=0,
+            last_info=None, subscriptions=[], last_preview=0., preview_key=None,
+            preview_pending=False, forwarded=0,
             progress=BackendProgress(timeout_s=max(10.,4*self._settings['max_update_ms']/1000)))
         with self._result_lock:
             self._segments.append(segment)
@@ -996,6 +1001,8 @@ class RtabmapNode(Node):
                 active = self._active
                 if active is not None and not active['finalized'] and not active['closing'] and active['process'].poll() is not None and not self._stopped():
                     raise RuntimeError('RTAB-Map process exited (exit ' + str(active['process'].poll()) + ')')
+                if active is not None:
+                    self._flush_preview(active)
             except _StorageLimit as error:
                 self._stop_reason = str(error)
                 self.freeze_capture()
@@ -1066,14 +1073,24 @@ class RtabmapNode(Node):
                 return
             packet = encode_mapping(cloud[2], pose, max_points=self._settings['preview_max_points'],
                                     pose_reference=segment.get('pose_reference'))
+            if segment.get('preview_key') == graph[:2] and segment['snapshot'] == packet:
+                return
             segment['snapshot'], segment['frame_id'] = packet, frame
-            if self._active is not segment or self._closed:
+            segment['preview_key'] = graph[:2]
+            segment['preview_pending'] = True
+            self._flush_preview(segment)
+
+    def _flush_preview(self, segment):
+        with self._result_lock:
+            if (self._active is not segment or self._closed or self._stopped() or
+                    segment['closing'] or not segment['preview_pending']):
                 return
             now = time.monotonic()
             if now - segment['last_preview'] < self._settings['preview_interval_s']:
                 return
             segment['last_preview'] = now
-            message = UInt8MultiArray(); message.data = array('B', packet)
+            segment['preview_pending'] = False
+            message = UInt8MultiArray(); message.data = array('B', segment['snapshot'])
             self._map_pub.publish(message)
 
     def _native_info(self, msg, segment):
@@ -1089,6 +1106,12 @@ class RtabmapNode(Node):
                     has_recovery_state = True
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],
                         relocalizations=int(recovery[1]), visual_inliers=int(recovery[2]))
+                    if recovery[0] == 1 and segment.get('preview_pending'):
+                        try:
+                            if self._stamp(msg) >= segment['preview_key'][0]:
+                                segment['preview_pending'] = False
+                        except AttributeError:
+                            pass  # Native searching evidence needs a capture time.
                     reacquired = values.get('Motus/VisualReacquiredInliers/')
                     if recovery[0] in (0, 3) and isinstance(reacquired, (int, float)) and 0 < reacquired <= recovery[2]:
                         segment['native_recovery']['visual_reacquired_inliers'] = int(reacquired)

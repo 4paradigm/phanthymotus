@@ -129,12 +129,13 @@ def test_gateway_snapshot_waits_for_matching_native_stamp_and_frame():
     points = np.array([[1., 2., 0.], [3., 4., 1.5]])
     segment = {'graph': (2_000_000_000, 'native/map', pose),
                'cloud': (1_000_000_000, 'native/map', points),
-               'snapshot': None, 'frame_id': '', 'last_preview': 0.}
+               'snapshot': None, 'frame_id': '', 'last_preview': 0., 'closing': False}
     packets = []
     gateway = NS(_result_lock=RLock(),
                  _settings={'preview_max_points': 10, 'preview_interval_s': .1},
-                 _active=segment, _closed=False,
+                 _active=segment, _closed=False, _stopped=lambda: False,
                  _map_pub=NS(publish=lambda msg: packets.append(bytes(msg.data))))
+    gateway._flush_preview = lambda segment: RtabmapNode._flush_preview(gateway, segment)
 
     # A stale cloud cannot be paired with the newer native optimized pose.
     RtabmapNode._publish_snapshot(gateway, segment)

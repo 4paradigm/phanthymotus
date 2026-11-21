@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import uuid
 
@@ -237,6 +238,25 @@ class ExternalOdometry:
         self.current = self.base
         self._output_stamp = 0
         self._output_pose = None
+        self._batch_changes = None
+
+    @contextmanager
+    def batch(self):
+        """Rebuild once after staging a batch of observations."""
+        changes = []
+        self._batch_changes = changes
+        try:
+            yield
+        finally:
+            self._batch_changes = None
+            if changes:
+                self._rebuild(min(changes))
+
+    def _changed(self, stamp):
+        if self._batch_changes is None:
+            self._rebuild(stamp)
+        else:
+            self._batch_changes.append(stamp)
 
     def motion(self, stamp, motion):
         prior = self.raw_motion.get(stamp)
@@ -245,7 +265,7 @@ class ExternalOdometry:
         previous = max((key for key in self.raw_motion if key < stamp), default=stamp-1)
         self.raw_motion[stamp] = motion
         # The new right endpoint changes only motion after the preceding sample.
-        self._rebuild(previous+1)
+        self._changed(previous+1)
         return True
 
     def vision(self, stamp, segment, body_pose, variance=None):
@@ -254,7 +274,7 @@ class ExternalOdometry:
                 (prior[0], prior[1].tobytes()) >= (segment, body_pose.tobytes())):
             return False
         self.raw_vision[stamp] = (segment, body_pose, variance)
-        self._rebuild(stamp)
+        self._changed(stamp)
         return True
 
     def replay_learning(self, stamp):
@@ -388,8 +408,15 @@ class ExternalOdometry:
             self.raw_vision = {stamp: event for stamp, event in self.raw_vision.items() if stamp > cut}
             self.checkpoints = {stamp: checkpoint for stamp, checkpoint in self.checkpoints.items() if stamp > cut}
 
-    def output(self):
-        state = self.current
+    def pending_output_states(self, earliest_stamp):
+        """Find new measurement checkpoints that can still be published."""
+        return [self.checkpoints[stamp] for stamp in sorted(self.checkpoints)
+                if stamp > self._output_stamp and stamp >= earliest_stamp
+                and self.checkpoints[stamp].last_update is not None]
+
+    def output(self, state=None):
+        if state is None:
+            state = self.current
         if state.last_update is None or state.stamp <= self._output_stamp:
             return None
         pose = state.transform

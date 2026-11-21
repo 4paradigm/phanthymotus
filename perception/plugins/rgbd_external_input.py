@@ -112,11 +112,16 @@ class ExternalOdometryInput:
         except queue.Empty:
             return []
         cutoff = time.monotonic() - _MAX_QUEUE_DELAY_S
+        wall_now = time.time_ns()
         with self.event_lock:
             while not self.events.empty():
                 batch.append(self.events.get_nowait())
+            # A bounded burst of fresh absolute poses can still bracket clouds
+            # after waiting in the queue. Auxiliary work keeps the shorter limit.
             ready = [event for received, event in batch
-                     if received >= cutoff or self._is_motion_boundary(event)]
+                     if received >= cutoff or self._is_motion_boundary(event)
+                     or (event[0] == 'motion' and event[3].pose is not None
+                         and 0 <= wall_now - event[2] <= _OUTPUT_TIMEOUT_NS)]
             self.dropped += len(batch) - len(ready)
             if self.evicted_motion_boundaries:
                 for _, source, stamp, _ in self.evicted_motion_boundaries:
@@ -183,10 +188,11 @@ class ExternalOdometryInput:
         if publish:
             self._publish()
 
-    def _publish(self):
+    def _publish(self, state=None):
         if not self.active and not self.motion_received:
             return
-        state = self.fuser.current
+        if state is None:
+            state = self.fuser.current
         if (not self.active and state.visual is None and
                 (state.mask is None or not state.mask[[0, 1, 5]].all())):
             # Preserve camera tracking while a partial input cannot establish a body track.
@@ -200,7 +206,7 @@ class ExternalOdometryInput:
             if self.active and 'stamp_ns' not in self.status:
                 self.status = dict(self.status, stamp_ns=stamp)
             return
-        sample = self.fuser.output()
+        sample = self.fuser.output(state)
         if sample is None:
             return
         quality = sample['vendor']['motus_slam']
@@ -276,15 +282,17 @@ class ExternalOdometryInput:
             self.fuser.replay_learning(key[0])
 
     def _apply_ready(self, events):
-        # Preserve the motion intervals, but emit just the newest result after
-        # catching up with events already waiting at the start of this batch.
-        for event in events:
-            try:
-                self._apply(event, publish=False)
-            except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
-                self.last_error = str(error)
-        if events:
-            self._publish()
+        if not events:
+            return
+        with self.fuser.batch():
+            for event in events:
+                try:
+                    self._apply(event, publish=False)
+                except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
+                    self.last_error = str(error)
+        # Keep the measured samples needed to bracket cloud capture timestamps.
+        for state in self.fuser.pending_output_states(time.time_ns()-_OUTPUT_TIMEOUT_NS):
+            self._publish(state)
 
     def _work(self):
         while not self.closed:

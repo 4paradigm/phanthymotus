@@ -347,7 +347,7 @@ def test_strong_old_landmarks_allow_travel_across_the_extended_window():
     assert gate.state != 'tracking'
 
 
-def test_burst_keeps_two_measured_pairs_only_during_relocalization(sessions):
+def test_relocalization_burst_keeps_two_most_recent_measured_pairs(sessions):
     from test_rgbd_degradation import received_images
 
     create, now, _ = sessions
@@ -362,6 +362,26 @@ def test_burst_keeps_two_measured_pairs_only_during_relocalization(sessions):
     assert session.pending.qsize() == 2
     buffered = [session.pending.get_nowait()[1][0] for _ in range(2)]
     assert buffered == [now[0]-20_000_000, now[0]]
+
+
+@pytest.mark.parametrize('external,stamps,expected', [
+    (False, [1220, 1240, 1260], [1220, 1260]),
+    (False, [1220, 1400, 1740], [1400, 1740]),
+    (True, [1220, 1240, 1260], [1260]),
+])
+def test_tracking_burst_preserves_a_fresh_visual_bridge(sessions, external, stamps, expected):
+    from test_rgbd_degradation import received_images
+
+    create, now, _ = sessions
+    session = create()
+    session.gate = anchored()
+    if external:
+        session.calibration['external_candidates'] = ('/state/odom',)
+    for milliseconds in stamps:
+        now[0] = milliseconds*1_000_000
+        received_images(session, now[0])
+    buffered = [session.pending.get_nowait()[1][0]//1_000_000 for _ in range(session.pending.qsize())]
+    assert buffered == expected
 
 
 @pytest.mark.parametrize('frontend', ['f2f', 'unpatched'])

@@ -21,6 +21,8 @@ _FRONTENDS = ('f2m_feature', 'f2f_optical_flow')
 # visual-kind loss with fresh inputs, then waits out a cooldown; after two
 # switches without tracking in between, ordinary recovery keeps the frontend.
 _AUTO_COOLDOWN_S, _AUTO_MAX_UNTRACKED_SWITCHES = 20., 2
+_RESPONSIVE_START_RETRY_S = 6.
+_NATIVE_REPORT_FRESH_S = 1.5
 
 
 class RgbdOdometryPlugin:
@@ -82,13 +84,12 @@ class RgbdOdometryPlugin:
                         continue
                     if info['status'] == 'lost' and state['lost_since'] is None:
                         state['lost_since'] = now
-                        # A published run interrupted by missing camera input
-                        # succeeded. Retry when both inputs return; a failed
-                        # launch still earns its own backoff below.
-                        if info['loss_kind'] == 'input' and session.first_tracking_at is not None:
+                        # A session that published tracking completed startup.
+                        if session.first_tracking_at is not None:
                             state.update(failure_streak=0, next_attempt=None, backoff_s=1.5)
+                    retry_at = self._retry_at(session, state)
                     if ((not restoring and now-state['lost_since'] < .8) or
-                            (state['next_attempt'] is not None and now < state['next_attempt']) or
+                            (retry_at is not None and now < retry_at) or
                             (restoring and state['mode_retry_after'] is not None and now < state['mode_retry_after']) or
                             not session.has_fresh_inputs(time.time_ns())):
                         continue
@@ -175,14 +176,29 @@ class RgbdOdometryPlugin:
             return dict(calibration, visual_frontend=other), other
         return calibration, None
 
+    @staticmethod
+    def _retry_at(session, state):
+        deadline, lost_at = state['next_attempt'], state['lost_since']
+        if deadline is None or lost_at is None:
+            return deadline
+        report = session.last_native_report_at
+        if (report is not None and
+                session.gate.loss_kind in ('visual', 'output', 'relocalization', 'input') and
+                lost_at - report <= _NATIVE_REPORT_FRESH_S and session.process.poll() is None):
+            # Retain the original deadline if the process exits during the hold.
+            return min(deadline, state['last_attempt'] + _RESPONSIVE_START_RETRY_S)
+        return deadline
+
     def _recovery_info(self, instance):
         state = self.recovery.get(instance)
         if state is None:
             return {}
         now = time.monotonic()
+        current = self.instances.get(instance)
+        retry_at = self._retry_at(current[0], state) if current else state['next_attempt']
         internal = {'lost_since', 'last_attempt', 'healthy_since', 'next_attempt', 'mode_retry_after'}
         return dict({k: deepcopy(v) for k, v in state.items() if k not in internal},
-                    retry_in_s=round(max(0., (state['next_attempt'] or now)-now), 2),
+                    retry_in_s=round(max(0., (retry_at or now)-now), 2),
                     restoration_retry_in_s=round(max(0., (state['mode_retry_after'] or now)-now), 2))
 
     def _frontend_info(self, instance):
