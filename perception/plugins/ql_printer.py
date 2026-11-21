@@ -269,7 +269,19 @@ $result = Join-Path $jobs '{job_id}.result.json'
 [IO.File]::WriteAllBytes($temporary, [Convert]::FromBase64String('{payload}'))
 Move-Item -LiteralPath $temporary -Destination $request -Force
 Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
-for ($i = 0; $i -lt 220 -and !(Test-Path -LiteralPath $result); $i++) {{ Start-Sleep -Milliseconds 500 }}
+for ($i = 0; $i -lt 220 -and !(Test-Path -LiteralPath $result); $i++) {{
+    # The on-demand task ignores a Start request while its prior short-lived
+    # worker is still exiting. If it has become Ready without consuming this
+    # job, start it again; otherwise the request would remain stranded until
+    # a later call happens to wake the task.
+    if ($i -gt 0 -and ($i % 20) -eq 0) {{
+        $currentTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction Stop
+        if ($currentTask.State -ne 'Running') {{
+            Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
+        }}
+    }}
+    Start-Sleep -Milliseconds 500
+}}
 if (!(Test-Path -LiteralPath $result)) {{ throw 'Visitor automation job timed out' }}
 $bytes = [IO.File]::ReadAllBytes($result)
 Remove-Item -LiteralPath $result -Force -ErrorAction SilentlyContinue

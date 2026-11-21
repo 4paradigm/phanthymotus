@@ -80,15 +80,16 @@ def main() -> int:
     )
     try:
         # Drain every request visible at startup. Task Scheduler serializes
-        # runs, while newly arriving files are picked up during a short grace
-        # period so concurrent robot calls cannot strand a request.
+        # runs, while newly arriving files are picked up during a grace period
+        # so a request racing a just-finished Task Scheduler invocation is not
+        # stranded until another call happens to wake the task.
         idle_since = None
         while True:
             requests = sorted(jobs.glob("*.request.json"), key=lambda item: item.stat().st_mtime)
             if not requests:
                 if idle_since is None:
                     idle_since = time.monotonic()
-                if time.monotonic() - idle_since >= 2:
+                if time.monotonic() - idle_since >= 10:
                     break
                 time.sleep(0.1)
                 continue

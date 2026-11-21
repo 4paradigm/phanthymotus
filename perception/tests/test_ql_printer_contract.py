@@ -235,6 +235,9 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertIn("login.stop", script)
         self.assertIn("Set-Content", script)
         self.assertIn("Start-Sleep -Milliseconds 250", script)
+        self.assertIn("($i % 20) -eq 0", script)
+        self.assertIn("$currentTask.State -ne 'Running'", script)
+        self.assertGreaterEqual(script.count("Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'"), 2)
         self.assertNotIn("Stop-ScheduledTask -TaskName 'Paradigm Visitor Login'", script)
 
     def test_unknown_action(self):
