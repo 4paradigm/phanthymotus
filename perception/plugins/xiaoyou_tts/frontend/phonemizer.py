@@ -716,12 +716,6 @@ class ContextualZHG2P:
         fixes = {x['start']: x['pinyin_override_at_start'] for x in interventions}
         return self._render(prepared, fixes), original[1]
 
-_BASIS=re.compile(r'以[\u4E00-\u9FFF]{1,48}?为基础')
-
-_VERIFIED_SPLIT_BASIS=re.compile(r'算力为基础')
-
-_FULL_BASIS=re.compile(r'以(?P<object>[\u4E00-\u9FFFA-Za-z0-9_ \t\-.]{1,64}?)为基础')
-
 _GROWTH_SUFFIX = re.compile(r'(?:见识|本事|个儿|个子|个头|得|高|胖|壮|大|出|成)')
 
 
@@ -765,12 +759,157 @@ _EN_VALUE = r'(?:(?:minus|negative|plus|positive)[ \t]+)?' + _EN_NUMBER
 
 _NUMERIC_VALUE = r'(?:' + _CN_VALUE + r'|' + _ARABIC_VALUE + r'|' + _EN_VALUE + r')'
 
-_VALUE_COPULA = re.compile(r'(?:能量|功率|电量|容量|体积|面积|电压|电流|带宽|速率|质量|温度范围|范围|延迟|速度|时长|数量|温度|值|结果|版本号|版本|编号|代码|端口号|端口)'
-                           r'(?:分别)?(?P<target>为)(?=[ \t]*' + _NUMERIC_VALUE + r')', re.I)
-
 _VERSION_VALUE = r'v[0-9]+(?:\.[0-9]+){0,3}(?![A-Za-z0-9_+\-/]|\.[A-Za-z0-9_.])'
 
-_VERSION_COPULA = re.compile(r'(?:版本号|版本)(?P<target>为)(?=[ \t]*' + _VERSION_VALUE + r')', re.I)
+_WEI_RESULT = (
+    r'基础(?!设施|岗位|课程|员工)|核心(?!团队|客户|用户|员工|成员)|中心(?!城区|城市|医院)|'
+    r'主要(?:依据|目标|参考|指标|对象)|重点(?!客户|用户|企业|项目)|'
+    r'衡量标准|标准|准入限制|准绳|准(?!客户|用户|会员|入)|例(?!外)|参考|依据|前提|目标|上限|下限|起点|入口|界|单位|'
+    r'主(?!要|办|体|人|席|导|管|机)|重(?!点|要)|限|荣|耻|贵|由|名|线索'
+)
+_WEI_FRAME = re.compile(
+    r'(?<![所足难得予加何之])以(?!及|前|后|来|往|内|外|上|下|为)'
+    r'(?P<object>[\u4e00-\u9fffA-Za-z0-9_ \t%-]{1,64}?(?:'
+    r'\.[0-9][\u4e00-\u9fffA-Za-z0-9_ \t%.-]{0,48}?)?)'
+    r'(?P<target>为)[ \t]*(?:' + _WEI_RESULT + r')'
+    r'(?=[ \t]*(?:$|[，。！？；：、,.!?;:)）〕”」]|的|'
+    r'(?:来|再|先|继续|重新)?(?:说明|讲解|解释|开展|制定(?!者|人|机构|部门|单位)|校验|执行|办理|进行|提供|部署|完成|实现|'
+    r'分析|评估|训练|开发|构建|建设|建立|搭建|设计|衡量|理解|推进|优化|处理|计算|申请|操作)))'
+)
+_WEI_ASSIGNMENT = re.compile(
+    r'(?:算力(?=为基础(?!设施|岗位|课程|员工))|设定|设置|设|定|修改|更改|改|调|调整|切换|切成|变更|变|更新|转换|转化|换算|'
+    r'升级|配置|定义|声明|指定|命名|标记|标注|标|视|当|识别|判定|误读|译|'
+    r'归结|划分|分|合并|拆分|推举|推|选举|改写|转写|登记|聘|任命|结)'
+    r'(?P<target>为)(?=[ \t]*[\u4e00-\u9fffA-Za-z0-9《“(])'
+)
+_WEI_FIELDS = (
+    r'能量|功率|电量|容量|体积|面积|电压|电流|带宽|速率|质量|温度(?:范围)?|范围|'
+    r'延迟|速度|时长|耗时|数量|样本数|记录量|值|结果|版本(?:号)?|编号|代码|端口(?:号)?|'
+    r'状态|模式|语言|格式|级别|编码|型号|角色|权限|时间|日期|人数|次数|评分|期限|'
+    r'长度|重量|尺寸|分辨率|帧率|转速|浓度|频率|金额|成本|误差|阈值|上限|下限|'
+    r'指标|比例|占用率|利用率|通过率|准确率|失败率|成功率|增长率'
+)
+_WEI_ENUM_VALUES = (
+    r'在线|离线|就绪|空闲|完成|已完成|已通过|通过|未通过|失败|已取消|待复核|异常|进行中|严重|'
+    r'正常|只读|读写|管理员|手动|自动|隐藏|可见|开启|关闭|中文|英文|立体声|宽屏|全屏|'
+    r'(?:true|false|stable|latest|debug|info|warn(?:ing)?|error|gpu|cpu|json|xml|utf-8|'
+    r'wav|mp3|flac|opus|pcm|auto|manual|active|inactive|on|off)(?![A-Za-z0-9_])|'
+    r'[A-Za-z]{1,6}[-_][0-9]+[A-Za-z]?(?![A-Za-z0-9_])'
+)
+_WEI_TYPED_VALUE = r'[ \t]*(?:' + _NUMERIC_VALUE + '|' + _VERSION_VALUE + '|' + _WEI_ENUM_VALUES + r')'
+_WEI_FIELD = re.compile(r'(?:' + _WEI_FIELDS + r')(?:分别)?(?P<target>为)(?=' + _WEI_TYPED_VALUE + r')', re.I)
+_WEI_TYPED_VALUE_PATTERN = re.compile(_WEI_TYPED_VALUE, re.I)
+_WEI_ASSIGNMENT_CUE = re.compile(
+    r'(?:^|[，。！？；,.!?;])[ \t]*$|(?:请|把|将|已|应|需|务必|手动|自动|重新)'
+    r'[\u4e00-\u9fffA-Za-z0-9 \t_.-]{0,24}$'
+)
+_WEI_NAMED_FIELD = re.compile(
+    r'(?:用户名|账号名|主机名|文件名|服务地址|服务路径)(?P<target>为)(?=[ \t]*[\u4e00-\u9fffA-Za-z0-9/])'
+)
+_WEI_GOAL_FIELD = re.compile(
+    r'(?:业务|项目|设计|运营|主要)目标(?P<target>为)(?=[ \t]*(?:减少|降低|提高|增加|缩短|改善|实现|达到))'
+)
+_WEI_BENEFICIARY = re.compile(
+    r'[ \t]*[\u4e00-\u9fffA-Za-z0-9 \t]{0,16}?'
+    r'(?:用户|客户|买家|卖家|商户|经销商|主办方|团队|部门|机构|班级|学校|公司|国家|学员|听众|读者|居民|'
+    r'同事|学生|员工|游客|孩子|观众|客人|宾客|来宾|工程师|人民|获奖者|参与者|志愿者|'
+    r'单位|供应商|合作方|申请人|您|你们?|我们?|他们?|她们?|大家|自己)'
+    r'(?:本人|们)?[ \t]*(?:提供|服务|办理|制作|发放|准备|安排|保留|推送|发出|发送|'
+    r'划拨|分配|开放|开通|定制|设计|启动|完成|生成|争取|谈判|扩容|介绍|解释|说明|演示|节省|减少|带来|'
+    r'着想|高兴|担心|庆祝|感到)'
+)
+_WEI_PURPOSE = re.compile(
+    r'[ \t]*(?:了|着|(?:提高|降低|解决|避免|防止|防灾|保障|保护|维护|实现|确保|改善|提升|满足)'
+    r'[\u4e00-\u9fffA-Za-z0-9 \t]{0,24}?而)'
+)
+_WEI_PASSIVE = re.compile(
+    r'(?P<target>为)(?!了|此|何|什么|所)(?:华为|行为|(?!为)[\u4e00-\u9fffA-Za-z0-9 \t]){1,32}?所'
+    r'(?:熟知|知晓|认识|知道|了解|爱戴|接受|认可|采用|采纳|遵守|引用|使用|容忍|'
+    r'禁止|制止|损坏|阻挡|困扰|误解|误会|核对|批准|打动|感动|吸引|知)'
+    r'了?(?=[ \t]*(?:[的，。！？；,.!?;]|$))'
+)
+_WEI_ATTRIBUTIVE_LEFT = re.compile(r'(?:一种|一个|一项|一条|一套|一份)[ \t]*$')
+_WEI_DEGREE = re.compile(
+    r'(?:广|极|尤|较|略|最|甚|颇|深|大)(?P<target>为)'
+    r'(?=流传|引用|人知|明显|相似|关键|重要|复杂|不满|不安|有趣|便利|合适|困难|'
+    r'出色|丰富|突出|危险|担忧|看好|遗憾|惊讶|感动|高兴|简单|稳定|高效)'
+)
+_WEI_FIXED = (
+    re.compile(r'(?:有|无)(?P<target>为)(?=青年|而治)'),
+    re.compile(r'(?P<target>为)人(?=(?:很|十分|特别|一向)?(?:热心|正直|诚恳|坦率|处世|忠厚|随和|诚实|谦逊|善良|可靠|老实|谨慎|宽厚))'),
+    re.compile(r'(?<=的)(?P<target>为)人(?=很|如何|值得|[，。！？；,.!?;]|$)'),
+    re.compile(r'(?:施|肇事者|何人|谁|[他她你我])所(?P<target>为)(?=之|皆|[，。！？；,.!?;]|$)'),
+    re.compile(r'(?:何人|谁)(?P<target>为)之(?=[，。！？；,.!?;]|$)'),
+    re.compile(r'不(?P<target>为)所动'),
+    re.compile(r'(?P<target>为)(?:后人|世人|人们|业界)(?:广为|广泛)(?=引用|使用|接受|采纳|认可|传播)'),
+    re.compile(r'拜[\u4e00-\u9fff]{1,16}?(?P<target>为)师'),
+    re.compile(r'(?:公推|推选|选举|提名)[\u4e00-\u9fff]{1,12}?(?P<target>为)(?=代表|负责人|组长|队长|主席)'),
+    re.compile(r'(?:此人|该人|他|她)(?P<target>为)'
+               r'(?=(?:(?:本次|本届|此次)(?:比赛|活动|项目)的|服务|项目|技术)?'
+               r'(?:负责人|主裁判|裁判|召集人|主持人|队长|代表)(?:[，。！？；,.!?;]|$))'),
+    re.compile(r'(?:原|现)(?P<target>为)(?=学校|工厂|医院|仓库|技术负责人|项目负责人|管理员)'),
+    re.compile(r'(?:变废|聚沙|化险|转危|化干戈)(?P<target>为)(?=宝|塔|夷|安|玉帛)'),
+    re.compile(r'化(?:失败|压力|悲痛|危机)(?P<target>为)(?=动力|机会|力量|行动|转机)'),
+    re.compile(r'(?:何以|未)(?P<target>为)(?=家|晚)'),
+    re.compile(r'我(?P<target>为)鱼肉'),
+)
+
+
+def _wei_targets(text, words, protected_spans=()):
+    """Select wéi on the full normalized source before splitting Han and Latin."""
+    if '为' not in text:
+        return []
+    targets = {}
+    starts = {start for _, start, _ in words}
+    wei_positions = {
+        position for word, start, _ in words
+        for position, character in enumerate(word, start) if character == '为'
+    }
+
+    def add(position, context, rule):
+        if position not in wei_positions:
+            return
+        if any(start <= position < end for start, end in protected_spans):
+            return
+        targets[position] = {'position': position, 'character': '为', 'pinyin': 'wei2',
+                             'context': context, 'rule': rule}
+
+    for word, start, _ in words:
+        if word == '华为':
+            add(start + 1, word, 'complete_native_word_华为')
+    for pattern, rule in (
+        (_WEI_FRAME, 'based_on_result'), (_WEI_ASSIGNMENT, 'assignment'),
+        (_WEI_FIELD, 'field_value'), (_WEI_NAMED_FIELD, 'field_identifier'),
+        (_WEI_GOAL_FIELD, 'field_goal'),
+    ):
+        for match in pattern.finditer(text):
+            position = match.start('target')
+            if pattern is _WEI_FRAME:
+                object_text = match['object']
+                if not re.search(r'[\u4e00-\u9fffA-Za-z0-9]', object_text):
+                    continue
+                if '.' in re.sub(r'(?<=[0-9])\.(?=[0-9])', '', object_text):
+                    continue
+            if pattern is _WEI_ASSIGNMENT:
+                action = text[match.start():position]
+                if len(action) == 1 and match.start() not in starts:
+                    continue
+                if (action in ('设置', '配置', '调整', '变更', '更新')
+                        and not _WEI_TYPED_VALUE_PATTERN.match(text, position + 1)
+                        and not _WEI_ASSIGNMENT_CUE.search(text[max(0, match.start()-28):match.start()])):
+                    continue
+            if not (_WEI_BENEFICIARY.match(text, position + 1) or _WEI_PURPOSE.match(text, position + 1)):
+                add(position, match.group(), rule)
+    for pattern in (_WEI_PASSIVE, _WEI_DEGREE, *_WEI_FIXED):
+        for match in pattern.finditer(text):
+            if pattern is _WEI_DEGREE and match.start() not in starts:
+                continue
+            if (pattern is _WEI_PASSIVE and text[match.end():].lstrip().startswith('的')
+                    and not _WEI_ATTRIBUTIVE_LEFT.search(text[max(0, match.start()-8):match.start()])):
+                continue
+            add(match.start('target'), match.group(),
+                'passive' if pattern is _WEI_PASSIVE else 'fixed_context')
+    return [targets[position] for position in sorted(targets)]
 
 def _syntax_targets(text,words):
     result=[]
@@ -790,10 +929,6 @@ def _syntax_targets(text,words):
             result.append({'position':match.start('target'),'character':character,
                            'pinyin':pinyin,'context':match.group(),'rule':rule,
                            'native_word_boundary_verified':True,'native_context_tokens':tokens})
-    for pattern in (_VALUE_COPULA, _VERSION_COPULA):
-        for match in pattern.finditer(text):
-            result.append({'position':match.start('target'),'character':'为','pinyin':'wei2',
-                           'context':match.group(),'rule':'numerical_value_copula_named_business_field'})
     return result
 
 class PolyphoneContextG2P:
@@ -818,7 +953,7 @@ class PolyphoneContextG2P:
             node=self._phrase_trie
             for character in phrase:node=node.setdefault(character,{})
             node[None]={'phrase':phrase,**record}
-        self.metadata={'kind':'isolated_polyphone_candidate_NOT_active_profile','source_path':str(Path(__file__).resolve()),'source_sha256':sha256(Path(__file__).read_bytes()).hexdigest(),'scope':['complete_native_word_华为_second_syllable_wei2','same_Chinese_span_以_1to48ChineseChars_为基础_target_wei2','verified_English_split_suffix_算力为基础_target_wei2','native_word_bounded_subject_得_action_dei3','native_word_bounded_verb_得_degree_quality_de5','native_word_bounded_manner_地_action_de5','numerical_value_copula_named_business_fields_wei2'],'bound_full_context_scope':'explicit_以…为基础_and_verified_grammar_phrases_and_numerical_value_copula_with_exact_offsets','global_dictionary_modified':False,'other_non_targets_delegate':True,'quality_accepted':False}
+        self.metadata={'kind':'isolated_polyphone_candidate_NOT_active_profile','source_path':str(Path(__file__).resolve()),'source_sha256':sha256(Path(__file__).read_bytes()).hexdigest(),'scope':['complete_native_word_华为_second_syllable_wei2','full_context_selected_wei2_complements_values_and_passives','native_word_bounded_subject_得_action_dei3','native_word_bounded_verb_得_degree_quality_de5','native_word_bounded_manner_地_action_de5'],'bound_full_context_scope':'verified_grammar_and_phrase_targets_with_exact_offsets','global_dictionary_modified':False,'other_non_targets_delegate':True,'quality_accepted':False}
 
         self.metadata.update(phrase_reading_count=self._phrase_count,
             phrase_reading_scope='one reviewed syllable in complete consecutive native Han words; bound literal spans excluded; no global dictionaries',
@@ -837,18 +972,14 @@ class PolyphoneContextG2P:
                 or not 0<=item[0]<item[1]<=len(normalized) for item in protected_spans):
             raise ValueError('Protected Chinese source spans require exact normalized offsets')
         words=self._words(normalized)
-        targets=[]
-        for match in _FULL_BASIS.finditer(normalized):
-            if not re.search(r'[\u4E00-\u9FFFA-Za-z0-9]',match.group('object')):continue
-            # Only numeric-internal version dots; sentence periods are not object characters.
-            if '.' in re.sub(r'(?<=[0-9])\.(?=[0-9])','',match.group('object')):continue
-            position=match.end()-3
-            if normalized[position]!='为':raise RuntimeError('Full-context target offset mismatch')
-            targets.append({'global_position':position,'context':match.group(),'rule':'bound_full_normalized_以…为基础','pinyin':'wei2'})
-        for item in _syntax_targets(normalized,words):
-            targets.append({**item,'global_position':item['position']})
-        for item in self._phrase_targets(normalized,words,protected_spans):
-            targets.append({**item,'global_position':item['position']})
+        targets = [
+            {**item, 'global_position': item['position']}
+            for item in (
+                *_wei_targets(normalized, words, protected_spans),
+                *_syntax_targets(normalized, words),
+                *self._phrase_targets(normalized, words, protected_spans),
+            )
+        ]
         token=self._context.set({'text':normalized,'targets':targets})
         try:yield self
         finally:self._context.reset(token)
@@ -930,12 +1061,9 @@ class PolyphoneContextG2P:
             if prepared[position]!=character:raise RuntimeError('Context target is not the exact '+character+' syllable')
             if not any(start<=position<end for _,start,end in words):raise RuntimeError('No native word contains the target')
             targets[position]={'position':position,'character':character,'pinyin':pinyin,'context':context,'rule':rule,**proof}
-        for word,start,end in words:
-            if word=='华为':add(start+1,word,'complete_native_word_华为')
-        for match in _BASIS.finditer(prepared):add(match.end()-3,match.group(),'explicit_以…为基础_same_Chinese_span')
-        # V6 splits an English GPU span before invoking its Chinese G2P.
-        # Only this already verified exact Chinese suffix is additionally allowed.
-        for match in _VERIFIED_SPLIT_BASIS.finditer(prepared):add(match.start()+2,match.group(),'verified_exact_算力为基础_suffix')
+        if self._context.get() is None:
+            for item in _wei_targets(prepared, words, _protected_term_spans(prepared)):
+                add(**item)
         for item in _syntax_targets(prepared,words):add(**item)
         return [targets[k]for k in sorted(targets)]
 
