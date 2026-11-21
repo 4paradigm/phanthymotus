@@ -223,6 +223,20 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertIn("4paradigm@10.100.10.14", command)
         self.assertNotIn("curl", command)
 
+    def test_browser_job_waits_for_login_edge_to_close_cleanly(self):
+        client = SSHBridgeClient("10.100.10.14", "4paradigm", "secret")
+        payload = base64.b64encode(json.dumps({"state": "listed"}).encode()).decode()
+        completed = CompletedProcess([], 0, stdout=("VISITOR_RESULT:" + payload + "\n").encode(), stderr=b"")
+        with patch("plugins.ql_printer.subprocess.run", return_value=completed) as run:
+            client.request("POST", "/list_visits", body={"visitor_page_url": "https://visitor.test/list"})
+        command = run.call_args.args[0]
+        script = base64.b64decode(command[-1].rsplit(" ", 1)[-1]).decode("utf-16le")
+        self.assertIn("Paradigm Visitor Login", script)
+        self.assertIn("login.stop", script)
+        self.assertIn("Set-Content", script)
+        self.assertIn("Start-Sleep -Milliseconds 250", script)
+        self.assertNotIn("Stop-ScheduledTask -TaskName 'Paradigm Visitor Login'", script)
+
     def test_unknown_action(self):
         self.assertEqual(self.call("explode")["code"], "bad_action")
 

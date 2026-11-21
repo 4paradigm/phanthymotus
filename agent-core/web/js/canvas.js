@@ -14,7 +14,7 @@
 import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js?v=visitor-printer-20261121-1';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';

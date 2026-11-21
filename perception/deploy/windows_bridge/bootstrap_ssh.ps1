@@ -66,7 +66,8 @@ try {
         if (!$core.core_files.$name) { throw "Incomplete package: $name" }
         [IO.File]::WriteAllBytes((Join-Path $install $name), [Convert]::FromBase64String($core.core_files.$name))
     }
-    & $python -m py_compile (Join-Path $install 'bridge_core.py') (Join-Path $install 'edge_backend.py') (Join-Path $install 'ssh_worker.py')
+    & $python -m py_compile (Join-Path $install 'bridge_core.py') (Join-Path $install 'edge_backend.py') `
+        (Join-Path $install 'ssh_worker.py') (Join-Path $install 'login_edge.py')
     if ($LASTEXITCODE) { throw 'Automation syntax validation failed' }
 
     $cfgPath = Join-Path $install 'config.json'
@@ -79,6 +80,62 @@ try {
         $cfg.edge.printer_name = ''
         $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     }
+
+    # Updating an existing install must release the old persistent Edge
+    # profile before the new login task starts. Prefer the cooperative stop
+    # signal; only close Edge processes whose command line names this profile.
+    $cfg = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $loginTask = 'Paradigm Visitor Login'
+    $loginState = Get-ScheduledTask -TaskName $loginTask -ErrorAction SilentlyContinue
+    if ($loginState -and $loginState.State -eq 'Running') {
+        $dataDir = Join-Path $install 'data'
+        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $dataDir 'login.stop') -Value 'upgrade' -Encoding ascii
+        for ($wait = 0; $wait -lt 40; $wait++) {
+            $loginState = Get-ScheduledTask -TaskName $loginTask -ErrorAction SilentlyContinue
+            if (!$loginState -or $loginState.State -ne 'Running') { break }
+            Start-Sleep -Milliseconds 250
+        }
+        if ($loginState -and $loginState.State -eq 'Running') {
+            Stop-ScheduledTask -TaskName $loginTask -ErrorAction SilentlyContinue
+            for ($wait = 0; $wait -lt 40; $wait++) {
+                $loginState = Get-ScheduledTask -TaskName $loginTask -ErrorAction SilentlyContinue
+                if (!$loginState -or $loginState.State -ne 'Running') { break }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+    }
+    $profilePath = [string]$cfg.edge.profile_dir
+    if (!$profilePath) { $profilePath = 'data/edge-profile' }
+    if (![IO.Path]::IsPathRooted($profilePath)) { $profilePath = Join-Path $install $profilePath }
+    $profilePath = [IO.Path]::GetFullPath($profilePath)
+    $edgeProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -eq 'msedge.exe' -and $_.CommandLine -and
+        $_.CommandLine.IndexOf($profilePath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    foreach ($edgeProcess in $edgeProcesses) {
+        $window = Get-Process -Id $edgeProcess.ProcessId -ErrorAction SilentlyContinue
+        if ($window) { $null = $window.CloseMainWindow() }
+    }
+    if ($edgeProcesses.Count) {
+        Start-Sleep -Seconds 3
+        $edgeProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.Name -eq 'msedge.exe' -and $_.CommandLine -and
+            $_.CommandLine.IndexOf($profilePath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        })
+        foreach ($edgeProcess in $edgeProcesses) {
+            Stop-Process -Id $edgeProcess.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    for ($wait = 0; $wait -lt 40; $wait++) {
+        $loginState = Get-ScheduledTask -TaskName $loginTask -ErrorAction SilentlyContinue
+        if (!$loginState -or $loginState.State -ne 'Running') { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($loginState -and $loginState.State -eq 'Running') {
+        throw '无法释放旧版访客 Edge 自动化任务，请关闭前台访客 Edge 后重试'
+    }
+    Remove-Item -LiteralPath (Join-Path $install 'data\login.stop') -Force -ErrorAction SilentlyContinue
 
     # Remove the obsolete network bridge completely.
     Stop-ScheduledTask -TaskName 'Paradigm Visitor Bridge Watchdog' -ErrorAction SilentlyContinue
@@ -100,11 +157,12 @@ try {
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $taskPrincipal -Settings $settings -Force | Out-Null
 
-    $loginTask = 'Paradigm Visitor Login'
     $loginAction = New-ScheduledTaskAction -Execute $python `
         -Argument ('"' + (Join-Path $install 'login_edge.py') + '" --automatic --config "' + $cfgPath + '"') `
         -WorkingDirectory $install
-    Register-ScheduledTask -TaskName $loginTask -Action $loginAction -Principal $taskPrincipal -Settings $settings -Force | Out-Null
+    $loginSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName $loginTask -Action $loginAction -Principal $taskPrincipal -Settings $loginSettings -Force | Out-Null
     Start-ScheduledTask -TaskName $loginTask
 
     New-Item -ItemType Directory -Force -Path (Join-Path $install 'data\jobs') | Out-Null

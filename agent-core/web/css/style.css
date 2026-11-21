@@ -880,23 +880,38 @@ html, body {
   opacity: .65;
 }
 .ql-printer-discover-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
   width: 100%;
-  min-height: 38px;
-  margin-top: 7px;
-  padding: 8px 14px;
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-sm);
-  background: var(--accent);
+  min-height: 44px;
+  margin-top: 10px;
+  padding: 11px 18px;
+  border: 0;
+  border-radius: 10px;
+  appearance: none;
+  background: linear-gradient(135deg, #d97732, #bd5426);
   color: #fff;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.2;
   cursor: pointer;
-  transition: filter .15s ease, transform .15s ease;
+  box-shadow: 0 5px 14px rgba(190, 84, 38, 0.22);
+  transition: transform .15s ease, box-shadow .15s ease, opacity .15s ease;
 }
-.ql-printer-discover-button:hover {
-  filter: brightness(1.06);
+.ql-printer-discover-button:hover:not(:disabled) {
   transform: translateY(-1px);
+  box-shadow: 0 7px 18px rgba(190, 84, 38, 0.3);
+}
+.ql-printer-discover-button:focus-visible {
+  outline: 3px solid var(--accent-dim);
+  outline-offset: 2px;
+}
+.ql-printer-discover-button:disabled {
+  cursor: wait;
+  opacity: .65;
 }
 .ql-printer-progress {
   margin-top: 8px;

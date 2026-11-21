@@ -18,6 +18,11 @@ def main():
     if not profile.is_absolute():
         profile = config_path.parent / profile
     profile.mkdir(parents=True, exist_ok=True)
+    data_dir = config_path.parent / "data"
+    pages_path = data_dir / "edge-pages.json"
+    stop_path = data_dir / "login.stop"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    pages_path.unlink(missing_ok=True)
 
     from playwright.sync_api import sync_playwright
 
@@ -38,6 +43,8 @@ def main():
             deadline = time.monotonic() + 15 * 60
             last_pages = []
             while time.monotonic() < deadline:
+                if stop_path.exists():
+                    break
                 if not context.pages:
                     break
                 time.sleep(1)
@@ -52,8 +59,6 @@ def main():
                         current_pages.append({"title": title or url, "url": url})
                 if current_pages:
                     last_pages = current_pages
-                    pages_path = config_path.parent / "data" / "edge-pages.json"
-                    pages_path.parent.mkdir(parents=True, exist_ok=True)
                     pages_path.write_text(json.dumps(last_pages, ensure_ascii=False), encoding="utf-8")
         else:
             input("完成后回到此窗口，按回车保存登录状态并退出：")

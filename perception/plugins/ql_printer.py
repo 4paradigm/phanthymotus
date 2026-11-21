@@ -239,8 +239,28 @@ class SSHBridgeClient:
         script = rf"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
+$action = '{action}'
 $task = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction Stop
 $install = $task.Actions | Select-Object -First 1 -ExpandProperty WorkingDirectory
+# The login task and the on-demand worker use the same persistent Edge profile.
+# Ask the login process to close it cleanly before a query or print opens it.
+if ($action -in @('list','print')) {{
+    $loginTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Login' -ErrorAction SilentlyContinue
+    if ($loginTask -and $loginTask.State -eq 'Running') {{
+        $data = Join-Path $install 'data'
+        New-Item -ItemType Directory -Force -Path $data | Out-Null
+        Set-Content -LiteralPath (Join-Path $data 'login.stop') -Value '{job_id}' -Encoding ascii
+    }}
+    for ($wait = 0; $wait -lt 40; $wait++) {{
+        $loginTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Login' -ErrorAction SilentlyContinue
+        if (!$loginTask -or $loginTask.State -ne 'Running') {{ break }}
+        Start-Sleep -Milliseconds 250
+    }}
+    if ($loginTask -and $loginTask.State -eq 'Running') {{
+        throw '登录中的 Edge 尚未正常退出；请关闭前台登录窗口后重试，避免浏览器配置被同时占用'
+    }}
+    Remove-Item -LiteralPath (Join-Path $install 'data\login.stop') -Force -ErrorAction SilentlyContinue
+}}
 $jobs = Join-Path $install 'data\jobs'
 New-Item -ItemType Directory -Force -Path $jobs | Out-Null
 $request = Join-Path $jobs '{job_id}.request.json'
