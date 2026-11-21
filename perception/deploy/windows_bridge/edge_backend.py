@@ -622,6 +622,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                 # the visitor-list page.
                 deadline = time.monotonic() + 45
                 printed = False
+                submitted = False
                 while time.monotonic() < deadline:
                     pages = [candidate for candidate in self._context.pages if not candidate.is_closed()]
                     candidates = [candidate for candidate in pages if candidate not in existing_pages]
@@ -634,7 +635,13 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                         if state == "complete":
                             printed = True
                             break
-                    if printed:
+                        if state == "submitted":
+                            # window.print() has handed the job to the browser
+                            # (kiosk printing sends it straight to the printer).
+                            # afterprint is unreliable here, so stop waiting
+                            # for it and confirm via the booking status below.
+                            submitted = True
+                    if printed or submitted:
                         break
                     active = next((candidate for candidate in candidates if not candidate.is_closed()), None)
                     if active is None:
@@ -646,6 +653,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     # list row keeps showing the stale status until the page
                     # is refreshed, so reload and re-check for a while before
                     # declaring the outcome unknown.
+                    final_status = ""
                     status_deadline = time.monotonic() + 15
                     while time.monotonic() < status_deadline:
                         try:
@@ -659,16 +667,30 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                             text = fresh.inner_text(timeout=2000) if fresh is not None else ""
                         except Exception:
                             text = ""
-                        if "已入场" in text or "已离场" in text:
+                        final_status = next(
+                            (status for status in ("已入场", "已离场", "未入场") if status in text),
+                            "",
+                        )
+                        if final_status in ("已入场", "已离场"):
                             printed = True
                             break
-                        page.wait_for_timeout(2000)
+                        page.wait_for_timeout(1500)
                     if not printed:
                         raise BridgeFailure(
                             "print_outcome_unknown",
                             "打印页没有报告完成，且访客状态仍未入场；请核对前台打印窗口和打印机后再决定是否重试",
                             uncertain=True,
                         )
+                else:
+                    final_status = ""
+                # Close any print page the portal opened; when afterprint was
+                # never observed its delayed window.close() never fires either.
+                for candidate in list(self._context.pages):
+                    if candidate not in existing_pages and not candidate.is_closed():
+                        try:
+                            candidate.close()
+                        except Exception:
+                            pass
             except Exception as exc:
                 if isinstance(exc, BridgeFailure):
                     raise
@@ -677,6 +699,8 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     "网页已触发打印，但浏览器未确认打印流程结束；系统不会自动重试，请核对打印机和访客状态",
                     uncertain=True,
                 ) from exc
+            if final_status:
+                return final_status
             try:
                 text = row.inner_text(timeout=1000)
             except Exception:
