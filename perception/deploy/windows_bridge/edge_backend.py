@@ -641,13 +641,29 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                         break
                     active.wait_for_timeout(200)
                 if not printed:
-                    # The portal may already have changed the booking status
-                    # even when its print page did not emit afterprint.
-                    try:
-                        text = row.inner_text(timeout=1000)
-                    except Exception:
-                        text = ""
-                    if "已入场" not in text:
+                    # The portal may update the booking status asynchronously
+                    # even when its print page did not emit afterprint.  The
+                    # list row keeps showing the stale status until the page
+                    # is refreshed, so reload and re-check for a while before
+                    # declaring the outcome unknown.
+                    status_deadline = time.monotonic() + 15
+                    while time.monotonic() < status_deadline:
+                        try:
+                            page.reload(wait_until="domcontentloaded")
+                            fresh = None
+                            for _ in range(10):
+                                fresh = self._row_for(page, visit)
+                                if fresh is not None:
+                                    break
+                                page.wait_for_timeout(500)
+                            text = fresh.inner_text(timeout=2000) if fresh is not None else ""
+                        except Exception:
+                            text = ""
+                        if "已入场" in text or "已离场" in text:
+                            printed = True
+                            break
+                        page.wait_for_timeout(2000)
+                    if not printed:
                         raise BridgeFailure(
                             "print_outcome_unknown",
                             "打印页没有报告完成，且访客状态仍未入场；请核对前台打印窗口和打印机后再决定是否重试",
