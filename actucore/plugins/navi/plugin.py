@@ -362,7 +362,7 @@ class NaviPlugin:
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
                     "obstacle_stop_m": {"type": "number",
-                                        "default": self._cfg.get("obstacle_stop_m", 0.6),
+                                        "default": self._cfg.get("obstacle_stop_m", policy_mod.Config.obstacle_stop_m),
                                         "description": "正前方障碍近于这个距离就完全"
                                                        "不前进（米）。达到或超过到达"
                                                        "距离阈值时，目标可能先被当作"
@@ -2360,7 +2360,9 @@ class NaviPlugin:
             route_target = (math.hypot(goal.x, goal.y), math.atan2(-goal.y, goal.x))
         detour, key = self._state.view_detour, self._state.local_plan.key
         leg = self._state.executing_leg
-        pose = self._state.active_scan.pose
+        scan = self._state.active_scan
+        pose = scan.pose
+        selected_route = scan.route_segment and scan.phase in ("brake", "turn", "evaluate")
         if self._command_timer is not None:
             with self._output_lock:
                 work = self._scheduled_command
@@ -2373,8 +2375,17 @@ class NaviPlugin:
         with self._obs_lock:
             jpeg = self._image_jpeg
             depth, ground = self._depth_map, self._depth_ground
-            if key is None or self._depth_ms != key[0]:
+            if not selected_route and (key is None or self._depth_ms != key[0]):
                 detour = None
+        if selected_route and detour is None and executing is None and scan.advance_m is not None:
+            geometry = self._config.scan_geometry or self._config.local_geometry
+            if geometry is not None:
+                origin = scan.advance_origin
+                if origin is None:
+                    f, r, heading = scan.origin if scan.origin_set else scan.pose
+                    origin = (f, r, heading + scan.directions[0] * scan.turn_angle)
+                selected = policy_mod.PathLeg(geometry, (scan.advance_m, 0.), origin)
+                detour = local_path.Detour(None, ((0., 0.), selected.remaining(scan.pose)), geometry)
         snapshot = {
             # Arrays and payloads are *replaced* by their callbacks, never
             # mutated in place, so holding a reference is a safe snapshot.

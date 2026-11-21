@@ -436,3 +436,26 @@ def test_executing_segment_is_visibly_distinct_from_candidate():
     executing = _render(depth_m=depth, ground=ground, detour=candidate, executing=active)
     assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
     assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+
+
+@needs_cv2
+def test_route_monitor_draws_selected_and_executing_routes_without_ground():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .21)
+    candidate = Detour(None, ((0., 0.), (.8, .3)), geometry)
+    active = Detour(None, ((0., 0.), (.8, -.3)), geometry)
+    baseline = _render(ground=None, clearance=None)
+    preview = _render(ground=None, clearance=None, detour=candidate)
+    executing = _render(ground=None, clearance=None, detour=candidate, executing=active)
+    assert not np.array_equal(preview, baseline)
+    assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
+    assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+
+
+@needs_cv2
+def test_unprojected_target_guidance_does_not_look_like_an_executing_route():
+    frame = _render(ground=None, clearance=None, route_target=(2., .2))
+    assert np.count_nonzero((frame[:145, 500:] == V._TARGET).all(axis=2)) > 30
+    assert not (frame == V._EXECUTING_ROUTE).all(axis=2).any()

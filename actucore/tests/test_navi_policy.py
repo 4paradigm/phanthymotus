@@ -518,7 +518,7 @@ def test_the_escape_turn_is_aimed_at_the_gap_rather_than_slammed_to_the_limit():
     The gap sits at `atan(keep / ahead)` off the nose, so the turn closes that
     angle with the same proportional law the main loop uses.
     """
-    config = _cfg()
+    config = _cfg(obstacle_stop_m=.60)
     decision = _step(detections=_detections(_obj(x=0.0)), config=config,
                      depth=_depth(map_=_obstacle_map(5.0, [(0.25, 0.6, 0.3)])))
     expected = config.k_yaw * math.atan2(P._keepout_m(config), 0.6)
@@ -1962,7 +1962,7 @@ def test_a_standard_doorway_reads_as_passable():
     比任何一扇门都宽。于是门框永远算在正前方，clearance 读到门平面而不是门洞。
     """
     true_fov = 0.888
-    config = _cfg(clearance_margin_m=.10, half_fov_rad=true_fov)
+    config = _cfg(clearance_margin_m=.10, half_fov_rad=true_fov, obstacle_stop_m=.60)
     # 必须用机器人自己声明的 footprint。Config 的兜底半宽 0.35 加上余量要求
     # **1.0 m 净宽**，而标准门只有 0.8~0.9 m —— 也就是说没有 footprint 声明的底盘
     # 本来就过不了门，而且过不去的理由跟视场角无关。R1 声明的是 0.179。
@@ -2280,7 +2280,7 @@ def test_unknown_range_and_zero_baseline_gain_do_not_acquire_an_artificial_floor
 
 def test_a_blocked_corridor_does_not_accumulate_forward_gain():
     config = _cfg(adaptive_k_fwd=True, stop_distance_m=0.4, stop_tolerance_m=0.05,
-                  k_fwd=0.4, use_lateral=False)
+                  k_fwd=0.4, use_lateral=False, obstacle_stop_m=.60)
     state = _adaptive_ready(config, distance=0.58)
     gains = []
     for _ in range(10):
@@ -2589,7 +2589,7 @@ def test_brake_before_box_and_resume_on_the_current_clear_observation():
 
 
 def test_box_blocking_both_routes_allows_only_a_slow_straight_approach():
-    cfg = _cfg(stop_distance_m=0.6, floor_vx=0.04)
+    cfg = _cfg(stop_distance_m=0.6, obstacle_stop_m=.60, floor_vx=0.04)
     box = _scene(2.8, [(0.0, 1.16, 0.65), (-0.58, 0.95, 0.2), (0.58, 0.95, 0.2)])
     detections = _detections(_obj(x=0.2))
     decision = _step(detections=detections, depth=box, config=cfg)
@@ -2812,7 +2812,12 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
 
     def observe(*args):
         blocked = fault == "sweeps_blocked" or (fault == "recovery_sweeps_blocked" and after_gap)
-        return (free & ~posts, posts) if blocked else (free, ~free)
+        if blocked:
+            return free & ~posts, posts
+        if fault == "corridor_blocked" and abs(robot[2]) > .30:
+            wall = np.isclose(local_path.FORWARD, .85)
+            return free & ~wall, wall
+        return free, ~free
 
     monkeypatch.setattr(active_scan, "observe", observe)
 
@@ -2879,7 +2884,7 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
                     return
             elif fault == "recovery_corridors_blocked":
                 assert values[:2] == [0., 0.]
-                if "转向后的直行走廊仍然被挡住" in decision.reason:
+                if "停车距离不足" in decision.reason:
                     assert min(recovery_turns) < 0. < max(recovery_turns)
                     assert state.active_scan.attempted and not state.active_scan.active
                     return
@@ -3464,7 +3469,7 @@ def test_near_turn_stops_forward_until_the_current_corridor_is_clear():
 
 
 def test_a_clear_observation_after_a_stop_allows_searching_for_a_lost_target():
-    cfg = _cfg(stop_distance_m=0.6, lost_frames=1)
+    cfg = _cfg(stop_distance_m=0.6, obstacle_stop_m=.60, lost_frames=1)
     blocked = _scene(3.0, [(0.0, 0.85, 0.65)])
     state = seed(_state(), _detections(_obj()), blocked, cfg)
     stopped = _step(detections=_detections(_obj()), depth=blocked, state=state, config=cfg)
@@ -3732,7 +3737,7 @@ def test_partial_outcome_requires_measured_progress_toward_the_original_target(
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2)
     config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, wz_max=0.,
-                  half_width_m=.2, stop_distance_m=.6)
+                  half_width_m=.2, stop_distance_m=.6, obstacle_stop_m=.60)
     state = _state(motion_source="measured")
     target = SimpleNamespace(observed=True, range_known=True, range_m=2.1,
                              measured_range_m=2.1, bearing_rad=0.)
@@ -4625,3 +4630,49 @@ def test_local_plan_dispatches_a_checked_turn_on_the_first_tick_while_approachin
     assert state.active_scan.route_segment and state.active_scan.phase == "turn"
     assert state.view_detour is not None
     assert decision.values[:5] == [0.] * 5 and 0. < abs(decision.values[5]) <= config.wz_max
+
+
+@pytest.mark.parametrize("ahead, obstacle, moves", [
+    (.83, False, True), (.48, False, False), (.83, True, False),
+])
+def test_post_turn_clear_corridor_uses_stopping_distance(ahead, obstacle, moves):
+    from plugins.navi import local_path
+
+    geometry = local_path.Geometry(None, None, np.eye(4), .20, .20, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+                  obstacle_stop_m=.50)
+    state = _state()
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1200
+    scan.phase, scan.advance_m = "evaluate", .45
+    scan.poses.append((1200, scan.pose, 0.))
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    if obstacle:
+        occupied = np.isclose(local_path.FORWARD, .35)
+    scan.views.append((1200, scan.pose, ~occupied, occupied))
+    feedback = dict(vx=0., vy=0., wz=0.)
+    result = P._advance_after_scan({"frame_id": 1200}, config, state, feedback,
+                                   ahead, config.obstacle_stop_m, 2., .1)
+    assert (result[0] > 0.) is moves
+
+
+def test_verified_target_corridor_releases_near_stop_recovery(monkeypatch):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+                  obstacle_stop_m=.50, use_lateral=False)
+    state = _state(recovery=True, blocked_for_s=1.)
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1200
+    occupied = np.isclose(local_path.FORWARD, .58, atol=.025) & (abs(local_path.RIGHT) > .50)
+    scan.views.append((1200, scan.pose, ~occupied, occupied))
+    frame = np.ones((8, 8))
+    depth = dict(frame_id=1200, map=frame, ground=frame.astype(bool))
+    feedback = dict(vx=0., vy=0., wz=0.)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.58, 1.))
+    result = P._avoid(.2, 0., 0., depth, config, P.APPROACHING, "", state,
+                      target_distance=2., target_bearing=0., odom=feedback, may_scan=True)
+    assert result[:3] == (.2, 0., 0.)
+    assert not state.recovery and not state.blocked_for_s

@@ -1726,7 +1726,7 @@ def test_a_calibrated_corridor_excludes_the_left_doorframe():
     import numpy as np
     from plugins.navi import policy, view
 
-    card = _card(half_width_m=0.23, clearance_margin_m=.10)
+    card = _card(half_width_m=0.23, clearance_margin_m=.10, obstacle_stop_m=.60)
     depth = np.full((480, 640), 1.12, dtype=np.float32)
     depth[168:408, 104:120] = 0.56
     declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
@@ -2456,3 +2456,35 @@ def test_checked_local_leg_uses_independent_command_timer(monkeypatch, event):
     else:
         assert published[1]["values"] == [0.] * 6
         assert not card._stage_command(request, old_epoch)
+
+
+def test_selected_turn_route_survives_new_depth_without_a_plan_cache():
+    import queue
+
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    card = _card()
+    card._view_queue = queue.Queue(maxsize=1)
+    scan = card._state.active_scan
+    geometry = card._config.local_geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    scan.phase, scan.route_segment, scan.advance_m = "brake", True, 1.
+    scan.directions, scan.turn_angle = (1.,), .30
+    candidate = Detour(None, ((0., 0.), (.955, .296), (1.5, .30)), geometry)
+    card._state.view_detour = candidate
+    card._publish_view()
+    assert card._view_queue.get_nowait()["detour"] == candidate
+
+    card._state.view_detour = None
+    card._depth_ms = 2
+    card._view_next_at = 0.
+    scan.phase, scan.origin_set, scan.pose = "turn", True, (0., 0., .10)
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["detour"].points[1] == pytest.approx((.98007, .19867), abs=1e-5)
+    assert snapshot["executing"] is None
+
+    scan.phase = "idle"
+    card._view_next_at = 0.
+    card._publish_view()
+    assert card._view_queue.get_nowait()["detour"] is None

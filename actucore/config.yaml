@@ -286,7 +286,7 @@ plugins:
     # 停车后用连续新深度帧确认通道，再逐步恢复。
     slow_distance_m: 1.5
     side_clearance_m: 1.0
-    obstacle_stop_m: 0.6
+    obstacle_stop_m: 0.5
 
     # 「走廊」是米制的，不是画面的三等分。
     #

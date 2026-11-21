@@ -141,7 +141,7 @@ class Config:
     odom_expected: bool = False
     local_geometry: Geometry | None = None
     scan_geometry: Geometry | None = None
-    obstacle_stop_m: float = 0.6
+    obstacle_stop_m: float = 0.5
     # Lateral offset that still allows full speed. **Not a gate** — past it the
     # speed is scaled down, reaching zero at align_full_stop. See
     # `_alignment_scale`.
@@ -2140,12 +2140,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         stop = min(slow, stop + speed * depth_age_s)
     near = ahead is not None and ahead <= stop
     approaching = ahead is not None and ahead < slow
-    scale = 1.0
-    if approaching:
-        scale *= max(0.0, (ahead - stop) / max(1e-6, slow - stop))
-        if status != ALIGNING:
-            status, reason = AVOIDING, f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速"
-
     side = 0.0
     local_command = None
     local_route = None
@@ -2221,13 +2215,24 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         ahead_band = (FORWARD > 0.) & (abs(FORWARD - plane) <= .10)
         observed_obstacle = (scan.grid()[1] & ahead_band & (abs(RIGHT) <= _keepout_m(config))).any()
     needs_detour = near or plan_obstacle or observed_obstacle or (foreground and approaching)
+    corridor_clear = False
     if needs_detour and not near and may_scan and scan is not None and not scan.has_result:
         motion = planar_feedback(odom) or state.command_tail
         floor = config.floor_wz_moving if vx or vy else config.floor_wz
         yaw = min(max(abs(wz), floor), _scan_yaw_rate(config, 1. if wz < 0. else -1.)) if wz else 0.
-        if _target_corridor_clear(depth, config, scan, target_distance, target_bearing,
-                                  (motion, state.commanded, (vx, vy, yaw))):
-            needs_detour = False
+        corridor_clear = _target_corridor_clear(
+            depth, config, scan, target_distance, target_bearing, (motion, state.commanded, (vx, vy, yaw)))
+        needs_detour = not corridor_clear
+
+    scale = 1.
+    if corridor_clear:
+        # The current route and velocity sweep have both passed the grid check.
+        state.recovery = False
+        state.blocked_for_s = 0.
+    elif approaching:
+        scale = max(0., (ahead - stop) / max(1e-6, slow - stop))
+        if status != ALIGNING:
+            status, reason = AVOIDING, f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速"
     if needs_detour:
         stationary_line = config.obstacle_stop_m + LOCAL_BLOCKED_APPROACH_BUFFER_M
         brake_at = min(slow, max(stop, stationary_line) if config.local_planning
@@ -2523,15 +2528,19 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
     horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
     waypoint_horizon = horizon + dt
     floor = config.floor_vx_moving if config.floor_vx_moving is not None else config.floor_vx
+    target_room = target_distance - config.stop_distance_m
+    obstacle_room = ahead - stop if ahead is not None else math.inf
+    room = min(target_room, obstacle_room)
+    speed = min(config.vx_max, max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS), room / horizon)
+    usable_speed = speed > 0. and speed >= floor
     remaining = scan.advance_m
     if scan.advance_origin is None:
         grid = scan.grid()
         keep = _keepout_m(config)
         corridor_clear = (local_path.segment_clear(grid[1], geometry, keep, 0., scan.advance_m)
                           and local_path.transition_clear(grid, geometry, keep, 1., ((scan.advance_m, 0.),)))
-        if not scan.route_segment and ahead is not None and ahead < config.slow_distance_m:
-            corridor_clear = False
-        if not corridor_clear:
+        too_close = not scan.route_segment and obstacle_room <= target_room and not usable_speed
+        if not corridor_clear or too_close:
             matched_view = scan.matches_route_view(depth)
             if (not scan.rerouted and not scan.command_only and matched_view
                     and ahead is not None and target_bearing is not None
@@ -2549,6 +2558,8 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
                 scan.exhaust()
             else:
                 scan.interrupt()
+            if corridor_clear:
+                return 0., 0., 0., AVOIDING, "主动观察：停车距离不足"
             reason = ("路线首段的直行走廊被挡住" if scan.route_segment
                       else "转向后的直行走廊仍然被挡住")
             return 0., 0., 0., AVOIDING, f"主动观察：{reason}"
@@ -2566,11 +2577,7 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
             scan.finish()
             return 0., 0., 0., AVOIDING, "主动观察：直行段结束，重新评估前方"
 
-    room = target_distance - config.stop_distance_m
-    if ahead is not None:
-        room = min(room, ahead - stop)
-    speed = min(config.vx_max, max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS), room / horizon)
-    if speed <= 0. or speed < floor or max(motion[0], previous[0]) * horizon > room:
+    if not usable_speed or max(motion[0], previous[0]) * horizon > room:
         if (scan.route_segment and scan.advance_origin is not None and not scan.command_only
                 and ahead is not None and ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance):
             scan.hold_for_replan("主动观察：直行余量不足，停车后重规划", retry_scan=False)

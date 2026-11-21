@@ -215,6 +215,25 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
             _column_of(edge, config.half_fov_rad, width))
 
 
+def _target_guidance(geometry, start, target, stop_distance_m):
+    if target is None:
+        return None
+    distance, bearing = target
+    if not (math.isfinite(distance) and distance > 0 and math.isfinite(bearing)):
+        return None
+    x, z = distance * math.sin(bearing), distance * math.cos(bearing)
+    goal = (z, x)
+    if geometry is not None:
+        forward, left = geometry.base_from_optical[:2, :3] @ (x, 0., z)
+        goal = (forward, -left)
+    approach = math.dist(start, goal)
+    if approach <= stop_distance_m + .05:
+        return None
+    end = tuple(target_m + (start_m - target_m) * stop_distance_m / approach
+                for start_m, target_m in zip(start, goal))
+    return start, end
+
+
 def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *,
                 stop_distance_m, pending=False):
     """Project route boundaries and dashed guidance to the stopping point."""
@@ -231,18 +250,9 @@ def route_lines(depth_m, ground, geometry, points, target, keep, width, height, 
         return []
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     sections = [(np.asarray(points, dtype=float), pending)] if points else []
-    if target is not None:
-        distance, bearing = target
-        if math.isfinite(distance) and distance > 0 and math.isfinite(bearing):
-            x, z = distance * math.sin(bearing), distance * math.cos(bearing)
-            body = rotation @ np.array([x, 0., z])
-            start = points[-1] if points else (0., 0.)
-            goal = (body[0], -body[1])
-            approach = math.dist(start, goal)
-            if approach > stop_distance_m + .05:
-                end = tuple(target_m + (start_m - target_m) * stop_distance_m / approach
-                            for start_m, target_m in zip(start, goal))
-                sections.append((np.linspace(start, end, 25), True))
+    guidance = _target_guidance(geometry, points[-1] if points else (0., 0.), target, stop_distance_m)
+    if guidance is not None:
+        sections.append((np.linspace(*guidance, num=25), True))
 
     near = .10
     lines = []
@@ -253,7 +263,7 @@ def route_lines(depth_m, ground, geometry, points, target, keep, width, height, 
             floor = (offset + normal @ origin - normal[0] * forward + normal[1] * right) / normal[2]
             optical = (np.column_stack((forward, -right, floor)) - origin) @ rotation
             for i, (a, b) in enumerate(zip(optical, optical[1:])):
-                if (dashed and i % 2 == 0) or max(a[2], b[2]) < near:
+                if (dashed and len(centre) > 2 and i % 2 == 0) or max(a[2], b[2]) < near:
                     continue
                 # Clip only the part behind the camera before projecting.
                 if a[2] < near:
@@ -293,6 +303,41 @@ def _line(frame, start, end, colour, thickness: int = 2):
 
     cv2.line(frame, start, end, _CASING, thickness + 3, cv2.LINE_AA)
     cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
+
+
+def _draw_route_inset(frame, detour, executing, guidance=None):
+    import cv2
+
+    routes = [(route.points, colour) for route, colour in
+              ((detour, _CORRIDOR), (executing, _EXECUTING_ROUTE))
+              if route is not None and len(route.points) > 1]
+    if guidance is not None:
+        routes.append((guidance, _TARGET))
+    height, width = frame.shape[:2]
+    size = min(132, width // 3, height // 3)
+    if not routes or size < 40:
+        return
+
+    points = np.array([(0., 0.)] + [point for route, _ in routes for point in route])
+    lower, upper = points.min(axis=0), points.max(axis=0)
+    midpoint = (upper + lower) / 2
+    scale = (size - 32) / max(.3, float((upper - lower).max()))
+    left, top = width - size - 8, 8
+
+    def pixel(point):
+        forward, right = (point - midpoint) * scale
+        return round(left + size / 2 + right), round(top + size / 2 + 6 - forward)
+
+    cv2.rectangle(frame, (left, top), (left + size, top + size), _CASING, -1)
+    _text(frame, "Top view", (left + 7, top + 15), _CORRIDOR, .38)
+    for route, colour in routes:
+        pixels = [pixel(point) for point in route]
+        for start, end in zip(pixels, pixels[1:]):
+            if colour == _TARGET:
+                _dashed_line(frame, start, end, colour)
+            else:
+                _line(frame, start, end, colour, thickness=3)
+    cv2.circle(frame, pixel((0., 0.)), 3, _TARGET, -1, cv2.LINE_AA)
 
 
 def _arrow(frame, origin, dx, dy, colour, label: str):
@@ -371,12 +416,19 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                 phase = _dashed_line(frame, a, b, _CORRIDOR, phase if a == previous_end else 0.)
             previous_end = b
 
+    execution_visible = False
     if executing is not None:
         for a, b, _ in route_lines(depth_m, ground, executing.geometry, executing.points, None,
                                   keep, width, height, stop_distance_m=config.stop_distance_m):
             visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
             if visible:
                 _line(frame, a, b, _EXECUTING_ROUTE, thickness=3)
+                execution_visible = True
+    if (detour is not None and previous_end is None) or (executing is not None and not execution_visible):
+        _draw_route_inset(frame, detour, executing)
+    elif previous_end is None and not execution_visible and route_target is not None:
+        guidance = _target_guidance(geometry, (0., 0.), route_target, config.stop_distance_m)
+        _draw_route_inset(frame, None, None, guidance)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
