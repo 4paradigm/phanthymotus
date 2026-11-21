@@ -547,6 +547,39 @@ def test_a_one_shot_result_is_echoed_onto_a_running_cards_topic(tmp_path):
     assert node.publishers[0].topic == vop_plugin.DEFAULT_OUTPUT_TOPIC
 
 
+@pytest.mark.parametrize("action", ["recognize_by_photo", "recognize_by_url"])
+def test_one_shot_on_stream_topic_has_no_ros_provenance(action, tmp_path, monkeypatch):
+    import plugins.image_input as image_input
+
+    plugin, executor = _photo_plugin(tmp_path, rows=[[1.0, 1.0, 2.0, 2.0, 0.9, 0]])
+    node = _node_with(plugin, executor)
+    try:
+        frame = _send_frame(node, _stamped_frame())
+        assert frame["temporal_eligible"] is True
+        args = {"action": action, "instance_id": "/cam/rgb"}
+        if action == "recognize_by_url":
+            monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: frame_bytes())
+            args["url"] = "https://example.com/scene.jpg"
+        else:
+            args["image_path"] = _write_frame(tmp_path)
+
+        reply = plugin.dispatch("vop", args)
+        published = _payloads(node)[1:]
+        assert len(published) == 1
+        echo = published[0]
+        assert reply["ok"] is True
+        assert echo["objects"] == reply["objects"]
+        assert echo["source_mode"] == "one_shot"
+        assert echo["source_clock_status"] == "unavailable"
+        assert echo["temporal_eligible"] is False
+        for payload in (reply, echo):
+            assert {"source_stamp", "source_frame_id", "source_topic", "stream_id",
+                    "frame_seq"}.isdisjoint(payload)
+        assert {"source_mode", "source_clock_status", "temporal_eligible"}.isdisjoint(reply)
+    finally:
+        plugin.dispatch("vop", {"action": "stop"})
+
+
 def test_a_one_shot_result_without_any_running_card_publishes_nothing(tmp_path):
     plugin, executor = _photo_plugin(tmp_path, rows=[[1.0, 1.0, 2.0, 2.0, 0.9, 0]])
     result = plugin.dispatch("vop", {"action": "recognize_by_photo",
@@ -617,25 +650,23 @@ def test_retire_leaves_the_executor_before_destroying_anything():
 
 # ── payload fields ───────────────────────────────────────────────────────────
 
-def test_published_payload_carries_count_and_latency():
+def test_published_payload_carries_count_and_latency(metadata_stream, monkeypatch):
     """Mirrors plugins/face.py: a consumer should not have to len() the list,
     and latency is the number an operator actually watches."""
-    plugin, executor = _plugin(
-        model=_FakeModel(rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]]))
-    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
-    node = executor.nodes[0]
-    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    _, node = metadata_stream(_FakeModel(rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]]))
+    wall_times = iter((2000.0, 2000.125))
+    monkeypatch.setattr(vop_plugin, "time", SimpleNamespace(
+        monotonic=vop_plugin.time.monotonic, time=lambda: next(wall_times, 2000.125)))
 
-    pub = node.publishers[0]
-    assert _wait_until(lambda: bool(pub.messages))
-    payload = json.loads(pub.messages[0])
+    payload = _send_frame(node, _stamped_frame(sec=123, nanosec=456))
+    assert type(payload["count"]) is int
     assert payload["count"] == 1
+    assert isinstance(payload["objects"], list)
     assert payload["count"] == len(payload["objects"])
-    assert isinstance(payload["latency_ms"], int)
-    assert payload["latency_ms"] >= 0
-    # `timestamp` keeps its name — face calls it `ts`, but renaming vop's would
-    # break every existing reader of {topic}/objects.
-    assert "timestamp" in payload
+    assert type(payload["latency_ms"]) is int
+    assert payload["latency_ms"] == 125
+    assert type(payload["timestamp"]) is float
+    assert payload["timestamp"] == 2000.125
 
 
 def test_an_empty_detection_still_reports_count_zero():
@@ -669,11 +700,12 @@ def test_the_one_shot_reply_reports_the_same_two_numbers(tmp_path):
     assert "latency_ms" in published
 
 
-# Lifecycle-only tests; source-field assertions arrive in PR2.
+# ── Stream source provenance ─────────────────────────────────────────────────
 
-def _stamped_frame(sec=123, nanosec=1, width=200):
+def _stamped_frame(sec=123, nanosec=1, width=200, frame_id=""):
     msg = _FakeCompressedImage(frame_bytes(width, 100))
     msg.header.stamp = SimpleNamespace(sec=sec, nanosec=nanosec)
+    msg.header.frame_id = frame_id
     return msg
 
 
@@ -721,6 +753,193 @@ class _BlockingWidthModel(_FakeModel):
         rows = np.array([[[0, 0, w, h, 0.9, 0]]], dtype=np.float32)
         return [rows], LetterboxMeta(1.0, 0, 0, w, h)
 
+
+def test_stream_preserves_source_stamp_and_frame_id(metadata_stream):
+    _, node = metadata_stream()
+    payload = _send_frame(node, _stamped_frame(
+        sec=1_987_654_321, nanosec=876_543_211, frame_id="camera_optical_frame"))
+
+    assert payload["source_stamp"] == {"sec": 1_987_654_321, "nanosec": 876_543_211}
+    assert all(type(value) is int for value in payload["source_stamp"].values())
+    assert payload["source_frame_id"] == "camera_optical_frame"
+    assert payload["source_topic"] == node.subscriptions[0].topic == "/cam/rgb"
+    assert payload["source_mode"] == "stream"
+    assert payload["source_clock_status"] == "ok"
+    assert payload["temporal_eligible"] is True
+
+
+def test_stream_reports_resolved_subscription_topic(metadata_stream, monkeypatch):
+    remaps = {"/cam/rgb": "/robot/front/rgb"}
+    monkeypatch.setattr(_FakeNode, "resolve_topic_name", lambda self, topic: remaps[topic])
+    _, node = metadata_stream()
+    assert _send_frame(node, _stamped_frame())["source_topic"] == "/robot/front/rgb"
+
+
+def test_inflight_inference_keeps_its_own_source_metadata(metadata_stream):
+    model = _BlockingWidthModel()
+    _, node = metadata_stream(model)
+    a = _stamped_frame(sec=10, nanosec=11, width=100, frame_id="A")
+    b = _stamped_frame(sec=20, nanosec=21, width=200, frame_id="B")
+    b.data = bytearray(b.data)
+    node._image_cb(a)
+    try:
+        assert model.entered.wait(timeout=2)
+        node._image_cb(b)
+        # A is in inference and B is still queued. The callback owns a copy of
+        # the mutable JPEG buffer and the scalar header values of each frame.
+        a.header.stamp.sec = b.header.stamp.sec = 999
+        a.header.frame_id = b.header.frame_id = "changed"
+        b.data[:] = frame_bytes(300, 100)
+    finally:
+        model.release.set()
+
+    assert _wait_until(lambda: len(node.publishers[0].messages) == 2)
+    first, second = _payloads(node)
+    assert first["objects"][0]["bbox"] == [0, 0, 100, 100]
+    assert first["source_stamp"] == {"sec": 10, "nanosec": 11}
+    assert first["source_frame_id"] == "A"
+    assert first["frame_seq"] == 0
+    assert second["objects"][0]["bbox"] == [0, 0, 200, 100]
+    assert second["source_stamp"] == {"sec": 20, "nanosec": 21}
+    assert second["source_frame_id"] == "B"
+    assert second["frame_seq"] == 1
+
+
+def test_single_slot_replaces_whole_packet_and_leaves_seq_gap(metadata_stream):
+    model = _BlockingWidthModel()
+    _, node = metadata_stream(model)
+    node._image_cb(_stamped_frame(sec=10, nanosec=1, width=100, frame_id="A"))
+    try:
+        assert model.entered.wait(timeout=2)
+        node._image_cb(_stamped_frame(sec=9, nanosec=2, width=200, frame_id="B"))
+        node._image_cb(_stamped_frame(sec=11, nanosec=3, width=300, frame_id="C"))
+        assert node._frames.dropped == 1
+    finally:
+        model.release.set()
+
+    assert _wait_until(lambda: len(node.publishers[0].messages) == 2)
+    first, last = _payloads(node)
+    assert [first["frame_seq"], last["frame_seq"]] == [0, 2]
+    assert first["stream_id"] == last["stream_id"]
+    assert first["objects"][0]["bbox"] == [0, 0, 100, 100]
+    assert first["source_stamp"] == {"sec": 10, "nanosec": 1}
+    assert first["source_frame_id"] == "A"
+    assert first["temporal_eligible"] is True
+    assert last["objects"][0]["bbox"] == [0, 0, 300, 100]
+    assert last["source_stamp"] == {"sec": 11, "nanosec": 3}
+    assert last["source_frame_id"] == "C"
+    # The overwritten frame regressed while A was still in flight.
+    assert last["source_clock_status"] == "regressed"
+    assert last["temporal_eligible"] is False
+
+
+def test_frame_seq_increases_for_each_frame_in_the_stream(metadata_stream):
+    _, node = metadata_stream()
+    payloads = [_send_frame(node, _stamped_frame(sec=sec)) for sec in range(10, 15)]
+    assert [payload["frame_seq"] for payload in payloads] == list(range(5))
+    assert len({payload["stream_id"] for payload in payloads}) == 1
+
+
+def test_fps_drop_still_advances_sequence_and_observes_clock(metadata_stream, monkeypatch):
+    _, node = metadata_stream()
+    node._frame_interval = 1
+    arrivals = iter((10.0, 10.5, 11.0))
+    monkeypatch.setattr(vop_plugin, "time", SimpleNamespace(
+        monotonic=lambda: next(arrivals), time=vop_plugin.time.time))
+
+    first = _send_frame(node, _stamped_frame(sec=100))
+    node._image_cb(_stamped_frame(sec=99))
+    last = _send_frame(node, _stamped_frame(sec=101))
+
+    assert len(_payloads(node)) == 2
+    assert [first["frame_seq"], last["frame_seq"]] == [0, 2]
+    assert last["source_clock_status"] == "regressed"
+    assert last["temporal_eligible"] is False
+
+
+def test_zero_source_stamp_is_preserved_and_unavailable(metadata_stream):
+    _, node = metadata_stream()
+    assert _send_frame(node, _stamped_frame(sec=10))["source_clock_status"] == "ok"
+    zero = _send_frame(node, _FakeCompressedImage(frame_bytes()))
+    assert zero["source_stamp"] == {"sec": 0, "nanosec": 0}
+    assert zero["source_clock_status"] == "unavailable"
+    assert zero["temporal_eligible"] is False
+    assert _send_frame(node, _stamped_frame(sec=11))["temporal_eligible"] is True
+
+
+def test_source_clock_regression_is_sticky(metadata_stream):
+    _, node = metadata_stream()
+    for sec in (100, 101):
+        payload = _send_frame(node, _stamped_frame(sec=sec))
+        assert payload["source_clock_status"] == "ok"
+        assert payload["temporal_eligible"] is True
+
+    for sec in (99, 102, 103, 0):
+        payload = _send_frame(node, _stamped_frame(sec=sec, nanosec=0))
+        assert payload["source_stamp"] == {"sec": sec, "nanosec": 0}
+        assert payload["source_clock_status"] == "regressed"
+        assert payload["temporal_eligible"] is False
+
+
+def test_source_clock_compares_nanoseconds_and_ignores_invalid_stamps(metadata_stream):
+    _, node = metadata_stream()
+    invalid = _send_frame(node, _stamped_frame(sec=300, nanosec=1_000_000_000))
+    assert invalid["source_stamp"] == {"sec": 300, "nanosec": 1_000_000_000}
+    assert invalid["source_clock_status"] == "unavailable"
+    assert invalid["temporal_eligible"] is False
+    assert _send_frame(node, _stamped_frame(sec=10, nanosec=2))["temporal_eligible"] is True
+    assert _send_frame(node, _stamped_frame(sec=10, nanosec=1))["source_clock_status"] == "regressed"
+
+
+def test_idempotent_start_keeps_stream_id_sequence_and_clock(metadata_stream):
+    plugin, node = metadata_stream()
+    first = _send_frame(node, _stamped_frame(sec=101))
+    assert _send_frame(node, _stamped_frame(sec=99))["source_clock_status"] == "regressed"
+
+    result = plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert result["state"] == "running"
+    assert plugin._executor.nodes == _FakeNode.instances == [node]
+    last = _send_frame(node, _stamped_frame(sec=102))
+    assert first["stream_id"] == last["stream_id"]
+    assert [first["frame_seq"], last["frame_seq"]] == [0, 2]
+    assert last["source_clock_status"] == "regressed"
+    assert last["temporal_eligible"] is False
+
+
+def test_stop_and_restart_renews_stream_id_and_resets_clock(metadata_stream):
+    plugin, old = metadata_stream()
+    old_id = _send_frame(old, _stamped_frame(sec=101))["stream_id"]
+    assert _send_frame(old, _stamped_frame(sec=99))["source_clock_status"] == "regressed"
+
+    result = plugin.dispatch("vop", {"action": "stop", "instance_id": "/cam/rgb"})
+    assert result["state"] == "idle"
+    assert old.destroyed
+    new = _node_with(plugin, plugin._executor)
+    assert new is not old
+    new._frame_interval = 0
+    for seq, sec in enumerate((10, 11)):
+        payload = _send_frame(new, _stamped_frame(sec=sec))
+        assert payload["stream_id"] != old_id
+        assert payload["frame_seq"] == seq
+        assert payload["source_clock_status"] == "ok"
+        assert payload["temporal_eligible"] is True
+
+
+def test_changed_stream_input_starts_new_provenance_context(metadata_stream):
+    plugin, old = metadata_stream()
+    before = _send_frame(old, _stamped_frame(sec=100))
+    result = plugin.dispatch("vop", {"action": "start", "instance_id": "/cam/rgb",
+                                     "input_topic": "/cam/new"})
+    assert result["state"] == "running"
+    assert old.destroyed
+    after = _send_frame(plugin._nodes["/cam/rgb"], _stamped_frame(sec=10))
+    assert after["source_topic"] == "/cam/new"
+    assert after["stream_id"] != before["stream_id"]
+    assert after["frame_seq"] == 0
+    assert after["temporal_eligible"] is True
+
+
+# ── Lifecycle regression tests ───────────────────────────────────────────────
 
 def test_stop_cancels_the_event_replaced_by_concurrent_start():
     node = vop_plugin._VOPNode("/cam/rgb", _FakeModel(), 0.3, 5, "stop_race")
@@ -978,7 +1197,10 @@ def test_inflight_retirement_is_tracked_until_worker_exits(metadata_stream, monk
                                  "input_topic": "/cam/new"})
         new = plugin._nodes["/cam/rgb"]
         assert new.get_name() != old.get_name()
-        _send_frame(new, _stamped_frame(width=300))
+        payload = _send_frame(new, _stamped_frame(width=300))
+        assert payload["stream_id"] != old._stream_id
+        assert payload["source_topic"] == "/cam/new"
+        assert payload["frame_seq"] == 0
         model.release.set()
         for thread in list(plugin._cleanup_threads):
             thread.join(timeout=3)

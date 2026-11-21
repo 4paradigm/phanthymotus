@@ -3294,8 +3294,30 @@ creation, prevents subsequent starts and allows repeated cleanup attempts.
 DepthART still requires an explicit stop before changing a live camera binding.
 
 VOP retains its existing generation/draining/reaper implementation and shares
-only the staged `NodeDisposal` primitive. None of these lifecycle fields changes
-the streamed detection payload or supplies image-source provenance.
+only the staged `NodeDisposal` primitive.
+
+### VOP source provenance
+
+VOP's `{input_topic}/objects` payload uses `timestamp` for the Unix time when
+VOP generates the result. Stream results carry `source_mode: "stream"` and
+preserve the original ROS image header in `source_stamp` (`sec` and `nanosec`
+as integers) and `source_frame_id`. `source_topic` is the resolved ROS input
+topic, including any remapping.
+
+`stream_id` identifies one running stream. Repeating an identical start keeps
+that ID. A replacement stream or a new start after stop gets a new ID and a
+fresh clock history. The callback numbers received frames from `frame_seq: 0`,
+so rate limiting and single-slot replacement can leave gaps in published results.
+
+`temporal_eligible` is a JSON boolean and is `true` when `source_clock_status`
+is `ok`. A zero or invalid stamp is preserved and reports `unavailable` before
+any regression. Once a valid stamp goes backward, all subsequent frames in that
+stream report `regressed`, including after the clock recovers. Both
+`unavailable` and `regressed` make `temporal_eligible` false.
+
+Photo and URL echoes on the ROS output topic carry `source_mode: "one_shot"`,
+`source_clock_status: "unavailable"`, and `temporal_eligible: false`. Those echoes
+omit the ROS source stamp, topic, frame ID, stream ID, and frame sequence.
 
 ### vop's streamed payload: `publish_bbox` and `publish_color`
 

@@ -35,9 +35,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import threading
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +50,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.latest_frame import LatestFrame
 from utils.ros_lifecycle import NodeDisposal, dispose_node
 
 from plugins.image_input import BadInput, load_image_bytes
@@ -401,6 +402,18 @@ TOOLS = [
 
 # ── ROS2 Node (one per instance/topic) ────────────────────────────────────────
 
+@dataclass(frozen=True)
+class _QueuedFrame:
+    data: bytes
+    source_stamp: tuple[int, int]
+    source_frame_id: str
+    source_topic: str
+    stream_id: str
+    frame_seq: int
+    source_clock_status: str
+    temporal_eligible: bool
+
+
 class _VOPNode(Node):
     """Per-topic YOLO inference node."""
 
@@ -424,7 +437,12 @@ class _VOPNode(Node):
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
         self._sub: Optional[object] = None
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._frames: LatestFrame[_QueuedFrame] = LatestFrame()
+        self._source_topic = ""
+        self._stream_id: Optional[str] = None
+        self._next_frame_seq = 0
+        self._last_valid_source_stamp: Optional[tuple[int, int]] = None
+        self._source_clock_regressed = False
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._frame_lock = threading.Lock()
@@ -486,7 +504,11 @@ class _VOPNode(Node):
             # it take frames belonging to the new stream.
             with self._frame_lock:
                 self._stop_event = threading.Event()
-                self._frame_queue = queue.Queue(maxsize=1)
+                self._frames = LatestFrame()
+                self._stream_id = uuid.uuid4().hex if self._input_topic else None
+                self._next_frame_seq = 0
+                self._last_valid_source_stamp = None
+                self._source_clock_regressed = False
                 self._last_inference_time = 0.0
                 self._state = "starting"
                 self._error = None
@@ -499,12 +521,14 @@ class _VOPNode(Node):
             try:
                 if self._input_topic:
                     if self._sub is None:
+                        # Resolve before the executor can deliver the first frame.
+                        self._source_topic = self.resolve_topic_name(self._input_topic)
                         self._sub = self.create_subscription(
                             CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
                         )
                     self._worker = threading.Thread(
                         target=self._inference_worker, daemon=True,
-                        args=(self._stop_event, self._frame_queue),
+                        args=(self._stop_event, self._frames),
                         name=f"vop_worker_{self._input_topic}")
                     self._worker.start()
             except Exception as error:
@@ -560,38 +584,50 @@ class _VOPNode(Node):
 
     def _image_cb(self, msg: CompressedImage):
         with self._frame_lock:
-            if not self._running or self._stop_event.is_set() or self._retired.is_set():
+            if (self._stream_id is None or not self._running
+                    or self._stop_event.is_set() or self._retired.is_set()):
                 return
+            # Observe the source clock and number every received frame, even
+            # when the FPS cap or the single-slot buffer drops that frame.
+            frame_seq = self._next_frame_seq
+            self._next_frame_seq += 1
+            stamp = msg.header.stamp
+            source_stamp = (stamp.sec, stamp.nanosec)
+            valid_stamp = source_stamp != (0, 0) and 0 <= stamp.nanosec < 1_000_000_000
+            if valid_stamp:
+                if (self._last_valid_source_stamp is not None
+                        and source_stamp < self._last_valid_source_stamp):
+                    self._source_clock_regressed = True
+                self._last_valid_source_stamp = source_stamp
+
             now = time.monotonic()
             if now - self._last_inference_time < self._frame_interval:
                 return
             self._last_inference_time = now
-            # Drop old frame if queue full (no backpressure)
-            try:
-                self._frame_queue.put_nowait(msg.data)
-            except queue.Full:
-                try:
-                    self._frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._frame_queue.put_nowait(msg.data)
-                except queue.Full:
-                    pass
+            clock_status = "unavailable"
+            if self._source_clock_regressed:
+                clock_status = "regressed"
+            elif valid_stamp:
+                clock_status = "ok"
+            self._frames.push(_QueuedFrame(
+                data=bytes(msg.data), source_stamp=source_stamp,
+                source_frame_id=msg.header.frame_id, source_topic=self._source_topic,
+                stream_id=self._stream_id, frame_seq=frame_seq,
+                source_clock_status=clock_status, temporal_eligible=clock_status == "ok",
+            ))
 
-    def _inference_worker(self, stop_event, frame_queue):
+    def _inference_worker(self, stop_event, frames: LatestFrame[_QueuedFrame]):
         import cv2
         from plugins.vision_runtime import decode_detections
 
         while not stop_event.is_set() and not self._retired.is_set():
-            try:
-                jpeg_bytes = frame_queue.get(timeout=1.0)
-            except queue.Empty:
+            packet = frames.pop(timeout=1.0)
+            if packet is None:
                 continue
             started = time.time()
             try:
                 frame = cv2.imdecode(
-                    np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
+                    np.frombuffer(packet.data, np.uint8), cv2.IMREAD_COLOR
                 )
                 if frame is None:
                     continue
@@ -600,7 +636,7 @@ class _VOPNode(Node):
                     outputs, meta, self._confidence
                 )
                 objects = self._extract_objects(boxes, scores, classes, frame)
-                self._publish_objects(objects, started)
+                self._publish_objects(objects, started, packet=packet, stop_event=stop_event)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
 
@@ -647,13 +683,16 @@ class _VOPNode(Node):
         return objects
 
     def publish_objects(self, objects: list, started: Optional[float] = None):
-        """Publish a detection payload. Used by the stream worker and by
-        the one-shot photo actions, so both emit the same thing."""
+        """Echo a one-shot detection on this node's output topic."""
         self._publish_objects(objects, started)
 
-    def _publish_objects(self, objects: list, started: Optional[float] = None):
+    def _publish_objects(self, objects: list, started: Optional[float] = None, *,
+                         packet: Optional[_QueuedFrame] = None,
+                         stop_event: Optional[threading.Event] = None):
         with self._frame_lock:
             if not self._running or self._stop_event.is_set() or self._retired.is_set():
+                return False
+            if stop_event is not None and stop_event is not self._stop_event:
                 return False
             self._detect_count += 1
             # `count` and `latency_ms` follow plugins/face.py: a consumer should not
@@ -671,6 +710,18 @@ class _VOPNode(Node):
                 # arrival: queue wait is a function of the fps cap, not of how long
                 # detection takes, and mixing them makes the number unreadable.
                 payload["latency_ms"] = int((time.time() - started) * 1000)
+            if packet is None:
+                payload.update(source_mode="one_shot", source_clock_status="unavailable",
+                               temporal_eligible=False)
+            else:
+                sec, nanosec = packet.source_stamp
+                payload.update(
+                    source_stamp={"sec": sec, "nanosec": nanosec},
+                    stream_id=packet.stream_id, frame_seq=packet.frame_seq, source_mode="stream",
+                    source_clock_status=packet.source_clock_status,
+                    temporal_eligible=packet.temporal_eligible, source_topic=packet.source_topic,
+                    source_frame_id=packet.source_frame_id,
+                )
             msg = String()
             msg.data = json.dumps(payload, ensure_ascii=False)
             self._pub.publish(msg)
