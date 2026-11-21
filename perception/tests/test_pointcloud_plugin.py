@@ -1015,10 +1015,8 @@ def metric_f32_declaration(width=2, height=1):
             'vendor': {**base['vendor'], 'depth_unit': 'm'}}
 
 
-def test_card_exposes_existing_depth_formats_without_manual_calibration():
+def test_card_does_not_expose_manual_calibration():
     tool = pc.TOOLS[0]
-    assert {p['format'] for p in tool['topic_in']} == {
-        'image/depth-zlib', 'image/depth-f32', 'image/depth-f32-zlib'}
     for schema in ('inputSchema', 'configSchema'):
         assert not {'calibration', 'cal_a', 'cal_b'} & tool[schema]['properties'].keys()
     for action in tool['inputSchema']['x-action-params'].values():

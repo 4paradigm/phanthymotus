@@ -5,10 +5,9 @@ from test_pointcloud_plugin import _plugin
 import plugins.pointcloud as pc
 
 
-def test_card_only_advertises_depth_inputs():
+def test_card_only_advertises_one_zlib_depth_input():
     tool = pc.TOOLS[0]
-    assert {port['format'] for port in tool['topic_in']} == {
-        'image/depth-zlib', 'image/depth-f32', 'image/depth-f32-zlib'}
+    assert [port['format'] for port in tool['topic_in']] == ['image/depth-zlib']
     assert 'mode' not in tool['inputSchema']['properties']
     assert tool['inputSchema']['properties']['input_topics']['maxItems'] == 1
 

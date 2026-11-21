@@ -81,7 +81,7 @@ def test_card_exposes_common_odom_and_isolates_instances(monkeypatch):
     Session.created=[];card=RgbdOdometryPlugin({},_FakeExecutor())
     tool=card.get_tools()[0]
     assert [p['format'] for p in tool['topic_in']] == [
-        'image/jpeg', 'image/depth-zlib', 'sensor/imu', 'state/odom', 'image/depth-f32-zlib']
+        'image/jpeg', 'image/depth-zlib', 'sensor/imu', 'state/odom']
     assert tool['odom_interface']['slam_pose']['profile']=='motus_slam/1'
     a=start(card,'one');b=start(card,'two');assert a['topic_out']!=b['topic_out']
     assert start(card,'one')['topic_out']==a['topic_out']

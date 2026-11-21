@@ -465,6 +465,7 @@ export async function initCanvas(initialMcps) {
     _execConnections = (layoutJson.data?.execConnections || []).filter(
       c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
     );
+    updateCanvasMcps(_allMcps);
     _resolveAllTopics();
     _scheduleRedraw();
 
@@ -583,6 +584,27 @@ function _withSlamRgbInput(topics, declarations, tool) {
   return missing.length ? [...ports, ...missing] : ports;
 }
 
+function _removeRetiredDepthInputs(card, declarations) {
+  if (!['pointcloud', 'rgbd_odometry'].includes(card.toolName) || !card.topicIn?.length ||
+      !declarations?.some(port => port.format === 'image/depth-zlib')) return false;
+  const formats = new Set(declarations.map(port => port.format));
+  const previous = card.topicIn;
+  const retained = previous.filter(port => formats.has(port.format) ||
+    !['image/depth-f32', 'image/depth-f32-zlib'].includes(port.format));
+  if (retained.length === previous.length) return false;
+
+  // Keep each surviving wire on its original port after the saved list changes.
+  _connections = _connections.filter(conn => {
+    if (conn.toCardId !== card.id || !previous[conn.toPortIdx]) return true;
+    const index = retained.indexOf(previous[conn.toPortIdx]);
+    if (index < 0) return false;
+    if (index !== Number(conn.toPortIdx)) conn.toPortIdx = String(index);
+    return true;
+  });
+  card.topicIn = retained;
+  return true;
+}
+
 export function updateCanvasMcps(mcps) {
   _allMcps = mcps || [];
   // This runs on a 10s poll and can replace card elements wholesale. Doing that
@@ -607,6 +629,7 @@ export function updateCanvasMcps(mcps) {
     // Tool-schema-level data from pings must NOT overwrite instance-specific topics.
     const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
     const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
+    if (_removeRetiredDepthInputs(card, liveTopicIn)) topicsChanged = true;
     if (typeof toolObj === 'object' && toolObj.multiInstance) {
       // (skip topic update — fall through to configSchema check below)
     } else {
@@ -3305,6 +3328,7 @@ async function _reloadLayout() {
     const cardIds = new Set(_cards.map(c => c.id));
     _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
     _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
+    updateCanvasMcps(_allMcps);
     _resolveAllTopics();
     _scheduleRedraw();
     _syncEmptyState();

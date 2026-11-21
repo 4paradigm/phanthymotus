@@ -237,8 +237,7 @@ class RgbdOdometryPlugin:
                      'required': ['topic', 'camera_from_body']}}},
                  'topic_in': [{'format': 'image/jpeg'}, {'format': 'image/depth-zlib'},
                               {'format': 'sensor/imu', 'optional': True},
-                              {'format': 'state/odom', 'optional': True},
-                              {'format': 'image/depth-f32-zlib', 'optional': True}],
+                              {'format': 'state/odom', 'optional': True}],
                  'topic_out': self._outputs('default'), 'odom_interface': _INTERFACE}]
 
     @staticmethod

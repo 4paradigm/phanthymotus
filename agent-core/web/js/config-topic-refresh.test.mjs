@@ -80,7 +80,8 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     },
   };
   const api = runInNewContext(
-    code('_withSlamRgbInput') + (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
+    code('_withSlamRgbInput') + code('_removeRetiredDepthInputs')
+    + (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
     + (revalidate ? code('_inputTopicsFor') + code('_revalidateDerivedTopics') : '')
     + code('_parseMcpCallResult') + code('_fetchTopicsFromDriver') + code('_refreshConfiguredTopics')
     + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_reloadLayout')
@@ -298,6 +299,35 @@ const slamInputs = [
   { topic: '/measured/cloud', format: 'sensor/pointcloud2' },
 ];
 const inputPorts = card => Array.from(card.el.querySelectorAll('.canvas-port.in'));
+
+test('restored VO and pointcloud cards drop retired float depth ports and retain zlib wiring', async () => {
+  const zlib = { format: 'image/depth-zlib' };
+  const raw = { format: 'image/depth-f32' };
+  const compressed = { format: 'image/depth-f32-zlib' };
+  const voInputs = [{ format: 'image/jpeg' }, zlib, { format: 'sensor/imu' }, { format: 'state/odom' }];
+  const metadata = [{ id: 'robot', tools: [
+    { name: 'pointcloud', multiInstance: true, topic_in: [zlib] },
+    { name: 'rgbd_odometry', multiInstance: true, topic_in: voInputs },
+  ] }];
+  const depthWire = { id: 'depth', fromCardId: 'camera', fromPortIdx: '0', toCardId: 'cloud', toPortIdx: '0' };
+  const retiredWire = { ...depthWire, id: 'float', fromPortIdx: '1', toPortIdx: '1' };
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [depthWire, retiredWire],
+    { dom: true, metadata });
+  p.add({ id: 'camera', mcpId: 'robot', toolName: 'camera', topicOut: [
+    { ...zlib, topic: '/camera/depth' }, { ...raw, topic: '/camera/float_depth' },
+  ] }, false);
+  p.add({ id: 'cloud', mcpId: 'robot', toolName: 'pointcloud', topicIn: [zlib, raw, compressed] }, false);
+  p.add({ id: 'vo', mcpId: 'robot', toolName: 'rgbd_odometry', topicIn: [...voInputs, compressed] }, false);
+
+  await p.save();
+  await p.reload();
+  const [, cloud, vo] = p.cards();
+  assert.deepEqual(inputPorts(cloud).map(port => port.dataset.format), [zlib.format]);
+  assert.deepEqual(inputPorts(vo).map(port => port.dataset.format), voInputs.map(port => port.format));
+  assert.equal(inputPorts(cloud)[0].dataset.topic, '/camera/depth');
+  await p.save();
+  assert.deepEqual(p.persisted().connections.map(wire => wire.id), [depthWire.id]);
+});
 
 test('restored SLAM inputs append the optional RGB port and retain saved required wire indices', async () => {
   const metadata = slamMetadata();

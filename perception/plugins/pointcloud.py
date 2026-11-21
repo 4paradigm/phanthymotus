@@ -75,7 +75,7 @@ TOOLS = [
         "type": "processor",
         "multiInstance": True,
         "description": (
-            "点云 — 一路整型或浮点深度图反投影为 3D 点云。"
+            "点云 — 将一路 image/depth-zlib 深度图反投影为 3D 点云。"
             "输出点云包（sensor/pointcloud）、摘要（data/json）和计算点云（sensor/pointcloud2）"
         ),
         "inputSchema": {
@@ -119,8 +119,6 @@ TOOLS = [
         },
         "topic_in": [
             {"format": "image/depth-zlib", "desc": "zlib 压缩深度图输入"},
-            {"format": "image/depth-f32", "desc": "32-bit 浮点深度图输入（米）"},
-            {"format": "image/depth-f32-zlib", "desc": "zlib 压缩浮点深度图输入（米）"},
         ],
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
