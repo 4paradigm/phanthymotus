@@ -48,6 +48,7 @@ export const SkeletonRenderer = {
   _rootGroup: null,  // Z-up → Y-up coordinate transform
   _pelvisGroup: null, // IMU orientation applied here
   _loaded: false,
+  _pendingFrame: null,
   _mcpId: null,
 
   mount(container, mcpId) {
@@ -55,6 +56,7 @@ export const SkeletonRenderer = {
     this._joints = {};
     this._links = {};
     this._loaded = false;
+    this._pendingFrame = null;
     this._el = document.createElement('div');
     this._el.className = 'renderer-skeleton';
     container.appendChild(this._el);
@@ -131,6 +133,12 @@ export const SkeletonRenderer = {
       if (this._scene !== scene) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
       this._buildFallbackSkeleton();
+    } finally {
+      if (this._scene === scene && this._loaded && this._pendingFrame) {
+        const frame = this._pendingFrame;
+        this._pendingFrame = null;
+        this.onData(frame);
+      }
     }
   },
 
@@ -504,7 +512,11 @@ export const SkeletonRenderer = {
   },
 
   onData(buffer, fmt) {
-    if (!this._loaded) return;
+    if (!this._loaded) {
+      // The bus can replay its latest snapshot before the URDF request finishes.
+      if (this._scene) this._pendingFrame = buffer;
+      return;
+    }
     try {
       const text = new TextDecoder().decode(buffer);
       const data = JSON.parse(text);
@@ -582,5 +594,6 @@ export const SkeletonRenderer = {
     this._raf = null;
     this._ro = null;
     this._loaded = false;
+    this._pendingFrame = null;
   },
 };

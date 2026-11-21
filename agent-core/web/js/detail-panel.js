@@ -104,7 +104,7 @@ export function showTopicDetail(topicPath, format, mcpId) {
   _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
-  _renderer.mount(body, mcpId);
+  _renderer.mount(body, Renderer === SkeletonRenderer ? mcpId : 'detail');
 
   _frames = 0;
   _status = document.createElement('div');
