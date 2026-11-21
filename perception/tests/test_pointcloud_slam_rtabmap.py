@@ -66,6 +66,7 @@ def test_runtime_parameters_use_external_odom_exact_sync_and_scan_only(tmp_path)
         assert params['Rtabmap/MemoryThr'] == '300' and params['Rtabmap/TimeThr'] == '100'
         assert params['Grid/Sensor'] == '0' and params['Icp/VoxelSize'] == '0.08'
         assert params['Grid/3D'] == 'true'
+        assert params['RGBD/ProximityBySpace'] == 'true'
     finally:
         process.close(timeout_s=3)
 
@@ -80,12 +81,27 @@ def test_optional_rgb_uses_one_sensor_data_process_for_image_and_scan_fallback(t
     assert all(params[k] is False for k in ('subscribe_rgb', 'subscribe_rgbd', 'subscribe_depth'))
     assert params['Reg/Strategy'] == '1'
     assert params['RGBD/ProximityOdomGuess'] == 'false'
+    assert params['RGBD/ProximityBySpace'] == 'true'
     assert params['RGBD/ProximityPathMaxNeighbors'] == '1'
     assert params['RGBD/NeighborLinkRefining'] == 'false'
     assert params['RGBD/LoopCovLimited'] == 'true'
     assert params['Grid/RangeMax'] == '0'
     assert params['Mem/BadSignaturesIgnored'] == 'false'
     assert params['Rtabmap/DetectionRate'] == '2'
+
+
+def test_pointcloud_only_fused_mount_pairs_scan_and_odometry_at_gateway_rate(tmp_path):
+    params = backend().mapping_parameters(tmp_path / 'map.db', '/private/fused', {
+        'max_pending': 10, 'voxel_size_m': .08, 'max_working_nodes': 300,
+        'max_update_ms': 100, 'scan_origin_recovery': True,
+        'capture_mount': {'interpolate': True}})
+    assert params['subscribe_sensor_data'] is True
+    assert params['subscribe_odom'] is False
+    assert params['motus_paired_sensor_odom'] is True
+    assert params['motus_paired_scan'] is True
+    assert params['Rtabmap/DetectionRate'] == '2'
+    assert params['RGBD/NeighborLinkRefining'] == 'false'
+    assert params['RGBD/ProximityBySpace'] == 'false'
 
 
 def test_live_preview_uses_existing_interval_and_bounds_native_cloud_size(tmp_path):

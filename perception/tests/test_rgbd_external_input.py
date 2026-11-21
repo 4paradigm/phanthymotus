@@ -11,7 +11,7 @@ from plugins import rgbd_external_input
 from plugins.external_motion_learning import ExternalMotionLearner
 from plugins.rgbd_body_mount import CaptureMounts
 from plugins.rgbd_odometry import RgbdOdometryPlugin
-from test_external_odometry_fusion import packet, pose_at
+from test_external_odometry_fusion import leg_attitude_packet, packet, pose_at
 from plugins.external_odometry_fusion import decode_motion
 from test_pointcloud_slam_stream import stream as slam_stream
 from test_rgbd_odometry_contract import declarations
@@ -100,6 +100,27 @@ def test_fusion_batch_publishes_fresh_intermediate_measurements(sessions, monkey
             1_080_000_000, 1_160_000_000, 1_240_000_000]
         assert [p['pose']['position'][0] for p in packets] == pytest.approx([.08, .16, .24])
         assert len(rebuilds) == 1
+    finally:
+        stream.close()
+
+
+def test_fusion_leg_attitude_cannot_publish_a_pose_until_measured_translation_returns(sessions):
+    _, now, _ = sessions
+    now[0] = 1_500_000_000
+    stream = fusion_input()
+    try:
+        for item in (leg_attitude_packet(0., 10., 0., .6),
+                     leg_attitude_packet(.1, 10.1, 0., .6),
+                     leg_attitude_packet(.31, -20., .126, .6, frame='new_leg')):
+            stream._apply(('motion', '/external', *decode_motion(item, now[0])))
+        previous, = [json.loads(msg) for msg in stream.publisher.messages]
+        assert previous['vendor']['motus_slam']['stamp_ns'] == 1_100_000_000
+        sample = leg_attitude_packet(.41, -19.9, .186, .6, frame='new_leg')
+        stream._apply(('motion', '/external', *decode_motion(sample, now[0])))
+        latest = json.loads(stream.publisher.messages[-1])
+        assert len(stream.publisher.messages) == 2
+        assert latest['vendor']['motus_slam']['stamp_ns'] == 1_410_000_000
+        assert latest['pose']['quaternion'][2] == pytest.approx(np.sin(.186/2))
     finally:
         stream.close()
 

@@ -69,6 +69,48 @@ def test_pose_precedes_twist_and_known_reset_does_not_create_motion():
     assert engine.current.transform[0, 3] == pytest.approx(1.5)
 
 
+def leg_attitude_packet(t, position, yaw, angular, *, frame='leg', child='body', source='bumi_leg_kinematics', reset=False):
+    item = packet(t, position, twist=[4., 5., 6., 0., 0., angular], frame=frame, reset=reset)
+    item['pose'].update(quaternion=[0., 0., np.sin(yaw/2), np.cos(yaw/2)], child_frame_id=child)
+    item['vendor'] = {'source': source}
+    return item
+
+
+def test_leg_origin_change_preserves_attitude_only_with_measured_body_rate():
+    engine = ExternalOdometry(learning=False)
+    for item in (leg_attitude_packet(0., 10., 0., .6),
+                 leg_attitude_packet(.1, 10.1, 0., .6),
+                 leg_attitude_packet(.31, -20., .126, .6, frame='new_leg')):
+        engine.motion(*decode_motion(item, 1))
+    np.testing.assert_allclose(engine.current.transform[:3, 3], [.1, 0., 0.])
+    assert np.arctan2(engine.current.transform[1, 0], engine.current.transform[0, 0]) == pytest.approx(.126)
+    assert engine.current.mask.tolist() == [False, False, False, True, True, True]
+    assert engine.current.twist[5] == pytest.approx(.6)
+
+
+def test_leg_attitude_uses_only_the_axes_observed_by_both_endpoints():
+    engine = ExternalOdometry(learning=False)
+    first = leg_attitude_packet(0., 10., 0., .6)
+    second = leg_attitude_packet(.21, -20., .126, .6, frame='new_leg')
+    for item in (first, second):
+        item['motion_model'] = 'planar'
+        engine.motion(*decode_motion(item, 1))
+    assert engine.current.mask.tolist() == [False, False, False, False, False, True]
+
+
+@pytest.mark.parametrize('override', [dict(source='chassis'), dict(child='another_body'),
+                                      dict(reset=True), dict(t=.5), dict(yaw=1.3), dict(angular=None)])
+def test_leg_attitude_does_not_cross_unverified_source_resets(override):
+    engine = ExternalOdometry(learning=False)
+    first = leg_attitude_packet(0., 10., 0., .6)
+    second = dict(t=.21, position=-20., yaw=.126, angular=.6, frame='new_leg')
+    second.update(override)
+    engine.motion(*decode_motion(first, 1))
+    engine.motion(*decode_motion(leg_attitude_packet(**second), 1))
+    assert engine.current.last_update is None
+    np.testing.assert_array_equal(engine.current.transform, np.eye(4))
+
+
 def test_late_vision_and_external_pose_rebuild_newer_corrections():
     def run(delayed):
         engine = ExternalOdometry(learning=False)
@@ -88,6 +130,45 @@ def test_late_vision_and_external_pose_rebuild_newer_corrections():
     np.testing.assert_allclose(ordered.current.transform, late.current.transform)
     np.testing.assert_allclose(ordered.current.covariance, late.current.covariance)
     assert 0 < late.current.transform[0, 3] < 1.05
+
+
+def test_unchanged_published_endpoint_does_not_recompute_pose_correction(monkeypatch):
+    from plugins import external_odometry_fusion as fusion
+
+    engine = ExternalOdometry(learning=False)
+    feed(engine, 0., 10.)
+    feed(engine, .2, 10.2)
+    engine.output()
+    feed(engine, .4, 10.4)
+    correction = fusion.se3_log
+    calls = []
+
+    def record(transform):
+        calls.append(transform)
+        return correction(transform)
+
+    monkeypatch.setattr(fusion, 'se3_log', record)
+    assert engine.output()['pose']['position'][0] == pytest.approx(.4)
+    assert calls == []
+
+    # A visual correction at the published capture can revise the checkpoint.
+    # Publication must still smooth a real revision in the original output gauge.
+    vision(engine, .2, 0.)
+    vision(engine, .4, .1)
+    feed(engine, .6, 10.6)
+    calls.clear()
+    out = engine.output()['pose']['position'][0]
+    assert len(calls) == 1
+    assert out > engine.current.transform[0, 3]
+
+    # Once a correction fits within one update, reuse the measured checkpoint
+    # instead of carrying a numerical difference into later publications.
+    feed(engine, .8, 10.8)
+    assert engine.output()['pose']['position'][0] == pytest.approx(engine.current.transform[0, 3])
+    feed(engine, 1., 11.)
+    calls.clear()
+    assert engine.output()['pose']['position'][0] == pytest.approx(engine.current.transform[0, 3])
+    assert calls == []
 
 
 def test_visual_progress_during_external_outage_is_not_counted_twice():
@@ -250,6 +331,29 @@ def test_late_visual_reuses_leg_noise_until_an_endpoint_changes(monkeypatch):
     np.testing.assert_array_equal(engine.current.covariance, expected.current.covariance)
 
 
+def test_repeated_measured_steps_reuse_motion_even_when_rewinding(monkeypatch):
+    from plugins.external_motion_learning import ExternalMotionLearner
+
+    engine = ExternalOdometry(learning=False)
+    for t, x in [(0., 0.), (.25, .4), (.5, .6), (.75, .7)]:
+        feed(engine, t, x)
+
+    correct = ExternalMotionLearner.corrected_velocity
+    calls = []
+
+    def record(learner, velocity, observed):
+        calls.append(velocity.copy())
+        return correct(learner, velocity, observed)
+
+    monkeypatch.setattr(ExternalMotionLearner, 'corrected_velocity', record)
+    assert vision(engine, .25, 0.)
+    assert calls == []
+    assert engine.current.transform[0, 3] == pytest.approx(.7)
+    assert feed(engine, .75, .8)
+    assert len(calls) == 1
+    assert engine.current.transform[0, 3] == pytest.approx(.8)
+
+
 def test_bumi_step_noise_is_split_once_when_vision_is_inside_the_interval():
     def run(late):
         engine = ExternalOdometry(learning=False)
@@ -266,6 +370,30 @@ def test_bumi_step_noise_is_split_once_when_vision_is_inside_the_interval():
     np.testing.assert_allclose(delayed.current.covariance, np.eye(6)*1.125)
     np.testing.assert_allclose(delayed.current.covariance, ordered.current.covariance)
     np.testing.assert_allclose(delayed.current.transform, ordered.current.transform)
+
+
+def test_bumi_covariance_uses_measured_endpoint_and_only_interpolates_split(monkeypatch):
+    from plugins import external_odometry_fusion as fusion
+
+    engine = ExternalOdometry(learning=False)
+    feed_covariance(engine, 0., [1.]*6)
+    feed_covariance(engine, .5, [1.125]*6, quaternion=[0., 0., .5, np.sqrt(.75)])
+    left, right = engine.raw_motion.values()
+    velocity = np.array([0., 0., 0., 0., 0., np.pi*2/3])
+    interpolate = fusion.se3_exp
+    calls = []
+
+    def record(increment):
+        calls.append(increment)
+        return interpolate(increment)
+
+    monkeypatch.setattr(fusion, 'se3_exp', record)
+    full = fusion._leg_increment_covariance(left, right, velocity, .5, 1., True)
+    assert calls == []
+    partial = fusion._leg_increment_covariance(left, right, velocity, .25, .5, False)
+    assert len(calls) == 1
+    np.testing.assert_allclose(full, np.eye(6)*.125, atol=1e-12)
+    np.testing.assert_allclose(partial, np.eye(6)*.0625, atol=1e-12)
 
 
 def test_bumi_covariance_uses_body_axes_and_sensor_lever_arm():

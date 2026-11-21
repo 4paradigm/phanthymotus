@@ -19,7 +19,7 @@
  	void publishCurrentGoal(const rclcpp::Time & stamp);
  #ifdef WITH_NAV2_MSGS
  #ifdef NAV_MSGS_FOXY
-@@ -301,10 +304,13 @@
+@@ -301,10 +304,14 @@
  
  private:
  	rtabmap::Rtabmap rtabmap_;
@@ -29,6 +29,7 @@
  	UMutex lastPoseMutex_;
  	rtabmap::Transform lastPose_;
 +	bool pairedSensorOdom_ = false;
++	bool pairedScan_ = false;
 +	std::chrono::steady_clock::time_point pairedAdmission_;
  	rclcpp::Time lastPoseStamp_;
  	std::vector<float> lastPoseVelocity_;
@@ -46,17 +47,27 @@
  
  #include <nav_msgs/msg/path.hpp>
  #include <std_msgs/msg/int32_multi_array.hpp>
-@@ -625,6 +627,9 @@
+@@ -281,5 +283,8 @@
+-	// Create the processing timer  
+-	processingCallbackGroup_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
++	pairedSensorOdom_ = this->declare_parameter("motus_paired_sensor_odom", false);
++	pairedScan_ = pairedSensorOdom_ && this->declare_parameter("motus_paired_scan", false);
++	// Paired scans use the subscriber's default group for processing and map services.
++	processingCallbackGroup_ = pairedScan_ ? this->get_node_base_interface()->get_default_callback_group() :
++			this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+ 	syncTimer_ = this->create_wall_timer(0s, std::bind(&CoreWrapper::processAsync, this), processingCallbackGroup_);  
+ 	syncTimer_->cancel();
+ 
+@@ -625,6 +630,8 @@
  
  	// Init RTAB-Map
  	rtabmap_.init(parameters_, databasePath_);
 +	if(this->declare_parameter("motus_visual_recovery", false))
 +		visualRecovery_.reset(new motus::VisualRecovery(parameters_,this->declare_parameter("motus_rgbd_image_recovery", false)));
-+	pairedSensorOdom_ = this->declare_parameter("motus_paired_sensor_odom", false);
  
  	if(rtabmap_.getMemory())
  	{
-@@ -994,6 +999,7 @@
+@@ -994,6 +1001,7 @@
  		}
  	}
  
@@ -64,7 +75,7 @@
  	rtabmap_.close();
  	printf("rtabmap: Saving database/long-term memory...done! (located at %s, %ld MB)\n", databasePath_.c_str(), UFile::length(databasePath_)/(1024*1024));
  
-@@ -1105,7 +1111,9 @@
+@@ -1105,7 +1113,9 @@
  	if(!paused_)
  	{
  		Transform odom = rtabmap_conversions::transformFromPoseMsg(odomMsg.pose.pose);
@@ -75,7 +86,7 @@
  		{
  			Transform odomTF;
  			if(stamp.seconds() != 0.0) {
-@@ -1132,7 +1140,7 @@
+@@ -1132,7 +1142,7 @@
  
  		UScopeMutex lock(lastPoseMutex_);
  
@@ -84,7 +95,7 @@
  		{
  			UWARN("Odometry is reset (identity pose or high variance (%f) detected). Increment map id!", MAX(odomMsg.pose.covariance[0], odomMsg.twist.covariance[0]));
  			triggerNewMapBeforeNextUpdate_ = true;
-@@ -1185,7 +1193,7 @@
+@@ -1185,7 +1195,7 @@
  			RCLCPP_WARN(this->get_logger(), "A null stamp has been detected in the input topics. Make sure the stamp in all input topics is set.");
  			ignoreFrame = true;
  		}
@@ -93,7 +104,7 @@
  		{
  			if(previousStamp_.seconds() > 0.0 && stamp.seconds() > previousStamp_.seconds() && stamp.seconds() - previousStamp_.seconds() < 1.0f/rate_)
  			{
-@@ -1222,7 +1230,7 @@
+@@ -1222,7 +1232,7 @@
  
  		UScopeMutex lock(lastPoseMutex_);
  
@@ -102,7 +113,7 @@
  		{
  			UWARN("Odometry is reset (identity pose detected). Increment map id!");
  			triggerNewMapBeforeNextUpdate_ = true;
-@@ -1881,6 +1889,36 @@
+@@ -1881,6 +1891,36 @@
  	}
  }
  
@@ -139,7 +150,7 @@
  void CoreWrapper::commonSensorDataCallback(
  		const rtabmap_msgs::msg::SensorData::ConstSharedPtr & sensorDataMsg,
  		const nav_msgs::msg::Odometry::ConstSharedPtr & odomMsg,
-@@ -1889,10 +1927,32 @@
+@@ -1889,10 +1929,34 @@
  	UTimer timerConversion;
  	UASSERT(sensorDataMsg.get());
  	std::string odomFrameId;
@@ -160,12 +171,14 @@
 +			RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Invalid Motus paired sensor/odometry observation");
 +			return;
 +		}
-+		// Bound computation by arrival cadence. The pointcloud card already
-+		// rate-limits its deliveries, which can be >0.5 s apart even when
-+		// their original captures are closer together.
-+		if(previousStamp_.nanoseconds() > 0 &&
-+				(rclcpp::Time(pairedOdom.header.stamp) <= previousStamp_ ||
-+				 (rate_ > 0 && std::chrono::duration<double>(arrival-pairedAdmission_).count() < 1.0/rate_)))
++		// Bound computation by arrival cadence. Scan-only observations spaced
++		// at capture can still arrive in a burst after matching cloud and pose.
++		const auto previousNs = previousStamp_.nanoseconds();
++		const auto captureGapNs = rclcpp::Time(pairedOdom.header.stamp).nanoseconds()-previousNs;
++		if(previousNs > 0 &&
++				(captureGapNs <= 0 ||
++				 (rate_ > 0 && std::chrono::duration<double>(arrival-pairedAdmission_).count() < 1.0/rate_ &&
++				  (!pairedScan_ || captureGapNs < 1e9/rate_))))
 +			return;
 +		odom = &pairedOdom;
 +	}
@@ -176,7 +189,12 @@
  		{
  			return;
  		}
-@@ -1912,6 +1972,12 @@
+@@ -1911,7 +1975,16 @@
+-	if(syncTimer_->is_canceled() && syncDataMutex_.lockTry() == 0)
++	// A paired scan already has exact odometry and mount data. Consume it in
++	// its subscription callback so a busy async timer cannot discard a recovery scan.
++	if(pairedScan_) syncDataMutex_.lock();
++	if(pairedScan_ || (syncTimer_->is_canceled() && syncDataMutex_.lockTry() == 0))
  	{
  		UScopeMutex lock(lastPoseMutex_);
  		syncData_.data = rtabmap_conversions::sensorDataFromROS(*sensorDataMsg);
@@ -189,7 +207,17 @@
  		syncData_.data.setId(lastPoseIntermediate_?-1:0);
  
  		OdometryInfo odomInfo;
-@@ -1969,13 +2035,14 @@
+@@ -1944,7 +2017,8 @@
+ 		lastPoseCovariance_ = cv::Mat();
+ 
+-		syncTimer_->reset();
++		if(!pairedScan_) syncTimer_->reset();
+ 		syncDataMutex_.unlock();
+ 	}
++	if(pairedScan_) processAsync();
+ }
+ 
+@@ -1969,13 +2043,14 @@
  void CoreWrapper::process(
  		const rclcpp::Time & stamp,
  		SensorData & data,
@@ -205,7 +233,7 @@
  	UTimer timer;
  	if(rtabmap_.isIDsGenerated() || data.id() > 0)
  	{
-@@ -2290,7 +2357,20 @@
+@@ -2290,7 +2365,20 @@
  		}
  
  		timeMsgConversion += timer.ticks();
@@ -227,7 +255,7 @@
  		{
  			timeRtabmap = timer.ticks();
  			mapToOdomMutex_.lock();
-@@ -3162,6 +3242,7 @@
+@@ -3162,6 +3250,7 @@
  {
  	RCLCPP_INFO(this->get_logger(), "rtabmap: Reset");
  	rtabmap_.resetMemory();
@@ -235,7 +263,7 @@
  
  	lastPoseMutex_.lock();
  	lastPoseCovariance_ = cv::Mat();
-@@ -3351,6 +3432,7 @@
+@@ -3351,6 +3440,7 @@
  
  	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database...");
  	rtabmap_.init(parameters_, databasePath_);
@@ -243,7 +271,7 @@
  	RCLCPP_INFO(get_logger(), "LoadDatabase: Loading database... done!");
  
  	if(rtabmap_.getMemory())
-@@ -3446,6 +3528,7 @@
+@@ -3446,6 +3536,7 @@
  
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory...");
  	rtabmap_.init(parameters_, databasePath_);
@@ -251,7 +279,7 @@
  	RCLCPP_INFO(this->get_logger(), "Backup: Reloading memory... done!");
  }
  
-@@ -4493,10 +4576,11 @@
+@@ -4493,10 +4584,11 @@
  	}
  }
  
@@ -264,7 +292,7 @@
  
  	if(infoPub_->get_subscription_count())
  	{
-@@ -4505,9 +4589,30 @@
+@@ -4505,9 +4597,30 @@
  		msg->header.stamp = stamp;
  		msg->header.frame_id = mapFrameId_;
  

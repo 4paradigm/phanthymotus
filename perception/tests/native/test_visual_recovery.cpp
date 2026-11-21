@@ -27,17 +27,19 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     const bool weakBridge=mode=="scan_origin_weak_bridge";
     const bool mixedChassis=mode=="chassis_legacy_transition";
     const bool partialReset=mode=="chassis_partial_reset_after_rgb_query";
-    const bool chassis=mode=="chassis_origin_change" || mixedChassis || partialReset;
+    const bool earlierAnchor=mode=="chassis_same_gauge_earlier_anchor";
+    const bool chassis=mode=="chassis_origin_change" || mixedChassis || partialReset || earlierAnchor;
     const bool originChange=mode=="scan_origin_change" || chassis || weakBridge;
     const auto depth=cv::imread(root+"/0.png",cv::IMREAD_UNCHANGED);
     if(depth.empty()) throw std::runtime_error("missing scan relocalization fixture");
     parameters["RGBD/LinearUpdate"]="0.03";
-    if(partialReset) parameters["RGBD/ProximityBySpace"]="false";
+    if(partialReset || earlierAnchor) parameters["RGBD/ProximityBySpace"]="false";
+    if(earlierAnchor) parameters["Icp/VoxelSize"]="0.08";
     rtabmap::Rtabmap map;
     map.init(parameters,output+".db");
     motus::VisualRecovery recovery(parameters);
     const auto frame=[&](double stamp, float x, bool hasPose, bool noOverlap, bool blackImage=false,
-                         bool badGuess=false, int origin=0)
+                         bool badGuess=false, int origin=0, int run=0)
     {
         const float f=260.f;
         cv::Mat scan(1,depth.total(),CV_32FC3);
@@ -45,7 +47,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         for(int v=0;v<depth.rows;++v) for(int u=0;u<depth.cols;++u)
         {
             const float z=depth.at<unsigned short>(v,u)/1000.f;
-            if(z>0) scan.at<cv::Vec3f>(0,count++)={(u-depth.cols/2.f)*z/f-x+(noOverlap?(chassis && origin==3?40.f:20.f):0.f),
+            if(z>0) scan.at<cv::Vec3f>(0,count++)={(u-depth.cols/2.f)*z/f-x+(noOverlap?((chassis && origin==3) || run?40.f:20.f):0.f),
                                                  (v-depth.rows/2.f)*z/f,z};
         }
         const rtabmap::CameraModel camera(f,f,depth.cols/2.,depth.rows/2.,rtabmap::Transform::getIdentity(),0.,depth.size());
@@ -72,7 +74,7 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         else if(origin)
         {
             cv::Mat packet(1,chassis?40:24,CV_8UC1,cv::Scalar::all(0));
-            if(chassis) std::fill_n(packet.data+24,16,origin+10);
+            if(chassis) std::fill_n(packet.data+24,16,(run?run:origin)+10);
             std::memcpy(packet.data,chassis?"MOTUSCH1":witnessedOutage?"MOTUSOD1":"MOTUSOR1",8);
             std::fill_n(packet.data+8,16,origin);
             data.setUserData(rtabmap::compressData2(packet),true);
@@ -83,9 +85,37 @@ static void testScanRelocalization(const std::string &root, const std::string &o
     };
     const int startingToken=originChange || witnessedOutage?1:0;
     if(!frame(1.,0.f,true,false,false,false,startingToken) ||
-       !frame(1.5,.12f,true,false,false,false,startingToken))
+       !frame(1.5,.12f,true,earlierAnchor,false,false,startingToken))
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto anchor=map.getLastLocationId();
+    if(earlierAnchor)
+    {
+        const auto old=map.getLocalOptimizedPoses();
+        if(old.size()!=2 || frame(2.,.04f,true,true,false,false,1,2) ||
+           !recovery.odom().isNull() || map.getLocalOptimizedPoses()!=old)
+            throw std::runtime_error("same gauge and new token cannot promote an unrelated scan");
+        const int rootId=old.begin()->first;
+        if(!frame(2.5,.045f,true,false,false,false,1,2) ||
+           recovery.state()!=motus::VisualRecovery::Localized || recovery.recoveryAnchor()!=rootId ||
+           std::abs(recovery.odom().x()-.045f)>.025f || map.getLocalOptimizedPoses().size()!=old.size()+1)
+            throw std::runtime_error("a return to the earlier optimized view must reconnect to the original root");
+        if(map.getParameters().at("RGBD/ProximityBySpace")!="false")
+            throw std::runtime_error("scan relocalization must not re-enable disabled automatic proximity");
+        for(const auto &p:old)
+            if(map.getLocalOptimizedPoses().at(p.first)!=p.second)
+                throw std::runtime_error("earlier anchor recovery moved a verified map pose");
+        const int closure=recovery.recoveryNode();
+        const auto grown=map.getLocalOptimizedPoses();
+        map.close();
+        rtabmap::Rtabmap reopened;
+        reopened.init(parameters,output+".db");
+        const auto *node=reopened.getMemory()->getSignature(closure);
+        if(reopened.getLocalOptimizedPoses()!=grown || !node ||
+           !node->hasLink(rootId,rtabmap::Link::kGlobalClosure))
+            throw std::runtime_error("earlier recovery must persist a measured type1 edge to the original root");
+        reopened.close(false);
+        return;
+    }
     if(partialReset)
     {
         const auto old=map.getLocalOptimizedPoses();
@@ -434,6 +464,7 @@ int main(int argc, char **argv)
     if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
        mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" || mode=="chassis_origin_change" || mode=="chassis_legacy_transition" ||
        mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" || mode=="chassis_partial_reset_after_rgb_query" ||
+       mode=="chassis_same_gauge_earlier_anchor" ||
        mode=="witnessed_scan_late_handoff" || mode=="witnessed_scan_weak_bridge" ||
        mode=="witnessed_scan_long_gap" || mode=="witnessed_scan_expired_gap" ||
        mode=="witnessed_scan_sparse_live")

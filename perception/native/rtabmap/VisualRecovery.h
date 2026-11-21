@@ -41,6 +41,12 @@ public:
         registration["Icp/PointToPlaneMinComplexity"]="0.02";
         registration["Icp/PointToPlaneLowComplexityStrategy"]="0";
         inertialIcp_.reset(new rtabmap::RegistrationIcp(registration));
+        // Preserve fine structure for the stricter two-way older-anchor check.
+        auto revisitRegistration=registration;
+        float voxelSize=rtabmap::Parameters::defaultIcpVoxelSize();
+        rtabmap::Parameters::parse(registration,"Icp/VoxelSize",voxelSize);
+        if(voxelSize>.06f) revisitRegistration["Icp/VoxelSize"]="0.06";
+        revisitIcp_.reset(new rtabmap::RegistrationIcp(revisitRegistration));
         // Scan tracking starts without a motion guess, so allow a little more translation.
         registration["Icp/MaxTranslation"]="0.25";
         registration["Icp/CorrespondenceRatio"]="0.07";
@@ -153,6 +159,7 @@ public:
                 rtabmap::OdometryInfo info;
                 finishLocalization(map,data,external,rtabmap::Transform(),info,false,!scanLocalized,{});
                 externalRun_=externalRun;
+                lastAcceptedExternalRun_=externalRun;
                 previousExternal_=external;
                 previousExternalStamp_=data.stamp();
                 initialized_=true;
@@ -420,6 +427,7 @@ public:
                 if(accepted && (externalRun || declaresOrigin))
                 {
                     externalRun_=externalRun;
+                    lastAcceptedExternalRun_=externalRun;
                     previousExternal_=external;
                     previousExternalStamp_=data.stamp();
                 }
@@ -471,7 +479,11 @@ public:
         if(waitForChassis || visualLossStamp_>0.) return false;
         const auto recoverGeometry=[&]()
         {
-            if(!relocalizeScan(map,data,statistics)) return false;
+            const bool sameGaugeRunChange=sameOrigin && !chassis.empty() && externalRun &&
+                lastAcceptedExternalRun_ && externalRun!=lastAcceptedExternalRun_ &&
+                continuousMotion(external,data.stamp(),maxLiveScanGap_);
+            const auto guess=sameGaugeRunChange?externalToNative_*external:rtabmap::Transform();
+            if(!relocalizeScan(map,data,statistics,false,guess)) return false;
             finishLocalization(map,data,external,visual,info,tracked,images,externalRun);
             return true;
         };
@@ -566,6 +578,10 @@ private:
     void beginLocalization(rtabmap::Rtabmap & map)
     {
         if(localizationMode_) return;
+        const auto &parameters=map.getParameters();
+        const auto proximity=parameters.find("RGBD/ProximityBySpace");
+        proximityBeforeLocalization_=proximity==parameters.end()?
+            rtabmap::Parameters::getDefaultParameters().at("RGBD/ProximityBySpace"):proximity->second;
         retryExternalNeighbor_=false;
         visualLossStamp_=0.;
         visualAlignment_.reset();
@@ -597,7 +613,7 @@ private:
             restore[param.first]=value!=current.end()?value->second:
                 rtabmap::Parameters::getDefaultParameters().at(param.first);
         }
-        restore["RGBD/ProximityBySpace"]="true";
+        restore["RGBD/ProximityBySpace"]=proximityBeforeLocalization_;
         insertion["Mem/IncrementalMemory"]="true";
         insertion["RGBD/MaxOdomCacheSize"]=std::to_string(maxOdomCacheSize_);
         map.parseParameters(insertion); // Spatial proximity is already off while searching.
@@ -631,8 +647,63 @@ private:
         return true;
     }
 
+    struct ScanMatch
+    {
+        int anchor;
+        rtabmap::Transform relative;
+        rtabmap::RegistrationInfo result;
+    };
+
+    std::optional<ScanMatch> matchEarlierScan(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
+            const std::map<int,rtabmap::Transform> & poses,const rtabmap::Transform & guess)
+    {
+        const auto identity=rtabmap::Transform::getIdentity();
+        const auto nearby=[](const rtabmap::Transform & delta,double meters,double degrees)
+        {
+            return !delta.isNull() && delta.getNorm()<=meters &&
+                delta.getAngle(rtabmap::Transform::getIdentity())<=degrees*CV_PI/180.;
+        };
+        const auto supported=[](const rtabmap::RegistrationInfo & info)
+        {
+            return info.icpStructuralComplexity>=.02 && info.icpCorrespondences>=1000 &&
+                info.icpInliersRatio>=minScanRelocalizationOverlap_ && validCovariance(info.covariance);
+        };
+        std::multimap<double,int> candidates;
+        auto *memory=map.getMemory();
+        for(const auto &pose:poses)
+        {
+            const auto *signature=memory->getSignature(pose.first);
+            if(pose.first==scanMapAnchor_ || !signature || signature->getPose().isNull()) continue;
+            const auto delta=signature->getPose().inverse()*guess;
+            const double cost=delta.getNorm()+delta.getAngle(identity);
+            if(std::isfinite(cost)) candidates.emplace(cost,pose.first);
+        }
+        int attempts=0;
+        for(const auto &candidate:candidates)
+        {
+            if(++attempts>3) break;
+            const int anchor=candidate.second;
+            rtabmap::LaserScan scan;
+            memory->getNodeData(anchor,false,true,false,false).uncompressDataConst(nullptr,nullptr,&scan);
+            if(scan.empty()) continue;
+            rtabmap::SensorData reference;
+            reference.setLaserScan(scan);
+            // The raw keyframe pose and fused pose share an odometry gauge.
+            // Optimized poses are used only to place an independently verified edge.
+            const auto initial=memory->getSignature(anchor)->getPose().inverse()*guess;
+            rtabmap::RegistrationInfo forward,reverse;
+            const auto relative=revisitIcp_->computeTransformation(reference,data,initial,&forward);
+            if(relative.isNull() || !supported(forward) || !nearby(initial.inverse()*relative,.10,5.)) continue;
+            const auto backward=revisitIcp_->computeTransformation(data,reference,initial.inverse(),&reverse);
+            if(!backward.isNull() && supported(reverse) && nearby(relative*backward,.02,1.))
+                return ScanMatch{anchor,relative,std::move(forward)};
+        }
+        return std::nullopt;
+    }
+
     bool relocalizeScan(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
-                        const std::map<std::string,float> & statistics,bool chassisReset=false)
+                        const std::map<std::string,float> & statistics,bool chassisReset=false,
+                        const rtabmap::Transform & sameGaugeGuess=rtabmap::Transform())
     {
         auto poses=map.getLocalOptimizedPoses();
         if(poses.empty() || data.laserScanRaw().empty()) return false;
@@ -691,21 +762,33 @@ private:
                 relative=registerFrom(scanMapGuess_->relative);
         }
         if(relative.isNull()) relative=registerFrom(identity);
+        int anchor=scanMapAnchor_;
+        if(relative.isNull() && !sameGaugeGuess.isNull())
+        {
+            const auto match=matchEarlierScan(map,data,poses,sameGaugeGuess);
+            if(match)
+            {
+                anchor=match->anchor;
+                relative=match->relative;
+                result=match->result;
+            }
+        }
         if(relative.isNull()) return false;
         const auto covariance=scanCovariance(result.covariance);
         cv::Mat information;
         if(!cv::invert(covariance,information,cv::DECOMP_CHOLESKY) || !cv::checkRange(information))
             return false;
-        const auto location=anchorPose->second*relative;
+        const auto location=poses.at(anchor)*relative;
         const auto previousPoses=poses;
         const auto links=map.getLocalConstraints();
         auto stats=statistics;
         stats["Motus/ScanRelocalizationOverlap/"]=result.icpInliersRatio;
         stats["Motus/ScanRelocalizationCorrespondences/"]=static_cast<float>(result.icpCorrespondences);
         beginLocalization(map);
-        const rtabmap::Link measured(scanMapAnchor_,0,rtabmap::Link::kGlobalClosure,relative,information);
+        const rtabmap::Link measured(anchor,0,rtabmap::Link::kGlobalClosure,relative,information);
         if(!promote(map,data,measured,location,covariance,stats,poses,links,previousPoses,links))
             return false;
+        scanMapAnchor_=anchor;
         scanMapGuess_=ScanMapGuess{relative,data.stamp()};
         return true;
     }
@@ -748,6 +831,7 @@ private:
             if(externalRun)
             {
                 externalRun_=externalRun;
+                lastAcceptedExternalRun_=externalRun;
                 previousExternal_=external;
                 previousExternalStamp_=data.stamp();
             }
@@ -962,7 +1046,7 @@ private:
         return true;
     }
     std::unique_ptr<rtabmap::Odometry> estimator_;
-    std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_,scanIcp_;
+    std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_,scanIcp_,revisitIcp_;
     rtabmap::RegistrationIcp neighborIcp_;
     int state_, minInliers_, maxOdomCacheSize_;
     float maxError_;
@@ -980,7 +1064,8 @@ private:
     };
     std::optional<ScanMapGuess> scanMapGuess_;
     bool retryExternalNeighbor_=false;
-    std::optional<ExternalRun> externalRun_, externalOrigin_;
+    std::optional<ExternalRun> externalRun_, externalOrigin_, lastAcceptedExternalRun_;
+    std::string proximityBeforeLocalization_;
     bool rgbdImageRecovery_;
     bool sawChassis_=false;
     rtabmap::Transform previousExternal_;

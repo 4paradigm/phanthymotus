@@ -17,7 +17,9 @@ from .rgbd_imu import rotation_from_quaternion
 _HISTORY_NS = 10_000_000_000
 _MAX_EVENTS = 512
 _MAX_INTERVAL_NS = 1_500_000_000
+_LEG_ATTITUDE_INTERVAL_NS = 250_000_000
 _FULL = np.ones(6, dtype=bool)
+_ANGULAR = np.array([False, False, False, True, True, True])
 _DEFAULT_VARIANCE = np.square([.025, .025, .035, .03, .03, .03])
 
 
@@ -112,6 +114,7 @@ class Motion:
     model: tuple | None
     cumulative_pose_covariance: np.ndarray | None = None
     body_from_sensor: np.ndarray | None = None
+    body_angular_velocity: np.ndarray | None = None
 
     def order_key(self):
         vector = self.pose if self.pose is not None else self.twist
@@ -119,7 +122,8 @@ class Motion:
         return (self.reset, self.pose is not None, vector.tobytes() if vector is not None else b'',
                 self.mask.tobytes(), repr(self.origin), self.variance.tobytes(), repr(self.model),
                 covariance is not None, covariance.tobytes() if covariance is not None else b'',
-                self.body_from_sensor.tobytes() if self.body_from_sensor is not None else b'')
+                self.body_from_sensor.tobytes() if self.body_from_sensor is not None else b'',
+                self.body_angular_velocity.tobytes() if self.body_angular_velocity is not None else b'')
 
 
 def decode_motion(packet, receipt_ns):
@@ -146,6 +150,7 @@ def decode_motion(packet, receipt_ns):
     record = packet.get('pose')
     pose = pose_matrix(record) if isinstance(record, dict) else None
     cumulative_pose_covariance = None
+    body_angular_velocity = None
     if pose is not None:
         length_scale = _scale(packet, 'length_scale_m')
         pose[:3, 3] *= length_scale
@@ -153,6 +158,12 @@ def decode_motion(packet, receipt_ns):
         # its odometry frame. Generic pose producers make no such guarantee.
         if vendor.get('source') == 'bumi_leg_kinematics':
             cumulative_pose_covariance = _bumi_pose_covariance(record, length_scale)
+            rate = packet.get('twist')
+            if mount is None and isinstance(rate, (list, tuple)) and len(rate) == 6:
+                try:
+                    body_angular_velocity = _vector(rate[3:], (3,)) * _scale(packet, 'angular_scale_radps')
+                except (TypeError, ValueError, OverflowError):
+                    pass  # Attitude continuity is optional evidence.
     if pose is not None and mount is not None:
         pose = pose @ np.linalg.inv(mount)
     planar = packet.get('motion_model') == 'planar'
@@ -179,10 +190,33 @@ def decode_motion(packet, receipt_ns):
         variance = np.where(diagonal > 0., diagonal, _DEFAULT_VARIANCE)
     model = ('planar' if planar else 'pose',) if pose is not None else ('twist',) if twist is not None else None
     return stamp, Motion(pose, twist, mask, origin, reset, variance, model,
-                         cumulative_pose_covariance, mount if cumulative_pose_covariance is not None else None)
+                         cumulative_pose_covariance, mount if cumulative_pose_covariance is not None else None,
+                         body_angular_velocity)
 
 
-def _leg_increment_covariance(left, right, velocity, elapsed_s, fraction):
+def _leg_origin_attitude(left, right, duration_ns):
+    """Carry SDK body attitude through an automatic leg-position rebase."""
+    if (duration_ns > _LEG_ATTITUDE_INTERVAL_NS or left.reset or right.reset or
+            left.body_angular_velocity is None or right.body_angular_velocity is None or
+            not all(left.origin) or not all(right.origin) or left.origin[1] != right.origin[1]):
+        return None
+    # The leg contact origin rebases translation, while SDK attitude remains
+    # in its controller frame. Require both endpoints' measured angular rate
+    # to support the relative quaternion before using it across that boundary.
+    change = np.eye(4)
+    change[:3, :3] = left.pose[:3, :3].T @ right.pose[:3, :3]
+    measured = se3_log(change)
+    seconds = duration_ns / 1e9
+    predicted = .5 * (left.body_angular_velocity + change[:3, :3] @ right.body_angular_velocity) * seconds
+    # Allow endpoint-rate sampling error during the short contact transition.
+    tolerance = np.deg2rad(2.) + .3 * np.linalg.norm(predicted)
+    error = np.linalg.norm(measured[3:] - predicted)
+    if not np.isfinite(error) or error > tolerance:
+        return None
+    return measured / seconds
+
+
+def _leg_increment_covariance(left, right, velocity, elapsed_s, fraction, at_measured_end):
     """Map the growth in upstream odometry axes into the step's end body axes."""
     start, end = left.cumulative_pose_covariance, right.cumulative_pose_covariance
     mount = right.body_from_sensor
@@ -193,7 +227,7 @@ def _leg_increment_covariance(left, right, velocity, elapsed_s, fraction):
         growth = _positive_covariance(end - start)
         if growth is None:
             return None
-        body = left.pose @ se3_exp(velocity * elapsed_s)
+        body = right.pose if at_measured_end else left.pose @ se3_exp(velocity * elapsed_s)
         sensor = body @ mount if mount is not None else body
         axes = np.eye(4)
         axes[:3, :3] = sensor[:3, :3].T
@@ -235,6 +269,7 @@ class ExternalOdometry:
         self.raw_motion = {}
         self.raw_vision = {}
         self._pose_intervals = OrderedDict()
+        self._learned_steps = OrderedDict()
         self.checkpoints = {}
         self.base = _State(0, np.eye(4), np.eye(6), np.zeros((6, 12)), ExternalMotionLearner(enabled=learning))
         self.current = self.base
@@ -292,7 +327,8 @@ class ExternalOdometry:
             self._pose_intervals.move_to_end(key)
             return cached[2], cached[3]
         velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
-        covariance = _leg_increment_covariance(left, right, velocity, (end-t0)/1e9, overlap/(t1-t0))
+        covariance = _leg_increment_covariance(left, right, velocity, (end-t0)/1e9,
+                                               overlap/(t1-t0), end == t1)
         self._pose_intervals[key] = (left, right, velocity, covariance)
         self._pose_intervals.move_to_end(key)
         if len(self._pose_intervals) > _MAX_EVENTS:
@@ -305,14 +341,19 @@ class ExternalOdometry:
         last = min(len(times)-1, bisect_left(times, end))
         for t0, t1 in zip(times[first:last], times[first+1:last+1]):
             left, right = self.raw_motion[t0], self.raw_motion[t1]
-            if right.reset or t1-t0 > _MAX_INTERVAL_NS or left.origin != right.origin or left.model != right.model:
+            if right.reset or t1-t0 > _MAX_INTERVAL_NS or left.model != right.model:
                 continue
             clipped_end = min(t1, end)
             overlap = clipped_end - max(t0, begin)
             if overlap <= 0:
                 continue
             increment_covariance = None
-            if left.pose is not None and right.pose is not None:
+            if left.origin != right.origin:
+                velocity = _leg_origin_attitude(left, right, t1-t0)
+                if velocity is None:
+                    continue
+                mask = _ANGULAR & left.mask & right.mask
+            elif left.pose is not None and right.pose is not None:
                 velocity, increment_covariance = self._pose_interval(t0, t1, left, right, clipped_end, overlap)
                 mask = left.mask & right.mask
             elif left.twist is not None and right.twist is not None:
@@ -322,6 +363,22 @@ class ExternalOdometry:
                 continue
             if mask.any():
                 yield np.where(mask, velocity, 0.), overlap/1e9, mask, right.variance, increment_covariance
+
+    def _learned_step(self, learner, velocity, dt, observed):
+        # Delayed visual measurements often replay the same measured motion.
+        # The prior can move without changing its body increment or adjoint.
+        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes())
+        step = self._learned_steps.get(key)
+        if step is None:
+            twist = learner.corrected_velocity(velocity, observed)
+            delta = se3_exp(twist * dt)
+            step = (twist, delta, _adjoint(np.linalg.inv(delta)))
+            self._learned_steps[key] = step
+            if len(self._learned_steps) > _MAX_EVENTS:
+                self._learned_steps.popitem(last=False)
+        else:
+            self._learned_steps.move_to_end(key)
+        return step
 
     def _advance(self, state, stamp, motion_times):
         transform, noise, sensitivity = state.transform, state.noise, state.sensitivity
@@ -334,9 +391,8 @@ class ExternalOdometry:
         mask = np.zeros(6, dtype=bool)
         twist = None
         for velocity, dt, observed, variance, increment in self._intervals(motion_times, state.stamp, stamp):
-            delta = learner.correct(velocity, dt, observed)
+            twist, delta, adjoint = self._learned_step(learner, velocity, dt, observed)
             transform = transform @ delta
-            adjoint = _adjoint(np.linalg.inv(delta))
             if increment is None:
                 process_noise = np.diag(np.where(observed, variance, .25) * dt)
             else:
@@ -348,7 +404,6 @@ class ExternalOdometry:
             if learner.enabled:
                 sensitivity = adjoint @ sensitivity + learner.velocity_parameter_jacobian(velocity, observed)*dt
             mask |= observed
-            twist = learner.corrected_velocity(velocity, observed)
         interval_update = mask.any()
         return replace(state, stamp=stamp, transform=transform, noise=noise, sensitivity=sensitivity,
                        learner=learner, motion_model=model,
@@ -437,10 +492,13 @@ class ExternalOdometry:
             return None
         pose = state.transform
         past = self.checkpoints.get(self._output_stamp)
-        if self._output_pose is not None and past is not None:
+        # Until a replay changes the published checkpoint, the correction is
+        # the identity. Keep the measured transform without a log/exp round trip.
+        if past is not None and self._output_pose is not None and self._output_pose is not past.transform:
             propagated = self._output_pose @ np.linalg.inv(past.transform) @ pose
             error = se3_log(np.linalg.inv(propagated) @ pose)
-            pose = propagated @ se3_exp(np.clip(error, -.03, .03))
+            if np.any(np.abs(error) > .03):
+                pose = propagated @ se3_exp(np.clip(error, -.03, .03))
         self._output_pose, self._output_stamp = pose, state.stamp
         axes = np.eye(4)
         axes[:3, :3] = pose[:3, :3]

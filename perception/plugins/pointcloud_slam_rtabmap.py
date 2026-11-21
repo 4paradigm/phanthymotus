@@ -36,7 +36,8 @@ def require_runtime():
 def paired_sensor_odom(settings):
     """The measured body pose and registered cloud share one private DDS delivery."""
     mount = settings.get('capture_mount') or {}
-    return settings.get('rgb_input') is not None and mount.get('interpolate', False)
+    has_sensor_data = settings.get('rgb_input') is not None or settings.get('scan_origin_recovery', False)
+    return has_sensor_data and mount.get('interpolate', False)
 
 
 def mapping_parameters(database_path, namespace, settings):
@@ -83,6 +84,13 @@ def mapping_parameters(database_path, namespace, settings):
         parameters['motus_rgbd_image_recovery'] = True
     if paired_sensor_odom(settings):
         parameters.update(subscribe_odom=False, motus_paired_sensor_odom=True)
+        parameters['Rtabmap/DetectionRate'] = '2'
+        if settings.get('rgb_input') is None:
+            parameters['motus_paired_scan'] = True
+            # Preserve measured neighbor poses during a turn. Weak scan ICP
+            # can distort them or create a false proximity loop.
+            parameters.update({'RGBD/NeighborLinkRefining': 'false',
+                               'RGBD/ProximityBySpace': 'false'})
     parameters.update(native_overrides(settings.get('native_parameters', {})))
     return parameters
 
