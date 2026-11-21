@@ -66,7 +66,7 @@ class FaceService:
                  det_size=(640, 640), det_thresh: float = 0.5,
                  nms_thresh: float = 0.4, max_image_side: int = 2048,
                  max_image_pixels: float = 60e6, warmup: bool = True,
-                 model: str = "buffalo_sc"):
+                 model: str = "buffalo_sc", detection_only: bool = False):
         from plugins.face_runtime import FaceAnalyzer
 
         # The decode limits are per-call on decode_image, not analyzer state, so they
@@ -82,6 +82,7 @@ class FaceService:
             model_dir=model_dir, model=model, providers=providers,
             num_threads=num_threads, det_size=det_size, det_thresh=det_thresh,
             nms_thresh=nms_thresh, warmup=warmup, in_process=True,
+            detection_only=detection_only,
         )
         log.info("face service ready: device=%s providers=%s",
                  self._analyzer.device, self._analyzer.providers)
@@ -90,9 +91,32 @@ class FaceService:
 
     def describe(self) -> dict:
         return {"device": self._analyzer.device,
-                "providers": list(self._analyzer.providers)}
+                "providers": list(self._analyzer.providers),
+                "recognition_loaded": self._analyzer._rec is not None}
 
     # ── the one call per frame ───────────────────────────────────────────────
+
+    def detect(self, image_bytes: bytes, frame_token: str,
+               det_thresh: float = 0.5) -> dict:
+        """Strict, full-resolution SCRFD only; no alignment or embeddings.
+
+        No face cap: every post-NMS detection is returned. Decode/inference
+        failures raise through the worker protocol, never an empty success.
+        """
+        import hashlib
+        from plugins.privacy_runtime import decode_jpeg, validated_regions
+
+        image = decode_jpeg(image_bytes)
+        height, width = image.shape[:2]
+        faces = self._analyzer.detect(image, max_faces=0,
+                                      det_thresh=det_thresh, strict=True)
+        entries = [{"bbox": list(face.bbox), "det_score": float(face.det_score)}
+                   for face in faces]
+        validated_regions(entries, width, height, det_thresh, 0.0)
+        return {"ok": True, "complete": True, "truncated": False,
+                "frame_token": frame_token,
+                "sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "width": width, "height": height, "faces": entries}
 
     def recognise(self, image_bytes: bytes, max_faces: int = 0,
                   det_thresh: float = 0.5, min_face_px: int = 64,
@@ -117,6 +141,8 @@ class FaceService:
             max_pixels=self._max_pixels)
         if image is None:
             return {"width": 0, "height": 0, "faces": [], "decoded": False}
+
+        self._analyzer.enable_recognition()
 
         height, width = image.shape[:2]
         faces = self._analyzer.detect(image, max_faces=max_faces)
@@ -163,6 +189,7 @@ class FaceService:
         `None` in place of any crop that could not be decoded or embedded, so one
         corrupt file cannot abandon the rest of a 4 000-sample pass.
         """
+        self._analyzer.enable_recognition()
         out = []
         for payload in crops or []:
             try:

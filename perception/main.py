@@ -266,10 +266,29 @@ class PerceptionBundle:
             self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
             log.info("BarcodeScanPlugin loaded")
 
+        # Weak-privacy smooth-mosaic demo is opt-in and separate from privacy_view.
+        # It never autostarts and must not be represented as anonymization.
+        if plugins_cfg.get("mosaic_smooth_demo", {}).get("enabled", False):
+            try:
+                from plugins.mosaic_smooth import MosaicSmoothDemoPlugin
+                self._plugins.append(MosaicSmoothDemoPlugin(
+                    plugins_cfg["mosaic_smooth_demo"], executor))
+                log.info("MosaicSmoothDemoPlugin loaded (demo only)")
+            except Exception:
+                log.error("MosaicSmoothDemoPlugin unavailable; continuing", exc_info=True)
+
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin
             self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
             log.info("SoundEventPlugin loaded")
+        if plugins_cfg.get("privacy_view", {}).get("enabled", False):
+            from plugins.privacy_view import PrivacyViewPlugin
+            try:
+                self._plugins.append(PrivacyViewPlugin(plugins_cfg["privacy_view"], executor))
+                log.info("PrivacyViewPlugin loaded")
+            except Exception:
+                log.error("PrivacyViewPlugin failed to load; continuing without it", exc_info=True)
+
         if plugins_cfg.get("face_recognition", {}).get("enabled", False):
             from plugins.face import FaceRecognitionPlugin
             # Guarded like TTSPlugin: this plugin needs the standalone

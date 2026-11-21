@@ -397,6 +397,7 @@ class FaceAnalyzer:
         warmup: bool = True,
         providers=None,
         in_process: bool = False,
+        detection_only: bool = False,
     ):
         if ort is None:
             raise RuntimeError(
@@ -474,9 +475,11 @@ class FaceAnalyzer:
             )
 
         self._det = ort.InferenceSession(det_path, options, providers=providers)
-        self._rec = ort.InferenceSession(rec_path, options, providers=providers)
+        self._rec_spec = (rec_path, options, providers)
+        self._rec = None
         self._det_input = self._det.get_inputs()[0].name
-        self._rec_input = self._rec.get_inputs()[0].name
+        if not detection_only:
+            self.enable_recognition()
         self._det_outputs = [output.name for output in self._det.get_outputs()]
 
         if len(self._det_outputs) != len(_FEAT_STRIDES) * 3:
@@ -526,7 +529,8 @@ class FaceAnalyzer:
                 (self._det_size[1], self._det_size[0], 3), dtype=np.uint8
             )
             self.detect(blank)
-            self.embed(np.zeros((_REC_INPUT_SIZE, _REC_INPUT_SIZE, 3), dtype=np.uint8))
+            if self._rec is not None:
+                self.embed(np.zeros((_REC_INPUT_SIZE, _REC_INPUT_SIZE, 3), dtype=np.uint8))
             log.info("[face] warmup done")
         except Exception:  # noqa: BLE001 - warmup must never block startup
             log.warning("[face] warmup failed; continuing", exc_info=True)
@@ -627,7 +631,8 @@ class FaceAnalyzer:
 
     # ── detection ─────────────────────────────────────────────────────────
 
-    def detect(self, bgr: np.ndarray, max_faces: int = 0) -> list[DetectedFace]:
+    def detect(self, bgr: np.ndarray, max_faces: int = 0,
+               det_thresh: float | None = None, strict: bool = False) -> list[DetectedFace]:
         """Detect faces in a BGR image, largest first."""
         if bgr is None or bgr.size == 0:
             return []
@@ -655,8 +660,22 @@ class FaceAnalyzer:
         blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
 
         outputs = self._det.run(self._det_outputs, {self._det_input: blob})
+        if strict:
+            # Privacy must distinguish a broken head from a successful empty
+            # detection. NaN scores otherwise disappear at thresholding.
+            if len(outputs) != 9:
+                raise ValueError("invalid SCRFD output count")
+            for level, stride in enumerate(_FEAT_STRIDES):
+                count = (input_h // stride) * (input_w // stride) * _NUM_ANCHORS
+                for offset, channels in ((0, 1), (3, 4), (6, 10)):
+                    values = np.asarray(outputs[level + offset])
+                    if values.size != count * channels or not np.isfinite(values).all():
+                        raise ValueError("invalid SCRFD output values or shape")
+                    if offset == 0 and ((values < 0).any() or (values > 1).any()):
+                        raise ValueError("invalid SCRFD confidence")
         boxes, keypoints, scores = scrfd_decode.decode(
-            outputs, input_h, input_w, scale, self._det_thresh, self._nms_thresh)
+            outputs, input_h, input_w, scale,
+            self._det_thresh if det_thresh is None else det_thresh, self._nms_thresh)
         if scores.size == 0:
             return []
         keep = range(len(scores))
@@ -680,6 +699,17 @@ class FaceAnalyzer:
         return faces
 
     # ── alignment, quality, embedding ─────────────────────────────────────
+
+    def enable_recognition(self) -> None:
+        """Load the identity network only when a recognition caller needs it.
+
+        FaceService calls are serialized by the ORT worker. Detection-only
+        consumers never create or run this session.
+        """
+        if self._rec is None:
+            path, options, providers = self._rec_spec
+            self._rec = ort.InferenceSession(path, options, providers=providers)
+            self._rec_input = self._rec.get_inputs()[0].name
 
     def align(self, bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
         """Warp a face onto the 112x112 ArcFace template."""

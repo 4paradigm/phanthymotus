@@ -484,7 +484,11 @@ def _build_engine(cfg: dict, on_status=None) -> _FaceEngine:
         # holds them for the life of the child instead of taking them per call.
         max_image_side=decode["max_side"], max_image_pixels=decode["max_pixels"],
     )
-    db = IdentityDB(**_db_options(cfg))
+    try:
+        db = IdentityDB(**_db_options(cfg))
+    except Exception:
+        analyzer.close()
+        raise
     return _FaceEngine(analyzer, db)
 
 
