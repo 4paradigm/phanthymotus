@@ -49,6 +49,10 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 from pathlib import Path
 
+# External odometry runs frequent small matrix operations alongside ROS callbacks.
+# Set the process-wide OpenBLAS limit before ROS or any plugin can load NumPy.
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
 import yaml
 
 import rclpy
