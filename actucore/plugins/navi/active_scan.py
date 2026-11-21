@@ -49,8 +49,9 @@ class ObservedObstacles:
     frame: tuple | None = None
     cells: set = field(default_factory=set)
     last_source: int = 0
+    approach_axes: dict = field(default_factory=dict)
 
-    def remember(self, pose, occupied):
+    def remember(self, pose, occupied, *, track_passage=False):
         if not occupied.any():
             return
         self.frame = pose.frame
@@ -58,22 +59,35 @@ class ObservedObstacles:
         c, s = math.cos(pose.yaw), math.sin(pose.yaw)
         x = pose.x + c * forward - s * left
         y = pose.y + s * forward + c * left
-        self.cells.update(zip(np.rint(x / RESOLUTION).astype(int),
-                              np.rint(y / RESOLUTION).astype(int)))
+        cells = list(zip(np.rint(x / RESOLUTION).astype(int), np.rint(y / RESOLUTION).astype(int)))
+        self.cells.update(cells)
+        if track_passage:
+            for cell, dx, dy in zip(cells, x - pose.x, y - pose.y):
+                distance = math.hypot(dx, dy)
+                if distance:
+                    self.approach_axes.setdefault(cell, (dx / distance, dy / distance))
 
-    def project(self, pose, observed_free=None):
+    def project(self, pose, observed_free=None, *, passed_clearance=None):
         if not self.cells or pose is None or pose.frame != self.frame:
             return None
-        cells = np.array(list(self.cells))
+        keys = list(self.cells)
+        cells = np.array(keys)
         x, y = (cells * RESOLUTION - (pose.x, pose.y)).T
-        # Keep hazards near the robot even while they are behind the optical view.
-        nearby = np.hypot(x, y) <= math.hypot(FORWARD.max(), RIGHT.max()) + RESOLUTION
-        if not nearby.all():
-            self.cells = set(map(tuple, cells[nearby]))
-            cells, x, y = cells[nearby], x[nearby], y[nearby]
+        if passed_clearance is None:
+            keep = np.hypot(x, y) <= math.hypot(FORWARD.max(), RIGHT.max()) + RESOLUTION
+        else:
+            # Use travel along the original sightline. Turning in place does
+            # not count as passing an obstacle.
+            forward, left = np.asarray([self.approach_axes.get(cell, (0., 0.)) for cell in keys]).T
+            keep = x * forward + y * left >= -passed_clearance
+        if not keep.all():
+            self._discard(cells[~keep])
+            cells, x, y = cells[keep], x[keep], y[keep]
         c, s = math.cos(pose.yaw), math.sin(pose.yaw)
         row = (x * c + y * s) / RESOLUTION + START[0]
         col = (x * s - y * c) / RESOLUTION + START[1]
+        if passed_clearance is not None:
+            row, col = np.round(row, 7), np.round(col, 7)
         indices = []
         cleared = np.full(len(x), observed_free is not None, dtype=bool)
         # Reproject conservatively across cell boundaries.
@@ -86,12 +100,17 @@ class ObservedObstacles:
                     cleared &= inside
                     cleared[inside] &= observed_free[r[inside], k[inside]]
         if cleared.any():
-            self.cells.difference_update(map(tuple, cells[cleared]))
+            self._discard(cells[cleared])
         hits = np.zeros(SHAPE, dtype=bool)
         for r, k, inside in indices:
             keep = inside & ~cleared
             hits[r[keep], k[keep]] = True
         return hits
+
+    def _discard(self, cells):
+        for key in map(tuple, cells):
+            self.cells.discard(key)
+            self.approach_axes.pop(key, None)
 
 
 @dataclass
@@ -100,6 +119,10 @@ class ActiveScan:
 
     obstacles: ObservedObstacles = field(default_factory=ObservedObstacles)
     historical_hits: np.ndarray | None = None
+    near_obstacles: ObservedObstacles = field(default_factory=ObservedObstacles)
+    near_hits: np.ndarray | None = None
+    near_revision: int = 0
+    near_odom_reference: tuple | None = None
     phase: str = "idle"
     attempted: bool = False
     exhausted: bool = False
@@ -420,11 +443,64 @@ class ActiveScan:
                 return tuple(lo + part * (hi - lo) for lo, hi in zip(lower, upper))
         return None
 
+    def _near_pose(self, pose):
+        memory = self.near_obstacles
+        if pose is not None and (not memory.cells or pose.frame == memory.frame):
+            self.near_odom_reference = (self.motion_frame, self.pose, pose)
+            return pose
+        reference = self.near_odom_reference
+        if not self.poses or self.command_only or reference is None or reference[0] is not self.motion_frame:
+            return None
+        # Continue in the same local frame with measured relative motion when
+        # the separately sampled body pose is late.
+        _, start, anchor = reference
+        df, dr = self.pose[0] - start[0], self.pose[1] - start[1]
+        angle = anchor.yaw + start[2]
+        c, s = math.cos(angle), math.sin(angle)
+        return PlanarPose(self.poses[-1][0], anchor.frame, anchor.x + c * df + s * dr,
+                          anchor.y + s * df - c * dr, anchor.yaw + start[2] - self.pose[2])
+
+    def update_near_obstacles(self, depth, geometry, pose, half_width, lookahead, *, approaching):
+        memory = self.near_obstacles
+        if not memory.cells and not approaching:
+            self.near_hits = None
+            return
+        pose = self._near_pose(pose)
+        if pose is None:
+            # Keep checking the last projection until relative odometry resumes.
+            return
+        capture = (depth or {}).get("obstacle_capture_pose")
+        source = (depth or {}).get("source_stamp_ns") or self.current_frame
+        radius = math.hypot(max(geometry.front, geometry.rear), half_width) + RESOLUTION
+        if (capture is not None and capture.frame == pose.frame and self.views
+                and source > memory.last_source and self.matches_route_view(depth)):
+            free, occupied = self.observed_grid()
+            memory.last_source = source
+            memory.project(capture, observed_free=free, passed_clearance=radius)
+            if approaching:
+                front = occupied & (FORWARD > 0.) & (FORWARD <= lookahead) & (abs(RIGHT) <= half_width)
+                if front.any():
+                    nearest = FORWARD[front].min()
+                    memory.remember(capture, front & (FORWARD <= nearest + 2 * RESOLUTION),
+                                    track_passage=True)
+        hits = memory.project(pose, passed_clearance=radius)
+        self.near_hits = hits if hits is not None and hits.any() else None
+        self.near_revision = pose.stamp_ms
+
+    @property
+    def remembered_hits(self):
+        if self.near_hits is None:
+            return self.historical_hits
+        if self.historical_hits is None:
+            return self.near_hits
+        return self.historical_hits | self.near_hits
+
     def grid(self):
         free, hits = self.observed_grid()
-        if self.historical_hits is None:
+        remembered = self.remembered_hits
+        if remembered is None:
             return free, hits
-        return free & ~self.historical_hits, hits | self.historical_hits
+        return free & ~remembered, hits | remembered
 
     def observed_grid(self):
         """Reproject nearby views. Occupation wins, and free cells need support."""

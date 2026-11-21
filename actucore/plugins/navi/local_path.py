@@ -444,9 +444,7 @@ def observed_waypoint(free, forward, right):
     return 0 <= row < free.shape[0] and 0 <= col < free.shape[1] and bool(free[row, col])
 
 
-def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, padding=0.):
-    """Check measured obstacles in the swept rectangle of the velocity ramps."""
-    occupied = grid[1]
+def _transition_hits(occupied, geometry, half_width, horizon_s, velocities, padding):
     forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
     rear = -geometry.rear + min(0., *forward)
     front = geometry.front + max(0., *forward)
@@ -455,17 +453,26 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, paddi
     half = RESOLUTION / 2 + padding
     swept = ((FORWARD + half > rear) & (FORWARD - half < front)
              & (RIGHT + half > left) & (RIGHT - half < right_edge))
-    return not (swept & occupied).any()
+    return swept & occupied
 
 
-def motion_sweep_clear(grid, geometry, half_width, horizon, velocities):
+def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, padding=0.):
+    """Check measured obstacles in the swept rectangle of the velocity ramps."""
+    return not _transition_hits(grid[1], geometry, half_width, horizon_s, velocities, padding).any()
+
+
+def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0.):
     """Bound footprint rotation and the departure from a straight velocity ramp."""
     turn = max(abs(yaw) for _, _, yaw in velocities) * horizon
     speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
     radius = math.hypot(max(geometry.front, geometry.rear), half_width)
-    padding = radius * min(2., turn) + speed * horizon * min(2., turn / 2)
-    return transition_clear(grid, geometry, half_width, horizon,
-                            tuple(v[:2] for v in velocities), padding=padding)
+    padding += radius * min(2., turn) + speed * horizon * min(2., turn / 2)
+    return _transition_hits(occupied, geometry, half_width, horizon,
+                            tuple(v[:2] for v in velocities), padding)
+
+
+def motion_sweep_clear(grid, geometry, half_width, horizon, velocities):
+    return not motion_sweep_hits(grid[1], geometry, half_width, horizon, velocities).any()
 
 
 def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):

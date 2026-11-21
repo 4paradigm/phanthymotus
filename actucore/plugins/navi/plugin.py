@@ -1819,6 +1819,10 @@ class NaviPlugin:
         if grid is None:
             return None
         clear = local_path.transition_clear(grid, geometry, keepout, horizon, velocities, padding=padding)
+        if clear and scan.near_hits is not None:
+            travel = speed * max(0, now_ms - scan.near_revision) / 1000
+            clear = local_path.transition_clear((None, scan.near_hits), geometry, keepout,
+                                                horizon, velocities, padding=padding + travel)
         return obs_ms, deadline, clear
 
     def next_command(self):
@@ -2210,13 +2214,13 @@ class NaviPlugin:
                            keep, horizon, brake_horizon, padding=padding)
         if reason is not None:
             return reason, True
-        historical = feedback.historical_hits
-        if historical is not None and historical.any():
+        remembered = feedback.remembered_hits
+        if remembered is not None and remembered.any():
             radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep) + velocity * horizon
             padding = (math.dist(feedback.pose[:2], work.checked_pose[:2])
                        + radius * (abs(feedback.pose[2] - work.checked_pose[2])
                                    + abs(feedback.motion[2]) * horizon))
-            if not local_path.transition_clear((None, historical), leg.geometry, keep,
+            if not local_path.transition_clear((None, remembered), leg.geometry, keep,
                                                horizon, velocities, padding=padding):
                 return "局部规划：执行段扫掠区有已记录障碍，停车后重规划", True
         return None

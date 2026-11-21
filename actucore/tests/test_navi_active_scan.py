@@ -1117,3 +1117,60 @@ def test_completed_view_prevents_repeated_observation_but_allows_route_alignment
     look.pose = (0., 0., 0.)
     assert not look.begin((1.,))
     assert look.begin((1.,), advance_m=.8, route_segment=True)
+
+
+@pytest.mark.parametrize("release", ["passed", "confirmed_free"])
+def test_camera_near_obstacle_follows_relative_pose_through_a_blind_frame(release):
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    obstacle = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+
+    def view(stamp, x, y, yaw, free, hits):
+        pose = PlanarPose(stamp, ("odom", "body"), x, y, yaw)
+        look.current_frame = stamp
+        look.views.clear()
+        look.views.append((stamp, look.pose, free, hits))
+        depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=True)
+
+    view(1000, 0., 0., 0., empty, obstacle)
+    view(1100, .30, 0., 0., empty, empty)
+    free, occupied = look.grid()
+    assert occupied[scan.START[0] + 10, scan.START[1]]
+    assert not free.any()
+
+    # Turning in place moves the hit out of the front image, not past the robot.
+    view(1200, .30, 0., math.pi, empty, empty)
+    assert look.near_obstacles.cells
+
+    if release == "passed":
+        view(1300, 1.35, -.40, 0., empty, empty)
+    else:
+        newly_clear = np.isclose(scan.FORWARD, .50) & (abs(scan.RIGHT) < .1)
+        view(1300, .30, 0., 0., newly_clear, empty)
+    assert not look.grid()[1].any()
+    assert not look.near_obstacles.cells
+
+
+def test_camera_near_obstacle_can_use_continuous_relative_odometry_during_pose_gap():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    obstacle = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
+    initial = PlanarPose(1000, ("local", "body"), 10., 2., math.pi / 2)
+    look.current_frame = 1000
+    look.poses.append((1000, look.pose, 0.))
+    look.views.append((1000, look.pose, empty, obstacle))
+    look.update_near_obstacles(dict(frame_id=1000, obstacle_capture_pose=initial),
+                               geometry, initial, .3, 1.5, approaching=True)
+
+    look.pose = (.30, 0., 0.)
+    look.poses.append((1100, look.pose, 0.))
+    look.update_near_obstacles(None, geometry, None, .3, 1.5, approaching=False)
+    assert look.near_hits[scan.START[0] + 9, scan.START[1]]
+    assert look.near_revision == 1100

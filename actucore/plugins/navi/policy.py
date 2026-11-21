@@ -1040,7 +1040,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
                 scan = state.active_scan
                 if scan.active or any(state.commanded):
                     state.feedback_guard_s = max(state.feedback_guard_s, (config.watchdog_ms + 50) / 1000)
-                state.active_scan = ActiveScan(obstacles=scan.obstacles)
+                state.active_scan = ActiveScan(obstacles=scan.obstacles, near_obstacles=scan.near_obstacles,
+                                               near_hits=scan.near_hits, near_revision=scan.near_revision)
                 state.escape_side = 0.
             # Keep one frame of reference for the rest of this task after a
             # fallback. Intermittent transforms must not interrupt each tick.
@@ -1080,6 +1081,10 @@ def step(*, detections, depth, odom, config: Config, state: State,
         if transitioning:
             decision = Decision(_twist(0., 0., 0.), AVOIDING, "运动方向切换，停车等待制动窗口")
     anchor, scan = state.goal_anchor, state.active_scan
+    if decision.values is not None and any(decision.values) and not scan.active and scan.near_hits is not None:
+        twist = tuple(decision.values[i] for i in (0, 1, 5))
+        if _near_sweep_hits(config, scan, odom, state, twist).any():
+            decision = Decision(_twist(0., 0., 0.), AVOIDING, "当前运动的扫掠区有盲区内已观测障碍")
     if (decision.reason == NO_LOCAL_ROUTE and scan.exhausted and scan.current_frame
             and anchor is not None and anchor.verified_range_m is not None
             and anchor.verified_range_m > config.arrival_distance_m
@@ -1302,7 +1307,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 hold = previous_scan.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
                 return Decision(_twist(0, 0, 0), AVOIDING, hold.reason)
             previous_scan.invalidate()
-            state.active_scan = ActiveScan(obstacles=previous_scan.obstacles)
+            state.active_scan = ActiveScan(obstacles=previous_scan.obstacles,
+                                           near_obstacles=previous_scan.near_obstacles,
+                                           near_hits=previous_scan.near_hits, near_revision=previous_scan.near_revision)
             if needs_guard:
                 state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
         state.motion_source = source
@@ -1348,6 +1355,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
             update = scan.update(scan_depth, odom, geometry,
                                  receipt_only=receipt_only, max_depth_age_ms=config.depth_age_limit_ms,
                                  follow_leg=state.detour_leg is not None)
+        if config.scan_geometry is None and geometry is not None and geometry.horizontal is not None:
+            target_range = (track.range_m if track is not None and track.range_known else math.inf)
+            if anchor is not None:
+                target_range = min(target_range, math.hypot(anchor.x, anchor.y))
+            reach = min(config.approach_check_distance_m + geometry.front,
+                        target_range - FORWARD_CLEARANCE_MARGIN_M)
+            approaching = (feedback is not None and (track is not None or anchor is not None)
+                           and max(feedback[0], state.commanded[0]) > STILL_LINEAR)
+            scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
+                                       approaching=approaching)
         if was_scanning and not scan.active:
             return Decision(_twist(0, 0, 0), AVOIDING,
                             update.reason if update else "主动观察中断；停车后重规划")
@@ -1964,6 +1981,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     free, occupied = grid
     observation = dict(depth, projected_grid=grid, body_half_width=config.half_width_m,
                        closest=closest, allow_unknown=True)
+    if scan.near_hits is not None:
+        observation["scan_revision"] = scan.near_revision
     if not scan.receipt_only:
         observation.update(scan_grid=grid, scan_revision=scan.poses[-1][0])
     target, optical_target = None, None
@@ -2114,6 +2133,19 @@ def _target_corridor_clear(depth, config, scan, distance, bearing, velocities):
             and local_path.motion_sweep_clear((free, occupied), geometry, keep, horizon, velocities))
 
 
+def _near_sweep_hits(config, scan, odom, state, twist):
+    geometry = config.scan_geometry or config.local_geometry
+    keep = _keepout_m(config)
+    motion = planar_feedback(odom) or state.command_tail
+    velocities = (motion, state.commanded, twist)
+    horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+    age = max(0, scan.control_ms - scan.near_revision) / 1000
+    radius = math.hypot(max(geometry.front, geometry.rear), keep)
+    padding = age * max(math.hypot(vx, vy) + radius * abs(yaw) for vx, vy, yaw in velocities)
+    return local_path.motion_sweep_hits(scan.near_hits, geometry, keep, horizon, velocities,
+                                        padding=padding)
+
+
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
            target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False,
            target_bearing=None, dt=0.):
@@ -2124,7 +2156,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if (scan is not None and geometry is not None and geometry.horizontal is not None
             and geometry.vertical is not None and scan.views and scan.matches_route_view(depth)
             and depth.get("ground") is None):
-        _, occupied = scan.grid()
+        _, occupied = scan.observed_grid()
+        if scan.historical_hits is not None:
+            occupied = occupied | scan.historical_hits
         hits = occupied & (FORWARD >= 0.) & (abs(RIGHT) <= _keepout_m(config))
         transform = geometry.base_from_optical
         ahead = (max(0., (float(FORWARD[hits].min()) - transform[0, 3]) / transform[0, 2])
@@ -2144,6 +2178,13 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             return 0., 0., 0., AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车"
         obstacle = _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan)
         if obstacle is not None:
+            ahead = obstacle if ahead is None else min(ahead, obstacle)
+            foreground = plan_obstacle = True
+            state.last_clearance = ahead
+    if scan is not None and scan.near_hits is not None:
+        swept = _near_sweep_hits(config, scan, odom, state, (vx, vy, wz))
+        if swept.any():
+            obstacle = max(0., float(FORWARD[swept].min()))
             ahead = obstacle if ahead is None else min(ahead, obstacle)
             foreground = plan_obstacle = True
             state.last_clearance = ahead
@@ -2301,6 +2342,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                   and (config.scan_geometry or config.local_geometry) is config.local_geometry
                   and scan.matches_route_view(depth)):
                 planning_depth.update(frame_id=scan.current_frame, project_scan_view=scan.grid)
+                if scan.near_hits is not None:
+                    planning_depth["scan_revision"] = scan.near_revision
             transitioning = False
             for candidate in order:
                 if state is not None and state.side_stall_s.get(candidate, -math.inf) >= config.stuck_window_s:

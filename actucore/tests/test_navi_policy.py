@@ -4722,3 +4722,23 @@ def test_unvalidated_dynamic_mount_uses_measured_hits_without_world_memory(monke
     assert command(1000, wall)[0] < .3
     assert not scan.obstacles.cells
     assert command(1100, np.zeros_like(wall))[0] == .3
+
+
+@pytest.mark.parametrize("right, can_move", [(0., False), (.65, True)])
+def test_blind_spot_history_only_blocks_a_motion_that_sweeps_through_it(monkeypatch, right, can_move):
+    geometry = P.local_path.Geometry(None, None, np.eye(4), .25, .25, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25,
+                  use_lateral=False, wz_max=0.)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    empty = np.zeros(P.local_path.SHAPE, dtype=bool)
+    scan.views.append((1000, scan.pose, empty, empty))
+    scan.near_hits = np.isclose(P.FORWARD, .40) & np.isclose(P.RIGHT, right)
+    frame = np.full((8, 8), 3.)
+    depth = dict(frame_id=1000, map=frame, ground=frame.astype(bool))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (3., .9))
+    result = P._avoid(.30, 0., 0., depth, config, P.APPROACHING, "", state,
+                      target_distance=3., target_bearing=0.,
+                      odom={"vx": 0., "vy": 0., "wz": 0.}, may_scan=True)
+    assert (result[0] > 0.) is can_move
