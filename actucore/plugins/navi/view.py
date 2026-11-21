@@ -305,14 +305,12 @@ def _line(frame, start, end, colour, thickness: int = 2):
     cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
 
 
-def _draw_route_inset(frame, detour, executing, guidance=None):
+def _draw_route_inset(frame, detour, executing):
     import cv2
 
     routes = [(route.points, colour) for route, colour in
               ((detour, _CORRIDOR), (executing, _EXECUTING_ROUTE))
               if route is not None and len(route.points) > 1]
-    if guidance is not None:
-        routes.append((guidance, _TARGET))
     height, width = frame.shape[:2]
     size = min(132, width // 3, height // 3)
     if not routes or size < 40:
@@ -333,10 +331,7 @@ def _draw_route_inset(frame, detour, executing, guidance=None):
     for route, colour in routes:
         pixels = [pixel(point) for point in route]
         for start, end in zip(pixels, pixels[1:]):
-            if colour == _TARGET:
-                _dashed_line(frame, start, end, colour)
-            else:
-                _line(frame, start, end, colour, thickness=3)
+            _line(frame, start, end, colour, thickness=3)
     cv2.circle(frame, pixel((0., 0.)), 3, _TARGET, -1, cv2.LINE_AA)
 
 
@@ -365,9 +360,42 @@ def _dashed_line(frame, a, b, colour, phase=0.):
     return (phase + length) % 15.
 
 
+def _draw_target_direction(frame, bearing, box, config):
+    height, width = frame.shape[:2]
+    start = (width // 2, height - 46)
+    if box:
+        end = (round(width * (box[0] + box[2]) / 2), round(height * box[3]))
+        _dashed_line(frame, start, end, _TARGET)
+        return
+    if bearing is None or not math.isfinite(bearing):
+        return
+
+    intrinsics = getattr(config, "depth_intrinsics", None)
+    if abs(bearing) >= math.pi / 2:
+        column = width if bearing > 0. else -1
+    elif intrinsics is None:
+        column = _column_of(bearing, config.half_fov_rad, width)
+    else:
+        fx, cx = intrinsics.for_width(width)
+        column = round(cx + fx * math.tan(bearing))
+    offscreen = not 0 <= column < width
+    if offscreen:
+        column = width - 13 if bearing > 0. else 12
+    end = (column, round(height * .58))
+    _dashed_line(frame, start, end, _TARGET)
+
+    if offscreen:
+        direction = math.atan2(end[1] - start[1], end[0] - start[0])
+        for wing in (-.55, .55):
+            angle = direction + wing
+            corner = (round(end[0] - 13 * math.cos(angle)), round(end[1] - 13 * math.sin(angle)))
+            _line(frame, corner, end, _TARGET)
+
+
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, rgb_jpeg=None, blend: float = 0.5,
            ground=None, detour=None, executing=None, depth_vertical=None, route_target=None,
+           target_bearing=None,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -403,7 +431,7 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     geometry = (detour.geometry if detour is not None else
                 camera_square(config.depth_intrinsics, depth_vertical, config.half_width_m))
     lines = route_lines(depth_m, ground, geometry, detour.points if detour is not None else (),
-                        route_target, keep, width, height,
+                        None, keep, width, height,
                         stop_distance_m=config.stop_distance_m,
                         pending=detour is not None and detour.command is None)
     phase, previous_end = 0., None
@@ -426,9 +454,6 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                 execution_visible = True
     if (detour is not None and previous_end is None) or (executing is not None and not execution_visible):
         _draw_route_inset(frame, detour, executing)
-    elif previous_end is None and not execution_visible and route_target is not None:
-        guidance = _target_guidance(geometry, (0., 0.), route_target, config.stop_distance_m)
-        _draw_route_inset(frame, None, None, guidance)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -450,6 +475,8 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
         _text(frame, f"path {2 * keep:.2f}m wide", (8, 46), _CORRIDOR, 0.5)
 
     # ── the target ───────────────────────────────────────────────────────────
+    bearing = route_target[1] if route_target is not None else target_bearing
+    _draw_target_direction(frame, bearing, box, config)
     if box:
         x1, y1, x2, y2 = (int(box[0] * width), int(box[1] * height),
                           int(box[2] * width), int(box[3] * height))

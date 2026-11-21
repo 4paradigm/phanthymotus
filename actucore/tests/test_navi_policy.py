@@ -3555,7 +3555,7 @@ def test_right_route_shorter_than_forward_slow_distance_can_be_selected():
     assert decision.status == P.AVOIDING
     assert decision.values[:2] == [0., 0.] and decision.values[5] < 0
     assert "朝右侧避让" in decision.reason
-    assert cfg.slow_distance_m == 1.5
+    assert cfg.slow_distance_m == 1.0
 
 
 def test_local_planning_holds_instead_of_using_an_unchecked_avoidance_turn():
@@ -3796,7 +3796,7 @@ def test_local_planner_holds_side_through_centimetre_noise_and_switches_if_block
     assert step(800) < 0
 
 
-def test_local_planner_checks_the_obstacle_at_the_start_of_the_slowdown_band(monkeypatch):
+def test_local_planner_checks_obstacles_before_the_slowdown_band(monkeypatch):
     cfg = _cfg(local_planning=True)
     state = _state(motion_source="command")
     monkeypatch.setattr(P, "_clearance", lambda *_args, **_kwargs: (1.48, 1.))
@@ -4676,3 +4676,49 @@ def test_verified_target_corridor_releases_near_stop_recovery(monkeypatch):
                       target_distance=2., target_bearing=0., odom=feedback, may_scan=True)
     assert result[:3] == (.2, 0., 0.)
     assert not state.recovery and not state.blocked_for_s
+
+
+@pytest.mark.parametrize("range_m, speed", [(1.1, .2), (.75, .1)])
+def test_default_speed_reduction_starts_at_one_metre(monkeypatch, range_m, speed):
+    config = _cfg(stop_distance_m=.60)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (range_m, 1.))
+    result = P._avoid(.2, 0., 0., _scene(range_m), config, P.APPROACHING, "",
+                      target_distance=range_m)
+    assert config.obstacle_stop_m == .50
+    assert result[0] == pytest.approx(speed)
+
+
+def test_unvalidated_dynamic_mount_uses_measured_hits_without_world_memory(monkeypatch):
+    from dataclasses import replace
+
+    from plugins.navi.local_path import camera_square
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.odom import PlanarPose
+
+    geometry = replace(camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2),
+                       free_space_validated=False)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
+               half_width_m=.2, use_lateral=False, wz_max=0.)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only = True
+    wall = np.isclose(P.FORWARD, 1.25)
+    frame = np.full((8, 8), 3.)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (3., 1.))
+    monkeypatch.setattr(P.local_path, "observe", lambda *args, **kwargs: (~wall, wall))
+
+    def command(stamp, hits):
+        pose = PlanarPose(stamp, ("odom", "body"), 0., 0., 0.)
+        scan.current_frame = stamp
+        scan.poses.append((stamp, scan.pose, 0.))
+        scan.views.clear()
+        scan.views.append((stamp, scan.pose, ~hits, hits))
+        observation = dict(frame_id=stamp, capture_ms=stamp, map=frame, ground=frame.astype(bool),
+                           body_mount_required=True, obstacle_capture_pose=pose)
+        feedback = dict(vx=0., vy=0., wz=0., obstacle_pose=pose)
+        return P._avoid(.3, 0., 0., observation, cfg, P.APPROACHING, "", state,
+                        target_distance=3., target_bearing=0., odom=feedback, may_scan=True)
+
+    assert command(1000, wall)[0] < .3
+    assert not scan.obstacles.cells
+    assert command(1100, np.zeros_like(wall))[0] == .3

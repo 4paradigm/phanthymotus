@@ -455,7 +455,18 @@ def test_route_monitor_draws_selected_and_executing_routes_without_ground():
 
 
 @needs_cv2
-def test_unprojected_target_guidance_does_not_look_like_an_executing_route():
-    frame = _render(ground=None, clearance=None, route_target=(2., .2))
-    assert np.count_nonzero((frame[:145, 500:] == V._TARGET).all(axis=2)) > 30
-    assert not (frame == V._EXECUTING_ROUTE).all(axis=2).any()
+def test_target_guidance_is_a_dashed_line_in_the_main_image():
+    frame = _render(ground=None, clearance=None, route_target=(2., 0.))
+    target = (frame == V._TARGET).all(axis=2)
+    assert not target[:145, 500:].any()
+    centre = target[290:420, 320]
+    assert centre.any() and not centre.all()
+
+
+@pytest.mark.parametrize("bearing, column", [(-1.2, 12), (1.2, 627)])
+@needs_cv2
+def test_offscreen_target_has_a_dashed_arrow_at_the_correct_edge(bearing, column):
+    frame = _render(ground=None, clearance=None, target_bearing=bearing)
+    target = (frame == V._TARGET).all(axis=2)
+    assert target[268:287, column].any()
+    assert not target[:145, 500:].any()

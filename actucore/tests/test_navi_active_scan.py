@@ -1099,3 +1099,21 @@ def test_scan_stop_tolerance_uses_buffered_odom_without_zeroing_velocity(monkeyp
         assert look._turn_translation(1.45, look.motion) == pytest.approx(speed * 1.45)
     else:
         assert "等待底盘停稳" in result.reason
+
+
+def test_completed_view_prevents_repeated_observation_but_allows_route_alignment():
+    look = scan.ActiveScan()
+    look.receipt_only, look.current_frame = True, 1200
+    look.phase, look.directions, look.origin_set = "turn", (1.,), True
+    look.pose = (0., 0., scan.ANGLE)
+    look.poses.append((1200, look.pose, 0.))
+    clear = np.zeros(scan.SHAPE, dtype=bool)
+    look.views.append((1200, look.pose, clear, clear))
+    look.command(None, .3, .6, 300)
+    assert look.ready
+
+    look.finish()
+    look.note_clear_path(1200)
+    look.pose = (0., 0., 0.)
+    assert not look.begin((1.,))
+    assert look.begin((1.,), advance_m=.8, route_segment=True)

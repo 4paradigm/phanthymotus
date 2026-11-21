@@ -120,6 +120,7 @@ class ActiveScan:
     max_feedback_gap_ms: int = ODOM_GAP_MS
     poses: deque = field(default_factory=lambda: deque(maxlen=32))
     views: deque = field(default_factory=lambda: deque(maxlen=40))
+    observed_vantages: deque = field(default_factory=lambda: deque(maxlen=32))
     current_frame: int = 0
     pending_depth: dict | None = None
     _pending_projection: tuple | None = None
@@ -471,8 +472,18 @@ class ActiveScan:
             return source == self.source_frame
         return self.current_frame == depth.get("frame_id")
 
+    def _already_observed(self, origin, angle):
+        return any(math.dist(origin[:2], view[:2]) <= .18
+                   and abs(math.remainder(origin[2] + angle - view[2], math.tau)) <= ANGLE / 2
+                   for view in self.observed_vantages)
+
     def begin(self, directions, *, advance_m=None, turn_angle=ANGLE, route_segment=False, reroute=False):
         if not self.current_frame or (self.attempted and not reroute) or (reroute and self.rerouted):
+            return False
+        if not route_segment and not self.command_only:
+            directions = tuple(side for side in directions
+                               if not self._already_observed(self.pose, side * turn_angle))
+        if not directions:
             return False
         if reroute:
             self.rerouted = True
@@ -495,6 +506,10 @@ class ActiveScan:
 
     def try_other_side(self):
         self.directions = self.directions[1:]
+        if not self.route_segment and not self.command_only:
+            origin = self.origin if self.origin_set else self.pose
+            self.directions = tuple(side for side in self.directions
+                                    if not self._already_observed(origin, side * ANGLE))
         if self.directions:
             self.turn_angle = ANGLE
             self.phase = "brake"
@@ -619,6 +634,10 @@ class ActiveScan:
                 self.issued_yaw = False
             else:
                 self.side_frame = self.current_frame
+                if self.views and self.views[-1][0] == self.current_frame:
+                    vantage = self.views[-1][1]
+                    if not self._already_observed(vantage, 0.):
+                        self.observed_vantages.append(vantage)
             self.phase = "evaluate" if returning or self.receipt_only or self.advance_m is not None else "return"
             return ScanCommand(reason="主动观察：使用当前深度评估路线")
         if (self.receipt_only and self.phase == "turn" and self.issued_yaw
@@ -825,6 +844,7 @@ class ActiveScan:
         self.odom_source = None
         self.poses.clear()
         self.views.clear()
+        self.observed_vantages.clear()
         self.pose = (0., 0., 0.)
         self.pose_origin = None
         self.pose_feedback_since_ms = 0

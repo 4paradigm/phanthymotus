@@ -2449,7 +2449,7 @@ class NaviPlugin:
                     ground=snapshot["ground"], detour=snapshot["detour"],
                     executing=snapshot["executing"],
                     depth_vertical=snapshot["depth_vertical"], route_target=snapshot["route_target"],
-                    config=self._config)
+                    target_bearing=snapshot["bearing"], config=self._config)
                 message = CompressedImage()
                 message.format = "jpeg"
                 message.data = view_mod.encode(frame)

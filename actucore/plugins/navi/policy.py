@@ -135,7 +135,7 @@ class Config:
     # target/heading requirements still apply; this is not a tolerance for
     # stale or predicted observations. Callers may request zero per action.
     stop_tolerance_m: float = 0.05
-    slow_distance_m: float = 1.5
+    slow_distance_m: float = 1.0
     side_clearance_m: float = 1.0
     local_planning: bool = False
     odom_expected: bool = False
@@ -361,6 +361,11 @@ class Config:
     @property
     def depth_age_limit_ms(self) -> int:
         return self.max_obs_age_ms if self.max_depth_age_ms is None else self.max_depth_age_ms
+
+    @property
+    def approach_check_distance_m(self) -> float:
+        # Keep checking obstacles before they enter the speed reduction band.
+        return max(1.5, self.slow_distance_m)
 
     def __post_init__(self):
         if self.max_depth_age_ms is not None and (
@@ -1129,7 +1134,7 @@ def _forward_gain(config: Config, state: State, distance, live: bool,
             or config.k_fwd == 0):
         state.adaptive_fwd_scale = 1.0
         return config.k_fwd
-    window = max(0.1, config.slow_distance_m - config.stop_distance_m)
+    window = max(0.1, config.approach_check_distance_m - config.stop_distance_m)
     error = max(0.0, distance - config.stop_distance_m)
     # This rational schedule keeps the settled, unsaturated P speed monotone
     # in distance error: approaching the target does not increase that speed.
@@ -1205,7 +1210,7 @@ def _wait_for_detour_goal(state, config, track, odom):
 
 def _reacquire_detour_goal(depth, config, state, raw_yaw, bearing, dt, odom):
     if (state.goal_anchor is not None
-            and (state.last_clearance is None or state.last_clearance >= config.slow_distance_m)):
+            and (state.last_clearance is None or state.last_clearance >= config.approach_check_distance_m)):
         yaw = _finalise_yaw(raw_yaw, False, bearing, config, state, dt)
         if yaw:
             stop = _search_turn_stop(depth, config, state, requested_yaw=yaw)
@@ -1748,7 +1753,7 @@ def _may_strafe(towards_right: bool, depth, config: Config) -> bool:
         return False
     offset = _keepout_m(config) * (1.0 if towards_right else -1.0)
     room, _ = _clearance(depth, config, lateral_offset_m=offset)
-    return room is None or room > config.slow_distance_m
+    return room is None or room > config.approach_check_distance_m
 
 
 def _approach(speed: float, bearing: float, depth, config: Config,
@@ -1856,12 +1861,12 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
     if can_plan:
         direction = state.last_seen_side if requested_yaw is None else -math.copysign(1., requested_yaw)
         if (requested_yaw is None and not state.searching_for_s
-                and ahead is not None and ahead < config.slow_distance_m
+                and ahead is not None and ahead < config.approach_check_distance_m
                 and depth.get("map") is not None):
             keep = _keepout_m(config)
             alternate, seen = _clearance(depth, config, lateral_offset_m=-direction * keep)
             current, _ = _clearance(depth, config, lateral_offset_m=direction * keep)
-            if (alternate is not None and alternate >= config.slow_distance_m
+            if (alternate is not None and alternate >= config.approach_check_distance_m
                     and seen >= config.coverage_min
                     and (current is None or alternate - current >= SIDE_SWITCH_ADVANTAGE_M)):
                 direction = -direction
@@ -1884,7 +1889,7 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
                 state.searched_rad = 0.
         state.last_seen_side = direction
     if state.recovery:
-        if not config.local_planning and ahead is not None and ahead < config.slow_distance_m:
+        if not config.local_planning and ahead is not None and ahead < config.approach_check_distance_m:
             return "近障停车，等待前方净空"
         state.recovery = False
     return None
@@ -2046,6 +2051,21 @@ def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distanc
     memory = scan.obstacles
     source = depth.get("source_stamp_ns") or depth.get("source_frame_id") or depth.get("capture_ms")
     max_depth = target_distance - FORWARD_CLEARANCE_MARGIN_M if target_distance is not None else None
+    if depth.get("body_mount_required") and not geometry.free_space_validated:
+        # An estimated moving mount suffices for this view, but must not
+        # insert obstacles into an odometry map that cannot clear them again.
+        if geometry is not config.scan_geometry or not scan.views or not scan.matches_route_view(depth):
+            return None
+        hits = scan.observed_grid()[1] if scan.receipt_only else scan.views[-1][3]
+        front = transform[0, 2]
+        if front <= 0.:
+            return None
+        if max_depth is not None:
+            corridor &= FORWARD <= max_depth * front + transform[0, 3]
+        marked = corridor & hits
+        if marked.any():
+            return max(0., (float(FORWARD[marked].min()) - transform[0, 3]) / front)
+        return None
     verified = (not scan.receipt_only and geometry.free_space_validated
                 and geometry is config.scan_geometry and scan.current_frame == depth.get("capture_ms"))
     capture_pose = depth.get("obstacle_capture_pose")
@@ -2122,13 +2142,13 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if scan is not None and geometry is not None and pose is not None:
         if scan.obstacles.cells and scan.obstacles.frame != pose.frame:
             return 0., 0., 0., AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车"
-        remembered = _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan)
-        if remembered is not None:
-            ahead = remembered if ahead is None else min(ahead, remembered)
+        obstacle = _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan)
+        if obstacle is not None:
+            ahead = obstacle if ahead is None else min(ahead, obstacle)
             foreground = plan_obstacle = True
             state.last_clearance = ahead
     stop = config.obstacle_stop_m
-    slow = config.slow_distance_m
+    check_distance = config.approach_check_distance_m
     depth_age_s = config.depth_age_limit_ms / 1000
     if foreground:
         # Reserve the distance travelled in one observation freshness window.
@@ -2137,9 +2157,9 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             measured_vx = motion[0]
         last_vx = state.commanded[0] if state is not None else 0.0
         speed = max(0.0, measured_vx or 0.0, last_vx)
-        stop = min(slow, stop + speed * depth_age_s)
+        stop = min(check_distance, stop + speed * depth_age_s)
     near = ahead is not None and ahead <= stop
-    approaching = ahead is not None and ahead < slow
+    approaching = ahead is not None and ahead < check_distance
     side = 0.0
     local_command = None
     local_route = None
@@ -2229,18 +2249,18 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         # The current route and velocity sweep have both passed the grid check.
         state.recovery = False
         state.blocked_for_s = 0.
-    elif approaching:
-        scale = max(0., (ahead - stop) / max(1e-6, slow - stop))
+    elif ahead is not None and ahead < config.slow_distance_m:
+        scale = max(0., (ahead - stop) / max(1e-6, config.slow_distance_m - stop))
         if status != ALIGNING:
             status, reason = AVOIDING, f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速"
     if needs_detour:
         stationary_line = config.obstacle_stop_m + LOCAL_BLOCKED_APPROACH_BUFFER_M
-        brake_at = min(slow, max(stop, stationary_line) if config.local_planning
+        brake_at = min(check_distance, max(stop, stationary_line) if config.local_planning
                        else stop + BLOCKED_APPROACH_BUFFER_M)
         horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
         approach = 0.
         if (foreground and aligned and depth.get("map") is not None and target_distance is not None
-                and ahead > brake_at and (config.local_planning or ahead < slow)):
+                and ahead > brake_at and (config.local_planning or ahead < check_distance)):
             limit = (ahead - brake_at) / horizon_s
             floor = config.floor_vx
             if config.local_planning:
@@ -2367,7 +2387,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                   if _scan_yaw_rate(config, side) > 0.
                                   and _scan_yaw_rate(config, side) >= config.floor_wz)
                     if (not scan.command_only and
-                            all(room is not None and room < slow for room, _ in rooms.values())):
+                            all(room is not None and room < check_distance for room, _ in rooms.values())):
                         # A nearby opening can require only small alignment.
                         # This preview ranks the heading; the drive still
                         # checks the corridor for measured obstacles.
@@ -2375,7 +2395,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         for direction in order:
                             offset = direction * ahead * math.tan(alignment)
                             room, seen = _clearance(depth, config, lateral_offset_m=offset)
-                            if room is not None and room >= slow and seen >= config.coverage_min:
+                            if room is not None and room >= check_distance and seen >= config.coverage_min:
                                 turn_angle = alignment
                                 order = ((direction, -direction, direction) if -direction in order else (direction,))
                                 break
@@ -2428,7 +2448,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     elif scan is not None:
         if scan.ready:
             scan.finish()
-        clear = ahead is None or ahead >= config.slow_distance_m
+        clear = ahead is None or ahead >= check_distance
         if scan.has_result and not near and (clear or not foreground):
             _, occupied = scan.grid()
             geometry = config.scan_geometry or config.local_geometry
@@ -2468,7 +2488,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     elif side:
         # Blend in the turn as clearance shrinks, keeping yaw towards the
         # chosen route even when the target is on the blocked side.
-        weight = 1.0 if near or not aligned else 1.0 - (ahead - stop) / max(1e-6, slow - stop)
+        weight = 1.0 if near or not aligned else 1.0 - (ahead - stop) / max(1e-6, check_distance - stop)
         yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
                     else config.k_yaw)
         escape_yaw = _clamp(-side * yaw_gain * math.atan2(keep, max(ahead, 0.1)),
