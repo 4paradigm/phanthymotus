@@ -8,12 +8,14 @@ import math
 
 import numpy as np
 
+from .depth import has_valid_returns
 from .local_path import Geometry, observe, RESOLUTION, START, SHAPE, RIGHT, FORWARD
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
 ANGLE_TOLERANCE = math.radians(2)
 STILL_LINEAR = .05
+SCAN_ODOM_LINEAR_TOLERANCE_MPS = .08
 STILL_YAW = .04
 ODOM_GAP_MS = 250
 MAP_AGE_MS = 2500
@@ -112,6 +114,7 @@ class ActiveScan:
     pose: tuple = (0., 0., 0.)
     motion_frame: object = field(default_factory=object)
     motion: tuple = (0., 0., 0.)
+    odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
     poses: deque = field(default_factory=lambda: deque(maxlen=32))
     views: deque = field(default_factory=lambda: deque(maxlen=40))
     current_frame: int = 0
@@ -232,8 +235,9 @@ class ActiveScan:
         else:
             self.pending_depth = None
         ground = (depth or {}).get("ground")
-        if (type(capture) is not int or ground is None
-                or depth.get("map") is None or not 0 <= stamp - capture <= max_depth_age_ms):
+        if (type(capture) is not int or not 0 <= stamp - capture <= max_depth_age_ms
+                or (ground is None and (geometry.horizontal is None or geometry.vertical is None))
+                or not has_valid_returns((depth or {}).get("map"))):
             return self.interrupt()
         if self.views and capture < self.views[-1][0]:
             # Reject out-of-order observations without replacing the map.
@@ -242,7 +246,7 @@ class ActiveScan:
         if self.views and capture == self.views[-1][0]:
             return
         pose = self._pose_at(capture)
-        if pose is None or not ground[::4, ::4].any():
+        if pose is None:
             self.current_frame = 0
             return self.interrupt()
         free, occupied = observe(depth["map"], geometry, RIGHT, FORWARD, RESOLUTION, ground)
@@ -291,7 +295,7 @@ class ActiveScan:
             self.poses.append((last_stamp, self.pose, last_motion[2]))
             self.odom_source, self.motion = last_source, last_motion
         if self.phase == "turn" and not self.issued_yaw and any(
-                math.hypot(vx, vy) > STILL_LINEAR for (vx, vy, _), _ in intervals):
+                math.hypot(vx, vy) > self.odom_linear_tolerance_mps for (vx, vy, _), _ in intervals):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
 
     def _hold_for_feedback_gap(self):
@@ -355,7 +359,8 @@ class ActiveScan:
                 frame = self.views[-1][0]
         ground = (depth or {}).get("ground")
         if (type(frame) is not int or abs(stamp - frame) > max_depth_age_ms
-                or ground is None or not ground[::4, ::4].any() or depth.get("map") is None):
+                or (ground is None and (geometry.horizontal is None or geometry.vertical is None))
+                or not has_valid_returns((depth or {}).get("map"))):
             if self.active and not self.command_only:
                 return self.hold_for_replan("主动观察：深度暂不可用，停车后重规划")
             return self.interrupt()
@@ -515,11 +520,11 @@ class ActiveScan:
             return self._timed_command(geometry, half_width, yaw_rate, watchdog_ms,
                                        obs_age_ms, min_yaw_rate, tick_s, previous_yaw is not None, yaw_limits)
         stamp = self.poses[-1][0]
-        speed = math.hypot(*self.motion[:2])
+        translating = math.hypot(*self.motion[:2]) > self.odom_linear_tolerance_mps
         if not self.current_frame:
             return self.interrupt("主动观察：观测超时，停车")
         if self.phase == "brake":
-            if (speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW
+            if (translating or abs(self.motion[2]) > STILL_YAW
                     or (self.pose_origin is not None and self.pose_feedback_since_ms < self.still_since)):
                 return ScanCommand(reason="主动观察：等待底盘停稳")
             if not self.origin_set:
@@ -534,14 +539,14 @@ class ActiveScan:
         if (self.phase != "brake_for_replan" and not turning and self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
-        if (self.receipt_only and speed > STILL_LINEAR and self.phase != "brake_for_replan"
+        if (self.receipt_only and translating and self.phase != "brake_for_replan"
                 and not turning):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
         if self.phase == "brake_for_replan":
             if stamp <= self.replan_after_ms:
                 return ScanCommand(reason="主动观察：停车确认运动反馈")
-            if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
-                motion = "检测到平移" if speed > STILL_LINEAR else "仍在转动"
+            if translating or abs(self.motion[2]) > STILL_YAW:
+                motion = "检测到平移" if translating else "仍在转动"
                 return ScanCommand(reason=f"主动观察：{motion}，停车后重规划")
             interrupted_turn = self.issued_yaw and self.advance_origin is None
             if self.retry_after_hold or not self.issued_yaw or self.advance_origin is not None:
@@ -556,7 +561,7 @@ class ActiveScan:
             self.phase = "idle"
             self.issued_yaw = False
             return ScanCommand(reason="主动观察：已停稳，重新规划", replanned_turn=interrupted_turn)
-        if speed > STILL_LINEAR and not turning:
+        if translating and not turning:
             return self.interrupt("主动观察：检测到平移，停车")
         if abs(self.motion[2]) > yaw_rate + .10:
             return self.interrupt("主动观察：实测转速超出限制，停车")
@@ -574,7 +579,7 @@ class ActiveScan:
             # the prior command to expire, then require a new stopped sample.
             fresh = (self.pose_feedback_since_ms >= self.turn_stop_ms if self.pose_origin is not None
                      else stamp > self.turn_stop_ms + watchdog_ms)
-            if not fresh or abs(self.motion[2]) > STILL_YAW or speed > STILL_LINEAR:
+            if not fresh or abs(self.motion[2]) > STILL_YAW or translating:
                 return ScanCommand(reason=wait_reason)
             if self.pose_origin is None:
                 # The chassis was commanded to stop during this interval.
@@ -591,7 +596,7 @@ class ActiveScan:
         turn_direction = -self.directions[0] if returning else self.directions[0]
         crossed_heading = self.issued_yaw and error * turn_direction <= 0.
         if abs(error) <= ANGLE_TOLERANCE or crossed_heading:
-            if abs(self.motion[2]) > STILL_YAW or speed > STILL_LINEAR:
+            if abs(self.motion[2]) > STILL_YAW or translating:
                 return ScanCommand(reason="主动观察：等待转向停止")
             if returning:
                 self.issued_yaw = False

@@ -89,6 +89,10 @@ def decode(payload: bytes) -> np.ndarray:
 
 
 
+def has_valid_returns(frame: np.ndarray | None) -> bool:
+    return frame is not None and bool((np.isfinite(frame) & (frame > 0.)).any())
+
+
 def _valid(patch: np.ndarray) -> np.ndarray:
     return patch[np.isfinite(patch) & (patch > 0)]
 

@@ -9,6 +9,7 @@ from functools import partial
 import numpy as np
 
 from .camera import HorizontalIntrinsics
+from .depth import has_valid_returns
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
@@ -171,33 +172,59 @@ def _neighbor_count(mask):
                for r in range(3) for c in range(3) if (r, c) != (1, 1))
 
 
-def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
-            require_valid_floor=False, check_free_space=True):
-    def no_floor():
-        if not require_valid_floor:
-            return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
+def _floorless_hits(frame):
+    """Keep vertically supported range returns when a floor plane is unavailable."""
+    step = max(1, frame.shape[0] // 50)
+    hits = np.zeros(frame.shape, dtype=bool)
+    upper, lower = frame[:-step], frame[step:]
+    # A floor usually recedes rapidly up the image; vertical faces keep a
+    # similar range across several rows. Keep both ends of a supported pair.
+    with np.errstate(invalid="ignore"):
+        supported = (upper > 0.) & (lower > 0.) & (
+            abs(upper - lower) <= .015 + .005 * np.minimum(upper, lower))
+    hits[:-step] |= supported
+    hits[step:] |= supported
+    return hits
 
+
+def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
+            require_valid_depth=False, check_free_space=True):
+    if geometry.horizontal is None or geometry.vertical is None or not has_valid_returns(frame):
+        if require_valid_depth:
+            return None
+        empty = np.zeros(right.shape, dtype=bool)
+        return empty, empty.copy()
     plane = optical_ground_plane(frame, geometry, ground)
-    if plane is None:
-        return no_floor()
     height, width = frame.shape
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     u = (np.arange(width) - cx) / fx
     v = (np.arange(height) - cy) / fy
     x, y = u * frame, v[:, None] * frame
-    optical_normal, c = plane
+    if plane is not None:
+        optical_normal, c = plane
+        normal = geometry.base_from_optical[:3, :3] @ optical_normal
+        if abs(normal[2]) >= .5 * np.linalg.norm(normal):
+            top = geometry.height if geometry.height is not None else abs(c / normal[2])
+            if .02 < top <= 2.5:
+                return _observe_with_floor(frame, geometry, right, forward, resolution, ground,
+                                           x, y, optical_normal, c, normal, top,
+                                           max_hit_depth, check_free_space)
+    hits = _floorless_hits(frame)
+    if max_hit_depth is not None:
+        hits &= frame <= max_hit_depth
+    return _project_hits(geometry, right, forward, resolution, x[hits], y[hits], frame[hits])
+
+
+def _observe_with_floor(frame, geometry, right, forward, resolution, ground,
+                        x, y, optical_normal, c, normal, top, max_hit_depth, check_free_space):
+    height, width = frame.shape
+    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     transform = geometry.base_from_optical
     rotation, origin = transform[:3, :3], transform[:3, 3]
-    normal = rotation @ optical_normal
-    if abs(normal[2]) < .5 * np.linalg.norm(normal):
-        return no_floor()
     floor_z = (c + normal @ origin - normal[0]*forward + normal[1]*right) / normal[2]
     # Check several heights below the declared top of the moving envelope.
     check_free_space = check_free_space and geometry.free_space_validated
     free = np.full(right.shape, check_free_space, dtype=bool)
-    top = geometry.height if geometry.height is not None else abs(c / normal[2])
-    if not .02 < top <= 2.5:
-        return no_floor()
     heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if check_free_space else ()
     # On a verified floor return, require the ray to clear the far edge of
     # this cell at the probe height. A fixed two-cell optical gap would reject
@@ -225,17 +252,26 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         hits &= frame <= max_hit_depth
     if geometry.height is not None:
         hits &= above_floor <= geometry.height + .05
-    body_points = np.column_stack((x[hits], y[hits], frame[hits])) @ rotation.T + origin
+    return _project_hits(geometry, right, forward, resolution, x[hits], y[hits], frame[hits],
+                         free=free, heights=above_floor[hits])
+
+
+def _project_hits(geometry, right, forward, resolution, x, y, z, *, free=None, heights=None):
+    if free is None:
+        free = np.zeros(right.shape, dtype=bool)
+    transform = geometry.base_from_optical
+    body_points = np.column_stack((x, y, z)) @ transform[:3, :3].T + transform[:3, 3]
     hit_row = np.rint((body_points[:, 0] - forward[0, 0]) / resolution).astype(int)
     hit_col = np.rint((-body_points[:, 1] - right[0, 0]) / resolution).astype(int)
     in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
                & (hit_col >= 0) & (hit_col < right.shape[1]))
     cells = (hit_row[in_grid], hit_col[in_grid])
-    hit_heights = above_floor[hits][in_grid]
-    raised = hit_heights >= geometry.min_obstacle_height
+    if heights is not None:
+        heights = heights[in_grid]
+    raised = np.ones(cells[0].shape, dtype=bool) if heights is None else heights >= geometry.min_obstacle_height
     counts = np.zeros(right.shape, dtype=int)
     np.add.at(counts, cells, raised)
-    if geometry.min_obstacle_height > MIN_OBSTACLE_HEIGHT_M:
+    if heights is not None and geometry.min_obstacle_height > MIN_OBSTACLE_HEIGHT_M:
         uncertain = np.zeros(right.shape, dtype=int)
         np.add.at(uncertain, cells, ~raised)
         free &= uncertain < 3
@@ -246,17 +282,18 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     ends = occupied & (neighbors == 1)
     small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
     if small.any():
-        sparse_hits = small[cells] & raised
-        sparse_cells = cells[0][sparse_hits], cells[1][sparse_hits]
-        heights = hit_heights[sparse_hits]
-        highest = np.zeros(right.shape)
-        lowest = np.full(right.shape, np.inf)
-        np.maximum.at(highest, sparse_cells, heights)
-        np.minimum.at(lowest, sparse_cells, heights)
         near = max(.40, geometry.front + 2 * resolution)
-        weak = ((counts < 8) & (highest - lowest < .05)
-                & (forward**2 + right**2 > near**2))
-        occupied &= ~(small & ((highest < .05) | weak))
+        weak = (counts < 8) & (forward**2 + right**2 > near**2)
+        if heights is None:
+            occupied &= ~(small & weak)
+        else:
+            sparse_hits = small[cells] & raised
+            sparse_cells = cells[0][sparse_hits], cells[1][sparse_hits]
+            highest = np.zeros(right.shape)
+            lowest = np.full(right.shape, np.inf)
+            np.maximum.at(highest, sparse_cells, heights[sparse_hits])
+            np.minimum.at(lowest, sparse_cells, heights[sparse_hits])
+            occupied &= ~(small & ((highest < .05) | (weak & (highest - lowest < .05))))
     return free, occupied
 
 
@@ -347,7 +384,7 @@ class PlanCache:
         frame = observation["frame_id"]
         if self.grid_frame != frame or self.grid_geometry is not geometry:
             self.grid = observe(observation["map"], geometry, RIGHT, FORWARD,
-                                RESOLUTION, observation["ground"])
+                                RESOLUTION, observation.get("ground"))
             self.grid_frame, self.grid_geometry = frame, geometry
         return self.grid
 
@@ -362,7 +399,7 @@ class PlanCache:
               watchdog_ms=300, *, velocity_limits=None, allow_forward=True, allow_return=True):
         frame = observation.get("frame_id")
         ground = observation.get("ground")
-        if frame is None or ground is None or geometry is None:
+        if frame is None or observation.get("map") is None or geometry is None:
             return None
         key = (frame, round(ahead, 2), half_width, max_age_ms, watchdog_ms, observation.get("scan_revision"),
                allow_forward, allow_return, velocity_limits, observation.get("stop_target"),
@@ -381,7 +418,8 @@ class PlanCache:
                 body_half_width=observation.get("body_half_width"),
                 closest=observation.get("closest", False),
                 preferred_heading=observation.get("preferred_heading"),
-                allow_unknown=observation.get("allow_unknown", False))
+                allow_unknown=observation.get("allow_unknown", False),
+                require_observed_endpoint=ground is not None and geometry.free_space_validated)
         return self.plans[side]
 
 
@@ -490,7 +528,7 @@ def opening_route(frame, occupied, geometry, half_width, plane, target):
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True, allow_return=True,
                          target=None, projected_grid=None, body_half_width=None, closest=False,
-                         preferred_heading=None, allow_unknown=False):
+                         preferred_heading=None, allow_unknown=False, require_observed_endpoint=True):
     if velocity_limits is not None:
         (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
         if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
@@ -504,9 +542,10 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if grid_input is None:
         grid_input = observe(frame, geometry, right, forward, resolution, ground)
     free, occupied = grid_input
+    observed_endpoint = allow_unknown and require_observed_endpoint
     if free is not None:
         free = free & ~occupied
-    if allow_unknown and (free is None or not free.any()):
+    if observed_endpoint and (free is None or not free.any()):
         return None
     if side < 0:
         free = free[:, ::-1] if free is not None else None
@@ -565,12 +604,12 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         allowed &= ranges >= stop
         if target_f - stop <= forward[goal[0], 0]:
             target_cells = ranges <= stop + max(tolerance, resolution / math.sqrt(2))
-            if allow_unknown:
+            if observed_endpoint:
                 target_cells &= free
             path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells)
         if path is None and closest:
             target_cells = ranges < ranges[start] - resolution / 2
-            if allow_unknown:
+            if observed_endpoint:
                 target_cells &= free
             path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells, target_cost=ranges)
             if path is None:
@@ -603,7 +642,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         if frontier.any():
             target_cells = frontier
             path = find_path(allowed, start, goal, steps=steps, target_cells=frontier)
-    if allow_unknown:
+    if observed_endpoint:
         # A route may cross unknown cells, but its executable part must end
         # at an observed centre. Replan from there with the next camera view.
         if path is None:
@@ -655,7 +694,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     occupied_bounds = (f0[blocked] - geometry.front, f1[blocked] + geometry.rear,
                        r0[blocked] - half_width, r1[blocked] + half_width)
     def command_to(point):
-        if allow_unknown and not free[point]:
+        if observed_endpoint and not free[point]:
             return None
         row, col = point
         dr, dc = row - row_zero, col - col_zero

@@ -4381,7 +4381,7 @@ def test_visible_foreground_triggers_detour_before_slowdown_then_survives_blind_
     assert tick(3000, 2.70, .35, frame="new segment")[0] == 0
 
 
-def test_no_cold_approach_when_depth_has_no_ground_for_local_geometry():
+def test_cold_approach_can_use_current_depth_without_ground():
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
     geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
@@ -4389,7 +4389,7 @@ def test_no_cold_approach_when_depth_has_no_ground_for_local_geometry():
     decision = P._avoid(.3, 0., 0., {"map": np.full((48, 64), 3.), "frame_id": 1200,
                                          "body_mount_required": True}, cfg,
                         P.APPROACHING, "", _state(), target_distance=3., may_scan=True)
-    assert decision[:3] == (0., 0., 0.)
+    assert decision[:3] == (.3, 0., 0.)
 
 
 def test_dynamic_head_facing_sideways_does_not_authorize_forward_navigation():
@@ -4572,3 +4572,34 @@ def test_checked_approach_can_move_while_turning(monkeypatch, arc_blocked):
                         odom=dict(vx=0., vy=0., wz=0.))
     assert decision[0] > 0. and decision[1] == 0.
     assert decision[2] == (0. if arc_blocked else .20)
+
+
+def test_local_plan_rechecks_and_drives_without_a_ground_mask():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(640, 420, 320),
+                                           (480, 420, 240), .20)
+    cfg = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    frame = np.full((480, 640), np.nan)
+    frame[220:370, 302:338] = .95
+
+    def tick(stamp, image):
+        depth = dict(map=image, frame_id=stamp)
+        odom = dict(vx=0., vy=0., wz=0., received_ms=stamp)
+        assert scan.update(depth, odom, geometry, receipt_only=True) is None
+        return P._avoid(.15, 0., 0., depth, cfg, P.APPROACHING, "", state,
+                        target_distance=3., target_bearing=0., odom=odom, may_scan=True, dt=.1)
+
+    decision = tick(1000, frame)
+    assert decision[:3] == (0., 0., 0.) and scan.route_segment
+    assert state.view_detour is not None
+    scan.phase = "evaluate"
+    assert tick(1100, frame)[0] == 0.  # A measured hit still blocks the corridor.
+    # At the new heading the post has moved out of the swept corridor.
+    frame = np.full_like(frame, np.nan)
+    frame[220:370, 520:538] = .95
+    scan.phase = "evaluate"
+    decision = tick(1200, frame)
+    assert decision[0] > 0. and decision[1:3] == (0., 0.)

@@ -66,7 +66,9 @@ import numpy as np
 
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
-from .active_scan import ANGLE, ANGLE_TOLERANCE, ActiveScan, ODOM_GAP_MS, STILL_LINEAR, STILL_YAW
+from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, ODOM_GAP_MS,
+                          SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW)
+from .depth import has_valid_returns
 from .track import Track, Tracker
 from . import local_path
 from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
@@ -247,6 +249,7 @@ class Config:
     lost_frames: int = 10
     max_obs_age_ms: int = 500
     max_depth_age_ms: int | None = None
+    scan_odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
     watchdog_ms: float = 300
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
@@ -391,7 +394,7 @@ class Config:
             if adaptive and not math.isfinite(base_gain * maximum):
                 raise ValueError(f"adaptive {key} and its maximum must be finite and nonnegative")
             setattr(self, key, base_gain)
-        for key in ("stop_distance_m", "stop_tolerance_m"):
+        for key in ("stop_distance_m", "stop_tolerance_m", "scan_odom_linear_tolerance_mps"):
             value = getattr(self, key)
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a finite nonnegative number")
@@ -1223,7 +1226,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     stale_capture = bool((depth or {}).get("capture_invalid"))
     frame = (depth or {}).get("map")
-    invalid_depth = frame is not None and not np.isfinite(frame).any()
+    invalid_depth = frame is not None and not has_valid_returns(frame)
     if stale_capture or invalid_depth:
         depth = None
     state.close_sample_gap_s += dt
@@ -1285,6 +1288,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 state.command_tail = (0., 0., 0.)
 
         scan = state.active_scan
+        scan.odom_linear_tolerance_mps = config.scan_odom_linear_tolerance_mps
         obstacle_pose = (odom or {}).get("obstacle_pose")
         if not (depth or {}).get("body_mount_required"):
             obstacle_pose = obstacle_pose or (odom or {}).get("motion_pose")
@@ -1758,7 +1762,7 @@ def _approach(speed: float, bearing: float, depth, config: Config,
     lateral = _lift(lateral, floor_y, limit_y)
     geometry = config.local_geometry
     if state is not None and config.local_planning and geometry is not None:
-        if depth.get("map") is None or depth.get("ground") is None or depth.get("frame_id") is None:
+        if depth.get("map") is None or depth.get("frame_id") is None:
             return forward, 0.
         scan = state.active_scan
         same_geometry = (config.scan_geometry or config.local_geometry) is geometry
@@ -1986,7 +1990,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             forward, right = plan.points[index]
             if forward <= 0.:
                 continue
-            if not local_path.observed_waypoint(free, forward, right):
+            if (depth.get("ground") is not None and geometry.free_space_validated
+                    and not local_path.observed_waypoint(free, forward, right)):
                 continue
             angle, length = math.atan2(right, forward), math.hypot(forward, right)
             if length < floor_x * horizon:
@@ -2027,12 +2032,12 @@ def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distanc
             and pose.stamp_ms == depth.get("capture_ms")):
         capture_pose = pose
     if (geometry is config.scan_geometry and scan.current_frame and type(source) is int
-            and depth.get("ground") is not None and depth.get("map") is not None
+            and depth.get("map") is not None
             and source > memory.last_source and capture_pose is not None
             and capture_pose.frame == pose.frame and (may_scan or (verified and memory.cells))):
         # Use the actual exposure, never a fused grid at a later robot pose.
         free, hits = local_path.observe(depth["map"], geometry, RIGHT, FORWARD,
-                                        local_path.RESOLUTION, depth["ground"],
+                                        local_path.RESOLUTION, depth.get("ground"),
                                         max_hit_depth=max_depth)
         memory.last_source = source
         if verified and memory.cells:
@@ -2072,7 +2077,17 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
            target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False,
            target_bearing=None, dt=0.):
     """Slow for foreground obstacles and look around them before local detours."""
+    scan = state.active_scan if config.local_planning and state is not None else None
+    geometry = config.scan_geometry or config.local_geometry
     ahead, coverage = _clearance(depth, config)
+    if (scan is not None and geometry is not None and geometry.horizontal is not None
+            and geometry.vertical is not None and scan.views and scan.matches_route_view(depth)
+            and depth.get("ground") is None):
+        _, occupied = scan.grid()
+        hits = occupied & (FORWARD >= 0.) & (abs(RIGHT) <= _keepout_m(config))
+        transform = geometry.base_from_optical
+        ahead = (max(0., (float(FORWARD[hits].min()) - transform[0, 3]) / transform[0, 2])
+                 if hits.any() and transform[0, 2] > 0. else None)
     if state is not None:
         state.last_clearance, state.last_coverage = ahead, coverage
 
@@ -2081,13 +2096,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     foreground = (ahead is not None
                   and (target_distance is None or depth.get("map") is None
                        or ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance))
-    scan = state.active_scan if config.local_planning and state is not None else None
-    geometry = config.scan_geometry or config.local_geometry
     pose = (odom or {}).get("obstacle_pose") or (odom or {}).get("motion_pose")
-    if (scan is not None and geometry is not None and depth.get("map") is not None
-            and (depth.get("body_mount_required") or pose is not None or scan.obstacles.cells)
-            and depth.get("ground") is None and (vx or vy)):
-        return 0., 0., 0., AVOIDING, "缺少地面观测，停车等待可检查的走廊"
     plan_obstacle = False
     if scan is not None and geometry is not None and pose is not None:
         if scan.obstacles.cells and scan.obstacles.frame != pose.frame:
@@ -2298,7 +2307,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     velocities = (motion, state.commanded)
                     safe_speed = min(ahead - stationary_line,
                                      target_distance - config.stop_distance_m) / horizon_s
-                    if (approach_geometry is not None and depth.get("ground") is not None
+                    if (approach_geometry is not None and depth.get("map") is not None
                             and depth.get("frame_id") is not None
                             and all(abs(vy) <= STILL_LINEAR and abs(vx) <= safe_speed
                                     for vx, vy, _ in velocities)):
@@ -2449,7 +2458,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             rate = math.copysign(config.floor_wz, wz)
             geometry = config.local_geometry
             if (state is not None and geometry is not None and abs(rate) <= _scan_yaw_rate(config, side)
-                    and depth.get("map") is not None and depth.get("ground") is not None
+                    and depth.get("map") is not None
                     and depth.get("frame_id") is not None):
                 _, hits = state.local_plan.grid_for(depth, geometry)
                 sweep = math.copysign((abs(rate) + .10) * horizon_s, -rate)
@@ -2480,13 +2489,14 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
     geometry = (config.scan_geometry or config.local_geometry
                 if scan.receipt_only else config.scan_geometry)
     state.avoidance_yaw_override = True
-    if geometry is None or not scan.current_frame or depth.get("ground") is None or target_distance is None:
+    if geometry is None or not scan.current_frame or target_distance is None:
         return 0., 0., 0., AVOIDING, "主动观察：等候可用的前进观测"
 
     motion = state.command_tail if scan.command_only else planar_feedback(odom)
     previous = state.commanded
-    if motion is None or any(abs(vy) > STILL_LINEAR or abs(wz) > STILL_YAW
-                             for _, vy, wz in (motion, previous)):
+    tolerance = STILL_LINEAR if scan.command_only else config.scan_odom_linear_tolerance_mps
+    if (motion is None or abs(motion[1]) > tolerance or abs(previous[1]) > STILL_LINEAR
+            or max(abs(motion[2]), abs(previous[2])) > STILL_YAW):
         return 0., 0., 0., AVOIDING, "主动观察：等待转向停止"
 
     horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
@@ -2504,7 +2514,8 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
             matched_view = scan.matches_route_view(depth)
             if (not scan.rerouted and not scan.command_only and matched_view
                     and ahead is not None and target_bearing is not None
-                    and all(math.hypot(vx, vy) <= STILL_LINEAR for vx, vy, _ in (motion, previous))):
+                    and math.hypot(*motion[:2]) <= tolerance
+                    and math.hypot(*previous[:2]) <= STILL_LINEAR):
                 rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep) for s in (-1., 1.)}
                 frame = depth.get("source_frame_id", depth.get("frame_id"))
                 order = _local_side_order(rooms, config, state, frame)
@@ -2608,7 +2619,7 @@ def _local_translation(depth, config, state, odom, ahead, side):
         return LocalHold.TRANSITION
     previous = state.commanded[:2]
     drift = speed and abs(measured_vx * vy - measured_vy * vx) / speed > .04
-    observed = depth.get("scan_grid") is not None or depth.get("ground") is not None
+    observed = depth.get("scan_grid") is not None or depth.get("map") is not None
     ramping = predicted or previous != command or math.hypot(measured_vx - vx, measured_vy - vy) > .02
     if depth.get("body_half_width") is not None or drift or (
             geometry is not None and observed and ramping
@@ -2617,8 +2628,7 @@ def _local_translation(depth, config, state, odom, ahead, side):
         if geometry is None:
             return LocalHold.TRANSITION
         if grid is None:
-            frame, ground = depth.get("map"), depth.get("ground")
-            if frame is None or ground is None or depth.get("frame_id") is None:
+            if depth.get("map") is None or depth.get("frame_id") is None:
                 return LocalHold.TRANSITION
             grid = state.local_plan.grid_for(depth, geometry)
         horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000

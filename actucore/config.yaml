@@ -398,6 +398,8 @@ plugins:
     max_obs_age_ms: 500
     # 深度单独校验接收时间和已验证的采集时间，并用于避障距离预算。
     max_depth_age_ms: 800
+    # 主动观察停稳判断的里程计线速度容差（m/s）。扫掠检查仍使用原始速度。
+    scan_odom_linear_tolerance_mps: 0.08
 
     # ── 目标跟踪（plugins/navi/track.py）─────────────────────────────────
     # 开始追一个目标的置信度门槛。

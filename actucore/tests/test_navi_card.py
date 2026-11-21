@@ -221,7 +221,7 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
             stopped.set()
 
     monkeypatch.setattr(card, "_publish_command", publish)
-    card._depth_ms, card._depth_ground = 1000, object()
+    card._depth_ms, card._depth_map = 1000, np.ones((4, 4))
     scan = card._state.active_scan
     scan.receipt_only = scan.buffered_odom = scan.issued_yaw = True
     scan.phase, scan.advance_m, scan.directions = "turn", 1., (-1.,)
@@ -289,7 +289,7 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
             elif stop == "duplicate":
                 card._velocity_history.append((now, 1100, (0., 0., .4)))
             elif stop == "depth":
-                card._depth_ground = None
+                card._depth_map = np.full((4, 4), np.nan)
             card._dispatch_command()
         if stop == "translation":
             assert published[-1]["values"][5] == .6
@@ -342,7 +342,7 @@ def test_velocity_timer_does_not_repeat_a_translation_or_extend_its_observations
 
 
 @pytest.mark.parametrize("case", [
-    "clear", "unknown", "obstacle", "duplicate", "old_target", "old_odom", "invalid_floor",
+    "clear", "unknown", "obstacle", "duplicate", "old_target", "old_odom", "invalid_depth",
     "expires_again",
 ])
 def test_late_local_translation_rechecks_new_depth_without_restamping_target(monkeypatch, case):
@@ -372,10 +372,10 @@ def test_late_local_translation_rechecks_new_depth_without_restamping_target(mon
                                 "局部规划：沿避障路线行进", distance_m=2.)
     monkeypatch.setattr(policy, "step", lambda **kwargs: candidate)
 
-    def observe(*args, require_valid_floor):
+    def observe(*args, require_valid_depth):
         nonlocal now
-        assert require_valid_floor
-        if case == "invalid_floor":
+        assert require_valid_depth
+        if case == "invalid_depth":
             return None
         occupied = np.zeros(local_path.SHAPE, dtype=bool)
         if case == "obstacle":
@@ -2161,7 +2161,7 @@ def test_full_depth_frames_filter_floor_only_for_avoidance():
 def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
                                                           with_odom, ttl_cap, expected_ttl, bumi_mount):
     import numpy as np
-    from plugins.navi import local_path, policy
+    from plugins.navi import active_scan, local_path, policy
 
     card = _card(confirm_hits=1, max_depth_age_ms=depth_limit_ms)
     node = _FakeNode({_DEPTH_TOPIC: ["sensor_msgs/msg/CompressedImage"]})
@@ -2218,8 +2218,9 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         return local_path.Detour((.04, 0.), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
 
     monkeypatch.setattr(local_path, "_checked_translation", plan)
-    free = np.ones(local_path.SHAPE, dtype=bool)
-    monkeypatch.setattr(local_path, "observe", lambda *args: (free, ~free))
+    occupied = (abs(local_path.RIGHT) < .05) & np.isclose(local_path.FORWARD, .80)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (~occupied, occupied))
+    monkeypatch.setattr(active_scan, "observe", local_path.observe)
     for index in range(6):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()

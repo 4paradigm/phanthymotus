@@ -1125,6 +1125,7 @@ class NaviPlugin:
                               for key in _TUNING_FIELDS},
                            "max_obs_age_ms": self._config.max_obs_age_ms,
                            "max_depth_age_ms": self._config.depth_age_limit_ms,
+                           "scan_odom_linear_tolerance_mps": self._config.scan_odom_linear_tolerance_mps,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -1781,7 +1782,7 @@ class NaviPlugin:
         if (latest is None or latest["frame_id"] <= depth["frame_id"]
                 or (source is not None and (latest.get("source_frame_id") or 0) <= source)
                 or latest.get("capture_invalid") or latest.get("body_mount_required")
-                or latest.get("map") is None or latest.get("ground") is None):
+                or latest.get("map") is None):
             return None
         depth_ms = latest.get("capture_ms") or latest["frame_id"]
         measured = odom_mod.planar_feedback(odom)
@@ -1807,7 +1808,7 @@ class NaviPlugin:
         padding = (math.hypot(max(geometry.front, geometry.rear), keepout)
                    + speed * horizon / 2) * turn
         grid = local_path.observe(latest["map"], geometry, local_path.RIGHT, local_path.FORWARD,
-                                  local_path.RESOLUTION, latest["ground"], require_valid_floor=True)
+                                  local_path.RESOLUTION, latest.get("ground"), require_valid_depth=True)
         if grid is None:
             return None
         clear = local_path.transition_clear(grid, geometry, keepout, horizon, velocities, padding=padding)
@@ -2161,11 +2162,11 @@ class NaviPlugin:
             if source < work.depth_grid[0]:
                 return "局部规划：深度帧顺序倒退，停车后重规划", True
             depth_ms = work.depth_grid[1]
-        if frame is None or ground is None or not 0 <= now_ms - depth_ms < config.depth_age_limit_ms:
+        if not 0 <= now_ms - depth_ms < config.depth_age_limit_ms or not depth_mod.has_valid_returns(frame):
             return "局部规划：深度暂不可用，停车后重规划", True
         if (work.depth_grid is None or work.depth_grid[:2] != (source, depth_ms)):
             grid = local_path.observe(frame, leg.geometry, local_path.RIGHT, local_path.FORWARD,
-                                      local_path.RESOLUTION, ground, require_valid_floor=True,
+                                      local_path.RESOLUTION, ground, require_valid_depth=True,
                                       check_free_space=False)
             work.depth_grid = (source, depth_ms, grid)
         command = tuple(work.message["values"][:2])
@@ -2212,8 +2213,8 @@ class NaviPlugin:
             elif work.turn is not None:
                 with self._obs_lock:
                     history = tuple(self._velocity_history)
-                    depth_ok = (self._depth_ground is not None
-                                and 0 <= now_ms - self._depth_ms <= self._config.depth_age_limit_ms)
+                    depth_ok = (0 <= now_ms - self._depth_ms <= self._config.depth_age_limit_ms
+                                and depth_mod.has_valid_returns(self._depth_map))
                 if depth_ok:
                     stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
                 else:

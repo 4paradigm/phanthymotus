@@ -491,3 +491,38 @@ def test_depth_grid_drops_small_noise_and_low_patches(case, occupied_cells):
     assert np.array_equal(fast, occupied)
     if occupied_cells == 0:
         assert not free[replay.START[0] + 18, replay.START[1]]
+
+
+def test_depth_without_floor_can_plan_around_a_visible_post():
+    horizontal = HorizontalIntrinsics(640, 420, 320)
+    geometry = replay.camera_square(horizontal, (480, 420, 240), .20)
+    tangent = (np.arange(480) - 240) / 420
+    depth = np.broadcast_to(.42 / np.maximum(tangent[:, None], .09), (480, 640)).copy()
+    depth[240:375, 306:335] = 1.
+    free, occupied = replay.observe(depth, geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION, None)
+    post = (abs(replay.RIGHT) <= .05) & np.isclose(replay.FORWARD, 1.)
+    assert occupied[post].any()
+    assert not occupied[replay.FORWARD < .90].any()
+    assert not free.any()
+    destination = dict(map=depth, frame_id=1000, allow_unknown=True, body_half_width=.20)
+    plan = replay.PlanCache().route(destination, geometry, .25, 1., 1., 500, 600)
+    assert plan is not None
+    assert max(right for _, right in plan.points) >= .30
+
+
+def test_fresh_frames_without_floor_are_usable_for_active_scan():
+    from plugins.navi.active_scan import ActiveScan
+
+    horizontal = HorizontalIntrinsics(640, 420, 320)
+    geometry = replay.camera_square(horizontal, (480, 420, 240), .20)
+    frame = np.full((480, 640), np.nan)
+    frame[200:345, 303:337] = 1.10
+    look = ActiveScan()
+    odom = dict(vx=0., vy=0., wz=0., received_ms=1000)
+    assert look.update(dict(map=frame, frame_id=1000), odom, geometry, receipt_only=True) is None
+    assert look.current_frame == 1000
+    assert look.grid()[1].any()
+    assert look.begin((1.,))
+    assert look.update(dict(map=np.full_like(frame, np.nan), frame_id=1100),
+                       dict(odom, received_ms=1100), geometry, receipt_only=True) is not None
+    assert not look.current_frame

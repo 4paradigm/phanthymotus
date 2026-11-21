@@ -978,3 +978,28 @@ def test_stopped_turn_that_passed_the_target_checks_the_actual_heading(monkeypat
         assert update(stamp).yaw == 0.
     assert look.ready
     assert math.degrees(look.pose[2]) > 30.
+
+
+@pytest.mark.parametrize("speed,turns", [(.072, True), (.10, False)])
+def test_scan_stop_tolerance_uses_buffered_odom_without_zeroing_velocity(monkeypatch, speed, turns):
+    look, geometry, _, _ = _setup(monkeypatch)
+    history = []
+
+    def tick(stamp, vx):
+        history.append((stamp, stamp, (vx, 0., 0.)))
+        odom = dict(_odom(stamp), vx=vx, received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=tuple(history))
+        update = look.update(_depth(stamp), odom, geometry, receipt_only=True)
+        return update or look.command(geometry, .25, 1., 600, 800)
+
+    tick(1000, 0.)
+    assert look.begin((1.,), advance_m=1.5)
+    assert tick(1100, speed).yaw == 0.
+    result = tick(1200, speed)
+    assert bool(result.yaw) is turns
+    if turns:
+        assert look.pose[0] == pytest.approx(.2 * speed)
+        assert look.motion[0] == speed
+        assert look._turn_translation(1.45, look.motion) == pytest.approx(speed * 1.45)
+    else:
+        assert "等待底盘停稳" in result.reason
