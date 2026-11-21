@@ -913,7 +913,7 @@ def test_s10_search_sweep_is_checked_against_hits_not_the_rear_grid_extent():
 
 
 def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
-    geometry = camera_square(object(), (480, 420, 243), .23)
+    geometry = camera_square(object(), (480, 420, 243), .23, at_front=True)
     transform = geometry.base_from_optical.copy()
     transform[:3, 3] = [.27, .04, .06]
     inverse = np.linalg.inv(transform).tolist()
@@ -922,6 +922,25 @@ def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
     mounted = body_square(geometry, {"camera_optical_from_cloud": inverse,
                                      "cloud_frame_id": "base_link"})
     np.testing.assert_allclose(mounted.base_from_optical, transform)
+    assert (geometry.front, geometry.rear) == (0., .46)
+    assert (mounted.front, mounted.rear) == (.23, .23)
+
+
+def test_front_camera_checks_the_body_behind_the_plan_origin():
+    from plugins.navi import local_path as grid
+
+    geometry = camera_square(object(), (480, 420, 243), .20, half_length=.23, at_front=True)
+    occupied = np.isclose(grid.FORWARD, .95) & np.isclose(grid.RIGHT, 0.)
+    # Stop at 0.80 m for a target 1.40 m ahead. The camera is already the
+    # front edge, so occupancy beyond the stopping point is outside the segment.
+    assert grid.segment_clear(occupied, geometry, .25, 0., 1.40 - .60)
+    occupied |= np.isclose(grid.FORWARD, .80) & np.isclose(grid.RIGHT, 0.)
+    assert not grid.segment_clear(occupied, geometry, .25, 0., 1.40 - .60)
+
+    occupied = np.isclose(grid.FORWARD, -.50) & np.isclose(grid.RIGHT, .25)
+    look = scan.ActiveScan()
+    assert look.clear_sweep(geometry, .25, 0., 0., occupied=occupied)
+    assert not look.clear_sweep(geometry, .25, .7, 0., occupied=occupied)
 
 
 @pytest.mark.parametrize("half_width", [.23, .35])

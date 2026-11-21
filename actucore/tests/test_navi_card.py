@@ -2226,7 +2226,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     assert reply["ttl_ms"] == expected_ttl
     assert card._config.local_planning
     assert card._config.half_width_m == .23
-    assert card._config.local_geometry.front == card._config.local_geometry.rear == .25
+    assert card._config.local_geometry.front == 0.
+    assert card._config.local_geometry.rear == .50
 
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
     card._state = policy.State(target="person")
@@ -2495,7 +2496,9 @@ def test_selected_turn_route_survives_new_depth_without_a_plan_cache():
 @pytest.mark.parametrize("next_frame", [
     "clear", "duplicate", "blocked", "feedback_gap", "duplicate_feedback", "old_target", "check_crosses_expiry",
 ])
-def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observation(monkeypatch, next_frame):
+@pytest.mark.parametrize("checked_prefix", [False, True])
+def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observation(
+        monkeypatch, next_frame, checked_prefix):
     import numpy as np
     from plugins.navi import local_path, policy
 
@@ -2505,6 +2508,10 @@ def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observati
     card._descriptor = {"rate": {"max_obs_age_ms": 800}}
     card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
     state = card._state
+    state.checked_prefix = checked_prefix
+    state.avoidance_yaw_override = checked_prefix
+    if checked_prefix:
+        state.view_detour = local_path.Detour(None, ((0., 0.), (.15, 0.)), card._config.local_geometry)
     state.active_scan.receipt_only = state.active_scan.buffered_odom = True
     card._ttl_ms = 400
     now = 1000
@@ -2538,11 +2545,13 @@ def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observati
     monkeypatch.setattr(card, "_observation_snapshot", snapshot)
     monkeypatch.setattr(local_path, "observe", observe)
     monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
-        [.15, 0., 0., 0., 0., .10], policy.APPROACHING, "target at 3 m", distance_m=3.))
+        [.15, 0., 0., 0., 0., .10], policy.AVOIDING if checked_prefix else policy.APPROACHING,
+        "checked motion", distance_m=3.))
     published = []
     monkeypatch.setattr(card, "_publish_command", published.append)
     assert card._stage_command(card.next_command(), card._output_epoch)
-    assert published[-1]["ttl_ms"] == 150
+    initial_ttl = 90 if checked_prefix and next_frame == "duplicate_feedback" else 150
+    assert published[-1]["ttl_ms"] == initial_ttl
     now = 1100
     card._dispatch_command()
     if next_frame == "clear":

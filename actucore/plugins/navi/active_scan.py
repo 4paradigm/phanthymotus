@@ -756,7 +756,7 @@ class ActiveScan:
             yaw_rate = max(min_yaw_rate, yaw_rate * self.turn_rate_scale)
         else:
             yaw_rate *= self.turn_rate_scale
-        if not geometry.front > 0 or not geometry.rear > 0 or not yaw_rate > 0 or yaw_rate < min_yaw_rate:
+        if not (geometry.front >= 0 and geometry.rear > 0 and yaw_rate > 0) or yaw_rate < min_yaw_rate:
             return self.interrupt()
         if self.motion[2] * math.copysign(1., error) > STILL_YAW:
             return ScanCommand(reason="主动观察：等待反向转动停止")
@@ -896,17 +896,20 @@ class ActiveScan:
         # Rotate the rectangle in small increments and include cell diagonal
         # plus the greatest displacement between successive angular samples.
         samples = max(2, math.ceil(abs(sweep) / .04) + 1)
-        radius = math.hypot(max(geometry.front, geometry.rear), half_width)
+        # Body-frame geometry already uses the chassis origin. In the
+        # front-camera approximation the yaw pivot is half a body length back.
+        pivot_offset = geometry.half_length if geometry.front == 0. else 0.
+        radius = math.hypot(max(geometry.front + pivot_offset, geometry.rear - pivot_offset), half_width)
         slack = translation + RESOLUTION / math.sqrt(2) + radius * abs(sweep) / (2 * (samples - 1))
         if occupied is None:
             occupied = self.turn_obstacles()
-        nearby = occupied & (FORWARD**2 + RIGHT**2 <= (radius + slack)**2)
+        nearby = occupied & ((FORWARD + pivot_offset)**2 + RIGHT**2 <= (radius + slack)**2)
         if not nearby.any():
             return True
-        occupied_forward, occupied_right = FORWARD[nearby], RIGHT[nearby]
+        occupied_forward, occupied_right = FORWARD[nearby] + pivot_offset, RIGHT[nearby]
         for angle in np.linspace(start_angle, start_angle + sweep, samples):
             c, s = math.cos(angle), math.sin(angle)
-            forward = occupied_forward * c + occupied_right * s
+            forward = occupied_forward * c + occupied_right * s - pivot_offset
             right = -occupied_forward * s + occupied_right * c
             outside_f = np.maximum(0., np.maximum(-geometry.rear - forward, forward - geometry.front))
             outside_r = np.maximum(0., abs(right) - half_width)

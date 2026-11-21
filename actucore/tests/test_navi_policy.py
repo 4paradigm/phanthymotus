@@ -2670,12 +2670,12 @@ def test_local_no_route_approach_stops_at_the_stricter_boundary(
             assert 0. < following[0] < decision[0]
 
 
-@pytest.mark.parametrize("case", ["clear_prefix", "blocked_prefix", "detour_found"])
+@pytest.mark.parametrize("case", ["clear_prefix", "clear_prefix_inside_preview", "blocked_prefix", "detour_found"])
 def test_local_planning_uses_checked_forward_prefix_before_observing(monkeypatch, case):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
-    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20, at_front=True)
     config = _cfg(local_planning=True, local_geometry=geometry, stop_distance_m=.60,
                   obstacle_stop_m=.60, max_depth_age_ms=800, watchdog_ms=600)
     state = _state(motion_source="measured")
@@ -2685,12 +2685,13 @@ def test_local_planning_uses_checked_forward_prefix_before_observing(monkeypatch
     look.poses.append((1000, look.pose, 0.))
     occupied = np.isclose(local_path.FORWARD, 1.15) & np.isclose(local_path.RIGHT, .20)
     occupied |= np.isclose(local_path.FORWARD, 1.75) & (local_path.RIGHT == 0.)
-    if case == "blocked_prefix":
-        occupied |= np.isclose(local_path.FORWARD, .35) & (local_path.RIGHT == 0.)
+    if case in ("blocked_prefix", "detour_found"):
+        occupied |= np.isclose(local_path.FORWARD, .15) & (local_path.RIGHT == 0.)
     look.views.append((1000, look.pose, ~occupied, occupied))
     frame = _scene(2.)
     frame.update(ground=np.ones_like(frame["map"], dtype=bool), frame_id=1000)
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.76, 1.))
+    clearance = 1.15 if case == "clear_prefix_inside_preview" else 1.76
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (clearance, 1.))
     monkeypatch.setattr(P, "_local_translation", lambda *args: None)
     routes_tried = []
 
@@ -2702,11 +2703,13 @@ def test_local_planning_uses_checked_forward_prefix_before_observing(monkeypatch
     decision = P._avoid(.5, 0., -.12, frame, config, P.APPROACHING, "", state,
                         target_distance=1.93, target_bearing=.15, may_scan=True,
                         odom={"vx": 0., "vy": -.034, "wz": 0.})
-    assert routes_tried
-    if case == "clear_prefix":
+    if case.startswith("clear_prefix"):
+        assert not routes_tried
         assert decision[:3] == (.15, 0., -.12)
         assert not look.active
+        assert state.checked_prefix
     else:
+        assert routes_tried
         assert decision[:3] == (0., 0., 0.)
         assert look.active and look.route_segment == (case == "detour_found")
 
@@ -3004,6 +3007,8 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
             free &= local_path.FORWARD >= .45
         return free, grid
 
+    # Exercise the turn-and-straight fallback after the prefix candidate fails.
+    monkeypatch.setattr(P, "_checked_forward_prefix", lambda *args: None)
     monkeypatch.setattr(active_scan, "observe", observe)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (
         .30 if blocked_in_new_view and (reached_view or state.active_scan.ready) else .90, .98))
@@ -4619,7 +4624,7 @@ def test_local_plan_dispatches_a_checked_turn_on_the_first_tick_while_approachin
     state = _state(target="person", motion_source="measured", commanded=(.2, 0., 0.),
                    goal_anchor=P.DetourGoal(3., 0.))
     frame = np.full((480, 640), np.nan)
-    frame[220:370, 302:338] = .95
+    frame[220:370, 302:338] = .65
     depth = dict(map=frame, frame_id=1000, capture_ms=980, control_ms=1000)
     odom = dict(vx=.12, vy=0., wz=0., received_ms=1000, source_sample_id=1000,
                 velocity_history=((1000, 1000, (.12, 0., 0.)),))

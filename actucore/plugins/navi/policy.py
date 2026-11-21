@@ -1059,8 +1059,9 @@ def step(*, detections, depth, odom, config: Config, state: State,
             state.use_body_mount = paired
         if state.use_body_mount:
             calibrated = depth.get("mount_accuracy_validated") is True
+            half_length = config.local_geometry.half_length
             geometry = replace(config.local_geometry, base_from_optical=depth["body_from_optical"],
-                               free_space_validated=calibrated,
+                               front=half_length, rear=half_length, free_space_validated=calibrated,
                                min_obstacle_height=(local_path.MIN_OBSTACLE_HEIGHT_M if calibrated
                                                     else config.local_geometry.min_obstacle_height))
             config = replace(config, scan_geometry=geometry, local_geometry=geometry)
@@ -2476,13 +2477,24 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             if speed > 0 and speed >= floor:
                 approach = speed
 
+        camera_routes = _camera_frame_routes(config, scan) and pose is None
+        if (camera_routes and approach and may_scan and geometry is not None
+                and not scan.active and not scan.result_frame and scan.views and scan.matches_route_view(depth)):
+            feedback = planar_feedback(odom)
+            if feedback is not None and max(abs(feedback[1]), abs(state.commanded[1])) <= STILL_LINEAR:
+                room = min(ahead - stationary_line, target_distance - config.stop_distance_m)
+                prefix = _checked_forward_prefix(scan, geometry, config, state, odom, feedback,
+                                                 approach, horizon_s, room, wz)
+                if prefix is not None:
+                    state.escape_side = 0.
+                    state.side_better_frames = 0
+                    return prefix
         keep = _keepout_m(config)
         rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
                  for s in (-1.0, 1.0)}
         if config.local_planning:
             order = _local_side_order(rooms, config, state,
                                       depth.get("source_frame_id", depth.get("frame_id")))
-            camera_routes = _camera_frame_routes(config, scan) and pose is None
             planning_depth = dict(depth, allow_forward=not near and aligned,
                                   body_half_width=config.half_width_m,
                                   closest=bool(scan is not None and scan.exhausted),
@@ -2538,7 +2550,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     limited = min(vx, config.vx_max, LOCAL_BLOCKED_APPROACH_MAX_MPS,
                                   (ahead - brake_at) / (horizon_s + depth_age_s), goal_room / horizon_s)
                     room = min(goal_room, ahead - brake_at)
-                    prefix = _checked_wheeled_prefix(scan, geometry, config, state, odom, feedback,
+                    prefix = _checked_forward_prefix(scan, geometry, config, state, odom, feedback,
                                                      limited, horizon_s, room, wz, order)
                     if prefix is not None:
                         return prefix
@@ -2748,18 +2760,19 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     return vx, vy, wz, status, reason
 
 
-def _checked_wheeled_prefix(scan, geometry, config, state, odom, motion, vx, horizon, room, yaw, sides):
+def _checked_forward_prefix(scan, geometry, config, state, odom, motion, vx, horizon, room, yaw, sides=()):
     """Choose a short twist and display the arc that it executes."""
     (floor, _), _ = _local_velocity_limits(config, 1.)
     if vx <= 0. or vx < floor:
         return None
     grid = scan.grid()
     keep = _keepout_m(config)
-    # With the target centred, bend away from the blocked corridor in the
-    # direction preferred by the side clearance checks.
-    steer = yaw or -sides[0] * .25
-    alternate = -math.copysign(.25, steer)
-    for requested in (steer, .5 * steer, alternate, 0.):
+    turns = (yaw, 0.) if yaw else (0.,)
+    if sides:
+        # A wheeled detour can also bend toward the side with more clearance.
+        steer = yaw or -sides[0] * .25
+        turns = (steer, .5 * steer, -math.copysign(.25, steer), 0.)
+    for requested in turns:
         turn = _clamp(requested, _scan_yaw_rate(config, 1. if requested < 0. else -1.))
         if requested and (not turn or abs(turn) < config.floor_wz_moving):
             continue

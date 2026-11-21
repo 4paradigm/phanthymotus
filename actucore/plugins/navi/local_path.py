@@ -17,8 +17,9 @@ STEPS = CARDINAL_STEPS + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 RESOLUTION = .05
 MIN_OBSTACLE_HEIGHT_M = .02
 APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M = .05
-START = (10, 28)
-SHAPE = (77, 57)
+# Preserve the forward range while covering the body behind a front camera.
+START = (20, 28)
+SHAPE = (87, 57)
 RIGHT, FORWARD = np.meshgrid((np.arange(SHAPE[1]) - START[1]) * RESOLUTION,
                               (np.arange(SHAPE[0]) - START[0]) * RESOLUTION)
 
@@ -309,9 +310,13 @@ class Geometry:
     free_space_validated: bool = True
     min_obstacle_height: float = MIN_OBSTACLE_HEIGHT_M
 
+    @property
+    def half_length(self):
+        return (self.front + self.rear) / 2
 
-def camera_square(horizontal, vertical, half_width, *, half_length=None):
-    """Plan in the camera frame, defaulting to a square footprint."""
+
+def camera_square(horizontal, vertical, half_width, *, half_length=None, at_front=False):
+    """Build a camera-frame approximation of the chassis footprint."""
     if horizontal is None or vertical is None:
         return None
     # Axis convention only: optical (right, down, forward) to (forward, left, up).
@@ -321,7 +326,8 @@ def camera_square(horizontal, vertical, half_width, *, half_length=None):
               and math.isfinite(half_length) and half_length > 0 else half_width)
     # The uncalibrated camera approximation can put a few centimetres of
     # floor residual into obstacle cells. Keep those cells unknown.
-    return Geometry(horizontal, vertical, axes, extent, extent, None,
+    front, rear = (0., 2 * extent) if at_front else (extent, extent)
+    return Geometry(horizontal, vertical, axes, front, rear, None,
                     min_obstacle_height=APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M)
 
 
@@ -349,7 +355,7 @@ def body_square(geometry, vendor):
     if transform[0, 2] < .75:  # Unambiguous forward-facing optical axis.
         return None
     return Geometry(geometry.horizontal, geometry.vertical, transform,
-                    geometry.front, geometry.rear, geometry.height)
+                    geometry.half_length, geometry.half_length, geometry.height)
 
 
 @dataclass(frozen=True)
