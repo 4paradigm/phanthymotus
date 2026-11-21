@@ -129,9 +129,14 @@ def print_readiness_script(wait_ms: Any = 1500) -> str:
   const nativeClose = window.close.bind(window);
   let preparingPrint = false;
   let closeRequested = false;
+  window.__paradigmPrintState = 'idle';
+  window.addEventListener('afterprint', () => {{
+    window.__paradigmPrintState = 'complete';
+    if (closeRequested) nativeClose();
+  }});
 
   window.close = () => {{
-    if (preparingPrint) {{
+    if (preparingPrint || window.__paradigmPrintState === 'submitted') {{
       closeRequested = true;
       return;
     }}
@@ -141,6 +146,7 @@ def print_readiness_script(wait_ms: Any = 1500) -> str:
   window.print = () => {{
     if (preparingPrint) return;
     preparingPrint = true;
+    window.__paradigmPrintState = 'preparing';
     const images = Array.from(document.images || []);
     const imageReady = images.map((image) => new Promise((resolve) => {{
       if (image.complete) return resolve();
@@ -156,9 +162,9 @@ def print_readiness_script(wait_ms: Any = 1500) -> str:
       .then(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
       .then(() => new Promise((resolve) => setTimeout(resolve, {delay})))
       .then(() => {{
+        window.__paradigmPrintState = 'submitted';
         nativePrint();
         preparingPrint = false;
-        if (closeRequested) setTimeout(nativeClose, 0);
       }});
   }};
 }})();
@@ -607,11 +613,17 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                 raise BridgeFailure("print_action_missing", "页面上没有找到“打印访客贴”操作")
             try:
                 action.click(timeout=5000)
-                page.wait_for_timeout(3000)
+                # The page delays window.print() until images and fonts are
+                # ready (up to 6.5 seconds). Wait for the browser's afterprint
+                # event instead of closing Edge after a fixed 3-second sleep.
+                page.wait_for_function(
+                    "window.__paradigmPrintState === 'complete'",
+                    timeout=45_000,
+                )
             except Exception as exc:
                 raise BridgeFailure(
                     "print_outcome_unknown",
-                    "点击打印后没有得到明确结果；系统不会自动重试，请前台核对打印机和访客状态",
+                    "网页已触发打印，但浏览器未确认打印流程结束；系统不会自动重试，请核对打印机和访客状态",
                     uncertain=True,
                 ) from exc
             try:
