@@ -12,11 +12,151 @@ from plugins.external_motion_learning import ExternalMotionLearner
 from plugins.rgbd_body_mount import CaptureMounts
 from plugins.rgbd_odometry import RgbdOdometryPlugin
 from test_external_odometry_fusion import packet, pose_at
+from plugins.external_odometry_fusion import decode_motion
 from test_pointcloud_slam_stream import stream as slam_stream
 from test_rgbd_odometry_contract import declarations
 from test_rgbd_odometry_status import sessions  # noqa: F401
 from test_rgbd_odometry_recovery import assisted_runtime, images
 from vision_stubs import _FakeExecutor
+
+
+def fusion_input():
+    return rgbd_external_input.ExternalOdometryInput('/fused/state/odom', dict(
+        frame_id='body', external_topic='/external', external_candidates=['/external']), learning=False)
+
+
+def test_fusion_rejects_stale_measurements_even_during_publication(sessions):
+    _, now, _ = sessions
+    stream = fusion_input()
+    try:
+        now[0] = 31_000_000_000
+        for t in (0., .2):
+            stream._apply(('motion', '/external', *decode_motion(packet(t, t), now[0])))
+        assert not stream.publisher.messages
+        assert stream.info()['status'] == 'lost'
+        assert stream.info()['stamp_ns'] == 1_200_000_000
+        assert stream.info()['reason'] == 'external fusion measurement is stale'
+
+        for t in (30., 30.2):
+            now[0] = 1_010_000_000 + round(t*1e9)
+            stream._apply(('motion', '/external', *decode_motion(packet(t, t), now[0])))
+        assert stream.info()['status'] == 'tracking'
+        assert json.loads(stream.publisher.messages[-1])['vendor']['motus_slam']['stamp_ns'] == 31_200_000_000
+        now[0] += 2_000_000_000
+        assert stream.info()['status'] == 'lost'
+    finally:
+        stream.close()
+
+
+def test_fusion_queue_keeps_recent_events_and_skips_expired_work(sessions, monkeypatch):
+    _, now, _ = sessions
+    enqueued_at = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: enqueued_at[0])
+    monkeypatch.setattr(rgbd_external_input, '_MAX_PENDING_EVENTS', 4, raising=False)
+    stream = fusion_input()
+    source = stream.node.subscriptions[0]
+    try:
+        for i in range(8):
+            t = i / 20
+            source.callback(NS(data=json.dumps(packet(t, t))))
+        assert stream.events.qsize() == 4
+        assert stream.dropped == 4
+        assert [event[2] for event in stream._take_ready()] == [
+            1_200_000_000, 1_250_000_000, 1_300_000_000, 1_350_000_000]
+        source.callback(NS(data=json.dumps(packet(.4, .4))))
+        enqueued_at[0] += .5
+        source.callback(NS(data=json.dumps(packet(.9, .9))))
+        assert [event[2] for event in stream._take_ready()] == [1_900_000_000]
+        assert stream.dropped == 5
+        now[0] = 1_950_000_000
+        for t in (.9, .95):
+            source.callback(NS(data=json.dumps(packet(t, t))))
+        stream._apply_ready(stream._take_ready())
+        emitted, = stream.publisher.messages
+        assert json.loads(emitted)['pose']['position'][0] == pytest.approx(.05)
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize('overflow', [False, True])
+def test_fusion_backlog_preserves_external_pose_reset(sessions, monkeypatch, overflow):
+    _, now, _ = sessions
+    timing = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: timing[0])
+    monkeypatch.setattr(rgbd_external_input, '_MAX_PENDING_EVENTS', 2)
+    stream = fusion_input()
+    source = stream.node.subscriptions[0]
+    try:
+        for t, x in ((0., 10.), (.1, 10.1)):
+            source.callback(NS(data=json.dumps(packet(t, x))))
+        stream._apply_ready(stream._take_ready())
+        source.callback(NS(data=json.dumps(packet(.2, -90., reset=True))))
+        timing[0] = 0.3
+        if overflow:
+            source.callback(NS(data=json.dumps(packet(.3, -89.9))))
+        source.callback(NS(data=json.dumps(packet(.5, -89.7))))
+        now[0] = 1_510_000_000
+        stream._apply_ready(stream._take_ready())
+        assert json.loads(stream.publisher.messages[-1])['pose']['position'][0] == pytest.approx(.4)
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize('overflow', [False, True])
+def test_fusion_backlog_does_not_integrate_a_dropped_twist_interval(sessions, monkeypatch, overflow):
+    _, now, _ = sessions
+    timing = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: timing[0])
+    monkeypatch.setattr(rgbd_external_input, '_MAX_PENDING_EVENTS', 2)
+    stream = fusion_input()
+    source = stream.node.subscriptions[0]
+
+    def send(t, x):
+        source.callback(NS(data=json.dumps(packet(t, twist=[x, 0., 0., 0., 0., 0.]))))
+
+    try:
+        send(0., 1.)
+        send(.1, 1.)
+        stream._apply_ready(stream._take_ready())
+        send(.2, 0.)
+        timing[0] = 0.3
+        if overflow:
+            send(.3, 0.)
+        send(.5, 0.)
+        now[0] = 1_510_000_000
+        stream._apply_ready(stream._take_ready())
+        expected = .1 if overflow else .2
+        assert json.loads(stream.publisher.messages[-1])['pose']['position'][0] == pytest.approx(expected)
+    finally:
+        stream.close()
+
+
+def test_fusion_does_not_bridge_overwritten_reset_with_out_of_order_pose(sessions, monkeypatch):
+    _, now, _ = sessions
+    monkeypatch.setattr(rgbd_external_input, '_MAX_PENDING_EVENTS', 2)
+    stream = fusion_input()
+    source = stream.node.subscriptions[0]
+
+    def send(t, x, reset=False):
+        source.callback(NS(data=json.dumps(packet(t, x, reset=reset))))
+
+    try:
+        send(0., 100.)
+        send(.1, 100.1)
+        stream._apply_ready(stream._take_ready())
+        send(.2, -90., reset=True)
+        send(.45, 7., reset=True)
+        send(.3, -89.9)
+        send(.5, 7.1)
+        now[0] = 1_510_000_000
+        stream._apply_ready(stream._take_ready())
+        assert json.loads(stream.publisher.messages[-1])['pose']['position'][0] == pytest.approx(.2)
+        send(.35, -89.8)
+        send(.6, 7.2)
+        stream._apply_ready(stream._take_ready())
+        assert json.loads(stream.publisher.messages[-1])['pose']['position'][0] == pytest.approx(.3)
+    finally:
+        stream.close()
 
 
 def test_visual_loss_does_not_change_public_fusion_status_or_segment(sessions, monkeypatch):
@@ -35,14 +175,14 @@ def test_visual_loss_does_not_change_public_fusion_status_or_segment(sessions, m
     try:
         for stamp, position in ((0., 10.), (.2, 10.2)):
             source.callback(NS(data=json.dumps(packet(stamp, position))))
-            stream._apply(stream.events.get_nowait())
+            stream._apply(stream._take_ready()[0])
         first = card.dispatch('rgbd_odometry', dict(action='info'))
         assert first['status'] == 'tracking'
         segment = first['segment_id']
         assert stream.node not in executor.nodes
         session.gate.fault('native visual tracking lost', 'visual')
         source.callback(NS(data=json.dumps(packet(.4, 10.4))))
-        stream._apply(stream.events.get_nowait())
+        stream._apply(stream._take_ready()[0])
         fused = card.dispatch('rgbd_odometry', dict(action='info'))
         assert fused['status'] == 'tracking' and fused['visual_status'] == 'lost'
         assert fused['segment_id'] == segment and fused['visual_segment_id'] == session.segment
@@ -57,7 +197,7 @@ def test_visual_loss_does_not_change_public_fusion_status_or_segment(sessions, m
         assert replacement is not session and replacement.external_stream is stream
         replacement.process.returncode = 0
         source.callback(NS(data=json.dumps(packet(.6, 10.6))))
-        stream._apply(stream.events.get_nowait())
+        stream._apply(stream._take_ready()[0])
         resumed = card.dispatch('rgbd_odometry', dict(action='info'))
         assert resumed['status'] == 'tracking' and resumed['segment_id'] == segment
         assert resumed['visual_segment_id'] == replacement.segment
@@ -92,7 +232,7 @@ def test_registered_card_publishes_external_body_motion_at_new_stamps(sessions, 
         source = next(sub for sub in stream.node.subscriptions if sub.topic == '/external')
         for at, position in ((0., 100.), (.25, 100.25), (.5, 100.5)):
             source.callback(NS(data=json.dumps(packet(at, position))))
-            stream._apply(stream.events.get_nowait())
+            stream._apply(stream._take_ready()[0])
         body = json.loads(stream.publisher.messages[-1])
         assert body['pose']['position'][0] == pytest.approx(10.5)
         assert body['pose']['child_frame_id'] == 'body'
@@ -101,7 +241,7 @@ def test_registered_card_publishes_external_body_motion_at_new_stamps(sessions, 
         stream._apply(('visual', 1_500_000_000, 'new', dict(position=[-30., 0., 0.],
                                                           quaternion=[0., 0., 0., 1.])))
         source.callback(NS(data=json.dumps(packet(.75, 100.75))))
-        stream._apply(stream.events.get_nowait())
+        stream._apply(stream._take_ready()[0])
         continued = json.loads(stream.publisher.messages[-1])
         assert continued['vendor']['motus_slam']['segment_id'] == segment
         assert continued['pose']['position'][0] == pytest.approx(10.75)
@@ -133,7 +273,7 @@ def test_external_pose_forwards_measured_camera_mount_at_its_own_stamp(sessions)
         stream._apply(('mount', dict(stamp_ns=capture, matrix=pose_at(1).tolist()), capture))
         for stamp, position in ((0., 10.), (.2, 10.2)):
             source.callback(NS(data=json.dumps(packet(stamp, position))))
-            stream._apply(stream.events.get_nowait())
+            stream._apply(stream._take_ready()[0])
         first = json.loads(stream.publisher.messages[-1])
         output = first['vendor']
         assert output['motus_slam']['stamp_ns'] == 1_200_000_000
@@ -148,7 +288,7 @@ def test_external_pose_forwards_measured_camera_mount_at_its_own_stamp(sessions)
         capture = 1_300_000_000
         stream._apply(('mount', dict(stamp_ns=capture, matrix=pose_at(2).tolist()), capture))
         source.callback(NS(data=json.dumps(packet(.4, 10.4))))
-        stream._apply(stream.events.get_nowait())
+        stream._apply(stream._take_ready()[0])
         slam.odom(json.loads(stream.publisher.messages[-1]), now=1.4)
         frame, = slam.accepted
         assert frame.cloud_stamp_ns == 1_250_000_000
@@ -182,7 +322,7 @@ def test_external_pose_publishes_while_parameter_solve_is_pending(sessions, monk
 
     def push_motion(t, x):
         source.callback(NS(data=json.dumps(packet(t, x))))
-        stream._apply(stream.events.get(timeout=.5))
+        stream._apply(stream._take_ready()[0])
 
     def train():
         for step in range(4):
@@ -238,7 +378,7 @@ def test_untyped_core_wire_classifies_external_odometry_from_payload(sessions, m
         assert stream.events.empty()
         for t, x in ((0., 20.), (.25, 20.25)):
             source.callback(NS(data=json.dumps(packet(t, x))))
-            stream._apply(stream.events.get_nowait())
+            stream._apply(stream._take_ready()[0])
             if t == 0.:
                 assert not stream.active and not stream.publisher.messages
         assert stream.active and stream.selected == '/arbitrary-motion'

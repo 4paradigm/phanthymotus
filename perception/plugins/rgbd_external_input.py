@@ -4,8 +4,9 @@ import json
 import queue
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import numpy as np
 
@@ -17,6 +18,9 @@ from utils.ros_lifecycle import dispose_node
 
 _LEARNING_BUDGET_MS = 50.
 _OUTPUT_TIMEOUT_S = 1.5
+_OUTPUT_TIMEOUT_NS = int(_OUTPUT_TIMEOUT_S * 1_000_000_000)
+_MAX_PENDING_EVENTS = 64
+_MAX_QUEUE_DELAY_S = .2
 
 
 class ExternalOdometryInput:
@@ -37,7 +41,10 @@ class ExternalOdometryInput:
             self.fixed_mount is not None or self.camera == self.body)
         self.motion_received = False
         self.selected = calibration.get('external_topic')
-        self.events = queue.Queue(maxsize=256)
+        self.events = queue.Queue(maxsize=_MAX_PENDING_EVENTS)
+        self.event_lock = threading.Lock()
+        self.evicted_motion_boundaries = deque(maxlen=_MAX_PENDING_EVENTS)
+        self.motion_cutoffs = {}
         self.closed = False
         self.last_error = None
         self.dropped = 0
@@ -78,11 +85,45 @@ class ExternalOdometryInput:
             raise
 
     def _offer(self, event):
-        if not self.closed:
-            try:
-                self.events.put_nowait(event)
-            except queue.Full:
-                self.dropped += 1
+        received = time.monotonic()
+        with self.event_lock:
+            if self.closed:
+                return
+            if self.events.full():
+                try:
+                    _, oldest = self.events.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    self.dropped += 1
+                    if self._is_motion_boundary(oldest):
+                        kind, source, stamp, motion = oldest
+                        # A dropped twist cannot stand in for the interval before it.
+                        self.evicted_motion_boundaries.append((kind, source, stamp, replace(motion, reset=True)))
+            self.events.put_nowait((received, event))
+
+    @staticmethod
+    def _is_motion_boundary(event):
+        return event[0] == 'motion' and (event[3].reset or event[3].twist is not None)
+
+    def _take_ready(self):
+        try:
+            batch = [self.events.get(timeout=.05)]
+        except queue.Empty:
+            return []
+        cutoff = time.monotonic() - _MAX_QUEUE_DELAY_S
+        with self.event_lock:
+            while not self.events.empty():
+                batch.append(self.events.get_nowait())
+            ready = [event for received, event in batch
+                     if received >= cutoff or self._is_motion_boundary(event)]
+            self.dropped += len(batch) - len(ready)
+            if self.evicted_motion_boundaries:
+                for _, source, stamp, _ in self.evicted_motion_boundaries:
+                    self.motion_cutoffs[source] = max(self.motion_cutoffs.get(source, 0), stamp)
+                ready = [*self.evicted_motion_boundaries, *ready]
+                self.evicted_motion_boundaries.clear()
+        return ready
 
     def _receive(self, source, msg):
         now = time.time_ns()
@@ -109,7 +150,7 @@ class ExternalOdometryInput:
             return self.fixed_mount
         return np.eye(4) if self.camera == self.body else None
 
-    def _apply(self, event):
+    def _apply(self, event, *, publish=True):
         kind, *values = event
         if kind == 'mount':
             self.mounts.observe(*values)
@@ -123,6 +164,11 @@ class ExternalOdometryInput:
             source, stamp, motion = values
             if self.selected is not None and self.selected != source:
                 return
+            if not motion.reset and stamp < self.motion_cutoffs.get(source, 0):
+                # A late sample must not bridge an interval cut by an eviction.
+                with self.event_lock:
+                    self.dropped += 1
+                return
             self.selected = source
             self.motion_received = True
             self.fuser.motion(stamp, motion)
@@ -134,6 +180,10 @@ class ExternalOdometryInput:
                     if len(self.pending_visual) > 24:
                         self.pending_visual.popitem(last=False)
                 return
+        if publish:
+            self._publish()
+
+    def _publish(self):
         if not self.active and not self.motion_received:
             return
         state = self.fuser.current
@@ -143,12 +193,17 @@ class ExternalOdometryInput:
             return
         if state.last_update == 'external' and not state.mask[[0, 1, 5]].all():
             return
+        if state.last_update is None:
+            return
+        stamp = state.stamp
+        if time.time_ns() - stamp > _OUTPUT_TIMEOUT_NS:
+            if self.active and 'stamp_ns' not in self.status:
+                self.status = dict(self.status, stamp_ns=stamp)
+            return
         sample = self.fuser.output()
         if sample is None:
             return
-        self.active = True
         quality = sample['vendor']['motus_slam']
-        stamp = quality['stamp_ns']
         mount = self._camera_mount(stamp)
         if mount is not None:
             packet = dict(matrix=mount.tolist(), parent_frame=self.body, child_frame=self.camera, stamp_ns=stamp)
@@ -164,7 +219,13 @@ class ExternalOdometryInput:
                 packet.update(capture)
                 status = 'available' if packet.get('matrix') is not None else 'unavailable'
                 sample['vendor']['camera_mount'] = dict(status=status, packet=packet)
-        self.publisher.publish(self.message_type(data=json.dumps(sample, allow_nan=False)))
+        message = self.message_type(data=json.dumps(sample, allow_nan=False))
+        if time.time_ns() - stamp > _OUTPUT_TIMEOUT_NS:
+            if self.active and 'stamp_ns' not in self.status:
+                self.status = dict(self.status, stamp_ns=stamp)
+            return
+        self.publisher.publish(message)
+        self.active = True
         self.status = dict(active=True, topic=self.selected, stamp_ns=stamp, published_at=time.monotonic(),
                            **sample['vendor']['external_fusion'])
         self.reported_stale = False
@@ -214,22 +275,29 @@ class ExternalOdometryInput:
         if result is not None:
             self.fuser.replay_learning(key[0])
 
+    def _apply_ready(self, events):
+        # Preserve the motion intervals, but emit just the newest result after
+        # catching up with events already waiting at the start of this batch.
+        for event in events:
+            try:
+                self._apply(event, publish=False)
+            except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
+                self.last_error = str(error)
+        if events:
+            self._publish()
+
     def _work(self):
         while not self.closed:
             try:
                 self._complete_learning()
-                try:
-                    event = self.events.get(timeout=.05)
-                except queue.Empty:
-                    if not self.reported_stale:
-                        info = self.info()
-                        if info['status'] == 'lost':
-                            self.status_publisher.publish(self.message_type(data=json.dumps(dict(
-                                status='lost', reason=info['reason'], pose_reference='body',
-                                visual_status=self.visual_state, external_fusion=info), allow_nan=False)))
-                            self.reported_stale = True
-                    continue
-                self._apply(event)
+                self._apply_ready(self._take_ready())
+                if not self.reported_stale:
+                    info = self.info()
+                    if info['status'] == 'lost':
+                        self.status_publisher.publish(self.message_type(data=json.dumps(dict(
+                            status='lost', reason=info['reason'], pose_reference='body',
+                            visual_status=self.visual_state, external_fusion=info), allow_nan=False)))
+                        self.reported_stale = True
             except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
                 self.last_error = str(error)
 
@@ -245,7 +313,10 @@ class ExternalOdometryInput:
                       learning_budget_skips=self.learning_budget_skips, segment_id=self.fuser.segment)
         published = result.pop('published_at', None)
         result.update(status='initializing', reason=None)
-        if published is not None:
+        stamp = result.get('stamp_ns')
+        if stamp is not None and time.time_ns() - stamp > _OUTPUT_TIMEOUT_NS:
+            result.update(status='lost', reason='external fusion measurement is stale')
+        elif published is not None:
             if time.monotonic()-published <= _OUTPUT_TIMEOUT_S:
                 result['status'] = 'tracking'
             else:
