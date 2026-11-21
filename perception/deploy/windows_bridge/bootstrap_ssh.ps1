@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator SSH required' }
@@ -133,9 +133,10 @@ try {
         Start-Sleep -Milliseconds 250
     }
     if ($loginState -and $loginState.State -eq 'Running') {
-        throw '无法释放旧版访客 Edge 自动化任务，请关闭前台访客 Edge 后重试'
+        throw 'Cannot release the previous visitor Edge task. Close its Edge window and retry.'
     }
-    Remove-Item -LiteralPath (Join-Path $install 'data\login.stop') -Force -ErrorAction SilentlyContinue
+    $loginStopPath = $install + '\data\login.stop'
+    Remove-Item -LiteralPath $loginStopPath -Force -ErrorAction SilentlyContinue
 
     # Remove the obsolete network bridge completely.
     Stop-ScheduledTask -TaskName 'Paradigm Visitor Bridge Watchdog' -ErrorAction SilentlyContinue
