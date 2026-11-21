@@ -260,20 +260,21 @@ def _project_hits(geometry, right, forward, resolution, x, y, z, *, free=None, h
     if free is None:
         free = np.zeros(right.shape, dtype=bool)
     transform = geometry.base_from_optical
-    body_points = np.column_stack((x, y, z)) @ transform[:3, :3].T + transform[:3, 3]
-    hit_row = np.rint((body_points[:, 0] - forward[0, 0]) / resolution).astype(int)
-    hit_col = np.rint((-body_points[:, 1] - right[0, 0]) / resolution).astype(int)
+    # Only forward and lateral coordinates contribute to cell indices.
+    body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
+    body_l = x * transform[1, 0] + y * transform[1, 1] + z * transform[1, 2] + transform[1, 3]
+    hit_row = np.rint((body_f - forward[0, 0]) / resolution).astype(int)
+    hit_col = np.rint((-body_l - right[0, 0]) / resolution).astype(int)
     in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
                & (hit_col >= 0) & (hit_col < right.shape[1]))
     cells = (hit_row[in_grid], hit_col[in_grid])
     if heights is not None:
         heights = heights[in_grid]
     raised = np.ones(cells[0].shape, dtype=bool) if heights is None else heights >= geometry.min_obstacle_height
-    counts = np.zeros(right.shape, dtype=int)
-    np.add.at(counts, cells, raised)
+    cell_ids = cells[0] * right.shape[1] + cells[1]
+    counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
     if heights is not None and geometry.min_obstacle_height > MIN_OBSTACLE_HEIGHT_M:
-        uncertain = np.zeros(right.shape, dtype=int)
-        np.add.at(uncertain, cells, ~raised)
+        uncertain = np.bincount(cell_ids[~raised], minlength=right.size).reshape(right.shape)
         free &= uncertain < 3
     occupied = counts >= 3
     # Clearing a suspect hit does not provide evidence of free space.

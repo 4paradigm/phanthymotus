@@ -1616,6 +1616,23 @@ def test_a_motion_decision_that_expires_during_planning_publishes_a_stop(monkeyp
     assert card._last_decision.status == navi_plugin.policy_mod.BLIND
 
 
+@pytest.mark.parametrize("age_ms,expired", [(599, False), (600, True), (690, True)])
+def test_planning_rejects_depth_already_expired_by_the_downstream_limit(monkeypatch, age_ms, expired):
+    card = _card(local_planning=True, max_depth_age_ms=800)
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 600})
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._depth_ms = now_ms - 20
+    card._depth_capture_ms = now_ms - age_ms
+
+    def step(**kwargs):
+        assert kwargs["depth"].get("capture_invalid", False) is expired
+        return navi_plugin.policy_mod.Decision([0.] * 6, navi_plugin.policy_mod.BLIND, "test")
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", step)
+    card.next_command()
+
+
 def test_first_avoidance_turn_that_expires_during_planning_reenters_a_stop_hold(monkeypatch):
     policy = navi_plugin.policy_mod
     card = _card(local_planning=True)
@@ -2116,6 +2133,17 @@ def test_head_depth_topic_binds_as_metric_depth():
 
     assert problem == ""
     assert bound["depth_map"] == "/nvidia_desktop/camera/head/depth"
+
+
+def test_metric_depth_subscription_keeps_only_the_latest_queued_frame():
+    node = _FakeNode()
+    depth = "/nvidia_desktop/camera/head/visual_depth"
+    objects = "/nvidia_desktop/camera/head/objects"
+    _, problem = _card()._bind_inputs(node, [objects, depth])
+    assert not problem
+    profiles = {topic: qos for _, topic, _, qos in node.subscription_details}
+    assert profiles[depth].depth == 1
+    assert profiles[objects].depth == 2
 
 
 

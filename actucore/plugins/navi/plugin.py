@@ -107,7 +107,7 @@ _IGNORED_LEGACY_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw",
                                     "stop_tolerance_m"))
 
 
-def _sensor_qos():
+def _sensor_qos(depth=2):
     """BEST_EFFORT, to match what every producer this card reads actually uses.
 
     **A reliable subscriber does not match a best-effort publisher.** ROS2 treats
@@ -130,7 +130,7 @@ def _sensor_qos():
 
     return QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST,
-                      depth=2,
+                      depth=depth,
                       durability=DurabilityPolicy.VOLATILE)
 
 
@@ -1411,7 +1411,9 @@ class NaviPlugin:
                 if selected is None:
                     return False
                 callback = self._on_depth_map
-                node.create_subscription(selected, topic, callback, qos)
+                # The planner replaces its current depth map on every callback.
+                # Decoding older maps ahead of the newest one spends its time budget.
+                node.create_subscription(selected, topic, callback, _sensor_qos(depth=1))
                 self._cancel_pending_depth_bind(node)
                 with self._lock:
                     if self._last_error.startswith(f"深度话题 {topic} 等待超过"):
@@ -1633,8 +1635,9 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
-    def _set_depth_map(self, depth, *, capture_ms=None, source_stamp_ns=None, source_frame=None):
-        received_ms = int(time.time() * 1000)
+    def _set_depth_map(self, depth, *, capture_ms=None, source_stamp_ns=None, source_frame=None,
+                       received_ms=None):
+        received_ms = int(time.time() * 1000) if received_ms is None else received_ms
         horizontal = self._config.depth_intrinsics
         vertical = self._depth_vertical
         ground = None
@@ -1653,6 +1656,7 @@ class NaviPlugin:
             self._depth_capture_ms = capture_ms if type(capture_ms) is int and 0 < capture_ms <= received_ms else None
 
     def _on_depth_map(self, message):
+        received_ms = int(time.time() * 1000)
         data = bytes(getattr(message, "data", b"") or b"")
         if not data:
             return
@@ -1665,7 +1669,8 @@ class NaviPlugin:
         stamp = getattr(getattr(message, "header", None), "stamp", None)
         ns = stamp.sec * 10**9 + stamp.nanosec if stamp is not None else None
         self._set_depth_map(depth, capture_ms=ns // 10**6 if ns else None, source_stamp_ns=ns,
-                            source_frame=getattr(getattr(message, "header", None), "frame_id", None))
+                            source_frame=getattr(getattr(message, "header", None), "frame_id", None),
+                            received_ms=received_ms)
 
     def _open_publisher(self):
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -1830,6 +1835,14 @@ class NaviPlugin:
 
         objects, depth, odom, objects_ms = self._observation_snapshot(
             with_capture_timing=self._config.local_planning)
+        max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+        bounded_age = type(max_age) in (int, float) and 0 < max_age < math.inf
+        if bounded_age and depth is not None and "control_ms" in depth:
+            capture = depth.get("capture_ms") or depth["frame_id"]
+            if depth["control_ms"] - capture >= max_age:
+                # An expired frame cannot produce a command the driver admits.
+                # Let the policy take its normal stop-and-refresh path immediately.
+                depth["capture_invalid"] = True
         previous_twist = self._state.commanded
         was_moving = any(previous_twist)
         previous_scan = self._state.active_scan
@@ -1893,9 +1906,8 @@ class NaviPlugin:
                 obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
                 if scan.current_frame:
                     obs_ms = min(obs_ms, scan.current_frame)
-        max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
         stale = (self._config.local_planning and any(values)
-                 and type(max_age) in (int, float) and 0 < max_age <= now_ms - obs_ms)
+                 and bounded_age and max_age <= now_ms - obs_ms)
         recheck_deadline = None
         recheck_blocked = False
         if (stale and objects is not None and depth is not None and values == decision.values
@@ -1939,6 +1951,11 @@ class NaviPlugin:
             else:
                 status = policy_mod.BLIND
                 reason = f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车"
+                depth_timing = depth or {}
+                log.info("navi expired observation: depth_stamp_ns=%s depth_received_ms=%s "
+                         "planning_started_ms=%s planning_finished_ms=%d observation_ms=%d",
+                         depth_timing.get("source_stamp_ns"), depth_timing.get("frame_id"),
+                         depth_timing.get("control_ms"), now_ms, obs_ms)
                 if scan.active and scan.receipt_only and not scan.command_only:
                     scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
             self._state.idle_for_s = idle_for_s
