@@ -418,3 +418,21 @@ def test_a_corrupt_jpeg_falls_back_to_the_depth_map():
     the frame it was handed is garbage."""
     frame = _render(rgb_jpeg=b"not a jpeg", depth_m=_depth(1.0))
     assert frame.shape == (480, 640, 3)
+
+
+
+@needs_cv2
+def test_executing_segment_is_visibly_distinct_from_candidate():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    candidate = Detour((.15, -.03), ((0., 0.), (.8, .3), (1.2, .3)), geometry)
+    active = Detour(None, ((0., 0.), (.8, -.15)), geometry)
+    preview = _render(depth_m=depth, ground=ground, detour=candidate)
+    executing = _render(depth_m=depth, ground=ground, detour=candidate, executing=active)
+    assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
+    assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()

@@ -67,6 +67,7 @@ _DEPTH_NEAR_SHARE = 0.72
 
 _NO_READING = (70, 70, 70)
 _CORRIDOR = (255, 255, 255)
+_EXECUTING_ROUTE = (115, 230, 105)
 _TARGET = (80, 220, 255)
 _ARROW = (120, 255, 120)
 _WARN = (80, 120, 255)
@@ -321,7 +322,7 @@ def _dashed_line(frame, a, b, colour, phase=0.):
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, rgb_jpeg=None, blend: float = 0.5,
-           ground=None, detour=None, depth_vertical=None, route_target=None,
+           ground=None, detour=None, executing=None, depth_vertical=None, route_target=None,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -369,6 +370,13 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
             else:
                 phase = _dashed_line(frame, a, b, _CORRIDOR, phase if a == previous_end else 0.)
             previous_end = b
+
+    if executing is not None:
+        for a, b, _ in route_lines(depth_m, ground, executing.geometry, executing.points, None,
+                                  keep, width, height, stop_distance_m=config.stop_distance_m):
+            visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
+            if visible:
+                _line(frame, a, b, _EXECUTING_ROUTE, thickness=3)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #

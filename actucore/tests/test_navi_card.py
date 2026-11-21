@@ -195,7 +195,9 @@ def test_lifecycle_stops_previous_motion_with_long_watchdog(monkeypatch, action)
     assert not any(card._state.commanded)
 
 
-@pytest.mark.parametrize("stop", ["expiry", "gap", "duplicate", "angle", "translation", "obstacle", "depth", "pause"])
+@pytest.mark.parametrize("stop", [
+    "first_short", "expiry", "gap", "duplicate", "angle", "translation", "obstacle", "depth", "pause",
+])
 def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypatch, stop):
     import numpy as np
     from plugins.navi.active_scan import CheckedTurnSweep, SHAPE, START
@@ -233,6 +235,8 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
     scan.turn_sweep = CheckedTurnSweep(geometry, .33, 1.15, occupied, scan.pose)
     card._state.commanded = (0., 0., .6)
     card._velocity_history.append((1000, 1000, (0., 0., 0.)))
+    if stop == "first_short":
+        card._descriptor = {"rate": {"max_obs_age_ms": 155}}
     entered = threading.Event()
     release = threading.Event()
 
@@ -244,6 +248,13 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
 
     monkeypatch.setattr(card, "next_command", plan)
     card._tick()
+    if stop == "first_short":
+        now = 1025  # The cadence delay leaves the same 80 ms as the field packet.
+        card._dispatch_command()
+        assert not published
+        assert card._scheduled_command is None
+        assert "控制周期" in card._output_stop[1]
+        return
     card._dispatch_command()
     assert published[-1]["values"][5] == .6
     now = 1100
@@ -263,6 +274,12 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
             pauser.start()
             assert stopped.wait(1)
         else:
+            if stop == "expiry":
+                now = 1350
+                card._velocity_history.append((now, now, (0., 0., .4)))
+                card._dispatch_command()
+                assert published[-1]["values"][5] == .6
+                assert published[-1]["ttl_ms"] == 50
             now = {"expiry": 1400, "gap": 1360, "duplicate": 1360,
                    "angle": 1320, "translation": 1200, "obstacle": 1200, "depth": 1200}[stop]
             if stop == "angle":
@@ -279,7 +296,7 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
             assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1400
             now = 1400
             card._dispatch_command()
-        expected = 4 if stop == "translation" else 3
+        expected = 4 if stop in ("translation", "expiry") else 3
         assert len(published) == expected and published[-1]["values"] == [0.] * 6
         if stop == "obstacle":
             assert "扫掠区有障碍" in card._output_stop[1]
@@ -494,13 +511,13 @@ def test_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypa
             continued = card.next_command()
             assert continued["values"] == left["values"]
             assert continued["obs_stamp_ms"] == 100_150
-            assert card._state.active_scan.active and not card._state.active_scan.locked
+            assert card._state.active_scan.active
             return
         card._depth_ms = 99_000
         stop = card.next_command()
         assert stop["values"] == [0.] * 6
         assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_250
-        assert card._state.active_scan.locked
+        assert card._state.active_scan.phase == "brake_for_replan"
         assert tick(100_350)["values"] == [0.] * 6
         return
     for stamp in range(100_250, 101_550, 100):
@@ -2324,3 +2341,86 @@ def test_obstacle_pose_uses_plain_timestamps_on_both_sides_of_capture(monkeypatc
     declaration["vendor"]["body_mount"] = dict(parent_frame="base_link")
     pose(10160, .16, child="base_footprint")
     assert "obstacle_pose" not in snapshot()[1]
+
+
+
+@pytest.mark.parametrize("event", ["plan_slow", "new_obstacle", "feedback_gap", "expiry"])
+def test_checked_local_leg_uses_independent_command_timer(monkeypatch, event):
+    import threading
+    import numpy as np
+    from plugins.navi import local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    card._running = True
+    card._publisher = card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 500}}
+    card._ttl_ms = 400
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    card._config.local_geometry = geometry
+    scan = card._state.active_scan
+    scan.receipt_only = scan.buffered_odom = True
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.odom_source = 1000
+    card._state.motion_source = "measured"
+    card._state.executing_leg = policy.PathLeg(geometry, (0., .6), scan.pose)
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append)
+    frame = np.ones((4, 4))
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~occupied, occupied))
+    card._depth_map = card._depth_ground = frame
+    card._depth_ms = card._odom_ms = 1000
+    card._velocity_history.append((1000, 1000, (0., 0., 0.)))
+    old_epoch = card._output_epoch
+    request = card._command_message([0., -.10, 0., 0., 0., 0.], 1., 900)
+    assert card._stage_command(request, old_epoch)
+    assert published[-1]["values"][1] == -.10
+
+    if event == "feedback_gap":
+        now = 1310
+        card._velocity_history.append((now, now, (0., -.10, 0.)))
+    elif event == "expiry":
+        now = 1400
+        for stamp in (1100, 1200, 1300, 1400):
+            card._velocity_history.append((stamp, stamp, (0., -.10, 0.)))
+    else:
+        now = 1100
+        card._velocity_history.append((now, now, (0., -.10, 0.)))
+        if event == "new_obstacle":
+            card._depth_ms = 1100
+            occupied[local_path.START[0], local_path.START[1] + 6] = True
+    card._odom_ms = now
+    if event == "plan_slow":
+        entered, finish = threading.Event(), threading.Event()
+
+        def slow_plan():
+            entered.set()
+            assert finish.wait(2.)
+            return None
+
+        monkeypatch.setattr(card, "next_command", slow_plan)
+        planner = threading.Thread(target=card._tick)
+        planner.start()
+        try:
+            assert entered.wait(2.)
+            card._dispatch_command()
+            assert planner.is_alive()
+            assert len(published) == 2
+        finally:
+            finish.set()
+            planner.join(2.)
+        assert not planner.is_alive()
+    else:
+        card._dispatch_command()
+        assert len(published) == 2
+    if event == "plan_slow":
+        assert published[1]["values"] == published[0]["values"]
+        assert published[1]["obs_stamp_ms"] == 900
+        assert published[1]["stamp_ms"] + published[1]["ttl_ms"] == 1400
+    else:
+        assert published[1]["values"] == [0.] * 6
+        assert not card._stage_command(request, old_epoch)

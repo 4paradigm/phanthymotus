@@ -19,7 +19,7 @@ ODOM_GAP_MS = 250
 MAP_AGE_MS = 2500
 SCAN_TIMEOUT_MS = 8000
 TURN_BURST_MS = 400
-TURN_PROGRESS_WINDOW_MS = 1500
+TURN_PROGRESS_WINDOW_MS = 2000
 TURN_PROGRESS_MIN_RAD = math.radians(3)
 
 
@@ -99,11 +99,6 @@ class ActiveScan:
     phase: str = "idle"
     attempted: bool = False
     exhausted: bool = False
-    locked: bool = False
-    interrupted_frame: int = 0
-    interrupted_source_frame: int | None = None
-    interrupted_odom_ms: int = 0
-    interrupt_reason: str = ""
     directions: tuple = ()
     turn_angle: float = ANGLE
     start_ms: int = 0
@@ -112,11 +107,10 @@ class ActiveScan:
     still_since: int = 0
     turn_start_heading: float = 0.
     retry_after_hold: bool = False
-    replan_cause: str = ""
-    turn_replan_used: bool = False
-    turn_retry_cause: str = ""
+    replan_after_ms: int = 0
     issued_yaw: bool = False
     pose: tuple = (0., 0., 0.)
+    motion_frame: object = field(default_factory=object)
     motion: tuple = (0., 0., 0.)
     poses: deque = field(default_factory=lambda: deque(maxlen=32))
     views: deque = field(default_factory=lambda: deque(maxlen=40))
@@ -169,7 +163,7 @@ class ActiveScan:
         return (self.receipt_only and self.buffered_odom and self.pose_origin is None
                 and self.advance_m is not None and self.phase == "turn")
 
-    def update(self, depth, odom, geometry, *, receipt_only=False, max_depth_age_ms=500):
+    def update(self, depth, odom, geometry, *, receipt_only=False, max_depth_age_ms=500, follow_leg=False):
         """Update measured motion and the latest usable depth observation."""
         if self.receipt_only != receipt_only:
             self.invalidate()
@@ -191,7 +185,7 @@ class ActiveScan:
         source = (odom or {}).get("source_sample_id") if self.receipt_only else None
         if self.poses:
             previous = self.poses[-1][0]
-            if self.receipt_only and self.active and body_pose is None and stamp > previous and history:
+            if self.receipt_only and (self.active or follow_leg) and body_pose is None and stamp > previous and history:
                 hold = self._integrate_receipt_motion(history, stamp, source, motion)
                 if hold is not None:
                     return hold
@@ -220,7 +214,7 @@ class ActiveScan:
         self.odom_source = source
         self.motion = motion
         timeout = 2 * SCAN_TIMEOUT_MS if self.receipt_only else SCAN_TIMEOUT_MS
-        if self.active and self.advance_origin is None and stamp - self.start_ms > timeout:
+        if self.phase in ("brake", "turn", "return") and stamp - self.start_ms > timeout:
             return self.interrupt("主动观察：观测超时，停车")
 
         self.current_frame = 0
@@ -273,8 +267,9 @@ class ActiveScan:
         intervals = []
         for received, identity, velocity in samples:
             if velocity is None:
+                hold = self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
                 self.poses.clear()
-                return self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
+                return hold
             if identity is not None and last_source is not None:
                 if identity < last_source:
                     return self.invalidate()
@@ -300,11 +295,13 @@ class ActiveScan:
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
 
     def _hold_for_feedback_gap(self):
+        hold = self.hold_for_replan("主动观察：运动反馈间隔过长，停车后重规划")
+        self.motion_frame = object()
         self.poses.clear()
-        return self.hold_for_replan("主动观察：运动反馈间隔过长，停车后重规划")
+        return hold
 
-    def check_turn_feedback(self, history, now_ms, max_yaw):
-        """Check a copy of the approved turn from the velocity timer."""
+    def sync_buffered_motion(self, history, now_ms):
+        """Consume every feedback sample since the copied control pose."""
         if not history or not 0 <= now_ms - history[-1][0] <= ODOM_GAP_MS:
             return "主动观察：运动反馈间隔过长，停车后重规划", True
         stamp, source, motion = history[-1]
@@ -317,6 +314,14 @@ class ActiveScan:
                 return hold.reason, True
         if now_ms - self.poses[-1][0] > ODOM_GAP_MS:
             return "主动观察：运动反馈间隔过长，停车后重规划", True
+        return None
+
+    def check_turn_feedback(self, history, now_ms, max_yaw):
+        """Check a copy of the approved turn from the velocity timer."""
+        stop = self.sync_buffered_motion(history, now_ms)
+        if stop is not None:
+            return stop
+        motion = history[-1][2]
         error = self.origin[2] + self.directions[0] * self.turn_angle - self.pose[2]
         if abs(motion[2]) > max_yaw + .10:
             return "主动观察：转速超出限制，停车后重规划", True
@@ -493,8 +498,6 @@ class ActiveScan:
 
     def finish(self):
         self.result_frame = self.current_frame if self.route_segment else self.side_frame
-        if self.advance_origin is not None and not self.exhausted:
-            self.turn_replan_used = False
         if self.route_segment:
             self.attempted = self.exhausted
             self.rerouted = False
@@ -528,43 +531,35 @@ class ActiveScan:
         # A released straight segment legitimately leaves the turn origin. A
         # replan hold after it must settle and replan, not lock on that travel.
         turning = self.issued_yaw and self.phase in ("turn", "return")
-        if (not turning and self.origin_set and self.advance_origin is None
+        if (self.phase != "brake_for_replan" and not turning and self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
         if (self.receipt_only and speed > STILL_LINEAR and self.phase != "brake_for_replan"
                 and not turning):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
         if self.phase == "brake_for_replan":
+            if stamp <= self.replan_after_ms:
+                return ScanCommand(reason="主动观察：停车确认运动反馈")
             if speed > STILL_LINEAR or abs(self.motion[2]) > STILL_YAW:
                 motion = "检测到平移" if speed > STILL_LINEAR else "仍在转动"
                 return ScanCommand(reason=f"主动观察：{motion}，停车后重规划")
-            if self.rerouted and self.advance_origin is None:
-                self.locked = True
-                return self.interrupt("主动观察：替代路线尚未前进，停车等待新导航指令")
-            released_route = self.route_segment and self.advance_origin is not None
-            interrupted_turn = (self.receipt_only and self.issued_yaw and self.advance_m is not None
-                                and self.advance_origin is None)
-            if interrupted_turn:
-                if self.turn_replan_used:
-                    return self.interrupt(
-                        f"主动观察：转向重试后再次中断；保持停车"
-                        f"（首次：{self.turn_retry_cause}；重试：{self.replan_cause}）")
-                self.turn_replan_used = True
-                self.turn_retry_cause = self.replan_cause
-                self.route_segment = False
-                self.advance_m = None
-                self.side_frame = self.result_frame = 0
-            if interrupted_turn or self.retry_after_hold or not self.issued_yaw or released_route:
+            interrupted_turn = self.issued_yaw and self.advance_origin is None
+            if self.retry_after_hold or not self.issued_yaw or self.advance_origin is not None:
                 self.attempted = False
-                self.retry_after_hold = False
+            elif interrupted_turn:
+                # A stalled observation can hand off to a checked local route.
+                self.exhausted = True
+            self.retry_after_hold = self.rerouted = False
+            self.route_segment = False
+            self.advance_origin = self.advance_m = None
+            self.side_frame = self.result_frame = 0
             self.phase = "idle"
             self.issued_yaw = False
             return ScanCommand(reason="主动观察：已停稳，重新规划", replanned_turn=interrupted_turn)
         if speed > STILL_LINEAR and not turning:
             return self.interrupt("主动观察：检测到平移，停车")
-        if (abs(self.motion[2]) > yaw_rate + .10
-                or abs(self.pose[2] - self.origin[2]) > max(ANGLE, self.turn_angle) + 2 * ANGLE_TOLERANCE):
-            return self.interrupt("主动观察：转速或转角超出限制，停车")
+        if abs(self.motion[2]) > yaw_rate + .10:
+            return self.interrupt("主动观察：实测转速超出限制，停车")
         # Short route turns also use bounded bursts when only delayed velocity
         # feedback is available. Stop on the control clock even on a repeated sample.
         bounded_turn = self.pose_origin is not None or self.advance_m is not None
@@ -593,7 +588,9 @@ class ActiveScan:
             self.turn_stop_ms = control_ms
             self.turn_until_ms = 0
             return ScanCommand(reason=wait_reason)
-        if abs(error) <= ANGLE_TOLERANCE:
+        turn_direction = -self.directions[0] if returning else self.directions[0]
+        crossed_heading = self.issued_yaw and error * turn_direction <= 0.
+        if abs(error) <= ANGLE_TOLERANCE or crossed_heading:
             if abs(self.motion[2]) > STILL_YAW or speed > STILL_LINEAR:
                 return ScanCommand(reason="主动观察：等待转向停止")
             if returning:
@@ -760,9 +757,7 @@ class ActiveScan:
     def hold_for_replan(self, reason, *, retry_scan=True):
         if self.phase != "brake_for_replan":
             self.retry_after_hold = retry_scan
-            prefix, suffix = "主动观察：", "，停车后重规划"
-            cause = reason[len(prefix):] if reason.startswith(prefix) else reason
-            self.replan_cause = cause[:-len(suffix)] if cause.endswith(suffix) else cause
+            self.replan_after_ms = self.poses[-1][0] if self.poses else 0
         self.phase = "brake_for_replan"
         self.current_frame = 0
         self.turn_until_ms = 0
@@ -770,12 +765,8 @@ class ActiveScan:
         return ScanCommand(reason=reason)
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):
-        if self.active and (self.issued_yaw or self.locked):
-            self.locked = True
-            self.interrupted_frame = self.views[-1][0] if self.views else self.current_frame
-            self.interrupted_source_frame = self.source_frame
-            self.interrupted_odom_ms = self.poses[-1][0] if self.poses else 0
-            self.interrupt_reason = reason
+        if self.active and self.issued_yaw and not self.command_only:
+            return self.hold_for_replan(reason)
         self.phase = "idle"
         self.retry_after_hold = False
         self.turn_until_ms = 0
@@ -784,6 +775,7 @@ class ActiveScan:
 
     def invalidate(self):
         stop = self.interrupt()
+        self.motion_frame = object()
         self.current_frame = 0
         self.pending_depth = None
         self._pending_projection = None
@@ -797,18 +789,11 @@ class ActiveScan:
         self.turn_stop_ms = None
         return stop
 
-    def has_feedback_after_interruption(self):
-        return (self.current_frame > self.interrupted_frame and bool(self.poses)
-                and self.poses[-1][0] > self.interrupted_odom_ms
-                and (self.interrupted_source_frame is None or (
-                    self.source_frame is not None and self.source_frame > self.interrupted_source_frame)))
-
     def note_clear_path(self, frame):
-        if self.locked or not frame or not (self.attempted or self.result_frame):
+        if not frame or not (self.attempted or self.result_frame):
             return
         self.rerouted = False
         self.attempted = False
         self.exhausted = False
         self.issued_yaw = False
-        self.turn_replan_used = False
         self.result_frame = 0

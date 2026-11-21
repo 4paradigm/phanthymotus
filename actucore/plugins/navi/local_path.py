@@ -164,8 +164,15 @@ def optical_ground_plane(frame, geometry, ground):
     return np.array([-a, 1., -b]), c
 
 
+def _neighbor_count(mask):
+    rows, cols = mask.shape
+    padded = np.pad(mask, 1)
+    return sum(padded[r:r + rows, c:c + cols]
+               for r in range(3) for c in range(3) if (r, c) != (1, 1))
+
+
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
-            require_valid_floor=False):
+            require_valid_floor=False, check_free_space=True):
     def no_floor():
         if not require_valid_floor:
             return np.zeros(right.shape, dtype=bool), np.zeros(right.shape, dtype=bool)
@@ -186,11 +193,12 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         return no_floor()
     floor_z = (c + normal @ origin - normal[0]*forward + normal[1]*right) / normal[2]
     # Check several heights below the declared top of the moving envelope.
-    free = np.full(right.shape, geometry.free_space_validated, dtype=bool)
+    check_free_space = check_free_space and geometry.free_space_validated
+    free = np.full(right.shape, check_free_space, dtype=bool)
     top = geometry.height if geometry.height is not None else abs(c / normal[2])
     if not .02 < top <= 2.5:
         return no_floor()
-    heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if geometry.free_space_validated else ()
+    heights = np.linspace(.02, top, max(4, math.ceil(top/.08))) if check_free_space else ()
     # On a verified floor return, require the ray to clear the far edge of
     # this cell at the probe height. A fixed two-cell optical gap would reject
     # valid near-floor rays simply because of their grazing angle.
@@ -223,7 +231,8 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
                & (hit_col >= 0) & (hit_col < right.shape[1]))
     cells = (hit_row[in_grid], hit_col[in_grid])
-    raised = above_floor[hits][in_grid] >= geometry.min_obstacle_height
+    hit_heights = above_floor[hits][in_grid]
+    raised = hit_heights >= geometry.min_obstacle_height
     counts = np.zeros(right.shape, dtype=int)
     np.add.at(counts, cells, raised)
     if geometry.min_obstacle_height > MIN_OBSTACLE_HEIGHT_M:
@@ -231,7 +240,24 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         np.add.at(uncertain, cells, ~raised)
         free &= uncertain < 3
     occupied = counts >= 3
-    return free & ~occupied, occupied
+    # Clearing a suspect hit does not provide evidence of free space.
+    free &= ~occupied
+    neighbors = _neighbor_count(occupied)
+    ends = occupied & (neighbors == 1)
+    small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
+    if small.any():
+        sparse_hits = small[cells] & raised
+        sparse_cells = cells[0][sparse_hits], cells[1][sparse_hits]
+        heights = hit_heights[sparse_hits]
+        highest = np.zeros(right.shape)
+        lowest = np.full(right.shape, np.inf)
+        np.maximum.at(highest, sparse_cells, heights)
+        np.minimum.at(lowest, sparse_cells, heights)
+        near = max(.40, geometry.front + 2 * resolution)
+        weak = ((counts < 8) & (highest - lowest < .05)
+                & (forward**2 + right**2 > near**2))
+        occupied &= ~(small & ((highest < .05) | weak))
+    return free, occupied
 
 
 @dataclass(frozen=True)
@@ -393,6 +419,16 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, paddi
     return not (swept & occupied).any()
 
 
+def motion_sweep_clear(grid, geometry, half_width, horizon, velocities):
+    """Bound footprint rotation and the departure from a straight velocity ramp."""
+    turn = max(abs(yaw) for _, _, yaw in velocities) * horizon
+    speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
+    radius = math.hypot(max(geometry.front, geometry.rear), half_width)
+    padding = radius * min(2., turn) + speed * horizon * min(2., turn / 2)
+    return transition_clear(grid, geometry, half_width, horizon,
+                            tuple(v[:2] for v in velocities), padding=padding)
+
+
 def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
     """Check a straight segment with the footprint already facing its heading."""
     cos, sin = math.cos(angle), math.sin(angle)
@@ -468,6 +504,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if grid_input is None:
         grid_input = observe(frame, geometry, right, forward, resolution, ground)
     free, occupied = grid_input
+    if free is not None:
+        free = free & ~occupied
     if allow_unknown and (free is None or not free.any()):
         return None
     if side < 0:
@@ -568,7 +606,9 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if allow_unknown:
         # A route may cross unknown cells, but its executable part must end
         # at an observed centre. Replan from there with the next camera view.
-        end = next((i for i in range(len(path) - 1, 0, -1) if free[path[i]]), 0) if path else 0
+        if path is None:
+            return None
+        end = next((i for i in range(len(path) - 1, 0, -1) if free[path[i]]), 0)
         if end:
             path = path[:end + 1]
         else:

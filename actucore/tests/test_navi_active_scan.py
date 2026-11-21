@@ -269,7 +269,7 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
         assert hold is None and look.poses[-1][0] == 1300
         sample(1600, wz=.10, source=1300)
         assert update().yaw == 0.
-        assert look.locked
+        assert look.phase == "brake_for_replan"
     else:
         assert look.phase == "brake_for_replan" and hold.yaw == 0.
         assert "间隔过长" in hold.reason
@@ -361,6 +361,48 @@ def test_buffered_turn_reaches_evaluation_with_slew_limited_feedback(monkeypatch
     assert look.ready and look.side_frame == 1950
 
 
+@pytest.mark.parametrize("planning_ms,expected_ttl", [(282, 242), (399, 125), (400, 0)])
+def test_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, planning_ms, expected_ttl):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1., "max_depth_age_ms": 800}, None)
+    card._config.local_geometry = geometry
+    card._descriptor = {"rate": {"max_obs_age_ms": 800}}
+    card._ttl_ms = 400
+    card._state.target, card._state.active_scan = "person", look
+    stamp = 100_000
+    simulated_lag = 0
+    depth_stamp = 99_924
+    history = []
+
+    def snapshot(**kwargs):
+        odom = dict(_odom(stamp), received_ms=stamp, source_sample_id=stamp, velocity_history=tuple(history))
+        return {"objects": []}, dict(_depth(depth_stamp), control_ms=stamp), odom, stamp
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(plugin.time, "time", lambda: (stamp + simulated_lag) / 1000)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: stamp / 1000)
+    _, depth, odom, _ = snapshot()
+    look.update(depth, odom, geometry, receipt_only=True, max_depth_age_ms=800)
+    assert look.begin((-1.,), advance_m=1.9, route_segment=True)
+    stamp += 100
+    history.append((stamp, stamp, (0., 0., 0.)))
+    assert not any(card.next_command()["values"])
+    stamp += 100
+    history.append((stamp, stamp, (0., 0., 0.)))
+    simulated_lag = planning_ms
+    message = card.next_command()
+    if expected_ttl:
+        assert message["values"][5] > 0.
+        assert message["obs_stamp_ms"] == depth_stamp
+        assert message["ttl_ms"] == expected_ttl
+        assert message["stamp_ms"] + message["ttl_ms"] == depth_stamp + 800
+    else:
+        assert not any(message["values"])
+        assert not look.issued_yaw
+
+
 @pytest.mark.parametrize("expiry", ["first_yaw", "renewal", "snapshot"])
 def test_card_finishing_a_turn_command_after_its_deadline_sends_stop(monkeypatch, expiry):
     from plugins.navi import plugin
@@ -411,15 +453,17 @@ def test_card_finishing_a_turn_command_after_its_deadline_sends_stop(monkeypatch
     assert look.turn_stop_ms == stop["stamp_ms"]
 
 
-def test_active_scan_stops_with_stale_odom_and_cannot_restart_on_same_obstacle(monkeypatch):
+def test_active_scan_waits_for_new_odom_then_can_replan(monkeypatch):
     lookout, geometry, _, _ = _setup(monkeypatch)
     _tick(lookout, geometry, 1000)
     assert lookout.begin((1., -1.))
     _tick(lookout, geometry, 1050)
     assert _tick(lookout, geometry, 1200).yaw < 0
-    lookout.update(_depth(1250), None, geometry)
-    assert not lookout.active
+    assert lookout.update(_depth(1250), None, geometry).yaw == 0.
+    assert lookout.phase == "brake_for_replan"
     assert not lookout.begin((1., -1.))
+    assert _tick(lookout, geometry, 1350).replanned_turn
+    assert lookout.begin((1., -1.))
 
 
 @pytest.mark.parametrize("lose_depth, yaw_limit", [(False, .83), (False, .60), (True, .83)])
@@ -524,7 +568,7 @@ def test_scan_rejects_unexpected_yaw_rate(monkeypatch):
     _tick(lookout, geometry, 1050)
     assert _tick(lookout, geometry, 1200).yaw > 0
     assert _tick(lookout, geometry, 1250, wz=.55).yaw == 0
-    assert lookout.locked
+    assert lookout.phase == "brake_for_replan"
 
 
 def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(monkeypatch):
@@ -535,7 +579,7 @@ def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(
     for stamp in range(1200, 9200, 200):
         assert _tick(lookout, geometry, stamp).yaw > 0
     assert _tick(lookout, geometry, 9200).yaw == 0
-    assert lookout.locked
+    assert lookout.phase == "brake_for_replan"
 
 
 @pytest.mark.parametrize("at_stop", [1250, 1050, None, 0])
@@ -570,13 +614,13 @@ def test_receipt_only_scan_keeps_turning_when_translation_has_no_collision(monke
     assert tick(1050).yaw == 0.
     assert tick(1150).yaw < 0.
     assert tick(1250, vx=.113, vy=-.014, yaw=-.204).yaw < 0.
-    assert look.active and not look.locked
+    assert look.active
     assert tick(1400, vx=-.006, vy=-.035).yaw < 0.
-    assert look.active and not look.locked and look.attempted
+    assert look.active and look.attempted
 
 
 @pytest.mark.parametrize("interruption", ["depth", "gap"])
-def test_interrupted_turn_can_replan_once_with_the_current_view(monkeypatch, interruption):
+def test_interrupted_turn_can_replan_after_two_interruptions(monkeypatch, interruption):
     look, geometry, _, _ = _setup(monkeypatch)
 
     def tick(stamp, source, *, depth=True):
@@ -600,12 +644,11 @@ def test_interrupted_turn_can_replan_once_with_the_current_view(monkeypatch, int
     assert tick(stopped + 400, 19, depth=False).yaw == 0.
     final = tick(stopped + 500, 20)
     assert final.yaw == 0.
-    assert "再次中断" in final.reason and "深度暂不可用" in final.reason
-    assert ("间隔过长" if interruption == "gap" else "深度暂不可用") in final.reason
-    assert look.locked and not look.begin((-1.,))
+    assert final.replanned_turn
+    assert look.begin((-1.,))
 
 
-def test_receipt_scan_with_no_yaw_progress_replans_before_standing_bias_locks_it(monkeypatch):
+def test_receipt_scan_allows_two_seconds_for_yaw_progress(monkeypatch):
     look, geometry, _, _ = _setup(monkeypatch)
 
     def tick(stamp):
@@ -617,16 +660,16 @@ def test_receipt_scan_with_no_yaw_progress_replans_before_standing_bias_locks_it
     assert look.begin((1., -1.))
     assert tick(1050).yaw == 0.
     assert tick(1150).yaw < 0.
-    for stamp in range(1250, 2550, 100):
-        tick(stamp)
-    hold = tick(2550)
+    for stamp in range(1250, 3050, 100):
+        assert tick(stamp).yaw < 0.
+    hold = tick(3050)
     assert hold.yaw == 0. and "转向无实测进展" in hold.reason
     # A subsequent missing frame must not make a stalled turn retryable.
-    look.update(None, {**_odom(2600), "received_ms": 2600},
+    look.update(None, {**_odom(3100), "received_ms": 3100},
                 geometry, receipt_only=True, max_depth_age_ms=800)
-    tick(2650)
-    assert tick(2800).yaw == 0.
-    assert not look.active and not look.locked and look.attempted
+    tick(3150)
+    assert tick(3300).yaw == 0.
+    assert not look.active and look.attempted and look.exhausted
 
 
 @pytest.mark.parametrize("missing", ["depth", "odom", "poll_gap"])
@@ -646,11 +689,11 @@ def test_receipt_scan_stops_then_replans_after_temporary_input_loss(monkeypatch,
     assert look.command(geometry, .33, 1., 600, 800).yaw < 0.
     loss = 1500 if missing == "poll_gap" else 1250
     hold = update(loss, depth=missing != "depth", odom=missing != "odom")
-    assert hold.yaw == 0. and look.active and not look.locked
+    assert hold.yaw == 0. and look.active
     for t, yaw in ((loss + 100, -.12), (loss + 200, 0.), (loss + 350, 0.)):
         update(t, wz=yaw)
         assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
-    assert not look.attempted and not look.has_result and not look.active and not look.locked
+    assert not look.attempted and not look.has_result and not look.active
     assert look.begin((-1., 1.))
 
 
@@ -679,12 +722,11 @@ def test_receipt_scan_distinguishes_rotation_from_translation_while_stopping(mon
 
 
 @pytest.mark.parametrize("released", [True, False])
-def test_receipt_scan_replan_after_travel_locks_only_before_a_released_straight_segment(
+def test_receipt_scan_replans_after_travel_and_depth_recovery(
         monkeypatch, released):
     """Tianyi 2.0, 2026-11-20 06:06:59: depth paused for 2.3 s while the scan's
     straight segment had already covered 0.62 m. The replan hold must use
-    the current view once feedback is available. Drift without a released segment
-    is still an unexplained translation and keeps locking."""
+    the current view once feedback is available."""
     look, geometry, _, _ = _setup(monkeypatch)
 
     def update(stamp, vx=0., depth=True):
@@ -712,11 +754,8 @@ def test_receipt_scan_replan_after_travel_locks_only_before_a_released_straight_
     assert update(7700) is None
     first = look.command(geometry, .33, 1., 600, 800)
     assert first.yaw == 0.
-    if not released:
-        assert not look.active and look.locked
-        return
     assert "重新规划" in first.reason
-    assert not look.active and not look.locked and not look.issued_yaw and not look.attempted
+    assert not look.active and not look.issued_yaw and not look.attempted
 
 
 @pytest.mark.parametrize("missing", ["depth", "odom"])
@@ -738,7 +777,6 @@ def test_receipt_scan_retries_if_input_lapses_while_braking_before_first_turn(mo
 
     update(2000)
     assert "已停稳，重新规划" in look.command(geometry, .33, 1., 600).reason
-    assert not look.locked
     assert look.begin((-1., 1.))
 
 
@@ -866,7 +904,7 @@ def test_receipt_only_scan_rejects_a_republished_depth_frame(monkeypatch):
     look.update({**view, "frame_id": 1550},
                 {**_odom(1550), "received_ms": 1550}, geometry, receipt_only=True)
     assert look.current_frame == 0
-    assert not look.active and look.locked
+    assert look.phase == "brake_for_replan"
 
 
 def test_observed_turn_can_use_the_current_depth_after_turning(monkeypatch):
@@ -902,7 +940,7 @@ def test_receipt_stamp_cannot_extend_the_life_of_repeated_odometry(monkeypatch):
     update(1250, 3)
     update(1350, 3)
     update(1450, 3)
-    assert not look.active and look.locked
+    assert look.phase == "brake_for_replan"
 
 
 def test_obstacle_evidence_survives_unknown_then_clears_only_on_measured_free_cells():
@@ -920,3 +958,23 @@ def test_obstacle_evidence_survives_unknown_then_clears_only_on_measured_free_ce
     assert memory.project(moved, observed_free=np.zeros_like(occupied)).any()
     assert not memory.project(moved, observed_free=reprojected.copy()).any()
     assert not memory.cells
+
+
+def test_stopped_turn_that_passed_the_target_checks_the_actual_heading(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, yaw=0.):
+        look.update(_depth(stamp), {**_odom(stamp, yaw), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        return look.command(geometry, .25, 1., 500, now_ms=stamp)
+
+    update(1000)
+    assert look.begin((1.,), advance_m=1.5, turn_angle=math.radians(26.57), route_segment=True)
+    assert update(1050).yaw == 0.
+    assert update(1150).yaw < 0.
+    look.pose = (0., 0., math.radians(32.))
+    assert update(1250, -.3).yaw == 0.
+    for stamp in range(1350, 1950, 100):
+        assert update(stamp).yaw == 0.
+    assert look.ready
+    assert math.degrees(look.pose[2]) > 30.

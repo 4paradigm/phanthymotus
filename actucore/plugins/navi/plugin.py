@@ -46,6 +46,7 @@ from ..control_stream import build as build_message
 from ..control_stream import negotiate
 from . import camera as camera_mod
 from . import depth as depth_mod
+from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
 from .active_scan import ActiveScan
@@ -70,6 +71,11 @@ class _ScheduledCommand:
     expires_at: float
     turn: ActiveScan | None
     sent: bool = False
+    leg: policy_mod.PathLeg | None = None
+    feedback: ActiveScan | None = None
+    depth_grid: tuple | None = None  # source identity, observation time, projected cells
+    checked_pose: tuple | None = None
+    previous_motion: tuple = (0., 0.)
 
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
@@ -595,8 +601,7 @@ class NaviPlugin:
             interface = args.get("odom_interface")
         self._adopt_odom_interface(interface, bound_topic=binding.get("odom"))
         if (self._timer is not None and self._config.local_planning and self._config.odom_expected
-                and self._config.local_geometry is not None and self._config.scan_geometry is None
-                and not binding.get("body_mount")):
+                and self._config.local_geometry is not None and self._config.scan_geometry is None):
             try:
                 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
@@ -1760,14 +1765,12 @@ class NaviPlugin:
 
     def _recheck_late_translation(self, decision, previous_twist, depth, objects_ms, max_age, now_ms):
         """Recheck one local velocity against a newer frame without rerunning path search."""
-        from . import local_path
-
         config, state = self._config, self._state
         scan, geometry = state.active_scan, config.local_geometry
         target_deadline = objects_ms + min(max_age, config.max_obs_age_ms)
         if (decision.status != policy_mod.AVOIDING or not state.avoidance_yaw_override
                 or state.view_detour is None or state.view_detour.geometry is not geometry or decision.values[5]
-                or scan.active or scan.locked or scan.result_frame or scan.obstacles.cells
+                or scan.active or scan.result_frame or scan.obstacles.cells
                 or not scan.receipt_only or not scan.buffered_odom or config.scan_geometry is not None
                 or geometry is None or depth.get("body_mount_required")
                 or decision.distance_m is None or not objects_ms <= now_ms < target_deadline):
@@ -1875,7 +1878,7 @@ class NaviPlugin:
         obs_ms = (now_ms if objects is None and self._state.goal_anchor is not None
                   else objects_ms or now_ms)
         if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
-                or scan.locked or was_searching) and not any(values):
+                or was_searching) and not any(values):
             # A hold applies now, even when the last input is about to expire.
             obs_ms = now_ms
         elif (self._config.local_planning and any(values)
@@ -1909,6 +1912,12 @@ class NaviPlugin:
                 else:
                     recheck_blocked = True
         buffered_turn = values[5] and scan.turn_until_ms and scan.buffered_turn
+        if buffered_turn and not stale and not previous_turn_deadline and depth is not None:
+            checked_ms = depth.get("control_ms")
+            if checked_ms is not None and checked_ms <= now_ms < scan.turn_until_ms:
+                # The first burst has not reached the wire. Give the checked
+                # duration to the controller, with the original freshness cap.
+                scan.turn_until_ms += now_ms - checked_ms
         if buffered_turn and not stale and type(max_age) in (int, float) and 0 < max_age < math.inf:
             scan.turn_until_ms = min(scan.turn_until_ms, int(obs_ms + max_age))
         expired_turn = values[5] and scan.turn_until_ms and now_ms >= scan.turn_until_ms
@@ -1942,6 +1951,8 @@ class NaviPlugin:
         if scan.turn_stop_ms is not None and scan.turn_stop_ms != previous_turn_stop_ms:
             # Bracket the outgoing stop, including time spent planning it.
             scan.turn_stop_ms = now_ms
+        if values != decision.values or not any(values[:2]) or values[5]:
+            self._state.detour_leg = self._state.executing_leg = None
         self._state.commanded = (values[0], values[1], values[5])
         if values[0] <= .05:
             self._state.moving_for_s = 0.
@@ -2032,6 +2043,7 @@ class NaviPlugin:
                     self._command_window = (0., 0.)
                     self._state.commanded = (0., 0., 0.)
                     self._state.commanded_vx = 0.
+                    self._state.detour_leg = self._state.executing_leg = None
                     scan = self._state.active_scan
                     if replan and scan.active and scan.receipt_only and not scan.command_only:
                         scan.hold_for_replan(reason)
@@ -2057,6 +2069,7 @@ class NaviPlugin:
                 self._cancel_scheduled_motion()
                 self._command_window = (0., 0.)
                 self._state.moving_for_s = 0.
+                self._state.detour_leg = self._state.executing_leg = None
                 self._last_error = f"{type(error).__name__}: {error}"
                 log.warning("navi tick failed: %s", error)
                 return
@@ -2085,10 +2098,9 @@ class NaviPlugin:
                 self._send_scheduled(dict(message, obs_stamp_ms=now_ms), now_ms, self._ttl_ms)
                 return True
             previous = self._scheduled_command
-            if (previous is not None and previous.turn is not None and previous.sent
-                    and (now >= previous.expires_at or now_ms >= previous.expires_ms)):
-                self._cancel_scheduled_motion(
-                    stop=(now_ms, "主动观察：转向指令窗口已到期", False))
+            if (previous is not None and (previous.turn is not None or previous.leg is not None)
+                    and previous.sent and (now >= previous.expires_at or now_ms >= previous.expires_ms)):
+                self._cancel_scheduled_motion(stop=(now_ms, "速度指令窗口已到期", False))
                 return False
             expires_ms = message["stamp_ms"] + message["ttl_ms"]
             max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
@@ -2096,6 +2108,21 @@ class NaviPlugin:
                 expires_ms = min(expires_ms, int(message["obs_stamp_ms"] + max_age))
             scan = self._state.active_scan
             turn = None
+            leg = self._state.executing_leg
+            feedback = None
+            depth_grid = None
+            if (leg is not None and scan.receipt_only and scan.buffered_odom and scan.poses
+                    and scan.pose_origin is None and leg.geometry is self._config.local_geometry
+                    and self._state.use_body_mount is not True
+                    and any(message["values"][:2]) and not message["values"][5]):
+                feedback = replace(scan, poses=deque(scan.poses, maxlen=scan.poses.maxlen),
+                                   views=deque(), phase="idle")
+                if scan.current_frame:
+                    expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
+                if previous is not None and previous.leg is not None and previous.leg.geometry is leg.geometry:
+                    depth_grid = previous.depth_grid
+            else:
+                leg = None
             if (scan.buffered_turn and scan.turn_sweep is not None and scan.poses
                     and message["values"][5] and not any(message["values"][:5])):
                 # Only the copied integration state belongs to the publisher.
@@ -2103,12 +2130,68 @@ class NaviPlugin:
                 if scan.current_frame:
                     expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
             expires_at = now + max(0, min(message["ttl_ms"], expires_ms - now_ms)) / 1000
-            self._scheduled_command = _ScheduledCommand(message, expires_ms, expires_at, turn)
+            previous_motion = (tuple(previous.message["values"][:2])
+                               if previous is not None and previous.sent else (0., 0.))
+            self._scheduled_command = _ScheduledCommand(
+                message, expires_ms, expires_at, turn, leg=leg, feedback=feedback, depth_grid=depth_grid,
+                checked_pose=scan.pose if leg is not None else None, previous_motion=previous_motion)
             if turn is None:
-                # A new checked planar command can take effect immediately.
-                # Only guarded turns are paced and repeated by the timer.
+                # Deliver a new result immediately. The independent timer
+                # can repeat the checked prefix while the next search runs.
                 self._dispatch_command()
             return True
+
+    def _check_scheduled_leg(self, work, now_ms, remaining_ms):
+        with self._obs_lock:
+            history = tuple(self._velocity_history)
+            frame, ground = self._depth_map, self._depth_ground
+            received, captured = self._depth_ms, self._depth_capture_ms
+            source = self._depth_source_ms
+            odom_ms = self._odom_ms
+        config = self._config
+        feedback, leg = work.feedback, work.leg
+        stop = feedback.sync_buffered_motion(history, now_ms)
+        if stop is not None:
+            return stop
+        if not 0 <= now_ms - odom_ms <= self._odom_max_age_ms:
+            return "局部规划：运动反馈已到期，停车后重规划", True
+        depth_ms = min(received, captured) if captured is not None else received
+        if (work.depth_grid is not None and source is not None and work.depth_grid[0] is not None
+                and source <= work.depth_grid[0]):
+            if source < work.depth_grid[0]:
+                return "局部规划：深度帧顺序倒退，停车后重规划", True
+            depth_ms = work.depth_grid[1]
+        if frame is None or ground is None or not 0 <= now_ms - depth_ms < config.depth_age_limit_ms:
+            return "局部规划：深度暂不可用，停车后重规划", True
+        if (work.depth_grid is None or work.depth_grid[:2] != (source, depth_ms)):
+            grid = local_path.observe(frame, leg.geometry, local_path.RIGHT, local_path.FORWARD,
+                                      local_path.RESOLUTION, ground, require_valid_floor=True,
+                                      check_free_space=False)
+            work.depth_grid = (source, depth_ms, grid)
+        command = tuple(work.message["values"][:2])
+        brake_horizon = (config.watchdog_ms + 50) / 1000
+        horizon = brake_horizon + min(remaining_ms, config.depth_age_limit_ms) / 1000
+        # The image was taken before this command. Cover motion since that
+        # frame as well as the braking horizon, even if it is reused.
+        previous = command if work.sent else work.previous_motion
+        velocities = feedback.motion[:2], previous, command
+        velocity = max(math.hypot(*v) for v in velocities)
+        padding = velocity * (now_ms - depth_ms) / 1000
+        keep = policy_mod._keepout_m(config)
+        reason = leg.check(feedback.pose, feedback.motion, previous, command, work.depth_grid[2],
+                           keep, horizon, brake_horizon, padding=padding)
+        if reason is not None:
+            return reason, True
+        historical = feedback.historical_hits
+        if historical is not None and historical.any():
+            radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep) + velocity * horizon
+            padding = (math.dist(feedback.pose[:2], work.checked_pose[:2])
+                       + radius * (abs(feedback.pose[2] - work.checked_pose[2])
+                                   + abs(feedback.motion[2]) * horizon))
+            if not local_path.transition_clear((None, historical), leg.geometry, keep,
+                                               horizon, velocities, padding=padding):
+                return "局部规划：执行段扫掠区有已记录障碍，停车后重规划", True
+        return None
 
     def _dispatch_command(self):
         with self._output_lock:
@@ -2135,12 +2218,24 @@ class NaviPlugin:
                     stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
                 else:
                     stop = ("主动观察：深度暂不可用，停车后重规划", True)
+                if (stop is None and not self._wire_moving
+                        and remaining_ms < math.ceil(1000 / self._rate_hz)):
+                    stop = ("主动观察：首条转向指令剩余窗口短于控制周期", False)
+            elif work.leg is not None:
+                stop = self._check_scheduled_leg(work, now_ms, remaining_ms)
+                now_ms = int(time.time() * 1000)
+                remaining_ms = min(work.expires_ms - now_ms,
+                                   round((work.expires_at - time.monotonic()) * 1000))
+                if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+                    stop = ("速度指令窗口已到期", False)
+                elif stop is None and now_ms - work.feedback.poses[-1][0] > policy_mod.ODOM_GAP_MS:
+                    stop = ("局部规划：运动反馈已到期，停车后重规划", True)
             if stop is not None:
                 self._cancel_scheduled_motion(stop=(now_ms, *stop))
                 return
-            # A turn has a feedback guard. Other motions are sent once and
-            # stay on their originally checked timing and observation budget.
-            if not work.sent or work.turn is not None:
+            # Only feedback-guarded motion may be repeated within the
+            # original checked timing and observation budget.
+            if not work.sent or work.turn is not None or work.leg is not None:
                 message = work.message
                 if work.sent and "control_interface" in message:
                     message = message.copy()
@@ -2235,6 +2330,17 @@ class NaviPlugin:
         if goal is not None:
             route_target = (math.hypot(goal.x, goal.y), math.atan2(-goal.y, goal.x))
         detour, key = self._state.view_detour, self._state.local_plan.key
+        leg = self._state.executing_leg
+        pose = self._state.active_scan.pose
+        if self._command_timer is not None:
+            with self._output_lock:
+                work = self._scheduled_command
+                if work is None or not work.sent or now >= work.expires_at:
+                    leg = None
+                elif work.leg is not None:
+                    leg, pose = work.leg, work.feedback.pose
+        executing = None if leg is None else local_path.Detour(
+            None, ((0., 0.), leg.remaining(pose)), leg.geometry)
         with self._obs_lock:
             jpeg = self._image_jpeg
             depth, ground = self._depth_map, self._depth_ground
@@ -2246,6 +2352,7 @@ class NaviPlugin:
             "depth_m": depth,
             "ground": ground,
             "detour": detour,
+            "executing": executing,
             "depth_vertical": self._depth_vertical,
             "route_target": route_target,
             "objects": self._objects,
@@ -2300,6 +2407,7 @@ class NaviPlugin:
                     coverage=snapshot["coverage"],
                     rgb_jpeg=snapshot["jpeg"], blend=self._view_blend,
                     ground=snapshot["ground"], detour=snapshot["detour"],
+                    executing=snapshot["executing"],
                     depth_vertical=snapshot["depth_vertical"], route_target=snapshot["route_target"],
                     config=self._config)
                 message = CompressedImage()

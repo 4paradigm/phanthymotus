@@ -453,3 +453,41 @@ def test_pose_aligned_scan_uses_only_obstacles_at_the_current_pose(monkeypatch):
     detour = replay._checked_translation(*args, velocity_limits=DECLARED_SPEEDS,
                                          observed_grid=(np.zeros_like(box), box))
     assert detour is not None and detour.command is not None
+
+
+@pytest.mark.parametrize("case,occupied_cells", [
+    ("weak_speckle", 0),
+    ("low_single", 0),
+    ("low_pair", 0),
+    ("low_strip", 5),
+    ("thin_leg", 1),
+    ("near_obstacle", 1),
+])
+def test_depth_grid_drops_small_noise_and_low_patches(case, occupied_cells):
+    horizontal = HorizontalIntrinsics(640, 420, 320)
+    vertical = (480, 420, 240)
+    geometry = replay.camera_square(horizontal, vertical, .20)
+    geometry = replay.body_square(geometry, {"body_from_optical": geometry.base_from_optical})
+    tangent = (np.arange(480) - 240) / 420
+    frame = np.broadcast_to(.42 / np.maximum(tangent[:, None], .09), (480, 640)).copy()
+    if case == "weak_speckle":
+        frame[380, 319:322] = .90
+    elif case == "low_single":
+        frame[418:422, 317:324] = .90
+    elif case == "low_pair":
+        frame[418:422, 320:342] = .90
+    elif case == "low_strip":
+        frame[418:422, 267:374] = .90
+    elif case == "thin_leg":
+        frame[315:395, 319:321] = .90
+    else:
+        frame[415, 319:322] = .30
+    ground = ground_mask(frame, horizontal, vertical)
+    free, occupied = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
+                                    replay.RESOLUTION, ground)
+    assert np.count_nonzero(occupied) == occupied_cells
+    _, fast = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD,
+                            replay.RESOLUTION, ground, check_free_space=False)
+    assert np.array_equal(fast, occupied)
+    if occupied_cells == 0:
+        assert not free[replay.START[0] + 18, replay.START[1]]
