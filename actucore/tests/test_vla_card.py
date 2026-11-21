@@ -154,6 +154,12 @@ def test_ttl_never_outlives_the_receivers_watchdog():
     assert negotiate.ttl_ms(30.0, DESCRIPTOR) >= 50        # floored
 
 
+@pytest.mark.parametrize("rate_hz,expected_ms", [(10, 200), (5, 300), (1, 300)])
+def test_command_ttl_cap_is_independent_of_receive_watchdog(rate_hz, expected_ms):
+    descriptor = {"rate": {"watchdog_ms": 600, "max_command_ttl_ms": 300}}
+    assert negotiate.ttl_ms(rate_hz, descriptor) == expected_ms
+
+
 # ── the message ──────────────────────────────────────────────────────────────
 
 def test_message_carries_every_field_the_receiver_checks():

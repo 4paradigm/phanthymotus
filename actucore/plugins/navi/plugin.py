@@ -2,7 +2,7 @@
 
 Three wires in (what is there, how far away it is, and optionally how fast we
 are actually going) and one command stream out. The card's own job is small:
-negotiate once at start, then run `policy.step` on a timer and publish what it
+negotiate at start, then run `policy.step` on a timer and publish what it
 returns. All of the behaviour is in `policy.py`, all of the geometry in
 `depth.py`, and both are ROS-free so they can be tested without a robot.
 
@@ -32,6 +32,7 @@ an answer, so this one does, and pushes the ACP callback when it gets there.
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import logging
 import math
@@ -39,13 +40,16 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
+from . import camera as camera_mod
 from . import depth as depth_mod
+from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
+from .active_scan import ActiveScan, DEPTH_RECHECK_HOLD
 
 log = logging.getLogger(__name__)
 
@@ -59,10 +63,25 @@ TOPIC_FORMAT = "control/velocity"
 # How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
 
+
+@dataclass
+class _ScheduledCommand:
+    message: dict
+    expires_ms: int
+    expires_at: float
+    turn: ActiveScan | None
+    sent: bool = False
+    leg: policy_mod.PathLeg | None = None
+    feedback: ActiveScan | None = None
+    depth_grid: tuple | None = None  # source identity, observation time, projected cells
+    checked_pose: tuple | None = None
+    previous_motion: tuple = (0., 0.)
+
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
 # timeout), but do not leave an untyped input retrying forever either.
 _DEPTH_TYPE_WAIT_S = 5.0
+_UNSENT_TURN = "主动观察：首条转向指令剩余窗口短于控制周期"
 
 # The six twist axes. **The order is fixed by the protocol** — motus.control/1's
 # MODES comment, loco_servo's AXIS_NAMES on the driver side and motus.odom/1's
@@ -89,7 +108,7 @@ _IGNORED_LEGACY_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw",
                                     "stop_tolerance_m"))
 
 
-def _sensor_qos():
+def _sensor_qos(depth=2):
     """BEST_EFFORT, to match what every producer this card reads actually uses.
 
     **A reliable subscriber does not match a best-effort publisher.** ROS2 treats
@@ -112,7 +131,7 @@ def _sensor_qos():
 
     return QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST,
-                      depth=2,
+                      depth=depth,
                       durability=DurabilityPolicy.VOLATILE)
 
 
@@ -138,9 +157,11 @@ class NaviPlugin:
         # other plugin here that holds per-instance state.
         self._lock = threading.RLock()
         self._descriptor: dict = {}
+        self._descriptor_changed = False
         self._node = None
         self._publisher = None
         self._timer = None
+        self._command_timer = None
         self._running = False
         self._starting = False
         self._start_cancelled = False
@@ -152,6 +173,15 @@ class NaviPlugin:
         self._last_error = ""
         self._last_decision = None
         self._last_tick = 0.0
+        self._command_window = (0., 0.)
+        # The velocity timer never takes the planner's lock.
+        self._output_lock = threading.RLock()
+        self._scheduled_command = None
+        self._output_epoch = 0
+        self._output_blocked = False
+        self._output_stop = None
+        self._wire_seq = 0
+        self._wire_moving = False
 
         self._config = policy_mod.Config(**{
             k: v for k, v in self._cfg.items()
@@ -184,13 +214,26 @@ class NaviPlugin:
         # A deque rather than a list: this is written every frame on the hot
         # path and has to be bounded — a card left running for an hour should
         # not be holding thirty thousand frames of detections.
-        from collections import deque
         self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
+        self._depth_ground = None
+        self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
+        self._depth_capture_ms = None
+        self._depth_source_ms = None
+        self._depth_source_ns = None
+        self._depth_vendor = {}
+        self._mounts = {}
+        self._obstacle_poses = deque(maxlen=32)
         self._odom = None
         self._odom_ms = 0
+        self._odom_received_ms = 0
+        self._odom_source_ms = None
+        self._velocity_history = deque(maxlen=32)
+        self._motion_pose = None
+        self._pose_feedback = None
+        self._odom_stamp_verified = False
         self._odom_interface = {}
         self._odom_max_age_ms = int(self._config.max_obs_age_ms)
         self._binding = {}
@@ -319,7 +362,7 @@ class NaviPlugin:
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
                     "obstacle_stop_m": {"type": "number",
-                                        "default": self._cfg.get("obstacle_stop_m", 0.6),
+                                        "default": self._cfg.get("obstacle_stop_m", policy_mod.Config.obstacle_stop_m),
                                         "description": "正前方障碍近于这个距离就完全"
                                                        "不前进（米）。达到或超过到达"
                                                        "距离阈值时，目标可能先被当作"
@@ -470,7 +513,30 @@ class NaviPlugin:
             self._paused = False
             self._last_error = ""
             self._state = policy_mod.State()
+            self._last_tick = 0.
+            self._command_window = (0., 0.)
             self._running = True
+
+        with self._obs_lock:
+            self._depth_map = None
+            self._depth_ground = None
+            self._depth_vertical = None
+            self._depth_bands = {}
+            self._depth_ms = 0
+            self._depth_capture_ms = None
+            self._depth_source_ms = None
+            self._depth_source_ns = None
+            self._depth_vendor = {}
+            self._mounts.clear()
+            self._obstacle_poses.clear()
+            self._odom = None
+            self._odom_ms = 0
+            self._odom_received_ms = 0
+            self._odom_source_ms = None
+            self._velocity_history.clear()
+            self._motion_pose = None
+            self._pose_feedback = None
+            self._odom_stamp_verified = False
 
         try:
             self._open_publisher()
@@ -500,6 +566,30 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
+        from .camera import for_topic
+        from .local_path import body_square, camera_square
+        footprint = descriptor.get("footprint") or {}
+        half_width = footprint.get("half_width")
+        valid_width = (type(half_width) in (int, float)
+                       and math.isfinite(half_width) and half_width > 0)
+        if binding.get("depth_map") and valid_width:
+            self._config.local_geometry = camera_square(
+                self._config.depth_intrinsics, self._depth_vertical, half_width,
+                half_length=footprint.get("half_length"))
+            depth_decl = for_topic(args.get("camera_info"), binding["depth_map"])
+            self._config.scan_geometry = body_square(self._config.local_geometry,
+                                                     depth_decl.get("vendor"))
+            if self._config.scan_geometry is None:
+                self._camera_notes.append("主动观察使用相机坐标系的底盘近似，按最新有效单视角规划")
+        self._config.local_planning = bool(
+            binding.get("depth_map") and (binding.get("odom") or self._config.local_geometry is not None))
+        if self._config.local_geometry is not None:
+            # Local path search can miss several command periods. Its swept
+            # motion already budgets the full downstream watchdog interval.
+            self._ttl_ms = negotiate.ttl_ms(rate, descriptor, periods=4.)
+        self._config.odom_expected = bool(binding.get("odom"))
+        if self._config.local_planning and self._config.local_geometry is None:
+            self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
         # Callers may supply producer contracts keyed by the actual wired
         # topic.  Selecting only after role binding prevents a second odometry
         # producer on the canvas from donating timing to the wrong stream.
@@ -511,6 +601,19 @@ class NaviPlugin:
         if interface is None:
             interface = args.get("odom_interface")
         self._adopt_odom_interface(interface, bound_topic=binding.get("odom"))
+        if (self._timer is not None and self._config.local_planning and self._config.odom_expected
+                and self._config.local_geometry is not None and self._config.scan_geometry is None):
+            try:
+                from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+
+                with self._output_lock:
+                    self._output_blocked = self._wire_moving = False
+                    self._wire_seq = 0
+                    self._command_timer = self._node.create_timer(
+                        1.0 / rate, self._dispatch_command, callback_group=MutuallyExclusiveCallbackGroup())
+            except Exception as error:                        # noqa: BLE001
+                self._unwind()
+                return self._error(f"速度发布定时器启动失败：{error}")
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
@@ -598,11 +701,21 @@ class NaviPlugin:
         depth has always been available and would produce confidently wrong
         distances. Now that both sides declare an `id`, it is a comparison.
         """
-        from .camera import camera_id, for_topic
+        from .camera import camera_id, for_topic, horizontal_intrinsics, vertical_intrinsics
 
         depth_topic = binding.get("depth_map") or binding.get("depth_summary")
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
+        vendor = depth_decl.get("vendor")
+        self._depth_vendor = vendor if binding.get("depth_map") and isinstance(vendor, dict) else {}
         self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
+        self._config.depth_intrinsics = (horizontal_intrinsics(depth_decl)
+                                         if binding.get("depth_map") else None)
+        if depth_decl and binding.get("depth_map") and self._config.depth_intrinsics is None:
+            self._camera_notes.append("深度图缺少可用针孔内参 fx/cx，避障走廊按画面中心和水平视场角估算")
+        if binding.get("depth_map"):
+            self._depth_vertical = vertical_intrinsics(depth_decl)
+            if self._depth_vertical is None:
+                self._camera_notes.append("深度图缺少完整针孔内参，沿用原始深度判断障碍")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,
@@ -728,8 +841,16 @@ class NaviPlugin:
             # A new target discards everything remembered about the old one —
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
+            self._publish_stop_if_moving()
+            obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State(target=target)
+            self._state.active_scan.obstacles = obstacles
+            self._last_decision = None
+            self._last_tick = 0.
+            self._command_window = (0., 0.)
             self._paused = False
+            with self._output_lock:
+                self._output_blocked = False
             # **The card mints this, agent-core does not supply it.** The ACP
             # contract runs the other way from what it looks like: an async tool
             # returns an `action_id` in its reply, agent-core parses it out and
@@ -788,12 +909,16 @@ class NaviPlugin:
                    for k in keys)
 
     def _stop_navigation(self):
+        self._cancel_scheduled_motion(block=True)
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             action_id, self._acp_action_id = self._acp_action_id, ""
             target = self._state.target
+            self._publish_stop_if_moving()
+            obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State()
+            self._state.active_scan.obstacles = obstacles
             if action_id:
                 result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
                 threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
@@ -801,35 +926,53 @@ class NaviPlugin:
         return {"state": "running", "message": "已停止导航，卡片仍在运行"}
 
     def _halt(self, halted: bool):
+        if halted:
+            self._cancel_scheduled_motion(block=True)
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             # A paused policy does not tick, so it cannot clear its own gain
             # schedule before resume. Keep the track, but restart gain gently.
+            if halted:
+                self._publish_stop_if_moving()
+                self._state.active_scan.invalidate()
+                self._state.commanded = (0., 0., 0.)
+            if self._paused != bool(halted):
+                self._last_tick = 0.
+                self._command_window = (0., 0.)
+                self._state.moving_for_s = 0.
             self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
+            if not halted:
+                with self._output_lock:
+                    self._output_blocked = False
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
 
     def _stop(self, *, cancel_start=True):
+        self._cancel_scheduled_motion(block=True)
         with self._lock:
             if self._starting and cancel_start:
                 self._start_cancelled = True
             if not self._running:
                 return {"state": "idle"}
+            self._publish_stop_if_moving()
             self._running = False
             self._paused = False
             node, self._node = self._node, None
             timer, self._timer = self._timer, None
-            self._publisher = None
+            with self._output_lock:
+                command_timer, self._command_timer = self._command_timer, None
+                self._publisher = None
 
         self._cancel_pending_depth_bind(node)
-        if timer is not None and node is not None:
-            try:
-                node.destroy_timer(timer)
-            except Exception:                                 # noqa: BLE001
-                pass
         if node is not None:
+            for active_timer in (timer, command_timer):
+                if active_timer is not None:
+                    try:
+                        node.destroy_timer(active_timer)
+                    except Exception:                         # noqa: BLE001
+                        pass
             try:
                 if self._executor is not None:
                     self._executor.remove_node(node)
@@ -887,8 +1030,30 @@ class NaviPlugin:
                 return self._error(f"配置 {key} 无效：{error}")
 
         with self._lock:
-            if self._starting and changed:
+            refresh = "control_interface" in args
+            if self._starting and (changed or refresh):
                 return self._error("卡片正在启动，暂不能修改参数")
+            descriptor = self._descriptor
+            if refresh:
+                if not self._running:
+                    return {"status": "idle"}
+                descriptor = args["control_interface"]
+                if (not self._descriptor or not isinstance(descriptor, dict)
+                        or {key: value for key, value in self._descriptor.items() if key != "limits"}
+                        != {key: value for key, value in descriptor.items() if key != "limits"}):
+                    return self._error("下游动作空间已变更，请重新启动 Navi")
+                limits = descriptor.get("limits")
+                if not isinstance(limits, dict) or any(
+                        not isinstance(limits.get(key), (tuple, list))
+                        or len(limits[key]) != ACTION_DIM
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               for value in limits[key])
+                        for key in ("lower", "upper", "min_magnitude", "min_magnitude_moving",
+                                    "max_delta_per_step")
+                        if key in ("lower", "upper") or key in limits):
+                    return self._error("下游速度限制无效")
+                if any(lo > hi for lo, hi in zip(limits["lower"], limits["upper"])):
+                    return self._error("下游速度限制无效")
             # Stage a complete replacement so the policy never observes half
             # of a config request. Copy effective geometry adopted from the
             # camera/chassis; rebuilding from YAML would discard that reading.
@@ -897,27 +1062,36 @@ class NaviPlugin:
             except (TypeError, ValueError, OverflowError) as error:
                 return self._error(f"配置无效：{error}")
             notes = self._limit_notes
-            if self._running and changed:
+            if self._running and (changed or refresh):
                 # Restore requested ceilings before adoption, including those
                 # unchanged by this request. Otherwise an already-clamped
                 # ceiling loses its explanatory note on the next gain change.
-                for key in ("vx_max", "vy_max", "wz_max", "search_rate"):
+                for key in ("vx_max", "vy_max", "wz_max", "search_rate", "use_lateral"):
                     setattr(candidate, key, changed.get(
                         key, self._cfg.get(
                             key, policy_mod.Config.__dataclass_fields__[key].default)))
-                notes = policy_mod.adopt_limits(candidate, self._descriptor)
+                notes = policy_mod.adopt_limits(candidate, descriptor)
             if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
                    for key in ("stop_distance_m",
                                "stop_tolerance_m", "slow_distance_m")):
                 # A successful gain/boundary change starts a fresh schedule;
                 # tracker state and unrelated navigation counters stay intact.
                 self._state.adaptive_fwd_scale = 1.0
+            if changed or (refresh and descriptor != self._descriptor):
+                if self._command_timer is not None:
+                    self._publish_stop_if_moving()
+                    self._command_window = (0., 0.)
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
+            if refresh and descriptor != self._descriptor:
+                self._descriptor = descriptor
+                self._descriptor_changed = True
             result = {"status": "configured", "config": changed,
                       "effective_config": {key: getattr(candidate, key)
                                            for key in changed}}
+            if refresh:
+                result["control_interface_updated"] = True
             if ignored:
                 result["ignored_parameters"] = ignored
             return result
@@ -951,6 +1125,9 @@ class NaviPlugin:
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
                            "max_obs_age_ms": self._config.max_obs_age_ms,
+                           "max_depth_age_ms": self._config.depth_age_limit_ms,
+                           "scan_odom_linear_tolerance_mps": self._config.scan_odom_linear_tolerance_mps,
+                           "max_feedback_gap_ms": self._config.max_feedback_gap_ms,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -963,7 +1140,11 @@ class NaviPlugin:
                            "search_rate": self._config.search_rate,
                            "use_lateral": self._config.use_lateral,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
-                           "slow_distance_m": self._config.slow_distance_m},
+                           "slow_distance_m": self._config.slow_distance_m,
+                           "side_clearance_m": self._config.side_clearance_m,
+                           "local_planning": self._config.local_planning,
+                           "local_geometry_ready": self._config.local_geometry is not None},
+                "downstream_limits": self._descriptor.get("limits") or {},
                 "published": self._published,
                 "gains": {
                     "forward": {"base": self._config.k_fwd,
@@ -1026,7 +1207,7 @@ class NaviPlugin:
                        "那是一个**角度**扇区，近处比机器人还窄（0.8 m 处只覆盖"
                        "±0.16 m），肩膀会擦到判据之外的东西。摘要还无法表达"
                        "「这一段有多少像素是有效的」，所以满是空洞的一段会被"
-                       "当成空旷")
+                       "当成空旷。到达需要有效的目标测距")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
                        "目标被遮挡时只能按**指令**（而非实测）推算它去了哪；"
@@ -1141,8 +1322,8 @@ class NaviPlugin:
         `output_topics_for` 决定，是个确定的契约，不依赖时序。消息类型只在名字
         认不出来时作为兜底 —— 那时图里有没有发布者才真的有参考价值。
 
-        还没有数据不是错误：`observation()` 的过期检查已经覆盖它，而那条路径的
-        结论是「什么都不发，让下游 watchdog 停住底盘」，正是此时该做的事。
+        还没有数据不是错误：`observation()` 会把未收到或过期的输入视为缺失，
+        此时策略不会开始运动。
         """
         bound = {"objects": "", "depth_map": "", "depth_summary": "", "odom": "",
                  "image": ""}
@@ -1185,6 +1366,9 @@ class NaviPlugin:
 
         qos = _sensor_qos()
         if bound["depth_map"]:
+            # The map is authoritative for clearance. A summary must not
+            # refresh the age or identity of a different, retained map.
+            bound["depth_summary"] = ""
             topic = bound["depth_map"]
             # ``camera_info`` is optical metadata, not a wire-format registry.
             # Prefer the canvas binding when supplied; keep the declaration
@@ -1229,7 +1413,9 @@ class NaviPlugin:
                 if selected is None:
                     return False
                 callback = self._on_depth_map
-                node.create_subscription(selected, topic, callback, qos)
+                # The planner replaces its current depth map on every callback.
+                # Decoding older maps ahead of the newest one spends its time budget.
+                node.create_subscription(selected, topic, callback, _sensor_qos(depth=1))
                 self._cancel_pending_depth_bind(node)
                 with self._lock:
                     if self._last_error.startswith(f"深度话题 {topic} 等待超过"):
@@ -1268,6 +1454,11 @@ class NaviPlugin:
                 self._depth_bind_topic = topic
                 self._depth_bind_deadline = time.monotonic() + _DEPTH_TYPE_WAIT_S
                 self._depth_bind_timer = node.create_timer(0.1, retry_depth)
+            vendor = camera_mod.for_topic(declarations, topic).get("vendor")
+            mount = camera_mod.mount_topic(vendor) if isinstance(vendor, dict) else None
+            if mount:
+                bound["body_mount"] = mount
+                node.create_subscription(String, mount, lambda msg: self._on_string("body_mount", msg), qos)
         if bound["image"]:
             # Kept as bytes and decoded only when a frame is drawn: the camera
             # runs at 15 fps and the overlay at 5, so decoding on arrival would
@@ -1376,7 +1567,26 @@ class NaviPlugin:
             elif role == "depth_summary":
                 self._depth_bands = depth_mod.bands_from_summary(payload)
                 self._depth_ms = now
+            elif role == "body_mount":
+                stamp = payload.get("stamp_ns")
+                if type(stamp) is int and stamp > 0:
+                    self._mounts[stamp] = camera_mod.capture_mount(self._depth_vendor, payload)
+                    if len(self._mounts) > 32:
+                        self._mounts.pop(next(iter(self._mounts)))
             elif role == "odom":
+                sample = odom_mod.measured_obstacle_pose(payload, self._depth_vendor)
+                history = self._obstacle_poses
+                if sample is None or not 0 <= now - sample[1].stamp_ms <= self._odom_max_age_ms:
+                    history.clear()
+                elif not history:
+                    history.append(sample)
+                elif sample[0] > history[-1][0]:
+                    if (sample[1].frame != history[-1][1].frame or
+                            sample[0] - history[-1][0] > policy_mod.ODOM_GAP_MS * 10**6):
+                        history.clear()
+                    history.append(sample)
+                elif sample[0] == history[-1][0] and sample != history[-1]:
+                    history.clear()
                 # All three axes the policy uses, not just `vx`. The stuck
                 # detector only ever wanted forward speed, but the tracker
                 # compensates its prediction for the robot's whole twist —
@@ -1391,17 +1601,31 @@ class NaviPlugin:
                 self._odom = {axis: odom_mod.axis_of(payload, axis)
                               for axis in ("vx", "vy", "wz")}
                 stamp = payload.get("stamp_ms")
+                self._odom_received_ms = now
+                self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
+                                        and not isinstance(stamp, bool)
+                                        and math.isfinite(stamp) and stamp > 0 else None)
+                self._velocity_history.append((now, self._odom_source_ms,
+                                               odom_mod.planar_feedback(self._odom)))
+                pose = odom_mod.planar_pose(payload, self._odom_source_ms)
+                previous = self._motion_pose
+                if pose is None or pose != previous:
+                    feedback = (pose.feedback_since(previous, policy_mod.ODOM_GAP_MS)
+                                if previous is not None and pose is not None else None)
+                    self._pose_feedback = (previous.stamp_ms, feedback) if feedback is not None else None
+                    if pose is None or previous is None or pose.stamp_ms > previous.stamp_ms:
+                        self._motion_pose = pose
+                timing = self._odom_interface.get("timing") or {}
+                vendor = payload.get("vendor")
+                stamp_source = vendor.get("stamp_source", "robot") if isinstance(vendor, dict) else "robot"
+                self._odom_stamp_verified = (timing.get("stamp_source") == "robot"
+                                             and stamp_source == "robot")
                 if self._odom_interface:
                     # A declared interface makes stamp_ms authoritative. An
                     # absent/non-finite stamp is not silently upgraded to a
                     # fresh receipt-time sample, because the declared maximum
                     # measurement delay would then be meaningless.
-                    if (isinstance(stamp, (int, float))
-                            and not isinstance(stamp, bool)
-                            and math.isfinite(stamp)):
-                        self._odom_ms = int(stamp)
-                    else:
-                        self._odom_ms = 0
+                    self._odom_ms = self._odom_source_ms or 0
                 else:
                     # Backwards compatibility for old producers whose timing
                     # contract predates stamp_source.
@@ -1413,13 +1637,28 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
-    def _set_depth_map(self, depth):
+    def _set_depth_map(self, depth, *, capture_ms=None, source_stamp_ns=None, source_frame=None,
+                       received_ms=None):
+        received_ms = int(time.time() * 1000) if received_ms is None else received_ms
+        horizontal = self._config.depth_intrinsics
+        vertical = self._depth_vertical
+        ground = None
+        if horizontal is not None and vertical is not None:
+            ground = depth_mod.ground_mask(depth, horizontal, vertical)
+        bands = depth_mod.nearest_by_band(depth)
         with self._obs_lock:
             self._depth_map = depth
-            self._depth_bands = depth_mod.nearest_by_band(depth)
-            self._depth_ms = int(time.time() * 1000)
+            self._depth_ground = ground
+            self._depth_bands = bands
+            self._depth_ms = received_ms
+            expected_frame = self._depth_vendor.get("frame_id")
+            self._depth_source_ns = (source_stamp_ns if not expected_frame or not source_frame
+                                     or source_frame == expected_frame else None)
+            self._depth_source_ms = capture_ms or None
+            self._depth_capture_ms = capture_ms if type(capture_ms) is int and 0 < capture_ms <= received_ms else None
 
     def _on_depth_map(self, message):
+        received_ms = int(time.time() * 1000)
         data = bytes(getattr(message, "data", b"") or b"")
         if not data:
             return
@@ -1429,9 +1668,14 @@ class NaviPlugin:
             with self._lock:
                 self._last_error = f"深度图解码失败：{error}"
             return
-        self._set_depth_map(depth)
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        ns = stamp.sec * 10**9 + stamp.nanosec if stamp is not None else None
+        self._set_depth_map(depth, capture_ms=ns // 10**6 if ns else None, source_stamp_ns=ns,
+                            source_frame=getattr(getattr(message, "header", None), "frame_id", None),
+                            received_ms=received_ms)
 
     def _open_publisher(self):
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from rclpy.node import Node
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
@@ -1446,31 +1690,140 @@ class NaviPlugin:
             self._view_thread = threading.Thread(
                 target=self._view_worker, daemon=True, name="navi_view")
             self._view_thread.start()
-        self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick)
+        # Sensor callbacks can refresh snapshots while the planner runs.
+        self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick,
+                                        callback_group=MutuallyExclusiveCallbackGroup())
         self._executor.add_node(node)
         with self._lock:
             self._node = node
 
     # ── the loop ─────────────────────────────────────────────────────────────
 
-    def observation(self):
+    def observation(self, *, with_capture_timing=False):
         """The three inputs, with anything stale replaced by None.
 
         Staleness is checked here rather than in the policy so that "too old"
         and "never arrived" are the same thing to the decision — both mean the
         card cannot see, and both must stop the robot.
         """
-        now = int(time.time() * 1000)
+        return self._observation_snapshot(with_capture_timing=with_capture_timing)[:3]
+
+    def _observation_snapshot(self, *, with_capture_timing):
         max_age = self._config.max_obs_age_ms
+        depth_age = self._config.depth_age_limit_ms
         with self._obs_lock:
-            objects = self._objects if now - self._objects_ms <= max_age else None
-            fresh_depth = now - self._depth_ms <= max_age
-            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
-                     if fresh_depth else None)
+            now = int(time.time() * 1000)
+            objects_ms = self._objects_ms
+            objects = self._objects if now - objects_ms <= max_age else None
+            fresh_depth = now - self._depth_ms <= depth_age
+            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
+                      "frame_id": self._depth_ms} if fresh_depth else None)
+            if depth is not None and self._depth_ground is not None:
+                depth["ground"] = self._depth_ground
+            if depth is not None:
+                if with_capture_timing:
+                    depth["control_ms"] = now
+                    ns = self._depth_source_ns
+                    if self._binding.get("body_mount"):
+                        depth["body_mount_required"] = True
+                    if ns is not None:
+                        depth["source_stamp_ns"] = ns
+                        if 0 <= now - ns // 10**6 <= depth_age:
+                            clock = self._depth_vendor.get("clock_reference") or {}
+                            mount = self._mounts.get(ns)
+                            if (mount is not None and isinstance(clock, dict)
+                                    and clock.get("clock_id") == clock.get("timestamp_basis") == "host_realtime"):
+                                depth["body_from_optical"], depth["mount_accuracy_validated"] = mount
+                            capture_pose = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
+                            if capture_pose is not None:
+                                depth["obstacle_capture_pose"] = capture_pose
+                if self._depth_source_ms is not None:
+                    depth["source_frame_id"] = self._depth_source_ms
+                capture = self._depth_capture_ms
+                if capture is not None and 0 <= now - capture <= depth_age:
+                    depth["capture_ms"] = capture
+                elif capture is not None:
+                    depth["capture_invalid"] = True
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
-        return objects, depth, odom
+            if with_capture_timing and odom is not None:
+                pose = self._motion_pose
+                uses_pose = (odom_mod.planar_feedback(odom) is None and self._pose_feedback is not None
+                             and pose is not None and
+                             0 <= now - pose.stamp_ms <= min(max_age, self._odom_max_age_ms))
+                if self._obstacle_poses:
+                    measured = self._obstacle_poses[-1][1]
+                    if 0 <= now - measured.stamp_ms <= policy_mod.ODOM_GAP_MS:
+                        odom = {**odom, "obstacle_pose": measured}
+                if uses_pose:
+                    since_ms, rates = self._pose_feedback
+                    odom = {**odom, "motion_pose": pose, "pose_feedback": rates,
+                            "pose_feedback_since_ms": since_ms, "control_ms": now}
+                received_ms = self._odom_received_ms or self._odom_ms
+                if 0 <= now - received_ms <= self._config.max_feedback_gap_ms:
+                    odom = {**odom, "received_ms": received_ms}
+                    if self._odom_source_ms is not None:
+                        odom["source_sample_id"] = self._odom_source_ms
+                    if not uses_pose and self._velocity_history:
+                        odom["velocity_history"] = tuple(self._velocity_history)
+                if not uses_pose and self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
+                    odom = {**odom, "stamp_ms": self._odom_ms}
+        return objects, depth, odom, objects_ms
+
+    def _recheck_late_translation(self, decision, previous_twist, depth, objects_ms, max_age, now_ms):
+        """Recheck one local velocity against a newer frame without rerunning path search."""
+        config, state = self._config, self._state
+        scan, geometry = state.active_scan, config.local_geometry
+        target_deadline = objects_ms + min(max_age, config.max_obs_age_ms)
+        if (decision.status != policy_mod.AVOIDING or not state.avoidance_yaw_override
+                or state.view_detour is None or state.view_detour.geometry is not geometry or decision.values[5]
+                or scan.active or scan.result_frame or scan.obstacles.cells
+                or not scan.receipt_only or not scan.buffered_odom or config.scan_geometry is not None
+                or geometry is None or depth.get("body_mount_required")
+                or decision.distance_m is None or not objects_ms <= now_ms < target_deadline):
+            return None
+
+        _, latest, odom, _ = self._observation_snapshot(with_capture_timing=True)
+        source = depth.get("source_frame_id")
+        if (latest is None or latest["frame_id"] <= depth["frame_id"]
+                or (source is not None and (latest.get("source_frame_id") or 0) <= source)
+                or latest.get("capture_invalid") or latest.get("body_mount_required")
+                or latest.get("map") is None):
+            return None
+        depth_ms = latest.get("capture_ms") or latest["frame_id"]
+        measured = odom_mod.planar_feedback(odom)
+        odom_ms = (odom or {}).get("received_ms")
+        if odom_ms is not None:
+            odom_ms = min(odom_ms, odom.get("stamp_ms", odom_ms))
+        if (measured is None or odom_ms is None
+                or max(abs(measured[2]), abs(previous_twist[2])) > .02):
+            return None
+        obs_ms = min(objects_ms, depth_ms, odom_ms)
+        deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
+                           odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms),
+                           obs_ms + max_age))
+        if now_ms >= deadline:
+            return None
+        horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        velocities = measured[:2], previous_twist[:2], tuple(decision.values[:2])
+        speed = max(math.hypot(*velocity) for velocity in velocities)
+        if speed * (horizon + (now_ms - objects_ms) / 1000) > decision.distance_m - config.stop_distance_m:
+            return None
+        keepout = policy_mod._keepout_m(config)
+        turn = max(abs(measured[2]), abs(previous_twist[2])) * horizon
+        padding = (math.hypot(max(geometry.front, geometry.rear), keepout)
+                   + speed * horizon / 2) * turn
+        grid = local_path.observe(latest["map"], geometry, local_path.RIGHT, local_path.FORWARD,
+                                  local_path.RESOLUTION, latest.get("ground"), require_valid_depth=True)
+        if grid is None:
+            return None
+        clear = local_path.transition_clear(grid, geometry, keepout, horizon, velocities, padding=padding)
+        if clear and scan.near_hits is not None:
+            travel = speed * max(0, now_ms - scan.near_revision) / 1000
+            clear = local_path.transition_clear((None, scan.near_hits), geometry, keepout,
+                                                horizon, velocities, padding=padding + travel)
+        return obs_ms, deadline, clear
 
     def next_command(self):
         """One tick of the policy, as a message or None.
@@ -1478,17 +1831,53 @@ class NaviPlugin:
         Public and ROS-free so the whole decision path — including the sequence
         numbers and the two timestamps — is testable without a node.
         """
-        now = time.time()
-        dt = (now - self._last_tick) if self._last_tick else 1.0 / self._rate_hz
-        self._last_tick = now
+        tick = time.monotonic()
+        control_period_s = 1.0 / self._rate_hz
+        previous_tick = self._last_tick
+        dt = tick - previous_tick if previous_tick else control_period_s
+        self._last_tick = tick
+        started, deadline = self._command_window
+        coverage = max(0., min(tick, deadline) - max(previous_tick or tick, started))
 
-        objects, depth, odom = self.observation()
+        objects, depth, odom, objects_ms = self._observation_snapshot(
+            with_capture_timing=self._config.local_planning)
+        max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+        bounded_age = type(max_age) in (int, float) and 0 < max_age < math.inf
+        if bounded_age and depth is not None and "control_ms" in depth:
+            capture = depth.get("capture_ms") or depth["frame_id"]
+            if depth["control_ms"] - capture >= max_age:
+                # An expired frame cannot produce a command the driver admits.
+                # Let the policy take its normal stop-and-refresh path immediately.
+                depth["capture_invalid"] = True
+        previous_twist = self._state.commanded
+        was_moving = any(previous_twist)
+        previous_scan = self._state.active_scan
+        issued_yaw = previous_scan.issued_yaw
+        previous_turn_stop_ms = previous_scan.turn_stop_ms
+        previous_turn_deadline = previous_scan.turn_until_ms
+        idle_for_s = self._state.idle_for_s
+        scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
+        was_searching = (self._config.local_planning and self._last_decision is not None
+                         and self._last_decision.status == policy_mod.SEARCHING)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
-                                   dt=dt)
+                                   dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
+                                   command_interrupted=bool(deadline and tick > deadline))
+        now = time.time()
+        scan = self._state.active_scan
         self._last_decision = decision
+        command_only = self._config.local_planning and self._state.motion_source == "command"
         if not decision.publishes:
-            return None
+            # Stop once when a policy goes quiet while the chassis may still
+            # hold its last motion command under the longer watchdog.
+            if (self._config.watchdog_ms <= 300
+                    and not (scan_guarded or was_searching or command_only)) or not was_moving:
+                if deadline > tick:
+                    self._state.commanded = previous_twist
+                return None
+            self._command_window = (0., 0.)
+            decision.values = [0.0] * ACTION_DIM
+            return self._command_message(decision.values, now, int(now * 1000))
 
         # Lift the command out of the robot's deadband, or drop it to zero. The
         # threshold comes from the downstream descriptor — it is a property of
@@ -1500,9 +1889,114 @@ class NaviPlugin:
         # also translates inflates a small correction and creates weaving.
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
-
-        obs_ms = self._objects_ms or int(now * 1000)
-        return self._command_message(values, now, obs_ms)
+        checked_search = self._config.local_planning and decision.status == policy_mod.SEARCHING
+        if (values != decision.values and self._config.local_planning
+                and (self._state.avoidance_yaw_override or scan_guarded or scan.active or checked_search)):
+            values = decision.values = [0.] * ACTION_DIM
+            decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
+        now_ms = int(now * 1000)
+        obs_ms = (now_ms if objects is None and self._state.goal_anchor is not None
+                  else objects_ms or now_ms)
+        if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
+                or was_searching) and not any(values):
+            # A hold applies now, even when the last input is about to expire.
+            obs_ms = now_ms
+        elif (self._config.local_planning and any(values)
+                and depth is not None and depth.get("frame_id") is not None):
+            obs_ms = min(obs_ms, depth.get("capture_ms") or scan.single_depth_ms or depth["frame_id"])
+            motion_pose = (odom or {}).get("motion_pose")
+            if motion_pose is not None:
+                obs_ms = min(obs_ms, motion_pose.stamp_ms)
+            if (scan_guarded or checked_search) and odom is not None:
+                stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
+                obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
+                if scan.current_frame:
+                    obs_ms = min(obs_ms, scan.current_frame)
+        stale = (self._config.local_planning and any(values)
+                 and bounded_age and max_age <= now_ms - obs_ms)
+        recheck_deadline = None
+        recheck_blocked = False
+        if (stale and objects is not None and depth is not None and values == decision.values
+                and obs_ms == (depth.get("capture_ms") or depth.get("frame_id"))):
+            refreshed = self._recheck_late_translation(
+                decision, previous_twist, depth, objects_ms, max_age, now_ms)
+            now = time.time()
+            now_ms = int(now * 1000)
+            if refreshed is not None and refreshed[0] <= now_ms < refreshed[1]:
+                checked_obs_ms, checked_deadline, clear = refreshed
+                if clear:
+                    obs_ms, recheck_deadline = checked_obs_ms, checked_deadline
+                    decision.reason = f"{decision.reason}，已用新深度复检"
+                    stale = False
+                else:
+                    recheck_blocked = True
+        buffered_turn = values[5] and scan.turn_until_ms and scan.buffered_turn
+        if buffered_turn and not stale and not previous_turn_deadline and depth is not None:
+            checked_ms = depth.get("control_ms")
+            if checked_ms is not None and checked_ms <= now_ms < scan.turn_until_ms:
+                # The first burst has not reached the wire. Give the checked
+                # duration to the controller, with the original freshness cap.
+                scan.turn_until_ms += now_ms - checked_ms
+        if buffered_turn and not stale and type(max_age) in (int, float) and 0 < max_age < math.inf:
+            scan.turn_until_ms = min(scan.turn_until_ms, int(obs_ms + max_age))
+        expired_turn = values[5] and scan.turn_until_ms and now_ms >= scan.turn_until_ms
+        if buffered_turn:
+            # A renewed command may not bridge an expiry that happened while
+            # the planner was running, even with a fresh feedback snapshot.
+            expired_turn = expired_turn or (scan is previous_scan and previous_turn_deadline
+                                            and now_ms >= previous_turn_deadline)
+        if expired_turn or stale:
+            if scan is not previous_scan or not issued_yaw:
+                scan.issued_yaw = False
+            if expired_turn:
+                scan.turn_until_ms = 0
+                scan.turn_stop_ms = now_ms
+                status, reason = policy_mod.AVOIDING, "主动观察：转向指令窗口已到期，停车等待新反馈"
+            elif recheck_blocked:
+                status, reason = policy_mod.AVOIDING, "局部规划：新深度复检发现扫掠区有障碍，停车等候重规划"
+            else:
+                status = policy_mod.BLIND
+                reason = f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车"
+                depth_timing = depth or {}
+                log.info("navi expired observation: depth_stamp_ns=%s depth_received_ms=%s "
+                         "planning_started_ms=%s planning_finished_ms=%d observation_ms=%d",
+                         depth_timing.get("source_stamp_ns"), depth_timing.get("frame_id"),
+                         depth_timing.get("control_ms"), now_ms, obs_ms)
+                if scan.active and scan.receipt_only and not scan.command_only:
+                    if scan.buffered_turn and obs_ms == (depth_timing.get("capture_ms") or
+                                                         depth_timing.get("frame_id")):
+                        scan.pause_for_depth(now_ms)
+                    else:
+                        scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
+            self._state.idle_for_s = idle_for_s
+            self._state.adaptive_fwd_scale = 1.
+            self._state.moving_for_s = 0.
+            values = [0.] * ACTION_DIM
+            hold = policy_mod.Decision(values, status, reason,
+                                       distance_m=decision.distance_m, bearing=decision.bearing)
+            self._last_decision = policy_mod._account_idle(hold, self._state, self._config, dt)
+            obs_ms = now_ms
+        if scan.turn_stop_ms is not None and scan.turn_stop_ms != previous_turn_stop_ms:
+            # Bracket the outgoing stop, including time spent planning it.
+            scan.turn_stop_ms = now_ms
+        if values != decision.values or not any(values[:2]) or values[5]:
+            self._state.detour_leg = self._state.executing_leg = None
+        self._state.commanded = (values[0], values[1], values[5])
+        if values[0] <= .05:
+            self._state.moving_for_s = 0.
+        message = self._command_message(values, now, obs_ms)
+        if recheck_deadline is not None:
+            message["ttl_ms"] = min(message["ttl_ms"], recheck_deadline - now_ms)
+        if values[5] and scan.turn_until_ms:
+            message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
+            if buffered_turn:
+                scan.turn_until_ms = now_ms + message["ttl_ms"]
+        if any(values):
+            issued = time.monotonic()
+            self._command_window = (issued, issued + min(message["ttl_ms"], self._config.watchdog_ms) / 1000)
+        else:
+            self._command_window = (0., 0.)
+        return message
 
     def _command_message(self, values, now, obs_ms):
         """Build one guarded normal-navigation command."""
@@ -1532,12 +2026,12 @@ class NaviPlugin:
         # "joint6" when it is the yaw rate, and the reader concludes the robot
         # is driving six joints.
         #
-        # Every N commands rather than every one: the descriptor is a hundred
-        # numbers and a constant — it cannot change after negotiation — so
-        # carrying it at 10 Hz would multiply the command stream for nothing.
+        # Every N commands and immediately after a limit refresh. Carrying
+        # the entire declaration at 10 Hz would multiply the command stream.
         # The first command always carries it, so a panel opened at any time has
         # names straight away instead of waiting out a cycle.
-        if self._seq % _DESCRIPTOR_EVERY == 1:
+        if self._descriptor_changed or self._seq % _DESCRIPTOR_EVERY == 1:
+            self._descriptor_changed = False
             # With a downstream, echo its descriptor — real limits are what
             # give the panel's range bars a scale. Without one, still carry the
             # axis names: the order is the protocol's, not anyone's to ask.
@@ -1564,19 +2058,50 @@ class NaviPlugin:
         return list(moving)
 
     def _tick(self):
+        entered = time.monotonic()
         with self._lock:
-            publisher = self._publisher
-            if publisher is None or not self._running or self._paused:
+            if self._publisher is None or not self._running or self._paused or self._starting:
                 return
             try:
+                with self._output_lock:
+                    epoch = self._output_epoch
+                    stop, self._output_stop = self._output_stop, None
+                if stop is not None:
+                    stamp, reason, replan = stop
+                    self._command_window = (0., 0.)
+                    self._state.commanded = (0., 0., 0.)
+                    self._state.commanded_vx = 0.
+                    self._state.detour_leg = self._state.executing_leg = None
+                    scan = self._state.active_scan
+                    if reason == DEPTH_RECHECK_HOLD and scan.buffered_turn:
+                        scan.pause_for_depth(stamp)
+                    elif replan and scan.active and scan.receipt_only and not scan.command_only:
+                        scan.hold_for_replan(reason)
+                    elif scan.buffered_turn:
+                        scan.turn_until_ms = 0
+                        # A candidate discarded before publication has no motion to brake.
+                        scan.turn_stop_ms = None if reason == _UNSENT_TURN else stamp
+                started = time.monotonic()
+                previous = self._last_tick
                 message = self.next_command()
-                if message is not None:
-                    from std_msgs.msg import String
-                    payload = String()
-                    payload.data = json.dumps(message, ensure_ascii=False)
-                    publisher.publish(payload)
-                    self._published += 1
+                decided = time.monotonic()
+                if self._command_timer is not None:
+                    if not self._stage_command(message, epoch):
+                        return
+                elif message is not None:
+                    self._publish_command(message)
+                finished = time.monotonic()
+                period = 1.0 / self._rate_hz
+                interval = self._last_tick - previous if previous else 0.
+                if self._config.local_planning and (interval > 2 * period or finished - entered > period):
+                    log.info("navi slow tick: interval=%.1f ms lock=%.1f ms decision=%.1f ms publish=%.1f ms seq=%s",
+                             interval * 1000, (started - entered) * 1000, (decided - started) * 1000,
+                             (finished - decided) * 1000, message["seq"] if message is not None else None)
             except Exception as error:                        # noqa: BLE001
+                self._cancel_scheduled_motion()
+                self._command_window = (0., 0.)
+                self._state.moving_for_s = 0.
+                self._state.detour_leg = self._state.executing_leg = None
                 self._last_error = f"{type(error).__name__}: {error}"
                 log.warning("navi tick failed: %s", error)
                 return
@@ -1588,6 +2113,226 @@ class NaviPlugin:
         self._publish_view()
 
         self._maybe_complete()
+
+    def _stage_command(self, message, epoch):
+        """Hand the publisher one checked result. New work replaces old work."""
+        with self._output_lock:
+            if epoch != self._output_epoch or self._output_blocked:
+                return False
+            if message is None:
+                if self._scheduled_command is not None:
+                    self._cancel_scheduled_motion()
+                return True
+            now_ms = int(time.time() * 1000)
+            now = time.monotonic()
+            if not any(message["values"]):
+                self._scheduled_command = None
+                self._send_scheduled(dict(message, obs_stamp_ms=now_ms), now_ms, self._ttl_ms)
+                return True
+            previous = self._scheduled_command
+            if (previous is not None and (previous.turn is not None or previous.leg is not None)
+                    and previous.sent and (now >= previous.expires_at or now_ms >= previous.expires_ms)):
+                self._cancel_scheduled_motion(stop=(now_ms, "速度指令窗口已到期", False))
+                return False
+            expires_ms = message["stamp_ms"] + message["ttl_ms"]
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+            if type(max_age) in (int, float) and 0 < max_age < math.inf:
+                expires_ms = min(expires_ms, int(message["obs_stamp_ms"] + max_age))
+            scan = self._state.active_scan
+            turn = None
+            leg = self._state.executing_leg
+            feedback = None
+            depth_grid = None
+            if (leg is not None and scan.receipt_only and scan.buffered_odom and scan.poses
+                    and scan.pose_origin is None and leg.geometry is self._config.local_geometry
+                    and self._state.use_body_mount is not True
+                    and any(message["values"][:2]) and not message["values"][5]):
+                feedback = replace(scan, poses=deque(scan.poses, maxlen=scan.poses.maxlen),
+                                   views=deque(), phase="idle")
+                if scan.current_frame:
+                    expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
+                if previous is not None and previous.leg is not None and previous.leg.geometry is leg.geometry:
+                    depth_grid = previous.depth_grid
+            else:
+                leg = None
+            if (scan.buffered_turn and scan.turn_sweep is not None and scan.poses
+                    and message["values"][5] and not any(message["values"][:5])):
+                # Only the copied integration state belongs to the publisher.
+                turn = replace(scan, poses=deque((scan.poses[-1],), maxlen=scan.poses.maxlen))
+                if scan.current_frame:
+                    expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
+            expires_at = now + max(0, min(message["ttl_ms"], expires_ms - now_ms)) / 1000
+            previous_motion = (tuple(previous.message["values"][:2])
+                               if previous is not None and previous.sent else (0., 0.))
+            self._scheduled_command = _ScheduledCommand(
+                message, expires_ms, expires_at, turn, leg=leg, feedback=feedback, depth_grid=depth_grid,
+                checked_pose=scan.pose if leg is not None else None, previous_motion=previous_motion)
+            if turn is None:
+                # Deliver a new result immediately. The independent timer
+                # can repeat the checked prefix while the next search runs.
+                self._dispatch_command()
+            return True
+
+    def _check_scheduled_leg(self, work, now_ms, remaining_ms):
+        with self._obs_lock:
+            history = tuple(self._velocity_history)
+            frame, ground = self._depth_map, self._depth_ground
+            received, captured = self._depth_ms, self._depth_capture_ms
+            source = self._depth_source_ms
+            odom_ms = self._odom_ms
+        config = self._config
+        feedback, leg = work.feedback, work.leg
+        stop = feedback.sync_buffered_motion(history, now_ms)
+        if stop is not None:
+            return stop
+        if not 0 <= now_ms - odom_ms <= self._odom_max_age_ms:
+            return "局部规划：运动反馈已到期，停车后重规划", True
+        depth_ms = min(received, captured) if captured is not None else received
+        if (work.depth_grid is not None and source is not None and work.depth_grid[0] is not None
+                and source <= work.depth_grid[0]):
+            if source < work.depth_grid[0]:
+                return "局部规划：深度帧顺序倒退，停车后重规划", True
+            depth_ms = work.depth_grid[1]
+        if not 0 <= now_ms - depth_ms < config.depth_age_limit_ms or not depth_mod.has_valid_returns(frame):
+            return "局部规划：深度暂不可用，停车后重规划", True
+        if (work.depth_grid is None or work.depth_grid[:2] != (source, depth_ms)):
+            grid = local_path.observe(frame, leg.geometry, local_path.RIGHT, local_path.FORWARD,
+                                      local_path.RESOLUTION, ground, require_valid_depth=True,
+                                      check_free_space=False)
+            work.depth_grid = (source, depth_ms, grid)
+        command = tuple(work.message["values"][:2])
+        brake_horizon = (config.watchdog_ms + 50) / 1000
+        horizon = brake_horizon + min(remaining_ms, config.depth_age_limit_ms) / 1000
+        # The image was taken before this command. Cover motion since that
+        # frame as well as the braking horizon, even if it is reused.
+        previous = command if work.sent else work.previous_motion
+        velocities = feedback.motion[:2], previous, command
+        velocity = max(math.hypot(*v) for v in velocities)
+        padding = velocity * (now_ms - depth_ms) / 1000
+        keep = policy_mod._keepout_m(config)
+        reason = leg.check(feedback.pose, feedback.motion, previous, command, work.depth_grid[2],
+                           keep, horizon, brake_horizon, padding=padding)
+        if reason is not None:
+            return reason, True
+        remembered = feedback.remembered_hits
+        if remembered is not None and remembered.any():
+            radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep) + velocity * horizon
+            padding = (math.dist(feedback.pose[:2], work.checked_pose[:2])
+                       + radius * (abs(feedback.pose[2] - work.checked_pose[2])
+                                   + abs(feedback.motion[2]) * horizon))
+            if not local_path.transition_clear((None, remembered), leg.geometry, keep,
+                                               horizon, velocities, padding=padding):
+                return "局部规划：执行段扫掠区有已记录障碍，停车后重规划", True
+        return None
+
+    def _dispatch_command(self):
+        with self._output_lock:
+            if not self._running or self._publisher is None:
+                return
+            now_ms = int(time.time() * 1000)
+            work = self._scheduled_command
+            if work is None:
+                if self._wire_moving:
+                    self._send_scheduled(None, now_ms, self._ttl_ms)
+                return
+            if self._output_blocked or self._paused:
+                return
+            remaining_ms = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
+            stop = None
+            if (work.turn is not None and not work.sent and not self._wire_moving
+                    and now_ms >= work.message["stamp_ms"]
+                    and remaining_ms < math.ceil(1000 / self._rate_hz)):
+                stop = (_UNSENT_TURN, False)
+            elif remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+                stop = ("速度指令窗口已到期", False)
+            elif work.turn is not None:
+                with self._obs_lock:
+                    history = tuple(self._velocity_history)
+                    depth_ok = (0 <= now_ms - self._depth_ms <= self._config.depth_age_limit_ms
+                                and depth_mod.has_valid_returns(self._depth_map))
+                if depth_ok:
+                    stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
+                else:
+                    stop = (DEPTH_RECHECK_HOLD, True)
+            elif work.leg is not None:
+                stop = self._check_scheduled_leg(work, now_ms, remaining_ms)
+                now_ms = int(time.time() * 1000)
+                remaining_ms = min(work.expires_ms - now_ms,
+                                   round((work.expires_at - time.monotonic()) * 1000))
+                if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+                    stop = ("速度指令窗口已到期", False)
+                elif stop is None and now_ms - work.feedback.poses[-1][0] > work.feedback.max_feedback_gap_ms:
+                    stop = ("局部规划：运动反馈已到期，停车后重规划", True)
+            if stop is not None:
+                self._cancel_scheduled_motion(stop=(now_ms, *stop))
+                return
+            # Only feedback-guarded motion may be repeated within the
+            # original checked timing and observation budget.
+            if not work.sent or work.turn is not None or work.leg is not None:
+                message = work.message
+                if work.sent and "control_interface" in message:
+                    message = message.copy()
+                    del message["control_interface"]
+                work.sent = self._send_scheduled(message, now_ms, remaining_ms) or work.sent
+
+    def _send_scheduled(self, message, now_ms, ttl_ms):
+        """Serialize wire sequence numbers for plan results and checked repeats."""
+        self._wire_seq = max(self._wire_seq + 1, message["seq"] if message is not None else 0)
+        if message is None:
+            packet = build_message(seq=self._wire_seq, values=[0.] * ACTION_DIM, mode=CONTROL_MODE,
+                                   dof=ACTION_DIM, source=f"mcp__actucore__{self.PREFIX}",
+                                   stamp_ms=now_ms, obs_stamp_ms=now_ms, ttl_ms=ttl_ms,
+                                   priority=int(self._cfg.get("priority", 50)))
+        else:
+            packet = dict(message, seq=self._wire_seq, stamp_ms=now_ms, ttl_ms=ttl_ms)
+        try:
+            self._publish_command(packet)
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi velocity publish failed: %s", error)
+            return False
+        self._wire_moving = any(packet["values"])
+        return True
+
+    def _cancel_scheduled_motion(self, *, block=False, stop=None):
+        with self._output_lock:
+            if self._command_timer is None:
+                return
+            self._output_epoch += 1
+            self._output_blocked |= block
+            self._output_stop = stop
+            self._scheduled_command = None
+            if stop is not None:
+                log.info("navi velocity hold: %s", stop[1])
+            if self._wire_moving and self._publisher is not None:
+                self._send_scheduled(None, int(time.time() * 1000), self._ttl_ms)
+
+    def _publish_command(self, message):
+        from std_msgs.msg import String
+
+        payload = String()
+        payload.data = json.dumps(message, ensure_ascii=False)
+        self._publisher.publish(payload)
+        self._published += 1
+
+    def _publish_stop_if_moving(self):
+        if self._command_timer is not None:
+            self._cancel_scheduled_motion()
+            self._state.commanded = (0., 0., 0.)
+            self._state.commanded_vx = 0.
+            return
+        scan = self._state.active_scan
+        if ((self._config.watchdog_ms <= 300 and not (scan.active or scan.result_frame))
+                or self._publisher is None
+                or not any(self._state.commanded)):
+            return
+        now = time.time()
+        try:
+            self._publish_command(self._command_message([0.0] * ACTION_DIM, now, int(now * 1000)))
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi stop command failed: %s", error)
+            return
+        self._state.commanded = (0.0, 0.0, 0.0)
+        self._state.commanded_vx = 0.0
 
     def _publish_view(self):
         """Hand the current decision to the render thread. **Never render here.**
@@ -1612,12 +2357,48 @@ class NaviPlugin:
         self._view_next_at = now + 1.0 / self._view_hz
 
         track = self._state.tracker.track
+        goal = self._state.goal_anchor
+        route_target = ((track.range_m, track.bearing_rad)
+                        if track is not None and track.range_known else None)
+        if goal is not None:
+            route_target = (math.hypot(goal.x, goal.y), math.atan2(-goal.y, goal.x))
+        detour, key = self._state.view_detour, self._state.local_plan.key
+        leg = self._state.executing_leg
+        scan = self._state.active_scan
+        pose = scan.pose
+        selected_route = scan.route_segment and scan.phase in ("brake", "turn", "evaluate")
+        if self._command_timer is not None:
+            with self._output_lock:
+                work = self._scheduled_command
+                if work is None or not work.sent or now >= work.expires_at:
+                    leg = None
+                elif work.leg is not None:
+                    leg, pose = work.leg, work.feedback.pose
+        executing = None if leg is None else local_path.Detour(
+            None, ((0., 0.), leg.remaining(pose)), leg.geometry)
         with self._obs_lock:
             jpeg = self._image_jpeg
+            depth, ground = self._depth_map, self._depth_ground
+            if not selected_route and (key is None or self._depth_ms != key[0]):
+                detour = None
+        if selected_route and detour is None and executing is None and scan.advance_m is not None:
+            geometry = self._config.scan_geometry or self._config.local_geometry
+            if geometry is not None:
+                origin = scan.advance_origin
+                if origin is None:
+                    f, r, heading = scan.origin if scan.origin_set else scan.pose
+                    origin = (f, r, heading + scan.directions[0] * scan.turn_angle)
+                selected = policy_mod.PathLeg(geometry, (scan.advance_m, 0.), origin)
+                detour = local_path.Detour(None, ((0., 0.), selected.remaining(scan.pose)), geometry)
         snapshot = {
             # Arrays and payloads are *replaced* by their callbacks, never
             # mutated in place, so holding a reference is a safe snapshot.
-            "depth_m": self._depth_map,
+            "depth_m": depth,
+            "ground": ground,
+            "detour": detour,
+            "executing": executing,
+            "depth_vertical": self._depth_vertical,
+            "route_target": route_target,
             "objects": self._objects,
             "jpeg": jpeg,
             "decision": self._last_decision,
@@ -1669,7 +2450,10 @@ class NaviPlugin:
                     clearance=snapshot["clearance"],
                     coverage=snapshot["coverage"],
                     rgb_jpeg=snapshot["jpeg"], blend=self._view_blend,
-                    config=self._config)
+                    ground=snapshot["ground"], detour=snapshot["detour"],
+                    executing=snapshot["executing"],
+                    depth_vertical=snapshot["depth_vertical"], route_target=snapshot["route_target"],
+                    target_bearing=snapshot["bearing"], config=self._config)
                 message = CompressedImage()
                 message.format = "jpeg"
                 message.data = view_mod.encode(frame)
@@ -1761,24 +2545,18 @@ class NaviPlugin:
         action that failed sits open until the ACP timeout, holding the barrier
         and telling nobody why.
         """
-        decision = self._last_decision
-        if decision is None:
-            return
-        if decision.status == policy_mod.ARRIVED:
-            status = "completed"
-        elif decision.status == policy_mod.FAILED:
-            status = "failed"
-        else:
-            return
-
         with self._lock:
+            decision = self._last_decision
+            if decision is None or decision.status not in (policy_mod.ARRIVED, policy_mod.FAILED):
+                return
+            status = "completed" if decision.status == policy_mod.ARRIVED else "failed"
             action_id, self._acp_action_id = self._acp_action_id, ""
-        if not action_id:
-            return
-
-        result = {"status": decision.status, "reason": decision.reason,
-                  "target": self._state.target,
-                  "distance_m": decision.distance_m}
+            if not action_id:
+                return
+            result = {"status": decision.status, "reason": decision.reason,
+                      "target": self._state.target, "distance_m": decision.distance_m}
+            if status == "failed" and self._state.partial_result is not None:
+                result.update(self._state.partial_result)
         threading.Thread(target=self._post_acp, args=(action_id, status, result),
                          daemon=True, name="navi_acp").start()
 

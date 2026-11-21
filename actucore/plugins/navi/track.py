@@ -120,18 +120,19 @@ class Track:
     state: str = TENTATIVE
     hits: int = 0
     history: deque = field(default_factory=lambda: deque(maxlen=8))
-    coast_s: float = 0.0
     age_s: float = 0.0
     # The last real observation and how long ago it was, for the re-update on
-    # re-acquisition. Without it the coast's own velocity is all that is left,
-    # and that is exactly the quantity that has been accumulating error.
+    # re-acquisition. It is transported into the current body frame at each
+    # prediction so the difference between observations excludes ego motion.
     last_obs: np.ndarray | None = None
     since_obs_s: float = 0.0
-    # Whether depth has ever actually reported a range for this object. A track
-    # can exist without one — the summary-only depth path has no reading for a
-    # band with nothing in it — and the policy has to be able to tell, because
-    # "assumed 3 m" must not be allowed to decide when the robot has arrived.
+    # Whether depth has ever provided a range for steering, including the
+    # summary-only band estimate. A bearing-only track has a placeholder range.
     range_known: bool = False
+    # Evidence applied on the current step. The range is the target's depth
+    # map sample before filtering, present only on the first use of that frame.
+    accepted_detection: bool = False
+    measured_range_m: float | None = None
 
     # Matches accumulated since the track started coasting. Resurrecting a
     # track decides what the robot chases, exactly as creating one does, so it
@@ -144,13 +145,13 @@ class Track:
         return self.state in (CONFIRMED, COASTING, REACQUIRING)
 
     @property
-    def observed(self) -> bool:
-        """A live, believed fix — not a prediction and not a fresh guess.
+    def coast_s(self) -> float:
+        return self.since_obs_s if self.state in (COASTING, REACQUIRING) else 0.0
 
-        What "arrived" is allowed to rest on. A coasted position is a good
-        enough reason to keep walking and a bad one to declare the journey over.
-        """
-        return self.state == CONFIRMED and self.coast_s == 0.0
+    @property
+    def observed(self) -> bool:
+        """A confirmed fix with no missed detection, including between frames."""
+        return self.state == CONFIRMED
 
     @property
     def position(self) -> np.ndarray:
@@ -207,8 +208,9 @@ class Tracker:
 
     def __init__(self):
         self.track: Track | None = None
-        # The payload stamp the lifecycle last counted. See `step`.
-        self._last_stamp = None
+        # Keep recent stamps across blind ticks and out-of-order delivery.
+        self._detection_stamps = deque(maxlen=64)
+        self._range_frames = deque(maxlen=64)
         # Why the last tick did what it did — surfaced in info(), because a
         # tracker that quietly refuses to confirm anything looks identical from
         # outside to a camera with nothing in front of it.
@@ -226,10 +228,21 @@ class Tracker:
         `detections` may be None (no fresh payload), which counts as a miss
         rather than as nothing happening.
         """
+        expired = False
         if self.track is not None:
             self._predict(ego, dt, config, ego_measured)
-            self.track.age_s += dt
-            self.track.since_obs_s += dt
+            track = self.track
+            track.age_s += dt
+            track.since_obs_s += dt
+            track.accepted_detection = False
+            track.measured_range_m = None
+            # Apply the limit before association, even when a late new frame
+            # arrives on this tick. It may start a new track after expiry.
+            if track.drivable and track.since_obs_s > config.max_coast_s:
+                self.track = None
+                expired = True
+                self.last_reason = (f"目标消失超过 {config.max_coast_s:.1f}s，"
+                                    "外推已不可信，放弃轨迹")
 
         # **One payload is one piece of evidence, however many times it is read.**
         #
@@ -245,17 +258,26 @@ class Tracker:
         # Prediction still runs above: our own motion continues whether or not
         # a new picture arrived. Only the *evidence* is skipped.
         stamp = (detections or {}).get("timestamp")
-        if detections is not None and stamp is not None and stamp == self._last_stamp:
-            return self.track if (self.track and self.track.drivable) else None
-        self._last_stamp = stamp
+        if stamp is not None:
+            if stamp in self._detection_stamps:
+                return self.track if (self.track and self.track.drivable) else None
+            self._detection_stamps.append(stamp)
 
         candidates = self._candidates(detections, depth, target, config)
         matched = self._associate(candidates, config)
 
-        if matched is None:
-            self._miss(dt, config, candidates)
-        else:
+        if matched is not None:
             self._hit(matched, config)
+            if (self.track.accepted_detection and matched["range_measured"]
+                    and depth is not None and depth.get("map") is not None
+                    and not depth.get("capture_invalid")):
+                depth_id = depth.get("source_frame_id", depth.get("frame_id"))
+                if depth_id is None or depth_id not in self._range_frames:
+                    self.track.measured_range_m = matched["range_m"]
+                    if depth_id is not None:
+                        self._range_frames.append(depth_id)
+        elif not expired:
+            self._miss(config, candidates)
 
         return self.track if (self.track and self.track.drivable) else None
 
@@ -283,6 +305,8 @@ class Tracker:
         control = np.concatenate([-rotation @ translation, np.zeros(2)])
 
         track.mean = transition @ track.mean + control
+        if track.last_obs is not None:
+            track.last_obs = rotation @ (track.last_obs - translation)
 
         # Process noise: what the *target* might do that we have not modelled.
         #
@@ -458,11 +482,8 @@ class Tracker:
             # its prediction: still drivable, still not jumped.
             track.reacquire_hits += 1
             track.history.append(True)
-            # `coast_s` deliberately keeps its value: until the match is
-            # accepted the position being published is still a prediction, and
-            # `describe()` should say so. It also bounds this state — at most
-            # `confirm_hits` ticks can pass before the track is either accepted
-            # or dropped by the coast budget.
+            # The coast clock keeps running until the match is accepted, so
+            # slow detection cannot extend the budget for driving a prediction.
             if track.reacquire_hits < config.confirm_hits:
                 track.state = REACQUIRING
                 self.last_reason = (
@@ -499,7 +520,7 @@ class Tracker:
         track.range_known = track.range_known or candidate["range_measured"]
         track.hits += 1
         track.history.append(True)
-        track.coast_s = 0.0
+        track.accepted_detection = True
         track.last_obs = point.copy()
         track.since_obs_s = 0.0
 
@@ -526,6 +547,7 @@ class Tracker:
             state=TENTATIVE,
             hits=1,
             range_known=candidate["range_measured"],
+            accepted_detection=True,
             last_obs=candidate["point"].copy(),
         )
         self.track.history.append(True)
@@ -542,7 +564,7 @@ class Tracker:
 
     # ── 4. miss ──────────────────────────────────────────────────────────────
 
-    def _miss(self, dt: float, config, candidates):
+    def _miss(self, config, candidates):
         track = self.track
         if track is None:
             self.last_reason = ("视野里没有匹配目标的检测" if not candidates
@@ -563,12 +585,6 @@ class Tracker:
 
         track.state = COASTING
         track.reacquire_hits = 0
-        track.coast_s += dt
-        if track.coast_s > config.max_coast_s:
-            self.track = None
-            self.last_reason = (f"目标消失超过 {config.max_coast_s:.1f}s，"
-                                "外推已不可信，放弃轨迹")
-            return
         self.last_reason = (f"目标暂时看不见（{track.coast_s:.1f}s），"
                             "按自身运动推算位置继续")
 

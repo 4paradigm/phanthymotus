@@ -77,6 +77,33 @@ def test_no_usable_reading_draws_no_corridor():
         assert V.corridor_edges(bad, config, 640) is None
 
 
+@pytest.mark.parametrize(("stop", "expected"), [
+    (.45, {(256, 343), (384, 343)}),
+    (.60, {(249, 354), (391, 354)}),
+    (.90, {(230, 385), (410, 385)}),
+])
+def test_route_edges_project_the_detour_and_stop_short_of_the_target(stop, expected):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    path = ((0., 0.), (.8, .0), (1.2, .2), (1.6, .2))
+
+    lines = V.route_lines(depth, ground, geometry, path, (2., 0.), .31, 640, 480,
+                          stop_distance_m=stop)
+
+    assert ((196, 440), (291, 373), False) in lines
+    assert ((444, 440), (456, 373), False) in lines
+    assert not any(dashed for _, _, dashed in lines)
+    direct = V.route_lines(depth, ground, geometry, (), (2., 0.), .31, 640, 480,
+                           stop_distance_m=stop)
+    assert direct and all(dashed for _, _, dashed in direct)
+    assert expected <= {end for _, end, _ in direct}
+
+
 def _decision(vx=0.0, vy=0.0, wz=0.0, status="approaching", distance=None):
     return P.Decision([vx, vy, 0.0, 0.0, 0.0, wz], status, "reason",
                       distance_m=distance, bearing=0.0)
@@ -197,7 +224,7 @@ def test_the_corridor_narrows_in_the_image_as_the_clearance_grows():
     image exists to show."""
     def edges(clearance):
         frame = _render(clearance=clearance)
-        lit = np.where((frame[400] == V._CORRIDOR).all(axis=1))[0]
+        lit = np.where((frame[374:412] == V._CORRIDOR).all(axis=2).any(axis=0))[0]
         return lit.min(), lit.max()
 
     near_l, near_r = edges(0.8)
@@ -215,7 +242,7 @@ def test_a_blocked_corridor_is_drawn_in_the_warning_colour():
 @needs_cv2
 def test_no_corridor_reading_draws_no_corridor():
     frame = _render(clearance=None)
-    assert not (frame == np.array(V._CORRIDOR)).all(axis=2).any()
+    assert not (frame[:-32] == np.array(V._CORRIDOR)).all(axis=2).any()
 
 
 # ── the target ───────────────────────────────────────────────────────────────
@@ -316,20 +343,24 @@ def test_both_numbers_are_drawn_when_a_measurement_exists():
 
 
 @needs_cv2
-def test_the_corridor_reads_as_a_width_not_as_two_stray_lines():
-    """Asked about twice, which is the design feedback.
-
-    Two bare verticals read as unrelated marks, and nothing connected them to
-    the half-width printed in a corner. A cross-bar with arrow ends is the
-    drawing convention for "this is a width", and the number belongs on the bar.
-    """
+def test_the_fallback_corridor_uses_dashed_guides_without_a_dimension_bar():
     frame = _render(clearance=1.0)
     left, right = V.corridor_edges(1.0, P.Config(), 640)
     bar = int(480 * 0.30)
 
     between = frame[bar, left + 8:right - 8]
-    lit = (between == np.array(V._CORRIDOR)).all(axis=1).sum()
-    assert lit > (right - left) * 0.5, "两条竖线之间没有横杆把它们连起来"
+    assert not (between == V._CORRIDOR).all(axis=1).any()
+    guides = (frame[150:350] == V._CORRIDOR).all(axis=2).any(axis=1)
+    assert guides.any() and not guides.all()
+
+
+@needs_cv2
+def test_a_planned_route_is_drawn_with_dashes(monkeypatch):
+    monkeypatch.setattr(V, "route_lines", lambda *args, **kwargs: [
+        ((220, 150), (220, 350), False),
+    ])
+    column = (_render(clearance=1.0)[150:350, 220] == V._CORRIDOR).all(axis=1)
+    assert column.any() and not column.all()
 
 
 @needs_cv2
@@ -387,3 +418,55 @@ def test_a_corrupt_jpeg_falls_back_to_the_depth_map():
     the frame it was handed is garbage."""
     frame = _render(rgb_jpeg=b"not a jpeg", depth_m=_depth(1.0))
     assert frame.shape == (480, 640, 3)
+
+
+
+@needs_cv2
+def test_executing_segment_is_visibly_distinct_from_candidate():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    candidate = Detour((.15, -.03), ((0., 0.), (.8, .3), (1.2, .3)), geometry)
+    active = Detour(None, ((0., 0.), (.8, -.15)), geometry)
+    preview = _render(depth_m=depth, ground=ground, detour=candidate)
+    executing = _render(depth_m=depth, ground=ground, detour=candidate, executing=active)
+    assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
+    assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+
+
+@needs_cv2
+def test_route_monitor_draws_selected_and_executing_routes_without_ground():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .21)
+    candidate = Detour(None, ((0., 0.), (.8, .3)), geometry)
+    active = Detour(None, ((0., 0.), (.8, -.3)), geometry)
+    baseline = _render(ground=None, clearance=None)
+    preview = _render(ground=None, clearance=None, detour=candidate)
+    executing = _render(ground=None, clearance=None, detour=candidate, executing=active)
+    assert not np.array_equal(preview, baseline)
+    assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
+    assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+
+
+@needs_cv2
+def test_target_guidance_is_a_dashed_line_in_the_main_image():
+    frame = _render(ground=None, clearance=None, route_target=(2., 0.))
+    target = (frame == V._TARGET).all(axis=2)
+    assert not target[:145, 500:].any()
+    centre = target[290:420, 320]
+    assert centre.any() and not centre.all()
+
+
+@pytest.mark.parametrize("bearing, column", [(-1.2, 12), (1.2, 627)])
+@needs_cv2
+def test_offscreen_target_has_a_dashed_arrow_at_the_correct_edge(bearing, column):
+    frame = _render(ground=None, clearance=None, target_bearing=bearing)
+    target = (frame == V._TARGET).all(axis=2)
+    assert target[268:287, column].any()
+    assert not target[:145, 500:].any()

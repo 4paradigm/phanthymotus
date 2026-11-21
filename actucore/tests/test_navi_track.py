@@ -391,6 +391,119 @@ def test_a_repeated_payload_still_advances_the_prediction():
         "the robot turned while re-reading one frame and the estimate did not move"
 
 
+@pytest.mark.parametrize("coasting", [False, True])
+def test_repeated_payloads_do_not_extend_the_coast_budget(coasting):
+    config = _cfg(max_coast_s=0.35)
+    tracker = T.Tracker()
+    for index in range(config.confirm_hits):
+        payload = _stamped(index, _obj())
+        _feed(tracker, payload, config=config)
+
+    if coasting:
+        payload = _stamped(10)
+        _feed(tracker, payload, config=config)
+        assert tracker.track.state == T.COASTING
+
+    _feed(tracker, payload, config=config, ticks=2)
+    assert tracker.track is not None
+    _feed(tracker, payload, config=config, ticks=2)
+    assert tracker.track is None
+
+
+def test_reacquisition_after_the_coast_budget_starts_a_new_track():
+    config = _cfg(max_coast_s=0.35)
+    tracker = T.Tracker()
+    for index in range(config.confirm_hits):
+        _feed(tracker, _stamped(index, _obj()), config=config)
+
+    _feed(tracker, _stamped(10), config=config)
+    _feed(tracker, _stamped(11, _obj()), config=config)
+    _feed(tracker, _stamped(12, _obj()), config=config)
+    assert tracker.track.state == T.REACQUIRING
+
+    assert _feed(tracker, _stamped(13, _obj()), config=config) is None
+    assert tracker.track.state == T.TENTATIVE
+    assert tracker.track.hits == 1
+
+
+def test_a_payload_is_still_a_duplicate_after_a_blind_tick():
+    config = _cfg()
+    tracker = T.Tracker()
+    payload = _stamped(1, _obj())
+    _feed(tracker, payload, config=config)
+    _feed(tracker, None, config=config)
+    _feed(tracker, payload, config=config)
+    assert tracker.track.hits == 1
+
+
+def test_fresh_target_range_is_the_sample_before_filtering():
+    config = _cfg()
+    tracker = T.Tracker()
+    for index in range(config.confirm_hits):
+        _feed(tracker, _stamped(index, _obj()), config=config)
+
+    payload = _stamped(10, _obj())
+    track = _feed(tracker, payload, config=config, depth=_depth(2.5))
+    assert track.accepted_detection
+    assert track.measured_range_m == pytest.approx(2.5)
+    assert track.range_m > 2.5
+
+    track = _feed(tracker, payload, config=config, depth=_depth(2.5))
+    assert track.observed
+    assert not track.accepted_detection
+    assert track.measured_range_m is None
+
+
+@pytest.mark.parametrize("depth", [
+    {"map": None, "bands": {"center": 3.0}},
+    _depth(0.0),
+    {**_depth(), "capture_invalid": True},
+])
+def test_accepted_bearing_with_no_valid_target_range_has_no_range_evidence(depth):
+    config = _cfg()
+    tracker = T.Tracker()
+    _feed(tracker, _detections(_obj()), config=config, ticks=config.confirm_hits)
+    track = _feed(tracker, _detections(_obj()), config=config, depth=depth)
+    assert track.accepted_detection
+    assert track.measured_range_m is None
+
+
+@pytest.mark.parametrize("depth_id", ["frame_id", "source_frame_id"])
+def test_two_detections_do_not_reuse_the_same_depth_frame_as_evidence(depth_id):
+    config = _cfg()
+    tracker = T.Tracker()
+    for index in range(config.confirm_hits):
+        _feed(tracker, _stamped(index, _obj()), config=config)
+
+    def depth_frame(frame, receipt):
+        return {**_depth(), "frame_id": receipt, depth_id: frame}
+
+    track = _feed(tracker, _stamped(10, _obj()), config=config,
+                  depth=depth_frame(20, 30))
+    assert track.measured_range_m == pytest.approx(3.0)
+    track = _feed(tracker, _stamped(11, _obj()), config=config,
+                  depth=depth_frame(20, 31))
+    assert track.accepted_detection
+    assert track.measured_range_m is None
+    track = _feed(tracker, _stamped(12, _obj()), config=config,
+                  depth=depth_frame(21, 32))
+    assert track.measured_range_m == pytest.approx(3.0)
+
+
+def test_reordered_detection_and_depth_payloads_cannot_add_evidence_twice():
+    config = _cfg(confirm_hits=2)
+    tracker = T.Tracker()
+    first = dict(_depth(), frame_id=20)
+    second = dict(_depth(), frame_id=21)
+    _feed(tracker, _stamped(1, _obj()), config=config, depth=first)
+    _feed(tracker, _stamped(2, _obj()), config=config, depth=second)
+
+    track = _feed(tracker, _stamped(1, _obj()), config=config, depth=first)
+    assert track.hits == 2 and not track.accepted_detection
+    assert track.measured_range_m is None
+    track = _feed(tracker, _stamped(3, _obj()), config=config, depth=first)
+    assert track.accepted_detection and track.measured_range_m is None
+
 def test_a_payload_with_no_stamp_is_counted_every_time():
     """A detector that does not stamp its output cannot be de-duplicated, and
     the safe fallback is to treat each read as evidence — over-counting is the
@@ -440,6 +553,21 @@ def test_one_missed_frame_restarts_the_re_acquisition_count():
     _feed(tracker, _detections(), config=config)
     track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
     assert track.state == T.REACQUIRING and track.reacquire_hits == 1
+
+
+def test_reacquiring_a_static_target_after_ego_motion_preserves_zero_velocity():
+    config = _cfg()
+    tracker = T.Tracker()
+    _feed(tracker, _detections(_obj()), config=config, ticks=config.confirm_hits)
+    _feed(tracker, _detections(), config=config,
+          ego=(0.4, 0.0, 1.0), dt=0.2)
+
+    # The robot translated 8 cm toward the target and rotated 0.2 rad left.
+    seen = _detections(_obj(bearing=0.2 / config.half_fov_rad))
+    track = _feed(tracker, seen, config=config, depth=_depth(2.92),
+                  ticks=config.confirm_hits)
+    assert track.state == T.CONFIRMED
+    assert track.mean[2:] == pytest.approx([0.0, 0.0], abs=1e-6)
 
 
 def test_the_gate_cannot_open_wider_than_the_target_could_walk():

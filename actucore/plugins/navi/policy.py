@@ -51,24 +51,28 @@ Two consequences that are not obvious and were both bugs here:
 
 ── the safety property that matters more than any of the above ──────────────
 
-**When in doubt, emit nothing.** Stale observation, unreadable depth, target
-lost for too long, stuck, arrived — all of them return `values=None`, and the
-card then publishes nothing at all. The driver's watchdog brings the chassis to
-a stop within `watchdog_ms`.
-
-That is a deliberate choice against the alternative, which is to emit an
-explicit zero. Emitting zero would also stop the robot, but it would keep the
-watchdog fed, so a policy that silently died would leave a robot that believes
-it is being driven. Silence is the one signal a broken upstream cannot fake.
+When the policy goes quiet after commanding motion, the card sends one zero
+twist if the downstream watchdog exceeds 300 ms. The driver watchdog still
+protects an interrupted command stream.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import Enum
 
+import numpy as np
+
+from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
-from .track import Tracker
+from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, ODOM_GAP_MS,
+                          SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW)
+from .depth import has_valid_returns
+from .track import Track, Tracker
+from . import local_path
+from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
+from .odom import PlanarPose, planar_axes, planar_feedback
 
 # Status values. `arrived` and `stuck` are terminal for one `navigate_to`;
 # the rest are things that happen on the way.
@@ -82,11 +86,26 @@ BLIND = "blind"          # no usable observation — distinct from "nothing seen
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 
+
+class LocalHold(Enum):
+    TRANSITION = "等待底盘速度过渡，保留当前绕行路线"
+    PREFIX = "局部规划：找到候选路线，首段不满足执行条件；停下"
+
 # A distance schedule, not online plant identification. Bounds are fixed so a
 # stalled chassis cannot learn an ever-larger command or a new speed floor.
 ADAPTIVE_FWD_MAX_SCALE = 3.0
 ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
 ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
+
+# The blocked-route buffer reserves braking room outside the obstacle stop.
+BLOCKED_APPROACH_BUFFER_M = 0.30
+LOCAL_BLOCKED_APPROACH_BUFFER_M = 0.05
+LOCAL_BLOCKED_APPROACH_MAX_MPS = 0.15
+
+# Longitudinal separation for identifying a foreground obstacle and resuming.
+FORWARD_CLEARANCE_MARGIN_M = 0.15
+SIDE_SWITCH_ADVANTAGE_M = 0.15
+SIDE_SWITCH_FRAMES = 3
 
 
 @dataclass
@@ -116,8 +135,13 @@ class Config:
     # target/heading requirements still apply; this is not a tolerance for
     # stale or predicted observations. Callers may request zero per action.
     stop_tolerance_m: float = 0.05
-    slow_distance_m: float = 1.5
-    obstacle_stop_m: float = 0.6
+    slow_distance_m: float = 1.0
+    side_clearance_m: float = 1.0
+    local_planning: bool = False
+    odom_expected: bool = False
+    local_geometry: Geometry | None = None
+    scan_geometry: Geometry | None = None
+    obstacle_stop_m: float = 0.5
     # Lateral offset that still allows full speed. **Not a gate** — past it the
     # speed is scaled down, reaching zero at align_full_stop. See
     # `_alignment_scale`.
@@ -181,6 +205,7 @@ class Config:
     # into a column range using this — and being 1.6x out there made the corridor
     # wider than any door.
     half_fov_rad: float = 0.888
+    depth_intrinsics: HorizontalIntrinsics | None = None
     # Sidestep while approaching, and to get out from in front of an obstacle.
     # Turn it off for a base with no lateral degree of freedom — the descriptor
     # pinning vy to zero does that on its own, but this says so in one place.
@@ -223,6 +248,10 @@ class Config:
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
     max_obs_age_ms: int = 500
+    max_depth_age_ms: int | None = None
+    scan_odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
+    max_feedback_gap_ms: int = ODOM_GAP_MS
+    watchdog_ms: float = 300
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
     # Confidence needed to **start** following something. Below this a
@@ -241,17 +270,9 @@ class Config:
     # a chassis declares is its **static envelope with the arms at rest**, and
     # what hits a doorframe is a swinging arm and a leg mid-stride. This is the
     # difference between "the box the robot is" and "the space to keep clear".
-    clearance_margin_m: float = 0.15
-    # How much of the corridor has to carry a real depth reading before its
-    # clearance is believed. Below `coverage_min` the card stops going forward
-    # and says so; between the two it slows in proportion.
-    #
-    # **Unknown is not free.** A depth map has holes, and the things that make
-    # them — chair legs, table edges, glass — are exactly the things that catch
-    # a shoulder. Without this a corridor full of holes reads as an empty one,
-    # because every invalid pixel drops silently out of the minimum.
+    clearance_margin_m: float = 0.05
+    # Prefer a better observed side when ordering detour candidates.
     coverage_min: float = 0.25
-    coverage_full: float = 0.60
 
     # ── tracking (see track.py) ──────────────────────────────────────────
     # A detection this dim may not create a track, but it may keep one alive if
@@ -317,6 +338,13 @@ class Config:
     # copy is a copy that goes stale. See `adopt_limits`.
     floor_vx: float = 0.0
     floor_vy: float = 0.0
+    floor_vx_moving: float | None = None
+    floor_vy_moving: float | None = None
+    left_vy_limit: float | None = None
+    right_vy_limit: float | None = None
+    scan_wz_limit: float | None = None
+    left_wz_limit: float | None = None
+    right_wz_limit: float | None = None
     floor_wz: float = 0.0
     # **The yaw floor while the robot is already translating**, which on a
     # legged robot is a different number entirely: a gait cycle that is running
@@ -330,7 +358,19 @@ class Config:
     # facing" turned out to be.
     floor_wz_moving: float = 0.0
 
+    @property
+    def depth_age_limit_ms(self) -> int:
+        return self.max_obs_age_ms if self.max_depth_age_ms is None else self.max_depth_age_ms
+
+    @property
+    def approach_check_distance_m(self) -> float:
+        # Keep checking obstacles before they enter the speed reduction band.
+        return max(1.5, self.slow_distance_m)
+
     def __post_init__(self):
+        if self.max_depth_age_ms is not None and (
+                type(self.max_depth_age_ms) is not int or self.max_depth_age_ms <= 0):
+            raise ValueError("max_depth_age_ms must be a positive integer")
         for key in ("response_yaw_gain",):
             value = getattr(self, key)
             if value is None:
@@ -360,7 +400,7 @@ class Config:
             if adaptive and not math.isfinite(base_gain * maximum):
                 raise ValueError(f"adaptive {key} and its maximum must be finite and nonnegative")
             setattr(self, key, base_gain)
-        for key in ("stop_distance_m", "stop_tolerance_m"):
+        for key in ("stop_distance_m", "stop_tolerance_m", "scan_odom_linear_tolerance_mps"):
             value = getattr(self, key)
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a finite nonnegative number")
@@ -412,6 +452,98 @@ class Gate:
 
 
 @dataclass
+class DetourGoal:
+    """Last trusted target point, transported by ego motion during a detour."""
+    x: float
+    y: float
+    pose: PlanarPose | None = None
+    predicted_m: float = 0.
+    predicted_rad: float = 0.
+    track: Track | None = None
+    verified_range_m: float | None = None
+    best_verified_distance_m: float | None = None
+    approach_start_range_m: float | None = None
+    approach_travel_m: float = 0.
+
+    def advance(self, odom, command, dt, *, approach_command=None):
+        pose = (odom or {}).get("motion_pose")
+        axes = planar_axes(odom)
+        pose_delta = pose is not None and self.pose is not None and pose.frame == self.pose.frame
+        if pose_delta:
+            dx, dy, yaw = pose.relative_to(self.pose)
+        else:
+            vx, vy, wz = (value if value is not None else fallback
+                          for value, fallback in zip(axes, command))
+            yaw = wz * dt
+            c, s = math.cos(yaw / 2), math.sin(yaw / 2)
+            dx, dy = dt * (c * vx - s * vy), dt * (s * vx + c * vy)
+            self.predicted_m += dt * math.hypot(vx if axes[0] is None else 0.,
+                                                vy if axes[1] is None else 0.)
+            if axes[2] is None:
+                self.predicted_rad += abs(yaw)
+        if approach_command is not None and (pose_delta or all(value is not None for value in axes[:2])):
+            if self.approach_start_range_m is None:
+                self.approach_start_range_m = self.verified_range_m
+            vx, vy = approach_command
+            progress = (dx * vx + dy * vy) / math.hypot(vx, vy)
+            if abs(progress) > STILL_LINEAR * dt:
+                self.approach_travel_m = max(0., self.approach_travel_m + progress)
+        self.pose = pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        x, y = self.x - dx, self.y - dy
+        self.x, self.y = c * x + s * y, -s * x + c * y
+
+
+@dataclass(frozen=True)
+class PathLeg:
+    """One checked translation, with a waypoint fixed in the odometry frame."""
+
+    geometry: local_path.Geometry
+    waypoint: tuple[float, float]   # forward, right in the origin's frame
+    origin: tuple[float, float, float]
+    motion_frame: object | None = None
+    goal: tuple[float, float] | None = None
+    command: tuple[float, float] = (0., 0.)
+
+    @staticmethod
+    def world_point(pose, point):
+        f, r, heading = pose
+        x, y = point
+        c, s = math.cos(heading), math.sin(heading)
+        return f + c * x - s * y, r + s * x + c * y
+
+    def remaining(self, pose):
+        f, r = self.world_point(self.origin, self.waypoint)
+        x, y, heading = pose
+        c, s = math.cos(heading), math.sin(heading)
+        return c * (f - x) + s * (r - y), -s * (f - x) + c * (r - y)
+
+    def check(self, pose, motion, previous, command, grid, keep, horizon, brake_horizon, *, padding=0.):
+        f, r = self.remaining(pose)
+        vx, vy = command
+        speed = math.hypot(vx, vy)
+        yaw = abs(motion[2])
+        heading_error = abs(math.remainder(pose[2] - self.origin[2], math.tau))
+        if yaw > .02 or heading_error > ANGLE_TOLERANCE:
+            return "局部规划：朝向偏离执行段，停车后重规划"
+        if abs(f * vy + r * vx) > speed * local_path.RESOLUTION:
+            return "局部规划：平移偏离执行段，停车后重规划"
+        distance = (f * vx - r * vy) / speed
+        measured = motion[:2]
+        velocities = (measured, previous, command)
+        stopping = max(speed * horizon, math.hypot(*measured) * brake_horizon,
+                       math.hypot(*previous) * brake_horizon)
+        if distance <= local_path.RESOLUTION / 2 or stopping > distance + 1e-9:
+            return "局部规划：已到执行段制动点"
+        radius = math.hypot(max(self.geometry.front, self.geometry.rear), keep)
+        padding += (radius + speed * horizon) * yaw * horizon
+        if grid is None or not local_path.transition_clear(
+                grid, self.geometry, keep, horizon, velocities, padding=padding):
+            return "局部规划：执行段扫掠区有障碍或观测不可用，停车后重规划"
+        return None
+
+
+@dataclass
 class State:
     """What the policy remembers between ticks. Owned by the card, passed in."""
 
@@ -422,6 +554,18 @@ class State:
     # `_approach`. It did not have one, and that is why every run began with a
     # sidestep nobody asked for.
     vy_gate: Gate = field(default_factory=Gate)
+    escape_side: float = 0.0
+    side_stall_s: dict[float, float] = field(default_factory=dict)
+    side_compare_frame: int | None = None
+    side_better_frames: int = 0
+    local_plan: PlanCache = field(default_factory=PlanCache)
+    view_detour: Detour | None = None
+    detour_leg: PathLeg | None = None
+    executing_leg: PathLeg | None = None
+    goal_anchor: DetourGoal | None = None
+    active_scan: ActiveScan = field(default_factory=ActiveScan)
+    use_body_mount: bool | None = None
+    recovery: bool = False
     # What the corridor read on the last tick. Kept so the debug overlay can
     # draw the number the decision was made from, rather than measuring the
     # depth map a second time and risking a picture that disagrees with the
@@ -434,6 +578,12 @@ class State:
     # or nothing at all, so the command is a serviceable proxy — much better
     # than assuming we are stationary while turning at 1 rad/s.
     commanded: tuple = (0.0, 0.0, 0.0)
+    command_dt_s: float = 0.
+    motion_source: str = ""
+    feedback_boot_s: float = 0.
+    feedback_guard_s: float = 0.
+    command_tail: tuple = (0., 0., 0.)
+    command_tail_s: float = 0.
     missing_frames: int = 0
     last_seen_side: float = 1.0          # +1 target was right, -1 it was left
     searching_for_s: float = 0.0
@@ -443,11 +593,13 @@ class State:
     avoidance_yaw_override: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
+    close_sample_gap_s: float = 0.0
     idle_for_s: float = 0.0
     arrived: bool = False
     blocked_for_s: float = 0.0
     # Set once, read forever after: failure is terminal for one navigate_to.
     failed_reason: str = ""
+    partial_result: dict | None = None
     notes: list = field(default_factory=list)
 
 
@@ -612,7 +764,7 @@ def _adopt_camera(config: Config, declaration: dict) -> list[str]:
     if abs(angle - previous) > 0.02:
         notes.append(
             f"相机声明的水平半视场角是 {angle:.3f} rad（{source}），已采纳 —— "
-            f"卡片配置里的 {previous:.3f} 不再生效。走廊宽度按这个数算，"
+            f"卡片配置里的 {previous:.3f} 不再生效。"
             f"两者相差 {abs(angle - previous) / max(previous, 1e-6) * 100:.0f}%")
     if source in ("unknown", "unspecified"):
         notes.append("相机没说这个视场角是量出来的还是猜的（source 缺失）")
@@ -638,7 +790,15 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """
     notes: list[str] = []
     notes.extend(_adopt_footprint(config, descriptor))
-    max_age = ((descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+    rate = (descriptor or {}).get("rate") or {}
+    watchdog = rate.get("watchdog_ms")
+    if (isinstance(watchdog, (int, float)) and not isinstance(watchdog, bool)
+            and math.isfinite(watchdog) and watchdog > 0):
+        config.watchdog_ms = watchdog
+    feedback_gap = rate.get("max_feedback_gap_ms")
+    if type(feedback_gap) is int and feedback_gap > 0:
+        config.max_feedback_gap_ms = min(feedback_gap, int(config.watchdog_ms))
+    max_age = rate.get("max_obs_age_ms")
     if (isinstance(max_age, (int, float)) and not isinstance(max_age, bool)
             and math.isfinite(max_age) and max_age > 0
             and max_age < config.max_obs_age_ms):
@@ -646,6 +806,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         notes.append(f"观测有效期已按下游准入上限收紧到 {max_age:g}ms")
     limits = (descriptor or {}).get("limits") or {}
     floors = list(limits.get("min_magnitude") or [])
+    moving_floors = list(limits.get("min_magnitude_moving") or [])
     lower = list(limits.get("lower") or [])
     upper = list(limits.get("upper") or [])
 
@@ -659,15 +820,28 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
 
     def at(row, index):
         try:
-            return abs(float(row[index]))
+            value = abs(float(row[index]))
+            return value if math.isfinite(value) else None
         except (IndexError, TypeError, ValueError):
             return None
 
     def signed_at(row, index):
         try:
-            return float(row[index])
+            value = float(row[index])
+            return value if math.isfinite(value) else None
         except (IndexError, TypeError, ValueError):
             return None
+
+    config.floor_vx_moving = at(moving_floors, 0)
+    config.floor_vy_moving = at(moving_floors, 1)
+    left_vy, right_vy = signed_at(upper, 1), signed_at(lower, 1)
+    config.left_vy_limit = max(0., left_vy) if left_vy is not None else None
+    config.right_vy_limit = max(0., -right_vy) if right_vy is not None else None
+    wz_lower, wz_upper = signed_at(lower, 5), signed_at(upper, 5)
+    config.left_wz_limit = max(0., wz_upper) if wz_upper is not None else None
+    config.right_wz_limit = max(0., -wz_lower) if wz_lower is not None else None
+    config.scan_wz_limit = (max(0., min(-wz_lower, wz_upper))
+                            if wz_lower is not None and wz_upper is not None else None)
 
     # The three twist axes this policy drives, by their index in the six-wide
     # vector. vz/wx/wy are not here because nothing here produces them.
@@ -681,7 +855,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             # The moving floor is optional: a chassis that does not declare one
             # keeps the standing floor everywhere, which is the old behaviour
             # and errs towards commanding too much rather than too little.
-            moving = at(list(limits.get("min_magnitude_moving") or []), 5)
+            moving = at(moving_floors, 5)
             config.floor_wz_moving = floor if moving is None else moving
             if moving is not None and moving < floor:
                 notes.append(
@@ -693,6 +867,10 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         # because the sink would reject it (it would, loudly) but because the
         # decomposition should put that speed on an axis that exists.
         bound = at(upper, index)
+        if index == 1 and config.left_vy_limit is not None and config.right_vy_limit is not None:
+            bound = max(config.left_vy_limit, config.right_vy_limit)
+        if index == 5 and config.left_wz_limit is not None and config.right_wz_limit is not None:
+            bound = max(config.left_wz_limit, config.right_wz_limit)
         if bound is not None and at(lower, index) == 0.0 and bound == 0.0:
             if getattr(config, ceiling_attr) > 0:
                 notes.append(f"下游底盘没有 {name} 这个自由度，已停用该轴")
@@ -717,33 +895,17 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             notes.append(f"{name}_max 超过下游允许的 {bound:g}，已压回")
             setattr(config, ceiling_attr, bound)
 
-        # Searching is a yaw-only motion, but it does not go through
-        # ``wz_max``: it deliberately uses a fixed rate so a lost target does
-        # not make the robot creep around its own deadband.  It is still a
-        # chassis command and alternates signs while sweeping, so its usable
-        # magnitude is the smaller of the positive and negative yaw bounds.
-        # Without this separate clamp, normal steering may negotiate correctly
-        # while a fixed-rate search is rejected at every tick.
+        # Search sweeps in both directions at a fixed rate. Its usable
+        # magnitude must fit both signed bounds and the effective yaw ceiling.
         if index == 5:
-            yaw_lower = signed_at(lower, index)
-            yaw_upper = signed_at(upper, index)
-            if yaw_lower is not None and yaw_upper is not None:
-                search_cap = max(0.0, min(yaw_upper, -yaw_lower))
-            elif yaw_upper is not None:
-                search_cap = max(0.0, yaw_upper)
-            elif yaw_lower is not None:
-                search_cap = max(0.0, -yaw_lower)
-            else:
-                search_cap = None
+            search_cap = min(value for value in (config.wz_max, config.left_wz_limit,
+                                                 config.right_wz_limit) if value is not None)
             # Negotiate the actual executable rate here, so sweep accounting
             # agrees with the command after deadband lifting. Zero stays off.
             candidate = config.search_rate
             if candidate > 0:
-                candidate = max(candidate, floor)
-            if search_cap is not None:
-                candidate = min(candidate, search_cap)
-            if (floor and search_cap is not None
-                    and search_cap + 1e-9 < floor):
+                candidate = min(max(candidate, floor), search_cap)
+            if floor and search_cap + 1e-9 < floor:
                 if config.search_rate != 0.0:
                     notes.append(
                         f"search_rate 的双向上限 {search_cap:g} 低于偏航最小"
@@ -848,9 +1010,8 @@ def target_distance(obj, depth, config: Config) -> float | None:
         if bbox:
             return depth_mod.sample_box(depth["map"], bbox)
         return depth_mod.sample_point(depth["map"], obj.get("position") or [0, 0])
-    # Summary-only: the best available is the band the target sits in, which is
-    # the nearest obstacle there and not the target itself. Usable for "am I
-    # about to arrive", misleading for anything finer.
+    # Summary-only gives the nearest obstacle in the target's band. It can
+    # constrain motion but cannot confirm the distance to the target.
     bands = depth.get("bands") or {}
     return bands.get(_band_of(_bearing(obj)))
 
@@ -864,9 +1025,91 @@ def _band_of(bearing: float) -> str:
 
 
 def step(*, detections, depth, odom, config: Config, state: State,
-         dt: float) -> Decision:
-    decision = _account_idle(_decide(detections, depth, odom, config, state, dt),
-                             state, config, dt)
+         dt: float, control_period_s: float | None = None, command_dt_s: float | None = None,
+         command_interrupted: bool = False) -> Decision:
+    state.command_dt_s = min(dt, config.watchdog_ms / 1000) if command_dt_s is None else command_dt_s
+    state.view_detour = None
+    state.executing_leg = None
+    if config.local_planning and config.local_geometry is not None and (depth or {}).get("body_mount_required"):
+        capture_pose = depth.get("obstacle_capture_pose")
+        pose = (odom or {}).get("obstacle_pose")
+        paired = (depth.get("body_from_optical") is not None and capture_pose is not None
+                  and pose is not None and capture_pose.frame == pose.frame)
+        if state.use_body_mount is not False:
+            if state.use_body_mount and not paired:
+                scan = state.active_scan
+                if scan.active or any(state.commanded):
+                    state.feedback_guard_s = max(state.feedback_guard_s, (config.watchdog_ms + 50) / 1000)
+                state.active_scan = ActiveScan(obstacles=scan.obstacles, near_obstacles=scan.near_obstacles,
+                                               near_hits=scan.near_hits, near_revision=scan.near_revision)
+                state.escape_side = 0.
+            # Keep one frame of reference for the rest of this task after a
+            # fallback. Intermittent transforms must not interrupt each tick.
+            state.use_body_mount = paired
+        if state.use_body_mount:
+            calibrated = depth.get("mount_accuracy_validated") is True
+            geometry = replace(config.local_geometry, base_from_optical=depth["body_from_optical"],
+                               free_space_validated=calibrated,
+                               min_obstacle_height=(local_path.MIN_OBSTACLE_HEIGHT_M if calibrated
+                                                    else config.local_geometry.min_obstacle_height))
+            config = replace(config, scan_geometry=geometry, local_geometry=geometry)
+        else:
+            depth = dict(depth, body_mount_required=False)
+    scan_before, phase_before = state.active_scan, state.active_scan.phase
+    decision = _decide(detections, depth, odom, config, state, dt, control_period_s=control_period_s)
+    scan = state.active_scan
+    if (decision.status == AVOIDING and decision.values is not None and not any(decision.values)
+            and scan.phase == "brake" and (scan is not scan_before or phase_before != "brake")
+            and scan.receipt_only and scan.buffered_odom and scan.pose_origin is None
+            and state.goal_anchor is not None
+            and max(math.hypot(*state.commanded[:2]), math.hypot(*scan.motion[:2])) > STILL_LINEAR):
+        geometry = config.scan_geometry or config.local_geometry
+        command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s)
+        if command.yaw:
+            decision.values = _twist(0., 0., command.yaw)
+            decision.reason = command.reason
+    if config.local_planning and state.motion_source == "command" and decision.values is not None:
+        last_x, last_y, last_yaw = state.command_tail
+        vx, vy, yaw = decision.values[0], decision.values[1], decision.values[5]
+        transitioning = (
+            (math.hypot(last_x, last_y) > STILL_LINEAR and yaw and not (vx or vy))
+            or (abs(last_yaw) > STILL_YAW and not (last_x or last_y) and (vx or vy))
+            or (abs(last_x) > STILL_LINEAR and last_x * vx < 0.)
+            or (abs(last_y) > STILL_LINEAR and last_y * vy < 0.)
+            or (abs(last_yaw) > STILL_YAW and last_yaw * yaw < 0. and not (vx or vy))
+        )
+        if transitioning:
+            decision = Decision(_twist(0., 0., 0.), AVOIDING, "运动方向切换，停车等待制动窗口")
+    anchor, scan = state.goal_anchor, state.active_scan
+    if decision.values is not None and any(decision.values) and not scan.active and scan.near_hits is not None:
+        twist = tuple(decision.values[i] for i in (0, 1, 5))
+        if _near_sweep_hits(config, scan, odom, state, twist).any():
+            decision = Decision(_twist(0., 0., 0.), AVOIDING, "当前运动的扫掠区有盲区内已观测障碍")
+    if (decision.reason == NO_LOCAL_ROUTE and scan.exhausted and scan.current_frame
+            and anchor is not None and anchor.verified_range_m is not None
+            and anchor.verified_range_m > config.arrival_distance_m
+            and anchor.approach_travel_m >= local_path.RESOLUTION
+            and anchor.approach_start_range_m is not None
+            and anchor.approach_start_range_m - anchor.verified_range_m >= local_path.RESOLUTION
+            and not any(state.commanded[:2])):
+        feedback = planar_feedback(odom)
+        if feedback is not None and math.hypot(*feedback[:2]) <= STILL_LINEAR and abs(feedback[2]) <= STILL_YAW:
+            state.failed_reason = "当前已观测局部空间内没有进一步可执行的接近路线"
+            state.partial_result = dict(outcome="partial", target_reached=False,
+                                        reachability_scope="observed_local",
+                                        remaining_distance_m=anchor.verified_range_m,
+                                        distance_basis="measured_range_to_original_target",
+                                        best_verified_distance_m=anchor.best_verified_distance_m)
+            decision = Decision(_twist(0., 0., 0.), FAILED, state.failed_reason,
+                                distance_m=anchor.verified_range_m, bearing=decision.bearing)
+    if decision.values is None or decision.values[0] <= .05 or command_interrupted or not state.command_dt_s:
+        state.moving_for_s = 0.
+    else:
+        stuck = _stuck(odom, state, state.commanded[0], state.command_dt_s, config)
+        if stuck:
+            state.failed_reason = stuck
+            decision = Decision(None, FAILED, stuck, distance_m=decision.distance_m, bearing=decision.bearing)
+    decision = _account_idle(decision, state, config, dt)
     if (decision.values is None or decision.values[0] <= 0
             or decision.status in (ARRIVED, FAILED, IDLE, BLIND, SEARCHING, ALIGNING)):
         # Do not carry an increased approach gain through a hold, search or
@@ -874,6 +1117,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
         state.adaptive_fwd_scale = 1.0
     # Remember what we asked for, so the tracker can compensate for our own
     # motion on the next tick even with no odometry wired.
+    if state.executing_leg is None or not (decision.values and any(decision.values[:2]) and not decision.values[5]):
+        state.detour_leg = state.executing_leg = None
     if decision.values is not None:
         state.commanded = (decision.values[0], decision.values[1],
                            decision.values[5])
@@ -894,7 +1139,7 @@ def _forward_gain(config: Config, state: State, distance, live: bool,
             or config.k_fwd == 0):
         state.adaptive_fwd_scale = 1.0
         return config.k_fwd
-    window = max(0.1, config.slow_distance_m - config.stop_distance_m)
+    window = max(0.1, config.approach_check_distance_m - config.stop_distance_m)
     error = max(0.0, distance - config.stop_distance_m)
     # This rational schedule keeps the settled, unsaturated P speed monotone
     # in distance error: approaching the target does not increase that speed.
@@ -913,17 +1158,10 @@ def _measured_yaw_rate(odom):
     Freshness is enforced by the card before this observation reaches policy.
     JSON booleans, missing axes and non-finite readings are not measurements.
     """
-    value = (odom or {}).get("wz")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        value = float(value)
-    except (ValueError, OverflowError):
-        return None
-    return value if math.isfinite(value) else None
+    return planar_axes(odom)[2]
 
 
-def _ego_twist(odom, state: State):
+def _ego_twist(odom, state: State, *, command_fraction=1.):
     """Our own motion, for the tracker's predict step. Returns (twist, measured).
 
     Measured if odometry is wired, commanded otherwise. **Per axis**, because
@@ -935,22 +1173,73 @@ def _ego_twist(odom, state: State):
     guessed twist is a guessed twist as far as the filter's confidence goes, and
     erring towards "guessed" only makes it trust its own predictions less.
     """
-    commanded = state.commanded
-    if not odom:
-        return commanded, False
-    out, measured = [], True
-    for index, name in enumerate(("vx", "vy", "wz")):
-        value = _measured_yaw_rate(odom) if name == "wz" else odom.get(name)
-        if value is None:
-            measured = False
-            out.append(commanded[index])
-        else:
-            out.append(float(value))
-    return tuple(out), measured
+    feedback = planar_axes(odom)
+    return (tuple(value if value is not None else command * command_fraction
+                  for value, command in zip(feedback, state.commanded)),
+            all(value is not None for value in feedback))
+
+
+MAX_PREDICTED_DETOUR_TRAVEL_M = 3.
+NO_LOCAL_ROUTE = "局部规划未找到可执行的避让路线；停下"
+
+
+def _wait_for_detour_goal(state, config, track, odom):
+    if not config.local_planning:
+        return False
+    scan = state.active_scan
+    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame or scan.exhausted)
+    observed = track is not None and track.observed and track.range_known
+    anchor = state.goal_anchor
+    if anchor is None:
+        if detouring:
+            if observed:
+                x = track.range_m * math.cos(track.bearing_rad)
+                y = -track.range_m * math.sin(track.bearing_rad)
+            elif track is not None and track.range_known and track.last_obs is not None:
+                # The tracker transports this observation with ego motion only.
+                x, y = track.last_obs
+            else:
+                return True
+            state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"), track=track)
+        return False
+    if detouring:
+        return False
+    if observed and track.measured_range_m is not None:
+        x = track.measured_range_m * math.cos(track.bearing_rad)
+        y = -track.measured_range_m * math.sin(track.bearing_rad)
+        if math.hypot(x - anchor.x, y - anchor.y) <= 3 * config.range_std_m:
+            state.goal_anchor = None
+            return False
+    return True
+
+
+def _reacquire_detour_goal(depth, config, state, raw_yaw, bearing, dt, odom):
+    if (state.goal_anchor is not None
+            and (state.last_clearance is None or state.last_clearance >= config.approach_check_distance_m)):
+        yaw = _finalise_yaw(raw_yaw, False, bearing, config, state, dt)
+        if yaw:
+            stop = _search_turn_stop(depth, config, state, requested_yaw=yaw)
+            if stop is None:
+                decision = _search(config, state, dt, odom, requested_yaw=yaw)
+                if decision.status == SEARCHING:
+                    decision.reason = "朝绕行前的目标转向，等待重新测距"
+                return decision
+            return Decision(_twist(0., 0., 0.), AVOIDING, stop)
+    return Decision(_twist(0., 0., 0.), AVOIDING, "停车等待原目标的有效测距")
+
+
+def _observation_command(scan, geometry, config, state, odom, dt, control_period_s):
+    yaw_limits = (_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+    return scan.command(geometry, _keepout_m(config), max(yaw_limits), config.watchdog_ms,
+                        config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
+                        now_ms=(odom or {}).get("control_ms"), tick_s=dt,
+                        previous_yaw=state.commanded[2], control_period_s=control_period_s,
+                        previous_command_s=state.command_dt_s, yaw_limits=yaw_limits,
+                        previous_linear=math.hypot(*state.commanded[:2]))
 
 
 def _decide(detections, depth, odom, config: Config, state: State,
-            dt: float) -> Decision:
+            dt: float, *, control_period_s: float | None) -> Decision:
     """One tick.
 
     `detections` — vop's latest payload, or None if stale/absent.
@@ -971,44 +1260,202 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if not state.target:
         return Decision(None, IDLE, "no navigation target")
 
+    stale_capture = bool((depth or {}).get("capture_invalid"))
+    frame = (depth or {}).get("map")
+    invalid_depth = frame is not None and not has_valid_returns(frame)
+    if stale_capture or invalid_depth:
+        depth = None
+    state.close_sample_gap_s += dt
+    if state.close_sample_gap_s > config.max_obs_age_ms / 1000:
+        state.close_for_s = 0.0
+
     # The tracker runs **before** the blind check, so a spell with no
     # observation is a run of misses rather than time that did not happen. It
     # is also the only way the coast clock advances while the card is blind —
     # otherwise a camera that stopped publishing would leave a track coasting
     # for ever, and the robot driving towards a prediction nobody is checking.
-    ego, ego_measured = _ego_twist(odom, state)
+    ego, ego_measured = _ego_twist(odom, state, command_fraction=state.command_dt_s / dt if dt else 0.)
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt)
+    anchor = state.goal_anchor
+    if anchor is not None:
+        approach_command = state.commanded[:2]
+        anchor.advance(odom, ego, dt, approach_command=(
+            approach_command if state.active_scan.exhausted and any(approach_command) else None))
+        anchor.verified_range_m = (track.measured_range_m
+                                   if track is not None and track is anchor.track and track.observed else None)
+        if anchor.verified_range_m is not None:
+            best = anchor.best_verified_distance_m
+            anchor.best_verified_distance_m = min(best, anchor.verified_range_m) if best is not None else anchor.verified_range_m
+        if (anchor.predicted_m > MAX_PREDICTED_DETOUR_TRAVEL_M
+                or anchor.predicted_rad > math.pi / 3 + 1e-9):
+            return Decision(_twist(0., 0., 0.), AVOIDING, "绕行目标的无反馈推算已达上限，停车")
 
-    # No usable observation is not the same as "nothing is there". Emitting
-    # nothing lets the watchdog stop the robot, which is the right resting
-    # state for "this policy cannot see".
-    if detections is None or depth is None:
-        return Decision(None, BLIND,
-                        "observation stale or missing (vop / depth); publishing nothing, "
-                        "leaving the stop to the downstream watchdog")
+    feedback = planar_feedback(odom) if config.local_planning else None
+    if config.local_planning and config.local_geometry is not None:
+        source = ("command" if feedback is None else
+                  "pose" if odom.get("motion_pose") is not None else "measured")
+        if source == "command" and config.odom_expected and not state.motion_source:
+            state.feedback_boot_s += dt
+            if state.feedback_boot_s * 1000 < ODOM_GAP_MS:
+                return Decision(_twist(0, 0, 0), AVOIDING, "等待首个有效运动反馈")
+        if state.motion_source and state.motion_source != source:
+            needs_guard = any(state.commanded) or state.active_scan.active
+            previous_scan = state.active_scan
+            if source == "command" and previous_scan.active and not previous_scan.command_only:
+                hold = previous_scan.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
+                return Decision(_twist(0, 0, 0), AVOIDING, hold.reason)
+            previous_scan.invalidate()
+            state.active_scan = ActiveScan(obstacles=previous_scan.obstacles,
+                                           near_obstacles=previous_scan.near_obstacles,
+                                           near_hits=previous_scan.near_hits, near_revision=previous_scan.near_revision)
+            if needs_guard:
+                state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
+        state.motion_source = source
+        frame = (depth or {}).get("frame_id") or 0
+        if state.feedback_guard_s > 0.:
+            state.feedback_guard_s = max(0., state.feedback_guard_s - dt)
+            return Decision(_twist(0, 0, 0), AVOIDING, "运动反馈来源已切换，等待底盘停稳")
+        if any(state.commanded):
+            state.command_tail = state.commanded
+            state.command_tail_s = (config.watchdog_ms + 50) / 1000
+        else:
+            state.command_tail_s = max(0., state.command_tail_s - dt)
+            if not state.command_tail_s:
+                state.command_tail = (0., 0., 0.)
+
+        scan = state.active_scan
+        scan.odom_linear_tolerance_mps = config.scan_odom_linear_tolerance_mps
+        scan.max_feedback_gap_ms = config.max_feedback_gap_ms
+        obstacle_pose = (odom or {}).get("obstacle_pose")
+        if not (depth or {}).get("body_mount_required"):
+            obstacle_pose = obstacle_pose or (odom or {}).get("motion_pose")
+        scan.historical_hits = scan.obstacles.project(obstacle_pose)
+        if scan.obstacles.cells and scan.historical_hits is None:
+            return Decision(_twist(0., 0., 0.), AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车")
+        mount = (depth or {}).get("body_from_optical")
+        if mount is not None and mount[0, 2] < .75:
+            if scan.active and not scan.command_only:
+                scan.hold_for_replan("主动观察：等候头部恢复前向观测")
+            return Decision(_twist(0., 0., 0.), AVOIDING, "相机朝向未覆盖车体前方，停车")
+        was_scanning = scan.active
+        can_align = (config.scan_geometry is not None and (depth or {}).get("capture_ms")
+                     and (odom or {}).get("stamp_ms"))
+        receipt_only = scan.receipt_only if was_scanning or scan.result_frame else not can_align
+        geometry = (config.scan_geometry or config.local_geometry) if receipt_only else config.scan_geometry
+        scan_depth = (depth if (detections is not None or anchor is not None)
+                      and not (depth or {}).get("capture_invalid") else None)
+        if source == "command":
+            geometry = config.scan_geometry or config.local_geometry
+            update = scan.observe_single(scan_depth, geometry, config.depth_age_limit_ms,
+                                         (depth or {}).get("control_ms", frame))
+            depth = (dict(depth, frame_id=scan.single_depth_ms) if scan.single_depth_ms else None)
+        else:
+            update = scan.update(scan_depth, odom, geometry,
+                                 receipt_only=receipt_only, max_depth_age_ms=config.depth_age_limit_ms,
+                                 follow_leg=state.detour_leg is not None)
+        if config.scan_geometry is None and geometry is not None and geometry.horizontal is not None:
+            target_range = (track.range_m if track is not None and track.range_known else math.inf)
+            if anchor is not None:
+                target_range = min(target_range, math.hypot(anchor.x, anchor.y))
+            reach = min(config.approach_check_distance_m + geometry.front,
+                        target_range - FORWARD_CLEARANCE_MARGIN_M)
+            approaching = (feedback is not None and (track is not None or anchor is not None)
+                           and max(feedback[0], state.commanded[0]) > STILL_LINEAR)
+            scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
+                                       approaching=approaching)
+        if was_scanning and not scan.active:
+            return Decision(_twist(0, 0, 0), AVOIDING,
+                            update.reason if update else "主动观察中断；停车后重规划")
+        if update is not None and (scan.active or scan.result_frame):
+            return Decision(_twist(0, 0, 0), AVOIDING, update.reason)
+        if scan.active and not scan.ready:
+            command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s)
+            if command.replanned_turn:
+                state.view_detour = None
+            return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)
+        if (scan.ready or scan.result_frame) and anchor is None and (track is None or not track.observed):
+            return Decision(_twist(0, 0, 0), AVOIDING, "主动观察：等待重新确认导航目标")
+
+    if depth is None or (detections is None and anchor is None):
+        if stale_capture:
+            return Decision(_twist(0., 0., 0.), BLIND, "深度采集时间已过期或无效；保持停车")
+        if invalid_depth:
+            state.recovery = True
+            state.escape_side = 0.0
+            state.side_better_frames = 0
+            return Decision(_twist(0., 0., 0.), AVOIDING, "深度图没有有效测距，看不清；保持停车")
+        missing = "vop / depth"
+        if detections is not None:
+            missing = "depth"
+        elif depth is not None:
+            missing = "vop"
+        return Decision(None, BLIND, f"observation stale or missing ({missing})")
+
+    previous_vy = state.commanded[1]
+    lateral_progress = (feedback is not None and previous_vy != 0.
+                        and math.copysign(1., previous_vy) * feedback[1] >
+                        max(STILL_LINEAR, abs(previous_vy) * config.stuck_speed_ratio))
+    side = state.escape_side
+    if feedback is not None and state.command_dt_s and side * previous_vy < 0.:
+        if lateral_progress:
+            state.side_stall_s.pop(side, None)
+        else:
+            # Count only time covered by a lateral request and measured
+            # feedback. A small same-sign standing bias is not progress.
+            state.side_stall_s[side] = state.side_stall_s.get(side, 0.) + state.command_dt_s
 
     bands = depth.get("bands") or {}
 
-    if track is None:
+    scan = state.active_scan
+    if (anchor is not None and ((scan.advance_origin is not None and scan.ready) or scan.exhausted)
+            and (math.hypot(anchor.x, anchor.y) <= config.arrival_distance_m
+                 or (track is not None and track is anchor.track and track.observed
+                     and track.measured_range_m is not None
+                     and track.measured_range_m <= config.arrival_distance_m))):
+        scan.finish()
+        scan.result_frame = 0
+        scan.exhausted = False
+        state.escape_side = 0.
+    if (anchor is not None and track is not None and anchor.track is track
+            and track.observed and track.measured_range_m is not None
+            and not (state.escape_side or scan.active or scan.result_frame or scan.exhausted)):
+        # The original track can move while the detour uses its frozen point.
+        # Replan from a fresh depth match on that track after leaving the detour.
+        anchor = state.goal_anchor = None
+    if (anchor is not None and not scan.active and not state.escape_side
+            and math.hypot(anchor.x, anchor.y) <= config.arrival_distance_m):
+        if _wait_for_detour_goal(state, config, track, odom):
+            angle = math.atan2(-anchor.y, anchor.x)
+            bearing = _clamp(angle / max(1e-6, config.half_fov_rad), 1.)
+            return _reacquire_detour_goal(depth, config, state, -config.k_yaw * bearing, bearing, dt, odom)
+        anchor = state.goal_anchor
+
+    if track is None and anchor is None:
+        reason = _search_turn_stop(depth, config, state)
+        if reason is not None:
+            return Decision(_twist(0, 0, 0), AVOIDING, reason)
         return _search(config, state, dt, odom)
 
     state.missing_frames = 0
-    state.searching_for_s = 0.0
-    state.searched_rad = 0.0
+    if anchor is None:
+        state.searching_for_s = 0.0
+        state.searched_rad = 0.0
     # Back to the normalised offset the rest of this file is written in.
     # `track.py` works in metres and radians; every threshold here — align_tol,
     # arrive_align_tol, lateral_max_bearing — is a fraction of the image half
     # width, and converting them instead would change what every deployed
     # config means.
-    bearing = _clamp(track.bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
+    bearing_rad = math.atan2(-anchor.y, anchor.x) if anchor is not None else track.bearing_rad
+    bearing = _clamp(bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
     state.last_seen_side = 1.0 if bearing >= 0 else -1.0
     # None, not a number, when depth has never had a reading for this object.
     # The summary-only path legitimately produces that, and the whole approach
     # law below already handles an unknown distance — what it must not do is
     # act on the placeholder the tracker needed in order to exist.
-    distance = track.range_m if track.range_known else None
+    distance = (math.hypot(anchor.x, anchor.y) if anchor is not None else
+                track.range_m if track.range_known else None)
 
     # Turn towards it, proportionally. Positive bearing means the target is
     # right of centre, and `wz` is positive counter-clockwise, so the sign is
@@ -1018,7 +1465,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # depends on something not known yet at this point — whether the robot ends
     # up translating — so the decision is deferred to `_finalise_yaw` once vx is
     # settled. See `floor_wz_moving`.
-    live = track.observed
+    live = anchor is None and track.observed
     yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
                 else config.k_yaw)
     # Pure proportional steering. odom.wz remains an observation for
@@ -1027,9 +1474,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
     raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m
-    if within:
-        state.close_for_s += dt
-    else:
+    measured = track.measured_range_m if live else None
+    measured_within = measured is not None and measured <= config.arrival_distance_m
+    if measured_within and within:
+        state.close_for_s += state.close_sample_gap_s if state.close_for_s else dt
+        state.close_sample_gap_s = 0.0
+    elif measured is not None or not within:
         state.close_for_s = 0.0
 
     # Arrived: in position and roughly facing it — or turning in place for long
@@ -1047,14 +1497,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # declare the journey over, so arrival needs a live fix. Without one the
     # code below falls through to the obstacle logic, which will stop for the
     # thing that is actually there and say so.
-    if within and live and (abs(bearing) <= config.arrive_align_tol
-                            or state.close_for_s >= config.arrive_patience_s):
+    detouring = config.local_planning and (state.escape_side or scan.active or scan.result_frame)
+    if (within and live and measured_within and not detouring
+            and (abs(bearing) <= config.arrive_align_tol or state.close_for_s >= config.arrive_patience_s)):
         state.arrived = True
         # One explicit zero before going quiet, so the chassis stops on a
         # command rather than on a watchdog timeout — arriving is a success and
         # should not look like a dropped link in the driver's log.
         return Decision(_twist(0.0, 0.0, 0.0), ARRIVED,
-                        f"target at {distance:.2f} m, stop distance reached"
+                        f"target at {measured:.2f} m, stop distance reached"
                         + f" (threshold {config.arrival_distance_m:.2f} m = "
                           f"{config.stop_distance_m:.2f} m + "
                           f"{config.stop_tolerance_m:.2f} m tolerance)"
@@ -1062,7 +1513,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
                            f" (still {bearing:+.2f} off-centre after "
                            f"{state.close_for_s:.1f}s in range; not waiting to "
                            f"align — see arrive_patience_s)"),
-                        distance_m=distance, bearing=bearing)
+                        distance_m=measured, bearing=bearing)
+
+    if within and depth.get("map") is None:
+        return Decision(_twist(0., 0., 0.), AVOIDING, "深度摘要显示近障，等待目标测距确认")
 
     # Forward speed scales continuously with alignment rather than switching.
     #
@@ -1076,13 +1530,19 @@ def _decide(detections, depth, odom, config: Config, state: State,
     align = _alignment_scale(bearing, config)
     if align <= 0.0:
         state.commanded_vx = 0.0
-        # Turning in place: the standing floor applies, so this is the one path
-        # that still needs the gate and the lift.
-        wz = _finalise_yaw(raw_wz, False, bearing, config, state, dt)
-        return Decision(_twist(0.0, 0.0, wz), ALIGNING,
-                        f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
+        state.avoidance_yaw_override = False
+        reason = f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正"
+        vx, vy, turn, status, reason = _avoid(
+            0.0, 0.0, raw_wz, depth, config, ALIGNING, reason, state,
+            target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
+            aligned=False, odom=odom, may_scan=(live or anchor is not None) and not within, dt=dt)
+        if _wait_for_detour_goal(state, config, track, odom):
+            return _reacquire_detour_goal(depth, config, state, raw_wz, bearing, dt, odom)
+        wz = _finalise_yaw(turn, bool(vx or vy), bearing, config, state, dt)
+        state.commanded_vx = vx
+        return Decision(_twist(vx, vy, wz), status, reason,
                         distance_m=distance, bearing=bearing,
-                        k_yaw_effective=yaw_gain)
+                        k_yaw_effective=None if state.avoidance_yaw_override else yaw_gain)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
@@ -1120,11 +1580,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
         dt=dt, min_dwell_s=config.min_dwell_s)
 
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
-                       state, dt)
+                       state, dt, odom=odom)
     tracking_wz = raw_wz
     state.avoidance_yaw_override = False
-    vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
-                                            status, reason, state)
+    vx, vy, raw_wz, status, reason = _avoid(
+        vx, vy, raw_wz, depth, config, status, reason, state,
+        target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
+        aligned=abs(bearing) < config.align_full_stop, odom=odom,
+        may_scan=(live or anchor is not None) and not within, dt=dt)
+    if _wait_for_detour_goal(state, config, track, odom):
+        return _reacquire_detour_goal(depth, config, state, tracking_wz, bearing, dt, odom)
     if within and config.stop_tolerance_m > 0 and (vx or vy):
         # Avoidance may propose a sidestep after the approach has stopped.
         # A configured arrival tolerance also holds that translation while
@@ -1137,7 +1602,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # that has been shuffling sideways for twelve seconds is not making
     # progress, and the caller deserves the real reason rather than a timeout
     # or, worse, a report that it arrived.
-    if status == AVOIDING and not vx:
+    if status == AVOIDING and not (vx or (lateral_progress and previous_vy * vy > 0.)):
         state.blocked_for_s += dt
         if state.blocked_for_s >= config.blocked_timeout_s:
             blocked = (f"前方被挡住了 {state.blocked_for_s:.0f} 秒，绕不过去："
@@ -1148,12 +1613,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
     else:
         state.blocked_for_s = 0.0
     # Now vx is settled, so which deadband the yaw axis is subject to is known.
+    if (config.local_planning and config.local_geometry is not None
+            and (vy or abs(previous_vy) > STILL_LINEAR or (feedback and abs(feedback[1]) > STILL_LINEAR))):
+        # The lateral prefix was checked at a fixed heading.
+        raw_wz = 0.
     wz = _finalise_yaw(raw_wz, bool(vx or vy), bearing, config, state, dt)
-
-    stuck = _stuck(odom, state, vx, dt, config)
-    if stuck:
-        state.failed_reason = stuck
-        return Decision(None, FAILED, stuck, distance_m=distance, bearing=bearing)
 
     state.commanded_vx = vx
     tracking_yaw_used = raw_wz == tracking_wz and not state.avoidance_yaw_override
@@ -1220,6 +1684,10 @@ def _finalise_yaw(raw: float, translating: bool, bearing: float,
     floor and is gated; walking, almost nothing does.
     """
     floor = config.floor_wz_moving if translating else config.floor_wz
+    ceiling = _scan_yaw_rate(config, 1. if raw < 0. else -1.)
+    if ceiling < floor:
+        return 0.
+    raw = _clamp(raw, ceiling)
     if floor <= 1e-6 or abs(raw) >= floor:
         # Keep the gate's state coherent, so a later transition back to turning
         # in place does not inherit a stale "already engaged".
@@ -1231,7 +1699,7 @@ def _finalise_yaw(raw: float, translating: bool, bearing: float,
         abs(bearing), engage=config.align_tol,
         release=config.align_tol * config.release_frac,
         dt=dt, min_dwell_s=config.min_dwell_s)
-    return _lift(raw, floor, config.wz_max) if turning else 0.0
+    return _lift(raw, floor, ceiling) if turning else 0.0
 
 
 def _alignment_scale(bearing: float, config: Config) -> float:
@@ -1260,13 +1728,11 @@ def _keepout_m(config: Config) -> float:
     return config.half_width_m + config.clearance_margin_m
 
 
-def _side_label(room, coverage, config: Config) -> str:
+def _side_label(room, config: Config) -> str:
     """One side's verdict, for a reason string an operator has to act on."""
-    if coverage < config.coverage_min:
-        return f"只有 {coverage * 100:.0f}% 深度有效"
     if room is None:
         return "无读数"
-    if room <= config.slow_distance_m:
+    if room <= config.side_clearance_m:
         return f"{room:.2f} m 处有东西"
     return f"{room:.2f} m"
 
@@ -1292,34 +1758,23 @@ def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
                               half_width_m=_keepout_m(config),
                               half_fov_rad=config.half_fov_rad,
                               reference_m=config.obstacle_stop_m,
-                              lateral_offset_m=lateral_offset_m)
+                              lateral_offset_m=lateral_offset_m,
+                              intrinsics=config.depth_intrinsics,
+                              ground=depth.get("ground"))
 
 
 def _may_strafe(towards_right: bool, depth, config: Config) -> bool:
-    """Whether it is honest to put speed on `vy` right now.
-
-    The question is not "is the right third of the picture empty" — that
-    describes what is ahead-and-to-the-right at a couple of metres, not what is
-    beside the shoulder. It is whether the corridor the robot would **move
-    into** is both measured and clear. An unmeasured one blocks: sideways is
-    the direction a forward-facing camera knows least about, and this is the one
-    place the policy could move into space it cannot see.
-
-    A sidestep whose corridor falls outside the lens gets zero coverage and is
-    refused on that alone, which is the correct answer rather than a special
-    case.
-    """
-    if not config.use_lateral or config.vy_max <= 0:
+    """Check measured obstacles in the destination corridor before strafing."""
+    floor, limit = _local_velocity_limits(config, 1. if towards_right else -1.)[1]
+    if limit <= 0 or floor > limit:
         return False
     offset = _keepout_m(config) * (1.0 if towards_right else -1.0)
-    room, coverage = _clearance(depth, config, lateral_offset_m=offset)
-    if coverage < config.coverage_min:
-        return False
-    return room is None or room > config.slow_distance_m
+    room, _ = _clearance(depth, config, lateral_offset_m=offset)
+    return room is None or room > config.approach_check_distance_m
 
 
 def _approach(speed: float, bearing: float, depth, config: Config,
-              state: "State" = None, dt: float = 0.0):
+              state: "State" = None, dt: float = 0.0, *, odom=None):
     """Split the approach speed between forward and sideways.
 
     The target sits at roughly `bearing * half_fov_rad` off the nose, so
@@ -1336,7 +1791,8 @@ def _approach(speed: float, bearing: float, depth, config: Config,
         return 0.0, 0.0
 
     angle = bearing * config.half_fov_rad
-    forward = _lift(speed * math.cos(angle), config.floor_vx, config.vx_max)
+    (floor_x, limit_x), (floor_y, limit_y) = _local_velocity_limits(config, 1. if bearing > 0 else -1.)
+    forward = _lift(speed * math.cos(angle), floor_x, limit_x)
 
     if abs(bearing) > config.lateral_max_bearing:
         # Too far off to trust either the bearing or the side band. Turn.
@@ -1346,7 +1802,28 @@ def _approach(speed: float, bearing: float, depth, config: Config,
         return forward, 0.0
     if not _worth_strafing(lateral, config, state, dt):
         return forward, 0.0
-    return forward, _lift(lateral, config.floor_vy, config.vy_max)
+    lateral = _lift(lateral, floor_y, limit_y)
+    geometry = config.local_geometry
+    if state is not None and config.local_planning and geometry is not None:
+        if depth.get("map") is None or depth.get("frame_id") is None:
+            return forward, 0.
+        scan = state.active_scan
+        same_geometry = (config.scan_geometry or config.local_geometry) is geometry
+        grid = (scan.grid() if same_geometry and scan.views and scan.matches_route_view(depth)
+                else state.local_plan.grid_for(depth, geometry))
+        previous = state.commanded[:2]
+        measured = planar_feedback(odom)
+        yaw = measured[2] if measured is not None else state.command_tail[2]
+        if max(abs(yaw), abs(state.commanded[2])) > STILL_YAW:
+            return forward, 0.
+        motion = measured[:2] if measured is not None else previous
+        horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        if not local_path.transition_clear(grid, geometry, _keepout_m(config), horizon,
+                                           (motion, previous, (forward, lateral))):
+            forward_clear = local_path.transition_clear(grid, geometry, _keepout_m(config), horizon,
+                                                        (motion, previous, (forward, 0.)))
+            return forward if forward_clear else 0., 0.
+    return forward, lateral
 
 
 def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
@@ -1371,9 +1848,10 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
     error sitting on the threshold would otherwise switch the axis on and off at
     tick rate, which is the juddering this card was written to remove.
     """
-    if config.floor_vy <= 1e-6:
+    floor = config.floor_vy if config.floor_vy_moving is None else config.floor_vy_moving
+    if floor <= 1e-6:
         return True                      # no deadband, no amplification, no gate
-    engage = config.floor_vy * config.lateral_lift_ratio
+    engage = floor * config.lateral_lift_ratio
     if state is None:
         return abs(lateral) >= engage
     return state.vy_gate.update(
@@ -1381,133 +1859,892 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
         dt=dt, min_dwell_s=config.min_dwell_s)
 
 
-def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
-    """Slow for what is ahead, and move out from in front of it if it is close.
-
-    Backing away is not available — the depth map covers what the camera sees
-    and nothing behind the robot, so reversing is moving blind.
-
-    When something is close enough to stop for, the robot both turns towards
-    the freer side **and** steps towards it. Turning alone only changes where it
-    is pointing; on a base that can translate, the sidestep is what actually
-    gets it out of the way, and doing both at once is one continuous motion
-    rather than a pirouette followed by a walk.
-    """
-    bands = (depth or {}).get("bands") or {}
+def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None) -> str | None:
+    """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
+    state.last_clearance, state.last_coverage = ahead, coverage
+    scan = state.active_scan
+    command_only = state.motion_source == "command"
+    geometry = (config.scan_geometry or config.local_geometry
+                if scan.receipt_only or command_only else config.scan_geometry)
+    can_plan = config.local_planning and (config.search_rate > 0 or requested_yaw is not None)
+    has_sweep = can_plan and geometry is not None and bool(scan.current_frame)
+    if not has_sweep:
+        if requested_yaw is None and ahead is not None and ahead <= config.obstacle_stop_m:
+            state.recovery = True
+            return f"原地搜索：前方 {ahead:.2f} m 触发近障停车"
+        if requested_yaw is not None or (can_plan and config.local_geometry is not None):
+            return "原地搜索：等待可用深度"
+    if can_plan:
+        direction = state.last_seen_side if requested_yaw is None else -math.copysign(1., requested_yaw)
+        if (requested_yaw is None and not state.searching_for_s
+                and ahead is not None and ahead < config.approach_check_distance_m
+                and depth.get("map") is not None):
+            keep = _keepout_m(config)
+            alternate, seen = _clearance(depth, config, lateral_offset_m=-direction * keep)
+            current, _ = _clearance(depth, config, lateral_offset_m=direction * keep)
+            if (alternate is not None and alternate >= config.approach_check_distance_m
+                    and seen >= config.coverage_min
+                    and (current is None or alternate - current >= SIDE_SWITCH_ADVANTAGE_M)):
+                direction = -direction
+        motion = state.command_tail if command_only else scan.motion
+        if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
+               for vx, vy, wz in (motion, state.commanded)):
+            return "原地搜索：等待平移或反向转动停稳"
+        if has_sweep:
+            horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
+            rate = config.search_rate if requested_yaw is None else abs(requested_yaw)
+            rate = max(rate, abs(scan.motion[2]), abs(state.commanded[2]))
+            sweep, slack = (rate + .10) * horizon, STILL_LINEAR * horizon
+            half_width = _keepout_m(config)
+            if not scan.clear_sweep(geometry, half_width, direction * sweep, slack):
+                if (requested_yaw is not None or max(abs(motion[2]), abs(state.commanded[2])) > STILL_YAW
+                        or not scan.clear_sweep(geometry, half_width, -direction * sweep, slack)):
+                    state.recovery = True
+                    return "原地搜索：转身扫掠范围有障碍，停车"
+                direction = -direction
+                state.searched_rad = 0.
+        state.last_seen_side = direction
+    if state.recovery:
+        if not config.local_planning and ahead is not None and ahead < config.approach_check_distance_m:
+            return "近障停车，等待前方净空"
+        state.recovery = False
+    return None
+
+
+def _local_side_order(rooms, config, state, frame):
+    priority = {
+        side: (coverage >= config.coverage_min,
+               room if room is not None else
+               (math.inf if coverage >= config.coverage_min else -math.inf),
+               coverage)
+        for side, (room, coverage) in rooms.items()
+    }
+    preferred = max(rooms, key=priority.__getitem__)
+    if state is None or state.escape_side not in rooms:
+        return preferred, -preferred
+
+    incumbent = state.escape_side
+    challenger = -incumbent
+    measured, room, _ = priority[challenger]
+    current_measured, current_room, _ = priority[incumbent]
+    better = measured and (not current_measured or room > current_room + SIDE_SWITCH_ADVANTAGE_M)
+    if not better or type(frame) is not int:
+        state.side_better_frames = 0
+    if type(frame) is int and frame != state.side_compare_frame:
+        previous = state.side_compare_frame
+        if previous is None or not 0 < frame - previous <= config.depth_age_limit_ms:
+            state.side_better_frames = 0
+        state.side_compare_frame = frame
+        state.side_better_frames += int(better)
+    if state.side_better_frames >= SIDE_SWITCH_FRAMES:
+        return challenger, incumbent
+    return incumbent, challenger
+
+
+def _scan_yaw_rate(config, side=None):
+    limit = (config.scan_wz_limit if side is None else
+             config.right_wz_limit if side > 0. else config.left_wz_limit)
+    return config.wz_max if limit is None else min(config.wz_max, limit)
+
+
+def _local_velocity_limits(config, side):
+    floor_x = config.floor_vx if config.floor_vx_moving is None else config.floor_vx_moving
+    floor_y = config.floor_vy if config.floor_vy_moving is None else config.floor_vy_moving
+    limit_y = config.vy_max if config.use_lateral else 0.
+    directional_limit = config.right_vy_limit if side > 0 else config.left_vy_limit
+    if directional_limit is not None:
+        limit_y = min(limit_y, directional_limit)
+    return (floor_x, config.vx_max), (floor_y, limit_y)
+
+
+def _camera_frame_routes(config, scan):
+    return (scan is not None and config.scan_geometry is None and scan.receipt_only
+            and scan.buffered_odom and scan.pose_origin is None and not scan.command_only)
+
+
+def _route_rank(plan, target):
+    residual = math.dist(plan.points[-1], local_path.target_in_grid(plan.geometry, *target))
+    length = sum(math.dist(a, b) for a, b in zip(plan.points, plan.points[1:]))
+    headings = [math.atan2(b[1] - a[1], b[0] - a[0]) for a, b in zip(plan.points, plan.points[1:])]
+    turns = sum(abs(math.remainder(b - a, math.tau)) for a, b in zip(headings, headings[1:]))
+    return round(residual / local_path.RESOLUTION), length + local_path.RESOLUTION * turns
+
+
+def _start_detour_segment(depth, config, state, geometry, ahead, directions, target_distance, target_bearing,
+                          *, reroute=False, rooms=None, closest=False):
+    floor_x, limit_x = _local_velocity_limits(config, 1.)[0]
+    if limit_x <= 0. or limit_x < floor_x:
+        return False
+    scan = state.active_scan
+    grid = scan.grid()
+    free, occupied = grid
+    observation = dict(depth, projected_grid=grid, body_half_width=config.half_width_m,
+                       closest=closest, allow_unknown=True)
+    if scan.near_hits is not None:
+        observation["scan_revision"] = scan.near_revision
+    if not scan.receipt_only:
+        observation.update(scan_grid=grid, scan_revision=scan.poses[-1][0])
+    target, optical_target = None, None
+    if target_distance is not None and target_bearing is not None:
+        forward = target_distance * math.cos(target_bearing)
+        right = target_distance * math.sin(target_bearing)
+        observation["stop_target"] = (
+            forward, right, config.stop_distance_m, config.stop_tolerance_m)
+        optical_target = (forward, right)
+        target = local_path.target_in_grid(geometry, forward, right)
+    keep = _keepout_m(config)
+    blocked = local_path.route_obstacles(grid, geometry, keep, allow_unknown=True)
+    # Prefer an A* passing lane with enough room for the turn to settle.
+    # A tight passage may still have a feasible shorter leg at the normal width.
+    plane = ahead * geometry.base_from_optical[0, 2] + geometry.base_from_optical[0, 3]
+    turning_room = local_path.RESOLUTION + max(0., plane) * math.tan(ANGLE_TOLERANCE)
+    if rooms and not state.escape_side and not reroute:
+        left, right = rooms[-1.], rooms[1.]
+        if (min(left[1], right[1]) >= config.coverage_min and left[0] is not None and right[0] is not None
+                and min(left[0], right[0]) >= config.side_clearance_m
+                and abs(left[0] - right[0]) < SIDE_SWITCH_ADVANTAGE_M):
+            # A low off-centre post can miss both image-side depth bands.
+            # Rank its measured body-grid position before insignificant range differences.
+            side = directions[0]
+            across = RIGHT[occupied & (abs(FORWARD - plane) <= .10) & (abs(RIGHT) <= keep)]
+            if across.size and np.all(side * across > local_path.RESOLUTION / 2):
+                directions = tuple(reversed(directions))
+
+    opening = None if closest else local_path.opening_route(depth["map"], occupied, geometry, keep,
+                                                            plane, target)
+
+    def candidates():
+        if opening is not None:
+            yield opening
+        for side in directions:
+            plan = state.local_plan.route(observation, geometry, keep + turning_room, ahead, side,
+                                          config.depth_age_limit_ms, config.watchdog_ms)
+            if plan is None:
+                plan = state.local_plan.route(observation, geometry, keep, ahead, side,
+                                              config.depth_age_limit_ms, config.watchdog_ms)
+            if plan is not None:
+                yield plan
+
+    horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
+    turn_occupied = occupied | scan.views[-1][3]
+    plans = (sorted(candidates(), key=lambda plan: _route_rank(plan, optical_target))
+             if closest and optical_target is not None else candidates())
+    for plan in plans:
+        for index in range(len(plan.points) - 1, 0, -1):
+            forward, right = plan.points[index]
+            if forward <= 0.:
+                continue
+            if (depth.get("ground") is not None and geometry.free_space_validated
+                    and not local_path.observed_waypoint(free, forward, right)):
+                continue
+            angle, length = math.atan2(right, forward), math.hypot(forward, right)
+            if length < floor_x * horizon:
+                continue
+            turn_rate = _scan_yaw_rate(config, math.copysign(1., angle))
+            if abs(angle) > ANGLE_TOLERANCE and (turn_rate <= 0. or turn_rate < config.floor_wz):
+                continue
+            if scan.command_only and abs(angle) >= math.pi / 3:
+                continue
+            if target is not None:
+                f, r = forward / length, right / length
+                along = min(length, max(0., target[0] * f + target[1] * r))
+                if math.hypot(target[0] - along * f, target[1] - along * r) < config.stop_distance_m:
+                    continue
+            if (local_path.segment_clear(blocked, geometry, keep, angle, length,
+                                         heading_tolerance=ANGLE_TOLERANCE if angle else 0.)
+                    and scan.clear_sweep(geometry, keep, angle, 0., occupied=turn_occupied)
+                    and (scan.command_only or abs(angle) <= ANGLE_TOLERANCE or scan.checked_turn_rate(
+                        geometry, keep, angle, turn_rate, config.floor_wz, horizon, turn_occupied))
+                    and scan.begin((math.copysign(1., angle),), advance_m=length,
+                                   turn_angle=abs(angle), route_segment=True, reroute=reroute)):
+                state.view_detour = local_path.Detour(None, (plan.points[0], *plan.points[index:]), geometry)
+                return True
+    return False
+
+
+def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan):
+    lookahead = FORWARD[-1, 0] - geometry.rear - .25
+    corridor = (abs(RIGHT) <= _keepout_m(config)) & (FORWARD >= 0.) & (FORWARD <= lookahead)
+    transform = geometry.base_from_optical
+    memory = scan.obstacles
+    source = depth.get("source_stamp_ns") or depth.get("source_frame_id") or depth.get("capture_ms")
+    max_depth = target_distance - FORWARD_CLEARANCE_MARGIN_M if target_distance is not None else None
+    if depth.get("body_mount_required") and not geometry.free_space_validated:
+        # An estimated moving mount suffices for this view, but must not
+        # insert obstacles into an odometry map that cannot clear them again.
+        if geometry is not config.scan_geometry or not scan.views or not scan.matches_route_view(depth):
+            return None
+        hits = scan.observed_grid()[1] if scan.receipt_only else scan.views[-1][3]
+        front = transform[0, 2]
+        if front <= 0.:
+            return None
+        if max_depth is not None:
+            corridor &= FORWARD <= max_depth * front + transform[0, 3]
+        marked = corridor & hits
+        if marked.any():
+            return max(0., (float(FORWARD[marked].min()) - transform[0, 3]) / front)
+        return None
+    verified = (not scan.receipt_only and geometry.free_space_validated
+                and geometry is config.scan_geometry and scan.current_frame == depth.get("capture_ms"))
+    capture_pose = depth.get("obstacle_capture_pose")
+    if (capture_pose is None and not depth.get("body_mount_required")
+            and pose.stamp_ms == depth.get("capture_ms")):
+        capture_pose = pose
+    if (geometry is config.scan_geometry and scan.current_frame and type(source) is int
+            and depth.get("map") is not None
+            and source > memory.last_source and capture_pose is not None
+            and capture_pose.frame == pose.frame and (may_scan or (verified and memory.cells))):
+        # Use the actual exposure, never a fused grid at a later robot pose.
+        free, hits = local_path.observe(depth["map"], geometry, RIGHT, FORWARD,
+                                        local_path.RESOLUTION, depth.get("ground"),
+                                        max_hit_depth=max_depth)
+        memory.last_source = source
+        if verified and memory.cells:
+            memory.project(capture_pose, observed_free=free)
+        if may_scan and (hits & corridor).any():
+            memory.remember(capture_pose, hits & (FORWARD >= 0.) & (FORWARD <= lookahead))
+    scan.historical_hits = memory.project(pose)
+    if scan.historical_hits is not None:
+        blocked = corridor & scan.historical_hits
+        if blocked.any():
+            return max(0., (float(FORWARD[blocked].min()) - transform[0, 3]) / transform[0, 2])
+    return None
+
+
+def _target_corridor_clear(depth, config, scan, distance, bearing, velocities):
+    """Check the footprint up to the target's stand-off point in the current view."""
+    geometry = (config.scan_geometry or config.local_geometry
+                if scan.receipt_only else config.scan_geometry)
+    if (geometry is None or distance is None or bearing is None or not scan.views
+            or not scan.matches_route_view(depth)):
+        return False
+    free, occupied = scan.grid()
+    if not (free.any() or occupied.any()):
+        return False
+    forward, right = local_path.target_in_grid(
+        geometry, distance * math.cos(bearing), distance * math.sin(bearing))
+    if forward <= 0.:
+        return False
+    length = max(0., math.hypot(forward, right) - config.stop_distance_m)
+    keep = _keepout_m(config)
+    horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+    return (local_path.segment_clear(occupied, geometry, keep, math.atan2(right, forward), length)
+            and local_path.motion_sweep_clear((free, occupied), geometry, keep, horizon, velocities))
+
+
+def _near_sweep_hits(config, scan, odom, state, twist):
+    geometry = config.scan_geometry or config.local_geometry
+    keep = _keepout_m(config)
+    motion = planar_feedback(odom) or state.command_tail
+    velocities = (motion, state.commanded, twist)
+    horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+    age = max(0, scan.control_ms - scan.near_revision) / 1000
+    radius = math.hypot(max(geometry.front, geometry.rear), keep)
+    padding = age * max(math.hypot(vx, vy) + radius * abs(yaw) for vx, vy, yaw in velocities)
+    return local_path.motion_sweep_hits(scan.near_hits, geometry, keep, horizon, velocities,
+                                        padding=padding)
+
+
+def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
+           target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False,
+           target_bearing=None, dt=0.):
+    """Slow for foreground obstacles and look around them before local detours."""
+    scan = state.active_scan if config.local_planning and state is not None else None
+    geometry = config.scan_geometry or config.local_geometry
+    ahead, coverage = _clearance(depth, config)
+    if (scan is not None and geometry is not None and geometry.horizontal is not None
+            and geometry.vertical is not None and scan.views and scan.matches_route_view(depth)
+            and depth.get("ground") is None):
+        _, occupied = scan.observed_grid()
+        if scan.historical_hits is not None:
+            occupied = occupied | scan.historical_hits
+        hits = occupied & (FORWARD >= 0.) & (abs(RIGHT) <= _keepout_m(config))
+        transform = geometry.base_from_optical
+        ahead = (max(0., (float(FORWARD[hits].min()) - transform[0, 3]) / transform[0, 2])
+                 if hits.any() and transform[0, 2] > 0. else None)
     if state is not None:
         state.last_clearance, state.last_coverage = ahead, coverage
 
-    # Too little of the corridor measured to say anything about it. Not the same
-    # as "clear", and it used to be treated as such — an invalid pixel simply
-    # dropped out of the minimum, so a corridor full of holes and an empty one
-    # produced the same number. The objects that make holes are the ones that
-    # catch a shoulder.
-    if coverage < config.coverage_min:
-        return (0.0, 0.0, wz, AVOIDING,
-                f"正前方只有 {coverage * 100:.0f}% 的深度有效，看不清就不往前走"
-                f"（需要 {config.coverage_min * 100:.0f}%）")
+    # The target itself also appears in the depth map. Only steer early
+    # around a return distinctly in front of it.
+    foreground = (ahead is not None
+                  and (target_distance is None or depth.get("map") is None
+                       or ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance))
+    pose = (odom or {}).get("obstacle_pose") or (odom or {}).get("motion_pose")
+    plan_obstacle = False
+    if scan is not None and geometry is not None and pose is not None:
+        if scan.obstacles.cells and scan.obstacles.frame != pose.frame:
+            return 0., 0., 0., AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车"
+        obstacle = _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan)
+        if obstacle is not None:
+            ahead = obstacle if ahead is None else min(ahead, obstacle)
+            foreground = plan_obstacle = True
+            state.last_clearance = ahead
+    if scan is not None and scan.near_hits is not None:
+        swept = _near_sweep_hits(config, scan, odom, state, (vx, vy, wz))
+        if swept.any():
+            obstacle = max(0., float(FORWARD[swept].min()))
+            ahead = obstacle if ahead is None else min(ahead, obstacle)
+            foreground = plan_obstacle = True
+            state.last_clearance = ahead
+    stop = config.obstacle_stop_m
+    check_distance = config.approach_check_distance_m
+    depth_age_s = config.depth_age_limit_ms / 1000
+    if foreground:
+        # Reserve the distance travelled in one observation freshness window.
+        motion = planar_feedback(odom) if config.local_planning else None
+        if motion is not None:
+            measured_vx = motion[0]
+        last_vx = state.commanded[0] if state is not None else 0.0
+        speed = max(0.0, measured_vx or 0.0, last_vx)
+        stop = min(check_distance, stop + speed * depth_age_s)
+    near = ahead is not None and ahead <= stop
+    approaching = ahead is not None and ahead < check_distance
+    side = 0.0
+    local_command = None
+    local_route = None
+    if scan is not None and (state.detour_leg is not None or
+                             (scan.ready and scan.advance_origin is not None)):
+        anchor, track = state.goal_anchor, state.tracker.track
+        if (anchor is not None and track is not None and track is anchor.track and track.observed
+                and track.measured_range_m is not None
+                and math.hypot(track.measured_range_m * math.cos(track.bearing_rad) - anchor.x,
+                               -track.measured_range_m * math.sin(track.bearing_rad) - anchor.y)
+                > max(3 * config.range_std_m, 3 * local_path.RESOLUTION)):
+            state.goal_anchor = state.detour_leg = None
+            scan.finish()
+            return 0., 0., 0., AVOIDING, "局部规划：目标位置已变化，停车后重规划"
+    if scan is not None and scan.ready and scan.advance_m is not None:
+        return _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance, dt,
+                                   target_bearing=target_bearing if may_scan else None)
+    if scan is not None and state.detour_leg is not None:
+        leg = state.detour_leg
+        current_geometry = (geometry if state.use_body_mount or leg.geometry is geometry
+                            else config.local_geometry)
+        goal = (None if target_distance is None or target_bearing is None or current_geometry is None
+                else PathLeg.world_point(scan.pose, local_path.target_in_grid(
+                    current_geometry, target_distance * math.cos(target_bearing),
+                    target_distance * math.sin(target_bearing))))
+        brake_horizon = (config.watchdog_ms + 50) / 1000
+        horizon = brake_horizon + config.depth_age_limit_ms / 1000
+        motion = planar_feedback(odom)
+        vx, vy = leg.command
+        state.avoidance_yaw_override = True
+        if (not config.use_lateral or motion is None or not scan.poses or not scan.current_frame
+                or scan.motion_frame is not leg.motion_frame
+                or (current_geometry is not leg.geometry and not state.use_body_mount)
+                or not may_scan or goal is None
+                or math.dist(leg.goal, goal) > 3 * local_path.RESOLUTION
+                or state.side_stall_s.get(state.escape_side, 0.) >= config.stuck_window_s
+                or (near and foreground and vx)):
+            state.detour_leg = None
+            return 0., 0., 0., AVOIDING, "局部规划：执行段条件已变化，停车后重规划"
+        f, r = leg.remaining(scan.pose)
+        speed = math.hypot(vx, vy)
+        along = (f * vx - r * vy) / speed
+        room = min(along, target_distance - config.stop_distance_m)
+        (floor_x, limit_x), (floor_y, limit_y) = _local_velocity_limits(config, state.escape_side)
+        scale = max(0., min(1., room / (speed * horizon),
+                            limit_x / abs(vx) if vx else 1., limit_y / abs(vy) if vy else 1.))
+        command = vx * scale, vy * scale
+        if not scale or (vx and abs(command[0]) < floor_x) or (vy and abs(command[1]) < floor_y):
+            state.detour_leg = None
+            return 0., 0., 0., AVOIDING, "局部规划：已到执行段制动点"
+        # Calibrated scans carry occupied history. The camera fallback uses
+        # its newest projection, with no path search in this control step.
+        grid = (scan.grid() if scan.views and geometry is current_geometry and scan.matches_route_view(depth)
+                else state.local_plan.grid_for(depth, current_geometry))
+        padding = 0.
+        if grid is not None and scan.receipt_only and scan.views and scan.matches_route_view(depth):
+            view_pose = scan.views[-1][1]
+            radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), _keepout_m(config))
+            padding = math.dist(view_pose[:2], scan.pose[:2]) + radius * abs(view_pose[2] - scan.pose[2])
+        reason = leg.check(scan.pose, motion, state.commanded[:2], command, grid,
+                           _keepout_m(config), horizon, brake_horizon, padding=padding)
+        if reason is not None:
+            state.detour_leg = None
+            return 0., 0., 0., AVOIDING, reason
+        state.executing_leg = leg
+        return *command, 0., AVOIDING, "局部规划：沿避障路线行进"
 
-    # Between the two thresholds the clearance is believed, but less of it than
-    # we would like was measured, so it is approached more slowly.
-    trust = min(1.0, max(0.0, (coverage - config.coverage_min)
-                         / max(1e-6, config.coverage_full - config.coverage_min)))
+    observed_obstacle = False
+    if (scan is not None and geometry is not None and scan.current_frame and scan.views
+            and may_scan and target_distance is not None and foreground and not approaching):
+        transform = geometry.base_from_optical
+        plane = ahead * transform[0, 2] + transform[0, 3]
+        ahead_band = (FORWARD > 0.) & (abs(FORWARD - plane) <= .10)
+        observed_obstacle = (scan.grid()[1] & ahead_band & (abs(RIGHT) <= _keepout_m(config))).any()
+    needs_detour = near or plan_obstacle or observed_obstacle or (foreground and approaching)
+    corridor_clear = False
+    if needs_detour and not near and may_scan and scan is not None and not scan.has_result:
+        motion = planar_feedback(odom) or state.command_tail
+        floor = config.floor_wz_moving if vx or vy else config.floor_wz
+        yaw = min(max(abs(wz), floor), _scan_yaw_rate(config, 1. if wz < 0. else -1.)) if wz else 0.
+        corridor_clear = _target_corridor_clear(
+            depth, config, scan, target_distance, target_bearing, (motion, state.commanded, (vx, vy, yaw)))
+        needs_detour = not corridor_clear
 
-    if ahead is None:
-        return _scaled(vx, trust, config.floor_vx, config.vx_max), \
-                _scaled(vy, trust, config.floor_vy, config.vy_max), \
-                wz, status, reason
+    scale = 1.
+    if corridor_clear:
+        # The current route and velocity sweep have both passed the grid check.
+        state.recovery = False
+        state.blocked_for_s = 0.
+    elif ahead is not None and ahead < config.slow_distance_m:
+        scale = max(0., (ahead - stop) / max(1e-6, config.slow_distance_m - stop))
+        if status != ALIGNING:
+            status, reason = AVOIDING, f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速"
+    if needs_detour:
+        stationary_line = config.obstacle_stop_m + LOCAL_BLOCKED_APPROACH_BUFFER_M
+        brake_at = min(check_distance, max(stop, stationary_line) if config.local_planning
+                       else stop + BLOCKED_APPROACH_BUFFER_M)
+        horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        approach = 0.
+        if (foreground and aligned and depth.get("map") is not None and target_distance is not None
+                and ahead > brake_at and (config.local_planning or ahead < check_distance)):
+            limit = (ahead - brake_at) / horizon_s
+            floor = config.floor_vx
+            if config.local_planning:
+                # Include the new command in the travel reserve used on the next tick.
+                if config.floor_vx_moving is not None:
+                    floor = config.floor_vx_moving
+                limit = min(limit, (target_distance - config.stop_distance_m) / horizon_s,
+                            (ahead - stationary_line) / (horizon_s + depth_age_s),
+                            max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS))
+            speed = min(vx * scale, config.vx_max, limit)
+            if speed > 0 and speed >= floor:
+                approach = speed
 
-    if ahead <= config.obstacle_stop_m:
-        # **Which way out, decided on metric corridors — not on the angular
-        # thirds.**
-        #
-        # This branch was the other half of the bug the metric corridor was
-        # introduced to fix. "Is the way ahead blocked" became metric; "which way
-        # do I go" stayed on `bands`, which describe what is ahead-and-to-the-side
-        # at a couple of metres rather than what is beside the shoulder. A
-        # **doorway** beside the path is the worst case for that: you can see
-        # through it, so it reads as the *emptiest* band, and the robot steers
-        # into the one thing in reach.
-        #
-        # That is what happened on r1_sz. The robot could have walked straight
-        # through a 1.1 m door; instead it reached the doorway, deliberately
-        # turned towards it, and put a shoulder into the frame — at
-        # `wz_max` = 1.5 rad/s and `vy_max` = 1.0 m/s, because the escape was
-        # full-scale and unconditional.
-        #
-        # So both sides are now judged by the corridor the robot would actually
-        # move into, which is the same question `_may_strafe` asks, and the turn
-        # is refused outright when neither side is measured and clear.
         keep = _keepout_m(config)
-        left_room, left_cov = _clearance(depth, config, lateral_offset_m=-keep)
-        right_room, right_cov = _clearance(depth, config, lateral_offset_m=keep)
+        rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep)
+                 for s in (-1.0, 1.0)}
+        if config.local_planning:
+            order = _local_side_order(rooms, config, state,
+                                      depth.get("source_frame_id", depth.get("frame_id")))
+            camera_routes = _camera_frame_routes(config, scan) and pose is None
+            planning_depth = dict(depth, allow_forward=not near and aligned,
+                                  body_half_width=config.half_width_m,
+                                  closest=bool(scan is not None and scan.exhausted),
+                                  allow_unknown=True)
+            route_target = None
+            if target_distance is not None and target_bearing is not None:
+                planning_depth["stop_target"] = (
+                    target_distance * math.cos(target_bearing), target_distance * math.sin(target_bearing),
+                    config.stop_distance_m, config.stop_tolerance_m)
+                route_target = planning_depth["stop_target"][:2]
+            if (scan is not None and config.scan_geometry is not None and scan.current_frame
+                    and (scan.historical_hits is not None
+                         or (not scan.receipt_only and (scan.ready or scan.has_result)))):
+                revision = pose.stamp_ms if pose is not None else (
+                    scan.poses[-1][0] if scan.poses else scan.current_frame)
+                planning_depth = dict(planning_depth, scan_grid=scan.grid(), scan_revision=revision)
+            elif (scan is not None and scan.receipt_only and scan.views
+                  and (config.scan_geometry or config.local_geometry) is config.local_geometry
+                  and scan.matches_route_view(depth)):
+                planning_depth.update(frame_id=scan.current_frame, project_scan_view=scan.grid)
+                if scan.near_hits is not None:
+                    planning_depth["scan_revision"] = scan.near_revision
+            transitioning = False
+            for candidate in order:
+                if state is not None and state.side_stall_s.get(candidate, -math.inf) >= config.stuck_window_s:
+                    continue
+                command = _local_translation(planning_depth, config, state, odom, ahead, candidate)
+                transitioning |= command is LocalHold.TRANSITION
+                if command is LocalHold.TRANSITION and candidate == state.escape_side:
+                    break
+                if isinstance(command, tuple) and (planning_depth["allow_forward"] or command[0] <= 0):
+                    floor, limit = _local_velocity_limits(config, candidate)[1]
+                    if command[1] == 0. or floor <= -candidate * command[1] <= limit:
+                        route = state.local_plan.plans.get(candidate)
+                        if local_route is not None and (route is None or
+                                _route_rank(route, route_target) >= _route_rank(local_route, route_target)):
+                            continue
+                        side, local_command = candidate, command
+                        local_route = route
+                        if not planning_depth["closest"] or route is None or route_target is None:
+                            break
+            if local_command is None and transitioning:
+                return 0.0, 0.0, 0.0, AVOIDING, LocalHold.TRANSITION.value
+            if scan is not None and local_command is None:
+                yaw_rate = max(_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+                geometry = (config.scan_geometry or config.local_geometry
+                            if scan.receipt_only else config.scan_geometry)
+                if (may_scan and foreground and geometry is not None
+                        and config.floor_wz <= yaw_rate and yaw_rate > 0
+                        and scan.current_frame):
+                    if ((not scan.attempted or (scan.exhausted and not scan.rerouted))
+                            and _start_detour_segment(depth, config, state, geometry, ahead, order,
+                                                     target_distance, target_bearing, rooms=rooms,
+                                                     reroute=scan.exhausted, closest=scan.exhausted)):
+                        return 0., 0., 0., AVOIDING, "局部规划：停车对准路线首段"
+            if scan is not None and scan.ready:
+                if local_command is not None or (not near and len(scan.directions) <= 1):
+                    scan.finish()
+                elif not near and scan.try_other_side():
+                    return 0.0, 0.0, 0.0, AVOIDING, "主动观察：尝试另一侧"
+                else:
+                    scan.exhaust()
+            if local_command is None:
+                feedback = planar_feedback(odom)
+                approach_clear = False
+                approach_yaw = 0.
+                if (approach and scan is not None and not scan.active
+                        and (feedback is not None or state.motion_source == "command")):
+                    approach_geometry = (config.scan_geometry if "scan_grid" in planning_depth
+                                         else config.local_geometry)
+                    motion = feedback if feedback is not None else state.command_tail
+                    velocities = (motion, state.commanded)
+                    safe_speed = min(ahead - stationary_line,
+                                     target_distance - config.stop_distance_m) / horizon_s
+                    if (approach_geometry is not None and depth.get("map") is not None
+                            and depth.get("frame_id") is not None
+                            and all(abs(vy) <= STILL_LINEAR and abs(vx) <= safe_speed
+                                    for vx, vy, _ in velocities)):
+                        grid = state.local_plan.grid_for(planning_depth, approach_geometry)
+                        yaw = _clamp(wz, _scan_yaw_rate(config, 1. if wz < 0. else -1.))
+                        if (feedback is not None and yaw and abs(yaw) >= config.floor_wz_moving
+                                and (grid[0].any() or grid[1].any()) and local_path.motion_sweep_clear(
+                                    grid, approach_geometry, keep, horizon_s, (*velocities, (approach, 0., yaw)))):
+                            approach_yaw, approach_clear = yaw, True
+                        else:
+                            approach_clear = local_path.motion_sweep_clear(
+                                grid, approach_geometry, keep, horizon_s, (*velocities, (approach, 0., 0.)))
+                # A distant hit can block the full goal corridor while the
+                # measured, camera-frame straight prefix is still executable.
+                prefer_approach = approach_clear and not approaching and camera_routes
+                if (not prefer_approach and scan is not None and not (scan.active or scan.attempted)
+                        and may_scan and foreground
+                        and geometry is not None and config.floor_wz <= yaw_rate and yaw_rate > 0
+                        and scan.current_frame):
+                    turn_angle = ANGLE
+                    free, occupied = scan.grid()
+                    unknown = ~(free | occupied)
+                    transform = geometry.base_from_optical
+                    obstacle = ahead * transform[0, 2] + transform[0, 3]
+                    angles = np.arctan2(RIGHT, FORWARD)
+                    relevant = unknown & (FORWARD > 0.) & (FORWARD <= obstacle + geometry.rear + .25)
+                    order = tuple(sorted(order, key=lambda side: np.count_nonzero(
+                        relevant & (RIGHT * side > keep)
+                        & (abs(angles - side * turn_angle) <= config.half_fov_rad)), reverse=True))
+                    order = tuple(side for side in order
+                                  if _scan_yaw_rate(config, side) > 0.
+                                  and _scan_yaw_rate(config, side) >= config.floor_wz)
+                    if (not scan.command_only and
+                            all(room is not None and room < check_distance for room, _ in rooms.values())):
+                        # A nearby opening can require only small alignment.
+                        # This preview ranks the heading; the drive still
+                        # checks the corridor for measured obstacles.
+                        alignment = math.radians(6)
+                        for direction in order:
+                            offset = direction * ahead * math.tan(alignment)
+                            room, seen = _clearance(depth, config, lateral_offset_m=offset)
+                            if room is not None and room >= check_distance and seen >= config.coverage_min:
+                                turn_angle = alignment
+                                order = ((direction, -direction, direction) if -direction in order else (direction,))
+                                break
+                    advance = (obstacle + geometry.rear + .25) / math.cos(ANGLE)
+                    if order and advance > 0. and scan.begin(order, advance_m=advance, turn_angle=turn_angle):
+                        return 0., 0., 0., AVOIDING, "主动观察：停车后观察较空旷的一侧"
+                if (scan is not None and not (scan.active or scan.attempted)
+                        and scan.current_frame and may_scan and foreground
+                        and not any(_scan_yaw_rate(config, d) > 0.
+                                    and _scan_yaw_rate(config, d) >= config.floor_wz for d in order)):
+                    scan.exhaust()
+                if state is not None:
+                    state.escape_side = 0.0
+                    state.side_better_frames = 0
+                    state.recovery = True
+                if state.motion_source != "command" and feedback is None:
+                    return 0.0, 0.0, 0.0, AVOIDING, "缺少可用的速度或连续位姿，局部规划和主动观察暂停"
+                if approach_clear:
+                    state.recovery = False
+                    state.view_detour = None
+                    state.avoidance_yaw_override = True
+                    detail = "低速接近并转向" if approach_yaw else "低速接近"
+                    return (approach, 0., approach_yaw, AVOIDING,
+                            f"两侧无可执行避让路线；{detail}（障碍停车线 {brake_at:.2f} m）")
+                if state is not None and state.view_detour is not None and not (scan and scan.exhausted):
+                    return 0.0, 0.0, 0.0, AVOIDING, LocalHold.PREFIX.value
+                return 0.0, 0.0, 0.0, AVOIDING, NO_LOCAL_ROUTE
+        else:
+            usable = {s: (cov >= config.coverage_min, math.inf if room is None else room)
+                      for s, (room, cov) in rooms.items()
+                      if (target_distance is not None or near)
+                      and (room is None or room > config.side_clearance_m)}
+            if usable:
+                side = (state.escape_side if state and state.escape_side in usable
+                        else max(usable, key=usable.get))
+            else:
+                left, right = (_side_label(rooms[s][0], config) for s in (-1.0, 1.0))
+                blocked = (f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
+                           f"（左 {left}，右 {right}）")
+                if approach and (state is None or not state.recovery):
+                    if state is not None:
+                        state.escape_side = 0.0
+                    return (approach, 0.0, 0.0, AVOIDING,
+                            f"{blocked}；低速接近（停车线 {brake_at:.2f} m）")
+                if state is not None:
+                    state.escape_side = 0.0
+                    state.recovery = True
+                return 0.0, 0.0, 0.0, AVOIDING, f"{blocked}；停下"
 
-        def _room(room, coverage):
-            """How much room a side offers, or None if the answer is not usable.
+    elif scan is not None:
+        if scan.ready:
+            scan.finish()
+        clear = ahead is None or ahead >= check_distance
+        if scan.has_result and not near and (clear or not foreground):
+            _, occupied = scan.grid()
+            geometry = config.scan_geometry or config.local_geometry
+            front = geometry.front + config.obstacle_stop_m
+            corridor = (abs(RIGHT) <= _keepout_m(config)) & (FORWARD >= 0) & (FORWARD <= front)
+            clear = not occupied[corridor].any()
+        if clear:
+            scan.note_clear_path(scan.current_frame)
+            if coverage >= config.coverage_min and not scan.result_frame:
+                state.side_stall_s.clear()
+        if scan.result_frame:
+            return 0.0, 0.0, 0.0, AVOIDING, "主动观察：前方走廊尚不可通行"
 
-            Unmeasured is not free. Sideways is the direction a forward-facing
-            camera knows least about, and this is the one place the policy moves
-            into space it cannot see.
-            """
-            if coverage < config.coverage_min:
-                return None
-            if room is None:
-                return float("inf")
-            return room if room > config.slow_distance_m else None
-
-        options = {-1.0: _room(left_room, left_cov),
-                   1.0: _room(right_room, right_cov)}
-        usable = {sign: room for sign, room in options.items() if room is not None}
-
-        if not usable:
-            # Nowhere to go that we can see. Keep the target-derived yaw — it at
-            # least points at the target — and do not spin towards a band: a
-            # walking humanoid rotating at wz_max sweeps its shoulders through
-            # space no corridor checked, which is exactly how one found a
-            # doorframe.
-            return (0.0, 0.0, wz, AVOIDING,
-                    f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
-                    f"（左 {_side_label(left_room, left_cov, config)}，"
-                    f"右 {_side_label(right_room, right_cov, config)}）；停下")
-
-        sign = max(usable, key=lambda k: usable[k])
-        # Turn towards the gap rather than at full scale. The gap sits at
-        # `atan(keep / ahead)` off the nose, so this is the same proportional law
-        # the main loop uses applied to the angle that actually has to be closed
-        # — bounded, derived, and about a third of what wz_max was commanding.
-        gap_angle = math.atan2(keep, max(ahead, 0.1))
+    (floor_x, limit_x), (floor_y, limit_y) = _local_velocity_limits(config, 1. if vy < 0 else -1.)
+    vx = _scaled(vx, scale, floor_x, limit_x)
+    vy = _scaled(vy, scale, floor_y, limit_y)
+    if state is not None:
+        if side != state.escape_side:
+            state.side_better_frames = 0
+            state.side_compare_frame = depth.get("source_frame_id", depth.get("frame_id"))
+        state.escape_side = side
+    if local_command is not None:
+        vx, vy = local_command
+        wz = 0.0
+        state.view_detour = local_route
+        if (may_scan and scan is not None and scan.poses and scan.current_frame and not scan.command_only
+                and local_route is not None and len(local_route.points) > 1
+                and target_distance is not None and target_bearing is not None):
+            leg_geometry = local_route.geometry
+            goal = PathLeg.world_point(scan.pose, local_path.target_in_grid(
+                leg_geometry, target_distance * math.cos(target_bearing),
+                target_distance * math.sin(target_bearing)))
+            state.detour_leg = state.executing_leg = PathLeg(
+                leg_geometry, local_route.points[1], scan.pose, scan.motion_frame, goal, local_command)
+        state.avoidance_yaw_override = True
+        status, reason = AVOIDING, "局部规划：沿避障路线行进"
+    elif side:
+        # Blend in the turn as clearance shrinks, keeping yaw towards the
+        # chosen route even when the target is on the blocked side.
+        weight = 1.0 if near or not aligned else 1.0 - (ahead - stop) / max(1e-6, check_distance - stop)
         yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
                     else config.k_yaw)
-        wz = _clamp(-sign * yaw_gain * gap_angle, config.wz_max)
+        escape_yaw = _clamp(-side * yaw_gain * math.atan2(keep, max(ahead, 0.1)),
+                            config.wz_max)
+        tracking_yaw = wz if wz * escape_yaw > 0 else 0.0
+        wz = (1.0 - weight) * tracking_yaw + weight * escape_yaw
+        vx = vy = 0.
         if state is not None:
             state.avoidance_yaw_override = True
-        # `sign` indexes the **offset corridor** (+1 = the one displaced to the
-        # right), while the body frame has y pointing **left** — so the sidestep
-        # takes the opposite sign. Getting this wrong steps into the obstacle it
-        # just decided to avoid, at full speed, and every other signal in the
-        # decision still looks right.
-        vy = (_lift(-sign * config.vy_max * config.lateral_scale,
-                    config.floor_vy, config.vy_max)
-              if _may_strafe(sign > 0, depth, config) else 0.0)
-        side = "右" if sign > 0 else "左"
-        return (0.0, vy, wz, AVOIDING,
-                f"走廊内 {ahead:.2f} m 处有障碍；停止前进，朝{side}侧"
-                + ("让开并转向" if vy else "转向"))
+        direction = "右" if side > 0 else "左"
+        status, reason = AVOIDING, f"走廊内 {ahead:.2f} m 处有障碍，朝{direction}侧避让"
+        if 0. < abs(wz) < config.floor_wz:
+            rate = math.copysign(config.floor_wz, wz)
+            geometry = config.local_geometry
+            if (state is not None and geometry is not None and abs(rate) <= _scan_yaw_rate(config, side)
+                    and depth.get("map") is not None
+                    and depth.get("frame_id") is not None):
+                _, hits = state.local_plan.grid_for(depth, geometry)
+                sweep = math.copysign((abs(rate) + .10) * horizon_s, -rate)
+                if state.active_scan.clear_sweep(geometry, _keepout_m(config), sweep,
+                                                 STILL_LINEAR * horizon_s, occupied=hits):
+                    wz = rate
+                else:
+                    wz = 0.
+            else:
+                wz = 0.
+        if not vy and not wz:
+            if state is not None:
+                state.recovery = True
+            return 0.0, 0.0, 0.0, AVOIDING, "当前控制限制下无法转向避让；停下"
 
-    if ahead < config.slow_distance_m:
-        span = max(1e-6, config.slow_distance_m - config.obstacle_stop_m)
-        scale = max(0.0, (ahead - config.obstacle_stop_m) / span)
-        # Both translation axes scale together, so slowing down does not also
-        # change the direction of travel.
-        scale *= trust
-        return (_scaled(vx, scale, config.floor_vx, config.vx_max),
-                _scaled(vy, scale, config.floor_vy, config.vy_max), wz, AVOIDING,
-                f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速")
+    if state is not None and state.recovery:
+        if not side and ahead is not None and ahead <= stop + FORWARD_CLEARANCE_MARGIN_M:
+            return 0.0, 0.0, 0.0, AVOIDING, "近障停车，等待通道有足够余量"
+        if not near:
+            state.blocked_for_s = 0.0
+        state.recovery = False
+    return vx, vy, wz, status, reason
 
-    return (_scaled(vx, trust, config.floor_vx, config.vx_max),
-            _scaled(vy, trust, config.floor_vy, config.vy_max), wz,
-            status, reason)
+
+def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance, dt, *,
+                        target_bearing=None):
+    scan = state.active_scan
+    geometry = (config.scan_geometry or config.local_geometry
+                if scan.receipt_only else config.scan_geometry)
+    state.avoidance_yaw_override = True
+    if geometry is None or not scan.current_frame or target_distance is None:
+        return 0., 0., 0., AVOIDING, "主动观察：等候可用的前进观测"
+
+    motion = state.command_tail if scan.command_only else planar_feedback(odom)
+    previous = state.commanded
+    tolerance = STILL_LINEAR if scan.command_only else config.scan_odom_linear_tolerance_mps
+    if (motion is None or abs(motion[1]) > tolerance or abs(previous[1]) > STILL_LINEAR
+            or max(abs(motion[2]), abs(previous[2])) > STILL_YAW):
+        return 0., 0., 0., AVOIDING, "主动观察：等待转向停止"
+
+    horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+    waypoint_horizon = horizon + dt
+    floor = config.floor_vx_moving if config.floor_vx_moving is not None else config.floor_vx
+    target_room = target_distance - config.stop_distance_m
+    obstacle_room = ahead - stop if ahead is not None else math.inf
+    room = min(target_room, obstacle_room)
+    speed = min(config.vx_max, max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS), room / horizon)
+    usable_speed = speed > 0. and speed >= floor
+    remaining = scan.advance_m
+    if scan.advance_origin is None:
+        grid = scan.grid()
+        keep = _keepout_m(config)
+        corridor_clear = (local_path.segment_clear(grid[1], geometry, keep, 0., scan.advance_m)
+                          and local_path.transition_clear(grid, geometry, keep, 1., ((scan.advance_m, 0.),)))
+        too_close = not scan.route_segment and obstacle_room <= target_room and not usable_speed
+        if not corridor_clear or too_close:
+            matched_view = scan.matches_route_view(depth)
+            if (not scan.rerouted and not scan.command_only and matched_view
+                    and ahead is not None and target_bearing is not None
+                    and math.hypot(*motion[:2]) <= tolerance
+                    and math.hypot(*previous[:2]) <= STILL_LINEAR):
+                rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep) for s in (-1., 1.)}
+                frame = depth.get("source_frame_id", depth.get("frame_id"))
+                order = _local_side_order(rooms, config, state, frame)
+                if _start_detour_segment(depth, config, state, geometry, ahead, order,
+                                         target_distance, target_bearing, reroute=True):
+                    return 0., 0., 0., AVOIDING, "主动观察：原直行走廊被挡，停车对准新路线首段"
+            if matched_view or scan.command_only:
+                if not scan.route_segment and scan.try_other_side():
+                    return 0., 0., 0., AVOIDING, "主动观察：尝试另一侧"
+                scan.exhaust()
+            else:
+                scan.interrupt()
+            if corridor_clear:
+                return 0., 0., 0., AVOIDING, "主动观察：停车距离不足"
+            reason = ("路线首段的直行走廊被挡住" if scan.route_segment
+                      else "转向后的直行走廊仍然被挡住")
+            return 0., 0., 0., AVOIDING, f"主动观察：{reason}"
+    else:
+        start_f, start_r, heading = scan.advance_origin
+        if scan.command_only:
+            scan.advance_commanded_m += max(0., previous[0]) * state.command_dt_s
+            progress = scan.advance_commanded_m
+        else:
+            forward, right, _ = scan.pose
+            progress = (forward - start_f) * math.cos(heading) + (right - start_r) * math.sin(heading)
+        remaining -= progress
+        if remaining <= 0. or (scan.route_segment
+                              and remaining <= max(local_path.RESOLUTION / 2, floor * waypoint_horizon)):
+            scan.finish()
+            return 0., 0., 0., AVOIDING, "主动观察：直行段结束，重新评估前方"
+
+    if not usable_speed or max(motion[0], previous[0]) * horizon > room:
+        if (scan.route_segment and scan.advance_origin is not None and not scan.command_only
+                and ahead is not None and ahead + FORWARD_CLEARANCE_MARGIN_M < target_distance):
+            scan.hold_for_replan("主动观察：直行余量不足，停车后重规划", retry_scan=False)
+            return 0., 0., 0., AVOIDING, "主动观察：直行余量不足，停车后重规划"
+        return 0., 0., 0., AVOIDING, "主动观察：停车距离不足"
+    if scan.route_segment:
+        speed = min(speed, remaining / waypoint_horizon)
+        if speed < floor:
+            scan.exhaust()
+            return 0., 0., 0., AVOIDING, "主动观察：路线点距离不足以执行底盘最低速度"
+        if max(motion[0], previous[0]) * horizon > remaining + 1e-9:
+            return 0., 0., 0., AVOIDING, "主动观察：在路线点前制动"
+    if not local_path.transition_clear(scan.grid(), geometry, _keepout_m(config), horizon,
+                                       (motion[:2], previous[:2], (speed, 0.))):
+        if scan.advance_origin is None and scan.try_other_side():
+            return 0., 0., 0., AVOIDING, "主动观察：尝试另一侧"
+        return 0., 0., 0., AVOIDING, "主动观察：直行扫掠区有障碍"
+    if scan.advance_origin is None:
+        scan.advance_origin = scan.pose
+    if scan.route_segment and not scan.command_only:
+        state.executing_leg = PathLeg(geometry, (scan.advance_m, 0.), scan.advance_origin, scan.motion_frame)
+    return speed, 0., 0., AVOIDING, "主动观察：转稳后直行"
+
+
+def _local_translation(depth, config, state, odom, ahead, side):
+    if state is None or not config.use_lateral or depth.get("capture_invalid"):
+        return None
+    measured = planar_feedback(odom)
+    if measured is None and state.motion_source != "command":
+        return None
+    predicted = measured is None
+    measured = state.command_tail if predicted else measured
+    measured_vx, measured_vy, measured_wz = measured
+    allow_forward = depth.get("allow_forward", True)
+    geometry = config.scan_geometry if "scan_grid" in depth else config.local_geometry
+    limits = _local_velocity_limits(config, side)
+    floor, limit = limits[1]
+    if limit <= 0 or floor > limit:
+        return None
+    _, (return_floor, return_limit) = _local_velocity_limits(config, -side)
+    if state.escape_side == side and any(state.commanded[:2]):
+        heading = math.atan2(-state.commanded[1], state.commanded[0])
+        depth = dict(depth, preferred_heading=round(heading, 2))
+    command = state.local_plan.translation(depth, geometry,
+                                           _keepout_m(config), ahead, side, config.depth_age_limit_ms,
+                                           config.watchdog_ms,
+                                           allow_forward=allow_forward,
+                                           allow_return=return_limit > 0 and return_floor <= return_limit,
+                                           velocity_limits=limits)
+    if state.view_detour is None and state.local_plan.key is not None and (
+            state.local_plan.key[0] == depth.get("frame_id")):
+        state.view_detour = state.local_plan.plans.get(side)
+    if command is None:
+        return LocalHold.PREFIX if state.view_detour is not None else None
+    if (abs(measured_wz) > .02 or (not allow_forward and abs(measured_vx) > .03)
+            or measured_vy * side > .06 or (predicted and measured_vx < -.03)):
+        return LocalHold.TRANSITION
+    vx, vy = command
+    (floor_x, limit_x), (floor_y, limit_y) = limits
+    if not (floor_x <= abs(vx) <= limit_x or vx == 0):
+        return None
+    if not (vy == 0 or floor_y <= -side * vy <= limit_y):
+        return None
+    speed = math.hypot(vx, vy)
+    measured_speed = math.hypot(measured_vx, measured_vy)
+    if measured_speed > speed + .02:
+        return LocalHold.TRANSITION
+    previous = state.commanded[:2]
+    drift = speed and abs(measured_vx * vy - measured_vy * vx) / speed > .04
+    observed = depth.get("scan_grid") is not None or depth.get("map") is not None
+    ramping = predicted or previous != command or math.hypot(measured_vx - vx, measured_vy - vy) > .02
+    if depth.get("body_half_width") is not None or drift or (
+            geometry is not None and observed and ramping
+            and (vx or previous[0]) and (vy or previous[1])):
+        grid = depth.get("scan_grid")
+        if geometry is None:
+            return LocalHold.TRANSITION
+        if grid is None:
+            if depth.get("map") is None or depth.get("frame_id") is None:
+                return LocalHold.TRANSITION
+            grid = state.local_plan.grid_for(depth, geometry)
+        horizon_s = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        keepout = _keepout_m(config)
+
+        def clear(scale):
+            return local_path.transition_clear(grid, geometry, keepout, horizon_s,
+                                               (measured[:2], previous, (vx * scale, vy * scale)))
+
+        if not clear(1.):
+            low = max(floor_x / abs(vx) if vx else 0., floor_y / abs(vy) if vy else 0.,
+                      (measured_speed - .02) / speed)
+            if not clear(low):
+                return LocalHold.TRANSITION
+            high = 1.
+            for _ in range(5):
+                scale = (low + high) / 2
+                if clear(scale):
+                    low = scale
+                else:
+                    high = scale
+            if low <= 0.:
+                return LocalHold.TRANSITION
+            return vx * low, vy * low
+    return (vx, vy)
 
 
 def _scaled(value: float, factor: float, floor: float, ceiling: float) -> float:
@@ -1523,7 +2760,7 @@ def _scaled(value: float, factor: float, floor: float, ceiling: float) -> float:
     return _lift(value * factor, floor, ceiling)
 
 
-def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
+def _search(config: Config, state: State, dt: float, odom=None, *, requested_yaw=None) -> Decision:
     """Target not in frame. Turn towards where it last was, then give up.
 
     Two ways to stop, and the first is the better one. With odometry the sweep
@@ -1568,8 +2805,9 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     every extra second of spin sweeps the shoulders through space no corridor
     has checked.
     """
-    state.missing_frames += 1
-    if state.missing_frames < config.lost_frames:
+    if requested_yaw is None:
+        state.missing_frames += 1
+    if requested_yaw is None and state.missing_frames < config.lost_frames:
         # Briefly occluded — a person walking past. Emitting nothing for a few
         # frames lets the watchdog hold rather than starting a search for
         # something that has not actually gone.
@@ -1582,7 +2820,7 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     # though the required motion is impossible.  Fail immediately so the
     # caller can select another strategy rather than waiting for a search that
     # cannot start.
-    if config.search_rate <= 0.0:
+    if requested_yaw is None and config.search_rate <= 0.0:
         state.failed_reason = (
             f"cannot search for {state.target!r}: downstream chassis has no "
             "executable yaw search rate")
@@ -1595,7 +2833,7 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     # robot sweeps away from the last place it saw the thing — which still
     # finds it eventually, by going all the way round, and so reads as "search
     # is just slow" rather than as a wrong sign.
-    wz = -config.search_rate * state.last_seen_side
+    wz = -config.search_rate * state.last_seen_side if requested_yaw is None else requested_yaw
 
     # **The component along the direction we are turning, signed — not `abs`.**
     #
@@ -1614,8 +2852,8 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     # negative credit that a later real sweep has to pay off.
     measured = _measured_yaw_rate(odom)
     sweep_measured = measured is not None
+    direction = 1.0 if wz >= 0 else -1.0
     if sweep_measured:
-        direction = 1.0 if wz >= 0 else -1.0
         state.searched_rad = max(0.0, state.searched_rad
                                  + measured * direction * dt)
     else:
@@ -1626,7 +2864,7 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
         # it the command is zeroed downstream and this would count a rotation
         # that never happened. Keeping search_rate above the threshold is what
         # makes the two agree.
-        state.searched_rad += abs(wz) * dt
+        state.searched_rad = max(0., state.searched_rad + state.commanded[2] * direction * state.command_dt_s)
 
     # Exhausted searches used to go quiet, which left the caller with no answer
     # at all — the task neither succeeded nor failed, and only the ACP timeout
@@ -1678,13 +2916,12 @@ def _stuck(odom, state: State, commanded_vx: float, dt: float,
     if commanded_vx <= 0.05:
         state.moving_for_s = 0.0
         return ""
-    if odom is None:
-        return ""
-    measured = odom.get("vx")
+    measured = planar_axes(odom)[0]
     if measured is None:
+        state.moving_for_s = 0.0
         return ""
 
-    if abs(measured) >= config.stuck_speed_ratio * commanded_vx:
+    if measured >= config.stuck_speed_ratio * commanded_vx:
         state.moving_for_s = 0.0
         return ""
 

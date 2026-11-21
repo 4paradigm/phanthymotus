@@ -34,6 +34,8 @@ import math
 
 import numpy as np
 
+from .local_path import camera_square, intrinsics_for, optical_ground_plane
+
 # **The dashboard's own depth ramp, not a second one.**
 #
 # The first version used viridis, and the result was two panels side by side
@@ -65,6 +67,7 @@ _DEPTH_NEAR_SHARE = 0.72
 
 _NO_READING = (70, 70, 70)
 _CORRIDOR = (255, 255, 255)
+_EXECUTING_ROUTE = (115, 230, 105)
 _TARGET = (80, 220, 255)
 _ARROW = (120, 255, 120)
 _WARN = (80, 120, 255)
@@ -202,9 +205,75 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
     if not clearance or not math.isfinite(clearance) or clearance <= 0:
         return None
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    intrinsics = getattr(config, "depth_intrinsics", None)
+    if intrinsics is not None:
+        fx, cx = intrinsics.for_width(width)
+        edge_px = fx * keep / clearance
+        return int(round(cx - edge_px)), int(round(cx + edge_px))
     edge = math.atan2(keep, max(clearance, 0.05))
     return (_column_of(-edge, config.half_fov_rad, width),
             _column_of(edge, config.half_fov_rad, width))
+
+
+def _target_guidance(geometry, start, target, stop_distance_m):
+    if target is None:
+        return None
+    distance, bearing = target
+    if not (math.isfinite(distance) and distance > 0 and math.isfinite(bearing)):
+        return None
+    x, z = distance * math.sin(bearing), distance * math.cos(bearing)
+    goal = (z, x)
+    if geometry is not None:
+        forward, left = geometry.base_from_optical[:2, :3] @ (x, 0., z)
+        goal = (forward, -left)
+    approach = math.dist(start, goal)
+    if approach <= stop_distance_m + .05:
+        return None
+    end = tuple(target_m + (start_m - target_m) * stop_distance_m / approach
+                for start_m, target_m in zip(start, goal))
+    return start, end
+
+
+def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *,
+                stop_distance_m, pending=False):
+    """Project route boundaries and dashed guidance to the stopping point."""
+    if geometry is None or depth_m is None or ground is None or not (points or target):
+        return []
+    plane = optical_ground_plane(depth_m, geometry, ground)
+    if plane is None:
+        return []
+    optical_normal, offset = plane
+    transform = geometry.base_from_optical
+    rotation, origin = transform[:3, :3], transform[:3, 3]
+    normal = rotation @ optical_normal
+    if abs(normal[2]) < .5 * np.linalg.norm(normal):
+        return []
+    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
+    sections = [(np.asarray(points, dtype=float), pending)] if points else []
+    guidance = _target_guidance(geometry, points[-1] if points else (0., 0.), target, stop_distance_m)
+    if guidance is not None:
+        sections.append((np.linspace(*guidance, num=25), True))
+
+    near = .10
+    lines = []
+    for centre, dashed in sections:
+        forward = centre[:, 0]
+        for side in (-keep, keep):
+            right = centre[:, 1] + side
+            floor = (offset + normal @ origin - normal[0] * forward + normal[1] * right) / normal[2]
+            optical = (np.column_stack((forward, -right, floor)) - origin) @ rotation
+            for i, (a, b) in enumerate(zip(optical, optical[1:])):
+                if (dashed and len(centre) > 2 and i % 2 == 0) or max(a[2], b[2]) < near:
+                    continue
+                # Clip only the part behind the camera before projecting.
+                if a[2] < near:
+                    a = a + (b - a) * ((near - a[2]) / (b[2] - a[2]))
+                elif b[2] < near:
+                    b = b + (a - b) * ((near - b[2]) / (a[2] - b[2]))
+                start_px = (round(cx + fx * a[0] / a[2]), round(cy + fy * a[1] / a[2]))
+                end_px = (round(cx + fx * b[0] / b[2]), round(cy + fy * b[1] / b[2]))
+                lines.append((start_px, end_px, dashed))
+    return lines
 
 
 # Everything drawn on top gets a dark casing first.
@@ -236,6 +305,36 @@ def _line(frame, start, end, colour, thickness: int = 2):
     cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
 
 
+def _draw_route_inset(frame, detour, executing):
+    import cv2
+
+    routes = [(route.points, colour) for route, colour in
+              ((detour, _CORRIDOR), (executing, _EXECUTING_ROUTE))
+              if route is not None and len(route.points) > 1]
+    height, width = frame.shape[:2]
+    size = min(132, width // 3, height // 3)
+    if not routes or size < 40:
+        return
+
+    points = np.array([(0., 0.)] + [point for route, _ in routes for point in route])
+    lower, upper = points.min(axis=0), points.max(axis=0)
+    midpoint = (upper + lower) / 2
+    scale = (size - 32) / max(.3, float((upper - lower).max()))
+    left, top = width - size - 8, 8
+
+    def pixel(point):
+        forward, right = (point - midpoint) * scale
+        return round(left + size / 2 + right), round(top + size / 2 + 6 - forward)
+
+    cv2.rectangle(frame, (left, top), (left + size, top + size), _CASING, -1)
+    _text(frame, "Top view", (left + 7, top + 15), _CORRIDOR, .38)
+    for route, colour in routes:
+        pixels = [pixel(point) for point in route]
+        for start, end in zip(pixels, pixels[1:]):
+            _line(frame, start, end, colour, thickness=3)
+    cv2.circle(frame, pixel((0., 0.)), 3, _TARGET, -1, cv2.LINE_AA)
+
+
 def _arrow(frame, origin, dx, dy, colour, label: str):
     import cv2
 
@@ -246,8 +345,57 @@ def _arrow(frame, origin, dx, dy, colour, label: str):
         _text(frame, label, (end[0] + 6, end[1] + 4), colour, 0.45)
 
 
+def _dashed_line(frame, a, b, colour, phase=0.):
+    length = math.dist(a, b)
+    if not length:
+        return phase
+    offset = -phase
+    while offset < length:
+        start, end = max(0., offset), min(length, offset + 8.)
+        if start < end:
+            points = [tuple(round(x + (y - x) * t / length) for x, y in zip(a, b))
+                      for t in (start, end)]
+            _line(frame, *points, colour, thickness=2)
+        offset += 15.
+    return (phase + length) % 15.
+
+
+def _draw_target_direction(frame, bearing, box, config):
+    height, width = frame.shape[:2]
+    start = (width // 2, height - 46)
+    if box:
+        end = (round(width * (box[0] + box[2]) / 2), round(height * box[3]))
+        _dashed_line(frame, start, end, _TARGET)
+        return
+    if bearing is None or not math.isfinite(bearing):
+        return
+
+    intrinsics = getattr(config, "depth_intrinsics", None)
+    if abs(bearing) >= math.pi / 2:
+        column = width if bearing > 0. else -1
+    elif intrinsics is None:
+        column = _column_of(bearing, config.half_fov_rad, width)
+    else:
+        fx, cx = intrinsics.for_width(width)
+        column = round(cx + fx * math.tan(bearing))
+    offscreen = not 0 <= column < width
+    if offscreen:
+        column = width - 13 if bearing > 0. else 12
+    end = (column, round(height * .58))
+    _dashed_line(frame, start, end, _TARGET)
+
+    if offscreen:
+        direction = math.atan2(end[1] - start[1], end[0] - start[0])
+        for wing in (-.55, .55):
+            angle = direction + wing
+            corner = (round(end[0] - 13 * math.cos(angle)), round(end[1] - 13 * math.sin(angle)))
+            _line(frame, corner, end, _TARGET)
+
+
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, rgb_jpeg=None, blend: float = 0.5,
+           ground=None, detour=None, executing=None, depth_vertical=None, route_target=None,
+           target_bearing=None,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -280,6 +428,32 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                                interpolation=cv2.INTER_NEAREST)
 
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    geometry = (detour.geometry if detour is not None else
+                camera_square(config.depth_intrinsics, depth_vertical, config.half_width_m))
+    lines = route_lines(depth_m, ground, geometry, detour.points if detour is not None else (),
+                        None, keep, width, height,
+                        stop_distance_m=config.stop_distance_m,
+                        pending=detour is not None and detour.command is None)
+    phase, previous_end = 0., None
+    for a, b, dashed in lines:
+        visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
+        if visible:
+            if dashed:  # Guidance already contains gaps in ground coordinates.
+                _line(frame, a, b, _CORRIDOR, thickness=2)
+            else:
+                phase = _dashed_line(frame, a, b, _CORRIDOR, phase if a == previous_end else 0.)
+            previous_end = b
+
+    execution_visible = False
+    if executing is not None:
+        for a, b, _ in route_lines(depth_m, ground, executing.geometry, executing.points, None,
+                                  keep, width, height, stop_distance_m=config.stop_distance_m):
+            visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
+            if visible:
+                _line(frame, a, b, _EXECUTING_ROUTE, thickness=3)
+                execution_visible = True
+    if (detour is not None and previous_end is None) or (executing is not None and not execution_visible):
+        _draw_route_inset(frame, detour, executing)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -288,36 +462,21 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     # every range, which is the single fact that took longest to become visible.
     edges = corridor_edges(clearance, config, width)
     if edges:
-        left, right = edges
-        blocked = clearance <= config.obstacle_stop_m
-        colour = _WARN if blocked else _CORRIDOR
-
-        # **Drawn as a dimension, not as two lines.**
-        #
-        # Two bare verticals were asked about twice: they read as unrelated
-        # marks, and nothing connected them to the `+-0.33m` in the corner. A
-        # cross-bar with arrow ends is the drawing convention for "this is a
-        # width", and putting the number on the bar rather than in a corner is
-        # what makes it answer its own question.
-        bar = int(height * 0.30)
-        for x in (left, right):
-            _line(frame, (x, bar), (x, height), colour)
-        cv2.arrowedLine(frame, (left, bar), (right, bar), _CASING, 6,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (right, bar), (left, bar), _CASING, 6,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (left, bar), (right, bar), colour, 2,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (right, bar), (left, bar), colour, 2,
-                        tipLength=0.04)
-        span = f"path {keep * 2:.2f}m wide"
-        (tw, _), _ = cv2.getTextSize(span, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        _text(frame, span, ((left + right - tw) // 2, bar - 8), colour, 0.5)
-        _text(frame,
-              f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
+        colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
+        if not lines:
+            for far, near in zip(edges, corridor_edges(clearance * .5, config, width)):
+                visible, a, b = cv2.clipLine((0, 0, width, height),
+                                            (far, int(height * .62)), (near, height - 1))
+                if visible:
+                    _dashed_line(frame, a, b, colour)
+        _text(frame, f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
               (8, 24), colour, 0.55)
+    if edges or lines:
+        _text(frame, f"path {2 * keep:.2f}m wide", (8, 46), _CORRIDOR, 0.5)
 
     # ── the target ───────────────────────────────────────────────────────────
+    bearing = route_target[1] if route_target is not None else target_bearing
+    _draw_target_direction(frame, bearing, box, config)
     if box:
         x1, y1, x2, y2 = (int(box[0] * width), int(box[1] * height),
                           int(box[2] * width), int(box[3] * height))

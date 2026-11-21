@@ -16,7 +16,7 @@ def feed(card, distance, bearing=0.0):
     card._depth_map = _solid_depth(distance)
     card._depth_bands = {name: distance for name in ("left", "center", "right")}
     card._objects_ms = card._depth_ms = int(now * 1000)
-    card._last_tick = now - 0.1
+    card._last_tick = time.monotonic() - 0.1
     return card.next_command()
 
 
@@ -97,11 +97,16 @@ def test_saved_legacy_yaw_flag_cannot_restore_scheduling_on_start():
         card._stop()
 
 
-def test_default_forward_gain_stops_at_the_configured_arrival_threshold():
+def test_default_forward_gain_stops_at_the_configured_arrival_threshold(monkeypatch):
     card = _card(use_lateral=False, stop_distance_m=0.8, stop_tolerance_m=0.05)
     card._running = True
     card._state.target = "chair"
-    emitted = [feed(card, 0.84) for _ in range(12)]
+    now = [123.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    emitted = []
+    for _ in range(12):
+        emitted.append(feed(card, 0.84))
+        now[0] += 0.1
     zeros = [message for message in emitted
              if message is not None and message["values"] == [0.0] * 6]
     assert len(zeros) == 1
