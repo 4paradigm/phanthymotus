@@ -1464,3 +1464,27 @@ def test_front_camera_near_memory_rotates_about_the_base_centre():
     look.update_near_obstacles(None, geometry, turned, .30, 1.50, approaching=False)
     assert look.near_hits[scan.START[0] - 5, scan.START[1] + 15]
     assert not look.near_hits[scan.START[0], scan.START[1] + 10]
+
+
+@pytest.mark.parametrize("speed,collision", [(.075, False), (.15, True)])
+def test_forward_sweep_uses_original_rotated_obstacle_after_it_leaves_view(speed, collision):
+    from plugins.navi import local_path
+
+    pose = PlanarPose(1795284451891, ("odom",), 9.3620810745, -.6700612578, -.2815547738)
+    memory = scan.ObservedObstacles(frame=pose.frame, cells={(185, -23)})
+    raster, squares = memory.project(pose, include_squares=True)
+    assert raster.sum() == 4
+    geometry = Geometry(None, None, np.eye(4), 0., .55, None)
+    velocities = ((-.000305, 0., 0.), (.0375, 0., -.06249), (speed, 0., -.06249))
+    args = (geometry, .275, 1.75, velocities)
+    assert local_path.motion_sweep_hits(raster, *args, padding=.109 * speed).any()
+    assert bool(local_path.motion_sweep_hits(squares, *args, padding=.109 * speed).any()) is collision
+    assert memory.cells == {(185, -23)}
+
+
+def test_exact_square_sweep_keeps_a_cell_enclosed_by_the_center_envelope():
+    from plugins.navi import local_path
+
+    occupancy = local_path.ObstacleSquares(np.array([[.10, .10]]), math.pi / 4)
+    geometry = Geometry(None, None, np.eye(4), 0., 0., None)
+    assert local_path.motion_sweep_hits(occupancy, geometry, 0., 1., ((.30, 0., 0.), (0., -.30, 0.))).any()

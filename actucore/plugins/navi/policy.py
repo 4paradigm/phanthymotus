@@ -1051,7 +1051,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
                 if scan.active or any(state.commanded):
                     state.feedback_guard_s = max(state.feedback_guard_s, (config.watchdog_ms + 50) / 1000)
                 state.active_scan = ActiveScan(obstacles=scan.obstacles, near_obstacles=scan.near_obstacles,
-                                               near_hits=scan.near_hits, near_revision=scan.near_revision,
+                                               near_hits=scan.near_hits, near_squares=scan.near_squares,
+                                               near_revision=scan.near_revision,
                                                observed_world=scan.observed_world)
                 state.escape_side = 0.
             # Keep one frame of reference for the rest of this task after a
@@ -1402,7 +1403,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             previous_scan.invalidate()
             state.active_scan = ActiveScan(obstacles=previous_scan.obstacles,
                                            near_obstacles=previous_scan.near_obstacles,
-                                           near_hits=previous_scan.near_hits, near_revision=previous_scan.near_revision,
+                                           near_hits=previous_scan.near_hits, near_squares=previous_scan.near_squares,
+                                           near_revision=previous_scan.near_revision,
                                            observed_world=previous_scan.observed_world)
             if needs_guard:
                 state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
@@ -2133,6 +2135,11 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     free, occupied = grid
     observation = dict(depth, projected_grid=grid, body_half_width=config.half_width_m,
                        closest=closest, allow_unknown=True)
+    shadow = scan.occlusion(geometry) if scan.receipt_only and not config.use_lateral else None
+    if shadow is not None and shadow.any():
+        observation["preview_occluded"] = True
+    else:
+        shadow = None
     if scan.near_hits is not None:
         observation["scan_revision"] = scan.near_revision
     if not scan.receipt_only:
@@ -2196,14 +2203,23 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
 
     horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
     turn_occupied = occupied | scan.views[-1][3]
+    latest_free = scan.views[-1][2]
+    have_free_evidence = bool(latest_free.any())
     for plan, require_observed in candidates():
-        for index in range(len(plan.points) - 1, 0, -1):
+        visible = local_path.visible_prefix(plan.points, shadow) if shadow is not None else len(plan.points)
+        preview = plan.points if visible < len(plan.points) else ()
+        for index in range(visible - 1, 0, -1):
             forward, right = plan.points[index]
             # A perpendicular waypoint can be reached by turning before driving.
             if forward < 0. or (forward == 0. and (config.use_lateral or not right)):
                 continue
             if (require_observed and depth.get("ground") is not None and geometry.free_space_validated
                     and not local_path.observed_waypoint(free, forward, right)):
+                continue
+            if preview and have_free_evidence and not local_path.observed_waypoint(latest_free, forward, right):
+                continue
+            if shadow is not None and index > 1 and local_path.visible_prefix(
+                    (plan.points[0], plan.points[index]), shadow) < 2:
                 continue
             angle, length = math.atan2(right, forward), math.hypot(forward, right)
             if length < floor_x * horizon:
@@ -2225,8 +2241,11 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                         (STILL_LINEAR * horizon if scan.command_only
                          else scan._turn_translation(horizon, scan.motion)), occupied=turn_occupied))
                     and scan.begin((math.copysign(1., angle),), advance_m=length,
-                                   turn_angle=abs(angle), route_segment=True, reroute=reroute)):
-                state.view_detour = local_path.Detour(None, (plan.points[0], *plan.points[index:]), geometry)
+                                   turn_angle=abs(angle), route_segment=True, reroute=reroute,
+                                   occluded_route=bool(preview))):
+                points = ((plan.points[0], plan.points[index]) if preview
+                          else (plan.points[0], *plan.points[index:visible]))
+                state.view_detour = local_path.Detour(None, points, geometry, preview)
                 return True
     return False
 
@@ -2307,9 +2326,12 @@ def _target_corridor_clear(depth, config, scan, distance, bearing, velocities):
     length = max(0., math.hypot(forward, right) - config.stop_distance_m)
     keep = _keepout_m(config)
     horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
-    return (local_path.segment_clear(occupied, geometry, keep, math.atan2(right, forward), length)
-            and local_path.motion_sweep_clear((free, occupied), geometry, config.half_width_m,
-                                          horizon, velocities))
+    if not local_path.segment_clear(occupied, geometry, keep, math.atan2(right, forward), length):
+        return False
+    motion_grid = scan.grid(include_near=False) if scan.near_squares is not None else (free, occupied)
+    return (local_path.motion_sweep_clear(motion_grid, geometry, config.half_width_m, horizon, velocities)
+            and (scan.near_squares is None or not scan.near_motion_hits(
+                geometry, config.half_width_m, horizon, velocities).any()))
 
 
 def _near_sweep_hits(config, scan, odom, state, twist):
@@ -2317,10 +2339,7 @@ def _near_sweep_hits(config, scan, odom, state, twist):
     motion = planar_feedback(odom) or state.command_tail
     velocities = (motion, state.commanded, twist)
     horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
-    age = max(0, scan.control_ms - scan.near_revision) / 1000
-    padding = age * max(math.hypot(vx, vy) for vx, vy, _ in velocities)
-    return local_path.motion_sweep_hits(scan.near_hits, geometry, config.half_width_m, horizon,
-                                        velocities, padding=padding)
+    return scan.near_motion_hits(geometry, config.half_width_m, horizon, velocities)
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
@@ -2581,7 +2600,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 if (may_scan and foreground and geometry is not None
                         and config.floor_wz <= yaw_rate and yaw_rate > 0
                         and scan.current_frame):
-                    if ((not scan.attempted or (scan.exhausted and not scan.rerouted))
+                    retry = scan.exhausted and not scan.rerouted
+                    if not config.use_lateral and scan.receipt_only and config.scan_geometry is None:
+                        retry = scan.matches_route_view(depth) and scan.retry_route(config.max_obs_age_ms)
+                    if ((not scan.attempted or retry)
                             and _start_detour_segment(depth, config, state, geometry, ahead, order,
                                                      target_distance, target_bearing, rooms=rooms,
                                                      reroute=scan.exhausted, closest=scan.exhausted)):
@@ -2785,35 +2807,41 @@ def _checked_forward_prefix(scan, geometry, config, state, odom, motion, vx, hor
     (floor, _), _ = _local_velocity_limits(config, 1.)
     if vx <= 0. or vx < floor:
         return None
-    grid = scan.grid()
+    grid = scan.grid(include_near=scan.near_squares is None)
     turns = (yaw, 0.) if yaw else (0.,)
     if sides:
         # A wheeled detour can also bend toward the side with more clearance.
         steer = yaw or -sides[0] * .25
         turns = (steer, .5 * steer, -math.copysign(.25, steer), 0.)
-    for requested in turns:
-        turn = _clamp(requested, _scan_yaw_rate(config, 1. if requested < 0. else -1.))
-        if requested and (not turn or abs(turn) < config.floor_wz_moving):
-            continue
-        velocities = motion, state.commanded, (vx, 0., turn)
-        if max(math.hypot(v[0], v[1]) for v in velocities) * horizon > room:
-            continue
-        if not local_path.motion_sweep_clear(grid, geometry, config.half_width_m, horizon, velocities):
-            continue
-        if scan.near_hits is not None and _near_sweep_hits(config, scan, odom, state, (vx, 0., turn)).any():
-            continue
-        if turn:
-            radius = vx / turn
-            points = tuple((radius * math.sin(turn * t), -radius * (1. - math.cos(turn * t)))
-                           for t in np.linspace(0., horizon, 6))
-        else:
-            points = ((0., 0.), (vx * horizon, 0.))
-        state.view_detour = Detour(None, points, geometry)
-        state.checked_prefix = True
-        state.avoidance_yaw_override = True
-        state.recovery = False
-        note = "沿可通行弧段前进" if turn else "沿可通行直行段前进"
-        return vx, 0., turn, AVOIDING, f"局部规划：{note}"
+    # Try shorter swept distances when the full-speed arc clips a corner.
+    # The current motion and all occupied evidence still constrain every trial.
+    for fraction in (1., .5, .25):
+        speed = vx * fraction
+        if speed < floor:
+            break
+        for requested in turns:
+            turn = _clamp(requested, _scan_yaw_rate(config, 1. if requested < 0. else -1.))
+            if requested and (not turn or abs(turn) < config.floor_wz_moving):
+                continue
+            velocities = motion, state.commanded, (speed, 0., turn)
+            if max(math.hypot(v[0], v[1]) for v in velocities) * horizon > room:
+                continue
+            if not local_path.motion_sweep_clear(grid, geometry, config.half_width_m, horizon, velocities):
+                continue
+            if scan.near_hits is not None and _near_sweep_hits(config, scan, odom, state, (speed, 0., turn)).any():
+                continue
+            if turn:
+                radius = speed / turn
+                points = tuple((radius * math.sin(turn * t), -radius * (1. - math.cos(turn * t)))
+                               for t in np.linspace(0., horizon, 6))
+            else:
+                points = ((0., 0.), (speed * horizon, 0.))
+            state.view_detour = Detour(None, points, geometry)
+            state.checked_prefix = True
+            state.avoidance_yaw_override = True
+            state.recovery = False
+            note = "沿可通行弧段前进" if turn else "沿可通行直行段前进"
+            return speed, 0., turn, AVOIDING, f"局部规划：{note}"
     return None
 
 
@@ -2885,6 +2913,11 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
                               and remaining <= max(local_path.RESOLUTION / 2, floor * waypoint_horizon)):
             scan.finish()
             return 0., 0., 0., AVOIDING, "主动观察：直行段结束，重新评估前方"
+
+    if (scan.occluded_route and local_path.visible_prefix(
+            ((0., 0.), (remaining, 0.)), scan.occlusion(geometry)) < 2):
+        scan.hold_for_replan("局部规划：前进段进入遮挡区，等待新视角复检", retry_scan=False)
+        return 0., 0., 0., AVOIDING, "局部规划：前进段进入遮挡区，等待新视角复检"
 
     if not usable_speed or max(motion[0], previous[0]) * horizon > room:
         if (scan.route_segment and scan.advance_origin is not None and not scan.command_only

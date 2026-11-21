@@ -5072,3 +5072,107 @@ def test_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monke
                                    config, state, geometry, .45, (1., -1.), 2.8, -.06)
     assert scan.directions == (-1.,)
     assert scan.advance_m == pytest.approx(.65)
+
+
+def test_checked_prefix_slows_before_stopping_for_an_obstacle_near_the_sweep():
+    grid = P.local_path
+    geometry = grid.camera_square(P.HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .275, at_front=True)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
+    state = _state()
+    scan = state.active_scan
+    scan.receipt_only = True
+    occupied = np.isclose(grid.FORWARD, .20) & np.isclose(grid.RIGHT, .30)
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    result = P._checked_forward_prefix(scan, geometry, config, state, None, (0., 0., 0.),
+                                       .15, 1.75, 1., 0.)
+    assert result is not None and 0. < result[0] < .15
+    assert not grid.motion_sweep_clear((~occupied, occupied), geometry, .275, 1.75, ((.15, 0., 0.),))
+    assert grid.motion_sweep_clear((~occupied, occupied), geometry, .275, 1.75, (result[:3],))
+
+
+def test_exhausted_camera_route_retries_only_with_new_depth_and_search_budget():
+    from plugins.navi.active_scan import ActiveScan
+
+    scan = ActiveScan(receipt_only=True, attempted=True, exhausted=True, rerouted=True,
+                      current_frame=1000, source_frame=900)
+    assert scan.retry_route(500)
+    assert not scan.rerouted
+    assert not scan.retry_route(500)
+    scan.current_frame = 1600  # Re-receiving the same depth is no new evidence.
+    assert not scan.retry_route(500)
+    scan.source_frame = 1399
+    assert not scan.retry_route(500)
+    scan.source_frame = 1400
+    assert scan.retry_route(500)
+
+
+def test_occluded_cells_stay_unknown_and_new_free_returns_take_precedence():
+    grid = P.local_path
+    geometry = grid.Geometry(None, None, np.eye(4), 0., .55, None)
+    empty = np.zeros(grid.SHAPE, dtype=bool)
+    occupied = np.isclose(grid.FORWARD, 1.) & (abs(grid.RIGHT) <= .15)
+    shadow = grid.occluded_cells(empty, occupied, geometry)
+    assert shadow[grid.START[0] + 30, grid.START[1]]
+    assert not shadow[grid.START[0] + 15, grid.START[1]]
+    assert not shadow[grid.START[0] + 30, grid.START[1] + 15]
+    assert not (shadow & occupied).any()
+
+    free = np.isclose(grid.FORWARD, 1.5) & np.isclose(grid.RIGHT, 0.)
+    restored = grid.occluded_cells(free, occupied, geometry)
+    assert not (restored & free).any()
+    assert grid.visible_prefix(((0., 0.), (.5, .30), (1.5, .30), (1.5, 0.)), shadow) == 3
+    assert grid.visible_prefix(((0., 0.), (.5, .30), (1.5, .30)), restored) == 3
+
+
+def test_local_detour_keeps_occluded_tail_as_preview_and_executes_visible_waypoint():
+    grid = P.local_path
+    geometry = grid.camera_square(P.HorizontalIntrinsics(640, 420, 320), (480, 420, 240), .275, at_front=True)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.275,
+                  stop_distance_m=.60)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    occupied = np.isclose(grid.FORWARD, .80) & (abs(grid.RIGHT) <= .23)
+    shadow = grid.occluded_cells(np.zeros(grid.SHAPE, dtype=bool), occupied, geometry)
+    free = (grid.FORWARD > .1) & (grid.FORWARD < 3.) & ~occupied & ~shadow
+    scan.views.append((1000, scan.pose, free, occupied))
+    depth = dict(frame_id=1000, map=np.full((480, 640), 4.), ground=np.ones((480, 640), dtype=bool))
+
+    assert P._start_detour_segment(depth, config, state, geometry, .8, (-1., 1.), 2.3, 0.)
+    assert scan.occluded_route
+    route = state.view_detour
+    assert len(route.points) == grid.visible_prefix(route.points, shadow) == 2
+    assert grid.observed_waypoint(free, *route.points[-1])
+    assert grid.visible_prefix(route.preview, shadow) < len(route.preview)
+    assert scan.advance_m == pytest.approx(math.hypot(*route.points[-1]))
+
+
+def test_checked_arc_uses_original_cell_without_dropping_its_collision_margin():
+    from plugins.navi.odom import PlanarPose
+
+    grid = P.local_path
+    geometry = grid.Geometry(None, None, np.eye(4), 0., .55, None)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275,
+                  max_depth_age_ms=1200, watchdog_ms=500)
+    state = _state(commanded=(.0375, 0., -.06249))
+    scan = state.active_scan
+    pose = PlanarPose(1891, ("odom",), 9.3620810745, -.6700612578, -.2815547738)
+    scan.near_obstacles.frame = pose.frame
+    scan.near_obstacles.cells.add((185, -23))
+    scan.near_hits, squares = scan.near_obstacles.project(pose, include_squares=True)
+    scan.control_ms, scan.near_revision = 2000, 1891
+    empty = np.zeros(grid.SHAPE, dtype=bool)
+    scan.receipt_only = True
+    scan.views.append((2000, scan.pose, ~empty, empty))
+    motion = (-.000305, 0., 0.)
+    odom = dict(vx=motion[0], vy=motion[1], wz=motion[2])
+
+    def prefix():
+        return P._checked_forward_prefix(scan, geometry, config, state, odom, motion,
+                                         .15, 1.75, 1., -.06249, (-1., 1.))
+
+    assert prefix()[0] == pytest.approx(.0375)
+    scan.near_squares = squares
+    assert prefix()[0] == pytest.approx(.075)
+    assert scan.grid()[1].sum() == 4

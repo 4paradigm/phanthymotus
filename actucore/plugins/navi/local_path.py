@@ -188,6 +188,34 @@ def _floorless_hits(frame):
     return hits
 
 
+def _floor_patch_evidence(frame, heights, pixels, intrinsics, optical_normal):
+    """Look for floor on both sides of a low return and a vertical face below it."""
+    fx, cx, fy, cy = intrinsics
+    row, col = np.divmod(pixels, frame.shape[1])
+    depth = frame[row, col]
+    floor_above = np.zeros(len(row), dtype=bool)
+    floor_below = floor_above.copy()
+    for distance in (.06, .08, .10):
+        step = np.ceil(distance * fy / depth).astype(int)
+        top = row - step
+        bottom = row + step
+        floor_above |= (top >= 0) & (abs(heights[np.maximum(top, 0), col]) <= .025)
+        floor_below |= (bottom < frame.shape[0]) & (
+            abs(heights[np.minimum(bottom, frame.shape[0] - 1), col]) <= .025)
+    x, y = (col - cx) * depth / fx, (row - cy) * depth / fy
+    down = optical_normal / np.linalg.norm(optical_normal)
+    face = np.ones(len(row), dtype=bool)
+    for distance in (.0225, .045):
+        dx, dy, dz = distance * down
+        expected = depth + dz
+        r = np.rint(cy + (y + dy) * fy / expected).astype(int)
+        c = np.rint(cx + (x + dx) * fx / expected).astype(int)
+        face &= (r >= 0) & (r < frame.shape[0]) & (c >= 0) & (c < frame.shape[1])
+        r, c = np.clip(r, 0, frame.shape[0] - 1), np.clip(c, 0, frame.shape[1] - 1)
+        face &= (abs(frame[r, c] - expected) <= .008) & (heights[r, c] >= .003)
+    return floor_above & floor_below, face
+
+
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
             require_valid_depth=False, check_free_space=True):
     valid = np.isfinite(frame) & (frame > 0.) if frame is not None else None
@@ -220,13 +248,17 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         valid &= frame <= max_hit_depth
         hits &= valid
     samples = valid if check_free_space else hits
+    floor_context = None
+    if above_floor is not None and geometry.min_obstacle_height == APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M:
+        floor_context = (frame, above_floor, samples, (fx, cx, fy, cy), optical_normal)
     return _project_observed(geometry, right, forward, resolution, x[samples], y[samples], frame[samples],
                              hits[samples], check_free_space=check_free_space,
-                             heights=above_floor[samples] if above_floor is not None else None)
+                             heights=above_floor[samples] if above_floor is not None else None,
+                             floor_context=floor_context)
 
 
 def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
-                      check_free_space, heights):
+                      check_free_space, heights, floor_context=None):
     transform = geometry.base_from_optical
     body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
     body_l = x * transform[1, 0] + y * transform[1, 1] + z * transform[1, 2] + transform[1, 3]
@@ -247,7 +279,8 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
     if small.any():
         near = max(.40, geometry.front + 2 * resolution)
-        weak = (counts < 8) & (forward**2 + right**2 > near**2)
+        far = forward**2 + right**2 > near**2
+        weak = (counts < 8) & far
         if heights is None:
             occupied &= ~(small & weak)
         else:
@@ -257,7 +290,23 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
             lowest = np.full(right.shape, np.inf)
             np.maximum.at(highest, sparse_cells, heights[sparse_hits])
             np.minimum.at(lowest, sparse_cells, heights[sparse_hits])
-            occupied &= ~(small & ((highest < .05) | (weak & (highest - lowest < .05))))
+            weak = small & weak & (highest - lowest < .05)
+            occupied &= ~(small & (highest < .05))
+            if floor_context is None:
+                occupied &= ~weak
+            else:
+                # Only suppress an extra near-floor patch with positive floor evidence.
+                # A thin upright face can also rescue a return from the weak-hit rule.
+                low = small & far & (highest <= APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M + .01)
+                candidates = (low | weak)[cells] & raised
+                if candidates.any():
+                    frame, above_floor, samples, intrinsics, optical_normal = floor_context
+                    pixels = np.flatnonzero(samples)[in_grid][candidates]
+                    floor, face = _floor_patch_evidence(frame, above_floor, pixels, intrinsics, optical_normal)
+                    ids = cell_ids[candidates]
+                    floor_votes = np.bincount(ids[floor], minlength=right.size).reshape(right.shape)
+                    face_votes = np.bincount(ids[face], minlength=right.size).reshape(right.shape)
+                    occupied &= ~((weak | (low & (floor_votes >= .8 * counts))) & (face_votes < 2))
     # Only metric returns establish visibility. Unseen gaps, blind regions,
     # and cells behind the last measured surface retain the unknown state.
     free = np.zeros(right.shape, dtype=bool)
@@ -331,6 +380,7 @@ class Detour:
     command: tuple[float, float] | None
     points: tuple[tuple[float, float], ...]  # metres, (forward, right)
     geometry: Geometry
+    preview: tuple[tuple[float, float], ...] = ()
 
 
 def target_in_grid(geometry, forward, right):
@@ -425,7 +475,8 @@ class PlanCache:
         key = (frame, round(ahead, 2), half_width, max_age_ms, watchdog_ms, observation.get("scan_revision"),
                allow_forward, allow_return, velocity_limits, observation.get("stop_target"),
                observation.get("body_half_width"), observation.get("closest"),
-               observation.get("preferred_heading"), observation.get("allow_unknown", False))
+               observation.get("preferred_heading"), observation.get("allow_unknown", False),
+               observation.get("preview_occluded", False))
         if self.key != key:
             self.key = key
             self.plans.clear()
@@ -440,7 +491,8 @@ class PlanCache:
                 closest=observation.get("closest", False),
                 preferred_heading=observation.get("preferred_heading"),
                 allow_unknown=observation.get("allow_unknown", False),
-                require_observed_endpoint=ground is not None and geometry.free_space_validated)
+                require_observed_endpoint=(ground is not None and geometry.free_space_validated
+                                           and not observation.get("preview_occluded")))
         return self.plans[side]
 
 
@@ -464,6 +516,41 @@ def observed_waypoint(free, forward, right):
     return 0 <= row < free.shape[0] and 0 <= col < free.shape[1] and bool(free[row, col])
 
 
+def occluded_cells(free, occupied, geometry):
+    """Mark unknown cells behind the closest measured obstacle on each camera ray."""
+    if not occupied.any():
+        return np.zeros_like(occupied)
+    origin = geometry.base_from_optical[:2, 3]
+    forward, right = FORWARD - origin[0], RIGHT + origin[1]
+    ranges = np.hypot(forward, right)
+    angles = np.arctan2(right, forward)
+    ray_count = 360
+    rays = (angles + math.pi / 2) * (ray_count / math.pi)
+    near = np.full(ray_count, np.inf)
+    hit = occupied & (forward > 0.)
+    radius = RESOLUTION / 2
+    width = np.arctan2(radius, ranges[hit]) * (ray_count / math.pi)
+    starts = np.maximum(0, np.floor(rays[hit] - width).astype(int))
+    ends = np.minimum(ray_count, np.floor(rays[hit] + width).astype(int) + 1)
+    for start, end, distance in zip(starts, ends, ranges[hit]):
+        np.minimum(near[start:end], distance, out=near[start:end])
+    nearest = near[np.clip(rays.astype(int), 0, ray_count - 1)]
+    return (forward > 0.) & ~free & ~occupied & (ranges > nearest + RESOLUTION)
+
+
+def visible_prefix(points, occluded):
+    """Return the count of waypoints reachable before crossing a shadow."""
+    for index, (start, end) in enumerate(zip(points, points[1:]), 1):
+        count = max(2, math.ceil(2 * math.dist(start, end) / RESOLUTION) + 1)
+        f, r = np.linspace(start, end, count).T
+        rows = START[0] + np.rint(f / RESOLUTION).astype(int)
+        cols = START[1] + np.rint(r / RESOLUTION).astype(int)
+        valid = (rows >= 0) & (rows < SHAPE[0]) & (cols >= 0) & (cols < SHAPE[1])
+        if occluded[rows[valid], cols[valid]].any():
+            return index
+    return len(points)
+
+
 def _transition_hits(occupied, geometry, half_width, horizon_s, velocities, padding):
     forward, right = zip(*((vx * horizon_s, -vy * horizon_s) for vx, vy in velocities))
     rear = -geometry.rear + min(0., *forward)
@@ -481,9 +568,52 @@ def transition_clear(grid, geometry, half_width, horizon_s, velocities, *, paddi
     return not _transition_hits(grid[1], geometry, half_width, horizon_s, velocities, padding).any()
 
 
+@dataclass(frozen=True)
+class ObstacleSquares:
+    """Original map cells expressed in the local (forward, right) frame."""
+
+    centers: np.ndarray
+    yaw: float
+
+
+def _square_sweep_hits(squares, lower, upper, radius):
+    # The pose yaw maps the map axes to forward/right. Both boxes are
+    # closed, so tangency counts as contact.
+    c, s = math.cos(squares.yaw), math.sin(squares.yaw)
+    axes = np.array(((c, s), (s, -c)))
+    lo, hi = np.array(lower), np.array(upper)
+    half = RESOLUTION / 2
+    center, extent = (lo + hi) / 2, (hi - lo) / 2
+    square_extent = half * np.abs(axes).sum(axis=1)
+    gaps = np.maximum(np.abs(squares.centers - center) - extent - square_extent, 0.)
+    candidates = squares.centers[(gaps**2).sum(axis=1) <= radius**2]
+    result = np.zeros(SHAPE, dtype=bool)
+    if not candidates.size:
+        return result
+
+    delta = candidates - center
+    # Four separating axes detect overlap even when no vertex is contained.
+    overlap = ((np.abs(delta) <= extent + square_extent).all(axis=1)
+               & (np.abs(delta @ axes) <= extent @ np.abs(axes) + half).all(axis=1))
+    offsets = np.array(((-1., -1.), (-1., 1.), (1., -1.), (1., 1.)))
+    vertices = candidates[:, None, :] + (half * offsets) @ axes
+    to_rect = np.maximum(0., np.maximum(lo - vertices, vertices - hi))
+    corners = center + extent * offsets
+    to_square = np.maximum(0., np.abs((corners - candidates[:, None, :]) @ axes) - half)
+    distance2 = np.minimum((to_rect**2).sum(axis=2).min(axis=1),
+                           (to_square**2).sum(axis=2).min(axis=1))
+    # Only project the cells that actually intersect the sweep. The mask is
+    # used for diagnostics and choosing a direction, not to decide contact.
+    rows, cols = (candidates[overlap | (distance2 <= radius**2)] / RESOLUTION + START).T
+    for r in (np.floor(rows), np.ceil(rows)):
+        for k in (np.floor(cols), np.ceil(cols)):
+            valid = (r >= 0) & (r < SHAPE[0]) & (k >= 0) & (k < SHAPE[1])
+            result[r[valid].astype(int), k[valid].astype(int)] = True
+    return result
+
+
 def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0.):
     """Sweep a circle centered on the chassis through its possible translations."""
-    rows, cols = np.nonzero(occupied)
     center = (geometry.front - geometry.rear) / 2
     radius = math.hypot(geometry.half_length, half_width) + .05
     # Independently ramped components can reach any center in these bounds.
@@ -491,13 +621,18 @@ def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, pa
     forward, right = zip(*((vx * horizon, -vy * horizon) for vx, vy, _ in velocities))
     turn = max(abs(yaw) for _, _, yaw in velocities) * horizon
     travel = math.hypot(max(map(abs, forward)), max(map(abs, right)))
-    slack = padding + travel * min(2., turn / 2)
-    f, r = FORWARD[rows, cols] - center, RIGHT[rows, cols]
-    # Use the nearest point of each occupied cell against the circle.
+    radius += padding + travel * min(2., turn / 2)
+    lower = center + min(0., *forward), min(0., *right)
+    upper = center + max(0., *forward), max(0., *right)
+    if isinstance(occupied, ObstacleSquares):
+        return _square_sweep_hits(occupied, lower, upper, radius)
+
+    rows, cols = np.nonzero(occupied)
+    f, r = FORWARD[rows, cols], RIGHT[rows, cols]
     half_cell = RESOLUTION / 2
-    df = np.maximum(0., np.maximum(min(0., *forward) - f, f - max(0., *forward)) - half_cell)
-    dr = np.maximum(0., np.maximum(min(0., *right) - r, r - max(0., *right)) - half_cell)
-    hits = df**2 + dr**2 <= (radius + slack)**2
+    df = np.maximum(0., np.maximum(lower[0] - f, f - upper[0]) - half_cell)
+    dr = np.maximum(0., np.maximum(lower[1] - r, r - upper[1]) - half_cell)
+    hits = df**2 + dr**2 <= radius**2
     result = np.zeros_like(occupied)
     result[rows[hits], cols[hits]] = True
     return result

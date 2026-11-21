@@ -526,3 +526,38 @@ def test_fresh_frames_without_floor_are_usable_for_active_scan():
     assert look.update(dict(map=np.full_like(frame, np.nan), frame_id=1100),
                        dict(odom, received_ms=1100), geometry, receipt_only=True) is not None
     assert not look.current_frame
+
+
+@pytest.mark.parametrize("case", ["floor_patch", "unknown_context", "low_edge", "tilted_edge", "thin_rod"])
+def test_camera_rejects_a_supported_floor_patch_but_keeps_thin_obstacles(case):
+    horizontal = HorizontalIntrinsics(640, 480, 320)
+    geometry = replay.camera_square(horizontal, (480, 480, 240), .275, at_front=True)
+    tangent = (np.arange(480) - 240) / 480
+    angle = .2 if case == "tilted_edge" else 0.
+    sn, cs = np.sin(angle), np.cos(angle)
+    coefficient = sn + cs * tangent
+    floor = .42 / np.where(coefficient > .1, coefficient, np.nan)
+    frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+    ground = np.isfinite(frame)
+    if case in ("floor_patch", "unknown_context"):
+        rows, cols = slice(316, 318), slice(316, 325)
+        if case == "unknown_context":
+            frame[280:351, cols] = np.nan
+            ground[280:351, cols] = False
+        frame[rows, cols] = (.42 - .056) / tangent[rows, None]
+    else:
+        obstacle_height = .16 if case == "thin_rod" else .058
+        depth = 2.30 / (cs - sn * tangent)
+        height = .42 - coefficient * depth
+        visible = np.flatnonzero((height > .004) & (height <= obstacle_height))
+        rows, cols = slice(visible[0], visible[-1] + 1), slice(320, 321 if case == "thin_rod" else 322)
+        frame[rows, cols] = depth[rows, None]
+    ground[rows, cols] = False
+
+    args = (frame, geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION, ground)
+    free, occupied = replay.observe(*args)
+    _, fast = replay.observe(*args, check_free_space=False)
+    assert np.array_equal(fast, occupied)
+    assert bool(occupied.any()) is (case != "floor_patch")
+    if case == "floor_patch":
+        assert free[replay.START[0] + 46, replay.START[1]]

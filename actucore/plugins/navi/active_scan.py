@@ -10,7 +10,7 @@ import numpy as np
 
 from .depth import has_valid_returns
 from .local_path import (FORWARD, FREE, OCCUPIED, RESOLUTION, RIGHT, SHAPE, START, UNKNOWN,
-                         Geometry, motion_sweep_hits, observe, project_observation)
+                         Geometry, ObstacleSquares, motion_sweep_hits, observe, occluded_cells, project_observation)
 from .odom import PlanarPose, planar_feedback
 
 ANGLE = math.radians(20)
@@ -176,9 +176,9 @@ class ObservedObstacles:
         col = (x * s - y * c) / RESOLUTION + START[1]
         return np.round(row, 7), np.round(col, 7)
 
-    def project(self, pose, observed_free=None, *, observed_occupied=None):
+    def project(self, pose, observed_free=None, *, observed_occupied=None, include_squares=False):
         if not self.has_cells or pose is None or pose.frame != self.frame:
-            return None
+            return (None, None) if include_squares else None
         cells = np.asarray(list(self.cells), dtype=int).reshape(-1, 2)
         window = None
         if self.free_cells is not None:
@@ -187,7 +187,7 @@ class ObservedObstacles:
             if local.size:
                 cells = np.concatenate((cells, local + origin))
         if not cells.size:
-            return None
+            return (None, None) if include_squares else None
         x, y = (cells * RESOLUTION - (pose.x, pose.y)).T
         # The local grid has finite bounds. Points outside it are kept in
         # the odometry map and can become relevant again when revisited.
@@ -218,6 +218,10 @@ class ObservedObstacles:
         for r, k, inside in indices:
             keep = inside & ~cleared
             hits[r[keep], k[keep]] = True
+        if include_squares:
+            in_grid = (~cleared & (-1 < row) & (row < SHAPE[0]) & (-1 < col) & (col < SHAPE[1]))
+            coordinates = (np.column_stack((row[in_grid], col[in_grid])) - START) * RESOLUTION
+            return hits, ObstacleSquares(coordinates, pose.yaw) if coordinates.size else None
         return hits
 
 
@@ -230,6 +234,7 @@ class ActiveScan:
     historical_free: np.ndarray | None = None
     near_obstacles: ObservedObstacles = field(default_factory=ObservedObstacles)
     near_hits: np.ndarray | None = None
+    near_squares: ObstacleSquares | None = None
     near_free: np.ndarray | None = None
     near_revision: int = 0
     near_odom_reference: tuple | None = None
@@ -260,10 +265,13 @@ class ActiveScan:
     pending_depth: dict | None = None
     _pending_projection: tuple | None = None
     _fused_view: tuple | None = None
+    _occlusion_view: tuple | None = field(default=None, repr=False, compare=False)
     side_frame: int = 0
     advance_m: float | None = None
     route_segment: bool = False
+    occluded_route: bool = False
     rerouted: bool = False
+    route_retry_frame: int | None = None
     advance_origin: tuple | None = None
     advance_commanded_m: float = 0.
     result_frame: int = 0
@@ -623,7 +631,7 @@ class ActiveScan:
                 memory.remember_view(capture, free, occupied, remember_occupied=selected,
                                      rolling_range=CAMERA_OCCUPANCY_MEMORY_RANGE_M)
         origin = self._footprint_origin(pose, geometry)
-        hits = memory.project(origin)
+        hits, self.near_squares = memory.project(origin, include_squares=True)
         self.near_free = memory.project_free(origin)
         self.near_hits = hits if hits is not None and hits.any() else None
         self.near_revision = pose.stamp_ms
@@ -636,9 +644,9 @@ class ActiveScan:
             return self.near_hits
         return self.historical_hits | self.near_hits
 
-    def grid(self):
+    def grid(self, *, include_near=True):
         free, hits = self.observed_grid()
-        remembered = self.remembered_hits
+        remembered = self.remembered_hits if include_near else self.historical_hits
         if self.near_free is not None:
             free = free | self.near_free
         if self.historical_free is not None:
@@ -646,6 +654,20 @@ class ActiveScan:
         if remembered is not None:
             hits = hits | remembered
         return free & ~hits, hits
+
+    def near_motion_hits(self, geometry, half_width, horizon, velocities):
+        occupied = self.near_squares if self.near_squares is not None else self.near_hits
+        age = max(0, self.control_ms - self.near_revision) / 1000
+        padding = age * max(math.hypot(vx, vy) for vx, vy, _ in velocities)
+        return motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, padding=padding)
+
+    def occlusion(self, geometry):
+        """Use the newest raw view so remembered hits cannot cast new shadows."""
+        frame = self.views[-1]
+        cached = self._occlusion_view
+        if cached is None or cached[0] is not frame or cached[1] is not geometry:
+            self._occlusion_view = (frame, geometry, occluded_cells(frame[2], frame[3], geometry))
+        return self._occlusion_view[2]
 
     @staticmethod
     def _project_view(depth, geometry):
@@ -733,7 +755,18 @@ class ActiveScan:
                    and abs(math.remainder(origin[2] + angle - view[2], math.tau)) <= ANGLE / 2
                    for view in self.observed_vantages)
 
-    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE, route_segment=False, reroute=False):
+    def retry_route(self, interval_ms):
+        """Release an exhausted route search once per newer depth and budget interval."""
+        frame = self.source_frame if self.source_frame is not None else self.current_frame
+        if (self.active or not self.exhausted or not self.current_frame
+                or (self.route_retry_frame is not None and frame - self.route_retry_frame < max(1, interval_ms))):
+            return False
+        self.route_retry_frame = frame
+        self.rerouted = False
+        return True
+
+    def begin(self, directions, *, advance_m=None, turn_angle=ANGLE, route_segment=False,
+              reroute=False, occluded_route=False):
         if not self.current_frame or (self.attempted and not reroute) or (reroute and self.rerouted):
             return False
         if not route_segment and not self.command_only:
@@ -747,6 +780,7 @@ class ActiveScan:
         self.directions = directions
         self.turn_angle = turn_angle
         self.route_segment = route_segment
+        self.occluded_route = occluded_route
         self.advance_m, self.advance_origin, self.advance_commanded_m = advance_m, None, 0.
         self.attempted = True
         if not reroute:
@@ -844,7 +878,7 @@ class ActiveScan:
                 # A stalled observation can hand off to a checked local route.
                 self.exhausted = True
             self.retry_after_hold = self.rerouted = False
-            self.route_segment = False
+            self.route_segment = self.occluded_route = False
             self.advance_origin = self.advance_m = None
             self.side_frame = self.result_frame = 0
             self.phase = "idle"
@@ -1063,10 +1097,11 @@ class ActiveScan:
         self.motion_frame = object()
         self.current_frame = 0
         self.pending_depth = None
-        self._pending_projection = self._fused_view = None
+        self._pending_projection = self._fused_view = self._occlusion_view = None
         self.historical_free = self.near_free = None
         self.source_frame = None
         self.odom_source = None
+        self.route_retry_frame = None
         self.poses.clear()
         self.views.clear()
         self.observed_vantages.clear()
@@ -1081,6 +1116,7 @@ class ActiveScan:
         if not frame or not (self.attempted or self.result_frame):
             return
         self.rerouted = False
+        self.route_retry_frame = None
         self.attempted = False
         self.exhausted = False
         self.issued_yaw = False
