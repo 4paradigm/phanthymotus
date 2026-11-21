@@ -4413,6 +4413,33 @@ def test_dynamic_head_facing_sideways_does_not_authorize_forward_navigation():
     assert result.values == [0.] * 6 and "朝向" in result.reason
 
 
+@pytest.mark.parametrize("aligned_before", [False, True])
+def test_dynamic_mount_without_matching_pose_uses_camera_frame(monkeypatch, aligned_before):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
+    cfg = _cfg(local_planning=True, local_geometry=geometry, confirm_hits=1)
+    state = _state()
+    depth = dict(map=np.full((48, 64), 3.), ground=np.ones((48, 64), dtype=bool),
+                 frame_id=1200, capture_ms=1150, body_mount_required=True)
+    motion = dict(vx=0., vy=0., wz=0., received_ms=1200)
+    seen = []
+    monkeypatch.setattr(P, "_avoid", lambda vx, vy, wz, depth, config, status, reason, *args, **kwargs:
+                        (seen.append(config.local_geometry) or vx, vy, wz, status, reason))
+    if aligned_before:
+        state.use_body_mount = True
+        state.active_scan.phase = "turn"
+        state.commanded = (.2, 0., 0.)
+        stop = P.step(detections=_detections(_obj()), depth=depth, odom=motion,
+                      state=state, config=cfg, dt=.1)
+        assert stop.values == [0.] * 6 and not state.active_scan.active
+    for _ in range(8):
+        result = P.step(detections=_detections(_obj()), depth=depth, odom=motion,
+                        state=state, config=cfg, dt=.1)
+    assert result.values is not None and result.values[0] > 0., result.reason
+    assert seen[0] is geometry
+
+
 def test_foreground_in_bottom_of_depth_image_is_remembered_before_it_disappears(monkeypatch):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics

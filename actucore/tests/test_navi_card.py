@@ -521,21 +521,17 @@ def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
     card = _card()
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
     frame = np.ones((2, 2), dtype=float)
-    for capture in (None, 122_000, 123_001):
+    for capture in (None, 123_001):
         card._set_depth_map(frame, capture_ms=capture)
         depth = card.observation(with_capture_timing=True)[1]
         assert depth["frame_id"] == 123_000
         assert "capture_ms" not in depth
 
-    card._depth_stamp_verified = True
     card._set_depth_map(frame, capture_ms=122_000)
     depth = card.observation(with_capture_timing=True)[1]
     assert depth["capture_invalid"] and "capture_ms" not in depth
     card._set_depth_map(frame, capture_ms=122_950)
     assert card.observation(with_capture_timing=True)[1]["capture_ms"] == 122_950
-    card._depth_stamp_verified = False
-    card._set_depth_map(frame, capture_ms=122_950)
-    assert "capture_ms" not in card.observation(with_capture_timing=True)[1]
 
 
 @pytest.mark.parametrize("sweep_observed, pose_only", [(True, False), (False, False), (False, True)])
@@ -2292,22 +2288,17 @@ def test_dynamic_body_mount_is_bound_to_the_depth_camera_and_exact_capture(monke
     assert "body_from_optical" not in observation()
 
 
-def test_obstacle_pose_uses_same_clock_measurements_on_both_sides_of_capture(monkeypatch):
+def test_obstacle_pose_uses_plain_timestamps_on_both_sides_of_capture(monkeypatch):
     from types import SimpleNamespace
     import numpy as np
 
     card = _card()
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 10.2)
-    clock = dict(clock_id="host_realtime", timestamp_basis="host_realtime", domain_id="boot1")
-    declaration = _decl(_DEPTH_TOPIC, vendor=dict(clock_reference=clock,
-                        timestamp_semantics="source_capture_mapped"))
+    declaration = _decl(_DEPTH_TOPIC, vendor={})
     card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding())
     card._set_depth_map(np.ones((8, 8)), source_stamp_ns=10_060_000_000, capture_ms=10_060)
-    def pose(stamp, x, domain="boot1", segment="run", measured_frame="odom", child="base_link", epoch="clock-1"):
-        measurement = dict(stamp_ns=stamp*10**6, clock_id="host_realtime",
-                           clock_epoch=epoch, frame_id=measured_frame, mapping={"verified": True})
-        slam = dict(stamp_source="measurement", status="tracking", segment_id=segment,
-                    clock_reference=dict(clock, domain_id=domain), measurement=measurement)
+    def pose(stamp, x, segment="run", child="base_link"):
+        slam = dict(status="tracking", segment_id=segment)
         data = dict(schema="motus.odom/1", frame="body", stamp_ms=10_197,
                     twist=[1., 0., None, None, None, 0.],
                     pose=dict(stamp_ms=stamp, frame_id="odom", child_frame_id=child,
@@ -2326,13 +2317,10 @@ def test_obstacle_pose_uses_same_clock_measurements_on_both_sides_of_capture(mon
     pose(10040, -1.)
     assert snapshot()[1]["obstacle_pose"].stamp_ms == 10120
     assert snapshot()[0]["obstacle_capture_pose"].x == pytest.approx(.06)
-    pose(10130, .13, domain="other")
-    assert "obstacle_capture_pose" not in snapshot()[0]
-    assert "obstacle_pose" not in snapshot()[1]
     pose(10140, .14, segment="new")
     assert "obstacle_capture_pose" not in snapshot()[0]
-    pose(10150, .15, measured_frame="map")
-    assert "obstacle_pose" not in snapshot()[1]
+    pose(10201, .15, segment="future")
+    assert "obstacle_capture_pose" not in snapshot()[0]
     declaration["vendor"]["body_mount"] = dict(parent_frame="base_link")
     pose(10160, .16, child="base_footprint")
     assert "obstacle_pose" not in snapshot()[1]

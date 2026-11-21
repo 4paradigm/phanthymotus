@@ -219,7 +219,6 @@ class NaviPlugin:
         self._depth_vendor = {}
         self._mounts = {}
         self._obstacle_poses = deque(maxlen=32)
-        self._depth_stamp_verified = False
         self._odom = None
         self._odom_ms = 0
         self._odom_received_ms = 0
@@ -702,10 +701,6 @@ class NaviPlugin:
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
         vendor = depth_decl.get("vendor")
         self._depth_vendor = vendor if binding.get("depth_map") and isinstance(vendor, dict) else {}
-        self._depth_stamp_verified = isinstance(vendor, dict) and (
-            vendor.get("hardware_capture_timestamp_available") is True
-            and vendor.get("source_stamp_preserved") is True
-            and not str(vendor.get("timestamp_source", "")).endswith("_unverified"))
         self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
         self._config.depth_intrinsics = (horizontal_intrinsics(depth_decl)
                                          if binding.get("depth_map") else None)
@@ -715,8 +710,6 @@ class NaviPlugin:
             self._depth_vertical = vertical_intrinsics(depth_decl)
             if self._depth_vertical is None:
                 self._camera_notes.append("深度图缺少完整针孔内参，沿用原始深度判断障碍")
-            if not self._depth_stamp_verified:
-                self._camera_notes.append("深度采集时间未验证，主动观察按最新有效单视角规划")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,
@@ -1573,7 +1566,7 @@ class NaviPlugin:
             elif role == "odom":
                 sample = odom_mod.measured_obstacle_pose(payload, self._depth_vendor)
                 history = self._obstacle_poses
-                if sample is None:
+                if sample is None or not 0 <= now - sample[1].stamp_ms <= self._odom_max_age_ms:
                     history.clear()
                 elif not history:
                     history.append(sample)
@@ -1647,12 +1640,11 @@ class NaviPlugin:
             self._depth_ground = ground
             self._depth_bands = bands
             self._depth_ms = received_ms
-            self._depth_source_ns = (source_stamp_ns if not source_frame or
-                                     source_frame == self._depth_vendor.get("frame_id") else None)
+            expected_frame = self._depth_vendor.get("frame_id")
+            self._depth_source_ns = (source_stamp_ns if not expected_frame or not source_frame
+                                     or source_frame == expected_frame else None)
             self._depth_source_ms = capture_ms or None
-            self._depth_capture_ms = (
-                capture_ms if capture_ms and self._depth_stamp_verified
-                and 0 <= received_ms - capture_ms <= self._config.depth_age_limit_ms else None)
+            self._depth_capture_ms = capture_ms if type(capture_ms) is int and 0 < capture_ms <= received_ms else None
 
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
@@ -1737,7 +1729,7 @@ class NaviPlugin:
                 capture = self._depth_capture_ms
                 if capture is not None and 0 <= now - capture <= depth_age:
                     depth["capture_ms"] = capture
-                elif self._depth_stamp_verified and self._depth_source_ms is not None:
+                elif capture is not None:
                     depth["capture_invalid"] = True
             odom_age = now - self._odom_ms
             odom = (self._odom

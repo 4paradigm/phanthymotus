@@ -163,39 +163,30 @@ def interface_provides(info: dict, name: str) -> bool:
 
 
 def measured_obstacle_pose(sample, camera_vendor):
-    """Match the measured pose's own clock and stamp to the depth camera clock."""
-    clock = camera_vendor.get("clock_reference")
-    vendor = sample.get("vendor")
-    slam = vendor.get("motus_slam") if isinstance(vendor, dict) else None
-    if (not isinstance(clock, dict) or not clock.get("domain_id")
-            or clock.get("clock_id") != "host_realtime" or clock.get("timestamp_basis") != "host_realtime"
-            or camera_vendor.get("timestamp_semantics") != "source_capture_mapped"
-            or not isinstance(slam, dict) or slam.get("stamp_source") != "measurement"):
-        return None
-    reference = slam.get("clock_reference")
-    if not isinstance(reference, dict) or any(reference.get(k) != clock[k] for k in
-                                               ("clock_id", "timestamp_basis", "domain_id")):
-        return None
-    measurement = slam.get("measurement")
-    if not isinstance(measurement, dict) or measurement.get("clock_id") != clock["clock_id"]:
-        return None
-    mapping = measurement.get("mapping")
-    if not isinstance(mapping, dict) or mapping.get("verified") is not True:
-        return None
-    ns = measurement.get("stamp_ns")
+    """Read a stamped body pose in the same host time as depth."""
     pose = sample.get("pose")
-    if type(ns) is not int or ns <= 0 or not isinstance(pose, dict) or pose.get("stamp_ms") != ns // 10**6:
+    stamp = pose.get("stamp_ms") if isinstance(pose, dict) else None
+    if type(stamp) is not int or stamp <= 0:
         return None
     mount = camera_vendor.get("body_mount")
-    if (measurement.get("frame_id") != pose.get("frame_id")
-            or not slam.get("segment_id") or not measurement.get("clock_epoch")
-            or (isinstance(mount, dict) and mount.get("parent_frame") != pose.get("child_frame_id"))):
+    if isinstance(mount, dict) and mount.get("parent_frame") != pose.get("child_frame_id"):
         return None
-    body = planar_pose(sample, ns // 10**6)
+    body = planar_pose(sample, stamp)
     if body is None:
         return None
-    continuity = (clock["domain_id"], measurement["clock_epoch"], measurement.get("source_generation"))
-    return ns, replace(body, frame=body.frame + continuity)
+
+    ns = stamp * 10**6
+    vendor = sample.get("vendor")
+    slam = vendor.get("motus_slam") if isinstance(vendor, dict) else None
+    measurement = slam.get("measurement") if isinstance(slam, dict) else None
+    if isinstance(measurement, dict):
+        precise = measurement.get("stamp_ns")
+        if (type(precise) is int and precise // 10**6 == stamp
+                and measurement.get("frame_id") == pose.get("frame_id")):
+            ns = precise
+        continuity = (measurement.get("clock_epoch"), measurement.get("source_generation"))
+        body = replace(body, frame=body.frame + continuity)
+    return ns, body
 
 
 def obstacle_pose_at(history, ns):

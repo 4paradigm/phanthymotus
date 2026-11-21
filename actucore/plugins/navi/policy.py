@@ -504,6 +504,7 @@ class State:
     view_detour: Detour | None = None
     goal_anchor: DetourGoal | None = None
     active_scan: ActiveScan = field(default_factory=ActiveScan)
+    use_body_mount: bool | None = None
     recovery: bool = False
     # What the corridor read on the last tick. Kept so the debug overlay can
     # draw the number the decision was made from, rather than measuring the
@@ -965,15 +966,30 @@ def step(*, detections, depth, odom, config: Config, state: State,
          command_interrupted: bool = False) -> Decision:
     state.command_dt_s = min(dt, config.watchdog_ms / 1000) if command_dt_s is None else command_dt_s
     state.view_detour = None
-    if (config.local_planning and config.local_geometry is not None and (depth or {}).get("body_mount_required")
-            and depth.get("body_from_optical") is not None):
-        # The exposure, not the current head angle, defines the body-frame grid.
-        calibrated = depth.get("mount_accuracy_validated") is True
-        geometry = replace(config.local_geometry, base_from_optical=depth["body_from_optical"],
-                           free_space_validated=calibrated,
-                           min_obstacle_height=(local_path.MIN_OBSTACLE_HEIGHT_M if calibrated
-                                                else config.local_geometry.min_obstacle_height))
-        config = replace(config, scan_geometry=geometry, local_geometry=geometry)
+    if config.local_planning and config.local_geometry is not None and (depth or {}).get("body_mount_required"):
+        capture_pose = depth.get("obstacle_capture_pose")
+        pose = (odom or {}).get("obstacle_pose")
+        paired = (depth.get("body_from_optical") is not None and capture_pose is not None
+                  and pose is not None and capture_pose.frame == pose.frame)
+        if state.use_body_mount is not False:
+            if state.use_body_mount and not paired:
+                scan = state.active_scan
+                if scan.active or any(state.commanded):
+                    state.feedback_guard_s = max(state.feedback_guard_s, (config.watchdog_ms + 50) / 1000)
+                state.active_scan = ActiveScan(obstacles=scan.obstacles)
+                state.escape_side = 0.
+            # Keep one frame of reference for the rest of this task after a
+            # fallback. Intermittent transforms must not interrupt each tick.
+            state.use_body_mount = paired
+        if state.use_body_mount:
+            calibrated = depth.get("mount_accuracy_validated") is True
+            geometry = replace(config.local_geometry, base_from_optical=depth["body_from_optical"],
+                               free_space_validated=calibrated,
+                               min_obstacle_height=(local_path.MIN_OBSTACLE_HEIGHT_M if calibrated
+                                                    else config.local_geometry.min_obstacle_height))
+            config = replace(config, scan_geometry=geometry, local_geometry=geometry)
+        else:
+            depth = dict(depth, body_mount_required=False)
     decision = _decide(detections, depth, odom, config, state, dt, control_period_s=control_period_s)
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
@@ -1226,13 +1242,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         scan.historical_hits = scan.obstacles.project(obstacle_pose)
         if scan.obstacles.cells and scan.historical_hits is None:
             return Decision(_twist(0., 0., 0.), AVOIDING, "缺少同坐标系位姿，保留已观测障碍并停车")
-        if (depth or {}).get("body_mount_required") and (
-                depth.get("body_from_optical") is None or depth.get("obstacle_capture_pose") is None
-                or obstacle_pose is None or depth["obstacle_capture_pose"].frame != obstacle_pose.frame):
-            if scan.active and not scan.command_only:
-                scan.hold_for_replan("主动观察：等候深度、外参与位姿配对")
-            return Decision(_twist(0., 0., 0.), AVOIDING, "等候同一深度帧的相机外参与底盘位姿")
-        if (depth or {}).get("body_mount_required") and config.local_geometry.base_from_optical[0, 2] < .75:
+        mount = (depth or {}).get("body_from_optical")
+        if mount is not None and mount[0, 2] < .75:
             if scan.active and not scan.command_only:
                 scan.hold_for_replan("主动观察：等候头部恢复前向观测")
             return Decision(_twist(0., 0., 0.), AVOIDING, "相机朝向未覆盖车体前方，停车")

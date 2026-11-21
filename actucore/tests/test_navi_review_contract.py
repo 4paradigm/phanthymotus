@@ -132,7 +132,6 @@ def test_depth_age_is_independent_of_other_observations(monkeypatch, receipt_age
     card = _card(max_depth_age_ms=800)
     try:
         start_card(card, rate={"max_hz": 20, "max_obs_age_ms": 500})
-        card._depth_stamp_verified = capture_age is not None
         frame = np.full((12, 12), 2.0)
         monkeypatch.setattr(time, "time", lambda: (now_ms - receipt_age) / 1000)
         card._set_depth_map(frame, capture_ms=None if capture_age is None else now_ms - capture_age)
