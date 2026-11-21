@@ -19,7 +19,9 @@ class Effect:
         self.cfg = cfg
         self.name = cfg["id"]
         asset = (root / cfg["asset"]).resolve()
-        if not asset.is_relative_to(root.resolve()):
+        try:
+            asset.relative_to(root.resolve())  # Path.is_relative_to needs Python >=3.9
+        except ValueError:
             raise ValueError("effect asset escapes resource directory")
         image = cv2.imread(str(asset), cv2.IMREAD_UNCHANGED)
         if image is None or image.ndim != 3 or image.shape[2] != 4 or max(image.shape[:2]) > 2048:

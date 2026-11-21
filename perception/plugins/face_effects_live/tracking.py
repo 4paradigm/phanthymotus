@@ -1,4 +1,6 @@
 """Bounded geometry tracker. Ambiguity hides effects; IDs are not identity."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from functools import lru_cache
 import numpy as np
