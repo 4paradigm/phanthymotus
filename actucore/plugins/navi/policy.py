@@ -250,6 +250,7 @@ class Config:
     max_obs_age_ms: int = 500
     max_depth_age_ms: int | None = None
     scan_odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
+    max_feedback_gap_ms: int = ODOM_GAP_MS
     watchdog_ms: float = 300
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
@@ -789,6 +790,9 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     if (isinstance(watchdog, (int, float)) and not isinstance(watchdog, bool)
             and math.isfinite(watchdog) and watchdog > 0):
         config.watchdog_ms = watchdog
+    feedback_gap = rate.get("max_feedback_gap_ms")
+    if type(feedback_gap) is int and feedback_gap > 0:
+        config.max_feedback_gap_ms = min(feedback_gap, int(config.watchdog_ms))
     max_age = rate.get("max_obs_age_ms")
     if (isinstance(max_age, (int, float)) and not isinstance(max_age, bool)
             and math.isfinite(max_age) and max_age > 0
@@ -1045,7 +1049,19 @@ def step(*, detections, depth, odom, config: Config, state: State,
             config = replace(config, scan_geometry=geometry, local_geometry=geometry)
         else:
             depth = dict(depth, body_mount_required=False)
+    scan_before, phase_before = state.active_scan, state.active_scan.phase
     decision = _decide(detections, depth, odom, config, state, dt, control_period_s=control_period_s)
+    scan = state.active_scan
+    if (decision.status == AVOIDING and decision.values is not None and not any(decision.values)
+            and scan.phase == "brake" and (scan is not scan_before or phase_before != "brake")
+            and scan.receipt_only and scan.buffered_odom and scan.pose_origin is None
+            and state.goal_anchor is not None
+            and max(math.hypot(*state.commanded[:2]), math.hypot(*scan.motion[:2])) > STILL_LINEAR):
+        geometry = config.scan_geometry or config.local_geometry
+        command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s)
+        if command.yaw:
+            decision.values = _twist(0., 0., command.yaw)
+            decision.reason = command.reason
     if config.local_planning and state.motion_source == "command" and decision.values is not None:
         last_x, last_y, last_yaw = state.command_tail
         vx, vy, yaw = decision.values[0], decision.values[1], decision.values[5]
@@ -1202,6 +1218,16 @@ def _reacquire_detour_goal(depth, config, state, raw_yaw, bearing, dt, odom):
     return Decision(_twist(0., 0., 0.), AVOIDING, "停车等待原目标的有效测距")
 
 
+def _observation_command(scan, geometry, config, state, odom, dt, control_period_s):
+    yaw_limits = (_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+    return scan.command(geometry, _keepout_m(config), max(yaw_limits), config.watchdog_ms,
+                        config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
+                        now_ms=(odom or {}).get("control_ms"), tick_s=dt,
+                        previous_yaw=state.commanded[2], control_period_s=control_period_s,
+                        previous_command_s=state.command_dt_s, yaw_limits=yaw_limits,
+                        previous_linear=math.hypot(*state.commanded[:2]))
+
+
 def _decide(detections, depth, odom, config: Config, state: State,
             dt: float, *, control_period_s: float | None) -> Decision:
     """One tick.
@@ -1289,6 +1315,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
         scan = state.active_scan
         scan.odom_linear_tolerance_mps = config.scan_odom_linear_tolerance_mps
+        scan.max_feedback_gap_ms = config.max_feedback_gap_ms
         obstacle_pose = (odom or {}).get("obstacle_pose")
         if not (depth or {}).get("body_mount_required"):
             obstacle_pose = obstacle_pose or (odom or {}).get("motion_pose")
@@ -1322,13 +1349,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if update is not None and (scan.active or scan.result_frame):
             return Decision(_twist(0, 0, 0), AVOIDING, update.reason)
         if scan.active and not scan.ready:
-            yaw_limits = (_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
-            command = scan.command(geometry, _keepout_m(config),
-                                   max(yaw_limits), config.watchdog_ms,
-                                   config.depth_age_limit_ms, min_yaw_rate=config.floor_wz,
-                                   now_ms=(odom or {}).get("control_ms"), tick_s=dt,
-                                   previous_yaw=state.commanded[2], control_period_s=control_period_s,
-                                   previous_command_s=state.command_dt_s, yaw_limits=yaw_limits)
+            command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s)
             if command.replanned_turn:
                 state.view_detour = None
             return Decision(_twist(0, 0, command.yaw), AVOIDING, command.reason)

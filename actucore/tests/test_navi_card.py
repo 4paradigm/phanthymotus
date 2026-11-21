@@ -254,6 +254,9 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
         assert not published
         assert card._scheduled_command is None
         assert "控制周期" in card._output_stop[1]
+        monkeypatch.setattr(card, "next_command", lambda: None)
+        card._tick()
+        assert scan.turn_until_ms == 0 and scan.turn_stop_ms is None
         return
     card._dispatch_command()
     assert published[-1]["values"][5] == .6

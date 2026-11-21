@@ -4603,3 +4603,25 @@ def test_local_plan_rechecks_and_drives_without_a_ground_mask():
     scan.phase = "evaluate"
     decision = tick(1200, frame)
     assert decision[0] > 0. and decision[1:3] == (0., 0.)
+
+
+def test_local_plan_dispatches_a_checked_turn_on_the_first_tick_while_approaching():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(640, 420, 320), (480, 420, 240), .20)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry,
+                  half_width_m=.20, watchdog_ms=500, wz_max=1.)
+    state = _state(target="person", motion_source="measured", commanded=(.2, 0., 0.),
+                   goal_anchor=P.DetourGoal(3., 0.))
+    frame = np.full((480, 640), np.nan)
+    frame[220:370, 302:338] = .95
+    depth = dict(map=frame, frame_id=1000, capture_ms=980, control_ms=1000)
+    odom = dict(vx=.12, vy=0., wz=0., received_ms=1000, source_sample_id=1000,
+                velocity_history=((1000, 1000, (.12, 0., 0.)),))
+
+    decision = P.step(detections=None, depth=depth, odom=odom, config=config,
+                      state=state, dt=.1, control_period_s=.1)
+
+    assert state.active_scan.route_segment and state.active_scan.phase == "turn"
+    assert state.view_detour is not None
+    assert decision.values[:5] == [0.] * 5 and 0. < abs(decision.values[5]) <= config.wz_max

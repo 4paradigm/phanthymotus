@@ -49,7 +49,7 @@ from . import depth as depth_mod
 from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
-from .active_scan import ActiveScan
+from .active_scan import ActiveScan, DEPTH_RECHECK_HOLD
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +81,7 @@ class _ScheduledCommand:
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
 # timeout), but do not leave an untyped input retrying forever either.
 _DEPTH_TYPE_WAIT_S = 5.0
+_UNSENT_TURN = "主动观察：首条转向指令剩余窗口短于控制周期"
 
 # The six twist axes. **The order is fixed by the protocol** — motus.control/1's
 # MODES comment, loco_servo's AXIS_NAMES on the driver side and motus.odom/1's
@@ -1126,6 +1127,7 @@ class NaviPlugin:
                            "max_obs_age_ms": self._config.max_obs_age_ms,
                            "max_depth_age_ms": self._config.depth_age_limit_ms,
                            "scan_odom_linear_tolerance_mps": self._config.scan_odom_linear_tolerance_mps,
+                           "max_feedback_gap_ms": self._config.max_feedback_gap_ms,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -1759,7 +1761,7 @@ class NaviPlugin:
                     odom = {**odom, "motion_pose": pose, "pose_feedback": rates,
                             "pose_feedback_since_ms": since_ms, "control_ms": now}
                 received_ms = self._odom_received_ms or self._odom_ms
-                if 0 <= now - received_ms <= policy_mod.ODOM_GAP_MS:
+                if 0 <= now - received_ms <= self._config.max_feedback_gap_ms:
                     odom = {**odom, "received_ms": received_ms}
                     if self._odom_source_ms is not None:
                         odom["source_sample_id"] = self._odom_source_ms
@@ -1799,7 +1801,7 @@ class NaviPlugin:
             return None
         obs_ms = min(objects_ms, depth_ms, odom_ms)
         deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
-                           odom_ms + min(self._odom_max_age_ms, policy_mod.ODOM_GAP_MS),
+                           odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms),
                            obs_ms + max_age))
         if now_ms >= deadline:
             return None
@@ -1957,7 +1959,11 @@ class NaviPlugin:
                          depth_timing.get("source_stamp_ns"), depth_timing.get("frame_id"),
                          depth_timing.get("control_ms"), now_ms, obs_ms)
                 if scan.active and scan.receipt_only and not scan.command_only:
-                    scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
+                    if scan.buffered_turn and obs_ms == (depth_timing.get("capture_ms") or
+                                                         depth_timing.get("frame_id")):
+                        scan.pause_for_depth(now_ms)
+                    else:
+                        scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
             self._state.idle_for_s = idle_for_s
             self._state.adaptive_fwd_scale = 1.
             self._state.moving_for_s = 0.
@@ -2063,10 +2069,14 @@ class NaviPlugin:
                     self._state.commanded_vx = 0.
                     self._state.detour_leg = self._state.executing_leg = None
                     scan = self._state.active_scan
-                    if replan and scan.active and scan.receipt_only and not scan.command_only:
+                    if reason == DEPTH_RECHECK_HOLD and scan.buffered_turn:
+                        scan.pause_for_depth(stamp)
+                    elif replan and scan.active and scan.receipt_only and not scan.command_only:
                         scan.hold_for_replan(reason)
                     elif scan.buffered_turn:
-                        scan.turn_until_ms, scan.turn_stop_ms = 0, stamp
+                        scan.turn_until_ms = 0
+                        # A candidate discarded before publication has no motion to brake.
+                        scan.turn_stop_ms = None if reason == _UNSENT_TURN else stamp
                 started = time.monotonic()
                 previous = self._last_tick
                 message = self.next_command()
@@ -2225,7 +2235,11 @@ class NaviPlugin:
                 return
             remaining_ms = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
             stop = None
-            if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+            if (work.turn is not None and not work.sent and not self._wire_moving
+                    and now_ms >= work.message["stamp_ms"]
+                    and remaining_ms < math.ceil(1000 / self._rate_hz)):
+                stop = (_UNSENT_TURN, False)
+            elif remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
                 stop = ("速度指令窗口已到期", False)
             elif work.turn is not None:
                 with self._obs_lock:
@@ -2235,10 +2249,7 @@ class NaviPlugin:
                 if depth_ok:
                     stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
                 else:
-                    stop = ("主动观察：深度暂不可用，停车后重规划", True)
-                if (stop is None and not self._wire_moving
-                        and remaining_ms < math.ceil(1000 / self._rate_hz)):
-                    stop = ("主动观察：首条转向指令剩余窗口短于控制周期", False)
+                    stop = (DEPTH_RECHECK_HOLD, True)
             elif work.leg is not None:
                 stop = self._check_scheduled_leg(work, now_ms, remaining_ms)
                 now_ms = int(time.time() * 1000)
@@ -2246,7 +2257,7 @@ class NaviPlugin:
                                    round((work.expires_at - time.monotonic()) * 1000))
                 if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
                     stop = ("速度指令窗口已到期", False)
-                elif stop is None and now_ms - work.feedback.poses[-1][0] > policy_mod.ODOM_GAP_MS:
+                elif stop is None and now_ms - work.feedback.poses[-1][0] > work.feedback.max_feedback_gap_ms:
                     stop = ("局部规划：运动反馈已到期，停车后重规划", True)
             if stop is not None:
                 self._cancel_scheduled_motion(stop=(now_ms, *stop))

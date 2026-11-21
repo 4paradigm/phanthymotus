@@ -361,6 +361,102 @@ def test_buffered_turn_reaches_evaluation_with_slew_limited_feedback(monkeypatch
     assert look.ready and look.side_frame == 1950
 
 
+@pytest.mark.parametrize("recovery", ["clear", "obstacle", "feedback_gap"])
+def test_buffered_route_survives_a_depth_lapse_and_checks_the_new_view(monkeypatch, recovery):
+    from plugins.navi import policy
+
+    look, geometry, _, blocked = _setup(monkeypatch)
+
+    def tick(stamp, *, wz=0., source=None):
+        depth = None if source is None else dict(_depth(stamp), control_ms=stamp, source_frame_id=source)
+        odom = dict(_odom(stamp, wz), received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=((stamp, stamp, (0., 0., wz)),))
+        update = look.update(depth, odom, geometry, receipt_only=True, max_depth_age_ms=600)
+        return update or look.command(geometry, .33, 1., 500, 600, now_ms=stamp)
+
+    tick(1000, source=900)
+    assert look.begin((-1.,), advance_m=1.0, turn_angle=.20, route_segment=True)
+    assert tick(1100, source=1000).yaw == 0.
+    assert tick(1200, source=1100).yaw > 0.
+    assert tick(1300, wz=.5).yaw == 0.
+    assert look.current_frame == 0 and look.advance_m == 1.0
+    assert look.phase == "turn" and look.turn_stop_ms == 1300
+
+    if recovery == "feedback_gap":
+        assert tick(1600, source=1500).yaw == 0.
+        assert look.phase == "brake_for_replan"
+        return
+
+    for stamp in (1400, 1500):
+        assert tick(stamp, source=1100).yaw == 0.
+        assert look.current_frame == 0  # Redelivery cannot unlock the paused turn.
+        assert look.turn_stop_ms == 1300
+    if recovery == "obstacle":
+        blocked[scan.START[0] + 3, scan.START[1]] = True
+    for stamp in (1600, 1700, 1800):
+        assert tick(stamp, source=stamp - 50).yaw == 0.
+    next_turn = tick(1900, source=1850)
+    if recovery == "obstacle":
+        assert next_turn.yaw == 0. and "扫掠区有障碍" in next_turn.reason
+        return
+
+    assert next_turn.yaw > 0.
+    assert look.advance_m == 1.0 and look.route_segment
+    assert tick(2000, wz=.65, source=1950).yaw > 0.
+    assert tick(2100, wz=.9, source=2050).yaw == 0.
+    for stamp in range(2200, 2800, 100):
+        assert tick(stamp, source=stamp - 50).yaw == 0.
+    assert look.ready
+    config = policy.Config(local_planning=True, local_geometry=geometry)
+    state = policy.State(target="person", motion_source="measured", active_scan=look,
+                         goal_anchor=policy.DetourGoal(2., 0.))
+    odom = dict(_odom(2700), received_ms=2700, source_sample_id=2700,
+                velocity_history=((2700, 2700, (0., 0., 0.)),))
+    depth = dict(_depth(2700), map=np.full(scan.SHAPE, 4.), control_ms=2700, source_frame_id=2650)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config, state=state, dt=.1)
+    assert decision.values[0] > 0. and not any(decision.values[1:])
+    assert decision.reason == "主动观察：转稳后直行"
+
+
+@pytest.mark.parametrize("blocked_sweep", [False, True])
+def test_checked_turn_can_start_without_a_preceding_stop(monkeypatch, blocked_sweep):
+    look, geometry, _, blocked = _setup(monkeypatch)
+    depth = dict(_depth(1000), control_ms=1000, source_frame_id=900)
+    odom = dict(_odom(1000), vx=.15, received_ms=1000, source_sample_id=1000,
+                velocity_history=((1000, 1000, (.15, 0., 0.)),))
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=1.0, turn_angle=.20, route_segment=True)
+    if blocked_sweep:
+        blocked[scan.START[0] + 6, scan.START[1]] = True
+
+    command = look.command(geometry, .33, 1., 500, 600, now_ms=1000,
+                           control_period_s=.1, previous_linear=.2)
+
+    if blocked_sweep:
+        assert not command.yaw and look.phase == "brake"
+    else:
+        assert command.yaw > 0. and look.phase == "turn"
+        assert look.turn_sweep.minimum_translation == pytest.approx(.23)
+
+
+def test_tianyi_buffered_turn_tolerates_a_short_feedback_gap():
+    from plugins.navi import policy
+
+    config = policy.Config()
+    policy.adopt_limits(config, {"rate": {"watchdog_ms": 500, "max_feedback_gap_ms": 350}})
+    assert config.max_feedback_gap_ms == 350
+    look = scan.ActiveScan(max_feedback_gap_ms=config.max_feedback_gap_ms,
+                           receipt_only=True, buffered_odom=True, phase="turn", issued_yaw=True)
+    look.poses.append((1000, look.pose, 0.))
+    look.odom_source = 1000
+    history = [(1000, 1000, (0., 0., 0.))]
+    assert look.sync_buffered_motion(history, 1300) is None
+    history.append((1330, 1330, (0., 0., .2)))
+    assert look.sync_buffered_motion(history, 1330) is None
+    assert look.poses[-1][0] == 1330
+    assert look.sync_buffered_motion(history, 1681)[1]
+
+
 @pytest.mark.parametrize("planning_ms,expected_ttl", [(282, 242), (399, 125), (400, 0)])
 def test_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, planning_ms, expected_ttl):
     from plugins.navi import plugin

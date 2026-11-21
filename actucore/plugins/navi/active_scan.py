@@ -23,6 +23,7 @@ SCAN_TIMEOUT_MS = 8000
 TURN_BURST_MS = 400
 TURN_PROGRESS_WINDOW_MS = 2000
 TURN_PROGRESS_MIN_RAD = math.radians(3)
+DEPTH_RECHECK_HOLD = "主动观察：深度暂不可用，停车等待新深度复检当前路线"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class CheckedTurnSweep:
     horizon: float
     occupied: np.ndarray
     pose: tuple
+    minimum_translation: float = 0.
 
 
 @dataclass
@@ -115,6 +117,7 @@ class ActiveScan:
     motion_frame: object = field(default_factory=object)
     motion: tuple = (0., 0., 0.)
     odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
+    max_feedback_gap_ms: int = ODOM_GAP_MS
     poses: deque = field(default_factory=lambda: deque(maxlen=32))
     views: deque = field(default_factory=lambda: deque(maxlen=40))
     current_frame: int = 0
@@ -139,6 +142,7 @@ class ActiveScan:
     turn_feedback_ms: int = 0
     turn_sweep: CheckedTurnSweep | None = None
     turn_yaw: float = 0.
+    turn_depth_paused: bool = False
     command_only: bool = False
     single_control_ms: int = 0
     single_depth_ms: int = 0
@@ -188,6 +192,7 @@ class ActiveScan:
         source = (odom or {}).get("source_sample_id") if self.receipt_only else None
         if self.poses:
             previous = self.poses[-1][0]
+            gap = self.max_feedback_gap_ms if self.receipt_only and body_pose is None else ODOM_GAP_MS
             if self.receipt_only and (self.active or follow_leg) and body_pose is None and stamp > previous and history:
                 hold = self._integrate_receipt_motion(history, stamp, source, motion)
                 if hold is not None:
@@ -198,10 +203,10 @@ class ActiveScan:
                     if source < self.odom_source:
                         return self.invalidate()
                     if source == self.odom_source:
-                        if not 0 <= stamp - previous <= ODOM_GAP_MS:
+                        if not 0 <= stamp - previous <= gap:
                             return self.invalidate()
                         stamp = previous
-                if not 0 <= stamp - previous <= ODOM_GAP_MS:
+                if not 0 <= stamp - previous <= gap:
                     if self.receipt_only and self.active and stamp > previous:
                         return self._hold_for_feedback_gap()
                     self.invalidate()
@@ -278,14 +283,14 @@ class ActiveScan:
                 if identity < last_source:
                     return self.invalidate()
                 if identity == last_source:
-                    if received - last_stamp > ODOM_GAP_MS:
+                    if received - last_stamp > self.max_feedback_gap_ms:
                         return self.invalidate()
                     continue
                 # Both identities are producer stamp_ms values. Their elapsed
                 # time also detects outages hidden by delivery in a batch.
-                if identity - last_source > ODOM_GAP_MS:
+                if identity - last_source > self.max_feedback_gap_ms:
                     return self._hold_for_feedback_gap()
-            if not 0 < received - last_stamp <= ODOM_GAP_MS:
+            if not 0 < received - last_stamp <= self.max_feedback_gap_ms:
                 return self._hold_for_feedback_gap()
             intervals.append((velocity, (received - last_stamp) / 1000))
             last_stamp, last_source, last_motion = received, identity, velocity
@@ -306,7 +311,7 @@ class ActiveScan:
 
     def sync_buffered_motion(self, history, now_ms):
         """Consume every feedback sample since the copied control pose."""
-        if not history or not 0 <= now_ms - history[-1][0] <= ODOM_GAP_MS:
+        if not history or not 0 <= now_ms - history[-1][0] <= self.max_feedback_gap_ms:
             return "主动观察：运动反馈间隔过长，停车后重规划", True
         stamp, source, motion = history[-1]
         previous = self.poses[-1][0]
@@ -316,7 +321,7 @@ class ActiveScan:
             hold = self._integrate_receipt_motion(history, stamp, source, motion)
             if hold is not None:
                 return hold.reason, True
-        if now_ms - self.poses[-1][0] > ODOM_GAP_MS:
+        if now_ms - self.poses[-1][0] > self.max_feedback_gap_ms:
             return "主动观察：运动反馈间隔过长，停车后重规划", True
         return None
 
@@ -336,7 +341,7 @@ class ActiveScan:
         checked = self.turn_sweep
         rate = max(abs(self.turn_yaw), abs(motion[2]))
         sweep = math.copysign(abs(error) + (rate + .10) * checked.horizon, error)
-        translation = self._turn_translation(checked.horizon, motion)
+        translation = max(checked.minimum_translation, self._turn_translation(checked.horizon, motion))
         translation += math.dist(self.pose[:2], checked.pose[:2])
         if not self.clear_sweep(checked.geometry, checked.half_width, sweep, translation,
                                 occupied=checked.occupied, start_angle=self.pose[2] - checked.pose[2]):
@@ -362,8 +367,13 @@ class ActiveScan:
                 or (ground is None and (geometry.horizontal is None or geometry.vertical is None))
                 or not has_valid_returns((depth or {}).get("map"))):
             if self.active and not self.command_only:
-                return self.hold_for_replan("主动观察：深度暂不可用，停车后重规划")
+                return self.pause_for_depth(self.control_ms or stamp)
             return self.interrupt()
+        if self.turn_depth_paused:
+            if ((self.source_frame is not None and source is None)
+                    or (self.views and frame <= self.views[-1][0])):
+                return ScanCommand(reason=DEPTH_RECHECK_HOLD)
+            self.turn_depth_paused = False
         self.current_frame = frame
         if self.views and self.views[-1][0] == frame:
             return
@@ -510,7 +520,7 @@ class ActiveScan:
 
     def command(self, geometry, half_width, yaw_rate, watchdog_ms, obs_age_ms=500, *,
                 min_yaw_rate=0., now_ms=None, tick_s=.1, previous_yaw=None, control_period_s=None,
-                previous_command_s=None, yaw_limits=None):
+                previous_command_s=None, yaw_limits=None, previous_linear=None):
         if not self.active or self.ready:
             return ScanCommand()
         if self.command_only:
@@ -523,8 +533,13 @@ class ActiveScan:
         translating = math.hypot(*self.motion[:2]) > self.odom_linear_tolerance_mps
         if not self.current_frame:
             return self.interrupt("主动观察：观测超时，停车")
+        rolling_start = (self.phase == "brake" and previous_linear is not None
+                         and self.receipt_only and self.buffered_odom and self.pose_origin is None
+                         and self.advance_m is not None and abs(self.motion[2]) <= STILL_YAW
+                         and abs(previous_yaw or 0.) <= STILL_YAW
+                         and max(previous_linear, math.hypot(*self.motion[:2])) > STILL_LINEAR)
         if self.phase == "brake":
-            if (translating or abs(self.motion[2]) > STILL_YAW
+            if ((translating and not rolling_start) or abs(self.motion[2]) > STILL_YAW
                     or (self.pose_origin is not None and self.pose_feedback_since_ms < self.still_since)):
                 return ScanCommand(reason="主动观察：等待底盘停稳")
             if not self.origin_set:
@@ -532,11 +547,13 @@ class ActiveScan:
             self.still_since = stamp
             self.turn_start_heading = self.pose[2]
             self.phase = "turn"
-            return ScanCommand(reason="主动观察：确认底盘已停稳")
+            if not rolling_start:
+                return ScanCommand(reason="主动观察：确认底盘已停稳")
         # A released straight segment legitimately leaves the turn origin. A
         # replan hold after it must settle and replan, not lock on that travel.
-        turning = self.issued_yaw and self.phase in ("turn", "return")
-        if (self.phase != "brake_for_replan" and not turning and self.origin_set and self.advance_origin is None
+        turning = (self.issued_yaw or rolling_start) and self.phase in ("turn", "return")
+        if (self.phase != "brake_for_replan" and (not turning or self.turn_stop_ms is not None)
+                and self.origin_set and self.advance_origin is None
                 and math.dist(self.pose[:2], self.origin[:2]) > .18):
             return self.interrupt("主动观察：检测到平移，停车")
         if (self.receipt_only and translating and self.phase != "brake_for_replan"
@@ -637,15 +654,22 @@ class ActiveScan:
                 return ScanCommand(reason=wait_reason)
         occupied = self.turn_obstacles()
 
+        # The old forward command can still be executing when the yaw request arrives.
+        minimum_translation = previous_linear * horizon if rolling_start else 0.
         yaw_rate = self.checked_turn_rate(geometry, half_width, error, yaw_rate, min_yaw_rate,
-                                          horizon, occupied)
+                                          horizon, occupied, minimum_translation=minimum_translation)
         if not yaw_rate:
+            if rolling_start:
+                self.phase = "brake"
+                self.origin_set = False
+                return ScanCommand(reason="主动观察：当前速度下转身扫掠区有障碍，停车")
             if not self.issued_yaw and self.try_other_side():
                 return ScanCommand(reason="主动观察：尝试另一侧的转身空间")
             return self.interrupt("主动观察：转身扫掠区有障碍，停车")
         self.issued_yaw = True
         if self.buffered_turn:
-            self.turn_sweep = CheckedTurnSweep(geometry, half_width, horizon, occupied, self.pose)
+            self.turn_sweep = CheckedTurnSweep(geometry, half_width, horizon, occupied, self.pose,
+                                               minimum_translation)
         if bounded_turn:
             if not self.turn_until_ms or renew:
                 self.turn_until_ms = control_ms + duration_ms
@@ -715,8 +739,9 @@ class ActiveScan:
             translation = max(translation, RESOLUTION)
         return translation
 
-    def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied):
-        translation = self._turn_translation(horizon, self.motion)
+    def checked_turn_rate(self, geometry, half_width, error, yaw_rate, min_yaw_rate, horizon, occupied,
+                          *, minimum_translation=0.):
+        translation = max(minimum_translation, self._turn_translation(horizon, self.motion))
 
         def clear_sweep(rate):
             turn_rate = max(rate, abs(self.motion[2]))
@@ -759,6 +784,17 @@ class ActiveScan:
                 return False
         return True
 
+    def pause_for_depth(self, stop_ms):
+        if not self.buffered_turn or not self.issued_yaw:
+            return self.hold_for_replan("主动观察：深度暂不可用，停车后重规划")
+        # Keep the chosen heading and straight segment through a brief outage.
+        # The next burst must use a new view and the normal stopped feedback.
+        self.turn_depth_paused = True
+        self.current_frame = self.turn_until_ms = 0
+        if self.turn_stop_ms is None:
+            self.turn_stop_ms = stop_ms
+        return ScanCommand(reason=DEPTH_RECHECK_HOLD)
+
     def hold_for_replan(self, reason, *, retry_scan=True):
         if self.phase != "brake_for_replan":
             self.retry_after_hold = retry_scan
@@ -767,6 +803,7 @@ class ActiveScan:
         self.current_frame = 0
         self.turn_until_ms = 0
         self.turn_stop_ms = None
+        self.turn_depth_paused = False
         return ScanCommand(reason=reason)
 
     def interrupt(self, reason="主动观察：深度或里程计不可用，停车"):
