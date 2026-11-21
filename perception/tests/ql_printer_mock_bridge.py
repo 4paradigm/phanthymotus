@@ -136,13 +136,30 @@ class MockBridge:
             def print_tag(self, body: dict):
                 ticket = str(body.get("ticket", "")).strip()
                 request_id = str(body.get("request_id", "")).strip()
-                if not ticket or not request_id:
-                    self.reply(400, {"ok": False, "error": "缺少 ticket 或 request_id", "code": "bad_request"})
+                if not request_id:
+                    self.reply(400, {"ok": False, "error": "缺少 request_id", "code": "bad_request"})
                     return
                 with bridge.lock:
                     previous = bridge.requests.get(request_id)
                     if previous is not None:
                         self.reply(200, previous)
+                        return
+                    if not ticket:
+                        name = str(body.get("name", "")).strip()
+                        host = str(body.get("host", "")).strip()
+                        matches = [v for v in bridge.visitors if v["id"] not in bridge.printed
+                                   and v["name"] == name and (not host or host in v["host"])]
+                        if len(matches) != 1:
+                            result = {"ok": False, "error": "没有唯一匹配的未入场访客", "code": "not_found" if not matches else "visitor_ambiguous"}
+                        elif not bridge.printer_ready:
+                            result = {"ok": False, "error": "打印机缺纸，请前台同事检查", "code": "printer_not_ready"}
+                        else:
+                            visitor_id = matches[0]["id"]
+                            bridge.printed.add(visitor_id)
+                            bridge.print_log.append(visitor_id)
+                            result = {"ok": True}
+                        bridge.requests[request_id] = result
+                        self.reply(200, result)
                         return
                     ticket_info = bridge.tickets.get(ticket)
                     if not ticket_info or time.monotonic() >= ticket_info["expires_at"]:

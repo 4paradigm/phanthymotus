@@ -154,8 +154,18 @@ try {
         -Argument ('"' + (Join-Path $install 'ssh_worker.py') + '" --config "' + $cfgPath + '"') `
         -WorkingDirectory $install
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    # -StartWhenAvailable:  if Start-ScheduledTask is called while the
+    #   interactive session is unavailable (locked / disconnected / user
+    #   switching), the task starts as soon as the session comes back
+    #   instead of silently dropping the start request.
+    # -MultipleInstances Queue: if a start request arrives while the
+    #   previous short-lived worker is still exiting (or still processing),
+    #   the new run is queued rather than silently discarded.  The worker
+    #   drains all *.request.json files on each run, so a queued instance
+    #   either picks up late arrivals (good) or exits after the 10 s idle
+    #   grace period (harmless).
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances Queue -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+        -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $taskPrincipal -Settings $settings -Force | Out-Null
 
     $loginAction = New-ScheduledTaskAction -Execute $python `

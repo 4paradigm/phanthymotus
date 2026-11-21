@@ -145,7 +145,7 @@ class VisitorBridge:
         backend: VisitorBackend,
         store: BridgeStore,
         *,
-        ticket_seconds: float = 300,
+        ticket_seconds: float = 12 * 3600,
         printable_statuses: tuple[str, ...] = ("未入场",),
         success_statuses: tuple[str, ...] = ("已入场",),
     ):
@@ -202,42 +202,65 @@ class VisitorBridge:
                 result = {"ok": False, "code": "ticket_expired", "error": "查询票据无效或已过期，请重新查询访客"}
                 self._finish(request_id, ticket, result)
                 return result
+            return self._print_visit_locked(visit, request_id, ticket, printer_name)
 
-            # print_visit performs the authoritative status check on the same
-            # page immediately before clicking. Avoid a separate full-page
-            # lookup here; it opened a second Edge search and added latency.
-            try:
-                if printer_name:
-                    after = self.backend.print_visit(visit, printer_name=printer_name)
-                else:
-                    after = self.backend.print_visit(visit)
-            except BridgeFailure as exc:
-                # A print timeout is ambiguous. Do not start a second Edge
-                # search here: that can reopen the browser, duplicate the
-                # operation, and exceed the SSH job deadline. The operator
-                # must verify the printer before retrying.
-                if exc.uncertain:
-                    result = {"ok": False, "code": exc.code, "error": str(exc)}
-                else:
-                    result = {"ok": False, "code": exc.code, "error": str(exc)}
-                self._finish(request_id, ticket, result)
+    def print_today_visit(self, name: str, host: str, request_id: str, printer_name: str = "") -> dict:
+        """Find one printable visit and print it within the same Edge session."""
+        name = str(name or "").strip()
+        host = str(host or "").strip()
+        request_id = str(request_id or "").strip()
+        if not name or len(name) > 32 or len(host) > 64 or not REQUEST_ID_RE.fullmatch(request_id):
+            raise BridgeFailure("bad_request", "缺少有效的访客姓名、被访人或 request_id")
+
+        with self._print_lock:
+            previous = self.store.get_request(request_id)
+            if previous is not None:
+                return previous
+            today = datetime.now().date().isoformat()
+            visits = self.backend.find_visits("", "", f"{today} 00:00:00", f"{today} 23:59:59")
+            matches = [
+                visit for visit in visits
+                if visit.status in self.printable_statuses
+                and visit.name == name
+                and (not host or host in visit.host)
+            ]
+            if not matches:
+                result = {"ok": False, "code": "not_found", "error": "今天的未入场访客中没有匹配预约，不能打印访客贴"}
+                self._finish(request_id, "", result)
                 return result
+            if len(matches) != 1:
+                result = {"ok": False, "code": "visitor_ambiguous", "error": "存在多条同名未入场预约，请补充被访人后再打印"}
+                self._finish(request_id, "", result)
+                return result
+            return self._print_visit_locked(matches[0], request_id, "", printer_name)
 
-            # The browser backend reads the resulting status from the same
-            # detail row after clicking print. Re-running login capture and
-            # the visitor search here needlessly reloads Edge and can exceed
-            # the SSH job deadline. A missing row status means the UI accepted
-            # the click but did not expose a status to confirm.
-            if after and after not in self.success_statuses:
-                result = {
-                    "ok": False,
-                    "code": "status_unconfirmed",
-                    "error": f"打印动作已发出，但访客状态为“{after}”；系统不会自动重试，请前台核对",
-                }
+    def _print_visit_locked(self, visit: Visit, request_id: str, ticket: str, printer_name: str) -> dict:
+        """Run the final UI action; caller holds _print_lock."""
+
+        # print_visit performs the authoritative status check on the same
+        # page immediately before clicking. Avoid a separate full-page lookup.
+        try:
+            if printer_name:
+                after = self.backend.print_visit(visit, printer_name=printer_name)
             else:
-                result = {"ok": True}
+                after = self.backend.print_visit(visit)
+        except BridgeFailure as exc:
+            # A print timeout is ambiguous. Do not start a second Edge search.
+            result = {"ok": False, "code": exc.code, "error": str(exc)}
             self._finish(request_id, ticket, result)
             return result
+
+        # The browser backend reads the resulting status from the same detail row.
+        if after and after not in self.success_statuses:
+            result = {
+                "ok": False,
+                "code": "status_unconfirmed",
+                "error": f"打印动作已发出，但访客状态为“{after}”；系统不会自动重试，请前台核对",
+            }
+        else:
+            result = {"ok": True}
+        self._finish(request_id, ticket, result)
+        return result
 
     def _finish(self, request_id: str, ticket: str, result: dict) -> None:
         self.store.save_request(request_id, result)

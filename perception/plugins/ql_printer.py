@@ -269,20 +269,49 @@ $result = Join-Path $jobs '{job_id}.result.json'
 [IO.File]::WriteAllBytes($temporary, [Convert]::FromBase64String('{payload}'))
 Move-Item -LiteralPath $temporary -Destination $request -Force
 Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
+# Quick sanity check: within 3 s the task should be Running or at least
+# Queued.  If it is still Ready / Unknown, the start request may have been
+# silently dropped (Interactive session unavailable, etc.) and we restart
+# immediately instead of burning the whole timeout.
+$startedConfirmed = $false
+for ($probe = 0; $probe -lt 6; $probe++) {{
+    $probeTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
+    if ($probeTask -and $probeTask.State -in @('Running','Queued')) {{
+        $startedConfirmed = $true
+        break
+    }}
+    Start-Sleep -Milliseconds 500
+}}
+if (!$startedConfirmed) {{
+    Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
+}}
+$restartCount = 0
 for ($i = 0; $i -lt 220 -and !(Test-Path -LiteralPath $result); $i++) {{
-    # The on-demand task ignores a Start request while its prior short-lived
-    # worker is still exiting. If it has become Ready without consuming this
-    # job, start it again; otherwise the request would remain stranded until
-    # a later call happens to wake the task.
+    # Every ~10 s, verify the task is alive.  With MultipleInstances=Queue,
+    # 'Running' means a worker is up, 'Queued' means another start is
+    # pending.  If the state is Ready (task finished and no queue), restart
+    # it — the previous instance may have exited without seeing this file
+    # because of a race or a startup crash.
     if ($i -gt 0 -and ($i % 20) -eq 0) {{
-        $currentTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction Stop
-        if ($currentTask.State -ne 'Running') {{
+        $currentTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
+        if ($currentTask -and $currentTask.State -notin @('Running','Queued')) {{
             Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'
+            $restartCount++
         }}
     }}
     Start-Sleep -Milliseconds 500
 }}
-if (!(Test-Path -LiteralPath $result)) {{ throw 'Visitor automation job timed out' }}
+if (!(Test-Path -LiteralPath $result)) {{
+    $diagTask = Get-ScheduledTask -TaskName 'Paradigm Visitor Automation' -ErrorAction SilentlyContinue
+    $diagState = if ($diagTask) {{ $diagTask.State }} else {{ 'NotFound' }}
+    $diagSentinel = Test-Path -LiteralPath (Join-Path $jobs 'worker.started')
+    $diagLog = ''
+    $logPath = Join-Path $install 'data\worker.log'
+    if (Test-Path -LiteralPath $logPath) {{
+        $diagLog = Get-Content -LiteralPath $logPath -Tail 5 -ErrorAction SilentlyContinue | Out-String
+    }}
+    throw "Visitor automation job timed out (state=$diagState restarts=$restartCount sentinel=$diagSentinel). $diagLog"
+}}
 $bytes = [IO.File]::ReadAllBytes($result)
 Remove-Item -LiteralPath $result -Force -ErrorAction SilentlyContinue
 Write-Output ('{self.MARKER}' + [Convert]::ToBase64String($bytes))
@@ -290,7 +319,17 @@ Write-Output ('{self.MARKER}' + [Convert]::ToBase64String($bytes))
         result = self._ssh(script, timeout_s)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).decode("utf-8", errors="replace")
-            detail = " ".join(detail.split())[-400:]
+            detail = " ".join(detail.split())[-600:]
+            if "Visitor automation job timed out" in detail:
+                # The on-demand worker never produced a result file.
+                # Extract the diagnostic tail the PowerShell script appended.
+                diag = detail.split("job timed out", 1)[-1].strip()
+                raise BridgeError(
+                    "前台自动化任务没有在时限内返回结果。"
+                    "常见原因：专用 Edge 启动失败、Windows 会话锁屏或断开、打印机卡住。"
+                    f"诊断信息：{diag}",
+                    "automation_timeout",
+                )
             raise BridgeError(
                 "SSH 无法执行前台自动化" + (f"：{detail}" if detail else ""),
                 "ssh_failed",
@@ -627,44 +666,56 @@ class QLPrinterPlugin:
             return {"status": "error", "code": "bad_args", "error": "print 需要访客姓名 name"}
         if len(name) > 32 or len(host) > 64:
             return {"status": "error", "code": "bad_args", "error": "姓名或被访人信息太长"}
-        _, visits = self._daily_visits()
-        matches = [
-            visit for visit in visits
-            if visit.get("name") == name and (not host or host in str(visit.get("host", "")))
-        ]
-        if not matches:
+        if not self._cfg["printer_name"]:
+            return {"status": "error", "code": "printer_required", "error": "请先在卡片中选择目标打印机"}
+        if not self._cfg["visitor_page_url"]:
+            return {"status": "error", "code": "visitor_page_required", "error": "请先在卡片中选择已登录的访客网页"}
+
+        # A fresh direct request lets the front desk re-check current visitor
+        # status on every new card action. The Windows store remains
+        # idempotent for retries of an explicit ticket/request_id operation.
+        with self._lock:
+            request_id = f"direct-{uuid.uuid4().hex}"
+            print_timeout_s = self._cfg["print_timeout_s"]
+        try:
+            payload = self._client().request(
+                "POST",
+                "/print_tag",
+                body={
+                    "name": name,
+                    "host": host,
+                    "request_id": request_id,
+                    "printer_name": self._cfg["printer_name"],
+                    "visitor_page_url": self._cfg["visitor_page_url"],
+                },
+                timeout_s=print_timeout_s,
+            )
+        except BridgeError as exc:
+            if exc.code == "not_found":
+                return {
+                    "status": "not_found", "name": name, "visits": [],
+                    "hint": "今天的未入场列表中没有匹配访客，不能打印访客贴",
+                }
+            raise
+        if payload.get("ok") is True:
+            return {"status": "printed", "request_id": request_id,
+                    "say": "访客贴打好了，在前台打印机上"}
+        if str(payload.get("code") or "") == "not_found":
             return {
                 "status": "not_found", "name": name, "visits": [],
                 "hint": "今天的未入场列表中没有匹配访客，不能打印访客贴",
             }
-        if len(matches) != 1:
-            return {
-                "status": "error",
-                "code": "visitor_ambiguous",
-                "error": "今天有多条同名未入场预约，不能直接打印；请填写被访人 host 缩小范围",
-            }
-
-        visit = matches[0]
-
-        key = (
-            name,
-            str(visit.get("host", "")),
-            str(visit.get("tail", "")),
-            str(visit.get("time", "")),
-        )
-        with self._lock:
-            request_id = self._direct_request_ids.get(key)
-            if not request_id:
-                request_id = f"direct-{uuid.uuid4().hex}"
-                if len(self._direct_request_ids) >= 64:
-                    self._direct_request_ids.pop(next(iter(self._direct_request_ids)))
-                self._direct_request_ids[key] = request_id
-        return self._print_ticket({"ticket": visit["ticket"], "request_id": request_id})
+        return {
+            "status": "failed",
+            "code": str(payload.get("code") or "print_failed"),
+            "error": str(payload.get("error") or "打印失败，请前台同事检查打印机"),
+            "request_id": request_id,
+        }
 
     def _print_action(self, args: dict) -> dict:
         # Backward-compatible for an older Skill that still submits ticket/request_id.
         # The public schema only exposes name/host, so canvas users never handle them.
-        if args.get("ticket") or args.get("request_id"):
+        if args.get("ticket"):
             return self._print_ticket(args)
         return self._find_and_print(args)
 

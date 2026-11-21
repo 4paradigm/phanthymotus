@@ -48,7 +48,7 @@ def main():
     bridge = VisitorBridge(
         backend,
         store,
-        ticket_seconds=float(config.get("ticket_seconds", 300)),
+        ticket_seconds=float(config.get("ticket_seconds", 12 * 3600)),
         printable_statuses=tuple(config.get("printable_statuses", ["未入场"])),
         success_statuses=tuple(config.get("success_statuses", ["已入场"])),
     )

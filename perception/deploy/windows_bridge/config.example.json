@@ -3,7 +3,7 @@
   "port": 8765,
   "shared_token": "安装程序生成的随机密钥",
   "database_path": "data/bridge.db",
-  "ticket_seconds": 300,
+  "ticket_seconds": 43200,
   "printable_statuses": ["未入场"],
   "success_statuses": ["已入场"],
   "edge": {
