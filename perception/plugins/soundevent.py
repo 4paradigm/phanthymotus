@@ -23,7 +23,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 
 log = logging.getLogger(__name__)
@@ -189,7 +189,7 @@ class YamNetLite:
         self._interpreter.allocate_tensors()
         self._input = self._interpreter.get_input_details()[0]
         self._output = self._interpreter.get_output_details()[0]
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def predict(self, waveform: np.ndarray) -> np.ndarray:
         waveform = np.asarray(waveform, dtype=np.float32)
@@ -308,6 +308,10 @@ class _SoundEventNode(Node):
             self._thread.start()
             log.info("[soundevent] started: %s -> %s", self.input_topic, self.output_topic)
             return self.status()
+
+    @property
+    def worker_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
     def request_retire(self) -> None:
         self._retired.set()
@@ -511,6 +515,8 @@ class SoundEventPlugin:
         self._nodes = {}  # type: Dict[str, _SoundEventNode]
         self._pending_starts = {}  # type: Dict[str, str]
         self._lock = threading.RLock()
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
         self._model = None  # type: Optional[YamNetLite]
         self._model_state = "idle"  # idle | loading | ready | error
         self._model_error = None  # type: Optional[str]
@@ -579,8 +585,9 @@ class SoundEventPlugin:
                 ):
                     return
                 key, input_topic = next(iter(self._pending_starts.items()))
+                request = self._lifecycle.current(key)
             try:
-                self._activate_pending(key, input_topic, model)
+                self._activate_pending(key, input_topic, model, request)
             except Exception:
                 log.exception("[soundevent] failed to start pending instance %s", key)
                 with self._lock:
@@ -695,159 +702,55 @@ class SoundEventPlugin:
                 result["error"] = self._model_error
             return result
 
-    def _dispose(self, key: str, node: _SoundEventNode) -> Dict[str, Any]:
-        try:
-            return node.retire()
-        finally:
-            dispose_node(self._executor, node, label="soundevent/%s" % key)
+    def _dispose(self, key, node) -> dict:
+        return self._lifecycle.retire(key, node, node.retire)
 
-    def _activate_pending(
-        self,
-        key: str,
-        input_topic: str,
-        model: YamNetLite,
-    ) -> Dict[str, Any]:
-        """Create and start one still-pending instance with a ready model."""
-        try:
-            node = _SoundEventNode(input_topic, model, node_suffix=key)
-        except Exception:
-            with self._lock:
-                if self._pending_starts.get(key) == input_topic:
-                    del self._pending_starts[key]
-            raise
-
-        registered = False
-        registration_error = None  # type: Optional[Exception]
-        current = None  # type: Optional[_SoundEventNode]
-        claimed = False
-        fresh = False
+    def _activate_pending(self, key, input_topic, model, request=None):
+        request = request or self._lifecycle.current(key)
+        result = self._lifecycle.start(
+            key, request, lambda: _SoundEventNode(input_topic, model, node_suffix=key),
+            self._lifecycle.retire_node)
         with self._lock:
-            claimed = self._pending_starts.get(key) == input_topic
-            current = self._nodes.get(key)
-            fresh = (
-                self._model is model
-                and self._model_state == "ready"
-            )
-            if claimed and current is None and fresh:
-                try:
-                    # Register before start: a concurrent stop must always be
-                    # able to find and retire this node.
-                    self._executor.add_node(node)
-                except Exception as error:
-                    registration_error = error
-                    del self._pending_starts[key]
-                else:
-                    self._nodes[key] = node
-                    del self._pending_starts[key]
-                    registered = True
-            elif claimed and current is not None:
-                # Another activation won the race for this key.
-                del self._pending_starts[key]
-
-        if not registered:
-            try:
-                node.destroy_node()
-            except Exception:
-                pass
-            if registration_error is not None:
-                raise registration_error
-            if current is not None:
-                return current.start()
-            if claimed and not fresh:
-                return self._loading_result(input_topic)
-            return {"state": "idle"}
-
-        try:
-            result = node.start()
-        except Exception:
-            with self._lock:
-                if self._nodes.get(key) is node:
-                    del self._nodes[key]
-            node.request_retire()
-            try:
-                self._dispose(key, node)
-            except Exception:
-                log.exception("[soundevent] failed to clean up start error")
-            raise
-
-        with self._lock:
-            still_ours = self._nodes.get(key) is node
-        if not still_ours:
-            # A concurrent stop retired the node while start() ran.
-            node.stop()
-            return {"state": "idle"}
+            if self._lifecycle.current(key) is request:
+                self._pending_starts.pop(key, None)
         return result
 
-    def _start(self, key: str, input_topic: str) -> Dict[str, Any]:
+    def _start(self, key: str, input_topic: str) -> dict:
         if not input_topic:
             raise ValueError("input_topic is required for start")
-
-        previous = None  # type: Optional[_SoundEventNode]
-        start_node = None  # type: Optional[_SoundEventNode]
-        model = None  # type: Optional[YamNetLite]
+        request, blocked = self._lifecycle.begin(key, input_topic)
+        if blocked:
+            return blocked
         with self._lock:
-            existing = self._nodes.get(key)
-            if (
-                existing is not None
-                and existing.input_topic == input_topic
-                and existing.state != "error"
-            ):
-                start_node = existing
-            else:
-                if existing is not None:
-                    previous = self._nodes.pop(key)
-                    previous.request_retire()
-                # Claim the key before any blocking cleanup. A concurrent stop
-                # can now cancel this start even before the node exists.
+            model = self._model
+            if self._model_state != "ready" or model is None:
                 self._pending_starts[key] = input_topic
-                if self._model_state == "ready" and self._model is not None:
-                    model = self._model
-                else:
-                    if self._model_state in ("idle", "error"):
-                        self._spawn_loader_locked()
+                if self._model_state in ("idle", "error"):
+                    self._spawn_loader_locked()
+                return self._loading_result(input_topic)
+        return self._activate_pending(key, input_topic, model, request)
 
-        if previous is not None:
-            result = self._dispose(key, previous)
-            if result.get("state") != "idle":
-                with self._lock:
-                    if self._pending_starts.get(key) == input_topic:
-                        del self._pending_starts[key]
-                return result
-
-        if start_node is not None:
-            return start_node.start()
-        if model is None:
-            return self._loading_result(input_topic)
-        return self._activate_pending(key, input_topic, model)
-
-    def _stop(self, instance_id: str) -> Dict[str, Any]:
-        items = []  # type: List[Tuple[str, _SoundEventNode]]
+    def _stop(self, instance_id: str) -> dict:
         with self._lock:
             if instance_id:
                 self._pending_starts.pop(instance_id, None)
-                node = self._nodes.pop(instance_id, None)
-                if node is not None:
-                    node.request_retire()
-                    items.append((instance_id, node))
             else:
                 self._pending_starts.clear()
-                items = list(self._nodes.items())
-                self._nodes.clear()
-                for _, node in items:
-                    node.request_retire()
+        return self._lifecycle.stop(instance_id or None)
 
-        failure = None
-        for key, node in items:
-            try:
-                result = self._dispose(key, node)
-            except Exception as error:
-                log.exception("[soundevent] failed to dispose %s", key)
-                result = {"state": "error", "message": str(error)}
-            if result.get("state") != "idle" and failure is None:
-                failure = result
-        return failure or {"state": "idle"}
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
 
-    def dispatch(self, name: str, args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    def _dispatch(self, name: str, args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         action = str(args.get("action", name))
         instance_id = str(args.get("instance_id", "") or "")
         input_topic = str(args.get("input_topic", "") or "")
@@ -862,6 +765,10 @@ class SoundEventPlugin:
         if action == "config":
             return {"status": "configured"}
         return None
+
+    def shutdown(self) -> dict:
+        """Cancel pending creation and retain failed cleanup for explicit retry."""
+        return self._lifecycle.shutdown()
 
 
 __all__ = ["SoundEventPlugin", "TOOLS"]
