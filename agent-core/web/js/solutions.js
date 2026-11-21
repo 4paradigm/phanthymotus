@@ -10,7 +10,7 @@
  *   3. 打包保存：画布强制勾选，技能只允许选"已激活且已上架"的
  */
 
-import { openInstanceConfigModal, openToolConfigModal } from './sidebar.js';
+import { openInstanceConfigModal, openToolConfigModal } from './sidebar.js?v=visitor-printer-20261121-1';
 import { reloadFromServer } from './canvas.js';
 import { isRcLoggedIn, rcHeaders, rcFetch, showAccount, refreshAccount } from './account.js';
 import { sessionId } from './session.js';

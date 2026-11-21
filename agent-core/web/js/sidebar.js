@@ -947,6 +947,197 @@ function _llmSourceInput(key, saved) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
+
+/** Shared by the sidebar settings and the placed card's settings. */
+function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved}) {
+  const input = document.createElement('select');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  let selected = saved || '';
+  input.add(new Option(selected || '连接后选择打印机', selected));
+
+  const initialize = document.createElement('button');
+  initialize.type = 'button';
+  initialize.textContent = '准备前台电脑';
+  initialize.className = 'ql-printer-init-button';
+  initialize.setAttribute('hidden', 'hidden');
+  const progress = document.createElement('div');
+  progress.className = 'ql-printer-progress';
+  progress.setAttribute('aria-live', 'polite');
+  const read = k => bodyEl.querySelector(`[data-key="${k}"]`)?.value.trim() || '';
+  const alive = () => initialize.isConnected && !overlay.classList.contains('hidden');
+  const automaticSsh = !props.bridge_url && !props.remote_start_user;
+  const connectionKeys = ['bridge_url', 'remote_start_user', 'remote_start_password', 'remote_start_port'];
+  const connection = () => automaticSsh ? ['visitor-frontdesk'] : connectionKeys.map(read);
+  const identity = () => JSON.stringify(connection());
+  const call = async args => {
+    const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tool: toolName, arguments: args}),
+    });
+    const envelope = await response.json();
+    if (!response.ok || ![0, 200].includes(envelope.code)) throw new Error(envelope.message || '请求失败');
+    const blocks = Array.isArray(envelope.data) ? envelope.data : envelope.data?.content;
+    const text = blocks?.find(b => b.type === 'text')?.text;
+    const result = text ? JSON.parse(text) : envelope.data;
+    if (!result || typeof result !== 'object') throw new Error('前台电脑返回了无法读取的结果');
+    return result;
+  };
+
+  let generation = 0;
+  let installing = false;
+  const showPending = label => {
+    input.replaceChildren(new Option(selected || label, selected));
+  };
+  input.addEventListener('change', () => { selected = input.value; });
+  const loadPrinters = async (silent = false) => {
+    const version = ++generation;
+    const address = connection();
+    const [bridge_url, remote_start_user, remote_start_password, remote_start_port] = automaticSsh ? ['', ''] : address;
+    const current = () => alive() && version === generation &&
+      JSON.stringify(connection()) === JSON.stringify(address);
+    if (!automaticSsh && (!bridge_url || !remote_start_user || !remote_start_password)) {
+      showPending('连接后选择打印机');
+      input.disabled = installing;
+      return;
+    }
+    input.disabled = true;
+    showPending('正在读取打印机…');
+    try {
+      const result = await call(automaticSsh ? {action: 'printers'} : {action: 'printers', bridge_url, remote_start_user,
+        remote_start_password, remote_start_port});
+      if (!current()) return;
+      if (!Array.isArray(result.printers)) throw new Error(result.error || '未返回打印机列表，请先准备前台电脑');
+      input.replaceChildren(new Option('请选择打印机', ''));
+      for (const p of result.printers) {
+        input.add(new Option(p.name + (p.default ? '（系统默认）' : '') + (p.offline ? '（离线）' : ''), p.name));
+      }
+      if (selected && !result.printers.some(p => p.name === selected)) {
+        input.add(new Option(selected + '（未在此电脑找到）', selected));
+      }
+      input.value = selected;
+      const pageInput = bodyEl.querySelector('[data-key="visitor_page_url"]');
+      if (pageInput && Array.isArray(result.pages)) {
+        const savedPage = pageInput.value;
+        pageInput.replaceChildren(new Option('请选择已登录且能看到访客列表的网页', ''));
+        for (const page of result.pages) pageInput.add(new Option(`${page.title || '访客网页'} — ${page.url}`, page.url));
+        if (savedPage && !result.pages.some(page => page.url === savedPage)) pageInput.add(new Option(`${savedPage}（当前未打开）`, savedPage));
+        pageInput.value = savedPage;
+      }
+    } catch (error) {
+      if (!current()) return;
+      showPending('暂时无法读取打印机');
+      if (!silent) progress.textContent = error.message;
+    } finally {
+      if (current()) input.disabled = installing;
+    }
+  };
+
+  initialize.onclick = async () => {
+    if (!(await ensureEdit()) || !alive() || installing) return;
+    const originalIdentity = identity();
+    const unchanged = () => alive() && identity() === originalIdentity;
+    const args = automaticSsh ? {action: 'initialize'} : {action: 'initialize', bridge_url: read('bridge_url'),
+      remote_start_user: read('remote_start_user'), remote_start_password: read('remote_start_password'),
+      remote_start_port: read('remote_start_port')};
+    if (!automaticSsh && (!args.bridge_url || !args.remote_start_user || !args.remote_start_password)) {
+      progress.textContent = '请填写前台电脑 IP、Windows 用户名和密码';
+      return;
+    }
+    installing = true;
+    initialize.disabled = true;
+    input.disabled = true;
+    generation++;
+    progress.textContent = '正在连接前台电脑并准备安装…';
+    let pairedIdentity = null;
+    try {
+      let result = await call(args);
+      const deploymentId = result.deployment_id;
+      while (result.status === 'installing') {
+        if (!deploymentId) throw new Error('请先升级机器人 perception，再使用简化初始化');
+        if (!unchanged()) return;
+        progress.textContent = '正在安装，请保持窗口打开；首次安装可能需要几分钟。';
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        if (!unchanged()) return;
+        result = await call({action: 'initialize_status', deployment_id: deploymentId});
+      }
+      if (!unchanged()) return;
+      if (result.status !== 'installed') throw new Error(result.error || '初始化未成功');
+      if (!deploymentId || result.deployment_id !== deploymentId) throw new Error('初始化结果不匹配，请重新连接前台电脑');
+      const cacheKey = `${mcpId}:${toolName}`;
+      const sharedValues = {...(_toolConfigs[cacheKey] || {})};
+      for (const field of bodyEl.querySelectorAll('[data-key]')) {
+        const def = props[field.dataset.key];
+        if (def && def.scope !== 'instance' && field.value.trim()) {
+          sharedValues[field.dataset.key] = _readConfigValue(field, def);
+        }
+      }
+      if (!automaticSsh) sharedValues.bridge_url = args.bridge_url;
+      const savedIdentity = identity();
+      pairedIdentity = savedIdentity;
+      // Persist the verified SSH connection now. The selected printer is
+      // still committed by Save.
+      const response = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+        method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(sharedValues),
+      });
+      if (!response.ok) throw new Error('安装成功，但连接配置未保存，请点击“保存”后重试');
+      _toolConfigs[cacheKey] = sharedValues;
+      if (!alive() || identity() !== savedIdentity) return;
+      progress.textContent = 'Edge 已打开：请登录访客网站并确认能看到访客列表，然后关闭 Edge，再选择网页和打印机并保存。';
+      await loadPrinters();
+    } catch (error) {
+      if (alive() && (unchanged() || identity() === pairedIdentity)) progress.textContent = error.message;
+    } finally {
+      installing = false;
+      if (alive()) {
+        initialize.disabled = false;
+        input.disabled = false;
+        if (identity() !== originalIdentity) {
+          progress.textContent = '连接信息已修改，请重新准备前台电脑。';
+        }
+      }
+    }
+  };
+
+  let reloadTimer;
+  let lastAddress = '';
+  const onInput = event => {
+    if (!initialize.isConnected) {
+      bodyEl.removeEventListener('input', onInput);
+      return;
+    }
+    if (automaticSsh || !connectionKeys.includes(event.target.dataset.key)) return;
+    generation++;
+    clearTimeout(reloadTimer);
+    if (read('bridge_url') !== lastAddress) {
+      selected = '';
+      lastAddress = read('bridge_url');
+    }
+    showPending('连接后选择打印机');
+    if (installing) {
+      progress.textContent = '配置已修改；正在进行的准备仍使用原配置，完成后请重新连接。';
+      return;
+    }
+    reloadTimer = setTimeout(() => { if (alive()) loadPrinters(true); }, 500);
+  };
+  bodyEl.addEventListener('input', onInput);
+  queueMicrotask(() => {
+    if (!alive()) return;
+    lastAddress = read('bridge_url');
+    loadPrinters(true);
+  });
+  return {input, controls: [initialize, progress]};
+}
+
+function _configEntries(props, toolName) {
+  const entries = Object.entries(props);
+  if (!['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) return entries;
+  const order = ['bridge_url', 'remote_start_user', 'remote_start_password', 'visitor_page_url', 'printer_name'];
+  const rank = ([key, def]) => def.advanced ? 100 : (order.includes(key) ? order.indexOf(key) : 50);
+  return entries.sort((a, b) => rank(a) - rank(b));
+}
+
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
   // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
   // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
@@ -971,10 +1162,17 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
   // If all fields are instance-scope, show them here too (as shared defaults)
   const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
+  const visitorPrinter = ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName);
+  const advancedBox = document.createElement('details');
+  advancedBox.className = 'tool-config-advanced';
+  const advancedTitle = document.createElement('summary');
+  advancedTitle.textContent = visitorPrinter ? '高级设置（通常不用修改）' : 'Advanced settings';
+  advancedBox.appendChild(advancedTitle);
 
-  for (const [key, def] of Object.entries(props)) {
+  for (const [key, def] of _configEntries(props, toolName)) {
     // Skip instance-scope fields only if there are also shared fields
-    if (hasSharedFields && def.scope === 'instance') continue;
+    if (hasSharedFields && def.scope === 'instance' &&
+        !(visitorPrinter && ['bridge-printer', 'edge-page'].includes(def.format))) continue;
     const fieldWrapper = document.createElement('div');
     fieldWrapper.className = 'tool-config-field';
     if (def['x-show-when']) fieldWrapper.dataset.showWhen = JSON.stringify(def['x-show-when']);
@@ -985,6 +1183,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
+    const extraControls = [];
     if (def.oneOf && Array.isArray(def.oneOf)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1031,6 +1230,21 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'edge-page' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.add(new Option(savedValues[key] || '准备前台电脑后选择', savedValues[key] || ''));
+      const discover = document.createElement('button');
+      discover.type = 'button';
+      discover.className = 'ql-printer-discover-button';
+      discover.textContent = '连接并获取打印机和网页';
+      discover.onclick = () => bodyEl.querySelector('.ql-printer-init-button')?.click();
+      extraControls.push(discover);
+    } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
+      const printer = _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved: savedValues[key]});
+      input = printer.input;
+      extraControls.push(...printer.controls);
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
@@ -1086,8 +1300,10 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
     fieldWrapper.appendChild(label);
     fieldWrapper.appendChild(input);
-    bodyEl.appendChild(fieldWrapper);
+    extraControls.forEach(control => fieldWrapper.appendChild(control));
+    (def.advanced ? advancedBox : bodyEl).appendChild(fieldWrapper);
   }
+  if (advancedBox.children.length > 1) bodyEl.appendChild(advancedBox);
 
   // x-show-when / x-hide-when: toggle field visibility based on controlling field value.
   // A condition value may be a single value or an array; an array means "any of
@@ -1309,7 +1525,9 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     box.className = 'tool-config-shared-group';
     const heading = document.createElement('div');
     heading.className = 'tool-config-shared-heading';
-    heading.textContent = '工具级设置 — 改这里会同时影响这个工具的所有卡片';
+    heading.textContent = ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)
+      ? '前台电脑'
+      : '工具级设置 — 改这里会同时影响这个工具的所有卡片';
     box.appendChild(heading);
     bodyEl.appendChild(box);
     sharedHost = box;
@@ -1328,7 +1546,9 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     const details = document.createElement('details');
     details.className = 'tool-config-advanced';
     const summary = document.createElement('summary');
-    summary.textContent = 'Advanced settings';
+    summary.textContent = ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)
+      ? '高级设置（通常不用修改）'
+      : 'Advanced settings';
     details.appendChild(summary);
     bodyEl.appendChild(details);
     advancedBox = details;
@@ -1336,11 +1556,12 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   };
 
   let hasFields = false;
-  for (const [key, def] of Object.entries(props)) {
+  for (const [key, def] of _configEntries(props, toolName)) {
     const isShared = def.scope !== 'instance';
     if (isShared && !sharedHost) continue;
     // Shared keys live in the tool-level row, not this instance's.
-    const vals = isShared ? sharedSaved : savedValues;
+    const vals = isShared ? sharedSaved : (['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)
+      ? {...sharedSaved, ...savedValues} : savedValues);
     hasFields = true;
 
     const label = document.createElement('label');
@@ -1352,6 +1573,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
+    const extraControls = [];
     if (def.oneOf && Array.isArray(def.oneOf)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1398,6 +1620,21 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'edge-page' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.add(new Option(vals[key] || '准备前台电脑后选择', vals[key] || ''));
+      const discover = document.createElement('button');
+      discover.type = 'button';
+      discover.className = 'ql-printer-discover-button';
+      discover.textContent = '连接并获取打印机和网页';
+      discover.onclick = () => bodyEl.querySelector('.ql-printer-init-button')?.click();
+      extraControls.push(discover);
+    } else if (def.format === 'bridge-printer' && ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) {
+      const printer = _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, saved: vals[key]});
+      input = printer.input;
+      extraControls.push(...printer.controls);
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
@@ -1460,10 +1697,23 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       help.textContent = def.description;
     }
 
-    const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
+    // Advanced shared settings belong in the same collapsed expert section as
+    // advanced instance settings.  Previously the shared branch won first,
+    // which flattened every SSH detail into the everyday card form.
+    const host = def.advanced ? advancedHost() : (isShared ? sharedHost : bodyEl);
     host.appendChild(label);
     host.appendChild(input);
+    for (const control of extraControls) host.appendChild(control);
     if (help) host.appendChild(help);
+  }
+  if (advancedBox) bodyEl.appendChild(advancedBox);
+
+  // Keep the discovery action visible in the card dialog.  It used to be
+  // attached only beside the printer field, which made it disappear when the
+  // instance layout rendered the page selector first.
+  if (visitorPrinter) {
+    const discover = bodyEl.querySelector('.ql-printer-init-button');
+    if (discover) discover.textContent = '连接并获取打印机和网页';
   }
 
   if (!hasFields) {

@@ -416,6 +416,16 @@ plugins:
   # jp5.11 的 2.2.0 叫 MatrixCodes，所以卡片上存模式而不是存名字。
   # formats 是给这里用的逃生口：写死一组 symbology 名（如 [DataMatrix]），
   # 非空时压过 scan_mode。卡片和 LLM 都看不到它，因为名字跨镜像不通用。
+  QL_printer:
+    enabled: true
+    bridge_url: ""
+    timeout_s: 8
+    print_timeout_s: 120
+    remote_start_user: "4paradigm"
+    remote_start_port: 22
+    remote_start_password: ""
+    visitor_page_url: ""
+
   barcode:
     enabled: true
     scan_mode: all

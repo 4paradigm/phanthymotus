@@ -4,7 +4,7 @@
  */
 
 import { getToken, setToken, verifyToken, consumeTokenFromUrl } from './auth.js';
-import { initSidebar, renderSidebar } from './sidebar.js';
+import { initSidebar, renderSidebar } from './sidebar.js?v=visitor-printer-20261121-1';
 import { initCanvas, updateCanvasMcps } from './canvas.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
 import { startDeploy } from './deploy-progress.js';

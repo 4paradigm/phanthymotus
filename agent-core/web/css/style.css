@@ -857,6 +857,70 @@ html, body {
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
 
+.ql-printer-init-button {
+  width: 100%;
+  margin-top: 10px;
+  padding: 11px 18px;
+  border: 0;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #d97732, #bd5426);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 650;
+  cursor: pointer;
+  box-shadow: 0 5px 14px rgba(190, 84, 38, 0.22);
+  transition: transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+}
+.ql-printer-init-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 7px 18px rgba(190, 84, 38, 0.3);
+}
+.ql-printer-init-button:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+.ql-printer-discover-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  margin-top: 10px;
+  padding: 11px 18px;
+  border: 0;
+  border-radius: 10px;
+  appearance: none;
+  background: linear-gradient(135deg, #d97732, #bd5426);
+  color: #fff;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.2;
+  cursor: pointer;
+  box-shadow: 0 5px 14px rgba(190, 84, 38, 0.22);
+  transition: transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+}
+.ql-printer-discover-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 7px 18px rgba(190, 84, 38, 0.3);
+}
+.ql-printer-discover-button:focus-visible {
+  outline: 3px solid var(--accent-dim);
+  outline-offset: 2px;
+}
+.ql-printer-discover-button:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+.ql-printer-progress {
+  margin-top: 8px;
+  min-height: 20px;
+  color: #6f625a;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 /* ── 决策核心的「大模型」：云端 / 本机 ──────────────────────────────────────
    一个二选一的切换，和输入框同高、同底色，放在表单里不显得是另一套控件。
    选本机时下面一行状态：现在跑的是哪个模型、上下文多长，或者为什么用不了。 */

@@ -14,7 +14,7 @@
 import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js?v=visitor-printer-20261121-1';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
@@ -1285,6 +1285,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         let enumVals = def.enum;
         if (key === 'action') {
           enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
+          if (['QL_printer', 'Visitor_Badge_Printer'].includes(toolName)) enumVals = enumVals.filter(v => ['list', 'print'].includes(v));
           // The page owns internal actions; the card exposes its entry and public actions.
           if (schema['x-workbench'] && schema['x-action-params']) {
             enumVals = enumVals.filter(v => v === schema['x-workbench'].entry || v in schema['x-action-params']);

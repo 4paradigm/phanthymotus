@@ -63,6 +63,20 @@ def test_single_word_prefix_still_resolves(bundle_cls):
     assert bundle.owns("ocr") is True
 
 
+def test_shared_ql_printer_routes_to_real_plugin(bundle_cls):
+    from plugins.ql_printer import QLPrinterPlugin
+    printer = QLPrinterPlugin({})
+    bundle = _bundle(bundle_cls, printer)
+    tools = bundle.get_all_tools()
+    assert len(tools) == 1
+    assert tools[0]["name"] == "Visitor_Badge_Printer"
+    assert tools[0]["type"] == "actuator"
+    assert bundle.owns("Visitor_Badge_Printer") is True
+    assert bundle.owns("QL_printer") is True
+    assert bundle.dispatch("Visitor_Badge_Printer", {"action": "info"}) == printer.dispatch("info", {})
+    assert bundle.dispatch("QL_printer", {"action": "info"}) == printer.dispatch("info", {})
+
+
 def test_underscored_prefix_resolves(bundle_cls):
     """The regression this resolver exists for."""
     face = _StubPlugin("face_recognition")
