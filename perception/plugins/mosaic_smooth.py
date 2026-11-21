@@ -25,6 +25,7 @@ from plugins.mosaic_smooth_runtime import (
     DemoConfig, MosaicDemoError, SmoothMosaic, validate_model, MAX_JPEG_BYTES,
 )
 from utils.model_downloader import ensure_mosaic_smooth_model
+from utils.model_progress import fetch_status
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
@@ -108,7 +109,7 @@ def output_topics(input_topic: str, key: str) -> list[dict]:
 
 
 class _DemoNode(Node):
-    def __init__(self, key, topic, cfg, model_path, finished):
+    def __init__(self, key, topic, cfg, model_path, finished, retry=False):
         suffix=hashlib.sha256(key.encode()).hexdigest()[:16]
         super().__init__("mosaic_smooth_demo_"+suffix)
         self.key=key
@@ -129,6 +130,13 @@ class _DemoNode(Node):
         self._output_times=deque(maxlen=90)
         self._state="idle"
         self._reason="not_started"
+        self._model_fetch = {
+            "stage": "retrying" if retry else "pending",
+            "retries": int(retry),
+            "percent": None,
+            "bytes_done": 0,
+            "bytes_total": None,
+        }
         self._received=0
         self._processed=0
         self._published=0
@@ -160,6 +168,7 @@ class _DemoNode(Node):
             return {
                 "schema":SCHEMA,"instance_id":self.key,
                 "state":self._state,"reason":self._reason,
+                "model_fetch":dict(self._model_fetch),
                 "privacy_guaranteed":False,
                 "warnings":[
                     "DEMO_ONLY_NOT_ANONYMIZATION",
@@ -185,11 +194,10 @@ class _DemoNode(Node):
             }
 
     def _publish_status(self):
-        result=self.snapshot()
         with self._gate:
             if self._state=="stopping":return
             msg = String()
-            msg.data = json.dumps(result, ensure_ascii=False)
+            msg.data = json.dumps(self.snapshot(), ensure_ascii=False)
             self._status_pub.publish(msg)
 
     def _on_frame(self,msg):
@@ -224,23 +232,59 @@ class _DemoNode(Node):
             if self._thread is not None:
                 return
             self._state="loading"
-            self._reason="initializing_model"
+            self._reason=("model_retrying" if self._model_fetch["retries"]
+                          else "initializing_model")
             self._thread=threading.Thread(
                 target=self._run,daemon=True,name="mosaic_smooth_"+self.get_name(),
             )
             self._thread.start()
 
+    def _model_stage(self, stage):
+        with self._gate:
+            if self._stop.is_set():
+                return
+            self._model_fetch["stage"] = stage
+            if stage == "retrying":
+                self._model_fetch["retries"] += 1
+            if stage == "downloading":
+                self._model_fetch.update(percent=0, bytes_done=0)
+            self._reason = "model_" + stage
+
+    def _fetch_model(self):
+        def status(text):
+            # Called only inside progress() with the gate held.
+            self._reason = text
+
+        render_progress, _ = fetch_status(status, "YuNet")
+
+        def progress(pct, mb_done, mb_total):
+            with self._gate:
+                if self._stop.is_set():
+                    return
+                self._model_fetch.update(
+                    percent=pct, bytes_done=round(mb_done * 1024 ** 2),
+                    bytes_total=round(mb_total * 1024 ** 2),
+                )
+                render_progress(pct, mb_done, mb_total)
+
+        return ensure_mosaic_smooth_model(progress_cb=progress, stage_cb=self._model_stage)
+
     def _run(self):
+        engine = None
         failure_reason = "model_or_runtime_failed"
         try:
             model_path = self.model_path
             if model_path is None:
                 failure_reason = "model_download_failed"
-                model_path = ensure_mosaic_smooth_model()
+                model_path = self._fetch_model()
                 failure_reason = "model_or_runtime_failed"
+            else:
+                self._model_stage("verifying_local")
             if self._stop.is_set():
                 return
             engine=SmoothMosaic(model_path,self.cfg)
+            if self.model_path is not None:
+                self._model_stage("local_verified")
             with self._gate:
                 if not self._stop.is_set():
                     self._state="running"
@@ -286,25 +330,41 @@ class _DemoNode(Node):
                                   else "face_roi_demo")
                     self._publish_status()
         except Exception as exc:
-            log.exception("[%s] %s", PREFIX, failure_reason)
             with self._gate:
                 if not self._stop.is_set():
+                    if self._model_fetch["stage"] == "verification_failed":
+                        failure_reason = "model_verification_failed"
+                    elif (self._model_fetch["stage"] == "verifying_local"
+                          and isinstance(exc, MosaicDemoError) and str(exc).startswith("model_")):
+                        self._model_fetch["stage"] = "verification_failed"
+                        failure_reason = "model_verification_failed"
+                    elif failure_reason == "model_download_failed":
+                        self._model_fetch["stage"] = "download_failed"
                     self._state="error"
                     self._reason=f"{failure_reason}:{type(exc).__name__}"
                     self._errors+=1
+            log.exception("[%s] %s", PREFIX, failure_reason)
             self._publish_status()
         finally:
             with self._gate:
                 self._state="stopping" if self._stop.is_set() else "error"
                 self._stop.set()
                 self._latest=None
-            self._finished(self)
+            try:
+                if engine is not None:
+                    engine.close()
+            finally:
+                self._finished(self)
 
     def request_stop(self):
         with self._cv:
             self._stop.set()
             self._state="stopping"
             self._reason="stopped"
+            if self._thread is not None and self._model_fetch["stage"] in (
+                    "pending", "retrying", "verifying_cache", "waiting_for_lock",
+                    "downloading", "verifying_download", "verifying_local"):
+                self._model_fetch["stage"] = "cancelled"
             self._latest=None
             self._cv.notify_all()
 
@@ -413,7 +473,8 @@ class MosaicSmoothDemoPlugin:
                         if self._model_path is not None:
                             validate_model(self._model_path)
                         node=_DemoNode(
-                            key,topic,cfg,self._model_path,self._finished
+                            key,topic,cfg,self._model_path,self._finished,
+                            retry=key in self._start_errors,
                         )
                         try:
                             self._executor.add_node(node)

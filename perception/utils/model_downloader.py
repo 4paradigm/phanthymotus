@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import time
 import zipfile
+from http.client import IncompleteRead
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen, urlretrieve
@@ -344,7 +345,7 @@ def select_bundle_family(bundles: dict, family: str | None = None) -> str:
 
 
 def ensure_verified_bundle(
-    name: str, model_dir: str, base_url, files: dict, progress_cb=None
+    name: str, model_dir: str, base_url, files: dict, progress_cb=None, *, stage_cb=None
 ) -> dict[str, str]:
     """Ensure a size/SHA256-pinned bundle is present and valid in model_dir.
 
@@ -357,11 +358,16 @@ def ensure_verified_bundle(
     a base URL or a template containing `{file}`. They are probed once per
     bundle and tried fastest-first, falling through on failure; the pinned
     size and SHA256 are what make that safe.
+
+    Optional `stage_cb(stage)` reports cache checks, transfer attempts, and
+    verification. Bytes reaching 100% does not mean the bundle is verified.
     """
     paths = {
         filename: os.path.join(model_dir, filename) for filename in files
     }
+    _notify_stage(name, stage_cb, "verifying_cache")
     if _bundle_matches(model_dir, files):
+        _notify_stage(name, stage_cb, "cache_hit")
         log.info(f"[model_downloader] {name}: verified bundle already at {model_dir}")
         return paths
 
@@ -371,14 +377,18 @@ def ensure_verified_bundle(
     # waiter re-checks the bundle once it gets the lock.
     lock_path = os.path.join(model_dir, f".{name.replace('/', '_')}.lock")
     with open(lock_path, "a+b") as lock_file:
+        _notify_stage(name, stage_cb, "waiting_for_lock")
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
+            _notify_stage(name, stage_cb, "verifying_cache")
             if _bundle_matches(model_dir, files):
+                _notify_stage(name, stage_cb, "cache_hit")
                 log.info(f"[model_downloader] {name}: verified by another instance")
                 return paths
             _download_verified_bundle(name, base_url, model_dir, files,
-                                      progress_cb=progress_cb)
+                                      progress_cb=progress_cb, stage_cb=stage_cb)
+            _notify_stage(name, stage_cb, "download_complete")
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -444,7 +454,7 @@ def _verify_pinned_file(path: str, metadata: dict) -> None:
 
 def _fetch_pinned_file(
     name: str, url: str, destination: str, metadata: dict, label: str = "",
-    progress_cb=None, done_bytes: int = 0, total_bytes: int = 0,
+    progress_cb=None, done_bytes: int = 0, total_bytes: int = 0, *, stage_cb=None,
 ) -> None:
     """Download one URL to destination, verifying its pinned size and SHA256.
 
@@ -462,7 +472,9 @@ def _fetch_pinned_file(
     total_bytes = total_bytes or int(metadata.get("size") or 0)
     last_error = None
     for attempt in range(1, 4):
+        verifying = False
         try:
+            _notify_stage(name, stage_cb, "downloading")
             log.info(
                 f"[model_downloader] {name}: downloading {label} "
                 f"(attempt {attempt}/3)"
@@ -470,8 +482,11 @@ def _fetch_pinned_file(
             fetched = 0
             last_pct = 0
             with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
+                # HTTPResponse.read(n) can wait for all n bytes. read1 gives
+                # small bundles observable progress before the transfer ends.
+                read = getattr(response, "read1", response.read) if progress_cb else response.read
                 while True:
-                    chunk = response.read(1024 * 1024)
+                    chunk = read(1024 * 1024)
                     if not chunk:
                         break
                     output.write(chunk)
@@ -480,7 +495,7 @@ def _fetch_pinned_file(
                         pct = min(int((done_bytes + fetched) * 100 / total_bytes), 100)
                         # Same 10%-step schedule as the archive path, so this
                         # costs nothing extra and reads the same in the UI.
-                        if pct >= last_pct + 10:
+                        if pct >= last_pct + 10 or last_pct < pct == 100:
                             last_pct = pct
                             try:
                                 progress_cb(pct,
@@ -491,14 +506,19 @@ def _fetch_pinned_file(
                                           f"progress_cb failed: {error}")
                 output.flush()
                 os.fsync(output.fileno())
+            _notify_stage(name, stage_cb, "verifying_download")
+            verifying = True
             _verify_pinned_file(destination, metadata)
             os.chmod(destination, 0o644)
             return
-        except (URLError, TimeoutError, OSError, ValueError) as error:
+        except (URLError, TimeoutError, OSError, ValueError, IncompleteRead) as error:
             last_error = error
+            _notify_stage(name, stage_cb, "verification_failed" if verifying and isinstance(error, ValueError)
+                          else "download_failed")
             if os.path.exists(destination):
                 os.unlink(destination)
             if attempt < 3:
+                _notify_stage(name, stage_cb, "retrying")
                 time.sleep(3)
     raise RuntimeError(
         f"[model_downloader] {name}: failed to download {label}"
@@ -596,7 +616,7 @@ def _order_sources(name: str, sources: list, files: dict) -> list:
 
 
 def _download_verified_bundle(
-    name: str, base_url: str, model_dir: str, files: dict, progress_cb=None
+    name: str, base_url: str, model_dir: str, files: dict, progress_cb=None, *, stage_cb=None
 ) -> None:
     """Download and verify a multi-file model before replacing its destination.
 
@@ -627,7 +647,7 @@ def _download_verified_bundle(
                                        destination, metadata, label=filename,
                                        progress_cb=progress_cb,
                                        done_bytes=done_bytes,
-                                       total_bytes=total_bytes)
+                                       total_bytes=total_bytes, stage_cb=stage_cb)
                     last_error = None
                     break
                 except Exception as error:      # noqa: BLE001 — try the next host
@@ -643,6 +663,8 @@ def _download_verified_bundle(
                         f"{source}: {error} ({type(cause).__name__})"
                         + (f"; {remaining} source(s) left" if remaining else "")
                     )
+                    if remaining:
+                        _notify_stage(name, stage_cb, "retrying")
             if last_error is not None:
                 raise last_error
             done_bytes += int(metadata.get("size") or 0)
@@ -781,18 +803,22 @@ MOSAIC_SMOOTH_MODEL_FILES = {
 }
 
 
-def ensure_mosaic_smooth_model() -> str:
+def ensure_mosaic_smooth_model(progress_cb=None, *, stage_cb=None) -> str:
     """Provision or reuse the pinned YuNet model in the shared model volume."""
+    name = "mosaic_smooth/yunet"
     model_dir = require_models_subpath(MOSAIC_SMOOTH_MODEL_DIR)
     legacy_path = os.path.join(model_dir, "yunet.onnx")
+    _notify_stage(name, stage_cb, "verifying_cache")
     if _file_matches(legacy_path, MOSAIC_SMOOTH_MODEL_FILES[MOSAIC_SMOOTH_MODEL_FILENAME]):
+        _notify_stage(name, stage_cb, "cache_hit")
         return legacy_path
 
     # An operator can select a deployment-accessible COS mirror using the
     # same base URL convention as the other model registrations.
     sources = os.environ.get("MOSAIC_SMOOTH_MODEL_BASE_URL") or MOSAIC_SMOOTH_MODEL_SOURCES
     paths = ensure_verified_bundle(
-        "mosaic_smooth/yunet", model_dir, sources, MOSAIC_SMOOTH_MODEL_FILES,
+        name, model_dir, sources, MOSAIC_SMOOTH_MODEL_FILES,
+        progress_cb=progress_cb, stage_cb=stage_cb,
     )
     return paths[MOSAIC_SMOOTH_MODEL_FILENAME]
 

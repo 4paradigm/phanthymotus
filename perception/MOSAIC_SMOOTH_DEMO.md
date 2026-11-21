@@ -16,12 +16,12 @@
 
 ## 部署条件
 
-复用 Perception 镜像现有 OpenCV `FaceDetectorYN`、NumPy、ROS2 和 `sensor_msgs/msg/CompressedImage`。
+复用 Perception 镜像现有 OpenCV、NumPy、ROS2 和 `sensor_msgs/msg/CompressedImage`。OpenCV 缺少可运行的 `FaceDetectorYN` 时，使用 Perception 共享 ORT 子进程中的 CPU 会话运行 YuNet 2023mar。该路径的检测输入长边限制为 640 像素，检测框会映射回马赛克输出画面。
 模型由 Perception 在运行时准备。默认 `model_path` 为空，首次经知情同意启动时，`ensure_verified_bundle()` 会验证缓存并在缺失或损坏时自动下载。给隔离测试容器挂载持久化、可写的 `/models`，缓存文件为 `/models/mosaic_smooth/face_detection_yunet_2023mar.onnx`。旧路径 `/models/mosaic_smooth/yunet.onnx` 上已有的有效文件也可以直接复用。模型文件随运行时缓存提供，镜像构建流程无需下载权重。
 
 权重来自 OpenCV Zoo 的固定提交，官方 Hugging Face 副本也固定到提交，两处文件逐字节一致。文件大小为 **232,589 字节**，SHA-256 为 `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`。转存或分发时随权重保留 MIT 版权与许可全文。 [OpenCV Zoo 权重](https://media.githubusercontent.com/media/opencv/opencv_zoo/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/face_detection_yunet_2023mar.onnx) · [官方 Hugging Face 副本](https://huggingface.co/opencv/face_detection_yunet/resolve/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/face_detection_yunet_2023mar.onnx) · [YuNet MIT 许可](https://github.com/opencv/opencv_zoo/blob/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/LICENSE)
 
-- **自动下载。** 缓存有效时直接使用。并发实例共享同一把文件锁，下载通过大小和 SHA-256 校验后才原子写入缓存。启动期间 `info` 显示 `loading`。下载及重试均失败时，`info` 显示 `model_download_failed` 及异常类型，详情在 Perception 日志中。失败实例无图像输出，再次 `start` 可重试。
+- **自动下载。** MCP `info` 和 ROS 状态话题中的 `model_fetch` 提供阶段、传输字节、百分比和重试次数。并发实例共享文件锁，分别报告等待、校验、缓存命中或下载完成。100% 表示传输进度，下载通过大小和 SHA-256 校验并原子写入缓存后才报告完成。最终失败区分 `model_download_failed` 和 `model_verification_failed`，再次 `start` 可重试。停止时立即关闭图像发布和进度更新，正在等待的文件锁或网络读取按下载器生命周期结束。
 - **受限网络。** 可在容器中设置 `MOSAIC_SMOOTH_MODEL_BASE_URL`，以已发布且部署可达的 COS 镜像目录替换两个默认来源。目录应提供 `face_detection_yunet_2023mar.onnx` 和对应的 MIT 许可证。镜像使用同一组校验值。
 - **离线部署。** 将校验过的模型和许可证放入挂载目录。可通过 `plugins.mosaic_smooth_demo.model_path` 或 `MOSAIC_SMOOTH_YUNET_MODEL` 指定只读模型文件，配置项优先。显式路径只做本地校验，缺失、大小错误或哈希错误均拒绝启动。旧配置中若填了 `model_path`，清空该项并取消设置模型路径环境变量即可使用自动下载。
 

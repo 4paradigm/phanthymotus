@@ -11,8 +11,10 @@ import hashlib
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass, replace
 
+from plugins.yunet_ort import cpu_session_spec
 from utils.model_downloader import (
     MOSAIC_SMOOTH_MODEL_FILENAME, MOSAIC_SMOOTH_MODEL_FILES,
 )
@@ -126,18 +128,68 @@ class SmoothMosaic:
         self.cv = cv
         import numpy as np
         self.np = np
-        if detector is None:
-            validate_model(model_path)
-            detector = cv.FaceDetectorYN.create(
-                model_path, "", (320, 320), 0.22, 0.3, 5000,
-            )
+        self._model_path = self._ort_service = None
         self.detector = detector
+        if detector is None:
+            self._model_path = validate_model(model_path)
+            create = getattr(getattr(cv, "FaceDetectorYN", None), "create", None)
+            if callable(create):
+                try:
+                    self.detector = create(model_path, "", (320, 320), 0.22, 0.3, 5000)
+                except cv.error:
+                    pass
+            if self.detector is None:
+                self._start_ort()
         self.number = 0
         self.detect_calls = 0
         self.fallback_frames = 0
         self.last_boxes = []
         self.points = None
         self.prev_gray = None
+
+    def _start_ort(self):
+        from plugins.ort_worker import get_worker
+
+        worker = get_worker()
+        key = "mosaic_smooth_demo.yunet." + uuid.uuid4().hex
+        try:
+            self._ort_service = worker.service(
+                key, "plugins.yunet_ort", "YuNetOrtService",
+                threshold=self.cfg.confidence_threshold, limit=self.cfg.max_faces + 1,
+                _ort_session=cpu_session_spec(self._model_path),
+            )
+        except Exception:
+            worker.drop(key)
+            raise
+        self.detector = None
+        self._input_limit = self._ort_service.describe()["max_side"]
+
+    def _detect(self, image):
+        height, width = image.shape[:2]
+        if self.detector is not None:
+            try:
+                self.detector.setInputSize((width, height))
+                return self.detector.detect(image)[1]
+            except self.cv.error:
+                if self._model_path is None:
+                    raise
+                self._start_ort()
+        scale = min(1., self._input_limit / max(width, height))
+        scaled_width = max(1, round(width * scale))
+        scaled_height = max(1, round(height * scale))
+        small = (image if scale == 1. else self.cv.resize(
+            image, (scaled_width, scaled_height), interpolation=self.cv.INTER_AREA,
+        ))
+        rows = self._ort_service.call("detect", image=small)
+        rows[:, :4] *= [width / scaled_width, height / scaled_height,
+                         width / scaled_width, height / scaled_height]
+        return rows
+
+    def close(self):
+        self.detector = None
+        service, self._ort_service = self._ort_service, None
+        if service is not None:
+            service.drop()
         self.last_detect_ok = 0.0
 
     def process(self, jpeg: bytes):
@@ -161,6 +213,8 @@ class SmoothMosaic:
         h, w = raw.shape[:2]
         if w != self.cfg.output_width:
             new_h = max(1, int(round(h*self.cfg.output_width/w)))
+            if new_h > MAX_SOURCE_SIDE:
+                raise MosaicDemoError("invalid_image_aspect_ratio")
             image = cv.resize(
                 raw, (self.cfg.output_width, new_h),
                 interpolation=cv.INTER_AREA,
@@ -173,8 +227,7 @@ class SmoothMosaic:
         do_detect = (self.number - 1) % self.cfg.detect_every_frames == 0
         if do_detect:
             self.detect_calls += 1
-            self.detector.setInputSize((image.shape[1], image.shape[0]))
-            _, faces = self.detector.detect(image)
+            faces = self._detect(image)
             boxes = []
             if faces is not None:
                 for face in faces:
@@ -250,5 +303,4 @@ class SmoothMosaic:
 
 __all__ = [
     "DemoConfig","MosaicDemoError","SmoothMosaic","validate_model",
-    "YUNET_SHA256",
 ]

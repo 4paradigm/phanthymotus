@@ -53,6 +53,11 @@ def fixture_jpeg():
 
 
 class TestConfig(unittest.TestCase):
+    def test_runtime_star_import_exports_defined_names(self):
+        exported = {}
+        exec("from plugins.mosaic_smooth_runtime import *", exported)
+        self.assertIs(exported["SmoothMosaic"], SmoothMosaic)
+
     def test_requires_explicit_consent(self):
         c = DemoConfig()
         self.assertFalse(c.consent_acknowledged)
@@ -182,6 +187,13 @@ class TestPixels(unittest.TestCase):
             with self.subTest(jpeg=jpeg):
                 with self.assertRaises(MosaicDemoError):
                     pipeline.process(jpeg)
+
+    def test_extreme_aspect_ratio_is_rejected_before_output_resize(self):
+        pipeline = SmoothMosaic("", DemoConfig(), detector=NoFaceDetector())
+        ok, jpeg = cv2.imencode(".jpg", np.zeros((2048, 2, 3), dtype=np.uint8))
+        self.assertTrue(ok)
+        with self.assertRaisesRegex(MosaicDemoError, "invalid_image_aspect_ratio"):
+            pipeline.process(jpeg.tobytes())
 
 
 if __name__=="__main__":
