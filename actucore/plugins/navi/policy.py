@@ -567,6 +567,7 @@ class State:
     local_plan: PlanCache = field(default_factory=PlanCache)
     view_detour: Detour | None = None
     checked_prefix: bool = False
+    search_sweep_checked: bool = False
     detour_leg: PathLeg | None = None
     executing_leg: PathLeg | None = None
     goal_anchor: DetourGoal | None = None
@@ -1037,6 +1038,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
     state.command_dt_s = min(dt, config.watchdog_ms / 1000) if command_dt_s is None else command_dt_s
     state.view_detour = None
     state.checked_prefix = False
+    state.search_sweep_checked = False
     state.executing_leg = None
     if config.local_planning and config.local_geometry is not None and (depth or {}).get("body_mount_required"):
         capture_pose = depth.get("obstacle_capture_pose")
@@ -1102,7 +1104,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
     anchor, scan = state.goal_anchor, state.active_scan
     if decision.values is not None and any(decision.values) and not scan.active and scan.near_hits is not None:
         twist = tuple(decision.values[i] for i in (0, 1, 5))
-        if _near_sweep_hits(config, scan, odom, state, twist).any():
+        searched = decision.status == SEARCHING and state.search_sweep_checked and not any(twist[:2])
+        if not searched and _near_sweep_hits(config, scan, odom, state, twist).any():
             decision = Decision(_twist(0., 0., 0.), AVOIDING, "当前运动的扫掠区有盲区内已观测障碍")
     if (decision.reason == NO_LOCAL_ROUTE and scan.exhausted and scan.current_frame
             and anchor is not None and anchor.verified_range_m is not None
@@ -1249,28 +1252,44 @@ def _wait_for_detour_goal(state, config, track, odom):
     return True
 
 
+def _search_yaw_candidates(config, yaw, both, scales):
+    for scale in scales:
+        for requested in (yaw * scale, -yaw * scale) if both else (yaw * scale,):
+            rate = _clamp(requested, _scan_yaw_rate(config, 1. if requested < 0. else -1.))
+            if rate and abs(rate) >= config.floor_wz:
+                yield rate
+
+
+def _search_for_target(depth, config, state, dt, odom):
+    reason = _search_turn_stop(depth, config, state)
+    if reason is None:
+        return _search(config, state, dt, odom)
+    if "扫掠范围有障碍" in reason:
+        yaw = -state.last_seen_side * config.search_rate
+        for rate in _search_yaw_candidates(config, yaw, True, (.5, .25)):
+            if _search_turn_stop(depth, config, state, requested_yaw=rate) is None:
+                if state.missing_frames + 1 < config.lost_frames:
+                    return _search(config, state, dt, odom)
+                state.missing_frames += 1
+                return _search(config, state, dt, odom, requested_yaw=rate)
+    return Decision(_twist(0., 0., 0.), AVOIDING, reason)
+
+
 def _reacquire_detour_goal(depth, config, state, raw_yaw, bearing, dt, odom, track):
     lost = track is None or not track.observed
     yaw = _finalise_yaw(raw_yaw, False, bearing, config, state, dt)
     if not yaw and lost and config.search_rate:
         yaw = -state.last_seen_side * config.search_rate
-    if yaw:
-        directions = (yaw, -yaw) if lost else (yaw,)
-        stop = None
-        for rate in directions:
-            limit = _scan_yaw_rate(config, 1. if rate < 0. else -1.)
-            rate = _clamp(rate, limit)
-            if not rate or abs(rate) < config.floor_wz:
-                continue
-            stop = _search_turn_stop(depth, config, state, requested_yaw=rate)
-            if stop is None:
-                decision = _search(config, state, dt, odom, requested_yaw=rate)
-                if decision.status == SEARCHING:
-                    decision.reason = "按当前扫掠区转向找回原目标"
-                return decision
-        if stop is not None:
-            return Decision(_twist(0., 0., 0.), AVOIDING, stop)
-    return Decision(_twist(0., 0., 0.), AVOIDING, "停车等待原目标的有效测距")
+    stop = "停车等待原目标的有效测距"
+    for rate in _search_yaw_candidates(config, yaw, lost, (1., .5, .25)):
+        reason = _search_turn_stop(depth, config, state, requested_yaw=rate)
+        if reason is None:
+            decision = _search(config, state, dt, odom, requested_yaw=rate)
+            if decision.status == SEARCHING:
+                decision.reason = "按当前扫掠区转向找回原目标"
+            return decision
+        stop = reason
+    return Decision(_twist(0., 0., 0.), AVOIDING, stop)
 
 
 def _observation_command(scan, geometry, config, state, odom, dt, control_period_s):
@@ -1413,10 +1432,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
         scan.observation_pose = obstacle_pose
         capture_pose = (depth or {}).get("obstacle_capture_pose")
         if (update is None and scan.phase == "turn" and not scan.route_segment
-                and scan.current_frame and scan.matches_route_view(depth)
-                and obstacle_pose is not None and capture_pose is not None
-                and obstacle_pose.frame == capture_pose.frame):
-            scan.record_observation(capture_pose)
+                and scan.current_frame and scan.matches_route_view(depth)):
+            if obstacle_pose is not None and capture_pose is not None and obstacle_pose.frame == capture_pose.frame:
+                scan.record_observation(capture_pose)
+            elif scan.views and not scan.command_only:
+                vantage = scan.views[-1][1]
+                if not scan._already_observed(vantage, 0.):
+                    scan.observed_vantages.append(vantage)
         if config.scan_geometry is None and geometry is not None and geometry.horizontal is not None:
             target_range = (track.range_m if track is not None and track.range_known else math.inf)
             if anchor is not None:
@@ -1471,10 +1493,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if (scan.ready or scan.result_frame) and anchor is None and (track is None or not track.observed):
             scan.finish()
             scan.note_clear_path(scan.current_frame)
-            reason = _search_turn_stop(depth, config, state)
-            if reason is not None:
-                return Decision(_twist(0., 0., 0.), AVOIDING, reason)
-            return _search(config, state, dt, odom)
+            return _search_for_target(depth, config, state, dt, odom)
 
     if depth is None or (detections is None and anchor is None):
         if stale_capture:
@@ -1531,10 +1550,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         anchor = state.goal_anchor
 
     if track is None and anchor is None:
-        reason = _search_turn_stop(depth, config, state)
-        if reason is not None:
-            return Decision(_twist(0, 0, 0), AVOIDING, reason)
-        return _search(config, state, dt, odom)
+        return _search_for_target(depth, config, state, dt, odom)
 
     state.missing_frames = 0
     if anchor is None:
@@ -2009,13 +2025,26 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
             rate = max(rate, abs(scan.motion[2]), abs(state.commanded[2]))
             sweep, slack = (rate + .10) * horizon, STILL_LINEAR * horizon
             half_width = _keepout_m(config)
-            if not scan.clear_sweep(geometry, half_width, direction * sweep, slack):
+            def clear(side):
+                if not scan.clear_sweep(geometry, half_width, side * sweep, slack):
+                    return False
+                age = max(0, scan.control_ms - scan.near_revision) / 1000
+                if scan.near_hits is None or not age:
+                    return True
+                radius = math.hypot(max(geometry.front, geometry.rear), half_width)
+                padding = age * max(math.hypot(vx, vy) + radius * abs(wz)
+                                    for vx, vy, wz in (motion, state.commanded))
+                return scan.clear_sweep(geometry, half_width, side * sweep, slack + padding,
+                                        occupied=scan.near_hits)
+
+            if not clear(direction):
                 if (requested_yaw is not None or max(abs(motion[2]), abs(state.commanded[2])) > STILL_YAW
-                        or not scan.clear_sweep(geometry, half_width, -direction * sweep, slack)):
+                        or not clear(-direction)):
                     state.recovery = True
                     return "原地搜索：转身扫掠范围有障碍，停车"
                 direction = -direction
                 state.searched_rad = 0.
+            state.search_sweep_checked = True
         state.last_seen_side = direction
     if state.recovery:
         if not config.local_planning and ahead is not None and ahead < config.approach_check_distance_m:
@@ -2297,8 +2326,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if scan is not None and scan.near_hits is not None:
         swept = _near_sweep_hits(config, scan, odom, state, (vx, vy, wz))
         if swept.any():
-            obstacle = max(0., float(FORWARD[swept].min()))
-            ahead = obstacle if ahead is None else min(ahead, obstacle)
+            # A hit in the proposed turn is reason to choose another motion.
+            # Only a hit in the straight corridor shortens its stopping room.
+            straight_edge = _keepout_m(config) + local_path.RESOLUTION / 2
+            straight_hits = swept & (abs(RIGHT) < straight_edge - 1e-9)
+            if ahead is None or straight_hits.any() or config.use_lateral:
+                hits = straight_hits if straight_hits.any() and not config.use_lateral else swept
+                obstacle = max(0., float(FORWARD[hits].min()))
+                ahead = obstacle if ahead is None else min(ahead, obstacle)
             foreground = plan_obstacle = True
             state.last_clearance = ahead
     stop = config.obstacle_stop_m
@@ -2490,8 +2525,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     limited = min(vx, config.vx_max, LOCAL_BLOCKED_APPROACH_MAX_MPS,
                                   (ahead - brake_at) / (horizon_s + depth_age_s), goal_room / horizon_s)
                     room = min(goal_room, ahead - brake_at)
-                    prefix = _checked_wheeled_prefix(scan, geometry, config, state, feedback, limited,
-                                                     horizon_s, room, wz, order)
+                    prefix = _checked_wheeled_prefix(scan, geometry, config, state, odom, feedback,
+                                                     limited, horizon_s, room, wz, order)
                     if prefix is not None:
                         return prefix
                 yaw_rate = max(_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
@@ -2700,7 +2735,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     return vx, vy, wz, status, reason
 
 
-def _checked_wheeled_prefix(scan, geometry, config, state, motion, vx, horizon, room, yaw, sides):
+def _checked_wheeled_prefix(scan, geometry, config, state, odom, motion, vx, horizon, room, yaw, sides):
     """Choose a short twist and display the arc that it executes."""
     (floor, _), _ = _local_velocity_limits(config, 1.)
     if vx <= 0. or vx < floor:
@@ -2719,6 +2754,8 @@ def _checked_wheeled_prefix(scan, geometry, config, state, motion, vx, horizon, 
         if max(math.hypot(v[0], v[1]) for v in velocities) * horizon > room:
             continue
         if not local_path.motion_sweep_clear(grid, geometry, keep, horizon, velocities):
+            continue
+        if scan.near_hits is not None and _near_sweep_hits(config, scan, odom, state, (vx, 0., turn)).any():
             continue
         if turn:
             radius = vx / turn

@@ -64,6 +64,21 @@ TOPIC_FORMAT = "control/velocity"
 _DESCRIPTOR_EVERY = 50
 
 
+@dataclass(frozen=True)
+class _ForwardCheck:
+    geometry: local_path.Geometry
+    frame_id: int
+    source_id: int | None
+    target_ms: int
+    distance_m: float
+    previous_twist: tuple
+    mount_frame: tuple | None
+    feedback_source: int | None
+    feedback_ms: int | None
+    remembered: object
+    remembered_ms: int
+
+
 @dataclass
 class _ScheduledCommand:
     message: dict
@@ -76,6 +91,7 @@ class _ScheduledCommand:
     depth_grid: tuple | None = None  # source identity, observation time, projected cells
     checked_pose: tuple | None = None
     previous_motion: tuple = (0., 0.)
+    forward_check: _ForwardCheck | None = None
 
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
@@ -177,6 +193,7 @@ class NaviPlugin:
         # The velocity timer never takes the planner's lock.
         self._output_lock = threading.RLock()
         self._scheduled_command = None
+        self._staged_forward_check = None
         self._output_epoch = 0
         self._output_blocked = False
         self._output_stop = None
@@ -1771,60 +1788,101 @@ class NaviPlugin:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom, objects_ms
 
-    def _recheck_late_translation(self, decision, previous_twist, depth, objects_ms, max_age, now_ms):
-        """Recheck one local velocity against a newer frame without rerunning path search."""
+    def _forward_check(self, decision, previous_twist, depth, odom, objects_ms):
+        """Copy the inputs needed to recheck a command without running the planner."""
         config, state = self._config, self._state
-        scan, geometry = state.active_scan, config.local_geometry
-        target_deadline = objects_ms + min(max_age, config.max_obs_age_ms)
-        if (decision.status != policy_mod.AVOIDING or not state.avoidance_yaw_override
-                or state.view_detour is None or state.view_detour.geometry is not geometry
-                or (decision.values[5] and not state.checked_prefix)
-                or scan.active or scan.result_frame or scan.obstacles.cells
-                or not scan.receipt_only or not scan.buffered_odom or config.scan_geometry is not None
-                or geometry is None or depth.get("body_mount_required")
-                or decision.distance_m is None or not objects_ms <= now_ms < target_deadline):
+        scan, route = state.active_scan, state.view_detour
+        if (not config.local_planning or depth is None or depth.get("map") is None
+                or depth.get("capture_invalid") or not decision.values or decision.values[0] <= 0
+                or decision.distance_m is None or not objects_ms or scan.active or scan.result_frame
+                or (decision.status != policy_mod.APPROACHING
+                    and not (decision.status == policy_mod.AVOIDING and state.avoidance_yaw_override
+                             and route is not None))):
             return None
+        geometry = (route.geometry if route is not None else config.scan_geometry or config.local_geometry)
+        if geometry is None:
+            return None
+        mount_frame = None
+        if state.use_body_mount:
+            capture_pose = depth.get("obstacle_capture_pose")
+            if capture_pose is None or depth.get("body_from_optical") is None:
+                return None
+            mount_frame = capture_pose.frame
+        elif depth.get("body_mount_required") and state.use_body_mount is not False:
+            return None
+        remembered = scan.remembered_hits
+        if remembered is None and (scan.obstacles.cells or scan.near_obstacles.cells):
+            return None
+        memory_ms = scan.control_ms or depth.get("control_ms") or depth["frame_id"]
+        if scan.near_hits is not None and scan.near_revision:
+            memory_ms = min(memory_ms, scan.near_revision)
+        return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
+                             objects_ms, decision.distance_m, previous_twist, mount_frame,
+                             (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
+                             remembered, memory_ms)
 
-        _, latest, odom, _ = self._observation_snapshot(with_capture_timing=True)
-        source = depth.get("source_frame_id")
-        if (latest is None or latest["frame_id"] <= depth["frame_id"]
-                or (source is not None and (latest.get("source_frame_id") or 0) <= source)
-                or latest.get("capture_invalid") or latest.get("body_mount_required")
-                or latest.get("map") is None):
+    def _recheck_forward(self, check, values, max_age, now_ms):
+        """Try the same short motion with newer depth and feedback on their own clocks."""
+        config = self._config
+        target_deadline = check.target_ms + min(max_age, config.max_obs_age_ms)
+        if not check.target_ms <= now_ms < target_deadline:
             return None
-        depth_ms = latest.get("capture_ms") or latest["frame_id"]
+        _, depth, odom, _ = self._observation_snapshot(with_capture_timing=True)
+        if (depth is None or depth["frame_id"] <= check.frame_id
+                or (check.source_id is not None and (depth.get("source_frame_id") or 0) <= check.source_id)
+                or depth.get("capture_invalid") or depth.get("map") is None):
+            return None
+        geometry = check.geometry
+        mount = depth.get("body_from_optical")
+        if mount is not None and mount[0, 2] < .75:
+            return None
+        if check.mount_frame is not None:
+            capture_pose = depth.get("obstacle_capture_pose")
+            pose = (odom or {}).get("obstacle_pose") or (odom or {}).get("motion_pose")
+            if mount is None or capture_pose is None or pose is None or capture_pose.frame != check.mount_frame or (
+                    pose.frame != check.mount_frame):
+                return None
+            geometry = replace(geometry, base_from_optical=mount)
+        depth_ms = depth.get("capture_ms") or depth["frame_id"]
         measured = odom_mod.planar_feedback(odom)
-        odom_ms = (odom or {}).get("received_ms")
-        if odom_ms is not None:
-            odom_ms = min(odom_ms, odom.get("stamp_ms", odom_ms))
-        if (measured is None or odom_ms is None
-                or (not state.checked_prefix and
-                    max(abs(measured[2]), abs(previous_twist[2])) > policy_mod.EXECUTION_YAW_TOLERANCE_RAD_S)):
+        received_ms = (odom or {}).get("received_ms")
+        if measured is None or received_ms is None:
             return None
-        obs_ms = min(objects_ms, depth_ms, odom_ms)
+        odom_ms = min(received_ms, odom.get("stamp_ms", received_ms))
+        feedback_source = odom.get("source_sample_id")
+        if check.feedback_source is not None and feedback_source is not None:
+            if feedback_source < check.feedback_source:
+                return None
+            if feedback_source == check.feedback_source and check.feedback_ms is not None:
+                odom_ms = min(odom_ms, check.feedback_ms)
+        obs_ms = min(check.target_ms, depth_ms, odom_ms)
         deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
                            odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms),
                            obs_ms + max_age))
-        if now_ms >= deadline:
+        if not max(depth_ms, odom_ms) <= now_ms < deadline:
             return None
         horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
-        velocities = measured, previous_twist, tuple(decision.values[i] for i in (0, 1, 5))
+        velocities = measured, check.previous_twist, tuple(values[i] for i in (0, 1, 5))
         speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
-        if speed * (horizon + (now_ms - objects_ms) / 1000) > decision.distance_m - config.stop_distance_m:
+        if speed * (horizon + (now_ms - check.target_ms) / 1000) > check.distance_m - config.stop_distance_m:
             return None
         keepout = policy_mod._keepout_m(config)
-        grid = local_path.observe(latest["map"], geometry, local_path.RIGHT, local_path.FORWARD,
-                                  local_path.RESOLUTION, latest.get("ground"), require_valid_depth=True)
+        grid = local_path.observe(depth["map"], geometry, local_path.RIGHT, local_path.FORWARD,
+                                  local_path.RESOLUTION, depth.get("ground"), require_valid_depth=True,
+                                  check_free_space=False)
         if grid is None:
             return None
-        clear = local_path.motion_sweep_clear(grid, geometry, keepout, horizon, velocities)
-        if clear and scan.near_hits is not None:
-            age = max(0, now_ms - scan.near_revision) / 1000
-            radius = math.hypot(max(geometry.front, geometry.rear), keepout)
-            travel = age * max(math.hypot(vx, vy) + radius * abs(yaw) for vx, vy, yaw in velocities)
-            clear = not local_path.motion_sweep_hits(scan.near_hits, geometry, keepout, horizon,
-                                                     velocities, padding=travel).any()
-        return obs_ms, deadline, clear
+        radius = math.hypot(max(geometry.front, geometry.rear), keepout)
+        travel_rate = max(math.hypot(vx, vy) + radius * abs(yaw) for vx, vy, yaw in velocities)
+        clear = not local_path.motion_sweep_hits(grid[1], geometry, keepout, horizon, velocities,
+                                                 padding=travel_rate * (now_ms - depth_ms) / 1000).any()
+        if clear and check.remembered is not None:
+            age = max(0, now_ms - check.remembered_ms) / 1000
+            clear = not local_path.motion_sweep_hits(check.remembered, geometry, keepout, horizon,
+                                                     velocities, padding=travel_rate * age).any()
+        newer = replace(check, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
+                        feedback_source=feedback_source, feedback_ms=odom_ms)
+        return obs_ms, deadline, clear, newer
 
     def next_command(self):
         """One tick of the policy, as a message or None.
@@ -1832,6 +1890,7 @@ class NaviPlugin:
         Public and ROS-free so the whole decision path — including the sequence
         numbers and the two timestamps — is testable without a node.
         """
+        self._staged_forward_check = None
         tick = time.monotonic()
         control_period_s = 1.0 / self._rate_hz
         previous_tick = self._last_tick
@@ -1917,16 +1976,17 @@ class NaviPlugin:
                  and bounded_age and max_age <= now_ms - obs_ms)
         recheck_deadline = None
         recheck_blocked = False
-        if (stale and objects is not None and depth is not None and values == decision.values
-                and obs_ms == (depth.get("capture_ms") or depth.get("frame_id"))):
-            refreshed = self._recheck_late_translation(
-                decision, previous_twist, depth, objects_ms, max_age, now_ms)
+        forward_check = (self._forward_check(decision, previous_twist, depth, odom, objects_ms)
+                         if bounded_age and objects is not None and values == decision.values else None)
+        if forward_check is not None and (stale or obs_ms + max_age - now_ms < control_period_s * 1000):
+            refreshed = self._recheck_forward(forward_check, values, max_age, now_ms)
             now = time.time()
             now_ms = int(now * 1000)
+            stale = max_age <= now_ms - obs_ms
             if refreshed is not None and refreshed[0] <= now_ms < refreshed[1]:
-                checked_obs_ms, checked_deadline, clear = refreshed
+                checked_obs_ms, checked_deadline, clear, newer = refreshed
                 if clear:
-                    obs_ms, recheck_deadline = checked_obs_ms, checked_deadline
+                    obs_ms, recheck_deadline, forward_check = checked_obs_ms, checked_deadline, newer
                     decision.reason = f"{decision.reason}，已用新深度复检"
                     stale = False
                 else:
@@ -1958,7 +2018,7 @@ class NaviPlugin:
             # the planner was running, even with a fresh feedback snapshot.
             expired_turn = expired_turn or (scan is previous_scan and previous_turn_deadline
                                             and now_ms >= previous_turn_deadline)
-        if expired_turn or stale:
+        if expired_turn or stale or recheck_blocked:
             if scan is not previous_scan or not issued_yaw:
                 scan.issued_yaw = False
             if expired_turn:
@@ -2005,6 +2065,8 @@ class NaviPlugin:
             if buffered_turn:
                 scan.turn_until_ms = now_ms + message["ttl_ms"]
         if any(values):
+            if forward_check is not None and self._state.executing_leg is None:
+                self._staged_forward_check = (message["seq"], forward_check)
             issued = time.monotonic()
             self._command_window = (issued, issued + min(message["ttl_ms"], self._config.watchdog_ms) / 1000)
         else:
@@ -2181,9 +2243,12 @@ class NaviPlugin:
             expires_at = now + max(0, min(message["ttl_ms"], expires_ms - now_ms)) / 1000
             previous_motion = (tuple(previous.message["values"][:2])
                                if previous is not None and previous.sent else (0., 0.))
+            staged = self._staged_forward_check
+            forward_check = staged[1] if staged is not None and staged[0] == message["seq"] else None
             self._scheduled_command = _ScheduledCommand(
                 message, expires_ms, expires_at, turn, leg=leg, feedback=feedback, depth_grid=depth_grid,
-                checked_pose=scan.pose if leg is not None else None, previous_motion=previous_motion)
+                checked_pose=scan.pose if leg is not None else None, previous_motion=previous_motion,
+                forward_check=forward_check)
             if turn is None:
                 # Deliver a new result immediately. The independent timer
                 # can repeat the checked prefix while the next search runs.
@@ -2281,12 +2346,33 @@ class NaviPlugin:
                     stop = ("速度指令窗口已到期", False)
                 elif stop is None and now_ms - work.feedback.poses[-1][0] > work.feedback.max_feedback_gap_ms:
                     stop = ("局部规划：运动反馈已到期，停车后重规划", True)
+            renewed = False
+            if (stop is None and work.forward_check is not None
+                    and remaining_ms <= math.ceil(1000 / self._rate_hz)):
+                max_age = self._descriptor["rate"]["max_obs_age_ms"]
+                checked = self._recheck_forward(work.forward_check, work.message["values"], max_age, now_ms)
+                now_ms = int(time.time() * 1000)
+                remaining_ms = min(work.expires_ms - now_ms,
+                                   round((work.expires_at - time.monotonic()) * 1000))
+                if remaining_ms <= 0:
+                    stop = ("速度指令窗口已到期", False)
+                elif checked is not None:
+                    obs_ms, deadline, clear, newer = checked
+                    if not clear:
+                        stop = ("局部规划：续发前扫掠复检发现障碍", True)
+                    elif min(now_ms + self._ttl_ms, deadline) > now_ms + remaining_ms:
+                        work.forward_check = newer
+                        work.message = dict(work.message, obs_stamp_ms=obs_ms)
+                        remaining_ms = min(self._ttl_ms, deadline - now_ms)
+                        work.expires_ms = now_ms + remaining_ms
+                        work.expires_at = time.monotonic() + remaining_ms / 1000
+                        renewed = True
             if stop is not None:
                 self._cancel_scheduled_motion(stop=(now_ms, *stop))
                 return
-            # Only feedback-guarded motion may be repeated within the
-            # original checked timing and observation budget.
-            if not work.sent or work.turn is not None or work.leg is not None:
+            # Turns and fixed legs can repeat within the existing window.
+            # Other forward motion requires a newly checked observation.
+            if not work.sent or renewed or work.turn is not None or work.leg is not None:
                 message = work.message
                 if work.sent and "control_interface" in message:
                     message = message.copy()

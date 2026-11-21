@@ -377,9 +377,9 @@ def test_late_local_translation_rechecks_new_depth_without_restamping_target(mon
     candidate = policy.Decision(values, policy.AVOIDING, "局部规划：沿避障路线行进", distance_m=2.)
     monkeypatch.setattr(policy, "step", lambda **kwargs: candidate)
 
-    def observe(*args, require_valid_depth):
+    def observe(*args, require_valid_depth, check_free_space):
         nonlocal now
-        assert require_valid_depth
+        assert require_valid_depth and not check_free_space
         if case == "invalid_depth":
             return None
         occupied = np.zeros(local_path.SHAPE, dtype=bool)
@@ -2490,3 +2490,68 @@ def test_selected_turn_route_survives_new_depth_without_a_plan_cache():
     card._view_next_at = 0.
     card._publish_view()
     assert card._view_queue.get_nowait()["detour"] is None
+
+
+@pytest.mark.parametrize("next_frame", [
+    "clear", "duplicate", "blocked", "feedback_gap", "duplicate_feedback", "old_target", "check_crosses_expiry",
+])
+def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observation(monkeypatch, next_frame):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=800, max_feedback_gap_ms=350)
+    card._running = True
+    card._publisher = card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 800}}
+    card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    state = card._state
+    state.active_scan.receipt_only = state.active_scan.buffered_odom = True
+    card._ttl_ms = 400
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    frame = np.ones((4, 4))
+    old = dict(map=frame, frame_id=950, capture_ms=350, source_frame_id=350)
+    new = dict(map=frame, frame_id=1090, capture_ms=900, source_frame_id=900)
+    if next_frame == "duplicate":
+        new["source_frame_id"] = old["source_frame_id"]
+    sample_ms = 740 if next_frame == "duplicate_feedback" else 995
+    odom = dict(vx=.1, vy=0., wz=0., received_ms=sample_ms, source_sample_id=sample_ms)
+    objects_ms = 600 if next_frame == "old_target" else 970
+
+    def observe(*_, **__):
+        nonlocal now
+        if next_frame == "check_crosses_expiry":
+            now += 55
+        grid = np.zeros(local_path.SHAPE, dtype=bool)
+        if next_frame == "blocked":
+            grid[local_path.START[0] + 5, local_path.START[1]] = True
+        return ~grid, grid
+
+    def snapshot(**kwargs):
+        if now == 1000:
+            return {"objects": []}, old, odom, objects_ms
+        latest_source = sample_ms if next_frame == "duplicate_feedback" else 1095
+        latest_odom = dict(odom, received_ms=1095, source_sample_id=latest_source)
+        return {"objects": []}, new, latest_odom if next_frame != "feedback_gap" else None, 1095
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(local_path, "observe", observe)
+    monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
+        [.15, 0., 0., 0., 0., .10], policy.APPROACHING, "target at 3 m", distance_m=3.))
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append)
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    assert published[-1]["ttl_ms"] == 150
+    now = 1100
+    card._dispatch_command()
+    if next_frame == "clear":
+        assert len(published) == 2 and published[-1]["values"][0] == .15
+        assert published[-1]["obs_stamp_ms"] == 900
+        assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] <= 1445
+    elif next_frame in ("blocked", "check_crosses_expiry"):
+        assert published[-1]["values"] == [0.] * 6
+    else:
+        now = 1150
+        card._dispatch_command()
+        assert published[-1]["values"] == [0.] * 6

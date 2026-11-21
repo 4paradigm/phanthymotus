@@ -4901,3 +4901,80 @@ def test_new_view_rechecks_the_target_corridor_before_continuing_an_observation_
                       config=config, state=state, dt=.1)
     assert (decision.values[0] > 0.) == (not blocked)
     assert scan.active == blocked
+
+
+@pytest.mark.parametrize("blocked,expect_search", [("side", True), ("inside", False)])
+def test_target_search_uses_a_directional_sweep_for_retained_obstacles(monkeypatch, blocked, expect_search):
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .23)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.23,
+                  search_rate=.6, lost_frames=1, max_depth_age_ms=800)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.near_hits = np.zeros(P.local_path.SHAPE, dtype=bool)
+    row, col = P.local_path.START
+    if blocked == "side":
+        scan.near_hits[row + 7, col + 8] = True
+    else:
+        scan.near_hits[row, col + 2] = True
+    scan.near_revision = 1000
+    monkeypatch.setattr(active_scan.ActiveScan, "update_near_obstacles", lambda *args, **kwargs: None)
+    empty = np.zeros_like(scan.near_hits)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~empty, empty))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (None, .9))
+    frame = np.ones((8, 8))
+    decision = P.step(detections=_detections(), depth=dict(map=frame, frame_id=1000, control_ms=1000),
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=1000), state=state, config=config, dt=.1)
+    assert (decision.status == P.SEARCHING and abs(decision.values[5]) > 0) == expect_search
+    assert decision.values[0] == 0.
+
+
+@pytest.mark.parametrize("lateral", [.35, .40])
+def test_off_axis_remembered_door_jamb_allows_a_checked_prefix(monkeypatch, lateral):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    g = P.local_path
+    geometry = g.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .275)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.275,
+                  max_depth_age_ms=800, obstacle_stop_m=.50, vx_max=.30)
+    state = _state(motion_source="measured", commanded=(.2, 0., 0.))
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame, scan.control_ms = True, 1000, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    grid = np.zeros(g.SHAPE, dtype=bool)
+    scan.views.append((1000, scan.pose, ~grid, grid))
+    scan.near_hits = np.isclose(g.FORWARD, .65) & np.isclose(g.RIGHT, lateral)
+    scan.near_revision = 1000
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+    view = dict(map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool), frame_id=1000)
+    decision = P._avoid(.2, 0., .3, view, config, P.APPROACHING, "", state,
+                        target_distance=2.5, target_bearing=.10, may_scan=True,
+                        odom=dict(vx=.20, vy=0., wz=0.))
+    assert decision[0] > 0 and decision[1] == 0. and abs(decision[2]) < .3
+    assert state.checked_prefix
+
+
+def test_view_received_during_interrupted_observation_is_remembered_without_paired_pose(monkeypatch):
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .23)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.23)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.phase = True, "turn"
+    scan.attempted, scan.directions, scan.origin_set = True, (1.,), True
+    scan.start_ms, scan.still_since = 900, 900
+    scan.pose = (0., 0., .18)
+    empty = np.zeros(P.local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~empty, empty))
+    frame = np.ones((8, 8))
+    P.step(detections=_detections(), depth=dict(map=frame, frame_id=1000, control_ms=1000),
+           odom=dict(vx=0., vy=0., wz=0., received_ms=1000), state=state, config=config, dt=.1)
+    assert scan.phase == "turn"
+    scan.interrupt()
+    scan.note_clear_path(1000)
+    scan.pose = (0., 0., 0.)
+    assert not scan.begin((1.,), turn_angle=.18)
