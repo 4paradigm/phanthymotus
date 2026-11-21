@@ -108,6 +108,18 @@ def test_card_starts_mapping_with_cloud_and_existing_odom_without_rgbd(card):
     assert len(card.get_tools()[0]['topic_out']) == 1
 
 
+def test_duplicate_start_reports_the_current_mapping_session(card):
+    node = capture(card)
+    response = call(card, 'start_mapping', map_name='Hall')
+    assert response['state'] == 'running'
+    assert response['map_name'] == 'Hall'
+    assert card._node is node and not node.closed
+    other = call(card, 'start_mapping', map_name='Other')
+    assert other['state'] == 'error'
+    assert 'mapping is already running' in other['message']
+    assert card._node is node
+
+
 def test_action_identifiers_match_canvas_display_names(card):
     tool = card.get_tools()[0]
     action = tool['inputSchema']['properties']['action']
@@ -943,7 +955,45 @@ def test_core_main_topics_can_resolve_generic_geometry_without_robot_name(card, 
         plugin.shutdown()
 
 
-def test_card_passes_only_connected_camera_evidence_to_runtime_discovery(card, monkeypatch):
+@pytest.mark.parametrize('start_fails', [False, True])
+def test_runtime_discovery_keeps_inputs_alive_until_gateway_subscribes(card, monkeypatch, start_fails):
+    inferred = settings()
+    del inferred['reserve_bytes']
+    subscriptions = set()
+    def discover(executor, odom_topic, cloud_topic, *, input_registry, handoff=None, **kwargs):
+        assert input_registry is registry
+        subscriptions.update((odom_topic, cloud_topic))
+        if handoff is None:
+            subscriptions.clear()
+        else:
+            handoff.callback(subscriptions.clear)
+        return inferred, {}
+    class Gateway(Session):
+        def __init__(self, *args, input_registry, input_declarations, **kwargs):
+            assert subscriptions == {'/pose', '/cloud'}
+            super().__init__(*args, **kwargs)
+
+        def start(self):
+            if start_fails:
+                raise RuntimeError('native startup failed')
+
+    registry = object()
+    monkeypatch.setattr(module, 'discover_runtime_geometry', discover)
+    monkeypatch.setattr(module, 'RtabmapNode', Gateway)
+    plugin = module.PointCloudSlamPlugin({'reserve_bytes': 0}, _FakeExecutor(), input_registry=registry)
+    try:
+        ready(plugin)
+        result = call(plugin, 'start_mapping', map_name='Generic')
+        assert result['state'] == ('error' if start_fails else 'running')
+        if start_fails:
+            assert 'native startup failed' in result['message']
+        assert not subscriptions
+    finally:
+        plugin.shutdown()
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_card_passes_only_connected_camera_evidence_to_runtime_discovery(card, monkeypatch, legacy):
     from test_pointcloud_slam_capture_mount import camera, pose
     from plugins.pointcloud_slam_capture_mount import resolve_capture_mount
     c = camera()
@@ -955,7 +1005,13 @@ def test_card_passes_only_connected_camera_evidence_to_runtime_discovery(card, m
     plugin = module.PointCloudSlamPlugin({'reserve_bytes': 0}, _FakeExecutor())
     try:
         args = arguments()
-        args['camera_infos'] = {'/cloud': c, '/unconnected': {'invalid': True}}
+        cameras = {'/cloud': c, '/unconnected': {'invalid': True}}
+        if legacy:
+            bindings = args.pop('input_bindings')
+            monkeypatch.setattr(module, 'discover_input_bindings', lambda topics: bindings)
+            args['camera_info'] = cameras
+        else:
+            args['camera_infos'] = cameras
         assert plugin.dispatch('pointcloud_slam', args)['state'] == 'ready'
         assert call(plugin, 'start_mapping', map_name='Dynamic')['state'] == 'running'
         assert plugin._session_settings['child_from_cloud'] is None

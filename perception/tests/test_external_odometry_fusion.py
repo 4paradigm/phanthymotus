@@ -223,6 +223,33 @@ def test_bumi_pose_covariance_adds_only_growth_within_one_leg_origin():
     np.testing.assert_allclose(engine.current.covariance, seed+2*np.diag(step))
 
 
+def test_late_visual_reuses_leg_noise_until_an_endpoint_changes(monkeypatch):
+    from plugins import external_odometry_fusion as fusion
+
+    calculate = fusion._leg_increment_covariance
+    calls = []
+
+    def record(*args):
+        calls.append(args)
+        return calculate(*args)
+
+    monkeypatch.setattr(fusion, '_leg_increment_covariance', record)
+    engine = ExternalOdometry(learning=False)
+    for t, variance in [(0., 1.), (.25, 1.125), (.5, 1.25), (.75, 1.5)]:
+        assert feed_covariance(engine, t, [variance]*6)
+    assert len(calls) == 3
+    assert vision(engine, .25, 0.)
+    assert len(calls) == 3
+    assert feed_covariance(engine, .5, [1.375]*6)
+    assert len(calls) == 5
+
+    expected = ExternalOdometry(learning=False)
+    for t, variance in [(0., 1.), (.25, 1.125), (.5, 1.375), (.75, 1.5)]:
+        feed_covariance(expected, t, [variance]*6)
+    vision(expected, .25, 0.)
+    np.testing.assert_array_equal(engine.current.covariance, expected.current.covariance)
+
+
 def test_bumi_step_noise_is_split_once_when_vision_is_inside_the_interval():
     def run(late):
         engine = ExternalOdometry(learning=False)

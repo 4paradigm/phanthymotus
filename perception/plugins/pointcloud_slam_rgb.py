@@ -1,5 +1,5 @@
 """Bounded optional RGB evidence; failures never hold the scan admission path."""
-from collections import deque
+from collections import OrderedDict, deque
 from copy import deepcopy
 from contextlib import contextmanager
 import threading
@@ -9,6 +9,9 @@ import numpy as np
 from .camera_geometry import CameraModel, camera_parameter, camera_transform, nearest_depth, project_depth
 from .pointcloud_slam_transforms import rigid
 from .pointcloud_slam_capture_mount import CaptureMounts, validate_mount_declaration
+
+_JPEG_HISTORY_BYTES = 8 * 1024 * 1024
+_JPEG_HISTORY_FRAMES = 128
 
 
 def validate_rgb_camera(declaration, *, topic):
@@ -65,6 +68,8 @@ class RgbLoopInput:
         self.K, self.width, self.height, self.frame_id = None, None, None, None
         self._condition = threading.Condition()
         self._frames = deque(maxlen=max(1, max_pending))
+        self._jpeg_history = OrderedDict()
+        self._jpeg_history_bytes = 0
         self._raw, self._thread, self._closed = None, None, False
         self._generation, self._last_stamp, self._used_stamp = 0, 0, 0
         self._counts = dict(received=0, decoded=0, decode_failures=0, dropped=0, matched=0)
@@ -97,7 +102,12 @@ class RgbLoopInput:
         if clear:
             self._generation += 1
             self._raw = None
-            self._frames.clear()
+            self._clear_frames()
+
+    def _clear_frames(self):
+        self._frames.clear()
+        self._jpeg_history.clear()
+        self._jpeg_history_bytes = 0
 
     def start(self):
         with self._condition:
@@ -114,7 +124,7 @@ class RgbLoopInput:
             self._closed = True
             self._generation += 1
             self._raw = None
-            self._frames.clear()
+            self._clear_frames()
             self._condition.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=.05)
@@ -139,7 +149,16 @@ class RgbLoopInput:
                 self._last_stamp = stamp
                 if self._raw is not None:
                     self._counts['dropped'] += 1
-                self._raw = (stamp, bytes(msg.data), self._generation)
+                data = bytes(msg.data)
+                self._raw = (stamp, data, self._generation)
+                # Keep compressed captures for delayed clouds without growing
+                # the decoded queue or decoding old frames on the ingress path.
+                self._jpeg_history_bytes += len(data) - len(self._jpeg_history.pop(stamp, b''))
+                self._jpeg_history[stamp] = data
+                while (len(self._jpeg_history) > _JPEG_HISTORY_FRAMES or
+                       self._jpeg_history_bytes > _JPEG_HISTORY_BYTES):
+                    _, evicted = self._jpeg_history.popitem(last=False)
+                    self._jpeg_history_bytes -= len(evicted)
                 self._condition.notify()
             except Exception as error:
                 self._fallback(error, clear=True)
@@ -175,6 +194,13 @@ class RgbLoopInput:
         import cv2
         return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
+    def _rectified_image(self, data):
+        image = self._decode_jpeg(data)
+        if (not isinstance(image, np.ndarray) or image.shape != (self.height, self.width, 3) or
+                image.dtype != np.uint8):
+            raise ValueError('RGB decode failed or dimensions differ from calibration')
+        return self.geometry.rectify_color(image)
+
     def _run(self):
         while True:
             with self._condition:
@@ -185,11 +211,7 @@ class RgbLoopInput:
                 self._raw = None
                 self._decoding_stamp = stamp
             try:
-                image = self._decode_jpeg(data)
-                if (not isinstance(image, np.ndarray) or image.shape != (self.height, self.width, 3) or
-                        image.dtype != np.uint8):
-                    raise ValueError('RGB decode failed or dimensions differ from calibration')
-                image = self.geometry.rectify_color(image)
+                image = self._rectified_image(data)
                 with self._condition:
                     if self._closed or generation != self._generation:
                         continue
@@ -210,7 +232,7 @@ class RgbLoopInput:
                         if self._raw is not None:
                             stamp, data, _ = self._raw
                             self._raw = (stamp, data, self._generation)
-                        self._frames.clear()
+                        self._clear_frames()
                         self._fallback(error)
             finally:
                 with self._condition:
@@ -242,9 +264,29 @@ class RgbLoopInput:
             self._used_stamp = selected[0]
             selected_index = min(range(len(self._frames)), key=lambda i: abs(self._frames[i][0]-cloud_stamp))
             del self._frames[selected_index]
+            self._jpeg_history_bytes -= len(self._jpeg_history.pop(selected[0], b''))
             self._counts['matched'] += 1
             self._state, self._reason = 'ready', None
             return selected[0], selected[1], self._generation
+
+    def take_retained(self, cloud_stamp, *, max_skew_ns):
+        with self._condition:
+            if self._closed:
+                return None
+            stamp = min(self._jpeg_history, key=lambda value: abs(value-cloud_stamp), default=None)
+            if stamp is None or abs(stamp-cloud_stamp) > max_skew_ns:
+                return None
+            data = self._jpeg_history.pop(stamp)
+            self._jpeg_history_bytes -= len(data)
+            generation = self._generation
+        image = self._rectified_image(data)
+        with self._condition:
+            if self._closed or generation != self._generation:
+                return None
+            self._used_stamp = stamp
+            self._counts['matched'] += 1
+            self._state, self._reason = 'ready', None
+            return stamp, image, generation
 
     @contextmanager
     def publication(self, generation):

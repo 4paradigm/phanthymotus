@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import uuid
@@ -233,6 +234,7 @@ class ExternalOdometry:
         self.solve_learning = solve_learning
         self.raw_motion = {}
         self.raw_vision = {}
+        self._pose_intervals = OrderedDict()
         self.checkpoints = {}
         self.base = _State(0, np.eye(4), np.eye(6), np.zeros((6, 12)), ExternalMotionLearner(enabled=learning))
         self.current = self.base
@@ -281,6 +283,22 @@ class ExternalOdometry:
         if stamp in self.raw_vision:
             self._rebuild(stamp)
 
+    def _pose_interval(self, t0, t1, left, right, end, overlap):
+        # A visual correction can replay these exact measured intervals many
+        # times. A replacement at the same timestamp invalidates either end.
+        key = (t0, t1, end, overlap)
+        cached = self._pose_intervals.get(key)
+        if cached is not None and cached[0] is left and cached[1] is right:
+            self._pose_intervals.move_to_end(key)
+            return cached[2], cached[3]
+        velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
+        covariance = _leg_increment_covariance(left, right, velocity, (end-t0)/1e9, overlap/(t1-t0))
+        self._pose_intervals[key] = (left, right, velocity, covariance)
+        self._pose_intervals.move_to_end(key)
+        if len(self._pose_intervals) > _MAX_EVENTS:
+            self._pose_intervals.popitem(last=False)
+        return velocity, covariance
+
     def _intervals(self, times, begin, end):
         """Return ordered clipped raw intervals in the producer's body tangent."""
         first = max(0, bisect_right(times, begin) - 1)
@@ -295,10 +313,8 @@ class ExternalOdometry:
                 continue
             increment_covariance = None
             if left.pose is not None and right.pose is not None:
-                velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
+                velocity, increment_covariance = self._pose_interval(t0, t1, left, right, clipped_end, overlap)
                 mask = left.mask & right.mask
-                increment_covariance = _leg_increment_covariance(
-                    left, right, velocity, (clipped_end-t0)/1e9, overlap/(t1-t0))
             elif left.twist is not None and right.twist is not None:
                 mask = left.mask & right.mask
                 velocity = np.where(mask, left.twist, 0.)

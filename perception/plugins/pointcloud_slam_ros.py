@@ -842,7 +842,11 @@ class RtabmapNode(Node):
         if rgb is None:
             # Decode may still be running after the cloud left ingress/queue.
             # Wait only for an already received matching JPEG.
-            rgb = self._rgb.take(stamp, now_ns, wait_s=.02)
+            rgb = self._rgb.take(stamp, now_ns, wait_s=.02, max_skew_ns=_RGB_RESERVATION_SKEW_NS)
+        if rgb is None:
+            rgb = self._rgb.take_retained(stamp, max_skew_ns=_RGB_RESERVATION_SKEW_NS)
+        if rgb is None:
+            rgb = self._rgb.take(stamp, now_ns)
         if rgb is None:
             return None
         with self._lock:

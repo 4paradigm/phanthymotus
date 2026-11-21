@@ -101,7 +101,8 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
 
 
 def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
-                              manual=None, max_gap_ms=200, timeout_s=5.0, camera_info=None, input_registry=None):
+                              manual=None, max_gap_ms=200, timeout_s=5.0, camera_info=None,
+                              input_registry=None, handoff=None):
     """Temporarily subscribe on the already-running executor.
 
     Do not start a second odometry estimator or use ROS arrival time as a
@@ -113,7 +114,7 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
     from sensor_msgs.msg import PointCloud2
     from utils.ros_lifecycle import dispose_node
 
-    probe = Node('pointcloud_slam_config_probe_' + uuid.uuid4().hex[:8])
+    probe = None
     lock, wake = threading.Lock(), threading.Event()
     poses, clouds = deque(maxlen=12), deque(maxlen=12)
 
@@ -146,12 +147,13 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
 
     try:
         if input_registry is None:
+            probe = Node('pointcloud_slam_config_probe_' + uuid.uuid4().hex[:8])
             probe.create_subscription(String, odom_topic, on_odom, qos_profile_sensor_data)
             probe.create_subscription(PointCloud2, cloud_topic, on_cloud, qos_profile_sensor_data)
+            executor.add_node(probe)
         else:
             leases.append(input_registry.acquire(odom_topic,String,{'format': 'state/odom'},on_odom))
             leases.append(input_registry.acquire(cloud_topic,PointCloud2,camera_info or {},on_cloud))
-        executor.add_node(probe)
         deadline = time.monotonic() + timeout_s
         last_error = ''
         while time.monotonic() < deadline:
@@ -168,6 +170,11 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
                         if context is not None:
                             settings['time_basis']=context.time_basis
                             provenance['time_basis']=context.time_basis
+                        # Keep the shared DDS readers alive until the gateway attaches.
+                        if handoff is not None:
+                            for lease in leases:
+                                handoff.callback(lease.close)
+                            leases.clear()
                         return settings,provenance
                     except ValueError as error:
                         last_error = str(error)
@@ -181,4 +188,5 @@ def discover_runtime_geometry(executor, odom_topic, cloud_topic, *,
                          (last_error or 'waiting for tracking odometry and capture-timed PointCloud2'))
     finally:
         for lease in leases:lease.close()
-        dispose_node(executor, probe, label='pointcloud_slam_config_probe')
+        if probe is not None:
+            dispose_node(executor, probe, label='pointcloud_slam_config_probe')

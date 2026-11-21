@@ -184,6 +184,25 @@ def test_decoded_cache_is_bounded_and_expired_at_take():
     finally: result.close()
 
 
+def test_late_cloud_can_match_the_retained_jpeg_capture():
+    result = helper(max_pending=2)
+    try:
+        for i in range(4):
+            stamp = STAMP + i * 100_000_000
+            result.image(message(stamp, data=bytes([i])), now_ns=stamp)
+            wait_for(lambda: result.info()['decoded'] == i + 1)
+        assert result.take(STAMP, STAMP + 350_000_000, exact=True) is None
+        stamp, image, generation = result.take_retained(STAMP + 10_000, max_skew_ns=20_000)
+        assert stamp == STAMP and image[0, 0, 0] == 0
+        assert result.take_retained(STAMP, max_skew_ns=20_000) is None
+        result.image(message(STAMP + 400_000_000, format='png'), now_ns=STAMP + 400_000_000)
+        with result.publication(generation) as valid:
+            assert not valid
+        assert result.take_retained(STAMP + 100_000_000, max_skew_ns=0) is None
+    finally:
+        result.close()
+
+
 def test_dynamic_mount_requires_exact_fresh_evidence_and_common_reference():
     c, config = camera(), settings()
     reference = dict(clock_id='clock', domain_id='host', timestamp_basis='host_realtime')

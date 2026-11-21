@@ -1,4 +1,5 @@
 """Point-cloud mapping card backed by the native RTAB-Map process."""
+from contextlib import ExitStack
 from copy import deepcopy
 import logging
 import json
@@ -445,14 +446,26 @@ class PointCloudSlamPlugin:
         self._topics = dict(bindings)
         self._legacy_core = legacy
         self._project_inputs = deepcopy(args)
+        if legacy and 'camera_infos' not in args and isinstance(args.get('camera_info'), dict):
+            self._project_inputs['camera_infos'] = self._project_inputs['camera_info']
         return {'state': 'ready', 'backend': 'rtabmap', 'topic_out': self._outputs()}
 
     def _start_mapping(self, args, *, resume):
-        from .pointcloud_slam_library import map_entries, validate_map_name
-        if self._node or self._pending:
+        if self._pending:
             raise ValueError('finish the pending map save first')
+        if self._node is not None:
+            if (not resume and self._bound_map_id is None and args.get('map_name') == self._map_name and
+                    not self._capture_stop.is_set()):
+                return {'state': 'running', 'map_name': self._map_name,
+                        'backend': 'rtabmap', 'topic_out': self._outputs()}
+            raise ValueError('mapping is already running; stop it before starting another map')
         if not self._project_inputs or self._capture_stop.is_set():
             raise ValueError('start the project before mapping')
+        with ExitStack() as handoff:
+            return self._open_mapping(args, resume=resume, handoff=handoff)
+
+    def _open_mapping(self, args, *, resume, handoff):
+        from .pointcloud_slam_library import map_entries, validate_map_name
         bound = args.get('map_id') if resume else None
         if resume and not bound:
             raise ValueError('map_id is required for resume_mapping')
@@ -473,7 +486,7 @@ class PointCloudSlamPlugin:
                 manual=self._config.get('child_from_cloud'),
                 max_gap_ms=self._config['max_gap_ms'],
                 **({'camera_info': camera} if camera is not None else {}),
-                **({'input_registry':self._input_registry} if self._input_registry else {}))
+                **({'input_registry': self._input_registry, 'handoff': handoff} if self._input_registry else {}))
         self._validate(self._settings())
         entries = map_entries(_ARCHIVE_DIR)
         entry = next((e for e in entries if e['id'] == bound), None) if bound is not None else None
@@ -520,6 +533,7 @@ class PointCloudSlamPlugin:
                 **({'restored_map': restored} if restored is not None else {}),
                 **({"input_registry": self._input_registry,
                     "input_declarations":self._project_inputs.get("camera_infos",{})} if self._input_registry else {}))
+            handoff.close()
             # A new mapping session replaces the saved view, never competes for
             # the single mapping topic.
             self._close_view()
