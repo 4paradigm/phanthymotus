@@ -4377,9 +4377,9 @@ def test_visible_foreground_triggers_detour_before_slowdown_then_survives_blind_
                         target_distance=3., target_bearing=0., odom=odom, may_scan=True)
 
     command = tick(1000, 1.90, 0.)
-    assert command[0] == 0 and scan.active
-    # An interrupted observation returned to idle after braking on the robot.
-    scan.interrupt()
+    assert command[0] == .15 and command[1] == 0. and command[2]
+    assert not scan.active and scan.historical_hits.any()
+    # The saved hit survives when the original obstacle leaves the view.
     hits[:] = False
     assert tick(2000, 2.70, .35)[0] == .15
     assert scan.historical_hits.any()
@@ -4799,3 +4799,105 @@ def test_linear_feedback_above_speed_limit_reduces_command_without_failing():
                      odom=dict(vx=.55, vy=0., wz=0.))
     assert 0. < decision.values[0] < cfg.vx_max
     assert not state.failed_reason
+
+
+@pytest.mark.parametrize("heading,yaw,allowed", [
+    (0.92, .0386, True), (5., .50, True), (5.01, 0., False), (0., .501, False),
+])
+def test_execution_leg_heading_and_yaw_thresholds(heading, yaw, allowed):
+    grid = np.zeros(P.local_path.SHAPE, dtype=bool)
+    geometry = P.local_path.Geometry(None, None, np.eye(4), .20, .20, None)
+    leg = P.PathLeg(geometry, (1., 0.), (0., 0., 0.))
+    command = (.1, 0.)
+    reason = leg.check((0., 0., math.radians(heading)), (.1, 0., yaw), command,
+                       command, (grid, grid), .25, 1., .35)
+    assert (reason is None) == allowed
+
+
+def test_distant_blocked_corridor_releases_a_checked_arc_prefix(monkeypatch):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    grid = P.local_path
+    geometry = grid.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    observed = dict(map=np.ones((4, 4)), ground=None, frame_id=1000, control_ms=1000)
+    occupied = np.isclose(grid.FORWARD, 2.) & (abs(grid.RIGHT) <= .10)
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+
+    result = P._avoid(.20, 0., 0., observed, config, P.APPROACHING, "", state,
+                      target_distance=3., target_bearing=0., may_scan=True, dt=.1,
+                      odom=dict(vx=0., vy=0., wz=0.))
+    assert result[0] > 0. and result[1] == 0. and result[2] != 0.
+    assert not scan.active
+    assert state.view_detour is not None and len(state.view_detour.points) > 2
+
+
+def test_side_waypoint_can_be_reached_by_turning_then_driving(monkeypatch):
+    geometry = P.local_path.Geometry(None, None, np.eye(4), .20, .20, None)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.poses.append((1000, scan.pose, 0.))
+    free = np.zeros(P.local_path.SHAPE, dtype=bool)
+    scan.views.append((1000, scan.pose, free, free.copy()))
+    side_route = P.local_path.Detour(None, ((0., 0.), (0., .55)), geometry)
+    monkeypatch.setattr(P.local_path, "opening_route", lambda *args: None)
+    monkeypatch.setattr(P.local_path.PlanCache, "route", lambda *args: side_route)
+
+    assert P._start_detour_segment(dict(frame_id=1000, map=np.ones((4, 4))), config, state,
+                                   geometry, 1., (1.,), None, None)
+    assert scan.turn_angle == pytest.approx(math.pi / 2)
+    assert scan.advance_m == pytest.approx(.55)
+
+
+def test_started_route_accepts_residual_turn_but_still_checks_new_obstacles():
+    geometry = P.local_path.Geometry(None, None, np.eye(4), .20, .20, None)
+    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    scan.route_segment, scan.advance_m = True, 1.
+    scan.advance_origin = (0., 0., 0.)
+    scan.pose = (.05, 0., math.radians(1.))
+    occupied = np.zeros(P.local_path.SHAPE, dtype=bool)
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    odom = dict(vx=.1, vy=0., wz=.05)
+    result = P._advance_after_scan({}, config, state, odom, 1.5, .5, 2.5, .1)
+    assert result[0] > 0. and result[1:3] == (0., 0.)
+
+    occupied[P.local_path.START[0] + 2, P.local_path.START[1] + 5] = True
+    result = P._advance_after_scan({}, config, state, odom, 1.5, .5, 2.5, .1)
+    assert result[:3] == (0., 0., 0.)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_new_view_rechecks_the_target_corridor_before_continuing_an_observation_turn(monkeypatch, blocked):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25, use_lateral=False)
+    track = SimpleNamespace(observed=True, range_known=True, range_m=2.5, measured_range_m=2.5,
+                            bearing_rad=0., last_obs=(2.5, 0.))
+    state = _state(motion_source="measured", goal_anchor=P.DetourGoal(2.5, 0., track=track))
+    scan = state.active_scan
+    scan.receipt_only, scan.phase = True, "turn"
+    scan.attempted, scan.directions, scan.origin_set = True, (1.,), True
+    scan.start_ms = scan.still_since = 900
+    occupancy = np.zeros(P.local_path.SHAPE, dtype=bool)
+    occupancy |= blocked & np.isclose(P.FORWARD, 1.) & (abs(P.RIGHT) < .15)
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~occupancy, occupancy))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1. if blocked else 2.5, 1.))
+    frame = np.ones((8, 8))
+    decision = P.step(detections=_detections(), depth=dict(map=frame, frame_id=1000, control_ms=1000),
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
+                      config=config, state=state, dt=.1)
+    assert (decision.values[0] > 0.) == (not blocked)
+    assert scan.active == blocked

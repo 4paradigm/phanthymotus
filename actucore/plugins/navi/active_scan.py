@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 
 import numpy as np
@@ -145,6 +145,8 @@ class ActiveScan:
     poses: deque = field(default_factory=lambda: deque(maxlen=32))
     views: deque = field(default_factory=lambda: deque(maxlen=40))
     observed_vantages: deque = field(default_factory=lambda: deque(maxlen=32))
+    observed_world: deque[PlanarPose] = field(default_factory=lambda: deque(maxlen=32))
+    observation_pose: PlanarPose | None = None
     current_frame: int = 0
     pending_depth: dict | None = None
     _pending_projection: tuple | None = None
@@ -554,7 +556,25 @@ class ActiveScan:
             return source == self.source_frame
         return self.current_frame == depth.get("frame_id")
 
+    @staticmethod
+    def _same_vantage(left, right):
+        return (left.frame == right.frame and math.hypot(left.x - right.x, left.y - right.y) <= .18
+                and abs(math.remainder(left.yaw - right.yaw, math.tau)) <= ANGLE / 2)
+
+    def record_observation(self, pose):
+        if not any(self._same_vantage(pose, view) for view in self.observed_world):
+            self.observed_world.append(pose)
+
     def _already_observed(self, origin, angle):
+        if self.observation_pose is not None:
+            pose = self.observation_pose
+            f, r = origin[0] - self.pose[0], origin[1] - self.pose[1]
+            rotation = pose.yaw + self.pose[2]
+            c, s = math.cos(rotation), math.sin(rotation)
+            goal = replace(pose, x=pose.x + c*f + s*r, y=pose.y + s*f - c*r,
+                           yaw=rotation - origin[2] - angle)
+            if any(self._same_vantage(goal, view) for view in self.observed_world):
+                return True
         return any(math.dist(origin[:2], view[:2]) <= .18
                    and abs(math.remainder(origin[2] + angle - view[2], math.tau)) <= ANGLE / 2
                    for view in self.observed_vantages)
@@ -936,6 +956,7 @@ class ActiveScan:
         self.poses.clear()
         self.views.clear()
         self.observed_vantages.clear()
+        self.observation_pose = None
         self.pose = (0., 0., 0.)
         self.pose_origin = None
         self.pose_feedback_since_ms = 0

@@ -1777,7 +1777,8 @@ class NaviPlugin:
         scan, geometry = state.active_scan, config.local_geometry
         target_deadline = objects_ms + min(max_age, config.max_obs_age_ms)
         if (decision.status != policy_mod.AVOIDING or not state.avoidance_yaw_override
-                or state.view_detour is None or state.view_detour.geometry is not geometry or decision.values[5]
+                or state.view_detour is None or state.view_detour.geometry is not geometry
+                or (decision.values[5] and not state.checked_prefix)
                 or scan.active or scan.result_frame or scan.obstacles.cells
                 or not scan.receipt_only or not scan.buffered_odom or config.scan_geometry is not None
                 or geometry is None or depth.get("body_mount_required")
@@ -1797,7 +1798,8 @@ class NaviPlugin:
         if odom_ms is not None:
             odom_ms = min(odom_ms, odom.get("stamp_ms", odom_ms))
         if (measured is None or odom_ms is None
-                or max(abs(measured[2]), abs(previous_twist[2])) > .02):
+                or (not state.checked_prefix and
+                    max(abs(measured[2]), abs(previous_twist[2])) > policy_mod.EXECUTION_YAW_TOLERANCE_RAD_S)):
             return None
         obs_ms = min(objects_ms, depth_ms, odom_ms)
         deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
@@ -1806,23 +1808,22 @@ class NaviPlugin:
         if now_ms >= deadline:
             return None
         horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
-        velocities = measured[:2], previous_twist[:2], tuple(decision.values[:2])
-        speed = max(math.hypot(*velocity) for velocity in velocities)
+        velocities = measured, previous_twist, tuple(decision.values[i] for i in (0, 1, 5))
+        speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
         if speed * (horizon + (now_ms - objects_ms) / 1000) > decision.distance_m - config.stop_distance_m:
             return None
         keepout = policy_mod._keepout_m(config)
-        turn = max(abs(measured[2]), abs(previous_twist[2])) * horizon
-        padding = (math.hypot(max(geometry.front, geometry.rear), keepout)
-                   + speed * horizon / 2) * turn
         grid = local_path.observe(latest["map"], geometry, local_path.RIGHT, local_path.FORWARD,
                                   local_path.RESOLUTION, latest.get("ground"), require_valid_depth=True)
         if grid is None:
             return None
-        clear = local_path.transition_clear(grid, geometry, keepout, horizon, velocities, padding=padding)
+        clear = local_path.motion_sweep_clear(grid, geometry, keepout, horizon, velocities)
         if clear and scan.near_hits is not None:
-            travel = speed * max(0, now_ms - scan.near_revision) / 1000
-            clear = local_path.transition_clear((None, scan.near_hits), geometry, keepout,
-                                                horizon, velocities, padding=padding + travel)
+            age = max(0, now_ms - scan.near_revision) / 1000
+            radius = math.hypot(max(geometry.front, geometry.rear), keepout)
+            travel = age * max(math.hypot(vx, vy) + radius * abs(yaw) for vx, vy, yaw in velocities)
+            clear = not local_path.motion_sweep_hits(scan.near_hits, geometry, keepout, horizon,
+                                                     velocities, padding=travel).any()
         return obs_ms, deadline, clear
 
     def next_command(self):
@@ -1907,7 +1908,7 @@ class NaviPlugin:
             motion_pose = (odom or {}).get("motion_pose")
             if motion_pose is not None:
                 obs_ms = min(obs_ms, motion_pose.stamp_ms)
-            if (scan_guarded or checked_search) and odom is not None:
+            if (scan_guarded or checked_search or self._state.checked_prefix) and odom is not None:
                 stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
                 obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
                 if scan.current_frame:
@@ -1930,6 +1931,18 @@ class NaviPlugin:
                     stale = False
                 else:
                     recheck_blocked = True
+        if self._state.checked_prefix and any(values) and not stale and recheck_deadline is None:
+            stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
+            feedback_ms = (odom or {}).get(stamp_key, (odom or {}).get("received_ms"))
+            depth_ms = (depth or {}).get("capture_ms") or scan.current_frame
+            if feedback_ms is not None and depth_ms:
+                recheck_deadline = min(feedback_ms + self._config.max_feedback_gap_ms,
+                                       depth_ms + self._config.depth_age_limit_ms)
+            if recheck_deadline is None or now_ms >= recheck_deadline:
+                values = decision.values = [0.] * ACTION_DIM
+                decision.reason = "局部规划：弧段所用深度或运动反馈已到期，停车"
+                obs_ms = now_ms
+                recheck_deadline = None
         buffered_turn = values[5] and scan.turn_until_ms and scan.buffered_turn
         if buffered_turn and not stale and not previous_turn_deadline and depth is not None:
             checked_ms = depth.get("control_ms")
@@ -2212,8 +2225,9 @@ class NaviPlugin:
         previous = command if work.sent else work.previous_motion
         velocities = feedback.motion[:2], previous, command
         velocity = max(math.hypot(*v) for v in velocities)
-        padding = velocity * (now_ms - depth_ms) / 1000
         keep = policy_mod._keepout_m(config)
+        radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep)
+        padding = (velocity + radius * abs(feedback.motion[2])) * (now_ms - depth_ms) / 1000
         reason = leg.check(feedback.pose, feedback.motion, previous, command, work.depth_grid[2],
                            keep, horizon, brake_horizon, padding=padding)
         if reason is not None:

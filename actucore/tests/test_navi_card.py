@@ -348,7 +348,8 @@ def test_velocity_timer_does_not_repeat_a_translation_or_extend_its_observations
     "clear", "unknown", "obstacle", "duplicate", "old_target", "old_odom", "invalid_depth",
     "expires_again",
 ])
-def test_late_local_translation_rechecks_new_depth_without_restamping_target(monkeypatch, case):
+@pytest.mark.parametrize("arc", [False, True])
+def test_late_local_translation_rechecks_new_depth_without_restamping_target(monkeypatch, case, arc):
     import numpy as np
     from plugins.navi import local_path, policy
 
@@ -358,6 +359,7 @@ def test_late_local_translation_rechecks_new_depth_without_restamping_target(mon
     card._ttl_ms = 400
     card._state.avoidance_yaw_override = True
     card._state.view_detour = local_path.Detour((.25, -.05), (), card._config.local_geometry)
+    card._state.checked_prefix = arc
     card._state.active_scan.receipt_only = card._state.active_scan.buffered_odom = True
     now = 100_000
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
@@ -371,8 +373,8 @@ def test_late_local_translation_rechecks_new_depth_without_restamping_target(mon
     target_ms = 99_450 if case == "old_target" else 99_850
     snapshots = iter([({"objects": []}, old, odom, target_ms), ({"objects": []}, new, odom, 99_990)])
     monkeypatch.setattr(card, "_observation_snapshot", lambda **kwargs: next(snapshots))
-    candidate = policy.Decision([.25, -.05, 0., 0., 0., 0.], policy.AVOIDING,
-                                "局部规划：沿避障路线行进", distance_m=2.)
+    values = [.25, 0., 0., 0., 0., .20] if arc else [.25, -.05, 0., 0., 0., 0.]
+    candidate = policy.Decision(values, policy.AVOIDING, "局部规划：沿避障路线行进", distance_m=2.)
     monkeypatch.setattr(policy, "step", lambda **kwargs: candidate)
 
     def observe(*args, require_valid_depth):

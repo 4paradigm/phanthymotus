@@ -1196,3 +1196,18 @@ def test_buffered_turn_cancels_only_the_burst_when_feedback_is_overspeed():
     history = ((1000, 1000, (0., 0., -1.34)),)
     assert look.check_turn_feedback(history, 1000, 1.) == (scan.TURN_SPEED_REDUCTION, False)
     assert look.active and look.advance_m == .8
+
+
+def test_observed_heading_survives_scan_reset_in_the_same_odometry_frame():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan()
+    seen = PlanarPose(1000, ("odom", "base"), 1., 2., -.35)
+    look.record_observation(seen)
+    look.invalidate()
+    look.observation_pose = PlanarPose(1100, seen.frame, 1., 2., 0.)
+    assert look._already_observed(look.pose, .35)
+    look.observation_pose = PlanarPose(1200, seen.frame, 1.25, 2., 0.)
+    assert not look._already_observed(look.pose, .35)
+    look.observation_pose = PlanarPose(1300, ("new-odom", "base"), 1., 2., 0.)
+    assert not look._already_observed(look.pose, .35)
