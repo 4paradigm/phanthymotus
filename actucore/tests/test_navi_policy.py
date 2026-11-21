@@ -5009,3 +5009,24 @@ def test_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_complete_ro
     assert state.view_detour.points[-1][1] < 0.
     assert g.segment_clear(scan.grid()[1], body, P._keepout_m(config),
                            -scan.turn_angle, scan.advance_m, heading_tolerance=P.ANGLE_TOLERANCE)
+
+
+def test_person_arrival_uses_confirmed_front_surface_at_configured_standoff():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    config = _cfg(confirm_hits=1, stop_distance_m=.60, stop_tolerance_m=0.,
+                  depth_intrinsics=HorizontalIntrinsics(80, 65., 39.5))
+    state = P.State(target="person")
+    person = _obj("person", bbox=(.2, .1, .8, .9))
+    frame = np.full((60, 80), 2.6, dtype=np.float32)
+    frame[22:31, 36:44] = .599
+
+    for stamp in (100, 200):
+        decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=stamp),
+                          odom=None, config=config, state=state, dt=.1)
+        assert not any(decision.values or ())
+        assert decision.status != P.ARRIVED
+    decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=300),
+                      odom=None, config=config, state=state, dt=.1)
+    assert decision.status == P.ARRIVED and not any(decision.values)
+    assert decision.distance_m == pytest.approx(.60, abs=.002)

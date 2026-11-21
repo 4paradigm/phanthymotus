@@ -1214,7 +1214,9 @@ def _fresh_detour_fix(anchor, track, config, depth):
     if (anchor is None or track is None or not track.observed or not track.range_known
             or track.measured_range_m is None or (depth or {}).get("map") is None):
         return None
-    last = getattr(track, "last_obs", None)
+    last = getattr(track, "front_fix", None)
+    if last is None:
+        last = getattr(track, "last_obs", None)
     bearing = math.atan2(-last[1], last[0]) if last is not None else track.bearing_rad
     distance = track.measured_range_m
     x, y = distance * math.cos(bearing), -distance * math.sin(bearing)
@@ -1237,7 +1239,8 @@ def _wait_for_detour_goal(state, config, track, odom):
                 y = -track.range_m * math.sin(track.bearing_rad)
             elif track is not None and track.range_known and track.last_obs is not None:
                 # The tracker transports this observation with ego motion only.
-                x, y = track.last_obs
+                front = getattr(track, "front_fix", None)
+                x, y = track.last_obs if front is None else front
             else:
                 return True
             state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"), track=track)
@@ -1343,6 +1346,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt)
+    if track is not None and getattr(track, "front_required", False) and track.front_fix is None:
+        state.goal_anchor = state.detour_leg = None
+        state.escape_side = 0.
+        if track.observed:
+            state.active_scan.interrupt()
+            state.commanded_vx = 0.
+            return Decision(_twist(0., 0., 0.), BLIND, "等待连续新深度确认目标最前端")
+        track = None
     anchor = state.goal_anchor
     target_fix = None
     refresh_target = False
@@ -1562,7 +1573,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # arrive_align_tol, lateral_max_bearing — is a fraction of the image half
     # width, and converting them instead would change what every deployed
     # config means.
-    bearing_rad = (math.atan2(-anchor.y, anchor.x) if anchor is not None else
+    front_known = track is not None and getattr(track, "front_fix", None) is not None
+    bearing_rad = (track.bearing_rad if front_known else
+                   math.atan2(-anchor.y, anchor.x) if anchor is not None else
                    target_fix[1] if target_fix is not None else track.bearing_rad)
     bearing = _clamp(bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
     state.last_seen_side = 1.0 if bearing >= 0 else -1.0
@@ -1570,7 +1583,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # The summary-only path legitimately produces that, and the whole approach
     # law below already handles an unknown distance — what it must not do is
     # act on the placeholder the tracker needed in order to exist.
-    distance = (math.hypot(anchor.x, anchor.y) if anchor is not None else
+    distance = (track.range_m if front_known else
+                math.hypot(anchor.x, anchor.y) if anchor is not None else
                 target_fix[0] if target_fix is not None else
                 track.range_m if track.range_known else None)
 

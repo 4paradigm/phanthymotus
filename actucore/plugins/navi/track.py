@@ -82,6 +82,9 @@ COASTING = "coasting"      # not seen this tick; position is predicted
 REACQUIRING = "reacquiring"  # something matched after a coast, not yet believed
 LOST = "lost"
 
+FRONT_CONFIRM_FRAMES = 3
+FRONT_MATCH_M = .30
+
 # Body frame throughout: x forward, y **left**, metres. Same convention as
 # motus.control/1's twist and motus.odom/1, so `vx`/`vy`/`wz` mean here exactly
 # what they mean on the wire.
@@ -139,6 +142,15 @@ class Track:
     # is held to the same evidence — see `_hit`.
     reacquire_hits: int = 0
 
+    # Navigation uses the confirmed front surface. Association still uses
+    # the object's box-based position, which is steadier through occlusions.
+    front_required: bool = False
+    front_fix: np.ndarray | None = None
+    front_candidate: np.ndarray | None = None
+    front_frame_id: int | None = None
+    front_hits: int = 0
+    front_age_s: float = 0.
+
     @property
     def drivable(self) -> bool:
         """Whether this track may move the robot. Tentative ones may not."""
@@ -158,12 +170,18 @@ class Track:
         return self.mean[:2]
 
     @property
+    def navigation_range_known(self) -> bool:
+        return self.front_fix is not None if self.front_required else self.range_known
+
+    @property
     def range_m(self) -> float:
-        return polar_of(self.position)[0]
+        point = self.front_fix
+        return polar_of(self.position if point is None else point)[0]
 
     @property
     def bearing_rad(self) -> float:
-        return polar_of(self.position)[1]
+        point = self.front_fix
+        return polar_of(self.position if point is None else point)[1]
 
     @property
     def position_std_m(self) -> float:
@@ -236,6 +254,9 @@ class Tracker:
             track.since_obs_s += dt
             track.accepted_detection = False
             track.measured_range_m = None
+            track.front_age_s += dt
+            if track.front_age_s > config.max_obs_age_ms / 1000:
+                track.front_fix = None
             # Apply the limit before association, even when a late new frame
             # arrives on this tick. It may start a new track after expiry.
             if track.drivable and track.since_obs_s > config.max_coast_s:
@@ -268,7 +289,9 @@ class Tracker:
 
         if matched is not None:
             self._hit(matched, config)
-            if (self.track.accepted_detection and matched["range_measured"]
+            if self.track.accepted_detection:
+                self._update_front(matched, depth, config)
+            if (self.track.accepted_detection and not self.track.front_required and matched["range_measured"]
                     and depth is not None and depth.get("map") is not None
                     and not depth.get("capture_invalid")):
                 depth_id = depth.get("source_frame_id", depth.get("frame_id"))
@@ -280,6 +303,37 @@ class Tracker:
             self._miss(config, candidates)
 
         return self.track if (self.track and self.track.drivable) else None
+
+    def _update_front(self, matched, depth, config):
+        """Count distinct, ordered depth frames for the associated person."""
+        from .depth import front_surface
+
+        track = self.track
+        box = matched["obj"].get("bbox_norm")
+        intrinsics = config.depth_intrinsics
+        if matched["name"].lower() == "person" and box and intrinsics is not None:
+            track.front_required = True
+        if not track.front_required or depth is None or depth.get("map") is None or depth.get("capture_invalid"):
+            return
+        frame = depth.get("source_frame_id") or depth.get("frame_id")
+        if type(frame) is not int or frame <= 0 or (
+                track.front_frame_id is not None and frame <= track.front_frame_id):
+            return
+        continuous = track.front_frame_id is not None and frame - track.front_frame_id <= config.max_obs_age_ms
+        track.front_frame_id = frame
+        point = front_surface(depth["map"], box, intrinsics, depth.get("ground")) if box and intrinsics else None
+        if point is None:
+            track.front_candidate = None
+            track.front_hits = 0
+            return
+        agrees = (continuous and track.front_candidate is not None
+                  and math.dist(point, track.front_candidate) <= FRONT_MATCH_M)
+        track.front_hits = min(track.front_hits + 1, FRONT_CONFIRM_FRAMES) if agrees else 1
+        track.front_candidate = point
+        if track.front_hits >= FRONT_CONFIRM_FRAMES:
+            track.front_fix = point
+            track.front_age_s = 0.
+            track.measured_range_m = track.range_m
 
     # ── 1. predict: mostly a statement about our own motion ──────────────────
 
@@ -307,6 +361,10 @@ class Tracker:
         track.mean = transition @ track.mean + control
         if track.last_obs is not None:
             track.last_obs = rotation @ (track.last_obs - translation)
+        if track.front_fix is not None:
+            track.front_fix = rotation @ (track.front_fix - translation)
+        if track.front_candidate is not None:
+            track.front_candidate = rotation @ (track.front_candidate - translation)
 
         # Process noise: what the *target* might do that we have not modelled.
         #
@@ -368,7 +426,7 @@ class Tracker:
                 # already believe, which makes this a bearing-only update in
                 # disguise: it can correct where the target is *pointing* and
                 # must not be allowed to claim anything about how far.
-                range_m = (self.track.range_m if self.track is not None
+                range_m = (polar_of(self.track.position)[0] if self.track is not None
                            else config.assumed_range_m)
             out.append({
                 "obj": obj,
@@ -603,7 +661,7 @@ class Tracker:
             "coast_s": round(track.coast_s, 2),
             "age_s": round(track.age_s, 1),
             "observed": track.observed,
-            "range_m": round(track.range_m, 2) if track.range_known else None,
+            "range_m": round(track.range_m, 2) if track.navigation_range_known else None,
             "position_std_m": round(track.position_std_m, 2),
             "reason": self.last_reason,
         }

@@ -2475,7 +2475,7 @@ class NaviPlugin:
         track = self._state.tracker.track
         goal = self._state.goal_anchor
         route_target = ((track.range_m, track.bearing_rad)
-                        if track is not None and track.range_known else None)
+                        if track is not None and track.navigation_range_known else None)
         if goal is not None:
             route_target = (math.hypot(goal.x, goal.y), math.atan2(-goal.y, goal.x))
         detour, key = self._state.view_detour, self._state.local_plan.key

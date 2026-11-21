@@ -584,3 +584,46 @@ def test_the_gate_cannot_open_wider_than_the_target_could_walk():
         track = _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
                       depth=_depth(0.7))
     assert track.state != T.CONFIRMED, "a 3.3 m jump was accepted as the target"
+
+
+def test_person_front_surface_needs_three_consistent_depth_frames():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    config = _cfg(confirm_hits=1, depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    tracker = T.Tracker()
+    image = np.full((60, 80), 2.5)
+    image[16:23, 51:58] = 1.6
+    image[15, 21] = .24
+    image[39:49, 26:38] = .35
+    ground = np.zeros_like(image, dtype=bool)
+    ground[39:49, 26:38] = True
+
+    def feed(stamp, source, frame=image):
+        return _feed(tracker, {"timestamp": stamp, "objects": [person]}, config=config,
+                     target="person", depth={"map": frame, "ground": ground, "frame_id": stamp,
+                                             "source_frame_id": source})
+
+    feed(100, 10)
+    result = feed(200, 11)
+    assert result.front_fix is None
+    assert result.measured_range_m is None
+    assert feed(300, 11).front_fix is None
+    assert feed(400, 9).front_fix is None
+    result = feed(500, 12)
+    assert result.front_fix is not None
+    assert result.range_m == pytest.approx(math.hypot(1.6, 1.6 * 12 / 60), abs=.03)
+    assert result.bearing_rad == pytest.approx(math.atan(12 / 60), abs=.015)
+    assert result.measured_range_m == result.range_m
+
+    changed = image.copy()
+    changed[16:23, 51:58] = 1.05
+    for stamp, source in ((600, 13), (700, 14)):
+        result = feed(stamp, source, changed)
+        assert result.range_m > 1.5
+        assert result.measured_range_m is None
+    assert feed(800, 15, changed).range_m < 1.1
+    for stamp in range(900, 1600, 100):
+        result = feed(stamp, 15, changed)
+    assert result.front_fix is None
+    assert not result.navigation_range_known

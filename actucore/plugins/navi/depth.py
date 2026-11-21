@@ -97,26 +97,46 @@ def _valid(patch: np.ndarray) -> np.ndarray:
     return patch[np.isfinite(patch) & (patch > 0)]
 
 
-def sample_box(depth_m: np.ndarray, bbox_norm) -> float | None:
-    """Distance to whatever fills a normalised box, or None if unreadable.
-
-    `bbox_norm` is `(x1, y1, x2, y2)` in 0..1 of the frame. Normalised rather
-    than pixels because vop's box is in *its* camera's resolution and this map
-    may have a different native resolution — passing pixels across that boundary is an
-    error that produces plausible numbers for the wrong part of the image.
-    """
-    height, width = depth_m.shape
-
+def _box_slices(shape, bbox_norm):
+    height, width = shape
     x1, y1, x2, y2 = bbox_norm
     left = max(0, min(width - 1, int(x1 * width)))
     right = max(left + 1, min(width, int(x2 * width)))
     top = max(0, min(height - 1, int(y1 * height)))
     bottom = max(top + 1, min(height, int(y2 * height)))
+    return slice(top, bottom), slice(left, right)
 
-    valid = _valid(depth_m[top:bottom, left:right])
+
+def sample_box(depth_m: np.ndarray, bbox_norm) -> float | None:
+    """Representative optical depth in a normalized detection box."""
+    valid = _valid(depth_m[_box_slices(depth_m.shape, bbox_norm)])
     if valid.size == 0:
         return None
     return round(float(np.percentile(valid, TARGET_PERCENTILE)), 3)
+
+
+def front_surface(depth_m, bbox_norm, intrinsics, ground=None):
+    """Project the nearest coherent patch in a detection box to (forward, left)."""
+    rows, cols = _box_slices(depth_m.shape, bbox_norm)
+    patch = depth_m[rows, cols]
+    if min(patch.shape) < 3:
+        return None
+    valid = np.isfinite(patch) & (patch > 0.)
+    if ground is not None:
+        valid &= ~ground[rows, cols]
+    windows = np.lib.stride_tricks.sliding_window_view(np.where(valid, patch, np.nan), (3, 3))
+    low = windows.min(axis=(-2, -1))
+    high = windows.max(axis=(-2, -1))
+    supported = high - low <= .08
+    if not supported.any():
+        return None
+    centre = windows[:, :, 1, 1]
+    fx, cx = intrinsics.for_width(depth_m.shape[1])
+    ray = (np.arange(cols.start + 1, cols.stop - 1) - cx) / fx
+    horizontal_range = np.where(supported, centre * np.hypot(1., ray), np.inf)
+    row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
+    forward = float(centre[row, col])
+    return np.array([forward, -forward * ray[col]])
 
 
 def sample_point(depth_m: np.ndarray, position, window: float = 0.05) -> float | None:
