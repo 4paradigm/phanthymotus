@@ -310,16 +310,16 @@ def test_it_does_not_arrive_while_still_misaligned():
     assert state.arrived is False
 
 
-@pytest.mark.parametrize("distance,arrived", [(1.25, True), (1.3, True), (1.301, False)])
-def test_arrival_tolerance_accepts_only_distances_within_the_extended_threshold(distance, arrived):
+@pytest.mark.parametrize("distance,arrived", [(1.099, False), (1.1, True), (1.2, True),
+                                              (1.25, True), (1.3, True), (1.301, False)])
+def test_arrival_tolerance_accepts_only_distances_within_the_parking_ring(distance, arrived):
     config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1)
     decision = _step(detections=_detections(_obj(bbox=(0.4, 0.4, 0.6, 0.6))),
                      depth=_depth(map_=_solid_depth(distance)), config=config)
     assert (decision.status == P.ARRIVED) is arrived
     if arrived:
         assert decision.values == [0.0] * 6
-        assert "threshold 1.30 m" in decision.reason
-        assert "0.10 m tolerance" in decision.reason
+        assert "1.20 m ± 0.10 m tolerance" in decision.reason
 
 
 def test_default_tolerance_is_five_centimetres():
@@ -375,22 +375,23 @@ def test_tolerance_arrival_emits_one_zero_and_stays_complete_if_distance_changes
     assert later.status == P.ARRIVED and later.values is None
 
 
-def test_tolerance_band_stops_translation_while_existing_heading_patience_runs():
-    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1,
-                  arrive_align_tol=0.01, arrive_patience_s=0.5)
-    detections = _detections(_obj(x=0.25, bbox=(0.5, 0.4, 0.7, 0.6)))
-    depth = _depth(map_=_solid_depth(1.25))
-    state = seed(_state(), detections, depth, config)
-    first = _step(detections=detections, depth=depth, state=state, config=config)
-    assert first.status != P.ARRIVED
-    assert first.values[:2] == [0.0, 0.0]
-    for _ in range(8):
-        decision = _step(detections=_next_frame(detections), depth=depth,
-                         state=state, config=config)
-        if decision.status == P.ARRIVED:
+@pytest.mark.parametrize("start_heading", [0., math.pi / 2, math.pi, -math.pi / 2])
+def test_parking_handles_any_approach_direction_and_aligns_in_place(start_heading):
+    config = _cfg(stop_distance_m=.60, stop_tolerance_m=.05, arrive_align_tol=.05)
+    sim = Sim(range_m=.62, bearing=.65, config=config)
+    sim.pose[2] = start_heading
+    c, t = math.cos(start_heading), math.sin(start_heading)
+    sim.target = np.array(((c, -t), (t, c))) @ sim.target
+    state = seed(_state(), *sim.observe(), config)
+    for _ in range(100):
+        decision = sim.run(state, ticks=1, odom=False)
+        assert decision.values[:2] == [0., 0.]
+        if state.arrived:
             break
-        assert decision.values[:2] == [0.0, 0.0]
-    assert decision.status == P.ARRIVED and decision.values == [0.0] * 6
+    assert decision.status == P.ARRIVED and decision.values == [0.] * 6
+    distance, angle = sim.relative()
+    assert distance == pytest.approx(.62)
+    assert abs(angle) <= config.arrive_align_tol * config.half_fov_rad
 
 
 def test_tolerance_does_not_complete_a_coasted_target_or_missing_observation():
@@ -408,7 +409,7 @@ def test_tolerance_does_not_complete_a_coasted_target_or_missing_observation():
 @pytest.mark.parametrize("tolerance", [0.0, 0.1])
 def test_tolerance_hold_also_stops_avoidance_translation_without_disabling_yaw(monkeypatch, tolerance):
     config = _cfg(stop_distance_m=1.2, stop_tolerance_m=tolerance,
-                  arrive_align_tol=0.01, arrive_patience_s=5.0)
+                  arrive_align_tol=0.01)
 
     def clearance(depth, config, lateral_offset_m=0.0):
         # A near pillar in the forward corridor, and clear space to its side.
@@ -416,7 +417,7 @@ def test_tolerance_hold_also_stops_avoidance_translation_without_disabling_yaw(m
 
     monkeypatch.setattr(P, "_clearance", clearance)
     decision = _step(detections=_detections(_obj(x=0.25, bbox=(0.5, 0.4, 0.7, 0.6))),
-                     depth=_depth(map_=_solid_depth(1.25)), config=config)
+                     depth=_depth(map_=_solid_depth(1.20)), config=config)
     assert decision.status != P.ARRIVED and decision.values[5] != 0
     assert decision.values[:2] == [0., 0.]
 
@@ -791,7 +792,7 @@ def test_arrival_inside_an_active_drive_segment_requires_the_original_measuremen
     config = _cfg(local_planning=True, local_geometry=geometry)
     state = _state(motion_source="measured")
     target = SimpleNamespace(observed=True, range_known=True, range_m=.84, measured_range_m=.84,
-                             bearing_rad=1. if association == "different_position" else 0.)
+                             bearing_rad=1. if association != "reacquired" else 0.)
     original = target if association == "same_track" else SimpleNamespace()
     state.goal_anchor = P.DetourGoal(.84, 0., track=original)
     scan = state.active_scan
@@ -807,10 +808,16 @@ def test_arrival_inside_an_active_drive_segment_requires_the_original_measuremen
                       odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
                       config=config, state=state, dt=.1)
     assert not scan.active and not scan.result_frame
-    assert (decision.status == P.ARRIVED) is (association != "different_position")
     assert decision.values[:2] == [0., 0.]
+    if association == "same_track":
+        assert decision.status == P.ALIGNING and decision.values[5] < 0.
+        target.bearing_rad = 0.
+        decision = P.step(detections=_detections(), depth=dict(depth, frame_id=1100),
+                          odom=dict(vx=0., vy=0., wz=0., received_ms=1100),
+                          config=config, state=state, dt=.1)
+    assert (decision.status == P.ARRIVED) is (association != "different_position")
     if association == "different_position":
-        assert state.goal_anchor is not None
+        assert state.goal_anchor is not None and not any(decision.values)
 
 
 def test_an_unmeasured_axis_never_reports_stuck():
@@ -1229,41 +1236,23 @@ def test_arrival_does_not_require_the_precision_the_drive_gate_does():
     assert decision.status == P.ARRIVED
 
 
-def test_being_close_but_never_aligned_still_arrives_eventually():
-    """The deadlock in full: inside the stop distance, turning for ever.
-    `idle_timeout_s` cannot catch it either — turning counts as motion."""
-    config = _cfg(arrive_patience_s=0.5, arrive_align_tol=0.01)
+def test_being_at_stop_distance_never_completes_while_heading_is_wrong():
+    config = _cfg(arrive_align_tol=0.01)
     state = _state()
-    for _ in range(12):
+    for _ in range(42):
         decision = _step(detections=_detections(_obj(x=0.30)),
-                         depth=_depth(map_=_solid_depth(0.5)),
+                         depth=_depth(map_=_solid_depth(.8)),
                          config=config, state=state, dt=0.1)
-        if decision.status == P.ARRIVED:
-            break          # the terminal reply is sticky; catch the moment
-    assert decision.status == P.ARRIVED
-    assert "not waiting to align" in decision.reason
+    assert decision.status == P.ALIGNING
+    assert decision.values[:2] == [0., 0.] and decision.values[5] < 0.
+    assert not state.arrived
 
 
-def test_leaving_the_stop_distance_resets_the_patience():
-    """Otherwise a moment spent close early on would count towards arriving
-    much later, somewhere else entirely.
-
-    The target walks away rather than teleporting: 1 m/s, which the tracker will
-    believe. At 8 m/s it would not, and rightly.
-    """
-    # No turning, so the heading never improves and arrival can only be decided
-    # by distance — which is what this test is about.
-    config = _cfg(arrive_patience_s=5.0, arrive_align_tol=0.01, wz_max=0.0)
-    sim = Sim(range_m=0.8, bearing=0.3, config=config, velocity=(1.0, 0.0))
-    state = seed(_state(), *sim.observe(), config)
-
-    sim.velocity = np.array([0.0, 0.0])
-    sim.run(state, ticks=5, dt=0.1)
-    assert state.close_for_s == pytest.approx(0.5)
-
-    sim.velocity = np.array([1.0, 0.0])
-    sim.run(state, ticks=15, dt=0.1)
-    assert state.close_for_s == 0.0
+def test_aligned_target_inside_stop_ring_does_not_count_as_arrived():
+    config = _cfg(stop_distance_m=.6, stop_tolerance_m=.05)
+    decision = _step(detections=_detections(_obj()), depth=_depth(map_=_solid_depth(.50)),
+                     config=config)
+    assert decision.status != P.ARRIVED and not any(decision.values)
 
 
 # ── the robot's deadband ─────────────────────────────────────────────────────
@@ -1832,7 +1821,7 @@ def test_a_coasted_position_cannot_be_called_an_arrival():
     Walking on a prediction is fine; declaring the journey over on one is not.
     """
     config = _cfg()
-    depth = _depth(map_=_solid_depth(0.5))
+    depth = _depth(map_=_solid_depth(0.8))
     state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
 
     # The target goes out of view. The track survives on its prediction, which
@@ -1841,9 +1830,7 @@ def test_a_coasted_position_cannot_be_called_an_arrival():
                       config=config, state=state, dt=0.1)
     assert decision.status != P.ARRIVED
     assert not state.arrived
-    # And the reason names what is actually there, rather than claiming
-    # success — which is the whole point of the reordering.
-    assert "障碍" in decision.reason
+    assert "等待实际测距" in decision.reason and not any(decision.values)
 
     # It comes back, and now the claim is supported.
     for _ in range(config.confirm_hits + 1):
@@ -2507,7 +2494,7 @@ def test_gap_turn_does_not_claim_tracking_gains_when_both_turns_equal_the_cap(mo
 
 def test_driver_response_profile_does_not_prevent_arrival():
     config = _cfg(response_yaw_gain=0.8)
-    decision = _profiled_frame(config, distance=0.7, bearing=0.0, odom={"wz": 0.1})
+    decision = _profiled_frame(config, distance=0.8, bearing=0.0, odom={"wz": 0.1})
     assert decision.status == P.ARRIVED
     assert decision.values == [0.0] * 6
     assert decision.k_yaw_effective is None
@@ -3025,6 +3012,8 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     decision = tick(1000, [0.] * 6)
     assert decision.values == [0.] * 6
     assert state.view_detour is not None
+    target.observed = False
+    target.measured_range_m = None
     scan = state.active_scan
     forward, right = state.view_detour.points[1]
     assert scan.directions[0] * scan.turn_angle == pytest.approx(math.atan2(right, forward))
@@ -4044,7 +4033,7 @@ def test_checked_straight_approach_keeps_tracking_a_moving_target(monkeypatch):
 
 
 @pytest.mark.parametrize("same_track, measured", [(True, True), (False, True), (True, False)])
-def test_scan_replan_requires_a_fresh_range_from_the_original_track(monkeypatch, same_track, measured):
+def test_scan_replan_updates_goal_only_with_a_fresh_range_from_the_original_track(monkeypatch, same_track, measured):
     from types import SimpleNamespace
     from plugins.navi import local_path
 
@@ -4074,12 +4063,14 @@ def test_scan_replan_requires_a_fresh_range_from_the_original_track(monkeypatch,
         observation = SimpleNamespace(**vars(track))
     observation.range_m = 4.6
     observation.measured_range_m = 4.6 if measured else None
+    if not measured:
+        observation.front_required, observation.front_fix = True, None
     decision = tick(1400)
     if same_track and measured:
         assert decision.values[0] > 0. and decision.distance_m == pytest.approx(4.6)
         assert state.goal_anchor is None
     else:
-        assert decision.values == [0.] * 6 and "等待原目标" in decision.reason
+        assert decision.values[0] > 0. and decision.distance_m == pytest.approx(3.81)
         assert state.goal_anchor is not None
 
 
@@ -4119,17 +4110,18 @@ def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monke
     assert decision.status == P.AVOIDING and decision.values[0] == .1
     assert decision.distance_m == pytest.approx(1.98 if odom is None else 2.)
 
-    # Once the route opens, wait for a live range from the frozen goal.
+    # Once the route opens, use odometry to approach the saved goal.
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2., 1.))
     decision = tick()
-    assert decision.values == [0.] * 6 and not state.arrived
+    assert decision.values[0] > 0. and not state.arrived
+    assert decision.status != P.SEARCHING and state.goal_anchor is not None
     observation[0] = track
     tick()
     assert state.goal_anchor is None
 
 
 @pytest.mark.parametrize("blocked, predicted", [(False, 1.6), (True, 1.6), (False, 3.1)])
-def test_anchored_reacquisition_can_turn_but_checks_sweep_and_prediction_budget(
+def test_remembered_goal_motion_checks_sweep_and_prediction_budget(
         monkeypatch, blocked, predicted):
     from plugins.navi import active_scan, local_path
 
@@ -4145,27 +4137,46 @@ def test_anchored_reacquisition_can_turn_but_checks_sweep_and_prediction_budget(
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, .1))
     decision = P.step(detections=None, depth=depth, odom=None, config=config, state=state, dt=.1)
 
-    assert decision.values[:5] == [0.] * 5
-    assert (decision.values[5] > 0.) is (not blocked and predicted < 3.)
-    assert not state.arrived and state.goal_anchor is not None
+    if blocked or predicted >= 3.:
+        assert not any(decision.values)
+    else:
+        assert decision.values[0] > 0.
+    assert decision.status != P.SEARCHING and not state.arrived and state.goal_anchor is not None
 
 
-def test_anchored_search_uses_the_same_timeout_when_measured_yaw_is_zero(monkeypatch):
+@pytest.mark.parametrize("blocked", [False, True])
+def test_remembered_side_goal_aligns_without_search_and_waits_for_a_live_fix(monkeypatch, blocked):
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .22, .22, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, search_timeout_s=.3)
-    state = _state(goal_anchor=P.DetourGoal(2., 1.), motion_source="measured")
-    free = np.ones(local_path.SHAPE, dtype=bool)
-    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
+    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
+               stop_distance_m=.6, stop_tolerance_m=.05, arrive_align_tol=.05)
+    state = _state(goal_anchor=P.DetourGoal(0., -.62), motion_source="measured")
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    occupied[local_path.START[0], local_path.START[1] + 3] = blocked
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~occupied, occupied))
     frame = np.ones((8, 8))
-    for stamp in range(1000, 1500, 100):
+    yaw = 0.
+    for stamp in range(1000, 7000, 100):
         decision = P.step(detections=None, depth=dict(map=frame, ground=frame.astype(bool), frame_id=stamp),
-                          odom=dict(vx=0., vy=0., wz=0., received_ms=stamp), config=cfg,
-                          state=state, dt=.1)
-    assert decision.status == P.FAILED
-    assert not state.searched_rad and state.goal_anchor is not None
+                          odom=dict(vx=0., vy=0., wz=yaw, received_ms=stamp),
+                          config=cfg, state=state, dt=.1)
+        assert decision.values[:2] == [0., 0.] and not state.arrived
+        assert decision.status != P.SEARCHING and not state.searching_for_s
+        next_yaw = decision.values[5]
+        if blocked:
+            assert next_yaw == 0. and "扫掠区有障碍" in decision.reason
+            break
+        if not next_yaw:
+            assert stamp > 1000
+            assert abs(decision.bearing) <= cfg.arrive_align_tol
+            assert "等待" in decision.reason
+            break
+        assert next_yaw < 0.
+        yaw = next_yaw
+    else:
+        pytest.fail("The remembered bearing did not converge")
+    assert state.goal_anchor is not None
 
 
 def test_command_only_scan_keeps_fresh_depth_when_detections_lapse(monkeypatch):
@@ -4789,8 +4800,40 @@ def test_reobserved_original_target_rechecks_direct_corridor_after_exhaustion(mo
     assert state.goal_anchor is None and not state.active_scan.exhausted
 
 
+def test_moved_original_target_updates_goal_during_active_detour(monkeypatch):
+    from types import SimpleNamespace
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    point = (2.6, -.8)
+    angle = math.atan2(-point[1], point[0])
+    distance = math.hypot(*point)
+    track = SimpleNamespace(observed=True, range_known=True, front_fix=point,
+                            measured_range_m=distance, range_m=distance, bearing_rad=angle)
+    anchor = P.DetourGoal(3.3, 0., track=track, target_missing=True)
+    state = _state(motion_source="measured", goal_anchor=anchor)
+    scan = state.active_scan
+    scan.receipt_only, scan.phase, scan.advance_m, scan.attempted = True, "evaluate", 1., True
+    scan.advance_origin = scan.pose
+    free = np.ones(P.local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (free, ~free))
+    monkeypatch.setattr(state.tracker, "step", lambda **kwargs: track)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (3.5, 1.))
+    frame = np.full((8, 8), 3.5)
+    decision = P.step(detections=_detections(), depth=dict(map=frame, frame_id=1000),
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
+                      config=config, state=state, dt=.1)
+
+    assert (anchor.x, anchor.y) == pytest.approx(point)
+    assert state.goal_anchor is None and scan.advance_m is None
+    assert decision.values[0] > 0. and decision.distance_m == pytest.approx(distance)
+    assert decision.bearing == pytest.approx(angle / config.half_fov_rad)
+
+
 @pytest.mark.parametrize("blocked", [False, True])
-def test_lost_detour_target_checks_turn_space_instead_of_old_forward_clearance(monkeypatch, blocked):
+def test_lost_detour_target_checks_motion_towards_remembered_goal(monkeypatch, blocked):
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -4805,9 +4848,11 @@ def test_lost_detour_target_checks_turn_space_instead_of_old_forward_clearance(m
     decision = P.step(detections=None, depth=dict(map=frame, ground=frame.astype(bool), frame_id=1000),
                       odom=dict(vx=0., vy=0., wz=0., received_ms=1000),
                       config=config, state=state, dt=.1)
-    assert decision.values[:5] == [0.] * 5
-    assert (decision.values[5] > 0.) is not blocked
-    assert state.goal_anchor is not None
+    if blocked:
+        assert not any(decision.values)
+    else:
+        assert decision.values[0] > 0. and decision.values[5] > 0.
+    assert decision.status != P.SEARCHING and state.goal_anchor is not None
 
 
 def test_linear_feedback_above_speed_limit_reduces_command_without_failing():
@@ -5024,26 +5069,20 @@ def test_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_complete_ro
                            -scan.turn_angle, scan.advance_m, heading_tolerance=P.ANGLE_TOLERANCE)
 
 
-def test_person_arrival_uses_confirmed_front_surface_at_configured_standoff():
+def test_person_arrival_uses_single_valid_front_surface_at_configured_standoff():
     from plugins.navi.camera import HorizontalIntrinsics
 
-    config = _cfg(confirm_hits=1, stop_distance_m=.60, stop_tolerance_m=0.,
+    config = _cfg(confirm_hits=1, stop_distance_m=.60, stop_tolerance_m=.01,
                   depth_intrinsics=HorizontalIntrinsics(80, 65., 39.5))
     state = P.State(target="person")
     person = _obj("person", bbox=(.2, .1, .8, .9))
     frame = np.full((60, 80), 2.6, dtype=np.float32)
     frame[22:31, 36:44] = .599
 
-    for stamp in (100, 200):
-        decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=stamp),
-                          odom=None, config=config, state=state, dt=.1)
-        assert not any(decision.values or ())
-        assert decision.status != P.ARRIVED
-        if stamp == 100:
-            state.active_scan.attempted = True
-            state.active_scan.phase = "brake"
-    assert not state.active_scan.active and not state.active_scan.attempted
-    decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=300),
+    decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=100),
+                      odom=None, config=config, state=state, dt=.1)
+    assert decision.status != P.ARRIVED and not any(decision.values or ())
+    decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=200),
                       odom=None, config=config, state=state, dt=.1)
     assert decision.status == P.ARRIVED and not any(decision.values)
     assert decision.distance_m == pytest.approx(.60, abs=.002)

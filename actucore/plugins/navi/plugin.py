@@ -278,8 +278,7 @@ class NaviPlugin:
         tuning_properties = {
             "stop_distance_m": {"type": "number", "minimum": 0,
                                 "title": "目标停止距离 stop_distance_m（m）",
-                                "description": "期望停在目标前的距离，按相机到目标"
-                                               "计算；到达距离阈值为此值加停止容差"},
+                                "description": "从任意方向接近时，期望相机与目标保持的距离，并朝向目标"},
         }
         stop_tolerance_spec = {
             "type": "number", "minimum": 0,
@@ -287,8 +286,7 @@ class NaviPlugin:
             "title": "本次停止距离容差 stop_tolerance_m（m）",
             "description": "仅覆盖本次 navigate_to；不写入卡片配置。"
                            "未填时每次恢复 0.05m，用于容纳相机测距误差。"
-                           "距离不大于停止距离加该容差时满足距离条件，"
-                           "仍需有效观测及原有对正条件。",
+                           "实测距离须落在停止距离加减该容差的范围内，并朝向目标。",
         }
         for key, spec in tuning_properties.items():
             spec["default"] = self._cfg.get(
@@ -1999,30 +1997,40 @@ class NaviPlugin:
                     obs_ms = min(obs_ms, scan.current_frame)
         stale = (self._config.local_planning and any(values)
                  and bounded_age and max_age <= now_ms - obs_ms)
+        prefix_deadline = None
+        if self._state.checked_prefix and any(values):
+            stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
+            feedback_ms = (odom or {}).get(stamp_key, (odom or {}).get("received_ms"))
+            depth_ms = (depth or {}).get("capture_ms") or scan.current_frame
+            if feedback_ms is not None and depth_ms:
+                prefix_deadline = min(feedback_ms + self._config.max_feedback_gap_ms,
+                                      depth_ms + self._config.depth_age_limit_ms)
         recheck_deadline = None
         recheck_blocked = False
         forward_check = (self._forward_check(decision, previous_twist, depth, odom, objects_ms)
                          if bounded_age and objects is not None and values == decision.values else None)
-        if forward_check is not None and (stale or obs_ms + max_age - now_ms < control_period_s * 1000):
-            refreshed = self._recheck_forward(forward_check, values, max_age, now_ms)
+        short_prefix = (prefix_deadline is not None
+                        and prefix_deadline - now_ms <= 2000 * control_period_s)
+        if forward_check is not None and (short_prefix or obs_ms + max_age - now_ms < 1000 * control_period_s):
+            original_deadline = min(obs_ms + max_age, now_ms + self._ttl_ms)
+            if prefix_deadline is not None:
+                original_deadline = min(original_deadline, prefix_deadline)
+            refreshed = self._recheck_forward(forward_check, values, max_age, now_ms,
+                                              allow_same_depth=short_prefix)
             now = time.time()
             now_ms = int(now * 1000)
             stale = max_age <= now_ms - obs_ms
             if refreshed is not None and refreshed[0] <= now_ms < refreshed[1]:
                 checked_obs_ms, checked_deadline, clear, newer = refreshed
-                if clear:
+                if clear and checked_deadline > original_deadline:
                     obs_ms, recheck_deadline, forward_check = checked_obs_ms, checked_deadline, newer
-                    decision.reason = f"{decision.reason}，已用新深度复检"
+                    recheck_note = "已用新深度复检" if newer.frame_id != depth["frame_id"] else "已用新反馈复检"
+                    decision.reason = f"{decision.reason}，{recheck_note}"
                     stale = False
-                else:
+                elif not clear:
                     recheck_blocked = True
         if self._state.checked_prefix and any(values) and not stale and recheck_deadline is None:
-            stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
-            feedback_ms = (odom or {}).get(stamp_key, (odom or {}).get("received_ms"))
-            depth_ms = (depth or {}).get("capture_ms") or scan.current_frame
-            if feedback_ms is not None and depth_ms:
-                recheck_deadline = min(feedback_ms + self._config.max_feedback_gap_ms,
-                                       depth_ms + self._config.depth_age_limit_ms)
+            recheck_deadline = prefix_deadline
             if recheck_deadline is None or now_ms >= recheck_deadline:
                 values = decision.values = [0.] * ACTION_DIM
                 decision.reason = "局部规划：弧段所用深度或运动反馈已到期，停车"

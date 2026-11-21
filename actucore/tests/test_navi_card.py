@@ -2668,3 +2668,43 @@ def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkey
     now = 1350 if new_feedback else 1250
     card._dispatch_command()
     assert published[-1]["values"] == [0.] * 6
+
+
+def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(monkeypatch):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=1200, max_feedback_gap_ms=350)
+    geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
+    card._config.local_geometry = geometry
+    card._descriptor = {"rate": {"max_obs_age_ms": 1200}}
+    card._ttl_ms = 400
+    state = card._state
+    scan = state.active_scan
+    scan.receipt_only = True
+    scan.current_frame, scan.source_frame = 950, 700
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    scan.views.append((950, scan.pose, ~occupied, occupied))
+    depth = dict(map=np.ones((4, 4)), frame_id=950, capture_ms=700, source_frame_id=700)
+    snapshots = iter(
+        ({"objects": []}, depth, dict(vx=.15, vy=0., wz=0., received_ms=t, source_sample_id=t), 960)
+        for t in (850, 1100)
+    )
+    clock = 1000
+
+    def plan(**_):
+        nonlocal clock
+        clock = 1150  # Several control beats consumed the old feedback window.
+        state.checked_prefix = state.avoidance_yaw_override = True
+        state.view_detour = local_path.Detour(None, ((0., 0.), (.15, 0.)), geometry)
+        return policy.Decision([.15, 0., 0., 0., 0., 0.], policy.AVOIDING, "checked", distance_m=3.)
+
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: clock / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: clock / 1000)
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: next(snapshots))
+    monkeypatch.setattr(policy, "step", plan)
+
+    command = card.next_command()
+    assert command["values"][0] == .15
+    assert command["obs_stamp_ms"] == 700
+    assert command["ttl_ms"] == 300

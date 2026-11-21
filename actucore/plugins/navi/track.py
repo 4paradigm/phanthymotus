@@ -82,8 +82,6 @@ COASTING = "coasting"      # not seen this tick; position is predicted
 REACQUIRING = "reacquiring"  # something matched after a coast, not yet believed
 LOST = "lost"
 
-FRONT_CONFIRM_FRAMES = 3
-FRONT_MATCH_M = .30
 
 # Body frame throughout: x forward, y **left**, metres. Same convention as
 # motus.control/1's twist and motus.odom/1, so `vx`/`vy`/`wz` mean here exactly
@@ -142,13 +140,12 @@ class Track:
     # is held to the same evidence — see `_hit`.
     reacquire_hits: int = 0
 
-    # Navigation uses the confirmed front surface. Association still uses
+    # Navigation uses the measured front surface. Association still uses
     # the object's box-based position, which is steadier through occlusions.
     front_required: bool = False
     front_fix: np.ndarray | None = None
-    front_candidate: np.ndarray | None = None
+    front_box: tuple | None = None
     front_frame_id: int | None = None
-    front_hits: int = 0
     front_age_s: float = 0.
 
     @property
@@ -281,6 +278,8 @@ class Tracker:
         stamp = (detections or {}).get("timestamp")
         if stamp is not None:
             if stamp in self._detection_stamps:
+                if stamp == self._detection_stamps[-1] and self.track is not None and self.track.observed:
+                    self._update_front(depth, config)
                 return self.track if (self.track and self.track.drivable) else None
             self._detection_stamps.append(stamp)
 
@@ -290,7 +289,11 @@ class Tracker:
         if matched is not None:
             self._hit(matched, config)
             if self.track.accepted_detection:
-                self._update_front(matched, depth, config)
+                box = matched["obj"].get("bbox_norm")
+                if matched["name"].lower() == "person" and box and config.depth_intrinsics is not None:
+                    self.track.front_required = True
+                self.track.front_box = box if self.track.front_required else None
+                self._update_front(depth, config)
             if (self.track.accepted_detection and not self.track.front_required and matched["range_measured"]
                     and depth is not None and depth.get("map") is not None
                     and not depth.get("capture_invalid")):
@@ -304,33 +307,23 @@ class Tracker:
 
         return self.track if (self.track and self.track.drivable) else None
 
-    def _update_front(self, matched, depth, config):
-        """Count distinct, ordered depth frames for the associated person."""
+    def _update_front(self, depth, config):
+        """Measure the associated person in the newest usable depth image."""
         from .depth import front_surface
 
         track = self.track
-        box = matched["obj"].get("bbox_norm")
+        box = track.front_box
         intrinsics = config.depth_intrinsics
-        if matched["name"].lower() == "person" and box and intrinsics is not None:
-            track.front_required = True
-        if not track.front_required or depth is None or depth.get("map") is None or depth.get("capture_invalid"):
+        if (not box or intrinsics is None or depth is None or depth.get("map") is None
+                or depth.get("capture_invalid")):
             return
         frame = depth.get("source_frame_id") or depth.get("frame_id")
         if type(frame) is not int or frame <= 0 or (
                 track.front_frame_id is not None and frame <= track.front_frame_id):
             return
-        continuous = track.front_frame_id is not None and frame - track.front_frame_id <= config.max_obs_age_ms
         track.front_frame_id = frame
-        point = front_surface(depth["map"], box, intrinsics, depth.get("ground")) if box and intrinsics else None
-        if point is None:
-            track.front_candidate = None
-            track.front_hits = 0
-            return
-        agrees = (continuous and track.front_candidate is not None
-                  and math.dist(point, track.front_candidate) <= FRONT_MATCH_M)
-        track.front_hits = min(track.front_hits + 1, FRONT_CONFIRM_FRAMES) if agrees else 1
-        track.front_candidate = point
-        if track.front_hits >= FRONT_CONFIRM_FRAMES:
+        point = front_surface(depth["map"], box, intrinsics, depth.get("ground"))
+        if point is not None:
             track.front_fix = point
             track.front_age_s = 0.
             track.measured_range_m = track.range_m
@@ -363,8 +356,6 @@ class Tracker:
             track.last_obs = rotation @ (track.last_obs - translation)
         if track.front_fix is not None:
             track.front_fix = rotation @ (track.front_fix - translation)
-        if track.front_candidate is not None:
-            track.front_candidate = rotation @ (track.front_candidate - translation)
 
         # Process noise: what the *target* might do that we have not modelled.
         #

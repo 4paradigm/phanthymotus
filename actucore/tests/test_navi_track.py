@@ -586,7 +586,7 @@ def test_the_gate_cannot_open_wider_than_the_target_could_walk():
     assert track.state != T.CONFIRMED, "a 3.3 m jump was accepted as the target"
 
 
-def test_person_front_surface_needs_three_consistent_depth_frames():
+def test_person_front_surface_uses_latest_valid_depth_frame():
     from plugins.navi.camera import HorizontalIntrinsics
 
     config = _cfg(confirm_hits=1, depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
@@ -605,25 +605,39 @@ def test_person_front_surface_needs_three_consistent_depth_frames():
                                              "source_frame_id": source})
 
     feed(100, 10)
-    result = feed(200, 11)
-    assert result.front_fix is None
-    assert result.measured_range_m is None
-    assert feed(300, 11).front_fix is None
-    assert feed(400, 9).front_fix is None
-    result = feed(500, 12)
-    assert result.front_fix is not None
+    result = tracker.track
     assert result.range_m == pytest.approx(math.hypot(1.6, 1.6 * 12 / 60), abs=.03)
     assert result.bearing_rad == pytest.approx(math.atan(12 / 60), abs=.015)
     assert result.measured_range_m == result.range_m
 
     changed = image.copy()
     changed[16:23, 51:58] = 1.05
-    for stamp, source in ((600, 13), (700, 14)):
+    for stamp, source in ((200, 10), (300, 9)):
         result = feed(stamp, source, changed)
         assert result.range_m > 1.5
         assert result.measured_range_m is None
-    assert feed(800, 15, changed).range_m < 1.1
-    for stamp in range(900, 1600, 100):
-        result = feed(stamp, 15, changed)
+    result = feed(300, 11, changed)  # Still the same valid detection payload.
+    assert result.range_m < 1.1
+    assert result.measured_range_m == result.range_m
+
+    for stamp in range(400, 1100, 100):
+        result = feed(stamp, 11, changed)
     assert result.front_fix is None
     assert not result.navigation_range_known
+
+
+def test_person_front_surface_ignores_a_new_depth_frame_without_a_return():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    cfg = _cfg(confirm_hits=1, depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    tracker = T.Tracker()
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    image = np.full((60, 80), 2.5)
+    _feed(tracker, {"timestamp": 100, "objects": [person]}, config=cfg,
+          target="person", depth={"map": image, "frame_id": 100})
+    distance = tracker.track.measured_range_m
+    assert distance == pytest.approx(2.5, abs=.03)
+    track = _feed(tracker, {"timestamp": 200, "objects": [person]}, config=cfg,
+                  target="person", depth={"map": np.zeros_like(image), "frame_id": 200})
+    assert track.measured_range_m is None
+    assert track.range_m == pytest.approx(distance)

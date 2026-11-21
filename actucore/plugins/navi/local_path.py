@@ -173,6 +173,30 @@ def _neighbor_count(mask):
                for r in range(3) for c in range(3) if (r, c) != (1, 1))
 
 
+def _drop_small_low_components(occupied, tall):
+    """Ignore low patches of up to three cells using eight-way connectivity."""
+    rows, cols = occupied.shape
+    offsets = tuple((dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc)
+    # A cell with at least three neighbours already belongs to a large patch.
+    seeds = np.argwhere(occupied & ~tall & (_neighbor_count(occupied) < 3))
+    for r, c in seeds:
+        if not occupied[r, c]:
+            continue
+        patch = {(r, c)}
+        pending = [(r, c)]
+        while pending and len(patch) < 4:
+            row, col = pending.pop()
+            for dr, dc in offsets:
+                nr, nc = row + dr, col + dc
+                if (0 <= nr < rows and 0 <= nc < cols and occupied[nr, nc]
+                        and (nr, nc) not in patch):
+                    patch.add((nr, nc))
+                    pending.append((nr, nc))
+        if len(patch) < 4 and not any(tall[row, col] for row, col in patch):
+            for row, col in patch:
+                occupied[row, col] = False
+
+
 def _floorless_hits(frame):
     """Keep vertically supported range returns when a floor plane is unavailable."""
     step = max(1, frame.shape[0] // 50)
@@ -274,6 +298,10 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     cell_ids = cells[0] * right.shape[1] + cells[1]
     counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
     occupied = counts >= 3
+    if heights is not None:
+        tall_ids = cell_ids[raised & (heights >= .10)]
+        tall = np.bincount(tall_ids, minlength=right.size).reshape(right.shape) > 0
+        _drop_small_low_components(occupied, tall)
     neighbors = _neighbor_count(occupied)
     ends = occupied & (neighbors == 1)
     small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
@@ -612,10 +640,15 @@ def _square_sweep_hits(squares, lower, upper, radius):
     return result
 
 
-def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0.):
-    """Sweep a circle centered on the chassis through its possible translations."""
+def _sweep_circle(geometry, half_width):
     center = (geometry.front - geometry.rear) / 2
     radius = math.hypot(geometry.half_length, half_width) + .05
+    return center, radius
+
+
+def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0.):
+    """Sweep a circle centered on the chassis through its possible translations."""
+    center, radius = _sweep_circle(geometry, half_width)
     # Independently ramped components can reach any center in these bounds.
     # Account for bending of the center's path while turning and translating.
     forward, right = zip(*((vx * horizon, -vy * horizon) for vx, vy, _ in velocities))
@@ -680,8 +713,10 @@ def opening_route(frame, occupied, geometry, half_width, plane, target):
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     transform = geometry.base_from_optical
     origin = transform[:3, 3]
-    f = np.full(math.ceil(2 * half_width / RESOLUTION) + 1, plane)
-    r = np.linspace(middle - half_width, middle + half_width, f.size)
+    samples = math.ceil(2 * half_width / RESOLUTION) + 1
+    r = np.append(np.linspace(middle - half_width, middle + half_width, samples),
+                  target[1] * plane / target[0])
+    f = np.full(r.size, plane)
     z = origin[2] + (plane - origin[0]) * transform[2, 2] / transform[0, 2]
     optical = (np.column_stack((f, -r, np.full_like(f, z))) - origin) @ transform[:3, :3]
     if np.any(optical[:, 2] <= 0):
@@ -691,13 +726,33 @@ def opening_route(frame, occupied, geometry, half_width, plane, target):
     if np.any((u < 0) | (u >= width) | (v < 0) | (v >= height)):
         return None
     measured = frame[v, u]
-    if not np.all(np.isfinite(measured) & (measured > optical[:, 2] + 2 * RESOLUTION)):
+    valid = np.isfinite(measured) & (measured > 0.)
+    if (not valid[-1] or np.count_nonzero(valid[:-1]) < .75 * samples
+            or np.any(measured[valid] <= optical[valid, 2] + 2 * RESOLUTION)):
         return None
     # The caller takes the longest safe prefix and checks it again after turning.
     end = min(plane + geometry.rear + .25, FORWARD[-1, 0] - geometry.front)
     points = tuple((forward, forward * middle / plane)
                    for forward in np.arange(0., end + 1e-9, RESOLUTION))
     return Detour(None, points, geometry)
+
+
+def _turnable_endpoints(cells, occupied, geometry, half_width):
+    """Apply the stationary body-circle sweep at each candidate goal cell."""
+    rows, cols = np.nonzero(cells)
+    if not len(rows) or not occupied.any():
+        return cells
+    center, radius = _sweep_circle(geometry, half_width)
+    half = RESOLUTION / 2
+    goals_f, goals_r = FORWARD[rows, cols] + center, RIGHT[rows, cols]
+    obstacles_f, obstacles_r = FORWARD[occupied], RIGHT[occupied]
+    result = cells.copy()
+    for start in range(0, len(rows), 64):
+        batch = slice(start, start + 64)
+        df = np.maximum(0., np.abs(goals_f[batch, None] - obstacles_f) - half)
+        dr = np.maximum(0., np.abs(goals_r[batch, None] - obstacles_r) - half)
+        result[rows[batch], cols[batch]] = ~((df**2 + dr**2) <= radius**2).any(axis=1)
+    return result
 
 
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
@@ -740,8 +795,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     start = (row_zero, col_zero)
     via = index(plane, bypass)
     goal = index(plane + geometry.rear + .25, 0)
-    if not (row_zero <= via[0] < goal[0] < grid.shape[0] and via[1] < grid.shape[1]):
-        return None
+    rejoin_in_grid = row_zero <= via[0] < goal[0] < grid.shape[0] and via[1] < grid.shape[1]
     half_cells = _footprint_cells(geometry, half_width)
     if half_cells[2] > row_zero or half_cells[1] > col_zero:
         return None
@@ -777,11 +831,12 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         target_r *= side
         ranges = np.hypot(forward - target_f, right - target_r)
         allowed &= ranges >= stop
-        if target_f - stop <= forward[goal[0], 0]:
-            target_cells = ranges <= stop + max(tolerance, resolution / math.sqrt(2))
-            if observed_endpoint:
-                target_cells &= free
-            path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells)
+        target_cells = allowed & (ranges <= stop + max(tolerance, resolution / math.sqrt(2)))
+        if observed_endpoint:
+            target_cells &= free
+        turn_width = half_width if body_half_width is None else body_half_width
+        target_cells = _turnable_endpoints(target_cells, occupied, geometry, turn_width)
+        path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells)
         if path is None and closest:
             target_cells = ranges < ranges[start] - resolution / 2
             if observed_endpoint:
@@ -789,6 +844,8 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
             path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells, target_cost=ranges)
             if path is None:
                 return None
+    if path is None and not rejoin_in_grid:
+        return None
     if path is None:
         target_cells = None
         # A fused view can confirm space to bend before the passing lane.

@@ -370,6 +370,27 @@ def test_detour_can_finish_at_the_requested_standoff_before_the_rejoin_point(mon
     assert forward < 1.45 + geometry.rear + .25
 
 
+def test_parking_ring_is_considered_even_beyond_the_obstacle_rejoin_depth():
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .15)
+    # The only opening near the object is on its left. The first box is
+    # much farther back than the parking ring.
+    start_box = (abs(replay.RIGHT) <= .10) & np.isclose(replay.FORWARD, .80)
+    front_of_target = (replay.RIGHT >= -.15) & (replay.RIGHT <= .30) & (
+        (replay.FORWARD >= 1.92) & (replay.FORWARD <= 2.36))
+    occupied = start_box | front_of_target
+    target = (2.60, 0., .60, .05)
+    detour = replay._checked_translation(
+        None, None, geometry, .20, .80, -1., 800, velocity_limits=None,
+        target=target, projected_grid=(~occupied, occupied), body_half_width=.15,
+        allow_unknown=True)
+
+    assert detour is not None
+    forward, right = detour.points[-1]
+    assert right < -.30
+    assert .55 <= np.hypot(2.60 - forward, right) <= .65
+
+
 def test_detour_can_start_sideways_when_the_passing_lane_is_only_partly_reachable(monkeypatch):
     geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
                                     (480, 420, 243), .23)
@@ -529,7 +550,7 @@ def test_fresh_frames_without_floor_are_usable_for_active_scan():
 
 
 @pytest.mark.parametrize("case", ["floor_patch", "unknown_context", "low_edge", "tilted_edge", "thin_rod"])
-def test_camera_rejects_a_supported_floor_patch_but_keeps_thin_obstacles(case):
+def test_camera_projection_drops_small_low_patches_but_keeps_the_taller_rod(case):
     horizontal = HorizontalIntrinsics(640, 480, 320)
     geometry = replay.camera_square(horizontal, (480, 480, 240), .275, at_front=True)
     tangent = (np.arange(480) - 240) / 480
@@ -558,6 +579,30 @@ def test_camera_rejects_a_supported_floor_patch_but_keeps_thin_obstacles(case):
     free, occupied = replay.observe(*args)
     _, fast = replay.observe(*args, check_free_space=False)
     assert np.array_equal(fast, occupied)
-    assert bool(occupied.any()) is (case != "floor_patch")
+    assert bool(occupied.any()) is (case == "thin_rod")
     if case == "floor_patch":
         assert free[replay.START[0] + 46, replay.START[1]]
+
+
+@pytest.mark.parametrize("heights,remaining", [
+    ((.09,), 0), ((.09, .09, .09), 0), ((.09,) * 4, 4),
+    ((.09, .10, .09), 3), (None, 3),
+])
+def test_low_components_use_diagonal_connectivity_and_strict_height_limit(heights, remaining):
+    n = len(heights) if heights is not None else 3
+    horizontal = HorizontalIntrinsics(640, 480, 320)
+    geometry = replay.camera_square(horizontal, (480, 480, 240), .275, at_front=True)
+    depth = np.repeat(1.2 + np.arange(n) * .05, 8)
+    right = np.repeat(.10 + np.arange(n) * .05, 8)
+    raised = np.ones(len(depth), dtype=bool)
+    kwargs = {"heights": np.repeat(heights, 8) if heights is not None else None}
+
+    free, occupied = replay._project_observed(
+        geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION,
+        right, np.zeros_like(depth), depth, raised, check_free_space=True, **kwargs)
+    _, fast = replay._project_observed(
+        geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION,
+        right, np.zeros_like(depth), depth, raised, check_free_space=False, **kwargs)
+    assert occupied.sum() == remaining
+    assert np.array_equal(fast, occupied)
+    assert free.sum() == n - remaining

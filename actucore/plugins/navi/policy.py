@@ -18,7 +18,7 @@ bad at both.
   2. travel towards it      vx and vy, decomposed along its bearing
   3. turn to face it        wz from the same bearing, at the same time
   4. slow and sidestep for obstacles the depth bands report
-  5. stop within `stop_distance_m + stop_tolerance_m`, and say so
+  5. stop within the configured distance band and face the target
 
 ── all three axes move together, and that is the whole point ────────────────
 
@@ -130,7 +130,7 @@ class Config:
     """
 
     stop_distance_m: float = 0.8
-    # Arrival may finish this far before the nominal camera-to-target distance.
+    # Allowed radial error around the nominal camera-to-target distance.
     # Five centimetres is the generic camera-depth tolerance. Live
     # target/heading requirements still apply; this is not a tolerance for
     # stale or predicted observations. Callers may request zero per action.
@@ -160,11 +160,6 @@ class Config:
     # never arrived — and `idle_timeout_s` could not catch it either, because
     # turning counts as motion and an oscillating aligner never stalls.
     arrive_align_tol: float = 0.30
-    # How long to keep trying to align, once inside the stop distance, before
-    # accepting arrival anyway. Spinning for ever in front of the target is a
-    # far worse outcome than facing it a little off: the position is what
-    # arriving means, the heading is a courtesy.
-    arrive_patience_s: float = 3.0
     # How long the corridor may stay blocked before the task gives up **naming
     # the obstacle**. Without it a blocked robot sidesteps and turns for ever:
     # it is commanding motion, so the idle timeout never fires, and the caller
@@ -415,6 +410,11 @@ class Config:
             raise ValueError("stop_distance_m + stop_tolerance_m must be finite")
 
     @property
+    def arrival_min_distance_m(self):
+        """Minimum camera-to-target range in the parking ring."""
+        return max(0., self.stop_distance_m - self.stop_tolerance_m)
+
+    @property
     def arrival_distance_m(self):
         """Maximum camera-to-target range that satisfies the distance test."""
         return self.stop_distance_m + self.stop_tolerance_m
@@ -600,8 +600,6 @@ class State:
     adaptive_fwd_scale: float = 1.0
     avoidance_yaw_override: bool = False
     moving_for_s: float = 0.0
-    close_for_s: float = 0.0
-    close_sample_gap_s: float = 0.0
     idle_for_s: float = 0.0
     arrived: bool = False
     blocked_for_s: float = 0.0
@@ -1104,6 +1102,18 @@ def step(*, detections, depth, odom, config: Config, state: State,
         decision.reason = f"{decision.reason}；实测速度超限，减速"
         state.commanded_vx = vx
     anchor, scan = state.goal_anchor, state.active_scan
+    geometry = config.scan_geometry or config.local_geometry
+    if (anchor is not None and decision.values is not None and any(decision.values)
+            and not scan.active and not state.checked_prefix and state.executing_leg is None
+            and geometry is not None and scan.current_frame and scan.views):
+        twist = tuple(decision.values[i] for i in (0, 1, 5))
+        motion = planar_feedback(odom) or state.command_tail
+        horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        grid = scan.grid(include_near=scan.near_squares is None)
+        if not local_path.motion_sweep_clear(grid, geometry, config.half_width_m, horizon,
+                                             (motion, state.commanded, twist)):
+            decision = Decision(_twist(0., 0., 0.), AVOIDING, "前往记忆目标的扫掠区有障碍",
+                                distance_m=decision.distance_m, bearing=decision.bearing)
     if decision.values is not None and any(decision.values) and not scan.active and scan.near_hits is not None:
         twist = tuple(decision.values[i] for i in (0, 1, 5))
         searched = decision.status == SEARCHING and state.search_sweep_checked and not any(twist[:2])
@@ -1212,8 +1222,8 @@ NO_LOCAL_ROUTE = "局部规划未找到可执行的避让路线；停下"
 
 
 def _fresh_detour_fix(anchor, track, config, depth):
-    if (anchor is None or track is None or not track.observed or not track.range_known
-            or track.measured_range_m is None or (depth or {}).get("map") is None):
+    if (anchor is None or track is None or not track.observed or track.measured_range_m is None
+            or (depth or {}).get("map") is None):
         return None
     last = getattr(track, "front_fix", None)
     if last is None:
@@ -1226,35 +1236,80 @@ def _fresh_detour_fix(anchor, track, config, depth):
     return None
 
 
-def _wait_for_detour_goal(state, config, track, odom):
+def _remember_detour_goal(state, config, track, odom):
     if not config.local_planning:
-        return False
+        return
     scan = state.active_scan
-    detouring = bool(state.escape_side or state.view_detour or scan.active or scan.result_frame or scan.exhausted)
-    observed = track is not None and track.observed and track.range_known
-    anchor = state.goal_anchor
-    if anchor is None:
-        if detouring:
-            if observed:
-                x = track.range_m * math.cos(track.bearing_rad)
-                y = -track.range_m * math.sin(track.bearing_rad)
-            elif track is not None and track.range_known and track.last_obs is not None:
-                # The tracker transports this observation with ego motion only.
-                front = getattr(track, "front_fix", None)
-                x, y = track.last_obs if front is None else front
-            else:
-                return True
-            state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"), track=track)
-        return False
-    if detouring:
-        return False
-    if observed and track.measured_range_m is not None:
-        x = track.measured_range_m * math.cos(track.bearing_rad)
-        y = -track.measured_range_m * math.sin(track.bearing_rad)
-        if math.hypot(x - anchor.x, y - anchor.y) <= 3 * config.range_std_m:
+    if not (state.escape_side or state.view_detour or scan.active or scan.result_frame or scan.exhausted):
+        if state.goal_anchor is not None and state.goal_anchor.verified_range_m is not None:
             state.goal_anchor = None
-            return False
-    return True
+        return
+    if state.goal_anchor is not None or track is None:
+        return
+    front = getattr(track, "front_fix", None)
+    if front is not None:
+        x, y = front
+    elif track.observed and track.range_known:
+        x = track.range_m * math.cos(track.bearing_rad)
+        y = -track.range_m * math.sin(track.bearing_rad)
+    elif track.range_known and track.last_obs is not None:
+        # The last observation has been transported by ego motion only.
+        x, y = track.last_obs
+    else:
+        return
+    state.goal_anchor = DetourGoal(x, y, (odom or {}).get("motion_pose"), track=track)
+
+
+def _reset_detour_route(state):
+    scan = state.active_scan
+    scan.finish()
+    scan.note_clear_path(scan.current_frame)
+    scan.advance_origin, scan.advance_m = None, None
+    scan.turn_until_ms, scan.turn_stop_ms = 0, None
+    scan.turn_sweep = None
+    state.detour_leg = None
+    state.escape_side, state.recovery = 0., False
+
+
+def _parking_alignment(depth, config, state, odom, distance, bearing, measured, observed):
+    """Finish at the measured radius with the chassis facing the target."""
+    state.commanded_vx = 0.
+    stop = _twist(0., 0., 0.)
+    if depth.get("map") is None or (not observed and state.goal_anchor is None):
+        return Decision(stop, AVOIDING, "已到预计停车范围，等待实际测距",
+                        distance_m=distance, bearing=bearing)
+    parking_range = measured if measured is not None else distance
+    if parking_range < config.arrival_min_distance_m - 1e-6:
+        return Decision(stop, AVOIDING, "已在目标停车圆环内侧，保持停车",
+                        distance_m=distance, bearing=bearing)
+    if abs(bearing) <= config.arrive_align_tol:
+        if observed and measured is not None and measured <= config.arrival_distance_m + 1e-6:
+            state.arrived = True
+            return Decision(stop, ARRIVED,
+                            f"target at {measured:.2f} m, stop distance reached and heading aligned "
+                            f"({config.stop_distance_m:.2f} m ± {config.stop_tolerance_m:.2f} m tolerance)",
+                            distance_m=measured, bearing=bearing)
+        return Decision(stop, ALIGNING, "已朝向目标，等待停车距离复测",
+                        distance_m=distance, bearing=bearing)
+
+    gain = config.response_yaw_gain if config.response_yaw_gain is not None else config.k_yaw
+    limit = _scan_yaw_rate(config, 1. if bearing > 0. else -1.)
+    yaw = _lift(-gain * bearing, config.floor_wz, limit) if limit >= config.floor_wz else 0.
+    reason = "已到停车范围，转向对准目标" if yaw else "当前转向能力无法对准目标"
+    scan = state.active_scan
+    geometry = config.scan_geometry or config.local_geometry
+    if yaw and config.local_planning and geometry is not None:
+        feedback = planar_feedback(odom) or state.command_tail
+        horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        if not scan.views or not scan.matches_route_view(depth):
+            yaw, reason = 0., "停车对准目标前等待可用的扫掠观测"
+        else:
+            grid = scan.grid(include_near=scan.near_squares is None)
+            if not local_path.motion_sweep_clear(
+                    grid, geometry, config.half_width_m, horizon, (feedback, state.commanded, (0., 0., yaw))):
+                yaw, reason = 0., "停车对准目标的扫掠区有障碍"
+        state.avoidance_yaw_override = True
+    return Decision(_twist(0., 0., yaw), ALIGNING, reason, distance_m=distance, bearing=bearing)
 
 
 def _search_yaw_candidates(config, yaw, both, scales):
@@ -1278,23 +1333,6 @@ def _search_for_target(depth, config, state, dt, odom):
                 state.missing_frames += 1
                 return _search(config, state, dt, odom, requested_yaw=rate)
     return Decision(_twist(0., 0., 0.), AVOIDING, reason)
-
-
-def _reacquire_detour_goal(depth, config, state, raw_yaw, bearing, dt, odom, track):
-    lost = track is None or not track.observed
-    yaw = _finalise_yaw(raw_yaw, False, bearing, config, state, dt)
-    if not yaw and lost and config.search_rate:
-        yaw = -state.last_seen_side * config.search_rate
-    stop = "停车等待原目标的有效测距"
-    for rate in _search_yaw_candidates(config, yaw, lost, (1., .5, .25)):
-        reason = _search_turn_stop(depth, config, state, requested_yaw=rate)
-        if reason is None:
-            decision = _search(config, state, dt, odom, requested_yaw=rate)
-            if decision.status == SEARCHING:
-                decision.reason = "按当前扫掠区转向找回原目标"
-            return decision
-        stop = reason
-    return Decision(_twist(0., 0., 0.), AVOIDING, stop)
 
 
 def _observation_command(scan, geometry, config, state, odom, dt, control_period_s):
@@ -1334,10 +1372,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
     invalid_depth = frame is not None and not has_valid_returns(frame)
     if stale_capture or invalid_depth:
         depth = None
-    state.close_sample_gap_s += dt
-    if state.close_sample_gap_s > config.max_obs_age_ms / 1000:
-        state.close_for_s = 0.0
-
     # The tracker runs **before** the blind check, so a spell with no
     # observation is a run of misses rather than time that did not happen. It
     # is also the only way the coast clock advances while the card is blind —
@@ -1347,10 +1381,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt)
+    anchor = state.goal_anchor
     if track is not None and getattr(track, "front_required", False) and track.front_fix is None:
-        state.goal_anchor = state.detour_leg = None
-        state.escape_side = 0.
-        if track.observed:
+        if anchor is None and track.observed:
             scan = state.active_scan
             scan.interrupt()
             history = (odom or {}).get("velocity_history")
@@ -1361,11 +1394,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if not (scan.active or scan.exhausted or scan.has_result):
                 scan.attempted = False
             state.commanded_vx = 0.
-            return Decision(_twist(0., 0., 0.), BLIND, "等待连续新深度确认目标最前端")
-        track = None
-    anchor = state.goal_anchor
+            return Decision(_twist(0., 0., 0.), BLIND, "等待目标最前端的有效深度")
+        if anchor is None:
+            track = None
     target_fix = None
-    refresh_target = False
+    refresh_target = reobserved_target = False
     if anchor is not None:
         approach_command = state.commanded[:2]
         anchor.advance(odom, ego, dt, approach_command=(
@@ -1375,9 +1408,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
             anchor.target_missing = True
         if target_fix is not None:
             moved = math.hypot(target_fix[2] - anchor.x, target_fix[3] - anchor.y)
-            refresh_target = anchor.target_missing or (
-                not state.active_scan.active and moved > max(3 * config.range_std_m,
-                                                            3 * local_path.RESOLUTION))
+            refresh_target = moved > max(3 * config.range_std_m, 3 * local_path.RESOLUTION)
+            reobserved_target = anchor.target_missing
+            anchor.x, anchor.y = target_fix[2:]
+            anchor.track = track
+            anchor.target_missing = False
+            anchor.predicted_m = anchor.predicted_rad = 0.
         anchor.verified_range_m = target_fix[0] if target_fix is not None else None
         if anchor.verified_range_m is not None:
             best = anchor.best_verified_distance_m
@@ -1385,6 +1421,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if (target_fix is None and (anchor.predicted_m > MAX_PREDICTED_DETOUR_TRAVEL_M
                                     or anchor.predicted_rad > math.pi / 3 + 1e-9)):
             return Decision(_twist(0., 0., 0.), AVOIDING, "绕行目标的无反馈推算已达上限，停车")
+
+        if math.hypot(anchor.x, anchor.y) <= config.arrival_distance_m + 1e-6:
+            scan = state.active_scan
+            if scan.active or scan.result_frame or scan.exhausted or state.detour_leg is not None:
+                _reset_detour_route(state)
+            refresh_target = reobserved_target = False
 
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
@@ -1474,10 +1516,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                        approaching=approaching)
         reviewing_observation = (target_fix is not None and feedback is not None
                                  and geometry is not None and geometry.horizontal is not None
-                                 and scan.phase in ("brake", "turn", "return") and not scan.route_segment)
+                                 and (reobserved_target or (
+                                     scan.phase in ("brake", "turn", "return") and not scan.route_segment)))
         if ((refresh_target or reviewing_observation) and update is None
                 and scan.current_frame and scan.matches_route_view(depth)):
-            distance, angle, x, y = target_fix
+            distance, angle = target_fix[:2]
             normalized = _clamp(angle / config.half_fov_rad, 1.)
             vx = min(config.vx_max, max(0., config.k_fwd * (distance - config.stop_distance_m)))
             vx *= _alignment_scale(normalized, config)
@@ -1490,19 +1533,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
             direct = _target_corridor_clear(depth, config, scan, distance, angle,
                                             (feedback or state.command_tail, state.commanded, (vx, 0., yaw)))
             if refresh_target or direct:
-                anchor.x, anchor.y, anchor.track = x, y, track
-                anchor.target_missing = False
-                anchor.predicted_m = anchor.predicted_rad = 0.
-                scan.finish()
-                scan.note_clear_path(scan.current_frame)
-                scan.advance_origin, scan.advance_m = None, None
-                scan.turn_until_ms, scan.turn_stop_ms = 0, None
-                scan.turn_sweep = None
-                state.detour_leg = None
-                state.escape_side, state.recovery = 0., False
+                _reset_detour_route(state)
                 was_scanning = False
                 if direct:
                     state.goal_anchor = anchor = None
+                refresh_target = False
+        if refresh_target:
+            _reset_detour_route(state)
+            return Decision(_twist(0., 0., 0.), AVOIDING, "局部规划：已更新目标位置，等待可用的规划观测")
         if was_scanning and not scan.active:
             return Decision(_twist(0, 0, 0), AVOIDING,
                             update.reason if update else "主动观察中断；停车后重规划")
@@ -1549,28 +1587,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     bands = depth.get("bands") or {}
 
     scan = state.active_scan
-    if (anchor is not None and ((scan.advance_origin is not None and scan.ready) or scan.exhausted)
-            and (math.hypot(anchor.x, anchor.y) <= config.arrival_distance_m
-                 or (track is not None and track is anchor.track and track.observed
-                     and track.measured_range_m is not None
-                     and track.measured_range_m <= config.arrival_distance_m))):
-        scan.finish()
-        scan.result_frame = 0
-        scan.exhausted = False
-        state.escape_side = 0.
-    if (anchor is not None and track is not None and anchor.track is track
-            and track.observed and track.measured_range_m is not None
+    if (anchor is not None and target_fix is not None and target_fix[0] > config.arrival_distance_m + 1e-6
             and not (state.escape_side or scan.active or scan.result_frame or scan.exhausted)):
-        # The original track can move while the detour uses its frozen point.
-        # Replan from a fresh depth match on that track after leaving the detour.
         anchor = state.goal_anchor = None
-    if (anchor is not None and not scan.active and not state.escape_side
-            and math.hypot(anchor.x, anchor.y) <= config.arrival_distance_m):
-        if _wait_for_detour_goal(state, config, track, odom):
-            angle = math.atan2(-anchor.y, anchor.x)
-            bearing = _clamp(angle / max(1e-6, config.half_fov_rad), 1.)
-            return _reacquire_detour_goal(depth, config, state, -config.k_yaw * bearing, bearing, dt, odom, track)
-        anchor = state.goal_anchor
 
     if track is None and anchor is None:
         return _search_for_target(depth, config, state, dt, odom)
@@ -1584,20 +1603,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # arrive_align_tol, lateral_max_bearing — is a fraction of the image half
     # width, and converting them instead would change what every deployed
     # config means.
-    front_known = track is not None and getattr(track, "front_fix", None) is not None
-    bearing_rad = (track.bearing_rad if front_known else
-                   math.atan2(-anchor.y, anchor.x) if anchor is not None else
-                   target_fix[1] if target_fix is not None else track.bearing_rad)
+    bearing_rad = (target_fix[1] if target_fix is not None else
+                   math.atan2(-anchor.y, anchor.x) if anchor is not None else track.bearing_rad)
     bearing = _clamp(bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
     state.last_seen_side = 1.0 if bearing >= 0 else -1.0
-    # None, not a number, when depth has never had a reading for this object.
-    # The summary-only path legitimately produces that, and the whole approach
-    # law below already handles an unknown distance — what it must not do is
-    # act on the placeholder the tracker needed in order to exist.
-    distance = (track.range_m if front_known else
+    distance = (target_fix[0] if target_fix is not None else
                 math.hypot(anchor.x, anchor.y) if anchor is not None else
-                target_fix[0] if target_fix is not None else
-                track.range_m if track.range_known else None)
+                track.range_m if track.range_known or getattr(track, "front_fix", None) is not None else None)
 
     # Turn towards it, proportionally. Positive bearing means the target is
     # right of centre, and `wz` is positive counter-clockwise, so the sign is
@@ -1615,50 +1627,17 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # D-like term.
     raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
-    within = distance is not None and distance <= config.arrival_distance_m
-    measured = track.measured_range_m if live else None
-    measured_within = measured is not None and measured <= config.arrival_distance_m
-    if measured_within and within:
-        state.close_for_s += state.close_sample_gap_s if state.close_for_s else dt
-        state.close_sample_gap_s = 0.0
-    elif measured is not None or not within:
-        state.close_for_s = 0.0
-
-    # Arrived: in position and roughly facing it — or turning in place for long
-    # enough. The second clause is not optional; see `arrive_patience_s`.
-    # **Arriving is a claim, and a coasted position cannot support it.**
-    #
-    # "I have reached the target" and "something is in the way" are different
-    # conclusions, and until now the first could impersonate the second: the
-    # arrival test runs before `_avoid`, so a track sitting on an obstacle
-    # reported success while the real target was metres away. On r1_sz that
-    # happened twice in a row — the track had been resurrected onto a traffic
-    # cone and the card declared it had arrived.
-    #
-    # A prediction is a good enough reason to keep walking and a bad one to
-    # declare the journey over, so arrival needs a live fix. Without one the
-    # code below falls through to the obstacle logic, which will stop for the
-    # thing that is actually there and say so.
-    detouring = config.local_planning and (state.escape_side or scan.active or scan.result_frame)
-    if (within and live and measured_within and not detouring
-            and (abs(bearing) <= config.arrive_align_tol or state.close_for_s >= config.arrive_patience_s)):
-        state.arrived = True
-        # One explicit zero before going quiet, so the chassis stops on a
-        # command rather than on a watchdog timeout — arriving is a success and
-        # should not look like a dropped link in the driver's log.
-        return Decision(_twist(0.0, 0.0, 0.0), ARRIVED,
-                        f"target at {measured:.2f} m, stop distance reached"
-                        + f" (threshold {config.arrival_distance_m:.2f} m = "
-                          f"{config.stop_distance_m:.2f} m + "
-                          f"{config.stop_tolerance_m:.2f} m tolerance)"
-                        + ("" if abs(bearing) <= config.arrive_align_tol else
-                           f" (still {bearing:+.2f} off-centre after "
-                           f"{state.close_for_s:.1f}s in range; not waiting to "
-                           f"align — see arrive_patience_s)"),
-                        distance_m=measured, bearing=bearing)
-
-    if within and depth.get("map") is None:
-        return Decision(_twist(0., 0., 0.), AVOIDING, "深度摘要显示近障，等待目标测距确认")
+    within = distance is not None and distance <= config.arrival_distance_m + 1e-6
+    if within:
+        observed = live or target_fix is not None or (
+            anchor is not None and track is not None and track is anchor.track and track.observed
+            and not anchor.target_missing and (
+                not getattr(track, "front_required", False) or track.front_fix is not None))
+        measured = target_fix[0] if target_fix is not None else track.measured_range_m if live else None
+        last = getattr(track, "last_obs", None)
+        if live and measured is not None and last is not None and getattr(track, "front_fix", None) is None:
+            bearing = _clamp(math.atan2(-last[1], last[0]) / max(1e-6, config.half_fov_rad), 1.)
+        return _parking_alignment(depth, config, state, odom, distance, bearing, measured, observed)
 
     # Forward speed scales continuously with alignment rather than switching.
     #
@@ -1677,10 +1656,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         vx, vy, turn, status, reason = _avoid(
             0.0, 0.0, raw_wz, depth, config, ALIGNING, reason, state,
             target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
-            aligned=False, odom=odom, may_scan=(live or anchor is not None) and not within, dt=dt)
-        if (_wait_for_detour_goal(state, config, track, odom)
-                or (reason == NO_LOCAL_ROUTE and anchor is not None and (track is None or not track.observed))):
-            return _reacquire_detour_goal(depth, config, state, raw_wz, bearing, dt, odom, track)
+            aligned=False, odom=odom, may_scan=live or anchor is not None, dt=dt)
+        _remember_detour_goal(state, config, track, odom)
         wz = _finalise_yaw(turn, bool(vx or vy), bearing, config, state, dt)
         state.commanded_vx = vx
         return Decision(_twist(vx, vy, wz), status, reason,
@@ -1694,21 +1671,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
         speed = min(speed, max(0.0, forward_gain
                                * (distance - config.stop_distance_m) * align))
         reason = f"target at {distance:.2f} m"
-
-    if within:
-        # Distance is already acceptable. Wait for the existing heading/live
-        # conditions without creeping towards the nominal, tighter distance.
-        speed = 0.0
-
-    if within and not live:
-        # Inside the stop distance by the tracker's reckoning, but the position
-        # is a prediction. Do not walk into whatever is actually there, and do
-        # not call it an arrival either — hold still and let `_avoid` below
-        # name the thing in the corridor, if there is one.
-        speed = 0.0
-        status = SEARCHING
-        reason = ("目标看起来已经在 {:.2f} m 内，但当前并没有真正看到它"
-                  "（轨迹处于预测状态），不按到达处理").format(distance)
 
     # Keep walking until the stop distance is genuinely reached.
     #
@@ -1730,17 +1692,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         vx, vy, raw_wz, depth, config, status, reason, state,
         target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
         aligned=abs(bearing) < config.align_full_stop, odom=odom,
-        may_scan=(live or anchor is not None) and not within, dt=dt)
-    if (_wait_for_detour_goal(state, config, track, odom)
-            or (reason == NO_LOCAL_ROUTE and anchor is not None and (track is None or not track.observed))):
-        return _reacquire_detour_goal(depth, config, state, tracking_wz, bearing, dt, odom, track)
-    if within and config.stop_tolerance_m > 0 and (vx or vy):
-        # Avoidance may propose a sidestep after the approach has stopped.
-        # A configured arrival tolerance also holds that translation while
-        # heading/live-fix checks finish; retain the avoidance yaw decision.
-        vx = vy = 0.0
-        reason += "; holding translation within arrival tolerance"
-
+        may_scan=live or anchor is not None, dt=dt)
+    _remember_detour_goal(state, config, track, odom)
     # **Blocked is an outcome, not a mood.** Trying to get round something is
     # the right first response, and it is what `_avoid` just did — but a robot
     # that has been shuffling sideways for twelve seconds is not making
@@ -2406,17 +2359,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     side = 0.0
     local_command = None
     local_route = None
-    if scan is not None and (state.detour_leg is not None or
-                             (scan.ready and scan.advance_origin is not None)):
-        anchor, track = state.goal_anchor, state.tracker.track
-        if (anchor is not None and track is not None and track is anchor.track and track.observed
-                and track.measured_range_m is not None
-                and math.hypot(track.measured_range_m * math.cos(track.bearing_rad) - anchor.x,
-                               -track.measured_range_m * math.sin(track.bearing_rad) - anchor.y)
-                > max(3 * config.range_std_m, 3 * local_path.RESOLUTION)):
-            state.goal_anchor = state.detour_leg = None
-            scan.finish()
-            return 0., 0., 0., AVOIDING, "局部规划：目标位置已变化，停车后重规划"
     if scan is not None and scan.ready and scan.advance_m is not None:
         return _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance, dt,
                                    target_bearing=target_bearing if may_scan else None)
