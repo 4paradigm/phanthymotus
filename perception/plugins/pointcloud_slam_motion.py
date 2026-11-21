@@ -150,6 +150,7 @@ class ScanMotion:
         from sensor_msgs.msg import PointCloud2
         from rtabmap_msgs.msg import OdomInfo
         from rclpy.qos import QoSProfile,ReliabilityPolicy
+        from rclpy.qos_event import PublisherEventCallbacks, SubscriptionEventCallbacks
         from utils.dds_transport import receive_environment
         executable=Path(get_package_prefix('rtabmap_odom'))/'lib/rtabmap_odom/icp_odometry'
         if not executable.is_file() or not os.access(executable,os.X_OK):
@@ -164,10 +165,15 @@ class ScanMotion:
         parameters=self.directory/'motion.params.json'
         parameters.write_text(json.dumps({'/**':{'ros__parameters':motion_parameters(self.settings,frame)}}))
         qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE)
-        publisher=self._publisher=self.node.create_publisher(PointCloud2,namespace+'/scan_cloud',qos)
+        # Retry replaces these private handles while the executor is spinning.
+        # Humble's default QoS event can hang while its wait set releases a
+        # destroyed handle. The reliable profiles themselves stay in use.
+        publisher=self._publisher=self.node.create_publisher(PointCloud2,namespace+'/scan_cloud',qos,
+            event_callbacks=PublisherEventCallbacks(use_default_callbacks=False))
         for kind,cls,topic in [('pose',Odometry,'odom'),('info',OdomInfo,'odom_info_lite')]:
             self._subscriptions.append(self.node.create_subscription(cls,namespace+'/'+topic,
-                lambda msg,k=kind,g=generation:self._observe(k,msg,g),qos))
+                lambda msg,k=kind,g=generation:self._observe(k,msg,g),qos,
+                event_callbacks=SubscriptionEventCallbacks(use_default_callbacks=False)))
         self._log=(self.directory/'motion.log').open('w+b',buffering=0)
         (self.directory/'dds').mkdir(exist_ok=True)
         self._process=subprocess.Popen([str(executable),'--ros-args','--disable-external-lib-logs','--params-file',str(parameters),

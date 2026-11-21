@@ -9,6 +9,29 @@ import numpy as np
 MAX_IMU_GAP_NS = 100_000_000
 
 
+def imu_timestamps(packet, received_ns):
+    """Normalize supplied timestamps and apply an optional numeric offset once."""
+    stamp, accel = packet.get('stamp_ns'), packet.get('accel_stamp_ns')
+    if stamp is None:
+        milliseconds = packet.get('stamp_ms')
+        if milliseconds is not None and type(milliseconds) is not int:
+            raise ValueError('IMU timestamp must be integer milliseconds')
+        stamp = received_ns if milliseconds is None else milliseconds * 1_000_000
+    offset = packet.get('time_offset_ns', 0)
+    accel = stamp if accel is None else accel
+    if any(type(value) is not int for value in (stamp, accel, offset)):
+        raise ValueError('IMU timestamps and offset must be integer nanoseconds')
+    return stamp + offset, accel + offset
+
+
+def imu_episode(packet, previous):
+    """Keep the last supplied identity until an explicit source or epoch change."""
+    previous_source, previous_epoch = previous
+    source = packet.get('source_id') or previous_source
+    epoch = packet.get('epoch') or (previous_epoch if source == previous_source else None)
+    return source, epoch
+
+
 @lru_cache(maxsize=16)
 def _proper_rotation(matrix_bytes):
     r = np.frombuffer(matrix_bytes, dtype=float).reshape(3, 3)
@@ -39,6 +62,13 @@ def _vector(value):
     if v.shape != (3,) or not np.isfinite(v).all():
         raise ValueError('IMU vectors must contain three finite SI measurements')
     return v
+
+
+def _scale(packet, field):
+    value = packet.get(field, 1.)
+    if type(value) not in (int, float) or not np.isfinite(value) or value <= 0.:
+        raise ValueError('IMU unit scale must be positive and finite')
+    return value
 
 def translation_extrinsics(packet):
     """Numeric format shared by fusion and its recovery probe."""
@@ -118,29 +148,28 @@ class ImuAttitude:
             if not isinstance(packet, dict) or packet.get('schema') != 'motus.imu/1':
                 raise ValueError('IMU packet must use the motus.imu/1 object format')
             rotations = (_rotation(packet.get('camera_from_gyro')), _rotation(packet.get('camera_from_accel')))
-            stamp, accel_stamp = packet.get('stamp_ns'), packet.get('accel_stamp_ns')
-            if type(stamp) is not int or type(accel_stamp) is not int:
-                raise ValueError('IMU timestamps must be integer nanoseconds')
-            angular = rotations[0] @ _vector(packet.get('angular_velocity'))
-            acceleration = rotations[1] @ _vector(packet.get('linear_acceleration'))
-            dt = (stamp - self.last_stamp) / 1e9 if self.history else 0.
-            source_id, epoch = packet.get('source_id'), packet.get('epoch')
-            mapping = packet.get('clock_mapping')
-            self.capture_source = None
-            if (isinstance(source_id, str) and source_id.strip() and (epoch is None or isinstance(epoch, str))
-                    and packet.get('stamp_source') == 'measurement' and packet.get('clock_id') == self.clock
-                    and not (isinstance(mapping, dict) and mapping.get('verified') is False)
-                    and packet.get('camera_frame_id') == self.frame and abs(stamp-accel_stamp) <= MAX_IMU_GAP_NS):
-                self.capture_source = (source_id, epoch, packet.get('calibration_id'),
-                                       packet.get('gyro_frame_id'), packet.get('accel_frame_id'),
-                                       rotations[0].tobytes(), rotations[1].tobytes())
-            # Native capture-time rotation hints still require an identified run.
-            source = self.capture_source if isinstance(epoch, str) and epoch.strip() else None
-            if source is None or source != self.rotation_source or not 0 < stamp-self.last_stamp <= MAX_IMU_GAP_NS:
+            stamp, accel_stamp = imu_timestamps(packet, now_ns)
+            gyro_scale = _scale(packet, 'gyro_scale_rad_s')
+            accel_scale = _scale(packet, 'accel_scale_m_s2')
+            angular = rotations[0] @ _vector(packet.get('angular_velocity')) * gyro_scale
+            acceleration = rotations[1] @ _vector(packet.get('linear_acceleration')) * accel_scale
+            episode = imu_episode(packet, (None, None) if self.rotation_source is None else self.rotation_source[:2])
+            source = (*episode, rotations[0].tobytes(), rotations[1].tobytes(), gyro_scale, accel_scale)
+            matched_acceleration = abs(stamp-accel_stamp) <= MAX_IMU_GAP_NS
+            self.capture_source = source if matched_acceleration else None
+            changed = source != self.rotation_source
+            delta_ns = stamp-self.last_stamp if self.history else 0
+            duplicate = bool(self.history) and not changed and delta_ns == 0
+            if not duplicate and (changed or not 0 < delta_ns <= MAX_IMU_GAP_NS):
                 self.rotation_generation += 1
                 self.rotation_run_length = 0
-            if source is not None:
+            if not duplicate:
                 self.rotation_run_length = min(self.rotation_run_length+1, self.orientation_history.maxlen)
+            if changed or delta_ns < 0:
+                self.quaternion = None
+                dt = 0.
+            else:
+                dt = delta_ns/1e9
             self.rotation_source = source
             self.last_stamp, self.last_accel = stamp, accel_stamp
             self.provenance = {key: deepcopy(packet.get(key)) for key in (
@@ -148,7 +177,7 @@ class ImuAttitude:
                 'stamp_source', 'clock_mapping', 'clock_id', 'camera_frame_id',
                 'gyro_frame_id', 'accel_frame_id', 'units')}
             magnitude = np.linalg.norm(acceleration)
-            gravity_valid = magnitude > 1e-12
+            gravity_valid = matched_acceleration and magnitude > 1e-12
             if self.quaternion is None:
                 if not gravity_valid:
                     self.quaternion = np.array([0., 0., 0., 1.])
@@ -168,8 +197,9 @@ class ImuAttitude:
                     self.quaternion = _multiply(self.quaternion, delta)
                     self.quaternion /= np.linalg.norm(self.quaternion)
             self.state, self.reason = 'active', None
-            self.history.append(stamp)
-            self.orientation_history.append((stamp, self.quaternion.copy()))
+            if not duplicate:
+                self.history.append(stamp)
+                self.orientation_history.append((stamp, self.quaternion.copy()))
             return {'stamp_ns': stamp, 'quaternion': self.quaternion.tolist(),
                     'angular_velocity': angular.tolist(), 'linear_acceleration': acceleration.tolist()}
         except (ValueError, TypeError, KeyError, OverflowError) as error:
@@ -177,8 +207,7 @@ class ImuAttitude:
             raise ValueError(str(error)) from error
 
     def covers(self, image_stamp_ns, now_ns):
-        return (self.status(now_ns) == 'active' and bool(self.history) and
-                self.history[0] <= image_stamp_ns <= self.history[-1])
+        return self.orientation_at(image_stamp_ns, now_ns, calibrated=True) is not None
 
     def orientation_at(self, image_stamp_ns, now_ns, *, calibrated=False):
         """Snapshot an actual capture bracket; never propagate or revive a filter.

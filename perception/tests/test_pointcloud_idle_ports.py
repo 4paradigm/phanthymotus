@@ -3,7 +3,7 @@ import struct
 import types
 
 import pytest
-from test_pointcloud_plugin import _plugin, metric_z16_declaration
+from test_pointcloud_plugin import _plugin, metric_f32_declaration
 from vision_stubs import _FakeImage
 
 
@@ -82,9 +82,9 @@ def test_metric_cloud_and_metadata_are_enabled_without_opt_in(instance_id):
     try:
         result = plugin.dispatch('pointcloud', {
             'action': 'start', 'instance_id': 'card', 'input_topic': '/depth',
-            'camera_info': [metric_z16_declaration(1)],
+            'camera_info': [metric_f32_declaration(1)],
             'input_metadata': {'/depth': {
-                'format': 'image/depth-z16', 'frame_metadata_topic': '/depth/evidence'}},
+                'format': 'image/depth-f32', 'frame_metadata_topic': '/depth/evidence'}},
         })
         assert result['state'] == 'running'
         info = plugin.dispatch('pointcloud', {'action': 'info', 'instance_id': instance_id})
@@ -98,8 +98,8 @@ def test_metric_cloud_and_metadata_are_enabled_without_opt_in(instance_id):
         assert any(c['format'] == 'sensor/pointcloud2' for c in info['camera_info'])
 
         node = executor.nodes[0]
-        msg = _FakeImage(data=struct.pack('<H', 2000), encoding='16UC1',
-                         width=1, height=1, step=2)
+        msg = _FakeImage(data=struct.pack('<f', 2.), encoding='32FC1',
+                         width=1, height=1, step=4)
         msg.header.frame_id = 'optical'
         msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
         node._emit_depth(msg)
@@ -113,7 +113,7 @@ def test_metric_cloud_and_metadata_are_enabled_without_opt_in(instance_id):
 @pytest.mark.parametrize('new_fx', [3.0, None])
 def test_running_metric_output_rejects_changed_calibration(new_fx):
     plugin, executor = _plugin()
-    original = metric_z16_declaration(1)
+    original = metric_f32_declaration(1)
     revised = {**original, 'K': [new_fx, *original['K'][1:]] if new_fx is not None else None}
     start = {'instance_id': 'card', 'input_topic': '/depth'}
     try:
@@ -149,7 +149,7 @@ def test_legacy_metric_toggle_cannot_disable_publishing_or_restart_card():
             assert not executor.nodes
             result = plugin.dispatch('pointcloud', {
                 'action': 'start', 'instance_id': 'card', 'input_topic': '/depth',
-                'camera_info': [metric_z16_declaration(1)],
+                'camera_info': [metric_f32_declaration(1)],
             })
             assert result['state'] == 'running'
             running = plugin.dispatch('pointcloud', {'action': 'info', 'instance_id': 'card'})
@@ -161,8 +161,8 @@ def test_legacy_metric_toggle_cannot_disable_publishing_or_restart_card():
             plugin.dispatch('pointcloud', {
                 'action': 'config', 'instance_id': 'card', 'metric_cloud': not enabled})
             assert executor.nodes == [node]
-            msg = _FakeImage(data=struct.pack('<H', 2000), encoding='16UC1',
-                             width=1, height=1, step=2)
+            msg = _FakeImage(data=struct.pack('<f', 2.), encoding='32FC1',
+                             width=1, height=1, step=4)
             msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
             node._emit_depth(msg)
             assert len(metric_publishers[0].raw_messages) == 1

@@ -153,10 +153,32 @@ def test_join_reports_imu_coverage_timeout_separately_from_missing_visual():
     msg, info = messages(1_000_000_000)
     frames.result('pose', msg, 1_020_000_000)
     frames.result('info', info, 1_020_000_000)
-    assert not fusion.frames
-    frames.drain(1_510_000_000)
     assert fusion.frames[0][1] is not None
-    assert frames.counts['imu_uncovered'] == frames.counts['deadline_expired'] == 1
+    assert frames.counts['imu_uncovered'] == 1 and frames.counts['deadline_expired'] == 0
+
+
+def test_external_learning_only_receives_accepted_native_visual_pose():
+    from test_rgbd_fusion import images, source, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    forwarded = []
+    captures.visual_sink = lambda *values: forwarded.append(values)
+    color, depth = images()
+    for offset in range(5_000_000, 100_000_001, 5_000_000):
+        fusion.observe_imu(source(anchor+offset), anchor+offset+1_000_000)
+    for offset, attitude in ((50_000_000, (0., 1.)), (100_000_000, (1., 0.))):
+        stamp = anchor+offset
+        pose, info = messages(stamp)
+        pose.child_frame_id = fusion.frame
+        pose.pose.pose.orientation.z, pose.pose.pose.orientation.w = attitude
+        captures.add_frame(stamp, color, depth, stamp+10_000_000)
+        captures.result('pose', pose, stamp+20_000_000)
+        captures.result('info', info, stamp+20_000_000)
+    assert len(forwarded) == 1
+    stamp, segment, observation = forwarded[0]
+    assert (stamp, segment) == (anchor+50_000_000, fusion.segment)
+    assert observation['quaternion'] == [0., 0., 0., 1.]
 
 
 @pytest.mark.parametrize('imu_resumes', ['same_capture', 'after_grace', 'next_capture', 'never'])
@@ -257,11 +279,13 @@ def test_native_visual_rejects_bad_covariance_inliers_and_changed_frames():
 
 def test_wired_fusion_mode_owns_imu_and_enables_geometry(monkeypatch):
     from plugins import rgbd_odometry as module
+    import sys
     class RecordingSession(Session):
         def __init__(self, calibration, executor, topic):
             super().__init__(calibration, executor, topic); self.calibration = calibration
     monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
     monkeypatch.setattr(module, 'require_runtime', lambda: None)
+    monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', object(), raising=False)
     card = RgbdOdometryPlugin({}, _FakeExecutor())
     result = card.dispatch('rgbd_odometry', dict(action='start',
         input_topics=['/rgb', '/depth', '/imu'], camera_info=declarations()))

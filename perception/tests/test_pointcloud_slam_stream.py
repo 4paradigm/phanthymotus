@@ -53,6 +53,57 @@ def chassis(ms, x=0., segment='a'):
     return sample
 
 
+def external_fusion(ms, x=0., segment='fusion', visual_segment='first'):
+    sample = odom(ms, x, segment)
+    sample['vendor']['motus_slam'] = dict(status='tracking', segment_id=segment,
+         pose_source='external_fusion', pose_reference='body', visual_segment_id=visual_segment)
+    return sample
+
+
+def test_external_fusion_uses_numeric_continuity_across_visual_restart_without_claims():
+    s = stream()
+    for ms, x, visual_segment in [(1000, 0., 'first'), (1100, .03, 'second'), (1200, .06, 'second')]:
+        s.odom(external_fusion(ms, x, visual_segment=visual_segment), now=ms/1000)
+    for ms in (1000, 1050, 1150, 1200):
+        s.cloud(ms*1_000_000, 'body', [[0, 0, 1]], now=1.2)
+    tokens = [frame.pose.external_continuity for frame in s.accepted]
+    assert len(tokens) == 4 and len(tokens[0]) == 16 and len(set(tokens)) == 1
+
+
+@pytest.mark.parametrize('before', [external_fusion(1000, 3.0), odom(1000, 3.0)])
+def test_external_fusion_origin_changes_do_not_interpolate_a_reset(before):
+    s = stream()
+    s.odom(before, now=1.)
+    s.odom(external_fusion(1200, 0., segment='new-card-run'), now=1.2)
+    s.cloud(1_100_000_000, 'body', [[0, 0, 1]], now=1.2)
+    assert not s.accepted
+    assert 'odometry origins' in s.last_error
+
+
+def test_external_fusion_uses_pose_update_time_over_camera_provenance():
+    sample = external_fusion(1100)
+    sample['vendor']['motus_slam'].update(stamp_ns=1_100_000_012,
+        observation=dict(schema='motus.observation/1', observation_stamp_ns=1_000_000_000))
+    assert decode_slam_odom(sample).stamp_ns == 1_100_000_012
+
+
+def test_external_fusion_interpolates_inline_mount_at_async_cloud_time():
+    s = stream(pose_capture_mount=True)
+    for ms, offset in ((1000, .2), (1100, .4)):
+        sample = external_fusion(ms)
+        transform = np.eye(4); transform[0, 3] = offset
+        sample['vendor']['camera_mount'] = {'packet': dict(stamp_ns=ms*1_000_000,
+            parent_frame='body', child_frame='camera', matrix=transform.tolist())}
+        s.odom(sample, now=ms/1000)
+        if ms == 1000:
+            # A sidecar without a numeric transform cannot impose a static
+            # identity when the camera is not in the pose's body frame.
+            s.cloud_metadata({'stamp_ns': 1_050_000_000}, now=1.05)
+            s.cloud(1_050_000_000, 'camera', [[0, 0, 1]], now=1.05)
+            assert not s.accepted
+    assert s.accepted[0].child_from_cloud[0, 3] == pytest.approx(.3)
+
+
 def measured_rgbd(ms, x=0., segment='a', ingress='local'):
     sample = odom(ms, x, segment)
     stamp = ms*1_000_000

@@ -184,11 +184,14 @@ def test_native_launch_uses_reliable_private_transport_without_external_ros_file
     monkeypatch.setitem(sys.modules,'ament_index_python.packages',packages)
     monkeypatch.setattr(sys.modules['rtabmap_msgs.msg'],'OdomInfo',object,raising=False)
     monkeypatch.setattr(sys.modules['rclpy.qos'],'qos_profile_sensor_data',object(),raising=False)
-    profiles=[]
-    def publisher(cls,topic,qos):
-        profiles.append(qos);return 'publisher'
-    def subscription(cls,topic,callback,qos):
-        profiles.append(qos);return topic
+    qos_event = NS(PublisherEventCallbacks=lambda **kw: NS(**kw),
+                   SubscriptionEventCallbacks=lambda **kw: NS(**kw))
+    monkeypatch.setitem(sys.modules, 'rclpy.qos_event', qos_event)
+    profiles, events = [], []
+    def publisher(cls,topic,qos,**kw):
+        events.append(kw.get('event_callbacks'));profiles.append(qos);return 'publisher'
+    def subscription(cls,topic,callback,qos,**kw):
+        events.append(kw.get('event_callbacks'));profiles.append(qos);return topic
     node=NS(create_publisher=publisher,create_subscription=subscription,
         destroy_publisher=lambda handle:None,destroy_subscription=lambda handle:None)
     commands=[]
@@ -205,6 +208,7 @@ def test_native_launch_uses_reliable_private_transport_without_external_ros_file
     from rclpy.qos import ReliabilityPolicy
     assert len(profiles)==3
     assert all(p.depth==1 and p.reliability==ReliabilityPolicy.RELIABLE for p in profiles)
+    assert all(item is not None and item.use_default_callbacks is False for item in events)
     assert parameters['Odom/GuessMotion']=='true'
     assert parameters['Icp/PointToPlaneLowComplexityStrategy']=='0'
     motion.close()
@@ -272,16 +276,19 @@ def test_timeout_restarts_private_native_and_ignores_old_same_stamp_callbacks(tm
     monkeypatch.setitem(sys.modules,'ament_index_python.packages',packages)
     monkeypatch.setattr(sys.modules['rtabmap_msgs.msg'],'OdomInfo',object,raising=False)
     monkeypatch.setattr(sys.modules['rclpy.qos'],'qos_profile_sensor_data',object(),raising=False)
+    qos_event = NS(PublisherEventCallbacks=lambda **kw: NS(**kw),
+                   SubscriptionEventCallbacks=lambda **kw: NS(**kw))
+    monkeypatch.setitem(sys.modules, 'rclpy.qos_event', qos_event)
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'],'PointCloud2',
         lambda:NS(header=NS(stamp=NS(sec=0,nanosec=0),frame_id='')))
     class Node:
         def __init__(self):
             self.callbacks={};self.publishers=[];self.handles=set();self.old_process=None
-        def create_subscription(self,cls,topic,callback,qos):
+        def create_subscription(self,cls,topic,callback,qos,**kw):
             self.callbacks[topic]=callback;self.handles.add(topic);return topic
         def destroy_subscription(self,topic):self.handles.remove(topic)
         def destroy_publisher(self,publisher):self.handles.remove(publisher.topic)
-        def create_publisher(self,cls,topic,qos):
+        def create_publisher(self,cls,topic,qos,**kw):
             node=self
             class Publisher:
                 def get_subscription_count(self):return 1

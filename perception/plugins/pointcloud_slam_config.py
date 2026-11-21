@@ -6,6 +6,7 @@ frame/clock names without guessing a robot model. A structurally valid mount
 may be used without calibration; the calibration flag is retained as provenance.
 """
 from collections import deque
+from copy import deepcopy
 import json
 import threading
 import time
@@ -13,6 +14,7 @@ import uuid
 
 import numpy as np
 
+from .camera_geometry import camera_parameter, camera_transform
 from .pointcloud_slam_contract import SpatialSlamError, validate_mount
 from .pointcloud_slam_odom import decode_slam_odom
 from .pointcloud_slam_transforms import rigid
@@ -43,6 +45,7 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
     quality = vendor.get('motus_slam', {}) if isinstance(vendor, dict) else {}
     quality = quality if isinstance(quality, dict) else {}
     mount = quality.get('extrinsic')
+    baseline = camera_parameter(camera_info, 'color_from_depth') if isinstance(camera_info, dict) else None
     if (mount is None and cloud_frame != pose.child_frame_id and isinstance(camera_info, dict)
             and isinstance(camera_info.get('vendor'), dict) and camera_info['vendor'].get('body_mount') is not None):
         if manual is None:
@@ -57,6 +60,9 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
             raise ValueError('odometry extrinsic frame/geometry invalid: ' + str(error)) from error
         if mount.get('matrix') is not None:
             proposed = _matrix(mount['matrix'])
+            if (pose.external_origin is not None and baseline is not None and
+                    mount.get('child_frame') not in (None, cloud_frame) and cloud_frame != pose.child_frame_id):
+                proposed = proposed @ camera_transform(baseline)
 
     manual_matrix = _matrix(manual) if manual is not None else None
     if manual_matrix is not None:
@@ -65,6 +71,8 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
         chosen, mode, provenance = proposed, 'static', 'producer_declared'
     elif mount is not None and mount.get('mode') == 'dynamic':
         chosen, mode, provenance = None, 'dynamic', 'producer_declared_dynamic'
+    elif pose.external_origin is not None and cloud_frame != pose.child_frame_id:
+        chosen, mode, provenance = None, 'dynamic', 'fusion_capture_mount'
     else:
         chosen, mode = np.eye(4), 'static'
         provenance = 'identical_frame' if cloud_frame == pose.child_frame_id else 'incoming_coordinates_assumed_aligned'
@@ -80,6 +88,10 @@ def infer_geometry(odom_sample, cloud_frame, cloud_stamp_ns, *, manual=None,
         'clock_id': pose.clock_id,
         'child_from_cloud': chosen.tolist() if chosen is not None else None,
         'extrinsic_mode': mode,
+        # An inferred identity can later be replaced when the optional
+        # external stream starts publishing in body coordinates.
+        **({'pose_capture_mount': True} if manual is None and mount is None else {}),
+        **({'color_from_depth': deepcopy(baseline)} if baseline is not None else {}),
     }, {
         'resolution': 'observed_ros_messages',
         'extrinsic_source': provenance,

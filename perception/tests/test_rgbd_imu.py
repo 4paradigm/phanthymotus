@@ -323,7 +323,7 @@ def test_imu_ingress_stays_bounded_and_consumes_retained_formatted_samples(monke
     import threading
     from collections import deque
     obj, published, runtime, NS, json = session(monkeypatch)
-    obj.imu_pending = deque([NS(data=json.dumps(packet()))]*100)
+    obj.imu_pending = deque([(NS(data=json.dumps(packet())), 1_000_000_000)]*100)
     obj.imu_queue_lock = threading.Lock();obj.imu_overflow = False
     with obj.lock:
         receiver = threading.Thread(target=lambda: obj._enqueue_imu(NS(data=json.dumps(packet()))))
@@ -342,7 +342,7 @@ def test_imu_ingress_only_queues_and_draining_does_not_chase_new_arrivals(monkey
     obj._enqueue_imu(NS(data=json.dumps(packet())))
     assert len(obj.imu_pending) == 1 and not published
     consumed = []
-    def consume(msg):
+    def consume(msg, received_ns):
         consumed.append(msg)
         if len(consumed) == 1:
             obj._enqueue_imu(NS(data='next batch'))
@@ -356,7 +356,7 @@ def test_imu_fault_during_publication_cannot_emit_a_prebuilt_tracking_pose(monke
     import sys, threading
     from collections import deque
     obj, _, runtime, NS, json = session(monkeypatch)
-    obj.imu_pending = deque([NS(data=json.dumps(packet(angular_velocity=[0.,0.])))])
+    obj.imu_pending = deque([(NS(data=json.dumps(packet(angular_velocity=[0.,0.]))), 1_000_000_000)])
     obj.imu_queue_lock = threading.Lock();obj.imu_overflow = False
     monkeypatch.setattr(runtime.time, 'time_ns', lambda: 1_001_000_000)
     monkeypatch.setattr(sys.modules['std_msgs.msg'], 'String', lambda **kw: NS(**kw))

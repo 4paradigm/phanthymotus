@@ -124,17 +124,10 @@ def test_card_config_wires_controller_prior_without_a_fusion_input(sessions, mon
         status = card.dispatch('rgbd_odometry', dict(action='info', instance_id='vo'))
         assert status['config']['imu_assisted'] is status['config']['short_term_compensation'] is False
         prior = next((s for s in session.node.subscriptions if s.topic == profile['topic']), None)
-        if clock_matches:
-            assert result['mode']['effective'] == 'controller_rotation'
-            assert result['topic_in'][-1] == {'topic': '/raw_body_imu', 'format': 'data/json'}
-            prior.callback(NS(data=json.dumps(dict(stamp_ns=now[0], timestamp_source='read_completion',
-                                                   quaternion=[0., 0., 0., 1.]))))
-            assert len(session.rotation_hints.controller_history) == 1
-        else:
-            assert result['mode']['effective'] == 'visual_only'
-            assert result['mode']['degraded'] is True
-            assert prior is None
-            assert all(binding['topic'] != profile['topic'] for binding in result['topic_in'])
+        assert result['mode']['effective'] == 'controller_rotation'
+        assert result['topic_in'][-1] == {'topic': '/raw_body_imu', 'format': 'data/json'}
+        prior.callback(NS(data=json.dumps(dict(stamp_ns=now[0], quaternion=[0., 0., 0., 1.]))))
+        assert len(session.rotation_hints.controller_history) == 1
         session._publish(make_sample('recovering', now[0], session.segment, 'camera-global'))
         sample = json.loads(session.publisher.messages[-1])
         assert sample['pose'] is None

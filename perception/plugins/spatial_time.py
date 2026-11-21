@@ -87,13 +87,15 @@ class TimePolicy:
         stamp = source.get('stamp_ns')
         if stamp is not None:
             _integer(stamp, 'capture stamp')
+        time_offset = source.get('time_offset_ns', 0)
+        _integer(time_offset, 'time offset')
         offset,uncertainty=source.get('mapping_offset_ns'),source.get('clock_mapping_uncertainty_ns')
         verified=source.get('clock_mapping_verified',False)
         capture=stamp is not None
         return FrameContext(
             observation_id=uuid.uuid4().hex, source_id=source.get('source_id'),
             source_epoch=source.get('source_epoch'), source_capture_id=source.get('source_capture_id'),
-            observation_stamp_ns=stamp if capture else ingress_realtime_ns,
+            observation_stamp_ns=stamp+time_offset if capture else ingress_realtime_ns,
             normalized_clock_id=(source.get('clock_id') or self.clock_id) if capture else self.clock_id,
             time_basis=source.get('time_basis') or ('source_capture' if capture else 'receipt_estimated'),
             ingress_realtime_ns=ingress_realtime_ns, ingress_monotonic_ns=ingress_monotonic_ns,

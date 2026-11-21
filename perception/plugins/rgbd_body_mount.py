@@ -6,6 +6,7 @@ import numpy as np
 
 from .pointcloud_slam_transforms import rigid
 from .rgbd_fusion import quaternion, rotation_from_quaternion
+from .rgbd_imu import interpolate_orientation
 
 
 def validate_mount_declaration(value, camera_frame, input_topics=()):
@@ -32,8 +33,9 @@ class CaptureMounts:
 
     def observe(self,packet,now_ns):
         try:
-            if not isinstance(packet,dict) or type(packet.get('stamp_ns')) is not int:
+            if not isinstance(packet,dict) or type(packet.get('stamp_ns', now_ns)) is not int:
                 raise ValueError('body mount must contain an integer timestamp')
+            packet = dict(packet, stamp_ns=packet.get('stamp_ns', now_ns))
             stamp=packet['stamp_ns']
             if packet.get('matrix') is not None:
                 rigid(packet['matrix'])
@@ -52,6 +54,27 @@ class CaptureMounts:
                     parent_frame=self.declaration['parent_frame'],child_frame=self.frame,
                     last_measurement_ns=self.last_stamp,buffered_samples=len(self.packets),
                     accuracy_validated=False)
+
+    def matrix_at(self, stamp):
+        """Return an exact transform or interpolate across a short numeric bracket."""
+        packet = self.packets.get(stamp)
+        if packet is not None:
+            return rigid(packet['matrix']) if packet.get('matrix') is not None else None
+        before = max((value for value in self.packets if value < stamp), default=None)
+        after = min((value for value in self.packets if value > stamp), default=None)
+        if before is None or after is None or after-before > 200_000_000:
+            return None
+        endpoints = [self.packets[value].get('matrix') for value in (before, after)]
+        if any(item is None for item in endpoints):
+            return None
+        a, b = map(rigid, endpoints)
+        q = interpolate_orientation([(before, np.asarray(quaternion(a[:3, :3]))),
+                                     (after, np.asarray(quaternion(b[:3, :3])))], stamp)
+        transform = np.eye(4)
+        transform[:3, :3] = rotation_from_quaternion(q)
+        weight = (stamp-before)/(after-before)
+        transform[:3, 3] = a[:3, 3]+weight*(b[:3, 3]-a[:3, 3])
+        return transform
 
     def attach(self,sample,now_ns):
         vendor=sample['vendor']

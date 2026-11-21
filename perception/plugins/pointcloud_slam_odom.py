@@ -26,9 +26,12 @@ class PoseSample:
     external_continuity: bytes = None
     chassis_origin: tuple = None
     visual_origin: tuple = None
+    external_origin: tuple = None
 
     @property
     def declared_origin(self):
+        if self.external_origin is not None:
+            return 'external_fusion', self.external_origin
         if self.chassis_origin is not None:
             return 'chassis', self.chassis_origin
         if self.visual_origin is not None:
@@ -37,6 +40,8 @@ class PoseSample:
 
     @property
     def stamp_ns(self):
+        if self.external_origin is not None and self.precise_stamp_ns is not None:
+            return self.precise_stamp_ns
         return (self.observation.observation_stamp_ns if self.observation is not None else
                 self.precise_stamp_ns if self.precise_stamp_ns is not None else self.stamp_ms*1_000_000)
 
@@ -98,10 +103,19 @@ def decode_slam_odom(sample):
         raise ValueError('precise pose timestamp must be integer nanoseconds')
     observation = quality.get('observation')
     observation = FrameContext.from_dict(observation) if isinstance(observation, dict) else None
+    origin = (quality.get('segment_id', vendor.get('segment_id', '')),
+              pose.get('frame_id', ''), pose.get('child_frame_id', ''))
+    reference = quality.get('pose_reference', vendor.get('pose_reference'))
+    external = (quality.get('pose_source') == 'external_fusion' and reference == 'body' and
+                all(isinstance(value, str) and value for value in origin))
+    fusion = vendor.get('external_fusion')
+    if external and isinstance(fusion, dict) and fusion.get('update') == 'external':
+        observed = fusion.get('observed')
+        if isinstance(observed, list) and len(observed) == 6 and not all(observed[i] is True for i in (0, 1, 5)):
+            raise ValueError('external motion does not constrain planar position and heading')
     return PoseSample(stamp, pose.get('frame_id', ''), pose.get('child_frame_id', ''),
-                      quality.get('segment_id', vendor.get('segment_id', '')), position,
-                      quaternion, covariance, quality.get('clock_id'),
-                      quality.get('pose_reference', vendor.get('pose_reference')), observation, precise)
+                      origin[0], position, quaternion, covariance, quality.get('clock_id'),
+                      reference, observation, precise, external_origin=origin if external else None)
 
 
 def decode_slam_prediction(sample, anchor):

@@ -245,3 +245,14 @@ def test_restored_process_preserves_existing_database_nodes(tmp_path):
         process.close(timeout_s=3)
     with sqlite3.connect(path) as db:
         assert db.execute('SELECT id FROM Node ORDER BY id').fetchall() == [(1,), (42,)]
+
+
+def test_external_capture_mount_sends_pose_and_scan_on_one_native_input(tmp_path):
+    params = backend().mapping_parameters(tmp_path / 'map.db', '/private/rgb', {
+        'max_pending': 10, 'voxel_size_m': .08, 'max_working_nodes': 300,
+        'max_update_ms': 100, 'rgb_input': {'topic': '/rgb'},
+        'capture_mount': {'interpolate': True}})
+    assert params['subscribe_sensor_data'] is True
+    assert params['subscribe_odom'] is False
+    assert params['motus_paired_sensor_odom'] is True
+    assert params['Rtabmap/DetectionRate'] == '2'

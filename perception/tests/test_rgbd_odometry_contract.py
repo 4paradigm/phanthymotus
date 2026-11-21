@@ -34,6 +34,8 @@ def test_inputs_are_resolved_by_declared_format_not_topic_name():
 ])
 def test_independent_numeric_geometry_does_not_require_identity_or_labels(field, value):
     data = declarations(); data['/depth'][field] = value
+    if field == 'D':
+        data['/depth']['distortion_model'] = 'plumb_bob'
     assert validate_inputs(data, ['/rgb','/depth'])['depth_topic'] == '/depth'
 
 
@@ -47,11 +49,12 @@ def test_depth_labels_do_not_gate_numeric_images(field, value):
     assert validate_inputs(data, ['/rgb','/depth'])['depth_topic'] == '/depth'
 
 
-def test_pairing_preserves_source_stamps_and_pairs_large_skew_fifo():
+def test_legacy_pairing_chooses_nearest_numeric_stamp_and_retains_future_frames():
     pairs=PairBuffer()
     assert pairs.push('color', 1_000_000_000, 'rgb', 1_010_000_000) is None
-    pair=pairs.push('depth', 2_000_200_000, 'z16', 1_010_000_000)
-    assert pair == ((1_000_000_000, 'rgb'), (2_000_200_000, 'z16'))
+    assert pairs.push('depth', 2_000_200_000, 'z16', 1_010_000_000) is None
+    assert pairs.push('color', 2_001_000_000, 'new-rgb', 2_010_000_000) == (
+        (2_001_000_000, 'new-rgb'), (2_000_200_000, 'z16'))
 
 
 def test_pairing_bounds_memory_without_rejecting_repeated_or_reset_stamps():
@@ -135,13 +138,13 @@ def test_missing_capture_declaration_uses_explicit_receipt_capability():
     assert validate_inputs(data,['/rgb','/depth'])['time_basis']=='receipt_estimated'
 
 
-def test_registered_color_resize_uses_existing_intrinsics_scaling():
+def test_registered_depth_projects_into_the_effective_color_intrinsics():
     data=declarations();color=data['/rgb']
     color['width'],color['height']=1280,960
     color['K']=[800,0,640,0,800,480,0,0,1]
     result=validate_inputs(data,['/rgb','/depth'])
     assert result['color_size']==(1280,960)
-    np.testing.assert_allclose(result['K'],np.array(data['/depth']['K']).reshape(3,3))
+    np.testing.assert_allclose(result['K'], np.array(data['/rgb']['K']).reshape(3, 3))
     color['K'][2]+=20
     assert validate_inputs(data,['/rgb','/depth'])['color_size']==(1280,960)
 

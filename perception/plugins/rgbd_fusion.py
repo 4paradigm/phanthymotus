@@ -330,9 +330,12 @@ class ShortTermFusion:
                     source = (self.imu.capture_source, tuple(translations))
                     if self.imu_coverage and source == self.imu_coverage[-1][1]:
                         source = self.imu_coverage[-1][1]
+                if self.imu_coverage and stamp == self.imu_coverage[-1][0] and source == self.imu_coverage[-1][1]:
+                    return
                 if self.imu_coverage and stamp <= self.imu_coverage[-1][0]:
                     self.imu_coverage.clear()
-                self.imu_coverage.append((stamp, source, self.imu.rotation_source is not None))
+                    self.samples.clear()
+                self.imu_coverage.append((stamp, source))
                 self.samples.append((stamp, np.array(sample['angular_velocity']),
                                      np.array(sample['linear_acceleration'])))
         except (ValueError, TypeError, KeyError) as error:
@@ -386,7 +389,8 @@ class ShortTermFusion:
         if len(self.warmup) < 3 or stamp-self.warmup[0][0] < 500_000_000:
             return False
         first_stamp, first_pose = self.warmup[0]
-        if not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp:
+        if (not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp or
+                (self.imu_coverage and not self._imu_covers(first_stamp, stamp))):
             return False
         entries = [s for s in self.samples if first_stamp <= s[0] <= stamp]
         # Include the measured samples bracketing both interpolation boundaries.
@@ -419,6 +423,8 @@ class ShortTermFusion:
         estimate = self.filter if estimate is None else estimate
         if stamp < estimate.stamp or not self.samples or stamp > self.samples[-1][0]:
             raise ValueError('frame lacks capture-time IMU coverage')
+        if self.imu_coverage and not self._imu_covers(estimate.stamp, stamp, max_gap_ns=None):
+            raise ValueError('IMU source or numeric motion model changed inside propagation')
         entries = list(self.samples)
         if entries[0][0] > estimate.stamp:
             raise ValueError('IMU history no longer covers estimator state')
@@ -441,17 +447,16 @@ class ShortTermFusion:
         if estimate.stamp != stamp:
             raise ValueError('IMU history has a propagation gap')
 
-    def _imu_covers(self, start, end, *, require_epoch=True):
+    def _imu_covers(self, start, end, *, max_gap_ns=MAX_IMU_GAP_NS):
         """Check the capture bracket and source continuity for the whole interval."""
         if start > end:
             return False
         right = source = None
-        for stamp, identity, has_epoch in reversed(self.imu_coverage):
-            if require_epoch and not has_epoch:
-                identity = None
+        for stamp, identity in reversed(self.imu_coverage):
             if stamp >= end:
                 source = identity
-            elif right is None or source is None or identity != source or not 0 < right-stamp <= MAX_IMU_GAP_NS:
+            elif (right is None or source is None or identity != source or stamp >= right or
+                  (max_gap_ns is not None and right-stamp > max_gap_ns)):
                 return False
             if stamp <= start:
                 return identity is not None
@@ -472,7 +477,7 @@ class ShortTermFusion:
             return False
         samples = [s for s in self.samples if ref_stamp <= s[0] <= stamp]
         # The measured visual pair establishes stationarity; the IMU corroborates it.
-        if len(samples) < 5 or not self._imu_covers(ref_stamp, stamp, require_epoch=False):
+        if len(samples) < 5 or not self._imu_covers(ref_stamp, stamp):
             return False
         gravity_force = -r.T@self.filter.g
         if any(np.linalg.norm(w-self.filter.bg) > .045 or
@@ -600,7 +605,7 @@ class ShortTermFusion:
         ref_p, ref_r = pose_values(ref_pose)
         p, r = pose_values(self.filter.camera_pose())
         initial = np.eye(4)
-        if self._imu_covers(ref_stamp, stamp, require_epoch=False):
+        if self._imu_covers(ref_stamp, stamp):
             initial[:3, :3], initial[:3, 3] = ref_r.T@r, ref_r.T@(p-ref_p)
         # Only a verified observation of this exact capture may authorize mapping.
         # Keep the visual reference and its original one-second lifetime.

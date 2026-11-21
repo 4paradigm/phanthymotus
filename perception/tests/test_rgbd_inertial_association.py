@@ -182,9 +182,8 @@ def test_controller_rotation_works_without_eskf_and_uses_calibrated_camera_basis
     hints.observe_controller(controller_packet(stamp+5_000_000, [0., 0., 0., 1.]), stamp+5_000_000)
     end = stamp+65_000_000
     hints.observe_controller(controller_packet(end, [0., 0., np.sin(.05), np.cos(.05)]), end)
-    assert not hints.offer(None, stamp, end, capture_clock='another-camera')
     assert not hints.offer(None, stamp+65_000_000, end, capture_clock='capture-clock')
-    assert hints.offer(None, stamp+30_000_000, end, capture_clock='capture-clock')
+    assert hints.offer(None, stamp+30_000_000, end, capture_clock='another-camera')
     msg, = messages
     q = msg.quaternion
     mount = rotation_from_quaternion(controller_profile()['camera_from_body'])
@@ -213,8 +212,8 @@ def test_controller_rotation_does_not_mix_absolute_origins_across_a_gap(hint_nod
     assert hints.offer(None, ready, ready, capture_clock='capture-clock')
 
 
-@pytest.mark.parametrize('fields', [{'quaternion': [0., 0., 0., 7.]},
-                                    {'timestamp_source': 'unknown'},
+@pytest.mark.parametrize('fields', [{'quaternion': [0., 0., 0., 0.]},
+                                    {'stamp_ns': 'invalid'},
                                     {'stamp_ns': 1_900_000_000}])
 def test_malformed_controller_samples_leave_legacy_capture_hint_available(hint_node, fields):
     from plugins.rgbd_association import RotationHints
@@ -296,7 +295,7 @@ def test_runtime_parameter_mode_keeps_optional_hint_separate_from_legacy_imu():
 
 
 @pytest.fixture
-def hint_session(sessions, hint_node, monkeypatch, tmp_path):
+def hint_session(sessions, hint_node, monkeypatch, tmp_path, request):
     from plugins.rgbd_odometry import RgbdOdometryPlugin
     from plugins import rgbd_odometry_runtime as runtime
     from test_rgbd_odometry_contract import declarations
@@ -314,7 +313,10 @@ def hint_session(sessions, hint_node, monkeypatch, tmp_path):
         return spawn(command, **kwargs)
     monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
     card = RgbdOdometryPlugin({}, _FakeExecutor())
-    result = card.dispatch('rgbd_odometry', dict(action='start', camera_info=declarations(),
+    camera_info = declarations()
+    if getattr(request, 'param', False):
+        camera_info['/depth']['format'] = 'image/depth-f32-zlib'
+    result = card.dispatch('rgbd_odometry', dict(action='start', camera_info=camera_info,
         input_topics=['/rgb', '/depth', '/nvidia_desktop/camera/rgbd/imu']))
     assert result['state'] == 'running', result
     session = card.instances['default'][0]
@@ -342,7 +344,8 @@ def test_camera_imu_input_enables_native_rotation_hint_by_default(hint_session):
     assert sample['vendor']['inertial_association']['native_applied'] is None
 
 
-@pytest.mark.parametrize('extra,expected', [({}, True), ({'clock_id': 'another-clock'}, False),
+@pytest.mark.parametrize('extra,expected', [({}, True), ({'clock_id': 'another-clock'}, True),
+                                          ({'clock_id': None}, True),
                                           ({'camera_from_body': [1., 0.]}, False)])
 def test_connected_imu_uses_controller_quaternion_without_card_config(hint_session, extra, expected):
     import json
@@ -394,6 +397,7 @@ def test_visual_restart_preserves_optional_rotation_without_restarting_fusion(hi
 @pytest.mark.parametrize('translations', [False, True])
 @pytest.mark.parametrize('coverage', [False, True])
 @pytest.mark.parametrize('color_offset_ns', [1, 800_000])
+@pytest.mark.parametrize('hint_session', [False, True], indirect=True)
 def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
         hint_session, monkeypatch, coverage, color_offset_ns, translations):
     import json
@@ -420,9 +424,13 @@ def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
 
     # Codec and DDS are boundaries; run the actual worker, pairing stamp choice,
     # optional-hint decision and publication order.
+    depth_pixels = []
+    def encode(extension, pixels, parameters):
+        depth_pixels.append(pixels)
+        return True, np.frombuffer(b'encoded-depth', np.uint8)
     monkeypatch.setitem(sys.modules, 'cv2', NS(IMREAD_COLOR=1, IMWRITE_PNG_COMPRESSION=16,
         imdecode=lambda data, mode: np.zeros((480, 640, 3), np.uint8),
-        imencode=lambda *args: (True, np.frombuffer(b'encoded-depth', np.uint8))))
+        imencode=encode))
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'CompressedImage', NS)
     monkeypatch.setattr(sys.modules['sensor_msgs.msg'], 'CameraInfo', NS, raising=False)
     monkeypatch.setattr(sys.modules['rtabmap_msgs.msg'], 'RGBDImage', NS)
@@ -431,7 +439,9 @@ def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
                            stamp=NS(sec=stamp//10**9, nanosec=stamp%10**9)),
                   data=data, format='compressed')
     color = frame(color_stamp, b'color-image')
-    depth = frame(depth_stamp, zlib.compress(np.full((480, 640), 1500, '<u2').tobytes()))
+    floating = session.calibration['depth_format'] == 'image/depth-f32-zlib'
+    values = np.full((480, 640), 1.50125 if floating else 1500, '<f4' if floating else '<u2')
+    depth = frame(depth_stamp, zlib.compress(values.tobytes()))
     originals = deepcopy((color.header, depth.header))
     session.pending.put(((color_stamp, color), (depth_stamp, depth)))
     def must_not_wait(seconds):
@@ -445,6 +455,7 @@ def test_actual_image_worker_offers_exact_hint_before_image_and_never_waits(
     session.rgbd.publish = image
     session._work()
     assert session.gate.state != 'lost', session.gate.reason
+    np.testing.assert_array_equal(depth_pixels[0].view(values.dtype).reshape(values.shape), values)
     assert session.counts['pairs'] == 1 and session.counts['dropped_pairs'] == 0
     assert [kind for kind, _ in events] == (['hint', 'image'] if coverage else ['image'])
     if coverage:
@@ -524,7 +535,7 @@ def test_recorded_odometry_includes_native_counters_without_an_info_request(hint
 @pytest.mark.parametrize('change,step', [
     ({}, 100_000_001), ({'epoch': 'boot2'}, 10_000_000),
     ({'camera_from_gyro': [[0,-1,0],[1,0,0],[0,0,1]]}, 10_000_000),
-    ({'clock_id': 'other'}, 10_000_000), ({'source_id': ''}, 10_000_000),
+    ({'source_id': 'another-sensor'}, 10_000_000),
 ])
 def test_transport_never_pairs_oriented_images_across_an_uncovered_imu_run(hint_node, change, step):
     from plugins.rgbd_association import RotationHints
@@ -541,9 +552,8 @@ def test_transport_never_pairs_oriented_images_across_an_uncovered_imu_run(hint_
     # A skipped image might fail registration, leaving the old native anchor.
     for stamp in range(other + 10_000_000, first+800_000_000, 10_000_000):
         attitude.observe(packet(stamp, **change), stamp)
-    valid = change.get('clock_id', 'capture-clock') == 'capture-clock' and change.get('source_id', 'camera')
-    assert hints.offer(attitude, stamp, stamp) == bool(valid)
-    assert len(messages) == 1 + bool(valid)
+    assert hints.offer(attitude, stamp, stamp)
+    assert len(messages) == 2
 
 
 def test_hint_after_clock_rewind_reads_only_the_new_imu_run(hint_node):

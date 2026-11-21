@@ -74,6 +74,29 @@ def test_missing_numeric_mount_waits_then_nearest_old_matrix_is_used():
     assert s.accepted[0].child_from_cloud[0,3] == .4
 
 
+@pytest.mark.parametrize('raw_depth', [False, True])
+def test_fused_cloud_requires_exact_or_bracketed_numeric_mount(raw_depth):
+    from test_pointcloud_slam_stream import external_fusion
+    declaration = camera()
+    if raw_depth:
+        declaration['vendor']['body_mount']['child_frame'] = 'color'
+        baseline = np.eye(4); baseline[0, 3] = .03
+        declaration['vendor']['color_from_depth'] = baseline.tolist()
+    cfg, _ = resolve_capture_mount(external_fusion(1000), declaration, 'camera_optical')
+    s = stream(cloud_frame='camera_optical', child_frame='body',
+               child_from_cloud=None, extrinsic_mode='dynamic')
+    pair = CaptureClouds(cfg['capture_mount'], max_pending=2)
+    s.odom(external_fusion(1000), now=1.)
+    s.odom(external_fusion(1200), now=1.2)
+    first = np.eye(4); first[0, 3] = .1
+    pair.mount(packet(1_000_000_000, first), s, now=1.2, measurement_now_ns=1)
+    pair.cloud(1_100_000_000, 'camera_optical', [[1, 2, 3]], 1, s, now=1.2, measurement_now_ns=1)
+    assert not s.accepted
+    last = np.eye(4); last[0, 3] = .3
+    pair.mount(packet(1_200_000_000, last), s, now=1.2, measurement_now_ns=1)
+    assert s.accepted[0].child_from_cloud[0, 3] == pytest.approx(.23 if raw_depth else .2)
+
+
 def test_changed_clock_and_mount_labels_do_not_retire_numeric_data():
     s,pair = pairing()
     changed = pose(); changed['vendor']['motus_slam']['clock_reference']['domain_id'] = 'other'

@@ -23,7 +23,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
 from std_msgs.msg import String, UInt8MultiArray
 
-from .pointcloud_slam_rtabmap import RtabmapProcess
+from .pointcloud_slam_rtabmap import RtabmapProcess, paired_sensor_odom
 from .pointcloud_slam_watchdog import BackendProgress
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
 from .pointcloud_slam_preview import PREVIEW_TOPIC
@@ -213,6 +213,14 @@ class RtabmapNode(Node):
             self._motion = ScanMotion(self,self._namespace+'/motion',self._settings,
                                       self._session_dir/'motion',self._wake)
         self._measurement_clock_ns = lambda: getattr(self.get_clock().now(), 'nanoseconds', None)
+        pose_capture_mount = self._settings.get('pose_capture_mount', False) or (
+            input_contract is not None and not self._settings.get('manual_extrinsic') and
+            not any(entry.get('extrinsic') for entry in input_contract.get('inputs', {}).values()))
+        cloud_camera = (input_declarations or {}).get(cloud_topic)
+        baseline = self._settings.get('color_from_depth')
+        if isinstance(cloud_camera, dict):
+            from .camera_geometry import camera_parameter
+            baseline = camera_parameter(cloud_camera, 'color_from_depth', baseline)
         keys = ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud', 'max_gap_ms',
                 'max_age_s', 'max_pending', 'max_cloud_points', 'max_measurement_age_ms', 'max_future_skew_ms')
         try:
@@ -221,7 +229,8 @@ class RtabmapNode(Node):
                 input_contract=input_contract, on_frame=self._queue_frame,
                 on_observation=self._observe_motion if self._motion is not None else None,
                 on_unlocalized_frame=None if self._raw_scan_input else self._queue_frame,
-                on_pose_loss=self._retire_pose_work, scan_origin_recovery=self._scan_origin_recovery)
+                on_pose_loss=self._retire_pose_work, scan_origin_recovery=self._scan_origin_recovery,
+                pose_capture_mount=pose_capture_mount, color_from_depth=baseline)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
             self._capture_clouds = None
             if self._settings.get('capture_mount'):
@@ -397,6 +406,8 @@ class RtabmapNode(Node):
         if pose is not None and pose.chassis_origin is not None:
             self._settings['rgbd_image_recovery'] = False
             self.stream.on_unlocalized_frame = self._queue_frame
+        if pose is not None and pose.external_origin is not None:
+            self.stream.on_unlocalized_frame = self._queue_frame
         if predicted and (self.stream.on_unlocalized_frame is None or self._active is None):
             self._rgb_reservations.pop(stamp, None)
             self._dropped += 1
@@ -417,7 +428,8 @@ class RtabmapNode(Node):
         rgb_deadline = now + (2 if pose is not None else 1) * _MEASURED_RGB_WAIT_MS / 1000.
         motion_deadline = now + self.stream.max_age_s - (self._receipt_clock() - received)
         self._queue.append((stamp, cloud, pose, matrix, received, self._admission_seq, observation,
-                            (rgb_deadline, motion_deadline), depth))
+                            (rgb_deadline, motion_deadline), depth,
+                            bool(context and context.get('pose_capture_mount'))))
         if pose is not None:
             # A usable newer observation supersedes optional unlocalized work;
             # never replay a delayed frame into an already advanced native map.
@@ -514,7 +526,8 @@ class RtabmapNode(Node):
         with self._result_lock:
             self._segments.append(segment)
             self._active = segment
-        segment['odom_pub'] = self.create_publisher(self._Odometry, namespace + '/odom', _NATIVE_QOS)
+        segment['odom_pub'] = (None if paired_sensor_odom(self._settings) else
+                               self.create_publisher(self._Odometry, namespace + '/odom', _NATIVE_QOS))
         segment['cloud_pub'] = self.create_publisher(
             self._SensorData, namespace + '/sensor_data', _NATIVE_QOS)
         segment['tf_pub'] = self.create_publisher(self._TFMessage,
@@ -535,7 +548,8 @@ class RtabmapNode(Node):
         while not self._stopped():
             if process.poll() is not None:
                 raise RuntimeError('RTAB-Map exited during startup (exit ' + str(process.poll()) + ')')
-            if segment['odom_pub'].get_subscription_count() and segment['cloud_pub'].get_subscription_count():
+            if (segment['cloud_pub'].get_subscription_count() and
+                    (segment['odom_pub'] is None or segment['odom_pub'].get_subscription_count())):
                 return segment
             if time.monotonic() >= deadline:
                 raise RuntimeError('RTAB-Map input discovery timed out')
@@ -560,6 +574,7 @@ class RtabmapNode(Node):
             if self._retire_overtaken(item):
                 return
         stamp, cloud, pose, matrix, received = item[:5]
+        dynamic_mount = self.stream.extrinsic_mode == 'dynamic' or (len(item) > 9 and item[9])
         predicted = pose is not None and pose.prediction_anchor_ns is not None
         measured = pose if not predicted else None
         transform = self._TransformStamped()
@@ -594,7 +609,7 @@ class RtabmapNode(Node):
             setattr(odom_transform.transform.translation, key, getattr(odom.pose.pose.position, key))
         odom_transform.transform.rotation = deepcopy(odom.pose.pose.orientation)
         odom_tf = self._TFMessage(); odom_tf.transforms = [odom_transform]
-        if self.stream.extrinsic_mode == 'dynamic':
+        if dynamic_mount:
             odom_tf.transforms.append(transform)
         cloud.header.frame_id = transform.child_frame_id
         observation = item[6] if len(item) > 6 else None
@@ -620,8 +635,9 @@ class RtabmapNode(Node):
             if measured is not None:
                 # Optional preparation can outlive the source run of a queued pose.
                 run = token if token is not None and measured.external_continuity == token else None
-                if measured.chassis_origin is not None:
-                    origin = hashlib.blake2b(json.dumps(measured.chassis_origin).encode(), digest_size=16).digest()
+                if measured.chassis_origin is not None or measured.external_origin is not None:
+                    gauge = measured.chassis_origin or measured.declared_origin
+                    origin = hashlib.blake2b(json.dumps(gauge).encode(), digest_size=16).digest()
                     payload = b'MOTUSCH1' + origin + (run or bytes(16))
                 elif self._scan_origin_recovery:
                     origin = hashlib.blake2b(json.dumps(measured.visual_origin).encode(), digest_size=16).digest()
@@ -632,14 +648,22 @@ class RtabmapNode(Node):
                     payload = b'MOTUSOD1' + run if run else None
                 if payload:
                     native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
-            if self.stream.extrinsic_mode != 'dynamic':
+            if not dynamic_mount:
                 segment['tf_pub'].publish(tf)
             if measured is not None:
                 segment['odom_tf_pub'].publish(odom_tf)
-            elif self.stream.extrinsic_mode == 'dynamic':
+            elif dynamic_mount:
                 # Keep the numerical mount, without publishing an invalid odom TF.
-                segment['tf_pub'].publish(tf)
-            segment['odom_pub'].publish(odom)
+                segment['odom_tf_pub'].publish(tf)
+            if segment['odom_pub'] is None:
+                from rclpy.serialization import serialize_message
+                wire = serialize_message(odom)
+                # Preserve RTAB-Map's compressed recovery evidence ahead of
+                # the private CDR envelope. The native adapter strips the suffix.
+                native.user_data = array('B', bytes(native.user_data) + wire +
+                                         struct.pack('<H8s', len(wire), b'MOTUSMP1'))
+            else:
+                segment['odom_pub'].publish(odom)
             # A decode fault may invalidate the optional image during projection;
             # the admitted scan and pose continue through the same native node.
             guard = self._rgb.publication(rgb_generation) if self._rgb is not None else nullcontext(True)
@@ -819,7 +843,16 @@ class RtabmapNode(Node):
         with self._lock:
             rgb_stamp, image, generation = rgb
             poses = list(self.stream._poses)
-            mount = saved_mount if saved_mount is not None else self._rgb.capture_mount(rgb_stamp, matrix, now_ns)
+            fallback = matrix
+            if (saved_mount is None and rgb_stamp != stamp and self._rgb.mounts is None and
+                    self.stream._external_body_frame is not None):
+                if self._capture_clouds is not None and self._capture_clouds.interpolate:
+                    fallback = self._capture_clouds.matrix_at(rgb_stamp, self.stream.cloud_frame)
+                elif self.stream._pose_capture_mount:
+                    capture = self.stream._mount_context(rgb_stamp, self.stream.cloud_frame)
+                    fallback = capture['child_from_cloud'] if capture is not None else None
+            mount = (saved_mount if saved_mount is not None else
+                     self._rgb.capture_mount(rgb_stamp, fallback, now_ns))
             if mount is None:
                 return None
         # Express the camera at its real capture time relative to the scan's

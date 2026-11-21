@@ -53,22 +53,24 @@ class RgbdPairer:
         self.dropped_by_side[kind] += 1
 
     def _candidate(self, first, second):
-        if first.time_basis == second.time_basis == 'source_capture':
-            skew = abs(first.observation_stamp_ns - second.observation_stamp_ns)
-            if first.normalized_clock_id and first.normalized_clock_id == second.normalized_clock_id:
-                if skew > self.max_skew_ns:
-                    return None
-                identity = (first.source_capture_id and (first.source_epoch or first.source_id) and
-                            first.source_capture_id == second.source_capture_id and
-                            first.source_epoch == second.source_epoch and first.source_id == second.source_id)
-                return (0, skew, 'capture_id') if identity else (1, skew, 'nearest_capture')
-            if skew <= self.max_skew_ns:
-                return 2, skew, 'nearest_capture_estimated'
-        if (first.ingress_clock_id and first.ingress_clock_id == second.ingress_clock_id and
-                abs(first.ingress_monotonic_ns - second.ingress_monotonic_ns) <= self.max_skew_ns):
-            skew = abs(first.ingress_realtime_ns - second.ingress_realtime_ns)
-            if skew <= self.max_skew_ns:
-                return 3, skew, 'receipt_estimated'
+        if (first.source_id and first.source_id == second.source_id and first.source_epoch and
+                second.source_epoch and first.source_epoch != second.source_epoch):
+            return None
+        skew = abs(first.observation_stamp_ns - second.observation_stamp_ns)
+        if skew > self.max_skew_ns:
+            return None
+        receipt = tuple(ctx.original_stamp is None and ctx.time_basis == 'receipt_estimated'
+                        for ctx in (first, second))
+        if any(receipt):
+            if all(receipt) and abs(first.ingress_monotonic_ns-second.ingress_monotonic_ns) > self.max_skew_ns:
+                return None
+            return skew, 'receipt_estimated'
+        if not first.normalized_clock_id or first.normalized_clock_id != second.normalized_clock_id:
+            return skew, 'nearest_capture_estimated'
+        identity = (first.source_capture_id and (first.source_epoch or first.source_id) and
+                    first.source_capture_id == second.source_capture_id and
+                    first.source_epoch == second.source_epoch and first.source_id == second.source_id)
+        return skew, 'capture_id' if identity else 'nearest_capture'
 
     def push(self, kind, message, context):
         if kind not in self.queues or type(getattr(context, 'observation_stamp_ns', None)) is not int:
@@ -85,8 +87,7 @@ class RgbdPairer:
         for side, queue in self.queues.items():
             for index in reversed(range(len(queue))):
                 pending = queue[index][1]
-                if (pending.ingress_clock_id == context.ingress_clock_id and
-                        context.ingress_monotonic_ns - pending.ingress_monotonic_ns > self.max_wait_ns):
+                if context.ingress_monotonic_ns - pending.ingress_monotonic_ns > self.max_wait_ns:
                     self._drop(side, index)
         q = self.queues[kind]
         q.append((message, context, size, self.sequence))
@@ -103,20 +104,26 @@ class RgbdPairer:
         for index, (_, pending, _, _) in enumerate(self.queues[other]):
             candidate = self._candidate(context, pending)
             if candidate is not None:
-                choices.append((*candidate, index))
+                skew, method = candidate
+                choices.append((skew, index, method))
         if not choices:
             return None
-        _, skew, method, index = min(choices)
-        for _ in range(index):
-            self._drop(other)
-        # Older frames on either stream have been superseded by this pair.
-        while len(q) > 1:
-            self._drop(kind)
-        cm, a, _, _ = self.queues['color'].popleft()
-        dm, b, _, _ = self.queues['depth'].popleft()
+        skew, index, method = min(choices)
+        selected = {kind: q.pop(), other: self.queues[other][index]}
+        del self.queues[other][index]
+        for side, queue in self.queues.items():
+            stamp = selected[side][1].observation_stamp_ns
+            for index in reversed(range(len(queue))):
+                if queue[index][1].observation_stamp_ns < stamp:
+                    self._drop(side, index)
+        cm, a, _, _ = selected['color']
+        dm, b, _, _ = selected['depth']
         color_time, depth_time = a, b
         if method == 'receipt_estimated':
-            color_time, depth_time = receipt_association(a), receipt_association(b)
+            color_time, depth_time = (
+                replace(receipt_association(ctx), observation_stamp_ns=ctx.observation_stamp_ns)
+                for ctx in (a, b)
+            )
         elif method == 'nearest_capture_estimated':
             # Retain capture values for visual processing on an unverified timeline.
             color_time, depth_time = (

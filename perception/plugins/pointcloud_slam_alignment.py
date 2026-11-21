@@ -22,6 +22,8 @@ def _slerp(a, b, ratio):
 
 
 def crosses_origin(a, b):
+    if a.external_origin is not None or b.external_origin is not None:
+        return a.external_origin != b.external_origin
     first, second = a.declared_origin, b.declared_origin
     return first is not None and second is not None and first != second
 
@@ -73,6 +75,7 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                                   tuple(c for c in (previous.observation,sample.observation) if c is not None),
                                   prediction, continuity,
                                   sample.chassis_origin if sample.chassis_origin == previous.chassis_origin else None,
-                                  sample.visual_origin if sample.visual_origin == previous.visual_origin else None)
+                                  sample.visual_origin if sample.visual_origin == previous.visual_origin else None,
+                                  sample.external_origin if sample.external_origin == previous.external_origin else None)
             previous = sample
     raise ValueError('no numeric pose at cloud timestamp')

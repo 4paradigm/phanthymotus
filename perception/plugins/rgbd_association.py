@@ -5,7 +5,7 @@ import re
 
 import numpy as np
 
-from .rgbd_imu import MAX_IMU_GAP_NS, _multiply, interpolate_orientation
+from .rgbd_imu import MAX_IMU_GAP_NS, _multiply, imu_episode, imu_timestamps, interpolate_orientation
 
 
 def association_enabled(calibration):
@@ -19,25 +19,25 @@ def _unit_quaternion(value):
     try:
         q = np.asarray(value, dtype=float)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError('controller rotation requires a unit quaternion in xyzw order') from None
-    if q.shape != (4,) or not np.isfinite(q).all() or abs(q @ q - 1.) > .002:
-        raise ValueError('controller rotation requires a unit quaternion in xyzw order')
-    return q / np.linalg.norm(q)
+        raise ValueError('controller rotation requires a finite nonzero xyzw quaternion') from None
+    if q.shape != (4,) or not np.isfinite(q).all() or not np.any(q):
+        raise ValueError('controller rotation requires a finite nonzero xyzw quaternion')
+    scaled = q / np.max(np.abs(q))
+    return scaled / np.linalg.norm(scaled)
 
 
 def validate_controller_rotation(profile):
-    """An explicit, capture-clock-specific alignment for a controller read-time prior."""
+    """Numerical alignment of a legacy controller orientation topic."""
     if profile is None:
         return None
-    if not isinstance(profile, dict) or any(not isinstance(profile.get(k), str) or not profile[k].strip()
-                                            for k in ('topic', 'clock_id', 'calibration_id')):
-        raise ValueError('controller rotation requires topic, clock_id and calibration_id')
-    topic, offset = profile['topic'], profile.get('read_time_offset_ns')
-    if not re.fullmatch(r'(/[A-Za-z_][A-Za-z_0-9]*)+', topic):
+    if not isinstance(profile, dict):
+        raise ValueError('controller rotation profile must be an object')
+    topic, offset = profile.get('topic'), profile.get('read_time_offset_ns', 0)
+    if not isinstance(topic, str) or not re.fullmatch(r'(/[A-Za-z_][A-Za-z_0-9]*)+', topic):
         raise ValueError('controller rotation requires an absolute ROS topic')
-    if type(offset) is not int or abs(offset) > MAX_IMU_GAP_NS:
-        raise ValueError('controller rotation read-time offset must be within 100 ms in integer nanoseconds')
-    return dict(topic=topic, clock_id=profile['clock_id'], calibration_id=profile['calibration_id'],
+    if type(offset) is not int:
+        raise ValueError('controller rotation time offset must be integer nanoseconds')
+    return dict(topic=topic, clock_id=profile.get('clock_id'), calibration_id=profile.get('calibration_id'),
                 camera_from_body=_unit_quaternion(profile.get('camera_from_body')).tolist(),
                 read_time_offset_ns=offset)
 
@@ -83,23 +83,19 @@ class RotationHints:
     def observe_controller(self, packet, now_ns, *, aligned=False):
         if not self.enabled or not isinstance(packet, dict):
             return
-        stamp = packet.get('stamp_ns')
-        if type(stamp) is not int or stamp <= 0 or not -50_000_000 <= now_ns - stamp <= 750_000_000:
-            return
         try:
+            stamp, _ = imu_timestamps(packet, now_ns)
             if aligned:
-                clock = packet.get('clock_id')
-                if self.controller is not None or not isinstance(clock, str) or not clock:
+                if self.controller is not None:
                     return
-                # The producer has already mapped stamp_ns to this camera clock.
                 body_from_camera = _unit_quaternion(packet.get('camera_from_body')) * [-1., -1., -1., 1.]
-                source = (clock, packet.get('source_id'), packet.get('epoch'), tuple(body_from_camera))
             else:
-                if self.controller is None or packet.get('timestamp_source') != 'read_completion':
+                if self.controller is None:
                     return
-                source = (self.controller['clock_id'],)
                 body_from_camera = self.body_from_camera
                 stamp += self.controller['read_time_offset_ns']
+            episode = imu_episode(packet, (None, None) if self.controller_source is None else self.controller_source[:2])
+            source = (*episode, tuple(body_from_camera))
             world_from_camera = _multiply(_unit_quaternion(packet.get('quaternion')), body_from_camera)
         except (ValueError, TypeError, OverflowError):
             return
@@ -123,7 +119,7 @@ class RotationHints:
         if type(stamp_ns) is not int or stamp_ns <= 0:
             return self._skip('hint requires an integer capture timestamp')
         quaternion = None
-        if self.controller_source is not None and capture_clock == self.controller_source[0]:
+        if self.controller_history:
             quaternion = interpolate_orientation(self.controller_history, stamp_ns)
         if quaternion is not None:
             source, generation = 'controller_rotation', self.controller_generation

@@ -262,6 +262,117 @@ def test_measured_chassis_without_rgb_marks_origin_and_dense_run(node, legacy_fi
     assert markers[1][24:] != markers[2][24:]
 
 
+def test_external_fusion_with_no_provenance_reaches_native_external_continuity(node):
+    import zlib
+    from test_pointcloud_slam_stream import external_fusion
+
+    for count, (ms, x, visual) in enumerate(((1000, 0., 'v1'), (1100, .04, 'v2')), start=1):
+        node._odom(NS(data=json.dumps(external_fusion(ms, x, visual_segment=visual))))
+        node._cloud(cloud(ms * 1_000_000, frame='body'))
+        assert _wait_until(lambda: node.status()['forwarded_clouds'] == count)
+    frames = published(node, '/sensor_data')[0].raw_messages
+    tokens = [zlib.decompress(bytes(msg.user_data)[:-12]) for msg in frames]
+    assert tokens[0] == tokens[1]
+    assert tokens[0].startswith(b'MOTUSCH1') and tokens[0][24:] != bytes(16)
+    poses = [msg.pose.pose for msg in published(node, '/odom')[0].raw_messages]
+    assert [pose.position.x for pose in poses] == [0., .04]
+
+
+def test_external_fusion_camera_cloud_waits_for_its_mount_and_applies_it_once(tmp_path, monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    from plugins.pointcloud_slam_config import infer_geometry
+    from test_pointcloud_slam_stream import external_fusion
+
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    first = external_fusion(1000, .2)
+    cfg, _ = infer_geometry(first, 'camera', 1_000_000_000)
+    assert cfg['extrinsic_mode'] == 'dynamic' and cfg['child_from_cloud'] is None
+    n = ros.RtabmapNode('/o', '/c', settings(**cfg), session_dir=tmp_path / 'session')
+    try:
+        n.start()
+        n._odom(NS(data=json.dumps(first)))
+        n._cloud(cloud(1_000_000_000, frame='camera'))
+        assert n.status()['forwarded_clouds'] == 0
+
+        for count, (capture, body_x, offset) in enumerate(((1000, .2, .3), (1100, .25, .5)), start=1):
+            value = external_fusion(capture, body_x)
+            matrix = np.eye(4); matrix[0, 3] = offset
+            value['vendor']['camera_mount'] = {'packet': dict(
+                stamp_ns=capture*1_000_000, parent_frame='body', child_frame='camera',
+                matrix=matrix.tolist())}
+            if count == 2:
+                n._cloud(cloud(capture*1_000_000, frame='camera'))
+                assert n.status()['forwarded_clouds'] == 1
+            n._odom(NS(data=json.dumps(value)))
+            assert _wait_until(lambda: n.status()['forwarded_clouds'] == count)
+            odom_msg = published(n, '/odom')[0].raw_messages[-1]
+            sensor_msg = published(n, '/sensor_data')[0].raw_messages[-1]
+            odom_tf = published(n, '/tf')[0].raw_messages[-1].transforms
+            assert odom_msg.pose.pose.position.x == body_x
+            assert odom_tf[-1].transform.translation.x == offset
+            assert sensor_msg.laser_scan_local_transform.translation.x == offset
+            assert bytes(sensor_msg.laser_scan.data) == bytes(cloud().data)
+        n._cloud(cloud(1_100_000_000, frame='body'))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 3)
+        assert published(n, '/tf')[0].raw_messages[-1].transforms[-1].transform.translation.x == 0.
+    finally:
+        n.close(); n.destroy_node()
+
+
+def test_camera_only_start_can_later_switch_to_fused_body_mount(tmp_path, monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    from plugins.pointcloud_slam_config import infer_geometry
+    from test_pointcloud_slam_stream import external_fusion
+
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    visual = odom(1000)
+    visual['pose']['child_frame_id'] = 'camera'
+    cfg, _ = infer_geometry(visual, 'camera', 1_000_000_000)
+    n = ros.RtabmapNode('/o', '/c', settings(**cfg), session_dir=tmp_path/'session')
+    try:
+        n.start()
+        n._odom(NS(data=json.dumps(visual)))
+        n._cloud(cloud())
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        fused = external_fusion(1100)
+        matrix = np.eye(4); matrix[0, 3] = .5
+        fused['vendor']['camera_mount'] = {'packet': dict(stamp_ns=1_100_000_000,
+            parent_frame='body', child_frame='camera', matrix=matrix.tolist())}
+        n._odom(NS(data=json.dumps(fused)))
+        n._cloud(cloud(1_100_000_000))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 2)
+        sensor = published(n, '/sensor_data')[0].raw_messages[-1]
+        assert sensor.laser_scan_local_transform.translation.x == .5
+        assert published(n, '/tf')[0].raw_messages[-1].transforms[-1].transform.translation.x == .5
+    finally:
+        n.close(); n.destroy_node()
+
+
+def test_external_fusion_raw_depth_cloud_uses_color_mount_and_numeric_baseline(tmp_path, monkeypatch):
+    import plugins.pointcloud_slam_ros as ros
+    from plugins.pointcloud_slam_config import infer_geometry
+    from test_pointcloud_slam_stream import external_fusion
+
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    value = external_fusion(1000)
+    matrix = np.eye(4); matrix[0, 3] = .2
+    value['vendor']['camera_mount'] = {'packet': dict(stamp_ns=1_000_000_000,
+        parent_frame='body', child_frame='color', matrix=matrix.tolist())}
+    baseline = np.eye(4); baseline[0, 3] = .03
+    cfg, _ = infer_geometry(value, 'raw_depth', 1_000_000_000,
+        camera_info={'vendor': {'color_from_depth': baseline.tolist()}})
+    n = ros.RtabmapNode('/o', '/c', settings(**cfg), session_dir=tmp_path/'session')
+    try:
+        n.start()
+        n._odom(NS(data=json.dumps(value)))
+        n._cloud(cloud(frame='raw_depth'))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == 1)
+        sensor = published(n, '/sensor_data')[0].raw_messages[-1]
+        assert sensor.laser_scan_local_transform.translation.x == pytest.approx(.23)
+    finally:
+        n.close(); n.destroy_node()
+
+
 @pytest.mark.parametrize('quality', [
     {'observation': {'schema': 'motus.observation/1', 'observation_stamp_ns': 1_100_000_000,
                      'normalized_clock_id': 'another-label'}},

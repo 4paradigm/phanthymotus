@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Depth-only pointcloud card: one Z16/zlib input, display and metric output.
+"""Depth-only pointcloud card: one integer or floating optical-depth input.
 
 Camera parameters come from upstream camera_info. Display output retains its
 approximate field-of-view fallback; metric output requires finite numeric intrinsics.
@@ -22,6 +22,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage, Image, PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 
+from plugins.camera_geometry import (CameraModel, camera_parameter, decode_depth_zlib, depth_scale,
+                                     zlib_decompress)
 from plugins.pointcloud_math import (
     MAX_POINTS,
     backproject_depth, decimation_stride,
@@ -36,6 +38,11 @@ log = logging.getLogger(__name__)
 DEFAULT_CLOUD_TOPIC = "/perception/pointcloud"
 DEFAULT_SUMMARY_TOPIC = "/perception/pointcloud_summary"
 _DEFAULT_INSTANCE = "_default"
+_DEPTH_FORMATS = {
+    "image/depth-zlib": "sensor_msgs/msg/CompressedImage",
+    "image/depth-f32": "sensor_msgs/msg/Image",
+    "image/depth-f32-zlib": "sensor_msgs/msg/CompressedImage",
+}
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -68,7 +75,7 @@ TOOLS = [
         "type": "processor",
         "multiInstance": True,
         "description": (
-            "点云 — 一路深度图（image/depth-z16 或 image/depth-zlib）反投影为 3D 点云。"
+            "点云 — 一路整型或浮点深度图反投影为 3D 点云。"
             "输出点云包（sensor/pointcloud）、摘要（data/json）和计算点云（sensor/pointcloud2）"
         ),
         "inputSchema": {
@@ -111,8 +118,9 @@ TOOLS = [
             },
         },
         "topic_in": [
-            {"format": "image/depth-z16", "desc": "16-bit 深度图输入（毫米）"},
             {"format": "image/depth-zlib", "desc": "zlib 压缩深度图输入"},
+            {"format": "image/depth-f32", "desc": "32-bit 浮点深度图输入（米）"},
+            {"format": "image/depth-f32-zlib", "desc": "zlib 压缩浮点深度图输入（米）"},
         ],
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
@@ -129,27 +137,25 @@ TOOLS = [
 _zlib_fail_count = 0
 
 
-def _decode_depth_message(msg, dimensions=None) -> tuple[Optional[np.ndarray], str]:
-    """z16 Image 或 depth-zlib CompressedImage → (深度图[米], 编码名)。
-
-    只接受 16UC1/mono16 的 uint16 毫米深度帧；32FC1 等浮点深度帧（米制）
-    点云卡片不支持，直接返回 None 拒绝。返回 (None, 编码名) 表示该帧不可用。
-    zlib 使用声明的画幅，未声明时沿用 visual_depth 的 640x480 约定。
-    """
+def _decode_depth_message(msg, dimensions=None, *, floating=False, scale=.001,
+                          registry=None, observation=None) -> tuple[Optional[np.ndarray], str]:
+    """Decode one depth frame in metres with its original sample validity."""
     global _zlib_fail_count
 
     if isinstance(msg, Image):
-        if msg.encoding not in ("16UC1", "mono16"):
+        if msg.encoding != "32FC1":
             return None, msg.encoding
         if any(type(v) is not int or v <= 0 for v in (msg.width, msg.height, msg.step)):
             return None, msg.encoding
         needed = msg.height * msg.step
-        if msg.width > 4096 or msg.height > 4096 or needed > 64*1024*1024 or msg.step < msg.width * 2 or len(msg.data) != needed:
+        itemsize = 4
+        if (msg.width > 4096 or msg.height > 4096 or needed > 64*1024*1024 or
+                msg.step < msg.width * itemsize or len(msg.data) != needed):
             return None, msg.encoding
-        dtype = np.dtype((">" if msg.is_bigendian else "<") + "u2")
+        dtype = np.dtype(">f4" if msg.is_bigendian else "<f4")
         depth = np.ndarray((msg.height, msg.width), dtype=dtype,
-                           buffer=bytes(msg.data[:needed]), strides=(msg.step, 2))
-        return depth.astype(np.float32) * 0.001, msg.encoding
+                           buffer=bytes(msg.data[:needed]), strides=(msg.step, itemsize))
+        return depth.astype(np.float32) * scale, msg.encoding
 
     # CompressedImage must identify depth, not a JPEG/PNG image.
     encoding = str(getattr(msg, "format", "") or "").lower()
@@ -158,36 +164,19 @@ def _decode_depth_message(msg, dimensions=None) -> tuple[Optional[np.ndarray], s
     width, height = dimensions if dimensions is not None else (640, 480)
     if any(type(v) is not int or not 0 < v <= 4096 for v in (width, height)):
         return None, "depth-zlib"
-    needed = width * height * 2
-    data = bytes(msg.data)
     try:
-        raw = zlib_decompress(data, cap=max(1 << 20, needed + 1))
+        if registry is None or observation is None:
+            depth = decode_depth_zlib(bytes(msg.data), width, height, floating=floating)
+        else:
+            depth = registry.decode_raw_depth(observation, msg.data, width, height, floating=floating)
     except Exception as error:
         _zlib_fail_count += 1
         if _zlib_fail_count == 1 or _zlib_fail_count % 100 == 0:
             log.warning(f"[pointcloud] depth-zlib decompress failed"
                         f"（第 {_zlib_fail_count} 帧）: {str(error)[:200]}")
         return None, getattr(msg, "format", "depth-zlib")
-    if len(raw) != needed:
-        return None, "depth-zlib"
     _zlib_fail_count = 0
-    depth = np.frombuffer(raw, dtype="<u2").reshape(height, width).astype(np.float32) * 0.001
-    return depth, "depth-zlib"
-
-
-def zlib_decompress(data: bytes, cap=1 << 20) -> bytes:
-    """有界解压：默认上限 1 MiB，声明画幅的调用方可传入对应字节上限。
-
-    review 第 18 轮 Issue 2：zlib.decompress 无上限——几百 KB 的压缩包
-    能声明几十 MB 的解压产物，在回调里把 perception 进程直接 OOM。
-    decompressobj.max_length 挡住超限，unconsumed_tail 非空即"还有没解
-    完的"= 超限，连同超出部分一起拒掉。"""
-    import zlib
-    d = zlib.decompressobj()
-    raw = d.decompress(data, cap)
-    if d.unconsumed_tail or d.unused_data or len(raw) > cap or not d.eof:
-        raise ValueError("invalid zlib stream or decompressed output exceeds the depth-frame cap")
-    return raw
+    return depth.astype(np.float32) * scale, "depth-zlib"
 
 
 class _PointCloudNode(Node):
@@ -201,6 +190,9 @@ class _PointCloudNode(Node):
         self._mode = "depth"
         self._input_topic = input_topic or ''
         self._calibration = calibration or {}
+        self._camera_model = self._scaled_camera = None
+        self._camera_geometry_error = None
+        self._depth_scale = .001
         self._fps = fps
         self._frame_interval = 1.0 / max(fps, 0.1)
         self._max_points = max_points
@@ -250,17 +242,13 @@ class _PointCloudNode(Node):
         format, discover actual publisher endpoint types rather than guessing
         from the topic name or creating incompatible DDS subscriptions.
         """
-        declared = {
-            "image/depth-z16": "sensor_msgs/msg/Image",
-            "image/depth-zlib": "sensor_msgs/msg/CompressedImage",
-        }
         if self._input_format:
-            if self._input_format not in declared:
+            if self._input_format not in _DEPTH_FORMATS:
                 raise ValueError(f"unsupported pointcloud input format: {self._input_format}")
-            return declared[self._input_format]
+            return _DEPTH_FORMATS[self._input_format]
         endpoints = self.get_publishers_info_by_topic(self._input_topic)
         types = {entry.topic_type for entry in endpoints}
-        supported = set(declared.values())
+        supported = set(_DEPTH_FORMATS.values())
         if types - supported:
             raise ValueError(f"unsupported pointcloud publisher types on {self._input_topic}: {sorted(types)}")
         if len(types) > 1:
@@ -272,7 +260,9 @@ class _PointCloudNode(Node):
         if msg_type is None:
             return False  # Publisher may appear after canvas startup.
         raw = msg_type == "sensor_msgs/msg/Image"
-        self._input_format = "image/depth-z16" if raw else "image/depth-zlib"
+        if self._input_format is None:
+            self._input_format = "image/depth-f32" if raw else "image/depth-zlib"
+            self._depth_scale = depth_scale(dict(self._input_declaration, format=self._input_format))
         callback = self._depth_image_cb if raw else self._depth_comp_cb
         if self._input_registry is None:
             self._subs.append(self.create_subscription(
@@ -382,9 +372,9 @@ class _PointCloudNode(Node):
         self._drop_stale(self._frame_queue, ("depth_zlib", msg) if context is None else ("depth_zlib", msg, context))
 
     def _depth_image_cb(self, msg: Image, context=None):
-        if self._throttled():
+        if msg.encoding != "32FC1" or self._throttled():
             return
-        self._drop_stale(self._frame_queue, ("depth_z16", msg) if context is None else ("depth_z16", msg, context))
+        self._drop_stale(self._frame_queue, ("depth_f32", msg) if context is None else ("depth_f32", msg, context))
 
 
     # ── worker：按模式出云 ─────────────────────────────────────────────────
@@ -421,19 +411,30 @@ class _PointCloudNode(Node):
 
     # A: 深度图 → 反投影
     def _emit_depth(self, msg, context=None):
-        depth_m, enc = _decode_depth_message(msg, getattr(self, "_input_dimensions", None))
+        floating = self._input_format in ("image/depth-f32", "image/depth-f32-zlib")
+        depth_m, enc = _decode_depth_message(msg, getattr(self, "_input_dimensions", None),
+                                             floating=floating, scale=self._depth_scale,
+                                             registry=self._input_registry, observation=context)
         if depth_m is None:
             self._metric_skip('invalid_depth')
             return
         h, w = depth_m.shape[:2]
         fx, fy, cx, cy = self._pinhole_for(w, h)
         stride = decimation_stride(w, h, self._max_points)
-        xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
-                                 self._min_depth_m, self._max_depth_m)
+        geometry = self._camera_model
+        if geometry is not None and (geometry.distorted or geometry.K[0, 1] != 0.):
+            if self._scaled_camera is None or (self._scaled_camera.width, self._scaled_camera.height) != (w, h):
+                self._scaled_camera = geometry.resized(w, h)
+            geometry = self._scaled_camera
+            xyz = geometry.backproject(depth_m, stride, self._min_depth_m, self._max_depth_m)
+        else:
+            geometry = None
+            xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride, self._min_depth_m, self._max_depth_m)
         self._publish(xyz)
-        if ((enc in ("16UC1", "mono16") and self._input_format == "image/depth-z16") or
-                (enc == "depth-zlib" and self._input_format == "image/depth-zlib")):
-            self._publish_metric(xyz, msg, w, h, context, depth_m=depth_m)
+        if self._camera_geometry_error:
+            self._metric_skip('invalid_camera_geometry')
+        elif enc in ("32FC1", "depth-zlib"):
+            self._publish_metric(xyz, msg, w, h, context, depth_m=depth_m, geometry=geometry)
         else:
             self._metric_skip('unsupported_encoding')
 
@@ -450,7 +451,7 @@ class _PointCloudNode(Node):
             return {'published': self._metric_published, 'skipped': dict(self._metric_skipped),
                     'last_skip_reason': self._metric_last_skip}
 
-    def _publish_metric(self, xyz, source, width, height, context=None, *, depth_m=None):
+    def _publish_metric(self, xyz, source, width, height, context=None, *, depth_m=None, geometry=None):
         if self._stop_event.is_set():
             return
         calibration = self._calibration
@@ -491,7 +492,7 @@ class _PointCloudNode(Node):
         if context is not None and self._input_registry is not None:
             self._metric_observation = context
             self._metric_frame = header.frame_id
-            depth = (depth_m, intrinsics, self._min_depth_m, self._max_depth_m) if depth_m is not None else None
+            depth = (depth_m, geometry or intrinsics, self._min_depth_m, self._max_depth_m) if depth_m is not None else None
             derived = self._input_registry.register_derived(self._metric_cloud_topic, cloud, context,
                                                             'depth_projection', depth=depth)
             if self._metric_metadata_pub is not None and not self._metric_metadata_source_topic:
@@ -630,8 +631,8 @@ class PointCloudPerceptionPlugin:
         if isinstance(metadata, dict) and isinstance(metadata.get(topic), dict):
             declarations.append(metadata[topic])
         for declaration in declarations:
-            if declaration.get("format") not in (None, "image/depth-z16", "image/depth-zlib"):
-                raise ValueError("点云仅支持 image/depth-z16 或 image/depth-zlib 深度输入")
+            if declaration.get("format") is not None and declaration["format"] not in _DEPTH_FORMATS:
+                raise ValueError("点云需要支持的深度图格式")
         return topic
 
     def _camera_info(self, instance_id, input_topic, nodes,
@@ -666,6 +667,10 @@ class PointCloudPerceptionPlugin:
                 return
             icfg = self._instance_configs.get(node_key, {})
             effective = self._effective_config(icfg)
+            upstream = self._upstream_camera.get(node_key) or {}
+            declaration = self._upstream_input_metadata.get(node_key) or {}
+            input_format = upstream.get("format") or declaration.get("format")
+            scale = depth_scale(dict(upstream, format=input_format))
             node = _PointCloudNode(
                 input_topic, calibration,
                 fps=effective['fps'], max_points=effective['max_points'],
@@ -673,14 +678,16 @@ class PointCloudPerceptionPlugin:
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
             node._applied_config = effective
-            with self._nodes_lock:
-                upstream = self._upstream_camera.get(node_key) or {}
             if all(type(upstream.get(k)) is int and 0 < upstream[k] <= 4096 for k in ('width', 'height')):
                 node._input_dimensions = (upstream['width'], upstream['height'])
-            declaration = self._upstream_input_metadata.get(node_key) or {}
             node._input_registry = self._input_registry
             node._input_declaration = upstream
-            node._input_format = upstream.get("format") or declaration.get("format")
+            node._input_format, node._depth_scale = input_format, scale
+            if calibration:
+                try:
+                    node._camera_model = CameraModel(upstream)
+                except (TypeError, ValueError, OverflowError) as error:
+                    node._camera_geometry_error = str(error)
             metadata_topic = declaration.get("frame_metadata_topic")
             if calibration and isinstance(metadata_topic, str) and metadata_topic:
                 node._metric_metadata_source_topic = metadata_topic
@@ -826,7 +833,7 @@ class PointCloudPerceptionPlugin:
             for node in selected:
                 if all(t["topic"] != node._input_topic for t in topics_in):
                     topics_in.append({"topic": node._input_topic,
-                                      "format": node._input_format or "image/depth-z16"})
+                                      "format": node._input_format or "image/depth-zlib"})
             # 每实例三个输出口；多实例时不再用 output_topics_for(None)
             # 的默认 /perception/... 话题把下游引向不存在的话题。
             if instance_id and instance_id in nodes:
@@ -895,8 +902,8 @@ class PointCloudPerceptionPlugin:
                     fmt="sensor/pointcloud2", stage="perception/pointcloud",
                     width=c['width'], height=c['height'])
                 if declaration:
-                    declaration[0]['K'] = [float(c['fx']), 0., float(c['cx']), 0.,
-                                           float(c['fy']), float(c['cy']), 0., 0., 1.]
+                    if metric_node._camera_model is not None:
+                        declaration[0]['K'] = metric_node._camera_model.K.reshape(-1).tolist()
                     camera_out.extend(declaration)
             if metadata_out:
                 info["input_metadata"] = metadata_out
@@ -916,7 +923,7 @@ class PointCloudPerceptionPlugin:
             declared = for_topic(args.get("camera_info"), input_topic)
             calibration = None
             width, height = declared.get("width"), declared.get("height")
-            if (declared.get("format") in ("image/depth-z16", "image/depth-zlib") and
+            if (declared.get("format") in (None, *_DEPTH_FORMATS) and
                     all(type(v) is int and 0 < v <= 4096 for v in (width, height))):
                 try:
                     matrix = np.asarray(declared.get("K"), dtype=float).reshape(3, 3)
@@ -940,6 +947,10 @@ class PointCloudPerceptionPlugin:
                     return {'state': 'error', 'message': 'stop the pointcloud instance before changing its input or metadata topic'}
                 if existing and existing._calibration != (calibration or {}):
                     return {'state': 'error', 'message': 'stop the pointcloud instance before changing its camera calibration'}
+                if existing and any(camera_parameter(declared, k) !=
+                                    camera_parameter(self._upstream_camera.get(node_key, {}), k)
+                                    for k in ('K', 'D', 'distortion_model', 'depth_scale_m', 'format')):
+                    return {'state': 'error', 'message': 'stop the pointcloud instance before changing its camera geometry'}
                 self._upstream_input_metadata[node_key] = declaration
                 self._upstream_camera[node_key] = declared
                 running = self._nodes.get(node_key)

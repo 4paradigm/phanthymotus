@@ -60,6 +60,27 @@ def test_camera_validation_is_owned_and_exact():
     assert result['topic'] == '/rgb'
 
 
+def test_rgb_attachment_rectifies_numeric_fisheye_without_camera_identity():
+    import cv2
+
+    source = camera()
+    source.pop('schema')
+    source.update(distortion_model='equidistant', D=[0.]*4)
+    native = np.arange(36, dtype=np.uint8).reshape(3, 4, 3)
+    result = RgbLoopInput(validate_rgb_camera(source, topic='/rgb'), settings())
+    result._decode_jpeg = lambda _: native
+    result.start()
+    try:
+        result.image(message(), now_ns=STAMP)
+        wait_for(lambda: result.info()['decoded'] == 1)
+        expected = cv2.fisheye.undistortImage(native, result.K, np.zeros(4), Knew=result.K)
+        actual = result.take(STAMP, STAMP)[1]
+        np.testing.assert_allclose(actual, expected, atol=1, rtol=0.)
+        assert actual is not native
+    finally:
+        result.close()
+
+
 @pytest.mark.parametrize('change', [dict(width=0), dict(height=4097),
     dict(width=True), dict(format='image/png'), dict(K=[1]*8),
     dict(K=[0.,0,1,0,2,1,0,0,1]), dict(K=[float('nan')]*9), dict(schema='other')])
@@ -173,12 +194,46 @@ def test_dynamic_mount_requires_exact_fresh_evidence_and_common_reference():
     assert result.camera is not None and result.mounts is not None
     result.mount(packet(STAMP), STAMP)
     assert np.array_equal(result.capture_mount(STAMP, None, STAMP), np.eye(4))
-    assert np.array_equal(result.capture_mount(STAMP+1, np.eye(4), STAMP+1), np.eye(4))
+    assert result.capture_mount(STAMP+1, np.eye(4), STAMP+1) is None
+    later = np.eye(4)
+    later[0, 3] = 1.
+    result.mount(packet(STAMP+2, matrix=later.tolist()), STAMP+2)
+    assert result.capture_mount(STAMP+1, None, STAMP+2)[0, 3] == .5
     assert np.array_equal(result.capture_mount(STAMP, None, STAMP+600_000_000), np.eye(4))
-    result.mount(packet(STAMP+1, status='unavailable', matrix=None), STAMP+1)
-    assert np.array_equal(result.capture_mount(STAMP+1, np.eye(4), STAMP+1), np.eye(4))
+    result.mount(dict(packet(STAMP+1, status='unavailable'), matrix=None), STAMP+1)
+    assert result.capture_mount(STAMP+1, np.eye(4), STAMP+1) is None
     bad = deepcopy(config); bad['capture_mount']['clock_reference']['domain_id'] = 'other'
     assert RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), bad).camera is not None
+
+
+def test_static_rgb_mount_uses_depth_to_color_transform_in_the_correct_direction():
+    c = camera()
+    color_from_depth = np.eye(4)
+    color_from_depth[0, 3] = .2
+    c['vendor']['color_from_depth'] = color_from_depth.tolist()
+    result = RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), settings())
+    body_from_depth = np.eye(4)
+    body_from_depth[1, 3] = 1.
+    body_from_color = result.capture_mount(STAMP, body_from_depth, STAMP)
+    np.testing.assert_allclose(np.linalg.inv(body_from_color) @ body_from_depth, color_from_depth)
+
+
+def test_explicit_rgb_body_mount_overrides_the_relative_depth_transform():
+    c = camera()
+    body_from_color = np.eye(4)
+    body_from_color[2, 3] = .4
+    c['vendor'].update(body_from_camera=body_from_color.tolist(), color_from_depth=np.eye(4).tolist())
+    result = RgbLoopInput(validate_rgb_camera(c, topic='/rgb'), settings())
+    np.testing.assert_array_equal(result.capture_mount(STAMP, np.eye(4), STAMP), body_from_color)
+
+
+def test_measured_rgbd_cache_keeps_the_points_distortion_model():
+    from plugins.camera_geometry import CameraModel
+
+    source = CameraModel(dict(width=3, height=1, K=np.eye(3), distortion_model='equidistant', D=[0.]*4))
+    raw = np.array([[0., 2., 0.]], dtype=np.float32)
+    projected = project_measured_depth((raw, source, .1, 5.), np.eye(4), np.eye(3), 4, 1)
+    np.testing.assert_array_equal(projected, [[0., 0., 2., 0.]])
 
 
 @pytest.mark.parametrize('status,reason', [('available', None),

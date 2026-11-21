@@ -1,5 +1,6 @@
 """Start-input diagnostics: name the missing input, never invent calibration."""
 from copy import deepcopy
+import sys
 
 import pytest
 
@@ -21,6 +22,7 @@ def card(monkeypatch):
 
     monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
     monkeypatch.setattr(module, 'require_runtime', lambda: None)
+    monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', object(), raising=False)
     Session.created = []
     value = RgbdOdometryPlugin({}, _FakeExecutor())
     yield value
@@ -53,7 +55,7 @@ def test_missing_declaration_names_topic_role_and_unconnected_declarations(card)
 
 @pytest.mark.parametrize('topics,needle', [
     (['/rgb', '/rgb'], 'duplicate /rgb'),
-    (['/rgb', '/depth', '/imu', '/extra'], 'imu_assisted=false, 4 input(s) connected'),
+    (['/rgb', '/depth', '/imu', '/extra', '/third'], 'imu_assisted=false, 5 input(s) connected'),
 ])
 def test_count_and_duplicate_failures_are_specific(card, topics, needle):
     result = start(card, input_topics=topics, camera_info=declarations())

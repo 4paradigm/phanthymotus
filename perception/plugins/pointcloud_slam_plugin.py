@@ -368,11 +368,19 @@ class PointCloudSlamPlugin:
         self._rgb_input_status = 'fallback' if self._input_diagnostics else 'disconnected'
         rgb_topic = next((t for t, f in bindings.items() if f == 'image/jpeg'), None)
         if rgb_topic is not None:
+            from .camera_geometry import camera_parameter
             from .pointcloud_slam_rgb import validate_rgb_camera
             cameras = args.get('camera_infos')
             if legacy and 'camera_infos' not in args:
                 cameras = args.get('camera_info')
             camera = cameras.get(rgb_topic) if isinstance(cameras, dict) else None
+            cloud_topic = next(t for t, f in bindings.items() if f == 'sensor/pointcloud2')
+            depth = cameras.get(cloud_topic) if isinstance(cameras, dict) else None
+            if (isinstance(camera, dict) and isinstance(depth, dict) and
+                    camera_parameter(camera, 'color_from_depth') is None):
+                registration = camera_parameter(depth, 'color_from_depth')
+                if registration is not None:
+                    camera = dict(camera, color_from_depth=registration)
             self._rgb_input = {'topic': rgb_topic, 'camera_info': deepcopy(camera)}
             try:
                 self._rgb_input = validate_rgb_camera(camera, topic=rgb_topic)
@@ -494,9 +502,13 @@ class PointCloudSlamPlugin:
             from .pointcloud_slam_library import copy_native_map
             restored = copy_native_map(_ARCHIVE_DIR, bound, args.get('revision'), session/'restored.db',
                 max_disk_bytes=settings['max_disk_bytes'], reserve_bytes=settings['reserve_bytes'])
-            for key in ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud', 'extrinsic_mode'):
+            for key in ('cloud_frame', 'child_frame', 'clock_id', 'child_from_cloud',
+                        'extrinsic_mode', 'color_from_depth'):
                 if settings.get(key) is None and restored['resolved'].get(key) is not None:
                     settings[key] = deepcopy(restored['resolved'][key])
+            if (self._resolved_inputs is None and self._config.get('child_from_cloud') is None and
+                    restored['resolved'].get('pose_capture_mount')):
+                settings.setdefault('pose_capture_mount', True)
             for key in ('cloud_frame', 'child_frame', 'clock_id'):
                 settings.setdefault(key, '')
         self._require_mapping_inputs(settings)

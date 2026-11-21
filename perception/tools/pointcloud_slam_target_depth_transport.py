@@ -15,13 +15,17 @@ source=rclpy.create_node('synthetic_depth_source')
 executor.add_node(source)
 results=[]
 try:
-    for kind,typ in [('zlib',CompressedImage),('z16',Image)]:
-        topic='/synthetic_validation/'+kind
-        fmt='image/depth-zlib' if kind=='zlib' else 'image/depth-z16'
+    for kind, typ, encoding, dtype, value, unit in [
+        ('zlib', CompressedImage, '16UC1', '<u2', 2000, 'mm'),
+        ('f32', Image, '32FC1', '<f4', 2., 'm'),
+        ('f32-zlib', CompressedImage, '32FC1', '<f4', 2., 'm'),
+    ]:
+        topic='/synthetic_validation/'+kind.replace('-', '_')
+        fmt='image/depth-'+kind
         declaration=dict(schema='motus.camera/1',topic=topic,format=fmt,id='synthetic_optical',
             source='derived-from-K',distortion_model='pinhole',width=640,height=480,
             K=[400.,0.,320.,0.,400.,240.,0.,0.,1.],
-            vendor=dict(depth_unit='mm',depth_source='measured',timestamp_semantics='source_capture_mapped'))
+            vendor=dict(depth_unit=unit,depth_source='measured',timestamp_semantics='source_capture_mapped'))
         plugin=PointCloudPerceptionPlugin({'metric_cloud':True,'fps':20},'synthetic',executor)
         publisher=source.create_publisher(typ,topic,qos_profile_sensor_data)
         received=[]
@@ -32,12 +36,13 @@ try:
             stamp=time.time_ns()  # timestamp at synthetic sample generation, not receive time
             msg=typ();msg.header.frame_id='synthetic_optical'
             msg.header.stamp.sec=stamp//1000000000;msg.header.stamp.nanosec=stamp%1000000000
-            if kind=='zlib':
-                msg.format='16UC1; compressedDepth zlib'
-                msg.data=zlib.compress(np.full((480,640),2000,dtype='<u2').tobytes())
+            raw=np.full((480,640),value,dtype=dtype)
+            if typ is CompressedImage:
+                msg.format=encoding+'; compressedDepth zlib'
+                msg.data=zlib.compress(raw.tobytes())
             else:
-                msg.height=480;msg.width=640;msg.encoding='16UC1';msg.step=640*2
-                msg.data=np.full((480,640),2000,dtype='<u2').tobytes()
+                msg.height=480;msg.width=640;msg.encoding=encoding;msg.step=raw.strides[0]
+                msg.data=raw.tobytes()
             deadline=time.monotonic()+8;next_send=0
             while not received and time.monotonic()<deadline:
                 if time.monotonic()>=next_send: publisher.publish(msg);next_send=time.monotonic()+.2

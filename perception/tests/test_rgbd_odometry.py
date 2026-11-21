@@ -80,7 +80,8 @@ def test_card_exposes_common_odom_and_isolates_instances(monkeypatch):
     monkeypatch.setattr(module,'require_runtime',lambda:None)
     Session.created=[];card=RgbdOdometryPlugin({},_FakeExecutor())
     tool=card.get_tools()[0]
-    assert [p['format'] for p in tool['topic_in']]==['image/jpeg','image/depth-zlib','sensor/imu']
+    assert [p['format'] for p in tool['topic_in']] == [
+        'image/jpeg', 'image/depth-zlib', 'sensor/imu', 'state/odom', 'image/depth-f32-zlib']
     assert tool['odom_interface']['slam_pose']['profile']=='motus_slam/1'
     a=start(card,'one');b=start(card,'two');assert a['topic_out']!=b['topic_out']
     assert start(card,'one')['topic_out']==a['topic_out']
@@ -180,6 +181,7 @@ def test_shutdown_attempts_other_instances_when_one_cleanup_fails():
 ])
 def test_old_service_config_and_canvas_arguments_cannot_override_wiring(monkeypatch, legacy):
     from plugins import rgbd_odometry as module
+    import sys
 
     class RecordingSession(Session):
         def __init__(self, calibration, executor, topic):
@@ -188,6 +190,7 @@ def test_old_service_config_and_canvas_arguments_cannot_override_wiring(monkeypa
 
     monkeypatch.setattr(module, 'RgbdSession', RecordingSession)
     monkeypatch.setattr(module, 'require_runtime', lambda: None)
+    monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', object(), raising=False)
     card = RgbdOdometryPlugin(legacy, _FakeExecutor())
     args = dict(action='start', input_topics=['/rgb', '/depth', '/imu'], camera_info=declarations())
     try:

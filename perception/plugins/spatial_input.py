@@ -1,5 +1,6 @@
 """One ingress per ROS stream, bounded independent delivery to each consumer."""
 from collections import deque, OrderedDict
+from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
@@ -8,6 +9,7 @@ import threading
 import time
 import uuid
 
+from .camera_geometry import decode_depth_zlib
 from .spatial_time import TimePolicy, FrameContext
 
 
@@ -118,6 +120,8 @@ class InputAdapterRegistry:
         self._lock = threading.RLock()
         self._streams, self._derived = {}, OrderedDict()
         self._derived_depth = OrderedDict()
+        self._raw_depth, self._decoding_depth = OrderedDict(), {}
+        self._raw_depth_bytes = 0
         self._node = None
         self._closed = False
         # A registry belongs to exactly one executor/ROS context, not all domains.
@@ -239,6 +243,43 @@ class InputAdapterRegistry:
         with self._lock:
             return self._derived_depth.get(observation.observation_id)
 
+    def decode_raw_depth(self, observation, data, width, height, *, floating=False):
+        """Decode compressed samples once per ingress frame, before applying calibration."""
+        if (observation is None or any(type(n) is not int or not 0 < n <= 4096 for n in (width, height)) or
+                width*height*(4 if floating else 2) > self.max_bytes):
+            return decode_depth_zlib(bytes(data), width, height, floating=floating)
+        key = (observation.observation_id, width, height, floating)
+        with self._lock:
+            depth = self._raw_depth.get(key)
+            if depth is not None:
+                self._raw_depth.move_to_end(key)
+                return depth
+            pending = self._decoding_depth.get(key)
+            own = pending is None
+            if own and not self._closed and len(self._decoding_depth) < self.max_pending:
+                pending = self._decoding_depth[key] = Future()
+        if pending is None:
+            return decode_depth_zlib(bytes(data), width, height, floating=floating)
+        if not own:
+            return pending.result()
+        try:
+            depth = decode_depth_zlib(bytes(data), width, height, floating=floating)
+        except BaseException as error:
+            with self._lock:
+                del self._decoding_depth[key]
+                pending.set_exception(error)
+            raise
+        with self._lock:
+            if not self._closed:
+                self._raw_depth[key] = depth
+                self._raw_depth_bytes += depth.nbytes
+                while len(self._raw_depth) > self.max_pending or self._raw_depth_bytes > self.max_bytes:
+                    _, evicted = self._raw_depth.popitem(last=False)
+                    self._raw_depth_bytes -= evicted.nbytes
+            del self._decoding_depth[key]
+            pending.set_result(depth)
+        return depth
+
     def _release(self, lease):
         with self._lock:
             stream = lease.stream
@@ -258,6 +299,8 @@ class InputAdapterRegistry:
         with self._lock:
             self._closed = True
             self._derived_depth.clear()
+            self._raw_depth.clear()
+            self._raw_depth_bytes = 0
             leases = [l for s in self._streams.values() for l in s['leases']]
         failures = []
         for lease in leases:

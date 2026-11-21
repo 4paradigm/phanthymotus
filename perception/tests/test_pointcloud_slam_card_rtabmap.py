@@ -1040,6 +1040,25 @@ def test_connected_rgb_reaches_session_settings_without_changing_spatial_contrac
     assert_rgb_port(card, '/rgb')
 
 
+@pytest.mark.parametrize('rgb_defines_matrix', [False, True])
+def test_depth_cloud_numeric_registration_reaches_optional_rgb(card, rgb_defines_matrix):
+    camera = rgb_camera()
+    supplied = deepcopy(settings()['child_from_cloud'])
+    supplied[0][3] = .2
+    rgb_value = deepcopy(supplied)
+    rgb_value[0][3] = .1
+    if rgb_defines_matrix:
+        camera['vendor']['color_from_depth'] = rgb_value
+    args = rgb_arguments(camera)
+    args['camera_infos']['/cloud'] = {'topic': '/cloud', 'format': 'sensor/pointcloud2',
+                                     'vendor': {'color_from_depth': supplied}}
+    assert card.dispatch('pointcloud_slam', args)['state'] == 'ready'
+    assert call(card, 'start_mapping', map_name='RGB')['state'] == 'running'
+    selected = card._session_settings['rgb_input']['camera_info']
+    actual = selected.get('color_from_depth', selected['vendor'].get('color_from_depth'))
+    assert actual == (rgb_value if rgb_defines_matrix else supplied)
+
+
 @pytest.mark.parametrize('broken', ['missing', 'intrinsics'])
 def test_invalid_connected_rgb_falls_back_without_blocking_mapping(card, broken):
     camera = rgb_camera()
@@ -1178,3 +1197,22 @@ def test_saved_native_map_can_resume_and_save_as_the_next_revision(card, monkeyp
     assert second['map_id'] == first['map_id']
     assert second['revision'] == 2
     assert second['map_name'] == 'Renamed Hall'
+
+
+def test_saved_fused_dynamic_mount_route_survives_resume(card, monkeypatch):
+    from test_pointcloud_slam_rgb_gateway import rgb_camera
+
+    ready(card)
+    card._runtime_inputs = dict(extrinsic_mode='dynamic', child_from_cloud=None,
+                                pose_capture_mount=True)
+    assert call(card, 'start_mapping', map_name='Fused')['state'] == 'running'
+    first = call(card, 'stop_mapping')
+    card._config.pop('child_from_cloud')
+    card._runtime_inputs = None
+    card._rgb_input = {'topic': '/rgb', 'camera_info': rgb_camera()}
+    original = module.RtabmapNode
+    monkeypatch.setattr(module, 'RtabmapNode',
+                        lambda *args, restored_map=None, **kwargs: original(*args, **kwargs))
+    assert call(card, 'resume_mapping', map_id=first['map_id'])['state'] == 'running'
+    assert card._session_settings['extrinsic_mode'] == 'dynamic'
+    assert card._session_settings['pose_capture_mount'] is True

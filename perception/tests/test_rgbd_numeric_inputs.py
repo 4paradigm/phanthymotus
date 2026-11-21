@@ -13,7 +13,7 @@ from plugins.spatial_time import TimePolicy
 from plugins import pointcloud as pc
 from test_rgbd_odometry_status import sessions  # noqa: F401
 from test_rgbd_odometry_contract import declarations
-from test_pointcloud_plugin import _plugin, metric_z16_declaration
+from test_pointcloud_plugin import _plugin, metric_zlib_declaration
 from test_pointcloud_slam_ros import cloud
 from vision_stubs import _FakeCompressedImage, _FakeImage
 
@@ -24,10 +24,10 @@ def test_rgbd_needs_only_format_dimensions_and_finite_intrinsics():
         for key in ('schema', 'id', 'distortion_model', 'D', 'source'):
             entry.pop(key, None)
         entry['vendor'] = {}
-    data['/depth'].update(width=3, height=2, K=[-2, .1, 1, .2, 3, 1, 1, 0, 2])
+    data['/depth'].update(width=3, height=2, K=[2, .1, 1, 0, 3, 1, 0, 0, 1])
     result = validate_inputs(data, ['/rgb', '/depth'])
     assert result['depth_size'] == (3, 2)
-    assert result['K'][0, 0] == -2
+    assert result['image_geometry'].depth.K[0, 0] == 2
 
 
 @pytest.mark.parametrize('key,bad', [('width', 0), ('height', True), ('K', [1]*8),
@@ -49,19 +49,21 @@ def test_pairing_rejects_expired_contexts_and_preserves_mismatched_capture_evide
     assert pairer.dropped_by_side == {'color': 1, 'depth': 0}
 
     pairer = RgbdPairer(max_wait_ns=1, max_skew_ns=1)
-    fresh = replace(second, ingress_monotonic_ns=11, ingress_realtime_ns=1_000_000_001)
+    fresh = replace(second, observation_stamp_ns=1_000_000_001,
+                    ingress_monotonic_ns=11, ingress_realtime_ns=1_000_000_002)
     pairer.push('color', NS(data=b'c'), first)
     pair = pairer.push('depth', NS(data=b'd'), fresh)
     assert pair.color_context is first and pair.depth_context is fresh
     assert pair.method == 'receipt_estimated'
     assert pair[0][0] == 1_000_000_000 and pair[1][0] == 1_000_000_001
-    assert pair.depth_context.observation_stamp_ns == 1
+    assert pair.depth_context.observation_stamp_ns == 1_000_000_001
 
 
 def test_legacy_pair_buffer_preserves_numeric_timestamp_behavior():
     legacy = PairBuffer(max_skew_ns=1)
     legacy.push('color', 0, 'color', 10**12)
-    assert legacy.push('depth', -10, 'depth', 1) == ((0, 'color'), (-10, 'depth'))
+    assert legacy.push('depth', -10, 'too_far', 1) is None
+    assert legacy.push('depth', -1, 'depth', 1) == ((0, 'color'), (-1, 'depth'))
 
 
 def test_cloud_without_frame_or_positive_time_still_normalizes_xyz():
@@ -77,14 +79,14 @@ def test_cloud_without_frame_or_positive_time_still_normalizes_xyz():
 
 def test_metric_projection_accepts_unlabelled_intrinsics_and_zero_header():
     plugin, executor = _plugin({'metric_cloud': True})
-    declaration = dict(format='image/depth-z16', width=2, height=1,
-                       K=[2, .2, 0, .3, 2, 0, 0, 0, 1])
+    declaration = dict(format='image/depth-f32', width=2, height=1,
+                       K=[2, .2, 0, 0, 2, 0, 0, 0, 1])
     try:
         assert plugin.dispatch('start', {'input_topic': '/depth',
             'camera_info': {'/depth': declaration}})['state'] == 'running'
         node = executor.nodes[0]
-        msg = _FakeImage(data=np.array([2000, 2000], dtype='<u2').tobytes(),
-                         encoding='16UC1', width=2, height=1, step=4)
+        msg = _FakeImage(data=np.array([2., 2.], dtype='<f4').tobytes(),
+                         encoding='32FC1', width=2, height=1, step=8)
         msg.header.stamp = NS(sec=0, nanosec=0)
         node._emit_depth(msg)
         pub = next(p for p in node.publishers if p.topic.endswith('/pointcloud_metric'))
@@ -97,7 +99,7 @@ def test_metric_projection_accepts_unlabelled_intrinsics_and_zero_header():
 
 def test_zlib_projection_uses_declared_dimensions_and_rejects_wrong_length():
     plugin, executor = _plugin({'metric_cloud': True})
-    declaration = metric_z16_declaration(3, 2); declaration['format'] = 'image/depth-zlib'
+    declaration = dict(metric_zlib_declaration(), width=3, height=2)
     try:
         assert plugin.dispatch('start', {'input_topic': '/depth',
             'camera_info': {'/depth': declaration}})['state'] == 'running'

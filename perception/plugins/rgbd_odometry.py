@@ -33,6 +33,7 @@ class RgbdOdometryPlugin:
         self.lock = threading.RLock()
         self.recovery = {}
         self.frontends = {}
+        self.external_streams = {}
         self.controller_profiles = {}
         self.retiring = {}
         self.recovery_node = self.recovery_timer = None
@@ -113,6 +114,10 @@ class RgbdOdometryPlugin:
                                             self._outputs(instance)[0]['topic'], publish_output=False,
                                             requested_calibration=requested, mode_transition=transition,
                                             **({'input_registry': self._input_registry} if self._input_registry else {}))
+                    if instance in self.external_streams:
+                        candidate.external_stream = self.external_streams[instance]
+                        if getattr(candidate, 'observations', None) is not None:
+                            candidate.observations.visual_sink = candidate._observe_external_visual
                     # The old worker can finish its first tracking estimate
                     # while the candidate starts. Decide before it can publish again.
                     with session.lock:
@@ -199,6 +204,12 @@ class RgbdOdometryPlugin:
                 del self.retiring[instance]
             except Exception as error:
                 failures.append('candidate cleanup: ' + str(error))
+        if instance in self.external_streams:
+            try:
+                self.external_streams[instance].close()
+                del self.external_streams[instance]
+            except Exception as error:
+                failures.append(str(error))
         if instance in self.instances:
             try:
                 self.instances[instance][0].close()
@@ -213,7 +224,7 @@ class RgbdOdometryPlugin:
     def get_tools(self):
         return [{'name': 'rgbd_odometry', 'type': 'processor', 'multiInstance': True,
                  'description': 'RGB-D 视觉里程计：彩色和实测深度估计相机位姿，接入相机 IMU 自动启用辅助',
-                 'inputSchema': {'type': 'object', 'properties': {
+                 'inputSchema': {'type': 'object', 'x-input-metadata-consumer': True, 'properties': {
                      'action': {'type': 'string', 'enum': ['start', 'stop', 'info']}}},
                  'configSchema': {'type': 'object', 'properties': {'controller_rotation': {
                      'type': ['object', 'null'], 'scope': 'instance', 'title': '控制器旋转先验',
@@ -223,10 +234,11 @@ class RgbdOdometryPlugin:
                                     'camera_from_body': {'type': 'array', 'items': {'type': 'number'},
                                                          'minItems': 4, 'maxItems': 4},
                                     'read_time_offset_ns': {'type': 'integer'}},
-                     'required': ['topic', 'clock_id', 'calibration_id', 'camera_from_body',
-                                  'read_time_offset_ns']}}},
+                     'required': ['topic', 'camera_from_body']}}},
                  'topic_in': [{'format': 'image/jpeg'}, {'format': 'image/depth-zlib'},
-                              {'format': 'sensor/imu', 'optional': True}],
+                              {'format': 'sensor/imu', 'optional': True},
+                              {'format': 'state/odom', 'optional': True},
+                              {'format': 'image/depth-f32-zlib', 'optional': True}],
                  'topic_out': self._outputs('default'), 'odom_interface': _INTERFACE}]
 
     @staticmethod
@@ -247,7 +259,19 @@ class RgbdOdometryPlugin:
             try:
                 topics = start_topics(args) if action == 'start' else None
                 if action == 'start':
-                    enabled = isinstance(topics, list) and len(topics) == 3
+                    metadata = args.get('input_metadata')
+                    metadata = metadata if isinstance(metadata, dict) else {}
+                    formats = {topic: item.get('format') for topic, item in metadata.items()
+                               if isinstance(item, dict)}
+                    if isinstance(args.get('input_bindings'), dict):
+                        formats.update(args['input_bindings'])
+                    try:
+                        calibration = validate_start_inputs(args.get('camera_info'), topics,
+                            isinstance(topics, list) and len(topics) == 3, bindings=formats)
+                    except ValueError as error:
+                        logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
+                        raise
+                    enabled = 'imu_topic' in calibration
                 else:
                     enabled = bool(current and action != 'stop' and
                                    any(port['format'] == 'sensor/imu' for port in current[2]))
@@ -270,11 +294,6 @@ class RgbdOdometryPlugin:
                         raise RuntimeError('RGB-D plugin is shutting down')
                     if instance in self.retiring:
                         raise RuntimeError('finish failed RGB-D cleanup with stop before restarting')
-                    try:
-                        calibration = validate_start_inputs(args.get('camera_info'), topics, enabled)
-                    except ValueError as error:
-                        logging.getLogger(__name__).warning('RGB-D %s start inputs: %s', instance, error)
-                        raise
                     if 'controller_rotation' in args:
                         profile = validate_controller_rotation(args['controller_rotation'])
                     if profile is not None:
@@ -284,22 +303,39 @@ class RgbdOdometryPlugin:
                     calibration.update(settings, visual_frontend=_FRONTENDS[0])
                     calibration['input_declarations'] = deepcopy(args.get('camera_info') or {})
                     image_topics = [calibration[k + '_topic'] for k in ('color', 'depth')]
-                    geometry = {topic: {key: args['camera_info'][topic].get(key)
-                                        for key in ('width', 'height', 'K', 'D')}
+                    from .camera_geometry import camera_parameter
+                    geometry = {topic: {key: camera_parameter(args['camera_info'][topic], key)
+                                        for key in ('width', 'height', 'K', 'D', 'distortion_model', 'format',
+                                                    'color_from_depth', 'depth_scale_m', 'body_from_camera')}
                                 for topic in image_topics}
-                    signature = json.dumps([image_topics, calibration.get('imu_topic'), geometry, profile],
+                    signature = json.dumps([image_topics, calibration.get('imu_candidates'),
+                                            calibration.get('external_candidates'), calibration.get('external_topic'),
+                                            geometry, profile],
                                            sort_keys=True)
                     if current and current[1] != signature:
                         raise ValueError('stop RGB-D odometry before changing its input geometry or rotation alignment')
                     if not current:
                         require_runtime()
                         self._ensure_supervisor()
-                        bindings = [{'topic': calibration[k + '_topic'], 'format': f}
-                                    for k, f in (('color', 'image/jpeg'), ('depth', 'image/depth-zlib'))]
-                        if enabled:
-                            bindings.append({'topic': calibration['imu_topic'], 'format': 'sensor/imu'})
+                        bindings = [{'topic': calibration['color_topic'], 'format': 'image/jpeg'},
+                                    {'topic': calibration['depth_topic'], 'format': calibration['depth_format']}]
+                        bindings.extend({'topic': topic, 'format': 'sensor/imu'}
+                                        for topic in calibration.get('imu_candidates', ()))
+                        if calibration.get('external_topic'):
+                            bindings.append({'topic': calibration['external_topic'], 'format': 'state/odom'})
                         current = (RgbdSession(calibration, self.executor, self._outputs(instance)[0]['topic'],
                             **({'input_registry': self._input_registry} if self._input_registry else {})), signature, bindings)
+                        if calibration.get('external_candidates'):
+                            from .rgbd_external_input import ExternalOdometryInput
+                            try:
+                                stream = ExternalOdometryInput(self._outputs(instance)[0]['topic'],
+                                    calibration, learning=args.get('external_motion_learning', True))
+                            except Exception:
+                                current[0].close(report_idle=False)
+                                raise
+                            self.external_streams[instance] = current[0].external_stream = stream
+                            if getattr(current[0], 'observations', None) is not None:
+                                current[0].observations.visual_sink = current[0]._observe_external_visual
                         controller = getattr(current[0], 'calibration', {}).get('controller_rotation')
                         if controller is not None:
                             bindings.append({'topic': controller['topic'], 'format': 'data/json'})
@@ -320,7 +356,17 @@ class RgbdOdometryPlugin:
                     active_profile = getattr(current[0], 'requested_calibration', {}).get('controller_rotation')
                     if active_profile is not None:
                         settings['controller_rotation'] = deepcopy(active_profile)
-                return {**(current[0].info() if current else {'state': 'idle'}),
+                stream = self.external_streams.get(instance)
+                info = current[0].info() if current else {'state': 'idle'}
+                if stream is not None:
+                    info['external_fusion'] = external = stream.info()
+                    if 'stamp_ns' in external:
+                        info.update(visual_status=info['status'], visual_segment_id=info['segment_id'],
+                                    visual_reason=info['reason'], status=external['status'],
+                                    reason=external['reason'], segment_id=external['segment_id'],
+                                    pose_reference='body', last_measurement_ns=external['stamp_ns'],
+                                    loss_kind='output' if external['status'] == 'lost' else None)
+                return {**info,
                         'topic_out': self._outputs(instance), 'odom_interface': _INTERFACE,
                         'topic_in': current[2] if current else [],
                         'recovery': self._recovery_info(instance),
@@ -340,7 +386,7 @@ class RgbdOdometryPlugin:
                 dispose_node(self.executor, self.recovery_node, label='RGB-D recovery')
                 self.recovery_node = self.recovery_timer = None
             failures = []
-            for instance in set(self.instances) | set(self.retiring):
+            for instance in set(self.instances) | set(self.retiring) | set(self.external_streams):
                 try:
                     self._stop_instance(instance)
                 except Exception as error:

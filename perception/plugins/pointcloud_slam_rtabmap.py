@@ -33,6 +33,12 @@ def require_runtime():
         raise RuntimeError('RTAB-Map ROS message dependencies unavailable: ' + str(error)) from error
 
 
+def paired_sensor_odom(settings):
+    """The measured body pose and registered cloud share one private DDS delivery."""
+    mount = settings.get('capture_mount') or {}
+    return settings.get('rgb_input') is not None and mount.get('interpolate', False)
+
+
 def mapping_parameters(database_path, namespace, settings):
     """Production scan mapping parameters, shared with the real-image smoke gate.
 
@@ -75,6 +81,8 @@ def mapping_parameters(database_path, namespace, settings):
                            'Grid/RangeMax': '0'})
     if settings.get('rgbd_image_recovery'):
         parameters['motus_rgbd_image_recovery'] = True
+    if paired_sensor_odom(settings):
+        parameters.update(subscribe_odom=False, motus_paired_sensor_odom=True)
     parameters.update(native_overrides(settings.get('native_parameters', {})))
     return parameters
 

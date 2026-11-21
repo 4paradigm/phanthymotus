@@ -7,9 +7,11 @@ import uuid
 
 import numpy as np
 
+from .camera_geometry import camera_transform
 from .pointcloud_slam_alignment import align_pose
 from .pointcloud_slam_odom import decode_slam_odom, decode_slam_prediction
 from .pointcloud_slam_transforms import rigid as _rigid
+from .rgbd_body_mount import CaptureMounts
 
 
 class SlamStream:
@@ -18,7 +20,7 @@ class SlamStream:
                  on_frame, max_measurement_age_ms=None,
                  max_future_skew_ms=None, input_contract=None, extrinsic_mode='static',
                  on_unlocalized_frame=None, on_observation=None, on_pose_loss=None,
-                 scan_origin_recovery=False):
+                 scan_origin_recovery=False, pose_capture_mount=False, color_from_depth=None):
         if any(type(v) is not int or v <= 0 for v in (max_pending, max_cloud_points)):
             raise ValueError('positive bounded capacities required')
         self.max_measurement_age_ms = max_measurement_age_ms
@@ -48,6 +50,10 @@ class SlamStream:
         self._last_cloud_stamp_ns = None
         self.input_contract = input_contract
         self._cloud_metadata = OrderedDict()
+        self._pose_capture_mount = pose_capture_mount
+        self._color_from_depth = color_from_depth
+        self._pose_mounts = OrderedDict()
+        self._external_body_frame = None
         self._unmatched_clouds = OrderedDict()
         self._metadata_fallbacks = 0
         self.last_error = ''
@@ -65,7 +71,7 @@ class SlamStream:
 
     @property
     def _live_visual_run(self):
-        # The last origin field records whether the measured run is chassis.
+        # The last origin field distinguishes external motion from visual-only.
         return (self._measured_run is not None and not self._measured_run[0][-1] and
                 self.continuity_token == self._last_admitted_run)
 
@@ -136,6 +142,7 @@ class SlamStream:
                 pose = replace(pose, visual_origin=(pose.segment_id, pose.frame_id))
             if self._pose_anchor is None or pose.stamp_ns >= self._pose_anchor.stamp_ns:
                 self._pose_anchor = pose
+                self._external_body_frame = pose.child_frame_id if pose.external_origin is not None else None
             # Confirmed corrections supersede hypotheses beyond their capture.
             poses = {p.stamp_ns: p for p in self._poses
                      if p.prediction_anchor_ns is None or p.stamp_ns < pose.stamp_ns}
@@ -149,12 +156,43 @@ class SlamStream:
         fresh_visual = self._live_visual_run and received is not None and 0 <= now-received <= self.max_age_s
         self._last_received = now if received is None or fresh_visual else received
         self._odom_state = 'coasting' if pose.prediction_anchor_ns is not None else 'tracking'
+        if pose.external_origin is not None and self._pose_capture_mount:
+            self._remember_pose_mount(sample['vendor'], pose)
+            self._drain_unmatched_clouds(now)
         self._drain(now, measurement_now_ns)
 
+    def _remember_pose_mount(self, vendor, pose):
+        mount = vendor.get('camera_mount')
+        packet = mount.get('packet') if isinstance(mount, dict) else None
+        if not isinstance(packet, dict):
+            return
+        stamp = packet.get('stamp_ns')
+        parent = packet.get('parent_frame')
+        child = packet.get('child_frame', self.cloud_frame)
+        if (type(stamp) is not int or not isinstance(child, str) or
+                (parent is not None and parent != pose.child_frame_id)):
+            return
+        history = self._pose_mounts.get(child)
+        if history is None or history.declaration['parent_frame'] != pose.child_frame_id:
+            history = CaptureMounts(dict(topic='external_fusion', parent_frame=pose.child_frame_id,
+                                         child_frame=child), child, None)
+            self._pose_mounts[child] = history
+        try:
+            history.observe(packet, stamp)
+        except ValueError as error:
+            self.last_error = str(error)
+        self._pose_mounts.move_to_end(child)
+        while len(self._pose_mounts) > 4:
+            self._pose_mounts.popitem(last=False)
+
     def _track_measured_run(self, sample, pose, context):
-        """Preserve declared chassis origins and certify continuity separately."""
+        """Track measured continuity in the active numeric odometry gauge."""
         vendor = sample.get('vendor')
         quality = vendor.get('motus_slam') if isinstance(vendor, dict) else None
+        if pose.external_origin is not None:
+            # The fusion card owns its body's local origin across visual resets.
+            # Only actual motion samples carry its main pose.
+            return self._remember_measured_run(pose, ('external_fusion', *pose.external_origin, True))
         chassis = (isinstance(quality, dict) and quality.get('pose_source') == 'chassis_odometry' and
                    quality.get('pose_reference') == 'body')
         visual = (isinstance(vendor, dict) and vendor.get('source') == 'rtabmap_rgbd_odometry' and
@@ -190,6 +228,9 @@ class SlamStream:
             # Native still needs the gauge identity to check this numeric pose.
             # Without a run token it verifies geometry before extending the map.
             return replace(pose, chassis_origin=origin) if chassis else pose
+        return self._remember_measured_run(pose, origin, chassis=chassis, visual=visual, vendor=vendor)
+
+    def _remember_measured_run(self, pose, origin, *, chassis=False, visual=False, vendor=None):
         token = None
         if self._measured_run is not None:
             last_origin, previous = self._measured_run
@@ -199,7 +240,7 @@ class SlamStream:
             angle = 2*math.acos(min(1., dot))
             # Measured VO can skip captures while its same-stamp registration
             # is still valid. Match the visual runtime's 1.5 s output bound.
-            max_interval = .5 if chassis else 1.5
+            max_interval = 1.5 if visual or pose.external_origin is not None else .5
             if last_origin == origin and (
                     (dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
                     (0 < dt <= max_interval and distance <= .1 + 1.5*dt and
@@ -275,6 +316,41 @@ class SlamStream:
         nearest=min(self._cloud_metadata,key=lambda t:abs(t-stamp))
         return deepcopy(self._cloud_metadata[nearest])
 
+    def _mount_context(self, stamp, frame, explicit=None):
+        if frame == self._external_body_frame:
+            return dict(child_from_cloud=np.eye(4).tolist(), pose_capture_mount=self._pose_capture_mount)
+        if explicit is not None:
+            return explicit
+        if self._pose_capture_mount and self._external_body_frame is not None:
+            context = self._cloud_metadata.get(stamp)
+            if context is not None and (context.get('extrinsic', {}).get('matrix') is not None or
+                    context['measurement'].get('child_from_cloud') is not None):
+                return dict(context, pose_capture_mount=True)
+            history = self._pose_mounts.get(frame)
+            matrix = history.matrix_at(stamp) if history is not None else None
+            if (history is None and self._color_from_depth is not None and
+                    frame == self.cloud_frame and len(self._pose_mounts) == 1):
+                # The VO mount names its color optical child while an
+                # unregistered cloud retains the depth optical coordinates.
+                color = next(iter(self._pose_mounts.values())).matrix_at(stamp)
+                if color is not None:
+                    matrix = color @ camera_transform(self._color_from_depth)
+            if matrix is not None:
+                return dict(child_from_cloud=matrix.tolist(), pose_capture_mount=True)
+            return None
+        return self._nearest_context(stamp)
+
+    def _drain_unmatched_clouds(self, now):
+        for stamp, (frame, cloud, received) in list(self._unmatched_clouds.items()):
+            if self._pose_capture_mount and now-received > self.max_age_s:
+                self._unmatched_clouds.pop(stamp)
+                self._dropped_pending += 1
+                continue
+            context = self._mount_context(stamp, frame)
+            if context is not None:
+                self._unmatched_clouds.pop(stamp)
+                self._accept_cloud(stamp, frame, cloud, now=now, received=received, capture_context=context)
+
     def cloud_metadata(self, packet, *, now, measurement_now_ns=None):
         if not isinstance(packet, dict) or type(packet.get('stamp_ns')) is not int:
             self.last_error = 'invalid cloud metadata timestamp'
@@ -284,10 +360,7 @@ class SlamStream:
             self._cloud_metadata[stamp] = self._capture_context(packet)
             while len(self._cloud_metadata) > self.max_pending:
                 self._cloud_metadata.popitem(last=False)
-            for cloud_stamp in list(self._unmatched_clouds):
-                frame,cloud,received=self._unmatched_clouds.pop(cloud_stamp)
-                self._accept_cloud(cloud_stamp,frame,cloud,now=now,received=received,
-                                   capture_context=self._nearest_context(cloud_stamp))
+            self._drain_unmatched_clouds(now)
         except ValueError as error:
             self.last_error = str(error)
 
@@ -298,12 +371,12 @@ class SlamStream:
         count = len(cloud) if point_count is None else point_count
         if type(count) is not int or not 0 < count <= self.max_cloud_points:
             raise ValueError('invalid cloud size or capacity')
-        if capture_context is None:
-            capture_context = self._nearest_context(stamp_ns)
-        if self._manual_extrinsic and capture_context is not None:
+        capture_context = self._mount_context(stamp_ns, frame, capture_context)
+        if self._manual_extrinsic and capture_context is not None and frame != self._external_body_frame:
             capture_context=deepcopy(capture_context)
             capture_context['child_from_cloud']=self.extrinsic.tolist()
-        if self.extrinsic_mode == 'dynamic' and capture_context is None:
+        if capture_context is None and (self.extrinsic_mode == 'dynamic' or
+                (self._pose_capture_mount and self._external_body_frame is not None)):
             self._unmatched_clouds[stamp_ns] = (frame, deepcopy(cloud), now if received is None else received)
             while len(self._unmatched_clouds) > self.max_pending:
                 self._unmatched_clouds.popitem(last=False)

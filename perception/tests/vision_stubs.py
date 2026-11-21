@@ -121,6 +121,12 @@ class _FakeExecutor:
     def remove_node(self, node):
         self.nodes.remove(node)
 
+    def spin(self):
+        pass
+
+    def shutdown(self, timeout_sec=None):
+        pass
+
 
 class _FakeString:
     def __init__(self):

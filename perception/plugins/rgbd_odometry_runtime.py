@@ -15,9 +15,10 @@ import tempfile
 import threading
 import time
 import uuid
-import zlib
 
 import numpy as np
+
+from .camera_geometry import decode_depth_zlib
 
 from utils.dds_transport import receive_environment
 
@@ -598,6 +599,7 @@ class CaptureObservations:
     def __init__(self, fusion, startup_gate=None):
         self.fusion = fusion
         self.startup_gate = startup_gate
+        self.visual_sink = None
         self.frames = OrderedDict()
         self.last_added = 0
         self.geometry_capture = None
@@ -712,10 +714,11 @@ class CaptureObservations:
             if 'imu_deadline' in entry and now > deadline:
                 # A late drain cannot establish that coverage was ready by the deadline.
                 coverage = False
-            if (not ready or not coverage) and now < deadline:
+            visual_only_startup = self.fusion.filter is None and not self.fusion.samples
+            if (not ready or (not coverage and not visual_only_startup)) and now < deadline:
                 break
             self.frames.pop(stamp)
-            if not ready or not coverage:
+            if not ready or (not coverage and not visual_only_startup):
                 self.counts['deadline_expired'] += 1
             if not ready:
                 self.expired.append(stamp)
@@ -744,6 +747,10 @@ class CaptureObservations:
             self.counts['completed'] += 1
             sample = self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
                                                reason=reason, arrival_ns=entry['added'])
+            if self.visual_sink is not None and sample.get('pose') is not None:
+                tracking = self.fusion.last_tracking
+                if tracking is not None and tracking[0] == stamp and tracking[2] is not None:
+                    self.visual_sink(stamp, self.fusion.segment, tracking[2])
             probe = self.startup_gate
             if probe is not None:
                 if self.fusion.filter is not None:
@@ -788,11 +795,6 @@ class RgbdSession:
         self.contexts_by_stamp = OrderedDict()
         calibration = observation_calibration(calibration, self.time_policy.clock_id)
         self.assistance_unavailable = None
-        controller = calibration.get('controller_rotation')
-        if (controller is not None and (calibration.get('time_basis') != 'source_capture' or
-                                        controller['clock_id'] != calibration['clock_id'])):
-            calibration.pop('controller_rotation')
-            self.assistance_unavailable = 'controller rotation alignment does not match the camera capture clock'
         if association_enabled(calibration):
             binary = require_runtime()
             try:
@@ -912,8 +914,9 @@ class RgbdSession:
                 # the callback group; admission still rejects samples over 750 ms old.
                 imu_qos = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
                 self.imu_callback_group = MutuallyExclusiveCallbackGroup()
-                self.node.create_subscription(String, self.imu_topic, self._enqueue_imu, imu_qos,
-                                              callback_group=self.imu_callback_group)
+                for source in self.requested_calibration.get('imu_candidates', (self.imu_topic,)):
+                    self.node.create_subscription(String, source, self._enqueue_imu, imu_qos,
+                                                  callback_group=self.imu_callback_group)
             if self.mounts is not None:
                 self.node.create_subscription(String, self.mounts.declaration['topic'], self._mount, qos_profile_sensor_data)
             self.node.create_timer(.05 if self.fusion else .2, self._watchdog)
@@ -960,11 +963,14 @@ class RgbdSession:
         with self.lock:
             self._drain_imu()
             try:
-                now, stamp = time.time_ns(), stamp_ns(msg)
+                now = time.time_ns()
+                header = getattr(msg, 'header', None)
+                capture = stamp_ns(msg) if getattr(header, 'stamp', None) is not None else None
+                stamp = now if capture is None else capture
                 if isinstance(self.pairs, RgbdPairer):
                     if context is None:
                         declaration = self.calibration.get('input_declarations', {}).get(self.calibration[kind + '_topic'], {})
-                        source = dict(declaration.get('vendor') or {}, stamp_ns=stamp)
+                        source = dict(declaration.get('vendor') or {}, stamp_ns=capture)
                         context = self.time_policy.select(source, now, time.monotonic_ns())
                     stamp = context.observation_stamp_ns
                 self.latest_inputs[kind] = now
@@ -972,7 +978,7 @@ class RgbdSession:
                     return
                 try:
                     pair = (self.pairs.push(kind, msg, context) if isinstance(self.pairs, RgbdPairer) else
-                            self.pairs.push(kind, stamp_ns(msg), msg, time.time_ns()))
+                            self.pairs.push(kind, stamp, msg, now))
                 except ValueError as error:
                     # Only malformed payload structure is rejected here.
                     self.counts['rejected_inputs'] += 1
@@ -1057,9 +1063,12 @@ class RgbdSession:
         if not (getattr(self.gate, "last_input_received", 0) or self.gate.last_input):
             return  # the watchdog's separate input timeout identifies missing images
         elapsed = now_s-getattr(self, 'visual_initialization_started', self.started)
-        if self._fusing() and self.imu.state == 'initializing' and elapsed >= IMU_STARTUP_GRACE_S:
+        if self._fusing() and self.imu.state == 'initializing':
             now_ns = time.time_ns()
-            if self.has_fresh_inputs(now_ns):
+            probe = getattr(self.observations, 'startup_gate', None)
+            raw_tracking = (probe is not None and probe.state == 'tracking' and
+                            0 <= now_ns-probe.last_stamp <= MAX_VISUAL_RESULT_AGE_NS)
+            if raw_tracking or (elapsed >= IMU_STARTUP_GRACE_S and self.has_fresh_inputs(now_ns)):
                 self.fusion.fault('camera IMU unavailable during startup; using visual tracking')
                 self._check_fusion(now_ns)
                 return
@@ -1153,7 +1162,7 @@ class RgbdSession:
             if len(self.imu_pending) >= 100:
                 self.imu_overflow = True
                 self.imu_pending.popleft()
-            self.imu_pending.append(msg)
+            self.imu_pending.append((msg, time.time_ns()))
 
     def _controller_imu(self, msg):
         with self.lock:
@@ -1173,38 +1182,41 @@ class RgbdSession:
             pending = list(self.imu_pending)
             self.imu_pending.clear()
             self.imu_overflow = False
-        for msg in pending:
+        for msg, received_ns in pending:
             if self.stop_event.is_set():
                 return
-            self._imu(msg)
+            self._imu(msg, received_ns)
 
-    def _imu(self, msg):
+    def _imu(self, msg, received_ns=None):
         with self.lock:
             if self.stop_event.is_set():
                 return
             try:
+                now = time.time_ns() if received_ns is None else received_ns
                 packet = json.loads(msg.data)
+                if isinstance(packet, dict) and packet.get('schema') == 'motus.odom/1':
+                    return  # Untyped canvas inputs are routed by their actual payload.
                 if (isinstance(packet, dict) and packet.get('schema') == 'motus.imu/1' and
                         'quaternion' in packet):
-                    self.rotation_hints.observe_controller(packet, time.time_ns(), aligned=True)
+                    self.rotation_hints.observe_controller(packet, now, aligned=True)
                     if 'angular_velocity' not in packet and 'linear_acceleration' not in packet:
                         return  # An orientation-only packet is an optional hint, not a fusion input.
                 if self._probing_auxiliary():
-                    self.auxiliary_probe.observe(packet, time.time_ns(), time.monotonic())
+                    self.auxiliary_probe.observe(packet, now, time.monotonic())
                 if self.gate.state == 'lost' or self.imu is None:
                     return
                 if getattr(self, 'fusion', None) is not None:
                     if self.fusion.state != 'lost':
                         try:
-                            self.fusion.observe_imu(packet, time.time_ns())
+                            self.fusion.observe_imu(packet, now)
                         except ValueError:
                             # Each stage records its own fault. Missing translation
                             # stops ESKF but leaves a valid rotation available.
                             return
                     else:
-                        self.imu.observe(packet, time.time_ns())
+                        self.imu.observe(packet, now)
                     return
-                sample = self.imu.observe(packet, time.time_ns())
+                sample = self.imu.observe(packet, now)
                 if sample is None:
                     return
                 from sensor_msgs.msg import Imu
@@ -1293,13 +1305,10 @@ class RgbdSession:
                         message.header.stamp.sec, message.header.stamp.nanosec = divmod(ctx.observation_stamp_ns, 10**9)
                 capture_stamp = native_capture_stamp(color, depth)
                 capture_clock = None
-                estimated_capture = False
                 if isinstance(pair, RgbdPair):
                     if (pair.color_time.time_basis == pair.depth_time.time_basis == 'source_capture' and
                             pair.color_time.normalized_clock_id == pair.depth_time.normalized_clock_id):
                         capture_clock = pair.color_time.normalized_clock_id
-                    estimated_capture = (pair.color_time.time_basis == 'capture_estimated' or
-                                         pair.depth_time.time_basis == 'capture_estimated')
                     selected = pair.color_time if capture_stamp == pair.color_time.observation_stamp_ns else pair.depth_time
                     other=pair.depth_time if selected is pair.color_time else pair.color_time
                     selected=replace(selected,observation_id=uuid.uuid4().hex,
@@ -1311,31 +1320,47 @@ class RgbdSession:
                 imu_deadline = time.monotonic() + .15
                 decode_started=time.monotonic_ns()
                 image = cv2.imdecode(np.frombuffer(color.data, np.uint8), cv2.IMREAD_COLOR)
-                decoder = zlib.decompressobj()
                 depth_width,depth_height=self.calibration.get('depth_size',(640,480))
-                needed = depth_width * depth_height * 2
-                raw = decoder.decompress(bytes(depth.data), needed + 1)
                 color_width,color_height=self.calibration.get('color_size',(640,480))
-                if (image is None or image.shape != (color_height, color_width, 3) or len(raw) != needed or
-                        not decoder.eof or decoder.unused_data or decoder.unconsumed_tail):
+                floating = self.calibration.get('depth_format') == 'image/depth-f32-zlib'
+                registry = getattr(self, 'input_registry', None)
+                if registry is not None and isinstance(pair, RgbdPair):
+                    raw_depth = registry.decode_raw_depth(pair.depth_context, depth.data, depth_width, depth_height,
+                                                          floating=floating)
+                else:
+                    raw_depth = decode_depth_zlib(bytes(depth.data), depth_width, depth_height, floating=floating)
+                if image is None or image.shape != (color_height, color_width, 3):
                     raise ValueError('RGB-D payload does not match declared image dimensions')
-                if (color_width,color_height)!=(depth_width,depth_height):
-                    image=cv2.resize(image,(depth_width,depth_height),interpolation=cv2.INTER_AREA)
-                    encoded,buffer=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,95])
-                    if not encoded:raise ValueError('registered RGB resize encoding failed')
-                    color=deepcopy(color)
-                    color.data=array('B',buffer.tobytes())
-                z16 = np.frombuffer(raw, '<u2').reshape(depth_height, depth_width)
-                image_quality = observation_quality(image, z16)
+                geometry = self.calibration.get('image_geometry')
+                if geometry is None:
+                    if (color_width, color_height) != (depth_width, depth_height):
+                        raise ValueError('RGB-D camera geometry is required for different image sizes')
+                    depth_image = raw_depth
+                else:
+                    rectified = geometry.rectify_color(image)
+                    if rectified is not image:
+                        encoded, buffer = cv2.imencode('.jpg', rectified, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        if not encoded:
+                            raise ValueError('rectified RGB encoding failed')
+                        color.data = array('B', buffer.tobytes())
+                    image = rectified
+                    depth_image = (raw_depth if geometry._aligned and geometry.scale == .001 and not floating
+                                   else geometry.align_depth(raw_depth))
+                image_quality = observation_quality(image, depth_image)
                 out = RGBDImage()
                 out.header = deepcopy(depth.header)
                 # RTAB-Map supports lossless PNG depth in RGBDImage. Keep the
                 # native inter-process message bounded instead of fragmenting
                 # 1.5 MB of raw RGB/depth over best-effort DDS on every frame.
-                ok, png = cv2.imencode('.png', z16, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                out.rgb_compressed = deepcopy(color)
+                png_pixels = depth_image
+                if depth_image.dtype != np.uint16:
+                    # RTAB-Map encodes float depth as four PNG byte channels.
+                    png_pixels = np.ascontiguousarray(depth_image, dtype='<f4').view(np.uint8).reshape(
+                        color_height, color_width, 4)
+                ok, png = cv2.imencode('.png', png_pixels, [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 if not ok:
                     raise ValueError('RGB-D lossless depth encoding failed')
-                out.rgb_compressed = deepcopy(color)
                 out.depth_compressed = CompressedImage()
                 out.depth_compressed.header = deepcopy(depth.header)
                 out.depth_compressed.format = 'png'
@@ -1344,7 +1369,7 @@ class RgbdSession:
                 for field in ('rgb_camera_info', 'depth_camera_info'):
                     info = CameraInfo()
                     info.header = deepcopy(out.header)
-                    info.width, info.height = depth_width, depth_height
+                    info.width, info.height = color_width, color_height
                     info.k, info.d, info.distortion_model = k, [0.] * 5, 'plumb_bob'
                     info.r = np.eye(3).ravel().tolist()
                     info.p = [k[0], 0., k[2], 0., 0., k[4], k[5], 0., 0., 0., 1., 0.]
@@ -1352,13 +1377,6 @@ class RgbdSession:
                 if hasattr(self,'stage_times'):
                     with self.lock:self.stage_times['decode'].append(max(0,time.monotonic_ns()-decode_started))
                 wait_started=time.monotonic_ns()
-                if estimated_capture:
-                    with self.lock:
-                        if self._fusing():
-                            self.fusion.fault('RGB-D capture clocks are unverified for ESKF')
-                            self._check_fusion(time.time_ns())
-                        elif self.fusion is None and self.imu is not None:
-                            self.gate.fault('RGB-D capture clocks are unverified for native IMU', 'imu')
                 covered=self._wait_for_imu(capture_stamp, deadline=imu_deadline)
                 if hasattr(self,'stage_times'):
                     with self.lock:self.stage_times['imu_wait'].append(max(0,time.monotonic_ns()-wait_started))
@@ -1373,7 +1391,7 @@ class RgbdSession:
                              self._imu_frame_ready(capture_stamp, time.time_ns()))
                     if ready and not self.stop_event.is_set():
                         if self._fusing():
-                            for sample in self.observations.add_frame(capture_stamp, image, z16, time.time_ns()):
+                            for sample in self.observations.add_frame(capture_stamp, image, depth_image, time.time_ns()):
                                 self._publish(sample)
                                 self.counts['estimates'] += 1
                             self._check_fusion(time.time_ns())
@@ -1397,7 +1415,7 @@ class RgbdSession:
                             self.quality_by_stamp.popitem(last=False)
                         if getattr(self, 'rotation_hints', None) is not None:
                             self.rotation_hints.offer(self.imu, capture_stamp, time.time_ns(),
-                                available=not estimated_capture, capture_clock=capture_clock)
+                                                      capture_clock=capture_clock)
                         probe_deadline = getattr(self.gate, 'relocalization_deadline_mono', None)
                         if probe_deadline is not None:
                             # A dropped best-effort probe has no acknowledgement.
@@ -1516,6 +1534,10 @@ class RgbdSession:
             vendor['reason'] = fallback.replace('_', '-') + ' fallback: ESKF ' + self.fallback['reason'][:80]
         return sample
 
+    def _observe_external_visual(self, stamp, segment, pose):
+        if self.publish_output and getattr(self, 'external_stream', None) is not None:
+            self.external_stream.visual(stamp, segment, pose)
+
     def _publish(self, sample):
         if not self.publish_output:
             return  # a replacement cannot advertise tracking before old cleanup succeeds
@@ -1541,7 +1563,7 @@ class RgbdSession:
             sample['vendor']['pause'] = dict(source='visual_gate', status='recovering', mapping_allowed=False)
         association = getattr(self, 'contexts_by_stamp', {}).get(stamp)
         context = association[0] if association else None
-        if getattr(self, 'mounts', None) is not None and (context is None or context.time_basis == 'source_capture'):
+        if getattr(self, 'mounts', None) is not None:
             sample = self.mounts.attach(sample, time.time_ns())
         if context is not None:
             self.published_context = context
@@ -1599,6 +1621,13 @@ class RgbdSession:
             depth_enabled=bool(self.fusion and self.fusion.geometry))
         sample['vendor']['registration'] = report
         self.last_registration = deepcopy(report)
+        stream = getattr(self, 'external_stream', None)
+        if stream is not None:
+            stream.visual_state = sample['vendor']['motus_slam']['status']
+            if sample['pose'] is not None and sample['vendor']['source'] == 'rtabmap_rgbd_odometry':
+                self._observe_external_visual(stamp, self.segment, sample['pose'])
+            if stream.active:
+                return
         output = String(data=json.dumps(sample, allow_nan=False))
         if context is not None and getattr(self, 'input_registry', None) is not None:
             self.input_registry.register_derived(self.topic, output, context, 'rgbd_odometry')

@@ -32,11 +32,11 @@ def test_receipt_pair_retains_separate_receipt_contexts():
     assert pair.color_context.source_capture_id is None and pair.depth_context.source_capture_id is None
 
 
-def test_epoch_and_time_basis_labels_do_not_prevent_pairing():
-    for kind,other in (('depth',context(epoch='two')),('color',context(receipt=True))):
-        p=RgbdPairer();p.push('color',msg(),context())
-        pair = p.push(kind,msg(),other)
-        assert (pair is not None) == (kind == 'depth')
+def test_explicit_epochs_on_same_source_do_not_pair_across_reset():
+    p=RgbdPairer()
+    p.push('color',msg(),replace(context(), source_id='device'))
+    assert p.push('depth',msg(),replace(context(epoch='two'), source_id='device')) is None
+    assert p.push('color',msg(),replace(context(epoch='two'), source_id='device')) is not None
 
 
 def test_count_byte_and_ingress_age_limit_pending_frames():
@@ -77,7 +77,7 @@ def test_one_missing_capture_preserves_the_other_source_time():
     assert pair.method=='receipt_estimated'
     assert pair.color_context.time_basis=='source_capture'
     assert pair.color_time.time_basis=='receipt_estimated'
-    assert pair[0][0]==a.ingress_realtime_ns
+    assert pair[0][0]==a.observation_stamp_ns
     assert pair.color_time.parent_observation_ids == (a.observation_id,)
     assert pair.color_time.original_stamp==a.original_stamp
     assert pair.depth_context.source_capture_id is None
@@ -116,16 +116,16 @@ def test_one_far_capture_does_not_consume_its_partner_or_fall_back_to_near_recei
     assert pairer.dropped_by_side == {'color': 1, 'depth': 0}
 
 
-def test_capture_identity_prefers_correct_frame_only_within_skew_bounds():
+def test_capture_identity_is_diagnostic_and_nearest_stamp_wins():
     pairer = RgbdPairer()
     same = context(1_000_000_000, capture='7')
     pairer.push('color', msg(), same)
     pairer.push('color', msg(), context(1_006_000_000, capture='8'))
-    assert pairer.push('depth', msg(), context(1_006_000_000, capture='7')).color_context is same
+    assert pairer.push('depth', msg(), context(1_006_000_000, capture='7')).color_context is not same
     assert pairer.push('depth', msg(), context(1_100_000_000, capture='8')) is None
 
 
-def test_different_capture_clocks_use_bounded_common_receipts():
+def test_distant_numeric_captures_do_not_use_receipt_time():
     pairer = RgbdPairer()
     a = context()
     b = replace(context(50), normalized_clock_id='depth_clock',
@@ -135,10 +135,7 @@ def test_different_capture_clocks_use_bounded_common_receipts():
     assert pairer.push('depth', msg(), b) is None
     near = replace(a, ingress_realtime_ns=b.ingress_realtime_ns+123,
                    ingress_monotonic_ns=b.ingress_monotonic_ns+123)
-    pair = pairer.push('color', msg(), near)
-    assert pair.method == 'receipt_estimated' and pair.skew_ns == 123
-    assert pair.color_time.time_basis == pair.depth_time.time_basis == 'receipt_estimated'
-    assert pair.color_context is near and pair.depth_context is b
+    assert pairer.push('color', msg(), near) is None
 
 
 @pytest.mark.parametrize('clock_id', ['depth_clock', ''])
@@ -171,7 +168,7 @@ def test_close_numeric_capture_stamps_pair_despite_clock_labels_and_delayed_ingr
     assert pairer.push('color', msg(), first).depth_time.normalized_clock_id == estimated_clock
 
 
-def test_declared_common_capture_clock_precedes_estimated_numeric_alignment():
+def test_closer_numeric_capture_precedes_shared_clock_label():
     pairer = RgbdPairer()
     declared = context()
     closer = replace(context(1_012_000_000), normalized_clock_id='other')
@@ -180,10 +177,10 @@ def test_declared_common_capture_clock_precedes_estimated_numeric_alignment():
 
     pair = pairer.push('depth', msg(), context(1_012_000_000))
 
-    assert pair.color_context is declared and pair.method == 'nearest_capture'
+    assert pair.color_context is closer and pair.method == 'nearest_capture_estimated'
 
 
-def test_close_numeric_capture_precedes_receipt_fallback():
+def test_numeric_capture_is_preserved_when_other_candidate_only_has_receipt():
     pairer = RgbdPairer()
     aligned = replace(context(), normalized_clock_id='other')
     receipt = context(1_080_000_000, receipt=True)

@@ -384,11 +384,7 @@ def test_frame_and_watchdog_predictions_require_imu_coverage_back_to_measured_an
         assert sample['vendor']['fusion']['prediction'] is None
 
 
-@pytest.mark.parametrize('change', [
-    {'clock_id': 'unrelated-clock'}, {'stamp_source': 'read_completion'},
-    {'camera_frame_id': 'another-camera'}, {'accel_stamp_ns': 1_000_000},
-    {'epoch': 'restarted'},
-])
+@pytest.mark.parametrize('change', [{'accel_stamp_ns': 1_000_000}, {'epoch': 'restarted'}])
 def test_inertial_prediction_cannot_cross_incomparable_or_discontinuous_samples(change):
     c, anchor = warmed()
     t = anchor + 10_000_000
@@ -400,16 +396,16 @@ def test_inertial_prediction_cannot_cross_incomparable_or_discontinuous_samples(
 
 
 @pytest.mark.parametrize('missing', ['source_id', 'epoch'])
-def test_prediction_needs_identifiable_measurements(missing):
+def test_prediction_coverage_uses_numeric_observations_without_identities(missing):
     c = ShortTermFusion('run', 'optical', 'capture-clock', K)
     for stamp in (1_000_000_000, 1_020_000_000):
         packet = source(stamp)
         del packet[missing]
         c.observe_imu(packet, stamp)
-    assert not c._imu_covers(1_000_000_000, 1_020_000_000)
+    assert c._imu_covers(1_000_000_000, 1_020_000_000)
 
 
-def test_measurement_without_epoch_can_aid_fusion_without_exporting_inertial_prediction(monkeypatch):
+def test_numeric_imu_without_epoch_can_aid_fusion_and_export_inertial_prediction(monkeypatch):
     def no_epoch(stamp):
         sample = source(stamp)
         del sample['epoch']
@@ -433,16 +429,12 @@ def test_measurement_without_epoch_can_aid_fusion_without_exporting_inertial_pre
     assert len(initial_poses) == 1
     assert initial_poses[0][0, 3] == pytest.approx(.006)
     assert out['pose'] is None
-    assert out['vendor']['fusion']['prediction'] is None
+    assert out['vendor']['fusion']['prediction'] is not None
 
 
 @pytest.mark.parametrize('change', [
-    {'source_id': None},
     {'epoch': 'restarted'},
-    {'clock_id': 'other-clock'},
-    {'clock_mapping': {'verified': False}},
-    {'stamp_source': 'read_completion'},
-    {'gyro_frame_id': 'different-axes'},
+    {'source_id': 'other-sensor'},
     {'camera_from_accel_translation': [.02, 0., 0.]},
 ])
 def test_internal_stationarity_rejects_imu_provenance_changes(change):
@@ -456,7 +448,6 @@ def test_internal_stationarity_rejects_imu_provenance_changes(change):
 @pytest.mark.parametrize('change', [
     {'camera_from_accel_translation': [.02, 0., 0.]},
     {'camera_from_gyro': [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]},
-    {'calibration_id': 'recalibrated'},
 ])
 def test_new_calibration_does_not_extend_an_old_prediction_anchor(change):
     c, anchor = warmed()

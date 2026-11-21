@@ -14,7 +14,7 @@ from plugins.pointcloud import PointCloudPerceptionPlugin
 def _declaration(topic='/depth', **overrides):
     return {
         'schema': 'motus.slam_input/1', 'topic': topic, 'kind': 'depth',
-        'format': 'image/depth-z16', 'source_id': 'depth-camera',
+        'format': 'image/depth-f32', 'source_id': 'depth-camera',
         'length_unit': 'mm', 'frame_id': 'optical', 'reference_point': None,
         'clock_id': 'ros', 'stamp_source': 'measurement',
         'observation_model': 'pinhole', 'cloud_semantics': 'depth_frame',
@@ -27,10 +27,10 @@ def _declaration(topic='/depth', **overrides):
 
 
 def _camera(topic='/depth'):
-    return {'schema': 'motus.camera/1', 'topic': topic, 'format': 'image/depth-z16',
+    return {'schema': 'motus.camera/1', 'topic': topic, 'format': 'image/depth-f32',
             'id': 'optical', 'source': 'derived-from-K', 'distortion_model': 'pinhole',
             'width': 1, 'height': 1, 'K': [2., 0., 0., 0., 2., 0., 0., 0., 1.],
-            'vendor': {'depth_unit': 'mm', 'depth_source': 'measured',
+            'vendor': {'depth_unit': 'm', 'depth_source': 'measured',
                        'timestamp_semantics': 'source_capture_mapped'}}
 
 
@@ -67,8 +67,8 @@ def _running(declaration=None, **args):
 
 
 def _depth(value=2., stamp_ns=123_000_000_456, frame='optical'):
-    msg = _FakeImage(data=np.array([round(value * 1000)], dtype='<u2').tobytes(),
-                     encoding='16UC1', width=1, height=1, step=2)
+    msg = _FakeImage(data=np.array([value], dtype='<f4').tobytes(),
+                     encoding='32FC1', width=1, height=1, step=4)
     msg.header.frame_id = frame
     msg.header.stamp = types.SimpleNamespace(
         sec=stamp_ns // 1_000_000_000, nanosec=stamp_ns % 1_000_000_000)

@@ -12,7 +12,8 @@ _TANGENT_FLOOR = np.diag(_TANGENT_SCALE**2)
 
 
 def _valid_depth(depth):
-    return (depth >= 200) & (depth <= 8000)
+    low, high = (200, 8000) if depth.dtype == np.uint16 else (.2, 8.)
+    return (depth >= low) & (depth <= high)
 
 
 def _bounded_transform(transform):
@@ -97,7 +98,7 @@ class DepthRegistration:
 
     def _points(self, depth):
         y, x = np.indices(depth.shape)
-        z = depth.astype(float)*.001
+        z = depth.astype(float)*(.001 if depth.dtype == np.uint16 else 1.)
         return np.stack(((x-self.K[0, 2])*z/self.K[0, 0],
                          (y-self.K[1, 2])*z/self.K[1, 1], z), -1)
 
@@ -203,8 +204,8 @@ class DepthRegistration:
         except (TypeError, ValueError):
             return None
         if (current.ndim != 2 or current.shape != reference.shape
-                or min(current.shape) < 8 or current.dtype != np.uint16
-                or reference.dtype != np.uint16 or not _bounded_transform(transform)):
+                or min(current.shape) < 8 or current.dtype not in (np.uint16, np.float32)
+                or reference.dtype not in (np.uint16, np.float32) or not _bounded_transform(transform)):
             return None
         valid_current, valid_reference = _valid_depth(current), _valid_depth(reference)
         if valid_current.mean() < .15 or valid_reference.mean() < .15:
@@ -343,7 +344,7 @@ def observation_quality(color, depth):
     image heuristics and model floors require real sensor validation.
     """
     image, depth = np.asarray(color), np.asarray(depth)
-    valid_depth = (depth.ndim == 2 and depth.size and depth.dtype == np.uint16
+    valid_depth = (depth.ndim == 2 and depth.size and depth.dtype in (np.uint16, np.float32)
                    and depth.shape == image.shape[:2])
     fraction = float(_valid_depth(depth).mean()) if valid_depth else 0.
     contrast, sharpness = 0., 0.

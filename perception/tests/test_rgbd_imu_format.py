@@ -46,6 +46,16 @@ def test_optional_provenance_can_be_absent_in_both_computation_paths():
     assert len(f.samples)==1
 
 
+def test_imu_missing_stamp_uses_receipt_time_once_and_defaults_second_vector_to_it():
+    a = ImuAttitude('optical', 'capture-clock')
+    p = packet()
+    del p['stamp_ns'], p['accel_stamp_ns']
+    now = 1_010_000_000
+    assert a.observe(p, now)['stamp_ns'] == now
+    assert a.last_accel == now
+    assert a.orientation_at(now, now + 100_000_000, calibrated=True) == [0., 0., 0., 1.]
+
+
 @pytest.mark.parametrize('stamp', [0,1_000_000_000,1_150_000_001,10_000_000_000,900_000_000])
 def test_numeric_time_is_consumed_without_age_order_skew_or_interval_policy(stamp):
     a=ImuAttitude('optical','capture-clock')

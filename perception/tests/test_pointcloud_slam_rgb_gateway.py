@@ -161,28 +161,30 @@ def image(n, ms, data=b'good'):
 
 @pytest.mark.parametrize("silent_odom", [False, True])
 def test_visual_depth_keeps_the_measured_grid_after_preview_decimation(calibrated_node, silent_odom):
+    from plugins.camera_geometry import CameraModel
     from plugins.spatial_input import InputAdapterRegistry, _identity
     from plugins.spatial_time import FrameContext
-    from test_pointcloud_plugin import _FakeImage, _plugin, metric_z16_declaration
+    from test_pointcloud_plugin import _FakeImage, _plugin, metric_f32_declaration
     from test_pointcloud_slam_stream import odom
 
     n = calibrated_node
     w, h = 640, 480
     n._rgb.width, n._rgb.height = w, h
     n._rgb.K = np.array([[600., 0., 319.5], [0., 600., 239.5], [0., 0., 1.]])
+    n._rgb.geometry = CameraModel(dict(width=w, height=h, K=n._rgb.K))
     n._rgb._decode_jpeg = lambda _: np.zeros((h, w, 3), np.uint8)
     n.stream.max_cloud_points = 20_000
     registry = InputAdapterRegistry()
     n._input_registry = registry
     plugin, executor = _plugin({'metric_cloud': True})
-    calibration = dict(metric_z16_declaration(w, h), K=n._rgb.K.ravel().tolist())
+    calibration = dict(metric_f32_declaration(w, h), K=n._rgb.K.ravel().tolist())
     assert plugin.dispatch('pointcloud', dict(action='start', input_topic='/depth',
                           camera_info={'/depth': calibration}))['state'] == 'running'
     producer = executor.nodes[0]
     producer._input_registry = registry
-    raw = np.full((h, w), 2000, dtype='<u2')
+    raw = np.full((h, w), 2., dtype='<f4')
     raw[1, 1] = 0
-    depth = _FakeImage(data=raw.tobytes(), encoding='16UC1', width=w, height=h, step=2*w)
+    depth = _FakeImage(data=raw.tobytes(), encoding='32FC1', width=w, height=h, step=4*w)
     ms = 1500 if silent_odom else 1000
     stamp = ms*1_000_000
     depth.header = NS(stamp=NS(sec=1, nanosec=stamp%10**9), frame_id='camera')
@@ -212,7 +214,7 @@ def test_visual_depth_keeps_the_measured_grid_after_preview_decimation(calibrate
         message = published(n, '/sensor_data')[0].raw_messages[-1]
         assert message.laser_scan.width == 19_200
         measured = np.frombuffer(message.right.data, dtype='<f4').reshape(h, w)
-        np.testing.assert_array_equal(measured, raw / 1000.)
+        np.testing.assert_array_equal(measured, raw)
         if silent_odom:
             assert n._pose_loss_seq == 1
             assert n.stream.pending_count == 0
@@ -872,6 +874,31 @@ def test_valid_external_pose_keeps_scan_mapping_when_async_motion_is_unavailable
     assert msg.laser_scan.data and not msg.left.data
     assert not n._motion_waiting
     assert published(n,'/odom')[0].raw_messages[-1].pose.pose.orientation.w==1.
+
+
+def test_fused_rgb_attachment_uses_the_mount_at_its_own_capture(tmp_path, monkeypatch):
+    from plugins import pointcloud_slam_ros as ros
+    from test_pointcloud_slam_stream import external_fusion
+
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    n = ros.RtabmapNode('/o', '/c', settings(extrinsic_mode='dynamic', child_from_cloud=None,
+        pose_capture_mount=True, rgb_input={'topic': '/rgb', 'camera_info': rgb_camera()}),
+        session_dir=tmp_path/'session')
+    try:
+        for ms, x, offset in ((1000, 0., .2), (1040, .04, .5)):
+            sample = external_fusion(ms, x)
+            matrix = np.eye(4); matrix[0, 3] = offset
+            sample['vendor']['camera_mount'] = dict(packet=dict(stamp_ns=ms*1_000_000,
+                parent_frame='body', child_frame='camera', matrix=matrix.tolist()))
+            n.stream.odom(sample, now=ms/1000)
+        stamp = 1_000_000_000
+        n._rgb_reservations[stamp] = (1_040_000_000, np.ones((4, 4, 3), np.uint8), 0)
+        matrix = np.eye(4); matrix[0, 3] = .2
+        pose = n.stream._poses[0]
+        result = n._rgb_attachment(cloud().header, stamp, pose, matrix, np.array([[0., 0., 20.]]))
+        assert result[3].translation.x == pytest.approx(.54)
+    finally:
+        n.close(); n.destroy_node()
 
 
 def test_external_recovery_discards_waiting_unlocated_frames(calibrated_node):

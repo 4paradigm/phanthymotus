@@ -6,55 +6,29 @@ import threading
 
 import numpy as np
 
+from .camera_geometry import CameraModel, camera_parameter, camera_transform, nearest_depth, project_depth
 from .pointcloud_slam_transforms import rigid
 from .pointcloud_slam_capture_mount import CaptureMounts, validate_mount_declaration
 
 
 def validate_rgb_camera(declaration, *, topic):
     try:
-        if (not isinstance(declaration, dict) or declaration.get('schema') != 'motus.camera/1' or
+        if (not isinstance(declaration, dict) or declaration.get('schema') not in (None, 'motus.camera/1') or
                 not isinstance(topic, str) or not topic or
-                declaration.get('format') != 'image/jpeg' or
-                any(type(declaration.get(k)) is not int or not 0 < declaration[k] <= 4096
-                    for k in ('width', 'height'))):
-            raise ValueError('RGB requires a connected JPEG topic and numeric dimensions')
-        k = np.asarray(declaration.get('K'), dtype=float)
-        d = np.asarray(declaration.get('D', []), dtype=float)
-        if (k.size != 9 or not np.isfinite(k).all() or k.flat[0] == 0 or k.flat[4] == 0 or
-                not np.isfinite(d).all()):
-            raise ValueError('RGB requires finite numeric camera intrinsics and distortion')
+                declaration.get('format') != 'image/jpeg'):
+            raise ValueError('RGB requires a connected JPEG topic')
+        CameraModel(declaration)
         return dict(topic=topic, camera_info=deepcopy(declaration))
     except (TypeError, AttributeError, OverflowError) as error:
         raise ValueError('invalid optional RGB declaration') from error
 
 
-def _nearest_depth(u, v, z, width, height):
-    """Keep nearest positive optical Z at each observed pixel."""
-    valid = ((u >= 0) & (u < width) & (v >= 0) & (v < height) &
-             (z > 0) & (z <= np.finfo(np.float32).max))
-    indices = v[valid].astype(np.intp)*width + u[valid].astype(np.intp)
-    depth = np.full(width*height, np.inf, dtype=np.float32)
-    np.minimum.at(depth, indices, z[valid].astype(np.float32))
-    depth[~np.isfinite(depth)] = 0
-    return depth.reshape(height, width)
-
-
-def project_depth(points, camera_from_cloud, K, width, height):
-    """Nearest optical Z of measured points; holes remain zero metres."""
-    transform = rigid(camera_from_cloud)
-    points = np.asarray(points, dtype=float).reshape(-1, 3)
-    points = points[np.isfinite(points).all(axis=1)]
-    moved = points @ transform[:3, :3].T + transform[:3, 3]
-    moved = moved[np.isfinite(moved).all(axis=1) & (moved[:, 2] > 0)]
-    k = np.asarray(K, dtype=float).reshape(3, 3)
-    pixels = moved @ k.T
-    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-        uv = np.rint(pixels[:, :2]/pixels[:, 2:3])
-    return _nearest_depth(uv[:, 0], uv[:, 1], moved[:, 2], width, height)
-
-
 def project_measured_depth(measured, camera_from_cloud, K, width, height):
-    depth, (fx, fy, cx, cy), minimum, maximum = measured
+    depth, source_model, minimum, maximum = measured
+    if isinstance(source_model, CameraModel):
+        points = source_model.backproject(depth, minimum=minimum, maximum=maximum)
+        return project_depth(points, camera_from_cloud, K, width, height)
+    fx, fy, cx, cy = source_model
     valid = np.isfinite(depth) & (depth > 0.) & (depth >= minimum) & (depth <= maximum)
     depth = np.where(valid, depth, 0.)
     source_K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
@@ -81,7 +55,7 @@ def project_measured_depth(measured, camera_from_cloud, K, width, height):
         u = np.rint(component(projection[0])/scale)
         v = np.rint(component(projection[1])/scale)
     z[~valid] = 0.
-    return _nearest_depth(u, v, z, width, height)
+    return nearest_depth(u, v, z, width, height)
 
 
 class RgbLoopInput:
@@ -106,8 +80,13 @@ class RgbLoopInput:
                 mount = validate_mount_declaration(vendor['body_mount'], vendor.get('frame_id', ''))
                 self.mounts = CaptureMounts(mount, vendor.get('frame_id', ''), vendor.get('clock_id'))
             self.camera = camera
-            self.K = np.asarray(camera['K'], dtype=float).reshape(3, 3)
-            self.width, self.height = camera['width'], camera['height']
+            self.geometry = CameraModel(camera)
+            static_mount = camera_parameter(camera, 'body_from_camera')
+            self.static_body_from_color = (None if static_mount is None else
+                                           camera_transform(static_mount, 'body_from_camera'))
+            baseline = camera_parameter(camera, 'color_from_depth')
+            self.depth_from_color = None if baseline is None else np.linalg.inv(camera_transform(baseline))
+            self.K, self.width, self.height = self.geometry.rectified_K, self.geometry.width, self.geometry.height
             self.frame_id, self._clock_id = vendor.get('frame_id', ''), vendor.get('clock_id')
         except Exception as error:
             self.camera, self.mounts = None, None
@@ -146,8 +125,13 @@ class RgbLoopInput:
                 return
             self._counts['received'] += 1
             try:
-                stamp = msg.header.stamp.sec*10**9 + msg.header.stamp.nanosec
-                if type(stamp) is not int or not 0 <= msg.header.stamp.nanosec < 10**9:
+                header_stamp = getattr(getattr(msg, 'header', None), 'stamp', None)
+                sec, nano = getattr(header_stamp, 'sec', None), getattr(header_stamp, 'nanosec', None)
+                if sec is nano is None:
+                    stamp = now_ns
+                elif type(sec) is int and type(nano) is int and 0 <= nano < 10**9:
+                    stamp = sec*10**9 + nano
+                else:
                     raise ValueError('RGB timestamp must be integer nanoseconds')
                 if (not isinstance(msg.format, str) or 'jpeg' not in msg.format.lower() or
                         not 0 < len(msg.data) <= 4*1024*1024):
@@ -205,6 +189,7 @@ class RgbLoopInput:
                 if (not isinstance(image, np.ndarray) or image.shape != (self.height, self.width, 3) or
                         image.dtype != np.uint8):
                     raise ValueError('RGB decode failed or dimensions differ from calibration')
+                image = self.geometry.rectify_color(image)
                 with self._condition:
                     if self._closed or generation != self._generation:
                         continue
@@ -281,12 +266,14 @@ class RgbLoopInput:
                 if self.camera is None:
                     return None
                 if self.mounts is None:
-                    return rigid(fallback_static_matrix)
-                packets = [p for p in self.mounts.packets.values() if p.get('matrix') is not None]
-                if not packets:
-                    raise ValueError('no numeric mount for RGB capture')
-                evidence = min(packets, key=lambda p: abs(p['stamp_ns']-stamp_ns))
-                return rigid(evidence['matrix'])
+                    if self.static_body_from_color is not None:
+                        return self.static_body_from_color.copy()
+                    cloud_mount = rigid(fallback_static_matrix)
+                    return cloud_mount if self.depth_from_color is None else cloud_mount @ self.depth_from_color
+                matrix = self.mounts.matrix_at(stamp_ns)
+                if matrix is None:
+                    raise ValueError('no numeric mount covers the RGB capture')
+                return matrix
             except Exception as error:
                 self._fallback(error)
                 return None

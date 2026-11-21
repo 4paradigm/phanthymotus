@@ -49,7 +49,7 @@ def test_pointcloud_no_longer_advertises_or_executes_calibration_action():
 
 
 @pytest.mark.parametrize(('format_name', 'expected'), [
-    ('image/depth-z16', '_depth_image_cb'),
+    ('image/depth-f32', '_depth_image_cb'),
     ('image/depth-zlib', '_depth_comp_cb'),
 ])
 def test_declared_input_format_uses_only_its_ros_message_type(format_name, expected):
@@ -63,33 +63,21 @@ def test_declared_input_format_uses_only_its_ros_message_type(format_name, expec
     plugin.dispatch('pointcloud', {'action': 'stop'})
 
 
-def test_float_depth_frames_are_rejected():
-    """点云卡片不接收 32FC1 米制浮点深度：驱动侧只有 uint16 毫米深度，
-    浮点帧按不可用拒掉，绝不拿它当米制值反投影。"""
-    msg = _FakeImage(data=np.array([[1.0, 2.5], [3.0, 4.0]], dtype="<f4").tobytes(),
-                     encoding="32FC1", width=2, height=2, step=8)
-    assert pc._decode_depth_message(msg) == (None, "32FC1")
-
-
-@pytest.mark.parametrize("endian,big", [("<", 0), (">", 1)])
-def test_uint16_depth_keeps_metres_with_row_padding(endian, big):
-    rows = [np.array([1000, 2500, 9999], dtype=endian + "u2").tobytes() + b"pp",
-            np.array([3000, 4000, 9999], dtype=endian + "u2").tobytes() + b"pp"]
-    msg = _FakeImage(data=b"".join(rows), encoding="16UC1", width=3,
-                     height=2, step=8, is_bigendian=big)
-    result, encoding = pc._decode_depth_message(msg)
-    assert encoding == "16UC1"
-    np.testing.assert_allclose(result, [[1.0, 2.5, 9.999], [3.0, 4.0, 9.999]])
+@pytest.mark.parametrize('encoding', ['16UC1', 'mono16'])
+def test_raw_z16_samples_are_rejected(encoding):
+    msg = _FakeImage(data=np.array([1000], dtype='<u2').tobytes(),
+                     encoding=encoding, width=1, height=1, step=2)
+    assert pc._decode_depth_message(msg, floating=True, scale=1.) == (None, encoding)
 
 
 def test_metric_cloud_preserves_header_and_optical_coordinates():
     plugin, executor = _plugin({"metric_cloud": True})
-    camera = metric_z16_declaration()
+    camera = metric_f32_declaration()
     plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth",
                                    "camera_info": {"/depth": camera}})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2000, 2000], dtype="<u2").tobytes(),
-                     encoding="16UC1", width=2, height=1, step=4)
+    msg = _FakeImage(data=np.array([2., 2.], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=2, height=1, step=8)
     msg.header.frame_id = "rgb_optical"
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
@@ -103,7 +91,7 @@ def test_metric_cloud_preserves_header_and_optical_coordinates():
     assert _cloud_pub(node).messages  # existing visualization stays available
     info = plugin.dispatch("pointcloud", {"action": "info"})
     assert {"topic": "/depth/pointcloud_metric", "format": "sensor/pointcloud2"} in info["topic_out"]
-    assert {"topic": "/depth", "format": "image/depth-z16"} in info["topic_in"]
+    assert {"topic": "/depth", "format": "image/depth-f32"} in info["topic_in"]
     projection = next(c for c in info["camera_info"] if c["topic"] == pub.topic)
     assert projection["id"] == camera["id"]
     assert projection["K"] == [2., 0., 0., 0., 2., 0., 0., 0., 1.]
@@ -112,10 +100,10 @@ def test_metric_cloud_preserves_header_and_optical_coordinates():
 
 def test_metric_cloud_accepts_unknown_frame_zero_stamp_and_resized_intrinsics():
     plugin, executor = _plugin({"metric_cloud": True})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_f32_declaration(1)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2000], dtype="<u2").tobytes(),
-                     encoding="16UC1", width=1, height=1, step=2)
+    msg = _FakeImage(data=np.array([2.], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=1, height=1, step=4)
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
     pub = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
@@ -126,26 +114,25 @@ def test_metric_cloud_accepts_unknown_frame_zero_stamp_and_resized_intrinsics():
     assert len(pub.messages) == 2
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     msg.width = 2
-    msg.step = 4
-    msg.data = np.array([2000, 2000], dtype="<u2").tobytes()
+    msg.step = 8
+    msg.data = np.array([2., 2.], dtype="<f4").tobytes()
     node._emit_depth(msg)
     assert len(pub.messages) == 3
     node.stop()
 
 
-def test_metric_info_reports_unlabelled_frame_and_rejected_float_depth():
+def test_metric_info_reports_unlabelled_frame_and_rejected_z16():
     plugin, executor = _plugin({'metric_cloud': True})
-    plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth', 'camera_info': [metric_z16_declaration(1)]})
+    plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth', 'input_topic': '/depth', 'camera_info': [metric_f32_declaration(1)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2000], dtype='<u2').tobytes(), encoding='16UC1',
-                     width=1, height=1, step=2)
+    msg = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
+                     width=1, height=1, step=4)
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     node._emit_depth(msg)
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
     assert info['published'] == 1 and info['last_skip_reason'] is None
-    # 32FC1 不再被解码，帧在 _decode_depth_message 就被拒（invalid_depth）。
-    bad = _FakeImage(data=np.array([2.], dtype='<f4').tobytes(), encoding='32FC1',
-                     width=1, height=1, step=4)
+    bad = _FakeImage(data=np.array([2000], dtype='<u2').tobytes(), encoding='16UC1',
+                     width=1, height=1, step=2)
     node._emit_depth(bad)
     info = plugin.dispatch('pointcloud', {'action': 'info'})['instances']['/depth']['metric_cloud']
     assert info['last_skip_reason'] == 'invalid_depth'
@@ -154,7 +141,7 @@ def test_metric_info_reports_unlabelled_frame_and_rejected_float_depth():
 
 def test_metric_start_accepts_numeric_depth_without_metric_labels():
     plugin, executor = _plugin({'metric_cloud': True})
-    declaration = {**_UPSTREAM_DECL, 'topic': '/depth', 'format': 'image/depth-z16'}
+    declaration = {**_UPSTREAM_DECL, 'topic': '/depth', 'format': 'image/depth-f32'}
     result = plugin.dispatch('pointcloud', {'action': 'start', 'mode': 'depth',
                                              'input_topic': '/depth', 'camera_info': [declaration]})
     assert result['state'] == 'running' and executor.nodes
@@ -164,12 +151,12 @@ def test_metric_start_accepts_numeric_depth_without_metric_labels():
 def test_display_remains_available_without_metric_intrinsics():
     plugin, executor = _plugin()
     result = plugin.dispatch("start", {"input_topic": "/depth",
-        "camera_info": {"/depth": {"format": "image/depth-z16"}}})
+        "camera_info": {"/depth": {"format": "image/depth-f32"}}})
     assert result["state"] == "running"
     node = executor.nodes[0]
     try:
-        msg = _FakeImage(data=struct.pack("<H", 2000), encoding="16UC1",
-                         width=1, height=1, step=2)
+        msg = _FakeImage(data=struct.pack("<f", 2.), encoding="32FC1",
+                         width=1, height=1, step=4)
         node._emit_depth(msg)
         assert _cloud_pub(node).messages
         metric = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
@@ -185,7 +172,7 @@ def test_legacy_global_config_cannot_disable_metric_cloud():
     plugin, executor = _plugin()
     config = plugin.dispatch("pointcloud", {"action": "config", "metric_cloud": False})
     assert config["config"] == {}
-    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
+    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_f32_declaration(1)]})
     assert result["state"] == "running"
     assert any(p.topic == "/depth/pointcloud_metric" for p in executor.nodes[0].publishers)
     executor.nodes[0].stop()
@@ -196,7 +183,7 @@ def test_canvas_metric_config_starts_depth_without_mode_argument():
     plugin.dispatch("pointcloud", {"action": "config", "instance_id": "card-1",
                                    "metric_cloud": True})
     result = plugin.dispatch("pointcloud", {"action": "start", "instance_id": "card-1",
-                                            "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
+                                            "input_topic": "/depth", "camera_info": [metric_f32_declaration(1)]})
     assert result["state"] == "running"
     node = executor.nodes[0]
     assert node._mode == "depth"
@@ -207,10 +194,10 @@ def test_canvas_metric_config_starts_depth_without_mode_argument():
 def test_metric_cloud_accepts_calibrated_depth_declaration():
     plugin, executor = _plugin()
     plugin.dispatch("pointcloud", {"action": "config", "instance_id": "card-1", "metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-f32",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.],
-                   "vendor": {"depth_unit": "mm", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
+                   "vendor": {"depth_unit": "m", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
     result = plugin.dispatch("pointcloud", {"action": "start", "instance_id": "card-1",
                                             "input_topic": "/depth", "camera_info": [declaration]})
     assert result["state"] == "running"
@@ -222,7 +209,7 @@ def test_metric_cloud_accepts_calibrated_depth_declaration():
 @pytest.mark.parametrize('source,model', [('manual', 'pinhole'), ('derived-from-K', 'unknown')])
 def test_metric_cloud_accepts_unverified_or_distorted_declaration(source, model):
     plugin, executor = _plugin({"metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-f32",
                    "id": "optical", "source": source, "distortion_model": model,
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
@@ -233,7 +220,7 @@ def test_metric_cloud_accepts_unverified_or_distorted_declaration(source, model)
 
 def test_metric_cloud_accepts_declaration_without_capture_time_semantics():
     plugin, executor = _plugin({"metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-f32",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
@@ -244,10 +231,10 @@ def test_metric_cloud_accepts_declaration_without_capture_time_semantics():
 
 def test_metric_cloud_accepts_finite_intrinsics_with_skew():
     plugin, executor = _plugin({"metric_cloud": True})
-    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-z16",
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "image/depth-f32",
                    "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
                    "width": 2, "height": 1, "K": [2., .2, 0., 0., 2., 0., 0., 0., 1.],
-                   "vendor": {"depth_unit": "mm", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
+                   "vendor": {"depth_unit": "m", "depth_source": "measured", "timestamp_semantics": "source_capture_mapped"}}
     result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
                                             "camera_info": [declaration]})
     assert result["state"] == "running"
@@ -256,7 +243,7 @@ def test_metric_cloud_accepts_finite_intrinsics_with_skew():
 
 def test_metric_depth_subscribes_only_to_image_type():
     plugin, executor = _plugin({"metric_cloud": True})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_f32_declaration(1)]})
     node = executor.nodes[0]
     assert [s.callback.__name__ for s in node.subscriptions] == ["_depth_image_cb"]
     node.stop()
@@ -264,10 +251,10 @@ def test_metric_depth_subscribes_only_to_image_type():
 
 def test_metric_cloud_keeps_source_header_through_worker_queue():
     plugin, executor = _plugin({"metric_cloud": True, "fps": 1000})
-    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_z16_declaration(1)]})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth", "camera_info": [metric_f32_declaration(1)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([2000], dtype="<u2").tobytes(),
-                     encoding="16UC1", width=1, height=1, step=2)
+    msg = _FakeImage(data=np.array([2.], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=1, height=1, step=4)
     msg.header.frame_id = "optical"
     msg.header.stamp = types.SimpleNamespace(sec=456, nanosec=789)
     node._depth_image_cb(msg)
@@ -306,7 +293,7 @@ def test_undeclared_auto_waits_for_late_publisher_and_binds_one_type(publisher_t
     node._topic_types['/cam/image_raw'] = [publisher_type]
     timer.callback()
     assert [sub.callback.__name__ for sub in node.subscriptions] == [callback]
-    expected_format = 'image/depth-z16' if publisher_type.endswith('/Image') else 'image/depth-zlib'
+    expected_format = 'image/depth-f32' if publisher_type.endswith('/Image') else 'image/depth-zlib'
     assert plugin.dispatch('info', {})['topic_in'] == [{'topic': '/cam/image_raw', 'format': expected_format}]
     assert node._input_discovery_timer is None
     assert timer.cancelled
@@ -332,19 +319,19 @@ def test_undeclared_auto_rejects_conflicting_publisher_types(monkeypatch):
 
 
 def test_auto_mode_depth_image_on_rgb_named_topic_publishes():
-    """z16 Image 发在 '/camera/image_raw'（不含 'depth'）也必须出云。
+    """32FC1 Image 发在 '/camera/image_raw'（不含 'depth'）也必须出云。
 
     旧实现按 '"depth" in input_topic' 判成 mono，只订 CompressedImage，
     Image 帧静默丢弃、一帧云都不出——review issue 2 的原始复现。
     """
     plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/camera/image_raw",
-                                   "camera_info": {"/camera/image_raw": {"format": "image/depth-z16"}}})
+                                   "camera_info": {"/camera/image_raw": {"format": "image/depth-f32"}}})
     node = executor.nodes[0]
 
-    depth_mm = np.full((4, 4), 1500, dtype="<u2")
-    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
-                     width=4, height=4, step=8)
+    depth_m = np.full((4, 4), 1.5, dtype="<f4")
+    msg = _FakeImage(data=depth_m.tobytes(), encoding="32FC1",
+                     width=4, height=4, step=16)
     image_cb = next(s.callback for s in node.subscriptions
                     if s.callback.__name__ == "_depth_image_cb")
     image_cb(msg)
@@ -396,7 +383,7 @@ def test_auto_mode_recognizes_visual_depth_producer_format():
 
 
 @pytest.mark.parametrize(('format_name', 'expected'), [
-    ('image/depth-z16', '_depth_image_cb'),
+    ('image/depth-f32', '_depth_image_cb'),
     ('image/depth-zlib', '_depth_comp_cb'),
 ])
 def test_explicit_depth_mode_subscribes_only_to_declared_type(format_name, expected):
@@ -411,15 +398,17 @@ def test_explicit_depth_mode_subscribes_only_to_declared_type(format_name, expec
 
 # ── 深度链路本身（A 路）──────────────────────────────────────────────────────
 
-def test_depth_z16_image_publishes_cloud():
+def test_discovered_depth_f32_image_publishes_cloud():
     plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud",
                     {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
     node = executor.nodes[0]
 
-    depth_mm = np.full((4, 4), 2000, dtype="<u2")
-    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
-                     width=4, height=4, step=8)
+    node._topic_types['/cam/depth'] = ['sensor_msgs/msg/Image']
+    node._input_discovery_timer.callback()
+    depth_m = np.full((4, 4), 2., dtype="<f4")
+    msg = _FakeImage(data=depth_m.tobytes(), encoding="32FC1",
+                     width=4, height=4, step=16)
     node._depth_image_cb(msg)
 
     raw_cloud, summary = _wait_cloud_and_summary(node)
@@ -457,11 +446,12 @@ def test_depth_image_with_wrong_encoding_is_ignored():
 def test_truncated_depth_image_is_ignored():
     plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud",
-                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth",
+                     "camera_info": {"/cam/depth": {"format": "image/depth-f32"}}})
     node = executor.nodes[0]
 
-    msg = _FakeImage(data=b"\x00" * 4, encoding="16UC1",
-                     width=4, height=4, step=8)
+    msg = _FakeImage(data=b"\x00" * 4, encoding="32FC1",
+                     width=4, height=4, step=16)
     node._depth_image_cb(msg)
     _wait_until(lambda: False, timeout=0.2)
     assert _cloud_pub(node).messages == []
@@ -470,12 +460,13 @@ def test_truncated_depth_image_is_ignored():
 def test_depth_respects_min_max_range():
     plugin, executor = _plugin(cfg={"fps": 1000, "min_depth_m": 1.0, "max_depth_m": 3.0})
     plugin.dispatch("pointcloud",
-                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth",
+                     "camera_info": {"/cam/depth": {"format": "image/depth-f32"}}})
     node = executor.nodes[0]
 
-    depth_mm = np.array([[500, 2000, 3500]], dtype="<u2")  # 0.5 / 2.0 / 3.5 m
-    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
-                     width=3, height=1, step=6)
+    depth_m = np.array([[.5, 2., 3.5]], dtype="<f4")
+    msg = _FakeImage(data=depth_m.tobytes(), encoding="32FC1",
+                     width=3, height=1, step=12)
     node._depth_image_cb(msg)
 
     _, summary = _wait_cloud_and_summary(node)
@@ -487,12 +478,13 @@ def test_depth_respects_min_max_range():
 def test_max_points_cap_is_honoured():
     plugin, executor = _plugin(cfg={"fps": 1000, "max_points": 100})
     plugin.dispatch("pointcloud",
-                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth",
+                     "camera_info": {"/cam/depth": {"format": "image/depth-f32"}}})
     node = executor.nodes[0]
 
-    depth_mm = np.full((60, 60), 2000, dtype="<u2")  # 3600 点 > 100
-    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
-                     width=60, height=60, step=120)
+    depth_m = np.full((60, 60), 2., dtype="<f4")  # 3600 点 > 100
+    msg = _FakeImage(data=depth_m.tobytes(), encoding="32FC1",
+                     width=60, height=60, step=240)
     node._depth_image_cb(msg)
 
     _, summary = _wait_cloud_and_summary(node)
@@ -503,7 +495,7 @@ def test_max_points_cap_is_honoured():
 # ── review 建议：mode / input_topics 数量校验 ─────────────────────────────────
 
 def test_start_rejects_unknown_mode():
-    """mode 拼错（如 detph）以前静默当 mono 处理 —— z16 帧永远收不到。"""
+    """mode 拼错（如 detph）以前静默当 mono 处理 ——深度图收不到。"""
     plugin, executor = _plugin()
     reply = plugin.dispatch("pointcloud", {
         "action": "start", "input_topic": "/cam/depth", "mode": "detph"})
@@ -534,7 +526,7 @@ def test_start_rejects_explicit_mode_without_any_input(mode):
 
 @pytest.mark.parametrize('index,bad', [(0, 0), (0, float('nan')), (0, 'abc'), (4, float('inf')), (2, float('nan')), (5, float('inf')), (8, float('inf'))])
 def test_metric_output_rejects_invalid_driver_intrinsics(index, bad):
-    decl = metric_z16_declaration()
+    decl = metric_f32_declaration()
     decl['K'][index] = bad
     plugin, executor = _plugin()
     try:
@@ -707,7 +699,8 @@ def test_worker_error_logs_full_trace_once_then_samples(caplog):
 
     plugin, executor = _plugin(cfg={"fps": 1000})
     plugin.dispatch("pointcloud",
-                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth",
+                     "camera_info": {"/cam/depth": {"format": "image/depth-f32"}}})
     node = executor.nodes[0]
 
     def _boom(self_inner, msg):
@@ -718,7 +711,7 @@ def test_worker_error_logs_full_trace_once_then_samples(caplog):
     try:
         with caplog.at_level(_logging.ERROR, logger="plugins.pointcloud"):
             for _ in range(150):
-                node._frame_queue.put(("depth_z16", "fake"))
+                node._frame_queue.put(("depth_f32", "fake"))
                 assert _wait_until(lambda: node._frame_queue.empty(), timeout=2.0)
             errors = [r for r in caplog.records if "worker error" in r.message]
             assert len(errors) == 2
@@ -729,15 +722,15 @@ def test_worker_error_logs_full_trace_once_then_samples(caplog):
             assert len(errors[1].message) < 300  # 采样条只有有界摘要
             # 好帧复位：之后第一条 worker 错误是新一轮的第 1 条（带 traceback）
             pc._PointCloudNode._emit_depth = original
-            good = _FakeImage(data=np.full((4, 4), 2000, dtype="<u2").tobytes(),
-                              encoding="16UC1", width=4, height=4, step=8)
-            node._frame_queue.put(("depth_z16", good))
+            good = _FakeImage(data=np.full((4, 4), 2., dtype="<f4").tobytes(),
+                              encoding="32FC1", width=4, height=4, step=16)
+            node._frame_queue.put(("depth_f32", good))
             assert _wait_until(lambda: bool(_cloud_pub(node).messages), timeout=2.0)
             # worker 先 publish 后才复位计数，主线程必须等 reset 可见，
             # 否则微秒级的竞争窗口会让这条好帧断言失败。
             assert _wait_until(lambda: node._worker_error_count == 0, timeout=2.0)
             pc._PointCloudNode._emit_depth = _boom
-            node._frame_queue.put(("depth_z16", "fake"))
+            node._frame_queue.put(("depth_f32", "fake"))
             assert _wait_until(lambda: node._worker_error_count == 1, timeout=2.0)
             errors = [r for r in caplog.records
                       if "worker error" in r.message and r.exc_info is not None]
@@ -750,7 +743,7 @@ def test_worker_error_logs_full_trace_once_then_samples(caplog):
 # ── review issue 3：camera_info 声明沿链路传递 ────────────────────────────────
 
 _UPSTREAM_DECL = {
-    "schema": "motus.camera/1", "topic": "/cam/rgb", "format": "image/depth-z16",
+    "schema": "motus.camera/1", "topic": "/cam/rgb", "format": "image/depth-f32",
     "id": "unitree/r1/camera_main", "width": 1280, "height": 720,
     "distortion_model": "unknown", "D": None,
     "K": [700.0, 0.0, 640.0, 0.0, 700.0, 360.0, 0.0, 0.0, 1.0],
@@ -906,7 +899,7 @@ def test_info_reports_depth_format_for_depth_mode():
     plugin.dispatch("pointcloud",
                     {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
     info = plugin.dispatch("pointcloud", {"action": "info"})
-    assert info["topic_in"][0]["format"] == "image/depth-z16"
+    assert info["topic_in"][0]["format"] == "image/depth-zlib"
     assert info["instances"]["/cam/depth"]["mode"] == "depth"
 
 
@@ -1016,33 +1009,72 @@ def metric_zlib_declaration():
                        'timestamp_semantics': 'source_capture_mapped'}}
 
 
-def metric_z16_declaration(width=2, height=1):
-    return {**metric_zlib_declaration(), 'format': 'image/depth-z16',
-            'width': width, 'height': height}
+def metric_f32_declaration(width=2, height=1):
+    base = metric_zlib_declaration()
+    return {**base, 'format': 'image/depth-f32', 'width': width, 'height': height,
+            'vendor': {**base['vendor'], 'depth_unit': 'm'}}
 
 
 def test_card_exposes_existing_depth_formats_without_manual_calibration():
     tool = pc.TOOLS[0]
     assert {p['format'] for p in tool['topic_in']} == {
-        'image/depth-z16', 'image/depth-zlib'}
+        'image/depth-zlib', 'image/depth-f32', 'image/depth-f32-zlib'}
     for schema in ('inputSchema', 'configSchema'):
         assert not {'calibration', 'cal_a', 'cal_b'} & tool[schema]['properties'].keys()
     for action in tool['inputSchema']['x-action-params'].values():
         assert 'calibration' not in action['params']
 
 
-def test_measured_z16_uses_driver_parameters_despite_saved_manual_calibration():
+@pytest.mark.parametrize('depth_format,dtype,samples,scale', [
+    ('image/depth-zlib', '<u2', [4, 8], .25),
+    ('image/depth-f32-zlib', '<f4', [1., 2.], None),
+])
+def test_metric_cloud_applies_numeric_depth_units_without_camera_identity(depth_format, dtype, samples, scale,
+                                                                         monkeypatch):
+    from plugins import spatial_input
+
+    declaration = dict(metric_f32_declaration(), format=depth_format)
+    declaration.pop('id')
+    declaration.pop('schema')
+    if scale is not None:
+        declaration['depth_scale_m'] = scale
+    plugin, executor = _plugin({'metric_cloud': True})
+    registry = spatial_input.InputAdapterRegistry()
+    try:
+        assert plugin.dispatch('start', {'input_topic': '/depth',
+            'camera_info': {'/depth': declaration}})['state'] == 'running'
+        node = executor.nodes[0]
+        payload = zlib.compress(np.array(samples, dtype=dtype).tobytes())
+        msg = _FakeCompressedImage(payload, fmt=depth_format)
+        msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+        context = registry.time_policy.select({'stamp_ns': 123_000_000_456}, 1, 2)
+        registry.decode_raw_depth(context, payload, 2, 1, floating=dtype == '<f4')
+        def duplicate(*args, **kwargs):
+            pytest.fail('pointcloud must reuse the raw cached samples')
+        monkeypatch.setattr(pc, 'decode_depth_zlib', duplicate)
+        monkeypatch.setattr(spatial_input, 'decode_depth_zlib', duplicate)
+        node._input_registry = registry
+        node._emit_depth(msg, context)
+        cloud = next(p for p in node.publishers if p.topic.endswith('/pointcloud_metric')).raw_messages[0]
+        np.testing.assert_allclose(np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 3),
+                                   [[0., 0., 1.], [1., 0., 2.]])
+    finally:
+        plugin.shutdown()
+        registry.close()
+
+
+def test_measured_f32_uses_driver_parameters_despite_saved_manual_calibration():
     old = {'calibration': {'fx': 99., 'fy': 99., 'cx': 1., 'cy': 1.},
            'cal_a': 2., 'cal_b': 3.}
     plugin, executor = _plugin({'metric_cloud': True, **old})
     plugin.dispatch('config', {'instance_id': 'card', **old})
     result = plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth',
-        'camera_info': [metric_z16_declaration()], **old})
+        'camera_info': [metric_f32_declaration()], **old})
     assert result['state'] == 'running'
     node = executor.nodes[0]
     try:
-        msg = _FakeImage(data=np.array([2000, 2000], dtype='<u2').tobytes(),
-                         encoding='16UC1', width=2, height=1, step=4)
+        msg = _FakeImage(data=np.array([2., 2.], dtype='<f4').tobytes(),
+                         encoding='32FC1', width=2, height=1, step=8)
         msg.header.frame_id = 'optical'
         msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
         node._emit_depth(msg)
@@ -1071,7 +1103,7 @@ def test_saved_manual_calibration_cannot_enable_metric_output_without_driver_par
 def test_saved_manual_settings_do_not_retire_or_override_display_instance(old):
     plugin, executor = _plugin(old)
     plugin.dispatch('start', {'instance_id': 'card', 'input_topic': '/depth', 'mode': 'depth',
-                             'camera_info': [metric_z16_declaration()], **old})
+                             'camera_info': [metric_f32_declaration()], **old})
     node = executor.nodes[0]
     try:
         plugin.dispatch('config', {'instance_id': 'card', **old})
@@ -1083,8 +1115,8 @@ def test_saved_manual_settings_do_not_retire_or_override_display_instance(old):
 
 @pytest.mark.parametrize('field,bad', [('depth_source', 'estimated'), ('depth_source', None),
     ('depth_unit', 'm'), ('timestamp_semantics', 'publication')])
-def test_metric_z16_accepts_source_units_and_capture_labels(field, bad):
-    declaration = metric_z16_declaration()
+def test_metric_f32_accepts_source_units_and_capture_labels(field, bad):
+    declaration = metric_f32_declaration()
     declaration['vendor'][field] = bad
     plugin, executor = _plugin({'metric_cloud': True})
     assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'running'
@@ -1093,7 +1125,7 @@ def test_metric_z16_accepts_source_units_and_capture_labels(field, bad):
 
 @pytest.mark.parametrize('field,bad', [('D', [.1, 0, 0, 0]), ('width', 0), ('height', None)])
 def test_metric_ignores_distortion_labels_but_requires_image_dimensions(field, bad):
-    declaration = metric_z16_declaration()
+    declaration = metric_f32_declaration()
     declaration[field] = bad
     plugin, executor = _plugin({'metric_cloud': True})
     assert plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [declaration]})['state'] == 'running'
@@ -1102,13 +1134,12 @@ def test_metric_ignores_distortion_labels_but_requires_image_dimensions(field, b
 
 
 @pytest.mark.parametrize('endian,big', [('<', 0), ('>', 1)])
-@pytest.mark.parametrize('encoding', ['16UC1', 'mono16'])
-def test_metric_z16_uses_row_stride_endian_and_millimetre_scale(endian, big, encoding):
+def test_metric_f32_uses_row_stride_and_endian(endian, big):
     plugin, executor = _plugin({'metric_cloud': True})
-    plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [metric_z16_declaration(2, 2)]})
+    plugin.dispatch('start', {'input_topic': '/depth', 'camera_info': [metric_f32_declaration(2, 2)]})
     node = executor.nodes[0]
-    msg = _FakeImage(data=np.array([[2000, 2000, 9999], [2000, 2000, 9999]], dtype=endian+'u2').tobytes(),
-                     encoding=encoding, width=2, height=2, step=6, is_bigendian=big)
+    msg = _FakeImage(data=np.array([[2., 2., 9.], [2., 2., 9.]], dtype=endian+'f4').tobytes(),
+                     encoding='32FC1', width=2, height=2, step=12, is_bigendian=big)
     msg.header.frame_id = 'optical'
     msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
     try:

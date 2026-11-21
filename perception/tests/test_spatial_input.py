@@ -2,6 +2,9 @@ import sys
 import threading
 import time
 from types import SimpleNamespace as NS
+import zlib
+
+import numpy as np
 import pytest
 from plugins.spatial_input import InputAdapterRegistry
 
@@ -97,6 +100,72 @@ def test_derived_cloud_keeps_first_ingress_and_parent_identity():
         assert cloud[0].ingress_monotonic_ns==seen[0].ingress_monotonic_ns
         assert cloud[0].parent_observation_ids==(seen[0].observation_id,)
     finally:a.close();c.close();r.close()
+
+
+def test_raw_depth_cache_shares_readonly_samples_and_separates_numeric_formats():
+    r = InputAdapterRegistry()
+    observation = r.time_policy.select({'stamp_ns': 1}, 2, 3)
+    payload = zlib.compress(np.array([1, 2], dtype='<u2').tobytes())
+    try:
+        raw = r.decode_raw_depth(observation, payload, 2, 1)
+        assert raw is r.decode_raw_depth(observation, payload, 2, 1)
+        np.testing.assert_array_equal(raw, [[1, 2]])
+        with pytest.raises(ValueError):
+            raw[0, 0] = 3
+        np.testing.assert_array_equal(r.decode_raw_depth(observation, payload, 1, 2), [[1], [2]])
+        assert r.decode_raw_depth(observation, payload, 1, 1, floating=True).dtype == np.dtype('<f4')
+    finally:
+        r.close()
+
+
+@pytest.mark.parametrize(('max_pending', 'max_bytes'), [(1, 32), (8, 6)])
+def test_raw_depth_cache_evicts_on_entry_and_byte_budgets(max_pending, max_bytes):
+    r = InputAdapterRegistry(max_pending=max_pending, max_bytes=max_bytes)
+    a = r.time_policy.select({'stamp_ns': 1}, 2, 3)
+    b = r.time_policy.select({'stamp_ns': 2}, 3, 4)
+    payload = zlib.compress(np.array([1, 2], dtype='<u2').tobytes())
+    try:
+        first = r.decode_raw_depth(a, payload, 2, 1)
+        r.decode_raw_depth(b, payload, 2, 1)
+        assert r.decode_raw_depth(a, payload, 2, 1) is not first
+    finally:
+        r.close()
+
+
+def test_raw_depth_cache_deduplicates_concurrent_consumers_without_blocking_other_keys(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from plugins import spatial_input
+    from plugins.camera_geometry import decode_depth_zlib
+
+    r = InputAdapterRegistry()
+    a = r.time_policy.select({'stamp_ns': 1}, 2, 3)
+    b = r.time_policy.select({'stamp_ns': 2}, 3, 4)
+    payload = zlib.compress(np.array([1, 2], dtype='<u2').tobytes())
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def decode(data, width, height, *, floating):
+        calls.append((width, height))
+        if (width, height) == (2, 1):
+            entered.set()
+            assert release.wait(2)
+        return decode_depth_zlib(data, width, height, floating=floating)
+
+    monkeypatch.setattr(spatial_input, 'decode_depth_zlib', decode)
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(r.decode_raw_depth, a, payload, 2, 1)
+            try:
+                assert entered.wait(1)
+                other_consumer = pool.submit(r.decode_raw_depth, a, payload, 2, 1)
+                independent = pool.submit(r.decode_raw_depth, b, payload, 1, 2)
+                np.testing.assert_array_equal(independent.result(timeout=1), [[1], [2]])
+            finally:
+                release.set()
+            assert first.result() is other_consumer.result()
+        assert calls.count((2, 1)) == 1
+    finally:
+        r.close()
 
 
 def test_consumer_timing_separates_queue_wait_from_callback_work():

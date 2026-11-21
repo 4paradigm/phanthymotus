@@ -69,6 +69,21 @@ def test_identical_frame_can_use_identity_without_unmeasured_mount():
     assert provenance['extrinsic_source'] == 'identical_frame'
 
 
+def test_fused_static_color_mount_is_composed_with_raw_depth_baseline():
+    from test_pointcloud_slam_stream import external_fusion
+
+    value = external_fusion(1000)
+    mount = np.eye(4); mount[0, 3] = .2
+    value['vendor']['motus_slam']['extrinsic'] = dict(mode='static',
+        child_frame='color', matrix=mount.tolist())
+    baseline = np.eye(4); baseline[0, 3] = .03
+    camera = {'vendor': {'color_from_depth': baseline.tolist()}}
+    config, _ = infer_geometry(value, 'raw_depth', 1_000_000_000, camera_info=camera)
+    assert config['child_from_cloud'][0][3] == pytest.approx(.23)
+    aligned, _ = infer_geometry(value, 'color', 1_000_000_000, camera_info=camera)
+    assert aligned['child_from_cloud'][0][3] == pytest.approx(.2)
+
+
 @pytest.mark.parametrize('change,match', [
     ('mount_matrix', '4x4'),
 ])

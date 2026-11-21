@@ -4,11 +4,13 @@ from copy import deepcopy
 
 import numpy as np
 
+from .camera_geometry import RgbdPreprocessor, camera_parameter
 from .spatial_contract import validate_tracking_pose
 
 
 # Position standard deviation limit shared by ESKF and SLAM's prediction input.
 SIGMA_LIMIT_M = .25
+DEPTH_FORMATS = ('image/depth-zlib', 'image/depth-f32-zlib')
 
 
 def validate_inputs(declarations, topics):
@@ -20,11 +22,11 @@ def validate_inputs(declarations, topics):
     if not isinstance(declarations, dict) or len(topics or []) != 2 or len(set(topics)) != 2:
         raise ValueError('connect one color and one depth input')
     entries = [declarations.get(topic) for topic in topics]
-    if (any(not isinstance(d, dict) for d in entries) or
-            {d.get('format') for d in entries} != {'image/jpeg', 'image/depth-zlib'}):
+    formats = [entry.get('format') for entry in entries if isinstance(entry, dict)]
+    if formats.count('image/jpeg') != 1 or sum(fmt in DEPTH_FORMATS for fmt in formats) != 1:
         raise ValueError('RGB-D requires image/jpeg and image/depth-zlib declarations')
     color = next(d for d in entries if d['format'] == 'image/jpeg')
-    depth = next(d for d in entries if d['format'] == 'image/depth-zlib')
+    depth = next(d for d in entries if d['format'] in DEPTH_FORMATS)
     for d in entries:
         if any(type(d.get(k)) is not int or not 0 < d[k] <= 4096 for k in ('width', 'height')):
             raise ValueError('RGB-D requires positive integer image dimensions up to 4096')
@@ -37,14 +39,22 @@ def validate_inputs(declarations, topics):
     cv = color.get('vendor') if isinstance(color.get('vendor'), dict) else {}
     dv = depth.get('vendor') if isinstance(depth.get('vendor'), dict) else {}
     roles = {entry['format']: topic for topic, entry in zip(topics, entries)}
-    result = dict(color_topic=roles['image/jpeg'], depth_topic=roles['image/depth-zlib'],
-                  K=np.asarray(depth['K'], dtype=float).reshape(3, 3),
+    try:
+        geometry = RgbdPreprocessor(color, depth)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise ValueError(str(error)) from None
+    result = dict(color_topic=roles['image/jpeg'], depth_topic=roles[depth['format']],
+                  K=geometry.K, image_geometry=geometry, depth_format=depth['format'],
                   color_size=(color['width'], color['height']), depth_size=(depth['width'], depth['height']),
                   frame_id=cv.get('frame_id') or dv.get('frame_id') or 'camera_optical',
                   clock_id=cv.get('clock_id') or dv.get('clock_id'),
                   time_basis='source_capture' if cv.get('clock_id') and dv.get('clock_id') else 'receipt_estimated',
                   depth_source=dv.get('depth_source', 'unknown'),
                   motion_limits=deepcopy(cv.get('motion_limits')))
+    body = camera_parameter(color, 'body_from_camera', camera_parameter(depth, 'body_from_camera'))
+    if body is not None:
+        from .pointcloud_slam_transforms import rigid
+        result['body_from_camera'] = rigid(body)
     mount = cv.get('body_mount', dv.get('body_mount'))
     if mount is not None:
         from .rgbd_body_mount import validate_mount_declaration
@@ -53,20 +63,33 @@ def validate_inputs(declarations, topics):
 
 
 class PairBuffer:
-    """Pair image arrivals in FIFO order while preserving their source times."""
+    """Pair legacy image input by the nearest supplied numeric timestamp."""
     def __init__(self, max_pending=5, max_skew_ns=20_000_000):
         self.queues = {kind: deque(maxlen=max_pending) for kind in ('color', 'depth')}
+        self.max_skew_ns = max_skew_ns
 
     @property
     def pending_count(self):
         return sum(len(q) for q in self.queues.values())
 
     def push(self, kind, stamp_ns, payload, now_ns):
+        stamp_ns = now_ns if stamp_ns is None else stamp_ns
         if kind not in self.queues or type(stamp_ns) is not int:
             raise ValueError('RGB-D requires an image role and integer timestamp')
+        other = 'depth' if kind == 'color' else 'color'
+        queue = self.queues[other]
+        if queue:
+            skew, index = min((abs(stamp_ns-t), i) for i, (t, _) in enumerate(queue))
+            if skew <= self.max_skew_ns:
+                matched = queue[index]
+                del queue[index]
+                pair = {kind: (stamp_ns, payload), other: matched}
+                for side, pending in self.queues.items():
+                    for index in reversed(range(len(pending))):
+                        if pending[index][0] < pair[side][0]:
+                            del pending[index]
+                return pair['color'], pair['depth']
         self.queues[kind].append((stamp_ns, payload))
-        color, depth = self.queues['color'], self.queues['depth']
-        return (color.popleft(), depth.popleft()) if color and depth else None
 
 
 def make_sample(status, stamp_ns, segment, clock, pose=None, *, reason=None, context=None):
@@ -121,7 +144,7 @@ def _describe_inputs(declarations, topics):
     return '; '.join(rows)
 
 
-def validate_start_inputs(declarations, topics, imu_assisted=False):
+def validate_start_inputs(declarations, topics, imu_assisted=False, *, bindings=None):
     """The optional third input is a self-describing JSON camera IMU stream.
 
     Failures name which input lacks a declaration or has the wrong format.
@@ -137,18 +160,40 @@ def validate_start_inputs(declarations, topics, imu_assisted=False):
         raise ValueError('connect distinct RGB-D/IMU input topics: duplicate ' +
                          ', '.join(_short(t) for t in duplicates[:2]))
     expected = 3 if imu_assisted else 2
-    if len(topics) != expected:
+    if (bindings is None and len(topics) != expected) or not 2 <= len(topics) <= 4:
         raise ValueError('connect two RGB-D topics and exactly one IMU topic when assistance is enabled: '
                          f'imu_assisted={str(imu_assisted).lower()}, {len(topics)} input(s) connected; {detail}')
     rgbd = [t for t in topics if isinstance(declarations.get(t), dict) and
-            declarations[t].get('format') in ('image/jpeg', 'image/depth-zlib')]
+            declarations[t].get('format') in ('image/jpeg', *DEPTH_FORMATS)]
     formats = [declarations[t]['format'] for t in rgbd]
-    missing = [f for f in ('image/jpeg', 'image/depth-zlib') if f not in formats]
+    missing = (['image/jpeg'] if 'image/jpeg' not in formats else [])
+    if not any(fmt in DEPTH_FORMATS for fmt in formats):
+        missing.append('image/depth-zlib')
     if len(rgbd) != 2 or missing:
         raise ValueError('connect one calibrated color and one measured depth input: ' +
                          (f'missing {" and ".join(missing)}; ' if missing else
                           'more than one declaration per role; ') + detail)
     calibration = validate_inputs(declarations, rgbd)
-    if imu_assisted:
-        calibration['imu_topic'] = next(t for t in topics if t not in rgbd)
+    optional = [t for t in topics if t not in rgbd]
+    if bindings is None:
+        if imu_assisted:
+            calibration['imu_topic'] = optional[0]
+        return calibration
+    roles = {'sensor/imu': [], 'state/odom': [], None: []}
+    for topic in optional:
+        role = bindings.get(topic)
+        if role is None and topic.endswith('/state/odom'):
+            role = 'state/odom'  # Legacy Core passes only the canonical output topic.
+        if role not in roles:
+            raise ValueError('unsupported optional RGB-D input format: ' + str(role))
+        roles[role].append(topic)
+    if len(roles['state/odom']) > 1 or len(roles['sensor/imu']) > 1:
+        raise ValueError('connect at most one external odometry and one IMU input')
+    imu = roles['sensor/imu'] or roles[None]
+    if imu:
+        calibration.update(imu_topic=imu[0], imu_candidates=tuple(imu))
+    if roles['state/odom']:
+        calibration['external_topic'] = roles['state/odom'][0]
+    if roles[None] or roles['state/odom']:
+        calibration['external_candidates'] = tuple(roles['state/odom'] or roles[None])
     return calibration
