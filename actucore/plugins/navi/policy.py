@@ -71,6 +71,7 @@ from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, ODOM_GAP_MS,
 from .depth import has_valid_returns
 from .track import Track, Tracker
 from . import local_path
+from . import dwa
 from .local_path import FORWARD, RIGHT, Detour, Geometry, PlanCache
 from .odom import PlanarPose, planar_axes, planar_feedback
 
@@ -138,6 +139,10 @@ class Config:
     slow_distance_m: float = 1.0
     side_clearance_m: float = 1.0
     local_planning: bool = False
+    # Opt-in while replay and real-hardware results are being compared.
+    local_controller: str = "legacy"  # "legacy" or "dwa"
+    dwa_horizon_s: float = 1.2
+    dwa_samples: int = 64
     odom_expected: bool = False
     local_geometry: Geometry | None = None
     scan_geometry: Geometry | None = None
@@ -363,6 +368,14 @@ class Config:
         return max(1.5, self.slow_distance_m)
 
     def __post_init__(self):
+        if self.local_controller not in ("legacy", "dwa"):
+            raise ValueError("local_controller must be 'legacy' or 'dwa'")
+        if type(self.dwa_samples) is not int or not 1 <= self.dwa_samples <= 256:
+            raise ValueError("dwa_samples must be an integer in [1, 256]")
+        if (type(self.dwa_horizon_s) not in (int, float)
+                or not math.isfinite(self.dwa_horizon_s)
+                or not .2 <= self.dwa_horizon_s <= 3.):
+            raise ValueError("dwa_horizon_s must be in [0.2, 3.0]")
         if self.max_depth_age_ms is not None and (
                 type(self.max_depth_age_ms) is not int or self.max_depth_age_ms <= 0):
             raise ValueError("max_depth_age_ms must be a positive integer")
@@ -568,6 +581,7 @@ class State:
     local_plan: PlanCache = field(default_factory=PlanCache)
     view_detour: Detour | None = None
     checked_prefix: bool = False
+    dwa_selected: bool = False
     search_sweep_checked: bool = False
     detour_leg: PathLeg | None = None
     executing_leg: PathLeg | None = None
@@ -1038,6 +1052,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
     state.command_dt_s = min(dt, config.watchdog_ms / 1000) if command_dt_s is None else command_dt_s
     state.view_detour = None
     state.checked_prefix = False
+    state.dwa_selected = False
     state.search_sweep_checked = False
     state.executing_leg = None
     if config.local_planning and config.local_geometry is not None and (depth or {}).get("body_mount_required"):
@@ -1094,6 +1109,11 @@ def step(*, detections, depth, odom, config: Config, state: State,
         if transitioning:
             decision = Decision(_twist(0., 0., 0.), AVOIDING, "运动方向切换，停车等待制动窗口")
     reduction = _feedback_speed_reduction(config, odom)
+    if state.dwa_selected and reduction < 1.:
+        # A post-plan velocity scale is a different, unchecked DWA trajectory.
+        decision = Decision(_twist(0., 0., 0.), AVOIDING,
+                            "DWA：实测速度超限，停车后重新采样")
+        state.dwa_selected = state.checked_prefix = False
     if reduction < 1. and decision.values is not None and any(decision.values):
         vx, vy, yaw = (decision.values[i] * reduction for i in (0, 1, 5))
         (floor_x, _), (floor_y, _) = _local_velocity_limits(config, 1. if vy < 0. else -1.)
@@ -1740,6 +1760,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         state.blocked_for_s = 0.0
     # Now vx is settled, so which deadband the yaw axis is subject to is known.
     if (config.local_planning and config.local_geometry is not None
+            and not state.dwa_selected
             and (vy or abs(previous_vy) > STILL_LINEAR or (feedback and abs(feedback[1]) > STILL_LINEAR))):
         # The lateral prefix was checked at a fixed heading.
         raw_wz = 0.
@@ -2099,6 +2120,81 @@ def _camera_frame_routes(config, scan):
             and scan.buffered_odom and scan.pose_origin is None and not scan.command_only)
 
 
+
+def _dwa_detour(depth, config, state, route, target_distance, target_bearing):
+    """Track an A* detour with a bounded DWA twist, without replacing its goal.
+
+    Only a fresh scan with measured movement can supply the initial state.
+    A camera-only footprint may support pure translation; turning needs the
+    camera-to-body mount that places the sweep at the chassis rotation origin.
+    """
+    scan = state.active_scan
+    if (config.local_controller != "dwa" or state.motion_source not in ("pose", "measured")
+            or scan.command_only or scan.active or not scan.poses or not scan.views
+            or not scan.current_frame or depth.get("capture_invalid")
+            or not scan.matches_route_view(depth) or route is None):
+        return None
+    geometry = route.geometry
+    if config.scan_geometry is not None:
+        if geometry is not config.scan_geometry:
+            return None
+        allow_yaw = True
+    else:
+        if geometry is not config.local_geometry:
+            return None
+        allow_yaw = False
+    if target_distance is None or target_bearing is None:
+        return None
+    target = local_path.target_in_grid(geometry,
+                                       target_distance * math.cos(target_bearing),
+                                       target_distance * math.sin(target_bearing))
+    left_vy = config.vy_max if config.left_vy_limit is None else config.left_vy_limit
+    right_vy = config.vy_max if config.right_vy_limit is None else config.right_vy_limit
+    if not config.use_lateral:
+        left_vy = right_vy = 0.
+    left_yaw = _scan_yaw_rate(config, -1.)
+    right_yaw = _scan_yaw_rate(config, 1.)
+    window = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+    horizon = max(config.dwa_horizon_s, window)
+    if horizon > 3.:
+        return None
+    grid = scan.grid()
+    proposed = dwa.select(
+        route=route.points, grid=grid, geometry=geometry,
+        half_width=_keepout_m(config), measured=scan.motion,
+        previous=state.commanded, x_limit=(0., config.vx_max),
+        y_limit=(-right_vy, left_vy), yaw_limit=(-right_yaw, left_yaw),
+        floors=(config.floor_vx if config.floor_vx_moving is None else config.floor_vx_moving,
+                config.floor_vy if config.floor_vy_moving is None else config.floor_vy_moving,
+                config.floor_wz, config.floor_wz_moving),
+        target=target, stop_distance=config.stop_distance_m,
+        horizon=horizon, max_candidates=config.dwa_samples, allow_yaw=allow_yaw)
+    if proposed is None:
+        return None
+    # Retain the existing all-speed swept-envelope check during introduction.
+    # It also covers command/watchdog response outside the nominal rollout.
+    # Do not replace it with an optimistic, acceleration-limited forecast.
+    if not local_path.motion_sweep_clear(
+            grid, geometry, config.half_width_m, window,
+            (scan.motion, state.commanded, proposed.command)):
+        return None
+    if scan.near_hits is not None and _near_sweep_hits(
+            config, scan, None, state, proposed.command).any():
+        return None
+    return proposed
+
+
+def _use_dwa(state, route, proposal, side):
+    """Publish exactly the twist whose rollout passed DWA's constraints."""
+    state.dwa_selected = True
+    state.checked_prefix = True
+    state.avoidance_yaw_override = True
+    state.escape_side = side
+    points = tuple((f, r) for f, r, _ in proposal.trajectory)
+    state.view_detour = Detour(None, points, route.geometry, route.points)
+    return (*proposal.command, AVOIDING, "局部规划：DWA沿已验证绕行轨迹运动")
+
+
 def _route_rank(plan, target):
     residual = math.dist(plan.points[-1], local_path.target_in_grid(plan.geometry, *target))
     length = sum(math.dist(a, b) for a, b in zip(plan.points, plan.points[1:]))
@@ -2220,6 +2316,12 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             if not local_path.segment_clear(blocked, geometry, keep, angle, length,
                                             heading_tolerance=ANGLE_TOLERANCE if angle else 0.):
                 continue
+            if (config.local_controller == "dwa" and config.scan_geometry is not None
+                    and geometry is config.scan_geometry):
+                proposal = _dwa_detour(depth, config, state, plan,
+                                       target_distance, target_bearing)
+                if proposal is not None:
+                    return _use_dwa(state, plan, proposal, math.copysign(1., angle))
             if rolling is not None:
                 if forward <= 0. or abs(angle) <= ANGLE_TOLERANCE:
                     continue
@@ -2601,10 +2703,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         state.escape_side = 0.
                         state.side_better_frames = 0
                         return prefix
-                if plan_now and _start_detour_segment(
+                if plan_now:
+                    detour = _start_detour_segment(
                         depth, config, state, geometry, ahead, order, target_distance, target_bearing,
-                        rooms=rooms, reroute=scan.exhausted, closest=scan.exhausted):
-                    return 0., 0., 0., AVOIDING, "局部规划：停车对准路线首段"
+                        rooms=rooms, reroute=scan.exhausted, closest=scan.exhausted)
+                    if isinstance(detour, tuple):
+                        return detour
+                    if detour:
+                        return 0., 0., 0., AVOIDING, "局部规划：停车对准路线首段"
             if scan is not None and scan.ready:
                 if local_command is not None or (not near and len(scan.directions) <= 1):
                     scan.finish()
@@ -2742,6 +2848,11 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             state.side_compare_frame = depth.get("source_frame_id", depth.get("frame_id"))
         state.escape_side = side
     if local_command is not None:
+        if local_route is not None:
+            proposal = _dwa_detour(depth, config, state, local_route,
+                                   target_distance, target_bearing)
+            if proposal is not None:
+                return _use_dwa(state, local_route, proposal, side)
         vx, vy = local_command
         wz = 0.0
         state.view_detour = local_route
