@@ -1,8 +1,8 @@
 # Dual-camera validation record
 
-Driver worktree is D:/phanthymotus-driver/.worktrees/piper-dual-camera.
+Driver validation used a separate worktree.
 Driver branch is codex/piper-dual-camera at 8242cffab75ec78a1b62ba4569e3ff4f71888d65.
-Perception worktree is D:/phanthymotus-driver/.worktrees/cross-view-object-consistency.
+Perception validation used a separate worktree.
 Perception branch is codex/cross-view-object-consistency. Original e0f0404 remains
 an ancestor. Source integration is d0874b8 and acceptance tooling is 7930576.
 
