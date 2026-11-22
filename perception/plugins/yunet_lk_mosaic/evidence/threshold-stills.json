@@ -1,0 +1,465 @@
+{
+  "inputs_sha256": {
+    "portrait": "88431cd9653ccd539741b555fb0a46b61558b301d4110412b5bc28b5e3ea6cb5",
+    "profiles": "2179e6b9e3bca0861fe0889e6f30c5b45d8e8f7e43e8886716a65a1ac16b61e3",
+    "slide": "a10eda925d34569340dc87c7e95d593c9fea6bdff18e59e2542ebe1776f1ea79",
+    "model": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+  },
+  "references": {
+    "frontal": [
+      [
+        230.0,
+        87.5,
+        325.0,
+        201.25
+      ]
+    ],
+    "brightness_0.30": [
+      [
+        230.0,
+        87.5,
+        325.0,
+        201.25
+      ]
+    ],
+    "brightness_0.12": [
+      [
+        230.0,
+        87.5,
+        325.0,
+        201.25
+      ]
+    ],
+    "brightness_0.07": [
+      [
+        230.0,
+        87.5,
+        325.0,
+        201.25
+      ]
+    ],
+    "small_192": [
+      [
+        149.0,
+        66.25,
+        177.5,
+        100.375
+      ]
+    ],
+    "small_144": [
+      [
+        131.75,
+        59.6875,
+        153.125,
+        85.28125
+      ]
+    ],
+    "small_112": [
+      [
+        120.25,
+        55.3125,
+        136.875,
+        75.21875
+      ]
+    ],
+    "small_80": [
+      [
+        108.75,
+        50.9375,
+        120.625,
+        65.15625
+      ]
+    ],
+    "profiles": [
+      [
+        91,
+        62,
+        144,
+        132
+      ],
+      [
+        501,
+        45,
+        555,
+        123
+      ]
+    ],
+    "slide": [],
+    "noise": [],
+    "blank": []
+  },
+  "thresholds": {
+    "0.1": {
+      "frontal": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.30": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "brightness_0.12": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.07": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_192": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "small_144": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_112": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "small_80": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "profiles": {
+        "matched": 2,
+        "missed": 0,
+        "unmatched_detections": 2
+      },
+      "slide": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "noise": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "blank": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      }
+    },
+    "0.22": {
+      "frontal": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.30": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.12": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.07": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_192": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_144": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_112": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "small_80": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "profiles": {
+        "matched": 2,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "slide": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "noise": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "blank": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      }
+    },
+    "0.28": {
+      "frontal": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.30": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.12": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.07": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_192": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_144": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_112": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "small_80": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "profiles": {
+        "matched": 2,
+        "missed": 0,
+        "unmatched_detections": 1
+      },
+      "slide": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "noise": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "blank": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      }
+    },
+    "0.45": {
+      "frontal": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.30": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.12": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.07": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_192": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_144": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_112": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_80": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "profiles": {
+        "matched": 2,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "slide": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "noise": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "blank": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      }
+    },
+    "0.7": {
+      "frontal": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.30": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.12": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.07": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_192": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_144": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_112": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_80": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "profiles": {
+        "matched": 2,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "slide": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "noise": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "blank": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      }
+    },
+    "0.9": {
+      "frontal": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.30": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.12": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "brightness_0.07": {
+        "matched": 0,
+        "missed": 1,
+        "unmatched_detections": 0
+      },
+      "small_192": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_144": {
+        "matched": 1,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "small_112": {
+        "matched": 0,
+        "missed": 1,
+        "unmatched_detections": 0
+      },
+      "small_80": {
+        "matched": 0,
+        "missed": 1,
+        "unmatched_detections": 0
+      },
+      "profiles": {
+        "matched": 0,
+        "missed": 2,
+        "unmatched_detections": 0
+      },
+      "slide": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "noise": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      },
+      "blank": {
+        "matched": 0,
+        "missed": 0,
+        "unmatched_detections": 0
+      }
+    }
+  }
+}

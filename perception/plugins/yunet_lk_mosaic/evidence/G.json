@@ -1,0 +1,135 @@
+{
+  "counts": {
+    "actual_processing_fps": 15.0,
+    "backend": "opencv",
+    "buffer_bytes": 0,
+    "buffer_frames": 0,
+    "corrected_frames": 72,
+    "detection_calls": 38,
+    "discarded_on_stop": 0,
+    "dropped_capacity": 0,
+    "expired_input": 0,
+    "expired_output": 0,
+    "face_frames": 150,
+    "input_overwritten": 149,
+    "lk_calls": 148,
+    "no_face_frames": 1,
+    "output_fps": 15.0,
+    "over_capacity_detections": 16,
+    "peak_buffer_bytes": 2764800,
+    "peak_buffer_frames": 4,
+    "processed": 151,
+    "processing_errors": 0,
+    "published": 151,
+    "published_corrected_frames": 72,
+    "source_latency_samples": 90,
+    "source_to_publish_p50_ms": 200.76,
+    "source_to_publish_p95_ms": 200.89,
+    "target_fps": 15,
+    "unreliable_track_updates": 1
+  },
+  "host": {
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "numpy": "1.26.4",
+    "opencv": "4.11.0",
+    "platform": "x86_64",
+    "python": "3.11.18"
+  },
+  "input_frames": 300,
+  "input_jpeg_sequence_sha256": "f0c226b4bf97a27be6912d3cf6f00411df60aa727f15a74d200b716d051cc566",
+  "mean_image_effect_fraction": 0.0757,
+  "model_sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+  "options": {
+    "adaptive": false,
+    "delay": 200,
+    "fps": 15,
+    "interval": 4,
+    "no_compensation": false,
+    "seconds": 10,
+    "start": 30,
+    "threads": 3,
+    "threshold": 0.28
+  },
+  "output_active_fps": 15.05,
+  "output_fps": 15.1,
+  "processed_fps": 15.1,
+  "published": 151,
+  "timing_ms": {
+    "analyze": {
+      "mean": 2.476,
+      "n": 151,
+      "p50": 1.456,
+      "p95": 6.122
+    },
+    "detect": {
+      "mean": 4.191,
+      "n": 38,
+      "p50": 4.113,
+      "p95": 4.723
+    },
+    "lk": {
+      "mean": 0.222,
+      "n": 148,
+      "p50": 0.214,
+      "p95": 0.304
+    },
+    "lk_quality": {
+      "mean": 0.251,
+      "n": 148,
+      "p50": 0.225,
+      "p95": 0.353
+    },
+    "process": {
+      "mean": 3.082,
+      "n": 151,
+      "p50": 2.087,
+      "p95": 6.762
+    },
+    "render": {
+      "mean": 0.606,
+      "n": 151,
+      "p50": 0.587,
+      "p95": 0.704
+    },
+    "source_to_publish": {
+      "mean": 200.752,
+      "n": 151,
+      "p50": 200.739,
+      "p95": 200.88
+    }
+  },
+  "variant": "new"
+}
