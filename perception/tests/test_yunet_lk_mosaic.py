@@ -1,3 +1,4 @@
+import hashlib
 import os
 import threading
 import time
@@ -377,7 +378,10 @@ def test_local_model_checksum_and_default_downloader(tmp_path, monkeypatch):
 
     wrong = tmp_path / "yunet.onnx"
     wrong.write_bytes(b"wrong")
-    with pytest.raises(MosaicError, match="model_verification_failed"):
+    with pytest.raises(MosaicError, match="model_verification_failed: size mismatch"):
+        resolve_model(str(wrong))
+    wrong.write_bytes(b"x" * model.MODEL_METADATA["size"])
+    with pytest.raises(MosaicError, match="model_verification_failed: SHA256 mismatch"):
         resolve_model(str(wrong))
 
     def fake_download(name, directory, sources, files, progress_cb):
@@ -390,6 +394,189 @@ def test_local_model_checksum_and_default_downloader(tmp_path, monkeypatch):
     monkeypatch.setenv("YUNET_LK_MOSAIC_MODEL_BASE_URL", "https://example.org/models")
     monkeypatch.setattr(model, "ensure_verified_bundle", fake_download)
     assert resolve_model(None) == str(wrong)
+
+
+@pytest.fixture
+def mosaic_tool(monkeypatch):
+    from plugins.yunet_lk_mosaic.plugin import MosaicNode, PREFIX, YuNetLkMosaicPlugin
+    from vision_stubs import _FakeExecutor
+
+    monkeypatch.setattr(MosaicNode, "create_timer", lambda *args: None, raising=False)
+    monkeypatch.delenv("YUNET_LK_MOSAIC_MODEL", raising=False)
+    executor = _FakeExecutor()
+    plugin = YuNetLkMosaicPlugin({}, executor)
+    try:
+        def call(action, **params):
+            return plugin.dispatch(PREFIX, {"action": action, **params})
+
+        assert call("config", consent_acknowledged=True)["state"] == "configured"
+        yield call
+    finally:
+        plugin.shutdown()
+
+
+@pytest.fixture
+def model_load_probe(monkeypatch):
+    from plugins.yunet_lk_mosaic import runtime
+
+    warming_up = threading.Event()
+    ready = threading.Event()
+    paths = []
+
+    class DetectorProbe:
+        def __init__(self, cv, path, config):
+            paths.append(path)
+
+        def detect(self, image):
+            warming_up.set()
+            assert ready.wait(5)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runtime, "YuNetDetector", DetectorProbe)
+    try:
+        yield warming_up, ready, paths
+    finally:
+        ready.set()
+
+
+def test_cold_download_reports_shared_status_in_info(mosaic_tool, model_load_probe, monkeypatch):
+    from plugins.yunet_lk_mosaic import model
+
+    began, allow_progress, reported, allow_completion = (threading.Event() for _ in range(4))
+    warming_up, ready, paths = model_load_probe
+
+    def download(name, directory, sources, files, progress_cb):
+        began.set()
+        assert allow_progress.wait(5)
+        progress_cb(40, 2, 5)
+        reported.set()
+        assert allow_completion.wait(5)
+        return {MODEL_FILE: "/verified/yunet.onnx"}
+
+    monkeypatch.setattr(model, "ensure_verified_bundle", download)
+    try:
+        assert mosaic_tool("start", input_topic="/camera/test")["state"] == "loading"
+        assert began.wait(5)
+        info = mosaic_tool("info")
+        assert info["state"] == "loading"
+        assert info["message"] == "正在准备模型 'YuNet' …"
+
+        allow_progress.set()
+        assert reported.wait(5)
+        info = mosaic_tool("info")
+        assert info["state"] == "loading"
+        assert info["reason"] == "downloading_model"
+        assert info["message"] == "正在下载模型 'YuNet' … 40% (2/5 MB)"
+        assert "model_fetch" not in info
+
+        allow_completion.set()
+        assert warming_up.wait(5)
+        info = mosaic_tool("info")
+        assert info["state"] == "loading"
+        assert info["message"] == "正在加载模型 'YuNet' …"
+        assert paths == ["/verified/yunet.onnx"]
+    finally:
+        allow_progress.set()
+        allow_completion.set()
+        ready.set()
+    assert mosaic_tool("stop")["state"] == "idle"
+
+
+def test_verified_cache_loads_without_downloading(mosaic_tool, model_load_probe, tmp_path, monkeypatch):
+    from plugins.yunet_lk_mosaic import model
+    from utils import model_downloader
+
+    contents = b"cached test model"
+    cached = tmp_path / MODEL_FILE
+    cached.write_bytes(contents)
+    monkeypatch.setattr(model, "require_models_subpath", lambda _: str(tmp_path))
+    monkeypatch.setattr(model, "MODEL_METADATA", {
+        "size": len(contents), "sha256": hashlib.sha256(contents).hexdigest(),
+    })
+
+    def unexpected_download(*args, **kwargs):
+        pytest.fail("a verified cached model must not be downloaded")
+
+    monkeypatch.setattr(model_downloader, "urlopen", unexpected_download)
+    warming_up, ready, paths = model_load_probe
+    try:
+        assert mosaic_tool("start", input_topic="/camera/test")["state"] == "loading"
+        assert warming_up.wait(5)
+        info = mosaic_tool("info")
+        assert info["state"] == "loading"
+        assert info["message"] == "正在加载模型 'YuNet' …"
+        assert paths == [str(cached)]
+
+        ready.set()
+        deadline = time.monotonic() + 5
+        while info["state"] == "loading" and time.monotonic() < deadline:
+            time.sleep(.01)
+            info = mosaic_tool("info")
+        assert info["state"] == "running"
+        assert info["message"] is None
+    finally:
+        ready.set()
+    assert mosaic_tool("stop")["state"] == "idle"
+
+
+@pytest.mark.parametrize("cause", [OSError("network offline"), ValueError("SHA256 mismatch")])
+def test_model_download_failure_stays_visible_in_info(mosaic_tool, monkeypatch, cause):
+    from plugins.yunet_lk_mosaic import model
+    from vision_stubs import _FakeNode
+
+    def failed_download(*args, progress_cb, **kwargs):
+        progress_cb(100, .22, .22)
+        raise RuntimeError("all model mirrors failed") from cause
+
+    monkeypatch.setattr(model, "ensure_verified_bundle", failed_download)
+    mosaic_tool("start", input_topic="/camera/test")
+    node = _FakeNode.instances[-1]
+    node.thread.join(timeout=5)
+    assert not node.thread.is_alive() and node.destroyed
+    info = mosaic_tool("info")
+    assert info["state"] == "error"
+    assert info["reason"].startswith("startup_failed:model_download_failed:")
+    assert str(cause) in info["message"]
+    assert "正在下载" not in info["message"]
+
+
+def test_default_bundle_discovers_mosaic_without_starting(monkeypatch):
+    import main
+    from plugins.yunet_lk_mosaic import runtime
+    from plugins.yunet_lk_mosaic.plugin import PREFIX
+    from vision_stubs import _FakeExecutor, _FakeNode
+
+    def unexpected_model(*args, **kwargs):
+        pytest.fail("registering a tool must not prepare a model")
+
+    monkeypatch.delenv("CONFIG_PATH", raising=False)
+    monkeypatch.setattr(runtime, "resolve_model", unexpected_model)
+    cfg = main._load_config()
+    assert cfg["mcp_port"] == 15720
+    assert cfg["plugins"][PREFIX]["enabled"] is True
+    assert cfg["plugins"][PREFIX]["consent_acknowledged"] is False
+    # Keep a real neighbouring processor in this off-device bundle.
+    plugins = {"echo_cancellation": cfg["plugins"]["echo_cancellation"],
+               "audio_mixer": {"enabled": False}}
+    executor = _FakeExecutor()
+    existing = main.PerceptionBundle({"plugins": plugins}, executor)
+    bundle = main.PerceptionBundle(
+        {"plugins": {**plugins, PREFIX: cfg["plugins"][PREFIX]}}, executor,
+    )
+    try:
+        tools = bundle.get_all_tools()
+        assert [t for t in tools if t["name"] != PREFIX] == existing.get_all_tools()
+        assert [t["type"] for t in tools if t["name"] == PREFIX] == ["processor"]
+        assert bundle.dispatch(PREFIX, {"action": "info"})["state"] == "idle"
+        assert bundle.dispatch(PREFIX, {
+            "action": "start", "input_topic": "/camera/test",
+        })["error"] == "consent_acknowledgment_required"
+        assert not executor.nodes and not _FakeNode.instances
+    finally:
+        bundle.shutdown()
+        existing.shutdown()
 
 
 @pytest.mark.parametrize("fallback", [False, True])

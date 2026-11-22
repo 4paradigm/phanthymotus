@@ -34,10 +34,16 @@ def resolve_model(path, progress=None):
         return path
     model_dir = require_models_subpath("/models/yunet_lk_mosaic")
     sources = os.environ.get("YUNET_LK_MOSAIC_MODEL_BASE_URL") or MODEL_SOURCES
-    return ensure_verified_bundle(
-        "yunet_lk_mosaic", model_dir, sources, {MODEL_FILE: MODEL_METADATA},
-        progress_cb=progress,
-    )[MODEL_FILE]
+    try:
+        return ensure_verified_bundle(
+            "yunet_lk_mosaic", model_dir, sources, {MODEL_FILE: MODEL_METADATA},
+            progress_cb=progress,
+        )[MODEL_FILE]
+    except (OSError, RuntimeError) as exc:
+        # The shared downloader chains the final network or verification
+        # error after exhausting its configured sources.
+        detail = f"{exc}: {exc.__cause__}" if exc.__cause__ is not None else str(exc)
+        raise MosaicError(f"model_download_failed: {detail}") from exc
 
 
 class YuNetDetector:

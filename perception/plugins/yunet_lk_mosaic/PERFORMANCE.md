@@ -55,6 +55,8 @@
 
 ## 复现
 
+当前镜像的默认配置会将 Card 加载到现有 Perception，启动处理仍须实例确认出镜同意。
+
 从独立工作树根目录运行。需要当前环境的 OpenCV、NumPy、pytest，以及另一个位于 `c8b6b15` 的旧版检出。测试模型用 [README](README.md) 的校验值准备。可选 ORT 用例需要 ONNX Runtime。人像用例默认读取 scikit-image 的示例图，也可将 `TEST_YUNET_FACE_IMAGE` 指向同一张 `astronaut.png`。参考原始数据区的路径由运行者指定。
 
 ```sh
@@ -62,9 +64,15 @@ CARD=perception/plugins/yunet_lk_mosaic
 export PYTHONPATH=perception TEST_YUNET_MODEL=/path/to/face_detection_yunet_2023mar.onnx
 python3 -m pytest perception/tests/test_yunet_lk_mosaic.py -q
 
-# 在仅有回环的隔离网络环境内，用 Fast DDS 运行以下命令。
-ROS_DOMAIN_ID=193 ROS_LOCALHOST_ONLY=1 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
-TEST_YUNET_LOCAL_DDS=1 python3 -m pytest "$CARD/tests/test_ros_mcp.py" -q
+# 在只有回环接口的独立网络命名空间内运行 Fast DDS。
+unshare --user --map-root-user --net sh -eu -c '
+  ip link set lo up
+  unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
+  export ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=1 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+  export TEST_YUNET_LOCAL_DDS=1
+  exec python3 -m pytest "$1/tests/test_ros_mcp.py" -q
+' sh "$CARD"
 
 VIDEO=/path/to/briefing-20140625.mp4
 OLD=/path/to/pr382-checkout

@@ -17,6 +17,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.model_progress import fetch_status
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
@@ -106,7 +107,7 @@ class MosaicNode(Node):
         self._path, self._finished = path, finished
         self._gate = threading.RLock()
         self._state, self._reason = "loading", "verifying_model"
-        self._progress = None
+        self._message = "正在准备模型 'YuNet' …"
         self._stream = None
         self._stamp = 0
         self._last_output_stamp = 0
@@ -134,7 +135,7 @@ class MosaicNode(Node):
                 "schema": SCHEMA, "instance_id": self.key,
                 "privacy_guaranteed": False,
                 "state": self._state, "reason": self._reason,
-                "model_fetch": self._progress,
+                "message": self._message,
                 "input_topic": self.topic, **_ports(self.topic, self.key),
                 "config": asdict(self.config),
                 "last_output_stamp_ns": self._last_output_stamp,
@@ -193,14 +194,11 @@ class MosaicNode(Node):
                 msg.data = json.dumps(self.snapshot(), ensure_ascii=False)
                 self._status_pub.publish(msg)
 
-    def _progress_update(self, percent, mb_done, mb_total):
+    def _download_status(self, message):
         with self._gate:
             if self._state == "loading":
                 self._reason = "downloading_model"
-                self._progress = {
-                    "percent": percent, "bytes_done": round(mb_done * 1024 ** 2),
-                    "bytes_total": round(mb_total * 1024 ** 2),
-                }
+                self._message = message
 
     def _processing_error(self, exc, frame):
         with self._gate:
@@ -212,21 +210,26 @@ class MosaicNode(Node):
     def _run(self):
         engine = None
         try:
-            engine = MosaicEngine(self._path, self.config, progress=self._progress_update)
+            progress_cb, _ = fetch_status(self._download_status, "YuNet")
+            engine = MosaicEngine(self._path, self.config, progress=progress_cb)
             with self._gate:
                 if self._state == "stopping":
                     return
+                self._reason = "warming_up_model"
+                self._message = "正在加载模型 'YuNet' …"
             engine.detector.detect(np.zeros((320, 320, 3), dtype=np.uint8))
             with self._gate:
                 if self._state == "stopping":
                     return
                 self._stream = MosaicStream(engine, self.config, self._publish_image, self._processing_error)
                 self._state, self._reason = "running", "waiting_for_camera"
+                self._message = None
             self._stream.run()
         except Exception as exc:
             with self._gate:
                 if self._state != "stopping":
                     self._state, self._reason = "error", f"startup_failed:{exc}"
+                    self._message = f"YuNet 模型启动失败：{exc}"
                     self._errors += 1
             LOG.exception("[%s] instance worker failed", PREFIX)
             self._publish_status()
@@ -240,6 +243,7 @@ class MosaicNode(Node):
     def stop(self):
         with self._gate:
             self._state, self._reason = "stopping", "stopped"
+            self._message = None
             if self._stream is not None:
                 self._stream.stop()
 
