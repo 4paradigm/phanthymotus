@@ -132,43 +132,27 @@ def test_late_vision_and_external_pose_rebuild_newer_corrections():
     assert 0 < late.current.transform[0, 3] < 1.05
 
 
-def test_unchanged_published_endpoint_does_not_recompute_pose_correction(monkeypatch):
-    from plugins import external_odometry_fusion as fusion
-
+def test_new_publication_reflects_revised_published_checkpoints():
     engine = ExternalOdometry(learning=False)
     feed(engine, 0., 10.)
     feed(engine, .2, 10.2)
     engine.output()
     feed(engine, .4, 10.4)
-    correction = fusion.se3_log
-    calls = []
-
-    def record(transform):
-        calls.append(transform)
-        return correction(transform)
-
-    monkeypatch.setattr(fusion, 'se3_log', record)
     assert engine.output()['pose']['position'][0] == pytest.approx(.4)
-    assert calls == []
 
     # A visual correction at the published capture can revise the checkpoint.
-    # Publication must still smooth a real revision in the original output gauge.
+    # Its accepted correction belongs in the next new measurement publication.
     vision(engine, .2, 0.)
     vision(engine, .4, .1)
+    assert engine.output() is None
     feed(engine, .6, 10.6)
-    calls.clear()
-    out = engine.output()['pose']['position'][0]
-    assert len(calls) == 2  # Smoothing, then the remaining pose offset for covariance.
-    assert out > engine.current.transform[0, 3]
+    assert engine.current.transform[0, 3] == pytest.approx(.55)
+    assert engine.output()['pose']['position'][0] == pytest.approx(.55)
 
-    # Once a correction fits within one update, reuse the measured checkpoint
-    # instead of carrying a numerical difference into later publications.
     feed(engine, .8, 10.8)
-    assert engine.output()['pose']['position'][0] == pytest.approx(engine.current.transform[0, 3])
+    assert engine.output()['pose']['position'][0] == pytest.approx(.75)
     feed(engine, 1., 11.)
-    calls.clear()
-    assert engine.output()['pose']['position'][0] == pytest.approx(engine.current.transform[0, 3])
-    assert calls == []
+    assert engine.output()['pose']['position'][0] == pytest.approx(.95)
 
 
 def test_visual_progress_during_external_outage_is_not_counted_twice():
@@ -449,7 +433,7 @@ def test_very_uncertain_vision_does_not_force_a_minimum_correction():
     assert engine.current.covariance[0, 0] < .002
 
 
-def test_smoothed_publication_includes_its_offset_from_the_estimated_pose():
+def test_publication_uses_corrected_estimate_and_its_uncertainty():
     engine = ExternalOdometry(learning=False)
     vision(engine, 0., 0.)
     feed(engine, 0., 0.)
@@ -458,11 +442,12 @@ def test_smoothed_publication_includes_its_offset_from_the_estimated_pose():
     vision(engine, .5, 0.)
     feed(engine, .6, .6)
     output = engine.output()['pose']
-    # Late correction moved the estimate back 5 cm; publication catches up
-    # by only 3 cm, leaving a known 2 cm difference from that estimate.
+    # The filter limits this late correction to 5 cm and retains uncertainty
+    # for its unapplied part. Publication must use that same corrected mean.
     assert engine.current.transform[0, 3] == pytest.approx(.55)
-    assert output['position'][0] == pytest.approx(.57)
-    assert output['covariance'][0] >= engine.current.covariance[0, 0] + .02**2 - 1e-12
+    assert output['position'][0] == pytest.approx(.55)
+    np.testing.assert_allclose(np.asarray(output['covariance']).reshape(6, 6),
+                               engine.current.covariance, atol=1e-12)
 
 
 def test_clipped_turn_keeps_the_actual_position_offset_in_covariance():
@@ -484,28 +469,36 @@ def test_clipped_turn_keeps_the_actual_position_offset_in_covariance():
     assert np.linalg.eigvalsh(covariance).min() >= -1e-12
 
 
-def test_smoothed_turn_keeps_world_position_and_rotation_offsets_in_covariance():
-    from plugins.external_motion_learning import se3_exp
+def test_replayed_publication_transports_full_covariance_to_world_axes():
+    from plugins.rgbd_imu import rotation_from_quaternion
 
     engine = ExternalOdometry(learning=False)
-    variance = np.array([.0001, .0004, .0009, .0001, .0004, .0009])
+    variance = np.array([.01, .04, .09, .16, .25, .36])
     engine.vision(2*NS, 'replacement', np.eye(4), variance)
     engine.output()
-    engine.vision(NS, 'original', se3_exp(np.array([1., 0., 0., 0., 0., 1.5])), variance)
-    engine.vision(3*NS, 'replacement', np.eye(4), variance)
+    original = np.array([[0., 0., 1., 1.], [1., 0., 0., 2.],
+                         [0., 1., 0., 3.], [0., 0., 0., 1.]])
+    relative = np.array([[1., 0., 0., 1.], [0., 0., -1., 0.],
+                         [0., 1., 0., 0.], [0., 0., 0., 1.]])
+    engine.vision(NS, 'original', original, variance)
+    assert engine.output() is None
+    engine.vision(3*NS, 'replacement', relative, variance)
     output = engine.output()['pose']
-    offset = np.r_[engine.current.transform[:3, 3] - output['position'], 0., 0., 1.5-.03]
-    covariance = np.asarray(output['covariance']).reshape(6, 6)
-    assert offset[1] > .6
-    assert covariance[1, 1] >= offset[1]**2
-    # Removing the known mean offset must leave the estimator's uncertainty,
-    # including translation/rotation cross terms from the shared offset.
-    remainder = covariance - np.outer(offset, offset)
-    rotation = np.array([[np.cos(1.5), -np.sin(1.5), 0.],
-                         [np.sin(1.5), np.cos(1.5), 0.], [0., 0., 1.]])
-    axes = np.zeros((6, 6))
-    axes[:3, :3] = axes[3:, 3:] = rotation
-    np.testing.assert_allclose(remainder, axes @ engine.current.covariance @ axes.T, atol=1e-12)
+    np.testing.assert_allclose(output['position'], [1., 3., 3.], atol=1e-12)
+    np.testing.assert_allclose(rotation_from_quaternion(output['quaternion']),
+                               [[0., 1., 0.], [1., 0., 0.], [0., 0., -1.]], atol=1e-12)
+    # The original rotation permutes x/y/z to y/z/x. The new one-metre
+    # translation along world y carries the two alignment endpoint variances:
+    # angular world x adds .72 to position z and their cross covariance;
+    # angular world z adds .50 to position x and a negative cross covariance.
+    # The noncommuting final turn also permutes the new visual variance.
+    expected = np.array([[.72, 0., 0., 0., 0., -.50],
+                         [0., .03, 0., 0., 0., 0.],
+                         [0., 0., .89, .72, 0., 0.],
+                         [0., 0., .72, .97, 0., 0.],
+                         [0., 0., 0., 0., .48, 0.],
+                         [-.50, 0., 0., 0., 0., .86]])
+    np.testing.assert_allclose(np.asarray(output['covariance']).reshape(6, 6), expected, atol=1e-12)
 
 
 def test_learning_uses_uncertainty_from_both_visual_endpoints():

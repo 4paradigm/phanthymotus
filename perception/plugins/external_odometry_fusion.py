@@ -290,7 +290,6 @@ class ExternalOdometry:
         self.base = _State(0, np.eye(4), np.eye(6), np.zeros((6, 12)), ExternalMotionLearner(enabled=learning))
         self.current = self.base
         self._output_stamp = 0
-        self._output_pose = None
         self._batch_changes = None
 
     @contextmanager
@@ -626,24 +625,14 @@ class ExternalOdometry:
             state = self.current
         if state.last_update is None or state.stamp <= self._output_stamp:
             return None
+        # Replay has already applied the filter's correction policy. Publish
+        # its estimate so the mean cannot depend on publication cadence.
         pose = state.transform
-        publication_error = np.zeros(6)
-        past = self.checkpoints.get(self._output_stamp)
-        # Until a replay changes the published checkpoint, the correction is
-        # the identity. Keep the measured transform without a log/exp round trip.
-        if past is not None and self._output_pose is not None and self._output_pose is not past.transform:
-            propagated = self._output_pose @ np.linalg.inv(past.transform) @ pose
-            error = se3_log(np.linalg.inv(propagated) @ pose)
-            if np.any(np.abs(error) > .03):
-                applied = np.clip(error, -.03, .03)
-                pose = propagated @ se3_exp(applied)
-                publication_error = _world_pose_offset(pose, state.transform)
-        self._output_pose, self._output_stamp = pose, state.stamp
+        self._output_stamp = state.stamp
         axes = np.eye(4)
-        axes[:3, :3] = state.transform[:3, :3]
+        axes[:3, :3] = pose[:3, :3]
         frame_rotation = _adjoint(axes)
-        covariance = (frame_rotation @ state.covariance @ frame_rotation.T +
-                      np.outer(publication_error, publication_error))
+        covariance = frame_rotation @ state.covariance @ frame_rotation.T
         fused = dict(position=pose[:3, 3].tolist(), quaternion=quaternion(pose[:3, :3]),
                      frame_id=self.segment+'_odom', child_frame_id=self.body_frame,
                      covariance=covariance.ravel().tolist())
