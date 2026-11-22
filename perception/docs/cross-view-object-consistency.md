@@ -8,19 +8,14 @@ MCP provides `config`, `start`, `stop` and `info`.
 
 ## Input contracts and upstream investigation
 
-- PiPER driver [#382](https://github.com/4paradigm/phanthymotus-driver/pull/382) exposes one
-  optional On camera sensor for the selected V4L2 color node per service. The two
-  `/dev/piper-camera-{1,2}` names are device choices. The reviewed PiPER camera
-  code sends JPEG in `sensor_msgs/CompressedImage`. Its ROS stamp is sourced
-  from the host-side capture pipeline and the optical frame name is constant.
-  Establish two independent color sources with unique topics on the workstation.
-  Verify the physical device/serial and the acquisition clock of each. An offline
-  placeholder with a fresh publish timestamp must be excluded upstream.
-- `motus.camera/1` can carry lens identity and intrinsics through the canvas.
-  A valid `K` and image size for each physical PiPER camera, registered sensor
-  depth, inter-camera extrinsics, and a common capture session were unavailable
-  in the inspected PiPER wiring. [Driver #530](https://github.com/4paradigm/phanthymotus-driver/pull/530)
-  calibrates gripper clearance against a table using arm feedback.
+- PiPER driver [#382](https://github.com/4paradigm/phanthymotus-driver/pull/382)
+  introduced an optional On camera sensor for one selected V4L2 color node.
+  The dual-camera Driver branch adds On camera B to the same service with
+  two serial-bound color devices and independently opened capture sessions.
+  `motus.camera/1` can describe optics. Valid installed-device intrinsics,
+  registered depth, and workbench extrinsics still need field evidence.
+  [Driver #530](https://github.com/4paradigm/phanthymotus-driver/pull/530)
+  calibrates gripper clearance using arm feedback.
 - VOP streams `objects[]` with `name`, `confidence` and an optional pixel
   `bbox=[x1,y1,x2,y2]`. Keep `publish_bbox` on. This change adds
   `source={frame_id,stamp_ns}` and `source_size=[width,height]` to streaming
@@ -45,7 +40,8 @@ MCP provides `config`, `start`, `stop` and `info`.
 
 Add two existing RGB camera cards and one VOP instance for each camera. Connect each
 camera to its VOP as well as to the corresponding A/B RGB port. Connect each
-VOP JSON output to the corresponding A/B Objects port. If verified depth is
+VOP JSON output to the corresponding A/B Objects port. To check RGB provenance
+and timing alone, omit the Objects ports and their topic bindings. If verified depth is
 available, wire each corresponding Depth port. Route the JSON output to a
 Dashboard inspection panel. The canvas passes `input_topics` as a list. The
 Card checks the connected set against the exact configured topic names, so equal
@@ -56,7 +52,7 @@ Set the Card's **rig_json** string to a JSON object with these fields.
 ```json
 {
   "camera_ids": ["bench_a", "bench_b"],
-  "session_id": "REPLACE_WITH_CAPTURE_SESSION",
+  "device_ids": ["REPLACE_WITH_CAMERA_A_DEVICE_ID", "REPLACE_WITH_CAMERA_B_DEVICE_ID"],
   "topics": {
     "a": {"rgb": "/bench/a/image", "objects": "/bench/a/image/objects"},
     "b": {"rgb": "/bench/b/image", "objects": "/bench/b/image/objects"}
@@ -80,15 +76,29 @@ maps optical coordinates (right, down, forward) to the chosen common frame.
 Depth values must be optical-axis Z, aligned and full-frame resampled with the
 same pixel mapping as the RGB. Verify these properties before declaring them.
 
-The workstation acquisition publisher or existing capture middleware must set
-`header.frame_id` to `<camera_id>@<session_id>` on the input RGB and preserve
-the original shared-clock Unix acquisition stamp. Use a fresh shared session ID
-when either camera restarts, changes source, or begins replay, and restart the
-Card with the new ID. Do not stamp at processing or reception time.
-The stock PiPER RGB output inspected here cannot supply this tag or identify
-offline placeholders in the image payload. A session-aware workstation source
-is an integration prerequisite for positive results. An unmodified RGB stream
-can exercise the port wiring and unverified-provenance diagnosis.
+Read the fingerprints from Driver MCP `info().device_id`. The capture tag
+`motus.capture/1|camera_id|optical_frame_id|capture_session_id|frame_sequence|host_read|device_id`
+travels atomically with JPEG, and its full value and nanosecond stamp must
+survive VOP and depth. The capture sessions are independent. A new session
+observed on either RGB input clears both views' buffered evidence. Delayed
+retired frames, wrong devices, wrong camera IDs, duplicates and stale data
+cannot populate a match. An older deployment with explicit
+`<camera_id>@<session_id>` tags can keep its existing `session_id` config and
+omit `device_ids`.
+
+For the provenance-enabled Driver, include the corresponding `device_id` and
+the same nonempty `calibration_version` in both calibration records. Stop the
+Card before changing the rig or calibration. Set `time_error_ms` only after
+measuring a conservative bound on cross-camera clock offset and differential
+host-read timing uncertainty at the intended frame rates. The Card requires
+observed skew plus this bound to fit inside `max_time_offset_ms` before any
+calibrated geometry is evaluated. Host-read timing alone cannot establish
+hardware synchronization.
+
+The two PiPER camera cards send color only. The deployed depth source must
+explicitly register the maps to RGB, use the declared wire format, and
+propagate the originating RGB frame tag and stamp. Validate any monocular
+model's metric and spatial accuracy before supplying it as qualified depth.
 
 ## Reading diagnostics
 
@@ -97,9 +107,12 @@ can exercise the port wiring and unverified-provenance diagnosis.
   pre-start, expired and other-session samples cannot update the match buffers.
   `timestamp` is the later source time in Unix seconds for a joined pair.
   Before a pair is available it is the report time.
-- Stream freshness and timing diagnostics can run without metric calibration.
-  Metric agreement, disagreement, field-of-view and occlusion evidence need
-  validated calibration and aligned depth. The Card keeps a bounded number of
+- Level 0 reports source identity, session, observed timing and freshness.
+  Level 1 reports a 2D epipolar candidate count with valid rectified calibration
+  and a qualified timing bound, when depth is unavailable. Level 2 adds the
+  existing 3D comparison on two valid, registered depth maps. Geometry reports
+  the calibration version when using provenance-enabled inputs. The epipolar
+  count describes compatible pairs and cannot establish identity. The Card keeps a bounded number of
   depth maps and detection lists and retains only the headers of RGB observations.
 - Candidate edges require both compatible class and spatial proximity.
   Mutually preferred edges with a clear margin are reported. Close alternatives
@@ -128,13 +141,21 @@ can exercise the port wiring and unverified-provenance diagnosis.
 3. Start the Card and test the Dashboard connections in both RGB-only and
    calibrated configurations. Inspect output during and after a disconnect,
    dropped detection, intentional skew, view exit and partial/full occlusion.
-4. Record a shared-clock, labelled two-camera session with RGB, detections,
-   depth and reference geometry. To replay with the live-clock interface,
-   preserve inter-frame timing while rebasing all source stamps together to the
-   current epoch and issuing a fresh session ID. Report recall, wrong matches
-   among predicted pairs, ambiguity coverage, residual quantiles and CPU/RSS
-   separately for the deployment data. Synthetic benchmarks measure only their
-   generated fixtures.
+4. Record both RGB and VOP topics and any registered depth topics while
+   the clocks and session tags are intact. Use
+   `ros2 bag record --storage sqlite3 -o piper-cross-view <topic-a-rgb> <topic-a-objects> <topic-b-rgb> <topic-b-objects>`
+   and append the verified depth topics if present. Save the original rig JSON
+   and survey records with the bag. Include both views of a common flashing
+   timing reference, stationary surveyed targets, occlusions, and disconnects.
+5. Point a Card running in a separate Perception service and isolated ROS domain at
+   `/cross_view_replay/{a,b}/{rgb,objects,depth}`. With `PYTHONPATH=perception`
+   and the ROS 2 Python bag plugin, run
+   `python perception/tools/replay_cross_view.py <bag-directory> <original-rig.json>`.
+   Start the Card shortly before replay. The tool rebases stamps together and
+   preserves the original relative timing, capture provenance and dropouts.
+   It creates new replay session IDs and leaves the source bag untouched.
+   Report measured synchronization error, false positives and negatives,
+   ambiguity coverage and metric residuals against the held-out survey.
 
 From the repository root, set `PYTHONPATH=perception` and run
 `python perception/tests/test_cross_view_object_consistency.py`. Add
@@ -144,3 +165,21 @@ run `python perception/tests/cross_view_ros_integration.py` for virtual
 publishers, MCP over loopback HTTP, DDS output and repeated startup/teardown. The existing
 `perception/Dockerfile.jetson` copies the plugin and utility directories and
 needs no Card-specific dependency or image layer.
+
+
+## Local image and integration reproduction
+
+```sh
+docker buildx build --platform linux/arm64 --load --build-arg JP_VERSION=511 \
+  -f perception/Dockerfile.jetson -t motus-cross-view:jp511-dockerfile .
+docker run --rm --network none --platform linux/arm64 --entrypoint bash \
+  -v "$PWD/perception/tests:/tests:ro" motus-cross-view:jp511-dockerfile \
+  -lc 'PYTHONPATH=/work python3 /tests/cross_view_ros_integration.py'
+```
+
+For browser acceptance, run a local Core and
+`cross_view_dashboard_fixture.py` on an isolated Docker network and ROS
+domain. Run `cross_view_dashboard_browser.mjs` with the browser-reachable Core
+URL, the Core-reachable fixture MCP URL, a local Chromium executable and a PNG
+output path. The test stores a fixture-only canvas in that Core. The virtual
+VOP outputs are labelled JSON fixtures and the test uses real MCP and DDS.
