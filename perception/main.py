@@ -235,6 +235,10 @@ class PerceptionBundle:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
                           exc_info=True)
 
+        fusion_cfg = plugins_cfg.get("semantic_surface_fusion", {})
+        if fusion_cfg.get("enabled", False):
+            from plugins.semantic_surface_fusion import SemanticSurfaceFusionPlugin
+            self._plugins.append(SemanticSurfaceFusionPlugin(fusion_cfg, executor))
         if plugins_cfg.get("measure", {}).get("enabled", False):
             from plugins.measure import MeasurePlugin
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))

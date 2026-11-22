@@ -4604,3 +4604,7 @@ autoload on, **176 passed** with it off.
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
 ```
+
+### Semantic Surface Fusion
+
+See the [Semantic Surface Fusion card guide](docs/semantic_surface_fusion.md) for canvas wiring, calibration, output fields and verification.

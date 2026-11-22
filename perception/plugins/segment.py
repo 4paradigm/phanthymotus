@@ -10,6 +10,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from plugins.camera_info import for_topic, inherit
 from plugins.semantic_masks import decode_camera_jpeg, overlay, semantic_maps
 from utils.qos import CAMERA_QOS
 
@@ -188,7 +189,7 @@ class SegmentationPlugin:
                     or any(not isinstance(v, str) or not v.strip() for v in labels) or len(set(labels)) != len(labels)):
                 raise ValueError(f"Invalid semantic segmentation preset {name!r}")
         self.preview = cfg.get("publish_overlay", True)
-        self.nodes, self.instances = {}, {}
+        self.nodes, self.instances, self.declarations = {}, {}, {}
         self.lock = threading.RLock()
 
     def get_tools(self):
@@ -207,6 +208,7 @@ class SegmentationPlugin:
         return engine, names
 
     def _remove(self, key):
+        self.declarations.pop(key, None)
         topic = self.instances.pop(key, "")
         if topic and self.nodes[topic].remove(key):
             self.nodes.pop(topic).close()
@@ -248,6 +250,8 @@ class SegmentationPlugin:
                         raise
                     self._remove(key)
                     self.instances[key] = topic
+                if "camera_info" in args:
+                    self.declarations[key] = for_topic(args["camera_info"], topic)
             elif action != "info":
                 raise ValueError("Unknown segmentation card action")
             active = self.nodes.get(self.instances.get(key))
@@ -264,6 +268,11 @@ class SegmentationPlugin:
                         if missing:
                             state, message = "error", "Classes absent from frozen YOLOE vocabulary: " + ", ".join(sorted(missing))
             wired = self.instances.get(key) or topic
+            ports = _ports(wired, name, key[1], self.preview)
+            declaration = self.declarations.get(key, {})
+            camera_info = inherit(declaration, topic=ports[0]["topic"], fmt="image/png",
+                                  stage="segment") if wired else []
             return {"state": state, "message": message, "classes": self.cards[name],
+                    "camera_info": camera_info,
                     "topic_in": [{"topic": wired, "format": "image/jpeg", "desc": "Camera JPEG"}],
-                    "topic_out": _ports(wired, name, key[1], self.preview)}
+                    "topic_out": ports}

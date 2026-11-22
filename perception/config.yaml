@@ -689,6 +689,14 @@ plugins:
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
 
+  semantic_surface_fusion:
+    enabled: true
+    sync_ms: 25
+    stale_ms: 1500
+    timeout_ms: 200
+    depth_scale: 0.001
+    max_points: 0
+
   measure:
     # 物体可见宽高测量：接 VOP 的 data/json 和一路米制深度图，输出距离、
     # 可见宽高，并可把 bbox/尺寸画到相机 JPEG 上。
