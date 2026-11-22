@@ -2999,8 +2999,12 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
                 rooms = {s: _clearance(depth, config, lateral_offset_m=s * keep) for s in (-1., 1.)}
                 frame = depth.get("source_frame_id", depth.get("frame_id"))
                 order = _local_side_order(rooms, config, state, frame)
-                if _start_detour_segment(depth, config, state, geometry, ahead, order,
-                                         target_distance, target_bearing, reroute=True):
+                new_route = _start_detour_segment(
+                    depth, config, state, geometry, ahead, order,
+                    target_distance, target_bearing, reroute=True)
+                if isinstance(new_route, tuple):
+                    return new_route
+                if new_route:
                     return 0., 0., 0., AVOIDING, "主动观察：原直行走廊被挡，停车对准新路线首段"
             if matched_view or scan.command_only:
                 if not scan.route_segment and scan.try_other_side():
