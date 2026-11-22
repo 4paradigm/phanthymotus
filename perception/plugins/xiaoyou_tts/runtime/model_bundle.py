@@ -21,13 +21,13 @@ from urllib.request import Request, urlopen
 SOURCE_SHA = 'a46bd6826d1074b93bc7a17379966d88005cd248136acd24aab4b6883e689bb0'
 
 FRONTEND_FILE = 'frontend/phonemizer.py'
-FRONTEND_SHA = '30ffceaace36c3781b3e5950ce3ac4e8e3542999a2eb8e858daf49d517839d0c'
+FRONTEND_SHA = '7e09fccb5136edc5e80d3214a3cb0014f2d9f80b8d775d2edf4004d8e60fd162'
 _RELEASE_FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7ce1db0dc5'
 
 NORMALIZATION_REVISION = '01yuewen-contextual-polyphones-compact-20261118'
 
 NORMALIZATION_MODULE_SHAS = {
-    'frontend/numbers.py': '1bc10c534d2f4509e93ae9044428c2157f2a243f9d1d19855a0da3f763474927',
+    'frontend/numbers.py': '8087a8d364c8861b935e9b9df5f363df441f2e65870745b51ff7c993df45453a',
 }
 # The immutable model manifest records the source from its original export.
 # The installed frontend is verified against the current hashes above.
@@ -55,7 +55,7 @@ NATIVE_WEIGHTS_SHA = 'f33dcf83714f3c42cbdad5c85a6ec09d1e69bec29e6c173992bff429f7
 
 # The published archive records the pre-merge excitation source.
 PHASE_DSP_SHA = '82e542dc0d002ff5214779ae568b66407cd0f2770495bb7614fc58bc3804a4b4'
-SYNTHESIS_SOURCE_SHA = '7099f9502cd38d56d027638f9d3191203af397a79f1c4e7115a8d746153d5d85'
+SYNTHESIS_SOURCE_SHA = '080c4157c705f9f8be4a74dcb1f91cae538d0f2fa41145e8aed235bb5e7104a3'
 
 STYLE_FILE_SHA = '1c0c128370aa247bbf3eb77bf798c0f7d4d4583074f9d582e314c4a0570ca13c'
 

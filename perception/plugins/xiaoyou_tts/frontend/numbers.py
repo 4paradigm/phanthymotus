@@ -791,8 +791,22 @@ _ABSOLUTE_PATH = (
     r"|/(?:[A-Za-z_.][A-Za-z0-9_.+~%=-]*/" + _PATH_PART + r"(?:/" + _PATH_PART + r")*"
     r"|[A-Za-z_.][A-Za-z0-9_.+~%=-]*\.[A-Za-z][A-Za-z0-9_]*))"
 )
+_PATH_SUFFIX = '|'.join(sorted(_FILENAME_SUFFIXES, key=lambda item: (-len(item), item)))
+_MIXED_PATH_PART = r"[A-Za-z0-9_.+~%=\u4e00-\u9fff-]+"
+_FILE_PATH = (
+    r"(?:[A-Za-z]:[/\\]|\.{1,2}[/\\]|/|" + _PATH_PART + r"[/\\])"
+    r"(?:" + _MIXED_PATH_PART + r"[/\\])*" + _MIXED_PATH_PART
+    + r"\.(?:" + _PATH_SUFFIX + r")(?![A-Za-z0-9_/\\@+-]|\.[A-Za-z0-9_.])"
+)
+_MIME_TYPE = re.compile(
+    r"(?:application/(?:json|ld\+json|problem\+json|xml|pdf|zip|octet-stream|x-www-form-urlencoded)"
+    r"|text/(?:plain|html|xml|css|csv|javascript|markdown)"
+    r"|audio/(?:wav|mpeg|ogg)|video/(?:mp4|webm)|image/(?:png|jpeg|webp|svg\+xml)"
+    r"|multipart/form-data)(?![A-Za-z0-9_/\\@+-]|\.[A-Za-z0-9_.])", re.I,
+)
 _ADDRESSES_AND_PATHS = re.compile(
-    r"(?<![A-Za-z0-9_./\\])(?:" + _URL + "|" + _EMAIL + "|" + _ABSOLUTE_PATH + ")", re.I)
+    r"(?<![A-Za-z0-9_./\\])(?:"
+    + "|".join((_URL, _EMAIL, _FILE_PATH, _ABSOLUTE_PATH, _MIME_TYPE.pattern)) + ")", re.I)
 
 def address_ranges(text, *, include_absolute_paths=False):
     """Return the original offsets, excluding punctuation outside each literal."""
@@ -807,13 +821,17 @@ def address_ranges(text, *, include_absolute_paths=False):
             yield match.start(), match.start() + len(address)
 
 def read_address(value, language):
-    """Retain the V4 spelling of addresses and add the Windows path separator."""
+    """Read the separators while retaining whole Han words in paths."""
     symbols = {**_SYMBOLS[language], '\\': '反斜杠' if language == 'ZH' else 'backslash'}
+    if _MIME_TYPE.fullmatch(value):
+        abbreviations = {'json', 'xml', 'pdf', 'html', 'css', 'csv', 'png', 'svg'}
+        return ' '.join(word.upper() if word in abbreviations else symbols.get(word, word)
+                        for word in re.findall(r'[a-z]+|[0-9]+|[/+.-]', value.lower()))
     return ' '.join(
-        char.upper() if char.isascii() and char.isalpha()
-        else _DIGITS[language][int(char)] if char.isascii() and char.isdigit()
-        else symbols[char]
-        for char in value
+        part.upper() if part.isascii() and part.isalpha()
+        else _DIGITS[language][int(part)] if part.isascii() and part.isdigit()
+        else symbols.get(part, part)
+        for part in re.findall(r'[\u4e00-\u9fff]+|.', value)
     )
 
 
@@ -823,12 +841,6 @@ def filename_spans(text):
  return tuple(m.span()for m in _FILENAME.finditer(text)
   if m.group().rsplit('.',1)[1].casefold()in _FILENAME_SUFFIXES
   and not any(a<m.end()and m.start()<b for a,b in excluded))
-
-_RELATIVE_FILE_PATH=re.compile(r'(?<![A-Za-z0-9_./\\])(?:[A-Za-z0-9_.\-]+[/\\])+[A-Za-z0-9_][A-Za-z0-9_.\-]*[A-Za-z0-9_\-](?![A-Za-z0-9_./\\])')
-
-def _relative_file_path_spans(text):
- return tuple(m.span()for m in _RELATIVE_FILE_PATH.finditer(text)
-  if m.group().rsplit('.',1)[-1].casefold()in _FILENAME_SUFFIXES)
 
 def _validate_auto_fallback(auto_fallback):
  if auto_fallback not in (None,'zh','en'):
@@ -906,8 +918,6 @@ def _protect(text):
  text=compounds.sub(compound,text)
  # Protect simple report.json as well as digit/underscore identifiers. The
  # original whole literal is restored; its speaking form belongs to G2P.
- for a,b in reversed(_relative_file_path_spans(text)):
-  text=text[:a]+stash_value(text[a:b])+text[b:]
  for a,b in reversed(filename_spans(text)):
   text=text[:a]+stash_value(text[a:b])+text[b:]
  text,native=protect_identifiers(text)

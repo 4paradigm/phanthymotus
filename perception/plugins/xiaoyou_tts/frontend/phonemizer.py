@@ -9,6 +9,7 @@ from __future__ import annotations
 from hashlib import sha256
 from contextvars import ContextVar
 from contextlib import contextmanager
+from concurrent.futures import CancelledError
 from bisect import bisect_right
 from functools import lru_cache
 from importlib.metadata import version
@@ -123,6 +124,13 @@ def _protected_term_spans(normalized):
             spans.append((start, start + len(literal)))
             start += len(literal)
     return tuple(sorted(set(spans)))
+
+
+def _touches_identifier(text, start, end):
+    separators = ('_', '/', '\\', '@', '`')
+    return (text[max(0, start - 1):start] in separators
+            or text[end:end + 1] in separators
+            or bool(re.match(r'\.[A-Za-z0-9_]', text[end:end + 2])))
 
 
 def source_hashes():
@@ -716,15 +724,18 @@ class ContextualZHG2P:
         fixes = {x['start']: x['pinyin_override_at_start'] for x in interventions}
         return self._render(prepared, fixes), original[1]
 
-_GROWTH_SUFFIX = re.compile(r'(?:见识|本事|个儿|个子|个头|得|高|胖|壮|大|出|成)')
+_GROWTH_OBJECT = r'(?:一些|一点儿?|点)?(?:见识|知识|本事|个儿|个子|个头)'
+_GROWTH_SUFFIX = re.compile(r'(?:长?' + _GROWTH_OBJECT + r'|得|高|胖|壮|大|出|成)')
 
 
-def _tower_is_object_of_hiding(text, start, end):
-    """Keep cáng in the narrow verb/object pattern “他想藏塔。”"""
-    following = text[end:end + 1]
-    if following and following not in '，。！？；,.!?;':
-        return False
-    return text[max(0, start - 2):start].endswith(('想', '打算', '试图'))
+def _tower_is_object_of_hiding(text, start):
+    left = text[max(0, start - 18):start]
+    right = text[start + len('藏塔'):]
+    if (left.endswith(('想', '打算', '试图', '准备', '决定'))
+            and re.match(r'(?=$|[，。！？；,.!?;]|之后(?:再|就|才)|了[，。！？]|起来)', right)):
+        return True
+    return (re.search(r'(?:把|将)[\u4e00-\u9fff]{1,16}$', left) is not None
+            and re.match(r'(?:旁边|前面|后面|下面|里面|底下)', right) is not None)
 
 _SYNTAX_RULES = (
     (re.compile(r'(?:我们|你们|他们|她们|咱们|大家|我|你|您|他|她)(?P<target>得)'
@@ -746,6 +757,125 @@ _SYNTAX_RULES = (
                 r'(?![高大出成])'),
      '长', 'chang2', 'length_after_measurement'),
 )
+
+_PHRASE_END = r'(?=[ \t]*(?:$|[\n，。！？；、：,.!?;:]))'
+_LINE_COUNT = r'第?[零一二两三四五六七八九十百千万几]+'
+_TIED_OBJECT = r'(?:安全带|鞋带|领带|救生衣|绳子|固定带)'
+_DEBT_CONTEXT = r'(?:借款|贷款|债务|欠款|这笔钱)[^，。！？；,.!?;]{0,10}?'
+_CAN_REPAY = r'上(?=$|[\s，。！？；、：,.!?;:吗呢吧了就才])'
+_DIMENSION = r'[零〇一二两三四五六七八九十百千万点0-9]+(?:\.[0-9]+)?\s*(?:毫米|厘米|分米|千米|公里|米)'
+
+# A contextual target can be inside a native token such as 请系 or 重装系统.
+# Match the surrounding words before splitting, then verify the syllable offset.
+_CONTEXT_READINGS = (
+    (re.compile(r'(?P<target>还)(?:钱|款|车|书|货|衣服)'
+                r'(?=[ \t]*(?:$|[\n，。！？；、：,.!?;:]|完|之后|以前|以后|之前|后|时|的时候|'
+                r'期[限间]|日期|手续|周期|[了吧吗呢]))'),
+     'huan2', 'return_object'),
+    (re.compile(r'(?P<target>还)书不离手'), 'hai2', 'also_before_nominal_clause'),
+    (re.compile(r'(?:把|将)[\u4e00-\u9fff]{1,16}?(?P<target>还)(?:给)?[我你您他她]'
+                + _PHRASE_END), 'huan2', 'return_to_person'),
+    (re.compile(r'(?:欠[^，。！？；,.!?;]{0,12}钱|(?:这本|那本|借来的|借的)书)'
+                r'[^。！？；.!?;]{0,18}?(?:没|未|要|会|该|须|愿)(?P<target>还)' + _PHRASE_END),
+     'huan2', 'return_referenced_item'),
+    (re.compile(_DEBT_CONTEXT + r'(?P<target>还)得' + _CAN_REPAY), 'huan2', 'can_repay_debt'),
+    (re.compile(_DEBT_CONTEXT + r'还(?P<target>得)' + _CAN_REPAY), 'de5', 'repay_potential_particle'),
+    (re.compile(r'(?:(?<=集体)|(?<![尊慎看器倚贵加侧注负着举体郑]))(?P<target>重)(?:'
+                r'装\s*(?:系统|操作系统|驱动|软件|应用|客户端|(?:CUDA|Python)(?![A-Za-z0-9_]))|'
+                r'做(?:一次|一遍|测试|实验|审核|整道题)|跑(?:一次|一遍|流程|任务|测试|脚本|实验)|'
+                r'听(?:一次|一遍|一下)?(?:(?:刚才|刚刚|之前|昨天)的?)?(?:这|那)?(?:一?段|一?遍)?'
+                r'(?:音频|录音|片段|原声))'),
+     'chong2', 'repeat_action_with_object'),
+    (re.compile(r'(?:音节|元音|重音|字音)(?:都)?(?:要|应|应该|应当|需要|必须|可以)?'
+                r'(?P<target>重)读(?![一两三几这那])'),
+     'zhong4', 'stress_in_pronunciation'),
+    (re.compile(_LINE_COUNT + r'(?P<target>行)\s*(?:[A-Za-z][A-Za-z0-9_+.-]*[ \t]*)?'
+                r'(?:代码|日志|文本|小字|指令|注释|命令|字)'),
+     'hang2', 'quantity_of_written_lines'),
+    (re.compile(r'(?:(?:代码|日志|文本|表格|注释)[^。！？；.!?;]{0,22}?|'
+                r'往[上下]看|向[上下]翻|查看|跳到|删除|填写|填入|站成|排成)' + _LINE_COUNT + r'(?P<target>行)'
+                r'(?=[ \t]*(?:$|[\n，。！？；、：,.!?;:上下里起]))'),
+     'hang2', 'line_in_written_context'),
+    (re.compile(_LINE_COUNT + r'(?P<target>行)是(?:日志|输出|代码|标题|注释)'),
+     'hang2', 'line_content'),
+    (re.compile(r'(?:一路|一起|结伴|(?:与|和|跟)\s*(?:家人|同事|朋友|导游|[我你他她](?:们)?|'
+                r'[A-Za-z][A-Za-z0-9_-]*\s*(?!\s*同行\s*(?:交流|分享|合作|讨论|学习|座谈))))'
+                r'同(?P<target>行)(?!业|列|政)'),
+     'xing2', 'travel_together'),
+    (re.compile(r'(?:^|(?<=[，。！？；,.!?;])\s*|(?:请|先|快|正在|开始|记得|忘了)|(?=系[好紧牢上着]))'
+                r'(?P<target>系)(?:好|紧|牢|上|着)?\s*(?:[A-Za-z][A-Za-z0-9_-]*\s*的\s*)?'
+                + _TIED_OBJECT + r'(?!损坏|失效|过期|故障|断裂|松动|系统)'),
+     'ji4', 'fasten_object'),
+    (re.compile(_TIED_OBJECT + r'(?:上|没|未|已|已经)?(?P<target>系)(?:紧|牢|好|在|着)(?!统)'),
+     'ji4', 'fastened_object'),
+    (re.compile(r'(?:^|(?<=[，。！？；,.!?;])\s*|[我你您他她](?:们)?|咱们|大家|孩子|'
+                r'还|也|就|才|总|必须|一定|之前|以后)(?P<target>得)'
+                r'(?:先|把|去|赶紧|尽快|注意|确保|检查|吃饭|上[班学课岗线]|按照|按时|记得|重新|'
+                r'当心|确认|休息|等|做|出门|提交|安排|考虑|核对|准备(?!金)|想|跟|小心)'),
+     'dei3', 'modal_before_action'),
+    (re.compile(r'[我你您他她](?:们)?说(?P<target>得)等(?=到|天亮|天黑|上一会|几分钟)'),
+     'dei3', 'reported_need_to_wait'),
+    (re.compile(r'(?:跑|走|跳|唱|写|读|说|讲|做|拿|解释|处理|检查|执行|急)(?P<target>得)'
+                r'(?:非常|十分|特别|比较|这么|那么|越来越|很|更|太|真)?'
+                r'(?:清楚|仔细|自然|流畅|准确|过去|有道理|流利|直跺脚|直发抖|好|快|慢|稳|起来)'),
+     'de5', 'degree_or_result_after_verb'),
+    (re.compile(r'(?:快快乐乐|痛痛快快|默默|缓慢|稳定|稳稳|迅速|耐心|安静|轻轻|踏实|彻底|礼貌|小心)(?P<target>地)'
+                r'(?:工作|执行|等|承担|前进|长大|说|学习|处理|完成|震撼|问|运行|往前走)'),
+     'de5', 'manner_before_action'),
+    (re.compile(r'(?P<target>长)(?=长?' + _GROWTH_OBJECT + r')'), 'zhang3', 'gain_experience'),
+    (re.compile(r'以[^，。！？；,.!?;]{1,16}?见(?P<target>长)' + _PHRASE_END), 'chang2', 'specialty'),
+    (re.compile(r'(?:(?:这|那|[一二两三四五六七八九十几]+)[个条段部份篇])?'
+                r'(?P<target>长)(?:文件名|链接|网址|文本|段落|音频|句子|视频|路径)'),
+     'chang2', 'long_content'),
+    (re.compile(r'(?:板子?|布|纸|线|电缆|绳子?|路|桥|隧道|钢管|零件|车身|机身|(?<!身)体|'
+                r'[宽高]\s*' + _DIMENSION + r'\s*[，,]\s*)'
+                r'\s*(?:约)?(?P<target>长)\s*(?:约|达|是)?\s*' + _DIMENSION),
+     'chang2', 'measured_length'),
+    (re.compile(r'乡(?P<target>长)'), 'zhang3', 'township_head'),
+    (re.compile(r'(?:[先再请]连|连接|接上|插上)(?P<target>长)线(?![路性包程])'),
+     'chang2', 'long_cable'),
+    (re.compile(r'(?:请|大家|门口|窗口|已经|开始|正在|经常)(?:前|外|先|都)?排(?P<target>长)龙'
+                r'(?=$|[了啦呢吗吧，。！？、；,.!?;])'),
+     'chang2', 'long_queue'),
+    (re.compile(r'(?P<target>藏)医(?!生)'), 'zang4', 'tibetan_medicine'),
+    (re.compile(r'[川青滇新](?P<target>藏)(?:线|公路|铁路)'), 'zang4', 'tibetan_route'),
+    (re.compile(r'(?:入|进|赴|援)(?P<target>藏)'
+                r'(?=[ \t]*(?:$|[\n，。！？；、：,.!?;:]|[了前后时]|旅游|之前|之后|路线))'),
+     'zang4', 'tibet_travel'),
+    (re.compile(r'(?<![无多几少复质整负分实余双奇偶])(?P<target>数)'
+                r'(?:钱|票|星星|羊|人数|人头)'),
+     'shu3', 'count_objects'),
+    (re.compile(r'(?<![人位次本票岁份系函参变总指倍计字代乘无多几少质整负息步分小底约基尾])(?P<target>数)'
+                r'(?:到\s*[零〇一二两三四五六七八九十百0-9]|一数(?!二)|(?:了)?[一两三几]遍|一下(?!子)|'
+                r'清(?!单|除|晰|洗)|完(?!整|全|善)|错(?!误率)|来数去)'),
+     'shu3', 'count_progress'),
+    (re.compile(r'(?:(?<=数来)(?=数去)|(?<=数一)(?=数(?!二)))(?P<target>数)'),
+     'shu3', 'repeat_counting'),
+    (re.compile(r'(?P<target>数)(?=数?(?:手里的|桌上的)(?:零钱|硬币|钱))'), 'shu3', 'count_visible_money'),
+    (re.compile(r'(?:自己|大家|我们|请|再|先)(?P<target>数)(?:吧|一下)' + _PHRASE_END),
+     'shu3', 'counting_request'),
+    (re.compile(r'(?:睡|找|摸|够|碰|瞧|看|闻|猜|买|吃|喝|赶|追)(?:得|不)(?P<target>着)'),
+     'zhao2', 'result_of_action'),
+    (re.compile(r'穿(?P<target>着)(?:很|比较|十分|非常|挺)?(?:朴素|得体|讲究|时髦|正式|随意|整齐)(?!的)'),
+     'zhuo2', 'description_of_attire'),
+    (re.compile(r'(?:棋盘|棋局|棋手|对弈|下棋)[^，。！？；,.!?;]{0,12}?(?:这|那|一|妙)(?P<target>着)'
+                r'(?=$|[，。！？；,.!?;]|[真很够好妙险稳])'),
+     'zhao1', 'board_game_move'),
+    (re.compile(r'(?:请|先|快|赶紧)(?P<target>给)水(?:和|以及|、)(?:面包|食物|饮料|饼干|牛奶)'),
+     'gei3', 'give_food_and_water'),
+    (re.compile(r'(?<![请指宗佛基传])(?P<target>教)(?:会了?[我你他她]|'
+                r'(?:[我你他她](?:们)?|孩子|小朋友|学生)(?=写|做|读|唱|算|说|叠|学|用|游泳|练|骑|编|打|弹|画)|'
+                r'数学|英语|语文|编程|游泳|钢琴)'),
+     'jiao1', 'teach_skill'),
+    (re.compile(r'(?:愿意|可以|想|先)(?P<target>教)[我你他她](?:们)?' + _PHRASE_END),
+     'jiao1', 'offer_to_teach'),
+    (re.compile(r'(?<![抽外派借统])(?P<target>调)(?:参(?!加|会|赛|观|与|照|考|展|审)|'
+                r'优(?=化|模型|参数|配置|结果|[，。！？；,.!?;]|$))'),
+     'tiao2', 'tune_model'),
+    (re.compile(r'(?:请勿|严禁|禁止|不许|不可|不要|别|不得|不准)外(?P<target>传)'),
+     'chuan2', 'distribute_outside'),
+)
+
 
 _CN_VALUE = r'(?:正负|正|负)?[零〇一二三四五六七八九十百千万亿兆两幺]+'
 
@@ -911,7 +1041,8 @@ def _wei_targets(text, words, protected_spans=()):
                 'passive' if pattern is _WEI_PASSIVE else 'fixed_context')
     return [targets[position] for position in sorted(targets)]
 
-def _syntax_targets(text,words):
+def _syntax_targets(text, words, *, protected_spans=None):
+    """Select local grammar readings and optional full-request overrides."""
     result=[]
     starts={start for _,start,_ in words};ends={end for _,_,end in words}
     for pattern,character,pinyin,rule in _SYNTAX_RULES:
@@ -929,6 +1060,23 @@ def _syntax_targets(text,words):
             result.append({'position':match.start('target'),'character':character,
                            'pinyin':pinyin,'context':match.group(),'rule':rule,
                            'native_word_boundary_verified':True,'native_context_tokens':tokens})
+    if protected_spans is not None:
+        positions = {target['position'] for target in result}
+        for pattern, pinyin, rule in _CONTEXT_READINGS:
+            for match in pattern.finditer(text):
+                position = match.start('target')
+                # These lexical modifiers must not match inside 厂长 or 收藏.
+                if (rule in ('long_content', 'tibetan_medicine')
+                        and position not in starts and match.start() not in starts):
+                    continue
+                if rule == 'township_head' and (match.start() not in starts or match.end() not in ends):
+                    continue
+                if position in positions or _touches_identifier(text, match.start(), match.end()) or any(
+                        start < match.end() and match.start() < end for start, end in protected_spans):
+                    continue
+                result.append({'position': position, 'character': match['target'],
+                               'pinyin': pinyin, 'context': match.group(), 'rule': rule})
+                positions.add(position)
     return result
 
 class PolyphoneContextG2P:
@@ -976,7 +1124,7 @@ class PolyphoneContextG2P:
             {**item, 'global_position': item['position']}
             for item in (
                 *_wei_targets(normalized, words, protected_spans),
-                *_syntax_targets(normalized, words),
+                *_syntax_targets(normalized, words, protected_spans=protected_spans),
                 *self._phrase_targets(normalized, words, protected_spans),
             )
         ]
@@ -984,18 +1132,17 @@ class PolyphoneContextG2P:
         try:yield self
         finally:self._context.reset(token)
 
-    def _verified_prepared_position(self,span,raw_position,prepared,character='为'):
+    def _verified_prepared_position(self, span, raw_position, converted, prepared, character):
         """Prove one exact authorized character offset across native preparation."""
         if not 0<=raw_position<len(span) or span[raw_position]!=character:
             raise RuntimeError('The bound source character is not '+character)
         zh=self._native
         left=zh.cn2an.transform(span[:raw_position],'an2cn')
         right=zh.cn2an.transform(span[raw_position+1:],'an2cn')
-        whole=zh.cn2an.transform(span,'an2cn')
-        if left+character+right!=whole:
+        if left+character+right!=converted:
             raise RuntimeError('cn2an source offset cannot be proven across this split')
         marker='\ue000POLYPHONE_TARGET\ue001'
-        if marker in span or marker in whole:raise RuntimeError('Offset marker collision')
+        if marker in span or marker in converted:raise RuntimeError('Offset marker collision')
         marked=zh.ZHG2P.map_punctuation(left+marker+right)
         if marked.count(marker)!=1 or marked.replace(marker,character,1)!=prepared:
             raise RuntimeError('Punctuation mapping does not preserve the exact target offset')
@@ -1012,12 +1159,16 @@ class PolyphoneContextG2P:
             raise ValueError('Invalid exact normalized character span')
         span=normalized[start:end]
         if re.search(r'[A-Za-z]',span):raise ValueError('English spans must use the unchanged English frontend')
-        zh=self._native;prepared=zh.ZHG2P.map_punctuation(zh.cn2an.transform(span,'an2cn'));targets=[]
+        zh = self._native
+        converted = zh.cn2an.transform(span, 'an2cn')
+        prepared = zh.ZHG2P.map_punctuation(converted)
+        targets = []
         for item in bound['targets']:
             source=item['global_position']
             if start<=source<end:
                 character=item.get('character','为')
-                position=self._verified_prepared_position(span,source-start,prepared,character)
+                position = self._verified_prepared_position(
+                    span, source - start, converted, prepared, character)
                 targets.append({**item,'position':position,'character':character,'source_span':[start,end],
                                 'source_span_position':source-start,'offset_proven':True})
         return self._call(span,en_callable=en_callable,bound_targets=targets,expected_prepared=prepared)
@@ -1037,16 +1188,14 @@ class PolyphoneContextG2P:
                 if record is None or cursor not in ends:continue
                 if any(a<cursor and start<b for a,b in protected_spans):continue
                 phrase = record['phrase']
-                if phrase == '藏塔' and _tower_is_object_of_hiding(text, start, cursor):
+                if phrase.startswith('藏塔') and _tower_is_object_of_hiding(text, start):
                     continue
                 if phrase in ('很长', '更长', '太长', '多长') and _GROWTH_SUFFIX.match(text, cursor):
                     continue
                 # Han-bearing filenames/paths may lie outside the ASCII-only
                 # literal reader. Their separators still disqualify a name;
                 # a sentence-final period remains ordinary punctuation.
-                before=text[start-1:start]if start else'';after=text[cursor:cursor+1]
-                if before in ('_','/','\\','@','`') or after in ('_','/','\\','@','`'):continue
-                if after=='.' and re.match(r'[A-Za-z0-9_]',text[cursor+1:cursor+2]):continue
+                if _touches_identifier(text, start, cursor):continue
                 position=start+record['offset'];pinyin=record['pinyin']
                 if position in targets and targets[position]['pinyin']!=pinyin:
                     raise RuntimeError('Conflicting complete-phrase Chinese readings')
@@ -1061,10 +1210,13 @@ class PolyphoneContextG2P:
             if prepared[position]!=character:raise RuntimeError('Context target is not the exact '+character+' syllable')
             if not any(start<=position<end for _,start,end in words):raise RuntimeError('No native word contains the target')
             targets[position]={'position':position,'character':character,'pinyin':pinyin,'context':context,'rule':rule,**proof}
+        protected_spans = None
         if self._context.get() is None:
-            for item in _wei_targets(prepared, words, _protected_term_spans(prepared)):
+            protected_spans = _protected_term_spans(prepared)
+            for item in _wei_targets(prepared, words, protected_spans):
                 add(**item)
-        for item in _syntax_targets(prepared,words):add(**item)
+        for item in _syntax_targets(prepared, words, protected_spans=protected_spans):
+            add(**item)
         return [targets[k]for k in sorted(targets)]
 
     def _existing_fixes(self,prepared):
@@ -1386,7 +1538,7 @@ class Frontend:
                     else:
                         is_address=kind=='address'
                         reading=numeric.read_address(value,lang.upper()) if is_address else _filename_reading(value,lang)
-                        if lang=='en':
+                        if lang=='en' and not _HAN.search(reading):
                             result.append(self.en.call_literal(normalized,a,b,reading,spell_letters=is_address)[0])
                         else:
                             # Generated words get their own exact Chinese scope;
@@ -1467,7 +1619,7 @@ class FrontendWorker:
             return 'Xiaoyou frontend worker stopped'
         return None
 
-    def _start(self, timeout):
+    def _start(self, timeout, *, cancelled=None):
         env = os.environ.copy()
         for name in ('PYTHONHOME', 'PYTHONPATH'):
             env.pop(name, None)
@@ -1478,7 +1630,7 @@ class FrontendWorker:
                     [PYTHON, '-Bs', '-m', __name__, str(child.fileno()), str(self._model_dir)],
                     pass_fds=(child.fileno(),), env=env, cwd=Path(__file__).resolve().parents[3],
                 )
-            hello = self._receive(timeout)
+            hello = self._receive(timeout, cancelled=cancelled)
             if hasattr(self, 'metadata') and hello[:2] != (self.metadata, self.legal_ids):
                 raise RuntimeError('Xiaoyou frontend worker restarted with different metadata or token IDs')
         except BaseException as error:
@@ -1487,10 +1639,17 @@ class FrontendWorker:
         self._failure = None
         return hello
 
-    def _receive(self, timeout):
+    def _receive(self, timeout, *, cancelled=None):
         try:
-            if not self._connection.poll(timeout):
-                raise TimeoutError('Xiaoyou frontend worker timed out')
+            deadline = time.monotonic() + timeout
+            while True:
+                if cancelled is not None and cancelled():
+                    raise CancelledError('Xiaoyou frontend startup cancelled')
+                remaining = max(0.0, deadline - time.monotonic())
+                if self._connection.poll(remaining if cancelled is None else min(remaining, .1)):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Xiaoyou frontend worker timed out')
             status, value = self._connection.recv()
         except EOFError as error:
             raise BrokenPipeError('Xiaoyou frontend worker stopped') from error
@@ -1500,25 +1659,29 @@ class FrontendWorker:
             raise ValueError(value)
         raise RuntimeError(value)
 
-    def normalize_text(self, *args, **options):
-        return self._call('normalize', args, options)
+    def normalize_text(self, *args, cancelled=None, **options):
+        return self._call('normalize', args, options, cancelled=cancelled)
 
-    def __call__(self, *args, **options):
-        return self._call('phonemize', args, options)
+    def __call__(self, *args, cancelled=None, **options):
+        return self._call('phonemize', args, options, cancelled=cancelled)
 
-    def phonemize_normalized(self, *args, **options):
-        return self._call('normalized_span', args, options)
+    def phonemize_normalized(self, *args, cancelled=None, **options):
+        return self._call('normalized_span', args, options, cancelled=cancelled)
 
-    def _call(self, operation, args, options):
+    def _call(self, operation, args, options, *, cancelled=None):
         # The backend serializes RPC and close. Recover before sending a new
         # operation so an interrupted or partial reply is never replayed.
         if self._closed:
             raise RuntimeError('Xiaoyou frontend worker is closed')
-        deadline = time.monotonic() + self.REQUEST_TIMEOUT
+        if cancelled is not None and cancelled():
+            raise CancelledError('Xiaoyou frontend request cancelled')
         process = self._process
         if process is None or process.poll() is not None:
             self._retire(self._failure or 'Xiaoyou frontend worker stopped')
-            self._start(max(0.0, deadline - time.monotonic()))
+            self._start(self.INITIAL_TIMEOUT, cancelled=cancelled)
+        if cancelled is not None and cancelled():
+            raise CancelledError('Xiaoyou frontend request cancelled')
+        deadline = time.monotonic() + self.REQUEST_TIMEOUT
         try:
             self._connection.send((operation, args, options))
             return self._receive(max(0.0, deadline - time.monotonic()))

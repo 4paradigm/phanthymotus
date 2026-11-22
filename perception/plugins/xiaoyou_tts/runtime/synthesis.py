@@ -13,6 +13,7 @@ import queue
 import re
 import threading
 import time
+from concurrent.futures import CancelledError
 
 import numpy as np
 
@@ -435,16 +436,22 @@ class TRTBackend:
                 raise RuntimeError('V6 backend is closed')
             if _cancel is not None and _cancel.is_set():
                 raise _CancelledGeneration('Request cancelled while waiting for frontend')
-            if _normalized_context is None:
-                _, ids = self.frontend(text, language, normalization_language=requested_language,
-                                       auto_fallback=auto_fallback)
-            else:
-                full, start, end = _normalized_context
-                if full[start:end] != text:
-                    raise ValueError('Normalized semantic span differs from full request')
-                _, ids = self.frontend.phonemize_normalized(
-                    full, language, start=start, end=end,
-                    normalization_language=requested_language, auto_fallback=auto_fallback)
+            def cancelled():
+                return self._closed or (_cancel is not None and _cancel.is_set())
+
+            try:
+                if _normalized_context is None:
+                    _, ids = self.frontend(text, language, normalization_language=requested_language,
+                                           auto_fallback=auto_fallback, cancelled=cancelled)
+                else:
+                    full, start, end = _normalized_context
+                    if full[start:end] != text:
+                        raise ValueError('Normalized semantic span differs from full request')
+                    _, ids = self.frontend.phonemize_normalized(
+                        full, language, start=start, end=end, normalization_language=requested_language,
+                        auto_fallback=auto_fallback, cancelled=cancelled)
+            except CancelledError as error:
+                raise _CancelledGeneration('Request cancelled during frontend startup') from error
         if _cancel is not None and _cancel.is_set():
             raise _CancelledGeneration('Request cancelled after frontend')
         return self._synthesize_ids(ids, _cancel=_cancel)
@@ -591,7 +598,12 @@ class TRTBackend:
                 raise RuntimeError('V6 backend is closed')
             if cancel is not None and cancel.is_set():
                 return
-            text = self.frontend.normalize_text(text, requested_language, auto_fallback=auto_fallback)
+            try:
+                text = self.frontend.normalize_text(
+                    text, requested_language, auto_fallback=auto_fallback,
+                    cancelled=lambda: self._closed or (cancel is not None and cancel.is_set()))
+            except CancelledError:
+                return
         if not isinstance(text, str) or not text.strip():
             raise ValueError('V6 normalization produced no spoken text')
         pending = queue.Queue(maxsize=2)
