@@ -66,11 +66,20 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                 position = tuple((1-ratio)*a + ratio*b for a, b in zip(previous.position, sample.position))
                 if not all(math.isfinite(v) for v in position):
                     raise ValueError('interpolated pose is not finite')
+                first_covariance, second_covariance = previous.covariance, sample.covariance
+                if first_covariance is None:
+                    covariance = second_covariance
+                elif second_covariance is None:
+                    covariance = first_covariance
+                else:
+                    # These trajectory samples share world error coordinates and can be correlated.
+                    covariance = tuple((1. - ratio) * a + ratio * b
+                                       for a, b in zip(first_covariance, second_covariance))
                 continuity = (sample.external_continuity
                               if previous.external_continuity == sample.external_continuity else None)
                 return PoseSample(cloud_stamp_ns // 1_000_000, sample.frame_id, sample.child_frame_id,
                                   sample.segment_id, position,
-                                  _slerp(previous.quaternion, sample.quaternion, ratio), None, sample.clock_id,
+                                  _slerp(previous.quaternion, sample.quaternion, ratio), covariance, sample.clock_id,
                                   sample.pose_reference, None, cloud_stamp_ns,
                                   tuple(c for c in (previous.observation,sample.observation) if c is not None),
                                   prediction, continuity,

@@ -158,7 +158,7 @@ def test_unchanged_published_endpoint_does_not_recompute_pose_correction(monkeyp
     feed(engine, .6, 10.6)
     calls.clear()
     out = engine.output()['pose']['position'][0]
-    assert len(calls) == 1
+    assert len(calls) == 2  # Smoothing, then the remaining pose offset for covariance.
     assert out > engine.current.transform[0, 3]
 
     # Once a correction fits within one update, reuse the measured checkpoint
@@ -425,3 +425,108 @@ def test_chassis_or_unusable_leg_covariance_uses_existing_noise(source, left, ri
     assert feed_covariance(engine, .5, right, x=.2, source=source)
     np.testing.assert_array_equal(engine.current.transform, reference.current.transform)
     np.testing.assert_array_equal(engine.current.covariance, reference.current.covariance)
+
+
+def test_clipped_visual_correction_retains_the_unapplied_update_uncertainty():
+    engine = ExternalOdometry(learning=False)
+    vision(engine, 0., 0.)
+    feed(engine, 0., 0.)
+    feed(engine, 1., .3)
+    vision(engine, 1., 0.)
+    # The nominal gain is 2/3: the intended 20 cm correction is limited to
+    # 5 cm. The remaining 15 cm must not disappear from reported uncertainty.
+    assert engine.current.transform[0, 3] == pytest.approx(.25)
+    assert engine.current.covariance[0, 0] >= .15**2
+    assert np.linalg.eigvalsh(engine.current.covariance).min() >= 0.
+
+
+def test_very_uncertain_vision_does_not_force_a_minimum_correction():
+    engine = ExternalOdometry(learning=False)
+    vision(engine, 0., 0.)
+    feed(engine, 0., 0.)
+    feed(engine, 1., 0.)
+    engine.vision(2*NS, 'vision', pose_at(.3), np.full(6, 10_000.))
+    assert abs(engine.current.transform[0, 3]) < 1e-6
+    assert engine.current.covariance[0, 0] < .002
+
+
+def test_smoothed_publication_includes_its_offset_from_the_estimated_pose():
+    engine = ExternalOdometry(learning=False)
+    vision(engine, 0., 0.)
+    feed(engine, 0., 0.)
+    feed(engine, .5, .5)
+    assert engine.output()['pose']['position'][0] == pytest.approx(.5)
+    vision(engine, .5, 0.)
+    feed(engine, .6, .6)
+    output = engine.output()['pose']
+    # Late correction moved the estimate back 5 cm; publication catches up
+    # by only 3 cm, leaving a known 2 cm difference from that estimate.
+    assert engine.current.transform[0, 3] == pytest.approx(.55)
+    assert output['position'][0] == pytest.approx(.57)
+    assert output['covariance'][0] >= engine.current.covariance[0, 0] + .02**2 - 1e-12
+
+
+def test_clipped_turn_keeps_the_actual_position_offset_in_covariance():
+    from plugins.external_motion_learning import se3_exp
+
+    engine = ExternalOdometry(learning=False)
+    variance = np.full(6, .0001)
+    engine.vision(NS, 'vision', np.eye(4), variance)
+    feed(engine, 0., twist=[0.]*6)
+    feed(engine, 1., twist=[0.]*6)
+    increment = np.array([1., 0., 0., 0., 0., 1.5])
+    engine.vision(2*NS, 'vision', se3_exp(increment), variance)
+    output = engine.output()['pose']
+    nominal = se3_exp(.8 * increment)
+    offset = nominal[:3, 3] - output['position']
+    covariance = np.asarray(output['covariance']).reshape(6, 6)
+    assert offset[1] > .4
+    assert covariance[1, 1] >= offset[1]**2
+    assert np.linalg.eigvalsh(covariance).min() >= -1e-12
+
+
+def test_smoothed_turn_keeps_world_position_and_rotation_offsets_in_covariance():
+    from plugins.external_motion_learning import se3_exp
+
+    engine = ExternalOdometry(learning=False)
+    variance = np.array([.0001, .0004, .0009, .0001, .0004, .0009])
+    engine.vision(2*NS, 'replacement', np.eye(4), variance)
+    engine.output()
+    engine.vision(NS, 'original', se3_exp(np.array([1., 0., 0., 0., 0., 1.5])), variance)
+    engine.vision(3*NS, 'replacement', np.eye(4), variance)
+    output = engine.output()['pose']
+    offset = np.r_[engine.current.transform[:3, 3] - output['position'], 0., 0., 1.5-.03]
+    covariance = np.asarray(output['covariance']).reshape(6, 6)
+    assert offset[1] > .6
+    assert covariance[1, 1] >= offset[1]**2
+    # Removing the known mean offset must leave the estimator's uncertainty,
+    # including translation/rotation cross terms from the shared offset.
+    remainder = covariance - np.outer(offset, offset)
+    rotation = np.array([[np.cos(1.5), -np.sin(1.5), 0.],
+                         [np.sin(1.5), np.cos(1.5), 0.], [0., 0., 1.]])
+    axes = np.zeros((6, 6))
+    axes[:3, :3] = axes[3:, 3:] = rotation
+    np.testing.assert_allclose(remainder, axes @ engine.current.covariance @ axes.T, atol=1e-12)
+
+
+def test_learning_uses_uncertainty_from_both_visual_endpoints():
+    engine = ExternalOdometry()
+    feed(engine, 0., 0.)
+    engine.vision(NS, 'vision', pose_at(0.), np.full(6, .01))
+    feed(engine, .2, 0.)
+    engine.vision(NS+200_000_000, 'vision', pose_at(0.), np.full(6, .04))
+    # Without known cross-correlation, each relative-component sigma is
+    # conservatively bounded by the sum of endpoint sigmas: 0.1 + 0.2.
+    np.testing.assert_allclose(engine.current.learner.window[0][5], [.3]*6)
+
+
+def test_learning_transports_start_uncertainty_to_the_end_body_axes():
+    engine = ExternalOdometry()
+    feed(engine, 0., 0.)
+    engine.vision(NS, 'vision', pose_at(0.), np.array([.01, .04, .09, .01, .04, .09]))
+    feed(engine, .2, 0.)
+    turned = np.eye(4)
+    turned[:3, :3] = [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]
+    engine.vision(NS+200_000_000, 'vision', turned, np.array([.16, .25, .36, .16, .25, .36]))
+    # A quarter turn swaps the start x/y sigmas before adding the end ones.
+    np.testing.assert_allclose(engine.current.learner.window[0][5], [.6, .6, .9, .6, .6, .9])

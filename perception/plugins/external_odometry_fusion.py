@@ -59,6 +59,15 @@ def _adjoint(matrix):
     return result
 
 
+def _world_pose_offset(reference, target):
+    """Pose-origin displacement and rotation-vector error in fixed world axes."""
+    rotation = np.eye(4)
+    rotation[:3, :3] = target[:3, :3] @ reference[:3, :3].T
+    offset = se3_log(rotation)
+    offset[:3] = target[:3, 3] - reference[:3, 3]
+    return offset
+
+
 def body_pose_observation(pose, body_from_camera):
     camera = pose_matrix(pose)
     body = camera @ np.linalg.inv(body_from_camera)
@@ -412,8 +421,8 @@ class ExternalOdometry:
                        motion_since_visual=state.motion_since_visual or bool(interval_update))
 
     def _correct(self, state, segment, observed, variance, motion_times):
-        visual = (state.stamp, segment, observed)
         variance = _DEFAULT_VARIANCE if variance is None else variance
+        visual = (state.stamp, segment, observed, variance)
         same_segment = state.visual is not None and state.visual[1] == segment
         alignment = state.alignments.get(segment)
         if alignment is None:
@@ -433,11 +442,25 @@ class ExternalOdometry:
             predicted = predicted @ np.linalg.inv(state.visual[2]) @ observed
         residual = se3_log(np.linalg.inv(predicted) @ target)
         diag = np.diag(state.covariance)
-        gain = np.clip(diag / (diag + variance), .1, .8)
-        transform = predicted @ se3_exp(np.clip(gain * residual, -.05, .05))
+        gain = np.clip(diag / (diag + variance), 0., .8)
+        correction = gain * residual
+        applied = np.clip(correction, -.05, .05)
+        increment = se3_exp(applied)
+        transform = predicted @ increment
         damping = np.diag(1.-gain)
         noise = damping @ state.noise @ damping.T + np.diag(gain**2*variance)
-        sensitivity = damping @ state.sensitivity
+        axes = np.eye(4)
+        axes[:3, :3] = increment[:3, :3].T
+        reframe = _adjoint(axes)
+        noise = reframe @ noise @ reframe.T
+        sensitivity = reframe @ damping @ state.sensitivity
+        if np.any(correction != applied):
+            # A finite SE(3) log's linear part is not a pose-origin offset.
+            # Keep the actual unresolved mean error in the bounded body axes.
+            nominal = predicted @ se3_exp(correction)
+            axes[:3, :3] = transform[:3, :3].T
+            unapplied = _adjoint(axes) @ _world_pose_offset(transform, nominal)
+            noise = noise + np.outer(unapplied, unapplied)
         learner = state.learner
         training = visual
         previous = state.training[0]
@@ -446,7 +469,14 @@ class ExternalOdometry:
                          self._intervals(motion_times, previous, state.stamp)]
             if intervals and abs(sum(x[1] for x in intervals)-(state.stamp-previous)/1e9) < 1e-6:
                 learner = learner.checkpoint()
-                learner.add(previous, state.stamp, intervals, np.linalg.inv(state.training[2]) @ observed,
+                delta = np.linalg.inv(state.training[2]) @ observed
+                transport = _adjoint(np.linalg.inv(delta))
+                start_variance = np.square(transport) @ state.training[3]
+                # Endpoint errors share visual history. With unknown cross-
+                # correlation, the sum of sigmas bounds each relative error;
+                # a weak endpoint must not become a precise training target.
+                sigma = np.sqrt(start_variance) + np.sqrt(variance)
+                learner.add(previous, state.stamp, intervals, delta, noise=sigma,
                             solve=self.solve_learning)
         elif learner.enabled and same_segment:
             training = state.training
@@ -491,6 +521,7 @@ class ExternalOdometry:
         if state.last_update is None or state.stamp <= self._output_stamp:
             return None
         pose = state.transform
+        publication_error = np.zeros(6)
         past = self.checkpoints.get(self._output_stamp)
         # Until a replay changes the published checkpoint, the correction is
         # the identity. Keep the measured transform without a log/exp round trip.
@@ -498,12 +529,15 @@ class ExternalOdometry:
             propagated = self._output_pose @ np.linalg.inv(past.transform) @ pose
             error = se3_log(np.linalg.inv(propagated) @ pose)
             if np.any(np.abs(error) > .03):
-                pose = propagated @ se3_exp(np.clip(error, -.03, .03))
+                applied = np.clip(error, -.03, .03)
+                pose = propagated @ se3_exp(applied)
+                publication_error = _world_pose_offset(pose, state.transform)
         self._output_pose, self._output_stamp = pose, state.stamp
         axes = np.eye(4)
-        axes[:3, :3] = pose[:3, :3]
+        axes[:3, :3] = state.transform[:3, :3]
         frame_rotation = _adjoint(axes)
-        covariance = frame_rotation @ state.covariance @ frame_rotation.T
+        covariance = (frame_rotation @ state.covariance @ frame_rotation.T +
+                      np.outer(publication_error, publication_error))
         fused = dict(position=pose[:3, 3].tolist(), quaternion=quaternion(pose[:3, :3]),
                      frame_id=self.segment+'_odom', child_frame_id=self.body_frame,
                      covariance=covariance.ravel().tolist())

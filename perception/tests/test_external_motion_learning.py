@@ -98,6 +98,13 @@ def test_constant_speed_reports_unobservable_scale_bias_split():
     assert learner.info()["rank"] == 1
     assert learner.correct(interval[0][0], .5, x_only)[0, 3] == pytest.approx(.45, abs=.005)
     assert np.linalg.eigvalsh(learner.covariance[np.ix_([0, 6], [0, 6])])[-1] > .02
+    # A single measurement constrains the combined scale/bias effect. Reversing
+    # the same speed exposes the uncertainty in their unmeasured split.
+    direction, = learner.info()["observable_directions"]
+    assert direction[0] * direction[6] > 0.
+    forward = learner.velocity_parameter_jacobian(interval[0][0], x_only)[0]
+    reverse = learner.velocity_parameter_jacobian(-interval[0][0], x_only)[0]
+    assert reverse @ learner.covariance @ reverse > 10. * (forward @ learner.covariance @ forward)
 
 
 def test_checkpoint_replay_deduplicates_intervals_and_preserves_covariance():
@@ -131,3 +138,74 @@ def test_one_large_visual_outlier_is_downweighted():
         _add(learner, index, intervals, visual)
     np.testing.assert_allclose(learner.info()["scale"], 1., atol=.12)
     np.testing.assert_allclose(learner.info()["bias"], 0., atol=.045)
+
+
+@pytest.mark.parametrize("observed", [np.ones(6, dtype=bool), np.eye(6, dtype=bool)[0]])
+@pytest.mark.parametrize("jitter", [0., .001])
+def test_steady_speed_calibration_generalizes_to_rest_and_reverse(observed, jitter):
+    learner = ExternalMotionLearner()
+    previous_bias_variance = learner.covariance[6, 6]
+    forward = np.array([.3, 0., 0., 0., 0., 0.])
+    for index in range(16):
+        velocity = forward.copy()
+        velocity[0] += (-1)**index * jitter
+        visual = np.eye(4)
+        visual[0, 3] = .8 * velocity[0] * .5
+        _add(learner, index, [(velocity, .5, observed)], visual)
+
+    np.testing.assert_allclose(learner.correct(np.zeros(6), 10., observed), np.eye(4), atol=1e-7)
+    assert learner.corrected_velocity(-forward, observed)[0] == pytest.approx(-.24, abs=.001)
+    assert learner.covariance[6, 6] == pytest.approx(previous_bias_variance)
+    np.testing.assert_allclose(learner.covariance, learner.covariance.T, atol=1e-12)
+    assert np.linalg.eigvalsh(learner.covariance)[0] > 0.
+
+
+def test_steady_window_preserves_previously_identified_bias():
+    learner = ExternalMotionLearner()
+    x_only = np.eye(6, dtype=bool)[0]
+    for index in range(36):
+        raw = [-.4, .3][index % 2] if index < 12 else .3
+        velocity = np.array([raw, 0., 0., 0., 0., 0.])
+        visual = np.eye(4)
+        visual[0, 3] = (.8 * raw + .035) * .5
+        _add(learner, index, [(velocity, .5, x_only)], visual)
+    np.testing.assert_allclose(learner.info()["scale"][0], .8, atol=1e-5)
+    np.testing.assert_allclose(learner.info()["bias"][0], .035, atol=1e-5)
+    calibrated = learner.parameters.copy()
+
+    # A later same-speed discrepancy supports adjusting one parameter only.
+    visual[0, 3] += .005
+    for index in range(36, 56):
+        _add(learner, index, [(velocity, .5, x_only)], visual)
+    assert learner.parameters[6] == pytest.approx(calibrated[6], abs=1e-7)
+    assert learner.corrected_velocity(velocity, x_only)[0] == pytest.approx(.285, abs=.001)
+
+
+def test_zero_raw_velocity_supports_bias_alone():
+    learner = ExternalMotionLearner()
+    velocity = np.zeros(6)
+    x_only = np.eye(6, dtype=bool)[0]
+    visual = np.eye(4)
+    visual[0, 3] = .012
+    prior_scale_variance = learner.covariance[0, 0]
+    for index in range(16):
+        _add(learner, index, [(velocity, .5, x_only)], visual)
+    assert learner.corrected_velocity(velocity, x_only)[0] == pytest.approx(.024, abs=.0001)
+    assert learner.info()["scale"][0] == pytest.approx(1.)
+    assert learner.covariance[0, 0] == pytest.approx(prior_scale_variance)
+
+
+def test_subnoise_jitter_about_zero_preserves_unobserved_scale():
+    learner = ExternalMotionLearner()
+    x_only = np.eye(6, dtype=bool)[0]
+    prior_scale_variance = learner.covariance[0, 0]
+    for index in range(16):
+        jitter = (-1)**index * .002
+        velocity = np.array([jitter, 0., 0., 0., 0., 0.])
+        visual = np.eye(4)
+        visual[0, 3] = (.024 + 1.3 * jitter) * .5
+        _add(learner, index, [(velocity, .5, x_only)], visual)
+
+    assert learner.info()["bias"][0] == pytest.approx(.024, abs=1e-5)
+    assert learner.info()["scale"][0] == pytest.approx(1.)
+    assert learner.covariance[0, 0] == pytest.approx(prior_scale_variance)

@@ -207,7 +207,20 @@ class ExternalMotionLearner:
             weights = np.sqrt(np.minimum(1., _HUBER / np.maximum(np.linalg.norm(residual, axis=1), 1e-12)))
             jacobian = (values[1:] - residual) / difference
             jacobian *= weights[None, :, None]
-            left, singular, right = np.linalg.svd(jacobian.reshape(12, -1).T, full_matrices=False)
+            jacobian = jacobian.reshape(12, -1).T
+            scale, bias = jacobian[:, :6], jacobian[:, 6:]
+            # The norm perpendicular to the other column measures the independent
+            # effect of a one-prior-sigma change, in window noise sigmas. Keep
+            # bias fixed at steady speed; near zero, bias alone can be measured.
+            scale_norm = np.linalg.norm(scale, axis=0)
+            bias_norm = np.linalg.norm(bias, axis=0)
+            product = scale_norm * bias_norm
+            cosine = np.sum(scale * bias, axis=0) / np.where(product > 0., product, 1.)
+            sine = np.sqrt(np.maximum(0., 1. - cosine**2))
+            fit_bias = (scale_norm == 0.) | (bias_norm * sine >= 1.)
+            fit_scale = ~fit_bias | (scale_norm * sine >= 1.)
+            design = np.column_stack((scale * fit_scale, bias * fit_bias))
+            left, singular, right = np.linalg.svd(design, full_matrices=False)
             rank = np.count_nonzero(singular > max(.02, singular[0] * 1e-3))
             if not rank:
                 self.rank = 0
@@ -234,12 +247,16 @@ class ExternalMotionLearner:
                 break
         # Use only this window's information. Shared visual endpoints and model
         # mismatch make the covariance an engineering estimate.
-        null = np.eye(12) - basis @ basis.T
+        # Propagate the uncertainty of held parameters through the conditional
+        # fit, e.g. uncertain bias also limits scale learned at a single speed.
+        measured = left[:, :rank].T @ jacobian
+        null = np.eye(12) - (basis / scales) @ measured
         factors = _PARAMETER_SCALE[:, None] * _PARAMETER_SCALE
         prior = self.covariance / factors
         observable = (basis * (2. / scales**2)) @ basis.T
-        self.covariance = (null @ prior @ null + observable) * factors
+        self.covariance = (null @ prior @ null.T + observable) * factors
         self.rank = int(rank)
-        self.observable_directions = (basis * _PARAMETER_SCALE[:, None]).T
+        measured_basis, _ = np.linalg.qr(measured.T)
+        self.observable_directions = (measured_basis * _PARAMETER_SCALE[:, None]).T
         self.parameters = point * _PARAMETER_SCALE
         return True
