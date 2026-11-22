@@ -22,6 +22,7 @@ import platform
 import re
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 
 import regex
@@ -29,7 +30,9 @@ import regex
 from plugins.vits2_tts_trt.frontend.special_text import read_numeric_literal
 
 from . import numbers as numeric
-from ..runtime.model_bundle import FRONTEND_FILE, NORMALIZATION_MODULE_SHAS, TERMS_FILE, detect_jetpack_major
+from ..runtime.model_bundle import (
+    FRONTEND_FILE, NORMALIZATION_MODULE_SHAS, TERMS_FILE, detect_jetpack_major, unpack_jp6_english_model,
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _LATIN_WORD = r"(?:[0-9]+(?=[A-Za-z]))?[A-Za-z][A-Za-z0-9_'’\-]*"
@@ -1608,7 +1611,15 @@ class FrontendWorker:
         self._process = None
         self._closed = False
         self._failure = None
-        self.metadata, self.legal_ids, self.dictionary_seconds = self._start(self.INITIAL_TIMEOUT)
+        self._english_model = None
+        try:
+            if detect_jetpack_major() == 6:
+                self._english_model = TemporaryDirectory(prefix='xiaoyou-english-model-')
+                unpack_jp6_english_model(model_dir, self._english_model.name)
+            self.metadata, self.legal_ids, self.dictionary_seconds = self._start(self.INITIAL_TIMEOUT)
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def failure_reason(self):
@@ -1623,6 +1634,8 @@ class FrontendWorker:
         env = os.environ.copy()
         for name in ('PYTHONHOME', 'PYTHONPATH'):
             env.pop(name, None)
+        if self._english_model is not None:
+            env['PYTHONPATH'] = self._english_model.name
         self._connection, child = Pipe()
         try:
             with child:
@@ -1713,7 +1726,12 @@ class FrontendWorker:
 
     def close(self):
         self._closed = True
-        self._retire()
+        try:
+            self._retire()
+        finally:
+            if self._english_model is not None:
+                self._english_model.cleanup()
+                self._english_model = None
 
 
 def run(connection, model_dir):
@@ -1724,7 +1742,7 @@ def run(connection, model_dir):
         import jieba
 
         if version('en-core-web-sm') != '3.8.0':
-            raise RuntimeError('Install the pinned Xiaoyou spaCy model in the frontend environment')
+            raise RuntimeError('Xiaoyou requires the pinned spaCy English model 3.8.0')
         started = time.perf_counter()
         jieba.initialize()
         if not jieba.dt.initialized:

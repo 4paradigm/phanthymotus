@@ -7,6 +7,7 @@ Existing bundles are rehashed before use; unknown/corrupt destinations are prese
 from contextlib import contextmanager
 import fcntl
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -17,11 +18,12 @@ import tempfile
 import time
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
+from zipfile import ZipFile
 
 SOURCE_SHA = 'a46bd6826d1074b93bc7a17379966d88005cd248136acd24aab4b6883e689bb0'
 
 FRONTEND_FILE = 'frontend/phonemizer.py'
-FRONTEND_SHA = '7e09fccb5136edc5e80d3214a3cb0014f2d9f80b8d775d2edf4004d8e60fd162'
+FRONTEND_SHA = '9fe8b062c3511c49e89eec54aca5c757d952fdbfa9ecbcd9d5271edd373e288a'
 _RELEASE_FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7ce1db0dc5'
 
 NORMALIZATION_REVISION = '01yuewen-contextual-polyphones-compact-20261118'
@@ -146,6 +148,19 @@ def sha(path):
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def unpack_jp6_english_model(model_dir, destination):
+    """Make the pinned wheel importable without altering the verified model tree."""
+    wheel = Path(model_dir) / 'frontend/en_core_web_sm-3.8.0-py3-none-any.whl'
+    size = 12_806_118
+    with wheel.open('rb') as stream:
+        data = stream.read(size + 1)
+    expected = '1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85'
+    if len(data) != size or hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError('Xiaoyou JP6 English model wheel differs from the pinned resource')
+    with ZipFile(BytesIO(data)) as archive:
+        archive.extractall(destination)
 
 
 def validate_frontend_files(front, directory):

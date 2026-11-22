@@ -1,4 +1,5 @@
-# JP5/JP6 / CPython 3.10 isolated xiaoyou01 frontend: all 81 deployed versions pinned.
+# CPython 3.10 isolated xiaoyou01 frontend dependencies.
+# JP6 loads the pinned English model from the verified runtime bundle.
 # Matches the hash-locked offline environment exercised by the real JP6 GPU/ROS tests.
 # TensorRT/CUDA/cuDNN/ROS are inherited from JetPack; no Torch/transformer extras.
 # jieba/docopt are public PyPI versions; no local wheel path or build-specific hash.
@@ -29,7 +30,6 @@ espeakng-loader==0.2.4
 phonemizer-fork==3.3.2
 num2words==0.5.14
 ordered-set==4.1.0
-en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
 
 # Exact transitive versions from the tested 81-package environment.
 addict==2.4.0
