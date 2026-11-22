@@ -4,7 +4,7 @@ MCP 名称 `yunet_lk_mosaic`。这张 processor Card 接收一路摄像头 JPEG�
 
 ## 启动和连接
 
-1. 在 Perception 的 YAML 中将 `plugins.yunet_lk_mosaic.enabled` 设为 `true`，按项目现有方式启动 Perception。卡默认禁用。源码运行且 ROS2 环境已加载时，从仓库根目录执行 `CONFIG_PATH=/path/to/perception.yaml PYTHONPATH=perception python3 perception/main.py`。
+1. 随项目提供的配置为 `plugins.yunet_lk_mosaic.enabled: true`。Card 默认注册到现有 Perception，公共 Canvas 可以发现它。默认 `consent_acknowledged: false`。只有确认出镜人员同意并调用 `start` 后，Card 才会订阅摄像头、加载模型和开始推理。源码运行且 ROS2 环境已加载时，从仓库根目录执行 `CONFIG_PATH=/path/to/perception.yaml PYTHONPATH=perception python3 perception/main.py`。
 2. 在 Canvas 连接相机的 `image/jpeg` 输出，打开实例配置并设置 `consent_acknowledged=true`。输入可来自已经接入项目的通用摄像头、浏览器摄像头或兼容的 ROS2 视频源。
 3. 使用 Card 的启动操作。用 `info` 查看模型和画面是否就绪，连接 `image/jpeg` 预览和 `data/json` 状态输出。停止实例后可修改配置并重新启动。
 
@@ -36,7 +36,7 @@ YAML 提供部署默认值，MCP `config` 可按实例覆盖。非法值返回�
 
 | 参数 | 默认值 | 支持值 |
 | --- | ---: | --- |
-| `enabled` | `false` | YAML 启用开关 |
+| `enabled` | `true` | 在现有 Perception 中注册 Card，供公共 Canvas 发现 |
 | `model_path` | 空 | YAML 指定已校验模型，空时走环境配置或下载 |
 | `consent_acknowledged` | `false` | 开启后允许启动 |
 | `target_fps` | 30 | 15 / 20 / 24 / 30，限制处理速率 |
@@ -64,4 +64,4 @@ YAML 提供部署默认值，MCP `config` 可按实例覆盖。非法值返回�
 
 `info.metrics` 区分目标处理 FPS、近 2 秒实际处理 FPS、输出 FPS 和最近 90 个已发布帧的源时间戳至 ROS 发布延迟 P50/P95。看摄像头到浏览器的延迟时，应另计摄像头取样、接收端 DDS 和渲染开销。状态还报告输入覆盖、过期、超容量、处理错误、缓存当前/峰值和已发布纠错帧数。降低目标 FPS 时，输入覆盖是预期的主动抽帧。
 
-弱光、很小或被遮挡的人脸、快速离开/进入、短时间交叉和超额人脸可能暂时露出。不同设备、分辨率及共享推理负载会改变处理和发布速率。正式资源中心的默认卡清单只登记默认启用的插件。本卡可启用后由 Perception MCP 发现。测试与复现见 [性能与复现](PERFORMANCE.md) 和 [提取前对照表](AUDIT.md)。
+弱光、很小或被遮挡的人脸、快速离开/进入、短时间交叉和超额人脸可能暂时露出。不同设备、分辨率及共享推理负载会改变处理和发布速率。测试与复现见 [性能与复现](PERFORMANCE.md) 和 [提取前对照表](AUDIT.md)。

@@ -2,6 +2,7 @@ import hashlib
 import os
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -540,6 +541,19 @@ def test_model_download_failure_stays_visible_in_info(mosaic_tool, monkeypatch, 
     assert info["reason"].startswith("startup_failed:model_download_failed:")
     assert str(cause) in info["message"]
     assert "正在下载" not in info["message"]
+
+
+def test_readme_default_enablement_matches_yaml():
+    import yaml
+
+    perception = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load((perception / "config.yaml").read_text(encoding="utf-8"))
+    enabled = str(config["plugins"]["yunet_lk_mosaic"]["enabled"]).lower()
+    readme = (perception / "plugins" / "yunet_lk_mosaic" / "README.md").read_text(encoding="utf-8")
+
+    assert f"`plugins.yunet_lk_mosaic.enabled: {enabled}`" in readme
+    assert f"| `enabled` | `{enabled}` |" in readme
+    assert "默认禁用" not in readme
 
 
 def test_default_bundle_discovers_mosaic_without_starting(monkeypatch):
