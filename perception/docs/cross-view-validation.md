@@ -103,3 +103,45 @@ Detailed build, image inspection, MCP/DDS and Driver logs are retained locally
 under .acceptance-evidence in this worktree. They are excluded from Git as
 machine-specific evidence. Draft review can proceed with these remaining
 failures disclosed. Deployment-ready acceptance remains pending.
+
+
+## Blocking-test baseline comparison and DDS isolation
+
+The Driver parent baseline 0bf74f67066e40e42c603d0679c9ea111f7ffbb6 and
+8242cffab75ec78a1b62ba4569e3ff4f71888d65 were each tested three times in
+bumi-driver-arm64:local-20261108 with network disabled, identical bind mount
+destination /driver and this command.
+
+    cd /driver
+    PYTHONPATH=tests:. python3 -m unittest test_piper_unified.UnifiedTests.test_pre_submission_cached_arrival_is_not_completion
+
+All six runs failed with stale end-effector feedback before the expected timeout.
+Durations were approximately 1.26–1.31 seconds. The test replaces
+GetArmEndPoseMsgs with a cached object whose time_stamp is real wall time.
+fast_execute advances a FastClock for execute_target while intent_motion.fresh
+checks real wall time. The cached object therefore becomes stale before the
+simulated-motion timeout is reported in this environment. The failure also
+exists in the actual parent baseline. No motion safety code or expected test
+outcome was modified. Individual logs remain in .acceptance-evidence.
+
+A direct /cross_view_probe std_msgs/String publisher/subscriber test was then
+run in the same isolated environment as Monitor. Domain was queried from rclpy
+and returned 87, with rmw_fastrtps_cpp, matching the environment. Subscriber QoS
+was sensor-data best-effort/volatile, publisher reliable/volatile.
+
+An ARM64 fixture publisher remained alive for a 90-second window. Separate
+subscribers in its own container and in the Core container each discovered zero
+publishers and received zero messages. A ROS_LOCALHOST_ONLY=1 same-container
+control also discovered zero publishers. A native amd64 Core publisher was
+discovered by a separate native Core subscriber and delivered actual
+{"probe":true} JSON. The ARM64 subscriber did not discover that publisher.
+Thus the reproduced loss precedes Core Monitor and WebSocket forwarding and
+also affects an independent ROS topic outside the Card. The precise cause in
+the ARM64 emulated ROS discovery/transport environment remains unresolved.
+The results do not establish a Card publisher or Core renderer defect.
+
+The temporary cross-view-debug-core and cross-view-debug-fixture containers and
+cross-view-debug network were removed after logs were preserved. The parent
+baseline worktree remains available for reproduction. No final-browser success,
+deployment readiness, or resolution of the ARM64 multiprocess discovery issue
+is claimed by this follow-up.
