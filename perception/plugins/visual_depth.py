@@ -1011,6 +1011,10 @@ class _DepthNode(Node):
         }
 
     def _image_cb(self, msg: CompressedImage):
+        from utils.frame_source import is_invalid_capture
+
+        if is_invalid_capture(getattr(msg, "header", None)):
+            return
         now = time.monotonic()
         if now - self._last_inference_time < self._frame_interval:
             return

@@ -2,11 +2,11 @@
 import numpy as np
 
 
-def calibration(record, camera_id):
+def calibration(record, camera_id, *, require_registered=True):
     """Validate a surveyed camera-to-world transform and rectified intrinsics."""
     if record["camera_id"] != camera_id or record["direction"] != "camera_to_world":
         raise ValueError("calibration_identity_or_direction")
-    if record["rectified"] is not True or record["depth_registered"] is not True:
+    if record["rectified"] is not True or (require_registered and record.get("depth_registered") is not True):
         raise ValueError("unregistered_depth_or_distorted_image")
     k = np.asarray(record["K"], dtype=float).reshape(3, 3)
     pose = np.asarray(record["T_world_camera"], dtype=float).reshape(4, 4)
@@ -18,7 +18,7 @@ def calibration(record, camera_id):
             or not np.allclose(r.T @ r, np.eye(3), atol=1e-5)
             or not np.isclose(np.linalg.det(r), 1)
             or not np.allclose(k[2], [0, 0, 1])
-            or k[0, 0] <= 0 or k[1, 1] <= 0
+            or k[0, 0] <= 0 or k[1, 1] <= 0 or not np.isclose(k[1, 0], 0)
             or not all(type(v) is int and 0 < v <= 8192 for v in (width, height))
             or not 0 <= k[0, 2] < width or not 0 <= k[1, 2] < height
             or not np.isfinite(error) or error < 0 or not record["world_frame"]):
@@ -54,7 +54,7 @@ def observations(objects, depth, camera, minimum):
             point = pose[:3, :3] @ (np.linalg.solve(k, [u, v, 1]) * z) + pose[:3, 3]
             target.update(point=point, score=score * len(valid) / patch.size,
                           spread=spread, pixel=[u, v], reason=None)
-        except (KeyError, TypeError, ValueError, np.linalg.LinAlgError):
+        except (KeyError, TypeError, ValueError, OverflowError, np.linalg.LinAlgError):
             continue
     return targets
 
@@ -149,3 +149,39 @@ def compare(objects, depths, cameras, tolerance, gate, ambiguity, minimum):
     return dict(state=state, reason=reason, matched_targets=matched, unmatched_targets=unmatched,
                 position_residual_m=max((m["position_residual_m"] for m in matched), default=None),
                 confidence=min((m["confidence"] for m in matched), default=0) if not unmatched else 0)
+
+
+
+def epipolar_candidates(objects, cameras, tolerance_px):
+    """Count compatible box centers in rectified images without inferring identity or range."""
+    ka, a, *_ = cameras[0]
+    kb, b, *_ = cameras[1]
+    r = b[:3, :3].T @ a[:3, :3]
+    x, y, z = b[:3, :3].T @ (a[:3, 3] - b[:3, 3])
+    if np.linalg.norm([x, y, z]) < 1e-6:
+        return None
+    essential = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]]) @ r
+    f = np.linalg.inv(kb).T @ essential @ np.linalg.inv(ka)
+
+    def centers(records, camera):
+        _, _, width, height, _ = camera
+        for obj in records:
+            try:
+                x1, y1, x2, y2 = map(float, obj["bbox"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if 0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height:
+                yield obj.get("name"), np.array([(x1 + x2) / 2, (y1 + y2) / 2, 1])
+
+    right = list(centers(objects[1], cameras[1]))
+    compatible = 0
+    for label, point in centers(objects[0], cameras[0]):
+        line_b = f @ point
+        for other_label, other_point in right:
+            if not isinstance(label, str) or label != other_label:
+                continue
+            line_a = f.T @ other_point
+            norm = min(np.linalg.norm(line_a[:2]), np.linalg.norm(line_b[:2]))
+            if norm > 0 and abs(other_point @ line_b) <= tolerance_px * norm:
+                compatible += 1
+    return compatible

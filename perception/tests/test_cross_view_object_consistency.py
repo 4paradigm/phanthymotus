@@ -2,6 +2,7 @@ import json
 import time
 import tracemalloc
 import unittest
+import uuid
 import zlib
 
 import numpy as np
@@ -10,6 +11,7 @@ from plugins.cross_view_object_consistency import (
     CrossViewObjectConsistencyPlugin, Synchronizer, decode_depth,
 )
 from plugins.cross_view_geometry import calibration, compare
+from utils.frame_source import capture_identity
 
 
 def record(camera_id, x, focal):
@@ -159,6 +161,154 @@ class SyncTest(unittest.TestCase):
         })["calibrated"])
         for _ in range(5):
             self.assertEqual(plugin.dispatch(tool["name"], {"action": "stop"})["state"], "idle")
+
+
+def capture_rig(*, calibrated=True, clock_bound=True):
+    config = rig()
+    config.pop("session_id")
+    config["device_ids"] = ["a" * 32, "b" * 32]
+    for side, camera in enumerate("ab"):
+        config["calibration"][camera].update(
+            device_id=config["device_ids"][side], calibration_version="survey-v1")
+    if not calibrated:
+        config.pop("calibration")
+    if clock_bound:
+        config["time_error_ms"] = 5
+    return config
+
+
+def capture_source(side, ns, sequence, generation=1):
+    camera = "ab"[side]
+    session = f"{side * 100 + generation:032x}"
+    tag = f"motus.capture/1|{camera}|{camera}_color_optical_frame|{session}|{sequence}|host_read|{camera * 32}"
+    return {"stamp_ns": ns, "frame_id": tag}
+
+
+class CaptureSourceTest(unittest.TestCase):
+    def configure(self, **options):
+        self.sync = Synchronizer(capture_rig(**options))
+        self.sync.start_ns = self.sync.cutover_ns = 1_000_000_000
+
+    def feed(self, side, ns, seq, generation=1, *, depth=True, source_side=None):
+        source = capture_source(side if source_side is None else source_side, ns, seq, generation)
+        camera = calibration(rig()["calibration"]["ab"[side]], "ab"[side])
+        objects, grid = scene([(0, 0, 1)], camera)
+        self.sync.ingest(side, "rgb", source, None, ns / 1e9)
+        self.sync.ingest(side, "objects", source, dict(objects=objects, source_size=[640, 480]), ns / 1e9)
+        if depth:
+            self.sync.ingest(side, "depth", source, grid, ns / 1e9)
+
+    def test_independent_sessions_and_qualified_depth(self):
+        self.configure()
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1)
+        result = self.sync.result(1.02)
+        self.assertEqual(result["state"], "consistent")
+        self.assertEqual(result["capability_level"], 2)
+        self.assertNotEqual(*result["capture_sessions"])
+        self.assertEqual([frame["camera_id"] for frame in result["capture_frames"]], ["a", "b"])
+
+    def test_restart_flushes_pair_and_rejects_retired_session(self):
+        self.configure()
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1)
+        self.feed(0, 1_030_000_000, 1, generation=2)
+        self.assertNotEqual(self.sync.result(1.03)["state"], "consistent")
+        self.feed(0, 1_040_000_000, 2)  # Delayed retired session even with a higher stamp.
+        self.feed(1, 1_045_000_000, 2)
+        result = self.sync.result(1.05)
+        self.assertEqual(result["state"], "consistent")
+        self.assertEqual(result["capture_frames"][0]["capture_timestamp_ns"], 1_030_000_000)
+
+    def test_offline_and_wrong_camera_reject_cached_pair_then_recover(self):
+        self.configure()
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1)
+        self.sync.ingest(0, "rgb", {"frame_id": "motus.capture/1|offline",
+                                   "frame_valid": False, "stamp_ns": 0}, None, 1.02)
+        self.assertEqual(self.sync.result(1.02)["reason"], "invalid_or_offline_capture_frame")
+        self.feed(0, 1_025_000_000, 2, source_side=1)
+        self.assertEqual(self.sync.result(1.03)["reason"], "capture_camera_or_device_mismatch")
+        for side in range(2):
+            self.feed(side, 1_035_000_000, 3)
+        self.assertEqual(self.sync.result(1.04)["state"], "consistent")
+
+    def test_levels_and_unverified_clock(self):
+        self.configure(calibrated=False)
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1, depth=False)
+        result = self.sync.result(1.02)
+        self.assertEqual((result["capability_level"], result["reason"]), (0, "missing_calibration"))
+        self.configure()
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1, depth=False)
+        result = self.sync.result(1.02)
+        self.assertEqual((result["capability_level"], result["epipolar_candidate_count"]), (1, 1))
+        self.assertIsNone(result["position_residual_m"])
+        self.configure(clock_bound=False)
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1)
+        self.assertEqual(self.sync.result(1.02)["reason"], "capture_clock_error_unverified_or_exceeds_limit")
+
+    def test_stale_b_then_fresh_frames_only(self):
+        self.configure()
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1)
+        self.feed(0, 2_020_000_000, 2)
+        self.assertEqual(self.sync.result(2.03)["reason"], "camera_b_rgb_stream_stale")
+        self.feed(1, 2_040_000_000, 1, generation=2)
+        self.assertNotEqual(self.sync.result(2.04)["state"], "consistent")
+        self.feed(0, 2_045_000_000, 3)
+        self.assertEqual(self.sync.result(2.05)["state"], "consistent")
+
+    def test_unmatched_calibration_versions_and_invalid_depth(self):
+        config = capture_rig()
+        config["calibration"]["b"]["calibration_version"] = "stale-survey"
+        self.sync = Synchronizer(config)
+        self.sync.start_ns = 1_000_000_000
+        for side in range(2):
+            self.feed(side, 1_010_000_000, 1)
+        self.assertEqual(self.sync.result(1.02)["reason"], "invalid_calibration")
+        self.configure()
+        self.feed(0, 1_010_000_000, 1)
+        self.feed(1, 1_010_000_000, 1, depth=False)
+        source = capture_source(1, 1_010_000_000, 1)
+        self.sync.ingest(1, "depth", source, np.zeros((480, 640), np.float32), 1.01)
+        result = self.sync.result(1.02)
+        self.assertEqual((result["capability_level"], result["reason"]), (1, "camera_b_depth_invalid"))
+
+    def test_rgb_only_without_detectors_reports_observed_timing(self):
+        config = capture_rig(calibrated=False, clock_bound=False)
+        config["topics"] = {"a": {"rgb": "/a"}, "b": {"rgb": "/b"}}
+        sync = Synchronizer(config)
+        sync.start_ns = 1_000_000_000
+        for side in range(2):
+            stamp = 1_010_000_000 + 5_000_000 * side
+            sync.ingest(side, "rgb", capture_source(side, stamp, 1), None, stamp / 1e9)
+        result = sync.result(1.02)
+        self.assertEqual(result["time_offset_ms"], 5)
+        self.assertEqual(result["reason"], "camera_a_objects_not_connected")
+        self.assertEqual(result["sync_status"], "unqualified")
+
+    def test_replay_preserves_timing_and_independent_sessions(self):
+        from tools.replay_cross_view import rebase_source
+
+        tags = [capture_source(side, 100 + side, 7) for side in range(2)]
+        run = uuid.uuid4()
+        rebased = [rebase_source(row["frame_id"], row["stamp_ns"], 1000, run) for row in tags]
+        self.assertEqual([stamp for _, stamp in rebased], [1100, 1101])
+        parsed = [capture_identity(tag) for tag, _ in rebased]
+        self.assertNotEqual(parsed[0]["capture_session_id"], parsed[1]["capture_session_id"])
+        self.assertEqual(rebased[0], rebase_source(tags[0]["frame_id"], 100, 1000, run))
+        self.assertEqual(rebase_source("motus.capture/1|offline", 0, 1000, run),
+                         ("motus.capture/1|offline", 0))
+
+    def test_equal_stamp_with_different_frame_sequence_does_not_join(self):
+        self.configure()
+        self.feed(1, 1_010_000_000, 1)
+        self.sync.ingest(0, "rgb", capture_source(0, 1_010_000_000, 1), None, 1.01)
+        self.sync.ingest(0, "objects", capture_source(0, 1_010_000_000, 2), {}, 1.01)
+        self.assertEqual(self.sync.result(1.02)["reason"], "awaiting_synchronized_frames")
 
 
 def benchmark(count=500):
